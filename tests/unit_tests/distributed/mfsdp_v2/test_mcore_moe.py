@@ -91,7 +91,7 @@ def test_standard_moe_training_and_clipping(
     optimizer_name,
     layer_pattern,
     grouped_gemm,
-    monkeypatch
+    monkeypatch,
 ):
     """Compare ordinary MoE training and clipping against an EP=1 reference."""
     process_group_collection, reference_process_group_collection = process_group_collections
@@ -451,17 +451,31 @@ def test_canonical_grouped_experts_reshard_and_update(
     calls = []
     for direction, name in (
         ("forward", "grouped_gemm_glu_wrapper_sm100"),
+        ("forward", "grouped_gemm_glu_hadamard_wrapper_sm100"),
+        ("forward", "grouped_gemm_glu_hadamard_quant_wrapper_sm100"),
         ("backward", "grouped_gemm_dglu_wrapper_sm100"),
     ):
-        original = getattr(cudnn, name)
+        original = getattr(cudnn, name, None)
+        if original is None:
+            continue
 
         def trace(*args, _original=original, _direction=direction, **kwargs):
             calls.append((_direction, kwargs.get("glu_layout"), kwargs.get("b_tensor") is None))
             return _original(*args, **kwargs)
 
         monkeypatch.setattr(cudnn, name, functools.wraps(original)(trace))
-    fused_type.grouped_gemm_activation_kernel.cache_clear()
-    fused_type.grouped_gemm_dactivation_kernel.cache_clear()
+    kernel_getters = [
+        getattr(fused_type, name)
+        for name in (
+            "grouped_gemm_activation_kernel",
+            "grouped_gemm_act_hadamard_kernel",
+            "grouped_gemm_act_hadamard_quant_kernel",
+            "grouped_gemm_dactivation_kernel",
+        )
+        if hasattr(fused_type, name)
+    ]
+    for get_kernel in kernel_getters:
+        get_kernel.cache_clear()
 
     recipe = {
         "bf16": None,
@@ -642,8 +656,8 @@ def test_canonical_grouped_experts_reshard_and_update(
         assert gathered_phases == ["forward", "backward"] * 2
     assert {direction for direction, _, _ in calls} == {"forward", "backward"}
     assert all(layout == "gate_then_up" and discrete for _, layout, discrete in calls)
-    fused_type.grouped_gemm_activation_kernel.cache_clear()
-    fused_type.grouped_gemm_dactivation_kernel.cache_clear()
+    for get_kernel in kernel_getters:
+        get_kernel.cache_clear()
 
 
 @pytest.mark.parametrize(

@@ -159,17 +159,31 @@ class TestFullyShardedDataParallel:
         calls = []
         for direction, name in (
             ("forward", "grouped_gemm_glu_wrapper_sm100"),
+            ("forward", "grouped_gemm_glu_hadamard_wrapper_sm100"),
+            ("forward", "grouped_gemm_glu_hadamard_quant_wrapper_sm100"),
             ("backward", "grouped_gemm_dglu_wrapper_sm100"),
         ):
-            original = getattr(cudnn, name)
+            original = getattr(cudnn, name, None)
+            if original is None:
+                continue
 
             def trace(*args, _original=original, _direction=direction, **kwargs):
                 calls.append((_direction, kwargs.get("glu_layout"), kwargs.get("b_tensor") is None))
                 return _original(*args, **kwargs)
 
             monkeypatch.setattr(cudnn, name, functools.wraps(original)(trace))
-        fused_type.grouped_gemm_activation_kernel.cache_clear()
-        fused_type.grouped_gemm_dactivation_kernel.cache_clear()
+        kernel_getters = [
+            getattr(fused_type, name)
+            for name in (
+                "grouped_gemm_activation_kernel",
+                "grouped_gemm_act_hadamard_kernel",
+                "grouped_gemm_act_hadamard_quant_kernel",
+                "grouped_gemm_dactivation_kernel",
+            )
+            if hasattr(fused_type, name)
+        ]
+        for get_kernel in kernel_getters:
+            get_kernel.cache_clear()
         recipe = {
             "bf16": None,
             "mxfp8": MXFP8BlockScaling(fp8_format=Format.E4M3),
@@ -306,8 +320,8 @@ class TestFullyShardedDataParallel:
             assert all(layout == "gate_then_up" and discrete for _, layout, discrete in calls)
         finally:
             model.stop_communication()
-            fused_type.grouped_gemm_activation_kernel.cache_clear()
-            fused_type.grouped_gemm_dactivation_kernel.cache_clear()
+            for get_kernel in kernel_getters:
+                get_kernel.cache_clear()
 
     def test_fsdp_mp_policy_with_default_args(self):
         """Test that FullyShardedDataParallel with default dtype args produces the expected policy."""
