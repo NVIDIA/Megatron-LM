@@ -209,6 +209,7 @@ no-build-isolation-package = [
     "transformer-engine",
     "transformer-engine-torch",
     "deep_gemm",
+    "deep-select",
     "fast-hadamard-transform",
 ]
 link-mode = "copy"
