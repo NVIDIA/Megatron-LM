@@ -202,7 +202,7 @@ These conditions are enforced for correctness:
 
 | Area | Required setting | Reason |
 | --- | --- | --- |
-| Model path | `--use-mcore-models` and a training `forward_step` that accepts `return_schedule_plan=True` | Combined 1F1B asks the model for fine-grained nodes instead of running a normal opaque forward. `GPTModel.build_schedule_plan()` is the production implementation. |
+| Model path | An MCore model implementing `build_schedule_plan()` and a training `forward_step` that accepts `return_schedule_plan=True` | Combined 1F1B asks the model for fine-grained nodes instead of running a normal opaque forward. `GPTModel.build_schedule_plan()` is the production implementation. |
 | PyTorch | 2.6 or newer | Older PyTorch versions have a known hang in this overlap path. |
 | EP | `--expert-model-parallel-size > 1` | With EP=1 there is no expert-parallel A2A to overlap. |
 | Dispatcher | `--moe-token-dispatcher-type alltoall` or `flex` | The `allgather` dispatcher does not expose the required dispatch/combine node interface. |
@@ -235,9 +235,9 @@ optimizer, and distributed-launch settings appropriate for the target system:
 export CUDA_DEVICE_MAX_CONNECTIONS=32
 
 torchrun ... pretrain_gpt.py \
-  --use-mcore-models \
   --transformer-impl transformer_engine \
   --bf16 \
+  --disable-bias-linear \
   --num-experts 128 \
   --expert-model-parallel-size 8 \
   --expert-tensor-parallel-size 1 \
@@ -247,6 +247,11 @@ torchrun ... pretrain_gpt.py \
   --global-batch-size 256 \
   ...
 ```
+
+The example disables linear bias to avoid the default bias-dropout fusion
+combination rejected by TE grouped experts. Biased grouped experts are supported
+with `bias_dropout_fusion=False`; disabling bias is not an overlap requirement.
+The deprecated `--use-mcore-models` flag is accepted but ignored and is not needed.
 
 After this baseline is correct and profiled, add `--delay-wgrad-compute` as a
 separate A/B experiment if backward A2A is still exposed.
@@ -273,7 +278,7 @@ the normal PP/VPP divisibility and warmup requirements.
 | `--ep-overlap-early-attn-memory-release` | Off | Runs attention backward earlier, before forward MLP, to release attention activations sooner. | Use to reduce an overlap-specific peak-memory regression. It can expose dispatch/combine communication and reduce throughput. |
 
 `--overlap-dispatch-backward-with-experts-wgrad` is a different optimization.
-It overlaps combine backward with expert wgrad and is mutually exclusive with
+It overlaps dispatch backward with expert wgrad and is mutually exclusive with
 combined 1F1B and `--delay-wgrad-compute`.
 
 ### Parallelism and batch shape
@@ -427,7 +432,7 @@ benchmarks. See [Megatron-FSDP](megatron_fsdp.md) for the broader setup.
 | mHC | PP>1 with Combined 1F1B is rejected; multiple MTP depths also reject mHC. |
 | Wide residual | `wide_residual` is rejected with Combined 1F1B. |
 | FP8 / FP4 | Supported on top of BF16/FP16, subject to the full-recompute delayed-scaling restriction. |
-| Hash MoE | `moe_n_hash_layers > 0` is not supported. |
+| Hash MoE | `moe_num_hash_layers > 0` is not supported. |
 | MOK megakernel | Not supported because MOK replaces the native dispatcher/expert/combine schedule. |
 | MoT / Bagel MoT layer | Not supported by the combined schedule. |
 | Model implementations | A custom or hybrid model must implement the schedule-plan interface and compatible per-layer callables; a normal `forward()` implementation alone is insufficient. |
@@ -455,12 +460,20 @@ commit and hardware before extrapolating them.
 
 ### Reproduce the ablation
 
-Use the same dispatcher and communication tuning in every run:
+Use the same dispatcher and communication tuning for a controlled comparison,
+subject to the platform-specific baseline requirement in step 2:
 
 1. Fix the commit, container, model, topology, parallel mapping, batch shape,
    precision, CUDA Graph mode, and random seed.
 2. Measure the dispatcher-optimized baseline without
    `--overlap-moe-expert-parallel-comm`.
+   On Hopper and earlier, with TP>1 or CP>1 and without FSDP, this non-overlap
+   baseline requires `CUDA_DEVICE_MAX_CONNECTIONS=1`. Use 1 in all runs for an
+   otherwise-identical ablation, or explicitly report the connection-setting
+   difference when comparing separately tuned configurations. Overlap-enabled
+   runs may use 1 or 32; profiling 32 remains useful for EP overlap. This baseline
+   restriction does not apply to Blackwell and newer, TP=CP=1, or FSDP. FSDP
+   separately rejects `CUDA_DEVICE_MAX_CONNECTIONS=1`.
 3. Enable only `--overlap-moe-expert-parallel-comm`.
 4. Add `--delay-wgrad-compute` as a third run, not as part of the overlap
    baseline.
