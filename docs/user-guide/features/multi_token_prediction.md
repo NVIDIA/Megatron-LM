@@ -68,7 +68,11 @@ Ordinary IndexShare (`dsa_indexer_topk_freq` and `dsa_indexer_skip_topk_offset`)
 still determines how depth 0 obtains its indices, including reuse from an earlier
 decoder layer. Repeated-layer index sharing then reuses those indices at later
 depths. An ordinary IndexShare source must run earlier in the same PP/VPP
-execution segment; cross-PP index sharing remains unsupported.
+execution segment; cross-PP index sharing remains unsupported. With a
+`pipeline_model_parallel_layout`, the configuration rejects a layout in which any
+PP/VPP chunk starts on a layer that reuses top-k from an earlier chunk: its first
+decoder layer, or the first MTP layer (`num_layers + 1`) of an MTP-only chunk,
+must compute its own top-k.
 
 Index sharing avoids additional indexer evaluations and auxiliary-loss contributions
 at later depths; review `dsa_indexer_loss_coeff` when changing this setting.
