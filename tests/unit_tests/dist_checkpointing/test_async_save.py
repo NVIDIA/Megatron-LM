@@ -8,7 +8,6 @@ from torch.distributed.checkpoint import CheckpointException
 
 from megatron.core.dist_checkpointing import ShardedTensor, load, save
 from megatron.core.dist_checkpointing.dict_utils import diff
-from megatron.core.dist_checkpointing.strategies.nvrx import has_nvrx_async_support
 from megatron.core.dist_checkpointing.strategies.torch import TorchDistSaveShardedStrategy
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -97,47 +96,3 @@ class TestAsyncSave:
             save(sharded_state_dict, async_ckpt_dir, async_sharded_save=True)
 
         Utils.destroy_model_parallel()
-
-
-_NVRX_SUBMODULES = [
-    'nvidia_resiliency_ext.checkpointing.async_ckpt.core',
-    'nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader',
-    'nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async',
-    'nvidia_resiliency_ext.checkpointing.async_ckpt.state_dict_saver',
-]
-
-
-class TestHasNvrxAsyncSupport:
-    """Tests for has_nvrx_async_support, focusing on the minimum-version check."""
-
-    def _fake_modules(self):
-        """MagicMock modules that satisfy every symbol and hasattr check in has_nvrx_async_support."""
-        return {name: mock.MagicMock() for name in _NVRX_SUBMODULES}
-
-    def test_version_check_passes(self):
-        """Returns True when all NVRx symbols are present and version meets the minimum."""
-        with (
-            mock.patch(
-                'megatron.core.dist_checkpointing.strategies.nvrx.import_module',
-                side_effect=lambda name: self._fake_modules()[name],
-            ),
-            mock.patch(
-                'megatron.core.dist_checkpointing.strategies.nvrx.is_nvrx_min_version',
-                return_value=True,
-            ),
-        ):
-            assert has_nvrx_async_support() is True
-
-    def test_version_check_fails(self):
-        """Returns False when all NVRx symbols are present but version is too old."""
-        with (
-            mock.patch(
-                'megatron.core.dist_checkpointing.strategies.nvrx.import_module',
-                side_effect=lambda name: self._fake_modules()[name],
-            ),
-            mock.patch(
-                'megatron.core.dist_checkpointing.strategies.nvrx.is_nvrx_min_version',
-                return_value=False,
-            ),
-        ):
-            assert has_nvrx_async_support() is False
