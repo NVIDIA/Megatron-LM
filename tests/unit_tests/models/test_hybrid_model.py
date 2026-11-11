@@ -68,7 +68,7 @@ def _mock_hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tenso
 def _make_postprocess_stub(config, training):
     """Build the minimal model surface needed by ``HybridModel._postprocess``."""
 
-    def output_layer(hidden_states, weight=None, runtime_gather_output=None):
+    def output_layer(hidden_states, weight=None, runtime_gather_output=None, output_dtype=None):
         return hidden_states, None
 
     output_layer.sequence_parallel = False
@@ -80,6 +80,7 @@ def _make_postprocess_stub(config, training):
         mtp_process=True,
         share_embeddings_and_output_weights=False,
         output_layer=output_layer,
+        lm_head_can_emit_fp32=False,
         pg_collection=pg_collection,
         tp_group=pg_collection.tp,
         _scale_logits=lambda logits: logits,
