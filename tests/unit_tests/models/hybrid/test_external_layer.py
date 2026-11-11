@@ -305,8 +305,13 @@ def test_external_layer_cp_token_ids_match_unsharded_reference(
     # Finish collectives before assertions so a failure cannot strand another rank.
     for parameter in actual.parameters():
         torch.distributed.all_reduce(parameter.grad, group=groups.cp)
-    torch.testing.assert_close(output, expected.index_select(0, positions))
-    torch.testing.assert_close(actual_input.grad, reference_input.grad.index_select(0, positions))
+    # mHC comparisons show sub-1e-3 numerical drift between CP and unsharded runs,
+    # including near-zero parameter gradients. Keep non-mHC and token-ID checks strict.
+    close_kwargs = {"rtol": 1e-3, "atol": 1e-3} if with_mhc else {}
+    torch.testing.assert_close(output, expected.index_select(0, positions), **close_kwargs)
+    torch.testing.assert_close(
+        actual_input.grad, reference_input.grad.index_select(0, positions), **close_kwargs
+    )
     for layer, layout in zip(actual.layers, layouts, strict=True):
         inner = layer.inner_layer if with_mhc else layer
         torch.testing.assert_close(
@@ -318,6 +323,7 @@ def test_external_layer_cp_token_ids_match_unsharded_reference(
             parameter.grad,
             reference.get_parameter(name).grad,
             msg=lambda message: f"{name}: {message}",
+            **close_kwargs,
         )
 
 
