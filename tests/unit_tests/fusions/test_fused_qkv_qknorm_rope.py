@@ -76,12 +76,14 @@ def test_matches_unfused_te_path(sq, b, ng, nq, hn, zc):
 
     for o, r in zip(out, ref):
         assert o.shape == r.shape and o.is_contiguous()
-    # Same op order and rounding points as the TE path; a rare rounding flip of the bf16 norm output
-    # can still move a RoPE output by a couple of ULPs, so bound how often outputs differ at all.
+    # Same op order and rounding points as the TE path. A rare rounding flip of the bf16 norm output
+    # (values of order 1) can survive RoPE even where cos/sin terms nearly cancel, so the bound is
+    # absolute at bf16 resolution, plus a bound on how often outputs differ at all.
     for o, r in zip(out, ref):
-        torch.testing.assert_close(o, r)
+        torch.testing.assert_close(o, r, atol=1.6e-2, rtol=1.6e-2)
         assert (o != r).float().mean().item() < 1e-4
-    torch.testing.assert_close(m_fus.grad, m_ref.grad, atol=1e-3, rtol=2**-7)
+    torch.testing.assert_close(m_fus.grad, m_ref.grad, atol=1.6e-2, rtol=1.6e-2)
+    assert (m_fus.grad != m_ref.grad).float().mean().item() < 1e-3
     torch.testing.assert_close(qn.weight.grad.float(), ref_dqw.float(), atol=1e-2, rtol=1e-2)
     torch.testing.assert_close(kn.weight.grad.float(), ref_dkw.float(), atol=1e-2, rtol=1e-2)
 
