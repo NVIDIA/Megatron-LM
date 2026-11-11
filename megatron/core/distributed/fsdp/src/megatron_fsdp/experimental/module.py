@@ -565,17 +565,17 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
 def _group_parameters(
     parameters: dict[str, nn.Parameter], parameter_grouping: ParameterGrouping
 ) -> list[dict[str, nn.Parameter]]:
-    if not isinstance(parameter_grouping, ParameterGrouping):
-        raise ValueError(f"Unsupported parameter grouping: {parameter_grouping!r}.")
-    grouped: dict[tuple[torch.dtype, bool, int | None], dict[str, nn.Parameter]] = {}
+    if parameter_grouping is ParameterGrouping.PER_PARAMETER:
+        by_parameter: dict[nn.Parameter, dict[str, nn.Parameter]] = {}
+        for name, parameter in parameters.items():
+            by_parameter.setdefault(parameter, {})[name] = parameter
+        return list(by_parameter.values())
+
+    grouped: dict[tuple[torch.dtype, bool], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
-        key = (
-            effective_dtype(parameter),
-            parameter.requires_grad,
-            id(parameter) if parameter_grouping is ParameterGrouping.PER_PARAMETER else None,
-        )
+        key = (effective_dtype(parameter), parameter.requires_grad)
         grouped.setdefault(key, {})[name] = parameter
-    return [grouped[key] for key in grouped]
+    return list(grouped.values())
 
 
 def _specialize_placements(
