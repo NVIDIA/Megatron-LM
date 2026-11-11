@@ -51,8 +51,9 @@ def checkpointed_forward(
         strict_runtime_validation_frequency (str, optional):
             ``config.strict_runtime_validation_frequency`` of the calling stack. When given,
             per-layer ``strict_runtime_validation`` flags are derived once per checkpointed
-            forward, keyed on the layer config type, so a recompute does not re-validate
-            layers that the first forward already validated.
+            forward for layers that support validation, keyed on their config type, so a
+            recompute does not re-validate layers that the first forward already validated.
+            Other layers keep their original interface and need no validation config.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -103,7 +104,11 @@ def checkpointed_forward(
                     )
 
                 strict_runtime_validation = None
-                if strict_runtime_validation_frequency is not None:
+                if strict_runtime_validation_frequency is not None and (
+                    isinstance(layer, TransformerLayer)
+                    or getattr(layer, "supports_hybrid_recompute_kwargs", False)
+                    or getattr(layer, "supports_strict_runtime_validation", False)
+                ):
                     # Key on the per-layer config type (HybridStack builds every layer and mHC
                     # wrapper with ``config=layer_config``); ``layer_type_list`` is a derived
                     # property that is recomputed on every access.
@@ -151,11 +156,7 @@ def checkpointed_forward(
                         if input_ids_by_layout is not None
                         else input_ids
                     )
-                if strict_runtime_validation is not None and (
-                    isinstance(layer, TransformerLayer)
-                    or getattr(layer, "supports_hybrid_recompute_kwargs", False)
-                    or getattr(layer, "supports_strict_runtime_validation", False)
-                ):
+                if strict_runtime_validation is not None:
                     layer_kwargs["strict_runtime_validation"] = strict_runtime_validation
                 with inner_quantization_context:
                     if isinstance(layer, TransformerLayer):

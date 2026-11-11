@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from contextlib import nullcontext
 from types import MethodType, SimpleNamespace
 from unittest import mock
 
@@ -229,7 +230,14 @@ def test_hybrid_stack_omits_input_ids_keyword_when_not_provided():
     assert 'input_ids' not in transformer_layer.calls[0]
 
 
-def test_hybrid_stack_full_recompute_preserves_ids_and_non_transformer_signature(monkeypatch):
+@pytest.mark.parametrize("recompute_method", ["uniform", "block"])
+@pytest.mark.parametrize(
+    "frequency, expected_validation",
+    [("always", [True, True]), ("once_per_microbatch", [True, False]), ("never", [False, False])],
+)
+def test_hybrid_stack_full_recompute_preserves_ids_and_non_transformer_signature(
+    monkeypatch, recompute_method, frequency, expected_validation
+):
     monkeypatch.setattr(
         tensor_parallel,
         "checkpoint",
@@ -238,12 +246,18 @@ def test_hybrid_stack_full_recompute_preserves_ids_and_non_transformer_signature
     transformer_layer = RecordingTransformerLayer()
     learned_transformer_layer = RecordingTransformerLayer(layer_number=2, is_hash_layer=False)
     non_transformer_layer = RecordingNonTransformerLayer()
-    stack = make_stack(
-        [transformer_layer, learned_transformer_layer, non_transformer_layer],
-        recompute_granularity="full",
-        recompute_method="uniform",
-        recompute_num_layers=3,
-    )
+    with (
+        pytest.warns(UserWarning, match="Strict runtime validation is disabled")
+        if frequency == "never"
+        else nullcontext()
+    ):
+        stack = make_stack(
+            [transformer_layer, learned_transformer_layer, non_transformer_layer],
+            recompute_granularity="full",
+            recompute_method=recompute_method,
+            recompute_num_layers=3,
+            strict_runtime_validation_frequency=frequency,
+        )
     input_ids = torch.arange(8).reshape(2, 4)
 
     run_stack(stack, input_ids)
@@ -251,6 +265,10 @@ def test_hybrid_stack_full_recompute_preserves_ids_and_non_transformer_signature
     assert transformer_layer.calls[0]['input_ids'] is input_ids
     assert 'input_ids' not in learned_transformer_layer.calls[0]
     assert non_transformer_layer.num_calls == 1
+    assert [
+        layer.calls[0]["strict_runtime_validation"]
+        for layer in (transformer_layer, learned_transformer_layer)
+    ] == expected_validation
 
 
 @pytest.mark.parametrize("full_recompute", [False, True])
