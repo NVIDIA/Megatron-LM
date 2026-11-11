@@ -451,8 +451,10 @@ class HybridStack(MegatronModule):
             self.layers.append(layer)
             physical_layer_offset += get_layer_type_physical_count(layer_config)
 
-        if self.config.cuda_graph_impl == "local":
-            annotate_first_last_layer(self.layers)
+        if self.config.cuda_graph_impl == "local" and not is_layer_group_stack:
+            # Only the outermost stack marks first/last, and it marks physical layers: a
+            # bracketed group must not mark its own ends, which are interior to the stack.
+            annotate_first_last_layer(self.physical_layers())
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)

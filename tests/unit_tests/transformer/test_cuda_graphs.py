@@ -1322,6 +1322,50 @@ class TestParallelHybridBlockCudagraphs:
             del parallel_mamba_block.layers[_].cudagraph_manager.cudagraph_runners[0].fwd_graph
 
 
+class TestGroupedHybridStackCudagraphs:
+    """CUDA graph code sees the physical layers inside bracketed HybridStack groups."""
+
+    def setup_method(self, method):
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel()
+        model_parallel_cuda_manual_seed(123)
+        CudaGraphManager.global_mempool = None
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+        destroy_num_microbatches_calculator()
+        _CudagraphGlobalRecord.cudagraph_created = False
+        _CudagraphGlobalRecord.cudagraph_record = []
+
+    def get_hybrid_block(self, layer_pattern, cuda_graph_impl):
+        transformer_config = TransformerConfig(
+            hidden_size=256,  # The Mamba layer places several constraints on this
+            num_layers=len(layer_pattern.replace("[", "").replace("]", "")),
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            cuda_graph_impl=cuda_graph_impl,
+        )
+        return HybridStack(
+            transformer_config,
+            hybrid_stack_spec.submodules,
+            layer_config_list=validate_segment_layers(layer_pattern, transformer_config),
+            pp_layer_offset=0,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'pp', 'cp']
+            ),
+        )
+
+    @pytest.mark.parametrize("layer_pattern", ["M-M*-", "[M-][M*-]", "M[-M*]-", "[M-M*-]"])
+    def test_first_last_marks_ignore_groups(self, layer_pattern):
+        """Only the stack's first and last physical layers are marked, grouped or not."""
+        block = self.get_hybrid_block(layer_pattern, cuda_graph_impl="local")
+        layers = block.physical_layers()
+
+        assert [layer.layer_number for layer in layers] == [1, 2, 3, 4, 5]
+        assert [layer.is_first_layer for layer in layers] == [True, False, False, False, False]
+        assert [layer.is_last_layer for layer in layers] == [False, False, False, False, True]
+
+
 # Global storage for comparing unique buffer counts across different num_microbatches,
 # keyed by (pp_size, vpp_size)
 _unique_buffer_counts = {}
