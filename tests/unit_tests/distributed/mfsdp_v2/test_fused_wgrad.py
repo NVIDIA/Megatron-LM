@@ -3,8 +3,9 @@
 """Transformer Engine fused weight-gradient tests for MFSDP v2.
 
 TE modules built with ``fuse_wgrad_accumulation=True`` write their weight gradients into
-``weight.main_grad``, which MFSDP points at its reduce-scatter input. Test buffer release in
-``test_memory.py`` and the buffer dtype in ``test_gradient_accumulation.py``.
+``weight.main_grad``, which MFSDP points at its reduce-scatter input, or at main_grad itself when
+no DP-inner reduction is needed, as on one rank. Test buffer release in ``test_memory.py`` and the
+buffer dtype in ``test_gradient_accumulation.py``.
 """
 
 import gc
@@ -21,6 +22,7 @@ from torch.utils.checkpoint import checkpoint
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
     Placements,
+    PrefetchOrder,
     RuntimePolicy,
     SchedulePolicy,
     finalize_gradients,
@@ -116,12 +118,13 @@ def _build_fused_wgrad_run(mesh, placements, variant, dtype, fuse, device):
         checkpoint_first=variant.startswith("checkpointed"),
         use_reentrant=variant == "checkpointed_reentrant",
     )
+    # TE can't scale what it accumulates, so check that grad_scale still applies exactly once.
     with fully_shard_context(FsdpContext(device=device)) as context:
         if variant == "mixed_unit":
-            fully_shard(model, mesh=mesh, placements=placements)
+            fully_shard(model, mesh=mesh, placements=placements, grad_scale=0.5)
         else:
-            fully_shard(model.first, mesh=mesh, placements=placements)
-            fully_shard(model.second, mesh=mesh, placements=placements)
+            fully_shard(model.first, mesh=mesh, placements=placements, grad_scale=0.5)
+            fully_shard(model.second, mesh=mesh, placements=placements, grad_scale=0.5)
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     fully_shard_optimizer(optimizer)
     return model, context, optimizer
@@ -145,12 +148,20 @@ def _train_fused_wgrad_model(model, context, optimizer, microbatches, set_to_non
 @pytest.mark.parametrize("set_to_none", [True, False])
 @pytest.mark.parametrize("num_microbatches", [1, 3])
 @pytest.mark.parametrize(
-    "variant", ["per_layer", "mixed_unit", "checkpointed", "checkpointed_reentrant", "hsdp"]
+    "variant",
+    [
+        "per_layer",
+        "mixed_unit",
+        "checkpointed",
+        "checkpointed_reentrant",
+        "hsdp",
+        "no_inner_reduction",
+    ],
 )
 def test_fused_wgrad_losses_match_unfused(
     distributed_setup, variant, num_microbatches, set_to_none, dtype
 ):
-    """TE layers writing wgrads into the reduce-scatter buffer train like the copy path."""
+    """TE layers writing fused wgrads train like the copy path."""
     device = distributed_setup.device
     world_size = distributed_setup.world_size
     if variant == "hsdp":
@@ -158,6 +169,12 @@ def test_fused_wgrad_losses_match_unfused(
             pytest.skip("HSDP requires an even number of at least 4 ranks for a 2-D DP mesh.")
         mesh = init_device_mesh(
             device.type, (2, world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
+        )
+        placements = _hsdp_placements()
+    elif variant == "no_inner_reduction":
+        # DP-inner size 1, as for experts under expert parallelism.
+        mesh = init_device_mesh(
+            device.type, (world_size, 1), mesh_dim_names=("dp_outer", "dp_inner")
         )
         placements = _hsdp_placements()
     else:
@@ -313,6 +330,62 @@ def test_fused_wgrad_with_delayed_weight_gradient(distributed_setup):
     torch.testing.assert_close(fused.weight.grad.full_tensor(), copied.weight.grad.full_tensor())
 
 
+def test_fused_wgrad_without_inner_reduction_writes_into_main_grad(distributed_setup, monkeypatch):
+    """With DP-inner size 1, TE writes into main_grad and no reduce-scatter input is allocated."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(
+        device.type, (distributed_setup.world_size, 1), mesh_dim_names=("dp_outer", "dp_inner")
+    )
+    layer = te.Linear(16, 16, bias=False, device=device, fuse_wgrad_accumulation=True)
+    with fully_shard_context(FsdpContext(device=device)):
+        fully_shard(layer, mesh=mesh, placements=_hsdp_placements())
+    [group] = layer.parameter_groups
+    [weight] = [fsdp_parameter.unsharded for fsdp_parameter in group.fsdp_parameters]
+
+    allocated = []
+    original = FsdpParameterGroup.allocate_partial_grad_buffer
+
+    def spy(self):
+        allocated.append(self)
+        return original(self)
+
+    monkeypatch.setattr(FsdpParameterGroup, "allocate_partial_grad_buffer", spy)
+    # Registered after fully_shard(), so this runs after MFSDP's backward pre-hook sets main_grad.
+    storages = []
+    layer.register_full_backward_pre_hook(
+        lambda _module, _grad_output: storages.append(weight.main_grad.untyped_storage().data_ptr())
+    )
+    layer(torch.randn(4, 16, device=device)).square().sum().backward()
+
+    assert storages == [group.main_grad.local_buffer.untyped_storage().data_ptr()]
+    assert allocated == []
+
+
+def test_fused_wgrad_accumulates_across_uses_and_backward_calls(distributed_setup):
+    """A layer used twice, and backward calls without zero_grad() in between, add up.
+
+    On one rank TE accumulates into main_grad itself. The second use's backward must not zero it
+    again, and the second call must add to the first call's gradient, which grad_scale has scaled.
+    """
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    x = torch.randn(4, 16, device=device)
+    grads = []
+    for fuse in (False, True):
+        torch.manual_seed(1234)
+        layer = te.Linear(16, 16, bias=False, device=device, fuse_wgrad_accumulation=fuse)
+        # Unit-scale weights keep both uses' contributions well above assert_close's atol.
+        with torch.no_grad():
+            nn.init.normal_(layer.weight, std=16**-0.5)
+        # Registration order has the layer once; execution calls it twice.
+        with fully_shard_context(FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)):
+            fully_shard(layer, mesh=mesh, placements=_default_placements(), grad_scale=0.5)
+        for _ in range(2):
+            layer(layer(x)).square().sum().backward()
+        grads.append(layer.weight.grad.to_local())
+    torch.testing.assert_close(grads[1], grads[0])
+
+
 # About 0.1 s on an H200: long enough for compute that does not wait to finish first.
 _DELAY_CYCLES = 1 << 28
 
@@ -380,6 +453,8 @@ def _fused_linear_stack(
     The root is first in backward order and owns no weights, so it allocates the last layer's
     buffer and its own post-backward only runs after every layer.
     """
+    if distributed_setup.world_size < 2:
+        pytest.skip("On one rank no DP-inner reduction is needed, so there is no fused buffer.")
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     torch.manual_seed(1234)

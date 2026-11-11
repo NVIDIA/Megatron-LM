@@ -369,7 +369,9 @@ class FsdpModule:
         groups = [
             group
             for group in self._parameter_groups
-            if group.fuse_wgrad_accumulation and group.partial_grad is None
+            if group.fuse_wgrad_accumulation
+            and group.requires_inner_reduction
+            and group.partial_grad is None
         ]
         if not groups:
             return
@@ -456,13 +458,14 @@ class FsdpModule:
 
         # TE writes fused wgrads into partial_grad, which the previous module in backward order
         # allocated; the first module allocates its own. Wait for it even so: when that module is
-        # this one's parent, none of its reductions has run yet.
+        # this one's parent, none of its reductions has run yet. Groups that need no DP-inner
+        # reduction have no partial_grad, and TE writes into main_grad instead.
         self._preallocate_partial_grads()
         if self._partial_grad_event is not None:
             current_stream.wait_event(self._partial_grad_event)
-            for group in self._parameter_groups:
-                if group.fuse_wgrad_accumulation:
-                    group.bind_partial_grad()
+        for group in self._parameter_groups:
+            if group.fuse_wgrad_accumulation:
+                group.bind_main_grad()
         # Allocate the next module's while prefetching, ahead of this module's reduce-scatter, so
         # that it is freed right after its own. unshard() advanced the order to that module.
         if prefetch:
@@ -498,8 +501,7 @@ class FsdpModule:
                 if not group.requires_grad:
                     continue
 
-                # TE needs partial_grad to write into even without an inner reduction.
-                if group.requires_inner_reduction or group.fuse_wgrad_accumulation:
+                if group.requires_inner_reduction:
                     self._reduce_inner_gradients(group)
                 else:
                     self._accumulate_local_gradients(group)

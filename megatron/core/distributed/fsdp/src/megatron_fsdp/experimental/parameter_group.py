@@ -129,11 +129,14 @@ class FsdpParameterGroup:
     # Padded (equal) or unpadded (unequal) segments for RowAtomic/BlockAtomic layouts.
     shard_layout: ShardLayout
     # Whether any of these trainable parameters belongs to a Transformer Engine module built with
-    # fuse_wgrad_accumulation=True, which writes its weight gradients into partial_grad.
+    # fuse_wgrad_accumulation=True, which writes its weight gradients into partial_grad, or into
+    # main_grad when no DP-inner reduction is needed.
     fuse_wgrad_accumulation: bool
     # With fuse_wgrad_accumulation, the reduce-scatter input of the next or current backward,
     # allocated before that backward starts. None otherwise.
     partial_grad: DBuffer | None
+    # Whether main_grad holds a total that TE accumulated unscaled and finalization then scaled.
+    _main_grad_is_scaled: bool
 
     def __init__(
         self,
@@ -387,6 +390,7 @@ class FsdpParameterGroup:
         self.main_grad = None
         self.pre_optimizer_main_grad = None
         self._main_grad_is_stale = False
+        self._main_grad_is_scaled = False
         grad_dtype = mixed_precision_policy.main_grads_dtype or parameters[0].dtype
         self.grad_comm_dtype = mixed_precision_policy.grad_comm_dtype or grad_dtype
         if not self.requires_grad:
@@ -651,14 +655,28 @@ class FsdpParameterGroup:
                 device=self.main_weight.device,
             )
 
-    def bind_partial_grad(self) -> None:
-        """Expose partial_grad's views as each parameter's ``main_grad`` for TE to write into.
+    def bind_main_grad(self) -> None:
+        """Expose the views TE accumulates fused wgrads into as each parameter's ``main_grad``.
 
-        Like Megatron's DDP, every parameter gets one; TE uses it only for fused weights.
+        Like Megatron's DDP, every parameter gets one; TE uses it only for fused weights. They are
+        partial_grad's views when the group needs a DP-inner reduction. Otherwise main_grad holds
+        full tensors, so TE accumulates into it directly, unscaled, and reduce_outer_gradients()
+        scales the total.
         """
-        assert self.partial_grad is not None
+        buffer = self.partial_grad if self.requires_inner_reduction else self.main_grad
+        assert buffer is not None
+        # Start the step from zero where the copy path would clear or overwrite main_grad. A module
+        # used twice binds again before its gradients are accumulated.
+        if buffer is self.main_grad and not hasattr(self.fsdp_parameters[0].unsharded, "main_grad"):
+            if self._main_grad_is_stale or not self._has_sharded_grads():
+                buffer.local_buffer.zero_()
+                self._main_grad_is_stale = False
+            elif self._main_grad_is_scaled:
+                # Accumulating on top of a finalized total: undo its scaling.
+                buffer.local_buffer.div_(self.grad_scale)
+            self._main_grad_is_scaled = False
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            fsdp_parameter.unsharded.main_grad = self.partial_grad.get_tensor_view(index)
+            fsdp_parameter.unsharded.main_grad = buffer.get_tensor_view(index)
 
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
         """Pack full local gradients on compute into the reduce-scatter input buffer.
@@ -686,6 +704,11 @@ class FsdpParameterGroup:
         this call and orders any outer reduction after the accumulation.
         """
         assert self.main_grad is not None
+        if self.fuse_wgrad_accumulation:
+            # TE already accumulated the fused wgrads into main_grad, unscaled (bind_main_grad()).
+            self.copy_gradients_to_partial_buffer(self.main_grad)
+            self._install_sharded_grads(self.main_grad)
+            return
         for fsdp_parameter in self.fsdp_parameters:
             if fsdp_parameter.unsharded.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
@@ -787,6 +810,14 @@ class FsdpParameterGroup:
         """
         assert self.main_grad is not None
         assert self.pre_optimizer_main_grad is not None
+        if (
+            self.fuse_wgrad_accumulation
+            and not self.requires_inner_reduction
+            and self.grad_scale != 1
+        ):
+            # TE can't scale what it accumulates into main_grad, so scale the total once here.
+            self.main_grad.local_buffer.mul_(self.grad_scale)
+            self._main_grad_is_scaled = True
         if self.pre_optimizer_main_grad is self.main_grad:
             # Optimizer layout equals the accumulation layout (e.g. plain DP): no
             # DP-outer axis to reduce, so grads already rest finalized.

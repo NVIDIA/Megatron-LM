@@ -79,6 +79,9 @@ reduce-scatter input must exist before Bwd\_i starts. Compared with the backward
   Megatron's DDP.
 - DI\_i still follows RS\_i, so at most two buffers are alive: one being filled and one being
   reduced.
+- A group that needs no DP-inner reduction, such as experts with DP-inner size 1, gets no
+  buffer. TE accumulates into `main_grad` itself, which is zeroed before the step's first
+  backward, and `grad_scale` is applied when gradients are finalized.
 
 The wait at the start of Bwd\_i is needed even when the order is right. Backward order lists a
 parent before its children, so a parent issues its last child's AI with no CI in between. With

@@ -137,6 +137,9 @@ def test_fused_wgrad_buffer_follows_grad_comm_dtype(
     x = torch.randn(4, 16, device=device, dtype=torch.bfloat16)
     model(x).float().sum().backward()
 
+    # On one rank no DP-inner reduction is needed, so TE writes into main_grad itself.
+    if distributed_setup.world_size == 1:
+        expected_comm_dtype = main_grads_dtype or torch.bfloat16
     assert main_grad_dtypes == [expected_comm_dtype], main_grad_dtypes
     assert model.weight.grad.dtype == (main_grads_dtype or torch.bfloat16)
 
