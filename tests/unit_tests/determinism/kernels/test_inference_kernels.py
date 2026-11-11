@@ -825,6 +825,8 @@ def test_vllm_fused_moe_and_moe_sum_replay():
                 decode_valid,
                 decode_routing,
                 num_tokens_hint=hint,
+                parallel_align=True,
+                tiled_sum=True,
             )
             return out[:decode_tokens]
 
@@ -1377,6 +1379,7 @@ def test_vllm_tiled_sum_matches_original_bits(topk, hidden, apply_weights):
             64,
             out=actual,
             apply_weights=apply_weights,
+            tiled=True,
         )
 
     with set_batch_invariant_mode(False):

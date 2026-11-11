@@ -1348,6 +1348,56 @@ class TestMoEModules:
             )
         assert layer.experts._nvfp4_weights is not None
 
+    @pytest.mark.parametrize("parallel_align", [False, True])
+    @pytest.mark.parametrize("tiled_sum", [False, True])
+    def test_inference_vllm_moe_layer_replays(self, parallel_align, tiled_sum):
+        """Inference MoELayer through the vLLM BF16 experts, with each combination of the
+        opt-in parallel alignment and tiled top-k sum."""
+        from megatron.core.models.gpt.moe_module_specs import get_inference_optimized_moe_spec
+        from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
+
+        self._init(ep=1)
+        seeded()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=1024,
+            num_attention_heads=8,
+            num_moe_experts=8,
+            moe_ffn_hidden_size=1024,
+            moe_router_topk=2,
+            moe_router_score_function="sigmoid",
+            moe_router_enable_expert_bias=True,
+            moe_router_dtype="fp32",
+            moe_grouped_gemm=True,
+            activation_func=squared_relu,
+            add_bias_linear=False,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            use_cpu_initialization=True,
+            normalization="RMSNorm",
+            transformer_impl="inference_optimized",
+            inference_grouped_gemm_backend="vllm",
+            inference_moe_token_dispatcher_type="nccl",
+            inference_moe_vllm_parallel_align=parallel_align,
+            inference_moe_vllm_tiled_sum=tiled_sum,
+        )
+        NCCLAllGatherDispatcher.allocate_buffers()
+        layer = get_inference_optimized_moe_spec()(config=config).cuda().eval()
+        # 64 tokens: 32-row tiles, which the parallel alignment covers.
+        hidden = torch.randn(64, 1, 1024, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad(), deterministic_algorithms(True), InferenceMode.active():
+            assert_module_replays_bit_exact(
+                layer,
+                (hidden,),
+                replays=3,
+                backward=False,
+                contention=True,
+                what=(
+                    f"MoELayer[inference, vllm, parallel_align={parallel_align}, "
+                    f"tiled_sum={tiled_sum}]"
+                ),
+            )
+
     @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
     @pytest.mark.parametrize(
         "offload_modules,offloaded_group,op_fuser",
