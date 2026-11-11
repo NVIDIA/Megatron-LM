@@ -749,7 +749,7 @@ class EngineLoopMixin:
                         #    goes stale once local work drains and would trigger a dummy forward
                         #    with no collective to join. Such a dummy forward would also need a
                         #    request-owned recurrent-state slot (the dedicated dummy slot is only
-                        #    reserved for EP > 1), which pending handoffs may all be holding.
+                        #    reserved when tp_ep > 1), which pending handoffs may all be holding.
                         # 1. there is no global work -> engine is idle. At any step in the future
                         #    one of the ranks can receive work. So we should be eagerly checking for that
                         # 2. it has been 20 steps since we last established consensus, and that consensus
