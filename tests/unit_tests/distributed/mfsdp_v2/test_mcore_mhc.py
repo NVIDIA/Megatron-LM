@@ -230,9 +230,7 @@ def test_mhc_training_matches_reference(process_group_collection, recompute_mhc,
                 torch.testing.assert_close(
                     parameter.grad.to_local(),
                     expected[reference_slices[name]],
-                    rtol=1e-4,
-                    atol=1e-8,
-                    msg=name,
+                    msg=lambda detail: f"{name}: {detail}",
                 )
 
         reference_optimizer.step()
