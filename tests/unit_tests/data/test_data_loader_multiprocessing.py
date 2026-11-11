@@ -65,10 +65,14 @@ def test_data_loader_workers(monkeypatch, start_method, split, collate_path, exi
         num_workers=1,
         use_varlen_dataset=collate_path in ('varlen', 'sbhd'),
         varlen_sbhd_validation=collate_path == 'sbhd',
-        dynamic_context_parallel=collate_path == 'dynamic_cp',
-        sequence_packing_scheduler='test' if collate_path == 'packing' else None,
     )
     cfg = SimpleNamespace(
+        model=SimpleNamespace(
+            transformer=SimpleNamespace(
+                dynamic_context_parallel=collate_path == 'dynamic_cp',
+                sequence_packing_scheduler='test' if collate_path == 'packing' else None,
+            )
+        ),
         train=SimpleNamespace(
             micro_batch_size=2, exit_signal_handler=exit_signal_handler, exit_signal=signal.SIGUSR1
         ),
