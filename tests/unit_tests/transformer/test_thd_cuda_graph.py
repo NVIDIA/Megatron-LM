@@ -1505,48 +1505,67 @@ def test_direct_layer_route_decompose_rejects_wrong_rank_before_flattening(monke
 
 
 @pytest.mark.parametrize("pp_size", [2, 4, 8])
-@pytest.mark.parametrize("vpp_size", [None, 2, 4])
-def test_slot_colors_never_share_storage_between_live_frames(pp_size, vpp_size):
+@pytest.mark.parametrize("vpp_size, group_factor", [(None, 1), (2, 1), (4, 1), (2, 2), (4, 2)])
+def test_slot_colors_never_share_storage_between_live_frames(pp_size, vpp_size, group_factor):
     """Saved-tensor and returned-gradient colors stay distinct across every reachable schedule.
 
-    Orders come from the production PP/VPP schedule for each rank and each microbatch count the
-    dynamic-CP scheduler can produce; the overlap check below is independent of the colorer.
+    As in capture, slots and colors are proved over the counts up to each rank's
+    schedule-period limit. The overlap check below, independent of the colorer, then replays
+    every count the dynamic-CP scheduler can produce up to twice the largest limit, which is at
+    least one full schedule period beyond it.
     """
+    from megatron.core.pipeline_parallel.schedules import get_pp_rank_microbatches
     from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
 
     num_chunks = vpp_size or 1
-    group_size = pp_size
+    group_size = pp_size * group_factor
+    vpp_group_size = group_size if vpp_size else None
     layers_per_chunk = [2] * num_chunks
-    counts = TECudaGraphHelper._get_dynamic_slot_liveness_microbatch_counts(
-        4 * pp_size, group_size if vpp_size else None
-    )
     helper = TECudaGraphHelper.__new__(TECudaGraphHelper)
     helper.num_model_chunks = num_chunks
-    orders_by_rank = {}
-    for rank in range(pp_size):
-        communicator = SimpleNamespace(
+    communicators = {
+        rank: SimpleNamespace(
             pp_group=SimpleNamespace(size=lambda: pp_size, rank=lambda rank=rank: rank),
             virtual_pipeline_model_parallel_size=vpp_size,
         )
-        orders_by_rank[rank] = [
-            helper._build_pipeline_order(count, group_size, p2p_communicator=communicator)
-            for count in counts
+        for rank in range(pp_size)
+    }
+
+    def orders(rank, max_count):
+        return [
+            helper._build_pipeline_order(count, group_size, p2p_communicator=communicators[rank])
+            for count in TECudaGraphHelper._get_dynamic_slot_liveness_microbatch_counts(
+                max_count, vpp_group_size
+            )
         ]
+
+    def proof_limit(rank, num_slots):
+        # The warmup of an untruncated schedule; 64 groups exceed every warmup here.
+        _, _, num_warmup, _ = get_pp_rank_microbatches(
+            64 * group_size, num_chunks, group_size, p2p_communicator=communicators[rank]
+        )
+        return TECudaGraphHelper._get_dynamic_slot_liveness_proof_limit(
+            num_warmup, num_chunks, num_slots, vpp_group_size
+        )
+
     # Every PP stage captures the same slot count (an all-reduce MAX in production).
     num_slots = max(
         TECudaGraphHelper._get_required_num_microbatch_slots_from_order(order, num_chunks)
-        for orders in orders_by_rank.values()
-        for order in orders
+        for rank in communicators
+        for order in orders(rank, proof_limit(rank, 1))
     )
+    limits = {rank: proof_limit(rank, num_slots) for rank in communicators}
+    replay_limit = 2 * max(limits.values())
 
-    for rank, orders in orders_by_rank.items():
+    for rank in communicators:
+        proof_orders = orders(rank, limits[rank])
         colors = TECudaGraphHelper._build_saved_tensor_liveness_colors(
-            orders, num_slots, layers_per_chunk
+            proof_orders, num_slots, layers_per_chunk
         )
         grad_colors = TECudaGraphHelper._build_user_grad_liveness_colors(
-            orders, num_slots, num_chunks
+            proof_orders, num_slots, num_chunks
         )
-        for order in orders:
+        for order in orders(rank, replay_limit):
             live, forward_idx, backward_idx, previous_grad = (
                 set(),
                 [0] * num_chunks,
