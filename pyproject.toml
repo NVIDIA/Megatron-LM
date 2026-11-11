@@ -124,6 +124,7 @@ dev = [
 inference = [
     "torch-memory-saver",
     "flashinfer-python>=0.7.2,<0.8.0",
+    "flash-attn-4[cu13]==4.0.0b36; sys_platform == 'linux'",
 ]
 
 otel = [

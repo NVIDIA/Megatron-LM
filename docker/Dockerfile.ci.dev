@@ -142,6 +142,13 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.32,targ
         export FLASH_MLA_DISABLE_SM90=1 NVCC_THREADS=16 \
             CFLAGS="-I/usr/local/cuda/include/cccl" CXXFLAGS="-I/usr/local/cuda/include/cccl"
     fi
+    # The base image keeps FlashAttention 4 inside FlashAttention 2's system flash_attn package,
+    # where it shadows the uv.lock version installed into the venv. Remove that copy.
+    /usr/bin/python3 -m pip uninstall -y --break-system-packages flash-attn-4
+    BASE_FLASH_ATTN=$(/usr/bin/python3 -c 'import importlib.util as u; s = u.find_spec("flash_attn"); print(s.submodule_search_locations[0] if s else "")')
+    if [ -n "${BASE_FLASH_ATTN}" ]; then
+        rm -rf "${BASE_FLASH_ATTN}/cute"
+    fi
     uv venv ${UV_PROJECT_ENVIRONMENT} --system-site-packages
     uv sync --only-group build
     # Limit per-package compiler concurrency on ARM.
@@ -173,6 +180,12 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.32,targ
         --no-install-package nvidia-cusparse-cu12 \
         --no-install-package nvidia-cusparselt-cu12 \
         --no-install-package nvidia-nccl-cu12
+
+    # Fail the build unless the flash_attn.cute that imports is the copy uv.lock installed.
+    python -c 'import flash_attn.cute, importlib.metadata as m, os; \
+        d = m.distribution("flash-attn-4"); \
+        assert os.path.samefile(flash_attn.cute.__file__, d.locate_file("flash_attn/cute/__init__.py")), flash_attn.cute.__file__; \
+        print("flash-attn", flash_attn.__version__, "| flash-attn-4", d.version, "from", flash_attn.cute.__file__)'
 
     # NCCL EP embeds its build-time JIT header path in Transformer Engine. Persist the headers
     # outside the BuildKit cache mount so zero-copy kernels can be compiled at runtime.

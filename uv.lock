@@ -1505,6 +1505,29 @@ wheels = [
 ]
 
 [[package]]
+name = "flash-attn-4"
+version = "4.0.0b36"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "apache-tvm-ffi", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "einops", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "nvidia-cutlass-dsl", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "quack-kernels", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "torch", marker = "sys_platform == 'never'" },
+    { name = "torch-c-dlpack-ext", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "typing-extensions", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/86/15/348b4ea3c30bdd34352a335e32896c065f2c9f996bc6f50839668e792daf/flash_attn_4-4.0.0b36.tar.gz", hash = "sha256:35ff3a9a9a3eca5edcc4b4d121bf5b14e507454ec14ff96da15c0357bc07d282", size = 499903, upload-time = "2026-10-21T08:19:47.004Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/82/6d/0550c426ceba8c68f75b80ed8a5075502ab349f1c3458b51bc37a6bac504/flash_attn_4-4.0.0b36-py3-none-any.whl", hash = "sha256:b6f0e2a264334cb1b59289ddd309c7c76d3a8d184268316b43403e51ba8795d2", size = 528175, upload-time = "2026-10-21T08:19:45.26Z" },
+]
+
+[package.optional-dependencies]
+cu13 = [
+    { name = "nvidia-cutlass-dsl", extra = ["cu13"], marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+]
+
+[[package]]
 name = "flash-linear-attention"
 version = "0.5.1"
 source = { registry = "https://pypi.org/simple" }
@@ -2639,6 +2662,7 @@ dev = [
     { name = "zstandard" },
 ]
 inference = [
+    { name = "flash-attn-4", extra = ["cu13"], marker = "sys_platform == 'linux'" },
     { name = "flashinfer-python" },
     { name = "torch-memory-saver" },
 ]
@@ -2744,6 +2768,7 @@ requires-dist = [
     { name = "emerging-optimizers", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.3.0" },
     { name = "fast-hadamard-transform", marker = "extra == 'dev'", git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = "~=0.50" },
+    { name = "flash-attn-4", extras = ["cu13"], marker = "sys_platform == 'linux' and extra == 'inference'", specifier = "==4.0.0b36" },
     { name = "flash-linear-attention", marker = "extra == 'ssm'", specifier = "==0.5.1" },
     { name = "flashinfer-python", marker = "extra == 'dev'", specifier = ">=0.7.2,<0.8.0" },
     { name = "flashinfer-python", marker = "extra == 'inference'", specifier = ">=0.7.2,<0.8.0" },
