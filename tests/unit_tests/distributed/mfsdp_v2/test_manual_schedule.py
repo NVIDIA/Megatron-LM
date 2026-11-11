@@ -3,7 +3,7 @@
 """Loss, gradient, and update parity for explicitly scheduled MFSDP training.
 
 The caller materializes weights and submits completed gradients without execution
-or gradient-completion hooks, for both independent tensor and packed sharding.
+or gradient-completion hooks, with both per-parameter and packed grouping.
 """
 
 import copy
@@ -13,36 +13,63 @@ import torch
 import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
-    PerTensor,
+    ParameterGrouping,
     Placements,
     RuntimePolicy,
     SchedulePolicy,
+    ShardLayout,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
 )
 
 
-@pytest.mark.parametrize("packed", [False, True], ids=["per_tensor", "packed"])
-def test_manual_schedule_matches_dense_training(distributed_setup, packed):
+@pytest.mark.parametrize(
+    "parameter_grouping, shard_layout, mesh_ndim",
+    [
+        pytest.param(ParameterGrouping.PER_PARAMETER, ShardLayout.PADDED, 1, id="per_parameter"),
+        pytest.param(ParameterGrouping.PACKED, ShardLayout.PADDED, 1, id="packed"),
+        pytest.param(
+            ParameterGrouping.PER_PARAMETER, ShardLayout.UNPADDED, 1, id="per_parameter_unpadded"
+        ),
+        pytest.param(ParameterGrouping.PER_PARAMETER, ShardLayout.PADDED, 2, id="per_parameter_2d"),
+    ],
+)
+def test_manual_schedule_matches_dense_training(
+    distributed_setup, parameter_grouping, shard_layout, mesh_ndim
+):
     """Three momentum-SGD steps match dense training on rank-local inputs."""
     setup = distributed_setup
     device = setup.device
-    mesh = init_device_mesh(device.type, (setup.world_size,))
+    if mesh_ndim == 2 and (setup.world_size < 2 or setup.world_size % 2):
+        pytest.skip("2-D mesh coverage requires an even number of ranks.")
+    mesh_shape = (setup.world_size,) if mesh_ndim == 1 else (2, setup.world_size // 2)
+    mesh = init_device_mesh(device.type, mesh_shape)
     torch.manual_seed(42)
     baseline = nn.Sequential(nn.Linear(7, 5), nn.Tanh(), nn.Linear(5, 3)).to(device)
     model = copy.deepcopy(baseline)
-    placement = Shard(0) if packed else PerTensor(Shard(0))
-    placements = Placements([0], [placement], [placement], [placement])
+    placement = Shard(0)
+    placements = Placements(list(range(mesh_ndim)), *[[placement] * mesh_ndim for _ in range(3)])
+    if mesh_ndim == 2:
+        placements = Placements(
+            [0, 1], [Replicate(), placement], [Partial("avg"), placement], [Replicate(), placement]
+        )
     context = FsdpContext(
         device=device, runtime_policy=RuntimePolicy(caller_managed_grad_sync=True)
     )
     with fully_shard_context(context):
-        fully_shard(model, mesh, placements, schedule_policy=SchedulePolicy(register_hooks=False))
+        fully_shard(
+            model,
+            mesh,
+            placements,
+            schedule_policy=SchedulePolicy(register_hooks=False),
+            shard_layout=shard_layout,
+            parameter_grouping=parameter_grouping,
+        )
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)
     fully_shard_optimizer(optimizer)
     reference_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05, momentum=0.9)
@@ -69,12 +96,16 @@ def test_manual_schedule_matches_dense_training(distributed_setup, packed):
         context.post_backward()
         context.finish_grad_sync()
 
-        for reference, parameter in zip(baseline.parameters(), model.parameters()):
+        for reference in baseline.parameters():
             dist.all_reduce(reference.grad, op=dist.ReduceOp.AVG)
-            # Packed shards need not follow DTensor's ordinary chunk geometry.
-            shards = [None] * dist.get_world_size()
-            dist.all_gather_object(shards, parameter.grad.to_local().cpu())
-            torch.testing.assert_close(torch.cat(shards).to(device), reference.grad)
+        # MFSDP shard geometry need not match DTensor's ordinary chunk geometry.
+        references = dict(baseline.named_parameters())
+        for group in model.parameter_groups:
+            full_grad = group.pre_optimizer_main_grad.redistribute([Replicate()] * mesh_ndim)
+            for index, parameter in enumerate(group.fsdp_parameters):
+                torch.testing.assert_close(
+                    full_grad.get_tensor_view(index), references[parameter.fqns[0]].grad
+                )
         optimizer.step()
         reference_optimizer.step()
 

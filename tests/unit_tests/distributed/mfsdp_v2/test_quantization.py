@@ -17,6 +17,7 @@ from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    ParameterGrouping,
     Placements,
     SchedulePolicy,
     finalize_gradients,
@@ -185,6 +186,7 @@ def _check_mxfp8_mlp_matches_reference(
     placements,
     num_microbatches,
     shard_layout: ShardLayout = ShardLayout.PADDED,
+    parameter_grouping: ParameterGrouping = ParameterGrouping.PACKED,
 ):
     """Train an MXFP8 MLP with MFSDP and check its losses track an unsharded reference."""
     device = distributed_setup.device
@@ -195,19 +197,29 @@ def _check_mxfp8_mlp_matches_reference(
         torch.manual_seed(2026)
         reference = _make_mlp(device)
     with fully_shard_context(FsdpContext(device=device)) as context:
-        fully_shard(model, mesh=mesh, placements=placements, shard_layout=shard_layout)
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=placements,
+            shard_layout=shard_layout,
+            parameter_grouping=parameter_grouping,
+        )
 
-    # MLP weights share one quantized group; biases use a regular DBuffer.
-    [weight_group] = [
+    # Per-parameter grouping separates physical weights; packed grouping combines by dtype.
+    per_parameter = parameter_grouping is ParameterGrouping.PER_PARAMETER
+    weight_groups = [
         g for g in model.parameter_groups if isinstance(g.model_weight, QuantizedDBuffer)
     ]
-    assert len(weight_group.fsdp_parameters) == 2
-    assert weight_group.main_weight.placements == tuple(
-        BlockAtomic(32) if isinstance(placement, Shard) else placement
-        for placement in placements.optimizer
-    )
-    [bias_group] = [g for g in model.parameter_groups if g is not weight_group]
-    assert isinstance(bias_group.model_weight, DBuffer)
+    assert len(weight_groups) == (2 if per_parameter else 1)
+    for group in weight_groups:
+        assert len(group.fsdp_parameters) == (1 if per_parameter else 2)
+        assert group.main_weight.placements == tuple(
+            BlockAtomic(32) if isinstance(placement, Shard) else placement
+            for placement in placements.optimizer
+        )
+    bias_groups = [g for g in model.parameter_groups if g not in weight_groups]
+    assert len(bias_groups) == (2 if per_parameter else 1)
+    assert all(isinstance(group.model_weight, DBuffer) for group in bias_groups)
 
     optimizer = FusedAdam(model.parameters(), lr=0.01)
     fully_shard_optimizer(optimizer)
@@ -278,6 +290,26 @@ def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements, sha
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
     _check_mxfp8_mlp_matches_reference(
         distributed_setup, mesh, placements, num_microbatches=1, shard_layout=shard_layout
+    )
+
+
+@pytest.mark.launch_on_gb200
+@requires_mxfp8
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_mxfp8_per_parameter_grouping_matches_reference(distributed_setup, shard_layout):
+    """Single-parameter groups reuse MXFP8 block alignment and train correctly."""
+    if distributed_setup.world_size < 2:
+        pytest.skip("Distributed MXFP8 coverage requires at least two ranks.")
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    _check_mxfp8_mlp_matches_reference(
+        distributed_setup,
+        mesh,
+        _ZERO3_PLACEMENTS,
+        num_microbatches=1,
+        shard_layout=shard_layout,
+        parameter_grouping=ParameterGrouping.PER_PARAMETER,
     )
 
 

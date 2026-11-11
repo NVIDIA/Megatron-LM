@@ -71,7 +71,8 @@ def fully_shard(
     mesh: DeviceMesh,
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None,
-    offload_policy: OffloadPolicy | None) -> None
+    offload_policy: OffloadPolicy | None,
+    parameter_grouping: ParameterGrouping = ParameterGrouping.PACKED) -> None
 ```
 
 Unlike MFSDP v1, `fully_shard` is expected to be called on each `nn.Module` that forms
@@ -116,6 +117,26 @@ parameters can escape its lowest FsdpModule ancestor to avoid issues like
 https://github.com/NVIDIA/Megatron-LM/pull/4899. Without this contract, it can be unsafe
 to unshard or reshard a parameter at the module boundary.
 
+The independent `parameter_grouping` policy controls which parameters share communication
+buffers within a unit. `ParameterGrouping.PACKED` (the default) groups parameters by
+effective dtype and requires-grad setting. `ParameterGrouping.PER_PARAMETER` creates
+one group per physical parameter, preserving tied aliases. For example:
+
+```python
+fully_shard(
+    module,
+    mesh=mesh,
+    placements=placements,
+    parameter_grouping=ParameterGrouping.PER_PARAMETER,
+)
+```
+
+Both grouping policies use the same mesh, placements, precision, and shard-layout
+rules. MXFP8 tensors retain 32-row block alignment; unpadded layouts use MFSDP's
+row/block boundaries. Per-parameter grouping issues separate collectives for each
+parameter; it does not promise FSDP2 shard geometry. See the
+[manual-scheduling unit test](../../../../../../tests/unit_tests/distributed/mfsdp_v2/test_manual_schedule.py).
+
 The placement is similar to DTensor’s placement but for the whole **unit** and per mesh
 axis.
 
@@ -134,14 +155,7 @@ axis.
     a single rank.
 - `TensorAtomic`. Don’t cut a parameter. For emerging optimizers that need full
   parameters.
-- `PerTensor(Shard(0))`. Independent per-tensor dim-0 sharding, as used in FSDP2.
-  The initial implementation creates one communication group per physical tensor
-  (tied aliases share a group), using the existing padded row-atomic layout for
-  each tensor. It supports ordinary floating-point parameters on a 1-D DP mesh.
-  Using it in any buffer placement splits all buffers into per-tensor groups.
-  This preserves Torch chunk geometry at the cost of collectives per tensor;
-  fused per-tensor communication is not implemented. See the
-  [manual-scheduling unit test](../../../../../../tests/unit_tests/distributed/mfsdp_v2/test_manual_schedule.py).
+
 
 ```
 Block-atomic sharding example

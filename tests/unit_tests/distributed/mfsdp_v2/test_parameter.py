@@ -10,7 +10,7 @@ from torch.distributed.tensor import DTensor, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
-    PerTensor,
+    ParameterGrouping,
     Placements,
     finalize_gradients,
     fully_shard,
@@ -81,7 +81,7 @@ def _default_placements() -> Placements:
 
 
 @pytest.mark.parametrize("rows", [1, 5])
-def test_per_tensor_shards_match_torch_chunks(distributed_setup, rows):
+def test_per_parameter_grouping_preserves_aliases_and_chunk_geometry(distributed_setup, rows):
     """Uneven shards and empty ranks match Torch chunking; tied aliases stay tied."""
     setup = distributed_setup
     torch.manual_seed(42)
@@ -89,9 +89,14 @@ def test_per_tensor_shards_match_torch_chunks(distributed_setup, rows):
     model.alias = model.weight
     originals = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
-    placements = Placements([0], *[[PerTensor(Shard(0))] for _ in range(3)])
+    placements = _default_placements()
     with fully_shard_context(FsdpContext(device=setup.device)):
-        fully_shard(model, mesh=mesh, placements=placements)
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=placements,
+            parameter_grouping=ParameterGrouping.PER_PARAMETER,
+        )
 
     assert len(model.parameter_groups) == 2
     assert model.alias is model.weight

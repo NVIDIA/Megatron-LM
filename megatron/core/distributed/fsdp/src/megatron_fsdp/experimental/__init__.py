@@ -19,7 +19,8 @@ from .context import FsdpContext, PrefetchOrder
 from .dbuffer import DBuffer
 from .fully_shard import Placements, finalize_gradients, fully_shard, fully_shard_context
 from .optimizer import fully_shard_optimizer, init_optimizer_state
-from .placement import PerTensor, ShardLayout
+from .parameter_grouping import ParameterGrouping
+from .placement import ShardLayout
 from .runtime_policy import RuntimePolicy
 from .schedule_policy import SchedulePolicy
 
@@ -27,7 +28,7 @@ __all__ = [
     "DBuffer",
     "FsdpContext",
     "Placements",
-    "PerTensor",
+    "ParameterGrouping",
     "PrefetchOrder",
     "RuntimePolicy",
     "SchedulePolicy",

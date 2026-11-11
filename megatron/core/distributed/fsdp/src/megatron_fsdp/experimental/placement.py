@@ -37,35 +37,7 @@ from collections.abc import Iterable
 from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
-__all__ = [
-    "BlockAtomic",
-    "PerTensor",
-    "RowAtomic",
-    "ShardLayout",
-    "TensorAtomic",
-    "changed_mesh_axis",
-]
-
-
-class PerTensor(Placement):
-    """Shard each physical tensor independently, using Torch's dim-0 chunking.
-
-    Pass ``PerTensor(Shard(0))`` to ``fully_shard``. The initial implementation
-    uses one communication group per physical tensor on a 1-D mesh, rather than
-    packing unrelated tensors into a shared shard. Tied registrations share a group.
-    Quantized tensors are not supported.
-    """
-
-    def __init__(self, placement: Placement) -> None:
-        if type(placement) is not Shard or placement.dim != 0:
-            raise NotImplementedError("PerTensor currently supports only Shard(0).")
-        self.placement = placement
-
-    def __eq__(self, other: object) -> bool:
-        return isinstance(other, PerTensor)
-
-    def __repr__(self) -> str:
-        return "PerTensor(Shard(0))"
+__all__ = ["BlockAtomic", "RowAtomic", "ShardLayout", "TensorAtomic", "changed_mesh_axis"]
 
 
 class ShardLayout(enum.Enum):
