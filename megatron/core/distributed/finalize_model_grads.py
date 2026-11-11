@@ -1,7 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from functools import partial
-from typing import Callable, Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Union
 
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
@@ -37,6 +37,7 @@ from ..utils import (
     get_pg_size,
     get_tensor_model_parallel_group_if_none,
 )
+from .param_and_grad_buffer import _ParamAndGradBuffer
 
 
 def _get_main_grad_attr(param: torch.nn.Parameter):
@@ -305,13 +306,15 @@ def _allreduce_embedding_grad(
         if grad is None and skip_if_none:
             return
         shard_range = None
-        if (
-            getattr(ddp_config, 'shard_embedding_grad_allreduce', False)
-            and not force_all_reduce
-            and not ddp_config.use_megatron_fsdp
-            and grad is orig_grad
-        ):
-            shard_range = _embedding_grad_shard_range(ddp_module, weight, grad, embd_group)
+        # Reducing only the distributed-optimizer shards is valid when (1) the DP grad sync was a
+        # reduce-scatter, so nothing reads the rest of the grad (force_all_reduce asks for the
+        # whole grad on every rank), and (2) the grad is the main grad in a DDP grad buffer, whose
+        # layout defines the shards. Megatron-FSDP and torch FSDP2 grads have no such buffer; there
+        # ``grad`` is a gathered copy of a differently sharded DTensor and is reduced whole.
+        if ddp_config.shard_embedding_grad_allreduce and not force_all_reduce:
+            grad_buffer = _grad_buffer_of_param(ddp_module, weight)
+            if grad_buffer is not None:
+                shard_range = grad_buffer.get_grad_shard_range_union(weight, grad, embd_group)
         if shard_range is None:
             torch.distributed.all_reduce(grad, group=embd_group)
         elif shard_range[1] > shard_range[0]:
@@ -326,88 +329,17 @@ def _allreduce_embedding_grad(
             setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
 
 
-# Attribute of an embedding parameter caching _embedding_grad_shard_range results:
-# {embedding-group ranks: (lo, hi) or None}.
-_EMBEDDING_GRAD_SHARD_RANGES_ATTR = "_embedding_grad_allreduce_shard_ranges"
-
-
-def _local_grad_shard_range(
-    ddp_module: torch.nn.Module, weight: torch.nn.Parameter
-) -> Optional[Tuple[int, int]]:
-    """Element range of ``weight``'s flattened grad inside this rank's distributed-optimizer
-    shard of its grad bucket, or None if the grad does not live in a reduce-scattered bucket."""
-    ddp_config = getattr(ddp_module, 'ddp_config', None)
-    bucket_group = getattr(ddp_module, 'param_to_bucket_group', {}).get(weight)
-    if (
-        ddp_config is None
-        or not ddp_config.use_distributed_optimizer
-        or bucket_group is None
-        or weight not in bucket_group.param_to_bucket
-    ):
+def _grad_buffer_of_param(
+    ddp_module: torch.nn.Module, param: torch.nn.Parameter
+) -> Optional[_ParamAndGradBuffer]:
+    """The DistributedDataParallel grad buffer that holds ``param``'s main grad, or None (e.g. for
+    Megatron-FSDP or torch FSDP2 model chunks, which have no such buffers)."""
+    if param not in getattr(ddp_module, 'param_to_bucket_group', {}):
         return None
-    bucket = bucket_group.param_to_bucket[weight]
-    start, end = bucket.param_to_index[weight]
-    dp_size = bucket_group.intra_distributed_optimizer_instance_size
-    dp_rank = bucket_group.intra_distributed_optimizer_instance_rank
-    if bucket.grad_data.numel() % dp_size != 0:
-        return None
-    shard_size = bucket.grad_data.numel() // dp_size
-    lo = max(start, dp_rank * shard_size)
-    hi = min(end, (dp_rank + 1) * shard_size)
-    if hi <= lo:
-        return (0, 0)
-    return (lo - start, hi - start)
-
-
-def _embedding_grad_shard_range(
-    ddp_module: torch.nn.Module,
-    weight: torch.nn.Parameter,
-    grad: torch.Tensor,
-    embd_group: torch.distributed.ProcessGroup,
-) -> Optional[Tuple[int, int]]:
-    """Element range of the flattened embedding grad to all-reduce across ``embd_group``.
-
-    With the distributed optimizer, the DP reduce-scatter leaves each rank with a valid grad only
-    in its own shard of the grad buffer, and the optimizer reads nothing else. The embedding-group
-    peers (same DP rank, different PP stages) therefore only need their shards reduced. This
-    returns the union of the peers' shard ranges in the param's element space ((0, 0) if no peer's
-    shard overlaps the param), or None to reduce the whole grad.
-
-    The ranges depend only on the buffer layout. They are exchanged once with an all-gather over
-    ``embd_group`` (all peers call this together) and cached; a first call inside a CUDA graph
-    capture reduces the whole grad instead and does not cache.
-    """
-    group_ranks = tuple(torch.distributed.get_process_group_ranks(embd_group))
-    cached = getattr(weight, _EMBEDDING_GRAD_SHARD_RANGES_ATTR, None)
-    if cached is None:
-        cached = {}
-        setattr(weight, _EMBEDDING_GRAD_SHARD_RANGES_ATTR, cached)
-    if group_ranks in cached:
-        return cached[group_ranks]
-    if torch.cuda.is_current_stream_capturing():
-        return None
-
-    local = _local_grad_shard_range(ddp_module, weight) if grad.is_contiguous() else None
-    if local is not None and local[1] > local[0]:
-        assert grad.numel() >= local[1]
-    local_tensor = torch.tensor(
-        [local[0], local[1], 1] if local is not None else [0, 0, 0],
-        dtype=torch.int64,
-        device=grad.device,
-    )
-    gathered = [torch.empty_like(local_tensor) for _ in range(get_pg_size(embd_group))]
-    torch.distributed.all_gather(gathered, local_tensor, group=embd_group)
-    ranges = [tuple(t.tolist()) for t in gathered]
-
-    result = None
-    if all(valid == 1 for _, _, valid in ranges):
-        nonempty = [(lo, hi) for lo, hi, _ in ranges if hi > lo]
-        if nonempty:
-            result = (min(lo for lo, _ in nonempty), max(hi for _, hi in nonempty))
-        else:
-            result = (0, 0)
-    cached[group_ranks] = result
-    return result
+    for buffer in ddp_module.buffers + ddp_module.expert_parallel_buffers:
+        if param in buffer.param_to_bucket:
+            return buffer
+    return None
 
 
 def _allreduce_position_embedding_grads(
