@@ -6,7 +6,8 @@ gated-delta-net code paths.
 The Mamba training mixer is covered by ``correctness/test_ssm_conv1d.py``; this module drives
 the kernels Megatron ships itself: the Mamba2 varlen chunked scan (``ssd_*`` kernels behind
 ``mamba_chunk_scan_combined_varlen``), the decode-time ``selective_state_update`` and
-``causal_conv1d_update``, the varlen causal conv, the Gated Delta Product varlen chunk scan
+``causal_conv1d_update``, the ReplaySSM speculative-decode kernels, the varlen causal conv,
+the Gated Delta Product varlen chunk scan
 (``gdp/*`` kernels) and its decode kernels -- single-token and speculative, where a step
 carries several draft tokens and the kernels snapshot the conv and recurrent state after
 each of them -- and the torch gated-delta-rule path that ``--deterministic-mode`` selects
@@ -23,6 +24,7 @@ import torch
 
 from megatron.core.ssm import mamba_mixer as mamba_mixer_module
 from megatron.core.ssm.ops.common import determinism as ssm_determinism
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.tuning import autotune_configs, choice_log
 from megatron.core.tuning import policy as tuning_policy
 from tests.unit_tests.determinism.correctness.test_ssm_conv1d import (
@@ -32,6 +34,7 @@ from tests.unit_tests.determinism.correctness.test_ssm_conv1d import (
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
+    deterministic_algorithms,
     seeded,
 )
 from tests.unit_tests.test_utilities import Utils
@@ -86,6 +89,73 @@ def _assert_pinned(*tuners):
 
 
 # --- Mamba2 --------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("mixer_type", ["mamba", "gdp"])
+def test_mixer_rmsnorm_gamma_replays(mixer_type):
+    """Actual mixer constructors mark gamma without changing gated norm forward/backward."""
+    if mamba_mixer_module.mamba_chunk_scan_combined is None:
+        pytest.skip("needs mamba_ssm")
+    if mixer_type == "gdp":
+        from tests.unit_tests.ssm.test_gated_delta_product import HAVE_GDP_DEPS
+        from tests.unit_tests.ssm.test_gated_delta_product import _build_mixer as build_gdp
+        from tests.unit_tests.ssm.test_gated_delta_product import _make_config
+
+        if not HAVE_GDP_DEPS:
+            pytest.skip("needs GDP dependencies")
+
+    seeded()
+    try:
+        if mixer_type == "mamba":
+            mixer = _build_mixer(deterministic_mode=False)
+        else:
+            Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+            model_parallel_cuda_manual_seed(123)
+            mixer = build_gdp(_make_config([]))
+        norm = mixer.norm
+        assert norm.weight.is_rmsnorm_weight
+        x = torch.randn(
+            4096, 2, norm.weight.numel(), device="cuda", dtype=norm.weight.dtype, requires_grad=True
+        )
+        gate = torch.randn_like(x, requires_grad=True)
+        assert_module_replays_bit_exact(
+            norm, (x, gate), replays=3, contention=True, what=f"{mixer_type} RMSNorm gamma"
+        )
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("clamp_value", [None, 2.0])
+def test_gdp_gating_replays(clamp_value):
+    """GDP's beta and log-decay gating, with and without the optional decay clamp."""
+    from tests.unit_tests.ssm.test_gated_delta_product import HAVE_GDP_DEPS
+    from tests.unit_tests.ssm.test_gated_delta_product import _build_mixer as build_gdp
+    from tests.unit_tests.ssm.test_gated_delta_product import _make_config
+
+    if not HAVE_GDP_DEPS:
+        pytest.skip("needs GDP dependencies")
+
+    seeded()
+    try:
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+        model_parallel_cuda_manual_seed(123)
+        config = _make_config([])
+        config.gdp_g_clamp_value = clamp_value
+        mixer = build_gdp(config)
+        runtime_cp = mixer._resolve_runtime_cp(None)
+        width = runtime_cp.nheads * (mixer.num_householder + 1)
+        # Wide logits so some decays fall below the clamp and its gradient mask is exercised.
+        ba = (8 * torch.randn(2, 4096, width, device="cuda")).to(torch.bfloat16)
+        ba.requires_grad_(True)
+        assert_replays_bit_exact(
+            lambda ba: mixer._compute_gating(ba, runtime_cp=runtime_cp),
+            (ba,),
+            replays=3,
+            contention=True,
+            what=f"GDP gating (clamp {clamp_value})",
+        )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_mamba_chunk_scan_combined_varlen_replays():
@@ -229,6 +299,140 @@ def test_selective_state_update_replays():
     )
 
 
+@pytest.mark.parametrize("act_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
+def test_replayssm_spec_step_replays(act_dtype):
+    """One ReplaySSM speculative step: the fused scatter + B.C precompute, the verify and flush
+    launches, and the cursor commit, with verify, flush, and padding rows in one batch."""
+    from megatron.core.ssm.ops.mamba2.mamba_ssm_replay import (
+        commit_replayssm_spec,
+        selective_state_update_replayssm_spec,
+    )
+
+    seeded()
+    nheads, headdim, dstate, ngroups = 32, 64, 128, 4
+    window, buffer_len = 3, 16  # W, B
+    max_cache_len = buffer_len + window  # L
+    buf = 1 << (max_cache_len - 1).bit_length()
+    batch, num_slots = 64, 96
+    d_inner = nheads * headdim
+
+    # Sparse slots with padding rows, and half the live rows flushing. Fill levels follow the
+    # early-flush invariant: verify rows hold wp + W <= B, flush rows wp + 2W > L.
+    slots = torch.randperm(num_slots, device="cuda")[:batch].to(torch.int32)
+    slots[::8] = -1
+    is_flush = torch.zeros(num_slots, dtype=torch.int8, device="cuda")
+    is_flush[slots[slots >= 0].long()[::2]] = 1
+    verify_wp = torch.randint(0, buffer_len - window + 1, (num_slots,), device="cuda")
+    flush_wp = torch.randint(buffer_len - window + 1, buffer_len + 1, (num_slots,), device="cuda")
+    write_pos = torch.where(is_flush.bool(), flush_wp, verify_wp).to(torch.int32)
+    origin = torch.randint(0, buf, (num_slots,), dtype=torch.int32, device="cuda")
+
+    state = torch.randn(num_slots, nheads, headdim, dstate, device="cuda") * 0.1
+    post_conv_cache = torch.randn(
+        num_slots, buf, d_inner + ngroups * dstate, device="cuda", dtype=act_dtype
+    )
+    dt_cache = torch.randn(num_slots, nheads, buf, device="cuda") * 0.5
+    bc_pre = torch.zeros(batch, ngroups, buf, 1 << (window - 1).bit_length(), device="cuda")
+    conv_out = torch.randn(
+        batch * window, d_inner + 2 * ngroups * dstate, device="cuda", dtype=act_dtype
+    )
+    dt_spec = torch.randn(batch * window, nheads, device="cuda", dtype=act_dtype)
+    A = (
+        (-torch.rand(nheads, device="cuda") - 1.0)
+        .view(nheads, 1, 1)
+        .expand(nheads, headdim, dstate)
+    )
+    D = torch.randn(nheads, device="cuda").unsqueeze(-1).expand(nheads, headdim)
+    dt_bias = torch.rand(nheads, device="cuda") - 4.0
+    qsl = torch.arange(0, (batch + 1) * window, window, dtype=torch.int32, device="cuda")
+    accepted = torch.randint(0, window, (batch,), device="cuda")
+    prefill = torch.zeros(batch, dtype=torch.int32, device="cuda")
+
+    def fn(
+        state,
+        post_conv_cache,
+        dt_cache,
+        bc_pre,
+        write_pos,
+        origin,
+        is_flush,
+        conv_out,
+        dt_spec,
+        A,
+        D,
+        dt_bias,
+        qsl,
+        slots,
+        accepted,
+        prefill,
+    ):
+        # The per-head scalar A (TIE_HDIM) and the broadcast D are the layouts the Mamba mixer
+        # dispatches; the harness must hand them over unchanged.
+        assert A.stride(-1) == 0 and A.stride(-2) == 0 and D.stride(-1) == 0
+        out = selective_state_update_replayssm_spec(
+            state,
+            post_conv_cache,
+            dt_cache,
+            conv_out,
+            dt_spec,
+            A,
+            write_pos=write_pos,
+            post_conv_state_pos=origin,
+            is_flush=is_flush,
+            query_start_loc=qsl,
+            state_batch_indices=slots,
+            max_cache_len=max_cache_len,
+            max_spec_len=window,
+            d_inner=d_inner,
+            ngroups=ngroups,
+            dstate=dstate,
+            D=D,
+            dt_bias=dt_bias,
+            dt_softplus=True,
+            bc_pre=bc_pre,
+        )
+        commit_replayssm_spec(
+            write_pos=write_pos,
+            post_conv_state_pos=origin,
+            is_flush=is_flush,
+            accepted_draft_counts=accepted,
+            prefill_status=prefill,
+            state_batch_indices=slots,
+            max_cache_len=max_cache_len,
+            max_spec_len=window,
+            cache_buf_len=buf,
+        )
+        # Everything the step updates in place: the flushed checkpoint, the ring caches, the
+        # B.C scratch, and the committed cursors.
+        return out, state, post_conv_cache, dt_cache, bc_pre, write_pos, origin, is_flush
+
+    assert_replays_bit_exact(
+        fn,
+        (
+            state,
+            post_conv_cache,
+            dt_cache,
+            bc_pre,
+            write_pos,
+            origin,
+            is_flush,
+            conv_out,
+            dt_spec,
+            A,
+            D,
+            dt_bias,
+            qsl,
+            slots,
+            accepted,
+            prefill,
+        ),
+        replays=4,
+        backward=False,
+        contention=True,
+        what="replayssm_spec_step",
+    )
+
+
 # --- causal conv (Megatron Triton variants) ---------------------------------------------------
 
 
@@ -249,6 +453,58 @@ def test_causal_conv1d_update_replays():
     assert_replays_bit_exact(
         fn, (x, conv_state, weight, bias), replays=4, backward=False, what="causal_conv1d_update"
     )
+
+
+def test_mixer_inference_param_caches_match_per_call_casts():
+    """Inference reads the FP32 conv weight/bias and A from the mixer's caches.
+
+    They must equal the per-call casts of the current parameters bit for bit, also after a
+    dtype conversion of an eval-mode module, so the conv update on FP32 conv states reads
+    the same operands and replays bit-exact.
+    """
+    from einops import rearrange
+
+    from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
+
+    seeded()
+    mixer = _build_mixer(deterministic_mode=False)
+    try:
+        mixer.float()
+        with torch.no_grad():
+            # Values that BF16 cannot represent, so a stale FP32 cache would show.
+            for param in (mixer.conv1d_weight, mixer.conv1d_bias, mixer.A_log):
+                param.copy_(torch.randn_like(param) * 0.1 + 1.001)
+        mixer.eval()
+        mixer.bfloat16()  # converts the parameters after the caches were filled
+
+        def per_call():
+            weight = rearrange(mixer.conv1d_weight, "d 1 w -> d w").float()
+            return weight, mixer.conv1d_bias.float(), -torch.exp(mixer.A_log.float())
+
+        with torch.no_grad():
+            weight, bias = mixer._get_conv_params(
+                mixer.conv1d_weight, mixer.conv1d_bias, torch.float32
+            )
+            assert weight.data_ptr() == mixer._inference_cache.conv_weight.data_ptr()
+            for got, want in zip((weight, bias, mixer._inference_cache.A_neg_exp), per_call()):
+                assert torch.equal(got, want)
+
+            batch, dim, width = 64, weight.shape[0], weight.shape[1]
+            x = torch.randn(batch, dim, device="cuda", dtype=torch.float32)
+            conv_state = torch.randn(batch, dim, width - 1, device="cuda", dtype=torch.float32)
+
+            def fn(x, conv_state):
+                return causal_conv1d_update(x, conv_state, weight, bias, True, None), conv_state
+
+            assert_replays_bit_exact(
+                fn,
+                (x, conv_state),
+                replays=4,
+                backward=False,
+                what="causal_conv1d_update on cached FP32 conv params",
+            )
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def test_causal_conv1d_update_spec_decode_replays():
