@@ -5331,6 +5331,7 @@ class TransformerConfig(ModelParallelConfig):
             and self.offload_modules
             and self.cuda_graph_impl == "transformer_engine"
             and not self.cuda_graph_modules
+            and not self.dynamic_context_parallel  # Dynamic CP rejects this combination.
         ):
             warnings.warn(
                 "Fine-grained activation offloading with Transformer Engine whole-layer "
@@ -6534,6 +6535,11 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     "Dynamic CP graphs capture TransformerLayer scopes only; remove 'mamba' from "
                     "cuda_graph_modules."
+                )
+            if self.fine_grained_activation_offloading and not self.cuda_graph_modules:
+                raise ValueError(
+                    "Dynamic CP graphs support fine-grained activation offloading only with "
+                    "partial cuda_graph_modules scopes, not whole-layer capture."
                 )
 
         if self.sequence_packing_scheduler is not None:

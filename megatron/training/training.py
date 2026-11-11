@@ -8100,8 +8100,10 @@ def _get_dynamic_cp_cuda_graph_helper_kwargs(args):
         and not args.use_varlen_dataset
         and not getattr(args, "mock_data", False)
     ):
-        # SFTDataset truncates after appending a conversation. If the pack has
-        # exactly seq_length tokens, one final (possibly empty) tail is included.
+        # SFTDataset pads the pack to a multiple of the divisor after each
+        # conversation, so at most seq_length // divisor conversations fit whole. When
+        # the divisor does not divide seq_length, a truncated final one adds one more;
+        # otherwise the truncated tail is empty and dropped, and the +1 is spare.
         max_subsamples_per_item = args.seq_length // _get_thd_source_padding_granularity(args) + 1
     return dict(
         dynamic_cp_group_getter=get_dynamic_data_context_parallel_groups,

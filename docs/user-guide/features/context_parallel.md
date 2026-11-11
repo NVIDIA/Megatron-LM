@@ -68,3 +68,8 @@ Packed absorbed MLA uses the microbatch's actual CP group for RoPE indexing. Its
 frequency table must cover the full sequence even when each rank holds only a
 chunk and the configured CP size is one. QKV up-projection recomputation retains
 the forward microbatch's group after the caller restores or changes its group.
+
+With `--cuda-graph-impl transformer_engine` and pipeline parallelism, Dynamic CP graphs
+size their schedule from a bound on the sequences in one dataset item. GPT data with
+`--dataloader-inter-document-masking` has no useful bound and is rejected; SFT, varlen
+and FIM data are not affected.

@@ -927,6 +927,19 @@ def test_offload_modules_fused_group_mlp_excludes_unfused_expert_knobs():
             AssertionError,
             "Dynamic context parallelism not supported with moe_z_loss_coeff",
         ),
+        (
+            {
+                "calculate_per_token_loss": True,
+                "cuda_graph_impl": "transformer_engine",
+                "cuda_graph_dynamic_microbatches": True,
+                "thd_max_packed_sequences": 2,
+                "pad_packed_seq_alignment": "max",
+                "fine_grained_activation_offloading": True,
+                "offload_modules": ["core_attn"],
+            },
+            ValueError,
+            "only with partial cuda_graph_modules scopes",
+        ),
     ],
 )
 def test_dynamic_cp_rejects_unsupported_config(overrides, exception, message):

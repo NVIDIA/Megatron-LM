@@ -148,11 +148,15 @@ buffers, so CPU copies preserve FP8 data and scale metadata instead of convertin
 them to the wrapper's nominal dtype.
 
 Dynamic-CP graphs use TE's slot saved-tensor hooks for offload scopes inside a graph,
-rather than nesting the ordinary offload hook inside the TE hook. Pinned CPU buffers
-follow the same union-liveness colors as the GPU saved arenas: mutually exclusive CP
-variants share the largest required host allocation. Forward records D2H copies;
-backward records H2D copies and reconstructs saved views, including their aliases.
-Offloaded saves do not also occupy GPU saved-arena storage.
+rather than nesting the ordinary offload hook inside the TE hook. Offloading requires
+partial `cuda_graph_modules` scopes (for example `attn`); whole-layer capture is
+rejected. Pinned CPU buffers follow the same union-liveness colors as the GPU saved
+arenas: mutually exclusive CP variants share the largest required host allocation.
+Forward records D2H copies; backward records H2D copies and reconstructs saved views,
+including their aliases. Offloaded saves do not also occupy GPU saved-arena storage.
+Because D2H runs on its own stream, each offloaded save is first copied on the compute
+stream so a later in-place write cannot change it; these copies stay in the graph pool
+until the end of that forward graph.
 If any saved view of a storage is retained on GPU, all saved views of that storage
 remain on GPU so mixed offload decisions cannot split their aliases.
 
