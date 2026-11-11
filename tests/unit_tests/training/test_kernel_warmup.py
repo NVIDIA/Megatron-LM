@@ -285,14 +285,14 @@ def test_config_activation_storage_reuses_warmed_backward(tp_group, add_bias, fp
 
 
 @pytest.fixture
-def pretrain_until_warmup(monkeypatch):
+def pretrain_until_warmup(monkeypatch, run_config):
     from megatron.training import training
 
     class WarmupReached(Exception):
         pass
 
     monkeypatch.setattr(training, "_STARTUP_TIMESTAMPS", {})
-    monkeypatch.setattr(training.ft_integration, "setup", lambda: None)
+    monkeypatch.setattr(training.ft_integration, "setup", lambda *args, **kwargs: None)
     monkeypatch.setattr(training, "initialize_megatron", lambda **kwargs: None)
     monkeypatch.setattr(training, "get_timers", lambda: None)
     monkeypatch.setattr(training, "get_train_state", lambda: Namespace())
@@ -313,6 +313,8 @@ def pretrain_until_warmup(monkeypatch):
             model=model_config,
             # The container's rule for a loader-only section: the model's per-sample maximum.
             sample_length=model_config.transformer.max_seq_length_per_sample,
+            fault_tolerance=run_config.fault_tolerance,
+            checkpoint=run_config.checkpoint,
             train=Namespace(micro_batch_size=9),
             logger=Namespace(log_progress=False, tensor_metrics=[]),
             validate=lambda: None,

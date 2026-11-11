@@ -144,10 +144,10 @@ def _validated(extra):
 @pytest.fixture
 def container_factory(monkeypatch):
     """pretrain_cfg_container_from_args on parsed arguments, without the optimizer / DDP setup."""
-    from megatron.training import training
+    from megatron.training import argument_utils
 
     monkeypatch.setattr(
-        training, "get_megatron_ddp_config", lambda args, **_: DistributedDataParallelConfig()
+        argument_utils, "get_megatron_ddp_config", lambda args, **_: DistributedDataParallelConfig()
     )
 
     def build(argv, *, data=False, **kwargs):
@@ -1070,7 +1070,7 @@ def test_the_loop_reads_the_dataset_length_and_a_loader_only_section_the_model_m
         "_set_timers",
         "_set_energy_monitor",
     ):
-        monkeypatch.setattr(global_vars, name, lambda ns: None)
+        monkeypatch.setattr(global_vars, name, lambda *a, **k: None)
     monkeypatch.setattr(global_vars, "_set_train_state", lambda: None)
     global_vars.initialize_training_runtime_services(args)
     assert calls.pop()["seq_length"] == 16
