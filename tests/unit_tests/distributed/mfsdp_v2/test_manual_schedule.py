@@ -27,7 +27,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 
 
-class _ScheduledLinearFunction(torch.autograd.Function):
+class ScheduledLinearFunction(torch.autograd.Function):
     """Own weight materialization and gradient submission at the compute sites."""
 
     @staticmethod
@@ -65,7 +65,7 @@ class _ScheduledLinear(nn.Linear):
 
     def forward(self, inputs):
         """Dispatch compute and its backward without registering execution hooks."""
-        return _ScheduledLinearFunction.apply(inputs, self.weight, self.bias, self)
+        return ScheduledLinearFunction.apply(inputs, self.weight, self.bias, self)
 
 
 @pytest.mark.parametrize(
