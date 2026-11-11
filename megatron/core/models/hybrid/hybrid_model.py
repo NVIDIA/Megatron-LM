@@ -653,7 +653,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                     "context-parallel layouts (linear_cp_layout != attention_cp_layout with "
                     "context_parallel_size > 1)."
                 )
-            if module._has_linear_layer_with_chunkwise_cp:
+            # The stack records chunkwise layers for any CP size, because it resolves the
+            # CP group per microbatch; they only need the metadata when CP is active.
+            if module._has_linear_layer_with_chunkwise_cp and module.cp_group.size() > 1:
                 raise ValueError(
                     "overlap_moe_expert_parallel_comm with HybridModel does not support "
                     "linear_cp_mode='chunkwise' with context_parallel_size > 1."

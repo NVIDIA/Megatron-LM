@@ -295,7 +295,7 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
             with _get_inner_quant_context(item_layer):
                 if item_type == LayerSymbols.MAMBA:
                     hidden_states = item_layer(
-                        hidden_states=hidden_states,
+                        hidden_states,
                         attention_mask=node.chunk_state.attention_mask,
                         packed_seq_params=node.chunk_state.packed_seq_params,
                     )
@@ -311,7 +311,7 @@ def build_hybrid_stack_callables(layer, layer_type: Optional[LayerPatternItem] =
                     # __call__ would route through _forward_mlp + mlp_bda, double-applying the
                     # post-attention residual.
                     hidden_states, _ = item_layer._forward_attention(
-                        hidden_states=hidden_states,
+                        hidden_states,
                         attention_mask=node.chunk_state.attention_mask,
                         rotary_pos_emb=node.chunk_state.rotary_pos_emb,
                         rotary_pos_cos=node.chunk_state.rotary_pos_cos,
