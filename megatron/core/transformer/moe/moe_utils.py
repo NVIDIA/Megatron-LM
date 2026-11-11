@@ -11,9 +11,12 @@ from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import (
     HAVE_TE,
     TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+    te_supports_deterministic_moe_aux_loss,
 )
 from megatron.core.fp4_utils import get_fp4_align_size
 from megatron.core.fp8_utils import get_fp8_align_size
+from megatron.core.inference.moe.sigmoid_topk import HAVE_TRITON as HAVE_SIGMOID_TOPK_KERNEL
+from megatron.core.inference.moe.sigmoid_topk import is_sigmoid_topk_supported, sigmoid_topk_routing
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import (
     get_cuda_rng_tracker,
@@ -76,6 +79,7 @@ def switch_load_balancing_loss_func(
     moe_aux_loss_coeff: float,
     fused: bool = False,
     padding_mask: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
 ) -> torch.Tensor:
     """Calculate the auxiliary loss for load balancing.
     Refer to the Switch Transformer (https://arxiv.org/abs/2101.03961)
@@ -128,6 +132,7 @@ def switch_load_balancing_loss_func(
         padding_mask (torch.Tensor, optional): Boolean mask indicating non-padding tokens.
                                                Shape in [num_tokens]. True for valid tokens,
                                                False for padding tokens. Defaults to None.
+        deterministic (bool): Require deterministic fused loss execution.
 
     Returns:
         torch.Tensor: The auxiliary loss for load balancing.
@@ -149,6 +154,14 @@ def switch_load_balancing_loss_func(
     if fused:
         if not HAVE_TE or fused_moe_aux_loss is None:
             raise ValueError("fused_moe_aux_loss is not available. Please install TE >= 2.7.0.")
+        supports_deterministic = te_supports_deterministic_moe_aux_loss()
+        if deterministic and not supports_deterministic:
+            raise ValueError(
+                "Deterministic fused MoE auxiliary loss requires Transformer Engine with "
+                "fused_moe_aux_loss(deterministic=...) support. Upgrade Transformer Engine "
+                "or set moe_router_aux_loss_fusion=False (--no-moe-router-aux-loss-fusion)."
+            )
+        deterministic_kwargs = {"deterministic": deterministic} if supports_deterministic else {}
         return fused_moe_aux_loss(
             probs=probs,
             tokens_per_expert=tokens_per_expert,
@@ -156,6 +169,7 @@ def switch_load_balancing_loss_func(
             topk=topk,
             num_experts=num_experts,
             coeff=moe_aux_loss_coeff,
+            **deterministic_kwargs,
         )
 
     aggregated_probs_per_expert = probs.sum(dim=0)
@@ -531,6 +545,7 @@ def unpermute(
     drop_and_pad: bool = False,
     pad_offsets: Optional[torch.Tensor] = None,
     batch_invariant_inverse_map: Optional[torch.Tensor] = None,
+    ep_invariant_combine: bool = False,
 ) -> torch.Tensor:
     """
     Restore the original order of tokens after permutation. If probs are provided, it
@@ -559,6 +574,10 @@ def unpermute(
         batch_invariant_inverse_map (torch.Tensor, optional): Fixed-shape
             `[2, num_tokens, topk]` map from token/top-k slot to permuted row and
             global expert id. Used by batch-invariant CUDA graph paths.
+        ep_invariant_combine (bool, optional): Under batch-invariant mode, sum each
+            token's expert rows over the fixed combine tree of ``ep_invariant_combine``
+            so the result does not depend on the expert-parallel size
+            (``moe_ep_invariant_combine``).
 
     Returns:
         torch.Tensor: The tokens restored to their original order.
@@ -593,6 +612,7 @@ def unpermute(
             probs=probs,
             num_experts=routing_map.size(1),
             inverse_map=batch_invariant_inverse_map,
+            ep_invariant=ep_invariant_combine,
         )
 
     _, hidden = restore_shape
@@ -789,6 +809,68 @@ def pad_routing_map(routing_map: torch.Tensor, pad_multiple: int) -> torch.Tenso
     return routing_map
 
 
+class _BatchInvariantSigmoidTopK(torch.autograd.Function):
+    """Sigmoid top-k routing whose forward is the Triton kernel and whose backward is eager.
+
+    The forward returns the kernel's probabilities, so training sees exactly the values
+    the inference engine computes. The backward differentiates the reference formula
+    (s_j / (sum_i s_i + 1e-20)) * scaling_factor, with s = sigmoid(logits), at the
+    kernel's indices; the expert bias only selects experts and receives no gradient.
+    """
+
+    @staticmethod
+    def forward(ctx, logits, expert_bias, topk, scaling_factor):
+        """Route with the kernel; returns probs [tokens, topk] and int64 indices."""
+        # The backward always normalizes; the reference leaves top-1 scores unnormalized.
+        assert topk > 1, "the batch-invariant sigmoid top-k path requires topk > 1"
+        probs, top_indices = sigmoid_topk_routing(
+            logits, expert_bias, topk, scaling_factor, batch_invariant=True
+        )
+        ctx.mark_non_differentiable(top_indices)
+        ctx.save_for_backward(logits, top_indices)
+        ctx.scaling_factor = scaling_factor
+        return probs, top_indices
+
+    @staticmethod
+    def backward(ctx, grad_probs, _grad_indices):
+        """Gradient of the reference formula at the kernel's indices."""
+        logits, top_indices = ctx.saved_tensors
+        with torch.enable_grad():
+            x = logits.detach().requires_grad_()
+            scores = torch.sigmoid(x).gather(1, top_indices)
+            probs = scores / (scores.sum(dim=-1, keepdim=True) + 1e-20)
+            if ctx.scaling_factor:
+                probs = probs * ctx.scaling_factor
+            (grad_logits,) = torch.autograd.grad(probs, x, grad_probs)
+        return grad_logits, None, None, None
+
+
+def _use_batch_invariant_sigmoid_topk(
+    logits, topk, score_function, expert_bias, use_pre_softmax, num_groups, group_topk
+) -> bool:
+    """Whether batch-invariant routing runs the Triton sigmoid top-k kernel.
+
+    The kernel computes each row independently with a launch configuration that does
+    not depend on the number of tokens, so it is batch invariant. Training and inference
+    both reach it through topk_routing_with_score_function, so the two sides compute
+    the same routing bit for bit.
+    """
+    return (
+        is_batch_invariant_mode_enabled()
+        and HAVE_SIGMOID_TOPK_KERNEL
+        and score_function == "sigmoid"
+        # Top-1 keeps unnormalized scores in the reference, which this path does not.
+        and topk > 1
+        and expert_bias is not None
+        and not use_pre_softmax
+        and num_groups is None
+        and group_topk is None
+        and logits.is_cuda
+        and logits.dtype == torch.float32
+        and is_sigmoid_topk_supported(logits.shape[-1], topk)
+    )
+
+
 def topk_routing_with_score_function(
     logits: torch.Tensor,
     topk: int,
@@ -805,6 +887,7 @@ def topk_routing_with_score_function(
     qb_histogram: Optional[torch.Tensor] = None,
     qb_bin_bounds: Optional[torch.Tensor] = None,
     topk_indices: Optional[torch.Tensor] = None,
+    allow_batch_invariant_sigmoid_topk: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Compute the routing probabilities and map for top-k selection with score function.
 
@@ -839,6 +922,9 @@ def topk_routing_with_score_function(
                                                 K3 Quantile Balancing histogram bounds.
         topk_indices (torch.Tensor, optional): Optional dense top-k index output buffer with shape
                                                [num_tokens, topk]. Only used by the fused TE path.
+        allow_batch_invariant_sigmoid_topk (bool): Allow the batch-invariant Triton sigmoid top-k
+            optimization. Set False when routing must keep the reference implementation across
+            passes. Defaults to True.
 
     Returns:
         Tuple[torch.Tensor, torch.Tensor]:
@@ -923,6 +1009,26 @@ def topk_routing_with_score_function(
         if fused_topk_with_score_function_supports_topk_indices and topk_indices is not None:
             kwargs["topk_indices"] = topk_indices
         return fused_topk_with_score_function(**kwargs)
+
+    if (
+        allow_batch_invariant_sigmoid_topk
+        and router_replay is None
+        and precomputed_indices is None
+        and not use_quantile_balancing
+        and _use_batch_invariant_sigmoid_topk(
+            logits, topk, score_function, expert_bias, use_pre_softmax, num_groups, group_topk
+        )
+    ):
+        bias = expert_bias.float()
+        if torch.is_grad_enabled() and logits.requires_grad:
+            probs, top_indices = _BatchInvariantSigmoidTopK.apply(
+                logits.contiguous(), bias, topk, scaling_factor
+            )
+        else:
+            probs, top_indices = sigmoid_topk_routing(
+                logits.contiguous(), bias, topk, scaling_factor, batch_invariant=True
+            )
+        return _topk_routing_output(logits, probs, top_indices, dense_output)
 
     def _compute_topk(
         scores: torch.Tensor,
@@ -1032,10 +1138,17 @@ def topk_routing_with_score_function(
         probs = probs * scaling_factor
 
     probs = probs.type_as(logits)
+    return _topk_routing_output(logits, probs, top_indices, dense_output)
 
+
+def _topk_routing_output(
+    logits: torch.Tensor, probs: torch.Tensor, top_indices: torch.Tensor, dense_output: bool
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Return top-k routing as dense [num_tokens, topk] or [num_tokens, num_experts] maps."""
     if dense_output:
         return probs, top_indices
 
+    num_tokens = logits.shape[0]
     if torch.are_deterministic_algorithms_enabled():
         # build [num_tokens, num_experts] from [num_tokens, topk]
         routing_probs = torch.zeros_like(logits)

@@ -49,9 +49,9 @@ try:
         RuntimePolicy,
         SchedulePolicy,
         ShardLayout,
+        finalize_gradients,
         fully_shard,
         fully_shard_context,
-        microbatch,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
         current_fully_shard_context,
@@ -169,6 +169,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise IMPORT_MEGATRON_FSDP_ERROR
         if pg_collection is None:
             raise ValueError("MFSDP v2 requires an explicit ProcessGroupCollection.")
+        ddp_config.finalize()
         FullyShardedDataParallelV2._validate_config(
             config, ddp_config, module, pg_collection, disable_bucketing
         )
@@ -474,7 +475,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         MCore's schedules wrap every microbatch but the last in ``no_sync_func``.
         """
-        with microbatch(self.module.context, is_last=False):
+        with finalize_gradients(self.module.context, enabled=False):
             yield
 
     @torch.no_grad()
