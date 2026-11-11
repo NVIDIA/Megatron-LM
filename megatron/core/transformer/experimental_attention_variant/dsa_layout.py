@@ -993,11 +993,13 @@ class PrebuiltPackedCPLayout:
 
         The copy overwrites tables that autograd may have saved for a backward that
         has not run yet: the K/V and indexer-K reorders save the inverse reorder for
-        their gather backward (the KPool gate reorder runs without grad and saves
-        nothing). Refresh a layout only after the backward of every microbatch that
-        consumed it has run: with separately captured forward and backward graphs and
-        several microbatches in flight (1F1B or interleaved pipelining), keep one static
-        layout per in-flight microbatch and geometry, not one per geometry. Eager
+        their gather backward (the frozen KPool selector's gate reorder runs without
+        grad and saves nothing; a trainable KPool indexer rejects packed THD with CP,
+        so it never reads these tables). Refresh a layout only after the backward of
+        every microbatch that consumed it has run: with separately captured forward
+        and backward graphs and several microbatches in flight (1F1B or interleaved
+        pipelining), keep one static layout per in-flight microbatch and geometry, not
+        one per geometry. Eager
         autograd reports a premature refresh through its version counter; a graph
         replay silently reads the new tables.
         """

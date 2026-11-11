@@ -56,6 +56,27 @@ def _check_fixed_raw_storage(tracker, size: int) -> None:
         raise RuntimeError("DSA metric tracker raw-loss storage does not match fixed capacity.")
 
 
+# Per-layer storage of the KPool tail mass p_E: the sum of p_E over the rows the sparse
+# pool-level loss uses, and the number of those rows. Kept apart from the indexer loss.
+_TAIL_MASS_KEYS = ("tail_mass_sums", "tail_mass_rows")
+
+
+def _check_fixed_tail_mass_storage(tracker, size: int) -> None:
+    """Validate optional tail-mass storage against a fixed tracker capacity."""
+    for key in _TAIL_MASS_KEYS:
+        storage = tracker.get(key)
+        if storage is None:
+            continue
+        if size == 0:
+            raise RuntimeError(
+                "Zero-capacity DSA metric tracker unexpectedly owns tail-mass storage."
+            )
+        if storage.shape[0] != size:
+            raise RuntimeError(
+                "DSA metric tracker tail-mass storage does not match fixed capacity."
+            )
+
+
 class DSAIndexerLossLoggingHelper:
     """Helper class for logging sparse attention indexer losses."""
 
@@ -84,6 +105,7 @@ class DSAIndexerLossLoggingHelper:
             if agreed_size == 0 and values is not None:
                 raise RuntimeError("Zero-capacity DSA metric tracker unexpectedly owns storage.")
             _check_fixed_raw_storage(tracker, agreed_size)
+            _check_fixed_tail_mass_storage(tracker, agreed_size)
             return
         if "values" not in tracker:
             tracker["values"] = torch.zeros(num_layers, device=torch.cuda.current_device())
@@ -93,11 +115,12 @@ class DSAIndexerLossLoggingHelper:
             )
             grown[: tracker["values"].shape[0]] = tracker["values"]
             tracker["values"] = grown
-        raw_values = tracker.get("raw_values")
-        if raw_values is not None and raw_values.shape[0] < tracker["values"].shape[0]:
-            grown = torch.zeros_like(tracker["values"])
-            grown[: raw_values.shape[0]] = raw_values
-            tracker["raw_values"] = grown
+        for key in ("raw_values",) + _TAIL_MASS_KEYS:
+            storage = tracker.get(key)
+            if storage is not None and storage.shape[0] < tracker["values"].shape[0]:
+                grown = torch.zeros_like(tracker["values"])
+                grown[: storage.shape[0]] = storage
+                tracker[key] = grown
 
     @staticmethod
     def save_loss_to_tracker(
@@ -147,15 +170,59 @@ class DSAIndexerLossLoggingHelper:
         tracker["avg_group"] = avg_group
 
     @staticmethod
+    def save_tail_mass_to_tracker(
+        tail_mass_sum: torch.Tensor,
+        row_count: torch.Tensor,
+        layer_number: int,
+        num_layers: int,
+        reduce_group: torch.distributed.ProcessGroup = None,
+        avg_group: torch.distributed.ProcessGroup = None,
+    ):
+        """Save a KPool layer's tail mass ``p_E`` for logging, apart from its indexer loss.
+
+        The tracker keeps, per layer, the sum of ``p_E`` over the rows the sparse pool-level
+        loss uses and the number of those rows; the logged value is their ratio. Both follow
+        the indexer loss's reduction (same groups), whose scale factors cancel in the ratio,
+        so the logged value is the row mean over microbatches and CP, DP and TP ranks. Nothing
+        here is added into the indexer loss, and nothing synchronizes with the host.
+
+        Args:
+            tail_mass_sum: 0-dim sum of ``p_E`` over the rows the loss uses.
+            row_count: 0-dim number of those rows.
+            layer_number: Layer index of the loss, 1-indexed.
+            num_layers: The number of total layers.
+            reduce_group: The indexer loss's group for reducing the loss.
+            avg_group: The indexer loss's group for averaging the loss.
+        """
+        if layer_number is None:
+            return
+
+        tracker = DSAIndexerLossLoggingHelper.tracker
+        DSAIndexerLossLoggingHelper.ensure_tracker_size(max(num_layers, layer_number))
+        sums, rows = (tracker.get(key) for key in _TAIL_MASS_KEYS)
+        if sums is None or rows is None:
+            if tracker.get("agreed_size") is not None:
+                # Fixed-capacity trackers own this storage from initialize_dsa_metric_tracker(),
+                # so capture never reallocates; a tracker built without it records nothing.
+                return
+            sums = torch.zeros_like(tracker["values"])
+            rows = torch.zeros_like(tracker["values"])
+            tracker[_TAIL_MASS_KEYS[0]], tracker[_TAIL_MASS_KEYS[1]] = sums, rows
+        sums[layer_number - 1] += tail_mass_sum.detach().to(sums.dtype)
+        rows[layer_number - 1] += row_count.detach().to(rows.dtype)
+        tracker["tail_mass_recorded"] = True
+        tracker["reduce_group"] = reduce_group
+        tracker["avg_group"] = avg_group
+
+    @staticmethod
     def clean_loss_in_tracker(preserve_groups: bool = False):
         """Clear indexer losses, optionally retaining reduction-group metadata."""
         tracker = DSAIndexerLossLoggingHelper.tracker
         reduce_group = tracker.get("reduce_group") if preserve_groups else None
         avg_group = tracker.get("avg_group") if preserve_groups else None
-        if "values" in tracker:
-            tracker["values"].zero_()
-        if "raw_values" in tracker:
-            tracker["raw_values"].zero_()
+        for key in ("values", "raw_values") + _TAIL_MASS_KEYS:
+            if key in tracker:
+                tracker[key].zero_()
         tracker["reduce_group"] = reduce_group
         tracker["avg_group"] = avg_group
 
@@ -254,12 +321,19 @@ class DSAIndexerLossLoggingHelper:
             if values is None or values.shape[0] != size:
                 raise RuntimeError("DSA metric tracker storage does not match its fixed capacity.")
             _check_fixed_raw_storage(tracker, size)
+            _check_fixed_tail_mass_storage(tracker, size)
         metric_tensors = [tracker["values"]]
         if DSAIndexerLossLoggingHelper._agree_raw_loss_logging(
             tracker, size, pp_group, lazy=agreed_size is None
         ):
             # Raw losses follow exactly the same reduction path as the scaled losses.
             metric_tensors.append(tracker["raw_values"])
+        if DSAIndexerLossLoggingHelper._agree_tail_mass_logging(
+            tracker, size, pp_group, lazy=agreed_size is None
+        ):
+            # The tail-mass sums and row counts take the same path too. Every reduction step
+            # scales both alike, so their ratio, the logged row mean, is unaffected.
+            metric_tensors.extend(tracker[key] for key in _TAIL_MASS_KEYS)
 
         for values in metric_tensors:
             if dynamic_cp_parent_group is not None:
@@ -321,6 +395,77 @@ class DSAIndexerLossLoggingHelper:
                 grown[: raw_values.shape[0]] = raw_values
             tracker["raw_values"] = grown
         return True
+
+    @staticmethod
+    def _agree_tail_mass_logging(tracker, size: int, pp_group, lazy: bool) -> bool:
+        """Return whether KPool tail masses are reduced and logged for this tracker.
+
+        Only trainable KPool layers write a tail mass, and some PP stages may have none, so
+        the decision is agreed once across PP and cached, like the raw-loss decision.
+        Fixed-capacity tail-mass storage exists on every PP rank, so its absence is already a
+        uniform "disabled". Runs that never record a tail mass reduce and log nothing new.
+        """
+        enabled = tracker.get("tail_mass_enabled")
+        if enabled is None:
+            if not lazy and any(key not in tracker for key in _TAIL_MASS_KEYS):
+                enabled = False
+            else:
+                enabled = bool(tracker.get("tail_mass_recorded", False))
+                if torch.distributed.is_initialized():
+                    flag = torch.tensor(
+                        [int(enabled)], device=torch.cuda.current_device(), dtype=torch.long
+                    )
+                    torch.distributed.all_reduce(
+                        flag, op=torch.distributed.ReduceOp.MAX, group=pp_group
+                    )
+                    enabled = bool(flag.item())
+            tracker["tail_mass_enabled"] = enabled
+        if not enabled:
+            return False
+        for key in _TAIL_MASS_KEYS:
+            storage = tracker.get(key)
+            if storage is None or storage.shape[0] < size:
+                # Only lazy trackers reach this: PP stages without a writer join with zeros.
+                grown = torch.zeros_like(tracker["values"])
+                if storage is not None:
+                    grown[: storage.shape[0]] = storage
+                tracker[key] = grown
+        return True
+
+    @staticmethod
+    def _track_tail_mass(writer, wandb_writer, total_loss_dict, iteration: int) -> None:
+        """Log the reduced KPool tail mass ``p_E``: per layer, and averaged over layers.
+
+        A layer's value is its row mean of ``p_E``. Layers without rows (skip layers, layers
+        without a trainable KPool indexer) are left out of both. The average over layers goes
+        to ``total_loss_dict`` and the writers as "indexer tail mass"; the writers also get
+        "indexer tail mass layer N". The loss scale does not apply: the value is a ratio.
+        """
+        tracker = DSAIndexerLossLoggingHelper.tracker
+        sums, rows = (tracker[key] for key in _TAIL_MASS_KEYS)
+        has_rows = rows > 0
+        per_layer = torch.where(
+            has_rows, sums / torch.where(has_rows, rows, torch.ones_like(rows)), 0.0
+        )
+        num_layers_with_rows = has_rows.sum().clamp_min(1).to(per_layer.dtype)
+        avg_tail_mass = (per_layer * has_rows).sum() / num_layers_with_rows
+
+        if total_loss_dict is not None:
+            if "indexer tail mass" in total_loss_dict:
+                total_loss_dict["indexer tail mass"] += avg_tail_mass
+            else:
+                total_loss_dict["indexer tail mass"] = avg_tail_mass
+        if writer is None and wandb_writer is None:
+            return
+        logged = {"indexer tail mass": avg_tail_mass}
+        for layer_index, (value, present) in enumerate(zip(per_layer.tolist(), has_rows.tolist())):
+            if present:
+                logged[f"indexer tail mass layer {layer_index + 1}"] = value
+        if writer is not None:
+            for name, value in logged.items():
+                writer.add_scalar(name, value, iteration)
+        if wandb_writer is not None:
+            wandb_writer.log(logged, iteration)
 
     @staticmethod
     def track_indexer_metrics(
@@ -409,6 +554,13 @@ class DSAIndexerLossLoggingHelper:
                 writer.add_scalar("indexer raw loss", avg_raw_indexer_loss, iteration)
             if wandb_writer is not None:
                 wandb_writer.log({"indexer raw loss": avg_raw_indexer_loss}, iteration)
+
+        if tracker.get("tail_mass_enabled", False) and all(
+            tracker.get(key) is not None for key in _TAIL_MASS_KEYS
+        ):
+            DSAIndexerLossLoggingHelper._track_tail_mass(
+                writer, wandb_writer, total_loss_dict, iteration
+            )
 
         DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=preserve_groups)
 
@@ -525,6 +677,7 @@ def initialize_dsa_metric_tracker(
         if agreed_size == 0 and values is not None:
             raise RuntimeError("Zero-capacity DSA metric tracker unexpectedly owns storage.")
         _check_fixed_raw_storage(tracker, agreed_size)
+        _check_fixed_tail_mass_storage(tracker, agreed_size)
         return agreed_size
 
     if torch.distributed.is_initialized():
@@ -535,13 +688,15 @@ def initialize_dsa_metric_tracker(
         local_required_size = int(size_tensor.item())
 
     size = local_required_size
-    if "values" in tracker or "raw_values" in tracker:
+    if any(key in tracker for key in ("values", "raw_values") + _TAIL_MASS_KEYS):
         raise RuntimeError("DSA metric tracker must be initialized before its first metric write.")
     if size > 0:
         tracker["values"] = torch.zeros(size, device=torch.cuda.current_device())
-        # Optional raw-loss storage shares the fixed capacity, so CUDA Graph captures of
-        # raw-loss writers also keep a stable address.
+        # Optional raw-loss and KPool tail-mass storage share the fixed capacity, so CUDA
+        # Graph captures of their writers also keep a stable address.
         tracker["raw_values"] = torch.zeros(size, device=torch.cuda.current_device())
+        for key in _TAIL_MASS_KEYS:
+            tracker[key] = torch.zeros(size, device=torch.cuda.current_device())
 
     tracker["agreed_size"] = size
     _record_tracker_pp_group(tracker, "agreed_size", pp_group)

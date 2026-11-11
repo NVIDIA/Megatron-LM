@@ -274,6 +274,87 @@ def test_dsa_kpool_scorer_backend_rejects_unsupported_configs(overrides, message
         _make_dsa_kpool_config(**settings)
 
 
+@pytest.mark.parametrize("loss_coeff", [None, 0.0, -1.0])
+def test_dsa_kpool_frozen_selector_accepts_any_loss_flavor(loss_coeff):
+    config = _make_dsa_kpool_config(
+        dsa_indexer_kpool=4, dsa_indexer_topk=8, dsa_indexer_loss_coeff=loss_coeff
+    )
+    assert config.dsa_indexer_kpool == 4
+
+
+@pytest.mark.parametrize(
+    "recompute",
+    [
+        dict(),
+        dict(recompute_granularity="selective", recompute_modules=["layernorm"]),
+        dict(recompute_granularity="selective", recompute_modules=["mlp"]),
+    ],
+)
+def test_dsa_kpool_trainable_selector_accepts_sparse_loss(recompute):
+    config = _make_dsa_kpool_config(
+        dsa_indexer_kpool=4,
+        dsa_indexer_topk=8,
+        dsa_indexer_loss_coeff=0.01,
+        dsa_indexer_use_sparse_loss=True,
+        **recompute,
+    )
+    assert config.dsa_indexer_loss_coeff == 0.01
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        # The dense KPool loss stays rejected; the message keeps its historical wording.
+        (dict(dsa_indexer_use_sparse_loss=False), "indexer loss is not supported"),
+        (dict(dsa_indexer_kpool_use_quantization=True), "does not support FP8 KPool scoring"),
+        (
+            dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1),
+            "does not support recompute_granularity='full'",
+        ),
+        (
+            dict(recompute_granularity="selective", recompute_modules=["core_attn"]),
+            "does not support selective recompute of 'core_attn'",
+        ),
+        (dict(recompute_granularity="selective"), "selective recompute of 'core_attn'"),
+    ],
+)
+def test_dsa_kpool_trainable_selector_rejects_unsupported_configs(overrides, message):
+    settings = dict(
+        dsa_indexer_kpool=4,
+        dsa_indexer_topk=8,
+        dsa_indexer_loss_coeff=0.01,
+        dsa_indexer_use_sparse_loss=True,
+    )
+    settings.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        _make_dsa_kpool_config(**settings)
+
+
+def test_dsa_kpool_trainable_selector_rejects_full_iteration_graphs():
+    with pytest.raises(ValueError, match="does not support cuda_graph_impl='full_iteration'"):
+        _make_dsa_kpool_config(
+            dsa_indexer_kpool=4,
+            dsa_indexer_topk=8,
+            dsa_indexer_loss_coeff=0.01,
+            dsa_indexer_use_sparse_loss=True,
+            cuda_graph_impl="full_iteration",
+        )
+
+
+@pytest.mark.parametrize("loss", [dict(), dict(dsa_indexer_loss_coeff=0.01)])
+def test_dsa_kpool_rejects_simplified_indexer(loss):
+    """The simplified indexer has no pools; KPool was silently ignored before this rule."""
+    with pytest.raises(ValueError, match="dsa_indexer_mode='simplified' does not support KPool"):
+        _make_dsa_kpool_config(
+            dsa_indexer_kpool=4,
+            dsa_indexer_topk=8,
+            dsa_indexer_mode="simplified",
+            dsa_indexer_use_sparse_loss=True,
+            num_query_groups=1,
+            **loss,
+        )
+
+
 def test_per_token_cudnn_still_rejects_fp32_weights_projection():
     with pytest.raises(ValueError, match="for per-token DSA"):
         _make_dsa_kpool_config(

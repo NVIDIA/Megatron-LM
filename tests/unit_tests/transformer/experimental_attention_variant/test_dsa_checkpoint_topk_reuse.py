@@ -628,6 +628,17 @@ def test_reuse_checkpoint_topk_frozen_config_validation(monkeypatch, overrides, 
         _small_reuse_config(monkeypatch, dsa_indexer_loss_coeff=0.0, **overrides)
 
 
+def test_reuse_checkpoint_topk_rejects_trainable_kpool(monkeypatch):
+    """KPool never reuses a checkpoint's top-k, with the (sparse) indexer loss on as well."""
+    with pytest.raises(ValueError, match="does not support KPool selection"):
+        _small_reuse_config(
+            monkeypatch,
+            dsa_indexer_loss_coeff=0.01,
+            dsa_indexer_use_sparse_loss=True,
+            dsa_indexer_kpool=2,
+        )
+
+
 # ---------------------------------------------------------------------------------------
 # Frozen indexer on CPU: the indexer projections are stubbed, the fused dispatch is enabled
 # and falls back to the PyTorch top-k (no kernel backend is installed), and checkpointing,

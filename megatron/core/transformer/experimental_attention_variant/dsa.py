@@ -551,6 +551,11 @@ def _normalize_indexer_teacher_target(
     """L1-normalize teacher mass without changing the legacy DSA path."""
     if non_compressed_lse is None:
         return dsa_indexer_loss.normalize_indexer_target(target)
+    return _normalize_teacher_target_exact_zero(target)
+
+
+def _normalize_teacher_target_exact_zero(target: torch.Tensor) -> torch.Tensor:
+    """L1-normalize non-negative teacher mass, keeping only exactly zero rows at zero."""
     row_mass = target.sum(dim=-1, keepdim=True)
     # External teacher mass can legitimately make the compressed mass smaller
     # than INDEXER_LOSS_EPS (or even float32 tiny). Only an exactly zero row is
@@ -725,8 +730,10 @@ def _kpool_compress_keys(
         # multiplying, not after an FP32 weighted sum.
         probabilities = torch.nan_to_num(score.softmax(dim=1)).to(k_p.dtype)
         return (probabilities * k_p).sum(dim=1)
-    # Numerically-stable per-dim softmax over dim=1 (the pool slot dim).
-    score_max = score.max(dim=1, keepdim=True).values
+    # Numerically-stable per-dim softmax over dim=1 (the pool slot dim). The shift cancels
+    # in the ratio below, so its exact gradient is zero; detach it so a trainable KPool
+    # indexer does not route a (rounding-only) gradient through the max.
+    score_max = score.detach().max(dim=1, keepdim=True).values
     prob = torch.exp(score - score_max)
     # weighted sum of k over pool slots: [num_pools, batch, head_dim]. Keep the
     # numerator 4D ([num_pools, 1, batch, head_dim]) so it broadcasts cleanly
@@ -1094,6 +1101,8 @@ def fused_qk_topk_kpool(
     kpool_key_dtype_compression: bool = False,
     hf_scoring: bool = False,
     pool_topk_fn: Optional[Callable[..., Optional[torch.Tensor]]] = None,
+    pooled_keys: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+    return_selection: bool = False,
 ):
     """Select complete causal pools and append each query's incomplete tail.
 
@@ -1132,9 +1141,29 @@ def fused_qk_topk_kpool(
 
     Model-level left padding is unsupported: causal DSA layers ignore the attention
     mask and treat padded tokens as real keys.
+
+    ``pooled_keys``, when given, is a precomputed ``(k_pooled, pool_token_base)``: the
+    pre-rotation pooled keys ``[pools, batch, dim]`` and each pool's first token in the
+    key coordinates of ``varlen_starts``/``varlen_ends`` (``-1`` for an invalid packed
+    capacity pool), as ``_kpool_compress_keys`` or ``_kpool_compress_keys_per_seg`` with
+    ``cu_seqlens_kv`` returns them. Compression is skipped, so ``k``, ``gate_score`` and
+    ``ape`` are not read; rotation and selection run as without it. An explicit ``mask``
+    is rejected, because its pool phase shifts the keys before compression. With
+    ``return_selection``, a third value is returned: the selected pool ids ``[batch,
+    queries, index_topk // pool_size]`` (int64, ``-1`` for unused slots) in the
+    selector's slot order, so that pool slot ``j`` expands to token slots
+    ``j * pool_size .. j * pool_size + pool_size - 1`` (with an explicit mask, the ids
+    index the phase-shifted pool grid and the mask may refill or drop token slots).
+    Callers that need no autograd graph run this function under ``no_grad``; the
+    selection itself is discrete.
     """
     if hf_scoring and not use_relu:
         raise ValueError("HF KPool scoring requires use_relu=True.")
+    if pooled_keys is not None and mask is not None:
+        raise ValueError(
+            "fused_qk_topk_kpool cannot take precomputed pooled_keys with an explicit "
+            "attention mask: the mask's pool phase shifts the keys before compression."
+        )
     sk = k.size(0)
     if q.size(0) == 0:
         # Empty packed-CP ranks still need a fixed-width index tensor; reshape
@@ -1142,6 +1171,11 @@ def fused_qk_topk_kpool(
         width = index_topk + (pool_size - 1 if always_select_tail else 0)
         scores = q.new_empty((q.size(1), 0, sk // pool_size), dtype=torch.float32)
         indices = torch.empty((q.size(1), 0, width), dtype=torch.int32, device=q.device)
+        if return_selection:
+            selected_pools = torch.empty(
+                (q.size(1), 0, index_topk // pool_size), dtype=torch.int64, device=q.device
+            )
+            return scores if return_index_scores else None, indices, selected_pools
         return scores if return_index_scores else None, indices
 
     # Packed pools restart at each document boundary.
@@ -1154,7 +1188,16 @@ def fused_qk_topk_kpool(
     if explicit_mask and not use_per_seg and sk > 0:
         pool_phase = _kpool_explicit_mask_pool_phase(mask, pool_size)
         k, gate_score, mask = _shift_kpool_explicit_mask_inputs(k, gate_score, mask, pool_phase)
-    if use_per_seg:
+    if pooled_keys is not None:
+        k_pooled, pool_token_base = pooled_keys
+        num_pools = k_pooled.size(0)
+        if pool_token_base.numel() != num_pools:
+            raise ValueError(
+                "pooled_keys must hold one pool_token_base entry per pooled key, got "
+                f"{pool_token_base.numel()} entries for {num_pools} pooled keys."
+            )
+        pool_token_base = pool_token_base.to(device=k_pooled.device, dtype=torch.int64)
+    elif use_per_seg:
         k_pooled, pool_token_base = _kpool_compress_keys_per_seg(
             k,
             gate_score,
@@ -1324,6 +1367,8 @@ def fused_qk_topk_kpool(
     if token_mask is not None:
         token_topk = _mask_topk_tokens_with_token_mask(token_topk, token_mask)
 
+    if return_selection:
+        return index_scores, token_topk, pool_topk.to(torch.int64)
     return index_scores, token_topk
 
 
@@ -1808,6 +1853,547 @@ class FusedDSAIndexerLoss(torch.autograd.Function):
         return gradients[: ctx.num_inputs]
 
 
+# Byte budget of one row chunk of the KPool sparse indexer loss (teacher and student).
+_KPOOL_LOSS_CHUNK_BYTES = 1024 * 1024 * 1024
+
+
+def _kpool_loss_chunk_rows(rows: int, bytes_per_row: int, chunk_bytes: int) -> int:
+    """Query rows per chunk, from shapes only (no host sync)."""
+    return min(rows, max(1, int(chunk_bytes) // max(1, int(bytes_per_row))))
+
+
+def _kpool_canonical_slots(
+    token_topk: torch.Tensor, pool_ids: torch.Tensor, *, index_topk: int, pool_size: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Put a KPool selection in canonical slot order: valid pools by ascending pool id.
+
+    ``pool_ids`` is ``[batch, sq, index_topk // pool_size]`` (``-1`` for unused slots) in
+    the selector's slot order, and ``token_topk`` is ``[batch, sq, index_topk + tail]``,
+    where pool slot ``j`` holds token slots ``j * pool_size .. j * pool_size + pool_size - 1``
+    and the last ``tail`` columns are the query-local tail. A stable sort of the valid pool
+    ids (unused slots last) regroups both the same way and keeps the tail columns in place,
+    so ranks that selected the same pools hold them in the same slots. The inputs are not
+    modified; new tensors are returned.
+
+    Returns:
+        ``(pool_ids_c, token_topk_c)`` with the shapes and dtypes of the inputs.
+    """
+    budget = index_topk // pool_size
+    if pool_ids.ndim != 3 or pool_ids.size(-1) != budget:
+        raise ValueError(f"pool_ids must be [batch, sq, {budget}], got {tuple(pool_ids.shape)}.")
+    if token_topk.ndim != 3 or token_topk.shape[:2] != pool_ids.shape[:2]:
+        raise ValueError(
+            "token_topk must be [batch, sq, width] with the rows of pool_ids, got "
+            f"{tuple(token_topk.shape)} and {tuple(pool_ids.shape)}."
+        )
+    if token_topk.size(-1) < index_topk:
+        raise ValueError(
+            f"token_topk must have at least index_topk={index_topk} columns, got "
+            f"{token_topk.size(-1)}."
+        )
+    batch, sq = pool_ids.shape[:2]
+    unused_last = torch.full_like(pool_ids, torch.iinfo(pool_ids.dtype).max)
+    order = torch.sort(
+        torch.where(pool_ids >= 0, pool_ids, unused_last), dim=-1, stable=True
+    ).indices
+    pool_ids_c = torch.gather(pool_ids, -1, order)
+    pool_tokens = token_topk[..., :index_topk].reshape(batch, sq, budget, pool_size)
+    pool_tokens = torch.gather(pool_tokens, 2, order.unsqueeze(-1).expand(-1, -1, -1, pool_size))
+    token_topk_c = torch.cat(
+        (pool_tokens.reshape(batch, sq, index_topk), token_topk[..., index_topk:]), dim=-1
+    )
+    return pool_ids_c, token_topk_c
+
+
+@torch.no_grad()
+def _kpool_sparse_pool_target(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    token_topk_c: torch.Tensor,
+    pool_ids_c: torch.Tensor,
+    *,
+    softmax_scale: float,
+    index_topk: int,
+    pool_size: int,
+    tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    chunk_bytes: int = _KPOOL_LOSS_CHUNK_BYTES,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pool-level teacher of the sparse KPool indexer loss, from the main attention.
+
+    For each main-attention head ``h`` on this rank and query row ``t``, with the attended
+    token ids ``A(t)`` of ``token_topk_c`` (selected pools plus the query-local tail;
+    ``-1`` is ignored):
+
+    - ``lse_h(t) = logsumexp_{j in A(t)} softmax_scale * query_h(t) . key_j``, the
+      attention's own normalizer, tail included;
+    - ``m_h(t, c)`` is the sum of ``exp(logit - lse_h(t))`` over the ``pool_size`` tokens of
+      the selected pool in slot ``c``: an absolute mass with no common shift.
+
+    The masses are summed over heads, SUM all-reduced over ``tp_group`` (which shards the
+    heads; every rank must hold the same canonical slots) and L1-normalized over the slots
+    with an exact-zero safe divide. Rows whose summed pool mass is exactly zero (no complete
+    pool, or a pool mass that underflows FP32 on every head) get an all-zero target. Unused
+    slots (``pool_ids_c < 0``) get zero target. The math is FP32 in row chunks of about
+    ``chunk_bytes``, sized from shapes without a host sync. On CUDA, BF16 or FP16 query and
+    latent key go through one GEMM with FP32 accumulation and FP32 output, which skips an
+    FP32 copy of the gathered keys (the products of two BF16 or FP16 values are exact in
+    FP32); other inputs are upcast to FP32 first.
+
+    Args:
+        query: Detached main-attention query ``[sq, batch, heads, dim]``.
+        key: Detached main-attention key ``[sk, batch, 1 or heads, dim]`` (one head for the
+            absorbed-MLA latent key).
+        token_topk_c: Attended token ids ``[batch, sq, index_topk + tail]`` in canonical
+            slot order (see ``_kpool_canonical_slots``).
+        pool_ids_c: Selected pool ids ``[batch, sq, index_topk // pool_size]``, canonical.
+
+    Returns:
+        ``(target [batch, sq, pools] fp32, row_has_mass [batch, sq] bool,
+        tail_mass [batch, sq] fp32)``. ``tail_mass`` is the head-summed probability of the
+        tail divided by the head-summed probability of every attended token (``p_E``),
+        zero for rows without attended tokens.
+    """
+    query, _ = dsa_layout.ensure_sbhd(query, "query")
+    key, _ = dsa_layout.ensure_sbhd(key, "key")
+    sq, batch, n_heads, head_dim = query.shape
+    sk, key_batch, key_heads, key_dim = key.shape
+    if key_batch != batch or key_dim != head_dim or key_heads not in (1, n_heads):
+        raise ValueError(
+            "KPool teacher expects key [sk, batch, 1 or heads, dim] matching query "
+            f"{tuple(query.shape)}, got {tuple(key.shape)}."
+        )
+    budget = index_topk // pool_size
+    if pool_ids_c.shape != (batch, sq, budget):
+        raise ValueError(
+            f"pool_ids_c must be [{batch}, {sq}, {budget}], got {tuple(pool_ids_c.shape)}."
+        )
+    width = token_topk_c.size(-1)
+    if token_topk_c.shape[:2] != (batch, sq) or width < index_topk:
+        raise ValueError(
+            f"token_topk_c must be [{batch}, {sq}, >= {index_topk}], got "
+            f"{tuple(token_topk_c.shape)}."
+        )
+    device = query.device
+    # Per row: head-summed pool masses, then the tail mass and the total attended mass.
+    # One contiguous buffer, so a single all-reduce sums the TP-sharded heads in place.
+    masses = torch.zeros(batch, sq, budget + 2, dtype=torch.float32, device=device)
+    if sq > 0 and sk > 0:
+        key_flat = key.reshape(sk * batch, key_heads * key_dim)
+        low_precision_gemm = (
+            device.type == "cuda"
+            and key_heads == 1
+            and query.dtype == key.dtype
+            and query.dtype in (torch.bfloat16, torch.float16)
+        )
+        gathered_key_bytes = key.element_size() + (0 if low_precision_gemm else 4)
+        bytes_per_row = batch * (
+            width * key_heads * key_dim * gathered_key_bytes
+            + 3 * n_heads * width * 4
+            + n_heads * head_dim * 4
+            + width * 8 * 3
+        )
+        chunk = _kpool_loss_chunk_rows(sq, bytes_per_row, chunk_bytes)
+        batch_offsets = torch.arange(batch, device=device, dtype=torch.int64).view(batch, 1, 1)
+        for start in range(0, sq, chunk):
+            end = min(start + chunk, sq)
+            rows = end - start
+            ids = token_topk_c[:, start:end].to(torch.int64)
+            valid = (ids >= 0) & (ids < sk)
+            flat_ids = ids.clamp(0, sk - 1) * batch + batch_offsets
+            # [batch, rows, width, key_heads, dim]
+            keys = key_flat.index_select(0, flat_ids.reshape(-1)).view(
+                batch, rows, width, key_heads, key_dim
+            )
+            queries = query[start:end].permute(1, 0, 2, 3)  # [batch, rows, heads, dim]
+            with torch.autocast(device_type=device.type, enabled=False):
+                if low_precision_gemm:
+                    logits = torch.bmm(
+                        queries.reshape(batch * rows, n_heads, head_dim),
+                        keys.view(batch * rows, width, key_dim).transpose(1, 2),
+                        out_dtype=torch.float32,
+                    ).view(batch, rows, n_heads, width)
+                elif key_heads == 1:
+                    logits = torch.matmul(
+                        queries.float(), keys.squeeze(3).float().transpose(-1, -2)
+                    )
+                else:
+                    logits = torch.einsum("brhd,brwhd->brhw", queries.float(), keys.float())
+            del keys
+            logits.mul_(softmax_scale).masked_fill_(~valid.unsqueeze(2), float("-inf"))
+            lse = torch.logsumexp(logits, dim=-1, keepdim=True)
+            # Rows without an attended token keep -inf logits, so their mass is exactly zero.
+            lse = torch.where(torch.isfinite(lse), lse, torch.zeros_like(lse))
+            probs = logits.sub_(lse).exp_()  # [batch, rows, heads, width]
+            del logits, lse
+            # Every mass below is a sum over heads: take it first, on [batch, rows, width].
+            head_mass = probs.sum(dim=2)
+            del probs
+            pool_mass = head_mass[..., :index_topk].reshape(batch, rows, budget, pool_size).sum(-1)
+            pool_mass.masked_fill_(pool_ids_c[:, start:end] < 0, 0.0)
+            masses[:, start:end, :budget] = pool_mass
+            masses[:, start:end, budget] = head_mass[..., index_topk:].sum(-1)
+            masses[:, start:end, budget + 1] = head_mass.sum(-1)
+            del head_mass, pool_mass
+    if tp_group is not None and get_pg_size(tp_group) > 1:
+        torch.distributed.all_reduce(masses, group=tp_group)
+    pool_mass = masses[..., :budget]
+    target = _normalize_teacher_target_exact_zero(pool_mass)
+    row_has_mass = pool_mass.sum(dim=-1) > 0
+    total_mass = masses[..., budget + 1]
+    tail_mass = masses[..., budget] / torch.where(
+        total_mass > 0, total_mass, torch.ones_like(total_mass)
+    )
+    return target, row_has_mass, tail_mass
+
+
+def _kpool_gather_selected_pool_keys(
+    k_pooled: torch.Tensor, pool_ids: torch.Tensor
+) -> torch.Tensor:
+    """Gather ``k_pooled [pools, batch, dim]`` at ``pool_ids [batch, rows, slots]``.
+
+    Returns ``[batch, rows, slots, dim]`` in the key dtype; unused slots (``-1``) read
+    pool 0, and zeros are returned when there are no pools.
+    """
+    num_pools, batch, head_dim = k_pooled.shape
+    if num_pools == 0:
+        return k_pooled.new_zeros(pool_ids.shape + (head_dim,))
+    flat_ids = pool_ids.clamp(0, num_pools - 1).to(torch.int64) * batch + torch.arange(
+        batch, device=pool_ids.device, dtype=torch.int64
+    ).view(batch, 1, 1)
+    return (
+        k_pooled.reshape(num_pools * batch, head_dim)
+        .index_select(0, flat_ids.reshape(-1))
+        .view(pool_ids.shape + (head_dim,))
+    )
+
+
+def _kpool_student_dtype(*tensors: torch.Tensor) -> torch.dtype:
+    """Arithmetic dtype of the KPool student: FP32, or FP64 for FP64 inputs (gradcheck)."""
+    return torch.float64 if any(t.dtype == torch.float64 for t in tensors) else torch.float32
+
+
+def _kpool_selected_pool_head_scores(
+    q: torch.Tensor,
+    k_pooled: torch.Tensor,
+    pool_ids: torch.Tensor,
+    *,
+    hf_scoring: bool,
+    use_relu: bool = True,
+    compute_dtype: Optional[torch.dtype] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Per-head selected-pool scores, before the head-weight reduction.
+
+    Returns ``(head_scores [batch, rows, heads, slots], queries [batch, rows, heads, dim],
+    keys [batch, rows, slots, dim])`` in ``compute_dtype`` (FP32 unless an input is FP64).
+    With ``hf_scoring`` the scores carry the QK scale ``dim**-0.5`` inside the ReLU, as
+    ``_compute_kpool_hf_scores`` does.
+    """
+    if hf_scoring and not use_relu:
+        raise ValueError("HF KPool scoring requires use_relu=True.")
+    if compute_dtype is None:
+        compute_dtype = _kpool_student_dtype(q, k_pooled)
+    with torch.autocast(device_type=q.device.type, enabled=False):
+        keys = _kpool_gather_selected_pool_keys(k_pooled, pool_ids).to(compute_dtype)
+        queries = q.permute(1, 0, 2, 3).to(compute_dtype)
+        scores = torch.matmul(queries, keys.transpose(-1, -2))
+        if hf_scoring:
+            scores = torch.relu(scores * (q.size(-1) ** -0.5))
+        elif use_relu:
+            scores = torch.relu(scores)
+    return scores, queries, keys
+
+
+def _kpool_reduce_selected_pool_head_scores(
+    head_scores: torch.Tensor, weights: torch.Tensor, *, hf_scoring: bool
+) -> torch.Tensor:
+    """Sum per-head scores with the head weights ``[rows, batch, heads]``, in selector order.
+
+    HF scoring uses the head-reduction GEMM of ``_compute_kpool_hf_scores``; legacy scoring
+    multiplies and sums over heads, as ``_kpool_topk_from_score_chunks`` does. The weights
+    take the dtype of ``head_scores``.
+    """
+    with torch.autocast(device_type=head_scores.device.type, enabled=False):
+        head_weights = weights.permute(1, 0, 2).to(head_scores.dtype)  # [batch, rows, heads]
+        if hf_scoring:
+            return torch.matmul(head_weights.unsqueeze(-2), head_scores).squeeze(-2)
+        return (head_scores * head_weights.unsqueeze(-1)).sum(dim=2)
+
+
+def _kpool_selected_pool_scores(
+    q: torch.Tensor,
+    weights: torch.Tensor,
+    k_pooled: torch.Tensor,
+    pool_ids: torch.Tensor,
+    *,
+    hf_scoring: bool,
+    use_relu: bool = True,
+) -> torch.Tensor:
+    """Student score of the sparse KPool indexer loss: the selector's score of selected pools.
+
+    ``q`` is ``[rows, batch, heads, dim]``, ``weights`` ``[rows, batch, heads]``,
+    ``k_pooled`` ``[pools, batch, dim]`` (the scoring inputs after any rotation) and
+    ``pool_ids`` ``[batch, rows, slots]``. With ``hf_scoring``,
+    ``I = sum_h w_h * relu((q_h . k) * dim**-0.5)``, where ``weights`` carries only the
+    head-count scale; otherwise ``I = sum_h w_h * relu(q_h . k)`` (ReLU per ``use_relu``),
+    with every scale folded into ``weights``. This is the single definition of the student
+    score. Unused slots (``-1``) get an arbitrary finite value; callers mask them.
+
+    Returns:
+        ``I [batch, rows, slots]`` in FP32 (FP64 when an input is FP64).
+    """
+    head_scores, _, _ = _kpool_selected_pool_head_scores(
+        q,
+        k_pooled,
+        pool_ids,
+        hf_scoring=hf_scoring,
+        use_relu=use_relu,
+        compute_dtype=_kpool_student_dtype(q, weights, k_pooled),
+    )
+    return _kpool_reduce_selected_pool_head_scores(head_scores, weights, hf_scoring=hf_scoring)
+
+
+def _kpool_student_bytes_per_row(batch: int, n_heads: int, head_dim: int, budget: int) -> int:
+    """Upper estimate of the student forward/backward bytes per query row (all samples)."""
+    return batch * (
+        budget * head_dim * 32  # gathered keys (native + FP32), dK slots, sort copy, FP64 prefix
+        + n_heads * budget * 4 * 4  # head scores, ReLU mask, head-score gradients
+        + n_heads * head_dim * 4 * 2  # FP32 queries and their gradient
+        + budget * 8 * 4  # slot ids, sort keys and orders
+    )
+
+
+def _kpool_accumulate_pool_key_grads(
+    grad_k_ext: torch.Tensor,
+    flat_ids: torch.Tensor,
+    contributions: torch.Tensor,
+    key_ids: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """Add per-slot pooled-key gradients into ``grad_k_ext`` without floating-point atomics.
+
+    With ``torch.are_deterministic_algorithms_enabled()``, use torch's deterministic
+    ``index_add_`` (sort based, fixed order). Otherwise sort the slots by key id (stable)
+    and sum each key's run of slots with ``torch.segment_reduce``, which adds a segment's
+    elements in a fixed order; the segment lengths come from ``searchsorted`` on the sorted
+    ids, so nothing waits on the host. A run holds at most one slot per row of the chunk
+    (a row's pools are distinct, and the caller spreads unused slots over padding rows), so
+    each segment stays short. Both orders are fixed, as in CSA's
+    ``_deterministic_sparse_indexer_grads_wk``. (A prefix sum over the sorted slots does the
+    same with more passes, and PyTorch's CUDA scan over a leading dimension runs one serial
+    thread per column: 0.1 s per chunk at 1M tokens.) Returns the (lazily built)
+    ``key_ids`` for reuse by the next chunk.
+    """
+    if torch.are_deterministic_algorithms_enabled():
+        grad_k_ext.index_add_(0, flat_ids, contributions)
+        return key_ids
+    if key_ids is None:
+        key_ids = torch.arange(grad_k_ext.size(0), device=grad_k_ext.device, dtype=torch.int64)
+    sorted_ids, order = torch.sort(flat_ids, stable=True)
+    lengths = torch.searchsorted(sorted_ids, key_ids, right=True)
+    lengths.sub_(torch.searchsorted(sorted_ids, key_ids, right=False))
+    # unsafe=True skips the length checks, which read the lengths on the host; the lengths
+    # sum to the slot count by construction (every id is a row of grad_k_ext).
+    grad_k_ext.add_(
+        torch.segment_reduce(
+            contributions.index_select(0, order), "sum", lengths=lengths, axis=0, unsafe=True
+        )
+    )
+    return key_ids
+
+
+class KPoolSparseIndexerLoss(torch.autograd.Function):
+    """Sparse pool-level KL loss that trains a KPool DSA indexer.
+
+    ``loss = loss_coeff * sum_rows(row_mask * KL(target || masked_softmax(I))) / row_count``
+    with ``I = _kpool_selected_pool_scores(q, weights, k_pooled, pool_ids_c)`` over the
+    selected pools (unused ``-1`` slots excluded) and the token loss's reduction: the
+    caller passes the token loss's row count, or 1 under ``calculate_per_token_loss``.
+    The forward saves only its inputs and recomputes the scores per row chunk in the
+    backward, which applies the exact logit gradient ``(p * sum(t) - t) * scale`` and
+    backpropagates it through the ReLU and the head weights. The pooled-key gradient is
+    accumulated without floating-point atomics. Gradients are returned for ``q``,
+    ``weights`` and ``k_pooled`` (zeros when there is nothing to score), ``None`` for the
+    rest. This Function is the kernel boundary for a fused implementation of the student.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        k_pooled: torch.Tensor,
+        pool_ids_c: torch.Tensor,
+        target: torch.Tensor,
+        row_has_mass: torch.Tensor,
+        row_count: Union[float, torch.Tensor],
+        loss_coeff: float,
+        hf_scoring: bool,
+        use_relu: bool,
+        chunk_bytes: int = _KPOOL_LOSS_CHUNK_BYTES,
+    ) -> torch.Tensor:
+        """Compute the loss in row chunks.
+
+        Args:
+            q: Indexer query ``[sq, batch, heads, dim]`` after any rotation.
+            weights: Indexer head weights ``[sq, batch, heads]``.
+            k_pooled: Pooled indexer keys ``[pools, batch, dim]`` after any rotation.
+            pool_ids_c: Selected pool ids ``[batch, sq, slots]``, ``-1`` for unused slots.
+            target: Teacher ``[batch, sq, slots]``, zero on unused slots.
+            row_has_mass: Rows that count ``[batch, sq]`` (bool).
+            row_count: Divisor of the summed KL (Python number or 0-dim tensor).
+            loss_coeff: Indexer loss coefficient.
+            hf_scoring: Whether the indexer uses HF KPool scoring.
+            use_relu: Whether the indexer scores use ReLU.
+            chunk_bytes: Byte budget of one row chunk.
+
+        Returns:
+            The scaled loss, a 0-dim FP32 tensor (FP64 when an input is FP64).
+        """
+        sq, batch, n_heads, head_dim = q.shape
+        budget = pool_ids_c.size(-1)
+        compute_dtype = _kpool_student_dtype(q, weights, k_pooled)
+        row_mask = row_has_mass.to(dtype=torch.bool, device=q.device)
+        kl_sum = torch.zeros((), dtype=compute_dtype, device=q.device)
+        if sq > 0 and budget > 0:
+            chunk = _kpool_loss_chunk_rows(
+                sq, _kpool_student_bytes_per_row(batch, n_heads, head_dim, budget), chunk_bytes
+            )
+            for start in range(0, sq, chunk):
+                end = min(start + chunk, sq)
+                pool_ids = pool_ids_c[:, start:end]
+                valid = pool_ids >= 0
+                scores = _kpool_selected_pool_scores(
+                    q[start:end],
+                    weights[start:end],
+                    k_pooled,
+                    pool_ids,
+                    hf_scoring=hf_scoring,
+                    use_relu=use_relu,
+                )
+                log_probs = dsa_masking.masked_log_softmax(scores, valid)
+                kl_per_row = dsa_indexer_loss.indexer_kl_per_row(
+                    target[:, start:end].to(compute_dtype), log_probs, valid
+                )
+                kl_sum = kl_sum + kl_per_row.masked_fill(~row_mask[:, start:end], 0.0).sum()
+        if isinstance(row_count, torch.Tensor):
+            row_count = row_count.detach().to(dtype=compute_dtype, device=q.device)
+            ctx.row_count = None
+            saved_row_count = row_count
+        else:
+            ctx.row_count = float(row_count)
+            saved_row_count = q.new_empty(0, dtype=compute_dtype)
+        loss = kl_sum / row_count * loss_coeff
+        ctx.save_for_backward(q, weights, k_pooled, pool_ids_c, target, row_mask, saved_row_count)
+        ctx.loss_coeff = loss_coeff
+        ctx.hf_scoring = hf_scoring
+        ctx.use_relu = use_relu
+        ctx.chunk_bytes = chunk_bytes
+        return loss
+
+    @staticmethod
+    @torch.autograd.function.once_differentiable
+    def backward(ctx, grad_loss: torch.Tensor):
+        """Recompute the scores per chunk and return the q, weights and k_pooled gradients."""
+        q, weights, k_pooled, pool_ids_c, target, row_mask, saved_row_count = ctx.saved_tensors
+        row_count = ctx.row_count if ctx.row_count is not None else saved_row_count
+        sq, batch, n_heads, head_dim = q.shape
+        num_pools = k_pooled.size(0)
+        budget = pool_ids_c.size(-1)
+        compute_dtype = _kpool_student_dtype(q, weights, k_pooled)
+        grad_q = torch.zeros(q.shape, dtype=compute_dtype, device=q.device)
+        grad_weights = torch.zeros(weights.shape, dtype=compute_dtype, device=weights.device)
+        grad_k = torch.zeros(k_pooled.shape, dtype=compute_dtype, device=k_pooled.device)
+        if sq > 0 and budget > 0 and num_pools > 0:
+            # d loss / d KL-sum, a 0-dim tensor: no host sync.
+            scale = grad_loss.detach().to(dtype=compute_dtype) * ctx.loss_coeff / row_count
+            chunk = _kpool_loss_chunk_rows(
+                sq, _kpool_student_bytes_per_row(batch, n_heads, head_dim, budget), ctx.chunk_bytes
+            )
+            total_keys = num_pools * batch
+            # Unused slots carry zero gradients; spread them over distinct dummy rows
+            # because the deterministic index_add_ serializes duplicate ids.
+            slots_per_chunk = chunk * batch * budget
+            pad_rows = min(4096, slots_per_chunk)
+            grad_k_ext = torch.zeros(
+                (total_keys + pad_rows, head_dim), dtype=compute_dtype, device=k_pooled.device
+            )
+            pad_ids = total_keys + (
+                torch.arange(slots_per_chunk, device=k_pooled.device, dtype=torch.int64) % pad_rows
+            )
+            batch_offsets = torch.arange(batch, device=q.device, dtype=torch.int64).view(
+                batch, 1, 1
+            )
+            key_ids = None
+            for start in range(0, sq, chunk):
+                end = min(start + chunk, sq)
+                pool_ids = pool_ids_c[:, start:end]
+                valid = pool_ids >= 0
+                head_scores, queries, keys = _kpool_selected_pool_head_scores(
+                    q[start:end],
+                    k_pooled,
+                    pool_ids,
+                    hf_scoring=ctx.hf_scoring,
+                    use_relu=ctx.use_relu,
+                    compute_dtype=compute_dtype,
+                )
+                scores = _kpool_reduce_selected_pool_head_scores(
+                    head_scores, weights[start:end], hf_scoring=ctx.hf_scoring
+                )
+                probs = dsa_masking.masked_softmax(scores, valid)
+                del scores
+                chunk_target = target[:, start:end].to(compute_dtype).masked_fill(~valid, 0.0)
+                # Exact logit gradient of KL(target || softmax): p * sum(target) - target.
+                grad_scores = (
+                    probs * chunk_target.sum(dim=-1, keepdim=True) - chunk_target
+                ) * scale
+                del probs, chunk_target
+                grad_scores = grad_scores.masked_fill(
+                    ~valid | ~row_mask[:, start:end].unsqueeze(-1), 0.0
+                )
+                with torch.autocast(device_type=q.device.type, enabled=False):
+                    head_weights = weights[start:end].permute(1, 0, 2).to(compute_dtype)
+                    # I = sum_h w_h * s_h  ->  dI/dw_h = s_h, dI/ds_h = w_h.
+                    grad_weights[start:end] = (
+                        torch.matmul(head_scores, grad_scores.unsqueeze(-1))
+                        .squeeze(-1)
+                        .permute(1, 0, 2)
+                    )
+                    grad_head_scores = head_weights.unsqueeze(-1) * grad_scores.unsqueeze(-2)
+                    if ctx.use_relu:
+                        grad_head_scores = grad_head_scores.masked_fill(head_scores <= 0, 0.0)
+                    del head_scores
+                    if ctx.hf_scoring:
+                        grad_head_scores = grad_head_scores * (head_dim**-0.5)
+                    grad_q[start:end] = torch.matmul(grad_head_scores, keys).permute(1, 0, 2, 3)
+                    del keys
+                    # [batch, rows, slots, dim]
+                    grad_keys = torch.matmul(grad_head_scores.transpose(-1, -2), queries)
+                    del grad_head_scores, queries
+                n_slots = grad_keys.size(0) * grad_keys.size(1) * budget
+                flat_ids = torch.where(
+                    valid,
+                    pool_ids.clamp_min(0).to(torch.int64) * batch + batch_offsets,
+                    pad_ids[:n_slots].view_as(pool_ids),
+                ).reshape(-1)
+                key_ids = _kpool_accumulate_pool_key_grads(
+                    grad_k_ext, flat_ids, grad_keys.reshape(-1, head_dim), key_ids
+                )
+                del grad_keys
+            grad_k = grad_k_ext[:total_keys].view(num_pools, batch, head_dim)
+        return (
+            grad_q.to(q.dtype),
+            grad_weights.to(weights.dtype),
+            grad_k.to(k_pooled.dtype),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+
+
 class DSAIndexerLossAutoScaler(torch.autograd.Function):
     """An AutoScaler that triggers the backward pass and scales the grad for indexer loss.
 
@@ -2127,11 +2713,65 @@ def _validate_dsa_kpool_config(config: TransformerConfig) -> None:
             "dsa_indexer_topk must be divisible by dsa_indexer_kpool for pool selection; "
             f"got topk={index_topk}, kpool={pool_size}."
         )
-    if (getattr(config, "dsa_indexer_loss_coeff", None) or 0.0) > 0:
+    # The same rules as TransformerConfig, for configs built without its validation.
+    # Attributes a minimal config lacks read as their defaults.
+    if getattr(config, "dsa_indexer_mode", "standard") == "simplified":
         raise ValueError(
-            "DSA indexer loss is not supported with kpool selection; set "
-            "dsa_indexer_loss_coeff=0 or dsa_indexer_kpool=1."
+            "dsa_indexer_mode='simplified' does not support KPool selection "
+            "(dsa_indexer_kpool > 1): the simplified indexer has no pool compression, so the "
+            f"pools would be silently ignored; got dsa_indexer_kpool={pool_size}."
         )
+    if getattr(config, "dsa_indexer_reuse_checkpoint_topk", False):
+        raise ValueError(
+            "dsa_indexer_reuse_checkpoint_topk does not support KPool selection "
+            f"(dsa_indexer_kpool > 1), got dsa_indexer_kpool={pool_size}."
+        )
+    if (getattr(config, "dsa_indexer_loss_coeff", None) or 0.0) > 0:
+        if not getattr(config, "dsa_indexer_use_sparse_loss", False):
+            raise ValueError(
+                "DSA indexer loss is not supported with kpool selection unless it is the "
+                "sparse pool-level loss: set dsa_indexer_use_sparse_loss=True to train the "
+                "KPool indexer, dsa_indexer_loss_coeff=0 to keep it frozen, or "
+                "dsa_indexer_kpool=1."
+            )
+        if getattr(config, "dsa_indexer_kpool_use_quantization", False):
+            raise ValueError(
+                "A trainable KPool indexer (dsa_indexer_kpool > 1 with dsa_indexer_loss_coeff "
+                "> 0) does not support FP8 KPool scoring (dsa_indexer_kpool_use_quantization): "
+                "its E4M3 round trip has no defined training gradient."
+            )
+        if getattr(config, "cuda_graph_impl", "none") == "full_iteration":
+            raise ValueError(
+                "A trainable KPool indexer (dsa_indexer_kpool > 1 with dsa_indexer_loss_coeff "
+                "> 0) does not support cuda_graph_impl='full_iteration'."
+            )
+        replay = _trainable_kpool_replay(config)
+        if replay is not None:
+            raise ValueError(_trainable_kpool_replay_message(replay))
+
+
+def _trainable_kpool_replay(config) -> Optional[str]:
+    """Name the activation recompute that would replay a DSA layer's selection, if any."""
+    granularity = getattr(config, "recompute_granularity", None)
+    if granularity == "full":
+        return "recompute_granularity='full'"
+    if granularity == "selective" and "core_attn" in (
+        getattr(config, "recompute_modules", None) or []
+    ):
+        return "selective recompute of 'core_attn'"
+    return None
+
+
+def _trainable_kpool_replay_message(replay: str) -> str:
+    """Rejection message for a trainable KPool indexer under a replaying recompute."""
+    return (
+        "A trainable KPool indexer (dsa_indexer_kpool > 1 with dsa_indexer_loss_coeff > 0) "
+        f"does not support {replay}: the checkpoint replay would select the pools again, and "
+        "the cuDNN top-k does not repeat its choice among tied scores, so the replayed sparse "
+        "attention and indexer loss could use other pools than the first call, whose output "
+        "the forward used. Use a recompute that does not replay core attention (e.g. "
+        "selective 'mla_up_proj' or 'mhc')."
+    )
 
 
 class DSAIndexer(MegatronModule):
@@ -2275,10 +2915,15 @@ class DSAIndexer(MegatronModule):
         self.index_kpool = self.config.dsa_indexer_kpool
         self.index_kpool_use_quantization = self.config.dsa_indexer_kpool_use_quantization
         self.index_kpool_always_select_tail = self.config.dsa_indexer_kpool_always_select_tail
-        # Per-token gate score for the kpool path; set in forward_before_topk.
+        # Per-token gate score of a frozen KPool selector; set in forward_before_topk.
         self._kpool_gate_score: Optional[torch.Tensor] = None
+        # A positive loss coefficient trains the whole KPool indexer, the pool gate and the
+        # slot bias included, with the sparse pool-level KL (KPoolSparseIndexerLoss);
+        # otherwise the KPool selector is frozen.
+        self._kpool_trainable = (
+            self.index_kpool > 1 and (self.config.dsa_indexer_loss_coeff or 0.0) > 0
+        )
         if self.index_kpool > 1:
-            # KPool currently supports selection only, not an auxiliary indexer loss.
             # fp32 [kpool, index_head_dim] additive positional bias per pool slot.
             kpool_param_device = (
                 "cpu" if self.config.use_cpu_initialization else torch.cuda.current_device()
@@ -2291,9 +2936,11 @@ class DSAIndexer(MegatronModule):
                         dtype=torch.float32,
                         device=kpool_param_device,
                     ),
-                    requires_grad=False,
+                    requires_grad=self._kpool_trainable,
                 )
             )
+            # A bias-like per-slot vector, not a weight matrix: keep it out of Muon.
+            setattr(self.index_kpool_compress_ape, "use_muon", False)
             # [index_head_dim, hidden_size]; gate_score = F.linear(x, gate) = x @ gate^T
             # -> [seqlen, index_head_dim]. Matches vLLM's checkpoint name (no .weight suffix).
             self.index_kpool_compress_gate = torch.nn.Parameter(
@@ -2303,7 +2950,7 @@ class DSAIndexer(MegatronModule):
                     dtype=self.config.params_dtype,
                     device=kpool_param_device,
                 ),
-                requires_grad=False,
+                requires_grad=self._kpool_trainable,
             )
             nn.init.normal_(self.index_kpool_compress_gate, std=0.01)
         else:
@@ -2413,10 +3060,74 @@ class DSAIndexer(MegatronModule):
         x = torch.cat([x_pe, x_nope], dim=-1)
         return x
 
-    def forward_before_topk(
-        self, x: torch.Tensor, qr: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
+    def kpool_pool_keys(
+        self,
+        k_local: torch.Tensor,
+        gate_local: Optional[torch.Tensor],
+        cu_seqlens: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """All computations before topk."""
+        """Compress indexer keys into KPool pools under the caller's grad mode.
+
+        ``k_local`` and ``gate_local`` are ``[tokens, batch, index_head_dim]``. Without
+        ``cu_seqlens`` the complete pools of the token axis are compressed; with packed
+        ``cu_seqlens`` the pools restart at every document, as ``fused_qk_topk_kpool``
+        compresses them. Uses the configured compression profile, before any rotation.
+
+        Returns:
+            ``(k_pooled [pools, batch, index_head_dim], pool_token_base [pools])``, where
+            ``pool_token_base`` holds each pool's first token on the given token axis
+            (``-1`` for an invalid packed capacity pool).
+        """
+        key_dtype_compression = self.config.dsa_indexer_kpool_key_dtype_compression
+        pool_size = self.index_kpool
+        if cu_seqlens is not None and cu_seqlens.numel() >= 2:
+            if k_local.size(0) < pool_size:
+                # No pool fits; still compress (nothing) through the gate and the slot bias,
+                # so they stay in this rank's autograd graph and receive a zero gradient.
+                return (
+                    _kpool_compress_keys(
+                        k_local[:0],
+                        gate_local[:0] if gate_local is not None else None,
+                        self.index_kpool_compress_ape,
+                        pool_size,
+                        kpool_key_dtype_compression=key_dtype_compression,
+                    ),
+                    torch.empty(0, device=k_local.device, dtype=torch.int64),
+                )
+            return _kpool_compress_keys_per_seg(
+                k_local,
+                gate_local,
+                self.index_kpool_compress_ape,
+                pool_size,
+                cu_seqlens,
+                kpool_key_dtype_compression=key_dtype_compression,
+            )
+        k_pooled = _kpool_compress_keys(
+            k_local,
+            gate_local,
+            self.index_kpool_compress_ape,
+            pool_size,
+            kpool_key_dtype_compression=key_dtype_compression,
+        )
+        pool_token_base = (
+            torch.arange(k_pooled.size(0), device=k_local.device, dtype=torch.int64) * pool_size
+        )
+        return k_pooled, pool_token_base
+
+    def forward_before_topk(
+        self,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+        return_kpool_gate_score: bool = False,
+    ) -> Tuple[torch.Tensor, ...]:
+        """All computations before topk.
+
+        Returns ``(q, k, weights)``. A KPool indexer also computes the per-token pool-gate
+        scores: by default they are stashed on the module for the subsequent selection
+        call (the frozen selector's contract); with ``return_kpool_gate_score`` they are
+        returned as a fourth value instead and nothing is stashed (the trainable path).
+        """
         packed_seq = packed_seq_params is not None and packed_seq_params.qkv_format == "thd"
 
         # =========================================
@@ -2542,14 +3253,20 @@ class DSAIndexer(MegatronModule):
         else:
             weights = weights * (self.index_n_heads**-0.5) * self.softmax_scale
 
-        # Save token-aligned compression scores for the subsequent pool selection.
+        # Token-aligned compression scores for the subsequent pool selection.
+        kpool_gate_score = None
         if self.index_kpool > 1 and self.index_kpool_compress_gate is not None:
+            if self._kpool_trainable:
+                # DSAttention calls this method directly, so DSAIndexer's forward pre-hook,
+                # which waits for an overlapped parameter all-gather, never runs for these
+                # two parameters. A frozen selector keeps them out of DDP: nothing to wait.
+                ensure_params_ready([self.index_kpool_compress_gate, self.index_kpool_compress_ape])
             with get_fp8_disabled_context(self.config):
-                self._kpool_gate_score = torch.nn.functional.linear(
-                    x, self.index_kpool_compress_gate
-                )
-        else:
+                kpool_gate_score = torch.nn.functional.linear(x, self.index_kpool_compress_gate)
+        if return_kpool_gate_score:
             self._kpool_gate_score = None
+            return q, k, weights, kpool_gate_score
+        self._kpool_gate_score = kpool_gate_score
 
         return q, k, weights
 
@@ -3083,6 +3800,159 @@ class DSAttention(MegatronModule):
             )
 
         return select_pools
+
+    def _kpool_pool_then_gather(
+        self,
+        k: torch.Tensor,
+        gate_score: Optional[torch.Tensor],
+        *,
+        cu_seqlens_kv: Optional[torch.Tensor],
+        cp_size: int,
+        cp_group: Optional[torch.distributed.ProcessGroup],
+        local_rows: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Pool this rank's indexer keys, then all-gather the pooled keys over CP.
+
+        The trainable KPool path compresses the rank's own tokens under the caller's grad
+        mode and gathers ``[local_pools, batch, dim]`` pooled keys, not the token-level
+        indexer K and gate. The gather runs in FP32, which keeps the values exact and makes
+        its backward reduce-scatter sum the CP ranks' pooled-key gradients in FP32; the
+        result is cast back to the pooled dtype. Each zigzag half holds whole pools
+        (DSAttention checks ``local_rows % (2 * pool_size) == 0``), so pooling commutes with
+        the gather, and the zigzag reorder built at pool granularity puts the pools in
+        sequence order: bit for bit the pools that the frozen path compresses from the
+        gathered keys. Packed THD (without CP) pools per document from ``cu_seqlens_kv``.
+
+        Returns:
+            ``(k_pooled [pools, batch, dim], pool_token_base [pools])`` in global order.
+        """
+        k_pooled, pool_token_base = self.indexer.kpool_pool_keys(
+            k, gate_score, cu_seqlens=cu_seqlens_kv
+        )
+        if cp_size <= 1:
+            return k_pooled, pool_token_base
+        pool_size = self.indexer.index_kpool
+        local_pools = k_pooled.size(0)
+        if k.size(0) != local_rows or local_pools * pool_size != local_rows:
+            raise RuntimeError(
+                "DSA trainable KPool expects whole pools of this CP rank's indexer keys: "
+                f"key_rows={k.size(0)}, local_rows={local_rows}, pools={local_pools}, "
+                f"pool_size={pool_size}."
+            )
+        pool_reorder_idx, pool_reorder_inv_idx = dsa_layout.build_zigzag_allgather_cp_key_reorder(
+            sq=local_pools, cp_size=cp_size, device=k.device, return_inverse_key_reorder=True
+        )
+        pooled_dtype = k_pooled.dtype
+        gathered = gather_from_sequence_parallel_region(k_pooled.float(), group=cp_group)
+        if gathered.size(0) != pool_reorder_idx.numel():
+            raise RuntimeError(
+                "DSA gathered pooled-key length mismatch: "
+                f"pools={gathered.size(0)}, expected={pool_reorder_idx.numel()}"
+            )
+        k_pooled = _permute_rows(gathered, pool_reorder_idx, pool_reorder_inv_idx).to(pooled_dtype)
+        pool_token_base = (
+            torch.arange(k_pooled.size(0), device=k_pooled.device, dtype=torch.int64) * pool_size
+        )
+        return k_pooled, pool_token_base
+
+    @staticmethod
+    def _broadcast_kpool_selection_from_tp_rank0(
+        topk_indices: torch.Tensor, pool_ids: torch.Tensor, tp_group: torch.distributed.ProcessGroup
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Give every TP rank the token top-k and pool ids that TP rank 0 selected."""
+        src = torch.distributed.get_process_group_ranks(tp_group)[0]
+        topk_indices = topk_indices.contiguous()
+        pool_ids = pool_ids.contiguous()
+        torch.distributed.broadcast(topk_indices, src=src, group=tp_group)
+        torch.distributed.broadcast(pool_ids, src=src, group=tp_group)
+        return topk_indices, pool_ids
+
+    def _kpool_sparse_indexer_loss(
+        self,
+        *,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        k_pooled: torch.Tensor,
+        topk_indices: torch.Tensor,
+        pool_ids: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        query_valid_rows: Optional[torch.Tensor],
+        indexer_loss_coeff: float,
+        tp_group: Optional[torch.distributed.ProcessGroup],
+        metric_num_layers: int,
+        metric_reduce_group: Optional[torch.distributed.ProcessGroup],
+        metric_avg_group: Optional[torch.distributed.ProcessGroup],
+    ) -> torch.Tensor:
+        """The sparse pool-level KL of a trainable KPool layer, attached to its indexer graph.
+
+        Canonicalizes the selected slots, builds the teacher from the detached main query and
+        key over every attended token (pools plus tail), and applies
+        ``KPoolSparseIndexerLoss`` to the indexer's own scoring inputs, rotated as the
+        selector rotates them. The rows and their reduction are the token loss's:
+        ``query_valid_rows`` (or every row) divides the summed KL, or nothing does under
+        ``calculate_per_token_loss``; rows without pool mass add zero.
+
+        It also records this layer's tail mass ``p_E`` in the metric tracker, apart from the
+        indexer loss: the loss drops the per-row ``1 - p_E`` weight, and the logged ``p_E``
+        shows what that leaves out. The tracker gets its sum over the rows the loss uses
+        (``row_has_mass``, and ``query_valid_rows`` when given) and their number.
+        ``metric_*`` are the indexer loss's tracker arguments.
+        """
+        pool_size = self.indexer.index_kpool
+        pool_ids_c, topk_indices_c = _kpool_canonical_slots(
+            topk_indices, pool_ids, index_topk=self.index_topk, pool_size=pool_size
+        )
+        target, row_has_mass, tail_mass = _kpool_sparse_pool_target(
+            query.detach(),
+            key.detach(),
+            topk_indices_c,
+            pool_ids_c,
+            softmax_scale=self.softmax_scale,
+            index_topk=self.index_topk,
+            pool_size=pool_size,
+            tp_group=tp_group,
+        )
+        batch, rows = pool_ids_c.shape[:2]
+        row_mask = row_has_mass
+        if query_valid_rows is not None:
+            row_mask = row_mask & query_valid_rows.to(dtype=torch.bool, device=row_mask.device)
+        # Rows without pool mass (p_E = 1) and padded rows stay out of the p_E mean, as they
+        # stay out of the loss. Device-side sums only: no host synchronization.
+        row_weight = row_mask.to(torch.float32)
+        DSAIndexerLossLoggingHelper.save_tail_mass_to_tracker(
+            tail_mass_sum=(tail_mass.float() * row_weight).sum(),
+            row_count=row_weight.sum(),
+            layer_number=self.layer_number,
+            num_layers=metric_num_layers,
+            reduce_group=metric_reduce_group,
+            avg_group=metric_avg_group,
+        )
+        if self.config.calculate_per_token_loss:
+            row_count = 1.0
+        elif query_valid_rows is not None:
+            row_count = query_valid_rows.sum().to(torch.float32).clamp_min(1.0)
+        else:
+            row_count = float(max(batch * rows, 1))
+        if self.config.dsa_indexer_rotate_activation:
+            # The selector scores q and the pooled keys after a Hadamard rotation.
+            if q.numel():
+                q = rotate_activation(q)
+            if k_pooled.numel():
+                k_pooled = rotate_activation(k_pooled)
+        return KPoolSparseIndexerLoss.apply(
+            q,
+            weights,
+            k_pooled,
+            pool_ids_c,
+            target,
+            row_mask,
+            row_count,
+            indexer_loss_coeff,
+            self.config.dsa_indexer_hf_scoring,
+            self.config.dsa_indexer_scoring_relu,
+            _KPOOL_LOSS_CHUNK_BYTES,
+        )
 
     @staticmethod
     def _memoized(cache: Optional[dict], key: tuple, build, prebuilt=None):
@@ -3675,11 +4545,11 @@ class DSAttention(MegatronModule):
             self.training and torch.is_grad_enabled() and indexer_loss_coeff > 0 and computes_topk
         )
         _is_kpool = self.indexer is not None and getattr(self.indexer, "index_kpool", 1) > 1
-        if use_indexer_loss and _is_kpool:
-            raise NotImplementedError(
-                "DSA indexer loss is not supported with kpool selection; set "
-                "dsa_indexer_loss_coeff=0 or use dsa_indexer_kpool=1."
-            )
+        # A KPool indexer with a positive loss coefficient is trainable. Its layer selects
+        # through the trainable path (pool, then gather over CP) in every forward: training,
+        # eval and no_grad alike, so its pools never depend on whether the loss runs;
+        # use_indexer_loss only decides whether the teacher and the loss are computed.
+        kpool_trainable = _is_kpool and indexer_loss_coeff > 0 and computes_topk
         if use_indexer_loss and sequence_parallel_query_is_local:
             raise RuntimeError(
                 "DSA indexer loss requires TP ranks to own the same query rows; "
@@ -3710,6 +4580,29 @@ class DSAttention(MegatronModule):
         query_valid_rows = dsa_masking.extract_query_valid_rows_from_packed_seq_params(
             packed_seq_params, b=b, sq=sq, device=query.device
         )
+        if kpool_trainable:
+            # Layouts the trainable KPool path does not cover. The config cannot see them:
+            # they come with the packed parameters and the mask of each forward.
+            kpool_size = self.indexer.index_kpool
+            if packed_thd and cp_size > 1:
+                raise ValueError(
+                    "A trainable KPool indexer (dsa_indexer_loss_coeff > 0) does not support "
+                    "packed THD sequences with context parallelism: its pools restart at every "
+                    "document, which would span CP ranks. Use cp_size=1 for packed sequences."
+                )
+            if float_mask is not None:
+                raise ValueError(
+                    "A trainable KPool indexer (dsa_indexer_loss_coeff > 0) does not support an "
+                    "explicit attention mask; use the causal mask type."
+                )
+            if cp_size > 1 and cp_local_sequence_rows % (2 * kpool_size) != 0:
+                raise ValueError(
+                    "A trainable KPool indexer (dsa_indexer_loss_coeff > 0) under context "
+                    "parallelism pools each CP rank's tokens before the all-gather, so each "
+                    "zigzag half must hold whole pools: the local sequence length must be a "
+                    f"multiple of 2 * dsa_indexer_kpool = {2 * kpool_size}, got "
+                    f"{cp_local_sequence_rows}."
+                )
         use_fused_kernels = dsa_kernels.use_fused_dsa_kernels(self.config)
         sparse_indexer_loss = self.config.dsa_indexer_use_sparse_loss
         # Reports a packed causal layout with identity key positions. CP size is an
@@ -3748,6 +4641,9 @@ class DSAttention(MegatronModule):
             and computes_topk
             and self.training
             and (sparse_indexer_loss if indexer_loss_on else not _is_kpool)
+            # KPool never reuses a checkpoint's top-k, frozen or trainable; the config
+            # rejects the combination, and this keeps a later-set flag from opening it.
+            and not _is_kpool
             and use_fused_kernels
             and not sequence_parallel_query_is_local
         )
@@ -3798,6 +4694,9 @@ class DSAttention(MegatronModule):
         topk_length = None
         topk_scores = None
         q = k = weights = None
+        # Pooled indexer keys of the trainable KPool path, in global pool order, and each
+        # pool's first token.
+        kpool_pooled_keys = kpool_pool_token_base = None
         local_packed_cp_query_start = 0
         local_packed_cp_query_len = sq
         if sequence_parallel_query_is_local:
@@ -3840,8 +4739,24 @@ class DSAttention(MegatronModule):
         else:
             assert self.indexer is not None
             with torch.enable_grad() if use_indexer_loss else torch.no_grad():
-                q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
-                if cp_size > 1 and k.size(0) in local_cp_kv_lens:
+                if kpool_trainable:
+                    # The trainable path pools this rank's tokens and gathers the pooled
+                    # keys over CP; the token-level indexer K and the gate stay local.
+                    q, k, weights, kpool_gate_score = self.indexer.forward_before_topk(
+                        x, qr, packed_seq_params, return_kpool_gate_score=True
+                    )
+                    kpool_pooled_keys, kpool_pool_token_base = self._kpool_pool_then_gather(
+                        k,
+                        kpool_gate_score,
+                        cu_seqlens_kv=cu_seqlens_kv if packed_thd else None,
+                        cp_size=cp_size,
+                        cp_group=cp_group,
+                        local_rows=cp_local_sequence_rows,
+                    )
+                    del kpool_gate_score
+                else:
+                    q, k, weights = self.indexer.forward_before_topk(x, qr, packed_seq_params)
+                if cp_size > 1 and not kpool_trainable and k.size(0) in local_cp_kv_lens:
                     if kv_reorder_idx is None:
                         kv_reorder_idx, kv_reorder_inv_idx = _build_kv_reorder_idx(k.size(0))
                     k = gather_from_sequence_parallel_region(k, group=cp_group)
@@ -3881,6 +4796,9 @@ class DSAttention(MegatronModule):
                     weights = weights[row_start:row_end].contiguous()
 
         def compute_indexer_loss_with_reference_path():
+            # The token-level loss selects tokens, not pools; KPool layers take the
+            # KPoolSparseIndexerLoss branch below and must never reach this one.
+            assert not _is_kpool, "KPool layers must not reach the token-level indexer loss."
             key_for_loss = key.detach()
             if absorbed_mla and key_for_loss.size(2) == 1 and query.size(2) > 1:
                 key_for_loss = key_for_loss.expand(-1, -1, query.size(2), -1)
@@ -4014,7 +4932,104 @@ class DSAttention(MegatronModule):
             if topk_length is not None:
                 topk_length = topk_length[:, row_start:row_end].contiguous()
 
-        if use_indexer_loss:
+        def kpool_selector_inputs():
+            """The mxfp8 guard and the pool scorer shared by both KPool selection branches."""
+            _reject_mxfp8_indexer_reference_fallback(
+                self.config,
+                f"the KPool indexer top-k of DSA layer {self.layer_number}",
+                "KPool selection does not use the cuDNN dense scorer",
+                path="the KPool selector",
+            )
+            return self._kpool_pool_topk_fn(
+                packed_thd=packed_thd,
+                has_mask=float_mask is not None,
+                positions_from_position_ids=position_ids is not None
+                and (cp_size > 1 or sequence_parallel_query_is_local),
+                local_rows=sq,
+                full_rows=sequence_parallel_tp_full_rows,
+                row_start=(
+                    sequence_parallel_tp_row_start if sequence_parallel_query_is_local else 0
+                ),
+                skv=skv,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+            )
+
+        if kpool_trainable:
+            assert q is not None and weights is not None and kpool_pooled_keys is not None
+            # ===================================
+            # Trainable KPool: select pools, then attach the sparse pool-level loss
+            # ===================================
+            kpool_size = self.indexer.index_kpool
+            kpool_pool_topk_fn = kpool_selector_inputs()
+            # Selection is discrete: it runs without grad on detached inputs, from the pooled
+            # keys built above (bit for bit the pools the frozen path compresses).
+            with torch.no_grad():
+                _index_scores, topk_indices, kpool_pool_ids = fused_qk_topk_kpool(
+                    q.detach(),
+                    k.detach(),
+                    weights.detach(),
+                    self.index_topk,
+                    kpool_size,
+                    None,
+                    self.indexer.index_kpool_compress_ape,
+                    mask=float_mask,
+                    varlen_starts=varlen_starts,
+                    varlen_ends=varlen_ends,
+                    key_positions=key_positions,
+                    cu_seqlens_kv=cu_seqlens_kv if packed_thd else None,
+                    use_relu=self.config.dsa_indexer_scoring_relu,
+                    always_select_tail=self.indexer.index_kpool_always_select_tail,
+                    fp8_indexer=self.indexer.index_kpool_use_quantization,
+                    rotate_activation_enabled=self.config.dsa_indexer_rotate_activation,
+                    return_index_scores=False,
+                    kpool_key_dtype_compression=(
+                        self.config.dsa_indexer_kpool_key_dtype_compression
+                    ),
+                    hf_scoring=self.config.dsa_indexer_hf_scoring,
+                    pool_topk_fn=kpool_pool_topk_fn,
+                    pooled_keys=(kpool_pooled_keys.detach(), kpool_pool_token_base),
+                    return_selection=True,
+                )
+                del _index_scores
+            if tp_size > 1 and not sequence_parallel_query_is_local:
+                # TP ranks select on their own, and the cuDNN top-k (or an exact tie at the
+                # selection boundary) need not agree across them. Rank 0's selection then
+                # feeds every rank's sparse attention and teacher, so all TP ranks attend
+                # the same tokens and compute the same TP-averaged indexer loss.
+                topk_indices, kpool_pool_ids = self._broadcast_kpool_selection_from_tp_rank0(
+                    topk_indices, kpool_pool_ids, tp_group
+                )
+            slice_topk_to_local_sequence_parallel_rows()
+            if use_indexer_loss:
+                metric_num_layers = max(
+                    self.layer_number, self.config.num_layers + (self.config.mtp_num_layers or 0)
+                )
+                # Also records the layer's tail mass p_E, in its own tracker slots.
+                indexer_loss = self._kpool_sparse_indexer_loss(
+                    q=q,
+                    weights=weights,
+                    k_pooled=kpool_pooled_keys,
+                    topk_indices=topk_indices,
+                    pool_ids=kpool_pool_ids,
+                    query=query,
+                    key=key,
+                    query_valid_rows=query_valid_rows,
+                    indexer_loss_coeff=indexer_loss_coeff,
+                    tp_group=tp_group,
+                    metric_num_layers=metric_num_layers,
+                    metric_reduce_group=indexer_reduce_group,
+                    metric_avg_group=indexer_avg_group,
+                )
+                DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                    loss=indexer_loss,
+                    raw_loss=indexer_loss / indexer_loss_coeff,
+                    layer_number=self.layer_number,
+                    num_layers=metric_num_layers,
+                    reduce_group=indexer_reduce_group,
+                    avg_group=indexer_avg_group,
+                )
+        elif use_indexer_loss:
             assert q is not None and k is not None and weights is not None
             # ===================================
             # Attach indexer topk and loss
@@ -4119,26 +5134,7 @@ class DSAttention(MegatronModule):
             # Get top-k indices
             # ===================================
             if _is_kpool:
-                _reject_mxfp8_indexer_reference_fallback(
-                    self.config,
-                    f"the KPool indexer top-k of DSA layer {self.layer_number}",
-                    "KPool selection does not use the cuDNN dense scorer",
-                    path="the KPool selector",
-                )
-                kpool_pool_topk_fn = self._kpool_pool_topk_fn(
-                    packed_thd=packed_thd,
-                    has_mask=float_mask is not None,
-                    positions_from_position_ids=position_ids is not None
-                    and (cp_size > 1 or sequence_parallel_query_is_local),
-                    local_rows=sq,
-                    full_rows=sequence_parallel_tp_full_rows,
-                    row_start=(
-                        sequence_parallel_tp_row_start if sequence_parallel_query_is_local else 0
-                    ),
-                    skv=skv,
-                    cp_size=cp_size,
-                    cp_rank=cp_rank,
-                )
+                kpool_pool_topk_fn = kpool_selector_inputs()
                 # KPool selection is discrete and does not need an autograd graph.
                 with torch.no_grad():
                     _index_scores, topk_indices = fused_qk_topk_kpool(

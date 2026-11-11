@@ -576,8 +576,9 @@ def test_refresh_before_backward_is_reported_by_eager_autograd():
     """Pins the copy_ contract: the reorders save a prebuilt table for the backward.
 
     The K/V and indexer-K reorders (``_permute_rows``) save the inverse reorder. The
-    KPool gate reorder runs without grad (KPool rejects the indexer loss, so its indexer
-    block runs under ``no_grad``) and saves nothing.
+    frozen KPool selector's gate reorder runs without grad (a frozen indexer block runs
+    under ``no_grad``) and saves nothing; a trainable KPool indexer rejects packed THD with
+    CP, so it never reads a packed-CP layout.
     """
     geometry = PackedCPLayoutGeometry(2, 0, 12, False, False)
     layout_a = build_packed_cp_layout_from_host([0, 8, 24], [0, 8, 24], geometry, _CPU)

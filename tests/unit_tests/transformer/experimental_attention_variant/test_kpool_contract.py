@@ -393,6 +393,50 @@ def test_kpool_allows_frozen_selector_without_auxiliary_loss(loss_coeff):
     )
 
 
+def test_kpool_allows_trainable_selector_with_sparse_loss():
+    _validate_dsa_kpool_config(
+        SimpleNamespace(
+            dsa_indexer_kpool=4,
+            dsa_indexer_topk=2048,
+            dsa_indexer_loss_coeff=0.01,
+            dsa_indexer_use_sparse_loss=True,
+            recompute_granularity='selective',
+            recompute_modules=['mla_up_proj', 'mhc'],
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ('loss_coeff', 'overrides', 'match'),
+    [
+        (0.01, dict(dsa_indexer_use_sparse_loss=False), 'indexer loss is not supported'),
+        (0.01, dict(dsa_indexer_kpool_use_quantization=True), 'FP8 KPool scoring'),
+        (0.01, dict(cuda_graph_impl='full_iteration'), 'full_iteration'),
+        (0.01, dict(recompute_granularity='full'), "recompute_granularity='full'"),
+        (
+            0.01,
+            dict(recompute_granularity='selective', recompute_modules=['core_attn']),
+            "selective recompute of 'core_attn'",
+        ),
+        (0.0, dict(dsa_indexer_mode='simplified'), "dsa_indexer_mode='simplified'"),
+        (0.01, dict(dsa_indexer_mode='simplified'), "dsa_indexer_mode='simplified'"),
+        (0.0, dict(dsa_indexer_reuse_checkpoint_topk=True), 'does not support KPool selection'),
+        (0.01, dict(dsa_indexer_reuse_checkpoint_topk=True), 'does not support KPool selection'),
+    ],
+)
+def test_kpool_rejects_untrainable_combinations(loss_coeff, overrides, match):
+    """The direct-API validator mirrors TransformerConfig's trainable-KPool rules."""
+    fields = dict(
+        dsa_indexer_kpool=4,
+        dsa_indexer_topk=16,
+        dsa_indexer_loss_coeff=loss_coeff,
+        dsa_indexer_use_sparse_loss=True,
+    )
+    fields.update(overrides)
+    with pytest.raises(ValueError, match=match):
+        _validate_dsa_kpool_config(SimpleNamespace(**fields))
+
+
 def _kpool_dsa_config(**kwargs):
     values = dict(
         num_layers=2,
