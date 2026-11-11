@@ -11,6 +11,7 @@ import torch.nn as nn
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
+from megatron.core.ops.attention.csa.output_rope import OutputRopeParams
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import async_gather_from_sequence_parallel_region
@@ -919,6 +920,7 @@ class CompressedSparseAttentionInterface(Protocol):
         packed_seq_params: PackedSeqParams | None = None,
         boundary_hidden: torch.Tensor | None = None,
         boundary_kv: torch.Tensor | None = None,
+        out_rope: Optional[OutputRopeParams] = None,
     ) -> torch.Tensor:
         """Apply compressed sparse attention."""
         ...
@@ -1068,7 +1070,12 @@ class CompressedSparseAttention(MegatronModule):
             self.indexer.backward_dw()
 
     def _forward_fused_sbhd(
-        self, query: torch.Tensor, key: torch.Tensor, x: torch.Tensor, qr: torch.Tensor
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        x: torch.Tensor,
+        qr: torch.Tensor,
+        out_rope: Optional[OutputRopeParams] = None,
     ) -> torch.Tensor:
         """Run the cuDNN/FlashMLA CSA path for an SBHD input."""
         sq, batch, _num_heads, _head_dim = query.size()
@@ -1118,6 +1125,7 @@ class CompressedSparseAttention(MegatronModule):
                 sparse_loss=self.config.dsa_indexer_use_sparse_loss,
                 kv_offset=compressed_offset,
                 calculate_per_token_loss=self.config.calculate_per_token_loss,
+                out_rope=out_rope,
             )
             nvtx_range_pop("sparse_attn_kernel")
 
@@ -1156,6 +1164,7 @@ class CompressedSparseAttention(MegatronModule):
                 flat_indices,
                 self.softmax_scale,
                 topk_length=flat_topk_length,
+                out_rope=out_rope,
             )
             nvtx_range_pop("sparse_attn_kernel")
         else:
@@ -1173,7 +1182,12 @@ class CompressedSparseAttention(MegatronModule):
 
             nvtx_range_push("sparse_attn_kernel")
             output = csa_sparse_attn(
-                query, kv_full, self.attn_sink.float(), flat_indices, self.softmax_scale
+                query,
+                kv_full,
+                self.attn_sink.float(),
+                flat_indices,
+                self.softmax_scale,
+                out_rope=out_rope,
             )
             nvtx_range_pop("sparse_attn_kernel")
 
@@ -1194,6 +1208,7 @@ class CompressedSparseAttention(MegatronModule):
         packed_seq_params: PackedSeqParams | None = None,
         boundary_hidden: torch.Tensor | None = None,
         boundary_kv: torch.Tensor | None = None,
+        out_rope: Optional[OutputRopeParams] = None,
     ) -> torch.Tensor:
         """Forward pass for CompressedSparseAttention.
 
@@ -1225,7 +1240,7 @@ class CompressedSparseAttention(MegatronModule):
                 boundary_hidden = x.new_empty((0, *x.shape[1:]))
                 boundary_kv = key.new_empty((0, *key.shape[1:]))
             return self._forward_packed(
-                query, key, x, qr, boundary_hidden, boundary_kv, packed_seq_params
+                query, key, x, qr, boundary_hidden, boundary_kv, packed_seq_params, out_rope
             )
         if attention_mask is not None:
             raise ValueError(
@@ -1248,7 +1263,7 @@ class CompressedSparseAttention(MegatronModule):
         ), "Packed sequence not supported for CompressedSparseAttention"
 
         if self.use_fused_kernels:
-            output = self._forward_fused_sbhd(query, key, x, qr)
+            output = self._forward_fused_sbhd(query, key, x, qr, out_rope)
             nvtx_range_pop("compressed_sparse_attn")
             return output
 
@@ -1382,6 +1397,7 @@ class CompressedSparseAttention(MegatronModule):
         boundary_hidden: Optional[torch.Tensor],
         boundary_kv: Optional[torch.Tensor],
         packed_seq_params: PackedSeqParams,
+        out_rope: Optional[OutputRopeParams] = None,
     ) -> torch.Tensor:
         """THD-packed context-parallel branch.
 
@@ -1678,6 +1694,7 @@ class CompressedSparseAttention(MegatronModule):
                 compressed_kv_rs_state,
                 self.window_size,
                 kv_reconstruction_parts,
+                out_rope,
             )
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                 loss=indexer_loss,
@@ -1698,6 +1715,7 @@ class CompressedSparseAttention(MegatronModule):
             topk_length=topk_length,
             kv_reconstruction_parts=kv_reconstruction_parts,
             q_padding_mask=q_padding_mask,
+            out_rope=out_rope,
         )
         if training_with_grad and indexer is not None:
             # Zero loss or a pack without compressed keys still needs explicit

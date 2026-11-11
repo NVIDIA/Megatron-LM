@@ -12,12 +12,14 @@ from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
+    RuntimePolicy,
     SchedulePolicy,
+    finalize_gradients,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
-    microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 from tests.unit_tests.distributed.mfsdp_v2.profiler_utils import (
@@ -88,10 +90,10 @@ _GEMM_OP_NAME_SUBSTRING = "aten::mm"
     ids=["default", "symmetric_memory"],
 )
 @pytest.mark.parametrize(
-    "unify_communication_stream", [False, True], ids=["separate_streams", "unified_stream"]
+    "overlap_allgather_reduction", [True, False], ids=["separate_streams", "unified_stream"]
 )
 def test_overlaps_communication_and_compute(
-    distributed_setup, placements_factory, use_symmetric_memory, unify_communication_stream
+    distributed_setup, placements_factory, use_symmetric_memory, overlap_allgather_reduction
 ):
     """ZeRO-1/2/3 communication should overlap GEMM compute."""
     world_size = distributed_setup.world_size
@@ -140,9 +142,13 @@ def test_overlaps_communication_and_compute(
     model = MultiChildModel(dim=dim, num_children=num_children).to(device=device, dtype=dtype)
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
     with fully_shard_context(
-        device=device,
-        use_symmetric_memory=use_symmetric_memory,
-        unify_communication_stream=unify_communication_stream,
+        FsdpContext(
+            device=device,
+            runtime_policy=RuntimePolicy(
+                use_symmetric_memory=use_symmetric_memory,
+                overlap_allgather_reduction=overlap_allgather_reduction,
+            ),
+        )
     ) as context:
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
@@ -155,7 +161,7 @@ def test_overlaps_communication_and_compute(
         """Run one optimizer step consuming two microbatches."""
         optimizer.zero_grad(set_to_none=True)
         for microbatch_index in range(2):
-            with microbatch(context, is_last=microbatch_index == 1):
+            with finalize_gradients(context, enabled=microbatch_index == 1):
                 model(x).sum().backward()
         optimizer.step()
 
@@ -223,7 +229,7 @@ def test_overlaps_communication_and_compute(
     gemm_streams = {event.device_resource_id for event in gemm_events}
     if allgather_events:
         assert len(allgather_streams) == 1
-        if unify_communication_stream:
+        if not overlap_allgather_reduction:
             assert allgather_streams == reduce_scatter_streams
         else:
             assert allgather_streams.isdisjoint(reduce_scatter_streams)
@@ -244,8 +250,10 @@ def test_overlaps_communication_and_compute(
             f"Expected exactly {expected_allgather_overlap_count} all-gathers to "
             f"overlap compute, got {allgather_overlap_count}/{len(allgather_groups)}."
         )
-    assert reduce_scatter_overlap_count == expected_reduce_scatter_overlap_count, (
-        f"Expected exactly {expected_reduce_scatter_overlap_count} reduce-scatters to overlap "
+    # Skipping the wait after non-final microbatches can also let their last
+    # reduction overlap the next forward.
+    assert reduce_scatter_overlap_count >= expected_reduce_scatter_overlap_count, (
+        f"Expected at least {expected_reduce_scatter_overlap_count} reduce-scatters to overlap "
         f"compute, got {reduce_scatter_overlap_count}/{len(reduce_scatter_groups)}."
     )
 
@@ -266,7 +274,7 @@ def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
     model = MultiChildModel(dim=dim, num_children=num_children).to(device=device, dtype=dtype)
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
     placements = _default_placements()
-    with fully_shard_context(device=device) as context:
+    with fully_shard_context(FsdpContext(device=device)) as context:
         for layer in model.layers:
             fully_shard(
                 layer,
@@ -283,7 +291,7 @@ def test_prefetch_size_zero_disables_allgather_overlap(distributed_setup):
     def train_one_step() -> None:
         optimizer.zero_grad(set_to_none=True)
         for microbatch_index in range(2):
-            with microbatch(context, is_last=microbatch_index == 1):
+            with finalize_gradients(context, enabled=microbatch_index == 1):
                 model(x).sum().backward()
         optimizer.step()
 

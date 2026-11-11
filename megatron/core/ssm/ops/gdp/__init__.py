@@ -18,19 +18,21 @@ dynamic-batching decode and prefill steps route here:
   gate and beta sigmoid it can apply in-kernel).
 * `gdp_decode_prepare` -- the reshape/gating step feeding decode.
 * `chunk_gated_delta_product_varlen` -- prefill.
+* `gdp_prefill_prepare` -- the reshape/gating step feeding prefill.
 
 All entry points are forward-only.
 """
 
 from .chunk import chunk_gated_delta_product_varlen
-from .decode_prepare import gdp_decode_prepare
 from .fused_recurrent import fused_recurrent_gated_delta_rule_update
 from .metadata import build_gdp_chunk_descriptors, max_gdp_chunk_counts
+from .prepare import gdp_decode_prepare, gdp_prefill_prepare
 
 __all__ = [
     "chunk_gated_delta_product_varlen",
     "fused_recurrent_gated_delta_rule_update",
     "gdp_decode_prepare",
+    "gdp_prefill_prepare",
     "build_gdp_chunk_descriptors",
     "max_gdp_chunk_counts",
 ]

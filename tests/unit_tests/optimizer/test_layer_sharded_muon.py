@@ -718,6 +718,129 @@ def test_degenerate_domain_group_falls_back_to_local_ns():
     torch.testing.assert_close(p.data, _reference_step(w, g), atol=1e-4, rtol=1e-4)
 
 
+class _DenseAndExperts(torch.nn.Module):
+    """One dense matrix plus expert matrices in both orientations, tagged the way the
+    MoE layers tag their expert weights (expert-parallel, column/row partition_dim)."""
+
+    def __init__(self, n_experts) -> None:
+        super().__init__()
+        self.dense = torch.nn.Linear(32, 48, bias=False)
+        self.experts = torch.nn.ModuleList(
+            torch.nn.Linear(*((16, 48) if i % 2 == 0 else (48, 16)), bias=False)
+            for i in range(n_experts)
+        )
+        for i, expert in enumerate(self.experts):
+            expert.weight.allreduce = False
+            _mark_tp(expert.weight, i % 2)
+
+
+def _layer_wise_muon(ns_batch_size, nesterov):
+    """TP1, expert TP1 and no GTP_remat (every domain one rank), with layer-sharded Muon
+    for both dense and expert buckets."""
+    from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+    from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+    from megatron.core.process_groups_config import ProcessGroupCollection
+    from megatron.core.transformer import TransformerConfig
+
+    torch.manual_seed(_SEED + 900)
+    model = DistributedDataParallel(
+        TransformerConfig(num_attention_heads=1, num_layers=1),
+        DistributedDataParallelConfig(use_distributed_optimizer=False),
+        _DenseAndExperts(n_experts=64).bfloat16().cuda(),  # >= 4 per shape per rank at DP 8
+    )
+    config = OptimizerConfig(
+        optimizer='muon',
+        lr=1e-2,
+        bf16=True,
+        use_distributed_optimizer=False,
+        use_layer_wise_distributed_optimizer=True,
+        muon_tp_mode='layer_sharded',
+        muon_split_qkv=False,
+        muon_ns_batch_size=ns_batch_size,
+        muon_nesterov=nesterov,
+        muon_extra_scale_factor=0.2,
+    )
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    optimizer = get_megatron_optimizer(
+        config, [model], pg_collection=pg_collection, use_gloo_process_groups=False
+    )
+    return model, [getattr(o, 'optimizer', o) for o in optimizer.chained_optimizers], optimizer
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("nesterov", [False, True], ids=["plain", "nesterov"])
+@pytest.mark.parametrize("ns_batch", [1, 4], ids=["ns_batch1", "ns_batch4"])
+def test_single_rank_domains_run_local_ns(monkeypatch, ns_batch, nesterov):
+    """Every domain is one rank, so the layer-wise wiring assigns no NS homes. The expert
+    LayerShardedMuon must run local NS (batched by shape), not TensorParallelMuon's
+    per-param loop; with ns_batch_size 1 its update equals that loop's bitwise. Nesterov inputs
+    are built per NS chunk, not all before the first chunk."""
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA (DDP-wrapped bf16 model)")
+    _require_batched_ns(ns_batch)
+
+    def _run():
+        model, base_optimizers, optimizer = _layer_wise_muon(ns_batch, nesterov)
+        params = list(model.module.parameters())
+        torch.manual_seed(_SEED + 910)  # same on every rank, like all-reduced grads
+        grads = [[torch.randn_like(p) for p in params] for _ in range(3)]
+        for step_grads in grads:
+            for p, g in zip(params, step_grads):
+                p.main_grad.copy_(g)
+            optimizer.step()
+        return [p.clone() for o in base_optimizers for g in o.param_groups for p in g['params']]
+
+    with monkeypatch.context() as m:
+        # Reference: TensorParallelMuon's per-param step.
+        m.setattr(LayerShardedMuon, "step", eo_mod.TensorParallelMuon.step)
+        reference = _run()
+    ns_ndims, lerps, lerps_per_ns = [], set(), []
+    real_ns, real_lerp = lsm.newton_schulz, torch.Tensor.lerp
+
+    def _recording_ns(x, **kwargs):
+        ns_ndims.append(x.ndim)
+        lerps_per_ns.append(len(lerps))
+        lerps.clear()
+        return real_ns(x, **kwargs)
+
+    def _counting_lerp(*args, **kwargs):  # out-of-place lerp = one Nesterov input
+        out = real_lerp(*args, **kwargs)
+        lerps.add(id(out))  # __torch_function__ re-enters with the same result
+        return out
+
+    monkeypatch.setattr(lsm, "newton_schulz", _recording_ns)
+    monkeypatch.setattr(torch.Tensor, "lerp", _counting_lerp)
+    masters = _run()
+
+    assert ns_ndims, "took the TensorParallelMuon fallback"
+    assert (3 in ns_ndims) == (ns_batch > 1), f"NS input ranks {sorted(set(ns_ndims))}"
+    # At most one chunk of inputs before each NS (+1: the dense bucket's Nesterov input).
+    assert max(lerps_per_ns) <= ns_batch + 1, f"Nesterov inputs per NS {sorted(set(lerps_per_ns))}"
+    for i, (a, b) in enumerate(zip(masters, reference)):
+        if ns_batch == 1:
+            assert torch.equal(a, b), f"param {i}: max |diff| {(a - b).abs().max().item():.3e}"
+        else:
+            torch.testing.assert_close(a, b, atol=1e-4, rtol=1e-4)
+
+
+def test_unwired_single_rank_domain_keeps_tp_fallback():
+    """Without homes or per-group domains (direct API, or a build without the layer-wise
+    wiring) the TensorParallelMuon fallback runs: it all-gathers an expert-TP shard over
+    pg_collection.expt_tp, although the constructor's domain is a single rank."""
+    _require_multi_rank()
+    S, r = dist.get_world_size(), dist.get_rank()
+    torch.manual_seed(_SEED + 920)
+    w, g = torch.randn(4 * S, 12), torch.randn(4 * S, 12)
+    p = _mark_tp(torch.nn.Parameter(w[r * 4 : (r + 1) * 4].clone()), 0)
+    p.expert_tp = True
+    p.grad = g[r * 4 : (r + 1) * 4].clone()
+    opt = _muon([p], gtp_remat_group=None, pg_collection=_pg_stub(expt_tp=_world()))
+    opt.step()
+    torch.testing.assert_close(
+        p.data, _reference_step(w, g)[r * 4 : (r + 1) * 4], atol=1e-4, rtol=1e-4
+    )
+
+
 # ---------------------------------------------------------------------------
 # Batched Newton-Schulz (ns_batch_size): baddbmm chunks vs the per-matrix path
 # ---------------------------------------------------------------------------

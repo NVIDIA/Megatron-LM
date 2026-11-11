@@ -62,8 +62,8 @@ class MambaInferenceStateConfig:
     slice start."""
 
     gdp_num_householder: int = 0
-    """Number of Householder copies of the Gated Delta Product layers, or 0 if the
-    model has none. Sizes the GDP chunk descriptors used by the forked prefill
+    """Number of Householder copies of the Gated Delta Product layers, 1 for GDN,
+    or 0 for other mixers. Sizes the chunk descriptors used by the forked prefill
     kernels, whose Householder-expanded token stream is this many times longer."""
 
     def __post_init__(self):
@@ -546,9 +546,9 @@ class InferenceConfig:
     Reserve one recurrent-state buffer for expert-parallel dummy forwards.
 
     Disaggregated handoff can retain every request-owned recurrent-state slot after its request
-    leaves the active batch. An idle EP rank still needs a state buffer for the dummy forward that
-    joins its peers' expert collectives. The reserved entry is outside normal request capacity and
-    is only allocated for hybrid models with expert parallelism.
+    leaves the active batch. An idle tp_ep rank still needs a state buffer for the dummy forward
+    that joins its peers' collectives. The reserved entry is outside normal request capacity and
+    is only allocated for hybrid models whose tp_ep group (expert TP x EP) has more than one rank.
     """
 
     max_tokens: Optional[int] = None
@@ -667,6 +667,24 @@ class InferenceConfig:
 
     num_speculative_tokens: int = 0
     """The number of speculative tokens to generate for decode steps."""
+
+    mamba_replay_ssm: bool = False
+    """For Mamba speculative decoding: enable ReplaySSM-style state management
+    (https://tridao.me/blog/2026/replayssm/). Instead of writing the SSM state to HBM every decode
+    step (and checkpointing per-draft states for rollback), keep a checkpoint state plus a small
+    per-(layer, slot) ring buffer of cached SSM inputs (post-conv `x`/`B` and raw `dt`).
+    Decode outputs are computed directly from the checkpoint and the cached inputs without
+    materializing intermediate states; the checkpoint is re-materialized only on (early-)flush
+    steps, and speculative rollback becomes a device-side ring-pointer move. Requires a per-head
+    scalar `A` (Mamba-2 / TIE_HDIM). Only affects the SSM state; conv-state rollback is
+    unchanged. No effect when `num_speculative_tokens == 0`."""
+
+    mamba_replay_buffer_len: int = 16
+    """ReplaySSM committed-history buffer length `B` (tokens). The logical flush threshold is
+    `L = B + W` where `W = 1 + num_speculative_tokens` is the verification-window length, and
+    the physical ring buffer is padded to the next power of two of `L`. A flush is scheduled one
+    window early (`write_pos + 2W > L`) so a full window always fits. Must satisfy `B >= W`.
+    Only used when `mamba_replay_ssm` is True."""
 
     enable_prefix_caching: bool = False
     """Whether to enable prefix caching for KV cache block sharing."""
@@ -808,8 +826,25 @@ class InferenceConfig:
     """Mode used to schedule dynamic batching inference work. Defaults to async scheduling; use
     ``AsyncScheduleMode.LEGACY`` to disable it."""
 
+    gc_mode: Literal["default", "freeze", "freeze_overlap"] = "freeze_overlap"
+    """Python garbage collection policy while the engine serves requests.
+
+    `default` keeps CPython's automatic collection unchanged. `freeze` collects and then
+    freezes the heap after engine setup, and again when the engine first drains after a step,
+    so later collections skip long-lived engine state objects; `freeze_overlap` additionally
+    disables automatic collection once the first-drain freeze is done and triggers GC right after
+    each forward pass is submitted, overlapping GC with the queued GPU work. Defaults to
+    `freeze_overlap`.
+    """
+
     logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
-    """Whether returned log-probs are modified by the sampling parameters or not."""
+    """Whether log-probs of engine-sampled tokens are modified by the sampling parameters.
+
+    `'processed_logprobs'` applies each request's temperature, top-k, and top-p to the
+    log-probs of tokens the engine sampled, including the top-N log-probs at those
+    positions. Prompt log-probs and prompt top-N log-probs score tokens the engine did
+    not sample, so they always use the raw distribution in both modes.
+    """
 
     request_metadata_types: Optional[List[Tuple[str, torch.dtype]]] = None
     """
@@ -821,16 +856,6 @@ class InferenceConfig:
     """Whether to use synchronous ZMQ collectives for inference. If True, the
     all_reduce_max operation will be performed synchronously, which can help reduce
     performance variability for MoEs.
-    """
-
-    disable_ep_consensus: bool = False
-    """If True, the engine skips the EP-group consensus all-reduce in
-    `run_engine_with_coordinator` and decides whether to step based on local
-    state alone. The rank still calls `controller.dummy_forward()` whenever
-    `local_pending == 0`, so EP collectives (NCCL all-to-all, etc.) stay in
-    sync — without this, a peer running a real forward would deadlock waiting
-    on this rank's all-to-all participation. Trades off the consensus
-    all-reduce CPU cost for unconditional dummy_forwards on idle ranks.
     """
 
     ep_consensus_interval: int = 20
@@ -854,8 +879,48 @@ class InferenceConfig:
     only when model weights are guaranteed not to change across those boundaries.
     """
 
+    inference_shortcut_moe_overlap: bool = False
+    """Overlap routed Shortcut MoE work with the ordinary predecessor forward."""
+
+    def validate_shortcut_moe_model(self, model_config) -> None:
+        """Validate model compatibility before engine setup and CUDA graph capture."""
+        if not self.inference_shortcut_moe_overlap:
+            return
+        if not model_config.moe_shortcut_connection:
+            raise ValueError("inference_shortcut_moe_overlap requires Shortcut MoE")
+
+        if model_config.transformer_impl != "inference_optimized":
+            raise ValueError(
+                "inference_shortcut_moe_overlap requires "
+                "transformer_impl='inference_optimized' for the language model"
+            )
+        if model_config.params_dtype != torch.bfloat16:
+            raise ValueError("inference_shortcut_moe_overlap requires BF16 model parameters")
+        if model_config.fp8 or model_config.fp4:
+            raise ValueError("Shortcut MoE overlap with FP8 or FP4 requires further testing")
+        if model_config.tensor_model_parallel_size != 1 or model_config.context_parallel_size != 1:
+            raise ValueError("inference_shortcut_moe_overlap requires TP=1 and CP=1")
+        if model_config.inference_moe_token_dispatcher_type != "nvls":
+            raise ValueError("inference_shortcut_moe_overlap requires the NVLS dispatcher")
+        if model_config.inference_disable_triton_nvls_kernels:
+            raise ValueError("inference_shortcut_moe_overlap requires Triton NVLS kernels")
+        if model_config.fine_grained_activation_offloading:
+            raise ValueError(
+                "inference_shortcut_moe_overlap requires "
+                "fine_grained_activation_offloading=False"
+            )
+        if model_config.batch_invariant_mode or model_config.gdp_cutedsl_kernel:
+            raise ValueError(
+                "inference_shortcut_moe_overlap requires further testing with batch-invariant mode "
+                "or CuTeDSL GDP kernels"
+            )
+
     def __post_init__(self, verbose: bool):
         self._verbose = verbose
+        if self.inference_shortcut_moe_overlap and self.num_speculative_tokens:
+            raise ValueError(
+                "Shortcut MoE overlap with speculative decoding requires further testing"
+            )
         self.async_sched_mode = AsyncScheduleMode(self.async_sched_mode)
         # Not capped at 1: alpha stopped being a blend weight when the score became
         # cache_score - alpha * relative_load, and values above 1 are meaningful --
@@ -875,6 +940,12 @@ class InferenceConfig:
             raise ValueError(
                 f"Unsupported logprobs_mode {self.logprobs_mode!r}. "
                 "Supported modes: raw_logprobs, processed_logprobs."
+            )
+
+        if self.gc_mode not in ("default", "freeze", "freeze_overlap"):
+            raise ValueError(
+                f"Unsupported gc_mode {self.gc_mode!r}. "
+                "Supported modes: default, freeze, freeze_overlap."
             )
 
         # The speculative log-probs path does not yet apply processed-logprobs.
