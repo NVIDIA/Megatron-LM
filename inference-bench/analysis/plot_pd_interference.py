@@ -69,8 +69,12 @@ def percentile(values, q):
 def summarize(label, run_dir, prefill_gpus_per_64):
     cfg = read_env(os.path.join(run_dir, "config.env"))
     gpus = int(cfg.get("GPUS") or 4 * int(cfg["NODES"]))
+    # Native PD (one job, one config.env) records PREFILL_GPUS; the earlier two-world PD runs
+    # wrote the prefill pool's own config.env under prefill/.
     prefill_cfg = read_env(os.path.join(run_dir, "prefill", "config.env"))
-    prefill_gpus = int(prefill_cfg.get("GPUS") or 0) if prefill_cfg else 0
+    prefill_gpus = int(cfg.get("PREFILL_GPUS") or 0) or (
+        int(prefill_cfg.get("GPUS") or 0) if prefill_cfg else 0
+    )
     per64 = prefill_gpus if prefill_gpus_per_64 is None else prefill_gpus_per_64
     charged = gpus + (per64 * gpus / 64 if prefill_gpus else 0)
 

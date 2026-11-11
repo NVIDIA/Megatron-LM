@@ -15,7 +15,10 @@
 # Run from the Megatron-LM repo root:
 #   source inference-bench/cluster.env
 #   sbatch inference-bench/server/launch_minf.sh
-#   sbatch --export=ALL,EXP_NAME=a2a,DISPATCHER=nvl_a2a,COMBINE_PRECISION=bf16 inference-bench/server/launch_minf.sh
+#   sbatch --export=ALL,EXP_NAME=nccl,DISPATCHER=nccl inference-bench/server/launch_minf.sh
+#
+# The server is examples/inference/launch_inference_server.py (the native OpenAI server), for
+# aggregated and disaggregated (PD=1) runs alike.
 #
 # Knobs (environment variables):
 #   EXP_NAME           run label                                    (default: run)
@@ -30,10 +33,8 @@
 #                      request on Ultra, this sets the concurrent-request cap   (default: 0.1)
 #   MAMBA_PREFIX_GB    Mamba prefix-cache buffer per GPU, with PREFIX_CACHING=1
 #                      (default: 50; ultrav3: 25)
-#   DISPATCHER         MoE EP dispatcher: nccl | nvls | nvl_a2a     (default: nvls)
-#   COMBINE_PRECISION  MoE combine precision: fp32 | bf16           (default: fp32)
-#   GEMM_BACKEND       routed-expert grouped GEMM: vllm | trtllm_bf16_routed | flashinfer | torch
-#                      (default: trtllm_bf16_routed)
+#   DISPATCHER         MoE EP dispatcher: nccl | nvls                (default: nvls)
+#   GEMM_BACKEND       routed-expert grouped GEMM: vllm | flashinfer | torch   (default: vllm)
 #   ASYNC              1 = async scheduling                         (default: 1)
 #   PREFIX_CACHING     1 = prefix caching, LRU eviction             (default: 1)
 #   SAMPLING           sampling backend: flashinfer | torch         (default: flashinfer)
@@ -47,9 +48,6 @@
 #                      inference_optimized requires); unset = BF16          (default: unset)
 #   SHARED_EXPERT_OVERLAP  1 = run the shared experts on a side stream, overlapped with the
 #                      routed experts; 0 = in order                         (default: 1)
-#   MCORE_ROUTING_COUNTS  1 = EP rank 0 counts each logged step's expert routing: a summary on
-#                      its step log and the raw per-layer, per-expert counts in
-#                      <exp dir>/routing_counts.jsonl (MCORE_ROUTING_COUNTS_PATH overrides)
 #   EVAL_MODE          1 = --eval-mode: chat responses skip echoing prompt token IDs, which
 #                      speeds up evals with long contexts             (default: 1)
 #   PROMPT_LOGPROBS    1 = materialize logits for every prompt token so /v1/completions can
@@ -66,16 +64,16 @@
 #                      With BENCH=1 each request is a single prefill step (keep <= 8192).
 #   BENCH_OSL / BENCH_ITERS / BENCH_WARMUP   output tokens / timed / warmup iterations
 #                                             (default: 1024 / 3 / 1)
-#   PD                 1 = prefill/decode disaggregation in this one job: the first PREFILL_NODES
-#                      nodes form the prefill pool, the rest the decode pool, each its own
-#                      torch.distributed world and coordinator. Both pools run with prefix
-#                      caching (required by the KV hand-off) and without the Mamba prefix cache
-#                      (MAMBA_PREFIX_GB=0). The prefill pool serves no HTTP and publishes its
-#                      coordinator address to <exp dir>/prefill_coordinator; the decode pool's
-#                      rank 0 hosts the frontend, which routes each request through both pools.
-#                      KV and Mamba state move over NIXL. Any PREFILL_<KNOB> overrides <KNOB> on
-#                      the prefill pool (PREFILL_TP, PREFILL_EP, ...). The prefill pool logs into
-#                      <exp dir>/prefill/.                        (default: 0 = aggregated)
+#   PD                 1 = prefill/decode disaggregation (main's native PD): one torch.distributed
+#                      world over the whole job, split by --inference-shards into a prefill
+#                      engine on the first PREFILL_NODES nodes and the decode engines on the rest;
+#                      one coordinator routes each request prefill -> decode, and global rank 0
+#                      (on the prefill node) hosts the HTTP frontend. KV and Mamba state move over
+#                      NIXL. Prefix caching is forced on (the hand-off needs it) and the Mamba
+#                      prefix cache off (decode must not have one). NODES / TP / EP / ETP size the
+#                      decode engines; PREFILL_TP / PREFILL_EP / PREFILL_ETP the prefill engine
+#                      (default: TP / all prefill GPUs / ETP). Other knobs apply to both pools.
+#                                                                 (default: 0 = aggregated)
 #   PREFILL_NODES      with PD=1: prefill-pool nodes                         (default: 1)
 #   DONE_FILE          file that stops the server when it appears  (default: <exp dir>/done)
 #   EXP_DIR            experiment directory (default: a new timestamped one)
@@ -101,15 +99,10 @@ if [ -z "${INFERENCE_BENCH_INNER:-}" ]; then
     export EXP_DIR="${EXP_DIR:-inference-bench/experiments/$(date +%Y%m%d_%H%M%S)_${EXP_NAME:-run}}"
     export DONE_FILE="${DONE_FILE:-${EXP_DIR}/done}"
     mkdir -p "${EXP_DIR}"
-    [ "${PD:-0}" == "1" ] && mkdir -p "${EXP_DIR}/prefill"
     echo "Experiment directory: ${EXP_DIR}"
     # Ranks run a private copy: bash reads scripts incrementally, so editing the original
     # while a job is running would corrupt that job's ranks.
     cp "${SCRIPT}" "${EXP_DIR}/launch_minf.sh"
-    # Per-step expert routing counts (EP rank 0) default into the experiment directory.
-    if [ "${MCORE_ROUTING_COUNTS:-0}" == "1" ]; then
-        export MCORE_ROUTING_COUNTS_PATH=${MCORE_ROUTING_COUNTS_PATH:-${EXP_DIR}/routing_counts.jsonl}
-    fi
     export INFERENCE_BENCH_INNER=1
     NUM_NODES=${SLURM_JOB_NUM_NODES:-1}
     if [ "${MODEL:-nanov3p5}" == "ultrav3" ] && [ "${NUM_NODES}" -lt 2 ]; then
@@ -126,49 +119,20 @@ if [ -z "${INFERENCE_BENCH_INNER:-}" ]; then
 fi
 
 # ── Inner: one rank ────────────────────────────────────────────────────────────
+SERVER=examples/inference/launch_inference_server.py
 export RANK=${SLURM_PROCID} LOCAL_RANK=${SLURM_LOCALID} WORLD_SIZE=${SLURM_NTASKS}
 # Multi-node runs use the rendezvous address the cluster exports; fall back to localhost.
 export MASTER_ADDR=${MASTER_ADDR:-localhost} MASTER_PORT=${MASTER_PORT:-29500}
 DONE_FILE=${DONE_FILE:-${EXP_DIR}/done}
-POOL_NODES=${SLURM_JOB_NUM_NODES:-1}
-DISAGG_ROLE=
-
-if [ "${PD:-0}" == "1" ]; then
-    # Split the job's nodes into the two pools, each its own torch.distributed world.
-    PREFILL_NODES=${PREFILL_NODES:-1}
-    PD_COORDINATOR_FILE="${EXP_DIR}/prefill_coordinator"
-    if (( SLURM_NODEID < PREFILL_NODES )); then
-        DISAGG_ROLE=prefill
-        POOL_NODES=${PREFILL_NODES}
-        FIRST_TASK=0
-        for var in $(compgen -v PREFILL_); do
-            [ "${var}" == "PREFILL_NODES" ] || export "${var#PREFILL_}=${!var}"
-        done
-        EXP_DIR="${EXP_DIR}/prefill"
-        EXP_NAME="${EXP_NAME:-run}_prefill"
-        MASTER_PORT=29600
-    else
-        DISAGG_ROLE=decode
-        POOL_NODES=$(( ${SLURM_JOB_NUM_NODES} - PREFILL_NODES ))
-        FIRST_TASK=$(( 4 * PREFILL_NODES ))
-        MASTER_PORT=29500
-    fi
-    RANK=$(( SLURM_PROCID - FIRST_TASK ))
-    WORLD_SIZE=$(( 4 * POOL_NODES ))
-    # Pool-local rendezvous: the pool's rank 0 publishes its host.
-    MASTER_FILE="${EXP_DIR}/.master_addr_${SLURM_JOB_ID}"
-    if [ "${RANK}" == "0" ]; then
-        hostname > "${MASTER_FILE}.tmp" && mv "${MASTER_FILE}.tmp" "${MASTER_FILE}"
-    fi
-    until [ -s "${MASTER_FILE}" ]; do sleep 1; done
-    MASTER_ADDR=$(cat "${MASTER_FILE}")
-    export RANK WORLD_SIZE MASTER_ADDR MASTER_PORT EXP_DIR EXP_NAME
-fi
+JOB_NODES=${SLURM_JOB_NUM_NODES:-1}
+# Decode (or aggregated) nodes; with PD=1 the first PREFILL_NODES nodes are the prefill pool.
+POOL_NODES=${JOB_NODES}
+[ "${PD:-0}" == "1" ] && POOL_NODES=$(( JOB_NODES - ${PREFILL_NODES:-1} ))
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export TRITON_CACHE_DIR=/tmp/triton_cache_${RANK}
 export TORCHINDUCTOR_CACHE_DIR=/tmp/inductor_cache_${RANK}
 
-if [ -n "${DISAGG_ROLE}" ]; then
+if [ "${PD:-0}" == "1" ]; then
     # The KV hand-off needs prefix caching; math prompts share no prefixes, so the Mamba prefix
     # cache would only take memory (and the decode pool must not have one).
     PREFIX_CACHING=1
@@ -185,7 +149,7 @@ spec = importlib.util.find_spec("nixl_cu13")
 root = os.path.dirname(os.path.dirname(spec.origin)) if spec else ""
 print(next(iter(sorted(glob.glob(os.path.join(root, "nixl_cu13.libs", "libucs-*.so*")))), ""))')
     if [ -z "${NIXL_UCS}" ]; then
-        echo "DISAGG_ROLE needs NIXL (nixl + nixl-cu13); use the +nixl image or set NIXL_PYTHONPATH"
+        echo "PD=1 needs NIXL (nixl + nixl-cu13); use the +nixl image or set NIXL_PYTHONPATH"
         touch "${DONE_FILE}"
         exit 1
     fi
@@ -195,10 +159,35 @@ fi
 # Ultra v3 runs TP8 x EP8 on 2 nodes; the others default to TP4.
 if [ "${MODEL:-nanov3p5}" == "ultrav3" ]; then TP=${TP:-8}; else TP=${TP:-4}; fi
 ETP=${ETP:-1}
-EP=${EP:-$((WORLD_SIZE / ETP))}
-if (( WORLD_SIZE % (EP * ETP) )); then
-    echo "EP x ETP = $((EP * ETP)) must divide the world size ${WORLD_SIZE}"
+POOL_GPUS=$((4 * POOL_NODES))
+EP=${EP:-$((POOL_GPUS / ETP))}
+if (( POOL_GPUS % (EP * ETP) || POOL_GPUS % TP )); then
+    echo "EP x ETP = $((EP * ETP)) and TP = ${TP} must divide the ${POOL_GPUS} (decode) GPUs"
     exit 1
+fi
+SHARD_ARGS=(--tensor-model-parallel-size "${TP}" --expert-model-parallel-size "${EP}"
+            --expert-tensor-parallel-size "${ETP}")
+if [ "${PD:-0}" == "1" ]; then
+    PREFILL_GPUS=$((4 * ${PREFILL_NODES:-1}))
+    PREFILL_TP=${PREFILL_TP:-${TP}}
+    PREFILL_ETP=${PREFILL_ETP:-${ETP}}
+    PREFILL_EP=${PREFILL_EP:-$((PREFILL_GPUS / PREFILL_ETP))}
+    if (( PREFILL_GPUS % PREFILL_TP || PREFILL_GPUS % (PREFILL_EP * PREFILL_ETP) )); then
+        echo "PREFILL_TP and PREFILL_EP x PREFILL_ETP must divide the ${PREFILL_GPUS} prefill GPUs"
+        exit 1
+    fi
+    # Each shard carries its own parallelism; the prefill shard takes the first global ranks.
+    SHARDS="tp=${PREFILL_TP},dp=$((PREFILL_GPUS / PREFILL_TP)),ep=${PREFILL_EP},expt_tp=${PREFILL_ETP},role=prefill"
+    SHARDS+="+tp=${TP},dp=$((POOL_GPUS / TP)),ep=${EP},expt_tp=${ETP},role=decode"
+    # The global parallel sizes only build process groups over the whole world (each model uses
+    # its shard's groups), so they just have to tile it; the prefill shard's sizes are used.
+    if (( WORLD_SIZE % PREFILL_TP || WORLD_SIZE % (PREFILL_EP * PREFILL_ETP) )); then
+        echo "PREFILL_TP and PREFILL_EP x PREFILL_ETP must divide the world size ${WORLD_SIZE}"
+        exit 1
+    fi
+    SHARD_ARGS=(--tensor-model-parallel-size "${PREFILL_TP}" --expert-model-parallel-size "${PREFILL_EP}"
+                --expert-tensor-parallel-size "${PREFILL_ETP}"
+                --inference-shards "${SHARDS}" --disagg-kv-transport-backend nixl)
 fi
 
 ARGS=(
@@ -214,15 +203,12 @@ ARGS=(
     --cuda-graph-impl local --cuda-graph-scope full_iteration_inference
     --transformer-impl inference_optimized
     --inference-max-seq-length 262144 --seq-length 262144 --max-position-embeddings 262144
-    # Parallelism and MoE dispatch.
-    --tensor-model-parallel-size "${TP}"
-    --expert-model-parallel-size "${EP}"
-    --expert-tensor-parallel-size "${ETP}"
+    # Parallelism (SHARD_ARGS) and MoE dispatch.
+    "${SHARD_ARGS[@]}"
     --inference-moe-token-dispatcher-type "${DISPATCHER:-nvls}"
-    --inference-moe-combine-precision "${COMBINE_PRECISION:-fp32}"
     --moe-token-dispatcher-type alltoall
     --moe-grouped-gemm
-    --inference-grouped-gemm-backend "${GEMM_BACKEND:-trtllm_bf16_routed}"
+    --inference-grouped-gemm-backend "${GEMM_BACKEND:-vllm}"
     --inference-use-synchronous-zmq-collectives
     --model-provider mamba
     --dist-ckpt-strictness log_unexpected
@@ -297,10 +283,6 @@ ARGS+=(--inference-dynamic-batching-buffer-size-gb "${BUFFER_GB:-${DEFAULT_BUFFE
 [ "${PREFIX_CACHING:-1}" == "1" ] && [ "${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}}" != "0" ] && ARGS+=(
     --inference-dynamic-batching-prefix-caching-mamba-gb "${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}}"
 )
-[ -n "${DISAGG_ROLE}" ] && ARGS+=(
-    --disagg-role "${DISAGG_ROLE}" --kv-transfer-backend nixl
-    --disagg-prefill-coordinator-file "${PD_COORDINATOR_FILE}"
-)
 [ -n "${MAX_REQUESTS:-}" ] && ARGS+=(--inference-dynamic-batching-max-requests "${MAX_REQUESTS}")
 [ "${EVAL_MODE:-1}" == "1" ] && ARGS+=(--eval-mode)
 # The server returns log-probs by default, which materializes logits for every prompt token
@@ -324,12 +306,12 @@ SLURM_JOB_ID=${SLURM_JOB_ID}
 IMAGE=${INFERENCE_BENCH_SERVE_IMAGE:-}
 TOKENIZER=${TOKENIZER}
 MODEL=${MODEL:-nanov3p5} NODES=${POOL_NODES} TP=${TP} EP=${EP} ETP=${ETP} BUFFER_GB=${BUFFER_GB:-${DEFAULT_BUFFER_GB:-50}} MAMBA_PREFIX_GB=${MAMBA_PREFIX_GB:-${DEFAULT_MAMBA_PREFIX_GB:-50}} MAMBA_RATIO=${MAMBA_RATIO:-0.1}
-DISPATCHER=${DISPATCHER:-nvls} COMBINE_PRECISION=${COMBINE_PRECISION:-fp32} GEMM_BACKEND=${GEMM_BACKEND:-trtllm_bf16_routed}
+DISPATCHER=${DISPATCHER:-nvls} GEMM_BACKEND=${GEMM_BACKEND:-vllm}
 ASYNC=${ASYNC:-1} PREFIX_CACHING=${PREFIX_CACHING:-1} SAMPLING=${SAMPLING:-flashinfer} EVAL_MODE=${EVAL_MODE:-1} PROMPT_LOGPROBS=${PROMPT_LOGPROBS:-0} PROFILE=${PROFILE:-0} LOG_INTERVAL=${LOG_INTERVAL:-1000} MAX_TOKENS=${MAX_TOKENS:-8192} CUDA_GRAPH_MAX_TOKENS=${CUDA_GRAPH_MAX_TOKENS:-2048} FP8_RECIPE=${FP8_RECIPE:-} SHARED_EXPERT_OVERLAP=${SHARED_EXPERT_OVERLAP:-1}
-PD=${PD:-0} DISAGG_ROLE=${DISAGG_ROLE} PREFILL_NODES=${PREFILL_NODES:-} GPUS=$((4 * POOL_NODES))
+PD=${PD:-0} PREFILL_NODES=${PREFILL_NODES:-} PREFILL_GPUS=${PREFILL_GPUS:-0} SHARDS=${SHARDS:-} GPUS=${POOL_GPUS}
 BENCH=${BENCH:-} BENCH_DATASET=${BENCH_DATASET:-gsm8k} BENCH_MIN_ISL=${BENCH_MIN_ISL:-0} BENCH_ISL=${BENCH_ISL:-0} BENCH_EXACT_ISLS=${BENCH_EXACT_ISLS:-}
 BENCH_OSL=${BENCH_OSL:-1024} BENCH_ITERS=${BENCH_ITERS:-3} BENCH_WARMUP=${BENCH_WARMUP:-1}
-CMD=python -m tools.run_dynamic_text_generation_server ${ARGS[*]}
+CMD=python ${SERVER} ${ARGS[*]}
 EOF
 fi
 
@@ -339,8 +321,13 @@ if [ "${PROFILE:-0}" == "1" ]; then
          --capture-range=cudaProfilerApi --capture-range-end=stop-shutdown
          --force-overwrite true -o "${EXP_DIR}/trace_rank${RANK}")
 fi
-"${PRE[@]}" python -m tools.run_dynamic_text_generation_server "${ARGS[@]}" > "${LOG}" 2>&1 &
+# Own process group: the server spawns its HTTP frontends as separate processes, which a signal
+# to the server alone would leave running.
+setsid "${PRE[@]}" python "${SERVER}" "${ARGS[@]}" > "${LOG}" 2>&1 &
 SERVER_PID=$!
+stop_server() {
+    kill -TERM -- "-${SERVER_PID}" 2>/dev/null
+}
 
 # Serve until DONE_FILE (<exp dir>/done) appears (written by the in-job sweep or by client.sh) or the server
 # dies. Under PROFILE the server shuts itself down when profiling stops; killing it early would
@@ -353,19 +340,24 @@ serve_until_done() {
     while kill -0 "${SERVER_PID}" 2>/dev/null && [ ! -f "${DONE_FILE}" ]; do sleep 2; done
     # A rank whose server died ends the deployment (in PD, both pools).
     kill -0 "${SERVER_PID}" 2>/dev/null || touch "${DONE_FILE}"
-    kill "${SERVER_PID}" 2>/dev/null
+    stop_server
     # The server's SIGTERM exit status (143) would make srun cancel the step as a failure.
     wait "${SERVER_PID}"
     exit 0
 }
 
 [ "${RANK}" != "0" ] && serve_until_done
-# The prefill pool of a PD deployment serves no HTTP; the decode pool's frontend reaches its
-# coordinator through PD_COORDINATOR_FILE.
-[ "${DISAGG_ROLE}" == "prefill" ] && serve_until_done
 
-# Rank 0: wait for the server, then either run the client sweep or keep serving.
-until grep -q "Running on http://0.0.0.0:5000" "${LOG}" 2>/dev/null; do
+# Rank 0 hosts the HTTP frontends (all replicas are listening once the server logs that it
+# started them; /health then answers). Wait for it, then either run the client sweep or serve.
+server_ready() {
+    python3 -c 'import sys, urllib.request
+try:
+    sys.exit(0 if urllib.request.urlopen("http://localhost:5000/health", timeout=5).status == 200 else 1)
+except Exception:
+    sys.exit(1)'
+}
+until server_ready; do
     if ! kill -0 "${SERVER_PID}" 2>/dev/null; then
         echo "Server exited during startup; see ${LOG}"
         touch "${DONE_FILE}"
@@ -373,7 +365,7 @@ until grep -q "Running on http://0.0.0.0:5000" "${LOG}" 2>/dev/null; do
     fi
     if [ -f "${DONE_FILE}" ]; then
         echo "Stopped during startup (${DONE_FILE} appeared)"
-        kill "${SERVER_PID}" 2>/dev/null
+        stop_server
         exit 1
     fi
     sleep 5
