@@ -2631,13 +2631,15 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
 
         # These fields are MCore-only and should not be forwarded to TE attention.
         # total_tokens and seq_idx are only for Mamba; tokens_per_sample is only for
-        # MoE sequence-level aux loss reshaping; cp_partition_mode and cp_partition_route
-        # are MCore CP metadata.
+        # MoE sequence-level aux loss reshaping; cp_partition_mode, cp_partition_route,
+        # tp_cp_partition_route, cp_scatter_cache and cp_singleton_group are MCore CP
+        # metadata.
         self.kept_packed_seq_params.discard("total_tokens")
         self.kept_packed_seq_params.discard("seq_idx")
         self.kept_packed_seq_params.discard("tokens_per_sample")
         self.kept_packed_seq_params.discard("cp_partition_mode")
         self.kept_packed_seq_params.discard("cp_partition_route")
+        self.kept_packed_seq_params.discard("tp_cp_partition_route")
         self.kept_packed_seq_params.discard("cp_scatter_cache")
         self.kept_packed_seq_params.discard("cp_singleton_group")
 
@@ -2750,6 +2752,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         """Run TE attention after the runtime CP binding has been installed."""
         if packed_seq_params is not None:
             self.kept_packed_seq_params.discard("cp_group")
+            self.kept_packed_seq_params.discard("tp_cp_group")
             self.kept_packed_seq_params.discard("local_cp_size")
 
         # Default to constructor-provided num_splits unless explicitly overridden

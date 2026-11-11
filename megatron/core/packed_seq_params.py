@@ -17,9 +17,17 @@ class PackedSeqParams:
     parameters to TEDotProductAttention and fused rope kernels for the
     `thd` (packed) sequence format
 
-    ``cp_partition_route`` is a per-microbatch THD CP layout conversion route.
-    Metadata annotation helpers update the current partition mode in-place while
-    preserving the route identity.
+    ``cp_partition_route`` is a per-microbatch THD CP layout conversion route over the
+    CP group. ``tp_cp_partition_route`` is the same kind of plan for the fused TP x CP
+    conversion of sequence-parallel shards, with split sizes in TP x CP group order.
+    A microbatch always carries the CP-only route and, under sequence parallelism with
+    fusable groups, the fused route as well: a module's sequence-parallel input shard
+    takes the fused exchange while its sequence-gathered core-attention output is
+    restored over the CP-only one (``prebuild_thd_cp_partition_routes`` builds both from
+    one host copy of ``cu_seqlens``). ``tp_cp_group`` is set under dynamic CP only: the
+    TP x sub-group that pairs with ``cp_group``; static CP leaves it None and modules
+    use their own TP x CP group. Metadata annotation helpers update the current
+    partition mode in-place while preserving the route identities.
     '''
 
     qkv_format: str = None
@@ -37,12 +45,14 @@ class PackedSeqParams:
     # TE represents CP-off as cp_group=None, while layout/RoPE helpers still need
     # the actual singleton group when the build-time CP group is larger.
     cp_singleton_group: Optional[dist.ProcessGroup] = None
+    tp_cp_group: dist.ProcessGroup = None
     total_tokens: int = None
     seq_idx: Tensor = None
     pad_between_seqs: Optional[bool] = None
     cp_partition_mode: Literal["zigzag", "contiguous"] = "zigzag"
     tokens_per_sample: int = None
     cp_partition_route: Optional["ThdCpRoute"] = None
+    tp_cp_partition_route: Optional["ThdCpRoute"] = None
     cp_scatter_cache: object = None
 
     def __post_init__(self):
@@ -107,6 +117,25 @@ def resolve_cp_group(
     if packed_seq_params is not None and packed_seq_params.cp_group is not None:
         return packed_seq_params.cp_group
     return static_cp_group
+
+
+def resolve_tp_cp_group(
+    static_tp_cp_group: Optional[dist.ProcessGroup], packed_seq_params: PackedSeqParams = None
+) -> Optional[dist.ProcessGroup]:
+    """Return the dynamic TP x CP group from packed_seq_params when set, else the static one.
+
+    Under dynamic CP the microbatch's CP group is a sub-group of the static one, so the
+    TP x CP group used to exchange sequence-parallel shards during layout conversion
+    must be the matching TP x sub-group. ``finalize_packed_seq_params`` stores it on the
+    metadata under dynamic CP only (see
+    ``get_dynamic_tensor_data_context_parallel_group_map``); for static CP the field
+    stays None and the module's own TP x CP group is returned, mirroring
+    ``resolve_cp_group``.
+    """
+    dynamic_tp_cp_group = getattr(packed_seq_params, "tp_cp_group", None)
+    if dynamic_tp_cp_group is not None:
+        return dynamic_tp_cp_group
+    return static_tp_cp_group
 
 
 def _pad_seq_tensor(t: Optional[Tensor], target_len: int) -> Optional[Tensor]:

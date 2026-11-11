@@ -1383,8 +1383,18 @@ def validate_args(args, defaults={}):
             args.ffn_hidden_size = 4 * args.hidden_size
 
     if args.kv_channels is None:
-        assert args.hidden_size % args.num_attention_heads == 0
-        args.kv_channels = args.hidden_size // args.num_attention_heads
+        if getattr(args, 'multi_latent_attention', False):
+            # MLA defines its head dim via qk_head_dim / qk_pos_emb_head_dim, independent of
+            # hidden_size / num_attention_heads, which need not divide evenly for an MLA model
+            # (e.g. Kimi-K3 / K3.1: hidden_size 7168, num_attention_heads 96, 7168 % 96 != 0).
+            # kv_channels is unused by the MLA forward but must be a sane value for the MuP
+            # softmax scale and the simplified-DSA indexer head-dim default, so derive it from
+            # the query head dim MLA actually passes to core attention instead of asserting the
+            # standard MHA/GQA invariant (which would raise a bare AssertionError here).
+            args.kv_channels = args.qk_head_dim + args.qk_pos_emb_head_dim
+        else:
+            assert args.hidden_size % args.num_attention_heads == 0
+            args.kv_channels = args.hidden_size // args.num_attention_heads
 
     if args.seq_length is not None and args.context_parallel_size > 1:
         assert args.seq_length % (args.context_parallel_size * 2) == 0, (
