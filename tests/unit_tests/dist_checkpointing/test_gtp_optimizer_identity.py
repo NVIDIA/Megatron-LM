@@ -20,6 +20,8 @@ from megatron.core.dist_checkpointing.optimizer import (
 )
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 
+pytestmark = pytest.mark.launch_on_gb200
+
 
 def _model_entry(factory):
     param = torch.nn.Parameter(torch.arange(8, dtype=torch.float16).reshape(2, 4))
