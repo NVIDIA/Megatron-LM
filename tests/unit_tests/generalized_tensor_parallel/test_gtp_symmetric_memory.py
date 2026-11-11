@@ -135,7 +135,6 @@ class TestTeardownContract:
 
         # Own state is gone: registries empty, free lists dropped.
         assert not gtp_symm._pools and not gtp_symm._registered
-        assert not gtp_symm._enabled_collectives
         assert not symmetric_wgrad_pool._free
         # Foreign allocations survive teardown untouched.
         torch.cuda.synchronize()
@@ -273,14 +272,12 @@ class TestRegisterCollectives:
     def test_collective_query_reflects_registration(self):
         group = _StubGroup(name="mode_query_group")
         # Fake a live rs-only registration; the query must scope by collective.
-        gtp_symm._registered[group.group_name] = group
-        gtp_symm._enabled_collectives[group.group_name] = frozenset({"rs"})
+        gtp_symm._registered[group.group_name] = (group, frozenset({"rs"}))
         try:
             assert gtp_symm.uses_gtp_symm_pool(group, collective="rs")
             assert not gtp_symm.uses_gtp_symm_pool(group, collective="ag")
         finally:
             del gtp_symm._registered[group.group_name]
-            del gtp_symm._enabled_collectives[group.group_name]
 
 
 class TestNeedsNcclMemStamp:
@@ -978,14 +975,25 @@ def _worker_ag_alloc_routing(rank, world_size, port):
 
 class TestConvertedQuantizedWeightMove:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA pool test")
-    def test_converted_mxfp8_weight_moves_whole(self, monkeypatch):
+    @pytest.mark.parametrize(
+        "recipe_name,buffers",
+        [
+            ("MXFP8BlockScaling", ("_rowwise_data", "_rowwise_scale_inv", "_columnwise_data")),
+            # Per-tensor FP8 stores _data/_transpose instead of rowwise/columnwise buffers.
+            ("Float8CurrentScaling", ("_data", "_transpose")),
+        ],
+    )
+    def test_converted_fp8_weight_moves_whole(self, monkeypatch, recipe_name, buffers):
         """The post-wrap move also handles a weight already converted to a GTP FP8 param."""
-        _requires_mxfp8()
         import transformer_engine.pytorch as te
-        from transformer_engine.common.recipe import MXFP8BlockScaling
+        from transformer_engine.common import recipe
 
-        group = _StubGroup(name="converted_fp8_move_group")
-        with te.fp8_model_init(enabled=True, recipe=MXFP8BlockScaling()):
+        if recipe_name == "MXFP8BlockScaling":
+            _requires_mxfp8()
+        elif not te.is_fp8_available():
+            pytest.skip("FP8 not available")
+        group = _StubGroup(name=f"converted_fp8_move_group_{recipe_name}")
+        with te.fp8_model_init(enabled=True, recipe=getattr(recipe, recipe_name)()):
             layer = te.Linear(64, 64, bias=False, params_dtype=torch.bfloat16, device="cuda")
         # Not registered at attach time, so the weight is converted but not pooled.
         gtp_module.attach_gtp_to_presharded_module(layer, group, 0)
@@ -996,7 +1004,8 @@ class TestConvertedQuantizedWeightMove:
         try:
             gtp_module._move_weight_to_symm_pool(w, group)
             assert w.is_in_symm_pool
-            for t in (w._rowwise_data, w._rowwise_scale_inv, w._columnwise_data):
+            for name in buffers:
+                t = getattr(w, name)
                 assert t is None or _in_pool(t, group)
             assert torch.equal(gtp_module.dequantize_gtp_native_fp8(w), before)
             del w, layer, before

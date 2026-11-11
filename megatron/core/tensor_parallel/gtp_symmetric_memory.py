@@ -42,12 +42,10 @@ logger = logging.getLogger(__name__)
 # One MemPool per GTP/EGTP group, created once.
 _pools: typing.Dict[str, torch.cuda.MemPool] = {}
 
-# Groups whose pool registration is live. Maps name -> group (not a set) because
-# teardown needs the group object to deregister.
-_registered: typing.Dict[str, typing.Any] = {}
-
-# Group name -> the collectives ({"ag", "rs"}) that route their buffers into its pool.
-_enabled_collectives: typing.Dict[str, frozenset] = {}
+# Groups whose pool registration is live: name -> (group, collectives). Keeps the group
+# object because teardown needs it to deregister; collectives is the subset of
+# {"ag", "rs"} that route their buffers into the pool.
+_registered: typing.Dict[str, typing.Tuple[typing.Any, frozenset]] = {}
 
 # Pools owned elsewhere, registered on a GTP group: (pool, group name) -> group.
 _registered_ext_pools: typing.Dict[typing.Tuple[torch.cuda.MemPool, str], typing.Any] = {}
@@ -118,12 +116,13 @@ def register_gtp_symm_pool(
             "be symmetric)."
         )
     pool = _get_gtp_symm_pool(group)
-    if group.group_name in _registered:
-        _enabled_collectives[group.group_name] |= collectives
+    name = group.group_name
+    if name in _registered:
+        registered_group, enabled = _registered[name]
+        _registered[name] = (registered_group, enabled | collectives)
         return pool
     _register_pool(pool, group, "GTP cache")
-    _registered[group.group_name] = group
-    _enabled_collectives[group.group_name] = collectives
+    _registered[name] = (group, collectives)
     return pool
 
 
@@ -148,7 +147,7 @@ def uses_gtp_symm_pool(group: dist.ProcessGroup | None, collective: str) -> bool
     registered."""
     if group is None or group.size() <= 1 or group.group_name not in _registered:
         return False
-    return collective in _enabled_collectives[group.group_name]
+    return collective in _registered[group.group_name][1]
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +300,7 @@ def deregister_and_clear_gtp_symm_pools() -> None:
     # Deregister while the recycled send buffers are still alive. Their memory keeps
     # the pool non-empty, so deregister_mem_pool (which skips empty pools) always runs.
     for name in sorted(_registered):
-        vmm_symm_allocator.deregister_mem_pool(_pools[name], _registered[name])
+        vmm_symm_allocator.deregister_mem_pool(_pools[name], _registered[name][0])
     for (pool, _), group in _registered_ext_pools.items():
         vmm_symm_allocator.deregister_mem_pool(pool, group)
     # Only now drop the buffers and the pools; the windows are gone, so the memory
@@ -309,5 +308,4 @@ def deregister_and_clear_gtp_symm_pools() -> None:
     symmetric_wgrad_pool.clear()
     _registered_ext_pools.clear()
     _registered.clear()
-    _enabled_collectives.clear()
     _pools.clear()

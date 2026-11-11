@@ -967,10 +967,7 @@ def _move_weight_to_symm_pool(param, gtp_remat_group):
             # restore the quantizer's usage afterwards (the optimizer's quantize_
             # updates rely on it).
             saved_usage = (quantizer.rowwise_usage, quantizer.columnwise_usage)
-            quantizer.set_usage(
-                rowwise=param._rowwise_data is not None,
-                columnwise=param._columnwise_data is not None,
-            )
+            quantizer.set_usage(**param.get_usages())
             try:
                 with gtp_symm_pool_ctx(gtp_remat_group):
                     pooled = quantizer.make_empty(
