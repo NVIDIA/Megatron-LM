@@ -4,8 +4,8 @@
 
 A corpus source is generic, like the files it is derived from: complete, unweighted and
 unsplit. Weights, train/validation choices and repetition belong to blends of sources.
-A corpus dump is an ordinary V3 dump with three restrictions, so it reuses the saver,
-files, parallel range jobs and resume unchanged:
+A corpus dump captures ordinary V3 records, with independent parts published by a
+consolidated chunk index:
 
 - one unweighted source (one ``--data-path`` prefix or SFT file), written under
   ``<corpus>/<source>/``;
@@ -13,11 +13,11 @@ files, parallel range jobs and resume unchanged:
   ``--split`` partition;
 - a seeded permutation, so every block is a random sample of the source.
 
-The epoch is padded to a whole number of global batches by repeating its first
-(permuted) samples; global positions at or beyond ``num_samples`` are filler, written
-but never part of the corpus.
+The epoch is padded to whole global batches for execution. The corpus saver removes
+filler samples before writing. Its progress tracker controls resume and replacement.
 """
 
+import json
 import os
 from typing import Any, Callable
 
@@ -25,8 +25,185 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
+from .format.arrow import file_meta
+from .format.contract import blend_contract, mismatched_corpus_order, mismatched_settings
+from .format.corpus import CorpusInventory, check_chunk
+from .v3_storage import Storage
+
 # Placeholder budget until the epoch length is known (set once the dataset is built).
 _UNTIL_EPOCH_END = 1 << 40
+_INVENTORY = None
+_TRACKER_PRESENT = False
+
+
+def corpus_inventory() -> CorpusInventory:
+    """Return the producer snapshot established collectively during checkpoint load."""
+    if _INVENTORY is None:
+        raise RuntimeError("Corpus inventory was not initialized during checkpoint restoration")
+    return _INVENTORY
+
+
+def reset_corpus_runtime() -> None:
+    """Discard cached producer state on an in-process restart."""
+    global _INVENTORY, _TRACKER_PRESENT
+    _INVENTORY, _TRACKER_PRESENT = None, False
+
+
+def producer_settings(args: Any, writers: int) -> dict:
+    """Megatron-only invariants for retrying an existing source's work assignment."""
+    return {
+        "name": "megatron",
+        "global_batch_size": args.global_batch_size,
+        "writers": writers,
+        "writer_mbs": args.micro_batch_size,
+        "save_interval": args.save_interval,
+    }
+
+
+def resume_corpus_iteration(args: Any) -> int:
+    """Use the output tracker as the authoritative cursor, without deleting data yet."""
+    from megatron.core import parallel_state as mpu
+
+    from .v3_runtime import dump_range
+
+    global _INVENTORY, _TRACKER_PRESENT
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    result = [None]
+    if rank == 0:
+        try:
+            inventory = CorpusInventory(Storage(args.logits_save_dir))
+            start, end = dump_range(args)
+            start = start or 0
+            settings = producer_settings(args, mpu.get_data_parallel_world_size())
+            spans = []
+            for directory, chunk in sorted(inventory.chunks.items()):
+                producer = chunk.get("producer", {})
+                if any(producer.get(key) != value for key, value in settings.items()):
+                    raise ValueError("Corpus producer settings changed; use a new source directory")
+                a, b = producer["start_iteration"], producer["end_iteration"]
+                if directory != f"chunk-{a:012d}" or not 0 <= a < b:
+                    raise ValueError("Invalid Megatron corpus chunk interval")
+                total = inventory.metadata["contract"]["num_samples"]
+                rows = sum(
+                    block["rows"] for part in chunk["parts"] for block in part["index"]["blocks"]
+                )
+                gbs = args.global_batch_size
+                if rows != min(total, b * gbs) - min(total, a * gbs):
+                    raise ValueError("Corpus chunk has the wrong number of real source rows")
+                spans.append((a, b))
+            previous = 0
+            for a, b in sorted(spans):
+                if a < previous:
+                    raise ValueError("Overlapping Megatron corpus chunks")
+                if a < start < b or a < end < b:
+                    raise ValueError("A corpus chunk crosses this job's assigned range boundary")
+                previous = b
+            try:
+                raw = Storage(args.save).read("latest_checkpointed_iteration.txt").decode().strip()
+            except FileNotFoundError:
+                raw = None
+            cursor = int(raw) if raw is not None else start
+            if not start <= cursor <= end:
+                raise ValueError(
+                    f"Corpus tracker {cursor} is outside this job's range {start}-{end}"
+                )
+            owned = [
+                path
+                for path in inventory.snapshot["objects"]
+                if start <= int(os.path.dirname(path).removeprefix("chunk-")) < end
+            ]
+            if raw is None and owned:
+                raise ValueError(
+                    "Existing corpus chunks have no progress tracker; create "
+                    "latest_checkpointed_iteration.txt in --save at the intended resume iteration"
+                )
+            covered = start
+            for a, b in sorted(spans):
+                if a == covered and b <= cursor:
+                    covered = b
+            if covered != cursor:
+                raise ValueError("Corpus tracker skips missing work or lies inside a chunk")
+            result[0] = {
+                "iteration": cursor,
+                "present": raw is not None,
+                "snapshot": inventory.snapshot,
+            }
+        except Exception as error:
+            result[0] = {"error": f"{type(error).__name__}: {error}"}
+    if dist.is_initialized():
+        dist.broadcast_object_list(result, src=0)
+    if "error" in result[0]:
+        raise RuntimeError(result[0]["error"])
+    _INVENTORY = CorpusInventory(Storage(args.logits_save_dir), result[0]["snapshot"])
+    _TRACKER_PRESENT = result[0]["present"]
+    return result[0]["iteration"]
+
+
+def initialize_corpus_metadata(saver: Any, expected: dict) -> dict:
+    """Validate the source, then unpublish only this job's selected replacement tail."""
+    from megatron.training import get_args
+
+    from .utils import _broadcast_without_pp
+    from .v3_runtime import _report_recorded_differences, dump_range
+
+    args = get_args()
+
+    def initialize() -> dict:
+        try:
+            inventory = corpus_inventory()
+            recorded_differences = set()
+            for chunk in inventory.chunks.values():
+                for part in chunk["parts"]:
+                    meta = file_meta(part["index"])
+                    differing, recorded = mismatched_settings(meta, expected)
+                    recorded_differences.update(recorded)
+                    differing += mismatched_corpus_order(meta, expected)
+                    if differing:
+                        raise ValueError(f"Corpus source settings changed: {', '.join(differing)}")
+            # Preserve the existing cross-source tokenizer check. This listing is
+            # performed once on initialization, never during flush or student reads.
+            root = Storage(args.kd_corpus_root)
+            seen = {args.kd_corpus_dump}
+            for path in root.list("*/chunk-*/index.json"):
+                source = path.split("/", 1)[0]
+                if source in seen:
+                    continue
+                seen.add(source)
+                chunk = json.loads(root.read(path))
+                meta = check_chunk(chunk)
+                if (
+                    blend_contract(meta["contract"])["tokenizer"]
+                    != expected["contract"]["tokenizer"]
+                ):
+                    raise ValueError(f"Corpus source {source} uses a different tokenizer")
+                if meta.get("recorded", {}).get("teacher") != expected["recorded"]["teacher"]:
+                    recorded_differences.add("teacher")
+            _, end = dump_range(args)
+            cursor = args.consumed_train_samples // args.global_batch_size
+            if not 0 <= cursor <= min(end, args.train_iters):
+                raise ValueError("Corpus tracker lies beyond the source epoch")
+            # Establish the initial tracker before uploads, so an interrupted first
+            # launch is distinguishable from a missing tracker on an existing source.
+            if not _TRACKER_PRESENT:
+                Storage(args.save).write("latest_checkpointed_iteration.txt", str(cursor).encode())
+            directories = {
+                os.path.dirname(path)
+                for path in inventory.snapshot["objects"]
+                if cursor <= int(os.path.dirname(path).removeprefix("chunk-")) < end
+            }
+            inventory.invalidate(directories)
+            return {
+                "metadata": {**expected, "published_through": args.consumed_train_samples},
+                "differing": sorted(recorded_differences),
+            }
+        except Exception as error:
+            return {"error": f"{type(error).__name__}: {error}"}
+
+    result = _broadcast_without_pp(initialize)
+    if "error" in result:
+        raise RuntimeError(result["error"])
+    _report_recorded_differences(result["differing"], "corpus sources and dump job")
+    return result["metadata"]
 
 
 def validate_corpus_dump(args: Any) -> None:
@@ -40,6 +217,8 @@ def validate_corpus_dump(args: Any) -> None:
         raise ValueError(f"--kd-corpus-dump source name {name!r} must be a plain directory name")
     if not getattr(args, "freeze_all_layers", False):
         raise ValueError("Corpus dumps require a frozen teacher (--freeze-all-layers)")
+    if getattr(args, "rampup_batch_size", None):
+        raise ValueError("Corpus dumping requires a fixed global batch size")
     paths = getattr(args, "data_path", None) or []
     if not getattr(args, "mock_data", False) and len(paths) != 1:
         raise ValueError(

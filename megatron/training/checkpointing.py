@@ -1433,23 +1433,44 @@ def save_checkpoint(
 
                 def progress_finalize_fn():
                     tracker_filename = get_checkpoint_tracker_filename(save_root)
-                    with maybe_msc.open(tracker_filename, 'w') as f:
-                        f.write(str(iteration))
-                    print(f"  recorded logits-dump progress: iteration "
-                          f"{iteration} to {tracker_filename}", flush=True)
+                    if getattr(args, 'kd_corpus_dump', None):
+                        from megatron.training.distillation.v3_storage import Storage
+
+                        Storage(save_root).write(
+                            'latest_checkpointed_iteration.txt', str(iteration).encode()
+                        )
+                    else:
+                        with maybe_msc.open(tracker_filename, 'w') as f:
+                            f.write(str(iteration))
+                    print(
+                        f"  recorded logits-dump progress: iteration "
+                        f"{iteration} to {tracker_filename}",
+                        flush=True,
+                    )
 
                 logits_finalize_fns.append(progress_finalize_fn)
-            async_logits_request = AsyncRequest(
+            async_request_cls = AsyncRequest
+            logits_async_args = logits_saver.take_pending_data()
+            if getattr(args, 'kd_corpus_dump', None):
+                logits_finalize_fns.insert(0, logits_saver.flush_finalize_fn(iteration))
+            async_logits_request = async_request_cls(
                 async_fn=logits_saver._write_batched_tar,
-                async_fn_args=logits_saver.take_pending_data(),
+                async_fn_args=logits_async_args,
                 finalize_fns=logits_finalize_fns,
+            )
+        elif getattr(args, 'kd_corpus_dump', None):
+            # Only the last PP stage owns a saver, but async queue completion is
+            # collective across WORLD. Match its request on every other stage.
+            async_request_cls = get_async_strategy(args.async_strategy)[1]['AsyncRequest']
+            async_logits_request = async_request_cls(
+                async_fn=None, async_fn_args=(), finalize_fns=[]
             )
 
         if on_saved is not None and async_save_request is not None:
             async_save_request.add_finalize_fn(on_saved)
         if async_save_request is not None:
             schedule_async_save(async_save_request)
-        if logits_saver is not None:
+        if logits_saver is not None or getattr(args, 'kd_corpus_dump', None):
             schedule_async_save(async_logits_request)
         print_rank_0(
             f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] scheduled '
@@ -2914,8 +2935,8 @@ def load_checkpoint(
         # those; --freeze-all-layers alone would still load the scheduler and assert on arg drift).
         finetune = True
         if getattr(args, 'logits_save_inputs', False):
-            # Offline KD v3: resume from what this job's range has actually published, not
-            # from the tracker, which can run ahead of a failed or interrupted flush.
+            # Replay resumes from published ranges. Corpus production instead honors
+            # its output tracker, regenerating any previously published tail after it.
             from megatron.training.distillation.v3_runtime import frozen_resume_iteration
 
             override_ckpt_iteration = frozen_resume_iteration(args)

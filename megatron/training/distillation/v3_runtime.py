@@ -9,7 +9,6 @@ from typing import Any, Callable
 import torch
 import torch.distributed as dist
 
-from .format.contract import blend_contract, mismatched_corpus_order
 from .v3_format import (
     FORMAT_VERSION,
     attention_mode_for_layout,
@@ -34,7 +33,6 @@ from .v3_storage import (
     discard_unpublished,
     has_legacy_tars,
     list_published,
-    parse_name,
     read_meta,
 )
 
@@ -222,15 +220,19 @@ def _published_end(storage: Storage, dp_size: int, start: int, end: int) -> int:
 
 
 def frozen_resume_iteration(args: Any) -> int:
-    """Return the iteration a frozen v3 teacher resumes from: its range's published end.
+    """Resume corpus production from its tracker, or replay dumping from publication.
 
-    The cache, not the progress tracker, is the source of truth, so a resubmitted
+    For replay dumps the cache, not the progress tracker, is the source of truth: a resubmitted
     parallel job (unchanged ``--override-ckpt-iteration``) continues inside its own
     range, and periodic ``--exit-interval`` requeues of a single writer advance.
     """
     if not hasattr(args, "logits_save_range_start"):
         # Record the user's range start once; load_checkpoint then replaces the override.
         args.logits_save_range_start = args.override_ckpt_iteration
+    if getattr(args, "kd_corpus_dump", None):
+        from .corpus_runtime import resume_corpus_iteration
+
+        return resume_corpus_iteration(args)
     start_iteration, end_iteration = dump_range(args)
     gbs = args.global_batch_size
 
@@ -333,6 +335,8 @@ def _dump_settings(saver: Any) -> dict[str, Any]:
         # A corpus source's extent is part of its contract: it defines completeness.
         settings["recorded"].pop("train_samples")
         settings["contract"]["num_samples"] = args.kd_corpus_samples
+        settings["contract"].pop("writers")
+        settings["contract"].pop("writer_mbs")
         settings["recorded"].pop("split")  # A corpus source is never split.
         # A basename is useful provenance for replay, but insufficient to identify a
         # corpus source when appending another job's part of the same epoch.
@@ -357,29 +361,6 @@ def _report_recorded_differences(differing: list[str], where: str) -> None:
         )
 
 
-def _check_corpus_sources(root: str, own: str, expected: dict) -> list[str]:
-    """Compare this source with one published file of every other source in the corpus.
-
-    All sources of a corpus must share a tokenizer; other differences (for example the
-    teacher) are returned for reporting.
-    """
-    storage = Storage(root)
-    seen, differing = set(), set()
-    for name in storage.list("*/dp*__*.index.json"):
-        folder = os.path.dirname(name)
-        if folder == own or folder in seen:
-            continue
-        seen.add(folder)
-        meta = read_meta(Storage(os.path.join(root, folder)), parse_name(os.path.basename(name)))
-        if (
-            blend_contract(meta["contract"])["tokenizer"]
-            != blend_contract(expected["contract"])["tokenizer"]
-        ):
-            raise ValueError(f"Corpus source {folder} uses a different tokenizer")
-        differing.update(mismatched_settings(meta, expected)[1])
-    return sorted(differing & {"teacher"})
-
-
 def initialize_dump_metadata(saver: Any) -> dict:
     """Check this dump job against the cache and find where it resumes, collectively."""
     from megatron.training import get_args
@@ -388,6 +369,10 @@ def initialize_dump_metadata(saver: Any) -> dict:
 
     args = get_args()
     expected = _dump_settings(saver)
+    if getattr(args, "kd_corpus_dump", None):
+        from .corpus_runtime import initialize_corpus_metadata
+
+        return initialize_corpus_metadata(saver, expected)
     gbs = args.global_batch_size
     frozen = bool(getattr(args, "freeze_all_layers", False))
 
@@ -399,13 +384,9 @@ def initialize_dump_metadata(saver: Any) -> dict:
             files = list_published(storage)
             first_sample = 0 if frozen else args.consumed_train_samples
             differing = []
-            root = getattr(args, "kd_corpus_root", None)
-            if root is not None:
-                own = os.path.relpath(saver.save_dir, root)
-                differing += _check_corpus_sources(root, own, expected)
             if files:
                 existing = read_meta(storage, files[0])
-                validate_metadata(existing, corpus=root is not None)
+                validate_metadata(existing)
                 first_sample = existing["contract"]["first_sample"]
                 required, recorded = mismatched_settings(
                     existing,
@@ -414,8 +395,6 @@ def initialize_dump_metadata(saver: Any) -> dict:
                         "contract": {**expected["contract"], "first_sample": first_sample},
                     },
                 )
-                if root is not None:
-                    required += mismatched_corpus_order(existing, expected)
                 if required:
                     raise ValueError(
                         f"Teacher settings differ from existing v3 files ({', '.join(required)}); "
@@ -962,12 +941,18 @@ def finish_dump() -> None:
     if saver is None or not hasattr(saver, "commit_attempt"):
         return
     saver.initialize()
+    if hasattr(saver, "finish"):
+        saver.finish()
+        return
     saver._write_batched_tar(*saver.take_pending_data())
 
 
 def reset_runtime() -> None:
     """Clear replay state when Megatron is torn down or restarted in-process."""
     global _PLAN, _HYBRID_LAYOUT, _PENDING_TARGETS, _STAGED_TARGETS
+    from .corpus_runtime import reset_corpus_runtime
+
+    reset_corpus_runtime()
     _PENDING_TARGETS = _STAGED_TARGETS = None
     if _PLAN is not None:
         for reader in _PLAN.get("readers", []):

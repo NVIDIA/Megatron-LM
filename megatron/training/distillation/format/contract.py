@@ -56,8 +56,8 @@ def validate_metadata(meta: dict[str, Any], *, replay: bool = True, corpus: bool
     """Reject metadata a reader cannot interpret.
 
     ``meta`` holds ``format_version``, the required settings under ``contract``, and
-    optional ``recorded`` and ``provenance`` dictionaries. A blend manifest carries the
-    shared settings only (``replay=False``), not a writer layout.
+    optional ``recorded`` and ``provenance`` dictionaries. Corpus files and blend
+    manifests use ``replay=False``: neither requires a teacher writer layout.
     """
     if meta.get("format_version") != FORMAT_VERSION:
         raise ValueError(f"Expected offline KD format version {FORMAT_VERSION} metadata")

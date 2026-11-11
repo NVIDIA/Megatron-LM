@@ -147,12 +147,15 @@ class PairedLogitsSaver(LogitsSaverHooks):
         if self.cp_rank == 0:
             args = get_args()
             contract = self.metadata_dict["contract"]
-            # Store the padding-free record, with target rows only where loss is applied.
-            inputs, values, indices, tail = finalize_record(
+            joined = self._prepare_record(
                 join_inputs(batches),
                 torch.cat(all_values),
                 torch.cat(all_indices),
                 torch.cat(all_tails),
+            )
+            # Store the padding-free record, with target rows only where loss is applied.
+            inputs, values, indices, tail = finalize_record(
+                *joined,
                 isolated=contract["attention_mode"] == "isolated_segments",
                 eod_id=(
                     get_tokenizer().eod
@@ -170,6 +173,10 @@ class PairedLogitsSaver(LogitsSaverHooks):
                 ),
             }
         self._captured.clear()
+
+    def _prepare_record(self, inputs: dict, *targets: torch.Tensor) -> tuple:
+        """Keep all replay samples; corpus writers remove batch fillers here."""
+        return inputs, *targets
 
     def commit_attempt(self) -> None:
         """Commit only the final selected execution, before checkpoint flushing."""

@@ -115,6 +115,10 @@ def build_logits_saver(args: Any) -> "LogitsSaverHooks":
         from .v3_saver import PairedLogitsSaver
 
         saver_class = PairedLogitsSaver
+        if getattr(args, "kd_corpus_dump", None):
+            from .corpus_saver import CorpusLogitsSaver
+
+            saver_class = CorpusLogitsSaver
     return saver_class(
         save_dir=args.logits_save_dir,
         k=args.logits_save_top_k,

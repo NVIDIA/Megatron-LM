@@ -1194,6 +1194,7 @@ def runtime_environment(monkeypatch):
     monkeypatch.setitem(sys.modules, utils.__name__, utils)
     runtime = importlib.import_module(f"{_namespace}.v3_runtime")
     runtime._PLAN = None
+    importlib.import_module(f"{_namespace}.corpus_runtime").reset_corpus_runtime()
     yield args, runtime, legacy_saver
     if runtime._PLAN is not None:
         for live in runtime._PLAN["readers"]:
@@ -1272,6 +1273,7 @@ def corpus_args(args, tmp_path, name="web"):
     dump_args(args)
     args.logits_save_dir = str(tmp_path)
     args.kd_corpus_dump = name
+    args.save = str(tmp_path / "progress" / name)
     args.data_path, args.mock_data, args.eval_iters, args.train_samples = (
         ["web_text"],
         False,
@@ -1353,11 +1355,10 @@ def test_corpus_metadata_requires_the_epoch_size(tmp_path, runtime_environment):
     metadata = runtime._dump_settings(teacher_saver(runtime, tmp_path))
     assert metadata["contract"]["num_samples"] == 20 and "train_samples" not in metadata["recorded"]
     assert "split" not in metadata["recorded"]
-    metadata["contract"]["first_sample"] = 0
-    codec.validate_metadata(metadata, corpus=True)
+    codec.validate_metadata(metadata, replay=False, corpus=True)
     del metadata["contract"]["num_samples"]
     with pytest.raises(ValueError, match="num_samples"):
-        codec.validate_metadata(metadata, corpus=True)
+        codec.validate_metadata(metadata, replay=False, corpus=True)
 
 
 def test_corpus_sources_must_share_a_tokenizer(tmp_path, runtime_environment, capsys):
@@ -1366,16 +1367,16 @@ def test_corpus_sources_must_share_a_tokenizer(tmp_path, runtime_environment, ca
     runtime.validate_options(args)
     args.kd_corpus_samples = 32
     metadata = runtime._dump_settings(teacher_saver(runtime, tmp_path))
-    metadata["contract"]["first_sample"] = 0
     other = json.loads(json.dumps(metadata))
     other["contract"]["num_samples"] = 64  # Sources differ in size and data, but share a teacher.
     other["recorded"]["teacher"] = "/other@1"
-    write_cache(tmp_path / "web", metadata=other, iterations=2)
+    corpus_source(tmp_path, "web", samples=64, iterations=2, metadata=other)
     saver = teacher_saver(runtime, tmp_path / "code")
+    runtime.frozen_resume_iteration(args)
     runtime.initialize_dump_metadata(saver)
     assert "recorded settings (teacher)" in capsys.readouterr().out
     other["contract"]["tokenizer"] = {**other["contract"]["tokenizer"], "sha256": "different"}
-    write_cache(tmp_path / "math", metadata=other, iterations=2)
+    corpus_source(tmp_path, "math", samples=64, iterations=2, metadata=other)
     with pytest.raises(RuntimeError, match="source math uses a different tokenizer"):
         runtime.initialize_dump_metadata(saver)
 
@@ -1393,17 +1394,56 @@ def test_storage_lists_nested_names_relative_to_its_root(tmp_path):
 blend = importlib.import_module(f"{_namespace}.format.blend")
 
 
-def corpus_source(root, name, *, samples, iterations, base=0, contract=None):
+def corpus_source(root, name, *, samples, iterations, base=0, contract=None, metadata=None):
     """Write a corpus source whose sample ``i`` has tokens (base + i) * 100 + position."""
-    metadata = settings(contract=contract)
-    metadata["recorded"].pop("train_samples")
+    chunks = importlib.import_module(f"{_namespace}.format.corpus")
+    metadata = metadata or settings(contract=contract)
+    metadata["recorded"].pop("train_samples", None)
+    metadata["recorded"].pop("split", None)
+    for key in codec.REPLAY_KEYS:
+        metadata["contract"].pop(key, None)
     metadata["contract"]["num_samples"] = samples  # Required for corpus sources.
-    write_cache(
-        root / name,
-        iterations=iterations,
-        metadata=metadata,
-        source=lambda ids, packed=False: inputs([base + i for i in ids], packed=packed),
-    )
+    storage = Storage(str(root / name))
+    for begin in range(0, iterations, 2):
+        directory = chunks.chunk_path(begin)
+        if storage.exists(f"{directory}/index.json"):
+            continue
+        end = min(begin + 2, iterations)
+        parts = []
+        for rank in range(2):
+            ids = [i for i in range(begin * 8, min(end * 8, samples)) if (i // 2) % 2 == rank]
+            if not ids:
+                continue
+            captured = codec.capture_batch(
+                inputs(
+                    [base + i for i in ids],
+                    packed=metadata["contract"]["attention_mode"] == "isolated_segments",
+                )
+            )
+            batch = arrow.samples_batch(
+                *make_record(captured, metadata["contract"]), vocab_size=len(TEST_VOCAB)
+            )
+            data, index = arrow.write_file([batch], metadata, block_bytes=TEST_BLOCK_BYTES)
+            path = chunks.part_path(rank)
+            storage.write(f"{directory}/{path}", data)
+            parts.append({"path": path, "index": index})
+        chunks.publish_chunk(
+            storage,
+            directory,
+            {
+                "chunk_version": chunks.CHUNK_VERSION,
+                "parts": parts,
+                "producer": {
+                    "name": "megatron",
+                    "start_iteration": begin,
+                    "end_iteration": end,
+                    "global_batch_size": 8,
+                    "writers": 2,
+                    "writer_mbs": 2,
+                    "save_interval": 2,
+                },
+            },
+        )
     return metadata
 
 
@@ -1443,7 +1483,7 @@ def test_blend_upsamples_with_whole_passes(tmp_path):
 def test_blend_excludes_filler_and_refuses_incomplete_sources(tmp_path):
     corpus_source(tmp_path, "web", samples=13, iterations=2)  # 16 positions, 3 filler.
     corpus_source(tmp_path, "math", samples=32, iterations=2, base=500)  # Half dumped.
-    with pytest.raises(ValueError, match="math covers samples 0-16 of 32; finish its dump"):
+    with pytest.raises(ValueError, match="math covers 16 of 32 samples; finish its dump"):
         blend.plan(blend_config(tmp_path), budget=8)
     corpus_source(tmp_path, "math", samples=32, iterations=4, base=500)  # Dump finished.
     manifest = blend.plan(blend_config(tmp_path), budget=8)
@@ -1495,15 +1535,15 @@ def test_corpus_reader_only_opens_the_lanes_of_its_rank(tmp_path):
         live.close()
 
 
-def test_corpus_reader_rejects_files_changed_since_planning(tmp_path):
+def test_corpus_reader_rejects_invalid_cached_indexes(tmp_path):
     two_sources(tmp_path)
     manifest = blend.plan(blend_config(tmp_path), budget=40)
-    manifest["files"][0]["size"] += 1
+    manifest["files"][0]["index"]["index_version"] = -1
     live = replay.CorpusReader(str(tmp_path), manifest)
     file_lanes = {int(lane) for lane, file_id, *_ in manifest["segments"] if file_id == 0}
     lane = min(file_lanes)
     try:
-        with pytest.raises(ValueError, match="changed since the blend was planned"):
+        with pytest.raises(ValueError, match="Unsupported offline KD index version"):
             live.samples(list(range(lane, 40, 4)), 40)
     finally:
         live.close()

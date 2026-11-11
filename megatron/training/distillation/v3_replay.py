@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from .format.arrow import block_range, check_index, decode_block, file_meta, read_block
+from .format.blend import MANIFEST_VERSION
 from .format.contract import blend_contract
 from .v3_format import LOGPROB_SENTINEL, TOKEN_FIELDS, mismatched_settings, validate_metadata
 from .v3_storage import FileName, Storage, list_published, read_index, validate_published_ranges
@@ -482,6 +483,8 @@ class CorpusReader(_BlockReader):
         prefetch_depth: int = 2,
         vocab_size: int | None = None,
     ):
+        if manifest.get("manifest_version") != MANIFEST_VERSION:
+            raise ValueError("Unsupported offline KD corpus manifest version")
         super().__init__(
             manifest["contract"],
             targets=targets,
@@ -503,35 +506,32 @@ class CorpusReader(_BlockReader):
         self.indexes: dict[int, dict] = {}
         self.index_lock = threading.Lock()
 
-    def _file(self, file_id: int) -> tuple[Storage, FileName, dict]:
+    def _file(self, file_id: int) -> tuple[Storage, str, dict]:
         entry = self.manifest["files"][file_id]
-        storage = self.storages.setdefault(
-            entry["folder"], Storage(os.path.join(self.root, entry["folder"]))
-        )
-        return storage, FileName(entry["dp_rank"], entry["start"], entry["end"]), entry
+        storage = self.storages.get(entry["folder"])
+        if storage is None:
+            storage = self.storages[entry["folder"]] = Storage(
+                os.path.join(self.root, entry["folder"])
+            )
+        return storage, entry["path"], entry
 
     def index(self, file_id: int) -> dict:
-        """Load (once) and check a planned file's index against the manifest."""
+        """Validate the supplied index once, without a second GET or HEAD request."""
         with self.index_lock:
             cached = self.indexes.get(file_id)
         if cached is not None:
             return cached
-        storage, name, entry = self._file(file_id)
-        index = read_index(storage, name)
-        if index.get("size") != entry["size"]:
-            raise ValueError(
-                f"Offline KD corpus file {entry['folder']}/{name.data} changed since the blend "
-                "was planned"
-            )
-        check_index(index, storage.size(name.data))
+        _, path, entry = self._file(file_id)
+        index = entry["index"]
+        check_index(index)
         metadata = file_meta(index)
-        validate_metadata(metadata, corpus=True)
+        validate_metadata(metadata, replay=False, corpus=True)
         contract = metadata["contract"]
         shared = blend_contract(contract)
         differing = [key for key in self.contract if shared.get(key) != self.contract[key]]
         if differing:
             raise ValueError(
-                f"Offline KD corpus file {entry['folder']}/{name.data} differs from the blend on "
+                f"Offline KD corpus file {entry['folder']}/{path} differs from the blend on "
                 f"{', '.join(differing)}"
             )
         with self.index_lock:
@@ -546,9 +546,9 @@ class CorpusReader(_BlockReader):
                     if stopped.is_set():
                         return
                     file_id, block = (int(v) for v in self.pieces[lane][piece][1:3])
-                    storage, name, entry = self._file(file_id)
-                    label = f"{entry['folder']}/{name.data}"
-                    yield (piece,), (storage, name.data, self.index(file_id), block, label)
+                    storage, path, entry = self._file(file_id)
+                    label = f"{entry['folder']}/{path}"
+                    yield (piece,), (storage, path, self.index(file_id), block, label)
 
             stream = self.lanes[lane] = _Lane(self, f"lane{lane}", items)
         return stream

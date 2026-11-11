@@ -152,7 +152,7 @@ class Storage:
             with self.open(name, "wb") as stream:
                 stream.write(data)
             return
-        os.makedirs(self.root, exist_ok=True)
+        os.makedirs(os.path.dirname(self.path(name)), exist_ok=True)
         staged = f"{name}.{uuid.uuid4().hex}.tmp"
         with self.open(staged, "wb") as stream:
             stream.write(data)

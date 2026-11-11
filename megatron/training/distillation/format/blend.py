@@ -24,23 +24,11 @@ from typing import Any
 
 import numpy as np
 
-from ..v3_storage import (
-    FileName,
-    Storage,
-    contiguous_end,
-    list_published,
-    read_index,
-    validate_published_ranges,
-)
-from .arrow import check_index, file_meta
-from .contract import (
-    blend_contract,
-    mismatched_corpus_order,
-    mismatched_settings,
-    validate_metadata,
-)
+from ..v3_storage import Storage
+from .contract import blend_contract
+from .corpus import CorpusInventory
 
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 DEFAULTS = {"seed": 1234, "lanes": 64}
 
 
@@ -57,67 +45,25 @@ def load_config(path: str) -> dict[str, Any]:
     return config
 
 
-def _source_rows(storage: Storage, name: str) -> tuple[dict, list, list, list]:
-    """Return a source's settings, files, file sizes, and pieces of real (non-filler) rows."""
-    files = list_published(storage)
-    if not files:
-        raise ValueError(f"Corpus source {name} has no published files")
-    indexes = []
-    meta = None
-    for file in files:
-        index = read_index(storage, file)
-        check_index(index)
-        file_settings = file_meta(index)
-        validate_metadata(file_settings, corpus=True)
-        if meta is None:
-            meta = file_settings
-        else:
-            differing = mismatched_settings(file_settings, meta)[0] + mismatched_corpus_order(
-                file_settings, meta
-            )
-            if differing:
-                raise ValueError(
-                    f"Corpus source {name} mixes files written with different settings ({', '.join(differing)})"
-                )
-        indexes.append(index)
-    contract = meta["contract"]
-    writers, mbs, total = contract["writers"], contract["writer_mbs"], contract["num_samples"]
-    if contract["first_sample"] != 0:
-        raise ValueError(f"Corpus source {name} must start at sample zero")
-    ranges = validate_published_ranges(files, writers, mbs)
-    covered = contiguous_end(ranges, 0)
-    if covered < total:
+def _source_rows(storage: Storage, name: str) -> tuple[dict, list, list]:
+    """Read one immutable inventory and plan all real rows without teacher layout."""
+    inventory = CorpusInventory(storage)
+    if inventory.metadata is None:
+        raise ValueError(f"Corpus source {name} has no published chunks")
+    files = inventory.parts()
+    pieces = [
+        (file_id, block, 0, entry["rows"], entry["supervised"])
+        for file_id, file in enumerate(files)
+        for block, entry in enumerate(file["index"]["blocks"])
+    ]
+    available = sum(b - a for _, _, a, b, _ in pieces)
+    total = inventory.metadata["contract"]["num_samples"]
+    if available != total:
         raise ValueError(
-            f"Corpus source {name} covers samples 0-{covered} of {total}; finish its dump first"
+            f"Corpus source {name} covers {available} of {total} samples; finish its dump first "
+            "and check for duplicate chunks"
         )
-    limit = total
-    complete = set(ranges)
-    pieces = []  # (file id, block, first row, end row, supervised rows)
-    for file_id, (file, index) in enumerate(zip(files, indexes)):
-        expected_rows = (file.end - file.start) // writers
-        cursor = 0
-        for entry in index["blocks"]:
-            if entry["first_row"] != cursor or entry["rows"] <= 0:
-                raise ValueError(f"Corpus source {name} file {file.index} has invalid block rows")
-            cursor += entry["rows"]
-        if cursor != expected_rows:
-            raise ValueError(f"Corpus source {name} file {file.index} has wrong rows for its range")
-        if file.start >= limit or (file.start, file.end) not in complete:
-            continue
-        for block, entry in enumerate(index["blocks"]):
-            rows = np.arange(entry["first_row"], entry["first_row"] + entry["rows"])
-            # The writer layout maps each row of this writer's file back to its sample.
-            samples = file.start + (rows // mbs) * mbs * writers + file.dp_rank * mbs + rows % mbs
-            real = samples < limit
-            if not real.any():
-                continue
-            edges = np.flatnonzero(np.diff(np.concatenate(([0], real.astype(np.int8), [0]))))
-            per_row = entry["supervised"] / entry["rows"]
-            for a, b in zip(edges[0::2], edges[1::2]):
-                pieces.append((file_id, block, int(a), int(b), per_row * (b - a)))
-    if not pieces:
-        raise ValueError(f"Corpus source {name} has no samples to blend")
-    return meta, files, [index["size"] for index in indexes], pieces
+    return inventory.metadata, files, pieces
 
 
 def _seed(*parts: Any) -> int:
@@ -161,7 +107,7 @@ def plan(config: dict[str, Any], *, budget: int) -> dict[str, Any]:
     for name in sorted(weights):
         folder = name
         storage = Storage(os.path.join(root, folder))
-        meta, source_files, sizes, pieces = _source_rows(storage, name)
+        meta, source_files, pieces = _source_rows(storage, name)
         shared = blend_contract(meta["contract"])
         if reference is None:
             reference = shared
@@ -169,10 +115,7 @@ def plan(config: dict[str, Any], *, budget: int) -> dict[str, Any]:
         if differing:
             raise ValueError(f"Corpus source {name} differs on {', '.join(differing)}")
         offset = len(files)
-        files += [
-            {"folder": folder, "dp_rank": f.dp_rank, "start": f.start, "end": f.end, "size": size}
-            for f, size in zip(source_files, sizes)
-        ]
+        files += [{"folder": folder, **file} for file in source_files]
         chosen, passes = _select(pieces, targets[name], seed, name)
         # Spread each source evenly along the stream: sort by position within its source.
         rng = np.random.RandomState(_seed(seed, name, "spread") % (1 << 32))
@@ -247,4 +190,4 @@ def describe(manifest: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-__all__ = ["FileName", "describe", "load_config", "manifest_hash", "plan"]
+__all__ = ["describe", "load_config", "manifest_hash", "plan"]

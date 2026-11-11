@@ -34,7 +34,7 @@ A frozen teacher must score deterministically: it still runs in train mode, so s
 `--hidden-dropout 0 --attention-dropout 0` (both default to 0.1); MoE input jitter and
 token dropping (`--moe-expert-capacity-factor`, `--moe-token-dropping`) are rejected too.
 
-A frozen teacher resumes from what the cache has actually published, not from its
+A frozen replay-dump teacher resumes from what the cache has actually published, not from its
 progress tracker, so a failed or interrupted flush never leaves a resubmitted job past
 its data. Partial flushes beyond that point are deleted on resume.
 
@@ -95,16 +95,40 @@ Each job writes `<corpus>/<source>/` and sizes itself to the source, ignoring
 `--train-iters`. Jobs for
 different sources can run in parallel, and each source can itself be split into parallel
 range jobs as above. Sources of one corpus must share a tokenizer (a job refuses to start
-otherwise); a different teacher is reported, not refused.
+otherwise); a different teacher is reported, not refused. Corpus production requires
+a fixed global batch size and unchanged producer DP, microbatch size and flush interval
+on resume. Student DP and batch sizes are independent of those production settings.
 
 The epoch is padded to a whole number of global batches by repeating its first samples;
-the source's epoch size is recorded as the required `num_samples` setting, and samples at
-or beyond it are filler that corpus readers ignore. A source is complete when its files
-cover `[0, num_samples)` padded to whole batches. Megatron's own dataset builder decides
+the source's epoch size is recorded as the required `num_samples` setting. The saver
+removes filler samples and their targets before serialization. A source is complete
+when the published chunks contain exactly `num_samples` real rows. Megatron's own dataset builder decides
 the samples, so SFT truncation and pretraining windows are exactly as in training.
 The writer first builds the ordinary GPT/SFT dataset and then applies the one-epoch
 wrapper. The dump seed controls both underlying dataset construction and the wrapper's
 permutation; student blend ordering has its own seed.
+
+#### Corpus resume and replacement
+
+The output `--save/latest_checkpointed_iteration.txt` is authoritative for corpus
+production. It is a teacher iteration, not a stored-row offset. A tracker containing
+`128` means resume at iteration 128: preserve earlier chunks, invalidate chunk indexes
+at or after 128 within this job's assigned range, and regenerate that tail. Editing the
+tracker to an earlier chunk boundary therefore requests a redo; existing completed
+chunks do not advance the cursor. An interruption after index publication but before
+tracker publication also regenerates that chunk on restart.
+
+Every parallel range job needs its own `--save` directory. A tracker cannot skip missing
+work, lie inside a chunk, or fall outside the job's range. If the range already contains
+objects but its tracker is missing, create the tracker at the intended resume boundary;
+the job refuses to guess. Fresh jobs create an initial tracker before uploading data.
+Source and producer compatibility checks run before any indexes are invalidated.
+Concurrent writers to the same range are unsupported.
+
+Consumers cache an immutable snapshot. Stop affected students and rebuild their
+loading plans before replacing corpus files. A previously trained student's manifest
+hash may reject the replacement; restarting a reader does not authorize changing its
+checkpoint's pinned schedule. Use another corpus directory if old readers must continue.
 
 ## Loading
 
@@ -154,8 +178,8 @@ tokens:
 
 - Each source contributes whole seeded passes over its blocks, then a seeded subset.
   An allocation larger than the source's epoch repeats it; a smaller allocation selects
-  a subset. Weights are relative proportions, not epoch counts. Filler samples are
-  skipped, and a source whose dump is not finished is refused.
+  a subset. Weights are relative proportions, not epoch counts. Fillers are never
+  stored, and a source whose dump is not finished is refused.
 - Every source is spread evenly along one stream, and the stream is cut into `lanes`
   equal lanes. Global sample `p` is position `p // lanes` of lane `p % lanes`, so the
   schedule does not depend on the student's DP size, and every global batch draws from
@@ -166,7 +190,7 @@ tokens:
   (16 MiB uncompressed each) in flight.
 
 Weights affect the student's consumption only. Every real sample is dumped once,
-regardless of any later blend; final-batch fillers are excluded by `contract.num_samples`.
+regardless of any later blend; the saver excludes final-batch fillers before writing.
 The manifest does not store another `weight` field per source: requested weights remain
 in its copy of the blend configuration.
 
@@ -291,35 +315,47 @@ token offsets. A sample is a GPT window or an SFT dataset row, which may contain
 isolated segments. With two writers, each file for `[0, 51200)` holds 25,600 samples.
 The files share a range name because together they cover that global range.
 
-A corpus root contains one such directory per source. The source directory name comes
+A corpus root contains independent chunks per source. The source directory name comes
 from `--kd-corpus-dump`, and the student blend configuration refers to that name:
 
 ```text
 /data/corpus/                         # teacher --logits-save-dir; blend "corpus"
 ├── web_crawl/                        # --kd-corpus-dump web_crawl
-│   ├── dp0__0-51200.arrow
-│   ├── dp0__0-51200.index.json
-│   ├── dp1__0-51200.arrow
-│   ├── dp1__0-51200.index.json
+│   ├── chunk-000000000000/
+│   │   ├── part-000000.arrow
+│   │   ├── part-000001.arrow
+│   │   └── index.json
+│   ├── chunk-000000000128/
+│   │   ├── part-000000.arrow
+│   │   └── index.json
 │   └── ...
 └── math_sft/                         # --kd-corpus-dump math_sft
-    ├── dp0__0-51200.arrow
-    ├── dp0__0-51200.index.json
-    ├── dp1__0-51200.arrow
-    ├── dp1__0-51200.index.json
+    ├── chunk-000000000000/
+    │   ├── part-000000.arrow
+    │   └── index.json
     └── ...
 
 /data/student-blend.json              # user-authored configuration, outside the dump
-/data/teacher-progress/<job>/         # normal Megatron checkpoints from --save
+/data/teacher-progress/<job>/         # frozen teacher's progress tracker from --save
 /data/student-progress/               # normal student checkpoints from --save
 ```
 
-Each source has its own writer layout and epoch size. Teacher progress checkpoints are
-separate from the Arrow dump: each parallel dump job needs its own progress directory.
+For Megatron the chunk number is its starting teacher iteration, zero-padded to 12
+digits; the second chunk above starts at 128. Numbers need not be consecutive. Parts
+are numbered by the current writer, but consumers use their explicit paths and never
+interpret that ordinal as a DP rank. A final writer with no real rows creates no part.
+Other producers can choose their own `chunk-*` identifiers and relative part paths.
+
+Each source has its own epoch size. Teacher progress is separate from the Arrow dump:
+each parallel dump job needs its own progress directory, containing the tracker rather
+than copies of the frozen weights.
 The student blend JSON is an input configuration, not an automatically generated dump
 file. V3 creates no separate input/target files, `metadata.json`, completion marker, or
 persisted corpus-manifest file. Required settings are embedded in every Arrow file and
 also available through the footer copy in its index.
+
+Corpus parts have no individual `.index.json` sidecars and there is no `commit.json`.
+The chunk's `index.json` consolidates all part indexes and publishes the entire chunk.
 
 ### Arrow files and publication
 
@@ -329,7 +365,7 @@ target columns, grouped into record batches ("blocks") of at most 16 MiB uncompr
 (a larger sample gets a block of its own). PyArrow opens the file directly; V3 adapters
 interpret its sample columns and the settings in schema metadata under `offline_kd`.
 
-The index is written after its data file is complete, so its existence publishes the
+For replay, the index is written after its data file is complete, so its existence publishes the
 range for that writer: local writes are staged and renamed, and remote objects become
 visible only when their upload completes. Discovery only lists index names. A complete
 flush group has an index for every writer rank `0..writers-1`. Missing writers or a gap
@@ -338,16 +374,31 @@ A published range is never replaced; a data file without an index (an interrupte
 ignored and overwritten by a retry. Temporary local writes may leave
 `<filename>.<uuid>.tmp` files after interruption; they are not published files.
 
+For corpus production, all writers upload their independent parts and return index
+descriptors through the worker result channel. After async completion across ranks,
+the publisher checks all writer results, publishes the consolidated chunk index, then
+advances the tracker. The final partial flush uses the same ordering synchronously.
+Parts without a chunk index are not visible to readers and may be overwritten. A redo
+first removes affected indexes; unreferenced old parts may remain and are ignored.
+
+Corpus discovery lists once per source snapshot and reads each chunk index once on
+the planning rank. Cached indexes are shared with readers in the manifest: consuming
+a file does not issue another index GET, size HEAD, or glob. Writers update their own
+inventory after publication without rereading S3. Corpus loading requires a complete
+source and never polls or refreshes its snapshot. The producer also performs one
+startup listing of sibling source indexes for tokenizer compatibility.
+
 ### JSON index
 
-The sidecar is a range-read directory and publication marker. Its footer and block
+The replay sidecar, also embedded as each corpus part's `index`, is a range-read
+directory. Its footer and block
 locations duplicate information obtainable from Arrow so that a reader can start with
 one small index read and then fetch only the blocks it needs.
 
 | Index key | Meaning and purpose |
 | --- | --- |
 | `index_version` | Currently `1`; versions the custom sidecar representation independently of V3 sample semantics. Unsupported versions fail validation. |
-| `size` | Arrow file size in bytes. Supplies the virtual range reader's file length and detects a size mismatch between index and data. It is not a content checksum. |
+| `size` | Arrow file size in bytes. Supplies the virtual range reader's file length. Replay compares it with the object size; corpus uses the cached value without a HEAD. It is not a content checksum. |
 | `footer` | Base64 copy of the Arrow IPC footer and trailer, including schema metadata. Avoids a separate footer fetch from the data file. |
 | `blocks` | Ordered array describing the file's Arrow record batches. Enables sample lookup and bounded range reads. |
 | `blocks[].first_row` | Zero-based sample row where the block starts within this writer's file. Enables locating a sample without reading preceding blocks; derivable from preceding row counts. |
@@ -359,12 +410,28 @@ one small index read and then fetch only the blocks it needs.
 
 A reader fetches each block with one ranged read, or only its input columns (the first
 pipeline stage, and middle stages for packed data, never download targets). Keeping one
-file per writer means a missing or corrupt file points directly at the rank (and node)
-that wrote it.
+file per writer during Megatron production helps identify which writer produced a
+missing or corrupt file, without imposing that layout on corpus consumers.
 
-The size checks detect truncation and many accidental file replacements. Same-size
-content changes are not guaranteed to be detected. Supervised-token reporting for a
+Replay size checks and short range-read checks detect many truncated files. Corpus
+readers use their pinned index snapshot; replacing files underneath them is unsupported.
+Same-size content changes are not guaranteed to be detected. Supervised-token reporting for a
 partially selected block uses its average per-sample count and is approximate.
+
+#### Consolidated corpus chunk index
+
+| Key | Meaning and purpose |
+| --- | --- |
+| `chunk_version` | Currently `1`; versions the consolidated publication layout. |
+| `parts` | Nonempty ordered list of completed parts. Empty writers are omitted. |
+| `parts[].path` | Unique relative path within this chunk. Absolute paths and parent traversal are rejected. |
+| `parts[].index` | Complete Arrow index described above, including footer and block information. Avoids separate per-part metadata reads. |
+| `producer` | Optional producer-specific resume information. Corpus consumers do not use it to locate samples. |
+| `producer.name` | Megatron writes `megatron`; another producer may omit this object or define its own resume fields. |
+| `producer.start_iteration`, `producer.end_iteration` | Megatron's executed iteration interval, with an exclusive end. Used to validate tracker boundaries, gaps, overlaps and job ownership. |
+| `producer.global_batch_size` | Converts teacher iterations to original source positions. Fixed on producer resume. |
+| `producer.writers`, `producer.writer_mbs` | Megatron work-assignment invariants, checked only when resuming that producer. Not a student decoding contract. |
+| `producer.save_interval` | Producer flush interval, fixed on resume so parallel-job boundaries remain consistent. |
 
 The rest of this section is the producer-neutral specification. Megatron is one producer;
 other producers (for example a vLLM-based dumper) and consumers (for example a Hugging
@@ -386,9 +453,6 @@ canonical digest described under [Tokenizer fingerprint](#tokenizer-fingerprint)
     "tokenizer": {"sha256": "<canonical tokenizer SHA-256>"},
     "attention_mode": "causal",
     "prefix_stable": true,
-    "writers": 2,
-    "writer_mbs": 2,
-    "first_sample": 0,
     "num_samples": 100000
   },
   "recorded": {
@@ -424,8 +488,9 @@ canonical digest described under [Tokenizer fingerprint](#tokenizer-fingerprint)
 Every file stores its inputs next to its targets, so a file is self-consistent on its
 own. Settings needed to interpret a file are required (`contract`). Files in one replay
 cache or corpus source must agree on them. Across sources in a corpus blend, token
-identity, attention mode and prefix stability must agree; writer layout remains per
-source/file. The blend manifest records its shared contract separately:
+identity, attention mode and prefix stability must agree. Writer layout is required
+only for replay; corpus parts contain no teacher layout contract. The blend manifest
+records its shared contract separately:
 
 | Key | Meaning and reason for storing it |
 | --- | --- |
@@ -433,16 +498,16 @@ source/file. The blend manifest records its shared contract separately:
 | `tokenizer.sha256` | Fingerprint of the complete token-to-ID mapping, true vocabulary size and special-token assignments. Prevents accepting different tokenizers merely because their vocabulary sizes happen to match. |
 | `attention_mode` | `causal`, `causal_eod_reset` or `isolated_segments` (see [Context](#context)). Prevents changing the context available to each teacher/student position. |
 | `prefix_stable` | Whether a retained prefix preserves the teacher's distributions. False for length-dependent position scaling such as dynamic NTK RoPE or LongRoPE's short/long switch. Megatron currently writes true. Shortening a longer sample requires true. |
-| `writers` | Teacher DP writer count. Defines which ranks must publish each complete group and participates in mapping global sample IDs to writer files. The student may use a different DP size. |
-| `writer_mbs` | Teacher microbatch size. Defines how successive microbatches were interleaved across the writer files; writer count alone cannot reconstruct that order. |
-| `first_sample` | Global sample ID where the intended replay dump begins. Separates a deliberate nonzero start from a missing initial range. Corpus and frozen-teacher dumps use zero. |
-| `num_samples` | Required only for corpus files: number of real samples in the source's epoch, before final-batch filling. Defines completeness and excludes repeated filler rows. It counts prepared GPT windows or SFT rows, not necessarily raw documents or conversations. |
+| `writers` | Replay only: teacher DP writer count. Defines complete groups and maps global sample IDs to writer files. Student DP may differ. |
+| `writer_mbs` | Replay only: teacher microbatch size, needed to reconstruct how writer files were interleaved. |
+| `first_sample` | Replay only: global sample ID where the intended dump begins. Separates a deliberate nonzero start from a missing initial range. Frozen replay teachers use zero. |
+| `num_samples` | Corpus only: real samples in the source epoch. The sum of published part rows must match it exactly. Fillers are removed before writing. Counts prepared GPT windows or SFT rows, not necessarily raw documents or conversations. |
 
-For a flush starting at global sample `s`, sample `x` lives in writer
+For a replay flush starting at global sample `s`, sample `x` lives in writer
 `((x-s)//writer_mbs) % writers`, at row
 `((x-s)//(writer_mbs*writers))*writer_mbs + (x-s)%writer_mbs` within that writer's file.
-Corpus planning uses this layout to recognize fillers; the student manifest then points
-directly to selected file/block rows.
+Corpus consumers do not use this formula; their manifest points directly to selected
+file/block rows, independently of the producing framework or its DP layout.
 
 For example, if the only available ranges are `[100, 200)` and `[200, 300)`,
 `first_sample=0` means the initial `[0, 100)` range is missing. `first_sample=100`
@@ -667,10 +732,11 @@ row, but its final label is then the sampled token rather than a data label.
 
 **Layout.**
 
-- Pack segments into samples in an `isolated_segments` cache with `writers=1` and
-  `writer_mbs=1` (or one file per writer, following the writer layout); store no padding.
-  `format/arrow.py` (`samples_batch`, `write_file`) and `v3_storage.publish` write the
-  files and index.
+- Pack segments into samples with `attention_mode=isolated_segments`; store no padding
+  or teacher DP layout. Set `num_samples` to the complete source's row count.
+  `format/arrow.py` (`samples_batch`, `write_file`) writes each part;
+  `format/corpus.publish_chunk` publishes its paths and indexes after all parts finish.
+  The optional `producer` resume object need not use Megatron's fields.
 - A student checks each pack against its own length after re-padding every segment to
   its SFT divisor (`2·CP`, times TP with sequence parallelism), so leave headroom for the
   students you expect; record the headroom you used as `padding_divisor`.
@@ -719,18 +785,19 @@ field.
 
 | Key | Meaning and purpose |
 | --- | --- |
-| `manifest_version` | Currently `1`. Identifies this internal plan representation; the reader does not currently enforce the value. |
+| `manifest_version` | Currently `2`. Identifies this internal plan representation with explicit paths and embedded indexes. |
 | `config` | Copy of the resolved blend configuration; field meanings are below. Megatron uses its corpus root to locate files. |
 | `budget` | Requested student sample count before rounding up to whole lanes. Descriptive once the schedule has been built. |
 | `lanes` | Number of streams, `L`. Global sample position `p` maps to lane `p % L` and offset `p // L`, independently of student DP. |
 | `lane_samples` | Equal number of samples assigned to each lane. Total planned capacity is `lanes * lane_samples`, at least the requested budget. |
 | `contract` | Shared tokenizer, attention mode and prefix stability. Writer layout is excluded. |
-| `files` | Array resolving scheduled file IDs to source folders, writer/range names and planned file properties. |
+| `files` | Array resolving scheduled file IDs to source folders, relative paths and cached indexes. |
 | `sources` | Per-source reporting and provenance summaries. Not needed to execute an already built schedule. |
 | `segments` | Integer array of schedule pieces `(lane, file_id, block, first_row, end_row)`. These pieces select sample rows; they are unrelated to the attention `segments` column stored inside Arrow. |
 | `hash` | SHA-256 over the canonical shared contract, file table, lane count, lane length and schedule-piece bytes. Checkpointed to detect a changed plan on resume. |
 
-The hash covers file names and sizes, but not file contents. It is not a corruption checksum. The absolute corpus root and descriptive
+The hash covers file names and complete cached indexes (including sizes, footers and
+block layouts), but not data-file contents. It is not a corruption checksum. The absolute corpus root and descriptive
 reporting fields are excluded, allowing the same file layout and schedule to be read
 from a replacement root. Resume still requires equivalent data in that replacement.
 
@@ -748,10 +815,8 @@ from a replacement root. Resume still requires equivalent data in that replaceme
 | Key | Meaning and purpose |
 | --- | --- |
 | `folder` | Source directory name taken directly from a key in `config.sources`, e.g. `math_sft`. Relative to `config.corpus`; matches the teacher's `--kd-corpus-dump` name. |
-| `dp_rank` | Writer rank; combines with `start` and `end` to reconstruct the Arrow/index file names. |
-| `start` | Inclusive global sample-range start in the original source dump. |
-| `end` | Exclusive global sample-range end in the original source dump. |
-| `size` | Expected Arrow file length when planning. Checked again when consuming the file. |
+| `path` | Explicit source-relative Arrow path, such as `chunk-000000000128/part-000001.arrow`. Has no DP interpretation. |
+| `index` | Cached Arrow index from the consolidated chunk index. Readers reuse it without another metadata GET or HEAD. |
 
 Within a schedule piece, `file_id` is an index into this table and `block` is an index
 into that file's `index.blocks`. `first_row` is inclusive and `end_row` exclusive,
@@ -825,8 +890,10 @@ The new modules in `megatron/training/distillation/` isolate the format, publica
 replay and token mappings, saver, runtime hooks, and paired loss (`v3_*.py`). The
 producer-neutral parts (target encodings, tokenizer fingerprint, metadata validation,
 the Arrow file and index layout, and the corpus blend planner) live in `format/`, which
-imports nothing from Megatron. Corpus dumps and blends add `corpus_runtime.py` and
-`CorpusReader` in `v3_replay.py`.
+imports nothing from Megatron during local/HF use. Corpus dumps and blends add
+`format/corpus.py` for chunk indexes and inventories, `corpus_saver.py` for filler
+filtering and publication, `corpus_runtime.py` for producer resume, and `CorpusReader`
+in `v3_replay.py`. The latter reuses the existing lane/block prefetch machinery.
 Small hooks in `arguments.py`, `training.py`, `checkpointing.py`, `pretrain_gpt.py`, and
 `pretrain_hybrid.py` select the V3 path. V3 reuses existing sparse top-K extraction,
 student output capture, the shared LM/sparse-KD loss and reporting, and the persistent
