@@ -962,19 +962,11 @@ def _move_weight_to_symm_pool(param, gtp_remat_group):
     quantizer = getattr(param, "_quantizer", None)
     with torch.no_grad():
         if quantizer is not None:
-            # Allocate the full quantized layout (data + scales) in the pool. Match the
-            # source tensor's populated buffers so copy_from_storage copies all of them;
-            # restore the quantizer's usage afterwards (the optimizer's quantize_
-            # updates rely on it).
-            saved_usage = (quantizer.rowwise_usage, quantizer.columnwise_usage)
+            # Allocate the full quantized layout (data + scales) in the pool, matching the
+            # source tensor's populated buffers so copy_from_storage copies all of them.
             quantizer.set_usage(**param.get_usages())
-            try:
-                with gtp_symm_pool_ctx(gtp_remat_group):
-                    pooled = quantizer.make_empty(
-                        param.shape, dtype=param.dtype, device=param.device
-                    )
-            finally:
-                quantizer.set_usage(rowwise=saved_usage[0], columnwise=saved_usage[1])
+            with gtp_symm_pool_ctx(gtp_remat_group):
+                pooled = quantizer.make_empty(param.shape, dtype=param.dtype, device=param.device)
             pooled.copy_from_storage(param)
         else:
             with gtp_symm_pool_ctx(gtp_remat_group):
