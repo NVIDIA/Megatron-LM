@@ -113,7 +113,12 @@ except Exception:
     has_nvidia_modelopt = False
 
 
-if has_nvrx_async_support():
+HAVE_NVRX = has_nvrx_async_support()
+
+if HAVE_NVRX:
+    from nvidia_resiliency_ext.checkpointing.async_ckpt.cached_metadata_filesystem_reader import (  # pylint: disable=line-too-long
+        CachedMetadataFileSystemReader,
+    )
     from nvidia_resiliency_ext.checkpointing.utils import _disable_gc
 else:
     from contextlib import contextmanager
@@ -1027,12 +1032,22 @@ def save_checkpoint(
                         checkpointing_context is not None
                         and 'load_strategy' in checkpointing_context
                     ):
+                        load_strategy = checkpointing_context['load_strategy']
                         cached_global_metadata = getattr(
-                            checkpointing_context['load_strategy'], 'cached_global_metadata', None
+                            load_strategy, 'cached_global_metadata', None
                         )
                         if cached_global_metadata is not None:
-                            logger.debug('Plugging in the read metadata from the load strategy...')
-                            save_strategy.cached_global_metadata = cached_global_metadata
+                            # Only the async save reuses the loaded metadata. Move the reference
+                            # out of the load strategy (the wrapped one, for a fully parallel
+                            # load) so that the metadata is freed once the save has used it.
+                            getattr(
+                                load_strategy, 'base_strategy', load_strategy
+                            ).cached_global_metadata = None
+                            if checkpoint.async_save:
+                                logger.debug(
+                                    'Plugging in the read metadata from the load strategy...'
+                                )
+                                save_strategy.cached_global_metadata = cached_global_metadata
                         else:
                             logger.debug(
                                 'Failed to plug in the read metadata from the load strategy...'
@@ -3385,6 +3400,12 @@ def load_checkpoint(
         use_megatron_fsdp=use_megatron_fsdp,
         **load_kwargs,
     )
+
+    if checkpoint.ckpt_assume_constant_structure and HAVE_NVRX:
+        # All metadata reads of this load shared one cached copy of the checkpoint's
+        # `.metadata`, and nothing reads it through the cache from here on. Release it so that
+        # the loaded metadata can be freed once the save strategy has handed it to NVRx.
+        CachedMetadataFileSystemReader.clear_metadata_cache()
 
     # Checkpoint not loaded.
     if state_dict is None:

@@ -861,6 +861,10 @@ class TorchDistSaveShardedStrategy:
                 self._metadata_cache = CheckpointMetadataCache()
                 if self.cached_global_metadata is not None:
                     self._metadata_cache.set_cached_global_metadata(self.cached_global_metadata)
+                    # The cache keeps its own compact copy of the loaded metadata. Drop this
+                    # reference so that the loaded metadata can be freed instead of being
+                    # traversed by every garbage collection for the rest of training.
+                    self.cached_global_metadata = None
             # Define additional arguments
             async_writer_kwargs["use_cached_data_structure"] = self.use_cached_ckpt_structure
             if self.cpu_shm_mode:
