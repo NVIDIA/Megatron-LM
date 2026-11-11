@@ -101,8 +101,8 @@ def test_cli_determinism_reaches_transformer_config(flags, expected):
     config = core_transformer_config_from_args(args, config_class=CapturingTransformerConfig)
     assert args.deterministic_mode is expected
     assert config.deterministic_mode is expected
-    
-    
+
+
 @pytest.mark.parametrize("version", [1, 2])
 def test_megatron_fsdp_user_buffer_registration_matches_version(monkeypatch, version):
     monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
