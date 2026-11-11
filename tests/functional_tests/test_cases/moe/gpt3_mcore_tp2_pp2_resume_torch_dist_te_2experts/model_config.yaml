@@ -40,6 +40,8 @@ MODEL_ARGS:
   --tensor-model-parallel-size: 2
   --pipeline-model-parallel-size: 2
   --num-experts: 2
+  --moe-token-dispatcher-type: allgather
+  --no-moe-grouped-gemm: true
   --sequence-parallel: true
   --moe-router-load-balancing-type: sinkhorn
   --moe-router-topk: 1
