@@ -22,6 +22,7 @@ __all__ = [
     "get_cp_positions_from_layout",
     "get_packed_qk_cu_seqlens",
     "invert_permutation",
+    "nonpacked_query_position_runs",
     "normalize_cp_comm_type",
     "build_packed_allgather_cp_local_positions_from_host",
     "build_packed_allgather_cp_query_positions_and_key_reorder_from_host",
@@ -139,6 +140,46 @@ def ensure_sbhd(tensor: torch.Tensor, name: str) -> Tuple[torch.Tensor, bool]:
     if tensor.ndim == 3:
         return tensor.unsqueeze(1), True
     raise ValueError(f"{name} must be 3D ([t,h,d]) or 4D ([s,b,h,d]), got {tensor.ndim}D")
+
+
+def nonpacked_query_position_runs(
+    *, local_rows: int, full_rows: int, row_start: int, skv: int, cp_size: int, cp_rank: int
+) -> Tuple[Optional[Tuple[Tuple[int, int, int], ...]], str]:
+    """Host-side query positions of a causal non-packed DSA call, as runs of consecutive tokens.
+
+    Returns ``((row_start, row_end, position), ...)`` in row order: local query rows
+    ``[row_start, row_end)`` sit at global token positions ``position, position + 1, ...``.
+    This describes the same positions as :func:`get_cp_positions_from_layout` (and the causal
+    bounds ``build_dsattention_forward_mask`` builds from them) for the layouts whose positions
+    follow from host facts alone: no CP (row ``i`` at position ``i``) and allgather CP with the
+    uniform zigzag split. ``full_rows`` is the CP-local row count; ``row_start`` and
+    ``local_rows`` pick this rank's rows of it when TP sequence parallelism keeps queries
+    local. Other layouts return ``(None, reason)``. Callers must exclude query positions taken
+    from ``position_ids``, attention masks and packed sequences themselves.
+    """
+    if cp_size <= 1:
+        full_runs = [(0, full_rows, 0)]
+    else:
+        if skv != full_rows * cp_size:
+            return None, (
+                "allgather CP with non-uniform rank lengths takes its positions from an all-gather"
+            )
+        if skv % (2 * cp_size) != 0:
+            return None, "the sequence length is not divisible by 2 * cp_size (no zigzag split)"
+        chunk = skv // (2 * cp_size)
+        full_runs = [
+            (0, chunk, cp_rank * chunk),
+            (chunk, 2 * chunk, (2 * cp_size - cp_rank - 1) * chunk),
+        ]
+    window_start, window_end = row_start, row_start + local_rows
+    if window_start < 0 or window_end > full_rows:
+        return None, "the local query rows fall outside the CP-local sequence"
+    runs = []
+    for run_start, run_end, position in full_runs:
+        start, end = max(run_start, window_start), min(run_end, window_end)
+        if start < end:
+            runs.append((start - window_start, end - window_start, position + start - run_start))
+    return tuple(runs), ""
 
 
 def build_zigzag_cp_local_positions(

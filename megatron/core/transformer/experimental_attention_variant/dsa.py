@@ -6,7 +6,7 @@ import logging
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -1093,6 +1093,7 @@ def fused_qk_topk_kpool(
     return_index_scores: bool = True,
     kpool_key_dtype_compression: bool = False,
     hf_scoring: bool = False,
+    pool_topk_fn: Optional[Callable[..., Optional[torch.Tensor]]] = None,
 ):
     """Select complete causal pools and append each query's incomplete tail.
 
@@ -1103,6 +1104,14 @@ def fused_qk_topk_kpool(
     Set return_index_scores=False to select in query chunks without retaining scores.
     Compression rounding is independent of Hadamard rotation and score quantization.
     With hf_scoring, weights must contain only the FP32 head-count scale.
+
+    ``pool_topk_fn``, when given, selects the pools of an unmasked, unpacked call without
+    retained scores instead of the PyTorch chunk loop:
+    ``pool_topk_fn(q, k_pooled, weights, pool_topk, pool_size, hf_scoring)`` receives the
+    scoring inputs after any rotation or FP8 rounding and returns ``[batch, queries,
+    pool_topk]`` pool ids with ``-1`` for unused slots, or None to keep the PyTorch loop.
+    The caller owns the causal rule it applies (row at position ``p`` selects among pools
+    ``[0, (p + 1) // pool_size)``, as ``varlen_starts``/``varlen_ends`` here).
 
     Without packing, an explicit mask starts the pool grid at each sample's first
     valid key, as the Hugging Face reference KPool indexer (transformers v5.16.1,
@@ -1221,22 +1230,28 @@ def fused_qk_topk_kpool(
         if mask is not None:
             assert mask.dtype == torch.float32, "mask dtype must be float32"
         index_scores = None
-        pool_topk = _kpool_topk_from_score_chunks(
-            q=q,
-            k_pooled=k_pooled,
-            weights=weights,
-            index_topk=index_topk,
-            pool_size=pool_size,
-            pool_exists=pool_exists if use_per_seg else None,
-            mask=mask,
-            varlen_starts=v_starts,
-            varlen_ends=v_ends,
-            key_positions=k_pos,
-            pool_token_base=pool_token_base,
-            sk=sk,
-            use_relu=use_relu,
-            hf_scoring=hf_scoring,
-        )
+        pool_topk = None
+        if pool_topk_fn is not None and mask is None and not use_per_seg:
+            pool_topk = pool_topk_fn(
+                q, k_pooled, weights, index_topk // pool_size, pool_size, hf_scoring
+            )
+        if pool_topk is None:
+            pool_topk = _kpool_topk_from_score_chunks(
+                q=q,
+                k_pooled=k_pooled,
+                weights=weights,
+                index_topk=index_topk,
+                pool_size=pool_size,
+                pool_exists=pool_exists if use_per_seg else None,
+                mask=mask,
+                varlen_starts=v_starts,
+                varlen_ends=v_ends,
+                key_positions=k_pos,
+                pool_token_base=pool_token_base,
+                sk=sk,
+                use_relu=use_relu,
+                hf_scoring=hf_scoring,
+            )
 
     # Expand [batch * queries, pools] to a fixed token budget.
     rows = pool_topk.shape[0] * pool_topk.shape[1]
@@ -1924,6 +1939,20 @@ def _warn_dsa_checkpoint_topk_reuse_fallback(layer_number: int, reason: str) -> 
         "dsa_indexer_reuse_checkpoint_topk is enabled, but the checkpoint replay of DSA layer "
         f"{layer_number} reran the dense indexer and top-k: {reason}. Further occurrences are "
         "not logged."
+    )
+
+
+_KPOOL_SCORER_FALLBACK_REASONS_WARNED: set = set()
+
+
+def _warn_kpool_scorer_fallback_once(reason: str) -> None:
+    """Warn once per reason when ``dsa_indexer_kpool_scorer_backend='cudnn'`` cannot apply."""
+    if reason in _KPOOL_SCORER_FALLBACK_REASONS_WARNED:
+        return
+    _KPOOL_SCORER_FALLBACK_REASONS_WARNED.add(reason)
+    logger.warning(
+        "dsa_indexer_kpool_scorer_backend='cudnn' keeps the PyTorch KPool scorer for this "
+        f"call: {reason}. Further calls with this reason are not logged."
     )
 
 
@@ -2989,6 +3018,72 @@ class DSAttention(MegatronModule):
             setattr(packed_seq_params, self._LAYOUT_HOLDER_ATTR, cache)
         return cache
 
+    def _kpool_pool_topk_fn(
+        self,
+        *,
+        packed_thd: bool,
+        has_mask: bool,
+        positions_from_position_ids: bool,
+        local_rows: int,
+        full_rows: int,
+        row_start: int,
+        skv: int,
+        cp_size: int,
+        cp_rank: int,
+    ):
+        """The fused pool selector for ``fused_qk_topk_kpool``, or None for the PyTorch scorer.
+
+        With ``dsa_indexer_kpool_scorer_backend='cudnn'``, returns a callable that hands the
+        pooled keys to the DSA kernel backend's ``run_kpool_pool_topk`` with this call's query
+        positions as host-side runs. They are the positions ``build_dsattention_forward_mask``
+        builds the causal bounds from, so both scorers apply the same causal rule. Layouts
+        whose positions are not host facts (packed THD, explicit masks, query positions taken
+        from ``position_ids``, non-uniform CP) keep the PyTorch scorer, warned once per reason.
+        ``positions_from_position_ids`` says that the forward reads the query positions from
+        ``position_ids``, which it does only under context parallelism or for a TP
+        sequence-parallel local query; ``position_ids`` passed without either are not read
+        and do not keep the PyTorch scorer.
+        """
+        if self.config.dsa_indexer_kpool_scorer_backend != "cudnn":
+            return None
+        query_runs = None
+        if not dsa_kernels.use_fused_dsa_kernels(self.config):
+            reason = "the fused DSA kernels are disabled (attention_backend is unfused)"
+        elif packed_thd:
+            reason = "packed THD sequences restart pools at every document"
+        elif has_mask:
+            reason = "an explicit attention mask replaces the causal layout"
+        elif positions_from_position_ids:
+            reason = "the query positions come from position_ids"
+        else:
+            query_runs, reason = dsa_layout.nonpacked_query_position_runs(
+                local_rows=local_rows,
+                full_rows=full_rows,
+                row_start=row_start,
+                skv=skv,
+                cp_size=cp_size,
+                cp_rank=cp_rank,
+            )
+        if query_runs is None:
+            _warn_kpool_scorer_fallback_once(reason)
+            return None
+        config = self.config
+
+        def select_pools(q, k_pooled, weights, pool_topk, pool_size, hf_scoring):
+            return dsa_kernels.run_kpool_pool_topk(
+                config,
+                q,
+                k_pooled,
+                weights,
+                pool_topk,
+                pool_size,
+                query_runs,
+                hf_scoring,
+                use_relu=config.dsa_indexer_scoring_relu,
+            )
+
+        return select_pools
+
     @staticmethod
     def _memoized(cache: Optional[dict], key: tuple, build, prebuilt=None):
         """Return ``cache[key]``, building it on first use. No-op when cache is None.
@@ -4030,6 +4125,20 @@ class DSAttention(MegatronModule):
                     "KPool selection does not use the cuDNN dense scorer",
                     path="the KPool selector",
                 )
+                kpool_pool_topk_fn = self._kpool_pool_topk_fn(
+                    packed_thd=packed_thd,
+                    has_mask=float_mask is not None,
+                    positions_from_position_ids=position_ids is not None
+                    and (cp_size > 1 or sequence_parallel_query_is_local),
+                    local_rows=sq,
+                    full_rows=sequence_parallel_tp_full_rows,
+                    row_start=(
+                        sequence_parallel_tp_row_start if sequence_parallel_query_is_local else 0
+                    ),
+                    skv=skv,
+                    cp_size=cp_size,
+                    cp_rank=cp_rank,
+                )
                 # KPool selection is discrete and does not need an autograd graph.
                 with torch.no_grad():
                     _index_scores, topk_indices = fused_qk_topk_kpool(
@@ -4054,6 +4163,7 @@ class DSAttention(MegatronModule):
                             self.config.dsa_indexer_kpool_key_dtype_compression
                         ),
                         hf_scoring=self.config.dsa_indexer_hf_scoring,
+                        pool_topk_fn=kpool_pool_topk_fn,
                     )
                     del _index_scores
                     self.indexer._kpool_gate_score = None

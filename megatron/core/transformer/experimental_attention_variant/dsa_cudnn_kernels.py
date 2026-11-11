@@ -3516,6 +3516,218 @@ def run_fused_qk_topk(
     return topk_indices, topk_length
 
 
+_KPOOL_DECLINES_LOGGED: set = set()
+_KPOOL_FUSED_SELECTION_LOGGED = False
+
+
+def _log_kpool_decline_once(reason: str) -> None:
+    """Warn once per reason that a cuDNN KPool selection request falls back to PyTorch."""
+    if reason in _KPOOL_DECLINES_LOGGED:
+        return
+    _KPOOL_DECLINES_LOGGED.add(reason)
+    logging.getLogger(__name__).warning(
+        "dsa_indexer_kpool_scorer_backend='cudnn' falls back to the PyTorch KPool scorer: %s",
+        reason,
+    )
+
+
+def _kpool_pool_topk_decline_reason(
+    q: Tensor,
+    k_pooled: Tensor,
+    weights: Tensor,
+    query_runs: Optional[Tuple[Tuple[int, int, int], ...]],
+    use_relu: bool,
+    hf_scoring: bool,
+) -> Optional[str]:
+    """Why :func:`run_kpool_pool_topk` cannot take this call (None if it can); host facts."""
+    if not use_relu:
+        return "the cuDNN indexer kernel scores with ReLU only"
+    if query_runs is None:
+        return "this layout's query positions are not known on the host"
+    if q.ndim != 4 or k_pooled.ndim != 3 or weights.ndim != 3:
+        return "expected q [sq, b, h, d], pooled keys [pools, b, d] and weights [sq, b, h]"
+    sq, b, h, d = q.shape
+    if k_pooled.size(1) != b or k_pooled.size(2) != d or tuple(weights.shape) != (sq, b, h):
+        return "q, pooled key and weight shapes disagree"
+    if q.dtype != torch.bfloat16 or k_pooled.dtype != torch.bfloat16:
+        return f"the kernel needs BF16 q and pooled keys, got {q.dtype} and {k_pooled.dtype}"
+    if not hf_scoring and weights.dtype != torch.bfloat16:
+        return f"the kernel needs BF16 head weights, got {weights.dtype}"
+    covered = 0
+    for row_start, row_end, position in query_runs:
+        if row_start != covered or row_end < row_start or position < 0:
+            return "the host query runs do not tile the query rows in order"
+        covered = row_end
+    if covered != sq:
+        return "the host query runs do not tile the query rows in order"
+    try:
+        _ensure_dsa_namespace()
+    except ImportError as exc:
+        return f"the cuDNN frontend DSA namespace is unavailable ({exc})"
+    return None
+
+
+def _kpool_q_offset_kwargs(
+    *, batch: int, n_rows: int, n_keys: int, ratio: int, first_position: int, device
+) -> Optional[dict]:
+    """Kwargs under which chunk row ``i`` sees keys ``[0, (first_position + i + 1) // ratio)``.
+
+    When the chunk's keys end exactly where its last row's view ends, the bottom-right
+    alignment (offset ``n_keys * ratio - n_rows``) is that rule on every frontend
+    (:func:`_bottom_right_q_offset_kwargs`). Otherwise an explicit ``q_causal_offsets`` sets it,
+    which needs a frontend that accepts the argument. Returns None when neither applies.
+    """
+    if n_keys * ratio - n_rows == first_position:
+        return _bottom_right_q_offset_kwargs(
+            _cudnn_dsa.indexer_forward_wrapper,
+            batch=batch,
+            seqlen_q=n_rows,
+            seqlen_k=n_keys,
+            ratio=ratio,
+            device=device,
+        )
+    if _supports_indexer_q_causal_offsets():
+        return {
+            "q_causal_offsets": torch.full(
+                (batch,), first_position, dtype=torch.int32, device=device
+            )
+        }
+    return None
+
+
+def run_kpool_pool_topk(
+    q: Tensor,
+    k_pooled: Tensor,
+    weights: Tensor,
+    pool_topk: int,
+    pool_size: int,
+    query_runs: Optional[Tuple[Tuple[int, int, int], ...]],
+    hf_scoring: bool,
+    use_relu: bool = True,
+    deterministic: bool = False,
+    config: Optional["TransformerConfig"] = None,
+) -> Optional[Tensor]:
+    """Select KPool pools with the cuDNN indexer kernel at ``ratio=pool_size``.
+
+    ``q`` is ``[sq, b, h, d]`` (after any rotation), ``k_pooled`` the compressed keys
+    ``[pools, b, d]`` of the whole (CP-gathered) sequence, ``weights`` ``[sq, b, h]`` as the
+    KPool scorer receives them. ``query_runs`` lists ``(row_start, row_end, position)``: local
+    rows ``[row_start, row_end)`` sit at consecutive global token positions starting at
+    ``position``, in row order, covering every row. A row at position ``p`` may select pools
+    ``[0, (p + 1) // pool_size)``, the pools whose last token comes before it, which is the
+    cuDNN indexer's causal rule at ``ratio=pool_size``.
+
+    Per run and row chunk (at most ``FUSED_INDEXER_MAX_SAFE_ROWS`` query rows per call), the
+    pooled keys are cropped to the chunk's last row, the kernel computes
+    ``sum_h w_h * relu(q_h . k)`` from BF16 inputs, and the indexer top-k of
+    ``dsa_indexer_topk_backend`` keeps ``pool_topk`` pools per row with the row's pool count
+    as its length. The weights are BF16 as given; with ``hf_scoring`` (FP32 weights carrying
+    only the head-count scale) they are the BF16 projection rebuilt exactly, and the HF
+    uniform factor ``(heads * head_dim)**-0.5`` is dropped, which no selection depends on.
+
+    Returns ``[b, sq, pool_topk]`` int64 pool ids in the top-k kernel's slot order (not by
+    score) with ``-1`` for unused slots, or None (warned once per reason) when the call is not
+    supported, so the caller keeps the PyTorch scorer.
+    """
+    reason = _kpool_pool_topk_decline_reason(q, k_pooled, weights, query_runs, use_relu, hf_scoring)
+    if reason is not None:
+        _log_kpool_decline_once(reason)
+        return None
+    sq, b, heads, _head_dim = q.shape
+    num_pools = k_pooled.size(0)
+    device = q.device
+    pool_ids = torch.full((b, sq, pool_topk), -1, dtype=torch.int64, device=device)
+    if sq == 0 or num_pools == 0 or pool_topk == 0:
+        return pool_ids
+
+    q_bshd = q.permute(1, 0, 2, 3)
+    k_bshd = k_pooled.permute(1, 0, 2).unsqueeze(2)
+    if hf_scoring:
+        # HF scores sum_h (w_h * n**-0.5) * relu(q_h.k * d**-0.5) with w_h the BF16 projection
+        # upcast. Selection depends only on the order of the scores, so drop the uniform factor
+        # (n * d)**-0.5 and hand the kernel w_h itself: undoing n**-0.5 in FP32 lands within a
+        # few FP32 ulps of the BF16 value, which the cast restores exactly for any head count.
+        weights = weights.float() * (heads**0.5)
+    w_bsh = weights.to(torch.bfloat16).permute(1, 0, 2)
+    options = _scorer_options_from_config(config)
+
+    for run_start, run_end, run_position in query_runs:
+        if run_end == run_start:
+            continue
+        run_keys = max(1, min(num_pools, (run_position + run_end - run_start) // pool_size))
+        # One call scores b * chunk_rows query rows; stay at or below the fused indexer's
+        # documented safe row count (dsa_fused_safety), whatever the batch size.
+        chunk_rows = min(
+            _indexer_score_chunk_rows(b, run_end - run_start, run_keys),
+            max(1, FUSED_INDEXER_MAX_SAFE_ROWS // b),
+        )
+        for row_start in range(run_start, run_end, chunk_rows):
+            row_end = min(row_start + chunk_rows, run_end)
+            n_rows = row_end - row_start
+            first_position = run_position + (row_start - run_start)
+            n_keys = min(num_pools, (first_position + n_rows) // pool_size)
+            if n_keys == 0:
+                continue  # no row of the chunk sees a complete pool
+            keys = k_bshd[:, :n_keys]
+            # The kernel needs n_rows <= keys * ratio. A chunk that starts near the sequence
+            # start (or a sequence shorter than its rows' view) can have fewer complete pools;
+            # pad zero pools that no row can see (each row's view and length stay n_keys-bound).
+            pad = max(0, -(-n_rows // pool_size) - n_keys)
+            if pad:
+                keys = torch.cat((keys, keys.new_zeros(b, pad, 1, keys.size(-1))), dim=1)
+            offset_kwargs = _kpool_q_offset_kwargs(
+                batch=b,
+                n_rows=n_rows,
+                n_keys=n_keys + pad,
+                ratio=pool_size,
+                first_position=first_position,
+                device=device,
+            )
+            if offset_kwargs is None:
+                _log_kpool_decline_once(
+                    "this cuDNN frontend has no q_causal_offsets, and a query chunk does not end "
+                    "on a pool boundary"
+                )
+                return None
+            scores = _indexer_forward_wrapper_with_warning(
+                q_bshd[:, row_start:row_end].contiguous(),
+                keys.contiguous(),
+                w_bsh[:, row_start:row_end].contiguous(),
+                ratio=pool_size,
+                sm_scale=_INDEXER_SOFTMAX_SCALE,
+                **offset_kwargs,
+            )["scores"]
+            positions = torch.arange(
+                first_position + 1, first_position + n_rows + 1, device=device, dtype=torch.int64
+            )
+            seq_lens = (
+                (positions // pool_size).clamp(max=n_keys).to(torch.int32).repeat(b).contiguous()
+            )
+            select_k = min(pool_topk, n_keys)
+            selected = _indexer_top_k_wrapper_chunked(
+                scores.reshape(b * n_rows, n_keys + pad).contiguous(),
+                seq_lens,
+                topk_k=select_k,
+                return_topk_scores=False,
+                deterministic=deterministic,
+                topk_backend=options.topk_backend,
+                topk_scratch_bytes=options.topk_scratch_bytes,
+            )["indices"]
+            del scores
+            pool_ids[:, row_start:row_end, :select_k] = selected.view(b, n_rows, select_k).to(
+                torch.int64
+            )
+    global _KPOOL_FUSED_SELECTION_LOGGED
+    if not _KPOOL_FUSED_SELECTION_LOGGED:
+        _KPOOL_FUSED_SELECTION_LOGGED = True
+        logging.getLogger(__name__).info(
+            "DSA KPool selection uses the cuDNN indexer kernel (ratio=%d, top-k backend %s).",
+            pool_size,
+            options.topk_backend,
+        )
+    return pool_ids
+
+
 def run_fused_qk_topk_with_loss(
     q: Tensor,
     k: Tensor,

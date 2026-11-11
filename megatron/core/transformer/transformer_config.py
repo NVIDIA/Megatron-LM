@@ -559,8 +559,8 @@ class TransformerConfig(ModelParallelConfig):
     with NaN scores, so with the sparse indexer loss (selected scores kept) it ends with
     ``topk_length`` 0 and attends to no key, and without it attends to those first columns;
     cuDNN keeps top-k - 1 real keys there. Requires ``dsa_kernel_backend='cudnn'``. KPool
-    selection (``dsa_indexer_kpool > 1``) does not run this top-k, so the option has no
-    effect there."""
+    selection (``dsa_indexer_kpool > 1``) runs this top-k only with
+    ``dsa_indexer_kpool_scorer_backend='cudnn'`` (over pools instead of tokens)."""
 
     dsa_cudnn_topk_scratch_gib: float = 2.0
     """Per-launch scratch budget, in GiB, of the cuDNN radix top-k of the DSA indexer.
@@ -734,6 +734,9 @@ class TransformerConfig(ModelParallelConfig):
     zai-org/GLM-5.3-Flash (transformers v5.16.1, Glm5NextTextIndexer): upcast projected
     head weights before scaling, scale FP32 q@k before ReLU, and reduce heads with FP32
     matmul. Compression rounding and score-input quantization remain independent options.
+    This is the arithmetic of the default PyTorch KPool scorer; with
+    ``dsa_indexer_kpool_scorer_backend='cudnn'`` the cuDNN kernel scores from the BF16
+    projection and drops the uniform scale, which selects the same pools up to ties.
     """
 
     dsa_indexer_qk_proj_use_quantization: bool = True
@@ -833,6 +836,32 @@ class TransformerConfig(ModelParallelConfig):
     This widens the output to ``dsa_indexer_topk + dsa_indexer_kpool - 1``; unused slots are -1.
     Set to False for fixed-width pool-only selection. Only applies when
     ``dsa_indexer_kpool > 1``.
+    """
+
+    dsa_indexer_kpool_scorer_backend: Literal["torch", "cudnn"] = "torch"
+    """How the frozen KPool selector scores pools and picks its top-k inside DSAttention.
+
+    ``'torch'`` scores every query row against every pooled key with PyTorch in FP32 and
+    query chunks, then masks and selects (the reference path).
+    ``'cudnn'`` scores the pooled keys with the cuDNN fused DSA indexer kernel at ratio
+    ``dsa_indexer_kpool``, whose causal rule (row at token position ``p`` sees pools
+    ``[0, (p + 1) // dsa_indexer_kpool)``) is KPool's, and selects with the indexer top-k
+    of ``dsa_indexer_topk_backend``. The kernel sums scores from the BF16 q, pooled keys and
+    head weights (with ``dsa_indexer_hf_scoring``, the BF16 projection; the HF uniform scale
+    does not change the selection), accumulating in another order than the FP32 PyTorch
+    scorer, so a row can swap pools whose scores tie at the selection boundary; the
+    selected pools come in the top-k kernel's order rather than by score. It needs
+    ``dsa_kernel_backend='cudnn'``, fused DSA kernels (``attention_backend`` not
+    ``unfused``), ReLU scoring, no FP8 KPool scoring and BF16 head weights (no
+    ``dsa_indexer_weights_proj_output_dtype='fp32'`` without HF scoring). It applies to
+    causal layouts whose query positions are known on the host (no CP, or non-packed
+    allgather CP in zigzag order; no attention mask; query positions not taken from
+    ``position_ids``, which DSAttention reads only under CP or for a TP sequence-parallel
+    local query); other calls keep ``'torch'``, logged once per reason, as do
+    off-pool-grid query chunks on a cuDNN frontend without ``q_causal_offsets`` (before
+    1.26).
+    On GB300 at the 1M CP64 rank shape (16,384 rows x 262,144 pools) one selection took
+    about 22 ms against 893 ms for ``'torch'``.
     """
 
     ####################
@@ -2814,7 +2843,8 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "dsa_indexer_weights_proj_output_dtype='fp32' is not supported by "
                 "dsa_kernel_backend='cudnn' for per-token DSA, which requires a BF16 indexer "
-                "weights tensor. KPool selection bypasses the cuDNN top-k path; use KPool or "
+                "weights tensor. The default KPool scorer (dsa_indexer_kpool > 1, "
+                "dsa_indexer_kpool_scorer_backend='torch') does not use it; use KPool or "
                 "dsa_kernel_backend='tilelang'/'none'."
             )
 
@@ -3214,6 +3244,50 @@ class TransformerConfig(ModelParallelConfig):
                     "DSA indexer loss is not supported with kpool selection; set "
                     "dsa_indexer_loss_coeff=0 or dsa_indexer_kpool=1."
                 )
+            if self.dsa_indexer_kpool_scorer_backend not in ("torch", "cudnn"):
+                raise ValueError(
+                    "dsa_indexer_kpool_scorer_backend must be 'torch' or 'cudnn', "
+                    f"got {self.dsa_indexer_kpool_scorer_backend!r}."
+                )
+            if self.dsa_indexer_kpool_scorer_backend == "cudnn":
+                if self.dsa_indexer_kpool <= 1:
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' applies only to KPool "
+                        f"selection (dsa_indexer_kpool > 1), got {self.dsa_indexer_kpool}."
+                    )
+                if self.dsa_kernel_backend != "cudnn":
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' needs "
+                        f"dsa_kernel_backend='cudnn', got {self.dsa_kernel_backend!r}."
+                    )
+                if not self.dsa_indexer_scoring_relu:
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' needs ReLU scoring "
+                        "(dsa_indexer_scoring_relu=True), as the cuDNN indexer kernel does."
+                    )
+                from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+                    use_fused_dsa_kernels,
+                )
+
+                if not use_fused_dsa_kernels(self):
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' needs the fused DSA kernels; "
+                        "attention_backend='unfused' disables them."
+                    )
+                if self.dsa_indexer_kpool_use_quantization:
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' scores BF16 inputs and does "
+                        "not support FP8 KPool scoring (dsa_indexer_kpool_use_quantization)."
+                    )
+                if (
+                    self.dsa_indexer_weights_proj_output_dtype == "fp32"
+                    and not self.dsa_indexer_hf_scoring
+                ):
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' needs BF16 indexer head "
+                        "weights; dsa_indexer_weights_proj_output_dtype='fp32' would be rounded "
+                        "to BF16. Use dsa_indexer_weights_proj_output_dtype='bf16'."
+                    )
         elif self.experimental_attention_variant == "dsv4_hybrid":
             if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
                 raise ValueError(

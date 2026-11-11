@@ -205,6 +205,44 @@ def run_fused_qk_topk(
     return result
 
 
+def run_kpool_pool_topk(
+    config: TransformerConfig,
+    q: Tensor,
+    k_pooled: Tensor,
+    weights: Tensor,
+    pool_topk: int,
+    pool_size: int,
+    query_runs: Optional[Tuple[Tuple[int, int, int], ...]],
+    hf_scoring: bool,
+    use_relu: bool = True,
+) -> Optional[Tensor]:
+    """Optional fused KPool pool selection (``dsa_indexer_kpool_scorer_backend='cudnn'``).
+
+    Returns ``[b, sq, pool_topk]`` int64 pool ids with ``-1`` for unused slots, or None when
+    the backend has no such hook or declines the call; the caller then keeps the PyTorch
+    KPool scorer. See ``dsa_cudnn_kernels.run_kpool_pool_topk`` for the contract.
+    """
+    fn = _resolve_fused_hook(config, "run_kpool_pool_topk")
+    if fn is None:
+        return None
+    result = fn(
+        q=q,
+        k_pooled=k_pooled,
+        weights=weights,
+        pool_topk=pool_topk,
+        pool_size=pool_size,
+        query_runs=query_runs,
+        hf_scoring=hf_scoring,
+        use_relu=use_relu,
+        **filter_kwargs_for_callable(
+            fn, {"deterministic": _deterministic_dsa_requested(config), "config": config}
+        ),
+    )
+    if result is None:
+        _log_declined_hook(config, "run_kpool_pool_topk", "backend returned None")
+    return result
+
+
 def run_fused_qk_topk_with_scores(
     config: TransformerConfig,
     q: Tensor,

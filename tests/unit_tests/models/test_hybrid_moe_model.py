@@ -117,6 +117,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "dsa_indexer_kpool_key_dtype_compression": False,
     "dsa_indexer_kpool_use_quantization": False,
     "dsa_indexer_kpool_always_select_tail": True,
+    "dsa_indexer_kpool_scorer_backend": "torch",
     "dsa_indexer_loss_coeff": None,
     "dsa_indexer_mode": "standard",
     "dsa_indexer_n_heads": None,

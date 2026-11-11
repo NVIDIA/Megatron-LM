@@ -64,6 +64,9 @@ def _forward(
     if cu_seqlens_q is None:
         b, sq = q.shape[:2]
         sk = k.shape[1]
+        if sq > sk * ratio:
+            # The released BSHD kernels reject this layout (measured with frontend 1.31).
+            raise ValueError(f"seqlen_q ({sq}) must be <= seqlen_k * ratio ({sk * ratio})")
         out = torch.full((b, sq, sk), fill_value, dtype=torch.float32)
         scores = _dense_scores(q, k[:, :, 0, :], w, sm_scale)
         rows = torch.arange(sq).view(1, sq, 1)
