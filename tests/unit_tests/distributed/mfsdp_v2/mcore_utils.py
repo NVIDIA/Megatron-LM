@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Shared cleanup helpers for MFSDP v2 MCore tests."""
+"""Shared cleanup and optional-backend guards for MFSDP v2 MCore tests."""
 
 import torch
 from torch.distributed.distributed_c10d import _world
@@ -24,3 +24,17 @@ def destroy_model_parallel():
     for group in list(_world.pg_map):
         if group is not torch.distributed.group.WORLD:
             torch.distributed.destroy_process_group(group)
+
+
+def require_canonical_grouped_glu(precision):
+    """Skip canonical grouped-GLU tests on hardware or optional backends without support."""
+    import pytest
+
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("Canonical grouped GLU requires SM100/103.")
+    cudnn = pytest.importorskip("cudnn")
+    grouped_mlp = pytest.importorskip("transformer_engine.pytorch.ops.fused.grouped_mlp")
+    supports = getattr(grouped_mlp, "_cudnn_frontend_supports_gate_then_up", None)
+    if supports is None or not supports(precision):
+        pytest.skip(f"Installed TE/cuDNN does not advertise canonical {precision} grouped GLU.")
+    return cudnn

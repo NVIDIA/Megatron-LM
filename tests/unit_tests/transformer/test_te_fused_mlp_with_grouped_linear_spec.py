@@ -219,9 +219,8 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         assert fc1_op.kwargs["accumulate_into_main_grad"] is True
         assert fc1_op.kwargs["split_alignment"] == 256
         assert fc1_op.weight0 is module.linear_fc1.weight
-        assert fc1_op._glu_interleave_size == 32
         assert isinstance(fused_impl[1], fake_te.ScaledSwiGLU)
-        assert fused_impl[1].kwargs == {"glu_interleave_size": 32}
+        assert fused_impl[1].kwargs == {"glu_interleave_size": None}
         assert fc2_op.kwargs["num_groups"] == 1
         assert fc2_op.kwargs["in_features"] == 4
         assert fc2_op.kwargs["out_features"] == 4
@@ -379,7 +378,8 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         )
 
     @pytest.mark.parametrize(
-        ("fp4_recipe", "recipe_name"), [("nvfp4", "NVFP4BlockScaling"), ("", "MXFP8BlockScaling")]
+        ("fp4_recipe", "recipe_name"),
+        [("nvfp4", "NVFP4BlockScaling"), ("", "MXFP8BlockScaling"), ("nvfp4_ue5m3", None)],
     )
     def test_forward_uses_recipe_and_drops_empty_bias(self, monkeypatch, fp4_recipe, recipe_name):
         import megatron.core.extensions.transformer_engine as te_ext
@@ -389,8 +389,10 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         fused_impl = lambda hidden_states, *args: hidden_states
         module = TEFusedMLPWithGroupedLinear.__new__(TEFusedMLPWithGroupedLinear)
         module._fused_impl = None
+        module.config = _make_config(fp8="e4m3", fp8_recipe="mxfp8")
         module._norm_seq = (lambda hidden_states: hidden_states,)
-        module.linear_fc2 = SimpleNamespace(te_return_bias=True, bias=torch.empty(0))
+        module.linear_fc1 = SimpleNamespace(training=True)
+        module.linear_fc2 = SimpleNamespace(training=True, te_return_bias=True, bias=torch.empty(0))
         object.__setattr__(module, "_make_fused_impl", lambda: fused_impl)
         registration_calls = []
         object.__setattr__(
@@ -413,7 +415,7 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
         monkeypatch.setattr(
             te_ext.te.common.recipe,
             "MXFP8BlockScaling",
-            lambda: make_recipe("MXFP8BlockScaling"),
+            lambda **kwargs: make_recipe("MXFP8BlockScaling"),
             raising=False,
         )
         monkeypatch.setattr(
@@ -429,6 +431,11 @@ class TestTEFusedMLPWithGroupedLinearControlFlow:
             monkeypatch.setenv("FP4_RECIPE", fp4_recipe)
         else:
             monkeypatch.delenv("FP4_RECIPE", raising=False)
+
+        if fp4_recipe == "nvfp4_ue5m3":
+            with pytest.raises(NotImplementedError, match="UE5M3"):
+                TEFusedMLPWithGroupedLinear.forward(module, torch.ones(2, 128, 4))
+            return
 
         out, bias = TEFusedMLPWithGroupedLinear.forward(module, torch.ones(2, 128, 4))
 
@@ -474,7 +481,8 @@ class TestTEFusedMLPWithGroupedLinearSpec:
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
     @pytest.mark.launch_on_gb200
-    def test_split_alignment_enables_fusion_without_env(self, monkeypatch):
+    @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "nvfp4", "bf16_override"])
+    def test_split_alignment_enables_fusion_without_env(self, monkeypatch, precision):
         import transformer_engine.pytorch as te
 
         if "split_alignment" not in inspect.signature(te.ops.GroupedLinear).parameters:
@@ -484,7 +492,11 @@ class TestTEFusedMLPWithGroupedLinearSpec:
         mxfp8_available, reason = te.is_mxfp8_available(return_reason=True)
         if not mxfp8_available:
             pytest.skip(reason)
-        fused_cls = te.ops.fused.GroupedMLP_CuTeGEMMGLU
+        fused_cls = (
+            te.ops.fused.GroupedMLP_CuTeGEMMGLUBf16
+            if precision in ("bf16", "bf16_override")
+            else te.ops.fused.GroupedMLP_CuTeGEMMGLU
+        )
         if not fused_cls.is_supported():
             pytest.skip("Fused grouped MLP requires supported GPU and cuDNN frontend kernels")
 
@@ -494,13 +506,58 @@ class TestTEFusedMLPWithGroupedLinearSpec:
             bf16=True,
             params_dtype=torch.bfloat16,
             use_cpu_initialization=False,
+            fp8="e4m3" if precision in ("mxfp8", "bf16_override") else None,
+            fp8_recipe="mxfp8",
+            fp4="e2m1" if precision == "nvfp4" else None,
+            fp4_recipe="nvfp4",
         )
         mlp = TEFusedMLPWithGroupedLinear(config, _make_submodules()).cuda()
+        if precision == "bf16_override":
+            from megatron.core.extensions.transformer_engine import (
+                TEQuantizationParams,
+                TEQuantizationRecipe,
+            )
+
+            override = TEQuantizationParams(
+                training_recipe=TEQuantizationRecipe(), evaluation_recipe=None
+            )
+            mlp.linear_fc1.te_quant_params = override
+            mlp.linear_fc2.te_quant_params = override
         hidden = torch.randn(
             (2, 128, config.hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True
         )
         output, bias = mlp(hidden)
-        output.backward(torch.randn_like(output))
+        grad_output = torch.randn_like(output)
+        output.backward(grad_output)
+        if precision in ("bf16", "bf16_override"):
+            from tests.unit_tests.generalized_tensor_parallel.test_gtp_grouped_mlp_precision import (
+                _assert_bf16_close,
+            )
+
+            ref_input = hidden.detach().clone().requires_grad_()
+            ref_fc1 = mlp.linear_fc1.weight.detach().clone().requires_grad_()
+            ref_fc2 = mlp.linear_fc2.weight.detach().clone().requires_grad_()
+            normed = F.layer_norm(
+                ref_input,
+                (config.hidden_size,),
+                mlp.linear_fc1.layer_norm_weight.detach(),
+                mlp.linear_fc1.layer_norm_bias.detach(),
+                mlp.linear_fc1.eps,
+            )
+            gate, up = F.linear(normed, ref_fc1).chunk(2, dim=-1)
+            activated = (F.silu(gate.float()) * up.float()).to(gate.dtype)
+            ref_output = F.linear(activated, ref_fc2)
+            ref_output.backward(grad_output)
+            torch.testing.assert_close(output, ref_output, atol=2e-3, rtol=2e-2)
+            for actual, reference in (
+                (hidden, ref_input),
+                (mlp.linear_fc1.weight, ref_fc1),
+                (mlp.linear_fc2.weight, ref_fc2),
+            ):
+                # Fused FP32 activation derivatives and BF16 GEMM accumulation can differ
+                # at cancellation points. Bound RMS and outliers against the signal,
+                # using the same BF16 budget as the independent distributed reference.
+                _assert_bf16_close(actual.grad, reference.grad, "independent BF16 gradient")
 
         (sequential,) = mlp._fused_impl
         assert sequential[0].split_alignment == 256

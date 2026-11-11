@@ -685,6 +685,30 @@ layouts.
 
 ### GLU Checkpoint Layout
 
+For cuDNN grouped GEMM with canonical `[all gate | all up]` weights, enable
+`--moe-grouped-gemm --use-te-op-fuser` and leave both GLU interleave sizes unset.
+This requires matching Transformer Engine and cuDNN frontend versions that expose
+the `gate_then_up` grouped-GLU capability. BF16, MXFP8, and NVFP4 compute are
+supported; NVFP4 uses standard E4M3 block scales, not the UE5M3 custom variant.
+The frontend maps the canonical weight layout inside the kernel, so
+model parameters, FP32 master weights, and optimizer moments need no GLU permutation.
+The existing expert-token alignment requirements still apply.
+
+GTP and Megatron FSDP use **separate per-expert parameters**: leave
+`moe_single_grouped_weight=False` and `moe_single_grouped_bias=False`. Packed single
+grouped weights are a separate TE/cuDNN capability and are not supported by these
+MCore sharding paths. Grouped shared experts can also leave their interleave size
+unset; dense grouped MLPs use the canonical layout. Both singleton paths resolve
+the logical weight dimensions after TP and before GTP weight sharding.
+
+Megatron FSDP V2 supports these compute recipes with BF16 parameter storage and
+gathers. It additionally supports MXFP8 parameter storage/gathers when both
+`fp8_param` and `fp8_param_gather` are enabled. NVFP4 parameter storage/gathers
+remain unsupported; NVFP4 **compute** uses high-precision parameters. Canonical
+checkpoints use the ordinary model/optimizer sharding mechanisms. These layout
+changes do not add general checkpoint-topology conversion or support converting
+an existing interleaved optimizer checkpoint on resume.
+
 `--moe-mlp-glu-interleave-size 32` makes routed expert activations interpret FC1
 channels as alternating blocks of 32 gate and 32 up channels. Native Megatron-LM
 converts contiguous checkpoint FC1 weights and biases into that runtime layout

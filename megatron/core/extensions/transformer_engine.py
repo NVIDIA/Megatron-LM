@@ -564,6 +564,34 @@ def condition_init_method(config, init_method):
     return init_method if config.perform_initialization else (lambda w: None)
 
 
+def get_te_weight_local_shape(weight: torch.Tensor) -> tuple[int, ...]:
+    """Logical weight shape after TP, before GTP weight sharding."""
+    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+    if HAVE_GTP:
+        from megatron.core.tensor_parallel.gtp_api import is_gtp_param
+
+        if is_gtp_param(weight):
+            return weight._unsharded_shape
+    return tuple(weight.shape)
+
+
+def get_te_grouped_mlp_quantization_context(linear_fc1, linear_fc2):
+    """Apply matching per-module overrides inside the model's autocast context."""
+    recipes = [
+        _get_fp8_autocast_recipe_for_quant_params(
+            getattr(linear, "te_quant_params", None), linear.training
+        )
+        for linear in (linear_fc1, linear_fc2)
+    ]
+    if recipes[0] != recipes[1]:
+        raise ValueError(
+            "TE grouped-MLP op-fuser requires the same precision override for linear_fc1 "
+            "and linear_fc2. Apply the override to both linears."
+        )
+    return nullcontext() if recipes[0] is None else _get_fp8_autocast_for_quant_recipe(recipes[0])
+
+
 def _gtp_pre_init(
     module,
     output_size,
@@ -3532,12 +3560,10 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             )
 
     class TEFusedMLPWithGroupedLinear(TEFusedMLP):
-        """Dense MLP using GroupedLinear(num_groups=1) to trigger
-        ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
+        """Dense MLP using canonical weights and fused grouped GEMM with one group.
 
-        Subclass of TEFusedMLP -> does not modify TEFusedMLP or TEGroupedMLP.
-        The fused kernel fires automatically via the TE op fuser when it detects
-        the GroupedLinear -> ScaledSwiGLU -> GroupedLinear pattern with MXFP8 recipe.
+        The TE op fuser selects cuDNN BF16, MXFP8, or NVFP4 kernels on SM100+
+        for the GroupedLinear -> ScaledSwiGLU -> GroupedLinear sequence.
         """
 
         def __init__(self, *args, **kwargs):
@@ -3628,15 +3654,13 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             norm_seq.append(op)
             self._norm_seq = (norm_seq,)
 
-            # GLU interleave size must match ScaledSwiGLU and the CuTe kernel.
-            _GLU_INTERLEAVE_SIZE = 32
-
             # FC1: GroupedLinear(num_groups=1) instead of BasicLinear
             weight = self.linear_fc1.weight
+            fc1_shape = get_te_weight_local_shape(weight)
             op = te.pytorch.ops.GroupedLinear(
                 num_groups=1,
-                in_features=weight.size(1),
-                out_features=weight.size(0) * tp_world_size,
+                in_features=fc1_shape[1],
+                out_features=fc1_shape[0] * tp_world_size,
                 device="meta",
                 dtype=weight.dtype,
                 bias=False,
@@ -3645,19 +3669,18 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 **self._grouped_linear_kwargs,
             )
             op.weight0 = weight
-            op._glu_interleave_size = _GLU_INTERLEAVE_SIZE  # signals fuser_forward to interleave
             fused_impl.append(op)
 
-            # ScaledSwiGLU with glu_interleave_size=32
-            # Required by ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8
-            fused_impl.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=32))
+            # Dense parameters and checkpoints retain contiguous gate/up halves.
+            fused_impl.append(te.pytorch.ops.ScaledSwiGLU(glu_interleave_size=None))
 
             # FC2: GroupedLinear(num_groups=1) instead of BasicLinear
             weight = self.linear_fc2.weight
+            fc2_shape = get_te_weight_local_shape(weight)
             op = te.pytorch.ops.GroupedLinear(
                 num_groups=1,
-                in_features=weight.size(1),
-                out_features=weight.size(0),
+                in_features=fc2_shape[1],
+                out_features=fc2_shape[0],
                 device="meta",
                 dtype=weight.dtype,
                 bias=False,
@@ -3666,8 +3689,6 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 **self._grouped_linear_kwargs,
             )
             op.weight0 = weight
-            # FC2 has no SwiGLU — MXFP8 quantization done on-the-fly in fuser_forward.
-            # No _mxfp8_weight0 pre-computation to avoid ~28 GB persistent FP8 tensors.
             fused_impl.append(op)
 
             return fused_impl
@@ -3731,47 +3752,29 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 total_tokens, device=hidden_states.device, dtype=hidden_states.dtype
             )
 
-            # Build fused impl and cache recipe lazily on first forward pass.
-            # Both are created once and reused — avoids object creation every call.
-            # This recipe cache is a hack (TEFusedMLP does not need
-            # it). Keep it for now for expediency, but future
-            # developers are warned that this should be refactored to
-            # use the model's recipe config like the other TE modules.
+            # Cache the model's compute recipe; retain the explicit legacy FP4 override.
             if not hasattr(self, '_recipe'):
                 if os.getenv("FP4_RECIPE", "") == "nvfp4":
                     self._recipe = te.common.recipe.NVFP4BlockScaling()
                 elif os.getenv("FP4_RECIPE", "") == "nvfp4_ue5m3":
-
-                    def _make_nvfp4_ue5m3_quantizer(
-                        role: te.pytorch.QuantizerRole,
-                    ) -> te.pytorch.NVFP4Quantizer:
-                        """Construct NVFP4 quantizer with UE5M3 scales and no per-tensor
-                        scale for activations."""
-                        tensor_type = role.tensor_type if role is not None else None
-                        if not tensor_type:
-                            tensor_type = "input"
-                        with_rht = tensor_type in ("input", "grad_output")
-                        return te.pytorch.NVFP4Quantizer(
-                            scale_dtype=te.pytorch.DType.kFloat8UE5M3,
-                            with_rht=with_rht,
-                            with_post_rht_amax=with_rht,
-                            with_2d_quantization=tensor_type == "weight",
-                            stochastic_rounding=False,
-                            with_random_sign_mask=False,
-                            disable_second_level_scale=tensor_type == "input",
-                        )
-
-                    # Construct custom recipe for NVFP4 with UE5M3 scales
-                    self._recipe = te.common.recipe.CustomRecipe(
-                        qfactory=_make_nvfp4_ue5m3_quantizer
+                    raise NotImplementedError(
+                        "Canonical dense grouped MLP does not support NVFP4 with UE5M3 "
+                        "scales. Use the standard NVFP4 recipe with E4M3 scales."
                     )
-                    self._recipe.enable_cutedsl_fused_grouped_mlp = True
+                elif self.config.fp8:
+                    from megatron.core.fp8_utils import get_fp8_recipe
+
+                    self._recipe = get_fp8_recipe(self.config)
+                elif self.config.fp4:
+                    from megatron.core.fp4_utils import get_fp4_recipe
+
+                    self._recipe = get_fp4_recipe(self.config)
                 else:
-                    self._recipe = te.common.recipe.MXFP8BlockScaling()
+                    self._recipe = None
             recipe = self._recipe
 
             if self._fused_impl is None:
-                with te.pytorch.quantized_model_init(enabled=True, recipe=recipe):
+                with te.pytorch.quantized_model_init(enabled=recipe is not None, recipe=recipe):
                     fused_impl = self._make_fused_impl()
                     self._register_hooks_on_fused_impl(fused_impl)
                     self._fused_impl = (fused_impl,)
@@ -3781,8 +3784,9 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             # gradient amplification, and causes convergence issues).
             normed = self._norm_seq[0](hidden_states_2d)
 
-            with te.pytorch.autocast(enabled=True, recipe=recipe):
-                out = self._fused_impl[0](normed, tokens_per_expert, scales, tokens_per_expert)
+            with te.pytorch.autocast(enabled=recipe is not None, recipe=recipe):
+                with get_te_grouped_mlp_quantization_context(self.linear_fc1, self.linear_fc2):
+                    out = self._fused_impl[0](normed, tokens_per_expert, scales, tokens_per_expert)
 
             out = out.view(*orig_shape[:-1], out.size(-1))
 

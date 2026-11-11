@@ -227,7 +227,6 @@ def test_validate_fused_grouped_swiglu_requires_clamped_te_support(monkeypatch, 
         ({"add_bias_linear": True}, None, "add_bias_linear"),
         ({"activation_func": F.gelu}, None, "SwiGLU activation"),
         ({"gated_linear_unit": False}, None, "SwiGLU activation"),
-        ({"moe_shared_expert_glu_interleave_size": None}, None, "glu_interleave_size"),
         ({}, "linear_fc1", "FC1"),
         ({}, "linear_fc2", "FC2"),
     ],
@@ -244,9 +243,11 @@ def test_validate_fused_grouped_swiglu_rejects_unsupported_configs(
         shared_expert._validate_fused_grouped_swiglu()
 
 
-def test_make_fused_grouped_swiglu_ops_builds_grouped_pipeline(monkeypatch):
+@pytest.mark.parametrize("glu_interleave_size", [None, 32])
+def test_make_fused_grouped_swiglu_ops_builds_grouped_pipeline(monkeypatch, glu_interleave_size):
     _patch_fake_shared_expert_te(monkeypatch)
-    shared_expert = _fake_shared_expert()
+    shared_expert = _fake_shared_expert(moe_shared_expert_glu_interleave_size=glu_interleave_size)
+    shared_expert._validate_fused_grouped_swiglu()
     shared_expert.linear_fc1.fuse_wgrad_accumulation = True
 
     ops = shared_expert._make_fused_grouped_swiglu_ops()
@@ -261,10 +262,10 @@ def test_make_fused_grouped_swiglu_ops_builds_grouped_pipeline(monkeypatch):
     assert fc1_op.kwargs["bias"] is False
     assert fc1_op.kwargs["accumulate_into_main_grad"] is True
     assert fc1_op.weight0 is shared_expert.linear_fc1.weight
-    assert fc1_op._glu_interleave_size == 32
+    assert fc1_op._glu_interleave_size == glu_interleave_size
 
     assert isinstance(activation_op, _FakeTEScaledSwiGLU)
-    assert activation_op.glu_interleave_size == 32
+    assert activation_op.glu_interleave_size == glu_interleave_size
     assert activation_op._grouped_mlp_unit_activation_scale is True
 
     assert isinstance(fc2_op, _FakeTEGroupedLinear)
@@ -427,7 +428,11 @@ class TestSharedExperts:
     @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.parametrize("overlap", [False, True])
-    def test_gpu_split_alignment_enables_fusion_without_env(self, monkeypatch, overlap):
+    @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "nvfp4", "bf16_override"])
+    @pytest.mark.parametrize("glu_interleave_size", [None, 32])
+    def test_gpu_split_alignment_enables_fusion_without_env(
+        self, monkeypatch, overlap, precision, glu_interleave_size
+    ):
         """The shared expert selects fused forward/backward ops using explicit alignment."""
         import inspect
 
@@ -451,7 +456,11 @@ class TestSharedExperts:
         mxfp8_available, reason = te.is_mxfp8_available(return_reason=True)
         if not mxfp8_available:
             pytest.skip(reason)
-        fused_cls = te.ops.fused.GroupedMLP_CuTeGEMMGLU
+        fused_cls = (
+            te.ops.fused.GroupedMLP_CuTeGEMMGLUBf16
+            if precision in ("bf16", "bf16_override")
+            else te.ops.fused.GroupedMLP_CuTeGEMMGLU
+        )
         if not fused_cls.is_supported():
             pytest.skip("Fused grouped MLP requires supported GPU and cuDNN frontend kernels")
 
@@ -463,14 +472,16 @@ class TestSharedExperts:
             ffn_hidden_size=256,
             moe_shared_expert_intermediate_size=256,
             use_grouped_gemm_for_shared_expert=True,
-            moe_shared_expert_glu_interleave_size=32,
+            moe_shared_expert_glu_interleave_size=glu_interleave_size,
             moe_shared_expert_overlap=overlap,
             use_cpu_initialization=False,
             bias_activation_fusion=False,
             bf16=True,
             params_dtype=torch.bfloat16,
-            fp8="e4m3",
+            fp8="e4m3" if precision in ("mxfp8", "bf16_override") else None,
             fp8_recipe="mxfp8",
+            fp4="e2m1" if precision == "nvfp4" else None,
+            fp4_recipe="nvfp4",
         )
         with get_fp8_context(config, is_init=True):
             shared_expert = FusedSharedExpertMLP(
@@ -479,6 +490,17 @@ class TestSharedExperts:
                 gate=False,
                 pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             ).cuda()
+        if precision == "bf16_override":
+            from megatron.core.extensions.transformer_engine import (
+                TEQuantizationParams,
+                TEQuantizationRecipe,
+            )
+
+            override = TEQuantizationParams(
+                training_recipe=TEQuantizationRecipe(), evaluation_recipe=None
+            )
+            shared_expert.linear_fc1.te_quant_params = override
+            shared_expert.linear_fc2.te_quant_params = override
         hidden = torch.randn(
             (128, 2, config.hidden_size), device="cuda", dtype=torch.bfloat16, requires_grad=True
         )
@@ -490,7 +512,30 @@ class TestSharedExperts:
             output = shared_expert.get_output()
         else:
             output = shared_expert(hidden)
-        output.backward(torch.randn_like(output))
+        grad_output = torch.randn_like(output)
+        output.backward(grad_output)
+        if precision in ("bf16", "bf16_override") and glu_interleave_size is None:
+            from tests.unit_tests.generalized_tensor_parallel.test_gtp_grouped_mlp_precision import (
+                _assert_bf16_close,
+            )
+
+            ref_input = hidden.detach().clone().requires_grad_()
+            ref_fc1 = shared_expert.linear_fc1.weight.detach().clone().requires_grad_()
+            ref_fc2 = shared_expert.linear_fc2.weight.detach().clone().requires_grad_()
+            gate, up = F.linear(ref_input, ref_fc1).chunk(2, dim=-1)
+            activated = (F.silu(gate.float()) * up.float()).to(gate.dtype)
+            ref_output = F.linear(activated, ref_fc2)
+            ref_output.backward(grad_output)
+            torch.testing.assert_close(output, ref_output, atol=2e-3, rtol=2e-2)
+            for actual, reference in (
+                (hidden, ref_input),
+                (shared_expert.linear_fc1.weight, ref_fc1),
+                (shared_expert.linear_fc2.weight, ref_fc2),
+            ):
+                # Fused FP32 activation derivatives and BF16 GEMM accumulation can differ
+                # at cancellation points. Bound RMS and outliers against the signal,
+                # using the same BF16 budget as the independent distributed reference.
+                _assert_bf16_close(actual.grad, reference.grad, "independent BF16 gradient")
 
         (sequential,) = shared_expert._fused_grouped_swiglu_ops
         assert sequential[0].split_alignment == 256

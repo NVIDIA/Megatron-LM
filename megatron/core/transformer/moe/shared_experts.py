@@ -15,6 +15,8 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.extensions.transformer_engine import (
     HAVE_TE,
     TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+    get_te_grouped_mlp_quantization_context,
+    get_te_weight_local_shape,
 )
 from megatron.core.fp4_utils import get_fp4_recipe
 from megatron.core.fp8_utils import get_fp8_recipe
@@ -457,12 +459,6 @@ class FusedSharedExpertMLP(SharedExpertMLP):
                 "with pytorch.ops.ScaledClampedQGeGLU when "
                 "activation_func_clamp_value is set."
             )
-        if self.config.moe_shared_expert_glu_interleave_size is None:
-            raise ValueError(
-                f"{self.__class__.__name__} requires "
-                "moe_shared_expert_glu_interleave_size to be set when "
-                "use_grouped_gemm_for_shared_expert=True."
-            )
         if not isinstance(self.linear_fc1, te.pytorch.Linear):
             raise ValueError(
                 f"{self.__class__.__name__} expects FC1 to be Transformer Engine Linear, "
@@ -481,10 +477,6 @@ class FusedSharedExpertMLP(SharedExpertMLP):
                 self._fused_grouped_swiglu_recipe = get_fp8_recipe(self.config)
             elif self.config.fp4:
                 self._fused_grouped_swiglu_recipe = get_fp4_recipe(self.config)
-            else:
-                raise ValueError(
-                    f"{self.__class__.__name__} requires either FP8 or FP4 to be enabled."
-                )
         return self._fused_grouped_swiglu_recipe
 
     def _make_fused_grouped_swiglu_ops(self) -> torch.nn.Module:
@@ -496,11 +488,12 @@ class FusedSharedExpertMLP(SharedExpertMLP):
 
         glu_interleave_size = self.config.moe_shared_expert_glu_interleave_size
         fc1_weight = self.linear_fc1.weight
+        fc1_shape = get_te_weight_local_shape(fc1_weight)
         op = te.pytorch.ops.GroupedLinear(
             num_groups=1,
-            in_features=fc1_weight.size(1),
-            # fc1_weight is the local TP shard and GroupedLinear has no TP, so use the local size.
-            out_features=fc1_weight.size(0),
+            in_features=fc1_shape[1],
+            # GroupedLinear sees the TP-local weight gathered across GTP ranks.
+            out_features=fc1_shape[0],
             device="meta",
             dtype=fc1_weight.dtype,
             bias=False,
@@ -529,10 +522,11 @@ class FusedSharedExpertMLP(SharedExpertMLP):
         ops.append(activation_op)
 
         fc2_weight = self.linear_fc2.weight
+        fc2_shape = get_te_weight_local_shape(fc2_weight)
         op = te.pytorch.ops.GroupedLinear(
             num_groups=1,
-            in_features=fc2_weight.size(1),
-            out_features=fc2_weight.size(0),
+            in_features=fc2_shape[1],
+            out_features=fc2_shape[0],
             device="meta",
             dtype=fc2_weight.dtype,
             bias=False,
@@ -590,13 +584,14 @@ class FusedSharedExpertMLP(SharedExpertMLP):
 
         recipe = self._get_fused_grouped_swiglu_recipe()
         if self._fused_grouped_swiglu_ops is None:
-            with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=recipe):
+            with te.pytorch.fp8_autocast(enabled=recipe is not None, fp8_recipe=recipe):
                 self._fused_grouped_swiglu_ops = (self._make_fused_grouped_swiglu_ops(),)
 
-        with te.pytorch.fp8_autocast(enabled=True, fp8_recipe=recipe):
-            output = self._fused_grouped_swiglu_ops[0](
-                hidden_states_2d, tokens_per_expert, scales, tokens_per_expert
-            )
+        with te.pytorch.fp8_autocast(enabled=recipe is not None, fp8_recipe=recipe):
+            with get_te_grouped_mlp_quantization_context(self.linear_fc1, self.linear_fc2):
+                output = self._fused_grouped_swiglu_ops[0](
+                    hidden_states_2d, tokens_per_expert, scales, tokens_per_expert
+                )
         return output.view(*orig_shape[:-1], output.size(-1))
 
     def _fused_grouped_swiglu_forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

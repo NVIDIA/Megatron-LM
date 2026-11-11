@@ -15,6 +15,7 @@ replays live in ``context_parallel/runtime/test_te_replay.py`` and
 
 import inspect
 import os
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -276,6 +277,63 @@ class TestTEWrappers:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not _IS_BLACKWELL, reason="canonical grouped GLU requires Blackwell")
+    @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "nvfp4"])
+    def test_canonical_grouped_mlp_replays(self, monkeypatch, grouped_mlp_fusions, precision):
+        """Canonical dispatch replays without packing weights or silently losing fusion.
+
+        The quantized dGLU uses cuDNN's deterministic probability-gradient reduction.
+        BF16 has no such reduction: its forward is exact and its backward must reject
+        the determinism request explicitly, rather than claim atomic dprob is exact.
+        """
+        import transformer_engine.pytorch as te
+
+        from tests.unit_tests.generalized_tensor_parallel.test_gtp_canonical_grouped_mlp import (
+            assert_canonical_fused,
+            canonical_config,
+            canonical_experts,
+            canonical_recipe,
+        )
+
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        seeded()
+        config = replace(canonical_config(precision), moe_ffn_hidden_size=1024)
+        experts = canonical_experts(config, ProcessGroupCollection.use_mpu_process_groups())
+        for param in experts.parameters():
+            param.main_grad = torch.zeros_like(param, dtype=torch.float32)
+            param.grad_added_to_main_grad = False
+        recipe = canonical_recipe(precision)
+        splits = torch.tensor([256, 0, 1536], device="cuda", dtype=torch.int64)
+
+        class Block(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.experts = experts
+
+            def forward(self, inputs, probs):
+                with te.autocast(enabled=recipe is not None, recipe=recipe):
+                    output, _ = self.experts(inputs, splits, probs)
+                assert_canonical_fused(self.experts, precision)
+                return output
+
+        module = Block()
+        inputs = torch.randn(1792, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        probs = torch.rand(1792, device="cuda", requires_grad=True)
+        assert_module_replays_bit_exact(
+            module,
+            (inputs, probs),
+            replays=3,
+            backward=precision != "bf16",
+            contention=True,
+            what=f"canonical cuDNN grouped MLP[{precision}]",
+        )
+        if precision == "bf16":
+            with pytest.raises(RuntimeError, match="BF16 fused grouped MLP.*nondeterministic"):
+                module(inputs, probs).sum().backward()
 
     def test_mark_grouped_tensor_is_numerically_transparent(self):
         """The paged-stash marker must not change activation values or gradients."""

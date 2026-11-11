@@ -906,7 +906,8 @@ class TransformerConfig(ModelParallelConfig):
     moe_shared_expert_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the shared expert MLP will use a block
     interleaved format. This is only effective when
-    use_grouped_gemm_for_shared_expert is set.
+    use_grouped_gemm_for_shared_expert is set. Leave unset for canonical gate/up
+    weights, including GTP and Megatron FSDP grouped-GEMM execution.
     Requires BF16 or FP16 model parameters when GLU is enabled.
     """
     moe_shortcut_connection: bool = False
@@ -1081,9 +1082,9 @@ class TransformerConfig(ModelParallelConfig):
     Required when ``moe_num_hash_layers > 0``."""
 
     use_grouped_gemm_for_dense_mlp: bool = False
-    """Use GroupedLinear(num_groups=1) for dense MLP to trigger the
-    ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
-    Requires ``use_te_op_fuser=True`` and SwiGLU activation.
+    """Use GroupedLinear(num_groups=1) with canonical gate/up weights for dense MLP.
+    Supports cuDNN BF16, MXFP8, and NVFP4 fusion on SM100+ with the matching TE/frontend.
+    Requires ``use_transformer_engine_op_fuser=True`` and SwiGLU activation.
     """
 
     moe_grouped_gemm: bool = True
@@ -1105,7 +1106,8 @@ class TransformerConfig(ModelParallelConfig):
     moe_single_grouped_weight: bool = False
     """When using TE GroupedLinear for MoE experts, store expert weights as a single grouped
     parameter via Transformer Engine's `GroupedTensor`. Requires ``moe_grouped_gemm=True`` and
-    ``moe_use_grouped_tensor=True``.
+    ``moe_use_grouped_tensor=True``. GTP weight sharding and Megatron FSDP require
+    separate per-expert parameters instead.
     """
 
     moe_single_grouped_bias: bool = False
@@ -1276,8 +1278,10 @@ class TransformerConfig(ModelParallelConfig):
     block interleaved format. Instead of interpreting the input tensor
     as a concatenation of gates and linear units, it will be
     interpreted as alternating blocks of gates and linear units.
-    This data format is experimental and primarily intended to enable
-    advanced fused kernels. Requires BF16 or FP16 model parameters when GLU is enabled."""
+    Leave unset for canonical gate/up weights; matching Transformer Engine and cuDNN
+    frontend versions fuse this layout without checkpoint permutations. GTP and Megatron
+    FSDP use canonical weights with separate per-expert parameters. The interleaved layout
+    requires BF16 or FP16 model parameters when GLU is enabled."""
 
     moe_expert_rank_capacity_factor: Optional[float] = None
     """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank, i.e. the
@@ -2596,6 +2600,11 @@ class TransformerConfig(ModelParallelConfig):
                     f"transformer-engine>=2.14.0, but your version is {get_te_version()}."
                 )
         if self.moe_single_grouped_weight:
+            if self.expert_gtp_weight_remat_size > 1:
+                raise ValueError(
+                    "GTP weight sharding requires moe_single_grouped_weight=False; "
+                    "use discrete per-expert weights with grouped GEMM."
+                )
             # Single grouped weights are supported for high-precision primary weights
             # (BF16/FP16), MXFP8 primary weights, and NVFP4 primary weights.
             # Other quantized primary-weight paths need grouped partial-cast support
