@@ -3010,9 +3010,20 @@ def setup_model_and_optimizer(
         )
 
     if args.logits_save_dir is not None and mpu.is_pipeline_last_stage():
-        from megatron.training.distillation import build_logits_saver
+        from megatron.training.distillation import LogitsSaverHooks
 
-        logits_saver = build_logits_saver(args)
+        saver_class = LogitsSaverHooks
+        if getattr(args, "logits_save_inputs", False):
+            from megatron.training.distillation.v3_runtime import v3_saver_class
+
+            saver_class = v3_saver_class(args)
+        logits_saver = saver_class(
+            save_dir=args.logits_save_dir,
+            k=args.logits_save_top_k,
+            p=args.logits_save_top_p,
+            min_k=args.logits_save_top_p_min_k,
+            save_dtype=args.logits_save_dtype,
+        )
         logits_saver.attach_hooks(unwrapped_model[-1])
 
     if args.logits_load_dir is not None and mpu.is_pipeline_last_stage():
@@ -3439,10 +3450,10 @@ def train_step(
     save_dgrads_in_this_iteration = (checkpoint.save_dgrads_interval is not None and
                                      (iteration + 1) % checkpoint.save_dgrads_interval == 0)
     while rerun_state_machine.should_run_forward_backward(rerun_data_iterator):
-        if args.logits_save_dir is not None:
-            from megatron.training.distillation import begin_logits_attempt
+        if getattr(args, "logits_save_inputs", False):
+            from megatron.training.distillation.v3_runtime import begin_attempt
 
-            begin_logits_attempt()
+            begin_attempt()
         # Set grad to zero.
         for model_chunk in model:
             model_chunk.zero_grad_buffer()
@@ -3599,10 +3610,10 @@ def train_step(
     if should_exit:
         return {}, True, should_checkpoint, should_exit, exit_code, None, None, 0, None, scheduled_num_microbatches
 
-    if args.logits_save_dir is not None:
-        from megatron.training.distillation import commit_logits_attempt
+    if getattr(args, "logits_save_inputs", False):
+        from megatron.training.distillation.v3_runtime import commit_attempt
 
-        commit_logits_attempt()
+        commit_attempt()
 
     # Empty unused memory.
     if cfg.train.empty_unused_memory_level >= 1:

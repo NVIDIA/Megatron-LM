@@ -933,6 +933,35 @@ def bind_student_logits(sidecar: dict | None) -> dict | None:
     return {**sidecar, "logits": get_student_logits_capture().pop()}
 
 
+def v3_saver_class(args: Any) -> type:
+    """The teacher saver for a v3 dump: a corpus source, or a replay cache."""
+    if getattr(args, "kd_corpus_dump", None):
+        from .corpus_saver import CorpusLogitsSaver
+
+        return CorpusLogitsSaver
+    from .v3_saver import PairedLogitsSaver
+
+    return PairedLogitsSaver
+
+
+def begin_attempt() -> None:
+    """Discard provisional saver data before a train-step attempt (rerun-safe dumps)."""
+    from .logits_saver import get_logits_saver
+
+    saver = get_logits_saver()  # None off the last pipeline stage.
+    if saver is not None:
+        saver.begin_attempt()
+
+
+def commit_attempt() -> None:
+    """Commit the accepted train-step attempt's saver data."""
+    from .logits_saver import get_logits_saver
+
+    saver = get_logits_saver()
+    if saver is not None:
+        saver.commit_attempt()
+
+
 def finish_dump() -> None:
     """Flush the final teacher tail synchronously after draining async writes."""
     from .logits_saver import get_logits_saver

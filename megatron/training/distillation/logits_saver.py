@@ -108,40 +108,6 @@ def check_logits_saver_failure() -> None:
         )
 
 
-def build_logits_saver(args: Any) -> "LogitsSaverHooks":
-    """Construct the teacher saver selected by the CLI (paired v3 with --logits-save-inputs)."""
-    saver_class = LogitsSaverHooks
-    if getattr(args, "logits_save_inputs", False):
-        from .v3_saver import PairedLogitsSaver
-
-        saver_class = PairedLogitsSaver
-        if getattr(args, "kd_corpus_dump", None):
-            from .corpus_saver import CorpusLogitsSaver
-
-            saver_class = CorpusLogitsSaver
-    return saver_class(
-        save_dir=args.logits_save_dir,
-        k=args.logits_save_top_k,
-        p=args.logits_save_top_p,
-        min_k=args.logits_save_top_p_min_k,
-        save_dtype=args.logits_save_dtype,
-    )
-
-
-def begin_logits_attempt() -> None:
-    """Discard provisional saver data before a train-step attempt (rerun-safe v3 dumps)."""
-    saver = get_logits_saver()
-    if saver is not None and hasattr(saver, "begin_attempt"):
-        saver.begin_attempt()
-
-
-def commit_logits_attempt() -> None:
-    """Commit the accepted train-step attempt's saver data."""
-    saver = get_logits_saver()
-    if saver is not None and hasattr(saver, "commit_attempt"):
-        saver.commit_attempt()
-
-
 class LogitsSaverHooks:
     """
     Hook-based utility to save top-K log-probabilities during training with minimal overhead.
@@ -687,8 +653,8 @@ class LogitsSaverHooks:
         global_indices = local_indices + vocab_offset
 
         # Pack logits, log-probs, and indices into a single tensor.
-        # fp32 exactly represents integers through 2^24, covering all supported
-        # vocabularies. Shape: (seq, batch, local_k, 3)
+        # fp32 can exactly represent integers up to 2^24, sufficient for
+        # 17-bit vocab indices.  Shape: (seq, batch, local_k, 3)
         combined = torch.stack(
             [local_logit_vals,
              local_logprob_vals.float(),
