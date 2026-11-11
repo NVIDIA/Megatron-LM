@@ -3673,6 +3673,25 @@ class TECudaGraphHelper:
         return tuple(range(multiple, max_num_microbatches + 1, multiple))
 
     @staticmethod
+    def _get_dynamic_slot_liveness_proof_limit(
+        num_warmup_microbatches, num_model_chunks, num_slots, microbatch_group_size_per_vp_stage
+    ):
+        """Return the largest microbatch count the slot liveness proof needs to enumerate.
+
+        Reachable counts are VPP-group aligned, so a shorter count's schedule table is a prefix
+        of a longer one's. A count whose warmup is not truncated orders the warmup forwards, one
+        forward/backward pair per remaining virtual microbatch, then the cooldown backwards.
+        Advancing a steady-state pair by lcm(num_slots, group size) microbatches revisits the
+        same model chunks and physical slots; warmup live sets are subsets of the first
+        steady-state one, and the cooldown starts no forward. Counts up to the returned limit,
+        including every count with a truncated warmup, therefore contain every saved-tensor and
+        returned-gradient conflict and every per-chunk outstanding count of a longer schedule.
+        """
+        group_size = microbatch_group_size_per_vp_stage or 1
+        steady_start = math.ceil(num_warmup_microbatches / num_model_chunks)
+        return math.ceil(steady_start / group_size) * group_size + math.lcm(num_slots, group_size)
+
+    @staticmethod
     def _get_dp_balanced_thd_max_num_microbatches(
         global_batch_size,
         dp_size,
@@ -3935,35 +3954,53 @@ class TECudaGraphHelper:
                 # The dynamic-CP scheduler returns at most max_num_microbatches packed
                 # microbatches; the nominal pre-packing count is not a reachable runtime count,
                 # and need not be aligned to the VPP group.
-                liveness_num_microbatches = max_num_microbatches
-                self._dynamic_slot_liveness_limit = liveness_num_microbatches
-                candidate_num_microbatches_values = (
+                from megatron.core.pipeline_parallel.schedules import get_pp_rank_microbatches
+
+                vpp_group_size = (
+                    None
+                    if self.config.virtual_pipeline_model_parallel_size is None
+                    else microbatch_group_size_per_vp_stage
+                )
+                self._dynamic_slot_liveness_limit = max_num_microbatches
+                self._dynamic_slot_liveness_counts = (
                     self._get_dynamic_slot_liveness_microbatch_counts(
-                        liveness_num_microbatches,
-                        (
-                            None
-                            if self.config.virtual_pipeline_model_parallel_size is None
-                            else microbatch_group_size_per_vp_stage
-                        ),
+                        max_num_microbatches, vpp_group_size
                     )
                 )
-                self._dynamic_slot_liveness_counts = candidate_num_microbatches_values
-                possible_orders = tuple(
-                    tuple(
-                        self._build_pipeline_order(
-                            candidate_num_microbatches,
-                            microbatch_group_size_per_vp_stage,
-                            overlap_moe_expert_parallel_comm=False,
-                        )
-                    )
-                    for candidate_num_microbatches in candidate_num_microbatches_values
+                _, _, num_warmup_microbatches, _ = get_pp_rank_microbatches(
+                    max_num_microbatches,
+                    self.num_model_chunks,
+                    microbatch_group_size_per_vp_stage,
+                    forward_only=False,
+                    overlap_moe_expert_parallel_comm=False,
                 )
-                self._dynamic_slot_liveness_orders = possible_orders
+                liveness_orders = {}
+
+                def extend_liveness_orders(num_slots):
+                    # Longer reachable schedules only repeat the live sets of these counts.
+                    limit = self._get_dynamic_slot_liveness_proof_limit(
+                        num_warmup_microbatches, self.num_model_chunks, num_slots, vpp_group_size
+                    )
+                    for count in self._dynamic_slot_liveness_counts:
+                        if count > limit:
+                            break
+                        if count not in liveness_orders:
+                            liveness_orders[count] = tuple(
+                                self._build_pipeline_order(
+                                    count,
+                                    microbatch_group_size_per_vp_stage,
+                                    overlap_moe_expert_parallel_comm=False,
+                                )
+                            )
+
+                # The ring size depends only on per-chunk outstanding counts, which repeat with
+                # the schedule table whatever the ring size is.
+                extend_liveness_orders(num_slots=1)
                 auto_num_slots = max(
                     self._get_required_num_microbatch_slots_from_order(
                         possible_order, self.num_model_chunks
                     )
-                    for possible_order in possible_orders
+                    for possible_order in liveness_orders.values()
                 )
                 pp_group = self.pp_group
                 if pp_group is not None and pp_group.size() > 1:
@@ -3974,6 +4011,9 @@ class TECudaGraphHelper:
                         auto_num_slots_tensor, op=torch.distributed.ReduceOp.MAX, group=pp_group
                     )
                     auto_num_slots = int(auto_num_slots_tensor.item())
+                # Physical frames also repeat with the ring; the aliasing proof covers its period.
+                extend_liveness_orders(auto_num_slots)
+                self._dynamic_slot_liveness_orders = tuple(liveness_orders.values())
                 self.num_microbatches = auto_num_slots
                 capture_mode = f"{capture_mode}_physical_slots"
                 fallback_reason = None
