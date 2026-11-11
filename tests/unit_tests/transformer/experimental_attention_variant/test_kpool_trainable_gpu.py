@@ -1507,9 +1507,14 @@ def test_cudnn_backend_trainable_layer_matches_the_reference(monkeypatch, scorer
     through the KPool loss alone and its loss matches the reference.
 
     The real token-level hooks of that backend raise when reached. With the cuDNN KPool
-    scorer, the layer's selector is the cuDNN pool top-k.
+    scorer, the layer's selector is the cuDNN pool top-k, and with cuDNN frontend >= 1.31 the
+    loss runs on the cuDNN frontend kernels instead of ``KPoolSparseIndexerLoss``
+    (``test_kpool_trainable_cudnn_gpu.py`` covers that path).
     """
     _require_cudnn_dsa()
+    cudnn_loss = scorer == "cudnn" and dsa_cudnn_kernels._cudnn_frontend_at_least(
+        dsa_cudnn_kernels._KPOOL_SPARSE_LOSS_MIN_FE_VERSION
+    )
     seen = _install_recorders(monkeypatch)
     config = _config(
         loss_coeff=_COEFF,
@@ -1527,7 +1532,7 @@ def test_cudnn_backend_trainable_layer_matches_the_reference(monkeypatch, scorer
     (record,) = _layer_losses(seen)
     (indexer_call,) = indexer_calls
     (call,) = seen.kpool
-    assert seen.loss_function_calls == 1
+    assert seen.loss_function_calls == (0 if cudnn_loss else 1)
     assert _is_trainable_call(call)
     assert (call.kwargs.get("pool_topk_fn") is not None) == (scorer == "cudnn")
     _assert_indexer_trained(trainable, run)

@@ -16,6 +16,11 @@ the kernels' arithmetic order:
   sparse indexer score recompute: FP32 ``softmax`` over the selected keys of
   ``sum_h relu(q_h . k) * w_h`` from BF16 inputs, slots with a negative index masked (or
   past ``topk_length`` when given), top-k a multiple of 128; calls are recorded.
+* ``Fe131KPoolLossDSA`` adds torch references of the two kernels of the cuDNN KPool indexer
+  loss: ``sparse_attn_score_recompute_wrapper`` (head-summed attention mass per slot from the
+  attention's LSE, L1-normalized; widths a multiple of 128 without ``topk_length``) and
+  ``indexer_backward_wrapper`` (the sparse indexer KL backward, at least 64 heads, with the
+  FE score-gradient stage); calls are recorded.
 * ``Fe131CleanLogitsDSA`` adds the proposed ``clean_logits`` switch. With
   ``clean_logits=False`` the buffer starts as ``poison`` (NaN by default) and only the
   causal prefix ``[0, causal_len)`` of every covered row is written, as the FE 1.31
@@ -362,6 +367,182 @@ class Fe131DSA:
         return {"scores": cls._run(q, k, w, fill_value=float("-inf"), kwargs=kwargs)}
 
     indexer_top_k_wrapper = staticmethod(indexer_top_k_wrapper)
+
+
+_TINY = torch.finfo(torch.float32).tiny
+
+
+def sparse_attn_score_recompute(
+    q,
+    k,
+    lse,
+    topk_indices,
+    sm_scale,
+    *,
+    qhead_per_kv_head=None,
+    topk_length=None,
+    topk_indices_global=False,
+):
+    """Torch reference of ``sparse_attn_score_recompute_wrapper`` (``"target"``).
+
+    ``S_j = sum_h exp(sm_scale * q_h . k_j - lse_h)`` over the slots with a non-negative id
+    (and below ``topk_length`` when given), L1-normalized per row; other slots are zero. Like
+    the FE 1.31 kernel at latent 512 and 64 heads: without ``topk_length`` the width must be a
+    multiple of 128, and ``topk_length`` over a ``-1`` id is refused (the kernel would read
+    the memory before ``k``).
+    """
+    assert q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16
+    assert lse.dtype == torch.float32 and topk_indices.dtype == torch.int32
+    assert q.ndim == 4 and k.ndim == 3 and topk_indices.ndim == 3
+    batch, rows, heads, _dim = q.shape
+    assert tuple(lse.shape) == (batch, rows, heads) and lse.is_contiguous()
+    assert qhead_per_kv_head in (None, heads) and not topk_indices_global
+    width = topk_indices.size(-1)
+    indices = topk_indices.long()
+    valid = indices >= 0
+    if topk_length is None:
+        assert width % 128 == 0, f"topk ({width}) must be a multiple of n_block_size (128)"
+    else:
+        inside = torch.arange(width).view(1, 1, width) < topk_length.view(batch, rows, 1)
+        assert not bool((inside & ~valid).any()), "topk_length covers a -1 id"
+        valid = valid & inside
+    safe = indices.clamp(0, k.size(1) - 1)
+    selected = torch.stack([k[b].float()[safe[b]] for b in range(batch)])
+    logits = torch.einsum("bqhd,bqwd->bqhw", q.float(), selected) * sm_scale
+    probs = torch.exp(logits - lse.unsqueeze(-1))
+    probs = torch.where(valid.unsqueeze(2), probs, torch.zeros_like(probs))
+    mass = probs.sum(dim=2)
+    total = mass.sum(dim=-1, keepdim=True)
+    return {"target": mass / torch.where(total > 0, total, torch.ones_like(total))}
+
+
+def indexer_backward(
+    q,
+    w,
+    k,
+    attn_score,
+    index_score,
+    topk_indices,
+    *,
+    sm_scale,
+    loss_coeff,
+    grad_loss,
+    block_I,
+    topk_indices_global=False,
+):
+    """Torch reference of ``indexer_backward_wrapper`` (sparse indexer KL backward).
+
+    The score is ``I = sum_h w_h * relu(sm_scale * q_h . k)``; the score gradient is the FE
+    stage ``g = -max(T, tiny) * [p >= tiny] * gs``, ``dI = g - p * sum(g)`` with
+    ``gs = grad_loss * loss_coeff / (B * S_q)``, and only slots with a valid id carry it. Like
+    the kernel: at least 64 heads, a top-k that is a multiple of ``block_I``, BF16 outputs, and
+    both score operands overwritten.
+    """
+    assert q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16 and w.dtype == torch.bfloat16
+    assert q.size(2) >= 64, "assert heads >= 64"
+    assert topk_indices.size(-1) % block_I == 0
+    batch, rows, _heads, dim = q.shape
+    keys = k.size(1)
+    total = batch * keys
+    ids = topk_indices.long()
+    if not topk_indices_global:
+        offsets = torch.arange(batch).view(batch, 1, 1) * keys
+        ids = torch.where(ids >= 0, ids + offsets, ids)
+    valid = (ids >= 0) & (ids < total)
+    scale = grad_loss.float() * loss_coeff / (batch * rows)
+    predict = index_score.float()
+    gate = (predict >= _TINY).float()
+    g = -attn_score.float().clamp_min(_TINY) * gate * scale
+    dlogit = (g - predict * g.sum(dim=-1, keepdim=True)).masked_fill(~valid, 0.0)
+    k_flat = k.reshape(total, dim).float()
+    selected = k_flat[ids.clamp(0, total - 1)]
+    queries = q.float()
+    dots = torch.einsum("bqhd,bqkd->bqhk", queries, selected) * sm_scale
+    slot_grad = dlogit.unsqueeze(2)
+    d_weights = (dots.clamp_min(0) * slot_grad).sum(dim=-1)
+    coeff = (dots > 0).float() * w.float().unsqueeze(-1) * slot_grad * sm_scale
+    d_q = torch.einsum("bqhk,bqkd->bqhd", coeff, selected)
+    d_selected = torch.einsum("bqhk,bqhd->bqkd", coeff, queries)
+    d_k = torch.zeros(total, dim).index_add_(0, ids[valid], d_selected[valid])
+    attn_score.fill_(float("nan"))
+    index_score.fill_(float("nan"))
+    return {
+        "d_index_q": d_q.to(q.dtype),
+        "d_weights": d_weights.to(w.dtype),
+        "d_index_k": d_k.view(batch, keys, dim).to(k.dtype),
+    }
+
+
+class Fe131KPoolLossDSA(Fe131DSA):
+    """FE 1.31 plus torch references of the two kernels of the cuDNN KPool indexer loss."""
+
+    calls: list = []
+    score_calls: list = []
+    backward_calls: list = []
+
+    @classmethod
+    def reset(cls):
+        super().reset()
+        cls.score_calls = []
+        cls.backward_calls = []
+
+    @classmethod
+    def sparse_attn_score_recompute_wrapper(
+        cls,
+        q,
+        k,
+        lse,
+        topk_indices,
+        sm_scale,
+        qhead_per_kv_head=None,
+        topk_indices_global=False,
+        topk_length=None,
+    ):
+        cls.score_calls.append(
+            dict(width=topk_indices.size(-1), topk_length=topk_length, heads=q.size(2))
+        )
+        return sparse_attn_score_recompute(
+            q,
+            k,
+            lse,
+            topk_indices,
+            sm_scale,
+            qhead_per_kv_head=qhead_per_kv_head,
+            topk_length=topk_length,
+            topk_indices_global=topk_indices_global,
+        )
+
+    @classmethod
+    def indexer_backward_wrapper(
+        cls,
+        q,
+        w,
+        k,
+        attn_score,
+        index_score,
+        topk_indices,
+        sm_scale=1.0,
+        loss_coeff=1.0,
+        grad_loss=None,
+        block_I=128,
+        topk_indices_global=False,
+    ):
+        cls.backward_calls.append(
+            dict(sm_scale=sm_scale, heads=q.size(2), topk=topk_indices.size(-1))
+        )
+        return indexer_backward(
+            q,
+            w,
+            k,
+            attn_score,
+            index_score,
+            topk_indices,
+            sm_scale=sm_scale,
+            loss_coeff=loss_coeff,
+            grad_loss=grad_loss,
+            block_I=block_I,
+            topk_indices_global=topk_indices_global,
+        )
 
 
 class Fe131CleanLogitsDSA(Fe131DSA):

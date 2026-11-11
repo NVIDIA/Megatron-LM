@@ -167,8 +167,22 @@ def _run_sparse_attention(
     key_positions: Optional[torch.Tensor],
     topk_length: Optional[torch.Tensor] = None,
     all_topk_rows_nonempty: bool = False,
-) -> torch.Tensor:
-    """Run sparse attention for absorbed and non-absorbed MLA paths."""
+    return_lse: bool = False,
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    """Run sparse attention for absorbed and non-absorbed MLA paths.
+
+    Returns the attention output. With ``return_lse=True`` it returns ``(output, lse)``
+    instead, where ``lse`` is the non-differentiable FP32 ``[sq, b, np]``
+    natural-log LSE of the fused sparse-attention kernel (layout in
+    ``dsa_cudnn_kernels.run_fused_absorbed_sparse_attention``). Only the fused absorbed-MLA
+    path returns it: when no fused backend runs the call, ``return_lse=True`` raises instead
+    of falling back to the PyTorch path, which computes no LSE.
+    """
+    if return_lse and not (absorbed_mla and dsa_kernels.use_fused_dsa_kernels(config)):
+        raise RuntimeError(
+            "return_lse=True needs the fused absorbed-MLA sparse attention (absorbed MLA and "
+            "a fused dsa_kernel_backend); the unfused DSA attention does not return the LSE."
+        )
     if absorbed_mla:
         latent_v_channels = int(getattr(config, "kv_lora_rank", 0) or 0)
         if latent_v_channels <= 0:
@@ -185,6 +199,7 @@ def _run_sparse_attention(
                 "Received absorbed layout with explicit value tensor."
             )
         output = None
+        lse = None
         if dsa_kernels.use_fused_dsa_kernels(config):
             output = dsa_kernels.run_fused_absorbed_sparse_attention(
                 config,
@@ -195,7 +210,17 @@ def _run_sparse_attention(
                 latent_v_channels,
                 topk_length=topk_length,
                 all_topk_rows_nonempty=all_topk_rows_nonempty,
+                # Passed only when requested, so the default call is unchanged.
+                **({"return_lse": True} if return_lse else {}),
             )
+            if return_lse:
+                if output is None:
+                    raise RuntimeError(
+                        f"DSA kernel backend {config.dsa_kernel_backend!r} declined the fused "
+                        "sparse attention, and return_lse=True cannot fall back to the "
+                        "unfused path, which does not return the LSE."
+                    )
+                output, lse = output
         # Fused backends may decline unsupported shapes or layouts by returning
         # None, so keep the absorbed PyTorch path as the authoritative fallback.
         if output is None:
@@ -213,6 +238,8 @@ def _run_sparse_attention(
         assert output is not None
         output = torch.einsum("sbhc,hdc->sbhd", output, up_v_weight).contiguous()
         output = output.view(output.size(0), output.size(1), -1)
+        if return_lse:
+            return output, lse
         return output
 
     return unfused_dsa_fn(
@@ -2394,6 +2421,102 @@ class KPoolSparseIndexerLoss(torch.autograd.Function):
         )
 
 
+def _kpool_pool_target_from_token_target(
+    token_target: torch.Tensor, pool_ids: torch.Tensor, *, index_topk: int, pool_size: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Pool-level teacher from a per-token-slot attention mass in the selector's layout.
+
+    ``token_target`` ``[batch, sq, index_topk + tail]`` is the main attention's head-summed
+    mass of each attended token slot, all on one per-row scale (pool slot ``j`` holds token
+    slots ``j * pool_size .. j * pool_size + pool_size - 1``, the last columns are the tail),
+    and ``pool_ids`` ``[batch, sq, index_topk // pool_size]`` the selected pools (``-1``
+    unused). Each pool's mass is the sum of its token slots; the result follows
+    ``_kpool_sparse_pool_target``: an exact-zero safe L1 normalization over the pools, rows
+    without pool mass all zero, and ``p_E`` = tail mass / total mass (zero for rows without
+    attended tokens).
+
+    Returns:
+        ``(target [batch, sq, pools] fp32, row_has_mass [batch, sq] bool,
+        tail_mass [batch, sq] fp32)``.
+    """
+    budget = index_topk // pool_size
+    batch, rows, width = token_target.shape
+    if width < index_topk or tuple(pool_ids.shape) != (batch, rows, budget):
+        raise ValueError(
+            f"KPool token target [{batch}, {rows}, >= {index_topk}] and pool ids "
+            f"[{batch}, {rows}, {budget}] expected, got {tuple(token_target.shape)} and "
+            f"{tuple(pool_ids.shape)}."
+        )
+    token_target = token_target.float()
+    pool_mass = token_target[..., :index_topk].reshape(batch, rows, budget, pool_size).sum(-1)
+    pool_mass = pool_mass.masked_fill(pool_ids < 0, 0.0)
+    target = _normalize_teacher_target_exact_zero(pool_mass)
+    row_has_mass = pool_mass.sum(dim=-1) > 0
+    total_mass = token_target.sum(dim=-1)
+    tail_mass = token_target[..., index_topk:].sum(dim=-1) / torch.where(
+        total_mass > 0, total_mass, torch.ones_like(total_mass)
+    )
+    return target, row_has_mass, tail_mass
+
+
+def _kpool_loss_rows(
+    row_has_mass: torch.Tensor,
+    tail_mass: torch.Tensor,
+    *,
+    query_valid_rows: Optional[torch.Tensor],
+    calculate_per_token_loss: bool,
+    layer_number: int,
+    num_layers: int,
+    reduce_group: Optional[torch.distributed.ProcessGroup],
+    avg_group: Optional[torch.distributed.ProcessGroup],
+) -> Tuple[torch.Tensor, Union[float, torch.Tensor]]:
+    """The rows of a KPool sparse loss and its divisor; records the layer's tail mass ``p_E``.
+
+    The rows are those with pool mass, and only the valid query rows when
+    ``query_valid_rows`` is given. The divisor is the token loss's: the valid row count, or
+    every row, or 1 under ``calculate_per_token_loss``. ``p_E`` goes to the metric tracker as
+    its sum over the loss's rows and their number (device-side sums: no host sync); the
+    other arguments are the indexer loss's tracker arguments.
+
+    Returns:
+        ``(row_mask [batch, sq] bool, row_count)``.
+    """
+    batch, rows = row_has_mass.shape
+    row_mask = row_has_mass
+    if query_valid_rows is not None:
+        row_mask = row_mask & query_valid_rows.to(dtype=torch.bool, device=row_mask.device)
+    # Rows without pool mass (p_E = 1) and padded rows stay out of the p_E mean, as they
+    # stay out of the loss.
+    row_weight = row_mask.to(torch.float32)
+    DSAIndexerLossLoggingHelper.save_tail_mass_to_tracker(
+        tail_mass_sum=(tail_mass.float() * row_weight).sum(),
+        row_count=row_weight.sum(),
+        layer_number=layer_number,
+        num_layers=num_layers,
+        reduce_group=reduce_group,
+        avg_group=avg_group,
+    )
+    if calculate_per_token_loss:
+        row_count = 1.0
+    elif query_valid_rows is not None:
+        row_count = query_valid_rows.sum().to(torch.float32).clamp_min(1.0)
+    else:
+        row_count = float(max(batch * rows, 1))
+    return row_mask, row_count
+
+
+def _kpool_scoring_inputs(
+    q: torch.Tensor, k_pooled: torch.Tensor, rotate: bool
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``q`` and the pooled keys as the selector scores them: Hadamard-rotated when enabled."""
+    if rotate:
+        if q.numel():
+            q = rotate_activation(q)
+        if k_pooled.numel():
+            k_pooled = rotate_activation(k_pooled)
+    return q, k_pooled
+
+
 class DSAIndexerLossAutoScaler(torch.autograd.Function):
     """An AutoScaler that triggers the backward pass and scales the grad for indexer loss.
 
@@ -2539,6 +2662,36 @@ def _warn_kpool_scorer_fallback_once(reason: str) -> None:
     logger.warning(
         "dsa_indexer_kpool_scorer_backend='cudnn' keeps the PyTorch KPool scorer for this "
         f"call: {reason}. Further calls with this reason are not logged."
+    )
+
+
+_KPOOL_LOSS_PATHS_LOGGED: set = set()
+
+
+def _log_kpool_loss_path_once(config: TransformerConfig, pytorch_reason: Optional[str]) -> None:
+    """Log once per reason which implementation runs the trainable KPool indexer loss.
+
+    ``pytorch_reason`` is None when the cuDNN frontend kernels run it, otherwise why the
+    PyTorch ``KPoolSparseIndexerLoss`` runs. That is a warning when the configuration asks
+    for the cuDNN kernels and the cuDNN KPool scorer, and information otherwise.
+    """
+    if pytorch_reason in _KPOOL_LOSS_PATHS_LOGGED:
+        return
+    _KPOOL_LOSS_PATHS_LOGGED.add(pytorch_reason)
+    if pytorch_reason is None:
+        logger.info(
+            "The trainable KPool indexer loss runs on the cuDNN frontend kernels (score "
+            "recompute teacher, cuDNN KPool scorer student, sparse indexer backward)."
+        )
+        return
+    asks_for_cudnn = (
+        config.dsa_kernel_backend == "cudnn" and config.dsa_indexer_kpool_scorer_backend == "cudnn"
+    )
+    logger.log(
+        logging.WARNING if asks_for_cudnn else logging.INFO,
+        "The trainable KPool indexer loss runs in PyTorch (KPoolSparseIndexerLoss), not on "
+        f"the cuDNN frontend kernels: {pytorch_reason}. Further forwards with this reason "
+        "are not logged.",
     )
 
 
@@ -3747,6 +3900,7 @@ class DSAttention(MegatronModule):
         skv: int,
         cp_size: int,
         cp_rank: int,
+        pool_scores_out: Optional[dict] = None,
     ):
         """The fused pool selector for ``fused_qk_topk_kpool``, or None for the PyTorch scorer.
 
@@ -3760,6 +3914,12 @@ class DSAttention(MegatronModule):
         ``position_ids``, which it does only under context parallelism or for a TP
         sequence-parallel local query; ``position_ids`` passed without either are not read
         and do not keep the PyTorch scorer.
+
+        With ``pool_scores_out`` (a dict), the selector also asks the backend for the score of
+        each selected pool and stores it under ``"pool_scores"`` (``[batch, sq, pool_topk]``
+        FP32, aligned with the pool ids it returns), the student of the cuDNN KPool loss;
+        the key stays unset when the scorer declines. It still returns only the pool ids, so
+        ``fused_qk_topk_kpool`` and the selection are the same as without it.
         """
         if self.config.dsa_indexer_kpool_scorer_backend != "cudnn":
             return None
@@ -3787,7 +3947,19 @@ class DSAttention(MegatronModule):
         config = self.config
 
         def select_pools(q, k_pooled, weights, pool_topk, pool_size, hf_scoring):
-            return dsa_kernels.run_kpool_pool_topk(
+            if pool_scores_out is None:
+                return dsa_kernels.run_kpool_pool_topk(
+                    config,
+                    q,
+                    k_pooled,
+                    weights,
+                    pool_topk,
+                    pool_size,
+                    query_runs,
+                    hf_scoring,
+                    use_relu=config.dsa_indexer_scoring_relu,
+                )
+            result = dsa_kernels.run_kpool_pool_topk(
                 config,
                 q,
                 k_pooled,
@@ -3797,7 +3969,14 @@ class DSAttention(MegatronModule):
                 query_runs,
                 hf_scoring,
                 use_relu=config.dsa_indexer_scoring_relu,
+                return_scores=True,
             )
+            if result is None:
+                return None
+            pool_ids, pool_scores = result
+            if pool_scores is not None:
+                pool_scores_out["pool_scores"] = pool_scores
+            return pool_ids
 
         return select_pools
 
@@ -3913,33 +4092,18 @@ class DSAttention(MegatronModule):
             pool_size=pool_size,
             tp_group=tp_group,
         )
-        batch, rows = pool_ids_c.shape[:2]
-        row_mask = row_has_mass
-        if query_valid_rows is not None:
-            row_mask = row_mask & query_valid_rows.to(dtype=torch.bool, device=row_mask.device)
-        # Rows without pool mass (p_E = 1) and padded rows stay out of the p_E mean, as they
-        # stay out of the loss. Device-side sums only: no host synchronization.
-        row_weight = row_mask.to(torch.float32)
-        DSAIndexerLossLoggingHelper.save_tail_mass_to_tracker(
-            tail_mass_sum=(tail_mass.float() * row_weight).sum(),
-            row_count=row_weight.sum(),
+        row_mask, row_count = _kpool_loss_rows(
+            row_has_mass,
+            tail_mass,
+            query_valid_rows=query_valid_rows,
+            calculate_per_token_loss=self.config.calculate_per_token_loss,
             layer_number=self.layer_number,
             num_layers=metric_num_layers,
             reduce_group=metric_reduce_group,
             avg_group=metric_avg_group,
         )
-        if self.config.calculate_per_token_loss:
-            row_count = 1.0
-        elif query_valid_rows is not None:
-            row_count = query_valid_rows.sum().to(torch.float32).clamp_min(1.0)
-        else:
-            row_count = float(max(batch * rows, 1))
-        if self.config.dsa_indexer_rotate_activation:
-            # The selector scores q and the pooled keys after a Hadamard rotation.
-            if q.numel():
-                q = rotate_activation(q)
-            if k_pooled.numel():
-                k_pooled = rotate_activation(k_pooled)
+        # The selector scores q and the pooled keys after a Hadamard rotation, when enabled.
+        q, k_pooled = _kpool_scoring_inputs(q, k_pooled, self.config.dsa_indexer_rotate_activation)
         return KPoolSparseIndexerLoss.apply(
             q,
             weights,
@@ -3952,6 +4116,122 @@ class DSAttention(MegatronModule):
             self.config.dsa_indexer_hf_scoring,
             self.config.dsa_indexer_scoring_relu,
             _KPOOL_LOSS_CHUNK_BYTES,
+        )
+
+    def _kpool_cudnn_loss_decline_reason(
+        self, *, tp_size: int, absorbed_mla: bool, query: torch.Tensor, key: torch.Tensor
+    ) -> Optional[str]:
+        """Why this forward's trainable KPool loss cannot run on the cuDNN frontend kernels.
+
+        None when it can, as far as host facts decide before selection; the cuDNN KPool
+        scorer must then still accept the forward and return its pool scores. The cuDNN path
+        needs TP size 1 (TP ranks use TP rank 0's selection, which another rank's top-k values
+        do not belong to), no deterministic mode, ``dsa_kernel_backend='cudnn'``, the cuDNN
+        KPool scorer (its top-k values are the student), HF scoring, the fused absorbed-MLA
+        sparse attention (its LSE feeds the teacher) and cuDNN frontend >= 1.31 (the backend
+        checks the last two).
+
+        Deterministic mode keeps the PyTorch loss: its pooled-key gradient is free of atomics
+        at a cost that grows with the selected pools, whereas the cuDNN path's atomic-free
+        replacement (``_deterministic_sparse_indexer_grads_wk``) sweeps every pooled key in
+        each query-row chunk, and its fixed per-key buffers shrink the chunks to one row at
+        1M tokens (262,144 pooled keys).
+        """
+        config = self.config
+        if tp_size > 1:
+            return (
+                f"tensor parallelism (TP size {tp_size}): every TP rank attends TP rank 0's "
+                "selection, which another rank's cuDNN top-k values do not belong to"
+            )
+        if dsa_kernels._deterministic_dsa_requested(config):
+            return (
+                "deterministic mode: the cuDNN path's atomic-free pooled-key gradient sweeps "
+                "every pooled key in each query-row chunk (one row per chunk at 1M tokens), "
+                "while the PyTorch loss accumulates it over the selected pools only"
+            )
+        if config.dsa_kernel_backend != "cudnn":
+            return f"dsa_kernel_backend is {config.dsa_kernel_backend!r}, not 'cudnn'"
+        if config.dsa_indexer_kpool_scorer_backend != "cudnn":
+            return (
+                "dsa_indexer_kpool_scorer_backend is "
+                f"{config.dsa_indexer_kpool_scorer_backend!r}, not 'cudnn'"
+            )
+        if not config.dsa_indexer_hf_scoring:
+            return "the indexer uses legacy (non-HF) KPool scoring"
+        if not dsa_kernels.use_fused_dsa_kernels(config):
+            return "the fused DSA kernels are disabled (attention_backend is unfused)"
+        if not absorbed_mla:
+            return (
+                "the main attention is not absorbed MLA, so no fused sparse attention returns "
+                "the LSE that the teacher reads"
+            )
+        return dsa_kernels.kpool_sparse_indexer_loss_decline_reason(config, query, key)
+
+    def _kpool_sparse_indexer_loss_cudnn(
+        self,
+        *,
+        q: torch.Tensor,
+        weights: torch.Tensor,
+        k_pooled: torch.Tensor,
+        topk_indices: torch.Tensor,
+        pool_ids: torch.Tensor,
+        pool_scores: torch.Tensor,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        lse: torch.Tensor,
+        query_valid_rows: Optional[torch.Tensor],
+        indexer_loss_coeff: float,
+        metric_num_layers: int,
+        metric_reduce_group: Optional[torch.distributed.ProcessGroup],
+        metric_avg_group: Optional[torch.distributed.ProcessGroup],
+    ) -> torch.Tensor:
+        """``_kpool_sparse_indexer_loss`` on cuDNN frontend kernels, after the sparse attention.
+
+        The teacher comes from FE score recompute on the selector's own token ids
+        (``topk_indices``: pool slots in selector order, then the tail), fed the LSE that the
+        fused sparse attention returned for them; each pool's slots are summed, and the
+        normalization, rows, divisor and ``p_E`` record are phase 1's. The student is the
+        cuDNN selector's own score of each selected pool (``pool_scores``, aligned with
+        ``pool_ids``), and the gradients come from the FE sparse indexer backward on the
+        pooled keys. TP size 1 only (see ``_kpool_cudnn_loss_decline_reason``), so slots
+        need no canonical order and the target no TP reduction.
+        """
+        token_target = dsa_kernels.run_kpool_attention_token_target(
+            self.config,
+            query=query.detach(),
+            key=key.detach(),
+            lse=lse,
+            token_topk=topk_indices,
+            softmax_scale=self.softmax_scale,
+        )
+        target, row_has_mass, tail_mass = _kpool_pool_target_from_token_target(
+            token_target, pool_ids, index_topk=self.index_topk, pool_size=self.indexer.index_kpool
+        )
+        del token_target
+        row_mask, row_count = _kpool_loss_rows(
+            row_has_mass,
+            tail_mass,
+            query_valid_rows=query_valid_rows,
+            calculate_per_token_loss=self.config.calculate_per_token_loss,
+            layer_number=self.layer_number,
+            num_layers=metric_num_layers,
+            reduce_group=metric_reduce_group,
+            avg_group=metric_avg_group,
+        )
+        q, k_pooled = _kpool_scoring_inputs(q, k_pooled, self.config.dsa_indexer_rotate_activation)
+        return dsa_kernels.run_kpool_sparse_indexer_loss(
+            self.config,
+            q=q,
+            weights=weights,
+            k_pooled=k_pooled,
+            pool_ids=pool_ids,
+            pool_scores=pool_scores,
+            target=target,
+            row_mask=row_mask,
+            row_count=row_count,
+            loss_coeff=indexer_loss_coeff,
+            hf_scoring=self.config.dsa_indexer_hf_scoring,
+            use_relu=self.config.dsa_indexer_scoring_relu,
         )
 
     @staticmethod
@@ -4932,7 +5212,7 @@ class DSAttention(MegatronModule):
             if topk_length is not None:
                 topk_length = topk_length[:, row_start:row_end].contiguous()
 
-        def kpool_selector_inputs():
+        def kpool_selector_inputs(pool_scores_out=None):
             """The mxfp8 guard and the pool scorer shared by both KPool selection branches."""
             _reject_mxfp8_indexer_reference_fallback(
                 self.config,
@@ -4953,15 +5233,34 @@ class DSAttention(MegatronModule):
                 skv=skv,
                 cp_size=cp_size,
                 cp_rank=cp_rank,
+                pool_scores_out=pool_scores_out,
             )
 
+        # The trainable KPool loss of this forward runs on the cuDNN frontend kernels after the
+        # sparse attention, whose LSE its teacher reads (kpool_cudnn_loss), or else in PyTorch
+        # (KPoolSparseIndexerLoss) before it.
+        kpool_cudnn_loss = False
+        kpool_pool_scores = None
+        kpool_metric_num_layers = max(
+            self.layer_number, self.config.num_layers + (self.config.mtp_num_layers or 0)
+        )
         if kpool_trainable:
             assert q is not None and weights is not None and kpool_pooled_keys is not None
             # ===================================
             # Trainable KPool: select pools, then attach the sparse pool-level loss
             # ===================================
             kpool_size = self.indexer.index_kpool
-            kpool_pool_topk_fn = kpool_selector_inputs()
+            # Decided per forward from host facts, then from whether the cuDNN KPool scorer
+            # accepts it: its pool scores are the cuDNN loss's student.
+            kpool_pytorch_loss_reason = None
+            kpool_pool_scores_out = None
+            if use_indexer_loss:
+                kpool_pytorch_loss_reason = self._kpool_cudnn_loss_decline_reason(
+                    tp_size=tp_size, absorbed_mla=absorbed_mla, query=query, key=key
+                )
+                if kpool_pytorch_loss_reason is None:
+                    kpool_pool_scores_out = {}
+            kpool_pool_topk_fn = kpool_selector_inputs(pool_scores_out=kpool_pool_scores_out)
             # Selection is discrete: it runs without grad on detached inputs, from the pooled
             # keys built above (bit for bit the pools the frozen path compresses).
             with torch.no_grad():
@@ -5002,9 +5301,17 @@ class DSAttention(MegatronModule):
                 )
             slice_topk_to_local_sequence_parallel_rows()
             if use_indexer_loss:
-                metric_num_layers = max(
-                    self.layer_number, self.config.num_layers + (self.config.mtp_num_layers or 0)
-                )
+                if kpool_pytorch_loss_reason is None:
+                    kpool_pool_scores = kpool_pool_scores_out.get("pool_scores")
+                    if kpool_pool_scores is None:
+                        kpool_pytorch_loss_reason = (
+                            "the cuDNN KPool scorer declined this forward (packed THD, an "
+                            "explicit mask, position_ids-derived positions, non-uniform CP or "
+                            "unsupported inputs; its own warning names which)"
+                        )
+                kpool_cudnn_loss = kpool_pytorch_loss_reason is None
+                _log_kpool_loss_path_once(self.config, kpool_pytorch_loss_reason)
+            if use_indexer_loss and not kpool_cudnn_loss:
                 # Also records the layer's tail mass p_E, in its own tracker slots.
                 indexer_loss = self._kpool_sparse_indexer_loss(
                     q=q,
@@ -5017,7 +5324,7 @@ class DSAttention(MegatronModule):
                     query_valid_rows=query_valid_rows,
                     indexer_loss_coeff=indexer_loss_coeff,
                     tp_group=tp_group,
-                    metric_num_layers=metric_num_layers,
+                    metric_num_layers=kpool_metric_num_layers,
                     metric_reduce_group=indexer_reduce_group,
                     metric_avg_group=indexer_avg_group,
                 )
@@ -5025,7 +5332,7 @@ class DSAttention(MegatronModule):
                     loss=indexer_loss,
                     raw_loss=indexer_loss / indexer_loss_coeff,
                     layer_number=self.layer_number,
-                    num_layers=metric_num_layers,
+                    num_layers=kpool_metric_num_layers,
                     reduce_group=indexer_reduce_group,
                     avg_group=indexer_avg_group,
                 )
@@ -5289,7 +5596,39 @@ class DSAttention(MegatronModule):
             varlen_ends=varlen_ends,
             key_positions=key_positions,
             all_topk_rows_nonempty=all_topk_rows_nonempty,
+            # The cuDNN KPool teacher reads the attention's own LSE; asked for only then, so
+            # every other call is unchanged. The output is the same either way.
+            **({"return_lse": True} if kpool_cudnn_loss else {}),
         )
+
+        if kpool_cudnn_loss:
+            output, attention_lse = output
+            # Also records the layer's tail mass p_E, in its own tracker slots.
+            indexer_loss = self._kpool_sparse_indexer_loss_cudnn(
+                q=q,
+                weights=weights,
+                k_pooled=kpool_pooled_keys,
+                topk_indices=topk_indices,
+                pool_ids=kpool_pool_ids,
+                pool_scores=kpool_pool_scores,
+                query=query,
+                key=key,
+                lse=attention_lse,
+                query_valid_rows=query_valid_rows,
+                indexer_loss_coeff=indexer_loss_coeff,
+                metric_num_layers=kpool_metric_num_layers,
+                metric_reduce_group=indexer_reduce_group,
+                metric_avg_group=indexer_avg_group,
+            )
+            del attention_lse
+            DSAIndexerLossLoggingHelper.save_loss_to_tracker(
+                loss=indexer_loss,
+                raw_loss=indexer_loss / indexer_loss_coeff,
+                layer_number=self.layer_number,
+                num_layers=kpool_metric_num_layers,
+                reduce_group=indexer_reduce_group,
+                avg_group=indexer_avg_group,
+            )
 
         if use_indexer_loss:
             if indexer_loss is None:
