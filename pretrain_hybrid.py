@@ -145,8 +145,8 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
             packed_seq_params_by_layout={cfg.model.transformer.linear_cp_layout: None},
         )
 
-    # The per-sample length (--seq-length); the container keeps it equal to the dataset's.
-    seq_length = cfg.model.transformer.max_seq_length_per_sample
+    # The sample length: the dataset's (the model's per-sample maximum for a loader-only section).
+    seq_length = cfg.sample_length
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)

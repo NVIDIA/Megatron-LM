@@ -469,7 +469,7 @@ def test_runtime_service_order_and_microbatch_inputs(
             num_layers=2,
             hidden_size=32,
             num_attention_heads=4,
-            max_seq_length_per_sample=32,  # the training sequence length the calculator takes
+            max_seq_length_per_sample=32,  # the loader-only sample length the calculator takes
         ),
         seq_length=32,
         vocab_size=128,

@@ -123,10 +123,6 @@ def model_provider(
         language_transformer_config = deepcopy(cfg.model.transformer)
     else:
         language_transformer_config = deepcopy(config)
-    # The training loop reads the per-sample length from the run config, as it read
-    # args.seq_length before: keep it on the vision length set above. The language model's
-    # copy, taken first, keeps the launcher's value.
-    cfg.model.transformer.max_seq_length_per_sample = num_image_embeddings
     if args.decoder_num_layers is not None:
         language_transformer_config.num_layers = args.decoder_num_layers
     if args.decoder_tp_comm_overlap:

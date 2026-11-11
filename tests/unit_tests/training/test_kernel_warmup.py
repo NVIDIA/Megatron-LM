@@ -311,6 +311,8 @@ def pretrain_until_warmup(monkeypatch):
         # no-ops here.
         cfg = Namespace(
             model=model_config,
+            # The container's rule for a loader-only section: the model's per-sample maximum.
+            sample_length=model_config.transformer.max_seq_length_per_sample,
             train=Namespace(micro_batch_size=9),
             logger=Namespace(log_progress=False, tensor_metrics=[]),
             validate=lambda: None,
@@ -341,10 +343,9 @@ def test_pretrain_passes_model_config_and_runtime_batch(
         should_pad_vocab=pad_vocab,
         logit_dtype=torch.float32,
     )
-    # Model settings, the microbatch size and the training sequence length (the transformer
-    # config's per-sample length, which the container writes from the dataset when it has
-    # one) come from the config container. args carries only what pretrain() reads before the
-    # warmup call.
+    # Model settings, the microbatch size and the sample length (the container's; for this
+    # loader-only run the transformer config's per-sample maximum) come from the config
+    # container. args carries only what pretrain() reads before the warmup call.
     args = Namespace(
         fine_grained_activation_offloading=False, tensor_model_parallel_size=tp_group.size()
     )

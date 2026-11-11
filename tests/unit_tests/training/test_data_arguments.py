@@ -191,6 +191,28 @@ def test_loader_flags_feed_the_section():
     assert loader.persistent_workers is False
 
 
+def test_loader_options_are_generated_from_the_dataloader_config():
+    """The loader options come from DataloaderConfig's fields (ArgumentGroupFactory): one action
+    per field except drop_last, its help the field docstring; the snapshot test above pins their
+    names, defaults, types and choices to the legacy registrations."""
+    from dataclasses import fields
+
+    from megatron.training.config import DataloaderConfig
+
+    actions = _actions_by_dest(_full_parser())
+    assert "drop_last" not in actions
+    helps = {
+        "dataloader_type": "Single pass vs multiple pass data loader.",
+        "num_workers": "Dataloader number of workers.",
+        "data_sharding": "Shard the dataset per data-parallel rank",
+        "pin_memory": "Pin host memory in the torch DataLoader",
+        "persistent_workers": "Keep the DataLoader workers alive between passes",
+    }
+    assert {f.name for f in fields(DataloaderConfig)} == set(helps) | {"drop_last"}
+    for dest, prefix in helps.items():
+        assert actions[dest].help.startswith(prefix), (dest, actions[dest].help)
+
+
 def test_inter_document_masking_on_the_cli_builds_a_valid_section():
     """validate_args clears create_attention_mask_in_dataloader under inter-document masking, so
     the section the factory builds passes the pair check the container enforces for Python."""

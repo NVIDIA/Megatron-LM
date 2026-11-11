@@ -179,8 +179,8 @@ def get_batch(data_iterator, vp_stage=None):
 
     cfg = get_run_config()
     # The model section's transformer config (the container builder derives one from the
-    # arguments for this script): the parallel values and the per-sample length, which the
-    # container keeps equal to the dataset's; the batch flags come from the data section.
+    # arguments for this script) gives the parallel values; the batch flags come from the data
+    # section and the sample length from the container (the dataset's).
     config = cfg.model.transformer
     flags = cfg.data.batch_flags()
 
@@ -218,7 +218,7 @@ def get_batch(data_iterator, vp_stage=None):
         cp_size=cp_size,
         tp_rank=tp_rank,
         micro_batch_size=cfg.train.micro_batch_size,
-        seq_length=config.max_seq_length_per_sample,
+        seq_length=cfg.sample_length,
         mtp_on_this_rank=mtp_on_this_rank,
         pipeline_model_parallel_size=config.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),

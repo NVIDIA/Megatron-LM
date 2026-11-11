@@ -18,10 +18,10 @@ class the builder instantiates (``GPTDataset``, ``MockGPTDataset``, ``GPTFIMData
 serves every GPT entry point: the args-to-config factory forwards every data argument, the class
 follows the family flags, and the provider hands ``cfg.data.dataset`` to the builder unchanged.
 The loop reads the section through ``batch_flags()`` and ``yields_unpacked_samples()``, never
-through ``args``; the sample length it runs at is the model section's
-``transformer.max_seq_length_per_sample``, which the container writes from the dataset's
-``sequence_length`` at ``finalize()`` (the launcher fills it from ``--seq-length`` for every
-entry point, so a loader-only section needs no length of its own).
+through ``args``; the sample length it runs at is the container's ``sample_length``: the dataset's
+``sequence_length``, or for a loader-only section the model's ``max_seq_length_per_sample``
+(Megatron Core's per-sample maximum, filled from ``--seq-length`` by the launcher; with a dataset
+the container checks that it covers the samples and fills it when unset).
 Entry points with their own data pipeline carry a loader-only section (``dataset is None``) and
 nothing here runs for them.
 """
@@ -62,28 +62,37 @@ CONTAINER_WRITTEN_FIELDS = (
 
 @dataclass(kw_only=True)
 class DataloaderConfig:
-    """Settings for building torch DataLoaders on top of a dataset."""
+    """Settings for building torch DataLoaders on top of a dataset. The CLI options are generated
+    from these fields (``ArgumentGroupFactory`` in ``_add_data_args``), except ``drop_last``."""
 
-    dataloader_type: str | None = None
+    dataloader_type: str | None = field(
+        default=None, metadata={"argparse_meta": {"choices": list(DATALOADER_TYPES)}}
+    )
     """Single pass vs multiple pass data loader. 'external' passes the dataset through unchanged.
     Unset selects 'single'."""
 
     num_workers: int = 2
     """Dataloader number of workers."""
 
-    data_sharding: bool = True
+    data_sharding: bool = field(
+        default=True, metadata={"argparse_meta": {"arg_names": ["--no-data-sharding"]}}
+    )
     """Shard the dataset per data-parallel rank before shuffling (cyclic sampler only)."""
 
-    pin_memory: bool = True
+    pin_memory: bool = field(
+        default=True, metadata={"argparse_meta": {"arg_names": ["--no-pin-memory"]}}
+    )
     """Pin host memory in the torch DataLoader (``--no-pin-memory`` turns it off)."""
 
-    persistent_workers: bool = True
+    persistent_workers: bool = field(
+        default=True, metadata={"argparse_meta": {"arg_names": ["--no-persistent-workers"]}}
+    )
     """Keep the DataLoader workers alive between passes (``--no-persistent-workers`` turns it off).
     Forced to False when ``num_workers == 0``: there are no workers to keep."""
 
     drop_last: bool = True
-    """Drop the last incomplete micro-batch. Declared only for now: the training loop keeps its
-    built-in value until the loader consumers read this config."""
+    """Drop the last incomplete micro-batch. Declared only for now (no CLI option): the training
+    loop keeps its built-in value until the loader consumers read this config."""
 
     def validate(self) -> None:
         """Check the loader settings without mutation."""

@@ -244,7 +244,7 @@ def initialize_megatron(
             sequence_length = (
                 args.decoder_seq_length
                 if getattr(args, "decoder_tp_comm_overlap", False)
-                else cfg.model.transformer.max_seq_length_per_sample
+                else cfg.sample_length
             )
             _initialize_tp_communicators(
                 transformer_config,

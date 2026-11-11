@@ -235,7 +235,7 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         data_parallel_size=cfg.get_batch_parallel_size(),
         decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
         step_batch_size_schedule=cfg.train.step_batch_size_schedule,
-        seq_length=cfg.model.transformer.max_seq_length_per_sample,
+        seq_length=cfg.sample_length,
     )
     _set_tensorboard_writer(args)
     _set_one_logger(args)
@@ -588,15 +588,10 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
         val = getattr(args, arg_name, None)
         if val is not None:
             resource_attrs[attr] = val
-    # The per-sample length: a training container's model section carries it (the container
-    # keeps it equal to the dataset's sequence_length); inference keeps its CLI boundary.
+    # The per-sample length: training reads the container's (the dataset's, or the model's
+    # per-sample maximum for a loader-only section); inference keeps its CLI boundary.
     # Skipped like any other unset field.
-    transformer = getattr(getattr(cfg, 'model', None), 'transformer', None)
-    sequence_length = (
-        getattr(transformer, 'max_seq_length_per_sample', None)
-        if transformer is not None
-        else getattr(args, 'seq_length', None)
-    )
+    sequence_length = cfg.sample_length if include_training else getattr(args, 'seq_length', None)
     if sequence_length is not None:
         resource_attrs['dl.sequence_length'] = sequence_length
 

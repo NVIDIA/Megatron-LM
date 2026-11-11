@@ -350,6 +350,19 @@ class PretrainConfigContainer(ConfigContainerBase):
         """Return independent batch partitions, including GTP batch shards but not CP."""
         return self.get_parallel_layout(self.get_model_world_size()).batch_parallel_size
 
+    @property
+    def sample_length(self) -> int | None:
+        """The per-sample sequence length the training loop runs at (what ``--seq-length`` set):
+        the dataset's ``sequence_length`` when the data section has a dataset; for a loader-only
+        section (an entry point whose datasets come from its own callback), the model's
+        ``transformer.max_seq_length_per_sample``, which the launcher fills from ``--seq-length``.
+        That field is Megatron Core's per-sample maximum, a bound that may exceed the dataset's
+        length, so the loop does not read it for a section with a dataset."""
+        dataset = self.data.dataset
+        if dataset is not None:
+            return dataset.sequence_length
+        return self.model.transformer.max_seq_length_per_sample
+
     def _optimizer_with_model_precision(self) -> OptimizerConfig:
         """Return an optimizer copy with authoritative model precision, without mutation."""
         precision = {
@@ -572,12 +585,12 @@ class PretrainConfigContainer(ConfigContainerBase):
         With a model section, dataset or not: dynamic CP needs the single loader, and a packing
         scheduler needs per-token loss and ``variable_seq_lengths`` (Core derives the latter at
         construction; a scheduler selected afterwards must set it). With a dataset: the model capacity covers the sample
-        length, a value given for one of the seven fields other sections own
+        length, a value given for one of the six fields other sections own
         (``CONTAINER_WRITTEN_FIELDS``) must agree with that section (the container writes them at
         ``finalize()``; the arguments and the saved file leave them at Megatron Core's defaults),
-        and the model section's ``max_seq_length_per_sample``, when given, is the sample length
-        (the container writes it from the dataset at ``finalize()``; the training loop reads the
-        length there, so a container with a dataset has one value for it).
+        and the model section's ``max_seq_length_per_sample``, Megatron Core's per-sample maximum,
+        covers the dataset's samples when given (the container fills an unset one from the dataset
+        at ``finalize()``; the loop reads the dataset's length through ``sample_length``).
         With both: SBHD validation excludes a scheduler, a packed varlen dataset needs one, and the
         sample length is a multiple of ``2 * cp`` under context parallelism. Each is the condition
         ``validate_args`` enforces on the CLI; here it holds for a Python or YAML container too.
@@ -625,11 +638,16 @@ class PretrainConfigContainer(ConfigContainerBase):
                     f"data.dataset.sequence_length ({dataset.sequence_length}, --seq-length)."
                 )
         per_sample = getattr(transformer, "max_seq_length_per_sample", None)
-        if per_sample is not None and per_sample != dataset.sequence_length:
+        if (
+            isinstance(per_sample, int)
+            and isinstance(dataset.sequence_length, int)
+            and per_sample < dataset.sequence_length
+        ):
             raise ValueError(
-                f"model.transformer.max_seq_length_per_sample={per_sample} disagrees with "
-                f"data.dataset.sequence_length={dataset.sequence_length}; the container writes "
-                "this field from the dataset at finalize(), leave it unset."
+                f"model.transformer.max_seq_length_per_sample={per_sample} is smaller than "
+                f"data.dataset.sequence_length={dataset.sequence_length}: Megatron Core's "
+                "per-sample maximum must cover the dataset's samples (left unset, the container "
+                "fills it from the dataset at finalize())."
             )
         validation = self.validation
         if (
@@ -783,10 +801,12 @@ class PretrainConfigContainer(ConfigContainerBase):
         if dataset is not None:
             # The six fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
             # from the validation config, the layout from the required model config.
-            # In the other direction, the model section's per-sample length is the dataset's
-            # sequence_length: the training loop reads the length from the transformer config,
-            # for a container with a dataset and for a loader-only one alike.
-            transformer.max_seq_length_per_sample = dataset.sequence_length
+            # In the other direction, Megatron Core's per-sample maximum (NCCL EP sizes its
+            # packed-input buffers from it) defaults to the dataset's length, which bounds every
+            # sample; an explicit larger value stays. The loop reads the length through
+            # sample_length, not from this bound.
+            if transformer.max_seq_length_per_sample is None:
+                transformer.max_seq_length_per_sample = dataset.sequence_length
             dataset.full_validation = self.validation.full_validation
             dataset.multiple_validation_sets = self.validation.multiple_validation_sets
             dataset.data_parallel_size = data_parallel_size
