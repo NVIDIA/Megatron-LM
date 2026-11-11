@@ -41,16 +41,14 @@ def main() -> None:
     assert len(set(hosts)) >= 2, "This functional test requires multiple nodes."
     mesh = DeviceMesh.from_group(dist.group.WORLD, device_type=device.type)
 
-    allocator = symm_mem.get_mempool_allocator(device)
-    # Match get_mem_pool()'s no-split policy: a segment owns a shared signal pad.
-    input_pool = torch.cuda.MemPool(allocator, no_split=True)
-    output_pool = torch.cuda.MemPool(allocator, no_split=True)
-    # Separate pools keep output registration from also registering the input segment.
-    with torch.cuda.use_mem_pool(input_pool):
+    # Follow PyTorch's no-split policy to avoid concurrent operations sharing
+    # a segment's signal pad.
+    # https://github.com/pytorch/pytorch/blob/v2.15.0/torch/distributed/_symmetric_memory/__init__.py#L2415-L2420
+    pool = symm_mem.get_mem_pool(device)
+    with torch.cuda.use_mem_pool(pool):
         source = DBuffer.empty(
             mesh, [RowAtomic()], [(world_size * 1024, 1024)], torch.bfloat16, device
         )
-    with torch.cuda.use_mem_pool(output_pool):
         output = DBuffer(mesh, [Replicate()], source.layout, source.dtype, device)
     assert source.is_symmetric_memory and output.is_symmetric_memory
     source.local_buffer.fill_(rank + 1)
@@ -81,7 +79,7 @@ def main() -> None:
 
     rs_actual = rs_output.local_buffer.cpu()
     # Release registered allocations before destroying their communicator.
-    del source, output, rs_input, rs_output, input_pool, output_pool
+    del source, output, rs_input, rs_output, pool
     kernels = {
         event.name
         for event in prof.events()
