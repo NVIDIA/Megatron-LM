@@ -201,12 +201,9 @@ class TestTransformerLayerSubmoduleCallables:
             pytest.param(
                 grouped_gemm,
                 dispatcher_type,
-                # NCCL 2.31 nonblocking all-to-all crashes in dev (#7744).
-                marks=(
-                    pytest.mark.flaky_in_dev
-                    if not grouped_gemm and dispatcher_type == "alltoall"
-                    else ()
-                ),
+                # All-to-all crashes (#7744) and grouped-GEMM hangs in dev:
+                # https://github.com/NVIDIA/Megatron-LM/actions/runs/38128757991/job/114439165065
+                marks=pytest.mark.flaky_in_dev if dispatcher_type == "alltoall" else (),
             )
             for grouped_gemm in [True, False]
             for dispatcher_type in get_valid_token_dispatcher_types()

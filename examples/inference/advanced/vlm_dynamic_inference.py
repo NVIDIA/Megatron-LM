@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Helpers for VLM dynamic-batching inference.
 
@@ -26,7 +26,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
-from megatron.training import print_rank_0
+from megatron.training import get_run_config, print_rank_0
 from megatron.training.checkpointing import (
     get_checkpoint_name,
     get_checkpoint_tracker_filename,
@@ -150,6 +150,11 @@ def _print_resolved_args(title, args):
 
 
 _MIMO_LANGUAGE_MODEL_PREFIX = 'language_model.module.module.'
+# A checkpoint saved without training args (e.g. by Megatron-Bridge) stores LLaVAModel's own key
+# names, so the MIMO checkpoint model loads it with every prefix mapped to itself.
+_LLAVA_CHECKPOINT_PREFIX_MAP = {
+    prefix: prefix for prefix in ('language_model.', 'vision_model.', 'vision_projection.')
+}
 # Captures (modality submodule prefix, encoder name) from a MIMO vision encoder key.
 _MIMO_ENCODER_KEY = re.compile(r'(modality_submodules\.[^.]+\.(?:module\.)*)encoders\.([^.]+)\.')
 # Training-only buffers that checkpoints may carry but inference models never build.
@@ -355,7 +360,9 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
     """Peek at the checkpoint's saved training args to detect VLM vs GPT.
 
     Returns True if the checkpoint was trained as a VLM (has
-    ``language_model_type``, or is a MIMO checkpoint), False otherwise. As a side-effect, copies
+    ``language_model_type``, or is a MIMO checkpoint), False otherwise. A checkpoint saved
+    without training args (e.g. by Megatron-Bridge) is a VLM when --vision-model-type is passed;
+    its architecture then comes entirely from the command line. As a side-effect, copies
     VLM-specific args from the checkpoint into the current args namespace
     so the multimodal model_provider can access them, and records resolution
     provenance on ``args._vlm_arg_resolution`` for the diagnostic dump.
@@ -367,7 +374,15 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
     user_passed_attrs = user_passed_attrs or set()
     result = load_args_from_checkpoint(args)
     if not isinstance(result, tuple):
-        return False
+        if 'vision_model_type' not in user_passed_attrs:
+            return False
+        # No saved args may also mean no checkpoint at all; fail now rather than after every rank
+        # builds the full model.
+        if args.load is None or not os.path.isfile(get_checkpoint_tracker_filename(args.load)):
+            raise ValueError(f'No checkpoint found at --load {args.load}')
+        args.mimo_checkpoint_prefix_map = _LLAVA_CHECKPOINT_PREFIX_MAP
+        _resolve_mimo_vision_args(args, None, user_passed_attrs)
+        return True
 
     _, checkpoint_args = result
     # MIMO training records its module-grid layout (--mimo-llm-*), and its checkpoints nest each
@@ -477,8 +492,10 @@ def get_model(is_vlm: bool) -> MegatronModule:
 
         model = _get_model(partial(model_provider, gpt_builder), wrap_with_ddp=False)
 
-    assert args.load is not None
-    args.exit_on_missing_checkpoint = True
+    checkpoint = get_run_config().checkpoint
+    assert checkpoint.load is not None
+    # Inference must not start from random weights.
+    checkpoint.exit_on_missing_checkpoint = True
     load_checkpoint(
         ddp_model=model,
         optimizer=None,

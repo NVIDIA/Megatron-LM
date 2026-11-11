@@ -1,8 +1,8 @@
 # Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
-# Forked from `fla/utils.py`, `fla/ops/utils/op.py`, `fla/ops/utils/index.py` and
-# `fla/modules/l2norm.py` in flash-linear-attention v0.5.1
+# Forked from `fla/utils.py`, `fla/ops/utils/op.py`, `fla/ops/utils/softplus.py`,
+# `fla/ops/utils/index.py` and `fla/modules/l2norm.py` in flash-linear-attention v0.5.1
 # (https://github.com/fla-org/flash-linear-attention).
 #
 # Licensed under the MIT license; see the LICENSE file in the repository root.
@@ -11,7 +11,7 @@
 
 The kernel modules in this package reference a handful of names that do not
 belong to any one of them: the hardware-capability probes that select autotune
-configurations, the chunk-descriptor builders, `exp` / `exp2`, and the L2
+configurations, the chunk-descriptor builders, `exp` / `exp2` / `softplus`, and the L2
 normalization applied to the queries and keys. Keeping them here makes the
 package self-contained, with no `fla` import at run time.
 
@@ -126,6 +126,35 @@ def exp(x):
 def exp2(x):
     """Base-2 exponentiate in fp32 regardless of the input dtype."""
     return tl.math.exp2(x.to(tl.float32))
+
+
+# ----------------------------------------------------------------------------
+# `fla.ops.utils.softplus`
+# ----------------------------------------------------------------------------
+# FLA's NVIDIA softplus is approximate inline PTX; it is copied verbatim so the
+# in-kernel GDN gate stays bitwise identical to upstream.
+_SOFTPLUS_PTX: tl.constexpr = tl.constexpr(
+    "{ .reg .pred p; setp.gt.f32 p, $1, 20.; @p mov.f32 $0, $1;"
+    " @!p mul.f32 $0, $1, 1.4426950408889634; @!p ex2.approx.ftz.f32 $0, $0;"
+    " @!p add.f32 $0, $0, 1.0; @!p lg2.approx.ftz.f32 $0, $0;"
+    " @!p mul.f32 $0, $0, 0.6931471805599453; }"
+)
+
+if IS_NVIDIA:
+
+    @triton.jit
+    def softplus(x):
+        """`log(1 + exp(x))` in fp32, saturating to the identity above 20."""
+        return tl.inline_asm_elementwise(
+            asm=_SOFTPLUS_PTX, constraints="=r,r", args=[x], dtype=tl.float32, is_pure=True, pack=1
+        )
+
+else:
+
+    @triton.jit
+    def softplus(x):
+        """`log(1 + exp(x))` in fp32, saturating to the identity above 20."""
+        return tl.where(x < 20.0, tl.math.log(1 + tl.math.exp(x)), x)
 
 
 # ----------------------------------------------------------------------------

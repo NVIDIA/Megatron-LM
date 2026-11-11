@@ -209,7 +209,7 @@ class TestInferenceWandbLogging:
             ), f"{field} should be float but is {type(stats[field])}"
 
     @pytest.mark.internal
-    @patch('megatron.core.inference.engines.dynamic_engine.HAVE_WANDB', True)
+    @patch('megatron.core.inference.engines.dynamic.engine.HAVE_WANDB', True)
     def test_engine_logging_step_interval_zero(self):
         """Test that no logging occurs when logging_step_interval is 0."""
         mock_wandb = Mock()
@@ -222,7 +222,7 @@ class TestInferenceWandbLogging:
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
-        mock_controller._async_sched_logits = Mock()
+        mock_controller._async_sched_forward = Mock()
         # Set up nested mock structure
         mock_controller.inference_wrapped_model = Mock()
         mock_controller.inference_wrapped_model.model = Mock()
@@ -279,7 +279,7 @@ class TestInferenceWandbLogging:
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
-        mock_controller._async_sched_logits = Mock()
+        mock_controller._async_sched_forward = Mock()
         # Set up nested mock structure
         mock_controller.inference_wrapped_model = Mock()
         mock_controller.inference_wrapped_model.model = Mock()

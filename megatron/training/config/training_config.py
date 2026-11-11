@@ -1,4 +1,5 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import signal
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional
@@ -112,9 +113,11 @@ class TrainingConfig:
 class ValidationConfig:
     """Configuration settings related to validation during or after model training."""
 
-    eval_iters: int | None = 100
+    eval_iters: int | list[int | None] | None = field(
+        default=100, metadata={"argparse_meta": {"type": int}}
+    )
     """Number of iterations to run for evaluation. Used for both validation and test. If not set,
-    evaluation will not run."""
+    evaluation will not run. Full/multiple validation resolves this to per-dataset counts."""
 
     eval_interval: int | None = None
     """Interval between running evaluation on validation set. If not set, evaluation will not run
@@ -138,11 +141,17 @@ class ValidationConfig:
     eval step.
     """
 
+    eval_empty_cuda_cache: bool = False
+    """Call torch.cuda.empty_cache() before and after each validation. Validation can route tokens
+    very unevenly across experts, so its allocations do not fit the training-shaped cache and can
+    grow reserved memory to the device limit; NCCL then fails to allocate collective buffers for
+    the checkpoint save that follows, since it allocates from the driver directly. Releasing the
+    cache on both sides returns that memory to the driver, at the cost of re-mapping training's
+    cache afterwards.
+    """
+
     skip_train: bool = False
     """If set, bypass the training loop, perform evaluation for validation/test, and exit."""
-
-    test_mode: bool = False
-    """Run all real-time test alongside the experiment."""
 
     full_validation: bool = False
     """If set, each time validation occurs it uses the full validation dataset(s). This currently only works for GPT datasets!"""
@@ -193,6 +202,23 @@ class SchedulerConfig:
     lr_warmup_samples: int = 0
     """number of samples to linearly warmup learning rate over."""
 
+    step_lr_rescale_schedule: str | None = None
+    """Step-wise LR multipliers in ``SAMPLES:MULTIPLIER`` format.
+
+    Entries may be comma- or whitespace-separated. The first threshold must be zero and all
+    subsequent thresholds must be strictly increasing. Thresholds use the same sample clock as
+    ``lr_warmup_samples`` and ``lr_decay_samples``. When unset, LR rescaling is disabled.
+    Example: ``0:0.5,1000:1.0``.
+    """
+
+    step_lr_rescale_warmup_samples: int = 0
+    """Number of samples used to linearly transition between step LR multipliers.
+
+    This applies to every transition after the initial schedule entry. The initial LR warmup is
+    still controlled by ``lr_warmup_samples``. A value of zero preserves instantaneous step
+    transitions.
+    """
+
     lr_warmup_init: float = 0.0
     """Initial value for learning rate warmup. The scheduler starts warmup from this value."""
 
@@ -227,17 +253,61 @@ class SchedulerConfig:
     weight_decay_incr_style: Literal["constant", "linear", "cosine"] = "constant"
     """Weight decay increment function."""
 
-    no_weight_decay_cond_type: Literal["qwen3_next"] | None = None
-    """Type of no weight decay condition. Choices:
-    None (default): param no weight decay if and only if it is 1D; or it is bias;
-    or it is embedding and embedding_init_method_std is not None.
-    "qwen3_next": In addition to the default rules, apply weight decay to qk layernorm as a special case."""
-
     wd_incr_steps: int | None = field(init=False, default=None)
     """Number of samples to increment weight decay over. Calculated at runtime."""
 
     wsd_decay_steps: int | None = field(init=False, default=None)
     """Number of samples to decay WSD weight decay. Calculated at runtime."""
+
+    def validate_run(
+        self,
+        *,
+        train_iters: int | None,
+        train_samples: int | None,
+        skip_train: bool,
+        weight_decay: float | None,
+    ) -> None:
+        """Check this section against the rest of the run it belongs to."""
+        if train_iters and not skip_train:
+            # If we use iteration-based training, make sure the
+            # sample-based options are off.
+            assert train_samples is None, \
+                'expected iteration-based training'
+            assert self.lr_decay_samples is None, \
+                'expected iteration-based learning rate decay'
+            assert self.lr_warmup_samples == 0, \
+                'expected iteration-based learning rate warmup'
+            if self.lr_warmup_fraction is not None:
+                assert self.lr_warmup_iters == 0, \
+                    'can only specify one of lr-warmup-fraction and lr-warmup-iters'
+
+        # Sample-based training.
+        if train_samples and not skip_train:
+            # If we use sample-based training, make sure the
+            # iteration-based options are off.
+            assert train_iters is None, \
+                'expected sample-based training'
+            assert self.lr_decay_iters is None, \
+                'expected sample-based learning rate decay'
+            assert self.lr_warmup_iters == 0, \
+                'expected sample-based learning rate warmup'
+            if self.lr_warmup_fraction is not None:
+                assert self.lr_warmup_samples == 0, \
+                    'can only specify one of lr-warmup-fraction ' \
+                    'and lr-warmup-samples'
+
+        if self.weight_decay_incr_style == "constant":
+            for w in (self.start_weight_decay, self.end_weight_decay):
+                assert w is None or w == weight_decay
+        else:
+            assert self.start_weight_decay is not None
+            assert self.end_weight_decay is not None
+
+    def finalize_scheduler_config(self, weight_decay: float | None) -> None:
+        """Finalize the scheduler configuration after validation and before training starts."""
+        if self.weight_decay_incr_style == "constant":
+            self.start_weight_decay = weight_decay
+            self.end_weight_decay = weight_decay
 
 
 @dataclass(kw_only=True)
@@ -246,6 +316,12 @@ class LoggerConfig:
 
     log_interval: int = 100
     """Report loss and timing interval."""
+
+    tensor_metrics: list[str] = field(default_factory=list)
+    """Tensor metric specifications in `NAME:INTERVAL` form, such as
+    `layer-param-l2:10`. Multiple specifications may be supplied after one
+    `--tensor-metrics` flag.
+    """
 
     log_params_norm: bool = False
     """If set, calculate and log parameters norm."""
@@ -335,6 +411,12 @@ class LoggerConfig:
 
     wandb_entity: str | None = None
     """The wandb entity name. It is useful when there are multiple sub-projects in a project."""
+
+    wandb_run_id: str | None = None
+    """The wandb run id, which is what a relaunch resumes. Defaults to the experiment
+    name with any character wandb rejects in a run id replaced by '-'. Set it explicitly
+    when two runs would otherwise derive the same id, or to resume a run whose
+    experiment name has since changed."""
 
     logging_level: int | None = None
     """Set default logging level"""
@@ -457,16 +539,16 @@ class CheckpointConfig:
     """Number of latest checkpoint to be saved."""
 
     save_optim: bool = True
-    """Do not save current optimizer."""
+    """Whether to save the optimizer state with every checkpoint."""
 
     save_rng: bool = True
-    """Do not save current rng state."""
+    """Whether to save the RNG state with every checkpoint."""
 
     load: str | None = None
     """Directory containing a model checkpoint."""
 
     load_optim: bool = True
-    """Do not load optimizer when loading checkpoint."""
+    """Whether to load the optimizer state when loading a checkpoint."""
 
     load_main_params_from_ckpt: bool = False
     """Load main parameters from checkpoint. When loading a model from a checkpoint without loading
@@ -475,7 +557,7 @@ class CheckpointConfig:
     """
 
     load_rng: bool = True
-    """Do not load rng state when loading checkpoint."""
+    """Whether to load the RNG state when loading a checkpoint."""
 
     non_persistent_save_interval: int | None = None
     """Number of iterations between non-persistent saves."""
@@ -549,15 +631,17 @@ class CheckpointConfig:
     Makes DistributedOptimizer checkpoint non-reshardable."""
 
     async_save: bool = False
-    """Apply async checkpointing save. Currently works only with `torch_dist` distributed checkpoint format."""
+    """Save checkpoints asynchronously. Distributed formats only (torch_dist, torch_dcp,
+    fsdp_dtensor; a legacy torch save cannot be asynchronous), and requires
+    ``use_persistent_ckpt_worker``."""
 
     async_strategy: Literal["nvrx"] = "nvrx"
     """Which async save strategy to use. Deprecated and will be removed."""
 
     use_persistent_ckpt_worker: bool = False
-    """Use a persistent background worker for async checkpoint saves. When enabled, creates a dedicated
-    worker thread/process for handling async saves. When disabled, uses temporal workers that are
-    created and destroyed for each save operation."""
+    """Use a persistent background worker for async checkpoint saves: a dedicated worker
+    thread/process that outlives each save. Required when ``async_save`` is set (an asynchronous
+    distributed save is rejected without it)."""
 
     async_ckpt_cpu_priority: int = 10
     """CPU nice value target (0-19, higher = lower priority) for the async checkpoint writer process.
@@ -683,24 +767,166 @@ class CheckpointConfig:
     verify_integrity: bool = False
     """Whether to hash checkpointing files during save and validate their integrity during load."""
 
-    def __post_init__(self):
+    stream_ckpt_dequant: bool = False
+    """Inference-only load path for models with quantized params (--fp8-param-gather or
+    --fp4-param-gather). The distributed checkpoint load quantizes each destination param in place
+    from a per-tensor high-precision scratch, instead of dequantizing the entire state dict to high
+    precision before the load starts, which allocates a full high-precision replica of the model
+    and can OOM on large models. The loaded state dict then holds the quantized params themselves,
+    so it is weights-only: it requires --no-load-optim, refuses --finetune,
+    --load-main-params-from-ckpt and any optimizer. Supports the tensorwise, mxfp8, blockwise and
+    nvfp4 recipes (not delayed scaling) and, with --ckpt-fully-parallel-load, only the broadcast
+    exchange algorithm. Pass it explicitly on the inference command line."""
+
+    dist_ckpt_workers: int = 1
+    """Number of workers for distributed checkpointing. Only used for async save.
+    If set to 1, the checkpointing is performed in a single process."""
+
+    override_ckpt_iteration: int | None = None
+    """Override the iteration stored in the loaded checkpoint. Also resets
+    consumed_train_samples accordingly so the data loader replays samples from that
+    iteration onward."""
+
+    ckpt_drop_redundant_extra_state: bool = False
+    """Drop TE `_extra_state` artifacts that carry no irreplaceable state (no FP8, or
+    block/current FP8 scaling) from the distributed checkpoint, keeping them local instead
+    of writing them. Only delayed-scaling `_extra_state` (amax history + scale) is ever
+    needed and it is always persisted regardless of this flag. By default (flag off) all
+    `_extra_state` are persisted, preserving the previous behavior. Older checkpoints load
+    unchanged either way."""
+
+    @property
+    def use_dist_ckpt(self) -> bool:
+        """Whether ``ckpt_format`` names a distributed checkpoint (everything but ``torch``).
+
+        Derived, never stored: ``update_use_dist_ckpt`` keeps the legacy ``args`` copy for the
+        readers that still take their checkpoint settings from the argument namespace.
+        """
+        return self.ckpt_format != "torch"
+
+    def validate(self) -> None:
+        """Checks that need no other section. Raises only; it neither mutates nor warns.
+
+        Run by ``ConfigContainerBase.validate()`` for the training and the inference container
+        (every CLI entry point validates the container it builds before any service starts).
+        Megatron-Bridge's subclass runs it from its own ``finalize()``, after its Bridge-only
+        checks: this is the one set of checkpoint rules.
+        """
         from megatron.training.utils import has_nvrx_checkpointing_async_support
 
         assert self.async_strategy in ["nvrx"], \
             f"async_strategy {self.async_strategy} is not supported. Available strategies: nvrx."
 
-        if (
-            self.async_save
-            and self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]
-        ):
-            assert has_nvrx_checkpointing_async_support(), (
-                "A compatible nvidia-resiliency-ext installation is required to enable "
-                "async save with async_strategy='nvrx'."
+        # An asynchronous distributed save needs the persistent checkpoint worker (a legacy torch
+        # save cannot be asynchronous at all: save_checkpoint rejects it). Megatron-Bridge makes
+        # the same requirement; Megatron-LM used to warn and fall back to a synchronous save.
+        if self.use_dist_ckpt and self.async_save:
+            assert self.use_persistent_ckpt_worker, (
+                "--async-save requires --use-persistent-ckpt-worker: an asynchronous distributed "
+                "save needs the persistent checkpoint worker."
             )
+            if self.ckpt_format in ["torch_dcp", "fsdp_dtensor"]:
+                assert has_nvrx_checkpointing_async_support(), (
+                    "A compatible nvidia-resiliency-ext installation is required to enable "
+                    "async save with async_strategy='nvrx'."
+                )
 
         if self.verify_integrity:
             assert self.ckpt_format == "torch_dist", \
                 f"`verify_integrity` is only supported with torch_dist checkpoint format."
+
+        if self.ckpt_convert_format is not None:
+            assert self.ckpt_convert_save is not None
+            assert self.load is not None
+
+        assert self.non_persistent_ckpt_type in ['global', 'local', None], \
+            'Currently only global and local checkpoints are supported'
+        if self.non_persistent_ckpt_type == 'local':
+            try:
+                from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
+                    LocalCheckpointManager,
+                )
+            except ModuleNotFoundError as e:
+                raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
+            assert self.non_persistent_local_ckpt_dir is not None, \
+                "Tried to use local checkpointing without specifying --local-ckpt-dir!"
+
+        # A save directory without a periodic interval (None or 0) saves at the end of training and
+        # on the exit paths only; the same rule for both frameworks (Megatron-Bridge's loops read
+        # it this way, Megatron-LM used to require an interval).
+        if self.save_interval is not None:
+            assert self.save_interval >= 0, \
+                "save_interval must be non-negative (None or 0 disables the periodic saves)"
+        if self.save_retain_interval is not None:
+            assert self.save_interval, "save_retain_interval requires a positive save_interval"
+            assert self.save_retain_interval > 0, "save_retain_interval must be positive"
+            assert self.save_retain_interval % self.save_interval == 0, \
+                "save_retain_interval must be divisible by save_interval"
+            assert self.most_recent_k in (None, -1), \
+                "save_retain_interval and most_recent_k cannot be enabled together"
+
+        # The PG-distribution cache stores one file per parallelization group, keyed by that
+        # group's ordered global ranks, and each file holds both the save and the load
+        # distribution derived from one gather over that group. A single create run (even one
+        # that only loads) therefore covers later saves only when save and load use the same
+        # group; otherwise a read run finds no cache file for the other side's group.
+        if self.ckpt_pg_tensors_cache_path is not None:
+            assert (
+                self.ckpt_fully_parallel_save_process_group
+                == self.ckpt_fully_parallel_load_process_group
+            ), (
+                "--ckpt-pg-tensors-cache-path requires --ckpt-fully-parallel-save-process-group and "
+                "--ckpt-fully-parallel-load-process-group to be identical, but got "
+                f"save='{self.ckpt_fully_parallel_save_process_group}' and "
+                f"load='{self.ckpt_fully_parallel_load_process_group}'. The cache is keyed by the "
+                "parallelization group, so with mixed groups a run that creates the cache for one "
+                "side leaves the other side without a cache file."
+            )
+
+        if self.load_main_params_from_ckpt:
+            assert not self.load_optim, (
+                'load_main_params_from_ckpt must be used with load_optim=False '
+                '(--load-main-params-from-ckpt with --no-load-optim).'
+            )
+
+        if self.stream_ckpt_dequant:
+            # Inference-only load path: the loaded state dict holds the re-quantized params
+            # themselves, so nothing that consumes the loaded values in high precision (optimizer
+            # main params) may run. `load_checkpoint` additionally refuses any optimizer. The
+            # precision-recipe rule stays in validate_args until the recipe is config-owned.
+            assert not self.load_optim and not self.finetune, (
+                '--stream-ckpt-dequant is an inference-only load path: it requires --no-load-optim '
+                'and cannot be used with --finetune.'
+            )
+            assert not self.load_main_params_from_ckpt, (
+                '--stream-ckpt-dequant cannot be used with --load-main-params-from-ckpt: the main '
+                'params would be initialized from the re-quantized params instead of the '
+                'high-precision checkpoint values.'
+            )
+            assert (
+                not self.fully_parallel_load
+                or self.ckpt_fully_parallel_load_exchange_algo == 'broadcast'
+            ), (
+                '--stream-ckpt-dequant supports --ckpt-fully-parallel-load only with '
+                '--ckpt-fully-parallel-load-exchange-algo broadcast.'
+            )
+
+        if self.override_ckpt_iteration is not None:
+            assert not self.finetune, \
+                "Cannot override checkpoint iteration together with finetune flag."
+
+        if self.replication_jump and not self.replication:
+            raise AssertionError(
+                "--replication-jump was specified without --replication; pass --replication or "
+                "drop the jump (Megatron-LM used to ignore it)."
+            )
+        if self.replication:
+            assert self.replication_jump is not None, \
+                "--replication requires the value of --replication-jump!"
+            assert self.non_persistent_ckpt_type == "local", (
+                "--replication requires args.non_persistent_ckpt_type == 'local', but got: "
+                f"{self.non_persistent_ckpt_type}"
+            )
 
 
 @dataclass(kw_only=True)
@@ -735,11 +961,29 @@ class TokenizerConfig:
         "HuggingFaceTokenizer",
         "Llama2Tokenizer",
         "TikTokenizer",
-        "MultimodalTokenizer",
         "NullTokenizer",
-        "NullMultimodalTokenizer",
         "SFTTokenizer",
-    ] = None
+        ] = field(
+                default=None,
+                metadata={
+                    "argparse_meta": {
+                        "choices": [
+                            "BertWordPieceLowerCase",
+                            "BertWordPieceCase",
+                            "GPT2BPETokenizer",
+                            "SentencePieceTokenizer",
+                            "GPTSentencePieceTokenizer",
+                            "HuggingFaceTokenizer",
+                            "Llama2Tokenizer",
+                            "TikTokenizer",
+                            "MultimodalTokenizer",
+                            "NullTokenizer",
+                            "NullMultimodalTokenizer",
+                            "SFTTokenizer",
+                        ]
+                    }
+                }
+            )
     """What type of tokenizer to use."""
 
     tokenizer_model: str = None
@@ -788,3 +1032,28 @@ class TokenizerConfig:
 
     use_gigatoken: Optional[bool] = False
     """Whether to use faster implementation of tokenizers (gigatoken)"""
+
+    sft_tokenizer_prompt_format: str = "nemotron-h-aligned"
+    """SFT prompt format."""
+
+@dataclass(kw_only=True)
+class MultiModalTokenizerConfig(TokenizerConfig):
+    """Extended tokenizer config with additional settings for multimodal-model tokenizers."""
+
+    tokenizer_type: Literal[
+        "MultimodalTokenizer",
+        "NullMultimodalTokenizer",
+    ] = None
+    """What type of tokenizer to use."""
+
+    tokenizer_prompt_format: Literal["mistral", "llama3", "chatml", "nvlm-yi-34b", "qwen2p0", "qwen2p5", "llama3p1", "nemotron5", "nemotron5-aligned", "llama_nemotron_8b", "nemotron6-moe"] | None = None
+    """Prompt format to use with the tokenizer."""
+
+    image_tag_type: Literal["nvlm", "internvl", ""] | None = None
+    """Surround image tokens with tags."""
+
+    force_system_message: bool = False
+    """Force a specific system message."""
+
+    tokenizer_keep_history_thinking: bool = False
+    """Preserve thinking traces in conversation history."""

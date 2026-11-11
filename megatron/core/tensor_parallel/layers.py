@@ -305,6 +305,49 @@ def _initialize_affine_weight_cpu(
     return None
 
 
+class EmbeddingWithGradAccumulationFusion(torch.autograd.Function):
+    """``F.embedding`` whose backward adds the weight gradient into ``weight.main_grad``.
+
+    The embedding counterpart of the linear layers' ``gradient_accumulation_fusion``: the
+    backward accumulates into ``main_grad``, sets ``grad_added_to_main_grad`` and hands autograd
+    a ZeroTensor (no storage), so the DDP hook still runs but adds nothing. ``main_grad`` gets
+    the values PyTorch's embedding backward followed by ``main_grad.add_`` gives it; when
+    ``can_accumulate_embedding_wgrad`` allows, only the rows of the tokens that occur are
+    touched instead of a dense ``[num_embeddings, hidden]`` gradient being built and added.
+    """
+
+    @staticmethod
+    def forward(ctx, ids, weight):
+        """Embedding lookup."""
+        ctx.save_for_backward(ids)
+        ctx.weight = weight
+        return F.embedding(ids, weight)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Add the weight gradient into main_grad."""
+        from megatron.core.fusions.fused_embedding_wgrad import (
+            accumulate_embedding_wgrad,
+            can_accumulate_embedding_wgrad,
+        )
+
+        (ids,) = ctx.saved_tensors
+        weight = ctx.weight
+        main_grad = weight.main_grad
+        if can_accumulate_embedding_wgrad(ids, grad_output, main_grad):
+            accumulate_embedding_wgrad(ids, grad_output, main_grad)
+        else:
+            main_grad.add_(
+                torch.ops.aten.embedding_dense_backward(
+                    grad_output, ids, weight.shape[0], -1, False
+                )
+            )
+        weight.grad_added_to_main_grad = True
+        return None, torch._efficientzerotensor(
+            weight.shape, dtype=weight.dtype, device=weight.device
+        )
+
+
 class VocabParallelEmbedding(torch.nn.Module):
     """Embedding parallelized in the vocabulary dimension.
 
@@ -409,6 +452,24 @@ class VocabParallelEmbedding(torch.nn.Module):
             # via GTPEmbeddingWeight.backward.
             self.weight._need_weight_prefetch = False
 
+    def _fuse_wgrad_accumulation(self, weight: torch.Tensor) -> bool:
+        """Whether the backward adds the weight gradient into ``main_grad`` itself.
+
+        With ``gradient_accumulation_fusion``, for a weight whose ``main_grad`` is owned by
+        Megatron's DDP (not Megatron-FSDP, GTP or ``zero_out_wgrad``, which mixes the gradients
+        of a weight shared on one stage through ``param.grad``).
+        """
+        return (
+            self.config.gradient_accumulation_fusion
+            and weight is self.weight
+            and weight.requires_grad
+            and torch.is_grad_enabled()
+            and hasattr(weight, "main_grad")
+            and hasattr(weight, "grad_added_to_main_grad")
+            and not getattr(weight, "zero_out_wgrad", False)
+            and not hasattr(weight, "__fsdp_param__")
+        )
+
     def forward(self, input_):
         """Forward.
 
@@ -433,6 +494,8 @@ class VocabParallelEmbedding(torch.nn.Module):
         # Get the embeddings.
         if self.deterministic_mode:
             output_parallel = weight[masked_input]
+        elif self._fuse_wgrad_accumulation(weight):
+            output_parallel = EmbeddingWithGradAccumulationFusion.apply(masked_input, weight)
         else:
             # F.embedding currently has a non-deterministic backward function
             output_parallel = F.embedding(masked_input, weight)
@@ -1293,6 +1356,7 @@ class ColumnParallelLinear(torch.nn.Module):
         weight: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
         inference_tp_ag_barrier: bool = False,
+        output_dtype: Optional[torch.dtype] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of ColumnParallelLinear
 
@@ -1309,6 +1373,8 @@ class ColumnParallelLinear(torch.nn.Module):
                 can copy-out the previous AG output. For more information, refer to
                 ``barrier_before`` in ``multimem_all_gather``
                 (``megatron.core.inference.communication.torch_symm_triton.collectives``).
+            output_dtype (torch.dtype, optional): GEMM output dtype for this call.
+                Default None means the `output_dtype` arg in the constructor will be used.
 
         Returns:
             - output
@@ -1383,7 +1449,7 @@ class ColumnParallelLinear(torch.nn.Module):
             ),
             tp_group=self.tp_group,
             gtp_remat_size=self.gtp_remat_size,
-            output_dtype=self.output_dtype,
+            output_dtype=self.output_dtype if output_dtype is None else output_dtype,
         )
 
         gather_output = self.gather_output

@@ -127,6 +127,10 @@ BODIES = {CHAT_PATH: CHAT_BODY, COMPLETIONS_PATH: COMPLETIONS_BODY}
 FAN_OUT_BODIES = {CHAT_PATH: {**CHAT_BODY, "n": 3}, COMPLETIONS_PATH: {"prompt": ["a", "b", "c"]}}
 PATHS = pytest.mark.parametrize("path", [CHAT_PATH, COMPLETIONS_PATH], ids=["chat", "completions"])
 NOT_A_NUMBER_ERROR = "Invalid sampling parameter: could not convert string to float: 'hot'"
+NOT_AN_INT_ERROR = (
+    "Invalid sampling parameter: int() argument must be a string, a bytes-like object or a real "
+    "number, not 'list'"
+)
 _ENDPOINT_MODULES = {CHAT_PATH: "chat_completions", COMPLETIONS_PATH: "completions"}
 _ENDPOINTS_PACKAGE = (
     "megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints"
@@ -316,6 +320,7 @@ _COMPLETIONS_DEFAULTS = {
                 "add_BOS": None,
                 "ignore_eos": None,
                 "streaming_interval": None,
+                "stream_options": None,
             },
             {},
             _CHAT_DEFAULTS,
@@ -324,11 +329,17 @@ _COMPLETIONS_DEFAULTS = {
         pytest.param(
             COMPLETIONS_PATH,
             {
+                "temperature": None,
+                "top_p": None,
+                "top_k": None,
                 "logprobs": None,
                 "echo": None,
+                "max_tokens": None,
                 "stop": None,
                 "include_stop_str_in_output": None,
                 "ignore_eos": None,
+                "streaming_interval": None,
+                "stream_options": None,
             },
             {},
             _COMPLETIONS_DEFAULTS,
@@ -369,13 +380,13 @@ _COMPLETIONS_DEFAULTS = {
             {"return_log_probs": True, "top_n_logprobs": 3, "skip_prompt_log_probs": True},
             id="completions-logprobs-int-without-echo",
         ),
-        # /v1/completions derives skip_prompt_log_probs from echo; the engine knob is not read.
+        # An explicit engine knob overrides the echo-derived default.
         pytest.param(
             COMPLETIONS_PATH,
             {"logprobs": 5, "skip_prompt_log_probs": False},
             {},
-            {"return_log_probs": True, "top_n_logprobs": 5, "skip_prompt_log_probs": True},
-            id="completions-explicit-skip-prompt-log-probs-is-ignored",
+            {"return_log_probs": True, "top_n_logprobs": 5, "skip_prompt_log_probs": False},
+            id="completions-explicit-skip-prompt-log-probs-wins-over-echo",
         ),
         pytest.param(
             CHAT_PATH,
@@ -432,14 +443,6 @@ _COMPLETIONS_DEFAULTS = {
             },
             id="completions-max-tokens-stop-string-ignore-eos",
         ),
-        # Only a streaming request reads stream_options; junk there is ignored otherwise.
-        pytest.param(
-            CHAT_PATH,
-            {"stream_options": ["include_usage"]},
-            {},
-            _CHAT_DEFAULTS,
-            id="chat-non-dict-stream-options-ignored",
-        ),
     ],
 )
 async def test_sampling_params_are_parsed_from_the_request(path, body, app_config, expected_fields):
@@ -456,6 +459,7 @@ async def test_sampling_params_are_parsed_from_the_request(path, body, app_confi
 
 # Fields the HTTP layer sets from the request body (chat also reads add_BOS) ...
 _REQUEST_CONTROLLED_FIELDS = {
+    "seed",
     "temperature",
     "top_k",
     "top_p",
@@ -464,6 +468,7 @@ _REQUEST_CONTROLLED_FIELDS = {
     "skip_prompt_log_probs",
     "num_tokens_to_generate",
     "stop_words",
+    "stop_token_ids",
     "detokenize_stop_sequence",
     "termination_id",
     "streaming_interval",
@@ -486,6 +491,7 @@ _ENGINE_OWNED_FIELDS = {
     "do_kv_handoff",
 }
 _EVERY_FIELD_REQUEST = {
+    "seed": 42,
     "temperature": 0.5,
     "top_p": 0.9,
     "top_k": 40,
@@ -496,6 +502,7 @@ _EVERY_FIELD_REQUEST = {
     "skip_prompt_log_probs": True,
     "max_tokens": 200,
     "stop": ["END"],
+    "stop_token_ids": [7],
     "include_stop_str_in_output": True,
     "add_BOS": True,
     "ignore_eos": True,
@@ -716,7 +723,6 @@ _NEMO_RL_OVERFLOW_BODY = (
     "This model's maximum context length was exceeded. Your messages resulted in 2 tokens. "
     f"Please reduce the length of the messages. Request 0: {_OVERFLOW}"
 )
-_PLAIN_OVERFLOW_BODY = f"Inference request(s) failed: Request 0: {_OVERFLOW}"
 
 
 def _on_both_endpoints(expected):
@@ -766,19 +772,15 @@ def _on_both_endpoints(expected):
             ),
             id="no-error-events",
         ),
-        # /v1/completions reports a context overflow like any other failure, while
-        # /v1/chat/completions reports the prompt length in the body Nemo-RL matches on, whatever
-        # the event type.
+        # Both endpoints report a context overflow in the body Nemo-RL matches on, as a 400,
+        # whatever the event type.
         pytest.param(
             [
                 failed_reply({"type": "ERROR_NONTRANSIENT", "payload": _OVERFLOW}),
                 _COMPLETED,
                 _COMPLETED,
             ],
-            {
-                CHAT_PATH: (_NEMO_RL_OVERFLOW_BODY, 400),
-                COMPLETIONS_PATH: (_PLAIN_OVERFLOW_BODY, 400),
-            },
+            _on_both_endpoints((_NEMO_RL_OVERFLOW_BODY, 400)),
             id="overflow-nontransient",
         ),
         pytest.param(
@@ -787,10 +789,7 @@ def _on_both_endpoints(expected):
                 _COMPLETED,
                 _COMPLETED,
             ],
-            {
-                CHAT_PATH: (_NEMO_RL_OVERFLOW_BODY, 400),
-                COMPLETIONS_PATH: (_PLAIN_OVERFLOW_BODY, 500),
-            },
+            _on_both_endpoints((_NEMO_RL_OVERFLOW_BODY, 400)),
             id="overflow-transient",
         ),
     ],
@@ -841,6 +840,32 @@ async def sse_payloads(response):
         json.loads(record.removeprefix("data: ")) for record in records[: -1 if done else None]
     ]
     return payloads, done
+
+
+@pytest.mark.asyncio
+@PATHS
+@pytest.mark.parametrize("stream", [False, True], ids=["non-streaming", "streaming"])
+@pytest.mark.parametrize(
+    "stream_options",
+    # A truthy non-object used to fail the handler after the streams were submitted, stranding
+    # them on the engine; a falsy one was silently read as "no usage". Both are rejected before
+    # anything is submitted, streaming or not.
+    [["include_usage"], False],
+    ids=["list", "false"],
+)
+async def test_non_object_stream_options_are_rejected_before_submission(
+    path, stream, stream_options, monkeypatch
+):
+    client = ReplyingClient()
+    app = build_streaming_app(path, client, monkeypatch)
+
+    response = await app.test_client().post(
+        path, json={**BODIES[path], "stream": stream, "stream_options": stream_options}
+    )
+
+    assert response.status_code == 400
+    assert await response.get_data(as_text=True) == "'stream_options' must be an object"
+    assert client.prompt_tokens == []  # nothing reached the engine
 
 
 @pytest.mark.asyncio

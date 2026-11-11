@@ -14,3 +14,50 @@ schedules (one without interleaving and one with interleaving, see [Efficient La
 for details), and a default no-pipelining schedule. It also contains methods
 for the point-to-point communication that is needed between pipeline stages.
 
+
+## Multi-stream residuals (mHC)
+
+Both the ordinary and interleaved pipeline schedules support
+`TransformerConfig.enable_mhc_connections`. Embeddings expand the residual at
+`pre_process`; intermediate physical and virtual stages carry all
+`mhc_num_residual_streams` streams. For GPT without MTP and for HybridModel, the
+final `post_process` chunk contracts the residual before the loss. GPT retains
+its mean contraction and HybridModel retains its learned contraction;
+checkpoint parameter names do not change.
+
+The common pipeline-width calculation sizes fixed P2P buffers as
+`hidden_size * mhc_num_residual_streams` when mHC and PP are enabled. This applies
+to **every communicating edge**, including the last physical rank sending to the
+first rank's next virtual chunk. Suppressed sends/receives at the true model
+boundaries need no single-stream buffer. Sequence parallelism and context
+parallelism continue to divide the sequence axis, while variable sequence lengths
+continue to exchange actual shapes through the existing P2P protocol.
+At PP2 the previous and next ranks coincide; batched communication orders forward
+messages before backward messages so that VPP's simultaneous activation and
+gradient exchanges remain distinct.
+
+Empty intermediate Hybrid stages return an independent, graph-connected output.
+This allows the schedule to pseudo-deallocate a sent output without resizing its
+input or losing the gradient path. Standalone GPT embedding/loss stages and
+explicit Hybrid pipeline patterns, including empty segments, retain their normal
+boundary behavior. GPT's embedding expansion returns a viewless tensor so that
+an embedding-only stage can safely release its sent output too.
+
+Eager selective mHC recomputation can be used with PP/VPP. Hybrid MTP must be on
+the final `post_process` chunk, where both the multi-stream decoder result and
+its learned single-stream contraction are available. Standalone Hybrid mHC MTP
+stages are rejected. GPTModel rejects mHC with PP and MTP because its decoder
+contracts the residual before the multi-stream MTP block. Enabling mHC still
+requires the corresponding GPT layer spec.
+
+`overlap_moe_expert_parallel_comm` with mHC pipeline parallelism is rejected.
+Inference wrappers also reject mHC when the resolved **inference** pipeline
+group has size greater than one: their receive buffers do not support the
+expanded residual width. This check is independent of the training PP setting.
+CUDA graph and offload combinations are not qualified by this pipeline support;
+existing full-recompute and selective-mHC-recompute/offload restrictions still
+apply.
+
+For validation coverage, see
+`tests/unit_tests/pipeline_parallel/test_pp_mhc_compatibility.py` and the
+`hybrid_mhc_tp2_pp2_mtp` / `hybrid_mhc_tp1_pp2_vpp2_empty_mtp` functional recipes.

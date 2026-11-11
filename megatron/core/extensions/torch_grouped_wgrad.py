@@ -109,6 +109,7 @@ class _TorchGroupedLinear(torch.autograd.Function):
     def forward(
         ctx: Any, x: torch.Tensor, counts: Tuple[int, ...], *weights: torch.Tensor
     ) -> torch.Tensor:
+        """Run TE grouped forward GEMMs and save inputs for gradient computation."""
         from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
 
         packed_x = x.reshape(-1, x.shape[-1])
@@ -142,6 +143,7 @@ class _TorchGroupedLinear(torch.autograd.Function):
     @staticmethod
     @torch.autograd.function.once_differentiable
     def backward(ctx: Any, grad_output: torch.Tensor) -> Tuple[Optional[torch.Tensor], ...]:
+        """Compute input gradients with TE and weight gradients with PyTorch."""
         from transformer_engine.pytorch.cpp_extensions import general_grouped_gemm
 
         packed_x, offsets, *weights = ctx.saved_tensors
