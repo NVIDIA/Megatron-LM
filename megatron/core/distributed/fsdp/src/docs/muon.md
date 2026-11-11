@@ -106,6 +106,10 @@ their Newton–Schulz. Each group in flight holds its momentum inputs, full tens
 and received updates, so `num_groups_in_flight` trades memory for overlap; zero
 gives the non-overlapped order.
 
+Groups whose tensors all sit on one rank need no communication. They are spread
+evenly over the pipeline, the last one at the end, and hide the transfers of the other
+groups; each is applied right after its Newton–Schulz.
+
 A simpler alternative in [issue #5533](https://github.com/NVIDIA/Megatron-LM/issues/5533)
 all-gathers boundary-matrix inputs and duplicates orthogonalization. The
 current path avoids that redundant computation.
