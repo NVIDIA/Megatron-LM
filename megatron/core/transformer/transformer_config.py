@@ -527,6 +527,30 @@ class TransformerConfig(ModelParallelConfig):
     and clamps every reader to the kernel's per-row column limit. Other scorer paths, and
     frontends without the switch, keep the prefill. Disable for A/B comparisons."""
 
+    dsa_cudnn_topk_scratch_gib: float = 2.0
+    """Per-launch scratch budget, in GiB, of the cuDNN radix top-k of the DSA indexer.
+
+    Each cuDNN top-k launch allocates a transient int32 scratch of ``rows x 2 x cols`` (twice
+    the FP32 scores of its rows), and the indexer runs the top-k in row chunks sized to this
+    budget, at least one 32-byte-aligned row group per launch (at most 8 rows of FP32 or 16 of
+    BF16 scores). The frontend also limits a launch to 2**31 scratch elements (8 GiB), so
+    budgets above 8 GiB give no larger launches. Larger budgets give fewer, fuller launches on
+    long rows: on GB300 (cuDNN frontend 1.31, top-k 2048, CUDA graph) 8 GiB took the 1M-token
+    CP64 rank-0 call (16384 x 1048576 scores) from 21.05 ms (64 launches of 256 rows at 2 GiB)
+    to 14.26 ms (16 launches of 1024 rows), and runs all 4096 rows of the 128K CP32 rank-0 call
+    in one launch (0.593 to 0.566 ms). Budgets above 2 GiB only change the executors that hand
+    the top-k a whole score buffer: the general packed THD scorer and the dense indexer loss
+    (loss on, ``dsa_indexer_use_sparse_loss=False``). The
+    plain causal, unfused bounds and single-sequence packed CP executors score in chunks of at
+    most 1 GiB of FP32 scores, whose top-k needs at most 2 GiB of scratch, so the default
+    already runs each chunk in one launch there. The cost is transient memory, eagerly and
+    inside CUDA graph memory pools: every call takes up to min(budget, twice its FP32 score
+    buffer), so a budget above the default costs more on every whole-buffer call whose FP32
+    scores exceed 1 GiB, e.g. 8 GiB instead of 2 GiB for a 32K-token CP1 packed THD call with
+    4 GiB of scores. The scratch is sized as for FP32 scores, which over-estimates BF16 ones.
+    Applies with ``dsa_kernel_backend='cudnn'`` to every cuDNN top-k of the DSA indexer; the
+    ``dsv4_hybrid`` CSA paths size their own."""
+
     dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
     """Precision used only by the fused compact DSA indexer forward and Top-K."""
 
@@ -2836,6 +2860,13 @@ class TransformerConfig(ModelParallelConfig):
                 f"{self.linear_num_value_heads=} must be a multiple of "
                 f"{linear_head_parallel_size=} for {self.linear_cp_mode=} "
                 f"and {self.experimental_attention_variant=}."
+            )
+        if not (
+            math.isfinite(self.dsa_cudnn_topk_scratch_gib) and self.dsa_cudnn_topk_scratch_gib > 0
+        ):
+            raise ValueError(
+                "dsa_cudnn_topk_scratch_gib must be a positive number of GiB, "
+                f"got {self.dsa_cudnn_topk_scratch_gib!r}."
             )
         if self.experimental_attention_variant == "dsa":
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
