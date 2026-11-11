@@ -518,8 +518,9 @@ def test_frozen_producer_replay_reuses_its_first_call_certificate(
 _CONSUMERS = 2
 
 
-def _make_gpu_config(*, tp: int, cp: int, consumer: str, recompute: str):
-    config = _make_config(tp=tp, cp=cp)
+def _make_gpu_config(*, tp: int, cp: int, deterministic: bool, consumer: str, recompute: str):
+    config = _make_config(tp=tp, cp=cp, deterministic=deterministic)
+    # Set after validation, like deterministic_mode in _make_config.
     if consumer == "skip-layers":
         # Layer 1 selects top-k and layers 2 and 3 reuse it.
         config.num_layers = 1 + _CONSUMERS
@@ -590,6 +591,13 @@ def cudnn_certificates(monkeypatch):
     monkeypatch.setattr(dsa_cudnn_kernels, "run_fused_absorbed_sparse_attention", recording_forward)
     monkeypatch.setattr(dsa_cudnn_kernels, "_run_sparse_attention_backward", recording_backward)
     return seen
+
+
+def _skip_if_deterministic_sparse_backward_unavailable(config, tp: int) -> None:
+    """Deterministic mode declines cuDNN sparse attention without a deterministic backward."""
+    query = torch.empty(0, 0, config.num_attention_heads // tp, 0, device="cuda")
+    if not dsa_cudnn_kernels._supports_deterministic_sparse_attention_backward(query):
+        pytest.skip("installed cuDNN DSA has no deterministic sparse-attention backward")
 
 
 def _shared_topk_step(calls, inputs, *, consumer: str, recompute: str, share_certificate: bool):
@@ -688,6 +696,7 @@ def _shared_topk_step(calls, inputs, *, consumer: str, recompute: str, share_cer
         pytest.param(2, 2, id="tp2cp2", marks=[pytest.mark.flaky, pytest.mark.flaky_in_dev]),
     ],
 )
+@pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize(
     ("consumer", "recompute"),
     [
@@ -699,7 +708,7 @@ def _shared_topk_step(calls, inputs, *, consumer: str, recompute: str, share_cer
     ],
 )
 def test_shared_certificate_is_bitwise_identical_on_cudnn(
-    tp, cp, consumer, recompute, cudnn_certificates, monkeypatch
+    tp, cp, deterministic, consumer, recompute, cudnn_certificates, monkeypatch
 ):
     _skip_if_cudnn_dsa_unavailable(tp * cp)
     Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
@@ -708,7 +717,11 @@ def test_shared_certificate_is_bitwise_identical_on_cudnn(
         torch.manual_seed(1234)
         DSAIndexerLossAutoScaler.set_loss_scale(torch.ones((), device="cuda"))
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
-        config = _make_gpu_config(tp=tp, cp=cp, consumer=consumer, recompute=recompute)
+        config = _make_gpu_config(
+            tp=tp, cp=cp, deterministic=deterministic, consumer=consumer, recompute=recompute
+        )
+        if deterministic:
+            _skip_if_deterministic_sparse_backward_unavailable(config, tp)
         calls = _make_gpu_calls(config, pg_collection, consumer)
         inputs = _make_inputs(
             config, tp_rank=pg_collection.tp.rank(), cp_rank=pg_collection.cp.rank(), cp=cp
@@ -753,10 +766,16 @@ def test_shared_certificate_is_bitwise_identical_on_cudnn(
         # The skipped masks only touched rows that do not exist, so forward is bitwise equal.
         for output, baseline_output in zip(outputs, baseline_outputs):
             torch.testing.assert_close(output, baseline_output, rtol=0, atol=0)
-        # Atomic accumulation in the sparse backward kernels differs run to run.
-        torch.testing.assert_close(loss, baseline_loss, rtol=1e-4, atol=1e-7)
-        for name, grad in grads.items():
-            _assert_similar(grad, baseline_grads[name], label=name, eps=1e-4)
+        if deterministic:
+            # Every grad, including the producer's after its consumers' backward ran.
+            torch.testing.assert_close(loss, baseline_loss, rtol=0, atol=0)
+            for name, grad in grads.items():
+                torch.testing.assert_close(grad, baseline_grads[name], rtol=0, atol=0, msg=name)
+        else:
+            # Atomic accumulation in the sparse backward kernels differs run to run.
+            torch.testing.assert_close(loss, baseline_loss, rtol=1e-4, atol=1e-7)
+            for name, grad in grads.items():
+                _assert_similar(grad, baseline_grads[name], label=name, eps=1e-4)
     finally:
         DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
         Utils.destroy_model_parallel()

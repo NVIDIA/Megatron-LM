@@ -66,7 +66,7 @@ def _skip_if_cudnn_dsa_unavailable(world_size: int) -> None:
         pytest.skip(f"cuDNN fused DSA dependencies are unavailable: {exc}")
 
 
-def _make_config(*, tp: int, cp: int) -> MLATransformerConfig:
+def _make_config(*, tp: int, cp: int, deterministic: bool) -> MLATransformerConfig:
     config = MLATransformerConfig(
         multi_latent_attention=True,
         experimental_attention_variant="dsa",
@@ -110,6 +110,8 @@ def _make_config(*, tp: int, cp: int) -> MLATransformerConfig:
         use_cpu_initialization=False,
         perform_initialization=True,
     )
+    # Set after validation: deterministic mode otherwise asserts launcher-level settings.
+    config.deterministic_mode = deterministic
     return config
 
 
@@ -269,8 +271,11 @@ def _assert_similar(actual: torch.Tensor, expected: torch.Tensor, *, label: str,
         pytest.param(2, 2, id="tp2cp2", marks=[pytest.mark.flaky, pytest.mark.flaky_in_dev]),
     ],
 )
+@pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("stash", ["used", "declined"])
-def test_checkpoint_replay_reuses_first_call_topk(tp, cp, stash, indexer_call_log, monkeypatch):
+def test_checkpoint_replay_reuses_first_call_topk(
+    tp, cp, deterministic, stash, indexer_call_log, monkeypatch
+):
     _skip_if_cudnn_dsa_unavailable(tp * cp)
     Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
     try:
@@ -278,7 +283,7 @@ def test_checkpoint_replay_reuses_first_call_topk(tp, cp, stash, indexer_call_lo
         torch.manual_seed(1234)
         DSAIndexerLossAutoScaler.set_loss_scale(torch.ones((), device="cuda"))
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
-        config = _make_config(tp=tp, cp=cp)
+        config = _make_config(tp=tp, cp=cp, deterministic=deterministic)
         attention = _make_attention(config, pg_collection)
         inputs = _make_inputs(
             config, tp_rank=pg_collection.tp.rank(), cp_rank=pg_collection.cp.rank(), cp=cp
@@ -318,12 +323,19 @@ def test_checkpoint_replay_reuses_first_call_topk(tp, cp, stash, indexer_call_lo
         output, loss, grads = reused
         # Forward attention consumes the same index-sorted selection either way.
         torch.testing.assert_close(output, baseline_output, rtol=0, atol=0)
-        # Atomic accumulation in the sparse backward kernels differs run to run, and
-        # reuse also changes the slot order inside the selected set (fp32 reduction
-        # order), so values agree to rounding.
-        torch.testing.assert_close(loss, baseline_loss, rtol=1e-4, atol=1e-7)
-        for name, grad in grads.items():
-            _assert_similar(grad, baseline_grads[name], label=name, eps=1e-4)
+        if deterministic:
+            # Deterministic mode canonicalizes slots by index on both paths and avoids
+            # atomics, so reusing the first call's top-k is bitwise identical.
+            torch.testing.assert_close(loss, baseline_loss, rtol=0, atol=0)
+            for name, grad in grads.items():
+                torch.testing.assert_close(grad, baseline_grads[name], rtol=0, atol=0, msg=name)
+        else:
+            # Atomic accumulation in the sparse backward kernels differs run to run, and
+            # reuse also changes the slot order inside the selected set (fp32 reduction
+            # order), so values agree to rounding.
+            torch.testing.assert_close(loss, baseline_loss, rtol=1e-4, atol=1e-7)
+            for name, grad in grads.items():
+                _assert_similar(grad, baseline_grads[name], label=name, eps=1e-4)
     finally:
         DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
         Utils.destroy_model_parallel()
@@ -381,7 +393,10 @@ def _frozen_step(attention: DSAttention, inputs: dict, grad_output_seed: int, ch
         pytest.param(2, 2, id="tp2cp2", marks=[pytest.mark.flaky, pytest.mark.flaky_in_dev]),
     ],
 )
-def test_frozen_checkpoint_replay_reuses_first_call_indices(tp, cp, indexer_call_log, monkeypatch):
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_frozen_checkpoint_replay_reuses_first_call_indices(
+    tp, cp, deterministic, indexer_call_log, monkeypatch
+):
     """Frozen indexer: the replay reuses the first call's indices and skips the indexer."""
     _skip_if_cudnn_dsa_unavailable(tp * cp)
     Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
@@ -389,7 +404,7 @@ def test_frozen_checkpoint_replay_reuses_first_call_indices(tp, cp, indexer_call
         model_parallel_cuda_manual_seed(1234)
         torch.manual_seed(1234)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
-        config = _make_config(tp=tp, cp=cp)
+        config = _make_config(tp=tp, cp=cp, deterministic=deterministic)
         # Freeze before building: DSAIndexer turns requires_grad off at construction.
         config.dsa_indexer_loss_coeff = 0.0
         attention = _make_attention(config, pg_collection)
@@ -461,8 +476,11 @@ def test_frozen_checkpoint_replay_reuses_first_call_indices(tp, cp, indexer_call
             torch.testing.assert_close(runs[name].output, runs["eager"].output, rtol=0, atol=0)
             for grad_name, grad in runs[name].grads.items():
                 expected = runs["eager"].grads[grad_name]
-                # Atomic accumulation in the sparse-attention backward differs run to run.
-                _assert_similar(grad, expected, label=f"{name} {grad_name}", eps=1e-4)
+                if deterministic:
+                    torch.testing.assert_close(grad, expected, rtol=0, atol=0, msg=grad_name)
+                else:
+                    # Atomic accumulation in the sparse-attention backward differs run to run.
+                    _assert_similar(grad, expected, label=f"{name} {grad_name}", eps=1e-4)
     finally:
         Utils.destroy_model_parallel()
 
