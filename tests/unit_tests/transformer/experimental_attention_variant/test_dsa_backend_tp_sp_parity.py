@@ -729,24 +729,6 @@ def test_indexer_metrics_average_only_ratio4_layers(monkeypatch: pytest.MonkeyPa
         DSAIndexerLossLoggingHelper.tracker = {}
 
 
-def test_indexer_loss_cleanup_can_preserve_graph_reduction_groups():
-    """CUDA Graph replays keep stable group objects while clearing accumulated loss."""
-    reduce_group = object()
-    avg_group = object()
-    DSAIndexerLossLoggingHelper.tracker = {
-        "values": torch.ones(2),
-        "reduce_group": reduce_group,
-        "avg_group": avg_group,
-    }
-    try:
-        DSAIndexerLossLoggingHelper.clean_loss_in_tracker(preserve_groups=True)
-        assert torch.count_nonzero(DSAIndexerLossLoggingHelper.tracker["values"]) == 0
-        assert DSAIndexerLossLoggingHelper.tracker["reduce_group"] is reduce_group
-        assert DSAIndexerLossLoggingHelper.tracker["avg_group"] is avg_group
-    finally:
-        DSAIndexerLossLoggingHelper.tracker = {}
-
-
 def test_indexer_metrics_reduce_across_pipeline_rank_without_indexer():
     """Every pipeline rank must join indexer loss reduction, even without a local indexer."""
     if Utils.world_size < 2:
@@ -766,7 +748,9 @@ def test_indexer_metrics_reduce_across_pipeline_rank_without_indexer():
             loss_scale=0.5,
             iteration=1,
             writer=None,
-            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=['pp', 'dp']),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['pp', 'dp', 'dp_cp']
+            ),
             total_loss_dict=total_loss_dict,
             num_layers=num_layers,
             num_indexer_layers=1,

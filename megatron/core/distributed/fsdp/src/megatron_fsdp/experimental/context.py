@@ -21,7 +21,8 @@ from weakref import WeakKeyDictionary
 import torch
 from torch import nn
 
-from .execution_order import ExecutionOrder
+from .execution_order import ExecutionEvent, ExecutionOrder
+from .phase import Phase
 from .runtime_policy import RuntimePolicy
 
 
@@ -39,15 +40,13 @@ class FsdpContext:
     inner_reduction_stream: torch.cuda.Stream
     # Aliases inner_reduction_stream unless DP-outer overlap is enabled.
     outer_reduction_stream: torch.cuda.Stream
-    # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
-    # unnecessary because each parameter group tracks whether model_weight is stale
-    # after syncing from main_weight.
-    is_last_microbatch: bool
+    # Whether backward should finalize accumulated gradients, including DP-outer
+    # reduction for HSDP/HFSDP. Scoped by finalize_gradients().
+    finalize_gradients: bool
     use_symmetric_memory: bool
     caller_managed_grad_sync: bool
     # Prefetch uses construction order unless execution-order recording is enabled.
-    forward_order: ExecutionOrder[nn.Module]
-    backward_order: ExecutionOrder[nn.Module]
+    execution_order: ExecutionOrder
     # Topology metadata must not keep modules alive after construction.
     _roots: WeakKeyDictionary[nn.Module, None]
     # Names are relative to each FSDP root and absent until finalization.
@@ -76,12 +75,12 @@ class FsdpContext:
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
                 that mesh. Every TensorAtomic parameter needs an entry; other entries are
                 ignored. Tensors are packed by owner without changing logical parameter order.
-            prefetch_order: ``REGISTRATION`` uses module registration order. ``RECORDED``
-                gathers parameters on demand and records module calls until the first
-                ``post_backward()``. Subsequent passes prefetch using those orders and must
-                repeat them consistently across data-parallel ranks. Recording currently
-                requires the ordinary module hooks; combined 1F1B bypasses them. Discard
-                the context if the recorded pass raises.
+            prefetch_order: ``REGISTRATION`` expects a forward/backward pass matching module
+                registration order. ``RECORDED`` gathers parameters on demand and records
+                module calls until the first ``post_backward()``. Subsequent passes must
+                repeat the complete sequence consistently across data-parallel ranks.
+                Recording currently requires the ordinary module hooks; combined 1F1B
+                bypasses them. Discard the context if the recorded pass raises.
         """
         overlap_allgather_reduction = runtime_policy.overlap_allgather_reduction
         overlap_outer_communication = runtime_policy.overlap_outer_communication
@@ -90,11 +89,10 @@ class FsdpContext:
         if device.type != "cuda":
             raise ValueError(f"FsdpContext requires a CUDA device, got {device}.")
 
-        self.is_last_microbatch = True
+        self.finalize_gradients = True
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
-        self.forward_order = ExecutionOrder()
-        self.backward_order = ExecutionOrder()
+        self.execution_order = ExecutionOrder()
         self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
@@ -165,11 +163,11 @@ class FsdpContext:
                     continue
                 self._module_names[module] = name
                 if not self._recording_execution_order:
-                    self.forward_order.append(module)
+                    self.execution_order.append(ExecutionEvent(module, Phase.FORWARD))
 
         if not self._recording_execution_order:
             for root in reversed(list(self._roots)):
-                _collect_backward_order(root, registered_modules, self.backward_order)
+                _collect_backward_order(root, registered_modules, self.execution_order)
 
         self._registered_modules.clear()
         self.parameter_to_owner = None
@@ -208,25 +206,31 @@ class FsdpContext:
         )
 
     def finish_grad_sync(self) -> None:
-        """Wait on submitted gradient reductions.
+        """Reshard remaining weights and wait on submitted gradient reductions.
 
         Call after all backward work, including delayed weight-gradient computation,
         and before reading or modifying gradients. This enqueues a stream dependency;
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
+        # A backward prefetch may gather a frozen module that never runs backward.
+        # Restore bindings and clear its gather state so the next iteration
+        # materializes fresh weights. All backward work, including delayed wgrad,
+        # must be complete here.
+        for module in self._module_names:
+            module.reshard()
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
 
     def post_backward(self) -> None:
-        """Finish backward cleanup and automatically synchronize the last microbatch."""
+        """Finish backward cleanup and synchronize gradients when finalization is enabled."""
         self._run_delayed_post_backward_callbacks()
         self._recording_execution_order = False
         # Standalone training can call optimizer.step() immediately after backward.
         # Wait for reductions on the last microbatch; earlier microbatches keep
         # overlapping reduction with compute. MCore calls finish_grad_sync() itself
         # after its schedule completes, including delayed weight gradients.
-        if not self.caller_managed_grad_sync and self.is_last_microbatch:
+        if not self.caller_managed_grad_sync and self.finalize_gradients:
             self.finish_grad_sync()
         self._post_backward_hook_registered = False
 
@@ -258,11 +262,11 @@ class FsdpContext:
 
 
 def _collect_backward_order(
-    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder[nn.Module]
+    module: nn.Module, registered_modules: set[nn.Module], order: ExecutionOrder
 ) -> None:
     """Collect one root's static backward prefetch order."""
     if module in registered_modules:
-        order.append(module)
+        order.append(ExecutionEvent(module, Phase.BACKWARD))
 
     for child in reversed(list(module.children())):
         _collect_backward_order(child, registered_modules, order)
