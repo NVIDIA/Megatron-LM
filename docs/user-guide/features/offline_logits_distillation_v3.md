@@ -76,11 +76,10 @@ Corpus sources additionally enforce the sample-order invariants described below.
 A corpus dump scores one whole source dataset into its own folder, so that dumps of
 several sources can later be blended like ordinary dataset files instead of replayed as
 one run. A corpus source is generic, like the files it comes from: complete, unweighted
-and unsplit. Weights, repetition and train/validation choices belong to blends. It is a
-frozen-teacher dump with three restrictions: one unweighted `--data-path` prefix (or SFT
-file), all of it exactly once as Megatron builds it (GPT windows or SFT rows, at the
-teacher's `--seq-length`; `--split` is ignored), and a seeded permutation (`--seed`), so
-every block is a random sample of the source:
+and unsplit. Weights, repetition and train/validation choices belong to blends. A frozen
+teacher scores one unweighted `--data-path` prefix (or SFT file) exactly once, using
+Megatron's GPT windows or SFT rows at the teacher's `--seq-length`. The dump ignores
+`--split` and preserves the underlying dataset's order:
 
 ```sh
 for source in web_crawl math_sft code; do
@@ -107,8 +106,9 @@ removes filler samples and their targets before serialization. A source is compl
 when the published chunks contain exactly `num_samples` real rows. Megatron's own dataset builder decides
 the samples, so SFT truncation and pretraining windows are exactly as in training.
 The writer first builds the ordinary GPT/SFT dataset and then applies the one-epoch
-wrapper. The dump seed controls both underlying dataset construction and the wrapper's
-permutation; student blend ordering has its own seed.
+padding wrapper. The dump seed still controls underlying dataset construction, which
+may shuffle samples itself; the wrapper adds no permutation or O(N) shuffle index.
+Student blend ordering has its own seed.
 
 #### Corpus resume and replacement
 
@@ -533,7 +533,7 @@ place is not detected; use a new source directory for a revised dataset.
 | `padding_divisor` | Teacher per-segment padding granularity, or `1` for non-SFT data. A corpus guard because padding can affect which segments fit before truncation. Students calculate their own padding divisor. |
 | `data` | Replay's path-agnostic blend description, or corpus's full source path/URI, or mock identity. A corpus guard against appending another source under the same source name. Students read the stored inputs rather than reopening this path. |
 | `split` | Replay-only original dataset partition (`--split`), for warnings and provenance. Not needed to load saved samples. Omitted from corpus files, whose source is unsplit. |
-| `seed` | Teacher dataset construction and corpus-permutation seed. A corpus guard: using another permutation for a later range can duplicate some original samples and omit others. Students use their own scheduling seed. |
+| `seed` | Teacher dataset-construction seed. A corpus guard: changing the underlying dataset's construction or shuffle for a later range can duplicate some original samples and omit others. The corpus wrapper adds no shuffle. Students use their own scheduling seed. |
 | `train_samples` | Replay-only requested teacher sample budget (`--train-samples`, or train iterations × global batch size), for provenance/warnings. It does not determine published availability. Omitted from corpus files, whose epoch size is `contract.num_samples`. |
 | `builder` | Producer's dataset-construction label. Megatron currently writes the hard-coded labels `GPTDataset`, `MockGPTDataset`, or `SFTDataset` (including mock SFT). A coarse corpus guard within one source; other producers need not use Megatron class names, and separate sources may differ. It does not fingerprint every preprocessing option. |
 

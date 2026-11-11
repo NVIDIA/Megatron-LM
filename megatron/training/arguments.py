@@ -3678,7 +3678,7 @@ def _add_logits_distillation_args(parser):
                        help='Use a v3 cache as the training dataset and KD target source.')
     group.add_argument('--kd-corpus-dump', type=str, default=None, metavar='SOURCE',
                        help='Dump a v3 corpus source: score the whole single --data-path '
-                            'dataset once, in a seeded order, with a frozen teacher, into '
+                            'dataset once, in its dataset order, with a frozen teacher, into '
                             '<--logits-save-dir>/SOURCE/. The run sizes itself to the source; '
                             '--train-iters and --split are ignored.')
     group.add_argument('--kd-corpus-blend', type=str, default=None, metavar='CONFIG',

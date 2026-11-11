@@ -10,8 +10,7 @@ consolidated chunk index:
 - one unweighted source (one ``--data-path`` prefix or SFT file), written under
   ``<corpus>/<source>/``;
 - all of it, exactly once, as Megatron builds it (GPT windows, SFT rows), with no
-  ``--split`` partition;
-- a seeded permutation, so every block is a random sample of the source.
+  ``--split`` partition or additional sample permutation.
 
 The epoch is padded to whole global batches for execution. The corpus saver removes
 filler samples before writing. Its progress tracker controls resume and replacement.
@@ -21,7 +20,6 @@ import json
 import os
 from typing import Any, Callable
 
-import numpy as np
 import torch
 import torch.distributed as dist
 
@@ -275,14 +273,13 @@ def epoch_length(dataset: Any) -> int:
 
 
 class CorpusEpoch(torch.utils.data.Dataset):
-    """One seeded permutation of a dataset's epoch, padded to whole global batches."""
+    """Preserve a dataset's epoch order and pad it to whole global batches."""
 
-    def __init__(self, dataset: Any, *, seed: int, global_batch_size: int):
+    def __init__(self, dataset: Any, *, global_batch_size: int):
         self.dataset = dataset
         self.num_samples = epoch_length(dataset)
         if self.num_samples < 1:
             raise ValueError("Corpus dump source has no samples")
-        self.order = np.random.RandomState(seed).permutation(self.num_samples)
         self.padded = -(-self.num_samples // global_batch_size) * global_batch_size
 
     def __len__(self) -> int:
@@ -290,7 +287,7 @@ class CorpusEpoch(torch.utils.data.Dataset):
 
     def __getitem__(self, index: int) -> Any:
         # Filler positions repeat the first samples; they are never part of the corpus.
-        return self.dataset[int(self.order[index % self.num_samples])]
+        return self.dataset[index % self.num_samples]
 
 
 def build_corpus_dump_datasets(args: Any, provider: Callable) -> tuple:
@@ -301,7 +298,7 @@ def build_corpus_dump_datasets(args: Any, provider: Callable) -> tuple:
     dataset = provider([None, None, None])[0]
     if dataset is None:
         raise ValueError("Corpus dump source has no samples")
-    epoch = CorpusEpoch(dataset, seed=args.seed, global_batch_size=args.global_batch_size)
+    epoch = CorpusEpoch(dataset, global_batch_size=args.global_batch_size)
     args.kd_corpus_samples = epoch.num_samples
     return epoch, None, None
 

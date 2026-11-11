@@ -1318,7 +1318,7 @@ def test_corpus_dump_validation_rejects_other_setups(
         runtime.validate_options(args)
 
 
-def test_corpus_epoch_is_one_seeded_permutation_padded_to_whole_batches():
+def test_corpus_epoch_preserves_dataset_order_and_pads_to_whole_batches():
     class Rows:
         """An SFT-like dataset: built with num_samples=None, its length is its rows."""
 
@@ -1331,14 +1331,10 @@ def test_corpus_epoch_is_one_seeded_permutation_padded_to_whole_batches():
         def __getitem__(self, index):
             return {"row": index}
 
-    epoch = corpus.CorpusEpoch(Rows(), seed=3, global_batch_size=4)
+    epoch = corpus.CorpusEpoch(Rows(), global_batch_size=4)
     assert (epoch.num_samples, len(epoch)) == (10, 12)
     rows = [epoch[i]["row"] for i in range(12)]
-    assert sorted(rows[:10]) == list(range(10)) and rows[10:] == rows[:2]  # Filler repeats.
-    again = corpus.CorpusEpoch(Rows(), seed=3, global_batch_size=4)
-    assert [again[i]["row"] for i in range(10)] == rows[:10]
-    other = corpus.CorpusEpoch(Rows(), seed=4, global_batch_size=4)
-    assert [other[i]["row"] for i in range(10)] != rows[:10]
+    assert rows == [*range(10), 0, 1]  # Preserve source order; only filler positions repeat.
 
 
 def test_corpus_epoch_length_sizes_the_run(runtime_environment):
