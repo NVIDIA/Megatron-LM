@@ -1304,6 +1304,7 @@ def test_corpus_dump_validation_sets_its_folder_and_one_epoch_budget(tmp_path, r
         ({"train_samples": 100}, "omit --train-samples"),
         ({"kd_corpus_dump": "a/b"}, "plain directory name"),
         ({"valid_data_path": ["v"]}, "valid-data-path"),
+        ({"dataloader_type": "cyclic"}, "dataloader-type single"),
     ],
 )
 def test_corpus_dump_validation_rejects_other_setups(

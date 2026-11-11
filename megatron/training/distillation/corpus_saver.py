@@ -121,7 +121,7 @@ class CorpusLogitsSaver(PairedLogitsSaver):
         task = self._last_flush
         group = mpu.get_tensor_and_data_parallel_group(with_context_parallel=True)
         src = dist.get_process_group_ranks(group)[0] if dist.is_initialized() else 0
-        settings = producer_settings(get_args(), self.dp_size)
+        settings = producer_settings(get_args())
 
         def finalize() -> None:
             local = None

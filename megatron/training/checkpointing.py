@@ -1442,11 +1442,8 @@ def save_checkpoint(
                     else:
                         with maybe_msc.open(tracker_filename, 'w') as f:
                             f.write(str(iteration))
-                    print(
-                        f"  recorded logits-dump progress: iteration "
-                        f"{iteration} to {tracker_filename}",
-                        flush=True,
-                    )
+                    print(f"  recorded logits-dump progress: iteration "
+                          f"{iteration} to {tracker_filename}", flush=True)
 
                 logits_finalize_fns.append(progress_finalize_fn)
             async_request_cls = AsyncRequest

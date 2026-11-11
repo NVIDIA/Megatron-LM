@@ -49,21 +49,17 @@ def reset_corpus_runtime() -> None:
     _INVENTORY, _TRACKER_PRESENT = None, False
 
 
-def producer_settings(args: Any, writers: int) -> dict:
-    """Megatron-only invariants for retrying an existing source's work assignment."""
-    return {
-        "name": "megatron",
-        "global_batch_size": args.global_batch_size,
-        "writers": writers,
-        "writer_mbs": args.micro_batch_size,
-        "save_interval": args.save_interval,
-    }
+def producer_settings(args: Any) -> dict:
+    """Megatron-only invariants for retrying an existing source's work assignment.
+
+    A chunk's rows depend only on its iterations and the global batch size; the rank
+    layout and flush interval may change between jobs of one source.
+    """
+    return {"name": "megatron", "global_batch_size": args.global_batch_size}
 
 
 def resume_corpus_iteration(args: Any) -> int:
     """Use the output tracker as the authoritative cursor, without deleting data yet."""
-    from megatron.core import parallel_state as mpu
-
     from .v3_runtime import dump_range
 
     global _INVENTORY, _TRACKER_PRESENT
@@ -74,7 +70,7 @@ def resume_corpus_iteration(args: Any) -> int:
             inventory = CorpusInventory(Storage(args.logits_save_dir))
             start, end = dump_range(args)
             start = start or 0
-            settings = producer_settings(args, mpu.get_data_parallel_world_size())
+            settings = producer_settings(args)
             spans = []
             for directory, chunk in sorted(inventory.chunks.items()):
                 producer = chunk.get("producer", {})
@@ -219,6 +215,9 @@ def validate_corpus_dump(args: Any) -> None:
         raise ValueError("Corpus dumps require a frozen teacher (--freeze-all-layers)")
     if getattr(args, "rampup_batch_size", None):
         raise ValueError("Corpus dumping requires a fixed global batch size")
+    if getattr(args, "dataloader_type", None) not in (None, "single"):
+        # Fillers are recognized by their position in Megatron's sequential order.
+        raise ValueError("Corpus dumping requires --dataloader-type single")
     paths = getattr(args, "data_path", None) or []
     if not getattr(args, "mock_data", False) and len(paths) != 1:
         raise ValueError(

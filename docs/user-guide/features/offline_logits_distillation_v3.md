@@ -96,8 +96,10 @@ Each job writes `<corpus>/<source>/` and sizes itself to the source, ignoring
 different sources can run in parallel, and each source can itself be split into parallel
 range jobs as above. Sources of one corpus must share a tokenizer (a job refuses to start
 otherwise); a different teacher is reported, not refused. Corpus production requires
-a fixed global batch size and unchanged producer DP, microbatch size and flush interval
-on resume. Student DP and batch sizes are independent of those production settings.
+Megatron's sequential sampler (`--dataloader-type single`, the default), because filler
+samples are recognized by their position, and a fixed global batch size, which must also
+stay unchanged on resume. DP size, microbatch size and the flush interval may change
+between jobs of one source; student DP and batch sizes are independent of all of them.
 
 The epoch is padded to a whole number of global batches by repeating its first samples;
 the source's epoch size is recorded as the required `num_samples` setting. The saver
@@ -429,9 +431,7 @@ partially selected block uses its average per-sample count and is approximate.
 | `producer` | Optional producer-specific resume information. Corpus consumers do not use it to locate samples. |
 | `producer.name` | Megatron writes `megatron`; another producer may omit this object or define its own resume fields. |
 | `producer.start_iteration`, `producer.end_iteration` | Megatron's executed iteration interval, with an exclusive end. Used to validate tracker boundaries, gaps, overlaps and job ownership. |
-| `producer.global_batch_size` | Converts teacher iterations to original source positions. Fixed on producer resume. |
-| `producer.writers`, `producer.writer_mbs` | Megatron work-assignment invariants, checked only when resuming that producer. Not a student decoding contract. |
-| `producer.save_interval` | Producer flush interval, fixed on resume so parallel-job boundaries remain consistent. |
+| `producer.global_batch_size` | Converts teacher iterations to original source positions. Fixed on producer resume; the rank layout and flush interval may change. |
 
 The rest of this section is the producer-neutral specification. Megatron is one producer;
 other producers (for example a vLLM-based dumper) and consumers (for example a Hugging
