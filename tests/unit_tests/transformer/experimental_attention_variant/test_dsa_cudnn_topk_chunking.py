@@ -401,3 +401,13 @@ def test_single_packed_cp_segments_launch_with_the_given_budget(recorded_budgets
     )
 
     assert len(recorded_budgets) >= 2 and all(budget == _BUDGET for budget in recorded_budgets)
+
+
+def test_deepgemm_logits_top_k_launches_with_the_given_budget(recorded_budgets):
+    logits = torch.randn((16, 64)).to(torch.bfloat16)
+    lengths = torch.full((16,), 64, dtype=torch.int32)
+
+    indices, values = dsa_cudnn_kernels._deepgemm_logits_topk(logits, lengths, 8, "cudnn", _BUDGET)
+
+    assert recorded_budgets == [_BUDGET]
+    assert indices.shape == (16, 8) and values.dtype == torch.bfloat16

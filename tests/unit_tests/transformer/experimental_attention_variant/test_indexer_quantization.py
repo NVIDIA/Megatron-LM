@@ -14,6 +14,7 @@ from megatron.core.quantization.indexer_quantization import (
     indexer_mxfp8_thd_scale_shape,
     make_indexer_mxfp8_scale_cu_seqlens,
     quantize_indexer_mxfp8,
+    quantize_indexer_mxfp8_packed_ue8m0,
     refresh_indexer_mxfp8_scale_cu_seqlens,
 )
 
@@ -162,3 +163,27 @@ def test_thd_preallocated_quantization_cuda_graph_replay(num_heads):
     assert not torch.equal(captured_data.float(), first_data)
     assert torch.equal(captured_data.float(), expected_data.float())
     assert torch.equal(captured_scale.view(torch.uint8), expected_scale.view(torch.uint8))
+
+
+@pytest.mark.parametrize("shape", [(1000, 32, 128), (4099, 128)], ids=["q", "k-ragged"])
+def test_packed_ue8m0_scales_are_deepgemm_bytes(shape):
+    """The int32 view of TE's logical scales is DeepGEMM's packed UE8M0 layout, byte for byte."""
+    try:
+        from deep_gemm.utils import per_token_cast_to_fp8
+    except (ImportError, OSError, RuntimeError, AttributeError) as exc:
+        pytest.skip(f"deep_gemm is unavailable: {exc}")
+    generator = torch.Generator(device="cuda").manual_seed(0)
+    x = torch.randn(shape, generator=generator, device="cuda").bfloat16()
+    x[0, ..., :32] = 0  # an all-zero group
+    data, scales = quantize_indexer_mxfp8_packed_ue8m0(x)
+    assert data.dtype == torch.float8_e4m3fn and data.shape == x.shape
+    assert scales.dtype == torch.int32 and scales.shape == x.shape[:-1]
+    flat = x.reshape(-1, 128)
+    ref_data, ref_scales = per_token_cast_to_fp8(
+        flat, use_ue8m0=True, gran_k=32, use_packed_ue8m0=True
+    )
+    nonzero = flat.abs().reshape(-1, 4, 32).amax(dim=-1).gt(0).all(dim=-1)
+    # DeepGEMM clamps amax to 1e-4 where TE keeps a zero group's own scale; compare the
+    # rows without an all-zero group bytewise, and every row's data.
+    assert torch.equal(scales.reshape(-1)[nonzero], ref_scales.reshape(-1)[nonzero])
+    assert torch.equal(data.reshape(-1, 128).view(torch.uint8), ref_data.view(torch.uint8))
