@@ -207,6 +207,15 @@ def test_external_layer_receives_parallel_process_groups(tp_size, cp_size):
 
 
 @pytest.fixture
+def isolated_mhc_compilation():
+    # Inherited Dynamo cache pressure can mix compiled and eager mHC arithmetic.
+    # Match the existing mHC tests by isolating compilation before and after each case.
+    torch._dynamo.reset()
+    yield
+    torch._dynamo.reset()
+
+
+@pytest.fixture
 def gpu_model_parallel():
     if not torch.cuda.is_available():
         pytest.skip("Requires CUDA for a real HybridModel and distributed checkpoint")
@@ -229,6 +238,7 @@ def gpu_context_parallel():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.usefixtures("isolated_mhc_compilation")
 @pytest.mark.parametrize("boundary_layout", ["contiguous", "zigzag"])
 @pytest.mark.parametrize("recompute_method", [None, "uniform", "block"])
 @pytest.mark.parametrize("with_mhc", [False, True])
@@ -327,6 +337,7 @@ def test_external_layer_cp_token_ids_match_unsharded_reference(
         )
 
 
+@pytest.mark.usefixtures("isolated_mhc_compilation")
 @pytest.mark.parametrize("recompute_mode", [None, "uniform", "block", "mhc"])
 def test_external_layer_mhc_matches_eager(gpu_model_parallel, recompute_mode):
     def make_stack(mode):
@@ -400,6 +411,7 @@ def test_external_layer_mhc_matches_eager(gpu_model_parallel, recompute_mode):
         torch.testing.assert_close(parameter.grad, eager.get_parameter(name).grad, msg=name)
 
 
+@pytest.mark.usefixtures("isolated_mhc_compilation")
 def test_external_transformer_subclass_mhc_calls_custom_forward(gpu_model_parallel):
     class CustomTransformerLayer(TransformerLayer):
         def __init__(self, config):
