@@ -33,6 +33,12 @@ comparator to report those projections' outputs (and, for MLA and KDA, the mixer
 output and gradients) as changed, after an identical BF16 instance reproduced the
 reference bit for bit; (3) enable KPool quantization and require the spy to see it.
 
+A trainable variant turns the indexer loss on (a positive dsa_indexer_loss_coeff
+with the sparse pool-level KL). Every indexer parameter, the pool gate and slot
+bias included, then requires and gets a gradient. The same bitwise comparison
+covers those gradients, and the parameters keep their opt-out precision: no FP8
+primary weight, a BF16 gate and an FP32 slot bias.
+
 Scope: TP=PP=EP=CP=1 mixer modules in the dev proxy geometry (hidden 1024, eight
 attention, indexer and KDA heads). DSA uses the PyTorch sparse-attention path,
 whose masked dense GEMMs are run-to-run reproducible. The fused cuDNN backward
@@ -124,6 +130,10 @@ _MLA_PROJECTIONS = (
     "linear_proj",
 )
 _INDEXER_PREFIX = "core_attention.indexer."
+_INDEXER_GATE = f"{_INDEXER_PREFIX}index_kpool_compress_gate"
+_INDEXER_APE = f"{_INDEXER_PREFIX}index_kpool_compress_ape"
+# A positive loss coefficient with the sparse pool-level KL trains the whole KPool indexer.
+_TRAINABLE_INDEXER = {"dsa_indexer_loss_coeff": 0.1, "dsa_indexer_use_sparse_loss": True}
 _INDEXER_QK_PROJECTIONS = (f"{_INDEXER_PREFIX}linear_wq_b", f"{_INDEXER_PREFIX}linear_wk")
 _INDEXER_WEIGHTS_PROJECTIONS = (f"{_INDEXER_PREFIX}linear_weights_proj",)
 _DSA_PROJECTIONS = _MLA_PROJECTIONS + _INDEXER_QK_PROJECTIONS + _INDEXER_WEIGHTS_PROJECTIONS
@@ -258,7 +268,10 @@ def _build_kda(config: MLATransformerConfig) -> KimiDeltaAttention:
 
 
 def _build_dsa(config: MLATransformerConfig) -> AbsorbedMLASelfAttention:
-    """Build the GLM53 ``D`` mixer: NoPE absorbed MLA with a frozen KPool DSA selector."""
+    """Build the GLM53 ``D`` mixer: NoPE absorbed MLA with a KPool DSA selector.
+
+    The selector is frozen unless the configuration turns the indexer loss on.
+    """
     spec = hybrid_glm53_stack_spec(config).submodules.dsa_layer.submodules.self_attention
     layer = build_module(spec, config=config, layer_number=1, pg_collection=_process_groups())
     assert isinstance(layer, AbsorbedMLASelfAttention)
@@ -428,7 +441,11 @@ def _copy_parameters(source: torch.nn.Module, target: torch.nn.Module) -> None:
 
 
 def _trainable_parameters(layer: torch.nn.Module, frozen_prefix: str | None) -> set[str]:
-    """Return trainable names; the frozen KPool selector must not require gradients."""
+    """Return trainable names; exactly the parameters under ``frozen_prefix`` are frozen.
+
+    The prefix names the frozen KPool selector. With the indexer loss on, the caller passes
+    None, and every parameter must require gradients.
+    """
     names = {name for name, _ in layer.named_parameters()}
     frozen = {name for name in names if frozen_prefix and name.startswith(frozen_prefix)}
     if frozen_prefix:
@@ -560,6 +577,9 @@ def _compare_bf16_and_fp8(kind, overrides, fp8_overrides, kpool_spy=None) -> _Co
     _assert_high_precision_parameters(candidate, reference)
     _copy_parameters(reference, control)
     _copy_parameters(reference, candidate)
+    if (bf16_config.dsa_indexer_loss_coeff or 0.0) > 0:
+        # The indexer loss trains the whole KPool indexer: no parameter is frozen.
+        frozen_prefix = None
     trainable = _trainable_parameters(reference, frozen_prefix)
 
     hidden, cotangent = _inputs()
@@ -571,7 +591,7 @@ def _compare_bf16_and_fp8(kind, overrides, fp8_overrides, kpool_spy=None) -> _Co
     return _Comparison(reference, candidate, trainable, repeated, expected, actual)
 
 
-def _assert_opt_outs_bitwise_inert(kind: str, kpool_spy=None, **overrides) -> None:
+def _assert_opt_outs_bitwise_inert(kind: str, kpool_spy=None, **overrides) -> _Comparison:
     runs = _compare_bf16_and_fp8(kind, overrides, _TARGET_FP8, kpool_spy)
     _assert_quantization_states(runs.actual, outer_fp8=True, fp8_projections=())
     if kpool_spy is not None:
@@ -591,6 +611,7 @@ def _assert_opt_outs_bitwise_inert(kind: str, kpool_spy=None, **overrides) -> No
     )
     assert not mismatches, f"FP8 opt-outs are not inert: {'; '.join(mismatches)} ({control_note})"
     _assert_high_precision_parameters(runs.candidate, runs.reference)
+    return runs
 
 
 def _assert_fp8_execution_detected(kind, opt_out_overrides, fp8_projections, changed) -> None:
@@ -628,6 +649,47 @@ def test_glm53_kda_fp8_opt_out_is_bitwise_inert(kda_core_in_fp32):
 def test_glm53_dsa_fp8_opt_outs_are_bitwise_inert(monkeypatch):
     """MLA, indexer and KPool opt-outs keep the NoPE KPool DSA mixer bitwise BF16 under FP8."""
     _assert_opt_outs_bitwise_inert("dsa", kpool_spy=_KPoolSpy(monkeypatch))
+
+
+@pytest.mark.usefixtures("model_parallel")
+def test_glm53_trainable_dsa_fp8_opt_outs_are_bitwise_inert(monkeypatch):
+    """With the indexer loss on, the trainable KPool indexer keeps its opt-out precision.
+
+    The comparison above with the sparse pool-level loss on: no parameter is frozen, and
+    every indexer parameter, the pool gate and slot bias included, gets a finite non-zero
+    gradient that is bitwise the same under the FP8 recipe. None becomes FP8: the indexer
+    projections keep BF16 primary weights, the gate the BF16 parameter dtype and the slot
+    bias FP32, and each gradient has its parameter's dtype.
+    """
+    # The loss enters the backward with scale 1, logged into a tracker of this test's own.
+    monkeypatch.setattr(dsa_module.DSAIndexerLossLoggingHelper, "tracker", {})
+    monkeypatch.setattr(
+        dsa_module.DSAIndexerLossAutoScaler,
+        "main_loss_backward_scale",
+        torch.ones((), device="cuda"),
+    )
+    runs = _assert_opt_outs_bitwise_inert(
+        "dsa", kpool_spy=_KPoolSpy(monkeypatch), **_TRAINABLE_INDEXER
+    )
+    indexer = {
+        name: parameter
+        for name, parameter in runs.candidate.named_parameters()
+        if name.startswith(_INDEXER_PREFIX)
+    }
+    assert {_INDEXER_GATE, _INDEXER_APE} <= set(indexer)
+    assert set(indexer) <= runs.trainable
+    modules = dict(runs.candidate.named_modules())
+    for name in _INDEXER_QK_PROJECTIONS + _INDEXER_WEIGHTS_PROJECTIONS:
+        assert not modules[name].primary_weights_in_fp8, f"{name} holds FP8 primary weights"
+    assert indexer[_INDEXER_GATE].dtype == torch.bfloat16
+    assert indexer[_INDEXER_APE].dtype == torch.float32
+    for name, parameter in indexer.items():
+        assert parameter.requires_grad, f"{name} is frozen with the indexer loss on"
+        assert not is_float8tensor(parameter), f"{name} is a TE quantized tensor"
+        grad = runs.actual.results[f"grad:{name}"]
+        assert grad is not None and torch.isfinite(grad).all(), name
+        assert torch.count_nonzero(grad).item() > 0, name
+        assert grad.dtype == parameter.dtype, f"{name}: gradient {grad.dtype}"
 
 
 @pytest.mark.usefixtures("model_parallel")

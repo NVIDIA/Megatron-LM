@@ -17,6 +17,13 @@ scale gradients are compared through their per-token contribution tensors
 (assert_mhc_decomposition): each scalar is a heavily cancelling sum, on which
 equally valid reference executions fail the bar against each other. Routing,
 DSA indices and all other links are unchanged.
+
+The trainable-indexer DE case turns the indexer loss on (the sparse pool-level
+KL). The forward, the stream wire and every trunk gradient keep the bars above.
+The HF indexer runs under no_grad and has no training rule, so the indexer
+gradients are checked on their own: each indexer parameter, the pool gate and
+slot bias included, needs a finite non-zero gradient. Those links are then
+compared as frozen ones.
 """
 
 import gc
@@ -71,7 +78,10 @@ BLOCK_MHC_SITES = (
 )
 
 
-def make_config(*, deterministic=False, backend='none', sparse=False, mtp=False):
+def make_config(
+    *, deterministic=False, backend='none', sparse=False, mtp=False, trainable_indexer=False
+):
+    """The GLM53 block config; ``trainable_indexer`` turns the sparse pool-level KL on."""
     return MLATransformerConfig(
         num_layers=2,
         hidden_size=HIDDEN,
@@ -112,7 +122,8 @@ def make_config(*, deterministic=False, backend='none', sparse=False, mtp=False)
         dsa_indexer_kpool_always_select_tail=True,
         dsa_indexer_kpool_key_dtype_compression=True,
         dsa_indexer_hf_scoring=True,
-        dsa_indexer_loss_coeff=0.0,
+        dsa_indexer_loss_coeff=0.1 if trainable_indexer else 0.0,
+        dsa_indexer_use_sparse_loss=trainable_indexer,
         dsa_indexer_k_norm_epsilon=1e-6,
         dsa_indexer_scoring_relu=True,
         dsa_indexer_rotate_activation=False,
@@ -874,14 +885,90 @@ def test_glm53_kda_dense_input_expansion_and_contraction(monkeypatch):
     _run_kda_dense(True, True, monkeypatch, compare_all_parameters=False)
 
 
-def _run_dsa_moe(backend, monkeypatch, mutate=None):
-    config = make_config(backend=backend, sparse=True)
+DSA_INDEXER = 'layers.0.inner_layer.self_attention.core_attention.indexer.'
+
+
+class FrozenIndexerView:
+    """The target's parameters with its trainable DSA indexer shown frozen.
+
+    The HF reference indexer is frozen. Detached views share the target's storage, so a
+    copy through them copies the target's values.
+    """
+
+    def __init__(self, module):
+        self.module = module
+
+    def named_parameters(self):
+        for name, parameter in self.module.named_parameters():
+            yield name, parameter.detach() if name.startswith(DSA_INDEXER) else parameter
+
+
+def record_indexer_losses(monkeypatch):
+    """Record each logged DSA indexer loss as ``(layer_number, loss)``.
+
+    The loss enters the backward with scale 1, and the test logs into a tracker of its own.
+    """
+    helper = dsa_module.DSAIndexerLossLoggingHelper
+    monkeypatch.setattr(helper, 'tracker', {})
+    monkeypatch.setattr(
+        dsa_module.DSAIndexerLossAutoScaler,
+        'main_loss_backward_scale',
+        torch.ones((), device='cuda'),
+    )
+    losses = []
+    save_loss = helper.save_loss_to_tracker
+
+    def record(*args, **kwargs):
+        losses.append((kwargs.get('layer_number'), kwargs['loss'].detach().cpu()))
+        return save_loss(*args, **kwargs)
+
+    monkeypatch.setattr(helper, 'save_loss_to_tracker', staticmethod(record))
+    return losses
+
+
+def freeze_trained_indexer(gold, losses):
+    """Check that the indexer trained, then show it frozen to the frozen HF reference.
+
+    HostParameters already required a finite gradient for every trainable parameter. The
+    layer must log one finite positive loss, and every indexer parameter, the pool gate
+    and slot bias included, needs a non-zero gradient. The HF indexer has no training
+    rule, so these gradients are recorded, not compared.
+    """
+    assert len(losses) == 1, f'{len(losses)} indexer losses logged for one forward'
+    layer_number, loss = losses[0]
+    assert layer_number == 1, layer_number
+    assert torch.isfinite(loss).all() and loss.item() > 0, f'indexer loss {loss.item()}'
+    names = sorted(name for name in gold.parameters if name.startswith(DSA_INDEXER))
+    gate, ape = f'{DSA_INDEXER}index_kpool_compress_gate', f'{DSA_INDEXER}index_kpool_compress_ape'
+    assert {gate, ape} <= set(names), names
+    norms = {}
+    for name in names:
+        parameter = gold.parameters[name]
+        assert parameter.requires_grad and parameter.grad is not None, name
+        assert torch.isfinite(parameter.grad).all(), name
+        assert torch.count_nonzero(parameter.grad).item() > 0, f'{name}: all-zero gradient'
+        norms[name] = parameter.grad.double().norm().item()
+        gold.parameters[name] = torch.nn.Parameter(parameter.detach(), requires_grad=False)
+    assert gold.parameters[gate].dtype == torch.bfloat16
+    assert gold.parameters[ape].dtype == torch.float32
+    record_details(
+        'trainable_indexer',
+        {
+            'indexer_loss': loss.item(),
+            'gradient_norms': norms,
+            'note': 'indexer gradients from the sparse pool-level KL; not compared with HF',
+        },
+    )
+
+
+def _run_dsa_moe(backend, monkeypatch, mutate=None, *, trainable_indexer=False):
+    config = make_config(backend=backend, sparse=True, trainable_indexer=trainable_indexer)
     apply_mutation(mutate, 'config', config)
     real = build_stack(config, 'DE')
     initialize_fixture(real)
     native = NativeHybridBlock(torch.device('cuda'), sparse=True)
     links = block_links(sparse=True)
-    copy_parameters(real, native, links)
+    copy_parameters(FrozenIndexerView(real) if trainable_indexer else real, native, links)
     hidden = torch.randn(130, 4, 4 * HIDDEN, device='cuda', dtype=torch.bfloat16)
     router = real.layers[1].inner_layer.mlp.router
     with torch.no_grad():
@@ -901,6 +988,7 @@ def _run_dsa_moe(backend, monkeypatch, mutate=None):
     )
     del native, router
     release_cuda()
+    losses = record_indexer_losses(monkeypatch) if trainable_indexer else None
     actual_input = hidden.clone().requires_grad_()
     real.set_input_tensor(actual_input)
     router_records = []
@@ -931,6 +1019,8 @@ def _run_dsa_moe(backend, monkeypatch, mutate=None):
     }
     buffers.assert_actual_unchanged(real, router_records)
     gold = HostParameters(real)
+    if trainable_indexer:
+        freeze_trained_indexer(gold, losses)
     wires.clear()
     del real, actual, actual_input
     release_cuda()
@@ -965,3 +1055,15 @@ def test_glm53_dsa_moe_mhc_native_forward_and_all_gradients(backend, monkeypatch
     Clamp decisions are replayed and the mHC scales are decomposed (module docstring).
     """
     _run_dsa_moe(backend, monkeypatch)
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize('backend', ['none', 'cudnn'])
+def test_glm53_dsa_moe_mhc_native_forward_and_all_gradients_trainable_indexer(backend, monkeypatch):
+    """The DE case with the indexer loss on (sparse pool-level KL).
+
+    The output, the stream wire, the DSA indices and every trunk gradient keep their native
+    parity. Every indexer parameter, the pool gate and slot bias included, gets a finite
+    non-zero gradient (module docstring).
+    """
+    _run_dsa_moe(backend, monkeypatch, trainable_indexer=True)

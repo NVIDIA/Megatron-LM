@@ -11,9 +11,18 @@ does not copy MCore's matrix absorption or reuse its kernels/math helpers.
 All hidden/head/latent dimensions are official. Sequence length is 17 and the
 token budget is 8 instead of 2048 so this short test actually prunes pools.
 This is single-layer BF16 coverage, not whole-checkpoint or training readiness.
+
+The trainable cases turn the indexer loss on (a positive dsa_indexer_loss_coeff
+with the sparse pool-level KL). The selection and the trunk must not change: HF
+still selects the same pools, and a frozen layer with the same parameters gives
+the same output and trunk gradients. Every indexer parameter, the pool gate and
+the slot bias included, gets a finite gradient, and the logged loss matches the
+independent reference in kpool_trainable_reference.py. The frozen HF indexer has
+no training rule, so the indexer gradients are not compared with HF.
 """
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -32,6 +41,9 @@ from megatron.core.transformer.experimental_attention_variant.absorbed_mla impor
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.experimental_attention_variant import (
+    kpool_trainable_reference as reference,
+)
 from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_parity_utils import (
     assert_similarity,
 )
@@ -46,9 +58,14 @@ _INDEX_DIM = 128
 _POOL = 4
 _TOPK = 8
 _EPS = 1e-5
+# A positive coefficient (with the sparse pool-level KL) trains the KPool indexer.
+_LOSS_COEFF = 0.1
+_INDEXER_PREFIX = 'core_attention.indexer.'
+_GATE = f'{_INDEXER_PREFIX}index_kpool_compress_gate'
+_APE = f'{_INDEXER_PREFIX}index_kpool_compress_ape'
 
 
-def _config(backend, kpool_scorer='torch'):
+def _config(backend, kpool_scorer='torch', *, trainable=False):
     return MLATransformerConfig(
         num_layers=1,
         hidden_size=_HIDDEN,
@@ -83,7 +100,8 @@ def _config(backend, kpool_scorer='torch'):
         dsa_indexer_kpool_key_dtype_compression=True,
         dsa_indexer_kpool_scorer_backend=kpool_scorer,
         dsa_indexer_hf_scoring=True,
-        dsa_indexer_loss_coeff=0.0,
+        dsa_indexer_loss_coeff=_LOSS_COEFF if trainable else 0.0,
+        dsa_indexer_use_sparse_loss=trainable,
         dsa_indexer_k_norm_epsilon=1e-6,
         dsa_indexer_scoring_relu=True,
         dsa_indexer_rotate_activation=False,
@@ -305,8 +323,151 @@ def _model_parallel():
         Utils.destroy_model_parallel()
 
 
-def _run_real_layer(backend, monkeypatch, *, compare_native, kpool_scorer='torch'):
-    config = _config(backend, kpool_scorer)
+def _require_cudnn_kpool_scorer():
+    """The skips of the frozen cuDNN-scorer case."""
+    from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels
+
+    try:
+        dsa_cudnn_kernels._ensure_dsa_namespace()
+    except ImportError as exc:
+        pytest.skip(f'cuDNN frontend DSA unavailable: {exc}')
+    if not dsa_cudnn_kernels._supports_indexer_q_causal_offsets():
+        # 17 tokens end off the pool grid; without q_causal_offsets the PyTorch scorer runs.
+        pytest.skip('this cuDNN frontend has no q_causal_offsets')
+
+
+def _expected_loss_path(backend, kpool_scorer):
+    """Where the trainable loss runs at TP1 with HF scoring and the fused sparse attention.
+
+    The cuDNN frontend kernels need both cuDNN backends and frontend >= 1.31; otherwise the
+    PyTorch ``KPoolSparseIndexerLoss`` runs.
+    """
+    if backend != 'cudnn' or kpool_scorer != 'cudnn':
+        return 'pytorch'
+    from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels
+
+    minimum = dsa_cudnn_kernels._KPOOL_SPARSE_LOSS_MIN_FE_VERSION
+    return 'cudnn' if dsa_cudnn_kernels._cudnn_frontend_at_least(minimum) else 'pytorch'
+
+
+def _trace_trainable_selector(selector, monkeypatch):
+    """Record, without changing anything, what a trainable selector's layer logs and runs.
+
+    ``losses`` holds each logged indexer loss, ``paths`` which loss Function ran (the
+    PyTorch ``KPoolSparseIndexerLoss`` or the cuDNN frontend one) and ``indexer`` each
+    ``forward_before_topk`` result of ``selector``: ``q``, ``k``, ``weights`` and the
+    pool-gate score. The loss enters the backward with scale 1, and the test logs into a
+    tracker of its own.
+    """
+    from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels
+
+    trace = SimpleNamespace(losses=[], paths=[], indexer=[])
+    helper = dsa_module.DSAIndexerLossLoggingHelper
+    monkeypatch.setattr(helper, 'tracker', {})
+    monkeypatch.setattr(
+        dsa_module.DSAIndexerLossAutoScaler,
+        'main_loss_backward_scale',
+        torch.ones((), device='cuda'),
+    )
+    save_loss = helper.save_loss_to_tracker
+
+    def record_loss(*args, **kwargs):
+        record = dict(kwargs)
+        for name in ('loss', 'raw_loss'):
+            if isinstance(record.get(name), torch.Tensor):
+                record[name] = record[name].detach().clone()
+        trace.losses.append(record)
+        return save_loss(*args, **kwargs)
+
+    monkeypatch.setattr(helper, 'save_loss_to_tracker', staticmethod(record_loss))
+    for path, function in (
+        ('pytorch', dsa_module.KPoolSparseIndexerLoss),
+        ('cudnn', dsa_cudnn_kernels.KPoolSparseIndexerLossFromScoresFunc),
+    ):
+
+        def apply(*args, _apply=function.apply, _path=path, **kwargs):
+            trace.paths.append(_path)
+            return _apply(*args, **kwargs)
+
+        monkeypatch.setattr(function, 'apply', apply)
+    forward_before_topk = selector.forward_before_topk
+
+    def capture_indexer(*args, **kwargs):
+        outputs = forward_before_topk(*args, **kwargs)
+        trace.indexer.append(tuple(output.detach().clone() for output in outputs))
+        return outputs
+
+    monkeypatch.setattr(selector, 'forward_before_topk', capture_indexer)
+    return trace
+
+
+def _selected_pool_ids(selection):
+    """Pool ids ``[b, sq, G]`` (``-1`` pads) of a token top-k's pool slots.
+
+    Each slot must hold ``_POOL`` consecutive tokens that start on the pool grid; the slot
+    order (score order or the fused selector's kernel order) does not matter to the loss.
+    """
+    tokens = selection[..., :_TOPK].detach().to(device='cpu', dtype=torch.int64)
+    slots = tokens.unflatten(-1, (_TOPK // _POOL, _POOL))
+    first = slots[..., 0]
+    valid = first >= 0
+    consecutive = first.unsqueeze(-1) + torch.arange(_POOL)
+    expected = torch.where(valid.unsqueeze(-1), consecutive, torch.full_like(slots, -1))
+    assert torch.equal(slots, expected), 'a selected pool slot does not hold consecutive tokens'
+    assert bool((first[valid] % _POOL == 0).all()), 'a selected pool is off the pool grid'
+    return torch.where(valid, first // _POOL, torch.full_like(first, -1))
+
+
+def _assert_trainable_loss(trace, selector, attention, selection, expected_path):
+    """One forward logged one loss, on ``expected_path``, equal to the independent reference.
+
+    The reference rebuilds the loss from the indexer's own tensors, the main query and key
+    the sparse attention received (``attention``) and the selection it attended, in the
+    layer's key-dtype compression profile, divided by every row of the batch.
+    """
+    assert trace.paths == [expected_path], f'loss Functions run: {trace.paths}'
+    assert len(trace.losses) == 1, f'{len(trace.losses)} indexer losses logged for one forward'
+    record = trace.losses[0]
+    assert record['layer_number'] == 1
+    loss = record['loss']
+    assert torch.isfinite(loss).all() and loss.item() > 0, f'indexer loss {loss.item()}'
+    torch.testing.assert_close(record['raw_loss'] * _LOSS_COEFF, loss, rtol=1e-6, atol=0)
+    assert len(trace.indexer) == 1
+    q, k, weights, gate_score = trace.indexer[0]
+    batch, rows = selection.shape[:2]
+    expected = reference.sparse_indexer_loss(
+        q=q.cpu(),
+        weights=weights.cpu(),
+        k=k.cpu(),
+        gate_score=gate_score.cpu(),
+        ape=selector.index_kpool_compress_ape.detach().cpu(),
+        query=attention['query'].cpu(),
+        key=attention['key'].cpu(),
+        pool_ids=_selected_pool_ids(selection),
+        pool_size=_POOL,
+        softmax_scale=attention['softmax_scale'],
+        hf_scoring=True,
+        use_relu=True,
+        profile='key_dtype',
+        loss_coeff=_LOSS_COEFF,
+        row_count=float(batch * rows),
+    )
+    torch.testing.assert_close(
+        loss.double().cpu(), expected.loss.detach().double(), rtol=1e-4, atol=1e-8
+    )
+
+
+def _attention_inputs(kwargs):
+    """The main query and key (copies) and the softmax scale of a sparse-attention call."""
+    return {
+        'query': kwargs['query'].detach().clone(),
+        'key': kwargs['key'].detach().clone(),
+        'softmax_scale': kwargs['softmax_scale'],
+    }
+
+
+def _run_real_layer(backend, monkeypatch, *, compare_native, kpool_scorer='torch', trainable=False):
+    config = _config(backend, kpool_scorer, trainable=trainable)
     spec = hybrid_glm53_stack_spec(config).submodules.dsa_layer.submodules.self_attention
     groups = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
     real = build_module(spec, config=config, layer_number=1, pg_collection=groups).cuda()
@@ -314,7 +475,9 @@ def _run_real_layer(backend, monkeypatch, *, compare_native, kpool_scorer='torch
     assert not real.use_rope
     selector = real.core_attention.indexer
     assert selector.index_kpool == _POOL
-    assert all(not parameter.requires_grad for parameter in selector.parameters())
+    # The loss on trains the whole KPool indexer, gate and slot bias included; off, it is frozen.
+    assert all(parameter.requires_grad == trainable for parameter in selector.parameters())
+    trace = _trace_trainable_selector(selector, monkeypatch) if trainable else None
     native = _NativeHFNoPEAttention(torch.device('cuda')) if compare_native else None
     real_parameters = dict(real.named_parameters())
     if native is not None:
@@ -326,13 +489,15 @@ def _run_real_layer(backend, monkeypatch, *, compare_native, kpool_scorer='torch
                 assert real_parameters[target].shape == native_parameters[source].shape
                 real_parameters[target].copy_(native_parameters[source])
 
-    selected_rows, fused_results, kpool_results = [], [], []
+    selected_rows, fused_results, kpool_results, attention_inputs = [], [], [], []
     sparse_attention = dsa_module._run_sparse_attention
     fused_attention = dsa_kernels.run_fused_absorbed_sparse_attention
     kpool_pool_topk = dsa_kernels.run_kpool_pool_topk
 
     def capture_selection(**kwargs):
         selected_rows.append(kwargs['topk_indices'].detach().clone())
+        if trainable:
+            attention_inputs.append(_attention_inputs(kwargs))
         return sparse_attention(**kwargs)
 
     def capture_fused_result(*args, **kwargs):
@@ -362,15 +527,25 @@ def _run_real_layer(backend, monkeypatch, *, compare_native, kpool_scorer='torch
         assert fused_results == []
     # The cuDNN KPool scorer must run, not fall back to the PyTorch scorer.
     assert kpool_results == ([True] if kpool_scorer == 'cudnn' else [])
+    if trainable:
+        assert {_GATE, _APE} <= set(real_parameters)
+        _assert_trainable_loss(
+            trace,
+            selector,
+            attention_inputs[0],
+            selected_rows[0],
+            _expected_loss_path(backend, kpool_scorer),
+        )
 
     grad = torch.randn_like(actual)
     actual.backward(grad)
     assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
     assert torch.count_nonzero(hidden.grad).item() > 0
     for name, parameter in real_parameters.items():
-        if name.startswith('core_attention.indexer.'):
+        if name.startswith(_INDEXER_PREFIX) and not trainable:
             assert not parameter.requires_grad and parameter.grad is None, name
         else:
+            # Trainable: every indexer parameter, the gate and slot bias included, from the KL.
             assert parameter.grad is not None and torch.isfinite(parameter.grad).all(), name
             assert torch.count_nonzero(parameter.grad).item() > 0, name
     if native is None:
@@ -409,6 +584,20 @@ def test_glm53_absorbed_mla_matches_independent_hf_attention(backend, monkeypatc
     _run_real_layer(backend, monkeypatch, compare_native=True)
 
 
+@pytest.mark.parametrize('backend', ['none', 'cudnn'])
+def test_glm53_real_absorbed_mla_trainable_selector_forward_backward(backend, monkeypatch):
+    """The loss on: every indexer parameter trains and the logged loss is the reference's."""
+    _run_real_layer(backend, monkeypatch, compare_native=False, trainable=True)
+
+
+@pytest.mark.parametrize('backend', ['none', 'cudnn'])
+def test_glm53_absorbed_mla_trainable_selector_matches_independent_hf_attention(
+    backend, monkeypatch
+):
+    """The loss on: HF's frozen selection, attention output and trunk gradients still hold."""
+    _run_real_layer(backend, monkeypatch, compare_native=True, trainable=True)
+
+
 def test_glm53_absorbed_mla_cudnn_kpool_scorer_matches_independent_hf_attention(monkeypatch):
     """``dsa_indexer_kpool_scorer_backend='cudnn'`` selects the HF pools through DSAttention."""
     from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels
@@ -421,6 +610,180 @@ def test_glm53_absorbed_mla_cudnn_kpool_scorer_matches_independent_hf_attention(
         # 17 tokens end off the pool grid; without q_causal_offsets the PyTorch scorer runs.
         pytest.skip('this cuDNN frontend has no q_causal_offsets')
     _run_real_layer('cudnn', monkeypatch, compare_native=True, kpool_scorer='cudnn')
+
+
+def test_glm53_absorbed_mla_trainable_cudnn_kpool_scorer_matches_independent_hf_attention(
+    monkeypatch,
+):
+    """The cuDNN-scorer case with the loss on, which then runs on the cuDNN frontend kernels
+    where the frontend is at least 1.31 (the attention also returns its LSE there)."""
+    _require_cudnn_kpool_scorer()
+    _run_real_layer('cudnn', monkeypatch, compare_native=True, kpool_scorer='cudnn', trainable=True)
+
+
+def _run_layer_pass(layer, hidden, grad, calls):
+    """One forward and backward of ``layer`` on a fresh leaf copy of ``hidden``."""
+    layer.zero_grad(set_to_none=True)
+    leaf = hidden.detach().clone().requires_grad_()
+    output, bias = layer(leaf, attention_mask=None)
+    assert bias is None and torch.isfinite(output).all()
+    output.backward(grad)
+    return SimpleNamespace(
+        call=calls[-1],
+        output=output.detach().clone(),
+        hidden_grad=leaf.grad.detach().clone(),
+        grads={
+            name: None if parameter.grad is None else parameter.grad.detach().clone()
+            for name, parameter in layer.named_parameters()
+        },
+    )
+
+
+def _assert_as_frozen(label, trainable, frozen, repeat, *, atomic):
+    """The trainable layer's tensor against the frozen layer's.
+
+    With ``atomic`` (the cuDNN backend, whose sparse-attention backward accumulates the
+    latent gradient atomically), runs need not agree bit for bit even after one pair did:
+    the trainable tensor and the frozen repeat must lie within a rounding-level bar of the
+    frozen tensor (a cosine deviation of 1e-4 is about a 1.4% relative difference).
+    Otherwise bit for bit when the frozen layer repeats the tensor bit for bit, else within
+    the same bar.
+    """
+    assert trainable is not None and frozen is not None and repeat is not None, label
+    if not atomic and torch.equal(frozen, repeat):
+        assert torch.equal(trainable, frozen), f'{label} differs from the frozen layer'
+        return
+    if atomic:
+        assert_similarity(repeat, frozen, eps=1e-4, label=f'{label} (frozen repeat)')
+    assert_similarity(trainable, frozen, eps=1e-4, label=label)
+
+
+def _run_trainable_against_frozen(backend, kpool_scorer, monkeypatch):
+    """A trainable layer against a frozen one with the same parameters, input and cotangent.
+
+    The frozen layer runs twice: what it repeats bit for bit, the trainable layer must give
+    bit for bit. The slot bias is non-zero, as in a trained checkpoint.
+    """
+    groups = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+    layers = []
+    for trainable in (False, True):
+        config = _config(backend, kpool_scorer, trainable=trainable)
+        spec = hybrid_glm53_stack_spec(config).submodules.dsa_layer.submodules.self_attention
+        layer = build_module(spec, config=config, layer_number=1, pg_collection=groups).cuda()
+        assert isinstance(layer, AbsorbedMLASelfAttention) and not layer.use_rope
+        assert layer.core_attention.indexer.index_kpool == _POOL
+        layers.append(layer)
+    frozen, trainable = layers
+    frozen_parameters = dict(frozen.named_parameters())
+    trainable_parameters = dict(trainable.named_parameters())
+    assert set(frozen_parameters) == set(trainable_parameters) == set(_PARAMETER_MAPPING.values())
+    with torch.no_grad():
+        frozen_parameters[_APE].uniform_(-1.0, 1.0)
+        for name, parameter in trainable_parameters.items():
+            assert parameter.dtype == frozen_parameters[name].dtype, name
+            parameter.copy_(frozen_parameters[name])
+    for name, parameter in frozen_parameters.items():
+        assert parameter.requires_grad != name.startswith(_INDEXER_PREFIX), name
+    assert all(parameter.requires_grad for parameter in trainable_parameters.values())
+    assert trainable_parameters[_GATE].dtype == torch.bfloat16
+    assert trainable_parameters[_APE].dtype == torch.float32
+
+    calls, fused_results, kpool_results = [], [], []
+    sparse_attention = dsa_module._run_sparse_attention
+    fused_attention = dsa_kernels.run_fused_absorbed_sparse_attention
+    kpool_pool_topk = dsa_kernels.run_kpool_pool_topk
+
+    def capture_call(**kwargs):
+        calls.append(dict(_attention_inputs(kwargs), selection=kwargs['topk_indices'].clone()))
+        return sparse_attention(**kwargs)
+
+    def capture_fused_result(*args, **kwargs):
+        result = fused_attention(*args, **kwargs)
+        fused_results.append(result is not None)
+        return result
+
+    def capture_kpool_result(*args, **kwargs):
+        result = kpool_pool_topk(*args, **kwargs)
+        kpool_results.append(result is not None)
+        return result
+
+    monkeypatch.setattr(dsa_module, '_run_sparse_attention', capture_call)
+    monkeypatch.setattr(dsa_kernels, 'run_fused_absorbed_sparse_attention', capture_fused_result)
+    monkeypatch.setattr(dsa_kernels, 'run_kpool_pool_topk', capture_kpool_result)
+    trace = _trace_trainable_selector(trainable.core_attention.indexer, monkeypatch)
+    hidden = torch.randn(17, 1, _HIDDEN, device='cuda', dtype=torch.bfloat16)
+    grad = torch.randn_like(hidden)
+    frozen_run = _run_layer_pass(frozen, hidden, grad, calls)
+    repeat = _run_layer_pass(frozen, hidden, grad, calls)
+    assert trace.losses == [] and trace.paths == [], 'a frozen layer logged an indexer loss'
+    trainable_run = _run_layer_pass(trainable, hidden, grad, calls)
+    assert len(calls) == 3
+    if backend == 'cudnn':
+        assert fused_results == [True] * 3, 'cuDNN case must not exercise the unfused fallback'
+    else:
+        assert fused_results == []
+    # The cuDNN KPool scorer must run, not fall back to the PyTorch scorer.
+    assert kpool_results == ([True] * 3 if kpool_scorer == 'cudnn' else [])
+    selection = trainable_run.call['selection']
+    _assert_trainable_loss(
+        trace,
+        trainable.core_attention.indexer,
+        trainable_run.call,
+        selection,
+        _expected_loss_path(backend, kpool_scorer),
+    )
+
+    # The fused selector returns pools in its top-k kernel's order, not by score.
+    frozen_selection, repeat_selection = frozen_run.call['selection'], repeat.call['selection']
+    torch.testing.assert_close(
+        torch.sort(selection, dim=-1).values,
+        torch.sort(frozen_selection, dim=-1).values,
+        rtol=0,
+        atol=0,
+    )
+    assert (selection[0, -1] >= 0).sum().item() == 9
+    # The PyTorch scorer's top-k order is deterministic; the cuDNN kernel's is checked as a set.
+    if kpool_scorer == 'torch':
+        assert torch.equal(frozen_selection, repeat_selection), 'the frozen order changed'
+        assert torch.equal(selection, frozen_selection), 'the selection order changed'
+    atomic = backend == 'cudnn'
+    _assert_as_frozen(
+        'attention output', trainable_run.output, frozen_run.output, repeat.output, atomic=atomic
+    )
+    _assert_as_frozen(
+        'hidden gradient',
+        trainable_run.hidden_grad,
+        frozen_run.hidden_grad,
+        repeat.hidden_grad,
+        atomic=atomic,
+    )
+    for name, parameter in trainable_parameters.items():
+        trained = trainable_run.grads[name]
+        if name.startswith(_INDEXER_PREFIX):
+            assert frozen_run.grads[name] is None and repeat.grads[name] is None, name
+            assert trained is not None and trained.dtype == parameter.dtype, name
+            assert torch.isfinite(trained).all(), name
+            assert torch.count_nonzero(trained).item() > 0, name
+        else:
+            _assert_as_frozen(
+                name, trained, frozen_run.grads[name], repeat.grads[name], atomic=atomic
+            )
+
+
+@pytest.mark.parametrize(
+    ('backend', 'kpool_scorer'),
+    [('none', 'torch'), ('cudnn', 'torch'), ('cudnn', 'cudnn')],
+    ids=['none', 'cudnn', 'cudnn-kpool-scorer'],
+)
+def test_glm53_absorbed_mla_trainable_selector_matches_the_frozen_layer(
+    backend, kpool_scorer, monkeypatch
+):
+    """The loss on trains every indexer parameter, the gate and slot bias included, and
+    leaves the selection, the attention output and every trunk gradient of the frozen
+    layer unchanged; the logged loss is the independent reference's."""
+    if kpool_scorer == 'cudnn':
+        _require_cudnn_kpool_scorer()
+    _run_trainable_against_frozen(backend, kpool_scorer, monkeypatch)
 
 
 _LEFT_PADDING = 3
@@ -519,3 +882,29 @@ def _run_real_layer_left_padded(backend, monkeypatch):
 @pytest.mark.parametrize('backend', ['none', 'cudnn'])
 def test_glm53_absorbed_mla_left_padding_matches_independent_hf_attention(backend, monkeypatch):
     _run_real_layer_left_padded(backend, monkeypatch)
+
+
+@pytest.mark.parametrize('backend', ['none', 'cudnn'])
+def test_glm53_absorbed_mla_trainable_selector_rejects_an_explicit_mask(backend, monkeypatch):
+    """The left-padded explicit mask stays frozen-only: a trainable selector raises on it.
+
+    DSAttention turns the boolean padding mask into its additive float mask, a layout the
+    trainable KPool path does not cover; the frozen selector accepts it (the case above).
+    """
+    config = _config(backend, trainable=True)
+    spec = hybrid_glm53_stack_spec(config).submodules.dsa_layer.submodules.self_attention
+    groups = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+    real = build_module(spec, config=config, layer_number=1, pg_collection=groups).cuda()
+    assert isinstance(real, AbsorbedMLASelfAttention)
+    assert all(parameter.requires_grad for parameter in real.core_attention.indexer.parameters())
+    monkeypatch.setattr(real, 'attn_mask_type', None)
+    sequence = 17
+    positions = torch.arange(sequence, device='cuda')
+    key_valid = (positions >= _LEFT_PADDING)[None]
+    visible = (positions[None, :] <= positions[:, None]) & key_valid & key_valid.T
+    attention_mask = ~visible[None, None]
+    hidden = torch.randn(
+        sequence, 1, _HIDDEN, device='cuda', dtype=torch.bfloat16, requires_grad=True
+    )
+    with pytest.raises(ValueError, match='explicit attention mask'):
+        real(hidden, attention_mask=attention_mask)
