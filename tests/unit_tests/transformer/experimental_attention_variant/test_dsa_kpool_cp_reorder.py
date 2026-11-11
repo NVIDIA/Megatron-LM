@@ -27,6 +27,7 @@ _FUSED_DSA_HOOKS = (
     "run_fused_dsa_attention",
     "run_fused_qk_topk",
     "run_fused_qk_topk_with_loss",
+    "run_fused_qk_topk_with_scores",
     "run_fused_absorbed_sparse_attention",
 )
 
