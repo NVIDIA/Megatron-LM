@@ -4,9 +4,10 @@
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
 import inspect
+import logging
 from typing import Callable, Optional
 
-from megatron.core.utils import internal_api
+from megatron.core.utils import internal_api, log_single_rank
 
 try:
     from deep_ep.utils import EventHandle, EventOverlap
@@ -33,8 +34,14 @@ except ImportError:
 
 import torch
 
+logger = logging.getLogger(__name__)
+
 _buffer = None
 _elastic_buffer = None
+# (allow_hybrid_mode, num_allocated_qps, deterministic) that _elastic_buffer was built with.
+_elastic_buffer_settings = None
+# Set when _elastic_buffer is built, so that its first dispatch logs the SM count DeepEP chose.
+_elastic_buffer_log_num_sms = False
 
 
 def get_hidden_bytes(x: torch.Tensor) -> int:
@@ -85,24 +92,67 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
     return _buffer
 
 
-def get_elastic_buffer(
-    group: torch.distributed.ProcessGroup, num_max_tokens_per_rank: int, hidden: int, num_topk: int
+def _check_uniform_num_max_tokens_per_rank(
+    group: torch.distributed.ProcessGroup, num_max_tokens_per_rank: int, device="cuda"
 ):
-    """Get or create a DeepEP v2 elastic buffer for all-to-all communication."""
-    global _elastic_buffer
+    """Raise a ValueError unless every rank of ``group`` passes the same token bound.
+
+    DeepEP v2 requires the same ``num_max_tokens_per_rank`` on every rank. One MAX all-reduce of
+    ``(bound, -bound)`` yields the largest and the smallest bound. It also initializes the NCCL
+    communicator before DeepEP reads ``_comm_ptr()`` in ``get_buffer_size_hint()``, since a fresh
+    group's pointer may still be null. The result is read on the host, and every rank of the
+    group must call this together, as on the first build of the buffer.
+    """
+    bounds = torch.tensor(
+        [num_max_tokens_per_rank, -num_max_tokens_per_rank], dtype=torch.int64, device=device
+    )
+    torch.distributed.all_reduce(bounds, op=torch.distributed.ReduceOp.MAX, group=group)
+    max_bound, negated_min_bound = bounds.tolist()
+    if max_bound != -negated_min_bound:
+        raise ValueError(
+            "DeepEP v2 requires the same num_max_tokens_per_rank on every rank, but the ranks of "
+            f"the dispatcher group passed values from {-negated_min_bound} to {max_bound}, "
+            "because their local token counts differ (for example with packed THD inputs). Set "
+            "moe_deepepv2_num_max_tokens_per_rank to a bound that covers every rank, or set "
+            "moe_deepepv2_pad_uneven_dispatch_inputs=True."
+        )
+
+
+def get_elastic_buffer(
+    group: torch.distributed.ProcessGroup,
+    num_max_tokens_per_rank: int,
+    hidden: int,
+    num_topk: int,
+    allow_hybrid_mode: bool = True,
+    num_allocated_qps: int = 0,
+    deterministic: bool = True,
+):
+    """Get or create a DeepEP v2 elastic buffer for all-to-all communication.
+
+    The first build on a group checks that every rank passes the same
+    ``num_max_tokens_per_rank``, as DeepEP v2 requires. ``allow_hybrid_mode`` goes to both the
+    size hint and the buffer. The cached buffer is rebuilt when the group or a setting changes,
+    or when it is too small; a rebuild is collective, so every rank must request it together.
+    """
+    global _elastic_buffer, _elastic_buffer_settings, _elastic_buffer_log_num_sms
 
     if _elastic_buffer is None or _elastic_buffer.group != group:
-        # Initialize the NCCL communicator before DeepEP reads _comm_ptr() in
-        # get_buffer_size_hint(); a fresh group's pointer may still be null.
-        torch.distributed.all_reduce(torch.zeros(1, device="cuda"), group=group)
+        # Every rank of the group builds together here, so a collective is safe.
+        _check_uniform_num_max_tokens_per_rank(group, num_max_tokens_per_rank)
 
     num_bytes = ElasticBuffer.get_buffer_size_hint(
-        group, num_max_tokens_per_rank=num_max_tokens_per_rank, hidden=hidden, num_topk=num_topk
+        group,
+        num_max_tokens_per_rank=num_max_tokens_per_rank,
+        hidden=hidden,
+        num_topk=num_topk,
+        allow_hybrid_mode=allow_hybrid_mode,
     )
 
+    settings = (allow_hybrid_mode, num_allocated_qps, deterministic)
     if (
         _elastic_buffer is None
         or _elastic_buffer.group != group
+        or _elastic_buffer_settings != settings
         or _elastic_buffer.num_bytes < num_bytes
         or _elastic_buffer.num_max_tokens_per_rank < num_max_tokens_per_rank
     ):
@@ -112,7 +162,21 @@ def get_elastic_buffer(
             num_max_tokens_per_rank=num_max_tokens_per_rank,
             hidden=hidden,
             num_topk=num_topk,
-            deterministic=True,
+            deterministic=deterministic,
+            allow_hybrid_mode=allow_hybrid_mode,
+            num_allocated_qps=num_allocated_qps,
+        )
+        _elastic_buffer_settings = settings
+        _elastic_buffer_log_num_sms = True
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Built a DeepEP v2 buffer: num_bytes={num_bytes}, "
+            f"num_max_tokens_per_rank={num_max_tokens_per_rank}, hidden={hidden}, "
+            f"num_topk={num_topk}, allow_hybrid_mode={allow_hybrid_mode}, "
+            f"deterministic={deterministic}, num_allocated_qps="
+            f"{getattr(_elastic_buffer, 'num_allocated_qps', None)} "
+            f"(requested {num_allocated_qps}; 0 is automatic).",
         )
     return _elastic_buffer
 
@@ -353,6 +417,16 @@ class DeepepV2Dispatch(torch.autograd.Function):
 
         if async_finish:
             event.current_stream_wait()
+
+        global _elastic_buffer_log_num_sms
+        if _elastic_buffer_log_num_sms and buffer is _elastic_buffer:
+            _elastic_buffer_log_num_sms = False
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"DeepEP v2 dispatch uses {handle.num_sms} SMs "
+                f"(requested {num_sms}; 0 is automatic).",
+            )
 
         ctx.buffer = buffer
         ctx.handle = handle

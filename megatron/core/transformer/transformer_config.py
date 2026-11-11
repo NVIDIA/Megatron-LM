@@ -1155,6 +1155,41 @@ class TransformerConfig(ModelParallelConfig):
     already padded to equal token counts.
     """
 
+    moe_deepepv2_num_max_tokens_per_rank: Optional[int] = None
+    """Token bound passed to the deepepv2 buffer and to every deepepv2 dispatch. DeepEP v2
+    requires the same num_max_tokens_per_rank on every rank of the dispatcher group. None (the
+    default) passes each rank's local token count; the first buffer build raises a ValueError if
+    the ranks' counts differ, but counts that diverge after it are not detected. Whenever local
+    counts can differ, for example with packed THD inputs, set a bound that covers every rank's
+    token count, or set moe_deepepv2_pad_uneven_dispatch_inputs; sequence packing requires one
+    of them. A dispatch with more tokens than the bound raises a ValueError. Only valid with the
+    deepepv2 backend.
+    """
+
+    moe_deepepv2_pad_uneven_dispatch_inputs: bool = False
+    """Pass the group-wide maximum token count to the deepepv2 buffer and dispatch, so that
+    ranks with different local token counts agree. Like
+    moe_hybridep_pad_uneven_dispatch_inputs, this costs one MAX all-reduce and a host sync per
+    dispatch; DeepEP v2 needs no tensor padding, because the bound is a maximum. Enable when
+    local token counts can differ across ranks and no fixed
+    moe_deepepv2_num_max_tokens_per_rank fits. Only valid with the deepepv2 backend, and not
+    together with moe_deepepv2_num_max_tokens_per_rank.
+    """
+
+    moe_deepepv2_num_allocated_qps: int = 0
+    """Number of RDMA queue pairs the deepepv2 buffer allocates. 0 (the default, and DeepEP's
+    default) lets DeepEP choose. A positive value is passed to DeepEP as an explicit count."""
+
+    moe_deepepv2_allow_hybrid_mode: bool = True
+    """Allow DeepEP v2 hybrid mode for the deepepv2 buffer. True (the default) equals DeepEP's
+    default; False requests DeepEP's direct mode. The same value goes to the buffer size hint
+    and to the buffer."""
+
+    moe_deepepv2_deterministic: bool = True
+    """Build the deepepv2 buffer with DeepEP's deterministic option. True (the default) keeps
+    the deterministic=True that the deepepv2 backend always passed; False lets DeepEP use its
+    non-deterministic algorithms."""
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
@@ -2626,9 +2661,49 @@ class TransformerConfig(ModelParallelConfig):
                 self.moe_enable_deepep or self.moe_flex_dispatcher_backend in ("deepep", "deepepv2")
             ):
                 raise ValueError(
-                    "Flex token dispatcher with deepep backend does not support "
-                    "moe_pad_expert_input_to_capacity"
+                    f"Flex token dispatcher with the {self.moe_flex_dispatcher_backend} backend "
+                    "does not support moe_pad_expert_input_to_capacity"
                 )
+
+        if (
+            self.moe_deepepv2_num_max_tokens_per_rank is not None
+            and self.moe_deepepv2_num_max_tokens_per_rank <= 0
+        ):
+            raise ValueError(
+                "moe_deepepv2_num_max_tokens_per_rank must be None or a positive integer, got "
+                f"{self.moe_deepepv2_num_max_tokens_per_rank}."
+            )
+        if self.moe_deepepv2_num_allocated_qps < 0:
+            raise ValueError(
+                "moe_deepepv2_num_allocated_qps must be 0 (automatic) or a positive integer, got "
+                f"{self.moe_deepepv2_num_allocated_qps}."
+            )
+        if (
+            self.moe_deepepv2_pad_uneven_dispatch_inputs
+            and self.moe_deepepv2_num_max_tokens_per_rank is not None
+        ):
+            raise ValueError(
+                "Set either moe_deepepv2_num_max_tokens_per_rank (a fixed bound) or "
+                "moe_deepepv2_pad_uneven_dispatch_inputs (the group maximum per dispatch), "
+                "not both."
+            )
+        if (
+            self.moe_deepepv2_num_max_tokens_per_rank is not None
+            or self.moe_deepepv2_pad_uneven_dispatch_inputs
+        ) and (
+            self.moe_token_dispatcher_type != "flex"
+            or self.moe_flex_dispatcher_backend != "deepepv2"
+        ):
+            raise ValueError(
+                "moe_deepepv2_num_max_tokens_per_rank and moe_deepepv2_pad_uneven_dispatch_inputs "
+                "require moe_token_dispatcher_type='flex' and "
+                "moe_flex_dispatcher_backend='deepepv2'."
+            )
+        if self.deterministic_mode and not self.moe_deepepv2_deterministic:
+            raise ValueError(
+                "deterministic_mode=True requires moe_deepepv2_deterministic=True, which builds "
+                "the DeepEP v2 buffer with DeepEP's deterministic option."
+            )
 
         if self.moe_hybridep_routing_map_mode not in ("indices", "bool"):
             raise ValueError("moe_hybridep_routing_map_mode must be one of 'indices' or 'bool'.")
@@ -5054,6 +5129,19 @@ class TransformerConfig(ModelParallelConfig):
                         "sequence_packing with HybridEP requires "
                         "moe_hybridep_pad_uneven_dispatch_inputs=True because packed token "
                         "counts can differ across dispatcher ranks"
+                    )
+                if (
+                    self.moe_megakernel_backend is None
+                    and self.moe_token_dispatcher_type == "flex"
+                    and self.moe_flex_dispatcher_backend == "deepepv2"
+                    and not self.moe_deepepv2_pad_uneven_dispatch_inputs
+                    and self.moe_deepepv2_num_max_tokens_per_rank is None
+                ):
+                    raise ValueError(
+                        "sequence_packing with deepepv2 requires "
+                        "moe_deepepv2_pad_uneven_dispatch_inputs=True or "
+                        "moe_deepepv2_num_max_tokens_per_rank because packed token counts can "
+                        "differ across dispatcher ranks"
                     )
 
 
