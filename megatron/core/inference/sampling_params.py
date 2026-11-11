@@ -65,7 +65,8 @@ class SamplingParams:
     # frontend, which is replicated) should set this to False.
     detokenize_generations: bool = True
     streaming: bool = False  # Emit incremental ENGINE_REPLY_PARTIAL frames.
-    streaming_interval: int = 1  # Minimum unsent tokens per ENGINE_REPLY_PARTIAL.
+    # Minimum unsent tokens per ENGINE_REPLY_PARTIAL after the first, which is sent immediately.
+    streaming_interval: int = 1
     do_kv_handoff: bool = False  # Pin KV blocks and expose metadata for peer transfer.
 
     # Optional request-local RNG; independent of dynamic batch position.

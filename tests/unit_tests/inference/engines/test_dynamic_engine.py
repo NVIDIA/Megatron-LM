@@ -4013,11 +4013,11 @@ def test_handle_failed_request_releases_vlm_request_data():
     loop.close()
 
 
-def test_streaming_partials_buffer_until_token_interval():
+def test_streaming_partials_send_first_tokens_then_buffer_until_token_interval():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine._partial_emit_lengths = {}
     request = types.SimpleNamespace(
-        generated_tokens=[11, 12],
+        generated_tokens=[],
         generated_log_probs=None,
         sampling_params=SamplingParams(
             streaming=True, streaming_interval=3, return_log_probs=False
@@ -4025,17 +4025,24 @@ def test_streaming_partials_buffer_until_token_interval():
     )
     engine.requests = {7: types.SimpleNamespace(record=[request])}
     engine.socket_for_receiving_requests = mock.Mock()
+    send = engine.socket_for_receiving_requests.send_multipart
 
+    engine._try_send_streaming_partials()  # nothing generated yet
+    send.assert_not_called()
+
+    request.generated_tokens.append(11)
+    engine._try_send_streaming_partials()  # the first token goes out at once
+    assert send.call_count == 1
+    assert engine._partial_emit_lengths == {7: 1}
+
+    request.generated_tokens.extend([12, 13])
+    engine._try_send_streaming_partials()  # 2 unsent < interval 3
+    assert send.call_count == 1
+
+    request.generated_tokens.append(14)
     engine._try_send_streaming_partials()
-
-    engine.socket_for_receiving_requests.send_multipart.assert_not_called()
-    assert engine._partial_emit_lengths == {}
-
-    request.generated_tokens.append(13)
-    engine._try_send_streaming_partials()
-
-    engine.socket_for_receiving_requests.send_multipart.assert_called_once()
-    assert engine._partial_emit_lengths == {7: 3}
+    assert send.call_count == 2
+    assert engine._partial_emit_lengths == {7: 4}
 
 
 def _collect_streamed_partials(engine, streamed):

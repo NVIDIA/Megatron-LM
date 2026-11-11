@@ -621,7 +621,9 @@ class CoordinatorMixin:
                 holdback = max(0, max(len(ids) for ids in stop_word_ids) - 1)
             emit_end = max(already, total - holdback)
             streaming_interval = getattr(request.sampling_params, "streaming_interval", 1)
-            if emit_end - already >= streaming_interval:
+            # The first tokens go out as soon as they exist (the client's time to first token);
+            # later deltas are buffered to streaming_interval tokens.
+            if emit_end > already and (already == 0 or emit_end - already >= streaming_interval):
                 new_tokens = _slice_merged_segments(segments, "generated_tokens", already, emit_end)
                 partial = {"request_id": rid, "new_tokens": new_tokens}
                 if request.sampling_params.return_log_probs:
