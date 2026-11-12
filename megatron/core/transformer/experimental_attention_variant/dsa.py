@@ -2248,7 +2248,9 @@ class DSAIndexer(MegatronModule):
         dsa_indexer_kpool = config.dsa_indexer_kpool
         if dsa_indexer_kpool > 1:
             if dsa_indexer_loss_enabled:
-                raise ValueError("KPool FLOPs require indexer loss to be disabled, as in DSAttention.")
+                raise ValueError(
+                    "KPool FLOPs require indexer loss to be disabled, as in DSAttention."
+                )
             if (
                 dsa_indexer_topk is None
                 or dsa_indexer_topk <= 0
@@ -2295,7 +2297,9 @@ class DSAIndexer(MegatronModule):
                 pools, next_pools = length // pool_size, (length + 1) // pool_size
                 dense_pairs = length * (length + 1) / 2 + fraction * (length + 1)
                 indexer_scale = _dsa_kpool_pairs(mean_seqlen, pool_size) / dense_pairs
-                compression_scale = pool_size * (pools + fraction * (next_pools - pools)) / mean_seqlen
+                compression_scale = (
+                    pool_size * (pools + fraction * (next_pools - pools)) / mean_seqlen
+                )
             # Gate on every token; one FMA per key component in complete pools.
             token_linear += 2 * num_indexer_layers * head_dim * (hidden_size + compression_scale)
             core *= indexer_scale

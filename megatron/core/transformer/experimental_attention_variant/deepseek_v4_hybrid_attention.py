@@ -603,7 +603,9 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
                     + hidden * indexer_heads
                 )
                 core_term += indexer_heads * indexer_dim / 4
-        return 2 * (token_term * total_real_tokens_in_batch + core_term * seqlen_squared_sum_in_batch)
+        return 2 * (
+            token_term * total_real_tokens_in_batch + core_term * seqlen_squared_sum_in_batch
+        )
 
     def __init__(
         self,

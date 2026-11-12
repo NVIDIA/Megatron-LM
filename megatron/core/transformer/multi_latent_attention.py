@@ -678,7 +678,8 @@ class MLASelfAttention(MultiLatentAttention):
         from megatron.core.transformer.mla_layer_config import MLALayerConfig
 
         if isinstance(config, DSALayerConfig) or (
-            not isinstance(config, MLALayerConfig) and config.experimental_attention_variant == "dsa"
+            not isinstance(config, MLALayerConfig)
+            and config.experimental_attention_variant == "dsa"
         ):
             from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 

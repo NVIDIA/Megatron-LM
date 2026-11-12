@@ -163,13 +163,16 @@ def test_legacy_non_silu_glu_flops_are_preserved(hybrid_pattern):
 
     # Legacy reporting uses the two-projection FFN coefficient for non-SiLU GLU.
     # One GQA, one FFN and logits contribute 4224 per token and 48 per squared length.
-    assert num_floating_point_operations(
-        config,
-        batch_size=1,
-        sequence_length=8,
-        total_real_tokens_in_batch=5,
-        seqlen_squared_sum_in_batch=13,
-    ) == 21744
+    assert (
+        num_floating_point_operations(
+            config,
+            batch_size=1,
+            sequence_length=8,
+            total_real_tokens_in_batch=5,
+            seqlen_squared_sum_in_batch=13,
+        )
+        == 21744
+    )
     assert config.transformer.gated_linear_unit is True
 
 
@@ -192,9 +195,12 @@ def test_mla_forward_flops_with_optional_query_projection(q_lora_rank, expected)
 
     # Projection MACs per token are 204 without Q LoRA, or 191 with it.
     # Causal attention contributes 14 FLOPs per squared sequence length.
-    assert MLASelfAttention.estimate_flops(
-        config, total_real_tokens_in_batch=5, seqlen_squared_sum_in_batch=13
-    ) == expected
+    assert (
+        MLASelfAttention.estimate_flops(
+            config, total_real_tokens_in_batch=5, seqlen_squared_sum_in_batch=13
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -208,9 +214,12 @@ def test_mla_forward_flops_with_optional_query_projection(q_lora_rank, expected)
 )
 def test_layer_forward_flops_include_variant_projections(layer_type, overrides, expected):
     config = _make_config(**overrides).transformer
-    assert layer_type.estimate_flops(
-        config, total_real_tokens_in_batch=5, seqlen_squared_sum_in_batch=13
-    ) == expected
+    assert (
+        layer_type.estimate_flops(
+            config, total_real_tokens_in_batch=5, seqlen_squared_sum_in_batch=13
+        )
+        == expected
+    )
 
 
 def _make_dsv4_config(pattern, **overrides):
