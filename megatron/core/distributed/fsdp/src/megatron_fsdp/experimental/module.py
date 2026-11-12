@@ -77,6 +77,8 @@ class FsdpModule:
             shard_layout: Padded or unpadded rank segments for every parameter group.
                 See ``fully_shard``.
         """
+        if context.weight_retain_distance and not schedule_policy.register_hooks:
+            raise ValueError("Recorded weight retention requires ordinary FSDP module hooks.")
         self._context = context
         self._phase = Phase.RESTING
         self._schedule_policy = schedule_policy
@@ -267,6 +269,7 @@ class FsdpModule:
         # A reentrant checkpoint recomputes before the child module's backward-pre
         # hook runs. The active autograd GraphTask identifies that recomputation.
         is_recomputing = self.phase is Phase.BACKWARD or is_in_backward()
+        is_evaluating = not cast(nn.Module, self).training and not torch.is_grad_enabled()
         if self.phase is not Phase.BACKWARD:
             self.phase = Phase.FORWARD
         # forward/backward each span multiple lifecycle methods (pre_forward ->
@@ -279,10 +282,13 @@ class FsdpModule:
 
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
-        if context.is_recording_execution_order and not is_recomputing:
+        if context.is_recording_execution_order and not is_recomputing and not is_evaluating:
             context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.FORWARD))
         self.unshard(
-            Phase.FORWARD, prefetch=not is_recomputing and not context.is_recording_execution_order
+            Phase.FORWARD,
+            prefetch=not is_recomputing
+            and not is_evaluating
+            and not context.is_recording_execution_order,
         )
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
@@ -302,6 +308,8 @@ class FsdpModule:
         """
         with self._nvtx_range("unshard"):
             compute_stream = self.context.current_stream()
+            if phase is not None:
+                self.context._weight_event(cast(nn.Module, self), "unshard", phase)
             self._unshard_parameter_groups(phase)
             # Compute waits only for this FsdpModule's all-gather (the prefetch below is
             # issued afterwards, so it is free to run concurrently with this FsdpModule).
@@ -371,23 +379,25 @@ class FsdpModule:
             self.phase = Phase.RESTING
         torch.cuda.nvtx.range_pop()
 
-    def reshard(self) -> None:
-        """Bind sharded parameters and release full parameter storage."""
+    def reshard(self, *, force: bool = False) -> None:
+        """Restore sharded bindings; force release bypasses recorded weight retention."""
         with self._nvtx_range("reshard"):
             self.bind_sharded_parameters()
-            self.release_unsharded_storage()
+            self.release_unsharded_storage(force=force)
 
     def bind_sharded_parameters(self) -> None:
         """Install sharded parameter references without changing storage."""
         for group in self._parameter_groups:
             group.bind_sharded_parameters()
 
-    def release_unsharded_storage(self) -> None:
-        """Free full parameter storage after compute without changing bindings."""
+    def release_unsharded_storage(self, *, force: bool = False) -> None:
+        """Release full weights, honoring recorded retention unless forced."""
         with self._nvtx_range("release_unsharded_storage"):
-            self._release_unsharded_storage()
+            self._release_unsharded_storage(force=force)
 
-    def _release_unsharded_storage(self, *, rowwise_only: bool = False) -> None:
+    def _release_unsharded_storage(
+        self, *, rowwise_only: bool = False, force: bool = False
+    ) -> None:
         """Select and release gathered storage after the current compute finishes."""
         if rowwise_only:
             groups_to_release = tuple(
@@ -396,6 +406,10 @@ class FsdpModule:
         else:
             groups_to_release = self._parameter_groups
         if not groups_to_release:
+            return
+        if not force and self.context._weight_event(
+            cast(nn.Module, self), "reshard_rowwise" if rowwise_only else "reshard"
+        ):
             return
         allgather_stream = self.context.allgather_stream
         allgather_stream.wait_stream(self.context.current_stream())

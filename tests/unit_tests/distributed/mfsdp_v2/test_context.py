@@ -11,6 +11,7 @@ from weakref import ref
 
 import pytest
 import torch
+import torch.distributed as dist
 import transformer_engine.pytorch as te
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
@@ -25,6 +26,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     finalize_gradients,
     fully_shard,
     fully_shard_context,
+    fully_shard_optimizer,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
     ExecutionEvent,
@@ -475,3 +477,191 @@ def test_delayed_wgrad_requires_caller_managed_sync(distributed_setup):
         pytest.raises(ValueError, match="caller_managed_grad_sync=True"),
     ):
         fully_shard(model, mesh=mesh, placements=_default_placements())
+
+
+@pytest.mark.parametrize("difference", ["weight-trace", "retain-distance"])
+def test_recorded_weight_retention_rejects_rank_divergence(distributed_setup, difference):
+    """Reject different weight tapes or retention thresholds without stranding peers."""
+    setup = distributed_setup
+    if setup.world_size < 2:
+        pytest.skip("Weight-retention consensus requires multiple ranks.")
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    late = setup.rank == setup.world_size - 1
+    distance = 4 if difference == "retain-distance" and late else 3
+    torch.manual_seed(73)
+    model = MultiChildModel(dim=32, num_children=2).to(setup.device)
+    with fully_shard_context(
+        FsdpContext(
+            device=setup.device,
+            prefetch_order=PrefetchOrder.RECORDED,
+            prefetch_process_group=mesh.get_group(0),
+            weight_retain_distance=distance,
+            runtime_policy=RuntimePolicy(caller_managed_grad_sync=True),
+        )
+    ) as context:
+        for module in (*model.layers, model):
+            fully_shard(module, mesh=mesh, placements=_default_placements())
+
+    inputs = torch.ones(2, 32, device=setup.device, requires_grad=True)
+    for microbatch in range(3):
+        with finalize_gradients(context, enabled=microbatch == 2):
+            model(inputs).square().mean().backward()
+    assert context.is_recording_execution_order
+    assert context._weight_events
+    if difference == "weight-trace" and late:
+        event = context._weight_events[-1]
+        assert event.operation == "reshard"
+        context._weight_events[-1] = event._replace(operation="unshard")
+    with pytest.raises(
+        RuntimeError, match=r"Recorded FSDP execution or weight retention differs across ranks\."
+    ):
+        context.finish_grad_sync()
+    # All ranks must reject the signature before any retention plan is replayed.
+    dist.barrier(group=mesh.get_group(0), device_ids=[setup.device.index])
+
+
+@pytest.mark.parametrize("prefetch", [False, True], ids=["on_demand", "prefetch"])
+def test_cross_microbatch_weight_retention_matches_unretained_training(
+    distributed_setup, monkeypatch, prefetch
+):
+    """Recorded retention saves real gathers without changing complete optimizer steps."""
+    device = distributed_setup.device
+    if distributed_setup.world_size < 2:
+        pytest.skip("Gather reuse requires multiple ranks.")
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    prefetch_size = None if prefetch else 0
+    models = []
+    contexts = []
+    optimizers = []
+    gathers = []
+    groups_by_model = []
+    for distance in (0, 3):
+        torch.manual_seed(73)
+        model = MultiChildModel(dim=32, num_children=2).to(device)
+        with fully_shard_context(
+            FsdpContext(
+                device=device,
+                prefetch_order=PrefetchOrder.RECORDED,
+                prefetch_process_group=mesh.get_group(0),
+                weight_retain_distance=distance,
+                runtime_policy=RuntimePolicy(caller_managed_grad_sync=True),
+            )
+        ) as context:
+            # Speculation must not consume weight events or defeat gather reuse.
+            for module in (*model.layers, model):
+                fully_shard(
+                    module,
+                    mesh=mesh,
+                    placements=_default_placements(),
+                    schedule_policy=SchedulePolicy(
+                        forward_prefetch_size=prefetch_size, backward_prefetch_size=prefetch_size
+                    ),
+                )
+        groups = [group for module in (model, *model.layers) for group in module.parameter_groups]
+        assert len(groups) == 3
+        counters = []
+        for group in groups:
+            gather = Mock(wraps=group._allgather_model_weight)
+            monkeypatch.setattr(group, "_allgather_model_weight", gather)
+            counters.append(gather)
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01, foreach=False)
+        fully_shard_optimizer(optimizer)
+        models.append(model)
+        contexts.append(context)
+        optimizers.append(optimizer)
+        gathers.append(counters)
+        groups_by_model.append(groups)
+
+    torch.manual_seed(101 + distributed_setup.rank)
+    inputs = torch.randn(3, 4, 32, device=device, requires_grad=True)
+    previous_weights = torch.cat(
+        [parameter.detach().to_local().flatten() for parameter in models[0].parameters()]
+    )
+
+    def train_step(index):
+        model, context, optimizer = models[index], contexts[index], optimizers[index]
+        optimizer.zero_grad(set_to_none=False)
+        if inputs.grad is not None:
+            inputs.grad.zero_()
+        losses = []
+        for microbatch, x in enumerate(inputs):
+            with finalize_gradients(context, enabled=microbatch == len(inputs) - 1):
+                loss = model(x).square().mean() / len(inputs)
+                loss.backward()
+            losses.append(loss.detach())
+        context.finish_grad_sync()
+        # This boundary must invalidate every retained gather before updating masters.
+        for group in groups_by_model[index]:
+            assert not group._unshard_events
+            assert group._unsharded_model_weight.local_buffer.untyped_storage().nbytes() == 0
+        gradients = torch.cat(
+            [parameter.grad.to_local().flatten() for parameter in model.parameters()]
+        )
+        optimizer.step()
+        weights = torch.cat(
+            [parameter.detach().to_local().flatten() for parameter in model.parameters()]
+        )
+        return torch.stack(losses), gradients, weights
+
+    def check_parity(outputs):
+        nonlocal previous_weights
+        for actual, expected in zip(outputs[1], outputs[0], strict=True):
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert not torch.equal(outputs[0][2], previous_weights)
+        previous_weights = outputs[0][2].clone()
+
+    def reset_counts():
+        for counters in gathers:
+            for counter in counters:
+                counter.reset_mock()
+
+    def check_counts(expected):
+        assert [
+            tuple(counter.call_count for counter in counters) for counters in gathers
+        ] == expected
+
+    stream = torch.cuda.Stream(device)
+    stream.wait_stream(torch.cuda.current_stream(device))
+    # Record a complete three-microbatch step, then replay it eagerly with fresh masters.
+    for step, expected in enumerate(([(6, 6, 6), (6, 6, 6)], [(6, 6, 6), (1, 4, 3)])):
+        reset_counts()
+        with torch.cuda.stream(stream):
+            outputs = [train_step(index) for index in range(2)]
+        torch.cuda.current_stream(device).wait_stream(stream)
+        check_counts(expected)
+        check_parity(outputs)
+        stream.wait_stream(torch.cuda.current_stream(device))
+        if step == 0:
+            evaluation_outputs = []
+            with torch.cuda.stream(stream), torch.no_grad():
+                for model, context in zip(models, contexts, strict=True):
+                    execution = tuple(context.execution_order)
+                    weight_events = tuple(context._weight_events)
+                    positions = (context.execution_order.position, context._weight_position)
+                    model.eval()
+                    evaluation_outputs.append(model(inputs[0]))
+                    model.train()
+                    assert tuple(context.execution_order) == execution
+                    assert tuple(context._weight_events) == weight_events
+                    assert (context.execution_order.position, context._weight_position) == positions
+            torch.cuda.current_stream(device).wait_stream(stream)
+            torch.testing.assert_close(evaluation_outputs[1], evaluation_outputs[0], rtol=0, atol=0)
+            stream.wait_stream(torch.cuda.current_stream(device))
+
+    # Each MB uses root/child0/child1 forward and root/child1/child0 backward.
+    # Distance three retains root across all uses, child1 F->B, and child0 B->next F.
+    # Thus the retained step gathers (root=1, child0=4, child1=3), versus (6, 6, 6).
+    reset_counts()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=stream):
+        outputs = [train_step(index) for index in range(2)]
+    check_counts([(6, 6, 6), (1, 4, 3)])
+    torch.cuda.current_stream(device).wait_stream(stream)
+    for _ in range(3):
+        with torch.cuda.stream(stream):
+            graph.replay()
+        torch.cuda.current_stream(device).wait_stream(stream)
+        check_parity(outputs)
+        # Replay executes the captured collectives without invoking Python wrappers.
+        check_counts([(6, 6, 6), (1, 4, 3)])
+        stream.wait_stream(torch.cuda.current_stream(device))

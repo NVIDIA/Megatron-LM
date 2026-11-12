@@ -113,6 +113,10 @@ class DistributedDataParallelConfig:
     megatron_fsdp_version: int = 1
     """Megatron-FSDP implementation version. Valid values are 1 and 2."""
 
+    fsdp_weight_retain_distance: int = 0
+    """Opt-in MFSDP v2 weight retention over recorded lifecycle events within a step.
+    Zero disables it; larger distances retain more full weights between uses."""
+
     overlap_outer_communication: bool = False
     """Overlap MFSDP v2's last-microbatch outer-DP gradient reduction with inner-DP
     reductions on a separate CUDA stream."""
