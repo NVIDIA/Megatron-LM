@@ -41,7 +41,7 @@ from megatron.training.config import container as container_module
 from megatron.training.config.dataset_config import CONTAINER_WRITTEN_FIELDS
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
-from megatron.training.models import GPTModelConfig, LLaVAModelConfig
+from megatron.training.models import GPTModelConfig, LLaVAModelConfig, T5ModelConfig
 from megatron.training.sequence_lengths import get_model_input_lengths
 
 MODEL_ARGV = (
@@ -1099,6 +1099,18 @@ def test_the_loop_reads_the_dataset_length_and_a_loader_only_section_the_model_m
     loader_only.model.transformer.max_seq_length_per_sample = None
     assert get_model_input_lengths(loader_only.model) == (None, None)
     assert "dl.sequence_length" not in global_vars.build_telemetry_resource_attrs(args)
+
+    # T5's encoder rows must not be confused with its larger decoder or allocation bound.
+    loader_only.model = T5ModelConfig(
+        transformer=_layout(max_seq_length_per_sample=64).transformer,
+        seq_length=128,
+        encoder_num_layers=2,
+        encoder_seq_length=16,
+        decoder_seq_length=32,
+    )
+    global_vars.initialize_training_runtime_services(args)
+    assert calls.pop()["seq_length"] == 16
+    assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 16
 
 
 @pytest.mark.parametrize("with_dataset", [False, True])

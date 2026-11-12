@@ -23,7 +23,7 @@ class T5ModelConfig:
     """Encoder input width, independent of the position-embedding capacity."""
 
     decoder_seq_length: int | None = None
-    """Decoder input width, independent of the encoder input width."""
+    """T5's independent decoder input width; not a decoder-only model's execution length."""
 
     vocab_size: int | None = None
     """Model vocabulary, or None until tokenizer initialization."""

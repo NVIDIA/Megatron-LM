@@ -16,6 +16,8 @@ def get_model_input_lengths(
     Callback pipelines without a registered dataset must emit the configured model
     width or supply variable-shape metadata to the schedule. For variable-length
     batches these are nominal widths, not substitutes for actual batch metadata.
+    The second result is reserved for encoder-decoder models (currently T5);
+    decoder-only and VLM models use only the first width.
     """
     # Avoid importing model configs while the training package is bootstrapping.
     from megatron.training.models import LLaVAModelConfig, T5ModelConfig

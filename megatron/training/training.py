@@ -4371,7 +4371,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     sequence_length = (
         dataset.packed_sequence_length or dataset.sequence_length
         if dataset is not None
-        else cfg.model.transformer.max_seq_length_per_sample
+        else get_model_input_lengths(cfg.model)[0]
     )
     checkpoint = cfg.checkpoint
     train_state = get_train_state()

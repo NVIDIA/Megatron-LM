@@ -117,6 +117,11 @@ The `--decoder-seq-length` CLI flag remains accepted: VLM entrypoints translate
 it into their execution width, while T5 retains an independent decoder width.
 Decoder-only models do not acquire a second decoder-length config field.
 
+Direct Python callers of the migrated callback dataset providers and task encoders
+must pass their length inputs explicitly instead of relying on global arguments.
+The supplied application entrypoints bind these inputs before `pretrain()`; their
+existing CLI invocations remain supported.
+
 ## GPT-3 Training Example
 
 Train a GPT-3 style model:

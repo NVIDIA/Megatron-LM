@@ -20,7 +20,6 @@ class LLaVAModelConfig:
     seq_length: int
     """Maximum position capacity, not the image or text data sequence length."""
 
-
     img_h: int = 224
     """Vision input height, also consumed by image preprocessing."""
 

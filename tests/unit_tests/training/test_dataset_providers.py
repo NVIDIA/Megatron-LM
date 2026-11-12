@@ -391,8 +391,6 @@ def test_entry_points_build_the_dataset_config_pretrain_gpt_built(
         assert packed is expected_packed
     wrapper = module.core_gpt_dataset_config_from_args(args)
     assert isinstance(wrapper, type(actual)) and wrapper.tokenizer is not None
-    # The standalone CLI wrapper has no container-derived physical pack width.
-    expected.packed_sequence_length = None
     assert _signature(wrapper, names) == _signature(expected, names)
 
 
