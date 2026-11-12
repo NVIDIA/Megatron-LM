@@ -118,7 +118,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
     Args:
         config (TransformerConfig): Model config
-        hybrid_stack_spec (ModuleSpec): Specifies the modules to use for the various layer types
+        hybrid_stack_spec (ModuleSpec, optional): Legacy override for built-in layer construction.
+            When omitted, use the standard Core stack; custom configs supply a layer_type class.
         vocab_size (int): Vocabulary size
         max_sequence_length (int): maximum size of sequence.
             This is used for positional embedding
@@ -169,9 +170,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
     def __init__(
         self,
         config: TransformerConfig,
-        hybrid_stack_spec: ModuleSpec,
-        vocab_size: int,
-        max_sequence_length: int,
+        hybrid_stack_spec: ModuleSpec | None = None,
+        vocab_size: int | None = None,
+        max_sequence_length: int | None = None,
         hybrid_layer_pattern: Optional[str] = None,
         hybrid_attention_ratio: Optional[float] = None,
         hybrid_mlp_ratio: Optional[float] = None,
@@ -192,6 +193,16 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         vp_stage: Optional[int] = None,
         hybrid_layer_config_list: Optional[Sequence[HybridLayerEntry]] = None,
     ) -> None:
+        if vocab_size is None or max_sequence_length is None:
+            raise ValueError("vocab_size and max_sequence_length must be provided.")
+        if hybrid_stack_spec is None:
+            # Resolve the existing built-in construction only at the model boundary. External
+            # configs supply module classes directly, independently of this compatibility API.
+            from megatron.core.models.hybrid.hybrid_layer_specs import (
+                hybrid_stack_spec as default_hybrid_stack_spec,
+            )
+
+            hybrid_stack_spec = default_hybrid_stack_spec
         # Snapshot the container immediately. If the root config is also used as a layer entry,
         # detach it before applying model-level normalization so that entry remains caller-owned.
         hybrid_layer_config_list_snapshot = (
@@ -225,6 +236,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.max_sequence_length = max_sequence_length
         self.hybrid_layer_pattern = hybrid_layer_pattern
         self.hybrid_layer_config_list = hybrid_layer_config_list_snapshot
+        self._has_custom_layers = any(
+            layer_utils.get_custom_layer_type(entry) is not None
+            for entry in (hybrid_layer_config_list_snapshot or ())
+        )
         self.pre_process = pre_process
         self.post_process = post_process
         self.fp16_lm_cross_entropy = fp16_lm_cross_entropy
@@ -733,6 +748,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         in_inference_mode = InferenceMode.is_active()
+        if self._has_custom_layers and (inference_context is not None or in_inference_mode):
+            raise ValueError("Custom hybrid layers do not support inference contexts yet.")
 
         if in_inference_mode:
             assert runtime_gather_output, "Inference must always gather TP logits"
@@ -775,7 +792,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         # Hash routing consumes batch-major token IDs. Under sequence parallelism,
         # shard them with decoder activations so each TP rank hashes its local tokens.
         hash_input_ids = None
-        if self.config.moe_num_hash_layers > 0:
+        if self.config.moe_num_hash_layers > 0 or self._has_custom_layers:
             hash_input_ids = input_ids
         if (
             self.config.sequence_parallel
@@ -1059,6 +1076,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         logits = self._scale_logits(logits)
         if in_inference_mode:
             logits = logits.float()
+        # Dynamic inference under CUDA graphs: write the logits into the controller's
+        # persistent buffer and return a view of it, so no graph pins its own copy.
+        logits_buffer = getattr(inference_context, "logits_output_buffer", None)
+        if logits_buffer is not None:
+            buffer_rows = logits_buffer[0, : logits.shape[0]]
+            buffer_rows.copy_(logits.squeeze(1))
+            logits = buffer_rows.unsqueeze(1)
         gather_output = (
             self.output_layer.gather_output
             if runtime_gather_output is None
