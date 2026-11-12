@@ -332,13 +332,26 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="tensor_parallel_ordered_reduce",
-        sources=("megatron/core/tensor_parallel/ordered_reduce.py",),
+        sources=("megatron/core/ops/collectives/ordered_reduce.py",),
         tests=(K + "test_ordered_reduce_kernels.py",),
         kind="triton",
-        notes="Batch-invariant TP reductions: Triton rank-order fold, direct-buffer symmetric-memory "
-        "pull kernels, NCCL all-to-all fallback, and the batch_invariant_tp_shards shard GEMM / "
-        "shard-order fold. Fixed fold order by construction; replays cover every path, one and several "
-        "partials per rank, and the shard path's stock backward.",
+        notes="Fixed-order rank/shard folds, direct-buffer symmetric-memory pulls, and NCCL "
+        "all-to-all fallbacks. Replay coverage includes one and several partials per rank.",
+    ),
+    KernelEntry(
+        name="ordered_row_linear",
+        sources=("megatron/core/ops/linear/ordered.py",),
+        tests=(K + "test_ordered_reduce_kernels.py", K + "test_te_wrappers.py"),
+        kind="external-lib",
+        notes="Torch and TE row-parallel GEMMs with operation-owned symmetric scratch and "
+        "ordinary TP backward; replayed through shard and TE module paths.",
+    ),
+    KernelEntry(
+        name="batch_invariant_vocab_sum",
+        sources=("megatron/core/ops/loss/vocab_sum.py",),
+        tests=(K + "test_ordered_reduce_kernels.py",),
+        kind="triton",
+        notes="Fixed-order vocabulary-shard row sums followed by ordered collective folding.",
     ),
     KernelEntry(
         name="tensor_parallel_random_share_storage",

@@ -20,17 +20,17 @@ from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 from megatron.core.inference.quantization.utils import mm_mxfp8
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.ops.collectives.ordered_reduce import (
+    ordered_reduce_scatter_shards,
+    symm_ordered_reduce_scatter,
+    symm_ordered_reduce_scatter_shards,
+    use_ordered_tp_reduce,
+)
+from megatron.core.ops.linear.ordered import row_parallel_shard_partials
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
-)
-from megatron.core.tensor_parallel.ordered_reduce import (
-    ordered_reduce_scatter_shards,
-    row_parallel_shard_partials,
-    symm_ordered_reduce_scatter,
-    symm_ordered_reduce_scatter_shards,
-    use_ordered_tp_reduce,
 )
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     get_batch_invariant_backend,
@@ -567,7 +567,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
     def _matmul_ordered_reduce_scatter(self, x, symm_mem_buffer):
         """Batch-invariant mode at TP >= 3: reduce-scatter with the fixed rank-order sum.
 
-        Gives the same bits as the training forward (tensor_parallel/ordered_reduce.py).
+        Gives the same bits as the training forward (ops/collectives/ordered_reduce.py).
         With a symmetric buffer, the GEMM writes into it and one kernel pulls the owned rows
         from every peer and folds them; otherwise all-to-all + fold. Called from
         _matmul_reduce_scatter when ``use_ordered_tp_reduce`` holds (one shard per rank).

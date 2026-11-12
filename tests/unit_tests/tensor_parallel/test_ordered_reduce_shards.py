@@ -8,9 +8,10 @@ import torch.distributed as dist
 
 from megatron.core.extensions.transformer_engine import TERowParallelLinear
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+from megatron.core.ops.collectives import ordered_reduce as orr
+from megatron.core.ops.linear import ordered as orl
 from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.ops.loss.fused_cross_entropy import fused_vocab_parallel_cross_entropy
-from megatron.core.tensor_parallel import ordered_reduce as orr
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -26,7 +27,7 @@ def _bits(t):
 
 def _canonical(x_full, w_full, num_shards):
     """The defined value: shard GEMM outputs folded in shard order, one rounding."""
-    parts = orr.row_parallel_shard_partials(x_full, w_full, num_shards)
+    parts = orl.row_parallel_shard_partials(x_full, w_full, num_shards)
     return orr.ordered_fold(parts.contiguous())
 
 
@@ -52,7 +53,7 @@ class TestShardReductions:
     def test_shard_partials_match_per_shard_gemm(self):
         Utils.initialize_model_parallel(1, 1)
         x, w = _inputs(37, 1024, 384, 0)
-        parts = orr.row_parallel_shard_partials(x, w, 4)
+        parts = orl.row_parallel_shard_partials(x, w, 4)
         for j in range(4):
             sl = slice(j * 256, (j + 1) * 256)
             assert torch.equal(parts[j], torch.matmul(x[:, sl].contiguous(), w[:, sl].t()))
@@ -64,7 +65,7 @@ class TestShardReductions:
         m, k, n = 64 * tp, 512 * shards, 448
         x, w = _inputs(m, k, n, 1)  # identical on every rank
         r, kl = group.rank(), k // tp
-        parts = orr.row_parallel_shard_partials(
+        parts = orl.row_parallel_shard_partials(
             x[:, r * kl : (r + 1) * kl], w[:, r * kl : (r + 1) * kl], shards // tp
         )
         with set_batch_invariant_mode(True):
@@ -79,7 +80,7 @@ class TestShardReductions:
         m, k, n = 5, 256 * shards, 200  # odd sizes: padding path
         x, w = _inputs(m, k, n, 2)
         r, kl = group.rank(), k // tp
-        parts = orr.row_parallel_shard_partials(
+        parts = orl.row_parallel_shard_partials(
             x[:, r * kl : (r + 1) * kl], w[:, r * kl : (r + 1) * kl], shards // tp
         )
         with set_batch_invariant_mode(True):
@@ -101,7 +102,7 @@ class TestShardReductions:
         symm = buf.maybe_get_tensor([c, m, n], dtype=torch.bfloat16)
         if symm["handle"] is None:
             pytest.skip("no symmetric memory")
-        parts = orr.row_parallel_shard_partials(
+        parts = orl.row_parallel_shard_partials(
             x[:, r * kl : (r + 1) * kl], w[:, r * kl : (r + 1) * kl], c, out=symm["tensor"]
         )
         out = orr.symm_ordered_reduce_scatter_shards(parts, symm["handle"])

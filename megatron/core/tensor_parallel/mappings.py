@@ -2,6 +2,11 @@
 
 import torch
 
+from megatron.core.ops.collectives.ordered_reduce import (
+    ordered_all_reduce,
+    ordered_reduce_scatter,
+    use_ordered_tp_reduce,
+)
 from megatron.core.parallel_state import get_global_memory_buffer
 from megatron.core.utils import (
     get_pg_size,
@@ -9,7 +14,6 @@ from megatron.core.utils import (
     is_torch_min_version,
 )
 
-from .ordered_reduce import ordered_all_reduce, ordered_reduce_scatter, use_ordered_tp_reduce
 from .utils import split_tensor_along_last_dim
 
 try:

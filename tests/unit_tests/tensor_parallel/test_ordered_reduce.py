@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Batch-invariant ordered TP reductions (megatron/core/tensor_parallel/ordered_reduce.py)."""
+"""Batch-invariant ordered TP reductions (megatron/core/ops/collectives/ordered_reduce.py)."""
 
 import pytest
 import torch
@@ -8,8 +8,9 @@ import torch.distributed as dist
 
 from megatron.core.extensions.transformer_engine import TERowParallelLinear, _BITPForward
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+from megatron.core.ops.collectives import ordered_reduce as orr
+from megatron.core.ops.linear import ordered as orl
 from megatron.core.tensor_parallel import mappings
-from megatron.core.tensor_parallel import ordered_reduce as orr
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.core.transformer.enums import AttnBackend
@@ -262,7 +263,7 @@ def _check_te_row_parallel_linear(sequence_parallel):
     ).cuda()
     assert layer._bi_tp_forward is _BITPForward.ORDERED_REDUCE
     # The shared GEMM scratch is allocated at construction, outside any forward or graph capture.
-    assert SymmetricMemoryManager.is_initialized(orr._training_buffer_key(layer._tp_group))
+    assert SymmetricMemoryManager.is_initialized(orl._training_buffer_key(layer._tp_group))
     assert layer.weight.shape == (768, cfg.hidden_size // TP)
     assert layer.weight.tensor_model_parallel and layer.weight.partition_dim == 1
     assert layer.bias.sequence_parallel == sequence_parallel
@@ -270,7 +271,7 @@ def _check_te_row_parallel_linear(sequence_parallel):
     with set_batch_invariant_mode(True, backend="te_native"):
         x = _partials((64, 2, cfg.hidden_size // TP), torch.bfloat16, seed=21)
         scratch = SymmetricMemoryManager.get_buffer(
-            orr._training_buffer_key(group)
+            orl._training_buffer_key(group)
         ).maybe_get_tensor((1, *x.shape[:-1], 768), dtype=x.dtype)
         if scratch["handle"] is not None:
             scratch["tensor"].fill_(float("nan"))
@@ -338,11 +339,11 @@ def test_direct_gemm_falls_back_when_scratch_does_not_fit(dtype):
     try:
         group = get_tensor_model_parallel_group_if_none(tp_group=None)
         SymmetricMemoryManager.get_buffer(
-            orr._training_buffer_key(group), process_group=group, size_mb=1
+            orl._training_buffer_key(group), process_group=group, size_mb=1
         )
         x = _partials((2048, 128), dtype, seed=51)
         weight = _partials((512, 128), dtype, seed=52)
-        out = orr.tp_shard_row_linear(x, weight, group, 1, True, use_te_gemm=True)
+        out = orl.tp_shard_row_linear(x, weight, group, 1, True, use_te_gemm=True)
         partial = general_gemm(weight, x, out_dtype=x.dtype)[0]
         expected = orr.ordered_reduce_scatter(partial, group)
         assert torch.equal(_bits(out), _bits(expected))

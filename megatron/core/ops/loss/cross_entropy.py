@@ -5,7 +5,6 @@ from typing import Tuple
 import torch
 
 from megatron.core.parallel_state import get_tensor_model_parallel_group
-from megatron.core.tensor_parallel.ordered_reduce import batch_invariant_vocab_sum
 from megatron.core.tensor_parallel.utils import VocabUtility
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
@@ -112,6 +111,10 @@ class VocabParallelCrossEntropy:
         one per rank), each summed in a fixed order and folded in shard order across TP, so
         the loss does not depend on the batch layout or, with shards, on the TP size.
         """
+        # tensor_parallel imports this module while parallel_state/utils are initializing.
+        # Load the ordered kernels only when the batch-invariant loss is actually used.
+        from megatron.core.ops.loss.vocab_sum import batch_invariant_vocab_sum
+
         target_mask, masked_target_1d, predicted_logits = (
             VocabParallelCrossEntropy.gather_predicted_logits(
                 vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index

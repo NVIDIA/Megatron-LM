@@ -1520,7 +1520,7 @@ class TransformerConfig(ModelParallelConfig):
 
     batch_invariant_collective: Literal["ordered", "multimem"] = "ordered"
     """Cross-rank EP combine collective under batch_invariant_mode (TP reductions always use
-    the fp32 rank-order fold of tensor_parallel/ordered_reduce.py). "ordered" (default) reduces with an explicit fixed rank-order fp32 Triton kernel —
+    the fp32 rank-order fold of ops/collectives/ordered_reduce.py). "ordered" (default) reduces with an explicit fixed rank-order fp32 Triton kernel —
     deterministic by construction on any hardware. "multimem" keeps the native
     NVLS in-switch reduce-scatter: measured to return the correctly-rounded
     exact fp32 sum (bitwise-equal to an fp64 reference over 16.7M adversarial
@@ -1533,7 +1533,7 @@ class TransformerConfig(ModelParallelConfig):
     linear independent of tensor_model_parallel_size. The reduction dimension is split into
     this many fixed shards; each shard's GEMM output is one partial, and the partials are
     summed in shard order (fp32 accumulator, one rounding; see
-    tensor_parallel/ordered_reduce.py). Any TP size that divides this value then gives the
+    ops/linear/ordered.py). Any TP size that divides this value then gives the
     same bits, so training and inference can use different TP sizes. At TP equal to this
     value each rank owns one shard and the reduction is the ordered TP reduction; at a
     smaller TP each rank computes its shards in one batched GEMM and sends one partial per

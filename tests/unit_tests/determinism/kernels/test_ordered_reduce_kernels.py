@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Bit-exact replay of the batch-invariant ordered TP reductions (tensor_parallel/ordered_reduce.py).
+"""Bit-exact replay of the batch-invariant ordered TP reductions (ops/collectives/ordered_reduce.py).
 
 Covers the Triton fold, the direct-buffer symmetric-memory pull kernels, the
 NCCL all-to-all fallback, the fixed-shard (``batch_invariant_tp_shards``) variants with one
@@ -12,8 +12,10 @@ import pytest
 import torch
 
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
+from megatron.core.ops.collectives import ordered_reduce as orr
+from megatron.core.ops.linear import ordered as orl
+from megatron.core.ops.loss.vocab_sum import batch_invariant_vocab_sum
 from megatron.core.tensor_parallel import mappings
-from megatron.core.tensor_parallel import ordered_reduce as orr
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
@@ -73,7 +75,7 @@ class TestOrderedReduceKernels:
         x = _mixed_magnitudes((TOKENS, K), 1)
         w = (torch.randn(HIDDEN, K, device="cuda") * 0.02).bfloat16()
         assert_replays_bit_exact(
-            lambda x, w: orr.ordered_fold(orr.row_parallel_shard_partials(x, w, num_shards)),
+            lambda x, w: orr.ordered_fold(orl.row_parallel_shard_partials(x, w, num_shards)),
             (x, w),
             backward=False,
             contention=True,
@@ -101,6 +103,23 @@ class TestOrderedReduceKernels:
             )
 
     @_requires_tp(4)
+    def test_vocab_sum_replays(self):
+        group = self._init(4)
+        seeded()
+        x = torch.rand((8, 4096), device="cuda")
+        assert_replays_bit_exact(
+            lambda x: batch_invariant_vocab_sum(x, group, 2),
+            (x,),
+            backward=False,
+            contention=True,
+            what="batch_invariant_vocab_sum",
+        )
+        # A row's denominator must not depend on the other rows in the batch.
+        full = batch_invariant_vocab_sum(x, group, 2)
+        single = batch_invariant_vocab_sum(x[:1], group, 2)
+        assert torch.equal(full[:1], single)
+
+    @_requires_tp(4)
     def test_ordered_reduce_scatter_replays(self):
         group = self._init(4)
         seeded()
@@ -126,7 +145,7 @@ class TestOrderedReduceKernels:
         c = shards // tp
         assert_replays_bit_exact(
             lambda x, w: orr.ordered_reduce_scatter_shards(
-                orr.row_parallel_shard_partials(x, w, c), group
+                orl.row_parallel_shard_partials(x, w, c), group
             ),
             (x, w),
             backward=False,
@@ -160,7 +179,7 @@ class TestOrderedReduceKernels:
         def pull(x, w):
             # The engine's sequence: GEMM into the symmetric buffer, pull reduce-scatter, then
             # an all-gather, which orders the next replay's GEMM after every peer's reads.
-            parts = orr.row_parallel_shard_partials(x, w, c, out=symm["tensor"])
+            parts = orl.row_parallel_shard_partials(x, w, c, out=symm["tensor"])
             if sync_after:
                 # Training reuses scratch without an intervening all-gather.
                 return orr.symm_ordered_reduce_scatter_shards(
@@ -183,7 +202,7 @@ class TestOrderedReduceKernels:
         x = _mixed_magnitudes((TOKENS, 2, K // 2), 6 + group.rank()).requires_grad_(True)
         w = (torch.randn(HIDDEN, K // 2, device="cuda") * 0.02).bfloat16().requires_grad_(True)
         assert_replays_bit_exact(
-            lambda x, w: orr.tp_shard_row_linear(x, w, group, 2, sequence_parallel),
+            lambda x, w: orl.tp_shard_row_linear(x, w, group, 2, sequence_parallel),
             (x, w),
             contention=True,
             what="tp_shard_row_linear",

@@ -11,6 +11,8 @@ parameters or state.
 * ``cross_entropy`` -- the eager custom-autograd implementation, with label smoothing,
   and the ``VocabParallelCrossEntropy`` steps the fused path shares.
 * ``fused_cross_entropy`` -- the same computation compiled with ``jit_fuser``.
+* ``vocab_sum`` -- fixed-order fp32 vocabulary-shard sums for batch-invariant losses;
+  takes an explicit process group and owns no persistent state.
 * ``backends`` -- ``select_cross_entropy``, which turns ``cross_entropy_loss_fusion``
   and ``cross_entropy_fusion_impl`` into the target a model binds once.
 

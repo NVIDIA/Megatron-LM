@@ -26,6 +26,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedState
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.ops.linear.ordered import prepare_ordered_reduce, tp_shard_row_linear
 from megatron.core.ops.norm.torch_norm import LayerNormInterface
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
@@ -49,7 +50,6 @@ from megatron.core.tensor_parallel.mappings import (
     reduce_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
 )
-from megatron.core.tensor_parallel.ordered_reduce import prepare_ordered_reduce, tp_shard_row_linear
 from megatron.core.tensor_parallel.random import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
@@ -1471,7 +1471,7 @@ class TELinear(te.pytorch.Linear):
                 tp_size = 1
                 tp_group_for_te = None
 
-        # Batch-invariant row-parallel forward (tensor_parallel/ordered_reduce.py):
+        # Batch-invariant row-parallel forward (ops/linear/ordered.py):
         # - SHARD_GEMMS (batch_invariant_tp_shards > TP): the K dim is cut into fixed shards and
         #   forward() computes this rank's shard GEMMs and folds all shards in order, so the bits
         #   do not depend on the TP size (the backward stays the stock row-parallel one).
