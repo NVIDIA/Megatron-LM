@@ -304,7 +304,6 @@ markers = [
     "flaky: mark flaky tests for LTS environment",
     "flaky_in_dev: mark flaky tests for DEV environment",
     "launch_on_gb200: mark a unit test to be launched on GB200 hardware (4 GPUs/node)",
-    "large: needs several GiB of device memory (e.g. int32-limit sizes); runs only when the -m expression names it",
 ]
 
 [tool.coverage.run]
