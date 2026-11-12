@@ -9,13 +9,14 @@ import torch
 import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 import transformer_engine.pytorch as te
-from torch.distributed import DeviceMesh
 from torch.distributed.tensor import DTensor
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 import megatron.core.distributed.fsdp.mcore_adapter_v2 as mcore_adapter_v2
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.mcore_adapter_v2 import _initialize_symmetric_memory_meshes
+from megatron.core.distributed.fsdp.mcore_adapter_v2 import (
+    _initialize_symmetric_memory_communicators,
+)
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
@@ -250,22 +251,21 @@ def test_nccl_ub_enables_symmetric_memory(process_group_collection, monkeypatch)
     assert fully_shard_context_calls == [True]
 
 
-def test_symmetric_memory_rendezvous_requires_initialized_mesh(distributed_setup):
-    """A cold group's window registration succeeds after its mesh is initialized."""
+def test_symmetric_memory_rendezvous_requires_initialized_communicator(distributed_setup):
+    """A cold group's window registration succeeds after its communicator is initialized."""
     if distributed_setup.world_size < 2:
         pytest.skip("Requires at least two ranks.")
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl")
     device = distributed_setup.device
     group = dist.new_group(backend="nccl")
-    mesh = DeviceMesh.from_group(group, device_type=device.type)
     with torch.cuda.use_mem_pool(symm_mem.get_mem_pool(device)):
         buffer = torch.empty(1024, device=device)
 
     with pytest.raises(dist.DistBackendError, match="Failed to window register"):
         symm_mem.rendezvous(buffer, group=group.group_name)
 
-    _initialize_symmetric_memory_meshes((mesh,), device)
+    _initialize_symmetric_memory_communicators((group,), device)
     assert symm_mem.rendezvous(buffer, group=group.group_name) is not None
 
 
