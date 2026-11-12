@@ -1507,16 +1507,35 @@ def validate_args(args, defaults={}):
                 f"{dp_cp_size}; expected one of {valid_group_sizes}"
             )
 
+        if getattr(args, 'dynamic_cp_runtime_config', None) is not None:
+            # Fail on a misspelled or incomplete file before the model is built. The check
+            # against the model and parallel configuration runs once the model exists.
+            from megatron.core.datasets.dcp_runtime_scheduler.runtime.config import (
+                load_runtime_config,
+            )
+
+            load_runtime_config(args.dynamic_cp_runtime_config)
+
         import warnings
 
-        warnings.warn(
-            f"Dynamic CP enabled: dp_size * context_parallel_size="
-            f"{args.data_parallel_size * args.context_parallel_size} "
-            f"will be used as the maximum dynamic CP group size. "
-            f"Dynamic CP groups will range from "
-            f"min_dynamic_context_parallel_size={args.min_dynamic_context_parallel_size} "
-            f"to {args.data_parallel_size * args.context_parallel_size}."
-        )
+        if getattr(args, 'dynamic_cp_runtime_config', None) is not None:
+            # The runtime scheduler decides the CP group sizes, not the range below.
+            warnings.warn(
+                f"Dynamic CP enabled with the runtime scheduler file "
+                f"{args.dynamic_cp_runtime_config}: the CP group sizes it forms are checked "
+                f"against the model and printed once the model is built."
+            )
+        else:
+            warnings.warn(
+                f"Dynamic CP enabled: dp_size * context_parallel_size="
+                f"{args.data_parallel_size * args.context_parallel_size} "
+                f"will be used as the maximum dynamic CP group size. "
+                f"Dynamic CP groups will range from "
+                f"min_dynamic_context_parallel_size={args.min_dynamic_context_parallel_size} "
+                f"to {args.data_parallel_size * args.context_parallel_size}."
+            )
+    elif getattr(args, 'dynamic_cp_runtime_config', None) is not None:
+        raise ValueError('--dynamic-cp-runtime-config requires --dynamic-context-parallel')
 
     if getattr(args, 'pad_packed_seq_alignment', None) is not None:
         args.pad_packed_seq_alignment = _parse_pad_packed_seq_alignment(

@@ -1,0 +1,182 @@
+{
+  "schema_version": 1,
+  "hardware": {
+    "h100": {
+      "gpu": "NVIDIA H100 80GB HBM3",
+      "cp1_geometries": [
+        {
+          "profile_name": "qwen3_30b",
+          "query_heads": 32,
+          "kv_heads": 4,
+          "head_dim": 128
+        },
+        {
+          "profile_name": "qwen3_235b",
+          "query_heads": 64,
+          "kv_heads": 4,
+          "head_dim": 128
+        },
+        {
+          "profile_name": "qwen3_next_80b",
+          "query_heads": 16,
+          "kv_heads": 2,
+          "head_dim": 256
+        },
+        {
+          "profile_name": "qwen3_5_397b",
+          "query_heads": 32,
+          "kv_heads": 2,
+          "head_dim": 256
+        },
+        {
+          "profile_name": "mixtral_8x7b",
+          "query_heads": 32,
+          "kv_heads": 8,
+          "head_dim": 128
+        },
+        {
+          "profile_name": "llama3_70b",
+          "query_heads": 64,
+          "kv_heads": 8,
+          "head_dim": 128
+        }
+      ],
+      "cp1_fixed_storage": {
+        "artifact": "cp1_max_cp_alignment_h100_20260818/frozen_models.json",
+        "sha256": "497e4cb6f835f1005a9bc663c1a8750a24bef7c7e76b0c4c4468cf07829dd964"
+      },
+      "singleton_sol": {
+        "artifact": "sol_validation_20260802/singleton_sol_calibration.json",
+        "sha256": "1391cad1d21cc0949006c55a4d85f8ef390d985b033548f7c4d8eab3ea39390c"
+      },
+      "te_p2p": {
+        "qwen3_30b": {
+          "query_heads": 32,
+          "kv_heads": 4,
+          "head_dim": 128,
+          "artifact": "cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_30b/final/frozen_cp_gqa_attention_model_cp64.json",
+          "sha256": "002cf104db9c8a2ccb7e94c19dc461312271f392469f45b18338ab993b66c3fc"
+        },
+        "qwen3_235b": {
+          "query_heads": 64,
+          "kv_heads": 4,
+          "head_dim": 128,
+          "artifact": "cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_235b/final/frozen_cp_gqa_attention_model_cp64.json",
+          "sha256": "b8fc86bae2df99aea53f554fb5e5e896079f68d1cd4f104474f9ce7c69d45ae9"
+        },
+        "qwen3_next_80b": {
+          "query_heads": 16,
+          "kv_heads": 2,
+          "head_dim": 256,
+          "artifact": "cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_next_80b/final/frozen_cp_gqa_attention_model_cp64.json",
+          "sha256": "76d0d2873fa7be0fe8731ac9ef7133d0697ed365bd40ba3202df8ab7de90a20a"
+        },
+        "qwen3_5_397b": {
+          "query_heads": 32,
+          "kv_heads": 2,
+          "head_dim": 256,
+          "artifact": "cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_5_397b/final/frozen_cp_gqa_attention_model_cp64.json",
+          "sha256": "9ee172e470ebe708c7715801802243233dbb0d566ff61ee4c1438f2fec743ee5"
+        },
+        "mixtral_8x7b": {
+          "query_heads": 32,
+          "kv_heads": 8,
+          "head_dim": 128,
+          "artifact": "cp_overlap/models/cp64_20260722_v3_ring/h100/mixtral_8x7b/final/frozen_cp_gqa_attention_model_cp64.json",
+          "sha256": "6adc4b364999981e25f2ed9bb31c70fc4fac46f03d4fab2bffd48f4c7cab6615"
+        },
+        "llama3_70b": {
+          "query_heads": 64,
+          "kv_heads": 8,
+          "head_dim": 128,
+          "artifact": "cp_overlap/models/cp64_20260722_v3_ring/h100/llama3_70b/final/frozen_cp_gqa_attention_model_cp64.json",
+          "sha256": "fd42e74320699891189f76babe5f25214ff2d10d330adafbfc99cf1740a2be55"
+        }
+      }
+    },
+    "gb200": {
+      "gpu": "NVIDIA GB200",
+      "cp1_geometries": [
+        {
+          "profile_name": "qwen3_30b",
+          "query_heads": 32,
+          "kv_heads": 4,
+          "head_dim": 128
+        },
+        {
+          "profile_name": "qwen3_235b",
+          "query_heads": 64,
+          "kv_heads": 4,
+          "head_dim": 128
+        },
+        {
+          "profile_name": "qwen3_next_80b",
+          "query_heads": 16,
+          "kv_heads": 2,
+          "head_dim": 256
+        },
+        {
+          "profile_name": "qwen3_5_397b",
+          "query_heads": 32,
+          "kv_heads": 2,
+          "head_dim": 256
+        },
+        {
+          "profile_name": "mixtral_8x7b",
+          "query_heads": 32,
+          "kv_heads": 8,
+          "head_dim": 128
+        },
+        {
+          "profile_name": "llama3_70b",
+          "query_heads": 64,
+          "kv_heads": 8,
+          "head_dim": 128
+        }
+      ],
+      "cp1": {
+        "standard_artifact": "cp1_tail_3k8k_six_geometry_gb200_20260722/frozen_models.json",
+        "standard_sha256": "9eaccf2b03b10cd8f7d48ce41384f2b736ad4138561baa1dd72487c0a8df91a6",
+        "backend_state_artifact": "cp1_tail_3k8k_six_geometry_gb200_20260722/head_dim256_backend_state_models_v2.json",
+        "backend_state_sha256": "47bb04e77f3ca763b6b4cdad42f41a929203b62bac2c1452cedf103f80e7dc4f"
+      },
+      "singleton_sol": {
+        "artifact": "sol_validation_20260802/singleton_sol_calibration.json",
+        "sha256": "1391cad1d21cc0949006c55a4d85f8ef390d985b033548f7c4d8eab3ea39390c"
+      },
+      "te_p2p": {
+        "qwen3_30b": {
+          "query_heads": 32,
+          "kv_heads": 4,
+          "head_dim": 128,
+          "artifact": "cp_overlap/models/cp64_20260722_v1_ring/gb200/qwen3_30b/final/frozen_cp_gqa_attention_model_cp64.json",
+          "sha256": "59398e454a6b3df0351a4158341a80c610a3d4f5f8102e0fa5b8ee0e18a2fa16"
+        },
+        "qwen3_235b": {
+          "query_heads": 64,
+          "kv_heads": 4,
+          "head_dim": 128,
+          "artifact": "cp_overlap/models/cp64_20260722_v1_ring/gb200/qwen3_235b/final/frozen_cp_gqa_attention_model_cp64.json",
+          "sha256": "aa2c0875b739222c9959e9b319cd78433655a07db95264fb26e957043597e380"
+        },
+        "mixtral_8x7b": {
+          "query_heads": 32,
+          "kv_heads": 8,
+          "head_dim": 128,
+          "artifact": "cp_overlap/models/cp64_20260722_v1_ring/gb200/mixtral_8x7b/final/frozen_cp_gqa_attention_model_cp64.json",
+          "sha256": "6aea48b7366ab4deaf7c2706685b06afcde6d8f51271ca87d41f08026e18ca7f"
+        },
+        "llama3_70b": {
+          "query_heads": 64,
+          "kv_heads": 8,
+          "head_dim": 128,
+          "artifact": "cp_overlap/models/cp64_20260722_v1_ring/gb200/llama3_70b/final/frozen_cp_gqa_attention_model_cp64.json",
+          "sha256": "49f8082eda9f7e57a125bc22a9453c71000757f228f33c13fc65b970d66f04f5"
+        }
+      },
+      "te_p2p_unavailable": {
+        "head_dim_256": "Transformer Engine 2.14.1 on SM100 has no backend for THD inter-sequence padding with P2P context parallelism; only exact no-inter-sequence-padding singleton SOL points are available."
+      }
+    }
+  }
+}

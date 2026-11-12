@@ -1,0 +1,486 @@
+{
+  "schema_version": 1,
+  "status": "frozen_pre_fresh_holdout_v2",
+  "contract": {
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "dtype": "bfloat16",
+    "phase": "forward",
+    "query_heads": 32,
+    "kv_heads": 4,
+    "head_dim": 128,
+    "physical_tokens_per_rank": 4096,
+    "sequence_alignment": 64,
+    "cp_sizes": [
+      2,
+      4,
+      8
+    ]
+  },
+  "source": {
+    "cp2_results": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260719_cp2_calibration_v4_host_clean/cp2/results.json",
+    "cp2_results_sha256": "c57344c50ec9c43c66bdd0261fe070f9e91024e11597867365a595d68ac50e78",
+    "host_component_results": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260719_cp2_host_components_v5/cp2/results.json",
+    "host_component_results_sha256": "6a7f3b5abab92b2fb8cc37e2c6719f477587509985b8c5b664dcc09c39412103",
+    "experiment_contract": "runtime/analysis/gqa_attention_model/cp_overlap_experiment_contract.json",
+    "experiment_contract_sha256": "37a444d967389d2801f3de65983f512d373cfd3e069eee10bf75333b591b74d2",
+    "communication_results": {
+      "2": {
+        "path": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260719_cp_comm_host_v2/cp2/results.json",
+        "sha256": "c9963b167a3e6574029ad6ca7ddd47e9da6310938ba340ba93e428c222d518c7"
+      },
+      "4": {
+        "path": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260719_cp_comm_host_v2/cp4/results.json",
+        "sha256": "5479279f1379addff2cc202605bbef65f6164ac642f0a15ce5a2a9ead68414a9"
+      },
+      "8": {
+        "path": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260719_cp_comm_host_v2/cp8/results.json",
+        "sha256": "e47cec5274debf32354b933ce04d67243632a04ab281c195d03f6d1a9b3dd54b"
+      }
+    },
+    "megatron_commit": "d314db2ea3ad2cc6b44aff39f931558fe0ba22a7",
+    "transformer_engine_version": "2.14.0+f031cf87",
+    "communication_metadata": {
+      "2": {
+        "timestamp_unix": 1784476782.217891,
+        "megatron_commit": "d314db2ea3ad2cc6b44aff39f931558fe0ba22a7",
+        "benchmark_source_sha256": "9a13864f4eaeea8e28b394927e7eb52ce9d6ca97d9fa4915469dc5b8ab573c1c",
+        "torch_version": "2.12.0a0+0291f960b6.nv26.04.48445190",
+        "transformer_engine_version": "2.14.0+f031cf87",
+        "cuda_version": "13.2",
+        "cudnn_version": 92100,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "cp_size": 2,
+        "geometry": {
+          "profile_name": "qwen3_30b",
+          "q_heads": 32,
+          "kv_heads": 4,
+          "head_dim": 128,
+          "hidden_size": 2048
+        },
+        "dtype": "bfloat16",
+        "qkv_format": "thd",
+        "mask": "causal",
+        "cp_comm_type": "p2p",
+        "physical_tokens_per_rank": 4096,
+        "sequence_alignment": 64,
+        "warmup": 1,
+        "iterations": 1,
+        "timing_batch_size": 1,
+        "component_warmup": 100,
+        "component_iterations": 500,
+        "modes": [
+          "overlap"
+        ],
+        "serialized_component_attention": true,
+        "cuda_device_max_connections": "1",
+        "nvte_fused_attn": null,
+        "nvte_batch_mha_p2p_comm": null
+      },
+      "4": {
+        "timestamp_unix": 1784476852.6835566,
+        "megatron_commit": "d314db2ea3ad2cc6b44aff39f931558fe0ba22a7",
+        "benchmark_source_sha256": "9a13864f4eaeea8e28b394927e7eb52ce9d6ca97d9fa4915469dc5b8ab573c1c",
+        "torch_version": "2.12.0a0+0291f960b6.nv26.04.48445190",
+        "transformer_engine_version": "2.14.0+f031cf87",
+        "cuda_version": "13.2",
+        "cudnn_version": 92100,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "cp_size": 4,
+        "geometry": {
+          "profile_name": "qwen3_30b",
+          "q_heads": 32,
+          "kv_heads": 4,
+          "head_dim": 128,
+          "hidden_size": 2048
+        },
+        "dtype": "bfloat16",
+        "qkv_format": "thd",
+        "mask": "causal",
+        "cp_comm_type": "p2p",
+        "physical_tokens_per_rank": 4096,
+        "sequence_alignment": 64,
+        "warmup": 1,
+        "iterations": 1,
+        "timing_batch_size": 1,
+        "component_warmup": 100,
+        "component_iterations": 500,
+        "modes": [
+          "overlap"
+        ],
+        "serialized_component_attention": true,
+        "cuda_device_max_connections": "1",
+        "nvte_fused_attn": null,
+        "nvte_batch_mha_p2p_comm": null
+      },
+      "8": {
+        "timestamp_unix": 1784476927.945115,
+        "megatron_commit": "d314db2ea3ad2cc6b44aff39f931558fe0ba22a7",
+        "benchmark_source_sha256": "9a13864f4eaeea8e28b394927e7eb52ce9d6ca97d9fa4915469dc5b8ab573c1c",
+        "torch_version": "2.12.0a0+0291f960b6.nv26.04.48445190",
+        "transformer_engine_version": "2.14.0+f031cf87",
+        "cuda_version": "13.2",
+        "cudnn_version": 92100,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "cp_size": 8,
+        "geometry": {
+          "profile_name": "qwen3_30b",
+          "q_heads": 32,
+          "kv_heads": 4,
+          "head_dim": 128,
+          "hidden_size": 2048
+        },
+        "dtype": "bfloat16",
+        "qkv_format": "thd",
+        "mask": "causal",
+        "cp_comm_type": "p2p",
+        "physical_tokens_per_rank": 4096,
+        "sequence_alignment": 64,
+        "warmup": 1,
+        "iterations": 1,
+        "timing_batch_size": 1,
+        "component_warmup": 100,
+        "component_iterations": 500,
+        "modes": [
+          "overlap"
+        ],
+        "serialized_component_attention": true,
+        "cuda_device_max_connections": "1",
+        "nvte_fused_attn": null,
+        "nvte_batch_mha_p2p_comm": null
+      }
+    }
+  },
+  "communication_wall_p10_ms": {
+    "2": 0.10143359750509262,
+    "4": 0.08383359760046005,
+    "8": 0.08710400015115738
+  },
+  "communication_host_launch_wall_p10_ms": {
+    "2": 0.0334172,
+    "4": 0.0334465,
+    "8": 0.0345809
+  },
+  "models": {
+    "attention_pure": {
+      "diagonal": {
+        "features": [
+          "tile128_work_m"
+        ],
+        "coefficients": [
+          0.1921266279050281,
+          0.0516983664056415
+        ],
+        "centers": [
+          4.4816457142857145
+        ],
+        "scales": [
+          4.282293865093212
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "lower": {
+        "features": [
+          "cp1_ms",
+          "s2_m",
+          "tile128_work_m",
+          "q_tokens_k",
+          "kv_tokens_k",
+          "max_q_k",
+          "max_kv_k",
+          "active_sequences",
+          "pad_between_seqs"
+        ],
+        "coefficients": [
+          0.1741406476213818,
+          -0.015993582813655302,
+          -0.039871416009382946,
+          0.06372490712033677,
+          -0.06446703964900537,
+          -1.3183898417423734e-16,
+          0.12146064291431836,
+          -0.11042270446113467,
+          -0.0017521877082926549,
+          0.01339265939431798
+        ],
+        "centers": [
+          0.17896164372756734,
+          5.417532952380951,
+          5.539139047619048,
+          3.56640625,
+          2.0,
+          1.5387834821428572,
+          0.9806547619047619,
+          4.9523809523809526,
+          0.47619047619047616
+        ],
+        "scales": [
+          0.040115485713466695,
+          4.947159677804306,
+          4.904325742409143,
+          0.9399660645826339,
+          1.0,
+          1.1343670838518156,
+          0.6112114566978869,
+          3.139247566447526,
+          0.4994327848429292
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "upper": {
+        "features": [
+          "tile128_work_m",
+          "max_q_k",
+          "max_kv_k"
+        ],
+        "coefficients": [
+          0.15977721852915625,
+          0.05255812083966342,
+          -0.029889674583629185,
+          0.03179822225332942
+        ],
+        "centers": [
+          2.8078994285714294,
+          0.43545386904761907,
+          1.5387834821428572
+        ],
+        "scales": [
+          3.6406600060664633,
+          0.4255215545801409,
+          1.1343670838518156
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      }
+    },
+    "attention_active_ratio": {
+      "features": [],
+      "coefficients": [
+        1.013501656251964
+      ],
+      "centers": [],
+      "scales": [],
+      "minimum": 0.0,
+      "maximum": 4.0
+    },
+    "attention_drain_ratio": {
+      "lower": {
+        "features": [
+          "pure_attention_ms"
+        ],
+        "coefficients": [
+          0.9706144299308395,
+          -0.04317318654742511
+        ],
+        "centers": [
+          0.17414064762138187
+        ],
+        "scales": [
+          0.04717996857515417
+        ],
+        "minimum": 0.0,
+        "maximum": 4.0
+      },
+      "upper": {
+        "features": [
+          "pure_attention_ms",
+          "active_sequences"
+        ],
+        "coefficients": [
+          0.6177393707711725,
+          0.06982905440756439,
+          -0.030309484745392357
+        ],
+        "centers": [
+          0.15977721852915627,
+          4.523809523809524
+        ],
+        "scales": [
+          0.05087442658312984,
+          3.141413809994408
+        ],
+        "minimum": 0.0,
+        "maximum": 4.0
+      }
+    },
+    "prepare": {
+      "diagonal": {
+        "features": [
+          "pad_between_seqs"
+        ],
+        "coefficients": [
+          0.08226262855210471,
+          0.05258026880980676
+        ],
+        "centers": [
+          0.47619047619047616
+        ],
+        "scales": [
+          0.49943278484292924
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "lower": {
+        "features": [
+          "q_tokens_k",
+          "kv_tokens_k",
+          "active_sequences",
+          "pad_between_seqs"
+        ],
+        "coefficients": [
+          0.05938605679465191,
+          -0.00919462326202616,
+          3.469446951953614e-18,
+          0.01697823630177108,
+          0.02859780831887787
+        ],
+        "centers": [
+          3.56640625,
+          2.0,
+          4.9523809523809526,
+          0.47619047619047616
+        ],
+        "scales": [
+          0.9399660645826339,
+          1.0,
+          3.139247566447526,
+          0.4994327848429292
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "upper": {
+        "features": [],
+        "coefficients": [
+          0.02670369537635927
+        ],
+        "centers": [],
+        "scales": [],
+        "minimum": 0.0,
+        "maximum": null
+      }
+    },
+    "lse": {
+      "full": {
+        "features": [],
+        "coefficients": [
+          0.06387794329563065
+        ],
+        "centers": [],
+        "scales": [],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "second_half": {
+        "features": [],
+        "coefficients": [
+          0.0061994666056264
+        ],
+        "centers": [],
+        "scales": [],
+        "minimum": 0.0,
+        "maximum": null
+      }
+    },
+    "output": {
+      "full": {
+        "features": [],
+        "coefficients": [
+          0.039706311232986895
+        ],
+        "centers": [],
+        "scales": [],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "second_half": {
+        "features": [
+          "active_sequences"
+        ],
+        "coefficients": [
+          0.026468114306529362,
+          0.0003368266010109205
+        ],
+        "centers": [
+          4.523809523809524
+        ],
+        "scales": [
+          3.141413809994408
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      }
+    },
+    "host_critical_rank": {
+      "diagonal_round": {
+        "features": [
+          "pad_between_seqs"
+        ],
+        "coefficients": [
+          0.43473945164285716,
+          0.056179154866916124
+        ],
+        "centers": [
+          0.47619047619047616
+        ],
+        "scales": [
+          0.49943278484292924
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "lower_round": {
+        "features": [
+          "pad_between_seqs"
+        ],
+        "coefficients": [
+          0.5898278802142858,
+          0.04090155819199843
+        ],
+        "centers": [
+          0.47619047619047616
+        ],
+        "scales": [
+          0.49943278484292924
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      }
+    },
+    "initialization_ms": 0.0,
+    "timeline_scale": 1.0,
+    "fixed_overhead_ms": 0.0,
+    "host_cp_scaling": {
+      "model": "fixed_per_call_plus_cp_rounds",
+      "formula": "host_ms = fixed_ms[padding_group] + cp_size * per_round_ms[padding_group]",
+      "minimum_cp_size": 4,
+      "calibration_cp_sizes": [
+        2,
+        4
+      ],
+      "groups": {
+        "aligned": {
+          "fixed_ms": 0.23316347999999998,
+          "per_round_ms": 0.3493992755
+        },
+        "inter_sequence_padded": {
+          "fixed_ms": 0.1973153330000006,
+          "per_round_ms": 0.46639393849999977
+        }
+      }
+    }
+  },
+  "provenance": {
+    "host_cp_scaling_v2": {
+      "cp2_results": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260719_cp2_calibration_v4_host_clean/cp2/results.json",
+      "cp2_results_sha256": "c57344c50ec9c43c66bdd0261fe070f9e91024e11597867365a595d68ac50e78",
+      "cp4_results": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260719_cp48_full_holdout_v1/cp4/results.json",
+      "cp4_results_sha256": "684a5a120b159f93eccdbd1a7fc481b0d15231bcf9a00fda5df341f717e63953",
+      "base_model_sha256": "9a5c7c537e221f9185f70c205f2e8f165b47be68defeb2b07455cf7d66731549",
+      "experiment_contract": "runtime/analysis/gqa_attention_model/cp_overlap_experiment_contract_v2.json",
+      "experiment_contract_sha256": "314486c831ab07cb19bc085246038a6346122f4bc7bbd71caff8efe307400932"
+    }
+  }
+}

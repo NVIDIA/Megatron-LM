@@ -1,0 +1,179 @@
+{
+  "version": "v1.1",
+  "hardware": "8 GPU per node, NVLink in-node, 400 Gb/s IB per-GPU rail cross-node",
+  "calibration_domain": "calibrated on a production multimodal transformer whose shape is withheld; the shipped profile module (usp_calib_v1.py) pairs this table with a synthetic example shape, so absolute example outputs illustrate the pipeline rather than reproduce the production system",
+  "methodology": {
+    "E2": "offline a2a collective microbenchmark sweep + full-grid collective-only attribution rerun",
+    "E3": "offline ring per-hop benchmark (R=2 and R=4 lanes)",
+    "E4": "offline compute kernel sweeps (FA / GEMM / MoE rate curves)",
+    "E6": "ring overlap precheck (backward chunk counts K in {1, 2, 4})",
+    "E7": "global residual calibration (profilers-off segment vs rank-max busy reconciliation)",
+    "E8": "heterogeneous-dataset validation (C_switch, closure transfer)",
+    "E9": "static tier sweeps on heterogeneous data (fwd KV exposure vs rho LUT, sp32 closure fix)",
+    "E10": "in-train a2a inflation reconciliation (per-tier measured/curve fits)",
+    "E11": "kernel-level attribution (FA long-seg flatness, MoE rate re-anchor, gamma decomposition)"
+  },
+  "time_model": "T_step = max_over_dp_buckets(T_comp + T_a2a + T_ring_exposed) + C_global",
+  "a2a": {
+    "law": "t_ms = max(floor, t0 + bytes/BW); one call per direction (pre=QKV, post=O) per attention per microbatch",
+    "scope_note": "curve includes tensor_split/contiguous/cat host copies (full all_to_all_tensor); in-train collective-only is faster (~700 GB/s implied), so this curve is a safe, slightly conservative upper bound. No in-train degradation (NVLink unaffected by FSDP/NIC traffic).",
+    "fits": {
+      "U2_pre": {"floor_ms": 0.211, "t0_ms": 0.116, "bw_gbps": 477},
+      "U2_post": {"floor_ms": 0.201, "t0_ms": 0.104, "bw_gbps": 806},
+      "U4_pre": {"floor_ms": 0.219, "t0_ms": 0.124, "bw_gbps": 412},
+      "U4_post": {"floor_ms": 0.211, "t0_ms": 0.114, "bw_gbps": 642},
+      "U8_pre": {"floor_ms": 0.245, "t0_ms": 0.154, "bw_gbps": 391},
+      "U8_post": {"floor_ms": 0.24, "t0_ms": 0.165, "bw_gbps": 610}
+    },
+    "validity_bytes": [500000, 604000000],
+    "held_out_max_err": 0.082,
+    "exposure": "fully exposed on critical path (no overlap); in-train totals 2.37s (sp16) / 2.97s (sp8) per rank-step in the anchor runs",
+    "held_out_err_attribution": "worst 8.2% is model-form error at the floor->linear knee (0.5-4x knee bytes: |err| p50 2.4% max 8.2%); floor region p50 0.4%, linear region p50 0.2%. Not noise, not copies. Full-grid collective-only rerun: host copies = ~55-58% of floor and 32-69% of slope (pre worse than post); pure-collective NVLink BW 888-1570 GB/s. Per-point jitter (p90-p10)/p50: a2a ~0.18-0.27 vs ring P2P 0.011, so the a2a fit floor is percent-level by nature. Curve unchanged: production U8 large messages sit in the linear region; the knee region corresponds to high-sp small buckets, already flagged conservative.",
+    "in_train_inflation_by_tier": {
+      "sp8": 1.44,
+      "sp16": 1.92,
+      "sp32": 3.01
+    },
+    "in_train_inflation_note": "T_a2a(in-train) = curve(bytes) x factor(tier). up_a2a completion includes waiting for U-group peers. Skew source: per-rank SPEED differences (in-group machine downclocking, confirmed via per-rank rate telemetry; measured ~6% systematic FA-rate spread, slow ranks stable across steps) -- NOT load imbalance (packing splits each sample evenly across sp ranks; in-group FA flops measured exactly equal). Monotone in R: absolute skew grows with compute between syncs while per-call bytes/baseline shrink. Fit: measured/curve on full per-step up_a2a totals -- sp8 1.467/1.415 (two independent runs), sp16 1.908 (homogeneous)/1.931 (heterogeneous), sp32 3.034 (homogeneous)/2.978 (heterogeneous); cross-dataset stable within 2%. Supersedes the older per-call-p50 'in-train is faster' reconciliation (E10); the skew mechanism was corrected after the initial fit."
+  },
+  "ring": {
+    "law": "per-hop completion t_ms = t0 + bytes/BW; bytes = tuple bytes (KV: K+V+cu_seqlens; dKV: dK+dV, pre-chunked /K)",
+    "fits": {
+      "kv": {"t0_ms": 0.242, "bw_gbps": 48.8},
+      "dkv": {"t0_ms": 0.188, "bw_gbps": 48.7}
+    },
+    "validity": "R=2 and R=4 both measured offline (67MB-1.21GB per hop, linear regime); R=4 curve identical to R=2 within noise (kv t0 0.231/48.7, dkv t0 0.17-0.18/48.7-48.8) -> per-hop completion cost is ring-size independent, reuse the R=2 fits for any R",
+    "held_out_max_err": 0.0012,
+    "in_train_bw_factor": 0.75,
+    "exposure_rule": "R=2: only bwd dKV tail exposed: T_ring_exposed ~= N_layer x beta(chunk_bytes) x (t0_dkv + tuple_bytes/(K x BW_dkv)); fwd KV / bwd KV / dKV middle fully hidden (<0.2% step); exposed fraction of tail chunks = 1/K exactly. R=4 adds a fwd KV term, see sp32_R4.",
+    "hidden_terms_validity": "bwd KV / dKV middle = 0 only inside the validity domain: bwd KV hiding budget is 2.5x flops at equal bytes -> its own threshold ~0.4x of the fwd one (s_bar >= ~0.4 x R x 41.7K); dKV middle threshold is another ~K lower. Production s_bar gives 4-10x margin; if solver buckets push s_bar below ~0.4x threshold these terms start exposing and the model is out of domain.",
+    "beta_by_chunk_bytes": {
+      "1193MB": 1.32,
+      "596MB": 1.72,
+      "298MB": 2.1,
+      "149MB": 2.5,
+      "note": "amplification of exposed wait vs offline completion; grows as chunks shrink (t0-type overhead + peer launch delay dominate); keys were K={1,2,4}@sp16 and K=4@sp32. Composition sensitivity (E9): on the heterogeneous dataset beta runs ~25% higher at comparable chunk bytes (266MB: 2.63, 132MB: 2.59) -- more intra-bucket length variance widens per-hop jitter; treat values as p50 with +25% band on heterogeneous data"
+    },
+    "fwdkv_exposure_frac_by_rho": {
+      "R2": {
+        "rho": [1.5, 1.75, 2.0, 2.3, 2.66, 3.06, 3.5, 4.0],
+        "frac": [0.194, 0.183, 0.155, 0.129, 0.098, 0.039, 0.016, 0.0]
+      },
+      "R4": {
+        "rho": [0.87, 1.0, 1.15, 1.32, 1.52],
+        "frac": [0.37, 0.36, 0.31, 0.31, 0.27]
+      },
+      "note": "E9: fraction of fwd KV hop waits exposed (>1ms) vs rho = s_bar/threshold, from STATIC sp16/sp32 sweeps on the heterogeneous dataset. Exposure decays smoothly with rho (ramp, not cliff): R=2 reaches ~0 only at rho>=3.5; R=4 unmeasured beyond 1.52 (extrapolate with R2 decay shape, low confidence). Below first knot: clamp (unmeasured, low confidence). Exposed wait ~= 0.85 x offline completion (both tiers). Per layer: frac x (R-1) x 0.85 x completion. impl: USPCalibV1Profile._ring_fwdkv_exposed_ms(hop_bytes, R, rho). A lower-variance static dataset sat 6-12% lower at equal rho -- heterogeneous intra-bucket variance adds exposure; this LUT is the conservative (heterogeneous) calibration."
+    },
+    "overlap_min_seg_tokens": {
+      "rule": "fwd KV hop fully hidden iff FLOPs-weighted mean segment length s_bar = sum(s_i^2)/S_bucket >= R x (c_kv/(4 Hq d)) x P_fa_eff/BW_eff; the prefactor c_kv/(4 Hq d) equals 1.0 at the production shape (validated on sp16/sp32 in-train hop bytes) and also at the shipped synthetic shape. Threshold depends ONLY on per-segment length, not bucket total.",
+      "conservative": {
+        "sp16_R2": 83000,
+        "sp32_R4": 167000,
+        "basis": "P/OF_fa_fwd(0.94)=1527TF/s, BW=48.8x0.75=36.6GB/s"
+      },
+      "optimistic": {
+        "sp16_R2": 59000,
+        "sp32_R4": 118000,
+        "basis": "P=1435TF/s law, BW=48.8GB/s offline"
+      },
+      "cross_check": "production natural s_bar 140-168K: sp16 1.7x above threshold -> fwd KV 93% hidden; sp32 right at threshold -> 1/3 hops exposed (E6). Solver: use as bucketing constraint with ~30% headroom; bwd threshold ~0.4x of fwd (not binding); dKV tail exposure is length-independent (mitigate via K only).",
+      "impl": "USPCalibV1Profile._ring_overlap_min_seg_tokens(R)"
+    },
+    "sp32_R4": {
+      "basis": "static sp32 30-step run (U8 x R4, K=4); supersedes the short-sample hot-switch preview",
+      "dkv_tail": "rule transfers: exposed frac 30.8% (~1/K), beta 2.5 @149MB chunks, contributes 1.93s/rank-step",
+      "fwd_kv": "first-class exposed term at R>=4: exposed frac 32.6% (~1/(R-1) hops), exposed wait ~0.87x completion, contributes 2.03s/rank-step; model as T_fwdkv_exposed ~= N_layer x (t0_kv + bytes_hop/BW_kv) per microbatch",
+      "bwd_kv_and_dkv_middle": "still hidden (<2%)",
+      "total": "ring exposure p50 4.25s/rank-step = ~4.5% of the 94.6s step (sp16 K=4: 1.4%)"
+    },
+    "fa_cache_note": "fa-cache IS wired and active on the ring path (the ring attention varlen cache accessor): AC replay skips fwd ring loop + FA. bwd KV rotations seen in backward are the backward pass's own ring loop (dq/dkv needs KV), not a recompute."
+  },
+  "compute": {
+    "law": "T = FLOPs / (P_plateau x eta_P(x)) with eta LUT (log-interp) from the offline compute sweep; or FA additive law below",
+    "plateaus_tflops": {
+      "fa_fwd_single": 1507.5,
+      "fa_bwd_single": 1281.2,
+      "fa_fwd_packed8": 1305.8,
+      "fa_bwd_packed8": 1197.8,
+      "gemm_attn_proj": 1756.6,
+      "moe_fwd_grad": 1231.0,
+      "moe_fwd_nograd_chunk16k": 1025.0
+    },
+    "knee_points_eta090": {
+      "fa_single_per_seg": 16384,
+      "fa_packed_per_seg": 8192,
+      "gemm_M": 8192,
+      "moe_routed_tokens": 32768
+    },
+    "fa_additive_law": {
+      "form": "T_ms = FLOPs / P + c_seg x n_seg; FLOPs_fwd = 4 x Hq x d x sum(qi x ki), FLOPs_bwd = 2.5 x FLOPs_fwd",
+      "fwd": {"P_tflops": 1435, "c_seg_ms": 0.00118},
+      "bwd": {"P_tflops": 1279, "c_seg_ms": 0.00565},
+      "validity": "n_seg <= ~1000; production n_seg ~9-10; fitted at the production attention shape; per-segment coverage 128-196K tokens (plateau holds to 196K)",
+      "long_seg_note": "E11 D-series: fixed-total varlen sweep, per-seg 8K-512K x nseg 1-64 -> fwd 1475-1505 / bwd 1186-1285 TF/s, completely flat. No efficiency decay past 8K per segment; the apparent sag past 8K in an earlier series is a shrinking-total (underfeeding) confound of that series' fixed-ssq design."
+    },
+    "moe_intrain_rule": "T_moe_fwd = flops_est / moe_intrain_rate_tflops (847 TF/s, in-train anchor); flops_est = the model's per-token MoE forward FLOPs (the production value is withheld; the shipped profile module uses a synthetic example constant); rate flat vs tokens (chunk-capped) ONLY for per-rank routed tokens >= 16384; below the chunk size use moe_rate_lut (log-interp) instead of the flat rate",
+    "moe_intrain_rate_tflops": 847,
+    "moe_rate_note": "in-train anchor: p50 of ~1.3M in-train MoE forward kernel events across nodes, +-4% node-uniform (E11). The ONLY trustworthy absolute MoE rate: offline plateaus are kernel-autotune-state dependent (an earlier offline baseline was an unreproducible outlier; a same-host re-run came out 23% lower; the knee SHAPE is still usable). The legacy OF_moe=1.25 factor (= 1059 outlier baseline / 847) was REMOVED from this table as misleading -- neither 1059 nor 1.25 has standalone meaning.",
+    "moe_rate_lut": {
+      "comment": "below-knee fallback, re-anchored per E11: values = the earlier offline sweep's relative shape x 847 TF/s in-train anchor (spliced continuously at 16384). Rationale: absolute offline rates are autotune-state dependent (two full sweeps disagree BOTH in level and shape, crossing at ~4K: the later sweep measured 293/459/604/691/750 -- faster at low tokens, lower plateau, earlier knee ~8-10K). The steeper earlier shape is kept as the CONSERVATIVE choice for solver penalties; the later shape serves as an upper-bound reference. In-train anchors only cover >=16.4K tokens, so the sub-16K region remains offline-only confidence.",
+      "tokens": [1024, 2048, 4096, 8192, 16384],
+      "tflops": [141, 290, 498, 689, 847]
+    },
+    "in_train_overhead_factors": {
+      "OF_fa_fwd": [0.94, 0.95],
+      "OF_fa_bwd": [1.0, 1.01],
+      "moe": "REMOVED: the legacy OF_moe=1.25 lived here; MoE now uses compute.moe_intrain_rate_tflops (847) directly, see moe_rate_note",
+      "note": "OF x law prediction = in-train time; FA measured on sp16 ring chunks (166k/664k events) and sp8 fa-cache packed (83k events), p10-p90 within +-7%"
+    },
+    "block_anchors_ms": {
+      "sp16": {"block_fwd_p50": 220.6, "block_bwd_p50": 679.3},
+      "sp8": {"block_fwd_p50": 423.3, "block_bwd_p50": 1304.1},
+      "bwd_fwd_ratio": "2.85-3.04 (full AC: recompute 1x + bwd ~2x)"
+    }
+  },
+  "global": {
+    "C_global_clean_ms": 2000,
+    "C_global_note": "E7 segment B (profilers off, 100 steps): step p50 83.2s vs segment A rank-max busy p50 82.1s -> clean C_global ~1.1-2.4s, v1 uses 2.0s (~2.5% of step). Earlier static 5.5s residual included ~3s profiler/recorder overhead. Instrumentation perturbation ~1.1s (1.3%, within data noise).",
+    "periodic_spikes": "RESOLVED: with profilers off no periodic structure remains; remaining +-15% step scatter is natural batch composition variance (not a cost model term)",
+    "gamma_comp": {
+      "definition": "gamma = measured block busy / modeled compute; model_fwd = FA_law_fwd + MoE_rule; model_bwd = 2.5x FA_law_bwd + 3x MoE_rule for ALL tiers -- fa-cache is active on the ring path too (AC replay restores cached out/lse, skips fwd ring loop + FA kernels; verified by event counts), so there is NO FA fwd-recompute term. MoE flops convention: the in-train MoE forward counter fires on chunked fwd AND AC replay, so single-forward = recorded/2.",
+      "pure_compute": {
+        "usage": "USE THIS with explicit T_a2a + T_ring_exposed terms (comm exposure subtracted from busy before fitting: all up_a2a wait + ring wait > 1ms)",
+        "sp8_fa_cache": {"fwd": 1.07, "bwd": 1.11},
+        "sp8_static_crosscheck": {"fwd": 1.041, "bwd": 1.151},
+        "sp16_ring": {"fwd": 1.075, "bwd": 1.191},
+        "sp16_hetero_crosscheck": {"fwd": 1.122, "bwd": 1.122},
+        "sp32_ring": {"fwd": 1.179, "bwd": 1.185},
+        "sp32_hetero_crosscheck": {"fwd": 1.177, "bwd": 1.174}
+      },
+      "comm_inclusive": {
+        "usage": "block-level shortcut: gamma x (FA+MoE) already contains intra-block a2a/ring exposure; do NOT add explicit comm terms on top",
+        "sp8_fa_cache": {"fwd": 1.125, "bwd": 1.15},
+        "sp8_static_crosscheck": {"fwd": 1.094, "bwd": 1.188},
+        "sp16_ring": {"fwd": 1.145, "bwd": 1.273},
+        "sp32_ring": {"fwd": 1.443, "bwd": 1.354}
+      },
+      "spread_p10_p90": 0.05,
+      "recommended": "pure_compute per-mode + explicit comm terms (matches the documented time model); single-number fallback 0.87 (pure) / 0.90 (inclusive)",
+      "basis": "fit with the comm-subtracted convention (MoE/2, no fa-recompute); each tier fit on one homogeneous run and cross-checked on one heterogeneous run",
+      "note": "gamma > 1: unmodeled ops (projections/norms/glue) put measured busy above the FA+MoE-only model; stable across datasets (hetero crosschecks within ~4%). v1.1 recalibration: previous v1 gammas (<1) were fit with two convention errors that partially cancelled (MoE replay flops double-counted; phantom FA fwd-recompute term on ring tiers). Closure replay revalidated after the fix.",
+      "kernel_attribution": "E11 (profiler-trace attribution on three ranks, mutually consistent): unmodeled kernels = 20-25% of modeled (FA+MoE) time, same order as gamma-1 (side-stream copies explain the gap). Breakdown of unmodeled: projection GEMMs (bf16) ~31%, copies/concat incl. FSDP staging ~20%, fp32 SIMT GEMMs ~18% (per-block conditioning/modulation on a non-tensor-core f32 path, 1.6-2s/rank-step -- optimization candidate), elementwise glue ~12%, router topk ~8%, fused attn-res + norm/rope ~12%."
+    },
+    "C_switch": 0,
+    "C_switch_note": "measured on the heterogeneous mixed-tier dataset (E8, 47 steps, ~half of them switch steps across sp8/16/32 mixes): switch vs non-switch wall p50 within +0.3/-1.5s of each other, buried in +-10s batch variance -> C_switch ~ 0, conservative upper bound 1.5s (<3% step). Model as 0; keep 1.5s inside the C_global uncertainty band if headroom needed.",
+    "gamma_hetero_crosscheck": {
+      "fwd": 0.847,
+      "bwd": 0.889,
+      "note": "E8 mixed-tier pure_compute fit; same family as sp8 (0.855/0.879) -> kernel calibration is dataset-independent"
+    },
+    "closure_all_datasets": "step-level closure p50 across the seven calibration/validation runs: -1.0%, -2.8%, -3.3%, -0.3% (heterogeneous mixed), +0.3%, +4.0%, +4.6%. All within +-5%; sp32 slightly conservative (overpredicts).",
+    "pending": "larger-scale C_global recheck (the anchor-scale window cannot reach the production per-GPU batch: the gradient-accumulation path crashes, and the single-microbatch setting exhausts fa-cache pinned host memory -> NCCL watchdog timeout); R=2 fwdkv exposure below rho 1.5 and R=4 above rho 1.52 (needs controlled replay); MoE cross-node rate spread mechanism unpinned (E11: -26..-34% on one node with FA unchanged; remeasure the in-train MoE rate per node window)"
+  },
+  "validity_domain": {
+    "eta_P_equals_1": "per-segment >= 8K (packed FA) and per-rank tokens >= 16K",
+    "topology": "measured on a multi-node anchor window; a2a in-node U<=8; ring cross-node R in {2, 4} (offline curves identical; in-train exposure structure measured for both)",
+    "data": "natural production batches + a heterogeneous mixed-tier dataset (E8: closure and gamma transfer without refit); controlled length-bucket replay not yet done"
+  }
+}

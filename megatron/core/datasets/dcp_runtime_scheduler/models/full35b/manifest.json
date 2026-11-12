@@ -1,0 +1,29 @@
+{
+  "adaptations": [
+    "Preserve consumed FA-v1 and GDN-v2 numerical function bodies; use package-relative imports and omit unused GDN-v1 features.",
+    "Extract only module coefficients, accuracy metadata, layer order and explicit cache mappings.",
+    "Extract density.json layer names/order only; no density coefficients or measured tail values are packaged.",
+    "Require fixed user non-attention F/B times excluding the whole predicted attention module.",
+    "Prepend the copyright header that the repository requires to the packaged Python files; function bodies unchanged."
+  ],
+  "packaged_sha256": {
+    "cp_round_geometry.py": "f919b5113a06f3b50582325ee802cafb1032077465324499715f9da452fa433b",
+    "gdn_features.py": "0ae1d49e3b4ab0b118f99bb8a4d82b48a1878c3b49494a32cd62eeb7c74459b1",
+    "geometry.py": "51fdc0fa8de87266c296f01d70049d616b7575daff4b83a66d5c24d460dba37a",
+    "parameters.json": "ba1559e028b252096fbe3bd801274d1aaa2f11e2d86bc5750cc4e8f22febc25e"
+  },
+  "source_candidate_sha256": "a268249ab9c342db393d1be0f321f88891a7fa0545b52e23460c0c58c3c26284",
+  "source_sha256": {
+    "attention.json": "6863c2f7cc06410b8da6f2055e67725687d8d343d347d33d6af6bbd9717af439",
+    "cache_program.json": "5607ff3713e4a3a56e91648546c25e8685b6c57e503f079f0121f30359cc896a",
+    "composition.json": "512e2be40dbe6957704b6591123a50540dbd174940eb7cbd535d446acde33882",
+    "contract.py": "9ae00280bae2d79e71d1962c8cfbb0efcf116ffcbff4e3aca6e3c4ea06ba8da7",
+    "cp_round_geometry.py": "b721f18f95e42cfbbbc0451f0df2bfb6ecf3c4929ea4c43a6d5186491453dad4",
+    "density.json": "227e777691520c33f0c1d480c20351d7dd80502133bb1d5a07e079b95603fc73",
+    "fixed_diagnostic_factory.py": "1d99fcbbcb50406d33f3f2a92ee9a212d2b0e6b7a20d9efc4787998868510115",
+    "full35b_gdn_v2_factory.py": "4bbf413b28cbef730246e5796ab302d1ce9bbee2a874d924af2751692118a8f9",
+    "gdn_v2/features.py": "13b05b06f247acc4bacb09a7719196e335b24fa5161d386b99241ec4ffc40c6b",
+    "geometry.py": "f10c2eec9429fa2b36ca57744515d8658e66734712968ea291c59e5c09259109"
+  },
+  "source_snapshot": "qwen35-full35b-nocg-20261106/fixed-diagnostic-candidate-20261106"
+}

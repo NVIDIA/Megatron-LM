@@ -184,6 +184,16 @@ class ModelParallelConfig:
     """Minimum CP group size for dynamic context parallel. Default 1 (no CP).
     The maximum is dp_size * context_parallel_size (the full DPxCP group)."""
 
+    dynamic_cp_runtime_config: Optional[str] = None
+    """Path to a JSON file that replaces the default dynamic-CP heuristic with a CPU
+    scheduler planning each global batch from a cost model. Its "type" selects the whole
+    scheduler: "dcp_benchmark" (benchmark cost model with the lightweight solver; ordinary
+    GQA or full Qwen3.5 follows from the training configuration) or "dynamic_usp"
+    (DynamicUSP cost model with the DynamicUSP solver). Every other scheduler input lives in
+    that file; see megatron/core/datasets/dcp_runtime_scheduler/README.md. Requires
+    dynamic_context_parallel.
+    """
+
     hybrid_context_parallel: bool = False
     """Deprecated. Use ``dynamic_context_parallel`` instead."""
 
@@ -700,6 +710,17 @@ class ModelParallelConfig:
         # tests/unit_tests/transformer/test_balanced_dynamic_pack_config.py and
         # tests/unit_tests/transformer/experimental_attention_variant/
         # test_attention_variant_dsa.py).
+
+        if self.dynamic_cp_runtime_config is not None:
+            # The file is read and validated when training starts
+            # (data_schedule.validate_dynamic_cp_runtime), not here.
+            if (
+                not isinstance(self.dynamic_cp_runtime_config, str)
+                or not self.dynamic_cp_runtime_config
+            ):
+                raise ValueError("dynamic_cp_runtime_config must be the path of a JSON file.")
+            if not self.dynamic_context_parallel:
+                raise ValueError("dynamic_cp_runtime_config requires dynamic context parallelism.")
 
         if self.thd_tail_padding_policy not in (None, "append_dummy_seq", "extend_last"):
             raise ValueError(
