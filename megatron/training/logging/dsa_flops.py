@@ -211,6 +211,7 @@ def dsa_layer_flops(
     dsa_indexer_topk: int | None,
     dsa_indexer_kpool: int = 1,
     dsa_indexer_kpool_always_select_tail: bool = True,
+    absorbed_mla: bool = True,
 ) -> float:
     """Calculate forward FLOPs for one DSA attention layer, excluding its indexer.
 
@@ -225,6 +226,7 @@ def dsa_layer_flops(
     its executed layer count and backward cost can differ from attention.
     With KPool, only complete pools are selected and expanded to original
     tokens; the tail flag controls additional incomplete-pool tokens.
+    Set ``absorbed_mla=False`` when the actual hybrid spec uses ordinary MLA.
     """
     if q_lora_rank is None:
         q_term = hidden_size * num_attention_heads * (qk_head_dim + qk_pos_emb_head_dim)
@@ -262,6 +264,8 @@ def dsa_layer_flops(
         )
         * sparse_core_scale
     )
+    if not absorbed_mla:
+        core = num_attention_heads * (qk_head_dim + qk_pos_emb_head_dim + v_head_dim) * sparse_core_scale
     return total_tokens * token_linear + seqlen_squared_sum * core
 
 

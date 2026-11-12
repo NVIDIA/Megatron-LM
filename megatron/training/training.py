@@ -889,6 +889,7 @@ def num_floating_point_operations(
     sequence_length,
     seqlen_squared_sum_in_batch=None,
     total_real_tokens_in_batch=None,
+    hybrid_model=None,
 ):
     """Compute the number of floating-point operations for one global batch.
 
@@ -914,14 +915,18 @@ def num_floating_point_operations(
             than ``batch_size * llm_seq_length`` whenever the dataloader added
             CP-alignment padding or end-of-sequence padding, so neither kind of
             padding shows up in the reported FLOPs.
+        hybrid_model: Actual HybridModel, when available. Its config list, resolved
+            root config, vocabulary, and built-in specs define the architecture to count.
+            Pattern-defined models retain the existing calculation.
     """
     from megatron.training.vocab_utils import model_vocab_size
 
-    transformer_cfg = model_config.transformer
+    layer_configs = getattr(hybrid_model, "hybrid_layer_config_list", None)
+    transformer_cfg = hybrid_model.config if layer_configs is not None else model_config.transformer
     llm_seq_length = sequence_length
     group_query_attention = transformer_cfg.num_query_groups != transformer_cfg.num_attention_heads
     swiglu = transformer_cfg.gated_linear_unit and transformer_cfg.activation_func is torch.nn.functional.silu
-    vocab_size = model_vocab_size(
+    vocab_size = hybrid_model.vocab_size if layer_configs is not None else model_vocab_size(
         model_config.vocab_size,
         should_pad_vocab=model_config.should_pad_vocab,
         make_vocab_size_divisible_by=model_config.make_vocab_size_divisible_by,
@@ -1058,6 +1063,29 @@ def num_floating_point_operations(
                 # out_proj: v_dim -> hidden_size
                 + hidden_size * v_dim
             )
+        )
+
+    def mla_layer_flops(total_tokens, squared_lengths, config):
+        """MLA forward projections and causal attention, shared by both architecture paths."""
+        q_dim = config.qk_head_dim + config.qk_pos_emb_head_dim
+        q_term = (
+            config.hidden_size * config.num_attention_heads * q_dim
+            if config.q_lora_rank is None
+            else config.q_lora_rank * (config.hidden_size + config.num_attention_heads * q_dim + 1)
+        )
+        projections = 2 * (
+            q_term
+            + config.kv_lora_rank
+            * (
+                config.hidden_size
+                + config.num_attention_heads * (config.qk_head_dim + config.v_head_dim)
+                + 1
+            )
+            + config.hidden_size * config.qk_pos_emb_head_dim
+            + config.num_attention_heads * config.v_head_dim * config.hidden_size
+        )
+        return total_tokens * projections + squared_lengths * config.num_attention_heads * (
+            q_dim + config.v_head_dim
         )
 
     def hybrid_flops(total_tokens, seqlen_squared_sum, hidden_size,
@@ -1217,62 +1245,11 @@ def num_floating_point_operations(
             standard_self_attn_term = 0
             standard_self_attn_core_term = 0
         elif transformer_cfg.multi_latent_attention:
-            '''
-            Basic arithmetic
-            let B is batch size, s is seq_len, h is embedding dim,
-            for one self_attnetion block (prenorm is not included)
-            qkv projection:  6Bsh^2
-            attn:            2Bs^2h
-            attn over value: 2Bs^2h
-            oproj:           2Bsh^2
-
-            references
-            https://arxiv.org/abs/2305.10403
-            https://arxiv.org/abs/2205.05198
-            '''
-            ## MLA
-            if transformer_cfg.q_lora_rank is None:
-                q_term = (
-                    transformer_cfg.hidden_size
-                    * transformer_cfg.num_attention_heads
-                    * (transformer_cfg.qk_head_dim + transformer_cfg.qk_pos_emb_head_dim)
-                )
-            else:
-                q_term = transformer_cfg.q_lora_rank * (
-                    transformer_cfg.hidden_size
-                    + transformer_cfg.num_attention_heads * (transformer_cfg.qk_head_dim + transformer_cfg.qk_pos_emb_head_dim)
-                    + 1
-                )
-            # Token-linear part of MLA self-attention (lora projs, kv proj, RoPE, output proj).
-            standard_self_attn_term = (
-                forward_backward_expansion_factor
-                * fma_expansion_factor
-                * (
-                    ## q lora + rope + q norm
-                    q_term
-                    ## kv lora + rope + kv norm
-                    + transformer_cfg.kv_lora_rank
-                    * (
-                        transformer_cfg.hidden_size
-                        + transformer_cfg.num_attention_heads * (transformer_cfg.qk_head_dim + transformer_cfg.v_head_dim)
-                        + 1
-                    )
-                    + transformer_cfg.hidden_size * transformer_cfg.qk_pos_emb_head_dim
-                    ## o proj
-                    + (transformer_cfg.num_attention_heads * transformer_cfg.v_head_dim) * transformer_cfg.hidden_size
-                )
+            standard_self_attn_term = forward_backward_expansion_factor * mla_layer_flops(
+                1, 0, transformer_cfg
             )
-            # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``. The
-            # ``/2`` accounts for the causal mask and the ``*2`` cancels it via FMA.
-            standard_self_attn_core_term = (
-                forward_backward_expansion_factor
-                * fma_expansion_factor
-                * (
-                    transformer_cfg.num_attention_heads
-                    * (transformer_cfg.qk_head_dim + transformer_cfg.qk_pos_emb_head_dim)
-                    / 2
-                    + transformer_cfg.num_attention_heads * transformer_cfg.v_head_dim / 2
-                )
+            standard_self_attn_core_term = forward_backward_expansion_factor * mla_layer_flops(
+                0, 1, transformer_cfg
             )
 
         else:
@@ -1491,6 +1468,176 @@ def num_floating_point_operations(
             )
         return total_floating_point_operations
 
+    def config_list_flops():
+        """Count each physical execution using the existing per-layer formulas."""
+        from numbers import Real
+
+        from megatron.core.models.hybrid import MTPSplit, PipelineSplit
+        from megatron.core.models.hybrid.layers import utils as layers
+
+        tokens, squared = total_real_tokens_in_batch, seqlen_squared_sum_in_batch
+        forward, expanded, mtp_depths, layer_number = 0, 0, 0, 0
+        for layer in layer_configs:
+            if layer is PipelineSplit:
+                continue
+            if layer is MTPSplit:
+                mtp_depths += 1
+                layer_number = 0
+                continue
+            layer_number += 1
+            implementation = layers.get_custom_layer_type(layer)
+            layer_type = type(layer)
+            if implementation is not None:
+                layer_flops = implementation.estimate_flops(
+                    layer, total_real_tokens_in_batch=tokens, seqlen_squared_sum_in_batch=squared
+                )
+                if (
+                    not isinstance(layer_flops, Real)
+                    or isinstance(layer_flops, bool)
+                    or not math.isfinite(layer_flops)
+                    or layer_flops < 0
+                ):
+                    raise ValueError(
+                        f"{implementation.__name__}.estimate_flops must return a finite, "
+                        f"nonnegative real number, got {layer_flops!r}."
+                    )
+                forward += layer_flops
+            elif layer_type is layers.AttentionLayerConfig:
+                forward += attn_layer_flops(
+                    tokens,
+                    squared,
+                    layer.hidden_size,
+                    layer.num_attention_heads,
+                    gqa_groups=layer.num_query_groups,
+                    kv_channels=layer.kv_channels,
+                )
+                if layer.attention_output_gate:
+                    forward += (
+                        2
+                        * tokens
+                        * layer.hidden_size
+                        * layer.kv_channels
+                        * layer.num_attention_heads
+                    )
+            elif layer_type is layers.MLALayerConfig:
+                forward += mla_layer_flops(tokens, squared, layer)
+            elif layer_type is layers.DSALayerConfig:
+                from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
+                    AbsorbedMLASelfAttention,
+                )
+                from megatron.core.transformer.experimental_attention_variant.dsa import (
+                    is_dsa_skip_topk_layer,
+                )
+                from megatron.training.logging.dsa_flops import _dsa_indexer_flops
+
+                attention = (
+                    hybrid_model.hybrid_stack_spec.submodules.dsa_layer.submodules.self_attention
+                )
+                forward += dsa_layer_flops(
+                    tokens,
+                    squared,
+                    layer.hidden_size,
+                    layer.num_attention_heads,
+                    layer.q_lora_rank,
+                    layer.kv_lora_rank,
+                    layer.qk_head_dim,
+                    layer.qk_pos_emb_head_dim,
+                    layer.v_head_dim,
+                    layer.dsa_indexer_topk,
+                    dsa_indexer_kpool=layer.dsa_indexer_kpool,
+                    dsa_indexer_kpool_always_select_tail=layer.dsa_indexer_kpool_always_select_tail,
+                    absorbed_mla=attention.module is AbsorbedMLASelfAttention,
+                )
+                token_linear, core = _dsa_indexer_flops(
+                    total_tokens=tokens,
+                    seqlen_squared_sum=squared,
+                    hidden_size=layer.hidden_size,
+                    q_lora_rank=layer.q_lora_rank,
+                    n_heads=layer.dsa_indexer_n_heads,
+                    head_dim=layer.dsa_indexer_head_dim,
+                    num_indexer_layers=int(
+                        not is_dsa_skip_topk_layer(
+                            layer_number,
+                            layer.dsa_indexer_skip_topk_offset,
+                            layer.dsa_indexer_topk_freq,
+                        )
+                    ),
+                    dsa_indexer_loss_enabled=(layer.dsa_indexer_loss_coeff or 0) > 0,
+                    dsa_indexer_use_sparse_loss=layer.dsa_indexer_use_sparse_loss,
+                    dsa_indexer_topk=layer.dsa_indexer_topk,
+                    dsa_indexer_kpool=layer.dsa_indexer_kpool,
+                )
+                expanded += tokens * token_linear + squared * core
+            elif layer_type is layers.CSALayerConfig:
+                if layer.compress_ratio not in (0, 4, 128):
+                    raise ValueError(f"Unsupported CSA compression ratio: {layer.compress_ratio}")
+                counts = {
+                    layers.Symbols.WINDOW: int(layer.compress_ratio == 0),
+                    layers.Symbols.CSA: int(layer.compress_ratio == 4),
+                    layers.Symbols.HCA: int(layer.compress_ratio == 128),
+                }
+                expanded += _dsv4_attention_flops(layer, counts, tokens, squared)
+            elif layer_type is layers.MambaLayerConfig:
+                from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
+
+                mixer = hybrid_model.hybrid_stack_spec.submodules.mamba_layer.submodules.mixer
+                if mixer.module is GatedDeltaProductMixer:
+                    forward += gated_delta_product_layer_flops(
+                        tokens,
+                        layer.hidden_size,
+                        layer.gdp_num_householder,
+                        layer.mamba_state_dim,
+                        layer.mamba_head_dim,
+                        layer.mamba_num_groups,
+                        layer.mamba_num_heads,
+                    )
+                else:
+                    forward += mamba_layer_flops(
+                        tokens,
+                        layer.hidden_size,
+                        layer.mamba_state_dim,
+                        layer.mamba_head_dim,
+                        layer.mamba_num_groups,
+                        layer.mamba_num_heads,
+                    )
+            elif layer_type is layers.GDNLayerConfig:
+                forward += gdn_layer_flops(
+                    tokens,
+                    layer.hidden_size,
+                    layer.linear_key_head_dim or 128,
+                    layer.linear_value_head_dim or 128,
+                    layer.linear_num_key_heads or 16,
+                    layer.linear_num_value_heads or 32,
+                    layer.linear_conv_kernel_dim or 4,
+                    use_gdn2=layer.experimental_attention_variant == "gdn2",
+                )
+            elif layer_type is layers.MLPLayerConfig:
+                forward += mlp_layer_flops(
+                    tokens,
+                    layer.hidden_size,
+                    layer.ffn_hidden_size / layer.hidden_size,
+                    layer.gated_linear_unit,
+                )
+            elif layer_type is layers.MoELayerConfig:
+                forward += moe_layer_flops(
+                    tokens,
+                    layer.hidden_size,
+                    layer.moe_ffn_hidden_size or layer.ffn_hidden_size,
+                    layer.moe_shared_expert_intermediate_size or 0,
+                    layer.moe_router_topk,
+                    layer.moe_latent_size,
+                    layer.gated_linear_unit,
+                )
+            else:
+                raise ValueError(
+                    f"No FLOP estimate is available for hybrid layer config {layer_type.__name__}."
+                )
+        # Count executions, including all repeated MTP depths and their output heads.
+        hidden_size = transformer_cfg.hidden_size
+        forward += 2 * tokens * mtp_depths * (3 * hidden_size + 2 * hidden_size**2)
+        forward += 2 * tokens * hidden_size * vocab_size * (1 + mtp_depths)
+        return 3 * forward + expanded
+
     def _uses_gated_delta_product_spec():
         """Return whether the hybrid stack uses GatedDeltaProductMixer.
 
@@ -1504,6 +1651,8 @@ def num_floating_point_operations(
         return getattr(mixer, "module", None) is GatedDeltaProductMixer
 
     # Main entrypoint for FLOPs calculation.
+    if layer_configs is not None:
+        return config_list_flops()
     if is_hybrid_model(model_config):
         # Calculate the number of each type of layer.
         from operator import itemgetter
@@ -3768,6 +3917,84 @@ def train_step(
     )
 
 
+def _hybrid_config_list_moe_logging_metadata(
+    hybrid_layer_config_list, mtp_use_repeated_layer: bool, moe_num_hash_layers: int
+):
+    """Derive config-list MoE metadata using the existing pattern logging conventions."""
+    from megatron.core.models.hybrid.hybrid_layer_allocation import (
+        PipelineSplit,
+        parse_hybrid_layer_config_list,
+    )
+    from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
+
+    parsed_config_list = parse_hybrid_layer_config_list(hybrid_layer_config_list)
+    main_configs = [
+        entry
+        for entry in parsed_config_list.main_layer_config_list
+        if entry is not PipelineSplit
+    ]
+    mtp_configs = parsed_config_list.mtp_layer_config_list or ()
+
+    # Routers reserve one logging slot per MTP depth, as on the pattern path.
+    num_layers = len(main_configs) + parsed_config_list.mtp_num_depths
+    main_moe_configs = [config for config in main_configs if type(config) is MoELayerConfig]
+    mtp_moe_configs = [config for config in mtp_configs if type(config) is MoELayerConfig]
+    mtp_repeats = (
+        1
+        if mtp_use_repeated_layer and parsed_config_list.mtp_num_depths > 0
+        else parsed_config_list.mtp_num_depths
+    )
+    num_moe_layers = len(main_moe_configs) + len(mtp_moe_configs) * mtp_repeats
+    num_hash_layers = min(len(main_moe_configs), max(moe_num_hash_layers, 0))
+    if num_moe_layers == 0:
+        return [], num_layers, 0, False, 0
+
+    routing_types = set()
+    moe_configs = [*main_moe_configs, *mtp_moe_configs]
+    for moe_config in moe_configs:
+        configured_types = moe_config.moe_router_load_balancing_type
+        routing_types.update([configured_types] if isinstance(configured_types, str) else configured_types)
+
+    metric_to_routing_type = {
+        "load_balancing_loss": "aux_loss",
+        "seq_load_balancing_loss": "seq_aux_loss",
+        "global_load_balancing_loss": "global_aux_loss",
+    }
+    track_names = [
+        metric_name
+        for metric_name, routing_type in metric_to_routing_type.items()
+        if routing_type in routing_types
+    ]
+    if any(config.moe_z_loss_coeff is not None for config in moe_configs):
+        track_names.append("z_loss")
+
+    return track_names, num_layers, num_moe_layers, True, num_hash_layers
+
+
+def _find_hybrid_model_for_runtime_metrics(model):
+    """Find a HybridModel through precision/DDP and language-model wrappers."""
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+
+    pending = [model]
+    visited = set()
+    while pending:
+        candidate = pending.pop()
+        if candidate is None or id(candidate) in visited:
+            continue
+        visited.add(id(candidate))
+        if isinstance(candidate, HybridModel):
+            return candidate
+        pending.extend(
+            nested
+            for nested in (
+                getattr(candidate, 'module', None),
+                getattr(candidate, 'language_model', None),
+            )
+            if nested is not None
+        )
+    return None
+
+
 def _get_indexer_logging_layer_counts(model_config) -> tuple[int, int | None]:
     """Return tracker slots and active CSA indexer modules for loss logging."""
     transformer_cfg = model_config.transformer
@@ -3815,8 +4042,16 @@ def training_log(
     packed_sequence_stats: Optional[Dict[str, float]] = None,
     num_microbatches: int | None = None,
     embedding_min_norm_metrics: Dict[str, float] | None = None,
+    moe_logging_metadata: tuple[list[str], int, int, bool, int] | None = None,
+    num_floating_point_operations_in_batch: float | None = None,
 ):
-    """Log training information such as losses, timing, ...."""
+    """Log training information such as losses, timing, ....
+
+    ``moe_logging_metadata`` contains metric names, tracker size, MoE layer count,
+    whether the model has MoE layers, and the main-stack hash-router count. If
+    omitted, use the model config metadata. Likewise, compute batch FLOPs
+    from the model config only if no count is supplied.
+    """
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     train_state = get_train_state()
@@ -3986,7 +4221,30 @@ def training_log(
         callback_manager.trigger("on_tensorboard_log")
     # Log MoE metrics.
     moe_log_string = ""
-    if cfg.model.transformer.num_moe_experts is not None:
+    has_moe_layers = (
+        moe_logging_metadata[3] if moe_logging_metadata is not None else cfg.model.transformer.num_moe_experts is not None
+    )
+
+    if moe_logging_metadata is not None and has_moe_layers:
+        moe_loss_scale = 1 / (num_microbatches or get_num_microbatches())
+        track_names, layers, num_moe_layers, _, num_hash_layers = moe_logging_metadata
+        moe_log_string = get_moe_metrics_tracker().report(
+            loss_scale=moe_loss_scale,
+            iteration=iteration,
+            writer=writer,
+            wandb_writer=wandb_writer,
+            per_layer_logging=cfg.model.transformer.moe_per_layer_logging,
+            force_initialize=True,
+            track_names=track_names,
+            num_layers=layers,
+            num_moe_layers=num_moe_layers,
+            moe_layer_freq=cfg.model.transformer.moe_layer_freq,
+            num_hash_layers=num_hash_layers,
+            pg_collection=pg_collection,
+            total_loss_dict=total_loss_dict,
+        )
+
+    if cfg.model.transformer.num_moe_experts is not None and moe_logging_metadata is None:
         moe_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         track_names = []
         if "aux_loss" in cfg.model.transformer.moe_router_load_balancing_type:
@@ -4107,13 +4365,17 @@ def training_log(
         elapsed_time_per_iteration = elapsed_time / total_iterations
         llm_world_size = cfg.get_model_world_size()
 
-        throughput = num_floating_point_operations(
-            cfg.model,
-            batch_size,
-            sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length,
-            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-            total_real_tokens_in_batch=total_real_tokens_in_batch,
-        ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
+        if num_floating_point_operations_in_batch is None:
+            num_floating_point_operations_in_batch = num_floating_point_operations(
+                cfg.model,
+                batch_size,
+                sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length,
+                seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+                total_real_tokens_in_batch=total_real_tokens_in_batch,
+            )
+        throughput = num_floating_point_operations_in_batch / (
+            elapsed_time_per_iteration * 10**12 * llm_world_size
+        )
 
         one_logger_utils.track_e2e_metrics(cfg.logger.log_throughput, throughput)
 
@@ -4192,7 +4454,7 @@ def training_log(
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 if should_reset:
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
-        if cfg.model.transformer.num_moe_experts is not None and moe_log_string:
+        if has_moe_layers and moe_log_string:
             log_string += moe_log_string
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
@@ -4865,6 +5127,23 @@ def train(
     cfg = get_run_config()
     timers = get_timers()
     train_state = get_train_state()
+    hybrid_model = _find_hybrid_model_for_runtime_metrics(model[0])
+    if hybrid_model is not None and hybrid_model.hybrid_layer_config_list is not None:
+        # Validate custom estimates before the first step through the same accounting path.
+        num_floating_point_operations(
+            cfg.model, 1, sequence_length=1,
+            total_real_tokens_in_batch=1, seqlen_squared_sum_in_batch=1,
+            hybrid_model=hybrid_model,
+        )
+    moe_logging_metadata = None
+    has_moe_layers = cfg.model.transformer.num_moe_experts is not None
+    if hybrid_model is not None and hybrid_model.hybrid_layer_config_list is not None:
+        moe_logging_metadata = _hybrid_config_list_moe_logging_metadata(
+            hybrid_model.hybrid_layer_config_list,
+            hybrid_model.config.mtp_use_repeated_layer,
+            hybrid_model.config.moe_num_hash_layers,
+        )
+        has_moe_layers = moe_logging_metadata[3]
 
     fault_injector_config = cfg.fault_tolerance.fault_injector
 
@@ -5506,6 +5785,7 @@ def train(
             sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
+            hybrid_model=hybrid_model,
         )
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
         train_state.num_floating_point_operations_so_far += num_floating_point_operations_in_batch
@@ -5586,6 +5866,8 @@ def train(
                     packed_sequence_stats=packed_sequence_stats,
                     num_microbatches=scheduled_num_microbatches,
                     embedding_min_norm_metrics=embedding_min_norm_metrics,
+                    moe_logging_metadata=moe_logging_metadata,
+                    num_floating_point_operations_in_batch=num_floating_point_operations_in_batch,
                 )
             # OTel: close the iteration-report super-span (parents params_norm + log;
             # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
@@ -5626,7 +5908,7 @@ def train(
             timers('interval-time', log_level=0).start(barrier=True)
             if cfg.logger.log_energy:
                 energy_monitor.resume()
-            if cfg.model.transformer.num_moe_experts is not None:
+            if has_moe_layers:
                 get_moe_metrics_tracker().clear()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
