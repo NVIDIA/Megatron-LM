@@ -146,6 +146,11 @@ def test_kda_cudnn_matches_fla(sequence_packing, pre_gdr_fusion):
         pytest.skip("The streamed pre-KDA fusion is unavailable.")
     Utils.initialize_model_parallel(1, 1)
     try:
+        # Seed before building the modules: their weights come from the CPU generator, and the
+        # gate-parameter gradients are only comparable on heads whose gate is not saturated.
+        torch.manual_seed(42)
+        batch = 1 if sequence_packing else 2
+        hidden_states = torch.randn((512, batch, 128), device="cuda", dtype=torch.bfloat16)
         model_parallel_cuda_manual_seed(123)
         config_kwargs = {"f_lora_rank": 8, "gate_lora_rank": 12}
         modules = {
@@ -161,11 +166,6 @@ def test_kda_cudnn_matches_fla(sequence_packing, pre_gdr_fusion):
         assert modules["fla"].gated_delta_rule is kda_module.chunk_kda
         assert modules["cudnn"].gated_delta_rule is chunk_kda_cudnn
 
-        torch.manual_seed(42)
-        batch = 1 if sequence_packing else 2
-        hidden_states = torch.randn(
-            (512, batch, modules["fla"].config.hidden_size), device="cuda", dtype=torch.bfloat16
-        )
         results = {}
         for backend, module in modules.items():
             module_input = hidden_states.clone().requires_grad_(True)
