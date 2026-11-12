@@ -59,18 +59,30 @@ _LR_SCHEDULER_STATE = "lr_scheduler.pt"
 
 def _isolate_compile_cache_per_rank() -> None:
     """Avoid torchinductor/triton cache races between local torchrun ranks."""
-    rank = os.environ.get("LOCAL_RANK") or os.environ.get("RANK")
+    # Ray assigns a unique global RANK to every actor, while LOCAL_RANK may be
+    # zero for all actors. Keep LOCAL_RANK only as a torchrun fallback.
+    rank = os.environ.get("RANK") or os.environ.get("LOCAL_RANK")
     if rank is None:
         return
-    for var in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR"):
+
+    cache_vars = ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR")
+    before = {var: os.environ.get(var) for var in cache_vars}
+    for var in cache_vars:
         base = os.environ.get(var)
         if not base:
             continue
+        # Preserve the per-run root before rewriting the public variable. This
+        # keeps repeated engine construction from appending rank_<N> twice.
         base_var = f"VERL_MLITE_BASE_{var}"
         root = os.environ.setdefault(base_var, base)
         rank_dir = os.path.join(root, f"rank_{rank}")
         os.makedirs(rank_dir, exist_ok=True)
         os.environ[var] = rank_dir
+
+    changes = ", ".join(
+        f"{var}: {before[var]!r} -> {os.environ.get(var)!r}" for var in cache_vars
+    )
+    print(f"[compile-cache] rank={rank} {changes}", flush=True)
 
 
 def _is_no_padding_pad_mode(pad_mode: Any) -> bool:
@@ -375,7 +387,16 @@ class MegatronLiteEngine(BaseEngine):
 
     def get_per_tensor_param(self, **kwargs):
         self._require_initialized()
-        if self.is_param_offload_enabled:
+        cpu_resident = bool(kwargs.pop("cpu_resident", False))
+        if cpu_resident and not self.is_param_offload_enabled:
+            raise RuntimeError("CPU-resident weight export requires parameter offload")
+        optimizer_backend = getattr(self.handle, "_extras", {}).get("optimizer_backend")
+        if cpu_resident and optimizer_backend != "fsdp2":
+            raise NotImplementedError(
+                f"CPU-resident weight export does not support the "
+                f"{optimizer_backend or 'unknown'} backend yet"
+            )
+        if self.is_param_offload_enabled and not cpu_resident:
             self.to("cuda", model=True, optimizer=False, grad=False)
         if not getattr(self, "_initial_sync_cache_cleared", False):
             aggressive_empty_cache(force_sync=True)
@@ -389,6 +410,10 @@ class MegatronLiteEngine(BaseEngine):
             buffer_max_size_bytes=2 * 1024**3,
             cpu=False,
         )
+        if cpu_resident:
+            export_kwargs["staging_device"] = torch.device(
+                get_device_name(), get_device_id()
+            )
         if self.engine_config.resync_format is not None:
             export_kwargs["target"] = self.engine_config.resync_format
             if self.engine_config.resync_config:

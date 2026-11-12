@@ -1359,6 +1359,7 @@ def export_hf_weights(
     rank0_only: bool = False,
     export_dtype: str | torch.dtype | None = None,
     cpu: bool = False,
+    staging_device: str | torch.device | None = None,
     buffer_max_size_bytes: int = DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Export model weights as HF-format (name, tensor) pairs.
@@ -1377,6 +1378,17 @@ def export_hf_weights(
 
     rank = dist.get_rank() if dist.is_initialized() else 0
     resolved_export_dtype = _resolve_export_dtype(export_dtype)
+    resolved_staging_device = (
+        torch.device(staging_device) if staging_device is not None else None
+    )
+
+    def _stage(tensor: torch.Tensor) -> torch.Tensor:
+        if resolved_staging_device is None or tensor.device == resolved_staging_device:
+            return tensor
+        with get_weight_sync_probe().measure(
+            "h2d", nbytes=_tensor_nbytes(tensor), device=resolved_staging_device
+        ):
+            return tensor.to(resolved_staging_device, non_blocking=True)
 
     def _iter_native_tensors():
         """Yield parameters plus persistent buffers present in the HF load plan."""
@@ -1393,7 +1405,9 @@ def export_hf_weights(
             )
             for name, param in base_chunk.named_parameters():
                 logical_name = canonical_state_key(name)
-                yield to_global_layer_name(logical_name, layer_map), param.data.detach()
+                yield to_global_layer_name(logical_name, layer_map), _stage(
+                    param.data.detach()
+                )
             persistent_buffers = [
                 (name, buffer)
                 for name, buffer in base_chunk.named_buffers()
@@ -1417,7 +1431,7 @@ def export_hf_weights(
                             f"{global_name!r} to {wmap[global_name]!r} for load "
                             f"but to {exported_names!r} for export"
                         )
-                    yield global_name, buffer.detach()
+                    yield global_name, _stage(buffer.detach())
 
     if ps.pp_size <= 1:
         exported_params = 0
