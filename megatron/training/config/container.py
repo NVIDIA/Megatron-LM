@@ -20,10 +20,6 @@ from megatron.core.distributed.torch_fully_sharded_data_parallel_config import (
     TorchFullyShardedDataParallelConfig,
 )
 from megatron.core.msc_utils import maybe_msc
-from megatron.core.num_microbatches_calculator import (
-    get_current_global_batch_size,
-    update_num_microbatches,
-)
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
@@ -853,6 +849,38 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.ddp.finalize()
 
 
+def _sample_schedule_calculator(train: TrainingConfig):
+    """Return the step-batch calculator used to count sample-based iterations.
+
+    finalize() calls this before the global calculator exists. The scheduled
+    global batch size does not depend on data-parallel size.
+    """
+    from megatron.core.num_microbatches_calculator import (
+        _GLOBAL_NUM_MICROBATCHES_CALCULATOR,
+        StepBatchsizeNumMicroBatchesCalculator,
+    )
+
+    if isinstance(_GLOBAL_NUM_MICROBATCHES_CALCULATOR, StepBatchsizeNumMicroBatchesCalculator):
+        return _GLOBAL_NUM_MICROBATCHES_CALCULATOR
+
+    # Same seq_length the runtime calculator receives. Absent args mean sample thresholds.
+    try:
+        from megatron.training.global_vars import get_args
+
+        seq_length = getattr(get_args(), "seq_length", None)
+    except AssertionError:
+        seq_length = None
+    return StepBatchsizeNumMicroBatchesCalculator(
+        micro_batch_size=train.micro_batch_size,
+        data_parallel_size=1,
+        decrease_batch_size_if_needed=train.decrease_batch_size_if_needed,
+        # Rank 0 logs the schedule. The global calculator does that at startup.
+        rank=-1,
+        schedule=train.step_batch_size_schedule,
+        seq_length=seq_length,
+    )
+
+
 def update_train_iters(train: TrainingConfig) -> None:
     """Resolve the sample-based training horizon on the supplied training config."""
     # Imported lazily: megatron.training.utils imports megatron.training.config.
@@ -864,14 +892,15 @@ def update_train_iters(train: TrainingConfig) -> None:
 
     if train.step_batch_size_schedule is not None:
         # Sample based training with step batch size schedule.
+        calculator = _sample_schedule_calculator(train)
         iterations = 0
         consumed_samples = 0
         while consumed_samples < train.train_samples:
-            update_num_microbatches(consumed_samples, consistency_check=False)
-            consumed_samples += get_current_global_batch_size()
+            calculator.update(consumed_samples, consistency_check=False)
+            consumed_samples += calculator.get_current_global_batch_size()
             iterations += 1
-        # Reset
-        update_num_microbatches(0, consistency_check=False)
+        # Reset the global calculator when this walk used it.
+        calculator.update(0, consistency_check=False)
         train.train_iters = iterations
     else:
         # Constant batch size with sample-based training.
