@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Convert authoritative MCore routes into MOK scheduler inputs."""
+"""Convert authoritative MCore routes into shared megakernel inputs."""
 
 from __future__ import annotations
 
@@ -102,9 +102,9 @@ class RoutingMapToIndices(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, probs, routing_map, topk):
-        """Compact authoritative dense routes into fixed-width MOK inputs."""
+        """Compact authoritative dense routes into fixed-width megakernel inputs."""
         if not HAVE_TRITON:
-            raise RuntimeError("routing_map_to_mok_inputs requires Triton")
+            raise RuntimeError("routing_map_to_indices requires Triton")
         if probs.ndim != 2 or routing_map.ndim != 2:
             raise ValueError("probs and routing_map must both be two-dimensional")
         if probs.shape != routing_map.shape:
@@ -167,10 +167,10 @@ class RoutingMapToIndices(torch.autograd.Function):
         return grad_probs, None, None
 
 
-def routing_map_to_mok_inputs(
+def routing_map_to_indices(
     probs: torch.Tensor, routing_map: torch.Tensor, topk: int
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compact an authoritative routing map into fixed-width MOK inputs.
+    """Compact an authoritative routing map into fixed-width megakernel inputs.
     Args:
         probs: Dense router probabilities with shape [num_tokens, num_experts].
         routing_map: Dense boolean/integer route map with the same shape as probs.

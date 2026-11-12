@@ -15,24 +15,10 @@ from megatron.core.extensions.transformer_engine import (
     _get_fp8_autocast_recipe_for_quant_params,
 )
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
+from megatron.core.transformer.moe.megakernel.route_adapter import routing_map_to_indices
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
-
-
-def routing_map_to_te_inputs(
-    probs: torch.Tensor, routing_map: torch.Tensor, topk: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Compact authoritative boolean routes, retaining zero-weight selected experts."""
-    if routing_map.dtype != torch.bool or routing_map.shape != probs.shape:
-        raise ValueError("TE MoE requires a boolean routing map with the same shape as probs")
-    num_experts = probs.shape[-1]
-    expert_indices = torch.arange(num_experts, device=routing_map.device, dtype=torch.int32)
-    candidates = expert_indices.expand_as(routing_map).masked_fill(~routing_map, num_experts)
-    indices = candidates.topk(topk, dim=-1, largest=False).values
-    valid = indices < num_experts
-    weights = probs.gather(-1, indices.clamp_max(num_experts - 1).long())
-    return weights.float().masked_fill(~valid, 0).contiguous(), indices.masked_fill(~valid, -1)
 
 
 class TEMegakernel(MegakernelBackend):
@@ -150,14 +136,13 @@ class TEMegakernel(MegakernelBackend):
             ),
         )
 
-    def _make_sequence(self, buffer):
+    def _make_megamoe_op(self, buffer):
         """Wrap native expert operations in dispatch/combine with internal metadata channels."""
         from transformer_engine.pytorch import ops
 
         experts, _ = self._native_experts
+        experts._grouped_linear_kwargs["split_alignment"] = self._ep_config.alignment
         fc1, activation, fc2 = experts._make_fused_ops()
-        fc1.split_alignment = self._ep_config.alignment
-        fc2.split_alignment = self._ep_config.alignment
         dispatch = ops.MoeDispatch(self._ep_config, buffer)
         combine = ops.MoeCombine(self._ep_config, buffer)
         dispatch.set_extra_output_channel(0, "tokens_per_expert", output_to_caller=False)
@@ -198,14 +183,14 @@ class TEMegakernel(MegakernelBackend):
             combine_bwd_quant_recipe=config.combine_bwd_quant_recipe,
         )
         if self._sequence is None:
-            self._sequence = (self._make_sequence(buffer),)
+            self._sequence = (self._make_megamoe_op(buffer),)
         (sequence,) = self._sequence
         sequence[0].buffer = buffer
         sequence[-1].buffer = buffer
         sequence.train(self.training)
-        weights, indices = routing_map_to_te_inputs(
-            probs.reshape(-1, self.config.num_moe_experts),
-            routing_map.reshape(-1, self.config.num_moe_experts),
+        weights, indices = routing_map_to_indices(
+            probs.reshape(-1, self.config.num_moe_experts).contiguous(),
+            routing_map.reshape(-1, self.config.num_moe_experts).contiguous(),
             config.top_k,
         )
         experts, shared_experts = self._native_experts
