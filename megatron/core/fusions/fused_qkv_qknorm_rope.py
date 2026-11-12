@@ -10,9 +10,9 @@ q [sq, b, ng * nq, hn], k [sq, b, ng, hn] and v [sq, b, ng, hn].
 Numerics follow the unfused TE path: the norm runs in fp32 and is rounded to the activation
 dtype (TE RMSNorm output), then RoPE runs in fp32 on the rounded value (TE fused RoPE). The
 backward mirrors it: RoPE dgrad rounded to the activation dtype, then RMSNorm dgrad in fp32 from
-the saved input with rsigma recomputed. dgamma is reduced per program into an fp32 buffer and
-summed once, so it is deterministic. Q/K/V dgrads are written straight into one
-[sq, b, ng, (nq + 2) * hn] tensor: no concat.
+the saved input with rsigma recomputed. dgamma is reduced per program into one fp32 row of a
+buffer, then a second kernel sums the rows in a fixed order, so it is deterministic. Q/K/V dgrads
+are written straight into one [sq, b, ng, (nq + 2) * hn] tensor: no concat.
 """
 
 from typing import Optional, Tuple
@@ -63,6 +63,8 @@ def _rsqrt(x):
 # BWD_WARPS None: 1 warp up to 8 query heads per group, else 2.
 FWD_TOKENS, FWD_WARPS = 1, 1
 BWD_TOKENS, BWD_WARPS = 16, None
+# Norm-weight grad reduction: rows of partials and grad columns per program, and warps.
+RED_ROWS, RED_COLS, RED_WARPS = 4096, 2, 8
 
 
 @triton.jit
@@ -159,8 +161,7 @@ def _qkv_qknorm_rope_bwd_kernel(
     dk_ptr,
     dv_ptr,
     dqkv_ptr,
-    dqw_part_ptr,
-    dkw_part_ptr,
+    dw_part_ptr,
     T,
     B,
     stride_qkv_s,
@@ -260,11 +261,30 @@ def _qkv_qknorm_rope_bwd_kernel(
             tl.store(dbase + (NQ + 1) * HN + d, tl.load(gv + d))
             tl.store(dbase + (NQ + 1) * HN + HALF + d, tl.load(gv + HALF + d))
 
-    part = (pid_t * NG + g) * HN
-    tl.store(dqw_part_ptr + part + d, dqw1)
-    tl.store(dqw_part_ptr + part + HALF + d, dqw2)
-    tl.store(dkw_part_ptr + part + d, dkw1)
-    tl.store(dkw_part_ptr + part + HALF + d, dkw2)
+    # One contiguous [2 * HN] row of partials per program: q weight grad, then k.
+    part = dw_part_ptr + (pid_t * NG + g) * (2 * HN)
+    tl.store(part + d, dqw1)
+    tl.store(part + HALF + d, dqw2)
+    tl.store(part + HN + d, dkw1)
+    tl.store(part + HN + HALF + d, dkw2)
+
+
+@triton.jit
+def _norm_weight_grad_reduce_kernel(
+    dw_part_ptr, dw_ptr, P, W: tl.constexpr, ROWS: tl.constexpr, COLS: tl.constexpr
+):
+    """dw[c] = sum over the P rows of column c of the [P, W] fp32 partials, in a fixed order."""
+    cols = tl.program_id(0) * COLS + tl.arange(0, COLS)
+    rows = tl.arange(0, ROWS)
+    acc = tl.zeros([ROWS, COLS], dtype=tl.float32)
+    for p0 in range(0, P, ROWS):
+        r = p0 + rows
+        acc += tl.load(
+            dw_part_ptr + r[:, None].to(tl.int64) * W + cols[None, :],
+            mask=(r < P)[:, None] & (cols < W)[None, :],
+            other=0.0,
+        )
+    tl.store(dw_ptr + cols, tl.sum(acc, axis=0).to(dw_ptr.dtype.element_ty), mask=cols < W)
 
 
 def _freqs_2d(freqs: torch.Tensor, sq: int, hn: int) -> torch.Tensor:
@@ -337,8 +357,8 @@ class _FusedQKVQKNormRoPE(torch.autograd.Function):
         T = sq * b
         n_t = triton.cdiv(T, BWD_TOKENS)
         dqkv = mixed_qkv.new_empty(sq, b, ng, row)
-        dqw_part = torch.empty(n_t * ng, hn, device=mixed_qkv.device, dtype=torch.float32)
-        dkw_part = torch.empty_like(dqw_part)
+        P = n_t * ng
+        dw_part = torch.empty(P, 2 * hn, device=mixed_qkv.device, dtype=torch.float32)
         _qkv_qknorm_rope_bwd_kernel[(n_t, ng)](
             mixed_qkv,
             qf,
@@ -349,8 +369,7 @@ class _FusedQKVQKNormRoPE(torch.autograd.Function):
             dk.contiguous(),
             dv.contiguous(),
             dqkv,
-            dqw_part,
-            dkw_part,
+            dw_part,
             T,
             b,
             mixed_qkv.stride(0),
@@ -369,8 +388,18 @@ class _FusedQKVQKNormRoPE(torch.autograd.Function):
             num_warps=BWD_WARPS or (1 if nq <= 8 else 2),
             enable_fp_fusion=True,
         )
-        dqw = dqw_part.sum(0).to(q_weight.dtype)
-        dkw = dkw_part.sum(0).to(k_weight.dtype)
+        dw = torch.empty(2, hn, device=mixed_qkv.device, dtype=q_weight.dtype)
+        _norm_weight_grad_reduce_kernel[(triton.cdiv(2 * hn, RED_COLS),)](
+            dw_part,
+            dw,
+            P,
+            W=2 * hn,
+            ROWS=RED_ROWS,
+            COLS=RED_COLS,
+            num_warps=RED_WARPS,
+            enable_fp_fusion=True,
+        )
+        dqw, dkw = dw[0], dw[1].to(k_weight.dtype)
         return dqkv, None, None, dqw, dkw, None, None, None
 
 
