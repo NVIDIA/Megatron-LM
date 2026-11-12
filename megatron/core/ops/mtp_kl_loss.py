@@ -64,6 +64,7 @@ def vocab_parallel_log_normalizer(
 class _VocabParallelKL(torch.autograd.Function):
     @staticmethod
     def forward(ctx, student, teacher, teacher_norm, temperature, tp_group, loss_scale):
+        """Compute scaled teacher-to-student KL loss across vocabulary shards."""
         student_norm = vocab_parallel_log_normalizer(student, temperature, tp_group)
         loss = _local_kl(student, teacher, student_norm, teacher_norm, 1.0 / temperature)
         if tp_group is not None and tp_group.size() > 1:
@@ -76,6 +77,7 @@ class _VocabParallelKL(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        """Return the scaled KL gradient for student logits only."""
         student, teacher, student_norm, teacher_norm = ctx.saved_tensors
         grad = _kl_grad(
             student,
