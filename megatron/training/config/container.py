@@ -842,12 +842,6 @@ class PretrainConfigContainer(ConfigContainerBase):
             self.checkpoint.load_optim = False
         dataset = self.data.dataset
         transformer = self.model.transformer
-        if transformer.max_seq_length_per_sample is None and dataset is not None:
-            transformer.max_seq_length_per_sample = dataset.sequence_length
-        if dataset is not None:
-            dataset_type = resolve_dataset_class(dataset, self.data.dataset_type)
-            if dataset_family_from_type(dataset_type)[0] == "sft":
-                dataset.packed_sequence_length = transformer.max_seq_length_per_sample
         data_parallel_size = None
         if dataset is not None:
             # The world size is known here: data_parallel_size gets the agreement check the other
@@ -868,7 +862,11 @@ class PretrainConfigContainer(ConfigContainerBase):
                 total_cp_ranks = transformer.context_parallel_size * (
                     data_parallel_size if scheduler == "default_dynamic_cp" else 1
                 )
-                input_length = dataset.packed_sequence_length or dataset.sequence_length
+                input_length = (
+                    transformer.max_seq_length_per_sample or dataset.sequence_length
+                    if self.data.is_sft()
+                    else dataset.sequence_length
+                )
                 if total_cp_ranks * budget < input_length:
                     raise ValueError(
                         f"The packed-sequence buffer ({total_cp_ranks} ranks * "
@@ -986,6 +984,10 @@ class PretrainConfigContainer(ConfigContainerBase):
         if dataset is not None:
             # Fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
             # from the validation config, the layout from the required model config.
+            if transformer.max_seq_length_per_sample is None:
+                transformer.max_seq_length_per_sample = dataset.sequence_length
+            if self.data.is_sft():
+                dataset.packed_sequence_length = transformer.max_seq_length_per_sample
             dataset.full_validation = self.validation.full_validation
             dataset.multiple_validation_sets = self.validation.multiple_validation_sets
             dataset.data_parallel_size = data_parallel_size

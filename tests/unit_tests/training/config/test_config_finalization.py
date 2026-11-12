@@ -84,8 +84,7 @@ def test_t5_input_widths_do_not_follow_position_capacity():
 
 
 @pytest.mark.parametrize(
-    "bound,capacity,error",
-    [(33, 64, "alignment"), (64, 32, "position capacity"), (32, 64, None)],
+    "bound,capacity,error", [(33, 64, "alignment"), (64, 32, "position capacity"), (32, 64, None)]
 )
 def test_sft_pack_validates_physical_shape(run_config, bound, capacity, error):
     cfg = run_config
