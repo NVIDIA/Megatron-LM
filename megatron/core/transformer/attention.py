@@ -41,6 +41,7 @@ from megatron.core.typed_torch import apply_module, copy_signature, not_none
 from megatron.core.utils import (
     deprecate_inference_params,
     divide,
+    ensure_params_ready,
     get_pg_rank,
     get_pg_size,
     is_fa_min_version,
@@ -1683,6 +1684,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         max_seqlen=rope_freqs_max_seqlen,
                     )
             elif self._has_qk_norm():
+                # The norm modules are not called, so their param pre-hooks don't run: publish
+                # their weights here (e.g. DDP overlap_param_gather) before the kernel reads them.
+                ensure_params_ready((self.q_layernorm.weight, self.k_layernorm.weight))
                 query, key, value = fused_qkv_qknorm_rope(
                     mixed_qkv,
                     q_pos_emb,

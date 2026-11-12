@@ -108,6 +108,7 @@ def test_self_attention_qk_layernorm_fused_matches_unfused():
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
     from megatron.core.transformer.spec_utils import build_module
     from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.core.utils import PARAM_READY_CALLBACK_ATTR
     from tests.unit_tests.test_utilities import Utils
 
     Utils.initialize_model_parallel(1, 1)
@@ -136,6 +137,11 @@ def test_self_attention_qk_layernorm_fused_matches_unfused():
         emb = RotaryEmbedding(kv_channels=64, rotary_percent=1.0, rotary_base=1e6).cuda()(sq)
         x = torch.randn(sq, b, 512, device="cuda", dtype=torch.bfloat16)
         gout = torch.randn_like(x)
+        # Stand-ins for a sharding backend's publication callbacks (e.g. DDP overlap_param_gather).
+        published = []
+        norm_weights = {"q": attn.q_layernorm.weight, "k": attn.k_layernorm.weight}
+        for name, w in norm_weights.items():
+            setattr(w, PARAM_READY_CALLBACK_ATTR, lambda name=name: published.append(name))
         res = []
         for flag in (False, True):
             cfg.fused_single_qkv_rope = flag
@@ -146,5 +152,9 @@ def test_self_attention_qk_layernorm_fused_matches_unfused():
             res.append((out, xi.grad, attn.q_layernorm.weight.grad, attn.k_layernorm.weight.grad))
         for a, r in zip(res[1], res[0]):
             torch.testing.assert_close(a.float(), r.float(), atol=2e-2, rtol=2e-2)
+        # The fused pass skips the norm modules' pre-hooks, so it must publish both weights itself.
+        assert published == ["q", "k"]
+        for w in norm_weights.values():
+            delattr(w, PARAM_READY_CALLBACK_ATTR)
     finally:
         Utils.destroy_model_parallel()
