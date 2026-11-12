@@ -59,9 +59,6 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module_utils import (
         copy_parameter_attributes,
     )
-    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.owner_planning import (
-        newton_schulz_cost,
-    )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
         sync_model_weights_from_main_weights,
     )
@@ -575,7 +572,10 @@ def _plan_tensor_owners(module: nn.Module, dp_size: int) -> Dict[nn.Parameter, i
         is_muon_matrix = parameter.ndim == 2 and not getattr(
             parameter, "is_embedding_or_output_parameter", False
         )
-        cost = newton_schulz_cost(parameter.shape) if is_muon_matrix else parameter.numel()
+        cost = parameter.numel()
+        if is_muon_matrix:
+            # Newton-Schulz work, as in assign_owner_work.
+            cost *= min(parameter.shape) * 5 + 1
         work.append((-cost, index, parameter))
     load = [0.0] * dp_size
     owners: Dict[nn.Parameter, int] = {}

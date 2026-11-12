@@ -9,7 +9,6 @@ Owner assignments use global process ranks.
 import dataclasses
 from collections.abc import Iterable
 
-import torch
 import torch.distributed as dist
 
 from .dbuffer import DBuffer
@@ -34,12 +33,6 @@ class _OwnerWork:
     tensor_index: int
     cost: float
     candidates: list[int]
-
-
-def newton_schulz_cost(shape: torch.Size) -> int:
-    """Relative work of a tensor's Newton-Schulz; see `assign_owner_work`."""
-    short_dim = min(shape[0], non_leading_numel(shape))
-    return shape.numel() * (short_dim * 5 + 1)
 
 
 def assign_owner_work(buffers: Iterable[DBuffer]) -> list[dict[int, int]]:
@@ -102,7 +95,8 @@ def assign_owner_work(buffers: Iterable[DBuffer]) -> list[dict[int, int]]:
                 for rank in ranks_in_buffer_order
                 if intersect_ranges(tensor_range, rank_ranges[rank]).numel > 0
             ]
-            cost = newton_schulz_cost(shape)
+            short_dim = min(shape[0], non_leading_numel(shape))
+            cost = shape.numel() * (short_dim * 5 + 1)
             work_items.append(_OwnerWork(buffer_key, tensor_index, cost, candidates))
 
     gathered: list[list[_OwnerWork]] = [[] for _ in range(dist.get_world_size())]
