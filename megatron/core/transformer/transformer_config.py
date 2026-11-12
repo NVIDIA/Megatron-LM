@@ -642,6 +642,9 @@ class TransformerConfig(ModelParallelConfig):
     there is no automatic fallback. ``torch`` selects the PyTorch-native reference
     implementation and is required when deterministic mode is enabled."""
 
+    kda_backend: Literal["fla", "cudnn"] = "fla"
+    """Recurrence backend for Kimi Delta Attention."""
+
     linear_conv_kernel_dim: Optional[int] = 4
     """Conv kernel dimension for the gated delta net."""
 
@@ -3003,6 +3006,23 @@ class TransformerConfig(ModelParallelConfig):
             ), "linear_num_value_heads must be set for a GDN-family layer."
 
             if self.experimental_attention_variant == "kda":
+                if self.kda_backend not in ("fla", "cudnn"):
+                    raise ValueError(
+                        f"kda_backend must be 'fla' or 'cudnn', got {self.kda_backend!r}."
+                    )
+                if (
+                    self.kda_backend == "cudnn"
+                    and has_context_parallelism
+                    and self.linear_cp_mode != "chunkwise"
+                ):
+                    raise ValueError(
+                        "cuDNN KDA context parallelism requires linear_cp_mode='chunkwise'."
+                    )
+                if self.kda_backend == "cudnn" and self.linear_key_head_dim not in (64, 128):
+                    raise ValueError(
+                        "cuDNN KDA requires equal key/value head dimensions of 64 or 128, "
+                        f"got {self.linear_key_head_dim}."
+                    )
                 if self.linear_num_key_heads != self.linear_num_value_heads:
                     raise ValueError("KDA requires equal key and value head counts.")
                 if self.linear_key_head_dim != self.linear_value_head_dim:

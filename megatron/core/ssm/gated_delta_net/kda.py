@@ -15,6 +15,7 @@ from megatron.core.context_parallel_layout import convert_module_input_tensors_c
 from megatron.core.fp8_utils import get_fp8_align_size, get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
+from megatron.core.ops.ssm.kda.backends import select_kda_recurrence
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_net.common import (
@@ -40,12 +41,11 @@ from megatron.core.utils import deprecate_inference_params, nvtx_range_pop, nvtx
 
 try:
     from fla.modules.fused_norm_gate import rms_norm_gated
-    from fla.ops.kda import chunk_kda
 
-    # KDA also relies on the shared FLA convolution, normalization, and CP helpers.
+    # The recurrence backend is imported only after config selection. Importing
+    # FLA's KDA backend here would load TileLang/TVM even when cuDNN is selected.
     HAVE_FLA_KDA = HAVE_FLA
 except ImportError:  # pragma: no cover
-    chunk_kda = None
     HAVE_FLA_KDA = False
 
 try:
@@ -104,7 +104,8 @@ class KimiDeltaAttention(_GDNBase):
             config.validate_kda()
         if not HAVE_FLA or not HAVE_FLA_KDA:  # pragma: no cover
             raise ImportError(
-                "FLA KDA is not installed. Install flash-linear-attention with KDA support."
+                "KDA preprocessing requires the Flash Linear Attention convolution and "
+                "normalization helpers. Install flash-linear-attention with KDA support."
             )
         if config.gdn_pre_gated_delta_rule_fusion and fused_streamed_pre_kda is None:
             raise ImportError(
@@ -342,7 +343,7 @@ class KimiDeltaAttention(_GDNBase):
         self.dt_bias_dim = self.qk_dim_local_tp
         self.a_log_dim = self.num_k_heads_local_tp
         self.gate_params_dtype = torch.float32
-        self.gated_delta_rule = chunk_kda
+        self.gated_delta_rule = select_kda_recurrence(self.config.kda_backend)
 
     def _get_in_proj_qkv_layout(self) -> QKVLayout:
         """Describe KDA's rank-major packed input projection for Muon splitting."""

@@ -2,6 +2,7 @@
 
 import os
 from dataclasses import fields
+from importlib.util import find_spec
 
 import pytest
 import torch
@@ -33,6 +34,7 @@ os.environ.update({"NCCL_NVLS_ENABLE": "0"})
 
 _KDA_INPUT_GRAD_ATOL = 3.2e-2
 _KDA_INPUT_GRAD_RELATIVE_L2 = 5e-3
+_HAVE_CUDNN = find_spec("cudnn") is not None
 
 
 def _make_config(
@@ -122,6 +124,119 @@ def test_kda_config_rejects_deterministic_chunkwise_cp():
             linear_cp_layout="contiguous",
             deterministic_mode=True,
         )
+
+
+def test_kda_config_rejects_unknown_backend():
+    with pytest.raises(ValueError, match="kda_backend must be"):
+        _make_config(kda_backend="unknown")
+
+
+def test_kda_config_requires_chunkwise_cp_for_cudnn():
+    with pytest.raises(ValueError, match="requires linear_cp_mode='chunkwise'"):
+        _make_config(cp_size=2, kda_backend="cudnn", linear_cp_mode="headwise")
+
+    config = _make_config(
+        cp_size=2,
+        kda_backend="cudnn",
+        linear_cp_mode="chunkwise",
+        linear_cp_layout="contiguous",
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+    )
+    assert config.kda_backend == "cudnn"
+
+    defaulted = _make_config(
+        cp_size=2,
+        kda_backend="cudnn",
+        linear_cp_mode=None,
+        linear_cp_layout="contiguous",
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+    )
+    assert defaulted.linear_cp_mode == "chunkwise"
+
+
+def test_transformer_config_exposes_kda_backend_to_hybrid_layers():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        experimental_attention_variant="kda",
+        is_hybrid_model=True,
+        kda_backend="cudnn",
+        linear_num_key_heads=4,
+        linear_num_value_heads=4,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+    )
+
+    layer_config = create_layer_config(config, Symbols.KDA)
+
+    assert config.kda_backend == "cudnn"
+    assert layer_config.kda_backend == "cudnn"
+
+
+@pytest.mark.parametrize("head_dim", [32, 256])
+def test_kda_config_rejects_unsupported_cudnn_head_dimension(head_dim):
+    with pytest.raises(ValueError, match="head dimensions of 64 or 128"):
+        _make_config(
+            kda_backend="cudnn", linear_key_head_dim=head_dim, linear_value_head_dim=head_dim
+        )
+
+
+@pytest.mark.internal
+@pytest.mark.skipif(
+    not _HAVE_CUDNN or not HAVE_FLA_KDA,
+    reason="The full cuDNN KDA layer requires cuDNN and the shared FLA preprocessing helpers.",
+)
+@pytest.mark.parametrize(
+    "cp_size",
+    [1, pytest.param(4, marks=pytest.mark.skipif(Utils.world_size < 4, reason="Requires 4 GPUs"))],
+)
+def test_kda_cudnn_packed_forward_backward(cp_size):
+    """Exercise the selected cuDNN backend through Megatron's packed KDA layer."""
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=cp_size
+    )
+    try:
+        config = _make_config(
+            cp_size=cp_size,
+            linear_cp_mode="chunkwise",
+            linear_cp_layout="contiguous",
+            kda_backend="cudnn",
+            linear_key_head_dim=128,
+            linear_value_head_dim=128,
+        )
+        model_parallel_cuda_manual_seed(2026)
+        layer = _build_kda(config)
+        assert layer.gated_delta_rule.__module__.endswith("cudnn_backend")
+
+        total_tokens = 1024
+        torch.manual_seed(2026)
+        hidden_global = torch.randn(
+            (total_tokens, 1, config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        packed_seq_params = make_test_packed_seq_params(cu_seqlens=[0, 256, 512, 768, total_tokens])
+        if cp_size > 1:
+            cp_group = parallel_state.get_context_parallel_group()
+            cp_rank = torch.distributed.get_rank(group=cp_group)
+            hidden_states = hidden_global.chunk(cp_size, dim=0)[cp_rank].contiguous()
+        else:
+            hidden_states = hidden_global
+        hidden_states = hidden_states.detach().requires_grad_(True)
+
+        output, bias = layer(hidden_states, None, packed_seq_params=packed_seq_params)
+        assert bias is None
+        output.float().square().mean().backward()
+        assert torch.isfinite(output).all()
+        assert hidden_states.grad is not None and torch.isfinite(hidden_states.grad).all()
+        for name, parameter in layer.named_parameters():
+            assert parameter.grad is not None, name
+            assert torch.isfinite(parameter.grad).all(), name
+    finally:
+        Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize("alignment", [0, -4])
@@ -457,11 +572,19 @@ def test_kda_cp2_packed_with_physical_padding_matches_cp1(two_stage_gates):
 def test_kda_layer_config_preserves_settings(explicit_settings):
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
     expected = dict(
-        kda_disable_fp8=False, kda_safe_gate=False, kda_lower_bound=None, kda_two_stage_gates=False
+        kda_backend="fla",
+        kda_disable_fp8=False,
+        kda_safe_gate=False,
+        kda_lower_bound=None,
+        kda_two_stage_gates=False,
     )
     if explicit_settings:
         expected.update(
-            kda_disable_fp8=True, kda_safe_gate=True, kda_lower_bound=-5.0, kda_two_stage_gates=True
+            kda_backend="cudnn",
+            kda_disable_fp8=True,
+            kda_safe_gate=True,
+            kda_lower_bound=-5.0,
+            kda_two_stage_gates=True,
         )
         # Model providers may attach per-layer settings to the stack config.
         for name, value in expected.items():
@@ -471,10 +594,9 @@ def test_kda_layer_config_preserves_settings(explicit_settings):
 
     assert type(layer_config) is KDALayerConfig
     assert layer_config is not config
-    # dev keeps kda_safe_gate/kda_lower_bound on TransformerConfig for the
-    # --kda-safe-gate/--kda-lower-bound CLI flags (#6556); the other KDA-only
-    # settings must stay off the stack config.
-    dev_stack_fields = {"kda_safe_gate", "kda_lower_bound"}
+    # Backend selection and the CLI gate settings live on TransformerConfig; the remaining
+    # KDA-only settings must stay off the stack config.
+    dev_stack_fields = {"kda_backend", "kda_safe_gate", "kda_lower_bound"}
     transformer_fields = {field.name for field in fields(TransformerConfig)}
     assert dev_stack_fields <= transformer_fields
     assert (set(expected) - dev_stack_fields).isdisjoint(transformer_fields)
