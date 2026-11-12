@@ -11,15 +11,20 @@ from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exac
 
 @pytest.mark.parametrize("dim", [512, 576])
 @pytest.mark.parametrize("topk", [64, 65])
-def test_absorbed_shape_forward_replays(dim, topk):
-    """NoPE and top-k padding retain bit-exact forward replay under stream contention."""
+@pytest.mark.parametrize("heads", [8, 96])
+def test_absorbed_shape_forward_replays(dim, topk, heads):
+    """NoPE, top-k and head padding retain bit-exact forward replay under stream contention.
+
+    ``heads=8`` is padded up to the 16-head minimum tile by the wrapper; ``heads=96`` is not a
+    power of two and runs natively, with the kernel masking its partial final head block.
+    """
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
     pytest.importorskip("tilelang")
     if tilelang_dsa.SparseMLA is None:
         pytest.skip("TileLang SparseMLA is unavailable")
     torch.manual_seed(23)
-    query = torch.randn(256, 1, 8, dim, device="cuda", dtype=torch.bfloat16)
+    query = torch.randn(256, 1, heads, dim, device="cuda", dtype=torch.bfloat16)
     key = torch.randn(256, 1, 1, dim, device="cuda", dtype=torch.bfloat16)
     indices = torch.arange(256, device="cuda")[:, None] - torch.arange(topk, device="cuda")
     indices = indices.clamp_min(-1).unsqueeze(0).to(torch.int32)

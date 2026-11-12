@@ -1156,7 +1156,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/experimental_attention_variant/ops/tilelang_dsa.py",),
         tests=(K + "test_dsa_tilelang_shapes.py",),
         kind="dispatch",
-        notes="SparseMLA forward replay with NoPE channel padding and invalid top-k slot padding. "
+        notes="SparseMLA forward replay with NoPE channel padding, invalid top-k slot padding and "
+        "both head-count paths (pad-to-16, and a non-power-of-two count whose partial final head "
+        "block is masked). "
         "Backward atomic accumulation remains covered by the DSA family exemption below; "
         "output and gradient parity are checked in test_dsa_tilelang_shapes under transformer/.",
     ),

@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
 from types import SimpleNamespace
@@ -444,13 +444,16 @@ def test_tilelang_kernel_helper_caches_and_env_parsing(monkeypatch):
     assert tilelang_dsa._is_supported_sparse_mla_head_count(64)
     assert tilelang_dsa._is_supported_sparse_mla_head_count(128)
     assert tilelang_dsa._is_supported_sparse_mla_head_count(256, kv_group=2)
-    assert not tilelang_dsa._is_supported_sparse_mla_head_count(96)
+    # Non-power-of-two head_kv >= 16 is natively supported for a single KV group (absorbed MLA):
+    # the kernels tile the head dimension and mask the partial final block, so they read/write
+    # exactly head_kv real heads (e.g. Kimi-K3.1's 96).
+    assert tilelang_dsa._is_supported_sparse_mla_head_count(96)
+    assert tilelang_dsa._is_supported_sparse_mla_head_count(48)
+    assert tilelang_dsa._is_supported_sparse_mla_head_count(192)
+    # Still declined: invalid kv_group, head_kv < 16, and non-power-of-two head_kv with more than
+    # one KV group (the partial-block head masking assumes a single group, g_i == 0).
     assert not tilelang_dsa._is_supported_sparse_mla_head_count(96, kv_group=0)
-    # head_kv that is not a power of two >= 16 pads to a larger head dim in the kernels and
-    # would index past the real head count, so it must decline to the unfused path.
     assert not tilelang_dsa._is_supported_sparse_mla_head_count(8)
-    assert not tilelang_dsa._is_supported_sparse_mla_head_count(48)
-    assert not tilelang_dsa._is_supported_sparse_mla_head_count(192)
     assert not tilelang_dsa._is_supported_sparse_mla_head_count(96, kv_group=2)
 
 

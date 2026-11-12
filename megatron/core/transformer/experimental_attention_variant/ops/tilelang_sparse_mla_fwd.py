@@ -120,12 +120,21 @@ def sparse_mla_fwd(  # pragma: no cover
     D_tail = tail_dim
 
     if head_kv > 64:
-        assert head_kv % 64 == 0, "head_kv should be a multiple of 64"
-        REPLICATE_H = head_kv // 64
+        # Ceil-divide so a head_kv that is not a multiple of 64 (e.g. 96 = 64 + 32) is covered by
+        # an extra, partially filled head block whose out-of-range rows are masked off below. For
+        # a multiple of 64 this equals head_kv // 64, so power-of-two head counts are unchanged.
+        REPLICATE_H = tilelang.cdiv(head_kv, 64)
     else:
         REPLICATE_H = 1
 
     H_per_block = padded_H if REPLICATE_H == 1 else 64
+    # Each head block spans H_per_block rows of shared-memory tiles (kept a power of two for the
+    # GEMM tiling), but the global Q/Output/Lse tensors only hold ``head_kv`` real heads. When
+    # head_kv is not a whole number of H_per_block-sized blocks, the final block is partial and
+    # its global head reads/writes must be masked so they never touch head index >= head_kv.
+    # For power-of-two head_kv (and a multiple of 64 when head_kv > 64) every block is full, so
+    # this stays False and the original unmasked T.copy path is taken bit-for-bit.
+    needs_head_mask = head_kv % H_per_block != 0
 
     @T.prim_func
     def main(
@@ -165,8 +174,23 @@ def sparse_mla_fwd(  # pragma: no cover
             H0 = g_i * padded_H + (0 if REPLICATE_H == 1 else (bx % REPLICATE_H) * 64)
             H1 = H0 + H_per_block
 
-            T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
-            T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
+            if not needs_head_mask:
+                T.copy(Q[b_i, s_i, H0:H1, :D], Q_shared)
+                T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
+            else:
+                # Partial final head block: load only real heads (global index < head_kv) and
+                # zero-fill the padded rows. The clamped index keeps the global read in bounds for
+                # the padded rows; their zeroed scores are isolated per head and never written out.
+                for h_i, d_i in T.Parallel(H_per_block, D):
+                    g_h = H0 + h_i
+                    Q_shared[h_i, d_i] = T.if_then_else(
+                        g_h < head_kv, Q[b_i, s_i, T.min(g_h, head_kv - 1), d_i], 0
+                    )
+                for h_i, d_i in T.Parallel(H_per_block, D_tail):
+                    g_h = H0 + h_i
+                    Q_tail_shared[h_i, d_i] = T.if_then_else(
+                        g_h < head_kv, Q[b_i, s_i, T.min(g_h, head_kv - 1), D + d_i], 0
+                    )
 
             for i_i in T.Pipelined(NI, num_stages=num_stages):
                 for bi_i in T.Parallel(BI):
@@ -221,8 +245,23 @@ def sparse_mla_fwd(  # pragma: no cover
                     sumexp[h_i] > 0, T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale, 0
                 )
 
-            T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
-            T.copy(sumexp, Lse[b_i, s_i, H0:H1])
+            if not needs_head_mask:
+                T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
+                T.copy(sumexp, Lse[b_i, s_i, H0:H1])
+            else:
+                # Partial final head block: stage through shared memory (same fp32 -> bf16 cast as
+                # the T.copy above) and write back only the real heads (global index < head_kv).
+                # Padded rows hold discardable garbage and must not touch out-of-range memory.
+                T.copy(acc_o, O_shared)
+                T.copy(sumexp, Lse_shared)
+                for h_i, d_i in T.Parallel(H_per_block, D):
+                    g_h = H0 + h_i
+                    if g_h < head_kv:
+                        Output[b_i, s_i, g_h, d_i] = O_shared[h_i, d_i]
+                for h_i in T.Parallel(H_per_block):
+                    g_h = H0 + h_i
+                    if g_h < head_kv:
+                        Lse[b_i, s_i, g_h] = Lse_shared[h_i]
 
     return main
 

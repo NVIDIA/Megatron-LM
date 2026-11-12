@@ -64,16 +64,32 @@ def _scratch_buffer_bytes(buf: torch.Tensor) -> int:
 def _is_supported_sparse_mla_head_count(heads: int, kv_group: int = 1) -> bool:
     """Return whether TileLang SparseMLA supports this query/KV head grouping.
 
-    The forward and backward kernels pad ``head_kv`` to ``max(next_power_of_2(head_kv), 16)``
-    and index the unpadded head dimension by that padded count with no head-dim bound, so they
-    only stay in bounds when no padding occurs. That requires ``head_kv`` (= ``heads //
-    kv_group``) to be a power of two and at least 16; any other value (e.g. 48, 192, or < 16)
-    must fall back to the unfused path rather than read/write past the real head count.
+    The forward and backward kernels tile the query-head dimension in fixed-width blocks (64-wide
+    in the forward, ``block_H``-wide in the backward) over ``head_kv`` (= ``heads // kv_group``)
+    real heads, masking the partial final block so global head reads/writes never touch an index
+    ``>= head_kv``. Supported head groupings are therefore:
+
+    * ``head_kv`` a power of two and ``>= 16``, for any ``kv_group`` -- the original fast path:
+      every head block is full, the masking is a no-op, and results are bit-identical to before.
+    * ``head_kv >= 16`` but not a power of two (e.g. Kimi-K3.1's 96 heads), only for
+      ``kv_group == 1`` (the absorbed-MLA case). The partial-block masking's padded-vs-real head
+      bookkeeping assumes a single KV group (``g_i == 0``); multi-group non-power-of-two layouts
+      still fall back to the unfused path.
+
+    ``head_kv < 16`` is still declined (the kernels use a minimum 16-head tile); the caller pads
+    such small shards up to 16 heads before reaching the kernel.
     """
     if kv_group <= 0 or heads % kv_group != 0:
         return False
     head_kv = heads // kv_group
-    return head_kv >= 16 and (head_kv & (head_kv - 1)) == 0
+    if head_kv < 16:
+        return False
+    if (head_kv & (head_kv - 1)) == 0:
+        # Power of two: every head block is full, so any valid kv_group is supported.
+        return True
+    # Non-power-of-two head_kv relies on partial-block head masking, which only the single-KV-group
+    # absorbed-MLA path handles correctly.
+    return kv_group == 1
 
 
 def _all_bfloat16(*tensors: torch.Tensor) -> bool:
@@ -806,8 +822,10 @@ def fused_sparse_mla_absorbed(
 
     query_bshd = query.permute(1, 0, 2, 3).contiguous()
     if kernel_heads != query_heads:
-        # SparseMLA uses a minimum 16-head tile without head bounds. Pad the caller
-        # tensor so small TP shards stay in bounds, then discard those heads below.
+        # SparseMLA uses a minimum 16-head tile, so query head counts below 16 (e.g. small TP
+        # shards) are padded up to 16 and the padded heads are discarded below. Head counts >= 16
+        # (including non-power-of-two counts such as 96) run natively with real-head bounds and
+        # take no padding here.
         query_bshd = torch.nn.functional.pad(query_bshd, (0, 0, 0, kernel_heads - query_heads))
     key_bshd = key.permute(1, 0, 2, 3).contiguous()
     indices_bsgk = topk_indices.unsqueeze(2).to(torch.int32).contiguous()
