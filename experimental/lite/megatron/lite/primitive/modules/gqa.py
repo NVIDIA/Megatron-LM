@@ -10,7 +10,6 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from megatron.lite.primitive.modules.attention.magi import MagiDotProductAttention
 from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.modules.gqa_utils import (
     split_grouped_qkvg,
@@ -25,7 +24,11 @@ from megatron.lite.primitive.parallel import (
     all_gather_last_dim_with_grad_reduce,
 )
 from megatron.lite.primitive.utils import ensure_divisible
-from megatron.lite.primitive.utils.rope import _apply_rotary_pos_emb_bshd, _apply_rotary_pos_emb_thd
+from megatron.lite.primitive.utils.rope import (
+    _apply_rotary_pos_emb_bshd,
+    _apply_rotary_pos_emb_thd,
+    apply_rope_sbhd,
+)
 from megatron.lite.primitive.utils.rotary import RotaryEmbedding
 
 # Whitelist of MC PackedSeqParams fields accepted by TE DotProductAttention.forward().
@@ -69,6 +72,8 @@ class GQAttention(nn.Module):
         lora_config: LoraConfig | dict | None = None,
         mrope_section: list[int] | None = None,
         attention_backend: str = "te",
+        rope_fusion: bool = False,
+        qkv_return_norm_output: bool = False,
     ):
         super().__init__()
         self.num_heads_local = ensure_divisible(num_attention_heads, ps.tp_size)
@@ -93,6 +98,9 @@ class GQAttention(nn.Module):
         self._use_thd = use_thd
         self._check_attention_backend(attention_backend)
         self.attention_backend = attention_backend
+        if rope_fusion and (attention_backend != "magi" or use_fp32_rope or mrope_section is not None):
+            raise ValueError("rope_fusion requires attention_backend='magi' without fp32 rope or MRoPE")
+        self._rope_fusion = rope_fusion
 
         # Declaration order follows MC's `SelfAttention` submodule order
         # (linear_proj → linear_qkv → q_layernorm → k_layernorm). `named_
@@ -112,6 +120,7 @@ class GQAttention(nn.Module):
             normalization="RMSNorm",
             eps=rms_norm_eps,
             zero_centered_gamma=zero_centered_gamma,
+            return_layernorm_output=qkv_return_norm_output,
         )
         self.q_norm = te.RMSNorm(head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma)
         self.k_norm = te.RMSNorm(head_dim, eps=rms_norm_eps, zero_centered_gamma=zero_centered_gamma)
@@ -176,6 +185,8 @@ class GQAttention(nn.Module):
 
     def _build_core_attn(self, attention_backend: str) -> nn.Module:
         if attention_backend == "magi":
+            from megatron.lite.primitive.modules.attention.magi import MagiDotProductAttention
+
             return MagiDotProductAttention(head_dim=self.head_dim)
         cp_kwargs = {}
         if self.ps.cp_size > 1:
@@ -215,7 +226,7 @@ class GQAttention(nn.Module):
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
     ) -> torch.Tensor:
-        qkv = self.qkv(x)
+        qkv = self._qkv_out(x)
         if self.qkv_lora is not None:
             qkv = qkv + self.qkv_lora(self._qkv_lora_input(x))
         if self._replicate_kv:
@@ -265,12 +276,8 @@ class GQAttention(nn.Module):
             ):
                 raise ValueError("MagiAttention position_ids exceed the RoPE table.")
             local_freqs = freqs.index_select(0, local_positions)
-            q = _apply_rotary_pos_emb_bshd(
-                q[:, None], local_freqs, rotary_interleaved=False, mscale=1.0
-            ).squeeze(1)
-            k = _apply_rotary_pos_emb_bshd(
-                k[:, None], local_freqs, rotary_interleaved=False, mscale=1.0
-            ).squeeze(1)
+            q = apply_rope_sbhd(q[:, None], local_freqs, fused=self._rope_fusion).squeeze(1)
+            k = apply_rope_sbhd(k[:, None], local_freqs, fused=self._rope_fusion).squeeze(1)
         elif is_packed:
             max_q = getattr(packed_seq_params, "max_seqlen_q", None)
             max_kv = getattr(packed_seq_params, "max_seqlen_kv", None)
@@ -339,6 +346,10 @@ class GQAttention(nn.Module):
         if self.proj_lora is not None:
             output = output + self.proj_lora(attn_out)
         return output
+
+    def _qkv_out(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.qkv(x)
+        return out[0] if self.qkv.return_layernorm_output else out
 
     def _qkv_lora_input(self, x: torch.Tensor) -> torch.Tensor:
         linear = self.qkv.linear

@@ -173,12 +173,16 @@ class ColumnParallelLinear(nn.Module):
         eps: float = 1e-6,
         zero_centered_gamma: bool = False,
         sequence_parallel: bool | None = None,
+        return_layernorm_output: bool = False,
     ):
         super().__init__()
         self.tp_size = ps.tp_size
         self.tp_rank = ps.tp_rank
         self.tp_group = ps.tp_group
         self.local_out = ensure_divisible(out_features, ps.tp_size)
+        if return_layernorm_output and normalization is None:
+            raise ValueError("return_layernorm_output requires normalization")
+        self.return_layernorm_output = return_layernorm_output
         self.use_sp = (
             ps.tp_size > 1 and not gather_output if sequence_parallel is None else sequence_parallel
         )
@@ -190,6 +194,7 @@ class ColumnParallelLinear(nn.Module):
                 normalization=normalization,
                 eps=eps,
                 zero_centered_gamma=zero_centered_gamma,
+                return_layernorm_output=return_layernorm_output,
                 params_dtype=torch.bfloat16,
                 parallel_mode="column",
                 sequence_parallel=self.use_sp,
@@ -209,11 +214,15 @@ class ColumnParallelLinear(nn.Module):
             )
         self.gather_output = gather_output
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor):
+        """Returns ``out``, or ``(out, norm_out)`` with ``return_layernorm_output``."""
         out = self.linear(x)
+        norm_out = None
+        if self.return_layernorm_output:
+            out, norm_out = out
         if self.gather_output and self.tp_size > 1:
             out = _AllGatherLastDim.apply(out, self.tp_size, self.tp_group)
-        return out
+        return out if norm_out is None else (out, norm_out)
 
 
 class RowParallelLinear(nn.Module):
@@ -319,6 +328,19 @@ class AccumulatingLinear(nn.Linear):
         )
 
 
+class _LookupEmbedding(nn.Embedding):
+    """Embedding table; lookups go through ``forward`` so module pre-hooks (DDP param gather) fire."""
+
+    def __init__(self, num_embeddings: int, embedding_dim: int, *, deterministic: bool = False):
+        super().__init__(num_embeddings, embedding_dim)
+        self.deterministic = deterministic
+
+    def forward(self, ids: torch.Tensor) -> torch.Tensor:
+        if self.deterministic:
+            return self.weight[ids]
+        return _EmbeddingAccumulatingIntoMainGrad.apply(self.weight, ids)
+
+
 class VocabParallelEmbedding(nn.Module):
     """Embedding table split across TP on the vocab dimension."""
 
@@ -333,17 +355,16 @@ class VocabParallelEmbedding(nn.Module):
         self.local_vocab = ensure_divisible(padded_vocab, ps.tp_size)
         self.vocab_start = self.tp_rank * self.local_vocab
         self.vocab_end = self.vocab_start + self.local_vocab
-        self.embedding = nn.Embedding(self.local_vocab, hidden_size)
+        self.embedding = _LookupEmbedding(
+            self.local_vocab, hidden_size, deterministic=self.deterministic
+        )
         self.tp_group = ps.tp_group
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         # input_ids: [B, S] → out: [S, B, H]
         mask = (input_ids >= self.vocab_start) & (input_ids < self.vocab_end)
         local_ids = (input_ids - self.vocab_start).clamp(min=0, max=self.local_vocab - 1)
-        if self.deterministic:
-            out = self.embedding.weight[local_ids]
-        else:
-            out = _EmbeddingAccumulatingIntoMainGrad.apply(self.embedding.weight, local_ids)
+        out = self.embedding(local_ids)
         out = out * mask.unsqueeze(-1)
         if self.tp_size > 1:
             out = _ReduceFromTP.apply(out, self.tp_group)
