@@ -4,10 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-pytestmark = [
-    pytest.mark.gpus(2),
-    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
-]
+pytestmark = [pytest.mark.gpus(2), pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")]
 
 
 def _make_train_config(ps):
@@ -239,9 +236,7 @@ def test_glm5_tiny_model_cp2_matches_full_sequence_reference_forward():
     torch.manual_seed(777)
     cp_model = _make_glm5_model(cfg, ps=ps).to(device=device, dtype=torch.bfloat16)
     torch.manual_seed(777)
-    ref_model = _make_glm5_model(cfg, ps=ParallelState()).to(
-        device=device, dtype=torch.bfloat16
-    )
+    ref_model = _make_glm5_model(cfg, ps=ParallelState()).to(device=device, dtype=torch.bfloat16)
     cp_model.eval()
     ref_model.eval()
 
@@ -304,10 +299,7 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
     import torch.distributed as dist
 
     from megatron.lite.model.glm5.config import Glm5Config
-    from megatron.lite.model.glm5.lite.protocol import (
-        _forward_step,
-        unpack_forward_output,
-    )
+    from megatron.lite.model.glm5.lite.protocol import _forward_step, unpack_forward_output
     from megatron.lite.primitive.parallel.state import ParallelState
     from megatron.lite.runtime.contracts.data import PackedBatch
 
@@ -315,17 +307,10 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
     world = dist.get_world_size()
     rank = dist.get_rank()
     cfg_kwargs = _tiny_config_kwargs()
-    cfg_kwargs.update(
-        max_position_embeddings=64,
-        num_hidden_layers=6,
-        num_nextn_predict_layers=1,
-    )
+    cfg_kwargs.update(max_position_embeddings=64, num_hidden_layers=6, num_nextn_predict_layers=1)
     indexer_types = ["full", "full", "full", "shared", "shared", "shared"]
     cfg = Glm5Config(
-        **cfg_kwargs,
-        index_topk_freq=4,
-        index_skip_topk_offset=3,
-        indexer_types=indexer_types,
+        **cfg_kwargs, index_topk_freq=4, index_skip_topk_offset=3, indexer_types=indexer_types
     )
     cfg.mlp_layer_types = ["dense"] * 7
     ps = ParallelState(cp_group=dist.group.WORLD, cp_size=world, cp_rank=rank)
@@ -340,17 +325,13 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
     batch = PackedBatch(
         input_ids=torch.cat(
             [
-                torch.randint(
-                    0, cfg.vocab_size, (length,), device=device, dtype=torch.long
-                )
+                torch.randint(0, cfg.vocab_size, (length,), device=device, dtype=torch.long)
                 for length in lengths
             ]
         ),
         labels=torch.cat(
             [
-                torch.randint(
-                    0, cfg.vocab_size, (length,), device=device, dtype=torch.long
-                )
+                torch.randint(0, cfg.vocab_size, (length,), device=device, dtype=torch.long)
                 for length in lengths
             ]
         ),
@@ -363,10 +344,7 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
     assert "mtp_loss" in out
     assert model.layers[3].self_attention.self_attention.skip_topk is True
     assert model.mtp is not None
-    assert (
-        model.mtp.layers[0].transformer_layer.self_attention.self_attention.skip_topk
-        is False
-    )
+    assert model.mtp.layers[0].transformer_layer.self_attention.self_attention.skip_topk is False
     out["loss"].backward()
 
     grad_norm = torch.zeros((), device=device)
@@ -386,6 +364,115 @@ def test_glm5_packed_thd_variable_sequence_cp2_forward_backward_smoke():
             f"loss={float(out['loss'].detach().item()):.6e} "
             f"grad_norm={float(grad_norm.detach().item()):.6e}"
         )
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize(
+    "indexer_topk",
+    [
+        pytest.param(
+            {"backend": "reference", "precision": "fast"},
+            id="reference-fast",
+            marks=[pytest.mark.gpus(2, min_architecture="blackwell"), pytest.mark.optional],
+        )
+    ],
+)
+def test_glm5_protocol_cp2_eval_forward_with_indexer_topk(indexer_topk):
+    """``ImplConfig.indexer_topk`` binds the DSA layers of a model built by the protocol.
+
+    The bound CP model's eval forward without autograd selects through the bindings (here the
+    matched-precision reference selector: DeepGEMM scores and the cuDNN frontend radix top-k, no
+    plugin) and matches the unbound model with the same weights layer by layer: every query of
+    these packed sequences sees at most ``index_topk`` keys, so both select all of them. A
+    training forward without autograd keeps the upstream selector.
+    """
+    import torch
+    import torch.distributed as dist
+
+    from megatron.lite.model.glm5.config import Glm5Config
+    from megatron.lite.model.glm5.lite import protocol
+    from megatron.lite.primitive.kernels.indexer_topk import IndexerTopKConfig
+    from megatron.lite.primitive.modules.attention.indexer_topk import IndexerTopKInstallation
+    from megatron.lite.runtime.contracts import ParallelConfig
+    from megatron.lite.runtime.contracts.data import PackedBatch
+
+    device = _init_dist_or_skip()
+    world = dist.get_world_size()
+    rank = dist.get_rank()
+    cfg_kwargs = _tiny_config_kwargs()
+    cfg_kwargs.update(num_hidden_layers=4)
+    cfg = Glm5Config(
+        **cfg_kwargs,
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        indexer_types=["full", "full", "full", "shared"],
+    )
+    cfg.mlp_layer_types = ["dense"] * 4
+
+    def build(spec):
+        impl_cfg = protocol.ImplConfig(
+            parallel=ParallelConfig(cp=world), optimizer=None, indexer_topk=spec
+        )
+        bundle = protocol.build_model(cfg, impl_cfg=impl_cfg)
+        return bundle, bundle.chunks[0].eval()
+
+    torch.manual_seed(20261001)
+    unbound_bundle, unbound = build(None)
+    bound_bundle, bound = build(indexer_topk)
+    bound.load_state_dict(unbound.state_dict())
+    assert "indexer_topk" not in unbound_bundle.extras
+    installation = bound_bundle.extras["indexer_topk"]
+    assert isinstance(installation, IndexerTopKInstallation)
+    assert installation.config == IndexerTopKConfig(**indexer_topk)
+    attentions = [layer.self_attention.self_attention for layer in bound.layers]
+    # The IndexShare shared layer reuses the top-k of its source layer and stays unbound.
+    assert [attention._indexer_topk for attention in attentions] == [*installation.bindings, None]
+
+    outputs = {"bound": [], "unbound": []}
+    hooks = [
+        attention.register_forward_hook(
+            lambda _module, _inputs, output, arm=arm: outputs[arm].append(output.detach())
+        )
+        for arm, model in (("bound", bound), ("unbound", unbound))
+        for attention in (layer.self_attention.self_attention for layer in model.layers)
+    ]
+    lengths = [96, 160, 252]
+    tokens = torch.randint(
+        0, cfg.vocab_size, (2, sum(lengths)), generator=torch.Generator().manual_seed(7)
+    ).to(device)
+    batch = PackedBatch(
+        input_ids=tokens[0],
+        labels=tokens[1],
+        seq_lens=torch.tensor(lengths, device=device, dtype=torch.int32),
+        loss_mask=torch.ones(sum(lengths), device=device, dtype=torch.float32),
+    )
+    with torch.no_grad():
+        expected = protocol._forward_step(unbound, batch)
+        actual = protocol._forward_step(bound, batch)
+    for hook in hooks:
+        hook.remove()
+
+    local_rows = sum(lengths) // world
+    for binding in installation.bindings:
+        stats = binding.stats
+        assert (stats.calls, stats.rows, stats.reference_rows) == (1, local_rows, local_rows)
+        assert (stats.litetopk_rows, stats.padding_rows) == (0, 0)
+    assert len(outputs["bound"]) == len(outputs["unbound"]) == len(attentions)
+    for layer, (got, want) in enumerate(zip(outputs["bound"], outputs["unbound"], strict=True)):
+        max_abs, max_rel = _distributed_diff_stats(got, want)
+        if rank == 0:
+            print(
+                f"glm5_indexer_topk_cp{world} layer={layer} "
+                f"max_abs_diff={max_abs:.6e} max_rel_diff={max_rel:.6e}"
+            )
+        assert max_rel <= 2e-2
+    assert torch.isfinite(actual["loss"]) and torch.isfinite(actual["log_probs"]).all()
+    torch.testing.assert_close(actual["log_probs"], expected["log_probs"], atol=2e-2, rtol=2e-2)
+
+    bound.train()
+    with torch.no_grad():
+        protocol._forward_step(bound, batch)
+    assert [binding.stats.calls for binding in installation.bindings] == [1, 1, 1]
 
 
 @pytest.mark.gpu
