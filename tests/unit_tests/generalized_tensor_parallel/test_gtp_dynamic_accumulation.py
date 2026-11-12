@@ -18,6 +18,10 @@ from megatron.core.tensor_parallel.layers import (
     linear_with_grad_accumulation_and_async_allreduce as tp_linear,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
+
+if not gtp.HAVE_TE:
+    pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
+
 from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noqa: F401
     _torchrun_dist_init,
     reset_gtp_globals,
@@ -27,7 +31,7 @@ from tests.unit_tests.generalized_tensor_parallel.gtp_test_utils import (  # noq
 class _Head(torch.nn.Module):
     """A GTP output head with optionally repeated uses."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
         self.config = TransformerConfig(
             num_layers=1,
@@ -38,10 +42,10 @@ class _Head(torch.nn.Module):
         )
         self.model_type = ModelType.encoder_or_decoder
         self.heads = 1
-        self.output_layer = torch.nn.Linear(64, 64, bias=False, device='cuda', dtype=torch.bfloat16)
+        self.output_layer = torch.nn.Linear(64, 64, bias=False, device="cuda", dtype=torch.bfloat16)
         self.tp_group = parallel_state.get_tensor_model_parallel_group()
         gtp.wrap_module_params_gtp(
-            self.output_layer, ['weight'], parallel_state.get_gtp_weight_remat_group()
+            self.output_layer, ["weight"], parallel_state.get_gtp_weight_remat_group()
         )
 
     def set_input_tensor(self, input_tensor):
@@ -69,11 +73,11 @@ def model(monkeypatch):
     """Use GTP2 and at least two DDP ranks."""
     world_size = torch.distributed.get_world_size()
     if world_size < 4 or world_size % 2:
-        pytest.skip('Requires an even number of ranks >= 4')
+        pytest.skip("Requires an even number of ranks >= 4")
     parallel_state.destroy_model_parallel()
     parallel_state.initialize_model_parallel(gtp_remat_size=2)
-    monkeypatch.setattr(gtp.GTP_CONFIG, 'async_reduction', False)
-    monkeypatch.setattr(gtp.GTP_CONFIG, 'weight_prefetch', False)
+    monkeypatch.setattr(gtp.GTP_CONFIG, "async_reduction", False)
+    monkeypatch.setattr(gtp.GTP_CONFIG, "weight_prefetch", False)
     head = _Head()
     try:
         yield head
@@ -94,8 +98,8 @@ def _forward_step(data_iterator, model):
     return model(next(data_iterator)), lambda value: (value.sum(), {})
 
 
-@pytest.mark.parametrize('mode', ['schedule', 'explicit', 'fallback'])
-@pytest.mark.parametrize('heads, no_sync', [(1, False), (3, True)])
+@pytest.mark.parametrize("mode", ["schedule", "explicit", "fallback"])
+@pytest.mark.parametrize("heads, no_sync", [(1, False), (3, True)])
 def test_dynamic_ga_ddp_gradient(model, heads, mode, no_sync, monkeypatch):
     """Check exact gradients and one RS across rising/falling GA with overlapping DDP."""
     model.heads = heads
@@ -107,7 +111,7 @@ def test_dynamic_ga_ddp_gradient(model, heads, mode, no_sync, monkeypatch):
     gtp.classify_gtp_remat_chains(ddp)
     weight = model.output_layer.weight
     rs = Mock(wraps=weight._reduce_scatter)
-    monkeypatch.setattr(weight, '_reduce_scatter', rs)
+    monkeypatch.setattr(weight, "_reduce_scatter", rs)
     model.config.no_sync_func = ddp.no_sync if no_sync else None
     model.config.finalize_model_grads_func = _finalize
     for microbatches in (2, 4, 1, 3):
@@ -117,13 +121,13 @@ def test_dynamic_ga_ddp_gradient(model, heads, mode, no_sync, monkeypatch):
             torch.full(
                 (2, 1, 64),
                 (torch.distributed.get_rank() + 1) * (i + 1),
-                device='cuda',
+                device="cuda",
                 dtype=torch.bfloat16,
                 requires_grad=True,
             )
             for i in range(microbatches)
         ]
-        if mode == 'schedule':
+        if mode == "schedule":
             forward_backward_no_pipelining(
                 forward_step_func=_forward_step,
                 data_iterator=iter(batches),
@@ -136,7 +140,7 @@ def test_dynamic_ga_ddp_gradient(model, heads, mode, no_sync, monkeypatch):
             for i, x in enumerate(batches):
                 with ddp.no_sync() if no_sync and i < microbatches - 1 else nullcontext():
                     loss = ddp(x).sum() / microbatches
-                    if mode == 'explicit' and i == microbatches - 1:
+                    if mode == "explicit" and i == microbatches - 1:
                         gtp.finalize_gtp_forward_counts(ddp)
                     loss.backward()
             before_fence = rs.call_count
@@ -150,8 +154,8 @@ def test_dynamic_ga_ddp_gradient(model, heads, mode, no_sync, monkeypatch):
             weight.main_grad, torch.full_like(weight.main_grad, expected), rtol=0, atol=1e-5
         )
         assert rs.call_count == 1
-        if mode != 'schedule':
-            assert before_fence == (1 if mode == 'explicit' else 0)
+        if mode != "schedule":
+            assert before_fence == (1 if mode == "explicit" else 0)
 
 
 def test_checkpointed_head_uses_fence(model):
@@ -159,7 +163,7 @@ def test_checkpointed_head_uses_fence(model):
     gtp.classify_gtp_remat_chains(model)
     weight = model.output_layer.weight
     weight.main_grad = torch.zeros_like(weight, dtype=torch.float32)
-    x = torch.ones(2, 1, 64, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    x = torch.ones(2, 1, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     loss = model(x).sum() + checkpoint(model, x, use_reentrant=True).sum()
     gtp.finalize_gtp_forward_counts(model)
     loss.backward()
