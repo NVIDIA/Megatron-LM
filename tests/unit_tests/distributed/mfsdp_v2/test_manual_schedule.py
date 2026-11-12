@@ -25,6 +25,9 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     fully_shard_optimizer,
 )
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
+    get_containing_parameter_group,
+)
 
 
 class MLP(nn.Module):
@@ -49,8 +52,8 @@ class ScheduledMLPFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, inputs, weight1, weight2, module):
         """Compute stage one while stage two's weights are being gathered."""
-        group1 = module.parameter_to_group[weight1]
-        group2 = module.parameter_to_group[weight2]
+        group1 = get_containing_parameter_group(weight1)
+        group2 = get_containing_parameter_group(weight2)
         ctx.module = module
         ctx.groups = (group1, group2)
         hidden = torch.tanh(F.linear(inputs, weight1))
@@ -121,8 +124,8 @@ class ScheduledMLP(MLP):
 
     def forward(self, inputs):
         """Wait for the first matrix and prefetch the second before stage one."""
-        group1 = self.parameter_to_group[self.weight1]
-        group2 = self.parameter_to_group[self.weight2]
+        group1 = get_containing_parameter_group(self.weight1)
+        group2 = get_containing_parameter_group(self.weight2)
         self.context.allgather_stream.wait_stream(self.context.current_stream())
         self.prefetch_group(group1)
         group1.wait_for_unshard(None)
@@ -175,13 +178,6 @@ def test_manual_schedule_matches_dense_training(
             shard_layout=shard_layout,
             parameter_grouping=parameter_grouping,
         )
-    # Bindings alternate between optimizer shards and full compute parameters.
-    model.parameter_to_group = {
-        representation: group
-        for group in model.parameter_groups
-        for parameter in group.fsdp_parameters
-        for representation in (parameter.sharded, parameter.unsharded)
-    }
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)
     fully_shard_optimizer(optimizer)
     reference_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05, momentum=0.9)
