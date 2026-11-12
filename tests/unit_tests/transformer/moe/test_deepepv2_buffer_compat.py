@@ -6,10 +6,11 @@ DeepEP 2.5 renamed ElasticBuffer to EPBuffer, keeps ``topk_idx`` by reference in
 handle, and rounds explicit SM counts up to even. The fake buffers below mimic DeepEP 2.1 and 2.5,
 so these tests need neither a GPU nor DeepEP. They patch module attributes, ``sys.modules``
 entries and ``torch.Tensor.clone`` through ``monkeypatch`` only and re-import nothing, so nothing
-is left behind except the fake classes cached by ``_dispatch_copies_topk_idx``.
+is left behind except the buffer classes cached by ``_dispatch_copies_topk_idx``.
 """
 
 import importlib.util
+import inspect
 import sys
 import types
 import warnings
@@ -397,3 +398,33 @@ class TestFusedA2AModuleImport:
         with pytest.warns(UserWarning, match="none of Buffer, ElasticBuffer or EPBuffer"):
             module = _load_private_fused_a2a(monkeypatch, _fake_deep_ep(__version__="9.9.0"))
         assert not module.HAVE_DEEP_EP and not module.HAVE_DEEP_EP_V2
+
+
+class TestRealDeepEP:
+    """Check the installed deep_ep against what fused_a2a relies on, without a GPU or a buffer."""
+
+    def test_installed_buffer_matches_what_fused_a2a_relies_on(self):
+        deep_ep = pytest.importorskip("deep_ep")
+        if hasattr(deep_ep, "EPBuffer"):
+            buffer_cls, fake, copies = deep_ep.EPBuffer, FakeEPBuffer, False
+        elif hasattr(deep_ep, "ElasticBuffer"):
+            buffer_cls, fake, copies = deep_ep.ElasticBuffer, FakeElasticBuffer, True
+        else:
+            pytest.skip("the installed deep_ep has neither EPBuffer nor ElasticBuffer")
+        assert fused_a2a.DeepEPV2Buffer is buffer_cls
+        # The fakes reject keywords outside these sets, so the real class must accept them all.
+        init_keywords = set(
+            "num_bytes num_max_tokens_per_rank hidden num_topk deterministic".split()
+        )
+        size_hint_keywords = {"num_max_tokens_per_rank", "hidden", "num_topk"}
+        checked = [
+            *fake.parameters.items(),
+            ("__init__", init_keywords),
+            ("get_buffer_size_hint", size_hint_keywords),
+        ]
+        for method, keywords in checked:
+            missing = keywords - inspect.signature(getattr(buffer_cls, method)).parameters.keys()
+            assert not missing, f"{buffer_cls.__name__}.{method} has no parameter {sorted(missing)}"
+        assert callable(getattr(buffer_cls, "capture", None))
+        # DeepEP 2.1 copies topk_idx into the dispatch handle itself; for 2.5, Megatron copies it.
+        assert fused_a2a._dispatch_copies_topk_idx(buffer_cls) is copies
