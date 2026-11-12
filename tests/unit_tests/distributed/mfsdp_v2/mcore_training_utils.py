@@ -4,9 +4,6 @@
 
 import contextlib
 
-import torch.distributed as dist
-from torch.distributed.tensor import DTensor
-
 from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 
 
@@ -38,35 +35,3 @@ def run_forward_backward_on_microbatches(
     if is_data_parallel:
         model.finish_grad_sync()
     return losses
-
-
-def run_training_steps(
-    model, forward_one_microbatch, optimizer, *, num_steps, data_parallel_group=None
-):
-    """Run independent training steps and snapshot losses, gradients, and updated weights.
-
-    Unwrapped reference models can supply a data-parallel group to average gradients.
-    Wrapped models use the synchronization in ``run_forward_backward_on_microbatches``.
-    Snapshots gather DTensors into full tensors for comparisons with unsharded references.
-    """
-
-    def snapshot(tensor):
-        value = tensor.full_tensor() if isinstance(tensor, DTensor) else tensor
-        return value.detach().clone()
-
-    history = []
-    for _ in range(num_steps):
-        optimizer.zero_grad()
-        losses = run_forward_backward_on_microbatches(model, forward_one_microbatch)
-        if data_parallel_group is not None:
-            for parameter in model.parameters():
-                if parameter.grad is not None:
-                    dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG, group=data_parallel_group)
-        gradients = tuple(
-            snapshot(parameter.grad) if parameter.grad is not None else None
-            for parameter in model.parameters()
-        )
-        optimizer.step()
-        parameters = tuple(snapshot(parameter) for parameter in model.parameters())
-        history.append(dict(losses=losses, gradients=gradients, parameters=parameters))
-    return history

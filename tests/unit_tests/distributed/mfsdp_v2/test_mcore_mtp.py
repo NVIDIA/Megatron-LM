@@ -17,11 +17,12 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     PrefetchOrder,
     RuntimePolicy,
     fully_shard_context,
-    fully_shard_optimizer,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
-from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import run_training_steps
+from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
+    run_forward_backward_on_microbatches,
+)
 
 
 class _SharedPredictor(nn.Module):
@@ -91,14 +92,8 @@ def test_shared_mtp_matches_unsharded_training(distributed_setup, ambient_contex
             device=device,
             pg_collection=groups,
         )
-    expected = run_training_steps(
-        baseline,
-        lambda: baseline(value),
-        torch.optim.SGD(baseline.parameters(), lr=0.05),
-        num_steps=3,
-        data_parallel_group=groups.dp_cp,
+    expected = run_forward_backward_on_microbatches(
+        baseline, lambda: baseline(value), num_microbatches=3
     )
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
-    fully_shard_optimizer(optimizer)
-    actual = run_training_steps(model, lambda: model(value), optimizer, num_steps=3)
+    actual = run_forward_backward_on_microbatches(model, lambda: model(value), num_microbatches=3)
     torch.testing.assert_close(actual, expected)
