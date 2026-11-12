@@ -121,7 +121,7 @@ def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | No
 
 
 def _initialize_symmetric_memory_communicators(
-    groups: tuple[dist.ProcessGroup | None, ...], device: torch.device
+    groups: tuple[dist.ProcessGroup, ...], device: torch.device
 ) -> None:
     """Initialize communicators before symmetric-memory registration.
 
@@ -129,8 +129,7 @@ def _initialize_symmetric_memory_communicators(
     https://github.com/pytorch/pytorch/issues/188567.
     """
     for group in groups:
-        if group is not None:
-            dist.barrier(group=group, device_ids=[device.index])
+        dist.barrier(group=group, device_ids=[device.index])
 
 
 class FullyShardedDataParallelV2(_BaseDataParallel):
@@ -205,7 +204,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 if config.num_moe_experts is not None:
                     groups += (pg_collection.expt_dp,)
             _initialize_symmetric_memory_communicators(
-                groups, torch.cuda.current_stream(device).device
+                tuple(group for group in groups if group is not None),
+                torch.cuda.current_stream(device).device,
             )
 
         # Optimizer construction reads this attribute; retain the v1 contract for compatibility.
