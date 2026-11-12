@@ -80,6 +80,8 @@ class FsdpModule:
         self._context = context
         self._phase = Phase.RESTING
         self._schedule_policy = schedule_policy
+        self._fsdp_cuda_graph_capturing = False
+        self._execution_hooks: list[tuple[str, int]] = []
         owned_parameters = _collect_owned_parameters(self)
         if grad_scale <= 0:
             raise ValueError(f"grad_scale must be positive, got {grad_scale}.")
@@ -157,15 +159,18 @@ class FsdpModule:
         module = cast(nn.Module, self)
         # Use PyTorch's callback module argument instead of capturing self so
         # these hooks do not retain a deleted FSDP module.
-        module.register_forward_pre_hook(
+        handle = module.register_forward_pre_hook(
             lambda hooked_module, _args: cast(FsdpModule, hooked_module).pre_forward()
         )
-        module.register_forward_hook(
+        self._execution_hooks.append(("_forward_pre_hooks", handle.id))
+        handle = module.register_forward_hook(
             lambda hooked_module, _args, _output: cast(FsdpModule, hooked_module).post_forward()
         )
-        module.register_full_backward_pre_hook(
+        self._execution_hooks.append(("_forward_hooks", handle.id))
+        handle = module.register_full_backward_pre_hook(
             lambda hooked_module, _grad_output: cast(FsdpModule, hooked_module).pre_backward()
         )
+        self._execution_hooks.append(("_backward_pre_hooks", handle.id))
         self.register_post_backward_hook(FsdpModule.post_backward)
         self.register_post_accumulate_grad_hook(FsdpModule.post_accumulate_grad)
 
@@ -184,7 +189,8 @@ class FsdpModule:
             else:
                 post_backward_hook(module)
 
-        cast(nn.Module, self).register_full_backward_hook(grad_checking_post_backward_hook)
+        handle = cast(nn.Module, self).register_full_backward_hook(grad_checking_post_backward_hook)
+        self._execution_hooks.append(("_backward_hooks", handle.id))
 
     def register_post_accumulate_grad_hook(
         self, post_accumulate_grad_hook: Callable[["FsdpModule"], None]
@@ -195,7 +201,7 @@ class FsdpModule:
 
         def post_accumulate_grad_hook_per_parameter(_: nn.Parameter) -> None:
             module = module_ref()
-            if module is None:
+            if module is None or module._fsdp_cuda_graph_capturing:
                 return
             if module._trainable_parameter_countdown.decrement():
                 post_accumulate_grad_hook(module)
@@ -233,6 +239,60 @@ class FsdpModule:
             if not group.requires_grad:
                 continue
             yield from group.fsdp_parameters
+
+    @contextmanager
+    def fsdp_cuda_graph_capture(self) -> Iterator[None]:
+        """Expose stable BF16 compute weights without capturing FSDP's execution hooks.
+
+        Captured units retain their existing gathered buffers until graph deletion.
+        Other units, including routed experts outside attention capture, keep their
+        normal storage lifecycle. Replay runs the original FSDP hooks outside the graph.
+        """
+        if self.phase is not Phase.RESTING:
+            raise RuntimeError("FSDP CUDA graph capture requires an idle module.")
+        for group in self._parameter_groups:
+            if group.dtype != torch.bfloat16 or self.context.use_symmetric_memory:
+                raise ValueError("FSDP partial CUDA graphs require BF16 without symmetric memory.")
+        saved_hooks = {}
+        self._fsdp_cuda_graph_capturing = True
+        try:
+            for group in self._parameter_groups:
+                group._retain_unsharded_storage = True
+            self.context.allgather_stream.wait_stream(self.context.current_stream())
+            self.unshard(Phase.FORWARD)
+            for name, hook_id in self._execution_hooks:
+                if name not in saved_hooks:
+                    saved_hooks[name] = getattr(self, name)
+                    setattr(self, name, saved_hooks[name].copy())
+                getattr(self, name).pop(hook_id, None)
+            yield
+        finally:
+            for name, hooks in saved_hooks.items():
+                setattr(self, name, hooks)
+            self._fsdp_cuda_graph_capturing = False
+            # The graph owner releases retained storage after resetting failed graphs.
+            self.reshard()
+
+    def release_cuda_graph_buffers(self) -> None:
+        """Release captured compute-weight storage after the graphs have been deleted."""
+        for group in self._parameter_groups:
+            group._retain_unsharded_storage = False
+        self.reshard()
+
+    def _call_cuda_graph(self, graph_func, *args, **kwargs):
+        """Keep normal module hooks around replay, including backward-pre hooks."""
+        if self._fsdp_cuda_graph_capturing:
+            return graph_func(*args, **kwargs)
+        had_forward = "forward" in self.__dict__
+        original_forward = self.forward
+        self.forward = graph_func
+        try:
+            return nn.Module.__call__(self, *args, **kwargs)
+        finally:
+            if had_forward:
+                self.forward = original_forward
+            else:
+                del self.forward
 
     @staticmethod
     def _pre_load_state_dict(
