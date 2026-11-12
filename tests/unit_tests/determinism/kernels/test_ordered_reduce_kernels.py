@@ -142,7 +142,8 @@ class TestOrderedReduceKernels:
 
     @_requires_tp(2)
     @pytest.mark.parametrize("tp,shards", [(2, 4), (4, 4), (4, 8)])
-    def test_symm_pull_replays(self, tp, shards):
+    @pytest.mark.parametrize("sync_after", [False, True])
+    def test_symm_pull_replays(self, tp, shards, sync_after):
         """Inference: the GEMM writes into the symmetric buffer, one pull kernel folds."""
         if Utils.world_size < tp:
             pytest.skip(f"needs {tp} GPUs")
@@ -166,6 +167,11 @@ class TestOrderedReduceKernels:
             # The engine's sequence: GEMM into the symmetric buffer, pull reduce-scatter, then
             # an all-gather, which orders the next replay's GEMM after every peer's reads.
             parts = orr.row_parallel_shard_partials(x, w, c, out=symm["tensor"])
+            if sync_after:
+                # Training reuses scratch without an intervening all-gather.
+                return orr.symm_ordered_reduce_scatter_shards(
+                    parts, symm["handle"], out, sync_after=True
+                )
             orr.symm_ordered_reduce_scatter_shards(parts, symm["handle"], out)
             torch.distributed.all_gather_into_tensor(gathered, out, group=group)
             return gathered

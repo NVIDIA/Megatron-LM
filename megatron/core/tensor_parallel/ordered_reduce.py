@@ -137,6 +137,7 @@ def _ordered_pull_kernel(
     ACC_FP64: tl.constexpr,
     ALIGNED: tl.constexpr,
     C: tl.constexpr,
+    SYNC_AFTER: tl.constexpr,
 ):
     """Read n elements from every peer's symmetric buffer and fold them in rank order.
 
@@ -154,7 +155,8 @@ def _ordered_pull_kernel(
         ``symm_ordered_reduce_scatter`` (C = 1);
       * ``InferenceRowParallelLinear._matmul_shards_reduce`` (``batch_invariant_tp_shards``
         with several shards per rank), via ``symm_ordered_reduce_scatter_shards`` (C > 1).
-    The training side uses the push kernel instead (its input is not in symmetric memory).
+    Direct-buffer training producers set SYNC_AFTER so every peer has finished reading
+    before the next GEMM overwrites the scratch buffer. Ordinary training tensors use push.
     """
     symm_mem_sync(
         signal_pad_ptrs,
@@ -187,6 +189,18 @@ def _ordered_pull_kernel(
                 else:
                     acc += v
         tl.store(out_ptr + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
+    if SYNC_AFTER:
+        # Training can overwrite the whole buffer before another collective runs.
+        sync_threads()
+        symm_mem_sync(
+            signal_pad_ptrs,
+            None,
+            RANK,
+            WORLD_SIZE,
+            hasPreviousMemAccess=True,
+            hasSubsequentMemAccess=True,
+        )
+        sync_threads()
 
 
 @triton.jit
@@ -517,7 +531,12 @@ def _pull_launch_config(n: int, element_size: int) -> Tuple[int, int, int]:
 
 
 def _launch_pull(
-    input_: torch.Tensor, out: torch.Tensor, symm_mem_hdl, num_parts: int, part_stride: int
+    input_: torch.Tensor,
+    out: torch.Tensor,
+    symm_mem_hdl,
+    num_parts: int,
+    part_stride: int,
+    sync_after: bool = False,
 ) -> torch.Tensor:
     """Launch the pull kernel; called by the two ``symm_ordered_reduce_scatter*`` wrappers.
 
@@ -552,13 +571,18 @@ def _launch_pull(
         ACC_FP64=acc_fp64,
         ALIGNED=aligned,
         C=num_parts,
+        SYNC_AFTER=sync_after,
         num_warps=num_warps,
     )
     return out
 
 
 def symm_ordered_reduce_scatter(
-    input_: torch.Tensor, symm_mem_hdl, output: Optional[torch.Tensor] = None
+    input_: torch.Tensor,
+    symm_mem_hdl,
+    output: Optional[torch.Tensor] = None,
+    *,
+    sync_after: bool = False,
 ) -> torch.Tensor:
     """Reduce-scatter dim 0 of ``input_``, a contiguous tensor in the symmetric buffer.
 
@@ -569,18 +593,25 @@ def symm_ordered_reduce_scatter(
     Used by the inference engine at TP >= 3: ``InferenceRowParallelLinear`` (its GEMM writes
     into the "tp" buffer) and ``inference_reduce_scatter_to_sequence_parallel_region``.
     """
-    return symm_ordered_reduce_scatter_shards(input_.unsqueeze(0), symm_mem_hdl, output)
+    return symm_ordered_reduce_scatter_shards(
+        input_.unsqueeze(0), symm_mem_hdl, output, sync_after=sync_after
+    )
 
 
 def symm_ordered_reduce_scatter_shards(
-    parts: torch.Tensor, symm_mem_hdl, output: Optional[torch.Tensor] = None
+    parts: torch.Tensor,
+    symm_mem_hdl,
+    output: Optional[torch.Tensor] = None,
+    *,
+    sync_after: bool = False,
 ) -> torch.Tensor:
     """:func:`ordered_reduce_scatter_shards` of ``parts`` [c, M, ...] in the symmetric buffer.
 
     ``parts`` is a contiguous tensor in the symmetric buffer. One pull kernel reads
     the owned rows of every peer's c partials and folds them in global shard order into
-    ``output`` (allocated when None). A rank may rewrite rows other than its own only after
-    a later collective has synchronized the group (in the engine, the next all-gather).
+    ``output`` (allocated when None). ``sync_after=True`` adds a trailing barrier, allowing
+    training to overwrite the whole scratch buffer on the next call. Without it, reuse
+    requires a later synchronizing collective (the inference engine's next all-gather).
 
     Used by ``InferenceRowParallelLinear._matmul_shards_reduce`` (the engine with several
     ``batch_invariant_tp_shards`` per rank).
@@ -593,7 +624,9 @@ def symm_ordered_reduce_scatter_shards(
     part_numel = parts[0].numel()
     assert part_numel == n_out * ws and parts.is_contiguous() and output.is_contiguous()
     assert parts.dtype == output.dtype
-    return _launch_pull(parts, output, symm_mem_hdl, num_parts=c, part_stride=part_numel)
+    return _launch_pull(
+        parts, output, symm_mem_hdl, num_parts=c, part_stride=part_numel, sync_after=sync_after
+    )
 
 
 # ── Fixed-shard row-parallel reductions (TP-invariant forward) ──────────────
