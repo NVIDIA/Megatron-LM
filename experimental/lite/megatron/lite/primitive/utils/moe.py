@@ -362,16 +362,18 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         weight: torch.Tensor,
         bias: torch.Tensor | None,
         router_dtype: torch.dtype,
+        use_te_gemm: bool = True,
     ) -> torch.Tensor:
         ctx.save_for_backward(inp, weight, bias)
         ctx.router_dtype = router_dtype
+        ctx.use_te_gemm = use_te_gemm
         ctx.input_dtype = inp.dtype
         ctx.weight_dtype = weight.dtype
         inp_shape = inp.shape
         inp = inp.view(-1, inp_shape[-1])
 
         gemm_out = None
-        if router_dtype != torch.float64:
+        if use_te_gemm and router_dtype != torch.float64:
             gemm_out = _te_general_gemm(weight, inp, router_dtype, layout="TN", bias=bias)
         if gemm_out is not None:
             output = gemm_out[0]
@@ -392,7 +394,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         grad_output = grad_output.view(-1, grad_shape[-1])
 
         grad_input_out = grad_weight_out = None
-        if ctx.router_dtype != torch.float64:
+        if ctx.use_te_gemm and ctx.router_dtype != torch.float64:
             grad_input_out = _te_general_gemm(
                 weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
             )
@@ -406,13 +408,19 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
             grad_weight = torch.mm(grad_output.t(), inp.to(ctx.router_dtype)).to(ctx.weight_dtype)
         grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
-        return grad_input.view(*inp_shape), grad_weight, grad_bias, None
+        return grad_input.view(*inp_shape), grad_weight, grad_bias, None, None
 
 
 def router_gating_linear(
-    inp: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None, router_dtype: torch.dtype
+    inp: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    router_dtype: torch.dtype,
+    *,
+    use_te_gemm: bool = True,
 ) -> torch.Tensor:
-    return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
+    """Router GEMM in ``router_dtype``; ``use_te_gemm=False`` uses ``torch.mm`` throughout."""
+    return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype, use_te_gemm)
 
 
 __all__ = [

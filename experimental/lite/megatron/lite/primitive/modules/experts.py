@@ -13,6 +13,7 @@ import torch.nn as nn  # pyright: ignore[reportMissingImports]
 
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.lite.primitive import transformer_engine as te
+from megatron.lite.primitive.kernels.quick_geglu import QUICK_GELU_ALPHA, clamped_quick_geglu
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
     SharedGroupedLinearLoRA,
@@ -38,9 +39,15 @@ def _expert_nvtx_range(name: str):
 
 
 def swiglu_with_probs(
-    y: torch.Tensor, probs: torch.Tensor | None, swiglu_limit: float = 0.0
+    y: torch.Tensor, probs: torch.Tensor | None, swiglu_limit: float = 0.0, activation: str = "silu"
 ) -> torch.Tensor:
-    """SwiGLU with optional expert probability scaling."""
+    """GLU activation with optional expert probability scaling.
+
+    ``activation="swigluoai"``: ``g * sigmoid(1.702 g) * (u + 1)`` with ``g <= limit`` and
+    ``|u| <= limit`` clamps (see ``kernels.quick_geglu``); otherwise SwiGLU.
+    """
+    if activation == "swigluoai":
+        return clamped_quick_geglu(y, limit=swiglu_limit, linear_offset=1.0, weights=probs)
     clamp_value = swiglu_limit if swiglu_limit > 0 else None
     if probs is not None:
         return weighted_bias_swiglu_impl(y, bias=None, weights=probs, clamp_value=clamp_value)
@@ -81,6 +88,13 @@ class Experts(nn.Module):
             raise NotImplementedError(f"etp_size={ps.etp_size} unsupported; use 1.")
         self.etp_group = ps.etp_group if ps.etp_size > 1 else None
         self.swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
+        self.activation = getattr(config, "hidden_act", "silu")
+        if self.activation == "swigluoai":
+            alpha = getattr(config, "swiglu_alpha", QUICK_GELU_ALPHA)
+            if alpha != QUICK_GELU_ALPHA or self.swiglu_limit <= 0:
+                raise ValueError("swigluoai needs swiglu_alpha=1.702 and a positive swiglu_limit")
+        elif self.activation not in ("silu", "swiglu"):
+            raise ValueError(f"Unsupported expert activation {self.activation!r}")
         self.fc1 = te.GroupedLinear(
             self.num_local_experts,
             config.hidden_size,
@@ -180,7 +194,9 @@ class Experts(nn.Module):
                 fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
-                h = act_ckpt.checkpoint(swiglu_with_probs, fc1_out, probs, self.swiglu_limit)
+                h = act_ckpt.checkpoint(
+                    swiglu_with_probs, fc1_out, probs, self.swiglu_limit, self.activation
+                )
                 out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
                     out = out + self.fc2_lora(h, m_splits)
@@ -189,7 +205,7 @@ class Experts(nn.Module):
                 fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
-                h = swiglu_with_probs(fc1_out, probs, self.swiglu_limit)
+                h = swiglu_with_probs(fc1_out, probs, self.swiglu_limit, self.activation)
                 out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
                     out = out + self.fc2_lora(h, m_splits)
