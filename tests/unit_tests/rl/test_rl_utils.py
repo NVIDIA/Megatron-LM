@@ -2333,7 +2333,6 @@ class TestRLUtils:
                 trajs_batch_size=micro_batch_size,
                 seq_length=sequence_length,
                 logprobs_batch_size=micro_batch_size,
-                decoder_seq_length=sequence_length,
                 dtype=torch.bfloat16,
                 pp_group=gpt_model.pg_collection.pp,
                 is_correction=False,

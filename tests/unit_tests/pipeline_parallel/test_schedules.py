@@ -402,9 +402,9 @@ def test_forward_backward_func_without_pipeline_parallel(mocker):
         (MultiModulePipelineCommunicator, True, 2),
     ],
 )
-@pytest.mark.parametrize("decoder_seq_length", [None, 8])
+@pytest.mark.parametrize("seq_length", [1, 8])
 def test_schedule_enables_grad_sync_on_first_stage(
-    monkeypatch, communicator_base, module_first_stage, pipeline_stages, decoder_seq_length
+    monkeypatch, communicator_base, module_first_stage, pipeline_stages, seq_length
 ):
     events = []
 
@@ -519,15 +519,14 @@ def test_schedule_enables_grad_sync_on_first_stage(
         data_iterator=None,
         model=model,
         num_microbatches=1,
-        seq_length=1,
-        decoder_seq_length=decoder_seq_length,
+        seq_length=seq_length,
         micro_batch_size=1,
         p2p_communicator=FakeCommunicator(),
         pg_collection=pg_collection,
     )
 
     assert events == ["enter_no_sync", "exit_no_sync", "backward"]
-    assert shape_lengths == [decoder_seq_length if decoder_seq_length is not None else 1] * 2
+    assert shape_lengths == [seq_length] * 2
 
 
 def test_forward_backward_func_with_pipeline_parallel(mocker):
@@ -655,7 +654,6 @@ def test_forward_backward_func_with_interleaving(mocker):
         num_microbatches=micro_batch_size,
         seq_length=sequence_length,
         micro_batch_size=micro_batch_size,
-        decoder_seq_length=256,
         forward_only=True,
     )
 
@@ -672,7 +670,6 @@ def test_forward_backward_func_with_interleaving(mocker):
             num_microbatches=7,
             seq_length=sequence_length,
             micro_batch_size=micro_batch_size,
-            decoder_seq_length=512,
             forward_only=True,
         )
 
@@ -684,7 +681,6 @@ def test_forward_backward_func_with_interleaving(mocker):
         num_microbatches=micro_batch_size,
         seq_length=sequence_length,
         micro_batch_size=micro_batch_size,
-        decoder_seq_length=sequence_length,
         forward_only=True,
     )
 
@@ -765,7 +761,6 @@ def test_forward_backward_func_with_uneven_interleaving(mocker):
         num_microbatches=micro_batch_size,
         seq_length=sequence_length,
         micro_batch_size=micro_batch_size,
-        decoder_seq_length=256,
         forward_only=True,
     )
 
@@ -783,7 +778,6 @@ def test_forward_backward_func_with_uneven_interleaving(mocker):
             num_microbatches=7,
             seq_length=sequence_length,
             micro_batch_size=micro_batch_size,
-            decoder_seq_length=512,
             forward_only=True,
         )
 
@@ -796,7 +790,6 @@ def test_forward_backward_func_with_uneven_interleaving(mocker):
         num_microbatches=micro_batch_size,
         seq_length=sequence_length,
         micro_batch_size=micro_batch_size,
-        decoder_seq_length=sequence_length,
         forward_only=True,
     )
 
@@ -986,7 +979,6 @@ def test_forward_backward_pipelining_with_interleaving_with_custom_pgs(mocker):
         num_microbatches=micro_batch_size,
         seq_length=sequence_length,
         micro_batch_size=micro_batch_size,
-        decoder_seq_length=256,
         forward_only=True,
         pg_collection=pg_collection,
         p2p_communicator=p2p_communicator,

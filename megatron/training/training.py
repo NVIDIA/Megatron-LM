@@ -3483,6 +3483,7 @@ def train_step(
     args = get_args()
     cfg = get_run_config()
     sequence_length, decoder_seq_length = get_model_input_lengths(cfg.model, cfg.data.dataset)
+    pipeline_seq_length = decoder_seq_length if decoder_seq_length is not None else sequence_length
     timers = get_timers()
 
     # OTel: set up per-step sub-span support.
@@ -3520,7 +3521,7 @@ def train_step(
             # Distillation shape-adjust reads parallel_state; only for modelopt-enabled runs.
             adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
                 model,
-                seq_length=decoder_seq_length if decoder_seq_length is not None else sequence_length,
+                seq_length=pipeline_seq_length,
                 micro_batch_size=cfg.train.micro_batch_size,
             )
         else:
@@ -3614,9 +3615,8 @@ def train_step(
                 data_iterator=forward_backward_data_iterator,
                 model=model,
                 num_microbatches=scheduled_num_microbatches,
-                seq_length=sequence_length,
+                seq_length=pipeline_seq_length,
                 micro_batch_size=cfg.train.micro_batch_size,
-                decoder_seq_length=decoder_seq_length,
                 forward_only=forward_only,
                 adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
                 force_all_reduce=save_wgrads_in_this_iteration,
@@ -5803,6 +5803,7 @@ def evaluate(
     args = get_args()
     cfg = get_run_config()
     sequence_length, decoder_seq_length = get_model_input_lengths(cfg.model, cfg.data.dataset)
+    pipeline_seq_length = decoder_seq_length if decoder_seq_length is not None else sequence_length
     timers = get_timers()
     train_state = get_train_state()
 
@@ -5866,7 +5867,7 @@ def evaluate(
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
         adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
             model,
-            seq_length=decoder_seq_length if decoder_seq_length is not None else sequence_length,
+            seq_length=pipeline_seq_length,
             micro_batch_size=eval_micro_batch_size,
         )
     else:
@@ -5917,9 +5918,8 @@ def evaluate(
                     data_iterator=packed_data_iterator,
                     model=model,
                     num_microbatches=scheduled_eval_num_microbatches,
-                    seq_length=sequence_length,
+                    seq_length=pipeline_seq_length,
                     micro_batch_size=eval_micro_batch_size,
-                    decoder_seq_length=decoder_seq_length,
                     forward_only=True,
                     adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
                     pg_collection=pg_collection,
@@ -5978,9 +5978,8 @@ def evaluate(
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
-                seq_length=sequence_length,
+                seq_length=pipeline_seq_length,
                 micro_batch_size=eval_micro_batch_size,
-                decoder_seq_length=decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True,
                 pg_collection=pg_collection,

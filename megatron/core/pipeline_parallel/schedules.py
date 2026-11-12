@@ -113,15 +113,13 @@ def get_forward_backward_func(
     num_microbatches (int, required):
         The number of microbatches to go through
 
-    seq_length (int, required): Sequence length of the current global batch. If this is a dual-stack
-        transformer, this is the encoder's sequence length. This is ignored if variable_seq_lengths
-        in the config is True. Otherwise, each microbatch in the current global batch size must use
-        this sequence length.
+    seq_length (int, required): Resolved sequence length of tensors exchanged between pipeline
+        stages, before context/sequence parallel partitioning. Callers must select the model's
+        pipeline input length (including image-token expansion for VLMs). This is ignored if
+        variable_seq_lengths in the config is True. Otherwise, each microbatch in the current
+        global batch must use this sequence length.
 
     micro_batch_size (int, required): The number of sequences in a microbatch.
-
-    decoder_seq_length (int, optional): The sequence length for the decoder in a dual-stack
-        transformer. This is ignored for a single-stack transformer.
 
     forward_only (optional, default = False): Perform only the forward step.
 
@@ -740,7 +738,6 @@ def forward_backward_no_pipelining(
     num_microbatches: int,
     seq_length: int,  # unused
     micro_batch_size: int,  # unused
-    decoder_seq_length: Optional[int] = None,  # unused
     forward_only: bool = False,
     collect_non_loss_data: bool = False,
     first_val_step: Optional[bool] = None,
@@ -1018,7 +1015,6 @@ def forward_backward_pipelining_with_interleaving(
     num_microbatches: int,
     seq_length: int,
     micro_batch_size: int,
-    decoder_seq_length: Optional[int] = None,
     forward_only: bool = False,
     collect_non_loss_data: bool = False,
     first_val_step: Optional[bool] = None,
@@ -2171,7 +2167,6 @@ def forward_backward_pipelining_without_interleaving(
     num_microbatches: int,
     seq_length: int,
     micro_batch_size: int,
-    decoder_seq_length: Optional[int] = None,
     forward_only: bool = False,
     collect_non_loss_data: bool = False,
     first_val_step: Optional[bool] = None,
@@ -2320,17 +2315,15 @@ def forward_backward_pipelining_without_interleaving(
     else:
         backward_func = backward_step
 
-    # Preserve the schedule's decoder-length API; the shape helper takes one resolved width.
-    pipeline_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
     recv_tensor_shapes = get_tensor_shapes(
-        seq_length=pipeline_seq_length,
+        seq_length=seq_length,
         micro_batch_size=micro_batch_size,
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
     )
     send_tensor_shapes = get_tensor_shapes(
-        seq_length=pipeline_seq_length,
+        seq_length=seq_length,
         micro_batch_size=micro_batch_size,
         config=config,
         tp_group=tp_group,
