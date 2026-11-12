@@ -18,6 +18,11 @@ from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import Yar
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.models.hybrid import HybridLayerEntry
 from megatron.core.models.hybrid.layers import utils as layer_utils
+from megatron.core.models.hybrid.recurrence import (
+    LoopDistribution,
+    validate_loop_count,
+    validate_recurrence_config,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
@@ -125,7 +130,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         hybrid_layer_pattern (str): Unified hybrid layer pattern with optional MTP and
             pipeline stage boundaries.
             Format: "<main_pattern>/<mtp_pattern>/<mtp_pattern>/..."
-            The main pattern may contain "|" to define pipeline stage boundaries.
+            The main pattern may contain "|" to define pipeline stage boundaries, or
+            ``prefix:body1:body2:...:suffix`` to repeat each body with shared weights
+            and the same loop count (PP=1 only).
             Examples:
                 - "M*M*" -> main decoder only, no MTP
                 - "M*M*/MM/MM" -> main="M*M*", mtp="MM", 2 depths
@@ -164,6 +171,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         hybrid_layer_config_list (Sequence[HybridLayerEntry], optional): First-class
             decoder, pipeline-split, and MTP configuration sequence. Mutually exclusive with
             ``hybrid_layer_pattern`` and its deprecated alternatives. Defaults to None.
+        n_loops_distribution (str, optional): Training loop-count weights, normalized
+            automatically, e.g., ``"1:1,4:1"``. Requires ':' boundaries in
+            hybrid_layer_pattern. Defaults to one loop. Evaluation uses the largest count
+            unless inference_n_loops or forward's n_loops is set.
+        inference_n_loops (int, optional): Fixed loop count used in both evaluation and
+            inference (model.eval()). None uses the largest training-distribution count.
+            Does not affect training. Forward's n_loops takes precedence.
     """
 
     def __init__(
@@ -191,6 +205,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         pg_collection: Optional[ProcessGroupCollection] = None,
         vp_stage: Optional[int] = None,
         hybrid_layer_config_list: Optional[Sequence[HybridLayerEntry]] = None,
+        n_loops_distribution: str | None = None,
+        inference_n_loops: int | None = None,
     ) -> None:
         # Snapshot the container immediately. If the root config is also used as a layer entry,
         # detach it before applying model-level normalization so that entry remains caller-owned.
@@ -292,6 +308,17 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             select_pipeline_segment_from_config_list,
         )
 
+        self.recurrent_layer_ranges = ()
+        self.n_loops_distribution = n_loops_distribution
+        self.inference_n_loops = inference_n_loops
+        if inference_n_loops is not None:
+            validate_loop_count(inference_n_loops, "inference_n_loops")
+        if n_loops_distribution is not None:
+            LoopDistribution.from_string(n_loops_distribution)
+        if self.hybrid_layer_config_list is not None and (
+            n_loops_distribution is not None or inference_n_loops is not None
+        ):
+            raise ValueError("Loop configuration requires ':' boundaries in hybrid_layer_pattern")
         self.mtp_pattern = None
         self.mtp_layer_config_list = None
         self._decoder_uses_mla = self.config.multi_latent_attention
@@ -370,6 +397,19 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
         else:
             parsed_pattern = parse_hybrid_pattern(self.hybrid_layer_pattern)
+            self.recurrent_layer_ranges = parsed_pattern.recurrent_layer_ranges
+            if self.recurrent_layer_ranges:
+                validate_recurrence_config(self.config)
+                if vp_stage is not None or not (self.pre_process and self.post_process):
+                    raise ValueError("Hybrid recurrence requires a complete non-pipelined model")
+                if (
+                    self.pg_collection.pp is not None and self.pg_collection.pp.size() != 1
+                ) or self.pg_collection.cp.size() != 1:
+                    raise ValueError("Hybrid recurrence requires PP=1 and CP=1 process groups")
+            elif n_loops_distribution is not None or inference_n_loops is not None:
+                raise ValueError(
+                    "Loop configuration requires ':' boundaries in hybrid_layer_pattern"
+                )
             self.mtp_pattern = parsed_pattern.mtp_pattern
             self.mtp_num_depths = parsed_pattern.mtp_num_depths
             hash_moe_layer_threshold = _get_hash_moe_layer_threshold(
@@ -534,6 +574,14 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             pg_collection=self.pg_collection,
             hash_moe_layer_threshold=hash_moe_layer_threshold or None,
             name="decoder",
+            **(
+                dict(
+                    recurrent_layer_ranges=self.recurrent_layer_ranges,
+                    n_loops_distribution=n_loops_distribution,
+                )
+                if self.recurrent_layer_ranges
+                else {}
+            ),
         )
 
         # MTP block - uses mtp_block_spec from hybrid_stack_spec.submodules
@@ -694,6 +742,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         cp_batch: ContextParallelBatch | None = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
+        n_loops: int | None = None,
+        recurrence_step: int | None = None,
     ) -> Any:
         """Forward function of the Hybrid model. This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -708,6 +758,12 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 ``labels`` still determine whether the model returns loss or logits.
                 Defaults to True.
             cp_batch: Input tensors and packed metadata keyed by CP layout.
+            n_loops (int, optional): Explicit positive loop count for a recurrent decoder.
+                Overrides both training sampling and inference_n_loops for this forward only.
+                Cached inference is not supported.
+            recurrence_step (int, optional): Logical training minibatch step, shared across
+                ranks and gradient-accumulation microbatches. Required for stochastic training
+                unless n_loops is supplied. Does not depend on local forward-call order.
             output_processor (Callable, optional): Caller-provided post-decoder hook. When set,
                 it receives the decoder output and output-layer/loss helpers, and its return
                 value is returned directly. The default output projection, logits/loss
@@ -725,6 +781,15 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             self.preprocess_for_paged_stash()
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        recurrent_ranges = getattr(self, "recurrent_layer_ranges", ())
+        if recurrent_ranges and inference_context is not None:
+            raise ValueError("Hybrid recurrence does not yet support cached inference")
+        if n_loops is not None and not recurrent_ranges:
+            raise ValueError("n_loops requires a recurrent hybrid layer pattern")
+        inference_n_loops = getattr(self, "inference_n_loops", None)
+        if n_loops is None and inference_n_loops is not None and not self.training:
+            n_loops = inference_n_loops
 
         in_inference_mode = InferenceMode.is_active()
 
@@ -887,6 +952,8 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 cp_layout_plan=cp_layout_plan,
                 input_ids=hash_input_ids,
+                **(dict(n_loops=n_loops) if n_loops is not None else {}),
+                **(dict(recurrence_step=recurrence_step) if recurrence_step is not None else {}),
             )
         if isinstance(decoder_output, tuple):
             hidden_states, mhc_multistream = decoder_output
