@@ -23,9 +23,10 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from megatron.lite.primitive.quantization.qat import canonical_state_key
 from safetensors import safe_open
 from safetensors.torch import save_file as _safe_save
+
+from megatron.lite.primitive.quantization.qat import canonical_state_key
 
 try:
     from torch.distributed.tensor import DTensor
@@ -33,9 +34,7 @@ except Exception:  # pragma: no cover - older torch without DTensor
     DTensor = None  # type: ignore[assignment]
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
-from megatron.lite.primitive.ckpt.weight_sync_probe import (  # isort: skip
-    get_weight_sync_probe,
-)
+from megatron.lite.primitive.ckpt.weight_sync_probe import get_weight_sync_probe  # isort: skip
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
@@ -64,17 +63,13 @@ def _copy_to_cpu(dst: torch.Tensor, src: torch.Tensor) -> None:
     if src.device.type == "cpu":
         dst.copy_(src)
         return
-    with get_weight_sync_probe().measure(
-        "d2h", nbytes=_tensor_nbytes(src), device=src.device
-    ):
+    with get_weight_sync_probe().measure("d2h", nbytes=_tensor_nbytes(src), device=src.device):
         dst.copy_(src)
 
 
 def _ep_all_gather(outputs: list[torch.Tensor], tensor: torch.Tensor, group) -> None:
     with get_weight_sync_probe().measure(
-        "ep_gather",
-        nbytes=sum(_tensor_nbytes(output) for output in outputs),
-        device=tensor.device,
+        "ep_gather", nbytes=sum(_tensor_nbytes(output) for output in outputs), device=tensor.device
     ):
         dist.all_gather(outputs, tensor, group=group)
 
@@ -102,9 +97,7 @@ def _materialize_dtensor(tensor: torch.Tensor) -> torch.Tensor:
     params (dist_opt backend) pass through untouched.
     """
     if DTensor is not None and isinstance(tensor, DTensor):
-        with get_weight_sync_probe().measure(
-            "fsdp_gather", device=tensor.device
-        ) as sample:
+        with get_weight_sync_probe().measure("fsdp_gather", device=tensor.device) as sample:
             result = tensor.full_tensor()
             sample.nbytes = _tensor_nbytes(result)
             return result
@@ -122,9 +115,7 @@ class HFWeights(Protocol):
         """Megatron Lite param name → [HF param names]. Multiple = concat (QKV, gate+up)."""
         ...
 
-    def hf_to_native(
-        self, native_name: str, hf_tensors: list[torch.Tensor]
-    ) -> torch.Tensor:
+    def hf_to_native(self, native_name: str, hf_tensors: list[torch.Tensor]) -> torch.Tensor:
         """Convert HF tensors → single Megatron Lite tensor (e.g. merge QKV)."""
         ...
 
@@ -232,9 +223,9 @@ class SafeTensorReader:
             return tensor
 
         tensor = self._get_raw_tensor(name, target_device)
-        scaled_quantized = isinstance(
-            tensor, torch.Tensor
-        ) and _is_scaled_quantized_dtype(tensor.dtype)
+        scaled_quantized = isinstance(tensor, torch.Tensor) and _is_scaled_quantized_dtype(
+            tensor.dtype
+        )
         scale_inv_name = f"{name}_scale_inv"
         if scaled_quantized and tensor.dim() == 2 and self.has_tensor(scale_inv_name):
             scale = self._get_raw_tensor(scale_inv_name, target_device).float()
@@ -243,11 +234,7 @@ class SafeTensorReader:
             tensor = tensor.float() * expanded[:rows, :cols]
 
         scale_name = f"{name[:-7] if name.endswith('.weight') else name}.scale"
-        if (
-            scaled_quantized
-            and tensor.dtype != torch.float32
-            and self.has_tensor(scale_name)
-        ):
+        if scaled_quantized and tensor.dtype != torch.float32 and self.has_tensor(scale_name):
             if target_shape is None:
                 raise RuntimeError(
                     f"Cannot dequantize block-scaled tensor {name!r} with dtype "
@@ -339,9 +326,9 @@ def _dequantize_groupwise_int4(
             f"weight={tuple(unpacked.shape)} scale={tuple(scale.shape)}."
         )
     group_size = unpacked.shape[1] // scale.shape[1]
-    return (
-        unpacked.unflatten(-1, (scale.shape[1], group_size)) * scale.unsqueeze(-1)
-    ).flatten(start_dim=-2)
+    return (unpacked.unflatten(-1, (scale.shape[1], group_size)) * scale.unsqueeze(-1)).flatten(
+        start_dim=-2
+    )
 
 
 _FP4_E2M1_TABLE = (
@@ -353,7 +340,7 @@ _FP4_E2M1_TABLE = (
     3.0,
     4.0,
     6.0,
-    0.0,
+    -0.0,  # E2M1 code 0x8 preserves the native checkpoint sign bit.
     -0.5,
     -1.0,
     -1.5,
@@ -370,9 +357,7 @@ def _is_scaled_quantized_dtype(dtype: torch.dtype) -> bool:
 
 def _unpack_groupwise_int4(packed: torch.Tensor, shape: torch.Size) -> torch.Tensor:
     if packed.dtype != torch.int32:
-        raise ValueError(
-            f"Expected packed int4 tensor to be int32, got {packed.dtype}."
-        )
+        raise ValueError(f"Expected packed int4 tensor to be int32, got {packed.dtype}.")
     rows, cols = int(shape[0]), int(shape[1])
     unpacked = torch.empty(
         (packed.shape[0], packed.shape[1] * 8), dtype=torch.int32, device=packed.device
@@ -392,8 +377,7 @@ def _dequantize_block_scaled_tensor(
         scale = scale.unsqueeze(-1)
     if scale.dtype == torch.uint8:
         scale = torch.pow(
-            torch.tensor(2.0, dtype=torch.float32, device=scale.device),
-            scale.float() - 127.0,
+            torch.tensor(2.0, dtype=torch.float32, device=scale.device), scale.float() - 127.0
         )
     else:
         scale = scale.float()
@@ -411,8 +395,7 @@ def _dequantize_block_scaled_tensor(
         table = torch.tensor(_FP4_E2M1_TABLE, dtype=torch.float32, device=tensor.device)
         packed = tensor.view(torch.uint8)
         tensor = torch.stack(
-            (table[(packed & 0x0F).long()], table[((packed >> 4) & 0x0F).long()]),
-            dim=-1,
+            (table[(packed & 0x0F).long()], table[((packed >> 4) & 0x0F).long()]), dim=-1
         ).flatten(-2)
     else:
         tensor = tensor.float()
@@ -468,9 +451,7 @@ def _resolve_export_dtype(export_dtype: str | torch.dtype | None) -> torch.dtype
     return aliases[normalized]
 
 
-def _cast_export_tensor(
-    tensor: torch.Tensor, export_dtype: torch.dtype | None
-) -> torch.Tensor:
+def _cast_export_tensor(tensor: torch.Tensor, export_dtype: torch.dtype | None) -> torch.Tensor:
     if export_dtype is None or not tensor.is_floating_point():
         return tensor
     return tensor.to(dtype=export_dtype)
@@ -481,21 +462,14 @@ def _cast_export_tensor(
 # ======================================================================
 
 
-def split_dim(
-    tensor: torch.Tensor, rank: int, world: int, dim: int = 0
-) -> torch.Tensor:
+def split_dim(tensor: torch.Tensor, rank: int, world: int, dim: int = 0) -> torch.Tensor:
     if world <= 1:
         return tensor
     return tensor.chunk(world, dim=dim)[rank].contiguous()
 
 
 def split_qkv(
-    tensor: torch.Tensor,
-    rank: int,
-    world: int,
-    num_q_heads: int,
-    num_kv_heads: int,
-    head_dim: int,
+    tensor: torch.Tensor, rank: int, world: int, num_q_heads: int, num_kv_heads: int, head_dim: int
 ) -> torch.Tensor:
     """TP-shard a fused [Q, K, V] weight, splitting Q/K/V heads independently.
 
@@ -582,7 +556,8 @@ def bucketed_all_gather_into_tensor(
                 tensor,
                 [
                     recv_buffer[
-                        rank * total_numel + offsets[idx] : rank * total_numel
+                        rank * total_numel
+                        + offsets[idx] : rank * total_numel
                         + offsets[idx]
                         + numel_per_tensor[idx]
                     ].view_as(tensor)
@@ -596,8 +571,7 @@ def bucketed_all_gather_into_tensor(
         [torch.empty_like(tensor) for _, tensor in bucket] for _ in range(group_size)
     ]
     gathered_flat_views = [
-        [tensor.view(-1) for tensor in rank_shards]
-        for rank_shards in gathered_shards_by_rank
+        [tensor.view(-1) for tensor in rank_shards] for rank_shards in gathered_shards_by_rank
     ]
 
     send_buffer = torch.empty(max_chunk_numel, dtype=dtype, device=device)
@@ -630,11 +604,7 @@ def bucketed_all_gather_into_tensor(
                 ].copy_(rank_recv_view[chunk_offset : chunk_offset + segment_numel])
 
     return [
-        (
-            name,
-            tensor,
-            [gathered_shards_by_rank[rank][idx] for rank in range(group_size)],
-        )
+        (name, tensor, [gathered_shards_by_rank[rank][idx] for rank in range(group_size)])
         for idx, (name, tensor) in enumerate(bucket)
     ]
 
@@ -676,13 +646,10 @@ def _iter_bucketed_materialized_tensors(
                     buffer_max_size_bytes=buffer_max_size_bytes,
                 )
                 total_global_numel = sum(
-                    local_tensor.numel() * bucket_group_size
-                    for _, local_tensor in bucket
+                    local_tensor.numel() * bucket_group_size for _, local_tensor in bucket
                 )
                 materialized_buffer = torch.empty(
-                    total_global_numel,
-                    dtype=bucket[0][1].dtype,
-                    device=bucket[0][1].device,
+                    total_global_numel, dtype=bucket[0][1].dtype, device=bucket[0][1].device
                 )
                 source_views: list[torch.Tensor] = []
                 destination_views: list[torch.Tensor] = []
@@ -741,11 +708,7 @@ def _iter_bucketed_materialized_tensors(
             else:
                 yield name, local
             continue
-        if (
-            placement is None
-            or type(placement).__name__ != "Shard"
-            or shard_dim is None
-        ):
+        if placement is None or type(placement).__name__ != "Shard" or shard_dim is None:
             yield from _flush_bucket()
             yield name, _materialize_dtensor(tensor)
             continue
@@ -780,9 +743,7 @@ def _iter_bucketed_materialized_tensors(
             bytes_per_extent = local_bytes // local_extent
             chunk_extent = max(per_rank_limit // bytes_per_extent, 1)
             full = torch.empty(global_shape, dtype=local.dtype, device=local.device)
-            with get_weight_sync_probe().measure(
-                "fsdp_gather", device=local.device
-            ) as sample:
+            with get_weight_sync_probe().measure("fsdp_gather", device=local.device) as sample:
                 for offset in range(0, local_extent, chunk_extent):
                     extent = min(chunk_extent, local_extent - offset)
                     local_chunk = local.narrow(shard_dim, offset, extent)
@@ -793,9 +754,9 @@ def _iter_bucketed_materialized_tensors(
                         buffer_max_size_bytes=buffer_max_size_bytes,
                     )[0]
                     for rank, gathered_chunk in enumerate(gathered_chunks):
-                        full.narrow(
-                            shard_dim, rank * local_extent + offset, extent
-                        ).copy_(gathered_chunk)
+                        full.narrow(shard_dim, rank * local_extent + offset, extent).copy_(
+                            gathered_chunk
+                        )
                 sample.nbytes = _tensor_nbytes(full)
             yield name, full
             continue
@@ -864,9 +825,7 @@ def to_global_layer_name(name: str, layer_map: dict[int, int]) -> str:
     return re.sub(r"layers\.(\d+)\.", _replace, name)
 
 
-def gather_gate_up(
-    tensor: torch.Tensor, world_size: int, group: dist.ProcessGroup
-) -> torch.Tensor:
+def gather_gate_up(tensor: torch.Tensor, world_size: int, group: dist.ProcessGroup) -> torch.Tensor:
     ffn_local = tensor.shape[0] // 2
     gate_full = allgather_concat(tensor[:ffn_local], world_size, group, dim=0)
     up_full = allgather_concat(tensor[ffn_local:], world_size, group, dim=0)
@@ -879,10 +838,7 @@ def gather_gate_up(
 
 
 def _load_weight_map_for_model(
-    base_model: nn.Module,
-    spec: HFWeights,
-    ps,
-    state: dict[str, torch.Tensor],
+    base_model: nn.Module, spec: HFWeights, ps, state: dict[str, torch.Tensor]
 ) -> dict[str, list[str]]:
     """Build the one native-to-HF plan shared by load and export."""
     logical_state_keys = tuple(
@@ -899,12 +855,7 @@ def _load_weight_map_for_model(
 
 
 def load_hf_weights(
-    model: nn.Module,
-    hf_path: str,
-    spec: HFWeights,
-    ps,
-    *,
-    vocab_size: int | None = None,
+    model: nn.Module, hf_path: str, spec: HFWeights, ps, *, vocab_size: int | None = None
 ) -> None:
     """Load HF safetensors into a Megatron Lite model using HFWeights.
 
@@ -982,15 +933,7 @@ def load_hf_weights(
             expert_gid = spec.expert_global_id(mapped)
             if expert_gid is not None:
                 loaded_name = _load_expert_weight(
-                    mapped,
-                    hf_names,
-                    reader,
-                    spec,
-                    ps,
-                    state,
-                    targets,
-                    expert_gid,
-                    expert_shard,
+                    mapped, hf_names, reader, spec, ps, state, targets, expert_gid, expert_shard
                 )
                 if loaded_name is not None:
                     loaded_names.add(loaded_name)
@@ -1000,9 +943,7 @@ def load_hf_weights(
             target = targets.get(actual) if actual is not None else None
             if target is None:
                 pp_size = int(getattr(ps, "pp_size", 1))
-                is_stage_global_target = pp_size > 1 and not mapped.startswith(
-                    "layers."
-                )
+                is_stage_global_target = pp_size > 1 and not mapped.startswith("layers.")
                 present_sources = (
                     []
                     if is_stage_global_target
@@ -1017,9 +958,7 @@ def load_hf_weights(
                 continue
 
             replica_group_hook = getattr(spec, "replica_group_for_load", None)
-            replica_group = (
-                replica_group_hook(mapped, ps) if callable(replica_group_hook) else None
-            )
+            replica_group = replica_group_hook(mapped, ps) if callable(replica_group_hook) else None
             replica_ranks: list[int] | None = None
             source_global_rank: int | None = None
             if (
@@ -1029,9 +968,7 @@ def load_hf_weights(
             ):
                 replica_ranks = dist.get_process_group_ranks(replica_group)
                 source_hook = getattr(spec, "replica_source_rank_for_load", None)
-                source_group_rank = (
-                    source_hook(mapped, ps) if callable(source_hook) else 0
-                )
+                source_group_rank = source_hook(mapped, ps) if callable(source_hook) else 0
                 if not 0 <= source_group_rank < len(replica_ranks):
                     raise ValueError(
                         f"source_group_rank={source_group_rank} is outside "
@@ -1039,9 +976,7 @@ def load_hf_weights(
                     )
                 source_global_rank = replica_ranks[source_group_rank]
                 if dist.get_rank() != source_global_rank:
-                    dist.broadcast(
-                        target.data, src=source_global_rank, group=replica_group
-                    )
+                    dist.broadcast(target.data, src=source_global_rank, group=replica_group)
                     loaded_names.add(actual)
                     continue
 
@@ -1059,9 +994,7 @@ def load_hf_weights(
             tensor = spec.hf_to_native(mapped, hf_tensors)
 
             custom_shard = getattr(spec, "shard_for_load", None)
-            sharded = (
-                custom_shard(mapped, tensor, ps) if callable(custom_shard) else None
-            )
+            sharded = custom_shard(mapped, tensor, ps) if callable(custom_shard) else None
             if sharded is not None:
                 tensor = sharded
             else:
@@ -1069,9 +1002,7 @@ def load_hf_weights(
                 if tp_info is not None:
                     split_d, tp_or_etp = tp_info
                     if tp_or_etp == 0:
-                        if vocab_size is not None and (
-                            "embed" in mapped or "head" in mapped
-                        ):
+                        if vocab_size is not None and ("embed" in mapped or "head" in mapped):
                             from megatron.lite.primitive.parallel import (  # isort: skip
                                 pad_vocab_for_tp,
                             )
@@ -1085,26 +1016,20 @@ def load_hf_weights(
                                     device=tensor.device,
                                 )
                                 tensor = torch.cat([tensor, pad], dim=0)
-                        qkv = (
-                            spec.qkv_spec(mapped) if hasattr(spec, "qkv_spec") else None
-                        )
+                        qkv = spec.qkv_spec(mapped) if hasattr(spec, "qkv_spec") else None
                         if qkv is not None:
                             tensor = split_qkv(tensor, ps.tp_rank, ps.tp_size, *qkv)
-                        elif split_d == 0 and (
-                            "gate_up" in mapped or ".fc1." in mapped
-                        ):
+                        elif split_d == 0 and ("gate_up" in mapped or ".fc1." in mapped):
                             tensor = split_gate_up(tensor, ps.tp_rank, ps.tp_size)
                         else:
-                            tensor = split_dim(
-                                tensor, ps.tp_rank, ps.tp_size, dim=split_d
-                            )
+                            tensor = split_dim(tensor, ps.tp_rank, ps.tp_size, dim=split_d)
                     else:
-                        tensor = split_dim(
-                            tensor, ps.etp_rank, ps.etp_size, dim=split_d
-                        )
+                        tensor = split_dim(tensor, ps.etp_rank, ps.etp_size, dim=split_d)
 
             converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
-            (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
+            (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(
+                converted
+            )
             if replica_ranks is not None:
                 assert source_global_rank is not None
                 dist.broadcast(target.data, src=source_global_rank, group=replica_group)
@@ -1127,20 +1052,10 @@ def load_hf_weights(
 
 
 def _load_expert_weight(
-    native_name,
-    hf_names,
-    reader,
-    spec,
-    ps,
-    state,
-    targets,
-    expert_gid,
-    expert_shard,
+    native_name, hf_names, reader, spec, ps, state, targets, expert_gid, expert_shard
 ) -> str | None:
     if expert_shard is None:
-        raise RuntimeError(
-            "Expert weight encountered but expert shard metadata is unavailable."
-        )
+        raise RuntimeError("Expert weight encountered but expert shard metadata is unavailable.")
     experts_per_rank, local_start = expert_shard
     if expert_gid < local_start or expert_gid >= local_start + experts_per_rank:
         return None
@@ -1159,9 +1074,7 @@ def _load_expert_weight(
         return None
 
     replica_group_hook = getattr(spec, "replica_group_for_load", None)
-    replica_group = (
-        replica_group_hook(native_name, ps) if callable(replica_group_hook) else None
-    )
+    replica_group = replica_group_hook(native_name, ps) if callable(replica_group_hook) else None
     replica_ranks: list[int] | None = None
     source_global_rank: int | None = None
     if (
@@ -1212,10 +1125,7 @@ def _load_expert_weight(
 
 
 def _handle_missing_hf_tensors(
-    spec: HFWeights,
-    native_name: str,
-    hf_names: list[str],
-    error: KeyError,
+    spec: HFWeights, native_name: str, hf_names: list[str], error: KeyError
 ) -> None:
     """Fail on required HF sources and explain every optional fallback.
 
@@ -1257,11 +1167,7 @@ def _read_hf_tensors(
     shape_hook = getattr(spec, "hf_target_shape", None)
     tensors: list[torch.Tensor] = []
     for index, hf_name in enumerate(hf_names):
-        candidates = (
-            candidate_hook(native_name, hf_name)
-            if callable(candidate_hook)
-            else [hf_name]
-        )
+        candidates = candidate_hook(native_name, hf_name) if callable(candidate_hook) else [hf_name]
         resolve = getattr(reader, "first_available", None)
         resolved = resolve(candidates) if callable(resolve) else candidates[0]
         if callable(shape_hook):
@@ -1271,9 +1177,7 @@ def _read_hf_tensors(
         elif target.ndim > 0 and target.shape[0] % len(hf_names) == 0:
             # The only model-agnostic multi-source layout is equal concatenation
             # on the leading dimension. Unequal layouts must provide the hook.
-            target_shape = torch.Size(
-                (target.shape[0] // len(hf_names), *target.shape[1:])
-            )
+            target_shape = torch.Size((target.shape[0] // len(hf_names), *target.shape[1:]))
         else:
             target_shape = None
         tensor = reader.get_tensor(
@@ -1290,10 +1194,7 @@ def _read_hf_tensors(
 
 
 def _present_hf_sources(
-    reader: SafeTensorReader,
-    spec: HFWeights,
-    native_name: str,
-    hf_names: list[str],
+    reader: SafeTensorReader, spec: HFWeights, native_name: str, hf_names: list[str]
 ) -> list[str]:
     """Return mapped checkpoint sources that exist without loading payloads."""
     resolve = getattr(reader, "first_available", None)
@@ -1302,11 +1203,7 @@ def _present_hf_sources(
     candidate_hook = getattr(spec, "hf_name_candidates", None)
     present: list[str] = []
     for hf_name in hf_names:
-        candidates = (
-            candidate_hook(native_name, hf_name)
-            if callable(candidate_hook)
-            else [hf_name]
-        )
+        candidates = candidate_hook(native_name, hf_name) if callable(candidate_hook) else [hf_name]
         try:
             present.append(resolve(candidates))
         except KeyError:
@@ -1384,10 +1281,7 @@ def export_hf_weights(
             base_chunk = unwrap_model(chunk)
             state = base_chunk.state_dict()
             layer_map = (
-                {
-                    i: base_chunk.layer_indices[i]
-                    for i in range(len(base_chunk.layer_indices))
-                }
+                {i: base_chunk.layer_indices[i] for i in range(len(base_chunk.layer_indices))}
                 if hasattr(base_chunk, "layer_indices")
                 else {}
             )
@@ -1395,9 +1289,7 @@ def export_hf_weights(
                 logical_name = canonical_state_key(name)
                 yield to_global_layer_name(logical_name, layer_map), param.data.detach()
             persistent_buffers = [
-                (name, buffer)
-                for name, buffer in base_chunk.named_buffers()
-                if name in state
+                (name, buffer) for name, buffer in base_chunk.named_buffers() if name in state
             ]
             if not persistent_buffers:
                 continue
@@ -1407,9 +1299,7 @@ def export_hf_weights(
                 if global_name in wmap:
                     exported_names = [
                         hf_name
-                        for hf_name, _tensor in spec.native_to_hf(
-                            global_name, buffer.detach()
-                        )
+                        for hf_name, _tensor in spec.native_to_hf(global_name, buffer.detach())
                     ]
                     if exported_names != wmap[global_name]:
                         raise RuntimeError(
@@ -1441,13 +1331,9 @@ def export_hf_weights(
             if rank0_only and rank != 0:
                 return
             for native_name, gathered_tensor in gathered_tensors.items():
-                if vocab_size is not None and (
-                    "embed" in native_name or "head" in native_name
-                ):
+                if vocab_size is not None and ("embed" in native_name or "head" in native_name):
                     gathered_tensor = gathered_tensor[:vocab_size]
-                for hf_name, hf_tensor in _native_to_hf(
-                    spec, native_name, gathered_tensor
-                ):
+                for hf_name, hf_tensor in _native_to_hf(spec, native_name, gathered_tensor):
                     yield hf_name, _cast_export_tensor(hf_tensor, resolved_export_dtype)
 
         def _flush_dense_bucket():
@@ -1483,9 +1369,7 @@ def export_hf_weights(
                 local_idx = parse_expert_idx(native_name)
                 packed_group_name = getattr(spec, "packed_expert_group_name", None)
                 packed_name = (
-                    packed_group_name(native_name)
-                    if callable(packed_group_name)
-                    else None
+                    packed_group_name(native_name) if callable(packed_group_name) else None
                 )
                 for ep_rank, shard in enumerate(shards):
                     global_idx = ep_rank * experts_per_rank + local_idx
@@ -1494,9 +1378,7 @@ def export_hf_weights(
                     if packed_name is None:
                         yield from _iter_mapped({global_name: export_shard})
                         continue
-                    packed_expert_buffers.setdefault(packed_name, {})[global_idx] = (
-                        export_shard
-                    )
+                    packed_expert_buffers.setdefault(packed_name, {})[global_idx] = export_shard
                 if packed_name is not None:
                     packed = packed_expert_buffers[packed_name]
                     if len(packed) == spec.num_experts:
@@ -1515,9 +1397,7 @@ def export_hf_weights(
                 native_params, buffer_max_size_bytes=buffer_max_size_bytes
             )
             if not cpu and limit is None
-            else (
-                (name, _materialize_dtensor(tensor)) for name, tensor in native_params
-            )
+            else ((name, _materialize_dtensor(tensor)) for name, tensor in native_params)
         )
         for gname, tensor in materialized_params:
             gathered_one: dict[str, torch.Tensor] = {}
@@ -1528,18 +1408,14 @@ def export_hf_weights(
                     tensor_bytes = tensor.numel() * tensor.element_size()
                     should_flush = bool(expert_bucket) and (
                         tensor.dtype != expert_bucket[0][1].dtype
-                        or expert_bucket_bytes + tensor_bytes
-                        > expert_bucket_limit_bytes
+                        or expert_bucket_bytes + tensor_bytes > expert_bucket_limit_bytes
                     )
                     if should_flush:
                         yield from _flush_expert_bucket()
                     expert_bucket.append((gname, tensor))
                     expert_bucket_bytes += tensor_bytes
                     exported_params += 1
-                    if (
-                        len(expert_bucket) >= 4
-                        or expert_bucket_bytes >= expert_bucket_limit_bytes
-                    ):
+                    if len(expert_bucket) >= 4 or expert_bucket_bytes >= expert_bucket_limit_bytes:
                         yield from _flush_expert_bucket()
                     continue
                 _gather_expert(gname, tensor, spec, ps, gathered_one, cpu=cpu)
@@ -1639,10 +1515,7 @@ def export_hf_weights(
                     if bucket_bytes >= buffer_max_size_bytes:
                         break
                 header: list[Any] = [
-                    [
-                        (name, tuple(tensor.shape), tensor.dtype)
-                        for name, tensor in bucket
-                    ]
+                    [(name, tuple(tensor.shape), tensor.dtype) for name, tensor in bucket]
                 ]
             else:
                 header = [None]
@@ -1708,9 +1581,7 @@ def _gather_expert(
         out[name] = _maybe_cpu(tensor, cpu=cpu)
 
 
-def _gather_expert_etp(
-    name: str, tensor: torch.Tensor, spec: HFWeights, ps
-) -> torch.Tensor:
+def _gather_expert_etp(name: str, tensor: torch.Tensor, spec: HFWeights, ps) -> torch.Tensor:
     # ETP gather
     if ps.etp_size > 1 and ps.etp_group is not None:
         tp_info = spec.tp_spec(name)
@@ -1785,10 +1656,7 @@ def stream_export_to_shards(
         _flush()
         total = len(tmp_names)
         if total == 1:
-            os.rename(
-                os.path.join(path, tmp_names[0]),
-                os.path.join(path, "model.safetensors"),
-            )
+            os.rename(os.path.join(path, tmp_names[0]), os.path.join(path, "model.safetensors"))
         elif total > 1:
             weight_map: dict[str, str] = {}
             for idx, (tmp, keys) in enumerate(zip(tmp_names, shard_keys), start=1):
@@ -1797,10 +1665,7 @@ def stream_export_to_shards(
                 for k in keys:
                     weight_map[k] = final
             with open(os.path.join(path, "model.safetensors.index.json"), "w") as f:
-                json.dump(
-                    {"metadata": {"total_size": total_size}, "weight_map": weight_map},
-                    f,
-                )
+                json.dump({"metadata": {"total_size": total_size}, "weight_map": weight_map}, f)
 
     if dist.is_initialized():
         dist.barrier()
@@ -1817,9 +1682,7 @@ def save_hf_weights(
 ) -> None:
     """Export + write sharded safetensors via ``stream_export_to_shards``."""
     stream_export_to_shards(
-        export_hf_weights(
-            model, spec, ps, vocab_size=vocab_size, rank0_only=True, cpu=True
-        ),
+        export_hf_weights(model, spec, ps, vocab_size=vocab_size, rank0_only=True, cpu=True),
         hf_path,
         shard_size_bytes=shard_size_bytes,
     )

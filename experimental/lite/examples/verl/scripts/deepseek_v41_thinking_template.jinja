@@ -1,0 +1,1 @@
+{{ "<｜begin▁of▁sentence｜>" + "<｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n" }}{% for message in messages %}{% if message["role"] == "user" %}{{ "<｜User｜>" + message["content"] }}{% endif %}{% endfor %}{% if add_generation_prompt %}{{ "<｜Assistant｜><think>" }}{% endif %}

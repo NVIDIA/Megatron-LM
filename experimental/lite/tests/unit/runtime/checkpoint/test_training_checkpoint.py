@@ -28,7 +28,9 @@ from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
 
-@pytest.mark.parametrize("groups, expected", [([], False), ([object(), object()], True), ([object(), None], False)])
+@pytest.mark.parametrize(
+    "groups, expected", [([], False), ([object(), object()], True), ([object(), None], False)]
+)
 def test_dist_opt_checkpoint_memory_efficient_metadata(groups, expected) -> None:
     opts = [
         SimpleNamespace(
@@ -114,7 +116,7 @@ class FakeWrapper(torch.nn.Module):
 
 
 DISTOPT_METADATA = {
-    "distrib_optim_sharding_type": "fully_reshardable",
+    "distrib_optim_sharding_type": "dp_reshardable",
     "distrib_optim_fully_reshardable_mem_efficient": False,
     "chained_optim_avoid_prefix": True,
 }
@@ -261,6 +263,9 @@ def test_dist_opt_model_state_keys_are_pp_and_vpp_aware() -> None:
 
 
 def test_dist_opt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt._saved_sharding_type", lambda _: "dp_reshardable"
+    )
     wrapped_module = torch.nn.Linear(4, 2)
     model = FakeWrapper(wrapped_module)
     optimizer = FakeDistOpt()
@@ -388,3 +393,25 @@ def test_runtime_checkpoint_api_passes_current_training_checkpoint_signature(
         },
     )
     assert loaded_step == 7
+
+
+def test_frozen_release_tables_are_excluded_from_checkpoint():
+    model = torch.nn.Module()
+    model.trainable = torch.nn.Linear(3, 2)
+    model.table = torch.nn.Linear(3, 2)
+    model.table.requires_grad_(False)
+    model.table.restored_from_release = True
+    ps = ParallelState()
+    attach_model_sharded_state_dict([model], ps)
+    state = _model_sharded_state_dict(model)['model']
+    assert any('trainable.weight' in key for key in state)
+    assert not any('table.' in key for key in state)
+
+
+def test_saved_sharding_metadata_overrides_current_default(monkeypatch):
+    monkeypatch.setenv('MLITE_DISTOPT_SHARDING_TYPE', 'fully_reshardable')
+    assert _dist_opt_checkpoint_metadata(None)['distrib_optim_sharding_type'] == 'fully_reshardable'
+    assert (
+        _dist_opt_checkpoint_metadata(None, 'dp_reshardable')['distrib_optim_sharding_type']
+        == 'dp_reshardable'
+    )

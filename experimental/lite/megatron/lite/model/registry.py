@@ -114,6 +114,17 @@ register_model(
 )
 
 
+register_model(
+    "deepseek_v41",
+    package="megatron.lite.model.deepseek_v41",
+    hf_model_types=["deepseek_v41", "deepseek_v41_text"],
+    impls={
+        "lite": "megatron.lite.model.deepseek_v41.lite.protocol",
+        "vllm": "megatron.lite.model.deepseek_v41.vllm.protocol",
+    },
+)
+
+
 # ---------------------------------------------------------------------------
 # Lookup functions
 # ---------------------------------------------------------------------------
