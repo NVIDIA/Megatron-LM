@@ -3,7 +3,6 @@
 """Shared-MTP execution-order coverage for the MFSDP v2 MCore adapter."""
 
 from contextlib import nullcontext
-from copy import deepcopy
 
 import pytest
 import torch
@@ -68,10 +67,13 @@ def test_shared_mtp_matches_unsharded_training(distributed_setup, ambient_contex
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     groups = ProcessGroupCollection(dp_cp=mesh.get_group())
     torch.manual_seed(1234)
-    baseline = _SharedPredictor().to(device)
-    module = deepcopy(baseline)
+    module = _SharedPredictor().to(device)
     torch.manual_seed(5678 + distributed_setup.rank)
     value = torch.randn(4, 16, device=device)
+    expected = run_forward_backward_on_microbatches(
+        module, lambda: module(value), num_microbatches=3
+    )
+    module.zero_grad(set_to_none=True)
     construction = (
         fully_shard_context(
             FsdpContext(
@@ -92,8 +94,5 @@ def test_shared_mtp_matches_unsharded_training(distributed_setup, ambient_contex
             device=device,
             pg_collection=groups,
         )
-    expected = run_forward_backward_on_microbatches(
-        baseline, lambda: baseline(value), num_microbatches=3
-    )
     actual = run_forward_backward_on_microbatches(model, lambda: model(value), num_microbatches=3)
     torch.testing.assert_close(actual, expected)
