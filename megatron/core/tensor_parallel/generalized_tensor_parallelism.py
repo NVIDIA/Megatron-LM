@@ -573,6 +573,26 @@ def initialize_graph_wgrad_rings() -> None:
     )
 
 
+def wait_for_gtp_all_gather_on_current_stream() -> None:
+    """Join the GTP all-gather side streams into the current stream after a forward-only step.
+
+    A forward-only step (evaluation) never reaches ``finalize_model_grads``, so nothing joins
+    the weight all-gather / prefetch work launched on the AG side streams. Whole-step CUDA-graph
+    capture then fails with "capturing stream has unjoined work". The reduce-scatter streams are
+    deliberately left alone: they carry no forward work. No-op when GTP is inactive.
+    """
+    cur = torch.cuda.current_stream()
+    capturing = torch.cuda.is_current_stream_capturing()
+    for s in _AG_STREAMS.values():
+        if capturing:
+            # Only streams that joined this capture: waiting on any other one would add a
+            # dependency on uncaptured work.
+            with torch.cuda.stream(s):
+                if not torch.cuda.is_current_stream_capturing():
+                    continue
+        cur.wait_stream(s)
+
+
 def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     """Fence the current stream against all GTP backward grad work before the DP gradient sync.
 

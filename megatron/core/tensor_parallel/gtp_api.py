@@ -37,6 +37,7 @@ try:
         move_gtp_weights_to_symm_pool,
         register_prefetch_chain,
         wait_async_comms,
+        wait_for_gtp_all_gather_on_current_stream,
         wait_for_gtp_grad_reduction_on_current_stream,
         wrap_module_params_gtp,
     )
@@ -89,6 +90,7 @@ __all__ = [
     "set_cuda_graph_mempool",
     "track_gtp_capture_comms",
     "wait_async_comms",
+    "wait_for_gtp_all_gather_on_current_stream",
     "wait_for_gtp_grad_reduction_on_current_stream",
     "wrap_module_params_gtp",
 ]
