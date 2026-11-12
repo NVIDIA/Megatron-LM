@@ -28,20 +28,14 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 
 
 class ScheduledLinearFunction(torch.autograd.Function):
-    """Own weight materialization and gradient submission at the compute sites."""
+    """Compute with materialized weights and drive their backward lifecycle."""
 
     @staticmethod
-    def forward(ctx, inputs, _weight, _bias, module):
-        """Gather for the forward GEMM and release weights immediately afterward."""
-        # Sharded parameters are inputs to apply() to retain autograd edges even
-        # when activations do not require gradients. Compute uses the full weights.
+    def forward(ctx, inputs, weight, bias, module):
+        """Run the forward GEMM with weights materialized by the module."""
         ctx.module = module
         ctx.save_for_backward(inputs)
-        module.context.allgather_stream.wait_stream(module.context.current_stream())
-        module.unshard()
-        output = F.linear(inputs, module.weight, module.bias)
-        module.reshard()
-        return output
+        return F.linear(inputs, weight, bias)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -64,8 +58,12 @@ class _ScheduledLinear(nn.Linear):
     """Linear whose autograd implementation explicitly drives its FSDP lifecycle."""
 
     def forward(self, inputs):
-        """Dispatch compute and its backward without registering execution hooks."""
-        return ScheduledLinearFunction.apply(inputs, self.weight, self.bias, self)
+        """Gather, compute with full weights, and reshard without execution hooks."""
+        self.context.allgather_stream.wait_stream(self.context.current_stream())
+        self.unshard()
+        output = ScheduledLinearFunction.apply(inputs, self.weight, self.bias, self)
+        self.reshard()
+        return output
 
 
 @pytest.mark.parametrize(
