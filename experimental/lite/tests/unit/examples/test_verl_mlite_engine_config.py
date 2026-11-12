@@ -216,3 +216,40 @@ def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
 
     assert scheduler.state_dict() == state
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.7)
+
+
+def test_local_lr_scheduler_keeps_no_decay_groups_undecayed() -> None:
+    from verl_mlite.engine.mlite_engine import _build_lr_scheduler
+
+    optimizer = SimpleNamespace(
+        param_groups=[
+            {"lr": 0.0, "weight_decay": 0.1, "wd_mult": 1.0},
+            {"lr": 0.0, "weight_decay": 0.0, "wd_mult": 0.0},
+            {"lr": 0.0, "weight_decay": 0.1},
+        ]
+    )
+    opt = SimpleNamespace(
+        total_training_steps=4,
+        lr_warmup_steps=0,
+        lr_warmup_steps_ratio=0.0,
+        lr_warmup_init=0.0,
+        lr=1.0,
+        min_lr=0.0,
+        lr_decay_steps=4,
+        lr_decay_style="constant",
+        weight_decay=0.1,
+        weight_decay_incr_style="constant",
+        lr_wsd_decay_steps=None,
+        lr_wsd_decay_style="exponential",
+    )
+
+    scheduler = _build_lr_scheduler(optimizer, opt)
+    scheduler.step(1)
+
+    assert [group["weight_decay"] for group in optimizer.param_groups] == [0.1, 0.0, 0.1]
+
+    for group in optimizer.param_groups:
+        group["weight_decay"] = 0.1
+    opt.total_training_steps = 0
+    assert _build_lr_scheduler(optimizer, opt) is None
+    assert [group["weight_decay"] for group in optimizer.param_groups] == [0.1, 0.0, 0.1]
