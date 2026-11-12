@@ -413,7 +413,7 @@ def _forward_mamba_layer_shared_prefix_cp_impl(
         packed_recurrence=packed_recurrence,
         ragged_state_fork=ragged_state_fork,
     )
-    output = layer(hidden_states=hidden_states, attention_mask=None, shared_prefix_call=call)
+    output = layer(hidden_states, attention_mask=None, shared_prefix_call=call)
     # A forward that accepts the request but never serves it would silently run dense Mamba.
     if not call.consumed:
         raise RuntimeError(
@@ -554,7 +554,7 @@ def _forward_mamba_layer_shared_prefix_cp_packed_fused_oracle(
         total_tokens=dense_total,
     )
     dense_output_local = layer(
-        hidden_states=dense_local, attention_mask=None, packed_seq_params=packed_seq_params
+        dense_local, attention_mask=None, packed_seq_params=packed_seq_params
     )
     if isinstance(dense_output_local, tuple):
         dense_output_local = dense_output_local[0]

@@ -153,7 +153,7 @@ class TestSharedPrefixMambaNumerics:
         def runs(layer, dtype):
             dense = run_layer(
                 layer,
-                lambda x: layer(hidden_states=x, attention_mask=None),
+                lambda x: layer(x, attention_mask=None),
                 data.dense_input.cuda().to(dtype),
                 data.dense_cotangent.cuda(),
             )
