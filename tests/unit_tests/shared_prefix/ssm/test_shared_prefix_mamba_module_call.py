@@ -128,8 +128,8 @@ def test_layer_passes_shared_prefix_call_to_the_mixer_only_when_set():
     hidden_states = torch.zeros(_LAYOUT.total_len, 1, _HIDDEN)
     call = mamba_shared_prefix.MambaSharedPrefixCall(_LAYOUT)
 
-    layer(hidden_states=hidden_states, attention_mask=None)
-    layer(hidden_states=hidden_states, attention_mask=None, shared_prefix_call=call)
+    layer(hidden_states, attention_mask=None)
+    layer(hidden_states, attention_mask=None, shared_prefix_call=call)
 
     dense, shared = layer.mixer.calls
     assert "shared_prefix_call" not in dense
