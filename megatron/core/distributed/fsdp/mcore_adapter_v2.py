@@ -204,12 +204,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 groups = (pg_collection.dp_cp,)
                 if config.num_moe_experts is not None:
                     groups += (pg_collection.expt_dp,)
-            communication_device = (
-                active_context.allgather_stream.device
-                if active_context is not None
-                else torch.cuda.current_stream(device).device
+            _initialize_symmetric_memory_communicators(
+                groups, torch.cuda.current_stream(device).device
             )
-            _initialize_symmetric_memory_communicators(groups, communication_device)
 
         # Optimizer construction reads this attribute; retain the v1 contract for compatibility.
         self.ddp_config = ddp_config
