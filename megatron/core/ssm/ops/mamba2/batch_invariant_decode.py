@@ -459,6 +459,14 @@ class MambaBatchInvariantDecode:
                 x.device,
                 x.dtype,
             )
+        elif max_requests > self.buffers.x.shape[0]:
+            raise RuntimeError(
+                f"Batch-invariant Mamba decode buffers hold {self.buffers.x.shape[0]} request "
+                f"slots but the inference context needs {max_requests}. The buffers keep the "
+                "size of the first context that ran this model: call "
+                "megatron.core.inference.utils.release_model_inference_buffers(model) once no "
+                "CUDA graph of the previous context is alive, before running a larger one."
+            )
         return self.buffers
 
     def seed(self, x, dt, B, C, cu_seqlens, batch_indices, max_requests) -> None:

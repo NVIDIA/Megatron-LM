@@ -41,6 +41,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 )
 from megatron.core.ssm.ops.gdp.metadata import max_gdp_chunk_counts
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     InferenceAllGatherDispatcherBase,
     NCCLAllGatherDispatcher,
@@ -402,6 +403,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     )
     def __init__(self, model_config: TransformerConfig, inference_config: InferenceConfig):
         super().__init__(inference_config=inference_config)
+
+        # Since we do not allow two simulatanesous inference contexts, any inference buffers
+        # allocated by a previous context instantation are now invalid and must be dropped.
+        self.release_class_level_state()
 
         # Prefix caching configuration
         self.enable_prefix_caching = inference_config.enable_prefix_caching
@@ -2010,6 +2015,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             if self.mamba_replay is not None:
                 self.mamba_replay.deallocate()
             self.dsa_metadata = None
+
+    @staticmethod
+    def release_class_level_state() -> None:
+        """Release the class-level state a context publishes into other classes."""
+        VllmFusedMoeBuffers._delete_buffers()
+        NVLSAllGatherVDispatcher._real_token_count_tensor = None
+        RouterReplay.clear_global_static_buffers()
+        for router in RouterReplay.get_instances():
+            router.recorded_topk_idx = None
 
     @classmethod
     def round_up_tokens(cls, value, tp_size=None):

@@ -25,7 +25,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     DecodeOnly,
     TextGenerationController,
 )
-from megatron.core.inference.utils import Counter, InferenceMode
+from megatron.core.inference.utils import Counter, InferenceMode, release_model_inference_buffers
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
@@ -293,6 +293,10 @@ class DynamicInferenceEngine(
                         if isinstance(val, (int, float)) and int(val) > max_step:
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
+
+        # Since we do not allow two simulatanesous inference engines, any inference buffers
+        # allocated by a previous engine instantation are now invalid and must be dropped.
+        release_model_inference_buffers(controller.inference_wrapped_model.model)
 
         if start_suspended:
             # The weights may not be present yet, so CUDA-graph capture waits for the first
