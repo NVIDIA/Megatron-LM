@@ -1,0 +1,2681 @@
+{
+  "schema_version": 1,
+  "status": "frozen_pre_cp64_holdout",
+  "contract": {
+    "profile_name": "qwen3_30b",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "dtype": "bfloat16",
+    "phase": "forward",
+    "query_heads": 32,
+    "kv_heads": 4,
+    "head_dim": 128,
+    "physical_tokens_per_rank": 4096,
+    "sequence_alignment": 128,
+    "cp_sizes": [
+      2,
+      4,
+      8,
+      16,
+      32,
+      64
+    ]
+  },
+  "source": {
+    "cp2_results": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260722_cp2_fullnode_validation_v3/qwen3_30b/cp2/results.json",
+    "cp2_results_sha256": "239b595c5759aae9c277c7e329a11064cd056cb15e0423ff853250149f2147cc",
+    "host_component_results": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260722_cp2_fullnode_validation_v3/qwen3_30b/cp2/results.json",
+    "host_component_results_sha256": "239b595c5759aae9c277c7e329a11064cd056cb15e0423ff853250149f2147cc",
+    "experiment_contract": "runtime/analysis/gqa_attention_model/cp_overlap_cp64_experiment_contract_20260722_v3.json",
+    "experiment_contract_sha256": "17a75a79ddd7189faed1b43a5bdf019c121de3f149490aafbdab715c4cc9b8d3",
+    "communication_results": {
+      "2": {
+        "path": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260722_cp2_fullnode_validation_v3/qwen3_30b/cp2/results.json",
+        "sha256": "239b595c5759aae9c277c7e329a11064cd056cb15e0423ff853250149f2147cc"
+      },
+      "4": {
+        "path": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260722_cp4_8_fullnode_align128safe_all6_v3/qwen3_30b/cp4/results.json",
+        "sha256": "288750697d1b5c371be7dd705e3c0589200a4d28cb9681a93fd4cdf133ececed"
+      },
+      "8": {
+        "path": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260722_cp4_8_fullnode_align128safe_all6_v3/qwen3_30b/cp8/results.json",
+        "sha256": "2ac35bbebb8382211b491339754708a3d0b753788a570f0d2db800cf4e3fb874"
+      },
+      "16": {
+        "path": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260722_cp16_32_64_align128safe_all6_v3/qwen3_30b/cp16/results.json",
+        "sha256": "f50283ba66ae64aa4be8d27c890416770e627bf4b58cd83ae02aeb605a89bf35"
+      },
+      "32": {
+        "path": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260722_cp16_32_64_align128safe_all6_v3/qwen3_30b/cp32/results.json",
+        "sha256": "71dbd5c14157688a66f6c43da2519205adcf6b3bda8c139e9815578c48ccce7d"
+      },
+      "64": {
+        "path": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260722_cp16_32_64_align128safe_all6_v3/qwen3_30b/cp64/results.json",
+        "sha256": "b04e192cf2479fd967b0d5c6a5fb9b15d407cb744eb8d62ed317b422a8ca1928"
+      }
+    },
+    "cp1_model": {
+      "path": "runtime/analysis/gqa_attention_model/cp1_tail_3k8k_six_geometry_forward/frozen_models.json",
+      "sha256": "8e76ca0ede26e018a66eece82d7937a1043e14bd87784bc9bb629d3d518e98e3"
+    },
+    "megatron_commit": "d314db2ea3ad2cc6b44aff39f931558fe0ba22a7",
+    "transformer_engine_version": "2.14.0+f031cf87",
+    "communication_metadata": {
+      "2": {
+        "timestamp_unix": 1784715372.2906842,
+        "megatron_commit": "d314db2ea3ad2cc6b44aff39f931558fe0ba22a7",
+        "benchmark_source_sha256": "6621388780c4e72a9015639e14f1b790f3212024035bca247721f31a272dd9e8",
+        "torch_version": "2.12.0a0+0291f960b6.nv26.04.48445190",
+        "transformer_engine_version": "2.14.0+f031cf87",
+        "cuda_version": "13.2",
+        "cudnn_version": 92100,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "cp_size": 2,
+        "geometry": {
+          "profile_name": "qwen3_30b",
+          "q_heads": 32,
+          "kv_heads": 4,
+          "head_dim": 128,
+          "hidden_size": 2048
+        },
+        "dtype": "bfloat16",
+        "qkv_format": "thd",
+        "mask": "causal",
+        "cp_comm_type": "p2p",
+        "physical_tokens_per_rank": 4096,
+        "sequence_alignment": 128,
+        "warmup": 100,
+        "iterations": 500,
+        "timing_batch_size": 25,
+        "component_warmup": 50,
+        "component_iterations": 40,
+        "modes": [
+          "overlap",
+          "serialized"
+        ],
+        "skip_components": false,
+        "skip_host_enqueue": false,
+        "skip_comm_only": false,
+        "serialized_component_attention": true,
+        "rank_topology": [
+          {
+            "rank": 0,
+            "local_rank": 0,
+            "cuda_device": 0,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 1,
+            "local_rank": 1,
+            "cuda_device": 1,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          }
+        ],
+        "cuda_device_max_connections": "1",
+        "nvte_fused_attn": null,
+        "nvte_batch_mha_p2p_comm": null
+      },
+      "4": {
+        "timestamp_unix": 1784715444.1288188,
+        "megatron_commit": "d314db2ea3ad2cc6b44aff39f931558fe0ba22a7",
+        "benchmark_source_sha256": "6621388780c4e72a9015639e14f1b790f3212024035bca247721f31a272dd9e8",
+        "torch_version": "2.12.0a0+0291f960b6.nv26.04.48445190",
+        "transformer_engine_version": "2.14.0+f031cf87",
+        "cuda_version": "13.2",
+        "cudnn_version": 92100,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "cp_size": 4,
+        "geometry": {
+          "profile_name": "qwen3_30b",
+          "q_heads": 32,
+          "kv_heads": 4,
+          "head_dim": 128,
+          "hidden_size": 2048
+        },
+        "dtype": "bfloat16",
+        "qkv_format": "thd",
+        "mask": "causal",
+        "cp_comm_type": "p2p",
+        "physical_tokens_per_rank": 4096,
+        "sequence_alignment": 128,
+        "warmup": 100,
+        "iterations": 500,
+        "timing_batch_size": 25,
+        "component_warmup": 50,
+        "component_iterations": 40,
+        "modes": [
+          "overlap",
+          "serialized"
+        ],
+        "skip_components": false,
+        "skip_host_enqueue": false,
+        "skip_comm_only": false,
+        "serialized_component_attention": true,
+        "rank_topology": [
+          {
+            "rank": 0,
+            "local_rank": 0,
+            "cuda_device": 0,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 1,
+            "local_rank": 1,
+            "cuda_device": 1,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 2,
+            "local_rank": 2,
+            "cuda_device": 2,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 3,
+            "local_rank": 3,
+            "cuda_device": 3,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          }
+        ],
+        "cuda_device_max_connections": "1",
+        "nvte_fused_attn": null,
+        "nvte_batch_mha_p2p_comm": null
+      },
+      "8": {
+        "timestamp_unix": 1784715542.026629,
+        "megatron_commit": "d314db2ea3ad2cc6b44aff39f931558fe0ba22a7",
+        "benchmark_source_sha256": "6621388780c4e72a9015639e14f1b790f3212024035bca247721f31a272dd9e8",
+        "torch_version": "2.12.0a0+0291f960b6.nv26.04.48445190",
+        "transformer_engine_version": "2.14.0+f031cf87",
+        "cuda_version": "13.2",
+        "cudnn_version": 92100,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "cp_size": 8,
+        "geometry": {
+          "profile_name": "qwen3_30b",
+          "q_heads": 32,
+          "kv_heads": 4,
+          "head_dim": 128,
+          "hidden_size": 2048
+        },
+        "dtype": "bfloat16",
+        "qkv_format": "thd",
+        "mask": "causal",
+        "cp_comm_type": "p2p",
+        "physical_tokens_per_rank": 4096,
+        "sequence_alignment": 128,
+        "warmup": 100,
+        "iterations": 500,
+        "timing_batch_size": 25,
+        "component_warmup": 50,
+        "component_iterations": 40,
+        "modes": [
+          "overlap",
+          "serialized"
+        ],
+        "skip_components": false,
+        "skip_host_enqueue": false,
+        "skip_comm_only": false,
+        "serialized_component_attention": true,
+        "rank_topology": [
+          {
+            "rank": 0,
+            "local_rank": 0,
+            "cuda_device": 0,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 1,
+            "local_rank": 1,
+            "cuda_device": 1,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 2,
+            "local_rank": 2,
+            "cuda_device": 2,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 3,
+            "local_rank": 3,
+            "cuda_device": 3,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 4,
+            "local_rank": 4,
+            "cuda_device": 4,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 5,
+            "local_rank": 5,
+            "cuda_device": 5,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 6,
+            "local_rank": 6,
+            "cuda_device": 6,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 7,
+            "local_rank": 7,
+            "cuda_device": 7,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          }
+        ],
+        "cuda_device_max_connections": "1",
+        "nvte_fused_attn": null,
+        "nvte_batch_mha_p2p_comm": null
+      },
+      "16": {
+        "timestamp_unix": 1784715357.7146308,
+        "megatron_commit": "d314db2ea3ad2cc6b44aff39f931558fe0ba22a7",
+        "benchmark_source_sha256": "6621388780c4e72a9015639e14f1b790f3212024035bca247721f31a272dd9e8",
+        "torch_version": "2.12.0a0+0291f960b6.nv26.04.48445190",
+        "transformer_engine_version": "2.14.0+f031cf87",
+        "cuda_version": "13.2",
+        "cudnn_version": 92100,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "cp_size": 16,
+        "geometry": {
+          "profile_name": "qwen3_30b",
+          "q_heads": 32,
+          "kv_heads": 4,
+          "head_dim": 128,
+          "hidden_size": 2048
+        },
+        "dtype": "bfloat16",
+        "qkv_format": "thd",
+        "mask": "causal",
+        "cp_comm_type": "p2p",
+        "physical_tokens_per_rank": 4096,
+        "sequence_alignment": 128,
+        "warmup": 100,
+        "iterations": 500,
+        "timing_batch_size": 25,
+        "component_warmup": 50,
+        "component_iterations": 40,
+        "modes": [
+          "overlap"
+        ],
+        "skip_components": true,
+        "skip_host_enqueue": false,
+        "skip_comm_only": false,
+        "serialized_component_attention": true,
+        "rank_topology": [
+          {
+            "rank": 0,
+            "local_rank": 0,
+            "cuda_device": 0,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 1,
+            "local_rank": 1,
+            "cuda_device": 1,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 2,
+            "local_rank": 2,
+            "cuda_device": 2,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 3,
+            "local_rank": 3,
+            "cuda_device": 3,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 4,
+            "local_rank": 4,
+            "cuda_device": 4,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 5,
+            "local_rank": 5,
+            "cuda_device": 5,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 6,
+            "local_rank": 6,
+            "cuda_device": 6,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 7,
+            "local_rank": 7,
+            "cuda_device": 7,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 8,
+            "local_rank": 0,
+            "cuda_device": 0,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 9,
+            "local_rank": 1,
+            "cuda_device": 1,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 10,
+            "local_rank": 2,
+            "cuda_device": 2,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 11,
+            "local_rank": 3,
+            "cuda_device": 3,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 12,
+            "local_rank": 4,
+            "cuda_device": 4,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 13,
+            "local_rank": 5,
+            "cuda_device": 5,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 14,
+            "local_rank": 6,
+            "cuda_device": 6,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 15,
+            "local_rank": 7,
+            "cuda_device": 7,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          }
+        ],
+        "cuda_device_max_connections": "1",
+        "nvte_fused_attn": null,
+        "nvte_batch_mha_p2p_comm": null
+      },
+      "32": {
+        "timestamp_unix": 1784715458.676686,
+        "megatron_commit": "d314db2ea3ad2cc6b44aff39f931558fe0ba22a7",
+        "benchmark_source_sha256": "6621388780c4e72a9015639e14f1b790f3212024035bca247721f31a272dd9e8",
+        "torch_version": "2.12.0a0+0291f960b6.nv26.04.48445190",
+        "transformer_engine_version": "2.14.0+f031cf87",
+        "cuda_version": "13.2",
+        "cudnn_version": 92100,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "cp_size": 32,
+        "geometry": {
+          "profile_name": "qwen3_30b",
+          "q_heads": 32,
+          "kv_heads": 4,
+          "head_dim": 128,
+          "hidden_size": 2048
+        },
+        "dtype": "bfloat16",
+        "qkv_format": "thd",
+        "mask": "causal",
+        "cp_comm_type": "p2p",
+        "physical_tokens_per_rank": 4096,
+        "sequence_alignment": 128,
+        "warmup": 100,
+        "iterations": 500,
+        "timing_batch_size": 25,
+        "component_warmup": 50,
+        "component_iterations": 40,
+        "modes": [
+          "overlap"
+        ],
+        "skip_components": true,
+        "skip_host_enqueue": false,
+        "skip_comm_only": false,
+        "serialized_component_attention": true,
+        "rank_topology": [
+          {
+            "rank": 0,
+            "local_rank": 0,
+            "cuda_device": 0,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 1,
+            "local_rank": 1,
+            "cuda_device": 1,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 2,
+            "local_rank": 2,
+            "cuda_device": 2,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 3,
+            "local_rank": 3,
+            "cuda_device": 3,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 4,
+            "local_rank": 4,
+            "cuda_device": 4,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 5,
+            "local_rank": 5,
+            "cuda_device": 5,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 6,
+            "local_rank": 6,
+            "cuda_device": 6,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 7,
+            "local_rank": 7,
+            "cuda_device": 7,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 8,
+            "local_rank": 0,
+            "cuda_device": 0,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 9,
+            "local_rank": 1,
+            "cuda_device": 1,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 10,
+            "local_rank": 2,
+            "cuda_device": 2,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 11,
+            "local_rank": 3,
+            "cuda_device": 3,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 12,
+            "local_rank": 4,
+            "cuda_device": 4,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 13,
+            "local_rank": 5,
+            "cuda_device": 5,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 14,
+            "local_rank": 6,
+            "cuda_device": 6,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 15,
+            "local_rank": 7,
+            "cuda_device": 7,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 16,
+            "local_rank": 0,
+            "cuda_device": 0,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 2
+          },
+          {
+            "rank": 17,
+            "local_rank": 1,
+            "cuda_device": 1,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 2
+          },
+          {
+            "rank": 18,
+            "local_rank": 2,
+            "cuda_device": 2,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 2
+          },
+          {
+            "rank": 19,
+            "local_rank": 3,
+            "cuda_device": 3,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 2
+          },
+          {
+            "rank": 20,
+            "local_rank": 4,
+            "cuda_device": 4,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 2
+          },
+          {
+            "rank": 21,
+            "local_rank": 5,
+            "cuda_device": 5,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 2
+          },
+          {
+            "rank": 22,
+            "local_rank": 6,
+            "cuda_device": 6,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 2
+          },
+          {
+            "rank": 23,
+            "local_rank": 7,
+            "cuda_device": 7,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 2
+          },
+          {
+            "rank": 24,
+            "local_rank": 0,
+            "cuda_device": 0,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 3
+          },
+          {
+            "rank": 25,
+            "local_rank": 1,
+            "cuda_device": 1,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 3
+          },
+          {
+            "rank": 26,
+            "local_rank": 2,
+            "cuda_device": 2,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 3
+          },
+          {
+            "rank": 27,
+            "local_rank": 3,
+            "cuda_device": 3,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 3
+          },
+          {
+            "rank": 28,
+            "local_rank": 4,
+            "cuda_device": 4,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 3
+          },
+          {
+            "rank": 29,
+            "local_rank": 5,
+            "cuda_device": 5,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 3
+          },
+          {
+            "rank": 30,
+            "local_rank": 6,
+            "cuda_device": 6,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 3
+          },
+          {
+            "rank": 31,
+            "local_rank": 7,
+            "cuda_device": 7,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 3
+          }
+        ],
+        "cuda_device_max_connections": "1",
+        "nvte_fused_attn": null,
+        "nvte_batch_mha_p2p_comm": null
+      },
+      "64": {
+        "timestamp_unix": 1784715476.0802493,
+        "megatron_commit": "d314db2ea3ad2cc6b44aff39f931558fe0ba22a7",
+        "benchmark_source_sha256": "6621388780c4e72a9015639e14f1b790f3212024035bca247721f31a272dd9e8",
+        "torch_version": "2.12.0a0+0291f960b6.nv26.04.48445190",
+        "transformer_engine_version": "2.14.0+f031cf87",
+        "cuda_version": "13.2",
+        "cudnn_version": 92100,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "cp_size": 64,
+        "geometry": {
+          "profile_name": "qwen3_30b",
+          "q_heads": 32,
+          "kv_heads": 4,
+          "head_dim": 128,
+          "hidden_size": 2048
+        },
+        "dtype": "bfloat16",
+        "qkv_format": "thd",
+        "mask": "causal",
+        "cp_comm_type": "p2p",
+        "physical_tokens_per_rank": 4096,
+        "sequence_alignment": 128,
+        "warmup": 100,
+        "iterations": 500,
+        "timing_batch_size": 25,
+        "component_warmup": 50,
+        "component_iterations": 40,
+        "modes": [
+          "overlap"
+        ],
+        "skip_components": true,
+        "skip_host_enqueue": false,
+        "skip_comm_only": false,
+        "serialized_component_attention": true,
+        "rank_topology": [
+          {
+            "rank": 0,
+            "local_rank": 0,
+            "cuda_device": 0,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 1,
+            "local_rank": 1,
+            "cuda_device": 1,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 2,
+            "local_rank": 2,
+            "cuda_device": 2,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 3,
+            "local_rank": 3,
+            "cuda_device": 3,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 4,
+            "local_rank": 4,
+            "cuda_device": 4,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 5,
+            "local_rank": 5,
+            "cuda_device": 5,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 6,
+            "local_rank": 6,
+            "cuda_device": 6,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 7,
+            "local_rank": 7,
+            "cuda_device": 7,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 0
+          },
+          {
+            "rank": 8,
+            "local_rank": 0,
+            "cuda_device": 0,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 9,
+            "local_rank": 1,
+            "cuda_device": 1,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 10,
+            "local_rank": 2,
+            "cuda_device": 2,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 11,
+            "local_rank": 3,
+            "cuda_device": 3,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 12,
+            "local_rank": 4,
+            "cuda_device": 4,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 13,
+            "local_rank": 5,
+            "cuda_device": 5,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 14,
+            "local_rank": 6,
+            "cuda_device": 6,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 15,
+            "local_rank": 7,
+            "cuda_device": 7,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 1
+          },
+          {
+            "rank": 16,
+            "local_rank": 0,
+            "cuda_device": 0,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 2
+          },
+          {
+            "rank": 17,
+            "local_rank": 1,
+            "cuda_device": 1,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 2
+          },
+          {
+            "rank": 18,
+            "local_rank": 2,
+            "cuda_device": 2,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 2
+          },
+          {
+            "rank": 19,
+            "local_rank": 3,
+            "cuda_device": 3,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 2
+          },
+          {
+            "rank": 20,
+            "local_rank": 4,
+            "cuda_device": 4,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 2
+          },
+          {
+            "rank": 21,
+            "local_rank": 5,
+            "cuda_device": 5,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 2
+          },
+          {
+            "rank": 22,
+            "local_rank": 6,
+            "cuda_device": 6,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 2
+          },
+          {
+            "rank": 23,
+            "local_rank": 7,
+            "cuda_device": 7,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 2
+          },
+          {
+            "rank": 24,
+            "local_rank": 0,
+            "cuda_device": 0,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 3
+          },
+          {
+            "rank": 25,
+            "local_rank": 1,
+            "cuda_device": 1,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 3
+          },
+          {
+            "rank": 26,
+            "local_rank": 2,
+            "cuda_device": 2,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 3
+          },
+          {
+            "rank": 27,
+            "local_rank": 3,
+            "cuda_device": 3,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 3
+          },
+          {
+            "rank": 28,
+            "local_rank": 4,
+            "cuda_device": 4,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 3
+          },
+          {
+            "rank": 29,
+            "local_rank": 5,
+            "cuda_device": 5,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 3
+          },
+          {
+            "rank": 30,
+            "local_rank": 6,
+            "cuda_device": 6,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 3
+          },
+          {
+            "rank": 31,
+            "local_rank": 7,
+            "cuda_device": 7,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 3
+          },
+          {
+            "rank": 32,
+            "local_rank": 0,
+            "cuda_device": 0,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 4
+          },
+          {
+            "rank": 33,
+            "local_rank": 1,
+            "cuda_device": 1,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 4
+          },
+          {
+            "rank": 34,
+            "local_rank": 2,
+            "cuda_device": 2,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 4
+          },
+          {
+            "rank": 35,
+            "local_rank": 3,
+            "cuda_device": 3,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 4
+          },
+          {
+            "rank": 36,
+            "local_rank": 4,
+            "cuda_device": 4,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 4
+          },
+          {
+            "rank": 37,
+            "local_rank": 5,
+            "cuda_device": 5,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 4
+          },
+          {
+            "rank": 38,
+            "local_rank": 6,
+            "cuda_device": 6,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 4
+          },
+          {
+            "rank": 39,
+            "local_rank": 7,
+            "cuda_device": 7,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 4
+          },
+          {
+            "rank": 40,
+            "local_rank": 0,
+            "cuda_device": 0,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 5
+          },
+          {
+            "rank": 41,
+            "local_rank": 1,
+            "cuda_device": 1,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 5
+          },
+          {
+            "rank": 42,
+            "local_rank": 2,
+            "cuda_device": 2,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 5
+          },
+          {
+            "rank": 43,
+            "local_rank": 3,
+            "cuda_device": 3,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 5
+          },
+          {
+            "rank": 44,
+            "local_rank": 4,
+            "cuda_device": 4,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 5
+          },
+          {
+            "rank": 45,
+            "local_rank": 5,
+            "cuda_device": 5,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 5
+          },
+          {
+            "rank": 46,
+            "local_rank": 6,
+            "cuda_device": 6,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 5
+          },
+          {
+            "rank": 47,
+            "local_rank": 7,
+            "cuda_device": 7,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 5
+          },
+          {
+            "rank": 48,
+            "local_rank": 0,
+            "cuda_device": 0,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 6
+          },
+          {
+            "rank": 49,
+            "local_rank": 1,
+            "cuda_device": 1,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 6
+          },
+          {
+            "rank": 50,
+            "local_rank": 2,
+            "cuda_device": 2,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 6
+          },
+          {
+            "rank": 51,
+            "local_rank": 3,
+            "cuda_device": 3,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 6
+          },
+          {
+            "rank": 52,
+            "local_rank": 4,
+            "cuda_device": 4,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 6
+          },
+          {
+            "rank": 53,
+            "local_rank": 5,
+            "cuda_device": 5,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 6
+          },
+          {
+            "rank": 54,
+            "local_rank": 6,
+            "cuda_device": 6,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 6
+          },
+          {
+            "rank": 55,
+            "local_rank": 7,
+            "cuda_device": 7,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 6
+          },
+          {
+            "rank": 56,
+            "local_rank": 0,
+            "cuda_device": 0,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 7
+          },
+          {
+            "rank": 57,
+            "local_rank": 1,
+            "cuda_device": 1,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 7
+          },
+          {
+            "rank": 58,
+            "local_rank": 2,
+            "cuda_device": 2,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 7
+          },
+          {
+            "rank": 59,
+            "local_rank": 3,
+            "cuda_device": 3,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 7
+          },
+          {
+            "rank": 60,
+            "local_rank": 4,
+            "cuda_device": 4,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 7
+          },
+          {
+            "rank": 61,
+            "local_rank": 5,
+            "cuda_device": 5,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 7
+          },
+          {
+            "rank": 62,
+            "local_rank": 6,
+            "cuda_device": 6,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 7
+          },
+          {
+            "rank": 63,
+            "local_rank": 7,
+            "cuda_device": 7,
+            "gpu_name": "NVIDIA H100 80GB HBM3",
+            "cuda_visible_devices": "0,1,2,3,4,5,6,7",
+            "slurm_node_id": 7
+          }
+        ],
+        "cuda_device_max_connections": "1",
+        "nvte_fused_attn": null,
+        "nvte_batch_mha_p2p_comm": null
+      }
+    }
+  },
+  "communication_wall_p10_ms": {
+    "2": 0.09839359745383264,
+    "4": 0.08422400057315826,
+    "8": 0.08747200295329094,
+    "16": 0.2660448133945465,
+    "32": 0.2784960001707077,
+    "64": 0.5536576092243196
+  },
+  "communication_rank_p10_ms": {
+    "2": [
+      0.08253440260887146,
+      0.0823328010737896
+    ],
+    "4": [
+      0.0767328031361103,
+      0.0769599974155426,
+      0.07708479836583138,
+      0.07719999924302101
+    ],
+    "8": [
+      0.07506239786744118,
+      0.07570880278944969,
+      0.0745600014925003,
+      0.07558400183916092,
+      0.0740639977157116,
+      0.0755712017416954,
+      0.07491199746727943,
+      0.07525759935379028
+    ],
+    "16": [
+      0.2586752027273178,
+      0.25808959305286405,
+      0.2563712000846863,
+      0.25530880987644194,
+      0.23625279143452652,
+      0.08942080065608025,
+      0.08773759976029395,
+      0.25967360138893125,
+      0.26108481287956237,
+      0.26047358810901644,
+      0.2594080090522766,
+      0.2590271919965744,
+      0.24046399369835858,
+      0.08601600006222725,
+      0.08594560101628304,
+      0.25652159452438356
+    ],
+    "32": [
+      0.2620320051908493,
+      0.2619615912437439,
+      0.2604159951210022,
+      0.2589056044816971,
+      0.2395391941070557,
+      0.08491839841008186,
+      0.08124480098485948,
+      0.26113280057907107,
+      0.2625408083200455,
+      0.2621311992406845,
+      0.2617504119873047,
+      0.2582271873950958,
+      0.23683201223611838,
+      0.08608640208840371,
+      0.07853760197758675,
+      0.2633632004261017,
+      0.26536960899829865,
+      0.265488001704216,
+      0.26433599591255186,
+      0.26120320707559586,
+      0.23479361236095436,
+      0.08456639721989632,
+      0.08392640054225921,
+      0.2636384040117264,
+      0.26535358726978303,
+      0.26546560823917387,
+      0.2643135875463486,
+      0.2616096019744873,
+      0.2413632012903691,
+      0.08756479769945144,
+      0.08439039811491966,
+      0.2612159997224808
+    ],
+    "64": [
+      0.262079992890358,
+      0.26184639036655427,
+      0.26090561151504515,
+      0.255158406496048,
+      0.10492480173707008,
+      0.08308799937367439,
+      0.07803199887275696,
+      0.2591519981622696,
+      0.26095361113548277,
+      0.26062399446964263,
+      0.25946880877017975,
+      0.2581023871898651,
+      0.23718080520629886,
+      0.0871488019824028,
+      0.08309439942240715,
+      0.2575904071331024,
+      0.2603008061647415,
+      0.25969600975513457,
+      0.25749440789222716,
+      0.25555519163608553,
+      0.23596161231398588,
+      0.08248639777302742,
+      0.07674240320920944,
+      0.26007041335105896,
+      0.2620927929878235,
+      0.2614623874425888,
+      0.2613375872373581,
+      0.25876481235027315,
+      0.07995839864015579,
+      0.08151359707117081,
+      0.08140480145812035,
+      0.2604608029127121,
+      0.26156478822231294,
+      0.26092801094055174,
+      0.25952640175819397,
+      0.25831039249897003,
+      0.23687679991126065,
+      0.07768000289797783,
+      0.07622719928622246,
+      0.26163519620895387,
+      0.26362880170345304,
+      0.2627295970916748,
+      0.26175359785556795,
+      0.2587712049484253,
+      0.241119995713234,
+      0.08392959833145142,
+      0.08533120155334473,
+      0.2605855882167816,
+      0.2618431895971298,
+      0.2620448052883148,
+      0.2588064044713974,
+      0.249913589656353,
+      0.07808319926261902,
+      0.08022079989314079,
+      0.07923519983887672,
+      0.2603711932897568,
+      0.2615679889917374,
+      0.2603327870368958,
+      0.25969918966293337,
+      0.2566496044397354,
+      0.23854398727416998,
+      0.08628800138831139,
+      0.08352959677577018,
+      0.2616896092891693
+    ]
+  },
+  "communication_host_launch_wall_p10_ms": {
+    "2": 0.0348607,
+    "4": 0.0351412,
+    "8": 0.0355982,
+    "16": 0.0370806,
+    "32": 0.0386198,
+    "64": 0.0391662
+  },
+  "models": {
+    "attention_pure": {
+      "diagonal": {
+        "features": [
+          "base_local_total_k",
+          "base_local_s2_m",
+          "sequence_count"
+        ],
+        "coefficients": [
+          0.19540520253635588,
+          0.0032884881149231465,
+          0.05593946211437401,
+          0.0016567178965102543
+        ],
+        "centers": [
+          3.3760230654761907,
+          4.220912666666667,
+          5.0
+        ],
+        "scales": [
+          0.7052103096334547,
+          3.90414814753686,
+          3.070597894314954
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "lower": {
+        "features": [
+          "cp1_ms",
+          "s2_m",
+          "tile128_work_m",
+          "q_tokens_k",
+          "kv_tokens_k",
+          "max_q_k",
+          "max_kv_k",
+          "active_sequences",
+          "pad_between_seqs",
+          "q_physical_tokens_k",
+          "kv_physical_tokens_k",
+          "base_local_total_k",
+          "base_local_max_k",
+          "base_local_max_sq_m",
+          "base_local_s2_m",
+          "capacity_utilization",
+          "sequence_count",
+          "single_sequence"
+        ],
+        "coefficients": [
+          0.1832755200493903,
+          -0.0024302770219937486,
+          -0.1929181402437003,
+          0.16968158476667164,
+          0.007247070922852088,
+          -0.00409991293093382,
+          0.017627870767247363,
+          0.012735113356389176,
+          0.018180702904205488,
+          0.014701988656134228,
+          2.8449465006019636e-16,
+          3.469446951953614e-16,
+          -0.0014368070966338318,
+          -0.005851452565712215,
+          -0.022510636587732016,
+          0.07771684820849918,
+          -0.0014368070966321526,
+          -0.013297972952704079,
+          -0.002342918952445474
+        ],
+        "centers": [
+          0.1808287081401728,
+          5.339542117006809,
+          5.477634089795908,
+          3.499035395408163,
+          1.9800488945578232,
+          1.5070099914965986,
+          0.9711309523809524,
+          4.9346938775510205,
+          0.47619047619047616,
+          4.0,
+          2.0,
+          3.3760230654761907,
+          1.3950892857142858,
+          3.0069201904761957,
+          4.220912666666659,
+          0.8440057663690477,
+          5.0,
+          0.23809523809523808
+        ],
+        "scales": [
+          0.03609185874012677,
+          4.829881327819052,
+          4.785324627063724,
+          0.9062487850873118,
+          0.19517014948786546,
+          1.1105702449775505,
+          0.6047232822576376,
+          3.1042795358828856,
+          0.4994327848429284,
+          1.0,
+          1.0,
+          0.7052103096334568,
+          0.9598689712797919,
+          4.348809544536065,
+          3.904148147536861,
+          0.1763025774083642,
+          3.070597894314954,
+          0.4259177099999587
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "upper": {
+        "features": [
+          "base_local_total_k",
+          "base_local_s2_m",
+          "sequence_count"
+        ],
+        "coefficients": [
+          0.16597411697413642,
+          -0.001897066923820044,
+          0.056871601333790815,
+          0.010819483092568208
+        ],
+        "centers": [
+          3.3760230654761907,
+          4.220912666666659,
+          5.0
+        ],
+        "scales": [
+          0.7052103096334568,
+          3.904148147536861,
+          3.070597894314954
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      }
+    },
+    "attention_active_ratio": {
+      "features": [
+        "pure_attention_ms",
+        "communication_ms"
+      ],
+      "coefficients": [
+        0.863988765563095,
+        0.06300845086338003,
+        0.024864843577849547
+      ],
+      "centers": [
+        0.18081361190802325,
+        0.07562628571476279
+      ],
+      "scales": [
+        0.05221508061619503,
+        0.0014510810651509841
+      ],
+      "minimum": 0.0,
+      "maximum": 4.0
+    },
+    "attention_active_ratio_scaling": {
+      "model": "direct_fitted_component_anchors",
+      "calibration_cp_sizes": [
+        2,
+        4,
+        8
+      ],
+      "communication_ms_range": [
+        0.0740639977157116,
+        0.08253440260887146
+      ],
+      "outside_range_policy": "clamp_interference_feature_only"
+    },
+    "attention_drain_ratio": {
+      "lower": {
+        "features": [],
+        "coefficients": [
+          0.9512207089755884
+        ],
+        "centers": [],
+        "scales": [],
+        "minimum": 0.0,
+        "maximum": 4.0
+      },
+      "upper": {
+        "features": [
+          "pure_attention_ms"
+        ],
+        "coefficients": [
+          0.6631475520762297,
+          0.08284514712152673
+        ],
+        "centers": [
+          0.16151035876049624
+        ],
+        "scales": [
+          0.05242864629420311
+        ],
+        "minimum": 0.0,
+        "maximum": 4.0
+      }
+    },
+    "prepare": {
+      "diagonal": {
+        "features": [
+          "pad_between_seqs"
+        ],
+        "coefficients": [
+          0.08463675666372389,
+          0.054613223708612386
+        ],
+        "centers": [
+          0.47619047619047616
+        ],
+        "scales": [
+          0.49943278484292936
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "lower": {
+        "features": [
+          "base_local_max_k",
+          "base_local_max_sq_m",
+          "sequence_count",
+          "pad_between_seqs"
+        ],
+        "coefficients": [
+          0.0598767716315936,
+          0.004902007081841598,
+          -0.00791315999404098,
+          -0.005506252968602707,
+          0.029108998002196813
+        ],
+        "centers": [
+          1.3950892857142858,
+          3.0069201904761957,
+          5.0,
+          0.47619047619047616
+        ],
+        "scales": [
+          0.9598689712797919,
+          4.348809544536065,
+          3.070597894314954,
+          0.4994327848429284
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "upper": {
+        "features": [],
+        "coefficients": [
+          0.03233252572693996
+        ],
+        "centers": [],
+        "scales": [],
+        "minimum": 0.0,
+        "maximum": null
+      }
+    },
+    "lse": {
+      "full": {
+        "features": [
+          "base_local_max_k",
+          "base_local_max_sq_m",
+          "sequence_count",
+          "pad_between_seqs"
+        ],
+        "coefficients": [
+          0.034020519150661774,
+          -0.040816073560866986,
+          0.02106756742469254,
+          -0.005167928006986335,
+          -0.00880282783058377
+        ],
+        "centers": [
+          1.3950892857142858,
+          3.0069201904761957,
+          5.0,
+          0.47619047619047616
+        ],
+        "scales": [
+          0.9598689712797919,
+          4.348809544536065,
+          3.070597894314954,
+          0.4994327848429284
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "second_half": {
+        "features": [],
+        "coefficients": [
+          0.006389629399074482
+        ],
+        "centers": [],
+        "scales": [],
+        "minimum": 0.0,
+        "maximum": null
+      }
+    },
+    "output": {
+      "full": {
+        "features": [],
+        "coefficients": [
+          0.040517644318448766
+        ],
+        "centers": [],
+        "scales": [],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "second_half": {
+        "features": [],
+        "coefficients": [
+          0.023683687610184256
+        ],
+        "centers": [],
+        "scales": [],
+        "minimum": 0.0,
+        "maximum": null
+      }
+    },
+    "host_critical_rank": {
+      "diagonal_round": {
+        "features": [
+          "pad_between_seqs"
+        ],
+        "coefficients": [
+          0.436877158,
+          0.061336405878188664
+        ],
+        "centers": [
+          0.47619047619047616
+        ],
+        "scales": [
+          0.49943278484292924
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "lower_round": {
+        "features": [
+          "pad_between_seqs"
+        ],
+        "coefficients": [
+          0.5914145865714284,
+          0.04687249417693316
+        ],
+        "centers": [
+          0.47619047619047616
+        ],
+        "scales": [
+          0.49943278484292924
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      }
+    },
+    "initialization_ms": 0.0,
+    "timeline_scale": 1.0,
+    "fixed_overhead_ms": 0.0,
+    "host_cp_scaling": {
+      "model": "linear_features",
+      "formula": "host_ms = linear_model[padding_group](cp_size, cp_size*I(sequence_count>4), cp_size*I(outside_single_nvlink_domain))",
+      "minimum_cp_size": 4,
+      "calibration_cp_sizes": [
+        2,
+        4,
+        8,
+        16,
+        32,
+        64
+      ],
+      "groups": {
+        "aligned": {
+          "features": [
+            "cp_size"
+          ],
+          "coefficients": [
+            7.575631265212124,
+            7.564015499811958
+          ],
+          "centers": [
+            21.0
+          ],
+          "scales": [
+            21.656407827707714
+          ],
+          "minimum": 0.0,
+          "maximum": null
+        },
+        "inter_sequence_padded": {
+          "features": [
+            "cp_size",
+            "cp_times_sequence_count_gt4"
+          ],
+          "coefficients": [
+            9.549738400733336,
+            9.254076319354041,
+            0.3896520389917217
+          ],
+          "centers": [
+            21.0,
+            16.8
+          ],
+          "scales": [
+            21.656407827707714,
+            21.113029152634635
+          ],
+          "minimum": 0.0,
+          "maximum": null
+        }
+      },
+      "outside_single_nvlink_domain_by_cp": {
+        "2": false,
+        "4": false,
+        "8": false,
+        "16": true,
+        "32": true,
+        "64": true
+      }
+    },
+    "single_sequence_wall_floor_by_cp": {
+      "model": "piecewise_linear_by_capacity_utilization",
+      "scope": "single_sequence_only",
+      "by_cp": {
+        "2": {
+          "cp_size": 2,
+          "calibration_source": "qwen3_30b CP2 direct full-call",
+          "points": [
+            {
+              "utilization": 0.25,
+              "wall_p10_ms": 0.9294803466796875,
+              "case": "single_u25"
+            },
+            {
+              "utilization": 0.5,
+              "wall_p10_ms": 0.926256248474121,
+              "case": "single_u50"
+            },
+            {
+              "utilization": 0.75,
+              "wall_p10_ms": 0.9253928756713867,
+              "case": "single_u75"
+            },
+            {
+              "utilization": 0.875,
+              "wall_p10_ms": 0.9282120971679688,
+              "case": "single_u87p5"
+            },
+            {
+              "utilization": 1.0,
+              "wall_p10_ms": 0.9277406616210937,
+              "case": "single_u100"
+            }
+          ]
+        },
+        "4": {
+          "cp_size": 4,
+          "calibration_source": "qwen3_30b CP4 direct full-call",
+          "points": [
+            {
+              "utilization": 0.25,
+              "wall_p10_ms": 1.6548202514648438,
+              "case": "single_u25"
+            },
+            {
+              "utilization": 0.5,
+              "wall_p10_ms": 1.6468886566162109,
+              "case": "single_u50"
+            },
+            {
+              "utilization": 0.75,
+              "wall_p10_ms": 1.6447863922119141,
+              "case": "single_u75"
+            },
+            {
+              "utilization": 0.875,
+              "wall_p10_ms": 1.6487980194091796,
+              "case": "single_u87p5"
+            },
+            {
+              "utilization": 1.0,
+              "wall_p10_ms": 1.6380442657470704,
+              "case": "single_u100"
+            }
+          ]
+        },
+        "8": {
+          "cp_size": 8,
+          "calibration_source": "qwen3_30b CP8 direct full-call",
+          "points": [
+            {
+              "utilization": 0.25,
+              "wall_p10_ms": 2.991495391845703,
+              "case": "single_u25"
+            },
+            {
+              "utilization": 0.5,
+              "wall_p10_ms": 2.9831129760742185,
+              "case": "single_u50"
+            },
+            {
+              "utilization": 0.75,
+              "wall_p10_ms": 3.006554473876953,
+              "case": "single_u75"
+            },
+            {
+              "utilization": 0.875,
+              "wall_p10_ms": 2.999615173339844,
+              "case": "single_u87p5"
+            },
+            {
+              "utilization": 1.0,
+              "wall_p10_ms": 3.0144010314941405,
+              "case": "single_u100"
+            }
+          ]
+        },
+        "16": {
+          "cp_size": 16,
+          "calibration_source": "qwen3_30b CP16 direct full-call",
+          "points": [
+            {
+              "utilization": 0.25,
+              "wall_p10_ms": 5.981108459472655,
+              "case": "single_u25"
+            },
+            {
+              "utilization": 0.5,
+              "wall_p10_ms": 5.952778625488281,
+              "case": "single_u50"
+            },
+            {
+              "utilization": 0.75,
+              "wall_p10_ms": 5.957781555175782,
+              "case": "single_u75"
+            },
+            {
+              "utilization": 0.875,
+              "wall_p10_ms": 5.941731506347656,
+              "case": "single_u87p5"
+            },
+            {
+              "utilization": 1.0,
+              "wall_p10_ms": 5.939050659179688,
+              "case": "single_u100"
+            }
+          ]
+        },
+        "32": {
+          "cp_size": 32,
+          "calibration_source": "qwen3_30b CP32 direct full-call",
+          "points": [
+            {
+              "utilization": 0.25,
+              "wall_p10_ms": 11.390154541015626,
+              "case": "single_u25"
+            },
+            {
+              "utilization": 0.5,
+              "wall_p10_ms": 11.387505249023437,
+              "case": "single_u50"
+            },
+            {
+              "utilization": 0.75,
+              "wall_p10_ms": 11.395086547851562,
+              "case": "single_u75"
+            },
+            {
+              "utilization": 0.875,
+              "wall_p10_ms": 11.447015502929688,
+              "case": "single_u87p5"
+            },
+            {
+              "utilization": 1.0,
+              "wall_p10_ms": 11.413457885742186,
+              "case": "single_u100"
+            }
+          ]
+        },
+        "64": {
+          "cp_size": 64,
+          "calibration_source": "qwen3_30b CP64 direct full-call",
+          "points": [
+            {
+              "utilization": 0.25,
+              "wall_p10_ms": 22.7178388671875,
+              "case": "single_u25"
+            },
+            {
+              "utilization": 0.5,
+              "wall_p10_ms": 22.658476562500002,
+              "case": "single_u50"
+            },
+            {
+              "utilization": 0.75,
+              "wall_p10_ms": 22.671829101562498,
+              "case": "single_u75"
+            },
+            {
+              "utilization": 0.875,
+              "wall_p10_ms": 22.73537451171875,
+              "case": "single_u87p5"
+            },
+            {
+              "utilization": 1.0,
+              "wall_p10_ms": 22.81003833007812,
+              "case": "single_u100"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "cp1_model_artifact": {
+    "contract": {
+      "gpu": "NVIDIA H100 80GB HBM3",
+      "scope": "core attention forward only",
+      "phase": "forward",
+      "timing_target": "rank_p10_ms",
+      "cp": 1,
+      "valid_total_tokens": [
+        3072,
+        8192
+      ],
+      "storage_dispatch": "4096 if total <= 4096 else 8192",
+      "tail_padding": "not represented as an executed sequence",
+      "minimum_sequence_tokens": 512,
+      "measured_sequence_count": [
+        4,
+        12
+      ]
+    },
+    "profiles": [
+      {
+        "name": "qwen3_30b",
+        "models": [
+          "Qwen3-30B-A3B"
+        ],
+        "q_heads": 32,
+        "kv_heads": 4,
+        "head_dim": 128,
+        "hidden_size": 2048
+      }
+    ],
+    "training_rows_sha256": "c1edc7fa2d66e251007c0489a9e9f2559e625825a82cb29f0f27d85f6d5af6b0",
+    "models": {
+      "qwen3_30b": {
+        "4096": {
+          "candidate": "s2:linear_time:ridge=0",
+          "family": "s2",
+          "kind": "linear_time",
+          "ridge": 0.0,
+          "features": [
+            "s2_m"
+          ],
+          "feature_centers": [
+            2.5135786666666666
+          ],
+          "feature_scales": [
+            0.6859587395327312
+          ],
+          "coefficients": [
+            0.18976877777777773,
+            -0.00040167674295392647
+          ],
+          "cv_metrics": {
+            "count": 18,
+            "median_ape_pct": 0.2774476817094731,
+            "mean_ape_pct": 0.36215006228090607,
+            "p90_ape_pct": 0.7082397929039029,
+            "max_ape_pct": 1.1044687717337682,
+            "weighted_absolute_error_pct": 0.3624918761975645,
+            "aggregate_signed_error_pct": 0.004961042375373204,
+            "rmse_ms": 0.0008845801335321842
+          },
+          "train_metrics": {
+            "count": 18,
+            "median_ape_pct": 0.2621242913871952,
+            "mean_ape_pct": 0.3322624718822105,
+            "p90_ape_pct": 0.6690511383024363,
+            "max_ape_pct": 1.0320774282592575,
+            "weighted_absolute_error_pct": 0.3326416665185003,
+            "aggregate_signed_error_pct": -2.220446049250313e-14,
+            "rmse_ms": 0.0008271934949699086
+          },
+          "train_rows": 18,
+          "distinct_total_groups": 9,
+          "candidate_leaderboard": [
+            {
+              "candidate": "s2:linear_time:ridge=0",
+              "rank_score": 1.136855361076858,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 0.2774476817094731,
+                "mean_ape_pct": 0.36215006228090607,
+                "p90_ape_pct": 0.7082397929039029,
+                "max_ape_pct": 1.1044687717337682,
+                "weighted_absolute_error_pct": 0.3624918761975645,
+                "aggregate_signed_error_pct": 0.004961042375373204,
+                "rmse_ms": 0.0008845801335321842
+              }
+            },
+            {
+              "candidate": "s2:linear_time:ridge=0.01",
+              "rank_score": 1.1368715995122458,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 0.2775477701523158,
+                "mean_ape_pct": 0.36216572566641464,
+                "p90_ape_pct": 0.7082792840993692,
+                "max_ape_pct": 1.1043631802873024,
+                "weighted_absolute_error_pct": 0.3625076017052541,
+                "aggregate_signed_error_pct": 0.004957943660510722,
+                "rmse_ms": 0.0008845713502701706
+              }
+            },
+            {
+              "candidate": "s2:linear_time:ridge=0.1",
+              "rank_score": 1.1370168376918428,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 0.27844297113216476,
+                "mean_ape_pct": 0.3623058205430656,
+                "p90_ape_pct": 0.7086324972758368,
+                "max_ape_pct": 1.103418759896933,
+                "weighted_absolute_error_pct": 0.3626482522088637,
+                "aggregate_signed_error_pct": 0.004930228447497242,
+                "rmse_ms": 0.0008844961699705885
+              }
+            },
+            {
+              "candidate": "s2:linear_log:ridge=0",
+              "rank_score": 1.1376674811789884,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 0.27704606119414643,
+                "mean_ape_pct": 0.36217614728918224,
+                "p90_ape_pct": 0.7092751949167899,
+                "max_ape_pct": 1.1035523453811606,
+                "weighted_absolute_error_pct": 0.36252099958454176,
+                "aggregate_signed_error_pct": 0.004035287037740254,
+                "rmse_ms": 0.0008846847890135988
+              }
+            },
+            {
+              "candidate": "s2:linear_log:ridge=0.01",
+              "rank_score": 1.137683647828931,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 0.27714544363507554,
+                "mean_ape_pct": 0.36219167064870006,
+                "p90_ape_pct": 0.7093146887309042,
+                "max_ape_pct": 1.1034465673893057,
+                "weighted_absolute_error_pct": 0.362536586253501,
+                "aggregate_signed_error_pct": 0.004031889789168908,
+                "rmse_ms": 0.0008846760731339536
+              }
+            },
+            {
+              "candidate": "s2:linear_log:ridge=0.1",
+              "rank_score": 1.1378282444454324,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 0.2780343427562458,
+                "mean_ape_pct": 0.36233051564484303,
+                "p90_ape_pct": 0.7096679240930757,
+                "max_ape_pct": 1.1025004834384027,
+                "weighted_absolute_error_pct": 0.3626759974637795,
+                "aggregate_signed_error_pct": 0.0040015127387826865,
+                "rmse_ms": 0.0008846014811753417
+              }
+            },
+            {
+              "candidate": "s2:linear_time:ridge=1",
+              "rank_score": 1.1383846396067638,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 0.281989765720043,
+                "mean_ape_pct": 0.3636251846460952,
+                "p90_ape_pct": 0.7119589343083552,
+                "max_ape_pct": 1.0945245419852458,
+                "weighted_absolute_error_pct": 0.3639728490104859,
+                "aggregate_signed_error_pct": 0.0046692163532258135,
+                "rmse_ms": 0.0008840864581052668
+              }
+            },
+            {
+              "candidate": "s2:linear_log:ridge=1",
+              "rank_score": 1.1391900478275523,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 0.28071075963035785,
+                "mean_ape_pct": 0.36363833174253596,
+                "p90_ape_pct": 0.7129944609518295,
+                "max_ape_pct": 1.0935910329749472,
+                "weighted_absolute_error_pct": 0.36398914315993014,
+                "aggregate_signed_error_pct": 0.0037161630127791057,
+                "rmse_ms": 0.0008841960673454971
+              }
+            },
+            {
+              "candidate": "s2_hinge_10p0m:linear_log:ridge=0",
+              "rank_score": 1.2018158133223256,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 0.33122187168946254,
+                "mean_ape_pct": 0.39056915383073454,
+                "p90_ape_pct": 0.7388109221511499,
+                "max_ape_pct": 1.2192085583040746,
+                "weighted_absolute_error_pct": 0.3910137579757852,
+                "aggregate_signed_error_pct": -0.0011651426279901678,
+                "rmse_ms": 0.000964268847248743
+              }
+            },
+            {
+              "candidate": "s2_hinge_10p5m:linear_log:ridge=0",
+              "rank_score": 1.2018158133223256,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 0.33122187168946254,
+                "mean_ape_pct": 0.39056915383073454,
+                "p90_ape_pct": 0.7388109221511499,
+                "max_ape_pct": 1.2192085583040746,
+                "weighted_absolute_error_pct": 0.3910137579757852,
+                "aggregate_signed_error_pct": -0.0011651426279901678,
+                "rmse_ms": 0.000964268847248743
+              }
+            }
+          ]
+        },
+        "8192": {
+          "candidate": "tile128_hinge_7p0m:linear_time:ridge=0.1",
+          "family": "tile128_hinge_7p0m",
+          "kind": "linear_time",
+          "ridge": 0.1,
+          "features": [
+            "tile128_hinge_7p0m"
+          ],
+          "feature_centers": [
+            3.5747022222222222
+          ],
+          "feature_scales": [
+            6.290566830895533
+          ],
+          "coefficients": [
+            0.24030716666666663,
+            0.08867580759346894
+          ],
+          "cv_metrics": {
+            "count": 18,
+            "median_ape_pct": 0.28169323457567175,
+            "mean_ape_pct": 1.3674249004976877,
+            "p90_ape_pct": 2.8808104798201697,
+            "max_ape_pct": 8.368755134367536,
+            "weighted_absolute_error_pct": 1.5616717795083093,
+            "aggregate_signed_error_pct": 0.1067140468494987,
+            "rmse_ms": 0.006553899346070824
+          },
+          "train_metrics": {
+            "count": 18,
+            "median_ape_pct": 0.2581081757316612,
+            "mean_ape_pct": 1.1636950131461483,
+            "p90_ape_pct": 2.495801098569146,
+            "max_ape_pct": 7.8719627629158015,
+            "weighted_absolute_error_pct": 1.2294736649546758,
+            "aggregate_signed_error_pct": -2.220446049250313e-14,
+            "rmse_ms": 0.005178624815627443
+          },
+          "train_rows": 18,
+          "distinct_total_groups": 18,
+          "candidate_leaderboard": [
+            {
+              "candidate": "tile128_hinge_7p0m:linear_time:ridge=0.1",
+              "rank_score": 5.3653336193137156,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 0.28169323457567175,
+                "mean_ape_pct": 1.3674249004976877,
+                "p90_ape_pct": 2.8808104798201697,
+                "max_ape_pct": 8.368755134367536,
+                "weighted_absolute_error_pct": 1.5616717795083093,
+                "aggregate_signed_error_pct": 0.1067140468494987,
+                "rmse_ms": 0.006553899346070824
+              }
+            },
+            {
+              "candidate": "tile128_hinge_7p0m:linear_time:ridge=0.01",
+              "rank_score": 5.497294723532267,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 0.265283071471633,
+                "mean_ape_pct": 1.3698960161929288,
+                "p90_ape_pct": 3.0270196121926385,
+                "max_ape_pct": 8.307910279014461,
+                "weighted_absolute_error_pct": 1.5664877079300703,
+                "aggregate_signed_error_pct": 0.10727867143598413,
+                "rmse_ms": 0.006610912810303279
+              }
+            },
+            {
+              "candidate": "tile128_hinge_7p0m:linear_time:ridge=0",
+              "rank_score": 5.513111992764191,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 0.2818753726562391,
+                "mean_ape_pct": 1.3754779075967019,
+                "p90_ape_pct": 3.043360632869583,
+                "max_ape_pct": 8.301109971651496,
+                "weighted_absolute_error_pct": 1.5723693349086691,
+                "aggregate_signed_error_pct": 0.10734177653684007,
+                "rmse_ms": 0.006619618190878013
+              }
+            },
+            {
+              "candidate": "tile256_hinge_7p5m:linear_time:ridge=0.1",
+              "rank_score": 5.55070891351469,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 0.6379203469988141,
+                "mean_ape_pct": 1.5183464852699,
+                "p90_ape_pct": 3.015632465194935,
+                "max_ape_pct": 8.52217938782291,
+                "weighted_absolute_error_pct": 1.6226580068201375,
+                "aggregate_signed_error_pct": 0.0919730843783606,
+                "rmse_ms": 0.006114609019896105
+              }
+            },
+            {
+              "candidate": "tile256_hinge_7p5m:linear_time:ridge=0.01",
+              "rank_score": 5.576376653603584,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 0.4760037381554785,
+                "mean_ape_pct": 1.4613416484268895,
+                "p90_ape_pct": 3.0647178105241752,
+                "max_ape_pct": 8.462146301006648,
+                "weighted_absolute_error_pct": 1.5806113391387326,
+                "aggregate_signed_error_pct": 0.09245971445446255,
+                "rmse_ms": 0.006158542816179312
+              }
+            },
+            {
+              "candidate": "tile256_hinge_7p5m:linear_time:ridge=0",
+              "rank_score": 5.579390263908236,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 0.4579071759906159,
+                "mean_ape_pct": 1.4557965623475126,
+                "p90_ape_pct": 3.070203819708042,
+                "max_ape_pct": 8.455436720715431,
+                "weighted_absolute_error_pct": 1.576636320106679,
+                "aggregate_signed_error_pct": 0.09251410252175685,
+                "rmse_ms": 0.006165961746811427
+              }
+            },
+            {
+              "candidate": "tile256_hinge_7p0m:linear_time:ridge=0.1",
+              "rank_score": 5.828915910398576,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 1.1120703518730064,
+                "mean_ape_pct": 1.8726471872135266,
+                "p90_ape_pct": 2.7635275040997285,
+                "max_ape_pct": 10.482334338314052,
+                "weighted_absolute_error_pct": 1.824024108601672,
+                "aggregate_signed_error_pct": 0.012249627026394982,
+                "rmse_ms": 0.006512661657404381
+              }
+            },
+            {
+              "candidate": "tile256_hinge_7p0m:linear_time:ridge=0.01",
+              "rank_score": 5.85751904113285,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 1.2421504210336645,
+                "mean_ape_pct": 1.91794667095742,
+                "p90_ape_pct": 2.7969680541558586,
+                "max_ape_pct": 10.432672441712027,
+                "weighted_absolute_error_pct": 1.8619143827449207,
+                "aggregate_signed_error_pct": 0.012314439867799898,
+                "rmse_ms": 0.006512930657901247
+              }
+            },
+            {
+              "candidate": "tile256_hinge_7p0m:linear_time:ridge=0",
+              "rank_score": 5.860715861626677,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 1.257282357193747,
+                "mean_ape_pct": 1.9230095544346806,
+                "p90_ape_pct": 2.80070552739742,
+                "max_ape_pct": 10.427121994444752,
+                "weighted_absolute_error_pct": 1.8661491780903392,
+                "aggregate_signed_error_pct": 0.012321683655946991,
+                "rmse_ms": 0.006515325015920084
+              }
+            },
+            {
+              "candidate": "s2_hinge_7p0m:linear_time:ridge=0",
+              "rank_score": 5.928489217435367,
+              "metrics": {
+                "count": 18,
+                "median_ape_pct": 0.4734575124319781,
+                "mean_ape_pct": 1.5343488910415275,
+                "p90_ape_pct": 3.7546848050492017,
+                "max_ape_pct": 6.9801856906176,
+                "weighted_absolute_error_pct": 1.7437899486588304,
+                "aggregate_signed_error_pct": 0.0960892734700014,
+                "rmse_ms": 0.006583740015390621
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "sustained_ring_effective_communication_wall_p10_ms": {
+    "16": 0.18718434041341148,
+    "32": 0.1871502449281754,
+    "64": 0.19379119388640872
+  },
+  "sustained_ring_effective_communication_rank_p10_ms": {
+    "16": [
+      0.18718434041341148,
+      0.18682428181966146,
+      0.18646267089843752,
+      0.18607269490559897,
+      0.18573095499674477,
+      0.1853677754720052,
+      0.18500869140625,
+      0.18651845499674477,
+      0.18673019409179686,
+      0.18585926920572918,
+      0.18598365681966145,
+      0.18563578694661456,
+      0.1850135498046875,
+      0.18466059977213545,
+      0.18426944783528648,
+      0.18697025146484372
+    ],
+    "32": [
+      0.18385589402721772,
+      0.18376497330204136,
+      0.1835850554435484,
+      0.1832708464591734,
+      0.183051517609627,
+      0.18296926781439013,
+      0.18501395145539315,
+      0.18711425190587197,
+      0.18710945572391632,
+      0.18711697879914316,
+      0.18695572588520665,
+      0.18677191555884576,
+      0.18635223191784273,
+      0.18625236068233364,
+      0.18624805278162804,
+      0.18610069028792847,
+      0.18607811712449598,
+      0.185983892625378,
+      0.18587539968182962,
+      0.1856803962953629,
+      0.18518359768775203,
+      0.18518344017767138,
+      0.1851429187405494,
+      0.18489359603389616,
+      0.18481247046685986,
+      0.18463678372290826,
+      0.18445515491116432,
+      0.184315427718624,
+      0.1841889412172379,
+      0.18411089694115426,
+      0.1839243420016381,
+      0.18357681963520667
+    ],
+    "64": [
+      0.19088083999875993,
+      0.19077909342447918,
+      0.1907330341641865,
+      0.19061314949156746,
+      0.19055169387090776,
+      0.19045474485367064,
+      0.19033790031312003,
+      0.19020532420324904,
+      0.19029904707651288,
+      0.19018335929749502,
+      0.19008493962363593,
+      0.19002911280071924,
+      0.1899273720393105,
+      0.18977177308097717,
+      0.18974797712053573,
+      0.18957464696490575,
+      0.18959041341145835,
+      0.18954236421130954,
+      0.1894152056981647,
+      0.18957446870349703,
+      0.19066861591641865,
+      0.19167444816468254,
+      0.19278706868489578,
+      0.19366701156374008,
+      0.19374422394283236,
+      0.19373338487413197,
+      0.19369026305183532,
+      0.19353261408730157,
+      0.1935191708519345,
+      0.1934352387927827,
+      0.19335582527281747,
+      0.19317135377914185,
+      0.1932221272786458,
+      0.1931358971974206,
+      0.19304266066778272,
+      0.19295014880952382,
+      0.19292565530443945,
+      0.19284903971354167,
+      0.19278909737723215,
+      0.1927017085968502,
+      0.1927383006262401,
+      0.19264800153459824,
+      0.19256528824094743,
+      0.1924420882936508,
+      0.19237388780381945,
+      0.19227386765252977,
+      0.19205910140749008,
+      0.1919187922402034,
+      0.19207835751488095,
+      0.19202504185267857,
+      0.19192897639198905,
+      0.19185614885602678,
+      0.19176762269035216,
+      0.19155423990885417,
+      0.19156273057725692,
+      0.19143609909784226,
+      0.19138397894965278,
+      0.1914254847935268,
+      0.19135104515438991,
+      0.19123966277591764,
+      0.19104794844370038,
+      0.19106379045758928,
+      0.1909834236266121,
+      0.1908897937593006
+    ]
+  },
+  "provenance": {
+    "cp64_scaling": {
+      "calibration_summary": "runtime/analysis/gqa_attention_model/cp_overlap/calibration/h100_cp2_64_six_geometry_20260722.json",
+      "calibration_summary_sha256": "14632b9205a699dcbf6c1f20e863214bf7e53a17fb16294015cc1ac8075e0b0a",
+      "base_model_sha256": "d1fb28b6583d3cfc6eecfc026b05bb325934f9e5b6a02d9fad85ea91288340ab",
+      "experiment_contract": "runtime/analysis/gqa_attention_model/cp_overlap_cp64_experiment_contract_20260722_v3.json",
+      "experiment_contract_sha256": "17a75a79ddd7189faed1b43a5bdf019c121de3f149490aafbdab715c4cc9b8d3",
+      "topology_by_cp": {
+        "2": {
+          "node_count": 1,
+          "outside_single_nvlink_domain": false
+        },
+        "4": {
+          "node_count": 1,
+          "outside_single_nvlink_domain": false
+        },
+        "8": {
+          "node_count": 1,
+          "outside_single_nvlink_domain": false
+        },
+        "16": {
+          "node_count": 2,
+          "outside_single_nvlink_domain": true
+        },
+        "32": {
+          "node_count": 4,
+          "outside_single_nvlink_domain": true
+        },
+        "64": {
+          "node_count": 8,
+          "outside_single_nvlink_domain": true
+        }
+      },
+      "sustained_ring_communication": {
+        "summary": "runtime/analysis/gqa_attention_model/cp_overlap/calibration/h100_sustained_ring_cp16_64_20260722.json",
+        "summary_sha256": "71204b68e28bae8f1791cb97811f281b4069c820a3ccc6896ae3f36096754653",
+        "payload_bytes": 8388608,
+        "cp_sizes": [
+          16,
+          32,
+          64
+        ],
+        "measurement": "TE-style alternating-stream receive-before-next-send ring; steady-state chain duration divided by CP-1",
+        "sources": {
+          "16": {
+            "path": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260722_sustained_ring_crossnode_v1/qwen3_30b/cp16/results.json",
+            "sha256": "11bbc8933694562943aca50441f424fdf2310cc525a76f8e0bbdfadea46bd8f4"
+          },
+          "32": {
+            "path": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260722_sustained_ring_crossnode_v1/qwen3_30b/cp32/results.json",
+            "sha256": "2078e926ff55b83bd8a4337aceaa4ff4e53357fd1554e4a1bde3e8a7f916abb5"
+          },
+          "64": {
+            "path": "runtime/analysis/gqa_attention_model/cp_overlap/runs/h100_20260722_sustained_ring_crossnode_v1/qwen3_30b/cp64/results.json",
+            "sha256": "231108976c98f57332d11268b407a30bef67e725a6b3c32966e41a30768f397c"
+          }
+        }
+      }
+    }
+  }
+}

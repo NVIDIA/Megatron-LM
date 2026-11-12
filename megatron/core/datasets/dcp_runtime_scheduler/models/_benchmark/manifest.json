@@ -1,0 +1,903 @@
+{
+  "edited_after_export": {
+    "edits": [
+      "files: the entries of the three five-layer Qwen3.5 proxy files were removed together with the files, and the UPSTREAM_README.md entry records a change made after the export",
+      "policy.scope and post_export_adaptation.source_files_not_packaged were added",
+      "source_snapshot.source_directory was replaced by a description",
+      "files: the entries of showcase_profiles.py and of the two qwen3_showcase_calibration files were removed together with the files",
+      "files: after the export, host names, node lists and scheduler job ids were removed from 19 parameter files, the cluster name and the job number from UPSTREAM_VALIDATION.md and the job number from one file name listed in UPSTREAM_MANIFEST.sha256; the digests that name those files (calibration_manifest.json, gqa_attention_model_registry.json, six constants of cp_gqa_attention_predictor.py, one base_artifact_sha256) were rebound; each entry records its change and no prediction parameter changed",
+      "post_export_adaptation.python_prefix_utf8: the copyright header that the repository requires of every Python file became the first line of the vendor prefix; the entries of the Python files were rebound",
+      "files: attention_predictor/_native/native_sdpa_cta_work.py had a run identifier removed from its module docstring"
+    ],
+    "note": "This manifest was edited by hand after the export. exporter_sha256 identifies the exporter that wrote the original.",
+    "scope_of_statements": "policy, post_export_adaptation and static_checks describe the files listed under \"files\". The Python-body and AST statements hold for every Python file whose entry lists only the vendor prefix: __init__.py is generated, and model_e2e/__init__.py and model_e2e/models.py carry a replaced layer-layout preset and no prediction code. cp_gqa_attention_predictor.py carries six rebound artifact digests and unchanged prediction code. The value statements concern prediction parameters; the identifiers removed after the export are recorded per file."
+  },
+  "exporter_sha256": "a245b1f11aa2d90e828e311e61324472b10d90bb800d57e8f9ab59cfaa934c04",
+  "files": {
+    "UPSTREAM_MANIFEST.sha256": {
+      "changes": [
+        "Remove a scheduler job number from one listed file name (verification/package-check.log); every digest retained"
+      ],
+      "source_bytes": 16098,
+      "source_path": "MANIFEST.sha256",
+      "source_sha256": "a852f48404deea08df0e568ef5790c42305651cbc9e2a765c96797b393f53841",
+      "vendor_bytes": 16090,
+      "vendor_sha256": "bd5575c73276be3ba74eb5a522ceeac079b29c9b8336c56e8fbabdb8c815367a"
+    },
+    "UPSTREAM_PROVENANCE.json": {
+      "changes": [],
+      "source_bytes": 17680,
+      "source_path": "PROVENANCE.json",
+      "source_sha256": "591e2c1b0640b9fba320e71bc258f83ad852791ced315fe49753fc124dee08fb",
+      "vendor_bytes": 17680,
+      "vendor_sha256": "591e2c1b0640b9fba320e71bc258f83ad852791ced315fe49753fc124dee08fb"
+    },
+    "UPSTREAM_README.md": {
+      "changes": [
+        "Describe the packaged full Qwen3.5-35B layout preset in place of the five-layer proxy preset"
+      ],
+      "source_bytes": 8901,
+      "source_path": "README.md",
+      "source_sha256": "6bfdcc4ceaf367d58a3dd63d5f926529f73dabcc682e11f474dc136a206e90eb",
+      "vendor_bytes": 8882,
+      "vendor_sha256": "bd8853021ec3c2036f61673f48f9deab251bc4ba8d1ba6f38d892e7c917a7f86"
+    },
+    "UPSTREAM_VALIDATION.md": {
+      "changes": [
+        "Remove the cluster name and the scheduler job number after the export; results retained"
+      ],
+      "source_bytes": 1871,
+      "source_path": "VALIDATION.md",
+      "source_sha256": "3094a1d3ed445df5d2eb2e648c13ace08e919b4edcc864d76c36c552290ec249",
+      "vendor_bytes": 1859,
+      "vendor_sha256": "dadd531a71701f2204af6161e592280acedbc089d5ee545fa43874de59df82b6"
+    },
+    "__init__.py": {
+      "changes": [
+        "Generated namespace marker; no imports or execution",
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": null,
+      "source_path": null,
+      "source_sha256": null,
+      "vendor_bytes": 281,
+      "vendor_sha256": "a350f81713969c0759aff0b064700cb33d90fac7c7e38cf0adfc1d010be71c6a"
+    },
+    "attention_predictor/__init__.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 268,
+      "source_path": "packages/attention-predictor/src/attention_predictor/__init__.py",
+      "source_sha256": "2a55d5a3020bf9ad3ca6a4e656f5e61d576e75ba752a01f076753b8dc40ea14a",
+      "vendor_bytes": 480,
+      "vendor_sha256": "1068d5101fb5c4c08be72d1e69052fbf481004ab06e7c07c54ff2c2062d920f9"
+    },
+    "attention_predictor/_legacy/__init__.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 61,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/__init__.py",
+      "source_sha256": "2050460ce2317b1df13305c7a4a94a3046c25cb8b4f26e2ae4562d5b48c3827e",
+      "vendor_bytes": 273,
+      "vendor_sha256": "599aca4a2dfa2825412144c23511460b9a08b06af791aff0c5c707161a355469"
+    },
+    "attention_predictor/_legacy/attention/__init__.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 219,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/__init__.py",
+      "source_sha256": "01c8662be3e124d4eae3fa31c64072c2b57eb62f5b9d172078a0c052ce3e8a9a",
+      "vendor_bytes": 431,
+      "vendor_sha256": "295523b5d0227339cbefe7b918762fc75a4607bc8a55f1a4baa81816c5510a54"
+    },
+    "attention_predictor/_legacy/attention/backward_model/__init__.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 42,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/backward_model/__init__.py",
+      "source_sha256": "a948ea54ef676b574a3bb8b803df4fbaeb9be5c0a3af8d8ead8e140275829508",
+      "vendor_bytes": 254,
+      "vendor_sha256": "7bbf17b1159719834ac99586d3ee9923807967946df4c6a0f4af4ca18ab770fc"
+    },
+    "attention_predictor/_legacy/attention/backward_model/backward_attention_predictor.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 30983,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/backward_model/backward_attention_predictor.py",
+      "source_sha256": "741367d0976afaf4e15ea8ffdcee9c05a7ccdbfe1a6569f7d77d1e146548c777",
+      "vendor_bytes": 31195,
+      "vendor_sha256": "4249fc6c530ddaf5efb8d2f45dd39165f62523c21128099d2b2c3a5dc5832d58"
+    },
+    "attention_predictor/_legacy/attention/backward_model/frozen_backward_attention_model.json": {
+      "changes": [
+        "JSON whitespace compacted; every value and branch retained",
+        "Remove scheduler job ids from contract.gb200_cp1_unavailable and hardware_provenance after the export; every model value retained"
+      ],
+      "source_bytes": 20273132,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/backward_model/frozen_backward_attention_model.json",
+      "source_sha256": "8855910bd77d920663cb037d0eeb8a605dd9ca2567247755cde9c7ccd377e500",
+      "vendor_bytes": 10860418,
+      "vendor_sha256": "79897b17aa0ec48e8097fe5f8f466c204778ccc03fff190726bd380b3ef6683e"
+    },
+    "attention_predictor/_legacy/attention/backward_model/frozen_backward_attention_model_h100_v2.json": {
+      "changes": [
+        "JSON whitespace compacted; every value and branch retained",
+        "Remove the scheduler job id from contract.gb200_cp1_unavailable after the export; every model value retained"
+      ],
+      "source_bytes": 12061515,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/backward_model/frozen_backward_attention_model_h100_v2.json",
+      "source_sha256": "d39156b0d2d48ba71d4c6748159cd1e8fbe27270b00480b7bc50a8409893a4ca",
+      "vendor_bytes": 6443721,
+      "vendor_sha256": "7c9a0904f7e57c8748ba7ec9d2bab18e6490b1786578f2128336525bb990edd7"
+    },
+    "attention_predictor/_legacy/attention/calibration_manifest.json": {
+      "changes": [
+        "Only artifacts[*].export_sha256, sources[cp_gqa_attention_predictor.py].export_sha256 and the note updated to the packaged bytes; original source SHA fields retained"
+      ],
+      "source_bytes": 10243,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/calibration_manifest.json",
+      "source_sha256": "9935445cddba4e75c2be066f278cdc8a8dbe62bde9710352f27d7c51e1c583ce",
+      "vendor_bytes": 9266,
+      "vendor_sha256": "d17b9f149d8807a5b4731481ca180ccca83c633d54c0d98f1f948be318824efe"
+    },
+    "attention_predictor/_legacy/attention/cp1_gqa_attention_predictor.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 45163,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp1_gqa_attention_predictor.py",
+      "source_sha256": "a44ae025f98815f97d1753169fd0256b34dc17c4db75e43c9c2d6fe520dd616c",
+      "vendor_bytes": 45375,
+      "vendor_sha256": "d5a9e66225109cfb96eafc8b4b6bfd75c71f3164e393f5a41688b9c553c29dd9"
+    },
+    "attention_predictor/_legacy/attention/cp1_max_cp_alignment_h100_20260818/frozen_models.json": {
+      "changes": [],
+      "source_bytes": 138730,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp1_max_cp_alignment_h100_20260818/frozen_models.json",
+      "source_sha256": "497e4cb6f835f1005a9bc663c1a8750a24bef7c7e76b0c4c4468cf07829dd964",
+      "vendor_bytes": 138730,
+      "vendor_sha256": "497e4cb6f835f1005a9bc663c1a8750a24bef7c7e76b0c4c4468cf07829dd964"
+    },
+    "attention_predictor/_legacy/attention/cp1_tail_3k8k_six_geometry_gb200_20260722/frozen_models.json": {
+      "changes": [],
+      "source_bytes": 88423,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp1_tail_3k8k_six_geometry_gb200_20260722/frozen_models.json",
+      "source_sha256": "9eaccf2b03b10cd8f7d48ce41384f2b736ad4138561baa1dd72487c0a8df91a6",
+      "vendor_bytes": 88423,
+      "vendor_sha256": "9eaccf2b03b10cd8f7d48ce41384f2b736ad4138561baa1dd72487c0a8df91a6"
+    },
+    "attention_predictor/_legacy/attention/cp1_tail_3k8k_six_geometry_gb200_20260722/head_dim256_backend_state_models_v2.json": {
+      "changes": [],
+      "source_bytes": 65310,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp1_tail_3k8k_six_geometry_gb200_20260722/head_dim256_backend_state_models_v2.json",
+      "source_sha256": "47bb04e77f3ca763b6b4cdad42f41a929203b62bac2c1452cedf103f80e7dc4f",
+      "vendor_bytes": 65310,
+      "vendor_sha256": "47bb04e77f3ca763b6b4cdad42f41a929203b62bac2c1452cedf103f80e7dc4f"
+    },
+    "attention_predictor/_legacy/attention/cp_gqa_attention_predictor.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged",
+        "Rebind six frozen-artifact sha256 constants to the packaged bytes; prediction code unchanged"
+      ],
+      "source_bytes": 70237,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_gqa_attention_predictor.py",
+      "source_sha256": "ece65414c2d9d1fcde51a83182058577d45d35076c1264f2bad6c43d2cb9a9a4",
+      "vendor_bytes": 70449,
+      "vendor_sha256": "6128c9c59999d08524256bd259d0e57dff14ce089c8920a49f3117548c5b4987"
+    },
+    "attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v1_ring/gb200/llama3_70b/final/frozen_cp_gqa_attention_model_cp64.json": {
+      "changes": [
+        "Remove host names, node lists and scheduler job ids from source.communication_metadata and provenance.cp64_scaling.topology_by_cp after the export; every other value retained"
+      ],
+      "source_bytes": 90002,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v1_ring/gb200/llama3_70b/final/frozen_cp_gqa_attention_model_cp64.json",
+      "source_sha256": "54560ccffa22aa8ea64b071a129771425d6fe945040ad47b006d03e635430d3a",
+      "vendor_bytes": 83107,
+      "vendor_sha256": "49f8082eda9f7e57a125bc22a9453c71000757f228f33c13fc65b970d66f04f5"
+    },
+    "attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v1_ring/gb200/mixtral_8x7b/final/frozen_cp_gqa_attention_model_cp64.json": {
+      "changes": [
+        "Remove host names, node lists and scheduler job ids from source.communication_metadata and provenance.cp64_scaling.topology_by_cp after the export; every other value retained"
+      ],
+      "source_bytes": 92884,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v1_ring/gb200/mixtral_8x7b/final/frozen_cp_gqa_attention_model_cp64.json",
+      "source_sha256": "aa5309652a6337cc2201335a1c3bf19464f11ff0826ee4e6145694867110dbe3",
+      "vendor_bytes": 85992,
+      "vendor_sha256": "6aea48b7366ab4deaf7c2706685b06afcde6d8f51271ca87d41f08026e18ca7f"
+    },
+    "attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v1_ring/gb200/qwen3_235b/final/frozen_cp_gqa_attention_model_cp64.json": {
+      "changes": [
+        "Remove host names, node lists and scheduler job ids from source.communication_metadata and provenance.cp64_scaling.topology_by_cp after the export; every other value retained"
+      ],
+      "source_bytes": 90956,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v1_ring/gb200/qwen3_235b/final/frozen_cp_gqa_attention_model_cp64.json",
+      "source_sha256": "15c960781977b4164fcac3cb183e8a88efffb9d3da3b26a7ecb4cdfc0d25a227",
+      "vendor_bytes": 84055,
+      "vendor_sha256": "aa2c0875b739222c9959e9b319cd78433655a07db95264fb26e957043597e380"
+    },
+    "attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v1_ring/gb200/qwen3_30b/final/frozen_cp_gqa_attention_model_cp64.json": {
+      "changes": [
+        "Remove host names, node lists and scheduler job ids from source.communication_metadata and provenance.cp64_scaling.topology_by_cp after the export; every other value retained"
+      ],
+      "source_bytes": 89639,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v1_ring/gb200/qwen3_30b/final/frozen_cp_gqa_attention_model_cp64.json",
+      "source_sha256": "6f7de0164c989dee7790c6f893dfff0011ef9f3f07a1b8a1cf4bf4c68166086e",
+      "vendor_bytes": 82744,
+      "vendor_sha256": "59398e454a6b3df0351a4158341a80c610a3d4f5f8102e0fa5b8ee0e18a2fa16"
+    },
+    "attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/llama3_70b/final/frozen_cp_gqa_attention_model_cp64.json": {
+      "changes": [
+        "Remove host names, node lists and scheduler job ids from source.communication_metadata and provenance.cp64_scaling.topology_by_cp after the export; every other value retained"
+      ],
+      "source_bytes": 91857,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/llama3_70b/final/frozen_cp_gqa_attention_model_cp64.json",
+      "source_sha256": "b016cb2f4f0e53f44359e1aceb919f40cb835dfb9ab1be1de03fc7f53cd919b1",
+      "vendor_bytes": 85494,
+      "vendor_sha256": "fd42e74320699891189f76babe5f25214ff2d10d330adafbfc99cf1740a2be55"
+    },
+    "attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/mixtral_8x7b/final/frozen_cp_gqa_attention_model_cp64.json": {
+      "changes": [
+        "Remove host names, node lists and scheduler job ids from source.communication_metadata and provenance.cp64_scaling.topology_by_cp after the export; every other value retained"
+      ],
+      "source_bytes": 89121,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/mixtral_8x7b/final/frozen_cp_gqa_attention_model_cp64.json",
+      "source_sha256": "8cb53ea4b1f6389721a429c18d9b54b872efd557e69d8aad40a9ce285dbcd1e8",
+      "vendor_bytes": 82758,
+      "vendor_sha256": "6adc4b364999981e25f2ed9bb31c70fc4fac46f03d4fab2bffd48f4c7cab6615"
+    },
+    "attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_235b/final/frozen_cp_gqa_attention_model_cp64.json": {
+      "changes": [
+        "Remove host names, node lists and scheduler job ids from source.communication_metadata and provenance.cp64_scaling.topology_by_cp after the export; every other value retained"
+      ],
+      "source_bytes": 91683,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_235b/final/frozen_cp_gqa_attention_model_cp64.json",
+      "source_sha256": "e9d37b19f22b86e688b2420cb284f35da78d3e39e9e23f841ad24fe46d4068ae",
+      "vendor_bytes": 85320,
+      "vendor_sha256": "b8fc86bae2df99aea53f554fb5e5e896079f68d1cd4f104474f9ce7c69d45ae9"
+    },
+    "attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_30b/final/frozen_cp_gqa_attention_model_cp64.json": {
+      "changes": [
+        "Remove host names, node lists and scheduler job ids from source.communication_metadata and provenance.cp64_scaling.topology_by_cp after the export; every other value retained"
+      ],
+      "source_bytes": 89262,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_30b/final/frozen_cp_gqa_attention_model_cp64.json",
+      "source_sha256": "89c90c825090dc178f5e41891133ba63c088b8543d629f41740225023e6b73a1",
+      "vendor_bytes": 82899,
+      "vendor_sha256": "002cf104db9c8a2ccb7e94c19dc461312271f392469f45b18338ab993b66c3fc"
+    },
+    "attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_5_397b/final/frozen_cp_gqa_attention_model_cp64.json": {
+      "changes": [
+        "Remove host names, node lists and scheduler job ids from source.communication_metadata and provenance.cp64_scaling.topology_by_cp after the export; every other value retained"
+      ],
+      "source_bytes": 88042,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_5_397b/final/frozen_cp_gqa_attention_model_cp64.json",
+      "source_sha256": "d3e44b7b6ffe40a3f5217afbaf7a5c2325b972ebdd06c4dd95e84deb1c3cae90",
+      "vendor_bytes": 81679,
+      "vendor_sha256": "9ee172e470ebe708c7715801802243233dbb0d566ff61ee4c1438f2fec743ee5"
+    },
+    "attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_next_80b/final/frozen_cp_gqa_attention_model_cp64.json": {
+      "changes": [
+        "Remove host names, node lists and scheduler job ids from source.communication_metadata and provenance.cp64_scaling.topology_by_cp after the export; every other value retained"
+      ],
+      "source_bytes": 87658,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_next_80b/final/frozen_cp_gqa_attention_model_cp64.json",
+      "source_sha256": "bed69cc4a7ce86203fc6e8eb46faf443fc47e877b8370ac04b0e53472a6b4cc8",
+      "vendor_bytes": 81295,
+      "vendor_sha256": "76d0d2873fa7be0fe8731ac9ef7133d0697ed365bd40ba3202df8ab7de90a20a"
+    },
+    "attention_predictor/_legacy/attention/cp_overlap/models/frozen_pre_fresh_holdout_v2/frozen_cp_gqa_attention_model_v2.json": {
+      "changes": [
+        "Remove host names from source.communication_metadata after the export; every other value retained"
+      ],
+      "source_bytes": 13747,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_overlap/models/frozen_pre_fresh_holdout_v2/frozen_cp_gqa_attention_model_v2.json",
+      "source_sha256": "1a7c629a9cc60b2995b179f1104e545e775e34b0ddf9741b0a1f69d7e7b9cde8",
+      "vendor_bytes": 13642,
+      "vendor_sha256": "720f9d12c535f0da8c7b0f053a1f280ed51a59895f80d32ff4b09a6d154188f0"
+    },
+    "attention_predictor/_legacy/attention/cp_overlap/models/multi_profile_20260720_v3/llama3_70b/frozen_v3/frozen_cp_gqa_attention_model_v3.json": {
+      "changes": [
+        "Remove host names from source.communication_metadata after the export; every other value retained"
+      ],
+      "source_bytes": 19026,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_overlap/models/multi_profile_20260720_v3/llama3_70b/frozen_v3/frozen_cp_gqa_attention_model_v3.json",
+      "source_sha256": "4767de9fb6ea1e7ace8419f8f4218e85d0fe873bae5bac2caf2546b8985aa9ea",
+      "vendor_bytes": 18921,
+      "vendor_sha256": "ea0ac673d6f25a00cc3df6f2bc7d1794d0ed9ef3eb3667c28b4e446a86ec5648"
+    },
+    "attention_predictor/_legacy/attention/cp_overlap/models/multi_profile_20260720_v3/mixtral_8x7b/frozen_v3/frozen_cp_gqa_attention_model_v3.json": {
+      "changes": [
+        "Remove host names from source.communication_metadata after the export; every other value retained"
+      ],
+      "source_bytes": 19031,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_overlap/models/multi_profile_20260720_v3/mixtral_8x7b/frozen_v3/frozen_cp_gqa_attention_model_v3.json",
+      "source_sha256": "0d5d0eaabec7427f8ee2b0ada8246ef4eda88608a03cdbf899906cd9675c9c6d",
+      "vendor_bytes": 18926,
+      "vendor_sha256": "c73c3703204d289edc52d7f2e86de59d687e9384c478a98b633d59ff962f4356"
+    },
+    "attention_predictor/_legacy/attention/cp_overlap/models/multi_profile_20260720_v3/qwen3_235b/frozen_v3/frozen_cp_gqa_attention_model_v3.json": {
+      "changes": [
+        "Remove host names from source.communication_metadata after the export; every other value retained"
+      ],
+      "source_bytes": 18491,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_overlap/models/multi_profile_20260720_v3/qwen3_235b/frozen_v3/frozen_cp_gqa_attention_model_v3.json",
+      "source_sha256": "85cce9c21bfd60c827b3953687bf27d265c3a2be5c6d89464c79263ede53bdea",
+      "vendor_bytes": 18386,
+      "vendor_sha256": "8227d18c5a7598087d25e4ad27789a213f9c5634b5e2aea1a2231bcc506b578a"
+    },
+    "attention_predictor/_legacy/attention/cp_overlap/models/multi_profile_20260720_v3/qwen3_5_397b/frozen_v3/frozen_cp_gqa_attention_model_v3.json": {
+      "changes": [
+        "Remove host names from source.communication_metadata after the export; every other value retained"
+      ],
+      "source_bytes": 18581,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_overlap/models/multi_profile_20260720_v3/qwen3_5_397b/frozen_v3/frozen_cp_gqa_attention_model_v3.json",
+      "source_sha256": "845c7615984003b2a888ea58aacbd16a47ca347b9e2a354701e2128a923b1c28",
+      "vendor_bytes": 18476,
+      "vendor_sha256": "28d3bcbee193c2ccb245943a8afa6044f2d2b366b71c5e479417a68b5f456ff2"
+    },
+    "attention_predictor/_legacy/attention/cp_overlap/models/multi_profile_20260720_v3/qwen3_next_80b/frozen_v3/frozen_cp_gqa_attention_model_v3.json": {
+      "changes": [
+        "Remove host names from source.communication_metadata after the export; every other value retained"
+      ],
+      "source_bytes": 19271,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_overlap/models/multi_profile_20260720_v3/qwen3_next_80b/frozen_v3/frozen_cp_gqa_attention_model_v3.json",
+      "source_sha256": "2003f388f45a2de8f23c11726829fa2dee90c166e44eaa5d27239fa166c97aed",
+      "vendor_bytes": 19166,
+      "vendor_sha256": "49b38ee027af69a184f7e0ff143150c0cd2940678bed4408a270fcc8ccff3f6d"
+    },
+    "attention_predictor/_legacy/attention/cp_pipeline.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 4413,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_pipeline.py",
+      "source_sha256": "570c1931079f64bad9d8bd101d5cc5e8541c2de33d61789ba7d40de5dd386c15",
+      "vendor_bytes": 4625,
+      "vendor_sha256": "3c68269a1ce2bc557087e11cd9a5dfe411abc015584dd1fc0364e60fdedc8663"
+    },
+    "attention_predictor/_legacy/attention/cp_round_geometry.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 6018,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/cp_round_geometry.py",
+      "source_sha256": "b721f18f95e42cfbbbc0451f0df2bfb6ecf3c4929ea4c43a6d5186491453dad4",
+      "vendor_bytes": 6230,
+      "vendor_sha256": "755587736eb226e7c05f1ddad1c40e3ab095f1f0efbd16650c6761d1e918deeb"
+    },
+    "attention_predictor/_legacy/attention/estimator.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 17505,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/estimator.py",
+      "source_sha256": "1d90848e8c5c1cff4ea3f1a97e0ad91e95f79064b280f87273b52dfc8b871272",
+      "vendor_bytes": 17717,
+      "vendor_sha256": "648b48ceef236eaa823e21f137680742d9acc832895b06972c80d582cef55992"
+    },
+    "attention_predictor/_legacy/attention/gb200_cp1_attention_predictor.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 6440,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/gb200_cp1_attention_predictor.py",
+      "source_sha256": "c07df704b026ee03c9c20f8d076015032058fad8415754da07173b1b37a87f24",
+      "vendor_bytes": 6652,
+      "vendor_sha256": "00280294483f5d69000ca1d4aef5b85c85ec34560a4a420467cd432140c94ea2"
+    },
+    "attention_predictor/_legacy/attention/gqa_attention_model_registry.json": {
+      "changes": [
+        "Only the ten te_p2p artifact sha256 bindings rebound to the packaged bytes"
+      ],
+      "source_bytes": 6574,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/gqa_attention_model_registry.json",
+      "source_sha256": "47c9da9962d99fc40267f17d993a5d799a29935897632efc0be28d1678faee21",
+      "vendor_bytes": 6574,
+      "vendor_sha256": "2b80ff2a5461615e93ab9a3e31d212a661e5ead44c5bad3435bc649dd2d490fb"
+    },
+    "attention_predictor/_legacy/attention/hardware_gqa_attention_predictor.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 23645,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/hardware_gqa_attention_predictor.py",
+      "source_sha256": "ad33c06f761d193bd6274c37a3ef0649d984386d2c3892cd70aa91fcd88ece91",
+      "vendor_bytes": 23857,
+      "vendor_sha256": "067e10faca0aea6254a5c331a2a29b1119d4d35df0bfd00d40e40388cc963d2f"
+    },
+    "attention_predictor/_legacy/attention/non_power_cp_20260829/__init__.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 46,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/non_power_cp_20260829/__init__.py",
+      "source_sha256": "fe19705a61ce5ba272fa683953d604cca690b9cb5cee913f3cb556144b604cbf",
+      "vendor_bytes": 258,
+      "vendor_sha256": "cc653ca1bf1ae4f3542db6fb567f699dc593f212e7a1102f65e10888db4c4d94"
+    },
+    "attention_predictor/_legacy/attention/non_power_cp_20260829/arbitrary_cp_backward_predictor.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 8750,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/non_power_cp_20260829/arbitrary_cp_backward_predictor.py",
+      "source_sha256": "85e692c7169324a4fc0bc4b18d1e2787e2b04ec38236da69aec42697498eb7a6",
+      "vendor_bytes": 8962,
+      "vendor_sha256": "a10e8ae34bab0e139386e96f72c71b6222ce6e447269c3e4983e2230f30262b3"
+    },
+    "attention_predictor/_legacy/attention/non_power_cp_20260829/models/h100_qwen3_30b_backward_cp1_32_integer_holdout_backed.json": {
+      "changes": [
+        "Only base_artifact_sha256 rebound to the packaged H100v2 bytes; all model values retained"
+      ],
+      "source_bytes": 6557,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/non_power_cp_20260829/models/h100_qwen3_30b_backward_cp1_32_integer_holdout_backed.json",
+      "source_sha256": "dcf45814399cb0dd30aeb4c82dd10192a5ff09abab624119475e389351d1d15e",
+      "vendor_bytes": 4938,
+      "vendor_sha256": "7ce373f825b6fccf7cff10bcaadcf1909ec37b33543df6cfa3b6a83ca87ea84b"
+    },
+    "attention_predictor/_legacy/attention/non_power_cp_20260829/models/h100_qwen3_30b_cp2_32_integer_candidate.json": {
+      "changes": [
+        "Remove host names, node lists and scheduler job ids from source.communication_metadata and provenance.cp64_scaling.topology_by_cp after the export; every other value retained"
+      ],
+      "source_bytes": 95414,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/non_power_cp_20260829/models/h100_qwen3_30b_cp2_32_integer_candidate.json",
+      "source_sha256": "dd652e90cf0514f5167ca1de9e6490f5eaaf30d3b113bccb6258a799d4d2f6fa",
+      "vendor_bytes": 89051,
+      "vendor_sha256": "84edd1738480a4d6dd42923d486ad8344d5ea6d1b31c397b509ca4a98f025660"
+    },
+    "attention_predictor/_legacy/attention/placement_calibration.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 7528,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/placement_calibration.py",
+      "source_sha256": "4875c8c24311a0601b2f8e140371032551cce09e78395d31683f89e8b016e207",
+      "vendor_bytes": 7740,
+      "vendor_sha256": "fee34ccc157d547b5f5e9e72646131f6a277cb64210c9878d12616dcf3cdca79"
+    },
+    "attention_predictor/_legacy/attention/singleton_sol_attention_predictor.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 5033,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/singleton_sol_attention_predictor.py",
+      "source_sha256": "49ce6305bef6ef2c662a13354ee2cdeb522332018f2c491ad1883a0bc2f693ca",
+      "vendor_bytes": 5245,
+      "vendor_sha256": "94ce138c307ec754b739ba50483b226db105d0afad13184e351cebc0a3ab8975"
+    },
+    "attention_predictor/_legacy/attention/sol_validation_20260802/singleton_sol_calibration.json": {
+      "changes": [],
+      "source_bytes": 6776,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/sol_validation_20260802/singleton_sol_calibration.json",
+      "source_sha256": "1391cad1d21cc0949006c55a4d85f8ef390d985b033548f7c4d8eab3ea39390c",
+      "vendor_bytes": 6776,
+      "vendor_sha256": "1391cad1d21cc0949006c55a4d85f8ef390d985b033548f7c4d8eab3ea39390c"
+    },
+    "attention_predictor/_legacy/attention/topology.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 9016,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/attention/topology.py",
+      "source_sha256": "0c0c9e183cdaae15f43639e98b645717e29670d92b4862e92582b3bfd3cf662d",
+      "vendor_bytes": 9228,
+      "vendor_sha256": "702e1a1d41df3764c6eef4f25975e8296aad12ac24e02abf7dccca6c7c93d84e"
+    },
+    "attention_predictor/_legacy/rank_timeline.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 8621,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/rank_timeline.py",
+      "source_sha256": "e885052166adaac058e5e4893fd6b224f14d58bc45f0d110001fa5e6af13735e",
+      "vendor_bytes": 8833,
+      "vendor_sha256": "e826ebaf46d90fa4387ca67807773f0833bbab0efb62936b0d2f5990f132d77e"
+    },
+    "attention_predictor/_legacy/validation.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 240,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_legacy/validation.py",
+      "source_sha256": "1a7e96fa09dbc47eb3f1defa635db8caed5e18d2678349213bbc6c391a087312",
+      "vendor_bytes": 452,
+      "vendor_sha256": "d28de2aab9a8946243de4dd1e6c6d6c82fa5af335bd18c8c2962803c5f394e45"
+    },
+    "attention_predictor/_native/__init__.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 61,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/__init__.py",
+      "source_sha256": "7ee0bd73f3e2f17211da1f01f5a4fc011c7e00329a33b165c9d56be48cb3c2a0",
+      "vendor_bytes": 273,
+      "vendor_sha256": "2e80e55870d5341081e3bcf74ae187c2eb6a2292936ef44a619c97f30b90e6e6"
+    },
+    "attention_predictor/_native/backward_phase_work.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 2476,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/backward_phase_work.py",
+      "source_sha256": "66279a7a5c8642f8281194ed906a2356e49239534459c1e7e7a8390ce1a8b631",
+      "vendor_bytes": 2688,
+      "vendor_sha256": "58e5abb8310f5965804c73e015c1e84ca895efb0ea1347da8bcf0a9018e5b102"
+    },
+    "attention_predictor/_native/backward_worker_work.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 729,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/backward_worker_work.py",
+      "source_sha256": "17eec8a1a3430484eaf5d5467358008e09124d89c82d291d84b8c309e8335347",
+      "vendor_bytes": 941,
+      "vendor_sha256": "23b5cad2e07c47d7c81ad98b41ea1bbec1e46643e24d72b4179cafe714706dd3"
+    },
+    "attention_predictor/_native/cp1_matrix_work.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 2702,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/cp1_matrix_work.py",
+      "source_sha256": "24f7f5ca17b2b123e48481cc5e2123b9acffc8ca8267e89a81a39ec6ef19ea30",
+      "vendor_bytes": 2914,
+      "vendor_sha256": "0de59d600d73f28f01a74ea8160109e74afe01df234c9349bfa47d6c724af1e5"
+    },
+    "attention_predictor/_native/cp1_model.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 1593,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/cp1_model.py",
+      "source_sha256": "6eac47472e1e9d304e92c8c3e34a74b143f6eba45aa4273b2c00eef319334542",
+      "vendor_bytes": 1805,
+      "vendor_sha256": "416b21e66f0ceea0538a06612c461bc175681189efb54a3abeed6f9166b80b66"
+    },
+    "attention_predictor/_native/export_cp1_program_bodies.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 167,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/export_cp1_program_bodies.py",
+      "source_sha256": "39609793cee91815b6da2c324e63d1fc1575aaecdac699ae301a09ddef454828",
+      "vendor_bytes": 379,
+      "vendor_sha256": "2a2fcaff7f81518f9467e3e9d32ca67e7f75d7a680cc18144dbb92d7087aeca4"
+    },
+    "attention_predictor/_native/geometry.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 3703,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/geometry.py",
+      "source_sha256": "b5fb509acd2a1a26b972b440da05817b998e48d593f2548f9c5a69b49a8a2aed",
+      "vendor_bytes": 3915,
+      "vendor_sha256": "4877dd666f554de4601b958e861c7720bafe59a6af97dd80815bad2168cff12c"
+    },
+    "attention_predictor/_native/h100_backward_dispatch.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 599,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/h100_backward_dispatch.py",
+      "source_sha256": "c6795dff006f03f6e0e5fff10f77d2ecba3a84a6031ed5e4f3f4639480818de1",
+      "vendor_bytes": 811,
+      "vendor_sha256": "b99c2eee2422109f826b11625eaa01b673be3ce22706231c0ddc61f6092564ed"
+    },
+    "attention_predictor/_native/h100_causal_loops.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 2275,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/h100_causal_loops.py",
+      "source_sha256": "528608614776e2bb6b0336463e572f28ddd2f499861d6a30bb86c930c2d70313",
+      "vendor_bytes": 2487,
+      "vendor_sha256": "68bf637df95ce17c9297da1147a760eccd896a5b18d324e987aeafbd07901e97"
+    },
+    "attention_predictor/_native/native_query_backward_work.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 2723,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/native_query_backward_work.py",
+      "source_sha256": "5ab29d44cafb93bc40b3031ff18030afe4d7575fa0e2d16b9b61684140e498d7",
+      "vendor_bytes": 2935,
+      "vendor_sha256": "54315ced7115be10b2ad2680a2364037f16f214f63cb80f658b37442d9ae7f2f"
+    },
+    "attention_predictor/_native/native_query_work.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 2014,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/native_query_work.py",
+      "source_sha256": "9e0353d4eeb29dd75667c9a080a1b159ed98390249809463ce31e96b21469ef8",
+      "vendor_bytes": 2226,
+      "vendor_sha256": "41f2103beb848db0bd32492e470e721893613257d2cd74b6b09ad9bd4c59eeee"
+    },
+    "attention_predictor/_native/native_sdpa_cta_work.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments",
+        "Remove a run identifier from the module docstring; no statement changed"
+      ],
+      "source_bytes": 1825,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/native_sdpa_cta_work.py",
+      "source_sha256": "3efce83f90bf11aade1742f1398f6cf4583c95a4b832672fd88c4412ad44c46b",
+      "vendor_bytes": 2029,
+      "vendor_sha256": "2d62e0a66ff3128346ccbc0591e7768103c5f44cddb49369331bf5876aaf2944"
+    },
+    "attention_predictor/_native/native_terminal_trace.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 179,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/native_terminal_trace.py",
+      "source_sha256": "c095a7ec927622bece6b9ba2d3f523eaa7efb1cb562a9b98c4658f522b8ecbce",
+      "vendor_bytes": 391,
+      "vendor_sha256": "ad17b323bccddcc378d3599e489fe64800c073bb8fda0156853cb45c20359403"
+    },
+    "attention_predictor/_native/prospective_backward_worker_cp1.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 2840,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/prospective_backward_worker_cp1.py",
+      "source_sha256": "821671e8ce4d812071a0fffb48b714e4f32fdb489952411dd8a9e995deb910ba",
+      "vendor_bytes": 3052,
+      "vendor_sha256": "0c2b48d548e8462f22f17eeb214d093e057420fccea07e7cbc45295e0afba048"
+    },
+    "attention_predictor/_native/prospective_disjoint_path_cp1.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 2929,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/prospective_disjoint_path_cp1.py",
+      "source_sha256": "2df091804d5e680ee8f83145f62ae8160f10cebde2b543899bec91a19bd6665b",
+      "vendor_bytes": 3141,
+      "vendor_sha256": "4ee97c13f8b0e0da6dc603d69f85f5da515256750191161e2d31961caa636da6"
+    },
+    "attention_predictor/_native/prospective_forward_mask_work.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 1004,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/prospective_forward_mask_work.py",
+      "source_sha256": "cde54fb0f97140ab02415f52fd15ad9718c63626942d41dac7b6c77b379ff8e8",
+      "vendor_bytes": 1216,
+      "vendor_sha256": "e32edd354d658e8994aa8b1528d23c9e76b81448281d6bffab3397812f968161"
+    },
+    "attention_predictor/_native/prospective_forward_worker_cp1.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 1436,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/prospective_forward_worker_cp1.py",
+      "source_sha256": "1191c6dcc8bda68d9e4a959abb783fc54eb336906544c97588c7f4dd7cfd265c",
+      "vendor_bytes": 1648,
+      "vendor_sha256": "db3769922ec1e659ce94576868b1da5bac020fe4a9359d357771d4e032c7ddcc"
+    },
+    "attention_predictor/_native/prospective_h100_backward_mask_work.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 620,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/prospective_h100_backward_mask_work.py",
+      "source_sha256": "b486dd26f20eb7a992f6a0a64f09d46d09af9c1290d9c27eab4f73e9a791947f",
+      "vendor_bytes": 832,
+      "vendor_sha256": "831e44310e4ef20b4ddb73db0222b86e1635acbd1f3b09112ce8ba238bc20c1d"
+    },
+    "attention_predictor/_native/prospective_job_resource_cp1.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 2395,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/prospective_job_resource_cp1.py",
+      "source_sha256": "5f76aaa81a4035239a049e7d4d8018f0ef0e4c7c3f34765aa597ebe56bce1f16",
+      "vendor_bytes": 2607,
+      "vendor_sha256": "f053831aaceec96b02b619cdae78b789bb5d68f1972cd7c93c617bd68c2e7690"
+    },
+    "attention_predictor/_native/prospective_source_count_cp1.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 1122,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/prospective_source_count_cp1.py",
+      "source_sha256": "0f2031e386f8844d5d9ac2df2d2196def32bb7ce4aa9bc920338540c705df0ac",
+      "vendor_bytes": 1334,
+      "vendor_sha256": "77e39321ecb94c7a059690c5ade1f4464d16c9a04011dcddadfbc464b7f36b9d"
+    },
+    "attention_predictor/_native/whole_resource_cp1.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 2894,
+      "source_path": "packages/attention-predictor/src/attention_predictor/_native/whole_resource_cp1.py",
+      "source_sha256": "61f19ee2f5462e797f3a7e9be602d350d11dee2efe9c2e1c8b043b71e2497b30",
+      "vendor_bytes": 3106,
+      "vendor_sha256": "02666301f4c28d8fd172c6725bb43b139449b4be94c82704c74f926e007b5363"
+    },
+    "attention_predictor/api.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 6434,
+      "source_path": "packages/attention-predictor/src/attention_predictor/api.py",
+      "source_sha256": "e762d3f1537d42d0a6270cff6f31455936d8477f95352335f22bc1448f7eec5f",
+      "vendor_bytes": 6646,
+      "vendor_sha256": "bfd0fab032b3a42e17f1b9d9f93de84264a60317d0f924b5fc1a812f7d744928"
+    },
+    "attention_predictor/data/experimental_cp1_gb200.json": {
+      "changes": [],
+      "source_bytes": 7609,
+      "source_path": "packages/attention-predictor/src/attention_predictor/data/experimental_cp1_gb200.json",
+      "source_sha256": "6ef754c4f464c06f9933dc9f17a8b3b2d6cda17d97e5f5a41c4517ab943257cc",
+      "vendor_bytes": 7609,
+      "vendor_sha256": "6ef754c4f464c06f9933dc9f17a8b3b2d6cda17d97e5f5a41c4517ab943257cc"
+    },
+    "attention_predictor/data/experimental_cp1_h100.json": {
+      "changes": [],
+      "source_bytes": 7604,
+      "source_path": "packages/attention-predictor/src/attention_predictor/data/experimental_cp1_h100.json",
+      "source_sha256": "e75c1bb14bd1bb40b2711ff62182f5c953b999a7189a97ecbd76dfccd31644e2",
+      "vendor_bytes": 7604,
+      "vendor_sha256": "e75c1bb14bd1bb40b2711ff62182f5c953b999a7189a97ecbd76dfccd31644e2"
+    },
+    "attention_predictor/data/manifest.json": {
+      "changes": [],
+      "source_bytes": 203,
+      "source_path": "packages/attention-predictor/src/attention_predictor/data/manifest.json",
+      "source_sha256": "4876535f52629a89b3b6f90b83657b3a2397a21ae63dba3cbc4c4c64d9a09414",
+      "vendor_bytes": 203,
+      "vendor_sha256": "4876535f52629a89b3b6f90b83657b3a2397a21ae63dba3cbc4c4c64d9a09414"
+    },
+    "model_e2e/__init__.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged",
+        "Replace the five-layer Qwen3.5 proxy layout/export with full40decoder+1MTP layout; numerical prediction kernels unchanged"
+      ],
+      "source_bytes": 381,
+      "source_path": "packages/model-e2e/src/model_e2e/__init__.py",
+      "source_sha256": "7312955fa8f232cb9f23762fb269e9bb3347b52f98b0651ee327ee2474124eb9",
+      "vendor_bytes": 589,
+      "vendor_sha256": "01ce504fc7074f95a867480180b86391e492f6e573633669428c80d733d48229"
+    },
+    "model_e2e/_timeline/__init__.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 61,
+      "source_path": "packages/model-e2e/src/model_e2e/_timeline/__init__.py",
+      "source_sha256": "7ee0bd73f3e2f17211da1f01f5a4fc011c7e00329a33b165c9d56be48cb3c2a0",
+      "vendor_bytes": 273,
+      "vendor_sha256": "2e80e55870d5341081e3bcf74ae187c2eb6a2292936ef44a619c97f30b90e6e6"
+    },
+    "model_e2e/_timeline/execution_program.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 3357,
+      "source_path": "packages/model-e2e/src/model_e2e/_timeline/execution_program.py",
+      "source_sha256": "7f8cc23ada4312ef4543295277be747cba957befbcac43ab914d49d9ba6416a5",
+      "vendor_bytes": 3569,
+      "vendor_sha256": "ea0a7e4202ca846ea36071eceaff81ffeb516b6af13b302498e629901b244696"
+    },
+    "model_e2e/_timeline/rank_timeline.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 2938,
+      "source_path": "packages/model-e2e/src/model_e2e/_timeline/rank_timeline.py",
+      "source_sha256": "8a7f73a197597bc2fdb53b460940001d8a36812be90f43ffad952993a8ce7837",
+      "vendor_bytes": 3150,
+      "vendor_sha256": "73ba2bfe023546b27081b45077c2caae7e0dd3f7af1234bb9ead0564c5824b5d"
+    },
+    "model_e2e/_timeline/training_timeline.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 43641,
+      "source_path": "packages/model-e2e/src/model_e2e/_timeline/training_timeline.py",
+      "source_sha256": "299befbf73a7d6690fa3e56339002c2ec6f8c410e42ecd3c60fe58c626115de3",
+      "vendor_bytes": 43853,
+      "vendor_sha256": "513de6cb2a546c997bf2e6521718c46a0fba0c165774e59ad7f2f2dad8fa159c"
+    },
+    "model_e2e/api.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged"
+      ],
+      "source_bytes": 11651,
+      "source_path": "packages/model-e2e/src/model_e2e/api.py",
+      "source_sha256": "675b8552536b19f2585c0a5ec1301fce204e33fd12ec57df507956d692ea53b9",
+      "vendor_bytes": 11863,
+      "vendor_sha256": "b20b2d7e55f9f3ea8627fab1f82df03aaae5fbeb82bbcea32c306c8878aae2bd"
+    },
+    "model_e2e/models.py": {
+      "changes": [
+        "Prepend the copyright header and vendor-only lint comments; original code body unchanged",
+        "Replace the five-layer Qwen3.5 proxy layout/export with full40decoder+1MTP layout; numerical prediction kernels unchanged"
+      ],
+      "source_bytes": 475,
+      "source_path": "packages/model-e2e/src/model_e2e/models.py",
+      "source_sha256": "34dbd43dc1af99b2cdcbb54d9dd9acaf5fa89e73d4823c79a258294995b58e9e",
+      "vendor_bytes": 701,
+      "vendor_sha256": "25a5912d2ef5515b9eaa19c3dfd07158fd81e8f7e7a2ebb72c8266fea5a5827c"
+    }
+  },
+  "hash_rebindings": {
+    "calibration_artifact_paths": [
+      "backward_model/frozen_backward_attention_model.json",
+      "backward_model/frozen_backward_attention_model_h100_v2.json",
+      "non_power_cp_20260829/models/h100_qwen3_30b_backward_cp1_32_integer_holdout_backed.json"
+    ],
+    "integer_base_artifact_new_sha256": "7c9a0904f7e57c8748ba7ec9d2bab18e6490b1786578f2128336525bb990edd7",
+    "integer_base_artifact_old_sha256": "d39156b0d2d48ba71d4c6748159cd1e8fbe27270b00480b7bc50a8409893a4ca"
+  },
+  "policy": {
+    "all_geometry_cp_and_backend_branches_preserved": true,
+    "all_prediction_parameter_values_preserved": true,
+    "all_prediction_source_body_bytes_unchanged": true,
+    "all_prediction_source_bytes_unchanged": false,
+    "diagnostic_data_pruned": false,
+    "duplicate_h100_backward_artifact_preserved": true,
+    "gzip_assets": false,
+    "predictions_tests_fitting_training_or_cluster_queries_run": false,
+    "scope": "The files listed under \"files\""
+  },
+  "post_export_adaptation": {
+    "original_python_body_bytes_unchanged": "true for every file except attention_predictor/_native/native_sdpa_cta_work.py, whose module docstring lost a run identifier",
+    "python_ast_unchanged": "true apart from that one docstring",
+    "python_prefix_utf8": "# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.\n# Frozen benchmark snapshot: preserve the original prediction code body.\n# isort: skip_file\n# fmt: off\n# ruff: noqa\n# pylint: skip-file\n\n",
+    "source_files_not_packaged": {
+      "omitted_by_the_export": {
+        "reason": "Examples, reference fits, tests, tools, verification output and packaging metadata of the source snapshot are not runtime files",
+        "source_path_prefixes": [
+          "examples/",
+          "references/",
+          "tests/",
+          "tools/",
+          "verification/"
+        ],
+        "source_paths": [
+          "packages/attention-predictor/pyproject.toml",
+          "packages/model-e2e/pyproject.toml"
+        ]
+      },
+      "removed_after_the_export": {
+        "reason": "The five-layer Qwen3.5 proxy predictor and its parameters are not part of this package. The showcase placement profile is not reachable from the runtime, is bound to the calibration manifest of the source snapshot, and listed its measurement files by absolute path",
+        "source_paths": [
+          "packages/attention-predictor/src/attention_predictor/_legacy/attention/qwen35_calibration/gb300_proxy.json",
+          "packages/attention-predictor/src/attention_predictor/_legacy/attention/qwen35_calibration/manifest.json",
+          "packages/attention-predictor/src/attention_predictor/_legacy/attention/qwen35_proxy.py",
+          "packages/attention-predictor/src/attention_predictor/_legacy/attention/qwen3_showcase_calibration/h100-nvl8-paired.json",
+          "packages/attention-predictor/src/attention_predictor/_legacy/attention/qwen3_showcase_calibration/manifest.json",
+          "packages/attention-predictor/src/attention_predictor/_legacy/attention/showcase_profiles.py"
+        ]
+      }
+    }
+  },
+  "runtime_requirements": {
+    "legacy_optional_numpy": ">=1.24",
+    "python": ">=3.10"
+  },
+  "schema_version": 1,
+  "source_snapshot": {
+    "legacy_git_commit": "ebd1a1cd551a9c541902540f88d5d71478fed985",
+    "manifest_sha256": "bd5575c73276be3ba74eb5a522ceeac079b29c9b8336c56e8fbabdb8c815367a",
+    "name": "attention-e2e-20261109",
+    "native_source_capsule_sha256": "6d4b1f7265a969e127f0a8fef6f601fe67d802fab6e25cfa3483ac826e44814d",
+    "provenance_sha256": "591e2c1b0640b9fba320e71bc258f83ad852791ced315fe49753fc124dee08fb",
+    "source_directory": "Export directory of the source snapshot (local path not recorded)"
+  },
+  "static_checks": {
+    "calibration_hash_closure": true,
+    "compact_json_values_unchanged": true,
+    "native_parameter_hash_closure": true,
+    "prediction_source_ast_unchanged": true,
+    "prediction_source_body_bytes_unchanged": true,
+    "prediction_source_bytes_unchanged": false,
+    "source_manifest_closure": true
+  }
+}

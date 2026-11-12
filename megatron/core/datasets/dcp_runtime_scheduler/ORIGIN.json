@@ -1,0 +1,147 @@
+{
+  "commit": "a55b345f20462182b2c4bb00fbc488a414dd5961",
+  "scope": "CPU schedulers with paired costs, benchmark predictors and the full Qwen3.5-35B model",
+  "adaptations": [
+    "remove historical heads/schema compatibility/report production",
+    "retain the selected numerical operations and coefficient values",
+    "extract only runtime parameters; original validation reports remain in the source repository",
+    "remove unused offline adapters and signature estimates; share the sequence-cap implementation",
+    "share solver pack filling, guide/exact layout pricing, input validation and result construction; remove unused offline plan fields",
+    "group cost models and coefficient files under models; share RuntimePlanner without one solver inheriting the other; move scoring timeline into runtime; formulas and parameters unchanged",
+    "Remove the old five-layer Qwen3.5 runtime proxy and replace the exported layout with the full 40 decoder layers plus one MTP layer"
+  ],
+  "source_python_sha256": {
+    "runtime/lightweight.py": "86720aded0f19a6a45d4fb10752ed7228a12ddb9c4dd41d78d9087df4d85cc17",
+    "runtime/planner.py": "ffdb09978204a006314b71fd5ce1599ee417d89daa166b9bd54de29700243d53",
+    "runtime/cost_model.py": "a659e35598e35e0f74038b4c27f20da1b9ff8e944c56eb65808ad052763087a0",
+    "runtime/sched/costs.py": "c26d469c1deff529dec8f526c946f08d003c6e50a0c507dbe35386dab87f16d9",
+    "runtime/sched/timeline.py": "6c0723afc72531e4cac128cf2785fec94118ca6ba78bb27333e0d68a73296aae"
+  },
+  "runtime_parameters_sha256": {
+    "models/usp_calib_v1.json": "d25989552ab9700f07261231fa13d66672d98684435fff57838442ca12c19cd7",
+    "models/qwen3_h100_p2p.json": "a031958b1a02cc523d4b0ab3163649f2f42532cd4e6daf6aa459768b99c0027e",
+    "models/_benchmark/UPSTREAM_PROVENANCE.json": "591e2c1b0640b9fba320e71bc258f83ad852791ced315fe49753fc124dee08fb",
+    "models/_benchmark/attention_predictor/_legacy/attention/backward_model/frozen_backward_attention_model.json": "79897b17aa0ec48e8097fe5f8f466c204778ccc03fff190726bd380b3ef6683e",
+    "models/_benchmark/attention_predictor/_legacy/attention/backward_model/frozen_backward_attention_model_h100_v2.json": "7c9a0904f7e57c8748ba7ec9d2bab18e6490b1786578f2128336525bb990edd7",
+    "models/_benchmark/attention_predictor/_legacy/attention/calibration_manifest.json": "d17b9f149d8807a5b4731481ca180ccca83c633d54c0d98f1f948be318824efe",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp1_max_cp_alignment_h100_20260818/frozen_models.json": "497e4cb6f835f1005a9bc663c1a8750a24bef7c7e76b0c4c4468cf07829dd964",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp1_tail_3k8k_six_geometry_gb200_20260722/frozen_models.json": "9eaccf2b03b10cd8f7d48ce41384f2b736ad4138561baa1dd72487c0a8df91a6",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp1_tail_3k8k_six_geometry_gb200_20260722/head_dim256_backend_state_models_v2.json": "47bb04e77f3ca763b6b4cdad42f41a929203b62bac2c1452cedf103f80e7dc4f",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v1_ring/gb200/llama3_70b/final/frozen_cp_gqa_attention_model_cp64.json": "49f8082eda9f7e57a125bc22a9453c71000757f228f33c13fc65b970d66f04f5",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v1_ring/gb200/mixtral_8x7b/final/frozen_cp_gqa_attention_model_cp64.json": "6aea48b7366ab4deaf7c2706685b06afcde6d8f51271ca87d41f08026e18ca7f",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v1_ring/gb200/qwen3_235b/final/frozen_cp_gqa_attention_model_cp64.json": "aa2c0875b739222c9959e9b319cd78433655a07db95264fb26e957043597e380",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v1_ring/gb200/qwen3_30b/final/frozen_cp_gqa_attention_model_cp64.json": "59398e454a6b3df0351a4158341a80c610a3d4f5f8102e0fa5b8ee0e18a2fa16",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/llama3_70b/final/frozen_cp_gqa_attention_model_cp64.json": "fd42e74320699891189f76babe5f25214ff2d10d330adafbfc99cf1740a2be55",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/mixtral_8x7b/final/frozen_cp_gqa_attention_model_cp64.json": "6adc4b364999981e25f2ed9bb31c70fc4fac46f03d4fab2bffd48f4c7cab6615",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_235b/final/frozen_cp_gqa_attention_model_cp64.json": "b8fc86bae2df99aea53f554fb5e5e896079f68d1cd4f104474f9ce7c69d45ae9",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_30b/final/frozen_cp_gqa_attention_model_cp64.json": "002cf104db9c8a2ccb7e94c19dc461312271f392469f45b18338ab993b66c3fc",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_5_397b/final/frozen_cp_gqa_attention_model_cp64.json": "9ee172e470ebe708c7715801802243233dbb0d566ff61ee4c1438f2fec743ee5",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_next_80b/final/frozen_cp_gqa_attention_model_cp64.json": "76d0d2873fa7be0fe8731ac9ef7133d0697ed365bd40ba3202df8ab7de90a20a",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp_overlap/models/frozen_pre_fresh_holdout_v2/frozen_cp_gqa_attention_model_v2.json": "720f9d12c535f0da8c7b0f053a1f280ed51a59895f80d32ff4b09a6d154188f0",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp_overlap/models/multi_profile_20260720_v3/llama3_70b/frozen_v3/frozen_cp_gqa_attention_model_v3.json": "ea0ac673d6f25a00cc3df6f2bc7d1794d0ed9ef3eb3667c28b4e446a86ec5648",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp_overlap/models/multi_profile_20260720_v3/mixtral_8x7b/frozen_v3/frozen_cp_gqa_attention_model_v3.json": "c73c3703204d289edc52d7f2e86de59d687e9384c478a98b633d59ff962f4356",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp_overlap/models/multi_profile_20260720_v3/qwen3_235b/frozen_v3/frozen_cp_gqa_attention_model_v3.json": "8227d18c5a7598087d25e4ad27789a213f9c5634b5e2aea1a2231bcc506b578a",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp_overlap/models/multi_profile_20260720_v3/qwen3_5_397b/frozen_v3/frozen_cp_gqa_attention_model_v3.json": "28d3bcbee193c2ccb245943a8afa6044f2d2b366b71c5e479417a68b5f456ff2",
+    "models/_benchmark/attention_predictor/_legacy/attention/cp_overlap/models/multi_profile_20260720_v3/qwen3_next_80b/frozen_v3/frozen_cp_gqa_attention_model_v3.json": "49b38ee027af69a184f7e0ff143150c0cd2940678bed4408a270fcc8ccff3f6d",
+    "models/_benchmark/attention_predictor/_legacy/attention/gqa_attention_model_registry.json": "2b80ff2a5461615e93ab9a3e31d212a661e5ead44c5bad3435bc649dd2d490fb",
+    "models/_benchmark/attention_predictor/_legacy/attention/non_power_cp_20260829/models/h100_qwen3_30b_backward_cp1_32_integer_holdout_backed.json": "7ce373f825b6fccf7cff10bcaadcf1909ec37b33543df6cfa3b6a83ca87ea84b",
+    "models/_benchmark/attention_predictor/_legacy/attention/non_power_cp_20260829/models/h100_qwen3_30b_cp2_32_integer_candidate.json": "84edd1738480a4d6dd42923d486ad8344d5ea6d1b31c397b509ca4a98f025660",
+    "models/_benchmark/attention_predictor/_legacy/attention/sol_validation_20260802/singleton_sol_calibration.json": "1391cad1d21cc0949006c55a4d85f8ef390d985b033548f7c4d8eab3ea39390c",
+    "models/_benchmark/attention_predictor/data/experimental_cp1_gb200.json": "6ef754c4f464c06f9933dc9f17a8b3b2d6cda17d97e5f5a41c4517ab943257cc",
+    "models/_benchmark/attention_predictor/data/experimental_cp1_h100.json": "e75c1bb14bd1bb40b2711ff62182f5c953b999a7189a97ecbd76dfccd31644e2",
+    "models/_benchmark/attention_predictor/data/manifest.json": "4876535f52629a89b3b6f90b83657b3a2397a21ae63dba3cbc4c4c64d9a09414",
+    "models/_benchmark/manifest.json": "eded46f0823c9b94746b1f113ca1d2d3d6659430a985a830de029eccb4746eda",
+    "models/full35b/parameters.json": "ba1559e028b252096fbe3bd801274d1aaa2f11e2d86bc5750cc4e8f22febc25e",
+    "models/full35b/manifest.json": "b8125e98f60f5b8689978aaa0711624c45d383bb6e20a5261192ca2d39da0caa"
+  },
+  "dynamic_usp": {
+    "project": "DynamicUSP",
+    "commit": "1ff97a4ae0beb5e088fadb9e112265bdd194b24d",
+    "scope": "Generic solve_gbs Stage 1 allocation and count search, plus the original usp_calib_v1 scalar cost model, bound to that search as scheduler type dynamic_usp; a calibration measured for classic P2P with the DynamicUSP calibration procedure is selected by hardware",
+    "adaptations": [
+      "remove head and communication-specific constraints; caller supplies legal group sizes",
+      "use the existing injected cost model and physical-capacity predicate",
+      "retain the original aligned power-of-two allocation policy",
+      "restore the default usp_calib_v1 formulas and calibration table unchanged for the fixed 44-layer, 24-Q-head, d160, U8 all-to-all plus ring profile",
+      "accept an optional calibration table path for the same scalar schema and fixed profile; record its content hash without changing the shared cost-model interface",
+      "omit custom profile options, profile-specific Stage 2, CLI and pipeline simulation"
+    ],
+    "source_python_sha256": {
+      "gbs/allocator.py": "7f9e3da37e6d613a46d504f2677a6e9c8a920af9b393f729ab6222647fbc2a8a",
+      "gbs/bounds.py": "8ec1410c93b9760b394c5ccaef03a0713ba61e602a55848e1a829a89136ff3ee",
+      "gbs/placement.py": "c3d33039a108e72caa67abc632c89f78d706e1b1b83e0da2ca8e2b150f06ed1b",
+      "gbs/search.py": "f3235b85347b2e111b219722969c5bef562f253c5ce9e67410d56f5eeec2aa9e",
+      "profiles/usp_calib_v1.py": "a2dbcff0099936e283b2386783861d7191c5319e1cf9e22a8bff30f33207329d"
+    },
+    "source_files_sha256": {
+      "profiles/calib_table_v1.json": "d25989552ab9700f07261231fa13d66672d98684435fff57838442ca12c19cd7"
+    },
+    "measured_calibrations": {
+      "h100": {
+        "parameters": "models/qwen3_h100_p2p.json",
+        "model": "models/qwen3_h100_p2p.py",
+        "methodology": {
+          "project": "DynamicUSP",
+          "commit": "18eb0f53dbdb3a13b19e49c02fd1782178947c9a",
+          "path": "skills/hot-switch-calibration/SKILL.md",
+          "adaptations": [
+            "Measure complete P2P self-attention forward/backward per layer for CP 1, 2, 4 and 8 instead of U8 all-to-all and ring coefficients for CP 8, 16 and 32",
+            "Use actual per-sequence physical padding and the maximum valid zigzag causal work of a rank",
+            "Model non-attention work with rank-weighted EP8 mean contributions",
+            "Fit a per-microbatch overhead and one iteration tail on recorded global batches"
+          ]
+        },
+        "recipe": {
+          "model": "Full Qwen3-30B-A3B, 48 layers, BF16",
+          "hardware": "32 NVIDIA H100 80GB HBM3 across four eight-GPU nodes",
+          "parallelism": "TP1, PP1, EP8, classic P2P context parallelism with CP 1, 2, 4 or 8 inside one node",
+          "tokens_per_rank": 4096,
+          "global_batch_size": 256,
+          "moe": "flex/hybridep with variable-token padding and forced-balanced routing",
+          "execution": "eager fused attention, no activation recomputation"
+        },
+        "measurements": {
+          "module_fitting_cases": 60,
+          "module_heldout_cases": 14,
+          "measured_steps_per_case": 20,
+          "step_overhead_batches": 3,
+          "step_overhead_rows": 11
+        }
+      }
+    }
+  },
+  "benchmark_predictors": {
+    "source_snapshot": "attention-e2e-20261109",
+    "source_manifest_sha256": "bd5575c73276be3ba74eb5a522ceeac079b29c9b8336c56e8fbabdb8c815367a",
+    "vendor_manifest_sha256": "eded46f0823c9b94746b1f113ca1d2d3d6659430a985a830de029eccb4746eda",
+    "source_identity": "models/_benchmark/UPSTREAM_PROVENANCE.json",
+    "adaptations": [
+      "Vendor both public predictor packages; preserve original prediction code bodies and ASTs, with the copyright header and vendor-only lint preservation comments",
+      "Compact two backward parameter JSON files without changing values; rebind their manifest/base-artifact hashes",
+      "Bind each attention query to CP * tokens_per_rank storage and actual contiguous physical ranks",
+      "Use the benchmark layer program and E2E dependency engine for candidate scoring",
+      "Require user-supplied fixed non-attention F/B times; no token regression, automatic measurement or E2E residual",
+      "Replace only the Qwen3.5 model-layout helper and export with the full 41-layer layout; preserve numerical predictor bodies and coefficients",
+      "Omit the five-layer Qwen3.5 proxy predictor and its parameter files",
+      "After the export, remove host names, node lists and scheduler job ids from the parameter files and the cluster name and job number from the validation note, and omit the showcase placement profile; rebind the digests that name the changed files; prediction parameters unchanged"
+    ],
+    "scope": "BF16 eager GQA diagnostic CP1 and explicitly selected historical multi-CP; runtime adapter TP1/PP1/VPP1",
+    "accuracy": "Imported prediction parameters and original limitations; software equivalence does not establish new hardware accuracy"
+  },
+  "full_qwen35": {
+    "source_snapshot": "qwen35-full35b-nocg-20261106/fixed-diagnostic-candidate-20261106",
+    "source_candidate_sha256": "a268249ab9c342db393d1be0f321f88891a7fa0545b52e23460c0c58c3c26284",
+    "packaged_manifest": "models/full35b/manifest.json",
+    "scope": "Full Qwen3.5-35B-A3B 40 decoder + 1 MTP; 30 GDN and 11 FA whole attention modules",
+    "calibrated_domain": "GB200, DPxCP 32, expert_model_parallel_size 32, 16384 tokens per rank, native CP transport, CP sizes 1 to 32",
+    "non_attention": "Required fixed user F/B times excluding whole attention modules; no fitted density service or E2E residual loaded",
+    "scientific_accuracy_passed": false,
+    "original_runtime_admission": false,
+    "adaptations": [
+      "Preserve exact FA-v1/GDN-v2 module features and coefficients and per-layer cache mapping",
+      "Compose the actual 41-layer program with the user's fixed non-attention times",
+      "Select from normal training model configuration under the paired dcp_benchmark route",
+      "Apply the parameters to classic P2P with power-of-two CP sizes and the append_dummy_seq tail policy"
+    ]
+  }
+}

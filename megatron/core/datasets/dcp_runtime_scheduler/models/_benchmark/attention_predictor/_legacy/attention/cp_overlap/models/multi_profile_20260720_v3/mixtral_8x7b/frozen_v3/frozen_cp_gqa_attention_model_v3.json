@@ -1,0 +1,647 @@
+{
+  "schema_version": 1,
+  "status": "frozen_pre_fresh_holdout_v2",
+  "contract": {
+    "profile_name": "mixtral_8x7b",
+    "gpu": "NVIDIA H100 80GB HBM3",
+    "dtype": "bfloat16",
+    "phase": "forward",
+    "query_heads": 32,
+    "kv_heads": 8,
+    "head_dim": 128,
+    "physical_tokens_per_rank": 4096,
+    "sequence_alignment": 64,
+    "cp_sizes": [
+      2,
+      4,
+      8
+    ]
+  },
+  "source": {
+    "cp2_results": "<source>/results.json",
+    "cp2_results_sha256": "3e0c4ceab5e47cc5f8a1edaab01136782d153d3f64b4681ef79ac07cdfa0429f",
+    "host_component_results": "<source>/results.json",
+    "host_component_results_sha256": "3e0c4ceab5e47cc5f8a1edaab01136782d153d3f64b4681ef79ac07cdfa0429f",
+    "experiment_contract": "<source>/cp_overlap_multi_profile_experiment_contract.json",
+    "experiment_contract_sha256": "f1141b1d08c3beebdd10a357827af9641b550165e15ee56500a25906225fdd59",
+    "communication_results": {
+      "2": {
+        "path": "<source>/results.json",
+        "sha256": "66d686fbb625c031b74b241e9f15559950d3678114abf9517db0f76cf71dcc25"
+      },
+      "4": {
+        "path": "<source>/results.json",
+        "sha256": "8d58acfdc0c830c0d2b640324b5ad02aa630736a3741482dd0c53372e0228c18"
+      },
+      "8": {
+        "path": "<source>/results.json",
+        "sha256": "4db921fd167f8ff19e29402e4429dc8b7c08976d1c8a5bbdb9045c411aabed84"
+      }
+    },
+    "megatron_commit": "d314db2ea3ad2cc6b44aff39f931558fe0ba22a7",
+    "transformer_engine_version": "2.14.0+f031cf87",
+    "communication_metadata": {
+      "2": {
+        "timestamp_unix": 1784537350.574403,
+        "megatron_commit": "d314db2ea3ad2cc6b44aff39f931558fe0ba22a7",
+        "benchmark_source_sha256": "30164f25fa5f79d65d9868116ba557040e61a037846951ecd8ff160443d08cfc",
+        "torch_version": "2.12.0a0+0291f960b6.nv26.04.48445190",
+        "transformer_engine_version": "2.14.0+f031cf87",
+        "cuda_version": "13.2",
+        "cudnn_version": 92100,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "cp_size": 2,
+        "geometry": {
+          "profile_name": "mixtral_8x7b",
+          "q_heads": 32,
+          "kv_heads": 8,
+          "head_dim": 128,
+          "hidden_size": 4096
+        },
+        "dtype": "bfloat16",
+        "qkv_format": "thd",
+        "mask": "causal",
+        "cp_comm_type": "p2p",
+        "physical_tokens_per_rank": 4096,
+        "sequence_alignment": 64,
+        "warmup": 500,
+        "iterations": 2000,
+        "timing_batch_size": 100,
+        "component_warmup": 500,
+        "component_iterations": 2000,
+        "modes": [
+          "overlap"
+        ],
+        "serialized_component_attention": true,
+        "cuda_device_max_connections": "1",
+        "nvte_fused_attn": null,
+        "nvte_batch_mha_p2p_comm": null
+      },
+      "4": {
+        "timestamp_unix": 1784537373.8867168,
+        "megatron_commit": "d314db2ea3ad2cc6b44aff39f931558fe0ba22a7",
+        "benchmark_source_sha256": "30164f25fa5f79d65d9868116ba557040e61a037846951ecd8ff160443d08cfc",
+        "torch_version": "2.12.0a0+0291f960b6.nv26.04.48445190",
+        "transformer_engine_version": "2.14.0+f031cf87",
+        "cuda_version": "13.2",
+        "cudnn_version": 92100,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "cp_size": 4,
+        "geometry": {
+          "profile_name": "mixtral_8x7b",
+          "q_heads": 32,
+          "kv_heads": 8,
+          "head_dim": 128,
+          "hidden_size": 4096
+        },
+        "dtype": "bfloat16",
+        "qkv_format": "thd",
+        "mask": "causal",
+        "cp_comm_type": "p2p",
+        "physical_tokens_per_rank": 4096,
+        "sequence_alignment": 64,
+        "warmup": 500,
+        "iterations": 2000,
+        "timing_batch_size": 100,
+        "component_warmup": 500,
+        "component_iterations": 2000,
+        "modes": [
+          "overlap"
+        ],
+        "serialized_component_attention": true,
+        "cuda_device_max_connections": "1",
+        "nvte_fused_attn": null,
+        "nvte_batch_mha_p2p_comm": null
+      },
+      "8": {
+        "timestamp_unix": 1784537443.861998,
+        "megatron_commit": "d314db2ea3ad2cc6b44aff39f931558fe0ba22a7",
+        "benchmark_source_sha256": "30164f25fa5f79d65d9868116ba557040e61a037846951ecd8ff160443d08cfc",
+        "torch_version": "2.12.0a0+0291f960b6.nv26.04.48445190",
+        "transformer_engine_version": "2.14.0+f031cf87",
+        "cuda_version": "13.2",
+        "cudnn_version": 92100,
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "cp_size": 8,
+        "geometry": {
+          "profile_name": "mixtral_8x7b",
+          "q_heads": 32,
+          "kv_heads": 8,
+          "head_dim": 128,
+          "hidden_size": 4096
+        },
+        "dtype": "bfloat16",
+        "qkv_format": "thd",
+        "mask": "causal",
+        "cp_comm_type": "p2p",
+        "physical_tokens_per_rank": 4096,
+        "sequence_alignment": 64,
+        "warmup": 500,
+        "iterations": 2000,
+        "timing_batch_size": 100,
+        "component_warmup": 500,
+        "component_iterations": 2000,
+        "modes": [
+          "overlap"
+        ],
+        "serialized_component_attention": true,
+        "cuda_device_max_connections": "1",
+        "nvte_fused_attn": null,
+        "nvte_batch_mha_p2p_comm": null
+      }
+    }
+  },
+  "communication_wall_p10_ms": {
+    "2": 0.11952000111341476,
+    "4": 0.10921599715948105,
+    "8": 0.11187200248241425
+  },
+  "communication_host_launch_wall_p10_ms": {
+    "2": 0.033087,
+    "4": 0.0323988,
+    "8": 0.0335299
+  },
+  "models": {
+    "attention_pure": {
+      "diagonal": {
+        "features": [
+          "base_local_total_k",
+          "base_local_s2_m",
+          "sequence_count"
+        ],
+        "coefficients": [
+          0.1919868971975076,
+          0.00342281674575947,
+          0.0560629953377481,
+          0.0017583816677392188
+        ],
+        "centers": [
+          3.3819754464285716,
+          4.227702761904762,
+          5.0
+        ],
+        "scales": [
+          0.7078751405940348,
+          3.9001326559499776,
+          3.070597894314954
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "lower": {
+        "features": [
+          "base_local_total_k",
+          "base_local_s2_m",
+          "sequence_count"
+        ],
+        "coefficients": [
+          0.1752833523211025,
+          0.007351808835441241,
+          0.04290219060122137,
+          0.003427887063648195
+        ],
+        "centers": [
+          3.3819754464285716,
+          4.227702761904761,
+          5.0
+        ],
+        "scales": [
+          0.7078751405940349,
+          3.900132655949977,
+          3.070597894314954
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "upper": {
+        "features": [
+          "base_local_total_k",
+          "base_local_s2_m",
+          "sequence_count"
+        ],
+        "coefficients": [
+          0.15975344826777774,
+          -0.0009662060523512248,
+          0.056613079241353795,
+          0.01046747774657656
+        ],
+        "centers": [
+          3.3819754464285716,
+          4.227702761904761,
+          5.0
+        ],
+        "scales": [
+          0.7078751405940349,
+          3.900132655949977,
+          3.070597894314954
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      }
+    },
+    "attention_active_ratio": {
+      "features": [],
+      "coefficients": [
+        1.0158915035561111
+      ],
+      "centers": [],
+      "scales": [],
+      "minimum": 0.0,
+      "maximum": 4.0
+    },
+    "attention_drain_ratio": {
+      "lower": {
+        "features": [
+          "pure_attention_ms"
+        ],
+        "coefficients": [
+          0.9694187676290336,
+          -0.04127142894473269
+        ],
+        "centers": [
+          0.1752833523211025
+        ],
+        "scales": [
+          0.04760860321246695
+        ],
+        "minimum": 0.0,
+        "maximum": 4.0
+      },
+      "upper": {
+        "features": [
+          "pure_attention_ms",
+          "active_sequences"
+        ],
+        "coefficients": [
+          0.6288847959537957,
+          0.06820139161811957,
+          -0.03051416287238816
+        ],
+        "centers": [
+          0.15975344826777776,
+          4.523809523809524
+        ],
+        "scales": [
+          0.05138015371242116,
+          3.141413809994408
+        ],
+        "minimum": 0.0,
+        "maximum": 4.0
+      }
+    },
+    "prepare": {
+      "diagonal": {
+        "features": [
+          "pad_between_seqs"
+        ],
+        "coefficients": [
+          0.08115672370241507,
+          0.05343562459195126
+        ],
+        "centers": [
+          0.47619047619047616
+        ],
+        "scales": [
+          0.49943278484292924
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "lower": {
+        "features": [
+          "q_tokens_k",
+          "kv_tokens_k",
+          "active_sequences",
+          "pad_between_seqs"
+        ],
+        "coefficients": [
+          0.06267108567768617,
+          -0.008554507626366243,
+          3.469446951953614e-18,
+          0.01619489015835183,
+          0.029342946400470603
+        ],
+        "centers": [
+          3.56640625,
+          2.0,
+          4.9523809523809526,
+          0.47619047619047616
+        ],
+        "scales": [
+          0.9399660645826339,
+          1.0,
+          3.139247566447526,
+          0.4994327848429292
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "upper": {
+        "features": [
+          "base_local_max_k",
+          "base_local_max_sq_m",
+          "sequence_count",
+          "pad_between_seqs"
+        ],
+        "coefficients": [
+          0.027429485782271338,
+          0.0005242335841102719,
+          -0.0009850449010266164,
+          0.0002598140497190449,
+          -0.00017218381554001257
+        ],
+        "centers": [
+          1.3950892857142858,
+          3.0069201904761904,
+          5.0,
+          0.47619047619047616
+        ],
+        "scales": [
+          0.9598689712797972,
+          4.3488095445360635,
+          3.070597894314954,
+          0.4994327848429292
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      }
+    },
+    "lse": {
+      "full": {
+        "features": [
+          "base_local_max_k",
+          "base_local_max_sq_m",
+          "sequence_count",
+          "pad_between_seqs"
+        ],
+        "coefficients": [
+          0.06469805745762727,
+          -0.00030339903896386966,
+          -0.02804218902091151,
+          -0.0015696116649140035,
+          -0.012491576291668312
+        ],
+        "centers": [
+          1.3950892857142858,
+          3.0069201904761904,
+          5.0,
+          0.47619047619047616
+        ],
+        "scales": [
+          0.9598689712797972,
+          4.3488095445360635,
+          3.070597894314954,
+          0.4994327848429292
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "second_half": {
+        "features": [],
+        "coefficients": [
+          0.00651977152031447
+        ],
+        "centers": [],
+        "scales": [],
+        "minimum": 0.0,
+        "maximum": null
+      }
+    },
+    "output": {
+      "full": {
+        "features": [],
+        "coefficients": [
+          0.040139936330536065
+        ],
+        "centers": [],
+        "scales": [],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "second_half": {
+        "features": [
+          "active_sequences"
+        ],
+        "coefficients": [
+          0.026692266531643413,
+          0.0003261296000329431
+        ],
+        "centers": [
+          4.523809523809524
+        ],
+        "scales": [
+          3.141413809994408
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      }
+    },
+    "host_critical_rank": {
+      "diagonal_round": {
+        "features": [
+          "pad_between_seqs"
+        ],
+        "coefficients": [
+          0.43626067226190474,
+          0.05919145919335698
+        ],
+        "centers": [
+          0.47619047619047616
+        ],
+        "scales": [
+          0.49943278484292924
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      },
+      "lower_round": {
+        "features": [
+          "pad_between_seqs"
+        ],
+        "coefficients": [
+          0.5912392198809523,
+          0.04315331492293535
+        ],
+        "centers": [
+          0.47619047619047616
+        ],
+        "scales": [
+          0.49943278484292924
+        ],
+        "minimum": 0.0,
+        "maximum": null
+      }
+    },
+    "initialization_ms": 0.0,
+    "timeline_scale": 1.0,
+    "fixed_overhead_ms": 0.0,
+    "host_cp_scaling": {
+      "model": "fixed_per_call_plus_cp_rounds",
+      "formula": "host_ms = fixed_ms[padding_group] + cp_size * per_round_ms[padding_group]",
+      "minimum_cp_size": 4,
+      "calibration_cp_sizes": [
+        2,
+        4
+      ],
+      "groups": {
+        "aligned": {
+          "fixed_ms": 0.21021753850000002,
+          "per_round_ms": 0.35968250225
+        },
+        "inter_sequence_padded": {
+          "fixed_ms": 0.20872397399999976,
+          "per_round_ms": 0.4652647297500001
+        }
+      }
+    },
+    "single_sequence_wall_floor_by_cp": {
+      "model": "piecewise_linear_by_capacity_utilization",
+      "scope": "single_sequence_only",
+      "by_cp": {
+        "2": {
+          "cp_size": 2,
+          "calibration_source": "initial_cp2_plus_prospective_singleton_edge_v1",
+          "points": [
+            {
+              "utilization": 0.25,
+              "wall_p10_ms": 0.930983299255371,
+              "case": "single_u25",
+              "calibration_source": "initial_cp2_calibration"
+            },
+            {
+              "utilization": 0.375,
+              "wall_p10_ms": 0.9474210433959961,
+              "case": "edge_single_u37p5",
+              "calibration_source": "prospective_singleton_edge_v1"
+            },
+            {
+              "utilization": 0.5,
+              "wall_p10_ms": 0.9288581085205079,
+              "case": "single_u50",
+              "calibration_source": "initial_cp2_calibration"
+            },
+            {
+              "utilization": 0.625,
+              "wall_p10_ms": 0.9456298370361328,
+              "case": "edge_single_u62p5",
+              "calibration_source": "prospective_singleton_edge_v1"
+            },
+            {
+              "utilization": 0.75,
+              "wall_p10_ms": 0.929252311706543,
+              "case": "single_u75",
+              "calibration_source": "initial_cp2_calibration"
+            },
+            {
+              "utilization": 0.8125,
+              "wall_p10_ms": 0.9464702682495117,
+              "case": "edge_single_u81p25",
+              "calibration_source": "prospective_singleton_edge_v1"
+            },
+            {
+              "utilization": 0.875,
+              "wall_p10_ms": 0.9286850128173828,
+              "case": "single_u87p5",
+              "calibration_source": "initial_cp2_calibration"
+            },
+            {
+              "utilization": 0.9375,
+              "wall_p10_ms": 0.9535580825805665,
+              "case": "edge_single_u93p75",
+              "calibration_source": "prospective_singleton_edge_v1"
+            },
+            {
+              "utilization": 1.0,
+              "wall_p10_ms": 0.9306389389038087,
+              "case": "single_u100",
+              "calibration_source": "initial_cp2_calibration"
+            }
+          ]
+        },
+        "4": {
+          "cp_size": 4,
+          "calibration_source": "prospective_singleton_edge_v1",
+          "points": [
+            {
+              "utilization": 0.375,
+              "wall_p10_ms": 1.6293402709960936,
+              "case": "edge_single_u37p5",
+              "calibration_source": "prospective_singleton_edge_v1"
+            },
+            {
+              "utilization": 0.625,
+              "wall_p10_ms": 1.6291991271972655,
+              "case": "edge_single_u62p5",
+              "calibration_source": "prospective_singleton_edge_v1"
+            },
+            {
+              "utilization": 0.8125,
+              "wall_p10_ms": 1.6233220825195311,
+              "case": "edge_single_u81p25",
+              "calibration_source": "prospective_singleton_edge_v1"
+            },
+            {
+              "utilization": 0.9375,
+              "wall_p10_ms": 1.6282429199218749,
+              "case": "edge_single_u93p75",
+              "calibration_source": "prospective_singleton_edge_v1"
+            }
+          ]
+        },
+        "8": {
+          "cp_size": 8,
+          "calibration_source": "prospective_singleton_edge_v1",
+          "points": [
+            {
+              "utilization": 0.375,
+              "wall_p10_ms": 3.108777282714844,
+              "case": "edge_single_u37p5",
+              "calibration_source": "prospective_singleton_edge_v1"
+            },
+            {
+              "utilization": 0.625,
+              "wall_p10_ms": 3.102782958984375,
+              "case": "edge_single_u62p5",
+              "calibration_source": "prospective_singleton_edge_v1"
+            },
+            {
+              "utilization": 0.8125,
+              "wall_p10_ms": 3.094464385986328,
+              "case": "edge_single_u81p25",
+              "calibration_source": "prospective_singleton_edge_v1"
+            },
+            {
+              "utilization": 0.9375,
+              "wall_p10_ms": 3.0889905395507813,
+              "case": "edge_single_u93p75",
+              "calibration_source": "prospective_singleton_edge_v1"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "provenance": {
+    "host_cp_scaling_v2": {
+      "cp2_results": "<source>/results.json",
+      "cp2_results_sha256": "3e0c4ceab5e47cc5f8a1edaab01136782d153d3f64b4681ef79ac07cdfa0429f",
+      "cp4_results": "<source>/results.json",
+      "cp4_results_sha256": "81bb62a29b98a4df8ce3d52e82838c1c0973e54d7e63ba4b71960a56f75d00be",
+      "base_model_sha256": "65f88857107bc16cb85f347edec7422c6bd91211ebee332ad4a07e50f7cf3833",
+      "experiment_contract": "<source>/cp_overlap_multi_profile_experiment_contract.json",
+      "experiment_contract_sha256": "f1141b1d08c3beebdd10a357827af9641b550165e15ee56500a25906225fdd59"
+    }
+  },
+  "singleton_floor_provenance": {
+    "base_model": "<source>/frozen_cp_gqa_attention_model_v2.json",
+    "base_model_sha256": "46240af9c4ae03374fadbc2a3535d608f0809d89a081f5fc79a2fb0238b8f2d3",
+    "edge_evaluation": "<source>/blind_singleton_edge_evaluation.json",
+    "edge_evaluation_sha256": "c7f150066dabc65be47a27185178ed19d2b414a1a512e375df5ea8a8b026cf12",
+    "result_sha256": {
+      "2": "ff502b8bd82de783f7b23d8d39e2d789892fa1049781809a856ce8bda3deaf38",
+      "4": "c627c908fad6f1c137db773728cef822cbb5dcba9b17b5cde9044b27dfcf0e85",
+      "8": "f0cf589e1da653301dee2295619c462f9a40e59d6b8237e0626e3c9e4ccbbc3d"
+    },
+    "note": "The first prospective singleton edge set exposed a distinct long-singleton host-backpressure regime and is calibration data for this branch. Accuracy must be judged on the second prospective low-count holdout."
+  }
+}
