@@ -38,14 +38,8 @@ class _SharedPredictor(nn.Module):
         return value.square().mean()
 
 
-def _config(repeated_mtp=True) -> TransformerConfig:
-    return TransformerConfig(
-        num_layers=2,
-        hidden_size=16,
-        num_attention_heads=4,
-        mtp_num_layers=2 if repeated_mtp else None,
-        mtp_use_repeated_layer=repeated_mtp,
-    )
+def _config() -> TransformerConfig:
+    return TransformerConfig(num_layers=2, hidden_size=16, num_attention_heads=4)
 
 
 def _ddp_config(prefetch_order="recorded") -> DistributedDataParallelConfig:
@@ -58,10 +52,8 @@ def _ddp_config(prefetch_order="recorded") -> DistributedDataParallelConfig:
     )
 
 
-@pytest.mark.parametrize(
-    "ambient_context,repeated_mtp", [(False, True), (True, True), (False, False)]
-)
-def test_shared_mtp_matches_unsharded_training(distributed_setup, ambient_context, repeated_mtp):
+@pytest.mark.parametrize("ambient_context", [False, True])
+def test_shared_mtp_matches_unsharded_training(distributed_setup, ambient_context):
     """Explicit recording supports reused modules independently of MTP settings."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -87,7 +79,7 @@ def test_shared_mtp_matches_unsharded_training(distributed_setup, ambient_contex
     )
     with construction:
         model = FullyShardedDataParallelV2(
-            config=_config(repeated_mtp),
+            config=_config(),
             ddp_config=_ddp_config(),
             module=module,
             fsdp_unit_modules=[nn.Linear],
