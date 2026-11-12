@@ -3,10 +3,11 @@
 """Muon with sharded momentum and owner-compute updates for MFSDP v2."""
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 import torch
+import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
 try:
@@ -36,6 +37,27 @@ class _FsdpGroupAssignment:
     tensor_to_owner_rank: dict[int, int]
 
 
+@dataclass(frozen=True)
+class _GroupStep:
+    """One FSDP group's part of an optimizer step: its posted gather or scatter and the buffers.
+
+    `sharded` is the DBuffer side of the transfer: the momentum inputs of a gather or the received
+    updates of a scatter. `full_updates` holds the owners' full tensors on the other side.
+    """
+
+    works: list[dist.Work]
+    fsdp_group: FsdpParameterGroup
+    tensor_to_optimizer_group_index: dict[int, int]
+    tensor_to_owner: dict[int, int]
+    sharded: DBuffer
+    full_updates: dict[int, torch.Tensor]
+
+    def wait(self) -> None:
+        """Order the current stream after the transfer; the host does not block."""
+        for work in self.works:
+            work.wait()
+
+
 # Design choice: integrating Emerging Optimizers (EO) into FsdpMuon.
 #
 # 1. Inherit from EO's Muon (chosen).
@@ -58,9 +80,13 @@ class FsdpMuon(Muon):
     """Muon for 2-D parameters with sharded optimizer buffers.
 
     Momentum remains sharded. Owner assignments balance orthogonalization across a
-    fixed set of buffers and are computed during initialization. Each step
-    gathers, orthogonalizes, scatters, and applies one buffer's updates at a time on
-    the caller's CUDA stream. Full matrices exist only on their assigned owners.
+    fixed set of buffers and are computed during initialization. Each step gathers,
+    orthogonalizes, and scatters each buffer on the caller's CUDA stream. Transfers are
+    asynchronous: the gathers of the next ``num_groups_in_flight`` buffers are posted before the
+    current one is orthogonalized, and a buffer's updates are applied after
+    ``num_groups_in_flight`` later buffers have been scattered, so each scatter overlaps their
+    Newton-Schulz.
+    Full matrices exist only on their assigned owners.
     The FSDP groups may use different meshes; owners are planned jointly across all ranks, so
     every rank must construct FsdpMuon.
     Parameters and optimizer groups must have the same order on every DP rank, and
@@ -79,13 +105,22 @@ class FsdpMuon(Muon):
 
     Args:
         *args: Positional arguments passed unchanged to EO's ``Muon``.
+        num_groups_in_flight: Number of buffers whose gathers are posted ahead of the one being
+            orthogonalized, and whose scatters are posted before a buffer's updates are applied.
+            Each buffer in flight adds its momentum inputs, full tensors, and received updates to
+            the peak memory. Zero gives the non-overlapped order.
         **kwargs: Keyword arguments passed unchanged to EO's ``Muon``.
     """
 
     _fsdp_group_assignments: list[_FsdpGroupAssignment]
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, num_groups_in_flight: int = 8, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
+        if num_groups_in_flight < 0:
+            raise ValueError(
+                f"num_groups_in_flight must be non-negative, got {num_groups_in_flight}."
+            )
+        self.num_groups_in_flight = num_groups_in_flight
 
         # Preserve discovery order: communication must be posted identically on every rank.
         fsdp_groups: dict[FsdpParameterGroup, None] = {}
@@ -131,6 +166,7 @@ class FsdpMuon(Muon):
         if closure is not None:
             raise ValueError("closure is not supported")
 
+        groups: list[tuple[FsdpParameterGroup, dict[int, int], dict[int, int]]] = []
         for assignment in self._fsdp_group_assignments:
             fsdp_group: FsdpParameterGroup = assignment.fsdp_group
             active: dict[int, int] = {
@@ -140,23 +176,49 @@ class FsdpMuon(Muon):
             }
             if not active:
                 continue
-            self._step_group(
-                fsdp_group, active, {i: assignment.tensor_to_owner_rank[i] for i in active}
-            )
+            owners = {i: assignment.tensor_to_owner_rank[i] for i in active}
+            groups.append((fsdp_group, active, owners))
 
-    def _step_group(
+        # Software pipeline over groups. While group i is orthogonalized, the gathers of the next
+        # `num_groups_in_flight` groups and the scatters of the previous `num_groups_in_flight`
+        # groups are in flight, so communication overlaps Newton-Schulz. A group step is set to
+        # None once used, so only the groups in flight hold buffers. Every rank posts transfers in
+        # the same order.
+        in_flight_gathers: list[_GroupStep | None] = [
+            self._gather(*group) for group in groups[: self.num_groups_in_flight]
+        ]
+        in_flight_scatters: list[_GroupStep | None] = []
+        for i in range(len(groups)):
+            if i + self.num_groups_in_flight < len(groups):
+                in_flight_gathers.append(self._gather(*groups[i + self.num_groups_in_flight]))
+            in_flight_gathers[i].wait()
+            self._orthogonalize_updates(in_flight_gathers[i])
+            in_flight_scatters.append(self._scatter(in_flight_gathers[i]))
+            # Drop the gather, and with it the momentum inputs it holds.
+            in_flight_gathers[i] = None
+            if i >= self.num_groups_in_flight:
+                self._apply_updates(in_flight_scatters[i - self.num_groups_in_flight])
+                in_flight_scatters[i - self.num_groups_in_flight] = None
+        for group_step in in_flight_scatters:
+            if group_step is not None:
+                self._apply_updates(group_step)
+
+    def _gather(
         self,
         fsdp_group: FsdpParameterGroup,
         tensor_to_optimizer_group_index: dict[int, int],
         tensor_to_owner: dict[int, int],
-    ) -> None:
-        """Gather momentum, orthogonalize on owners, and scatter updates.
+    ) -> _GroupStep:
+        """Compute momentum inputs and post their gather to the owners.
 
         Args:
             fsdp_group: FSDP buffers and parameters to update.
             tensor_to_optimizer_group_index: Active indices into ``fsdp_group.fsdp_parameters``
                 mapped to indices into ``self.param_groups`` for their optimizer settings.
             tensor_to_owner: The same active tensor indices mapped to global owner ranks.
+
+        Returns:
+            The posted gather, holding the momentum inputs and the owners' full-tensor destinations.
         """
         buffer: DBuffer = fsdp_group.main_weight
         momentum_inputs: DBuffer = self._compute_momentum_inputs(
@@ -168,16 +230,31 @@ class FsdpMuon(Muon):
             for i, owner in tensor_to_owner.items()
             if owner == this_rank
         }
-        gather(momentum_inputs, full_updates, tensor_to_owner=tensor_to_owner)
-        self._orthogonalize_updates(fsdp_group, tensor_to_optimizer_group_index, full_updates)
+        works = gather(momentum_inputs, full_updates, tensor_to_owner=tensor_to_owner)
+        return _GroupStep(
+            works=works,
+            fsdp_group=fsdp_group,
+            tensor_to_optimizer_group_index=tensor_to_optimizer_group_index,
+            tensor_to_owner=tensor_to_owner,
+            sharded=momentum_inputs,
+            full_updates=full_updates,
+        )
 
+    def _scatter(self, group_step: _GroupStep) -> _GroupStep:
+        """Post the scatter of a gathered group's orthogonalized updates.
+
+        Returns:
+            The same group's step, now holding the scatter works and the buffer that receives
+            the updates of remote-owned tensors.
+        """
+        buffer: DBuffer = group_step.fsdp_group.main_weight
         local_updates: DBuffer = DBuffer(
             buffer.mesh, buffer.placements, buffer.layout, torch.float32, buffer.device
         )
-        scatter(full_updates, local_updates, tensor_to_owner=tensor_to_owner)
-        self._apply_local_updates(
-            fsdp_group, tensor_to_optimizer_group_index, full_updates, local_updates
+        works = scatter(
+            group_step.full_updates, local_updates, tensor_to_owner=group_step.tensor_to_owner
         )
+        return replace(group_step, works=works, sharded=local_updates)
 
     def _compute_momentum_inputs(
         self, fsdp_group: FsdpParameterGroup, tensor_to_optimizer_group_index: dict[int, int]
@@ -221,13 +298,11 @@ class FsdpMuon(Muon):
                 local_input.copy_(momentum.reshape(local_input.shape))
         return momentum_inputs
 
-    def _orthogonalize_updates(
-        self,
-        fsdp_group: FsdpParameterGroup,
-        tensor_to_optimizer_group_index: dict[int, int],
-        full_updates: dict[int, torch.Tensor],
-    ) -> None:
+    def _orthogonalize_updates(self, group_step: _GroupStep) -> None:
         """Replace this rank's gathered inputs with full orthogonalized updates."""
+        fsdp_group: FsdpParameterGroup = group_step.fsdp_group
+        tensor_to_optimizer_group_index: dict[int, int] = group_step.tensor_to_optimizer_group_index
+        full_updates: dict[int, torch.Tensor] = group_step.full_updates
         with eo_utils.fp32_matmul_precision(self.fp32_matmul_prec):
             for i, update in full_updates.items():
                 param: torch.nn.Parameter = fsdp_group.fsdp_parameters[i].sharded
@@ -235,16 +310,14 @@ class FsdpMuon(Muon):
                 kwargs: dict[str, Any] = {k: v for k, v in group.items() if k != "params"}
                 full_updates[i] = self.orthogonalize(param, update.float(), **kwargs).contiguous()
 
-    def _apply_local_updates(
-        self,
-        fsdp_group: FsdpParameterGroup,
-        tensor_to_optimizer_group_index: dict[int, int],
-        full_updates: dict[int, torch.Tensor],
-        local_updates: DBuffer,
-    ) -> None:
-        """Apply owned result slices and received updates to local parameter shards."""
+    def _apply_updates(self, group_step: _GroupStep) -> None:
+        """Wait for a group's scatter, then apply owned result slices and received updates."""
+        group_step.wait()
+        fsdp_group: FsdpParameterGroup = group_step.fsdp_group
+        full_updates: dict[int, torch.Tensor] = group_step.full_updates
+        local_updates: DBuffer = group_step.sharded
         buffer: DBuffer = fsdp_group.main_weight
-        for i, group_index in tensor_to_optimizer_group_index.items():
+        for i, group_index in group_step.tensor_to_optimizer_group_index.items():
             param: DTensor = cast(DTensor, fsdp_group.fsdp_parameters[i].sharded)
             weight: torch.Tensor = param.to_local()
             if i in full_updates:
