@@ -48,7 +48,7 @@ def broadcast_from_last_pipeline_stage(
     Args:
         size: Expected tensor size
         dtype: Expected tensor dtype
-        tensor: Tensor to broadcast (only on last stage)
+        tensor: Tensor to broadcast (last stage) or an optional receive buffer (non-last stage).
         pp_group: Custom process group (if None, uses global state)
     """
     # Use custom process group or fall back to global state
@@ -66,7 +66,7 @@ def broadcast_from_last_pipeline_stage(
         last_rank = torch.distributed.get_process_group_ranks(pp_group)[pp_group.size() - 1]
         is_last_stage = pp_group.rank() == pp_group.size() - 1
 
-    if is_last_stage:
+    if is_last_stage or tensor is not None:
         assert size == list(
             tensor.shape
         ), f"Expected tensor of shape {size} but got {list(tensor.shape)}"
