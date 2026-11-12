@@ -92,6 +92,12 @@ def download_from_gitlab(pipeline_id: int, only_failing: bool):
                 golden_values_source_name = golden_values_source_name.replace(
                     "generations", "golden_values"
                 )
+                if re.fullmatch(r"(?:dev|lts)_dgx_[a-z0-9]+", environment):
+                    golden_values_source_name = re.sub(
+                        r"^golden_values_(?:dev|lts)_dgx_[a-z0-9]+",
+                        f"golden_values_{environment}",
+                        golden_values_source_name,
+                    )
 
                 golden_values_target = (
                     pathlib.Path("tests")

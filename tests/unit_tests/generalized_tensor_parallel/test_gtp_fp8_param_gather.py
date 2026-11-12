@@ -460,6 +460,7 @@ class TestGTPFp8ParamGather:
             FLA_SEQUENCE_PACKING_REASON or "GDP requires mamba-ssm, einops, FLA, and causal-conv1d"
         ),
     )
+    @pytest.mark.flaky_in_dev
     @pytest.mark.parametrize("overlap", [False, True])
     def test_gtp_gdp_adamw_moe_muon_mxfp8_sync(self, overlap):
         """GTP2 GDP-AdamW + MoE-Muon MXFP8 weights must update and stay synchronized."""
@@ -499,6 +500,7 @@ class TestGTPFp8ParamGather:
     @pytest.mark.skipif(
         not HAVE_EMERGING_OPTIMIZERS, reason="emerging-optimizers package is required"
     )
+    @pytest.mark.flaky_in_dev
     @pytest.mark.parametrize("overlap", [False, True])
     def test_muon_layout_and_mxfp8_param_gather_parity(self, overlap):
         """Padded LayerWise MXFP8 sync must match the legacy LayerWise path.

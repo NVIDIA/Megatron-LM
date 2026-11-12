@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import argparse
 from copy import deepcopy
+from functools import partial
 from typing import TYPE_CHECKING, Optional
+
+import torch
 
 from examples.mimo.model_providers import MimoProvider
 from examples.mimo.model_providers.radio_encoder import (
@@ -22,7 +25,10 @@ from examples.mimo.utils.hetero import get_grid_dim_size
 from megatron.core.activations import squared_relu
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
-from megatron.core.models.mamba.mamba_layer_specs import mamba_stack_spec
+from megatron.core.models.hybrid.hybrid_layer_specs import (
+    mamba_stack_spec,
+    wide_residual_hybrid_stack_spec,
+)
 from megatron.core.models.mamba.mamba_model import MambaModel
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.submodules.vision import VisionModalitySubmodules
@@ -35,6 +41,8 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_pg_rank, get_pg_size
+from megatron.training.global_vars import get_run_config
+from megatron.training.vocab_utils import model_vocab_size
 
 try:
     from megatron.core.extensions.transformer_engine import TERowParallelLinear
@@ -97,15 +105,6 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     return parser
 
 
-def _vocab_size(args: argparse.Namespace) -> int:
-    """Resolve the vocabulary size from stock args (``padded_vocab_size`` / ``vocab_size``)."""
-    for attr in ("padded_vocab_size", "vocab_size"):
-        value = getattr(args, attr, None)
-        if value:
-            return int(value)
-    raise ValueError("vocab size unresolved: set --vocab-size / a tokenizer, or padded_vocab_size")
-
-
 def nemotron_projection_layer_spec() -> ModuleSpec:
     """Return the Nemotron VLM RADIO-to-language projector layer spec."""
     if TERowParallelLinear is None:
@@ -119,34 +118,42 @@ def nemotron_projection_layer_spec() -> ModuleSpec:
 
 
 def nemotron_language_config(
-    args: argparse.Namespace, tp_size: int, pp_size: int, ep_size: int, expt_tp_size: int
+    args: argparse.Namespace,
+    tp_size: int,
+    pp_size: int,
+    ep_size: int,
+    expt_tp_size: int,
+    cp_size: int = 1,
 ) -> TransformerConfig:
-    """Nemotron6-MoE language config: stock from-args base + model-specific overrides."""
-    config = deepcopy(_base_config(args))
+    """Nemotron6-MoE language config with per-module topology overrides."""
+    config = deepcopy(_base_config())
+    gtp_remat_num_sequence_shards = config.gtp_remat_num_sequence_shards
     # Code-only fields + hetero parallelism pins.
     config.variable_seq_lengths = True
     config.expert_model_parallel_size = ep_size
     config.expert_tensor_parallel_size = expt_tp_size
     config.tensor_model_parallel_size = tp_size
     config.pipeline_model_parallel_size = pp_size
+    config.context_parallel_size = cp_size
     config.tensor_parallel_num_weight_shards, config.gtp_weight_remat_size = (
         resolve_tensor_parallel_weight_shards(
             tp_size,
-            getattr(args, "tensor_parallel_num_weight_shards", None),
-            getattr(args, "gtp_weight_remat_size", 1),
+            config.tensor_parallel_num_weight_shards,
+            config.gtp_weight_remat_size,
         )
     )
     config.expert_tensor_parallel_num_weight_shards, config.expert_gtp_weight_remat_size = (
         resolve_tensor_parallel_weight_shards(
             expt_tp_size,
-            getattr(args, "expert_tensor_parallel_num_weight_shards", None),
-            getattr(args, "expert_gtp_weight_remat_size", 1),
+            config.expert_tensor_parallel_num_weight_shards,
+            config.expert_gtp_weight_remat_size,
             shards_field="expert_tensor_parallel_num_weight_shards",
             tp_field="expert_tensor_parallel_size",
         )
     )
     config.sequence_parallel = tp_size > 1
-    config.position_embedding_type = "none"
+    config.tensor_parallel_num_sequence_shards = tp_size * gtp_remat_num_sequence_shards
+    config.position_embedding_type = args.position_embedding_type
     return config
 
 
@@ -173,9 +180,10 @@ def nemotron_projection_config(
     base_config: TransformerConfig | None = None,
 ) -> TransformerConfig:
     """Vision-to-Nemotron projection config: stock from-args base + overrides."""
-    config = deepcopy(base_config if base_config is not None else _base_config(args))
+    config = deepcopy(base_config if base_config is not None else _base_config())
     config.num_layers = 1
-    config.hidden_size = int(args.hidden_size)
+    cfg = get_run_config()
+    config.hidden_size = cfg.model.transformer.hidden_size
     config.num_attention_heads = 1
     config.ffn_hidden_size = 4 * projection_input_size
     config.gated_linear_unit = False
@@ -186,9 +194,11 @@ def nemotron_projection_config(
     config.normalization = "RMSNorm"
     _make_dense_non_hybrid(config)  # Projection inherits no MoE/Mamba/hybrid settings.
     config.tensor_model_parallel_size = tp_size
+    config.context_parallel_size = 1
     if base_config is None:
         _disable_gtp(config)
     config.sequence_parallel = False
+    config.tensor_parallel_num_sequence_shards = None
     return config
 
 
@@ -225,38 +235,60 @@ def language_model_spec(
     dim sizes when a group is missing.
     """
     # None on ranks outside the language grid -> sizes come from the grid; when a
-    # collection is provided its pp/tp/ep/expt_tp groups must all be present.
+    # collection is provided its pp/tp/cp/ep/expt_tp groups must all be present.
     if pg_collection is None:
         pp_rank = 0
         pp_size = get_grid_dim_size(llm_grid, "pp")
         tp_size = get_grid_dim_size(llm_grid, "tp")
+        cp_size = get_grid_dim_size(llm_grid, "cp") * get_grid_dim_size(
+            llm_grid, "gtp_remat_sequence_shards"
+        )
         ep_size = getattr(args, "mimo_llm_ep", 1)
         expt_tp_size = getattr(args, "mimo_llm_expt_tp", None) or 1
     else:
         assert all(
-            getattr(pg_collection, name, None) is not None for name in ("pp", "tp", "ep", "expt_tp")
-        ), "language pg_collection is missing a required pp/tp/ep/expt_tp group"
+            getattr(pg_collection, name, None) is not None
+            for name in ("pp", "tp", "cp", "ep", "expt_tp")
+        ), "language pg_collection is missing a required pp/tp/cp/ep/expt_tp group"
         pp_rank = get_pg_rank(pg_collection.pp)
         pp_size = get_pg_size(pg_collection.pp)
         tp_size = get_pg_size(pg_collection.tp)
+        cp_size = get_pg_size(pg_collection.cp)
         ep_size = get_pg_size(pg_collection.ep)
         expt_tp_size = get_pg_size(pg_collection.expt_tp)
 
-    config = nemotron_language_config(args, tp_size, pp_size, ep_size, expt_tp_size)
+    cfg = get_run_config()
+    config = nemotron_language_config(
+        args, tp_size, pp_size, ep_size, expt_tp_size, cp_size=cp_size
+    )
     require_per_token_loss(config)
+    stack_spec = (
+        wide_residual_hybrid_stack_spec
+        if getattr(config, "wide_residual", None) is not None
+        else mamba_stack_spec
+    )
     return ModuleSpec(
         module=MambaModel,
         params={
             "config": config,
-            "mamba_stack_spec": mamba_stack_spec,
-            "vocab_size": _vocab_size(args),
+            "mamba_stack_spec": stack_spec,
+            "vocab_size": model_vocab_size(
+                cfg.model.vocab_size,
+                should_pad_vocab=cfg.model.should_pad_vocab,
+                make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
+                tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
+            ),
             "max_sequence_length": args.seq_length,
             "pre_process": pp_rank == 0,
             "post_process": pp_rank == pp_size - 1,
-            "hybrid_layer_pattern": args.hybrid_layer_pattern,
-            "position_embedding_type": "none",
+            "hybrid_layer_pattern": cfg.model.hybrid_layer_pattern,
+            "position_embedding_type": args.position_embedding_type,
+            "rotary_base": args.rotary_base,
+            "rotary_percent": args.rotary_percent,
+            "seq_len_interpolation_factor": args.rotary_seq_len_interpolation_factor,
             "share_embeddings_and_output_weights": False,
             "scatter_embedding_sequence_parallel": False,
+            "logit_dtype": cfg.model.logit_dtype,
             "pg_collection": pg_collection,
         },
     )
@@ -331,18 +363,53 @@ def nemotron_special_token_ids(args: argparse.Namespace) -> dict[str, int]:
     return {RADIO_ENCODER_MODULE_NAME: args.image_token_id}
 
 
+def _nemotron_bridge_recv_shape(
+    batch: dict, image_token_id: int, hidden_size: int
+) -> tuple[int, int]:
+    """Derive the local projected-vision receive shape from language input IDs."""
+    input_ids = batch.get("input_ids")
+    if not isinstance(input_ids, torch.Tensor):
+        raise TypeError("bridge receive shape requires tensor batch['input_ids']")
+    if input_ids.ndim != 2:
+        raise ValueError(f"expected 2D batch['input_ids'], got shape {tuple(input_ids.shape)}")
+    return int((input_ids == image_token_id).sum().item()), hidden_size
+
+
 def build_nemotron_communicator(
     args: argparse.Namespace, topology: "HeteroTopology"
 ) -> MultiModulePipelineCommunicator:
     """Wire the RADIO-encoder -> language cross-grid pipeline communicator."""
     language_grid = topology.grids[MIMO_LANGUAGE_MODULE_KEY]
     language_config = language_model_spec(args, None, language_grid).params["config"]
+    if RADIO_ENCODER_MODULE_NAME not in topology.grids:
+        # LLM-only topology has no encoder or cross-module bridge metadata.
+        return MultiModulePipelineCommunicator(
+            topology.grids,
+            {MIMO_LANGUAGE_MODULE_KEY: []},
+            language_config,
+            dim_mapping={"s": 0, "h": 2, "b": 1},
+        )
+    bridge_recv_shape_fns = None
+    if getattr(args, "mimo_bridge_skip_shape_exchange", False):
+        bridge_hidden_size = language_config.hidden_size
+        if getattr(args, "mimo_run_input_projections_on_llm_ranks", False):
+            vision_config = radio_vision_config(args, args.mimo_encoder_tp, 1)
+            bridge_hidden_size = _vision_projection_input_size(args, vision_config)
+        bridge_recv_shape_fns = {
+            RADIO_ENCODER_MODULE_NAME: partial(
+                _nemotron_bridge_recv_shape,
+                image_token_id=int(args.image_token_id),
+                hidden_size=bridge_hidden_size,
+            )
+        }
     return MultiModulePipelineCommunicator(
         topology.grids,
         {RADIO_ENCODER_MODULE_NAME: [MIMO_LANGUAGE_MODULE_KEY], MIMO_LANGUAGE_MODULE_KEY: []},
         language_config,
         dim_mapping={"s": 0, "h": 2, "b": 1},
         module_output_ndim={RADIO_ENCODER_MODULE_NAME: 2},
+        bridge_recv_shape_fns=bridge_recv_shape_fns,
+        bridge_comm_dtypes={RADIO_ENCODER_MODULE_NAME: language_config.params_dtype},
     )
 
 

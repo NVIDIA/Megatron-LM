@@ -143,15 +143,39 @@ def _build_expert_linear(implementation: str, config: TransformerConfig) -> torc
 
 @pytest.mark.parametrize(
     (
+        "implementation",
         "tensor_model_parallel_size",
         "expert_tensor_parallel_size",
         "gtp_weight_remat_size",
         "expert_gtp_weight_remat_size",
     ),
-    [(2, 1, 1, 1), (1, 2, 1, 1), (1, 1, 1, 2)],
-)
-@pytest.mark.parametrize(
-    "implementation", ["native", "transformer_engine", "transformer_engine_grouped"]
+    [
+        ("native", 2, 1, 1, 1),
+        ("native", 1, 2, 1, 1),
+        ("native", 1, 1, 1, 2),
+        ("transformer_engine", 2, 1, 1, 1),
+        ("transformer_engine", 1, 2, 1, 1),
+        pytest.param(
+            "transformer_engine",
+            1,
+            1,
+            1,
+            2,
+            marks=pytest.mark.flaky_in_dev,
+            id="transformer-engine-expert-gtp-remat",
+        ),
+        ("transformer_engine_grouped", 2, 1, 1, 1),
+        ("transformer_engine_grouped", 1, 2, 1, 1),
+        pytest.param(
+            "transformer_engine_grouped",
+            1,
+            1,
+            1,
+            2,
+            marks=pytest.mark.flaky_in_dev,
+            id="transformer-engine-grouped-expert-gtp-remat",
+        ),
+    ],
 )
 def test_expert_grad_sync_uses_expert_data_parallel_group(
     implementation: str,

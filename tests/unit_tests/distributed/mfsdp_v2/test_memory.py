@@ -1,6 +1,10 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Memory-accounting tests for Megatron-FSDP."""
+"""Memory-accounting tests for Megatron-FSDP.
+
+Tests asserting memory usage or storage release belong here, including during
+CUDA graph capture and replay.
+"""
 
 import logging
 
@@ -12,12 +16,15 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
     Placements,
+    PrefetchOrder,
+    RuntimePolicy,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import Flat
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import MixedPrecisionPolicy
 
 logger = logging.getLogger(__name__)
@@ -51,7 +58,7 @@ class ElementwiseModel(nn.Module):
         return torch.relu(x + self.weight[0])
 
 
-def _flat_placements() -> Placements:
+def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
@@ -71,6 +78,38 @@ def _mb(num_bytes: int) -> str:
     return f"{num_bytes / 1024**2:.2f} MB"
 
 
+def test_shared_layer_releases_storage(distributed_setup):
+    """Release weights per invocation while accumulating gradients from both uses."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    layer = nn.Linear(4, 4, bias=False, device=device)
+    nn.init.ones_(layer.weight)
+    model = nn.Sequential(layer, layer)
+    with fully_shard_context(FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)):
+        fully_shard(layer, mesh, _default_placements())
+
+    completions = []
+
+    def check_data_and_grad(module, _grad_input, _grad_output):
+        # Each invocation releases its weight storage when its backward finishes.
+        assert module.weight.untyped_storage().nbytes() == 0
+        if not completions:
+            # The shared weight's gradient still awaits the other use's contribution.
+            assert module.weight.grad is None
+        completions.append(module)
+
+    # Observe PyTorch's completion independently of MFSDP's hook wrapper.
+    layer.register_full_backward_hook(check_data_and_grad)
+    x = torch.ones(2, 4, device=device, requires_grad=True)
+    model(x).sum().backward()
+    assert len(completions) == 2
+    # Each use contributes 8 to every weight gradient.
+    torch.testing.assert_close(
+        layer.weight.grad.full_tensor(), torch.full((4, 4), 16.0, device=device)
+    )
+    torch.testing.assert_close(x.grad, torch.full_like(x, 16.0))
+
+
 @pytest.mark.parametrize("main_params_dtype", [torch.bfloat16, torch.float32])
 def test_persistent_sharded_storage(distributed_setup, main_params_dtype):
     """FSDP should retain only its sharded weights and gradients at rest."""
@@ -84,10 +123,10 @@ def test_persistent_sharded_storage(distributed_setup, main_params_dtype):
     dim = 4096
     dtype = torch.bfloat16
     model = MultiChildModel(dim=dim, num_children=8).to(dtype=dtype)
-    placements = _flat_placements()
+    placements = _default_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=main_params_dtype)
     allocated_before = torch.cuda.memory_allocated(device)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
         fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
@@ -127,10 +166,10 @@ def test_persistent_sharded_storage(distributed_setup, main_params_dtype):
 
 
 @pytest.mark.parametrize(
-    "unify_communication_stream", [False, True], ids=["separate_streams", "unified_stream"]
+    "overlap_allgather_reduction", [True, False], ids=["separate_streams", "unified_stream"]
 )
 def test_training_step_peak_memory_bounds_full_size_buffers(
-    distributed_setup, unify_communication_stream
+    distributed_setup, overlap_allgather_reduction
 ):
     """A training step should stay within its full-size-buffer bound."""
     rank = distributed_setup.rank
@@ -143,9 +182,14 @@ def test_training_step_peak_memory_bounds_full_size_buffers(
     dim = 4096
     dtype = torch.bfloat16
     model = MultiChildModel(dim=dim, num_children=8).to(dtype=dtype)
-    placements = _flat_placements()
+    placements = _default_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    with fully_shard_context(device=device, unify_communication_stream=unify_communication_stream):
+    with fully_shard_context(
+        FsdpContext(
+            device=device,
+            runtime_policy=RuntimePolicy(overlap_allgather_reduction=overlap_allgather_reduction),
+        )
+    ):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
         fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
@@ -168,14 +212,13 @@ def test_training_step_peak_memory_bounds_full_size_buffers(
     train_step()
     peak_delta = torch.cuda.max_memory_allocated(device) - resting_allocated
 
-    # Backward keeps the current child and one prefetched child unsharded. The current
-    # child also has a full wgrad until it is copied into a full reduce-scatter input.
-    # With separate streams, their allocation cannot reuse the released full-weight
-    # storage, for a four-buffer peak. With a unified stream, the release precedes the
-    # allocation on that stream, reducing the peak to three. The slack on top covers
+    # Backward keeps the current child and one prefetched child unsharded. Gradient
+    # readiness can precede module completion, so the full wgrad and packed reduce-scatter
+    # input may also coexist before resharding. Both stream configurations therefore
+    # allow four full buffers. The slack on top covers
     # allocator granularity and small temporaries, measured at ~169 KiB.
     child_weight_nbytes = dim * dim * torch.empty((), dtype=dtype).element_size()
-    full_buffer_bound = 3 if unify_communication_stream else 4
+    full_buffer_bound = 4
     bound_nbytes = full_buffer_bound * child_weight_nbytes + 1024**2
 
     assert peak_delta < bound_nbytes, (
@@ -200,7 +243,7 @@ def test_zero1_memory_uses_sharded_optimizer_and_replicated_weight(distributed_s
     model = ElementwiseModel(dim).to(device=device, dtype=dtype)
     mesh = init_device_mesh(device.type, (world_size,))
     placements = _zero1_placements()
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         fully_shard(model, mesh=mesh, placements=placements)
     optimizer = torch.optim.Adam(model.parameters(), lr=0.01, foreach=False)
     fully_shard_optimizer(optimizer)
@@ -223,7 +266,7 @@ def test_zero1_memory_uses_sharded_optimizer_and_replicated_weight(distributed_s
     peak_nbytes = torch.cuda.max_memory_allocated(device) - allocated_before_setup
     resting_nbytes = torch.cuda.memory_allocated(device) - allocated_before_setup
     assert parameter_group.model_weight.placements == (Replicate(),)
-    assert parameter_group.post_optimizer_model_weight.placements == (Flat(),)
+    assert parameter_group.post_optimizer_model_weight.placements == (RowAtomic(),)
 
     optimizer_state_nbytes = sum(
         state["exp_avg"].to_local().nbytes + state["exp_avg_sq"].to_local().nbytes
@@ -253,8 +296,8 @@ def test_deleted_model_releases_fsdp_storage(distributed_setup):
     # only detects storage retained by the deleted FSDP model itself.
     allocated_before = torch.cuda.memory_allocated(device)
     model = ElementwiseModel(dim=8192).to(dtype=torch.bfloat16, device=device)
-    with fully_shard_context(device=device):
-        fully_shard(model, mesh=mesh, placements=_flat_placements())
+    with fully_shard_context(FsdpContext(device=device)):
+        fully_shard(model, mesh=mesh, placements=_default_placements())
 
     x = torch.ones(1, 8192, dtype=torch.bfloat16, device=device)
     output = model(x)
@@ -275,9 +318,9 @@ def test_fully_shard_returns_to_resting_memory(distributed_setup):
     dim = 4096
     dtype = torch.bfloat16
     model = MultiChildModel(dim=dim, num_children=2).to(dtype=dtype, device=device)
-    placements = _flat_placements()
+    placements = _default_placements()
     policy = MixedPrecisionPolicy(main_params_dtype=dtype, main_grads_dtype=dtype)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         for layer in model.layers:
             fully_shard(layer, mesh=mesh, placements=placements, mixed_precision_policy=policy)
         fully_shard(model, mesh=mesh, placements=placements, mixed_precision_policy=policy)
@@ -316,7 +359,7 @@ def test_fully_shard_returns_to_resting_memory(distributed_setup):
     [
         pytest.param(_zero1_placements, id="zero1"),
         pytest.param(_zero2_placements, id="zero2"),
-        pytest.param(_flat_placements, id="zero3"),
+        pytest.param(_default_placements, id="zero3"),
     ],
 )
 def test_fully_shard_reduces_peak_training_memory(distributed_setup, placements_factory):
@@ -353,7 +396,7 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup, placements_
 
     torch.manual_seed(4321)
     model = nn.Sequential(*[nn.Linear(dim, dim, dtype=dtype) for _ in range(layers)]).to(device)
-    with fully_shard_context(device=device):
+    with fully_shard_context(FsdpContext(device=device)):
         for layer in model:
             fully_shard(
                 layer,

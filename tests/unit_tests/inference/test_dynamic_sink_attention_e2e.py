@@ -25,6 +25,7 @@ What this exercises that the math-only unit tests in
   * The full plumbing through ``Attention.forward()`` →
     ``flash_decode_and_prefill()`` → sink correction → linear_proj.
 """
+
 import pytest
 import torch
 
@@ -38,7 +39,7 @@ from megatron.core.utils import is_fa_min_version
 # in a separate edit to ``DynamicEngineTestConfig``.
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicInferenceEngineTestBase,
-    set_rounder,
+    reset_rounder,
 )
 from tests.unit_tests.test_utilities import Utils
 
@@ -81,7 +82,7 @@ class TestDynamicEngineSinkAttention(DynamicInferenceEngineTestBase):
         # Deliberately NOT calling delete_cuda_graphs() — these tests do
         # not enable CUDA graphs, so there is nothing to clean up, and
         # avoiding the call sidesteps the known teardown SIGABRT.
-        set_rounder(64)
+        reset_rounder()
         Utils.destroy_model_parallel()
 
     @staticmethod

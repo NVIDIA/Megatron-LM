@@ -835,6 +835,8 @@ class FlextronTopKRouterElasticityManager:
         """Attach hooks to TopKRouter for expert masking."""
         if not self.enabled:
             return
+        if router.config.moe_num_hash_layers > 0:
+            raise ValueError("Flextron expert elasticity does not support hash MoE routing.")
 
         # Store original method for restoration
         original_routing = router.routing

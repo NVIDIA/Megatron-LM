@@ -61,6 +61,30 @@ swap_model_weights(train_model, infer_model, refit_method="nccl")
 # MXFP8 transform is auto-resolved from the cached plan.
 ```
 
+### Multiple destination pools
+
+Disaggregated inference can refit the same training model into multiple
+disjoint destination shards. Every rank participates in one collective pass
+per pool and exposes its target model only during the pass identified by
+`dst_pool_index`. Use the same pool arguments for preparation and transfer so
+each plan, including any MXFP8 transform, is ready before CUDA graph capture:
+
+```python
+prepare_swap_model_weights(
+    src_model=train_model,
+    target_model=local_inference_model,
+    num_dst_pools=2,
+    dst_pool_index=local_pool_index,
+)
+swap_model_weights(
+    train_model,
+    local_inference_model,
+    refit_method="nccl",
+    num_dst_pools=2,
+    dst_pool_index=local_pool_index,
+)
+```
+
 ### Non-collocated (training and inference on disjoint ranks)
 
 ```python
@@ -77,15 +101,87 @@ swap_model_weights(None, None, "nccl",
                    src_rank_offset=0, dst_rank_offset=src_world)
 ```
 
+### MIMO training with ordinary LLaVA inference
+
+The public prepare/swap API accepts the original models without caller-side
+adapters or new arguments:
+
+```python
+from megatron.core.resharding.refit import prepare_swap_model_weights, swap_model_weights
+
+# Each rank supplies its local model, or None on the opposite side.
+prepare_swap_model_weights(train_model, inference_model, group=refit_group)
+# After an optimizer step, collectively on all refit ranks:
+swap_model_weights(train_model, inference_model, "nccl", group=refit_group)
+```
+
+Regular refit reads tensor names and one root process-group collection. MIMO
+differs in two ways: its components have separate process groups, and their
+storage paths differ from LLaVA's. The transfer planner already accepts both
+owning groups and separate storage/matching names in `ParameterMetadata`.
+
+Models can declare their local components through an optional `refit_modules()`
+method returning `(matching_label, module, process_group_collection)` tuples.
+Each module must be the original model or one of its registered descendants;
+precision/DDP wrappers are allowed. An empty matching label preserves the
+component's tensor names, for example when removing an inference wrapper prefix.
+Refit uses its ordinary parameter extractor with each component's groups, then
+prefixes the matching name with its label and the storage name with its actual
+module path. Rank offsets and metadata serialization remain internal to refit.
+The declarations must cover every parameter and persistent buffer exactly once
+and produce unique matching names. Models without the method retain the ordinary
+extraction path. An empty list describes a rank with no state.
+
+MIMO matches its language model, image encoder, and input projector under
+`language_model`, `vision_model`, and `vision_projection`. These match standard
+LLaVA's registered names, so inference does not need MIMO. For example, TP2
+language training can use two GPUs, TP1 vision/projector training a third,
+and standard TP1 LLaVA inference a fourth.
+
+The executor uses original tensor paths, including wrapper levels; declarations
+do not rename modules or checkpoint keys. Buffer dtypes are matched by transfer
+ID. The existing rank-offset arguments still apply when the refit group joins
+independent worlds.
+
+The MIMO mapping covers a core CLIP image encoder and at most one input projector.
+Other encoder implementations may require their own matching declarations and
+explicit ownership. MIMO configurations enabling FP8, FP4, Kitchen, or per-module
+quantization recipes are rejected. Missing ownership, unmapped names, and
+ambiguous destination names raise errors. Callers must use equivalent component
+architectures and input preprocessing; matching tensor names and shapes alone
+do not establish equivalence.
+
+Plans are cached between optimizer steps; update tensor values in place.
+Models declaring `refit_modules()` use a memoized fingerprint of the planner's
+local metadata, including tensor paths, layouts and ordered group membership.
+Rebuilding an equivalent model reuses its plan without retaining model identities.
+Fingerprints are memoized only for live models and cleared with the plan cache.
+Initialize persistent buffers to their runtime dtypes before the first swap
+(for example, MoE routers promote their bias to FP32 on first forward).
+A buffer dtype change that preserves the tensor object requires
+`clear_plan_cache()` on all refit ranks and a new prepare call before swapping
+again.
+For a new layout, construct new model objects, call `clear_plan_cache()` on
+**all** refit ranks, and prepare again. Replacing tensors or submodules on an
+existing model is not automatically tracked by refit's tensor caches.
+
+TP2 affine projectors currently require bias to be disabled: the projector
+forward adds its local bias after gathering the output, which is incompatible
+with a sharded bias at TP2. This is a model-forward limitation, independent
+of refit.
+
 ## Copy Service Backends
 
 | Backend | Transport | Best for | Notes |
 |---------|-----------|----------|-------|
-| `nccl` | GPU P2P via `batch_isend_irecv` | Intra-node / single cluster | Lowest latency; default choice |
-| `nccl_m2n` | NCCL M2N copy/staging reshard | Large non-collocated source/destination groups | Requires `nccl-extensions` and NCCL 2.30.5+; source ranks must precede destination ranks; pair-size skew adds padding |
+| `nccl` | GPU P2P via `batch_isend_irecv` | Intra-node / single cluster | Lowest latency for collocated refits; runs the plan in lockstep batches |
+| `nccl_m2n` | Native NCCL M2N reshard of whole tensors | Large non-collocated source/destination groups | Requires `nccl-extensions` and NCCL 2.30.5+; disjoint, source-first rank intervals; see restrictions below |
 | `gloo` | CPU-staged via Gloo PG | Cross-cluster / multi-node | Higher latency; works where NCCL cross-cluster doesn't |
 | `nvshmem` | Pipelined NVSHMEM puts | High-throughput intra-node | Requires NVSHMEM; uses double-buffered kernel pipeline |
-| `nixl` | GPU RDMA via NIXL (UCX), sender-initiated WRITE | Cross-cluster / non-collocated | Requires NIXL; transfers GPU memory directly (no host staging) |
+| `nixl` | GPU RDMA via NIXL (UCX), sender-initiated WRITE | Cross-cluster / non-collocated | Requires NIXL; transfers GPU memory directly (no host staging); one destination pool only |
+
+`swap_model_weights()` has no default backend; callers pass `refit_method`
+explicitly. In the built-in RL loop, `--refit-method` defaults to `gloo`.
 
 Backends that support collocated models detect same-rank (local) transfers via
 `task_id` and short-circuit them into direct `tensor.copy_()` instead of going
@@ -104,9 +200,19 @@ assemble the complete BF16 value before quantizing it once.
 model-wide submission because its receive address map must remain stable across
 refits. `nccl_m2n` uses the rank-coordinated value as its native grouped-
 submission limit instead. Ranks agree on the smallest configured non-`None`
-value. When every rank uses `None`, generic backends preserve the previous
-single model-wide submission and NCCL M2N preserves its environment setting or
-256 MiB default.
+value. When every rank uses `None`, NCCL M2N preserves its environment setting
+or 256 MiB default.
+
+Independently of the byte limit, `nccl`, `gloo`, and `nvshmem` cap each batch
+at 32 logical parameters by default (`MEGATRON_REFIT_MAX_PARAMS_PER_BATCH`;
+`0` removes the cap). A byte budget alone can still pack thousands of small
+tensors (norm weights, biases, router `expert_bias`) into one
+`batch_isend_irecv`; NCCL splits such large groups into kernel plans at
+rank-dependent points, and matching sends and receives that land in different
+plans deadlock ([pytorch#174288](https://github.com/pytorch/pytorch/issues/174288)).
+Every rank derives the batches from the same gathered metadata and environment,
+so they agree without another collective. With the cap disabled and no byte
+limit, these backends submit the whole model in one batch.
 
 ### NCCL M2N backend
 
@@ -128,31 +234,63 @@ export NCCL_M2N_LIBRARY=/path/to/libnccl_m2n.so
 ```
 
 Select it with `refit_method="nccl_m2n"` or `--refit-method nccl_m2n`.
-The backend preserves the existing ReFIT planner and packs its operations into
-one logical `[source, destination, bytes]` tensor. Source ranks shard dimension
-0, destination ranks shard dimension 1, and one cross-dimension
-`nccl.m2n.reshard` call moves the entire batch through M2N's managed
-copy/staging transport. Before a plan's first call, ranks exchange byte counts,
-tensor counts, and an ordered layout digest for every source/destination pair;
-any sender/receiver disagreement fails before weight data moves. The result is
-cached with the immutable plan, so subsequent refits do not run that collective
-or repeat the peer/layout validation.
+
+#### How it executes a plan
+
+The backend does not consume the planner's point-to-point slice operations.
+From the same gathered metadata and the same DP-replica source selection, the
+planner also builds backend-neutral `TensorReshardSpec`s, one per logical
+parameter and destination TP mesh. A spec records the global shape, the local
+shapes on the source and destination TP meshes, the shard dimension on each
+side (`None` for a replicated tensor), and the two rank meshes. Packed
+parameters whose components are TP-sharded independently (for example Mamba
+`in_proj` and `conv1d`) produce one spec per component instead of being lowered
+into point-to-point slices.
+
+For each spec, the service wraps the local source and destination tensors as
+`nccl.m2n.DistTensor`s with a `Shard(dim)` or `Replicate()` placement on a 1-D
+mesh and enqueues one `reshard` call. Every distinct (source mesh, destination
+mesh) pair, typically one per pipeline-stage pair, gets its own NCCL4Py
+communicator, created on first use from a unique ID broadcast over the refit
+group with the source ranks first, and its own CUDA stream, so stage pairs run
+concurrently. Within a pair, complete parameters are submitted in
+`m2n.group()` batches of at most `max_group_bytes` destination bytes to
+amortize M2N's fixed per-call work. The limit is the plan's coordinated
+`execution_batch_bytes` if set, otherwise `MEGATRON_NCCL_M2N_MAX_GROUP_BYTES`,
+otherwise 256 MiB; a single parameter may exceed it.
+
+Destination views that are not contiguous are received into a temporary buffer
+and copied back after their group is enqueued. Model parameter storage itself
+is not replaced. With an MXFP8 destination, each parameter is received as one
+full BF16 buffer and quantized once on the same stream, so the group limit also
+bounds the BF16 staging on each destination rank. Only receiver-side MXFP8
+conversion is supported.
+
+On first use, the service all-gathers each rank's source/destination role and
+group-byte limit, validates the rank topology described below and that every
+rank uses the same limit, and caches the result. Each plan's specs are checked
+locally against that topology before any weight data moves. If a submission
+fails, the service is marked unusable; close it and construct a new one.
+
+#### Restrictions
 
 This backend supports only non-collocated multi-rank layouts. The communication
-group must contain a contiguous source interval starting at group rank 0,
-immediately followed by a contiguous destination interval, with no overlapping
-or idle ranks, and `num_dst_pools > 1` is not supported. Use a process group
-scoped to exactly one source/destination pool when the application has extra
-ranks. The M2N API describes a regular tensor, so every pair uses the largest
-validated pair payload as its trailing extent; skewed pair sizes therefore add
-wire padding. The logical transfer size is
-`src_count * dst_count * max_pair_bytes`, and each rank temporarily stages
-`peer_count * max_pair_bytes`. The staging tensor is returned to PyTorch's
-caching allocator after each refit rather than retained by the service. Model
-parameter storage itself is not replaced. Supported mesh sizes are validated
-by `nccl-extensions`. GTP-sharded parameters currently use the generic `nccl`,
-`gloo`, `nvshmem`, or `nixl` slice-transfer path; `nccl_m2n` rejects such plans
-before communication instead of treating a GTP shard as a complete weight.
+group must use NCCL for CUDA tensors and must contain a contiguous source
+interval starting at group rank 0, immediately followed by a contiguous
+destination interval, with no overlapping or idle ranks, and
+`num_dst_pools > 1` is not supported. Use a process group scoped to exactly one
+source/destination pool when the application has extra ranks. Supported mesh
+sizes are validated by `nccl-extensions`.
+
+Plans that cannot be expressed as whole-tensor specs are rejected before
+communication. This currently covers:
+
+- GTP-sharded parameters (use the generic `nccl`, `gloo`, `nvshmem`, or `nixl`
+  slice-transfer path instead of treating a GTP shard as a complete weight);
+- strided TP layouts (`partition_stride != 1`), which includes the `fc1`
+  weight of gated linear units such as SwiGLU;
+- fused expert tensors that are not exposed as per-expert parameters;
+- source and destination dtypes that differ.
 
 The built-in RL loop currently creates its training and inference models on the
 same ranks, so it rejects `nccl_m2n`; non-collocated launchers can use the public
@@ -209,7 +347,8 @@ across refits.
 | Cache | Key | Contents | Why |
 |-------|-----|----------|-----|
 | `_service_cache` | Backend name + process-group identity + M2N execution limit | `CopyService` instance | Avoid re-creating backend communicators and buffers |
-| `_plan_cache` | (rank, src_config, dst_config, num_experts, execution limit) | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits; configs include dense/expert GTP-remat sizes |
+| `_plan_cache` | Rank, source/destination config, offsets, world size, expert count, pool, execution limit | `ReshardPlan` + attached transform | Avoid collective plan rebuild on repeated refits; ordinary configs include dense/expert GTP-remat sizes; models declaring `refit_modules()` use a metadata fingerprint |
+| `_model_fingerprints` | Weak model key | Metadata fingerprint | Avoid re-extracting composite metadata on warm swaps; entries expire with models and are cleared by `clear_plan_cache()` |
 
 Call `clear_all_caches()` before destroying distributed process groups
 to avoid stale references.  This also finalizes NVSHMEM resources.
