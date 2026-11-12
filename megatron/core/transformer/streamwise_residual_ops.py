@@ -74,7 +74,8 @@ def _streamwise_block_config(batch: int, stream_width: int) -> tuple[int, int, i
     if stream_width >= 512:
         return 32, 256, 4
     block_batch = 64 if batch >= 4096 else 32
-    return block_batch, min(128, stream_width), 4
+    # Triton arange extents must be powers of two, including widths such as 96.
+    return block_batch, min(128, 1 << (stream_width - 1).bit_length()), 4
 
 
 def _streamwise_backward_block_config(batch: int, stream_width: int) -> tuple[int, int, int]:

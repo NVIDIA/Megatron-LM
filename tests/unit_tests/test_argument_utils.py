@@ -367,6 +367,31 @@ def test_shortcut_connection_rejects_fsdp(monkeypatch, fsdp_flag):
         validate_args(args)
 
 
+@pytest.mark.parametrize(
+    "metric", ["layer-residual-accumulator-l2:10", "layer-residual-contribution-l2:5"]
+)
+def test_shortcut_fusion_rejects_residual_tensor_metrics(monkeypatch, metric):
+    """A fused layer returns its unwritten input residual, so its residual metrics are rejected."""
+    monkeypatch.setattr(sys, 'argv', ['test_argument_utils.py'])
+    args = parse_args()
+    args.num_layers = 2
+    args.hidden_size = 128
+    args.num_attention_heads = 4
+    args.max_position_embeddings = 1024
+    args.seq_length = 1024
+    args.micro_batch_size = 1
+    args.train_iters = 1
+    args.lr = 1e-4
+    args.tokenizer_type = 'NullTokenizer'
+    args.vocab_size = 1024
+    args.moe_shortcut_connection = True
+    args.moe_shortcut_wide_residual_norm_fusion = True
+    args.tensor_metrics = ["global-param-l2:10", metric]
+
+    with pytest.raises(AssertionError, match="does not support the tensor metrics"):
+        validate_args(args)
+
+
 @dataclass
 class ConfigWithOptional:
     """Config with optional fields."""

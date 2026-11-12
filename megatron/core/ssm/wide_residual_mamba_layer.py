@@ -2,6 +2,7 @@
 """Mamba layer specialization for streamwise wide-residual connections."""
 
 from contextlib import nullcontext
+from dataclasses import dataclass, fields
 
 from torch import Tensor
 
@@ -13,12 +14,29 @@ from megatron.core.transformer.residual_connection import (
     ResidualConnectionState,
 )
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
+from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     load_residual_state,
+    map_residual_sharded_keys,
 )
 from megatron.core.typed_torch import apply_module
+
+
+@dataclass
+class WideResidualMambaLayerSubmodules(MambaLayerSubmodules):
+    """MambaLayerSubmodules plus the mixer's wide-residual connections (a fused spec selects a
+    WriteReadNorm read and a DeferredWrite write)."""
+
+    residual_read: type = StreamwiseSigmoidWideResidualConnection
+    residual_write: type = StreamwiseSigmoidWideResidualConnection
+
+    @classmethod
+    def widen(cls, submodules: MambaLayerSubmodules, **connections):
+        """``submodules`` with these connections (the defaults for the others)."""
+        values = {f.name: getattr(submodules, f.name) for f in fields(submodules)}
+        return cls(**{**values, **connections})
 
 
 class WideResidualMambaLayer(MambaLayer):
@@ -26,16 +44,30 @@ class WideResidualMambaLayer(MambaLayer):
 
     supports_wide_residual_connections: bool = True
 
+    @classmethod
+    def get_input_layernorm_module(cls, submodules: MambaLayerSubmodules) -> tuple[str, ...]:
+        """Where a spec puts this layer's input RMSNorm, as attribute names from the layer: its
+        norm slot, or the mixer's in_proj it is fused into."""
+        return ("norm",) if submodules.norm is not IdentityOp else ("mixer", "in_proj")
+
+    @classmethod
+    def get_wide_residual_modules(cls, submodules: MambaLayerSubmodules) -> tuple[str, str]:
+        """This layer's wide-residual (read, write) connection fields."""
+        del submodules
+        return "residual_read", "residual_write"
+
     def __init__(
         self,
         config: TransformerConfig,
-        submodules: MambaLayerSubmodules,
+        submodules: WideResidualMambaLayerSubmodules | MambaLayerSubmodules,
         layer_number: int = 1,
         pg_collection: ProcessGroupCollection = None,
         pp_layer_offset: int = 0,
         name: str | None = None,
         is_mtp_layer: bool = False,
     ) -> None:
+        if not isinstance(submodules, WideResidualMambaLayerSubmodules):
+            submodules = WideResidualMambaLayerSubmodules.widen(submodules)
         if is_mtp_layer:
             raise ValueError(
                 "MTP auxiliary stacks must use ordinary-width MambaLayer, not "
@@ -59,11 +91,11 @@ class WideResidualMambaLayer(MambaLayer):
                 "returns its own residual."
             )
 
-        self.residual_read = StreamwiseSigmoidWideResidualConnection(
-            config, self.layer_number, "mamba", operation="read"
+        self.residual_read = build_module(
+            submodules.residual_read, config, self.layer_number, "mamba", operation="read"
         )
-        self.residual_write = StreamwiseSigmoidWideResidualConnection(
-            config, self.layer_number, "mamba", operation="write"
+        self.residual_write = build_module(
+            submodules.residual_write, config, self.layer_number, "mamba", operation="write"
         )
         self.register_load_state_dict_pre_hook(load_residual_state)
         self.residual_stream_hidden_size = (
@@ -81,6 +113,12 @@ class WideResidualMambaLayer(MambaLayer):
                 f"hidden_size={self.config.hidden_size}, got "
                 f"{self.residual_read.branch_hidden_size}."
             )
+
+    def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+        """Key the residual read/write parameters as existing checkpoints store them."""
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        map_residual_sharded_keys(sharded_state_dict, prefix)
+        return sharded_state_dict
 
     def _get_residual_connection(self):
         """Return the connection surrounding the Mamba mixer."""
