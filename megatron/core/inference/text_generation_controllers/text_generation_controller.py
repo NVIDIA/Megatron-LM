@@ -400,7 +400,7 @@ class TextGenerationController(MTPControllerMixin):
             SymmetricMemoryManager,
         )
 
-        if getattr(self.model_config, 'inference_disable_triton_nvls_kernels', False):
+        if getattr(self.model_config, "inference_disable_triton_nvls_kernels", False):
             return None
         if not (HAVE_TORCH_SYMM_MEM and HAVE_TRITON):
             return None

@@ -323,6 +323,9 @@ def multimem_all_gather(
         output_tensor.numel() % input_tensor.numel() == 0
         and output_tensor.numel() // input_tensor.numel() == symm_mem_hdl.world_size
     ), "Output numel must be exactly world_size * input numel for all-gather."
+    assert (
+        input_tensor.dtype == output_tensor.dtype
+    ), "Input and output dtypes must match: the multicast store copies raw bytes."
     if last_dim_width is not None:
         assert (
             input_tensor.dim() == 2

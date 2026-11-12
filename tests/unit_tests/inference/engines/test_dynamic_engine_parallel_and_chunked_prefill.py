@@ -1249,6 +1249,129 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
                 request.status == Status.COMPLETED
             ), f"Request {request.request_id}: status={request.status}"
 
+    # ---- Symmetric-memory logits buffer under replayed CUDA graphs --------- #
+    #
+    # At TP > 1 with local CUDA graphs on NVLS, the controller keeps its logits buffer in
+    # symmetric memory and each rank's model multicast-stores its vocab shard straight into
+    # it. Serving only ever runs that store from a replayed graph, so that is where it is
+    # checked, against the same graphs gathering and copying into a plain buffer.
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
+    @torch.inference_mode()
+    def test_multicast_logits_buffer_under_cuda_graph_replay(self, model_provider, monkeypatch):
+        """TP=2 under replayed CUDA graphs: the multicast store leaves the rows that sampling
+        reads bitwise equal, every step, to the gather and copy into a plain buffer.
+
+        The vocab is 128 so an fp32 shard row (64 values) is 16-byte divisible, as the store
+        requires. Skips only where symmetric memory cannot initialize.
+        """
+        from megatron.core.inference.communication.torch_symm_triton import is_device_nvls_capable
+        from megatron.core.inference.symmetric_memory import HAVE_TORCH_SYMM_MEM, HAVE_TRITON
+        from tests.unit_tests.inference.engines.test_dynamic_engine import DynamicEngineTestConfig
+
+        skip_if_mamba_sequence_packing_not_available(model_provider)
+        Utils.initialize_distributed()
+        if torch.distributed.get_world_size() < 2:
+            pytest.skip("Test requires at least 2 GPUs")
+
+        def run():
+            test_config = DynamicEngineTestConfig(
+                num_requests=0,
+                model_provider=model_provider,
+                transformer_impl="inference_optimized",
+                tensor_model_parallel_size=2,
+                # The inference-optimized transformer requires SP when tp_size > 1.
+                sequence_parallel=True,
+                max_sequence_length=32,
+                context_max_requests=8,
+                num_cuda_graphs=4,
+                force_build_cuda_graphs=True,
+            )
+            test_config.vocab_size = 128
+            env = self._build_test_env(test_config)
+            engine, context = env.engine, env.engine.context
+
+            # Record the rows the sampler is handed: the product's own read of the buffer.
+            sampler = engine.controller._sampling
+            sample_kernel = sampler.sample_kernel
+            sampled_logits = []
+
+            def record_sampled_logits(logits, n, ctx, **kwargs):
+                indices = kwargs.get("gather_indices")
+                rows = logits[:n] if indices is None else logits[indices[:n].long()]
+                sampled_logits.append(rows.clone())
+                return sample_kernel(logits, n, ctx, **kwargs)
+
+            monkeypatch.setattr(sampler, "sample_kernel", record_sampled_logits)
+
+            # No termination id, so every request decodes for exactly six steps.
+            for request_id, prompt_length in enumerate((8, 11, 13, 16)):
+                prompt = torch.arange(prompt_length, dtype=torch.int64, device="cuda")
+                engine.add_request(
+                    request_id=request_id,
+                    prompt=prompt * (request_id + 3) % (test_config.vocab_size - 1),
+                    sampling_params=SamplingParams(
+                        num_tokens_to_generate=6, termination_id=-1, top_k=1, top_p=0.0
+                    ),
+                )
+            tokens, step_log = {}, []
+            while engine.has_unfinished_requests():
+                result = engine.step_modern()
+                dims = context.batch_dimensions
+                step_log.append(
+                    (
+                        dims.prefill_req_count,
+                        dims.decode_req_count,
+                        context.using_cuda_graph_this_step(),
+                    )
+                )
+                for request in result["finished_requests"]:
+                    tokens[request.request_id] = list(request.generated_tokens)
+            return env, tokens, sampled_logits, step_log
+
+        env, tokens, logits, step_log = run()
+        if env.engine.context.logits_buffer_multicast_handle is None:
+            # Legitimate only where symmetric memory cannot initialize.
+            if not SymmetricMemoryManager.is_initialized("tp_logits"):
+                nvls_capable = (
+                    HAVE_TORCH_SYMM_MEM
+                    and HAVE_TRITON
+                    and is_device_nvls_capable(torch.device(torch.cuda.current_device()))
+                )
+                assert not nvls_capable, "NVLS is available but no symmetric buffer was tried"
+                pytest.skip("NVLS symmetric memory unavailable on this platform")
+            reason = SymmetricMemoryManager.get_buffer("tp_logits").init_failure_reason
+            assert reason is not None, "symmetric memory initialized but no multicast buffer"
+            pytest.skip(f"symmetric memory unavailable: {reason}")
+
+        # Guard against a vacuous comparison: the model's graphs must exist and replay.
+        model = env.engine.controller.inference_wrapped_model.model
+        assert model.cudagraph_manager.cudagraph_runners
+        graphed_decode_steps = sum(
+            1 for prefill, decode, graphed in step_log if graphed and decode and not prefill
+        )
+        assert graphed_decode_steps >= 2, f"fewer than two graphed decode-only steps: {step_log}"
+
+        # Same graphs with a plain buffer: the gather and copy that the store replaces.
+        self._release_ep_resources()
+        Utils.destroy_model_parallel()
+        monkeypatch.setattr(
+            TextGenerationController, "_try_allocate_symmetric_logits_buffer", lambda *args: None
+        )
+        plain_env, plain_tokens, plain_logits, plain_step_log = run()
+        assert plain_env.engine.context.logits_buffer_multicast_handle is None
+        assert plain_step_log == step_log
+        assert len(plain_logits) == len(logits)
+        for step, (multicast, plain) in enumerate(zip(logits, plain_logits)):
+            assert torch.equal(
+                multicast, plain
+            ), f"sampling call {step}: the multicast store and the gathered copy differ"
+        assert tokens == plain_tokens
+
     # ---- Inference-optimized MoE + expert parallelism + CUDA graphs -------- #
     #
     # `test_parallel_inference` skips inference_optimized whenever ep_size > 1 ("MoE models are
