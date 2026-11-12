@@ -26,6 +26,7 @@ from megatron.core.process_groups_config import (
     ProcessGroupCollection,
     warn_global_process_group_fallback,
 )
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
@@ -110,14 +111,20 @@ class TestGlobalProcessGroupFallbacks:
         assert attention.tp_group is parallel_state.get_tensor_model_parallel_group()
 
     @pytest.mark.skipif(not HAVE_TE, reason="the GPT attention spec needs Transformer Engine")
-    @pytest.mark.parametrize("test_mode", [False, True])
-    def test_self_attention_without_collection_uses_global_groups(self, monkeypatch, test_mode):
+    @pytest.mark.parametrize(
+        "test_mode, qk_layernorm", [(False, False), (False, True), (True, False), (True, True)]
+    )
+    def test_self_attention_without_collection_uses_global_groups(
+        self, monkeypatch, test_mode, qk_layernorm
+    ):
         Utils.initialize_model_parallel(tensor_model_parallel_size=2, context_parallel_size=2)
         global_dp_group = parallel_state.get_data_parallel_group()
-        if not test_mode:
-            # Only run_realtime_tests reads dp, so building must not need an initialized DP group.
+        # Only run_realtime_tests reads the DP groups, and only with test_mode and qk_layernorm.
+        needs_dp = test_mode and qk_layernorm
+        if not needs_dp:
+            # Building must not need an initialized DP group.
             def forbid_dp_group(*args, **kwargs):
-                raise AssertionError("SelfAttention resolved the DP group outside test_mode")
+                raise AssertionError("SelfAttention resolved the DP group without needing it")
 
             monkeypatch.setattr(parallel_state, "get_data_parallel_group", forbid_dp_group)
         config = TransformerConfig(
@@ -128,11 +135,14 @@ class TestGlobalProcessGroupFallbacks:
             context_parallel_size=2,
             use_cpu_initialization=True,
             test_mode=test_mode,
+            qk_layernorm=qk_layernorm,
         )
         with pytest.warns(FutureWarning) as record:
             attention = SelfAttention(
                 config,
-                get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+                get_gpt_layer_with_transformer_engine_submodules(
+                    qk_layernorm=qk_layernorm
+                ).self_attention.submodules,
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
             )
@@ -142,10 +152,158 @@ class TestGlobalProcessGroupFallbacks:
         assert groups["tp"] is parallel_state.get_tensor_model_parallel_group()
         assert groups["cp"] is parallel_state.get_context_parallel_group()
         assert "hcp" in groups
-        if test_mode:
+        if needs_dp:
+            # Without GTP remat the replicate group and the GTP-inclusive group are one group.
             assert groups["dp"] is global_dp_group
+            assert groups["dp_gtp_remat"] is global_dp_group
         else:
             assert "dp" not in groups
+            assert "dp_gtp_remat" not in groups
+
+    @pytest.mark.skipif(not HAVE_TE, reason="the GPT attention spec needs Transformer Engine")
+    @pytest.mark.parametrize(
+        "test_mode, qk_layernorm", [(False, False), (False, True), (True, False)]
+    )
+    def test_self_attention_without_collection_builds_before_initialization(
+        self, test_mode, qk_layernorm
+    ):
+        """Before initialize_model_parallel() the fallback finds no group and TE defers its own."""
+        Utils.destroy_model_parallel()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            test_mode=test_mode,
+            qk_layernorm=qk_layernorm,
+        )
+        submodules = get_gpt_layer_with_transformer_engine_submodules(
+            qk_layernorm=qk_layernorm
+        ).self_attention.submodules
+        with pytest.warns(FutureWarning) as record:
+            attention = SelfAttention(
+                config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+            )
+        _fallback_warning(record, "SelfAttention")
+        # Core attention is handed no collection, so it takes its own fallback and warns as well.
+        _fallback_warning(record, "TEDotProductAttention")
+        assert attention.tp_group is None
+        assert attention.core_attention._tp_group is None
+
+        # An explicit collection without a TP group is still rejected.
+        with pytest.raises(ValueError, match="non-None tp process group"):
+            SelfAttention(
+                config,
+                submodules,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                pg_collection=ProcessGroupCollection(tp=None, cp=None),
+            )
+
+    @pytest.mark.skipif(not HAVE_TE, reason="the GPT attention spec needs Transformer Engine")
+    def test_self_attention_realtime_tests_need_an_initialized_dp_group(self):
+        """With test_mode and qk_layernorm the fallback reads the DP group when it is built."""
+        Utils.destroy_model_parallel()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            test_mode=True,
+            qk_layernorm=True,
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            with pytest.raises(AssertionError, match="is not initialized"):
+                SelfAttention(
+                    config,
+                    get_gpt_layer_with_transformer_engine_submodules(
+                        qk_layernorm=True
+                    ).self_attention.submodules,
+                    layer_number=1,
+                    attn_mask_type=AttnMaskType.causal,
+                )
+
+    @pytest.mark.skipif(not HAVE_TE, reason="the GPT attention spec needs Transformer Engine")
+    @pytest.mark.skipif(not HAVE_GTP, reason="GTP requires Transformer Engine >= 2.19")
+    @pytest.mark.skipif(Utils.world_size % 2 != 0, reason="GTP remat of 2 needs an even world size")
+    @pytest.mark.parametrize("collection", ["omitted", "full", "dp_only"])
+    def test_realtime_tests_compare_qk_layernorm_across_gtp_remat_peers(
+        self, monkeypatch, collection
+    ):
+        """run_realtime_tests covers GTP-remat peers, as the global DP accessors did by default."""
+        Utils.initialize_model_parallel(gtp_remat_size=2)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            test_mode=True,
+            qk_layernorm=True,
+        )
+        kwargs = {}
+        if collection == "full":
+            kwargs["pg_collection"] = ProcessGroupCollection.use_mpu_process_groups()
+        elif collection == "dp_only":
+            # A collection for a custom grid may carry only its own dp group.
+            kwargs["pg_collection"] = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", FutureWarning)
+            attention = SelfAttention(
+                config,
+                get_gpt_layer_with_transformer_engine_submodules(
+                    qk_layernorm=True
+                ).self_attention.submodules,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                **kwargs,
+            ).cuda()
+
+        # Identical parameters pass on every rank.
+        attention.run_realtime_tests()
+
+        # Each replicate-DP group stays consistent; the groups, one per GTP-remat peer, differ.
+        replicate_dp_group = parallel_state.get_data_parallel_group(with_gtp_remat=False)
+        replicate_dp_ranks = torch.distributed.get_process_group_ranks(replicate_dp_group)
+        with torch.no_grad():
+            attention.q_layernorm.weight.fill_(1.0 + min(replicate_dp_ranks))
+
+        if collection == "dp_only":
+
+            def forbid_dp_group(*args, **kwargs):
+                raise AssertionError("run_realtime_tests read the global DP group")
+
+            monkeypatch.setattr(parallel_state, "get_data_parallel_group", forbid_dp_group)
+            attention.run_realtime_tests()
+        else:
+            with pytest.raises(AssertionError, match="Discrepancy between q_w in DP ranks"):
+                attention.run_realtime_tests()
+
+    @pytest.mark.skipif(not HAVE_TE, reason="the GPT attention spec needs Transformer Engine")
+    def test_self_attention_test_mode_requires_a_dp_group(self):
+        Utils.initialize_model_parallel()
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            test_mode=True,
+            qk_layernorm=True,
+        )
+        with pytest.raises(ValueError, match="requires a dp process group"):
+            SelfAttention(
+                config,
+                get_gpt_layer_with_transformer_engine_submodules(
+                    qk_layernorm=True
+                ).self_attention.submodules,
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                    required_pgs=['tp', 'cp']
+                ),
+            )
 
     @requires_te_hierarchical_cp
     def test_self_attention_without_collection_supports_hierarchical_cp(self):
@@ -242,6 +400,35 @@ class TestGlobalProcessGroupFallbacks:
         _fallback_warning(record, "MultiTokenPredictionBlock")
         assert mtp.cp_group is parallel_state.get_context_parallel_group()
         assert mtp.tp_group is parallel_state.get_tensor_model_parallel_group()
+
+    @pytest.mark.skipif(not HAVE_TE, reason="the GPT attention spec needs Transformer Engine")
+    def test_mtp_block_without_collection_resolves_dp_groups_for_realtime_tests(self):
+        Utils.initialize_model_parallel()
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            num_layers=2,
+            hidden_size=64,
+            num_attention_heads=8,
+            use_cpu_initialization=True,
+            test_mode=True,
+            qk_layernorm=True,
+        )
+        spec = get_gpt_mtp_block_spec(
+            config=config,
+            spec=get_gpt_layer_with_transformer_engine_spec(qk_layernorm=True),
+            use_transformer_engine=True,
+        )
+        with pytest.warns(FutureWarning) as record:
+            mtp = MultiTokenPredictionBlock(config=config, spec=spec)
+        _fallback_warning(record, "MultiTokenPredictionBlock")
+        attentions = [m for m in mtp.modules() if isinstance(m, SelfAttention)]
+        assert attentions
+        for attention in attentions:
+            # Without GTP remat the two groups are one object, so check the fields themselves.
+            groups = vars(attention.pg_collection)
+            assert groups["dp_gtp_remat"] is parallel_state.get_data_parallel_group()
+            assert groups["dp"] is parallel_state.get_data_parallel_group(with_gtp_remat=False)
+            assert attention._realtime_test_dp_group() is groups["dp_gtp_remat"]
 
     def test_mtp_placement_without_pp_group_uses_global_group(self):
         Utils.initialize_model_parallel(pipeline_model_parallel_size=2)

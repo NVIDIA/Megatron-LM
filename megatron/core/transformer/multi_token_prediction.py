@@ -2515,6 +2515,10 @@ class MultiTokenPredictionBlock(MegatronModule):
             required_pgs = ['cp', 'hcp', 'tp', 'pp'] + (
                 ['dp', 'gtp_remat'] if self.config.mtp_hsm else []
             )
+            if self.config.test_mode and self.config.qk_layernorm:
+                # SelfAttention.run_realtime_tests in the MTP layers compares the Q/K layernorm
+                # parameters across the data-parallel group.
+                required_pgs += [g for g in ('dp', 'dp_gtp_remat') if g not in required_pgs]
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
         # Ensure the provided process groups include TP, CP, and PP.
         for group_name in ('tp', 'cp', 'pp'):
