@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
-import re
 import sys
 from pathlib import Path
 
@@ -58,14 +57,6 @@ def pytest_runtest_logreport(report):
             file=sys.stderr,
             flush=True,
         )
-
-
-def pytest_runtest_setup(item):
-    """Run ``large`` tests only when the -m expression names the marker."""
-    if item.get_closest_marker("large") and not re.search(
-        r"\blarge\b", item.config.getoption("markexpr") or ""
-    ):
-        pytest.skip("large test: opt in with -m large")
 
 
 @pytest.fixture(autouse=True)
