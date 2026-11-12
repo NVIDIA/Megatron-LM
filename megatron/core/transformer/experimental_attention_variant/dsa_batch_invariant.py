@@ -16,7 +16,10 @@ from megatron.core.inference.contexts.attention_context.dsa_metadata import (
 try:
     import deep_select
 except ImportError as error:
-    raise ImportError("Batch-invariant simplified DSA requires the inference extra.") from error
+    raise ImportError(
+        "Batch-invariant simplified DSA requires DeepSelect; install the batch_invariant "
+        "dependency group."
+    ) from error
 
 
 def project(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
@@ -52,7 +55,8 @@ def score_width(max_seq_length: int | None, topk: int) -> int:
 def select(
     scores: torch.Tensor, lengths: torch.Tensor, topk: int, *, out: torch.Tensor | None = None
 ) -> torch.Tensor:
-    """Select request-local positions in ascending order, with trailing -1 padding."""
+    """Select request-local positions in ascending order
+    (to support fixed order for tied scores), with trailing -1 padding."""
     _, indices = deep_select.topk(
         scores,
         topk,

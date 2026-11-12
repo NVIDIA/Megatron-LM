@@ -1106,14 +1106,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/experimental_attention_variant/dsa_batch_invariant.py",
             "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference_kernels.py",
         ),
-        tests=(
-            K + "test_dsa_batch_invariant.py",
-            "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_batch_invariant.py",
-        ),
+        tests=(K + "test_dsa_batch_invariant.py",),
         kind="dispatch",
         training_path=True,
         notes="DeepSelect ties, fixed forward reduction, contiguous/paged/chunked/decode and "
-        "CUDA graph exact replay; backward accumulation is checked numerically separately.",
+        "CUDA graph exact replay; backward accumulation is checked against FP64 references.",
     ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
@@ -1151,21 +1148,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/transformer/experimental_attention_variant/dsa_min_memory_triton.py",
         ),
-        tests=(
-            "tests/unit_tests/transformer/test_dsa_min_memory_kernels.py",
-            "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_batch_invariant.py",
-        ),
+        tests=("tests/unit_tests/transformer/test_dsa_min_memory_kernels.py",),
         kind="triton",
         notes="Streaming top-k routing, selected-score forward/backward, scatter of the selected "
         "gradient and the normalized weight gradient. The tests assert torch.equal against the "
-        "torch reference on the rows top-k orders stably.",
+        "torch reference on the rows top-k orders stably. The batch-invariant -1 support suffix "
+        "and FP32 value-gradient path are exercised indirectly through dsa_min_memory_gqa in "
+        "test_dsa_batch_invariant.py.",
     ),
     KernelEntry(
         name="dsa_min_memory_torch",
         sources=("megatron/core/transformer/experimental_attention_variant/dsa_min_memory.py",),
         tests=(
             "tests/unit_tests/transformer/test_dsa_min_memory_kernels.py",
-            "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_batch_invariant.py",
+            K + "test_dsa_batch_invariant.py",
         ),
         kind="torch-op",
         notes="index_add_ accumulates the key, value and indexer-K gradients where top-k selects "

@@ -2645,7 +2645,6 @@ dev = [
     { name = "zstandard" },
 ]
 inference = [
-    { name = "deep-select" },
     { name = "flashinfer-python" },
     { name = "torch-memory-saver" },
 ]
@@ -2684,6 +2683,7 @@ training = [
 [package.dev-dependencies]
 batch-invariant = [
     { name = "deep-gemm" },
+    { name = "deep-select" },
 ]
 build = [
     { name = "cython" },
@@ -2717,6 +2717,7 @@ linting = [
 ]
 no-pypi-wheels = [
     { name = "deep-gemm" },
+    { name = "deep-select" },
     { name = "emerging-optimizers" },
     { name = "flash-mla" },
 ]
@@ -2747,7 +2748,6 @@ requires-dist = [
     { name = "av", marker = "extra == 'dev'" },
     { name = "causal-conv1d", marker = "extra == 'ssm'", specifier = "~=1.5" },
     { name = "datasets", marker = "extra == 'dev'" },
-    { name = "deep-select", marker = "extra == 'inference'", git = "https://github.com/deepseek-ai/DeepSelect.git?rev=bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18" },
     { name = "einops", marker = "extra == 'dev'", specifier = "~=0.8" },
     { name = "emerging-optimizers", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.3.0" },
     { name = "fast-hadamard-transform", marker = "extra == 'dev'", git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" },
@@ -2797,7 +2797,10 @@ requires-dist = [
 provides-extras = ["training", "mlm", "dev", "inference", "otel", "lts", "te", "ssm"]
 
 [package.metadata.requires-dev]
-batch-invariant = [{ name = "deep-gemm", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=ea2b7805b97956268bed1adf94591f428ded6cc1" }]
+batch-invariant = [
+    { name = "deep-gemm", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=ea2b7805b97956268bed1adf94591f428ded6cc1" },
+    { name = "deep-select", git = "https://github.com/deepseek-ai/DeepSelect.git?rev=bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18" },
+]
 build = [
     { name = "cython", specifier = ">=3.0.0" },
     { name = "hatchling" },
@@ -2830,6 +2833,7 @@ linting = [
 ]
 no-pypi-wheels = [
     { name = "deep-gemm", git = "https://github.com/deepseek-ai/DeepGEMM.git?rev=ea2b7805b97956268bed1adf94591f428ded6cc1" },
+    { name = "deep-select", git = "https://github.com/deepseek-ai/DeepSelect.git?rev=bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18" },
     { name = "emerging-optimizers", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.3.0" },
     { name = "flash-mla", git = "https://github.com/deepseek-ai/FlashMLA?rev=nv_dev" },
 ]
