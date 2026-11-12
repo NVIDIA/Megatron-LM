@@ -20,6 +20,7 @@ from megatron.core.transformer.attention import Attention, SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.packed_seq_test_utils import make_test_packed_seq_params
 from tests.unit_tests.transformer.parallel_test_utils import _test_parallel_attention_correctness
 
 pytestmark = pytest.mark.usefixtures("run_config")
