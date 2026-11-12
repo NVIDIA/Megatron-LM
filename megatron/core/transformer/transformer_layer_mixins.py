@@ -394,11 +394,16 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
             return True
 
         # import modules here to avoid a circular import
+        from megatron.core.transformer.cuda_graphs import _attention_runs_eager_under_packing
         from megatron.core.transformer.moe.moe_layer import MoELayer
 
-        if CudaGraphModule.attn in modules and not (
-            isinstance(self.self_attention, IdentityOp)
-            and isinstance(self.cross_attention, IdentityOp)
+        if (
+            CudaGraphModule.attn in modules
+            and not (
+                isinstance(self.self_attention, IdentityOp)
+                and isinstance(self.cross_attention, IdentityOp)
+            )
+            and not _attention_runs_eager_under_packing(self.self_attention, self.config)
         ):
             # attn layer.
             return True

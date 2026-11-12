@@ -2308,6 +2308,24 @@ class CudaGraphManager(torch.nn.Module):
 
 
 # The following functions are for capturing CUDA Graphs using TE make_graphed_callables().
+def _attention_runs_eager_under_packing(attention, config) -> bool:
+    """Whether a packed-THD GDN-family (GDN / KDA) attention must stay out of per-layer graphs.
+
+    Packed GDN-family layers check their boundaries on the host, and FLA derives its chunk
+    indices on the host from the boundary values (cached by tensor identity), so a captured
+    layer would replay the pack layout of its capture sample, or fail on the host copy during
+    capture. With a sequence packing scheduler these layers therefore run eagerly while the
+    other layers of the scope are captured. (Upstream, NVIDIA/Megatron-LM#8840 makes them
+    capturable in chunk-wise graphs with FLA >= 0.6.)
+    """
+    if getattr(config, "sequence_packing_scheduler", None) is None:
+        return False
+    # import here to avoid a circular import
+    from megatron.core.ssm.gated_delta_net.common import _GDNBase
+
+    return isinstance(attention, _GDNBase)
+
+
 def _te_cuda_graph_layer_is_graphable(layer, config):
     """Check whether a module registered a TE graph for the requested scope."""
     return (

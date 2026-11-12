@@ -153,6 +153,7 @@ class HyperConnectionHybridLayer(TECudaGraphMixin, GraphableMegatronModule):
             return True
         # Import here to avoid a circular import.
         from megatron.core.ssm.mamba_layer import MambaLayer
+        from megatron.core.transformer.cuda_graphs import _attention_runs_eager_under_packing
         from megatron.core.transformer.mlp import MLP
         from megatron.core.transformer.moe.moe_layer import MoELayer
 
@@ -167,9 +168,13 @@ class HyperConnectionHybridLayer(TECudaGraphMixin, GraphableMegatronModule):
                     or CudaGraphModule.moe_router in modules
                     or CudaGraphModule.moe_preprocess in modules
                 )
-            if CudaGraphModule.attn in modules and not (
-                isinstance(inner.self_attention, IdentityOp)
-                and isinstance(inner.cross_attention, IdentityOp)
+            if (
+                CudaGraphModule.attn in modules
+                and not (
+                    isinstance(inner.self_attention, IdentityOp)
+                    and isinstance(inner.cross_attention, IdentityOp)
+                )
+                and not _attention_runs_eager_under_packing(inner.self_attention, inner.config)
             ):
                 return True
             if CudaGraphModule.mlp in modules and isinstance(inner.mlp, MLP):
