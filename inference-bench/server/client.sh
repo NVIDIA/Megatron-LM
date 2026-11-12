@@ -70,7 +70,12 @@ until [ -f "${EXP_DIR}/host" ]; do
     fi
     sleep 10
 done
-SERVER="http://$(cat "${EXP_DIR}/host"):5000"
+SERVER_HOST=$(cat "${EXP_DIR}/host")
+# Cluster DNS occasionally fails to resolve a node name for a moment; a client that starts then
+# would fail its first request and end the run. Wait (up to 5 min) until the name resolves.
+for _ in $(seq 60); do getent hosts "${SERVER_HOST}" > /dev/null && break; sleep 5; done
+getent hosts "${SERVER_HOST}" > /dev/null || echo "warning: ${SERVER_HOST} does not resolve"
+SERVER="http://${SERVER_HOST}:5000"
 TOKENIZER=$(sed -n 's/^TOKENIZER=//p' "${EXP_DIR}/config.env")
 echo "Client on $(hostname), server ${SERVER}"
 cat >> "${EXP_DIR}/config.env" <<EOF
