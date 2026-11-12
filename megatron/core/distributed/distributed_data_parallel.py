@@ -116,7 +116,17 @@ class DistributedDataParallel(_BaseDataParallel):
     def _validate_config(
         config: TransformerConfig, ddp_config: DistributedDataParallelConfig
     ) -> None:
-        """Validate model settings that depend on the data-parallel configuration."""
+        """Validate resolved buffer policy and model settings before wrapper setup."""
+        if ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            assert (
+                ddp_config.fp8_param_gather
+            ), "Reuse grad buffer only when keeping params in MXFP8."
+            if ddp_config.grad_buffer_offload:
+                raise ValueError(
+                    "Gradient-buffer offload is incompatible with "
+                    "reuse_grad_buf_for_mxfp8_param_ag because parameters share gradient storage."
+                )
+
         if config.moe_virtual_expert_load_balance and config.fp8:
             if not ddp_config.fp8_param_gather:
                 raise ValueError(
@@ -137,6 +147,7 @@ class DistributedDataParallel(_BaseDataParallel):
         pg_collection: Optional[ProcessGroupCollection] = None,
         full_param_layout: Optional[FullParamLayout] = None,
     ):
+        ddp_config.finalize()
         self._validate_config(config, ddp_config)
         super().__init__(config=config, module=module)
         if has_config_logger_enabled(config):
@@ -155,6 +166,7 @@ class DistributedDataParallel(_BaseDataParallel):
         dp_group = process_group_dict['dp_group']
         if ddp_config.bucket_size is None:
             ddp_config.bucket_size = max(40000000, 1000000 * dp_group.size())
+            ddp_config._bucket_size_resolved = True
         # Set bucket_size to infinity if overlap_grad_reduce is False.
         if not ddp_config.overlap_grad_reduce:
             ddp_config.bucket_size = None

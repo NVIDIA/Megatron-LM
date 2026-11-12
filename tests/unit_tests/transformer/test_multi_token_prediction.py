@@ -26,6 +26,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.num_microbatches_calculator import destroy_num_microbatches_calculator
+from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import (
     get_context_parallel_group,
@@ -34,7 +35,6 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import checkpoint as tensor_parallel_checkpoint
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -89,7 +89,7 @@ from megatron.training.global_vars import (
 )
 from megatron.training.training import get_model, setup_model_and_optimizer
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 if HAVE_TE:
     from megatron.core.extensions.transformer_engine import TEColumnParallelGroupedLinear
@@ -1521,6 +1521,60 @@ class TestMultiTokenPredictionLayer:
         assert output_weight.grad is not None
         assert torch.count_nonzero(output_weight.grad) == 0
 
+    @pytest.mark.parametrize(
+        ("normalize_by_main_tokens", "expected_valid_gradient"), [(False, 4.0 / 3.0), (True, 1.0)]
+    )
+    def test_process_mtp_loss_main_token_normalization_is_opt_in(
+        self, normalize_by_main_tokens, expected_valid_gradient
+    ):
+        """The opt-in path leaves MTP as a sum for global main-token finalization."""
+        config = TransformerConfig(
+            mtp_num_layers=1,
+            mtp_loss_scaling_factor=1.0,
+            mtp_normalize_loss_by_main_tokens=normalize_by_main_tokens,
+            calculate_per_token_loss=True,
+            num_layers=2,
+            hidden_size=1,
+            num_attention_heads=1,
+            use_cpu_initialization=True,
+        )
+        seq_len = 4
+        hidden_states = torch.ones(2 * seq_len, 1, 1, requires_grad=True)
+        mtp_module.MTPLossAutoScaler.set_loss_scale(torch.tensor(1.0))
+
+        result = process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=torch.arange(seq_len).unsqueeze(0),
+            loss_mask=torch.ones(1, seq_len),
+            output_layer=lambda hidden, **kwargs: (hidden, None),
+            output_weight=None,
+            is_training=False,
+            compute_language_model_loss=lambda labels, logits: logits.squeeze(-1).transpose(0, 1),
+            config=config,
+        )
+        result.sum().backward()
+
+        mtp_grad = hidden_states.grad[seq_len:, 0, 0]
+        expected = torch.tensor(
+            [expected_valid_gradient] * (seq_len - 1) + [0.0], dtype=mtp_grad.dtype
+        )
+        assert torch.allclose(mtp_grad, expected)
+
+    def test_main_token_mtp_normalization_requires_per_token_loss(self):
+        with pytest.raises(
+            ValueError,
+            match="mtp_normalize_loss_by_main_tokens=True requires calculate_per_token_loss=True",
+        ):
+            TransformerConfig(
+                mtp_num_layers=1,
+                mtp_normalize_loss_by_main_tokens=True,
+                calculate_per_token_loss=False,
+                num_layers=2,
+                hidden_size=1,
+                num_attention_heads=1,
+                use_cpu_initialization=True,
+            )
+
     def test_process_mtp_loss_masks_later_steps_after_invalid_input(self):
         """Mask an MTP prediction after its conditioning path reaches an invalid token."""
         config = TransformerConfig(
@@ -1881,7 +1935,7 @@ class TestMTPHiddenStateRollUnderParallelism:
                 None if cu_seqlens_padded is None else cu_seqlens_padded.view(1, -1)
             ),
         }
-        batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=cp_group)
+        batch = get_batch_on_this_cp_rank(batch, dynamic_cp=False, cp_group=cp_group)
         positions = batch["tokens"][0]
         if sequence_parallel:
             positions = positions.chunk(get_pg_size(tp_group))[get_pg_rank(tp_group)]
@@ -2710,9 +2764,7 @@ class TestMultiTokenPrediction:
             config=config,
             transformer_layer_spec=transformer_layer_spec,
             mtp_block_spec=mtp_block_spec,
-            # create_test_args builds args without a tokenizer, so args.vocab_size stays
-            # None; padded_vocab_size is what the training entrypoint passes anyway.
-            vocab_size=cfg_container.tokenizer.padded_vocab_size,
+            vocab_size=cfg_container.model.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -2949,6 +3001,7 @@ class TestMultiTokenPrediction:
             tmp_path_dist_ckpt / 'test_mtp_model_reconfiguration_model_A'
         ) as ckpt_dir_A:
             set_ckpt_path(ckpt_dir_A)
+            sync_checkpoint_config(get_args())
             save_checkpoint(
                 iteration,
                 gpt_model_ref,
@@ -2972,13 +3025,14 @@ class TestMultiTokenPrediction:
             gpt_model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
                 ModelType.encoder_or_decoder, self.model_provider
             )
+            sync_checkpoint_config(args)
             load_checkpoint(
                 gpt_model, optimizer, opt_param_scheduler, strict=False, restore_training_state=True
             )
             batch["output_ref"] = output_ref
             # Get batch for current CP rank (handles CP tensor splitting)
             batch = get_batch_on_this_cp_rank(
-                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                batch, dynamic_cp=False, cp_group=get_context_parallel_group()
             )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = gpt_model[0].forward(
@@ -3099,7 +3153,7 @@ class TestMultiTokenPrediction:
 
         batch = self.get_batch(self.seq_length, self.micro_batch_size)
         batch = get_batch_on_this_cp_rank(
-            batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+            batch, dynamic_cp=False, cp_group=get_context_parallel_group()
         )
         gpt_model, _, _ = setup_model_and_optimizer(
             ModelType.encoder_or_decoder, self.model_provider
@@ -5034,7 +5088,7 @@ class TestMultiTokenPredictionHybrid:
         cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout="contiguous",
-            is_hybrid_cp=False,
+            dynamic_cp=False,
             cp_group=cp_group,
             additional_layouts=("zigzag",),
             sequence_parallel=tp > 1,
@@ -5344,7 +5398,7 @@ class TestMultiTokenPredictionHybrid:
         model = HybridModel(
             config=config,
             hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=cfg_container.tokenizer.vocab_size,
+            vocab_size=cfg_container.model.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -5528,6 +5582,7 @@ class TestMultiTokenPredictionHybrid:
             embedding=None,
             mtp=MTPStub(),
             output_layer=output_layer,
+            lm_head_can_emit_fp32=False,
             training=True,
             compute_language_model_loss=compute_language_model_loss,
             pg_collection=types.SimpleNamespace(
@@ -5889,6 +5944,7 @@ class TestMultiTokenPredictionHybrid:
 
         with TempNamedDir(tmp_path_dist_ckpt / 'test_mtp_mamba_model_reconfiguration') as ckpt_dir:
             set_ckpt_path(ckpt_dir)
+            sync_checkpoint_config(get_args())
             save_checkpoint(
                 iteration,
                 mamba_model_ref,
@@ -5924,6 +5980,7 @@ class TestMultiTokenPredictionHybrid:
                 cfg_container=cfg_container,
                 pg_collection=pg_collection,
             )
+            sync_checkpoint_config(args)
             load_checkpoint(
                 mamba_model,
                 optimizer,
@@ -5934,7 +5991,7 @@ class TestMultiTokenPredictionHybrid:
 
             batch["output_ref"] = output_ref
             batch = get_batch_on_this_cp_rank(
-                batch, is_hybrid_cp=False, cp_group=get_context_parallel_group()
+                batch, dynamic_cp=False, cp_group=get_context_parallel_group()
             )
             tokens, labels, loss_mask, attention_mask, position_ids, output_ref = batch.values()
             output = mamba_model[0].forward(

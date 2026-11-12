@@ -271,6 +271,7 @@ class TestDynamicContext:
         enable_chunked_prefill: bool = False,
         max_requests: int = None,
         expert_model_parallel_size: int = 1,
+        expert_tensor_parallel_size: int = None,
         reserve_recurrent_state_dummy_slot: bool = False,
         mamba_memory_ratio: float = None,
     ):
@@ -296,6 +297,7 @@ class TestDynamicContext:
                 kv_channels=kv_channels,
                 num_attention_heads=num_attention_heads,
                 expert_model_parallel_size=expert_model_parallel_size,
+                expert_tensor_parallel_size=expert_tensor_parallel_size,
                 num_moe_experts=2 if expert_model_parallel_size > 1 else None,
             ),
             inference_config=InferenceConfig(
@@ -2931,6 +2933,25 @@ class TestDynamicContext:
         assert ctx._cpu_mamba_batch_indices_decode[0] == metadata.dummy_state_idx
         ctx.reset()
         assert metadata.mamba_state_free_slot_count == 0
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize(
+        "expert_model_parallel_size, expert_tensor_parallel_size, expected",
+        [(1, 1, False), (2, 1, True), (1, 2, True)],
+    )
+    def test_hybrid_dummy_slot_reserved_when_tp_ep_group_has_peers(
+        self, expert_model_parallel_size, expert_tensor_parallel_size, expected
+    ):
+        # The work consensus runs over the tp_ep group (ETP x EP), so TP > 1 with EP = 1
+        # can also run a dummy forward and needs the reserved recurrent-state slot.
+        ctx = self._get_hybrid_ep_context(
+            num_cuda_graphs=16,
+            expert_model_parallel_size=expert_model_parallel_size,
+            expert_tensor_parallel_size=expert_tensor_parallel_size,
+            reserve_recurrent_state_dummy_slot=True,
+        )
+        assert ctx.reserve_recurrent_state_dummy_slot is expected
 
     @pytest.mark.internal
     @rounder_override(1)

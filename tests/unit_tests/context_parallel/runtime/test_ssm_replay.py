@@ -138,7 +138,10 @@ def test_gdp_chunkwise_runtime_cp_full_head_gating_replays():
     mixer = GatedDeltaProductMixer.__new__(GatedDeltaProductMixer)
     torch.nn.Module.__init__(mixer)
     mixer.config = SimpleNamespace(
-        linear_cp_mode="chunkwise", linear_cp_layout="contiguous", gdp_cutedsl_kernel=False
+        linear_cp_mode="chunkwise",
+        linear_cp_layout="contiguous",
+        gdp_cutedsl_kernel=False,
+        gdp_g_clamp_value=None,
     )
     mixer.pg_collection = SimpleNamespace(cp=SimpleNamespace(size=lambda: 4, rank=lambda: 0))
     mixer.cp = None

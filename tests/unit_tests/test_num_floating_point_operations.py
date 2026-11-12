@@ -12,13 +12,19 @@ For unpacked BSHD with a full causal mask the L^2 work is exactly
 These tests pin both code paths and the accumulator math.
 """
 
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
 import torch
 
 import megatron.training.training as training_module
+from megatron.core.activations import situlu
+from megatron.core.models.hybrid.hybrid_layer_specs import gdp_stack_spec
+from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.training.logging.dsa_flops import dsa_indexer_flops, dsa_layer_flops
+from megatron.training.models import GPTModelConfig, HybridModelConfig
 from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
     consume_vision_model_flops_stats,
@@ -126,6 +132,104 @@ def _make_hybrid_args(*, num_layers=4, hidden_size=512, num_attention_heads=8, s
     return args, cfg
 
 
+def _make_gpt_config(
+    *,
+    num_layers=4,
+    hidden_size=512,
+    num_attention_heads=8,
+    seq_length=1024,
+    swiglu=True,
+    ffn_hidden_size=None,
+    padded_vocab_size=32000,
+):
+    """Dense MHA Transformer (no GQA, MoE, MLA, or MTP)."""
+    return GPTModelConfig(
+        transformer=TransformerConfig(
+            num_layers=num_layers,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            ffn_hidden_size=ffn_hidden_size if ffn_hidden_size is not None else 4 * hidden_size,
+            gated_linear_unit=swiglu,
+            activation_func=torch.nn.functional.silu if swiglu else torch.nn.functional.gelu,
+        ),
+        seq_length=seq_length,
+        vocab_size=padded_vocab_size,
+    )
+
+
+def _make_hybrid_config(*, num_layers=4, hidden_size=512, num_attention_heads=8, seq_length=1024):
+    """Minimal args for a 2-attn + 2-mamba hybrid model."""
+    args = _make_gpt_config(
+        num_layers=num_layers,
+        hidden_size=hidden_size,
+        num_attention_heads=num_attention_heads,
+        seq_length=seq_length,
+    )
+    # ``M`` = Mamba, ``*`` = attention, ``-`` = MLP.
+    args.transformer.mamba_state_dim = 128
+    args.transformer.mamba_head_dim = 64
+    args.transformer.mamba_num_groups = 8
+    args.transformer.mamba_num_heads = 128
+    args.transformer.gdp_num_householder = 3
+    return HybridModelConfig(
+        transformer=args.transformer,
+        seq_length=seq_length,
+        vocab_size=args.vocab_size,
+        hybrid_layer_pattern="*M*M",
+    )
+
+
+def _args_model_config(args, cfg):
+    """Build a model-config view of a flat, dev-style ``args`` namespace.
+
+    ``num_floating_point_operations`` reads a model config with a nested
+    ``transformer`` config. The flat fixtures map onto it field for field,
+    except for the names the config API derives differently: the GLU
+    activation, the MoE expert count, the GQA group count, and the vocab.
+    """
+    situ_glu = getattr(args, "situ_glu", False)
+    transformer = SimpleNamespace(**vars(args))
+    transformer.gated_linear_unit = bool(args.swiglu or situ_glu)
+    if situ_glu:
+        transformer.activation_func = situlu
+    elif args.swiglu:
+        transformer.activation_func = torch.nn.functional.silu
+    else:
+        transformer.activation_func = torch.nn.functional.gelu
+    transformer.num_moe_experts = args.num_experts
+    if not args.group_query_attention:
+        transformer.num_query_groups = args.num_attention_heads
+    transformer.tensor_model_parallel_size = 1
+    return SimpleNamespace(
+        transformer=transformer,
+        hybrid_layer_pattern=args.hybrid_layer_pattern,
+        seq_length=args.seq_length,
+        vocab_size=cfg.tokenizer.padded_vocab_size,
+        should_pad_vocab=False,
+        make_vocab_size_divisible_by=1,
+    )
+
+
+def _flops(args, cfg, batch_size, **kwargs):
+    """Call ``num_floating_point_operations`` with an ``(args, cfg)`` fixture pair.
+
+    Model configs (``GPTModelConfig`` / ``HybridModelConfig``) pass through
+    unchanged. Flat ``args`` namespaces go through ``_args_model_config`` and
+    also supply the vision-encoder metadata.
+    """
+    if hasattr(args, "transformer"):
+        model_config = args
+    else:
+        model_config = _args_model_config(args, cfg)
+        kwargs.setdefault("vision_args", args)
+    decoder_seq_length = getattr(args, "decoder_seq_length", None)
+    kwargs.setdefault(
+        "sequence_length",
+        decoder_seq_length if decoder_seq_length is not None else args.seq_length,
+    )
+    return num_floating_point_operations(model_config, batch_size, **kwargs)
+
+
 def _make_kda_hybrid_args():
     """Minimal KDA dimensions for hybrid FLOPs tests."""
     args, cfg = _make_hybrid_args()
@@ -159,9 +263,9 @@ def test_situ_glu_counts_the_same_ffn_gemms_as_swiglu():
     situ_glu_args, situ_glu_cfg = _make_gpt_args(swiglu=False)
     situ_glu_args.situ_glu = True
 
-    assert num_floating_point_operations(
+    assert _flops(
         situ_glu_args, situ_glu_cfg, batch_size=8
-    ) == num_floating_point_operations(swiglu_args, swiglu_cfg, batch_size=8)
+    ) == _flops(swiglu_args, swiglu_cfg, batch_size=8)
 
 
 def _enable_qwen35_vision_flops(args, validate=True):
@@ -195,28 +299,32 @@ class TestBSHDBackwardCompat:
     """For unpacked BSHD, the new optional arg must not change the result."""
 
     def test_default_matches_explicit_bshd(self):
-        args, cfg = _make_gpt_args()
+        args = _make_gpt_config()
         batch_size = 8
 
-        default_flops = num_floating_point_operations(args, cfg, batch_size)
+        default_flops = num_floating_point_operations(
+            args, batch_size, sequence_length=args.seq_length
+        )
         explicit_flops = num_floating_point_operations(
             args,
-            cfg,
             batch_size,
+            sequence_length=args.seq_length,
             seqlen_squared_sum_in_batch=batch_size * args.seq_length * args.seq_length,
         )
 
         assert default_flops == explicit_flops
 
     def test_hybrid_default_matches_explicit_bshd(self):
-        args, cfg = _make_hybrid_args()
+        args = _make_hybrid_config()
         batch_size = 4
 
-        default_flops = num_floating_point_operations(args, cfg, batch_size)
+        default_flops = num_floating_point_operations(
+            args, batch_size, sequence_length=args.seq_length
+        )
         explicit_flops = num_floating_point_operations(
             args,
-            cfg,
             batch_size,
+            sequence_length=args.seq_length,
             seqlen_squared_sum_in_batch=batch_size * args.seq_length * args.seq_length,
         )
 
@@ -224,34 +332,43 @@ class TestBSHDBackwardCompat:
 
     def test_mla_default_matches_explicit_bshd(self):
         """MLA self-attention also splits into token-linear + L^2 parts."""
-        args, cfg = _make_gpt_args(num_attention_heads=8)
-        args.multi_latent_attention = True
-        args.group_query_attention = False
-        args.q_lora_rank = None
-        args.qk_head_dim = 64
-        args.qk_pos_emb_head_dim = 32
-        args.kv_lora_rank = 256
-        args.v_head_dim = 64
+        args = _make_gpt_config(num_attention_heads=8)
+        args.transformer = MLATransformerConfig(
+            num_layers=args.num_layers,
+            hidden_size=args.hidden_size,
+            num_attention_heads=args.num_attention_heads,
+            ffn_hidden_size=args.ffn_hidden_size,
+            activation_func=torch.nn.functional.silu,
+            gated_linear_unit=True,
+            q_lora_rank=None,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=32,
+            kv_lora_rank=256,
+            v_head_dim=64,
+        )
         batch_size = 4
 
-        default_flops = num_floating_point_operations(args, cfg, batch_size)
+        default_flops = num_floating_point_operations(
+            args, batch_size, sequence_length=args.seq_length
+        )
         explicit_flops = num_floating_point_operations(
             args,
-            cfg,
             batch_size,
+            sequence_length=args.seq_length,
             seqlen_squared_sum_in_batch=batch_size * args.seq_length * args.seq_length,
         )
 
         assert default_flops == explicit_flops
 
     def test_multimodal_defaults_use_decoder_sequence_length(self):
-        multimodal_args, multimodal_cfg = _make_gpt_args(seq_length=256)
-        multimodal_args.decoder_seq_length = 4096
-        language_args, language_cfg = _make_gpt_args(seq_length=4096)
+        multimodal_args = _make_gpt_config(seq_length=256)
+        language_args = _make_gpt_config(seq_length=4096)
 
         assert num_floating_point_operations(
-            multimodal_args, multimodal_cfg, batch_size=8
-        ) == num_floating_point_operations(language_args, language_cfg, batch_size=8)
+            multimodal_args, batch_size=8, sequence_length=4096
+        ) == num_floating_point_operations(
+            language_args, batch_size=8, sequence_length=language_args.seq_length
+        )
 
 
 class TestMTPE2ETVFlops:
@@ -263,10 +380,10 @@ class TestMTPE2ETVFlops:
         args.mtp_num_layers = 3
         args.mtp_loss_type = "cross_entropy"
         batch_size = 2
-        cross_entropy_flops = num_floating_point_operations(args, cfg, batch_size)
+        cross_entropy_flops = _flops(args, cfg, batch_size)
 
         args.mtp_loss_type = "e2e_tv"
-        e2e_tv_flops = num_floating_point_operations(args, cfg, batch_size)
+        e2e_tv_flops = _flops(args, cfg, batch_size)
 
         expected_extra = (
             2 * batch_size * args.seq_length * args.hidden_size * cfg.tokenizer.padded_vocab_size
@@ -286,7 +403,7 @@ class TestQwen35VisionFlops:
     )
     def test_runtime_grid_stats_add_exact_vision_flops(self, args, cfg):
         batch_size = 2
-        decoder_flops = num_floating_point_operations(args, cfg, batch_size)
+        decoder_flops = _flops(args, cfg, batch_size)
         _enable_qwen35_vision_flops(args)
 
         # Equivalent to grids [[2, 4, 4], [1, 2, 4]]:
@@ -298,7 +415,7 @@ class TestQwen35VisionFlops:
             "vision_seqlen_squared_sum_in_batch": 576,
             "vision_merged_tokens_in_batch": 10,
         }
-        multimodal_flops = num_floating_point_operations(args, cfg, batch_size, **vision_stats)
+        multimodal_flops = _flops(args, cfg, batch_size, **vision_stats)
 
         # Hand-computed for the tiny config set by _enable_qwen35_vision_flops
         # (hidden=8, ffn=16, heads=2, kv_channels=4, in_channels=3, patch=2,
@@ -330,10 +447,10 @@ class TestQwen35VisionFlops:
         # and a mock-data resolution, not the runtime (T, H, W) grid.
         args, cfg = _make_gpt_args()
         batch_size = 3
-        decoder_flops = num_floating_point_operations(args, cfg, batch_size)
+        decoder_flops = _flops(args, cfg, batch_size)
 
         _enable_qwen35_vision_flops(args)
-        assert num_floating_point_operations(args, cfg, batch_size) == decoder_flops
+        assert _flops(args, cfg, batch_size) == decoder_flops
 
     def test_temporal_extent_independent_of_temporal_patch_size(self):
         # T is whatever the processor emitted, never vision_temporal_patch_size.
@@ -344,11 +461,11 @@ class TestQwen35VisionFlops:
         common = dict(vision_total_tokens_in_batch=32, vision_merged_tokens_in_batch=8)
 
         # T=1, 4x8 grid: one 32-long sequence -> sum(L^2) = 1024.
-        one_frame = num_floating_point_operations(
+        one_frame = _flops(
             args, cfg, 2, vision_seqlen_squared_sum_in_batch=1024, **common
         )
         # T=4, 4x2 grid: four 8-long sequences -> sum(L^2) = 4 * 64 = 256.
-        four_frames = num_floating_point_operations(
+        four_frames = _flops(
             args, cfg, 2, vision_seqlen_squared_sum_in_batch=256, **common
         )
         # Only the attention term differs: 2 layers * 3 * 4 * dsum * proj(=8).
@@ -358,7 +475,7 @@ class TestQwen35VisionFlops:
         args, cfg = _make_gpt_args()
         _enable_qwen35_vision_flops(args)
         with pytest.raises(ValueError, match="must be provided together"):
-            num_floating_point_operations(args, cfg, batch_size=2, vision_total_tokens_in_batch=40)
+            _flops(args, cfg, batch_size=2, vision_total_tokens_in_batch=40)
 
     def test_invalid_vision_metadata_fails_loudly(self):
         # Metadata is validated eagerly (at model-construction time), not
@@ -373,7 +490,7 @@ class TestQwen35VisionFlops:
         args, cfg = _make_gpt_args()
         _enable_qwen35_vision_flops(args)
         with pytest.raises(ValueError, match="must be non-negative"):
-            num_floating_point_operations(
+            _flops(
                 args,
                 cfg,
                 batch_size=2,
@@ -389,7 +506,7 @@ class TestQwen35VisionFlops:
         args, cfg = _make_gpt_args()
         _enable_qwen35_vision_flops(args, validate=False)
         with pytest.raises(ValueError, match="validate_vision_flops_metadata"):
-            num_floating_point_operations(
+            _flops(
                 args,
                 cfg,
                 batch_size=2,
@@ -407,25 +524,28 @@ class TestQwen35VisionFlops:
 
     def test_disabled_vision_preserves_decoder_only_result(self):
         args, cfg = _make_gpt_args()
-        decoder_flops = num_floating_point_operations(args, cfg, batch_size=2)
+        decoder_flops = _flops(args, cfg, batch_size=2)
         args.count_vision_model_flops = False
         args.vision_flops_variant = "unknown"
-        assert num_floating_point_operations(args, cfg, batch_size=2) == decoder_flops
+        assert _flops(args, cfg, batch_size=2) == decoder_flops
 
 
 class TestTHDScaling:
     """Only the L^2 attention term should depend on ``seqlen_squared_sum_in_batch``."""
 
     def test_doubling_seqlen_squared_sum_increases_only_attention(self):
-        args, cfg = _make_gpt_args()
+        args = _make_gpt_config()
         batch_size = 8
         bshd_sum = batch_size * args.seq_length * args.seq_length
 
         flops_bshd = num_floating_point_operations(
-            args, cfg, batch_size, seqlen_squared_sum_in_batch=bshd_sum
+            args, batch_size, sequence_length=args.seq_length, seqlen_squared_sum_in_batch=bshd_sum
         )
         flops_doubled = num_floating_point_operations(
-            args, cfg, batch_size, seqlen_squared_sum_in_batch=2 * bshd_sum
+            args,
+            batch_size,
+            sequence_length=args.seq_length,
+            seqlen_squared_sum_in_batch=2 * bshd_sum,
         )
 
         delta = flops_doubled - flops_bshd
@@ -439,7 +559,7 @@ class TestTHDScaling:
 
     def test_thd_packed_below_bshd_when_chunks_shorter(self):
         """A packed batch with shorter chunks does less attention work."""
-        args, cfg = _make_gpt_args()
+        args = _make_gpt_config()
         batch_size = 8
         s = args.seq_length
 
@@ -450,9 +570,11 @@ class TestTHDScaling:
         bshd_sum = batch_size * s * s
 
         flops_thd = num_floating_point_operations(
-            args, cfg, batch_size, seqlen_squared_sum_in_batch=thd_sum
+            args, batch_size, sequence_length=args.seq_length, seqlen_squared_sum_in_batch=thd_sum
         )
-        flops_bshd = num_floating_point_operations(args, cfg, batch_size)
+        flops_bshd = num_floating_point_operations(
+            args, batch_size, sequence_length=args.seq_length
+        )
 
         # THD must be strictly less than BSHD (attention contribution shrinks).
         assert flops_thd < flops_bshd
@@ -462,13 +584,15 @@ class TestTHDScaling:
         assert flops_bshd - flops_thd == expected_savings
 
     def test_thd_zero_seqlen_squared_sum_removes_core_attn(self):
-        args, cfg = _make_gpt_args()
+        args = _make_gpt_config()
         batch_size = 8
 
         flops_no_core = num_floating_point_operations(
-            args, cfg, batch_size, seqlen_squared_sum_in_batch=0
+            args, batch_size, sequence_length=args.seq_length, seqlen_squared_sum_in_batch=0
         )
-        flops_default = num_floating_point_operations(args, cfg, batch_size)
+        flops_default = num_floating_point_operations(
+            args, batch_size, sequence_length=args.seq_length
+        )
 
         q_proj_size = args.kv_channels * args.num_attention_heads
         bshd_sum = batch_size * args.seq_length * args.seq_length
@@ -481,28 +605,35 @@ class TestHybridTHDScaling:
     """The hybrid attn_layer_flops path also must respond to seqlen_squared_sum."""
 
     def test_hybrid_thd_below_bshd(self):
-        args, cfg = _make_hybrid_args()
+        args = _make_hybrid_config()
         batch_size = 4
         s = args.seq_length
 
         thd_sum = batch_size * 4 * (s // 4) ** 2  # 4 chunks of s/4
         flops_thd = num_floating_point_operations(
-            args, cfg, batch_size, seqlen_squared_sum_in_batch=thd_sum
+            args, batch_size, sequence_length=args.seq_length, seqlen_squared_sum_in_batch=thd_sum
         )
-        flops_bshd = num_floating_point_operations(args, cfg, batch_size)
+        flops_bshd = num_floating_point_operations(
+            args, batch_size, sequence_length=args.seq_length
+        )
 
         assert flops_thd < flops_bshd
 
     def test_hybrid_attention_layers_count(self):
         """Mamba/MLP/MoE layers are L-linear, so the L^2 delta is exactly the
         attention layers' core-attention contribution."""
-        args, cfg = _make_hybrid_args()
+        args = _make_hybrid_config()
         batch_size = 4
 
         bshd_sum = batch_size * args.seq_length * args.seq_length
-        flops_bshd = num_floating_point_operations(args, cfg, batch_size)
+        flops_bshd = num_floating_point_operations(
+            args, batch_size, sequence_length=args.seq_length
+        )
         flops_doubled = num_floating_point_operations(
-            args, cfg, batch_size, seqlen_squared_sum_in_batch=2 * bshd_sum
+            args,
+            batch_size,
+            sequence_length=args.seq_length,
+            seqlen_squared_sum_in_batch=2 * bshd_sum,
         )
 
         # Pattern "*M*M" -> 2 attention layers.
@@ -537,15 +668,15 @@ class TestHybridTHDScaling:
         # Regular attention '*' is intentionally not the reference: hybrid grammar
         # assigns different projection work to '*' and '+'.
         args.hybrid_layer_pattern = "CMHM"
-        flops_mla_variants = num_floating_point_operations(args, cfg, batch_size)
+        flops_mla_variants = _flops(args, cfg, batch_size)
         args.hybrid_layer_pattern = "+M+M"
-        flops_dense_mla = num_floating_point_operations(args, cfg, batch_size)
+        flops_dense_mla = _flops(args, cfg, batch_size)
 
         assert flops_mla_variants == flops_dense_mla
         # And attention must be a non-trivial contributor: dropping the two
         # attention layers entirely (all Mamba) changes the estimate.
         args.hybrid_layer_pattern = "MMMM"
-        flops_no_attn = num_floating_point_operations(args, cfg, batch_size)
+        flops_no_attn = _flops(args, cfg, batch_size)
         assert flops_mla_variants != flops_no_attn
 
 
@@ -589,21 +720,21 @@ class TestHybridMatchesStandard:
         batch_size = 4
 
         # BSHD: closed-form defaults.
-        assert num_floating_point_operations(
+        assert _flops(
             standard, standard_cfg, batch_size
-        ) == num_floating_point_operations(hybrid, hybrid_cfg, batch_size)
+        ) == _flops(hybrid, hybrid_cfg, batch_size)
 
         # THD: both paths must consume the ragged stats identically.
         s = standard.seq_length
         thd_sum_sq = batch_size * 4 * (s // 4) ** 2
         thd_tokens = batch_size * s * 3 // 4
-        assert num_floating_point_operations(
+        assert _flops(
             standard,
             standard_cfg,
             batch_size,
             seqlen_squared_sum_in_batch=thd_sum_sq,
             total_real_tokens_in_batch=thd_tokens,
-        ) == num_floating_point_operations(
+        ) == _flops(
             hybrid,
             hybrid_cfg,
             batch_size,
@@ -676,9 +807,9 @@ class TestMTPLogitFlops:
         total_tokens = batch_size * args.seq_length
 
         args.mtp_detach_heads = False
-        attached_flops = num_floating_point_operations(args, cfg, batch_size)
+        attached_flops = _flops(args, cfg, batch_size)
         args.mtp_detach_heads = True
-        detached_flops = num_floating_point_operations(args, cfg, batch_size)
+        detached_flops = _flops(args, cfg, batch_size)
 
         # One FMA-counted output-projection pass (wgrad) disappears per draft
         # head. Forward and hidden-state dgrad remain.
@@ -701,9 +832,9 @@ class TestMTPLogitFlops:
         batch_size = 2
 
         args.mtp_loss_type = "cross_entropy"
-        cross_entropy_flops = num_floating_point_operations(args, cfg, batch_size)
+        cross_entropy_flops = _flops(args, cfg, batch_size)
         args.mtp_loss_type = "e2e_tv"
-        e2e_tv_flops = num_floating_point_operations(args, cfg, batch_size)
+        e2e_tv_flops = _flops(args, cfg, batch_size)
 
         # The frozen target projection adds one forward pass, independent of
         # the number of draft heads and their omitted weight gradients.
@@ -721,9 +852,9 @@ class TestMTPLogitFlops:
         batch_size = 2
 
         args.mtp_detach_heads = False
-        attached_flops = num_floating_point_operations(args, cfg, batch_size)
+        attached_flops = _flops(args, cfg, batch_size)
         args.mtp_detach_heads = True
-        detached_flops = num_floating_point_operations(args, cfg, batch_size)
+        detached_flops = _flops(args, cfg, batch_size)
 
         assert attached_flops == detached_flops
 
@@ -736,9 +867,9 @@ class TestMTPLogitFlops:
         batch_size = 2
 
         del args.mtp_detach_heads
-        legacy_flops = num_floating_point_operations(args, cfg, batch_size)
+        legacy_flops = _flops(args, cfg, batch_size)
         args.mtp_detach_heads = False
-        explicit_attached_flops = num_floating_point_operations(args, cfg, batch_size)
+        explicit_attached_flops = _flops(args, cfg, batch_size)
 
         assert legacy_flops == explicit_attached_flops
 
@@ -785,7 +916,7 @@ class TestKimiDeltaAttentionFlops:
         )
         logits_forward = 2 * total_tokens * args.hidden_size * cfg.tokenizer.padded_vocab_size
 
-        assert num_floating_point_operations(args, cfg, batch_size) == 3 * (
+        assert _flops(args, cfg, batch_size) == 3 * (
             kda_forward + logits_forward
         )
 
@@ -797,10 +928,10 @@ class TestMLAHeadwiseOutputGateFlops:
         args, cfg = _make_mla_hybrid_args()
         batch_size = 2
         bshd_sum = batch_size * args.seq_length**2
-        flops_full = num_floating_point_operations(
+        flops_full = _flops(
             args, cfg, batch_size, seqlen_squared_sum_in_batch=bshd_sum
         )
-        flops_half = num_floating_point_operations(
+        flops_half = _flops(
             args, cfg, batch_size, seqlen_squared_sum_in_batch=bshd_sum // 2
         )
         expected_delta = (
@@ -817,9 +948,9 @@ class TestMLAHeadwiseOutputGateFlops:
         total_tokens = batch_size * args.seq_length
 
         args.attention_output_gate = False
-        ungated_flops = num_floating_point_operations(args, cfg, batch_size)
+        ungated_flops = _flops(args, cfg, batch_size)
         args.attention_output_gate = True
-        gated_flops = num_floating_point_operations(args, cfg, batch_size)
+        gated_flops = _flops(args, cfg, batch_size)
 
         expected_delta = 3 * 2 * total_tokens * args.hidden_size * args.num_attention_heads
         assert gated_flops - ungated_flops == expected_delta
@@ -842,10 +973,10 @@ class TestHybridAttentionOutputGateFlops:
         total_tokens = batch_size * args.seq_length
 
         args.attention_output_gate = False
-        ungated_flops = num_floating_point_operations(args, cfg, batch_size)
+        ungated_flops = _flops(args, cfg, batch_size)
         args.attention_output_gate = True
         args.gated_attention_proj_granularity = gate_granularity
-        gated_flops = num_floating_point_operations(args, cfg, batch_size)
+        gated_flops = _flops(args, cfg, batch_size)
 
         expected_delta = 3 * 2 * total_tokens * args.hidden_size * gate_projection_size
         assert gated_flops - ungated_flops == expected_delta
@@ -855,13 +986,13 @@ class TestGatedDeltaProductFlops:
     """GDP FLOPs must use the Householder count from the model configuration."""
 
     def test_householder_count_changes_flops(self):
-        args, cfg = _make_hybrid_args()
-        args.spec = ["megatron.core.models.hybrid.hybrid_layer_specs", "gdp_stack_spec"]
+        args = _make_hybrid_config()
+        args.hybrid_stack_spec = gdp_stack_spec
         batch_size = 4
 
-        flops_m3 = num_floating_point_operations(args, cfg, batch_size)
+        flops_m3 = num_floating_point_operations(args, batch_size, sequence_length=args.seq_length)
         args.gdp_num_householder = 4
-        flops_m4 = num_floating_point_operations(args, cfg, batch_size)
+        flops_m4 = num_floating_point_operations(args, batch_size, sequence_length=args.seq_length)
 
         total_tokens = batch_size * args.seq_length
         d_inner = args.mamba_num_heads * args.mamba_head_dim
@@ -892,13 +1023,13 @@ class TestAttentionResidualFlops:
         disabled_args = SimpleNamespace(**vars(args))
         disabled_args.enable_attention_residuals = False
         disabled_args.attn_res_block_layers = None
-        disabled_flops = num_floating_point_operations(
+        disabled_flops = _flops(
             disabled_args, cfg, batch_size, **flops_kwargs
         )
         enabled_args = SimpleNamespace(**vars(args))
         enabled_args.enable_attention_residuals = True
         enabled_args.attn_res_block_layers = block_layers
-        enabled_flops = num_floating_point_operations(enabled_args, cfg, batch_size, **flops_kwargs)
+        enabled_flops = _flops(enabled_args, cfg, batch_size, **flops_kwargs)
         return enabled_flops - disabled_flops
 
     @staticmethod
@@ -1038,10 +1169,10 @@ class TestAttentionResidualFlops:
     @pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
     def test_missing_optional_flags_preserves_disabled_flops(self, hybrid):
         args, cfg = self._hybrid_args("K-+E", "+E", 2) if hybrid else _make_gpt_args()
-        expected = num_floating_point_operations(args, cfg, 2)
+        expected = _flops(args, cfg, 2)
         del args.enable_attention_residuals
         del args.attn_res_block_layers
-        assert num_floating_point_operations(args, cfg, 2) == expected
+        assert _flops(args, cfg, 2) == expected
 
     @pytest.mark.parametrize("backend", ["eager", "compile", "fla"])
     def test_nominal_flops_are_backend_independent(self, backend):
@@ -1064,13 +1195,15 @@ class TestPaddingRemoval:
     def test_default_total_tokens_matches_bshd(self):
         """When ``total_real_tokens_in_batch`` is ``None`` the default is
         ``batch_size * args.seq_length``, recovering the old BSHD result."""
-        args, cfg = _make_gpt_args()
+        args = _make_gpt_config()
         batch_size = 8
-        default_flops = num_floating_point_operations(args, cfg, batch_size)
+        default_flops = num_floating_point_operations(
+            args, batch_size, sequence_length=args.seq_length
+        )
         explicit_flops = num_floating_point_operations(
             args,
-            cfg,
             batch_size,
+            sequence_length=args.seq_length,
             total_real_tokens_in_batch=batch_size * args.seq_length,
             seqlen_squared_sum_in_batch=batch_size * args.seq_length * args.seq_length,
         )
@@ -1079,22 +1212,22 @@ class TestPaddingRemoval:
     def test_lower_total_tokens_reduces_token_linear_flops(self):
         """Halving the real token count must halve every token-linear term.
         The core-attention L^2 term is unchanged (we hold ``seqlen_sq`` fixed)."""
-        args, cfg = _make_gpt_args()
+        args = _make_gpt_config()
         batch_size = 8
         full_tokens = batch_size * args.seq_length
         full_sum_sq = batch_size * args.seq_length * args.seq_length
 
         flops_full = num_floating_point_operations(
             args,
-            cfg,
             batch_size,
+            sequence_length=args.seq_length,
             total_real_tokens_in_batch=full_tokens,
             seqlen_squared_sum_in_batch=full_sum_sq,
         )
         flops_half = num_floating_point_operations(
             args,
-            cfg,
             batch_size,
+            sequence_length=args.seq_length,
             total_real_tokens_in_batch=full_tokens // 2,
             seqlen_squared_sum_in_batch=full_sum_sq,
         )
@@ -1115,7 +1248,7 @@ class TestPaddingRemoval:
         """Removing only the projection/MLP padding (``total_real_tokens``
         drops) must NOT change the core-attention contribution. Pin that the
         two parameters are independent."""
-        args, cfg = _make_gpt_args()
+        args = _make_gpt_config()
         batch_size = 8
         full_tokens = batch_size * args.seq_length
         full_sum_sq = batch_size * args.seq_length * args.seq_length
@@ -1123,15 +1256,15 @@ class TestPaddingRemoval:
         # Fix sum_sq (attention work); vary token count (projection work).
         flops_a = num_floating_point_operations(
             args,
-            cfg,
             batch_size,
+            sequence_length=args.seq_length,
             total_real_tokens_in_batch=full_tokens,
             seqlen_squared_sum_in_batch=full_sum_sq,
         )
         flops_b = num_floating_point_operations(
             args,
-            cfg,
             batch_size,
+            sequence_length=args.seq_length,
             total_real_tokens_in_batch=full_tokens * 3 // 4,  # 25% padding
             seqlen_squared_sum_in_batch=full_sum_sq,
         )
@@ -1140,8 +1273,8 @@ class TestPaddingRemoval:
         # Sanity check it's positive and that a 1-token swing scales linearly.
         flops_c = num_floating_point_operations(
             args,
-            cfg,
             batch_size,
+            sequence_length=args.seq_length,
             total_real_tokens_in_batch=full_tokens - 1,
             seqlen_squared_sum_in_batch=full_sum_sq,
         )
@@ -1150,22 +1283,22 @@ class TestPaddingRemoval:
     def test_hybrid_padding_removal(self):
         """The hybrid path also threads ``total_tokens`` through every layer
         helper (mamba, gdn, mlp, moe, attn projections, logits)."""
-        args, cfg = _make_hybrid_args()
+        args = _make_hybrid_config()
         batch_size = 4
         full_tokens = batch_size * args.seq_length
         full_sum_sq = batch_size * args.seq_length * args.seq_length
 
         flops_full = num_floating_point_operations(
             args,
-            cfg,
             batch_size,
+            sequence_length=args.seq_length,
             total_real_tokens_in_batch=full_tokens,
             seqlen_squared_sum_in_batch=full_sum_sq,
         )
         flops_half = num_floating_point_operations(
             args,
-            cfg,
             batch_size,
+            sequence_length=args.seq_length,
             total_real_tokens_in_batch=full_tokens // 2,
             seqlen_squared_sum_in_batch=full_sum_sq,
         )
@@ -1925,7 +2058,7 @@ class TestDSv4Hybrid:
         total_tokens = batch_size * args.seq_length
         sum_sq = batch_size * args.seq_length**2
 
-        flops = num_floating_point_operations(args, cfg, batch_size)
+        flops = _flops(args, cfg, batch_size)
         expected = _dsv4_golden_flops(args, cfg, total_tokens, sum_sq)
         assert flops == expected
 
@@ -1939,7 +2072,7 @@ class TestDSv4Hybrid:
         total_tokens = sum(packed_lengths)
         thd_sum_sq = sum(L**2 for L in packed_lengths)
 
-        flops = num_floating_point_operations(
+        flops = _flops(
             args,
             cfg,
             batch_size,
@@ -1949,7 +2082,7 @@ class TestDSv4Hybrid:
         expected = _dsv4_golden_flops(args, cfg, total_tokens, thd_sum_sq)
         assert flops == expected
         # THD must be strictly less than BSHD.
-        bshd_flops = num_floating_point_operations(args, cfg, batch_size)
+        bshd_flops = _flops(args, cfg, batch_size)
         assert flops < bshd_flops
 
     @pytest.mark.parametrize(
@@ -1976,7 +2109,7 @@ class TestDSv4Hybrid:
             training_module, "_dsv4_hybrid_self_attention_flops", capture_ratio_counts
         )
 
-        num_floating_point_operations(args, cfg, batch_size=2)
+        _flops(args, cfg, batch_size=2)
 
         assert observed_ratio_counts == [expected_ratio_counts]
 
@@ -2079,21 +2212,21 @@ class TestDSv4HybridMatchesStandard:
         batch_size = 2
 
         # BSHD (closed-form defaults).
-        assert num_floating_point_operations(
+        assert _flops(
             standard, standard_cfg, batch_size
-        ) == num_floating_point_operations(hybrid, hybrid_cfg, batch_size)
+        ) == _flops(hybrid, hybrid_cfg, batch_size)
 
         # THD: both paths must consume the ragged stats identically.
         s = standard.seq_length
         thd_sum_sq = batch_size * 4 * (s // 4) ** 2
         thd_tokens = batch_size * s * 3 // 4
-        assert num_floating_point_operations(
+        assert _flops(
             standard,
             standard_cfg,
             batch_size,
             seqlen_squared_sum_in_batch=thd_sum_sq,
             total_real_tokens_in_batch=thd_tokens,
-        ) == num_floating_point_operations(
+        ) == _flops(
             hybrid,
             hybrid_cfg,
             batch_size,
@@ -2122,8 +2255,8 @@ class TestDSv4HybridMatchesStandard:
             ratios=[0, 4, 128, 128], mtp=1, moe=True
         )
         batch_size = 2
-        std_flops = num_floating_point_operations(standard, standard_cfg, batch_size)
-        hyb_flops = num_floating_point_operations(hybrid, hybrid_cfg, batch_size)
+        std_flops = _flops(standard, standard_cfg, batch_size)
+        hyb_flops = _flops(hybrid, hybrid_cfg, batch_size)
         assert hyb_flops == std_flops
 
 
@@ -2141,16 +2274,19 @@ def _make_dsa_args(dsa_indexer_loss_coeff=0.01, dsa_indexer_use_sparse_loss=Fals
     ``dsa_indexer_use_sparse_loss`` selects the sparse (top-k only) KL
     variant, which shrinks the scoring backward to the selected pairs.
     """
-    args, cfg = _make_gpt_args(
-        num_layers=4,
-        hidden_size=512,
-        num_attention_heads=8,
+    args = GPTModelConfig(
+        transformer=MLATransformerConfig(
+            num_layers=4,
+            hidden_size=512,
+            num_attention_heads=8,
+            ffn_hidden_size=2048,
+            gated_linear_unit=True,
+            activation_func=torch.nn.functional.silu,
+        ),
         seq_length=256,
-        ffn_hidden_size=2048,
-        padded_vocab_size=1024,
+        vocab_size=1024,
     )
-    args.multi_latent_attention = True
-    args.group_query_attention = False
+    cfg = SimpleNamespace(tokenizer=SimpleNamespace(padded_vocab_size=1024))
     args.q_lora_rank = 128
     args.kv_lora_rank = 64
     args.qk_head_dim = 48
@@ -2178,7 +2314,7 @@ def _dsa_golden_flops(args, cfg, total_tokens, seqlen_squared_sum, num_indexer_l
     """
     fwd_bwd = 3
     fma = 2
-    ffn_exp = 3 if args.swiglu else 2
+    ffn_exp = 3 if args.gated_linear_unit else 2
     num_layers = args.num_layers
     nh = args.num_attention_heads
 
@@ -2256,7 +2392,7 @@ class TestDSA:
         total_tokens = batch_size * args.seq_length
         sum_sq = batch_size * args.seq_length**2
 
-        flops = num_floating_point_operations(args, cfg, batch_size)
+        flops = num_floating_point_operations(args, batch_size, sequence_length=args.seq_length)
         expected = _dsa_golden_flops(args, cfg, total_tokens, sum_sq)
         assert flops == expected
 
@@ -2272,8 +2408,8 @@ class TestDSA:
 
         flops = num_floating_point_operations(
             args,
-            cfg,
             batch_size,
+            sequence_length=args.seq_length,
             seqlen_squared_sum_in_batch=thd_sum_sq,
             total_real_tokens_in_batch=total_tokens,
         )
@@ -2281,7 +2417,9 @@ class TestDSA:
         assert isinstance(flops, int)
         assert flops == expected
         # THD must be strictly less than BSHD.
-        bshd_flops = num_floating_point_operations(args, cfg, batch_size)
+        bshd_flops = num_floating_point_operations(
+            args, batch_size, sequence_length=args.seq_length
+        )
         assert flops < bshd_flops
 
     @pytest.mark.parametrize("loss_coeff", [0.0, None])
@@ -2297,10 +2435,13 @@ class TestDSA:
         total_tokens = batch_size * args.seq_length
         sum_sq = batch_size * args.seq_length**2
 
-        flops = num_floating_point_operations(args, cfg, batch_size)
+        flops = num_floating_point_operations(args, batch_size, sequence_length=args.seq_length)
         assert flops == _dsa_golden_flops(args, cfg, total_tokens, sum_sq)
         # A frozen indexer must cost strictly less than a trained one.
-        assert flops < num_floating_point_operations(*_make_dsa_args(0.01), batch_size=batch_size)
+        trained, trained_cfg = _make_dsa_args(0.01)
+        assert flops < num_floating_point_operations(
+            trained, sequence_length=trained.seq_length, batch_size=batch_size
+        )
 
     @pytest.mark.parametrize("seq_length", [256, 8192])
     def test_sparse_indexer_loss_shrinks_scoring_backward(self, seq_length):
@@ -2320,8 +2461,12 @@ class TestDSA:
         sparse_args, sparse_cfg = _make_dsa_args(dsa_indexer_use_sparse_loss=True)
         dense_args.seq_length = sparse_args.seq_length = seq_length
 
-        dense = num_floating_point_operations(dense_args, dense_cfg, batch_size)
-        sparse = num_floating_point_operations(sparse_args, sparse_cfg, batch_size)
+        dense = num_floating_point_operations(
+            dense_args, batch_size, sequence_length=dense_args.seq_length
+        )
+        sparse = num_floating_point_operations(
+            sparse_args, batch_size, sequence_length=sparse_args.seq_length
+        )
         assert sparse == _dsa_golden_flops(sparse_args, sparse_cfg, total_tokens, sum_sq)
         if seq_length <= sparse_args.dsa_indexer_topk:
             assert sparse == dense
@@ -2332,7 +2477,9 @@ class TestDSA:
                 dsa_indexer_loss_coeff=0.0, dsa_indexer_use_sparse_loss=True
             )
             frozen.seq_length = seq_length
-            assert sparse > num_floating_point_operations(frozen, frozen_cfg, batch_size)
+            assert sparse > num_floating_point_operations(
+                frozen, batch_size, sequence_length=frozen.seq_length
+            )
 
     def test_sparse_loss_ignored_without_indexer_loss(self):
         """Sparse vs dense KL is moot when the indexer loss is off: the
@@ -2345,8 +2492,12 @@ class TestDSA:
         off_sparse, off_sparse_cfg = _make_dsa_args(
             dsa_indexer_loss_coeff=0.0, dsa_indexer_use_sparse_loss=True
         )
-        assert num_floating_point_operations(off_dense, off_dense_cfg, batch_size) == (
-            num_floating_point_operations(off_sparse, off_sparse_cfg, batch_size)
+        assert num_floating_point_operations(
+            off_dense, batch_size, sequence_length=off_dense.seq_length
+        ) == (
+            num_floating_point_operations(
+                off_sparse, batch_size, sequence_length=off_sparse.seq_length
+            )
         )
 
     def test_cross_layer_index_sharing(self):
@@ -2368,13 +2519,18 @@ class TestDSA:
 
         # Layers 1..8 compute when (max(L - 1, 0) % 4) == 0, i.e. layers 1 and 5.
         expected = _dsa_golden_flops(args, cfg, total_tokens, sum_sq, num_indexer_layers=2)
-        assert num_floating_point_operations(args, cfg, batch_size) == expected
+        assert (
+            num_floating_point_operations(args, batch_size, sequence_length=args.seq_length)
+            == expected
+        )
 
         # Sharing must be cheaper than every layer running its own indexer.
         no_sharing, no_sharing_cfg = _make_dsa_args()
         no_sharing.num_layers = 8
-        assert num_floating_point_operations(args, cfg, batch_size) < num_floating_point_operations(
-            no_sharing, no_sharing_cfg, batch_size
+        assert num_floating_point_operations(
+            args, batch_size, sequence_length=args.seq_length
+        ) < num_floating_point_operations(
+            no_sharing, batch_size, sequence_length=no_sharing.seq_length
         )
 
     @pytest.mark.parametrize(
@@ -2400,7 +2556,7 @@ class TestDSA:
 
         monkeypatch.setattr(training_module, "_dsa_indexer_flops", capture_indexer_count)
 
-        num_floating_point_operations(args, cfg, batch_size=2)
+        _flops(args, cfg, batch_size=2)
 
         assert observed_indexer_executions == [expected_indexer_executions]
 
@@ -2416,12 +2572,14 @@ class TestDSA:
         args.seq_length = 8192
         batch_size = 1
 
-        corrected = num_floating_point_operations(args, cfg, batch_size)
+        corrected = num_floating_point_operations(args, batch_size, sequence_length=args.seq_length)
 
         # Same model reading as plain MLA (the branch DSA used to fall into).
-        dense = SimpleNamespace(**vars(args))
-        dense.experimental_attention_variant = None
-        assert corrected < num_floating_point_operations(dense, cfg, batch_size)
+        dense = deepcopy(args)
+        dense.transformer.experimental_attention_variant = None
+        assert corrected < num_floating_point_operations(
+            dense, batch_size, sequence_length=dense.seq_length
+        )
 
 
 class TestDSAHelperEdgeCases:
@@ -2493,7 +2651,7 @@ class TestDSAHelperEdgeCases:
         args.mamba_num_heads = 128
 
         with pytest.raises(AssertionError, match="hybrid-model path"):
-            num_floating_point_operations(args, cfg, 2)
+            _flops(args, cfg, 2)
 
     def test_hybrid_dsa_rejected_without_variant_attribute(self):
         """The guard must key off the 'D' symbols in the layer pattern, not
@@ -2510,7 +2668,7 @@ class TestDSAHelperEdgeCases:
         args.mamba_num_heads = 128
 
         with pytest.raises(AssertionError, match="hybrid-model path"):
-            num_floating_point_operations(args, cfg, 2)
+            _flops(args, cfg, 2)
 
 
 def _dsa_golden_layer_terms(
@@ -2600,7 +2758,13 @@ def _make_hybrid_dsa_args(dsa_indexer_loss_coeff=0.01, dsa_indexer_use_sparse_lo
     args.mamba_num_groups = 8
     args.mamba_num_heads = 128
     args.gdp_num_householder = 1
-    return args, cfg
+    model = HybridModelConfig(
+        transformer=args.transformer,
+        seq_length=args.seq_length,
+        vocab_size=args.vocab_size,
+        hybrid_layer_pattern="D-D-",
+    )
+    return model, cfg
 
 
 class TestDSAFlopsHelpers:
@@ -2687,11 +2851,11 @@ class TestDSAFlopsHelpers:
 
         args, cfg = _make_hybrid_dsa_args()
         args.hybrid_layer_pattern = "--"
-        expected = num_floating_point_operations(args, cfg, 2)
-        for name in list(vars(args)):
+        expected = num_floating_point_operations(args, 2, sequence_length=args.seq_length)
+        for name in list(vars(args.transformer)):
             if name.startswith("dsa_"):
-                delattr(args, name)
-        assert num_floating_point_operations(args, cfg, 2) == expected
+                setattr(args.transformer, name, None)
+        assert num_floating_point_operations(args, 2, sequence_length=args.seq_length) == expected
 
 
 def _kpool_golden_scales(mean_length, pool_size, topk, select_tail):
@@ -2835,7 +2999,7 @@ class TestDSAKPool:
         args.dsa_indexer_kpool = 1
         tokens, sum_sq = sum(lengths), sum(length**2 for length in lengths)
         stats = dict(total_real_tokens_in_batch=tokens, seqlen_squared_sum_in_batch=sum_sq)
-        before = num_floating_point_operations(args, cfg, 2, **stats)
+        before = _flops(args, cfg, 2, **stats)
         _, old_core = _dsa_golden_layer_terms(
             args, tokens, sum_sq, attention_layers, indexer_layers
         )
@@ -2860,7 +3024,7 @@ class TestDSAKPool:
         expected_delta = extra_projection_and_compression + sum_sq * (new_core - old_core)
         args.dsa_indexer_kpool = pool_size
         args.dsa_indexer_kpool_always_select_tail = select_tail
-        after = num_floating_point_operations(args, cfg, 2, **stats)
+        after = _flops(args, cfg, 2, **stats)
         assert isinstance(after, int)
         # Each public total is independently truncated to an integer.
         assert after - before == pytest.approx(expected_delta, rel=0, abs=1)

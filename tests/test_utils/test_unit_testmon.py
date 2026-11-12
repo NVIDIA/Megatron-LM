@@ -469,7 +469,9 @@ def cpu_baseline(project, tmp_path):
     for path in (project / "tests").glob("test_*.py"):
         path.rename(directory / path.name)
     (directory / "test_app.py").write_text(
-        (directory / "test_app.py").read_text() + "\nimport pytest\n\n@pytest.mark.experimental\n"
+        "# Unicode source: input → output\n"
+        + (directory / "test_app.py").read_text()
+        + "\nimport pytest\n\n@pytest.mark.experimental\n"
         "def test_experimental():\n    assert active(2) == 3\n"
     )
     (project / "pytest.ini").write_text("[pytest]\nmarkers = experimental: experimental test\n")
@@ -485,6 +487,8 @@ def cpu_baseline(project, tmp_path):
         "mappings:\n  - source_dirs: [unobserved]\n    test_buckets:\n"
         f"      {platform}: [tests/unit_tests/example/test_other.py]\n"
     )
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    subprocess.run(["git", "-C", str(project), "add", "."], check=True)
     cache_dir = tmp_path / "cpu-cache"
     for phase in cache_module.PHASES:
         marker = "not experimental" if phase == "prod" else "experimental"
@@ -514,6 +518,7 @@ def cpu_baseline(project, tmp_path):
     [
         ("unchanged", "selected", []),
         ("dependency", "selected", ["test_app.py"]),
+        ("unused-dependency", "selected", []),
         ("new-test", "selected", ["test_app.py", "test_new.py"]),
         ("mandatory", "selected", ["test_other.py"]),
         ("missing-cache", "full", []),
@@ -536,6 +541,10 @@ def test_cpu_selection(cpu_baseline, change, mode, selected):
     elif change == "dependency":
         # Selection must not execute this now-failing test.
         (project / "app.py").write_text("def active(value):\n    return value + 2\n")
+    elif change == "unused-dependency":
+        dependency = project / "app.py"
+        dependency.write_text(dependency.read_text().replace("value - 1", "value - 2"))
+        subprocess.run(["git", "-C", str(project), "add", "app.py"], check=True)
     elif change == "new-test":
         (project / "tests/unit_tests/example/test_new.py").write_text(
             "def test_new():\n    assert False\n"

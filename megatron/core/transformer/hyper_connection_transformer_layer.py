@@ -96,6 +96,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             submodules.mlp_hyper_connection, config=self.config, layer_number=self.layer_number
         )
 
+        # mHC has always bypassed this legacy hook, which cannot carry residual state.
+        self._legacy_forward_post_mlp = None
+
         self._mhc_recompute_manager = None
         self._validate_mhc_recompute_attn_cuda_graph_split()
         if self.config.cuda_graph_impl == "local":
@@ -159,6 +162,17 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 "cross-attention: its context output exceeds the split's graph "
                 "output arity."
             )
+
+    def __call__(self, *args, **kwargs):
+        # TODO(kwangjuna): Unify this entry point with WR's recompute manager
+        # in the follow-up layer PR.
+        if kwargs.get("residual_stream_recompute_context") is not None:
+            raise ValueError(
+                "mHC does not accept residual_stream_recompute_context; use mhc_recompute_manager."
+            )
+        # TransformerLayer.__call__ moves mhc_recompute_manager onto self before the
+        # CUDA-graph machinery sees kwargs; popping it here too would reset it to None.
+        return super().__call__(*args, **kwargs)
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
         """Override to produce n-stream hidden_states of shape [s, b, n*C].
