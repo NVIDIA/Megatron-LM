@@ -1,6 +1,6 @@
 # Megatron-FSDP Examples
 
-Example scripts for training and checkpoint conversion using [Megatron-FSDP](../../docs/user-guide/features/megatron_fsdp.md). These demonstrate recommended configurations for Llama 3 8B and DeepSeek-V3 671B models, as well as checkpoint format conversion between `torch_dist` (N-D parallel) and `fsdp_dtensor` formats.
+Example scripts for training and checkpoint conversion using [Megatron-FSDP](../../docs/user-guide/features/megatron_fsdp.md). These demonstrate recommended configurations for Llama 3 8B and DeepSeek-V3 671B models, a DeepSeek-V4 Pro proxy with the Muon optimizer, as well as checkpoint format conversion between `torch_dist` (N-D parallel) and `fsdp_dtensor` formats.
 
 ## Scripts
 
@@ -109,6 +109,69 @@ Before running, update the `#SBATCH` directives and `--container-mounts` in the 
 - **Recomputation**: Selective recomputation of `mlp`, `moe`, `mla_up_proj`, and `layernorm` modules
 - **Optimizations**: NCCL user buffers, FSDP double buffering, meta-device initialization, per-token loss, overlapped grad-reduce and param-gather
 - **Tokenizer**: `deepseek-ai/DeepSeek-V3` via HuggingFace
+
+---
+
+### `sbatch_mfsdp_muon_deepseek_v4_pro.sh`
+
+SLURM batch script for a **DeepSeek-V4 Pro** proxy (Pro width and expert layout, 7 decoder blocks) trained with Megatron-FSDP v2 and the **Muon** optimizer on 64 GB200 GPUs (16 nodes x 4). It runs 12 iterations on mock data and is meant for measuring the Muon optimizer step.
+
+#### Usage
+
+```bash
+export MEGATRON_PATH=/path/to/Megatron-LM
+export CONTAINER_IMAGE=/path/to/container.sqsh   # or docker image URL
+export CONTAINER_MOUNTS=/lustre:/lustre          # must include MEGATRON_PATH and OUTPUT_PATH
+export OUTPUT_PATH=/path/to/output
+
+sbatch --account=<account> --partition=<partition> --segment=16 \
+    examples/megatron_fsdp/sbatch_mfsdp_muon_deepseek_v4_pro.sh
+```
+
+On NVL72 systems, `--segment=16` keeps the 16 nodes in one NVLink domain. Rank logs, Nsight reports, and caches go to `$OUTPUT_PATH/mfsdp-muon-deepseek-v4-pro-<job id>/`.
+
+#### Requirements
+
+A container with PyTorch 2.13 (NGC PyTorch 26.07) and Transformer Engine 2.18, plus the DeepSeek-V4 attention kernels, installed for example into a virtual environment on shared storage whose Python is passed as `PYTHON`:
+
+```bash
+python -m venv --system-site-packages /path/to/dsv4-env
+/path/to/dsv4-env/bin/python -m pip install --no-deps nvidia-cudnn-frontend==1.29.1 \
+    apache-tvm-ffi==0.1.11 nvidia-cutlass-dsl==4.8.0 nvidia-cutlass-dsl-libs-base==4.8.0 \
+    nvidia-cutlass-dsl-libs-core==4.8.0 nvidia-cutlass-dsl-libs-cu13==4.8.0
+FLASH_MLA_DISABLE_SM90=1 /path/to/dsv4-env/bin/python -m pip install --no-deps --no-build-isolation \
+    'git+https://github.com/deepseek-ai/FlashMLA.git@b7643bd54521f563b839b98289b5cd048c062ba2'
+TORCH_CUDA_ARCH_LIST=10.0 /path/to/dsv4-env/bin/python -m pip install --no-deps --no-build-isolation \
+    'git+https://github.com/Dao-AILab/fast-hadamard-transform.git@f134af63deb2df17e1171a9ec1ea4a7d8604d5ca'
+```
+
+The tokenizer, `unsloth/DeepSeek-V3`, is downloaded from Hugging Face into `HF_HOME` (default `$OUTPUT_PATH/cache/huggingface`).
+
+#### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MEGATRON_PATH` | *(required)* | Path to the Megatron-LM repository. |
+| `CONTAINER_IMAGE` | *(required)* | Container image (`.sqsh` file or Docker URL). |
+| `CONTAINER_MOUNTS` | *(required)* | Container mounts; they must include `MEGATRON_PATH` and `OUTPUT_PATH`. |
+| `OUTPUT_PATH` | *(required)* | Shared directory for logs, Nsight reports, and caches. |
+| `PYTHON` | `python` | Python interpreter with the kernels above. |
+| `PROFILE` | `0` | Set to `1` to record Nsight Systems reports on `PROFILE_RANKS` for steps 9–11. |
+| `PROFILE_RANKS` | `0 32 48 63` | Ranks to profile. |
+| `EXTRA_ARGS` | N/A | Extra training flags, e.g. `--train-iters 20`. |
+
+#### Measuring the optimizer step
+
+With `PROFILE=1`, each profiled rank writes an Nsight Systems report of steps 9–11 to `nsys/` in the run directory. In each step, the optimizer's GPU work follows the last backward kernels; on these ranks it is mostly Muon's Newton-Schulz GEMMs, overlapped with the gather and scatter of the next and previous parameter groups.
+
+#### Configuration Summary
+
+- **Model**: DeepSeek-V4 Pro width (hidden 7168, 128 heads, 384 routed experts, top-6 routing) with 7 hybrid decoder blocks (HCA/CSA attention and MoE), mHC with 4 residual streams, and one MTP depth
+- **Parallelism**: TP=1, PP=1, CP=1, EP=64; dense parameters in Megatron-FSDP v2 ZeRO-3 over 64 ranks
+- **Precision**: BF16 with MXFP8 (FP8 parameter gather)
+- **MoE**: Flex dispatcher with HybridEP backend, grouped GEMM, `sqrtsoftplus` routing with expert bias
+- **Optimizer**: Muon (`deepseekv4` coefficients, 10 Newton-Schulz steps, momentum 0.95) for matrices, Adam for the rest
+- **Batch size**: micro-batch=1, global-batch=64, sequence length=4096
 
 ---
 
