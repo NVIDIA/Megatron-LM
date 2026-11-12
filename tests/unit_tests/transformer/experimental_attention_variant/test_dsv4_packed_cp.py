@@ -358,7 +358,9 @@ def test_packed_cp_matches_full_attention_and_gradients(
 
 
 @pytest.mark.parametrize("rotate", [False, True])
-def test_packed_output_rope_backward_contract(monkeypatch, rotate):
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("with_indexer", [False, True])
+def test_packed_output_rope_backward_contract(monkeypatch, rotate, deterministic, with_indexer):
     """Packed autograd restores backend inputs without changing the saved output or dO."""
     from megatron.core.transformer.experimental_attention_variant.csa_utils import (
         packed_sparse_attention as packed_attention,
@@ -384,15 +386,78 @@ def test_packed_output_rope_backward_contract(monkeypatch, rotate):
     seen = []
 
     def backward(q, k, out, grad, *_args, **_kwargs):
+        assert _kwargs["deterministic"] is deterministic
         torch.testing.assert_close(out, q * 2)
         seen.append(grad.clone())
         return grad * 2, torch.zeros_like(k), torch.zeros_like(sink)
 
     monkeypatch.setattr(packed_attention, "_csa_sparse_attention_backward", backward)
-    args = (query, kv, sink, indices, None, 1.0, 0, None, None)
-    if rotate:
+    if with_indexer:
+        q_indexer = torch.zeros(4, 1, 2)
+        k_indexer = torch.zeros(1, 2)
+        weights = torch.ones(4, 1)
+        fake_dsa = SimpleNamespace(
+            sparse_indexer_score_recompute_wrapper=lambda _q, _k, _w, ids, **_kw: {
+                "predict": torch.ones_like(ids, dtype=torch.float32)
+            },
+            indexer_backward_wrapper=lambda q, w, k, *_args, **_kw: {
+                "d_index_q": torch.zeros_like(q),
+                "d_index_k": torch.zeros_like(k),
+                "d_weights": torch.zeros_like(w),
+            },
+        )
+        monkeypatch.setattr(packed_attention, "_DSA", fake_dsa)
+        monkeypatch.setattr(
+            packed_attention, "_compute_attn_target", lambda *_args, **_kwargs: torch.zeros(4, 1)
+        )
+        monkeypatch.setattr(
+            packed_attention.csa_indexer_loss_kernels,
+            "sparse_kl_loss",
+            lambda *_args, **_kwargs: torch.tensor(0.0),
+        )
+        monkeypatch.setattr(
+            packed_attention,
+            "async_reduce_scatter_along_first_dim",
+            lambda tensor, **_kwargs: SimpleNamespace(tensor=tensor),
+        )
+        args = (
+            query,
+            kv,
+            sink,
+            indices,
+            q_indexer,
+            k_indexer,
+            weights,
+            indices,
+            kv[3:],
+            1.0,
+            1.0,
+            0.3,
+            4,
+            True,
+            1,
+            4,
+            (None, None, None),
+            None,
+            k_indexer,
+            kv[3:],
+            SimpleNamespace(size=lambda: 1),
+            3,
+            None,
+            SimpleNamespace(handle=None),
+            SimpleNamespace(handle=None),
+            0,
+            None,
+        )
+        attention_func = packed_attention.FusedCSAIndexerSparseAttnFromTopkFunc
+    else:
+        args = (query, kv, sink, indices, None, 1.0, 0, None, None)
+        attention_func = packed_attention.CSASparseAttnFunc
+    if rotate or deterministic:
         args += (rope,)
-    output, _, _ = packed_attention.CSASparseAttnFunc.apply(*args)
+    if deterministic:
+        args += (deterministic,)
+    output = attention_func.apply(*args)[0].reshape_as(query)
     saved = output.detach().clone()
     upstream = torch.ones(1, 1, 4).expand_as(output)
     output.backward(upstream)

@@ -136,7 +136,7 @@ def test_packed_sparse_attention_padding_is_sink_only(monkeypatch, deterministic
     monkeypatch.setattr(attention, "_ensure_dsa_namespace", lambda: None)
     if with_lengths:
         output = attention.CSASparseAttnFunc.apply(
-            query, kv, sink, indices, lengths, 0.5, 0, None, padding, deterministic
+            query, kv, sink, indices, lengths, 0.5, 0, None, padding, None, deterministic
         )[0]
     else:
         output = attention.csa_sparse_attn(
@@ -214,7 +214,7 @@ def test_packed_indexer_attention_padding_is_sink_only(monkeypatch, deterministi
     seen = {}
     saved = []
     ctx = SimpleNamespace(
-        needs_input_grad=(False,) * 28, save_for_backward=lambda *xs: saved.extend(xs)
+        needs_input_grad=(False,) * 29, save_for_backward=lambda *xs: saved.extend(xs)
     )
 
     def fake_flash(q, _kv, ids, _scale, *, topk_length, **_kwargs):
@@ -266,6 +266,7 @@ def test_packed_indexer_attention_padding_is_sink_only(monkeypatch, deterministi
         None,
         None,
         3,
+        None,
         None,
         deterministic,
     )
