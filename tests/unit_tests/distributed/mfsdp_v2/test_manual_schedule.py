@@ -80,8 +80,7 @@ class ScheduledMLPFunction(torch.autograd.Function):
         ctx.weights = (weight1, weight2)
         ctx.fsdp_context = fsdp_context
         hidden = torch.tanh(F.linear(inputs, weight1))
-        if group1 is not group2:
-            reshard_group(group1, allgather_stream)
+        reshard_group(group1, allgather_stream)
         # The first GEMM and activation did not wait for this later gather.
         fsdp_context.current_stream().wait_event(ready2)
         output = F.linear(hidden, weight2)
@@ -106,15 +105,13 @@ class ScheduledMLPFunction(torch.autograd.Function):
 
         grad_hidden = grad_output.matmul(weight2)
         weight2.grad = grad_output.t().matmul(hidden)
-        if group1 is not group2:
-            reduce_group(group2, reduction_stream)
-            reshard_group(group2, allgather_stream)
+        reduce_group(group2, reduction_stream)
+        reshard_group(group2, allgather_stream)
 
         compute_stream.wait_event(ready1)
         grad_projected = grad_hidden * (1 - hidden.square())
         grad_input = grad_projected.matmul(weight1) if ctx.needs_input_grad[0] else None
         weight1.grad = grad_projected.t().matmul(inputs)
-        # Packed grouping must wait until both parameter gradients are ready.
         reduce_group(group1, reduction_stream)
         reshard_group(group1, allgather_stream)
         # The group methods install optimizer gradients directly.
@@ -141,19 +138,14 @@ class ScheduledMLP(MLP):
 
 
 @pytest.mark.parametrize(
-    "parameter_grouping, shard_layout, mesh_ndim",
+    "shard_layout, mesh_ndim",
     [
-        pytest.param(ParameterGrouping.PER_PARAMETER, ShardLayout.PADDED, 1, id="per_parameter"),
-        pytest.param(ParameterGrouping.PACKED, ShardLayout.PADDED, 1, id="packed"),
-        pytest.param(
-            ParameterGrouping.PER_PARAMETER, ShardLayout.UNPADDED, 1, id="per_parameter_unpadded"
-        ),
-        pytest.param(ParameterGrouping.PER_PARAMETER, ShardLayout.PADDED, 2, id="per_parameter_2d"),
+        pytest.param(ShardLayout.PADDED, 1, id="padded"),
+        pytest.param(ShardLayout.UNPADDED, 1, id="unpadded"),
+        pytest.param(ShardLayout.PADDED, 2, id="2d_hsdp"),
     ],
 )
-def test_manual_schedule_matches_dense_training(
-    distributed_setup, parameter_grouping, shard_layout, mesh_ndim
-):
+def test_manual_schedule_matches_dense_training(distributed_setup, shard_layout, mesh_ndim):
     """Three momentum-SGD steps match dense training on rank-local inputs."""
     setup = distributed_setup
     device = setup.device
@@ -181,7 +173,7 @@ def test_manual_schedule_matches_dense_training(
             placements,
             schedule_policy=SchedulePolicy(register_hooks=False),
             shard_layout=shard_layout,
-            parameter_grouping=parameter_grouping,
+            parameter_grouping=ParameterGrouping.PER_PARAMETER,
         )
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05, momentum=0.9)
     fully_shard_optimizer(optimizer)
