@@ -29,7 +29,7 @@ nothing here runs for them.
 """
 
 from dataclasses import dataclass, field, fields
-from typing import Any
+from typing import Any, Literal, get_args
 
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
@@ -37,7 +37,9 @@ from megatron.training.config.utils import serialize_value
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 
-DATALOADER_TYPES = ("single", "cyclic", "external")
+DataloaderType = Literal["single", "cyclic", "external"]
+"""The loader kinds; the CLI choices of ``--dataloader-type`` come from this annotation."""
+DATALOADER_TYPES = get_args(DataloaderType)
 # Family -> (dataset class, mock dataset class or None): the legacy family flags select the class
 # and DataConfig.validate() checks the class against the config.
 DATASET_CLASSES: dict[str, tuple[type, type | None]] = {
@@ -66,11 +68,10 @@ CONTAINER_WRITTEN_FIELDS = (
 class DataloaderConfig:
     """Settings for building torch DataLoaders on top of a dataset. The CLI options are generated
     from these fields (``ArgumentGroupFactory`` in ``_add_data_args``), except ``drop_last``; the
-    three store-false flags take the factory's ``--no-*`` and ``--disable-*`` spellings."""
+    three store-false flags take the factory's ``--no-*`` and ``--disable-*`` spellings and
+    ``dataloader_type``'s choices come from its ``Literal`` annotation."""
 
-    dataloader_type: str | None = field(
-        default=None, metadata={"argparse_meta": {"choices": list(DATALOADER_TYPES)}}
-    )
+    dataloader_type: DataloaderType | None = None
     """Single pass vs multiple pass data loader. 'external' passes the dataset through unchanged.
     Unset selects 'single'."""
 
