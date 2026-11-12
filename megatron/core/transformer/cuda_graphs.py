@@ -2303,14 +2303,19 @@ def _layer_is_graphable(layer, config):
     if not isinstance(layer, GraphableMegatronModule):
         return False
 
-    # If cuda_graph_modules is not set, every layer is graphed.
-    if not config.cuda_graph_modules:
-        return True
-
     # import modules here to avoid a circular import
     from megatron.core.models.hybrid.layers.hybrid_hyper_connection import (
         HyperConnectionHybridLayer,
     )
+
+    # Custom layer types run eagerly under mHC, whatever the scopes.
+    if isinstance(layer, HyperConnectionHybridLayer) and layer._has_custom_inner_layer():
+        return False
+
+    # If cuda_graph_modules is not set, every layer is graphed.
+    if not config.cuda_graph_modules:
+        return True
+
     from megatron.core.ssm.mamba_layer import MambaLayer
     from megatron.core.transformer.identity_op import IdentityOp
     from megatron.core.transformer.mlp import MLP
@@ -2318,9 +2323,6 @@ def _layer_is_graphable(layer, config):
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
     if isinstance(layer, HyperConnectionHybridLayer):
-        # Custom layer types run eagerly under mHC.
-        if layer._has_custom_inner_layer():
-            return False
         # The wrapper owns capture, but the concrete inner layer determines
         # which configured scopes apply. A MoE-only wrapper has no attention
         # work to graph when only attn is selected.

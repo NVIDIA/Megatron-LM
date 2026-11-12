@@ -176,9 +176,9 @@ For `HybridModel`, the graph boundary is the mHC wrapper. Capture includes its
 stream aggregation and mixing, and static inputs have width
 `hidden_size * mhc_num_residual_streams`. Hybrid MTP stacks participate in TE
 capture through their individual wrapped layers. A custom GPT layer specification
-using `HyperConnectionTransformerLayer` follows the same TE protocol. Custom Hybrid
-layer types (a layer config's `layer_type`) run eagerly under mHC, because TE capture
-of the wrapper would bypass their `forward`.
+using `HyperConnectionTransformerLayer` follows the same TE protocol. With TE graphs,
+custom Hybrid layer types (a layer config's `layer_type`) run eagerly under mHC,
+because TE capture of the wrapper would bypass their `forward`.
 
 | Training path | mHC capture coverage |
 |---|---|

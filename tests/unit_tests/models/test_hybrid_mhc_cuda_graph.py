@@ -752,11 +752,15 @@ class _CustomTransformerConfig(TransformerConfig):
 
 
 @pytest.mark.launch_on_gb200
-@pytest.mark.parametrize("graphs", ["attention_split", "moe_router"])
+@pytest.mark.parametrize("graphs", ["whole_layer", "attention_split", "moe_router"])
 def test_mhc_te_graphs_keep_custom_transformer_layers_eager(graphs):
     """The wrapper's graph paths call TransformerLayer internals, so custom layers stay eager."""
     moe = graphs == "moe_router"
-    if moe:
+    if graphs == "whole_layer":
+        # The default scope graphs every graphable layer.
+        root = _config("hybrid", [])
+        assert not root.cuda_graph_modules
+    elif moe:
         root = _config("hybrid_moe", [CudaGraphModule.attn, CudaGraphModule.moe_router])
     else:
         root = _split_config(mhc_num_residual_streams=2, mhc_sinkhorn_iterations=3)
