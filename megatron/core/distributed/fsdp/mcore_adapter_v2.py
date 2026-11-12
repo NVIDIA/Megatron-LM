@@ -17,7 +17,7 @@
 import contextlib
 import logging
 from contextlib import nullcontext
-from typing import Dict, List, NamedTuple, Optional, Tuple, Type
+from typing import List, NamedTuple, Optional, Tuple, Type
 
 import torch
 import torch.distributed as dist
@@ -239,7 +239,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         expert_dp_mesh, expert_placements = _build_expert_mesh_and_placements(
             config, ddp_config, pg_collection, device_type
         )
-        tensor_atomic_owners = None
         if ddp_config.megatron_fsdp_tensor_atomic:
             dense_placements = Placements(
                 dp_axes=[0],
@@ -247,7 +246,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 gradient=[TensorAtomic()],
                 optimizer=[TensorAtomic()],
             )
-            tensor_atomic_owners = _plan_tensor_owners(module, dp_mesh.size())
         dense_grad_scale, expert_grad_scale = _get_grad_scales(config, dp_mesh, expert_dp_mesh)
 
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
@@ -290,12 +288,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     "RuntimePolicy(caller_managed_grad_sync=True)."
                 )
             construction_context = nullcontext(active_context)
-        with construction_context as context:
-            if tensor_atomic_owners is not None:
-                context.parameter_to_owner = {
-                    **(context.parameter_to_owner or {}),
-                    **tensor_atomic_owners,
-                }
+        with construction_context:
             collector = FsdpUnitCollector(tuple(fsdp_unit_modules))
             for submodule in collector.collect(module):
                 is_expert = isinstance(submodule, (TEGroupedMLP, SequentialMLP))
@@ -552,40 +545,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 # the partial gradient buffer MFSDP allocates, or a redistribute crosses two mesh axes
 # at once and is rejected.
 #
-def _plan_tensor_owners(module: nn.Module, dp_size: int) -> Dict[nn.Parameter, int]:
-    """Assign each dense parameter to one rank, balancing Newton-Schulz work greedily.
-
-    Expert parameters keep their own mesh and are left out. Matrices that Muon updates cost
-    their Newton-Schulz work; the others cost their numel. The plan depends only on parameter
-    shapes, so every rank computes the same one.
-    """
-    expert_parameters = {
-        id(parameter)
-        for submodule in module.modules()
-        if isinstance(submodule, MoELayer)
-        for parameter in submodule.experts.parameters()
-    }
-    work = []
-    for index, (name, parameter) in enumerate(module.named_parameters()):
-        if id(parameter) in expert_parameters:
-            continue
-        is_muon_matrix = parameter.ndim == 2 and not getattr(
-            parameter, "is_embedding_or_output_parameter", False
-        )
-        cost = parameter.numel()
-        if is_muon_matrix:
-            # Newton-Schulz work, as in assign_owner_work.
-            cost *= min(parameter.shape) * 5 + 1
-        work.append((-cost, index, parameter))
-    load = [0.0] * dp_size
-    owners: Dict[nn.Parameter, int] = {}
-    for negative_cost, _, parameter in sorted(work, key=lambda item: item[:2]):
-        owner = min(range(dp_size), key=lambda rank: (load[rank], rank))
-        owners[parameter] = owner
-        load[owner] -= negative_cost
-    return owners
-
-
 # Applying this per axis reproduces the named strategies: HSDP is no_shard outer over
 # ZeRO-3 inner, HFSDP is optim outer over ZeRO-3 inner -- whose optimizer placement is
 # then Shard on both axes, i.e. sharded across the flattened DP domain.
