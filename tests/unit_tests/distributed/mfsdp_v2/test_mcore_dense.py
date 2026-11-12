@@ -143,7 +143,9 @@ def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(process_grou
         pg_collection=process_group_collection,
     )
 
-    assert wrapped.module.context.gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER
+    assert (
+        wrapped.module.context.gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER
+    )
     assert isinstance(wrapped.module, FsdpModule)
 
     parameters = dict(wrapped.module.named_parameters())
