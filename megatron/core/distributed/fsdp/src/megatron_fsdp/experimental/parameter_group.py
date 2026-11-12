@@ -17,6 +17,7 @@
 from collections.abc import Iterable
 from contextlib import nullcontext
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, cast
 from weakref import ReferenceType, ref
 
 import torch
@@ -35,7 +36,7 @@ from .module_utils import copy_parameter_attributes, get_parameter_owner
 from .phase import Phase
 from .placement import BlockAtomic, RowAtomic, ShardLayout, TensorAtomic
 
-if HAVE_TE:
+if TYPE_CHECKING or HAVE_TE:
     from .quantized_dbuffer import QuantizedDBuffer, effective_dtype, update_mxfp8_tensor
 else:
     QuantizedDBuffer = DBuffer
@@ -487,11 +488,18 @@ class FsdpParameterGroup:
             return
 
         if self._model_weight_is_stale:
-            self.post_optimizer_model_weight.redistribute(
-                self.model_weight.placements, out=self.model_weight
-            )
+            # Compute-weight buffers always have the same representation.
+            if isinstance(self.model_weight, DBuffer):
+                cast(DBuffer, self.post_optimizer_model_weight).redistribute(
+                    self.model_weight.placements, out=self.model_weight
+                )
+            else:
+                cast(QuantizedDBuffer, self.post_optimizer_model_weight).redistribute(
+                    self.model_weight.placements, out=self.model_weight
+                )
             self._model_weight_is_stale = False
 
+        ready_phases: tuple[Phase, ...]
         if self._unsharded_model_weight.is_alias_of(self.model_weight):
             ready_phases = (Phase.FORWARD, Phase.BACKWARD)
         elif isinstance(self._unsharded_model_weight, DBuffer):
@@ -547,6 +555,7 @@ class FsdpParameterGroup:
         compute weights ignore them and gather their whole buffer.
         """
         unsharded_model_weight = self._unsharded_model_weight
+        buffers: tuple[DBuffer, ...]
         if isinstance(unsharded_model_weight, DBuffer):
             buffers = (unsharded_model_weight,)
         else:
@@ -564,11 +573,12 @@ class FsdpParameterGroup:
             tuple(buffer.local_buffer for buffer in buffers)
         ):
             if isinstance(unsharded_model_weight, DBuffer):
-                self.model_weight.redistribute(
+                # Sharded and unsharded compute weights share a representation.
+                cast(DBuffer, self.model_weight).redistribute(
                     unsharded_model_weight.placements, out=unsharded_model_weight
                 )
             else:
-                self.model_weight.redistribute(
+                cast(QuantizedDBuffer, self.model_weight).redistribute(
                     unsharded_model_weight.placements,
                     out=unsharded_model_weight,
                     rowwise=rowwise,

@@ -15,7 +15,7 @@
 """Distributed tensor buffers for Megatron-FSDP."""
 
 import dataclasses
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 import torch
 import torch.distributed as dist
@@ -37,7 +37,7 @@ class _OwnedRange:
     buffer_relative_offset: int
 
 
-def _validate_placements(placements: Iterable[Placement]) -> None:
+def _validate_placements(placements: Sequence[Placement]) -> None:
     """Validate DBuffer placements form a supported contiguous local layout."""
     seen_shard = False
     for placement in placements:
@@ -325,9 +325,12 @@ class DBuffer:
             self.layout,
         )
 
-    def is_alias_of(self, other: "DBuffer") -> bool:
+    def is_alias_of(self, other: object) -> bool:
         """Whether the local buffers share backing storage, including distinct views."""
-        return self.local_buffer.untyped_storage() is other.local_buffer.untyped_storage()
+        return (
+            isinstance(other, DBuffer)
+            and self.local_buffer.untyped_storage() is other.local_buffer.untyped_storage()
+        )
 
     @classmethod
     def distribute_tensors(

@@ -76,7 +76,7 @@ def _setup_nvtx_recording(monkeypatch: pytest.MonkeyPatch, events: list[NvtxEven
     def parse_nvtx_label(label: str) -> tuple[str, str]:
         match = _NVTX_LABEL_PATTERN.fullmatch(label)
         assert match is not None
-        return match.groups()
+        return match.group(1), match.group(2)
 
     def record_push(label: str) -> None:
         name, operation = parse_nvtx_label(label)

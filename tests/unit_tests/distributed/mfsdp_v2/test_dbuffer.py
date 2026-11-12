@@ -246,6 +246,7 @@ def test_is_alias_of(distributed_setup):
     assert buffer.is_alias_of(view)
     assert view.is_alias_of(buffer)
     assert not buffer.is_alias_of(separate)
+    assert not buffer.is_alias_of(None)
 
     buffer.release_storage()
     separate.release_storage()
