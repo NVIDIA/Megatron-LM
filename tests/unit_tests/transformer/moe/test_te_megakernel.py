@@ -6,7 +6,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from megatron.core.transformer.moe.megakernel.te import routing_map_to_te_inputs
+from megatron.core.transformer.moe.megakernel.te import routing_map_to_indices
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 
@@ -74,14 +74,21 @@ def test_te_backend_rejects_unsupported_config(overrides, match):
         te_config(**overrides)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_authoritative_routes_and_probability_gradients():
-    probs = torch.tensor([[0.0, 90.0, 0.5, 80.0], [7.0, 8.0, 9.0, 10.0]], requires_grad=True)
-    routes = torch.tensor([[True, False, True, False], [False, False, False, False]])
-    weights, indices = routing_map_to_te_inputs(probs, routes, 2)
-    torch.testing.assert_close(indices, torch.tensor([[0, 2], [-1, -1]], dtype=torch.int32))
-    torch.testing.assert_close(weights, torch.tensor([[0.0, 0.5], [0.0, 0.0]]))
-    weights.backward(torch.tensor([[2.0, 3.0], [4.0, 5.0]]))
-    torch.testing.assert_close(probs.grad, torch.tensor([[2.0, 0.0, 3.0, 0.0], [0.0] * 4]))
+    probs = torch.tensor(
+        [[0.0, 90.0, 0.5, 80.0], [7.0, 8.0, 9.0, 10.0]], device="cuda", requires_grad=True
+    )
+    routes = torch.tensor([[True, False, True, False], [False, False, False, False]], device="cuda")
+    weights, indices = routing_map_to_indices(probs, routes, 2)
+    torch.testing.assert_close(
+        indices, torch.tensor([[0, 2], [-1, -1]], dtype=torch.int32, device="cuda")
+    )
+    torch.testing.assert_close(weights, torch.tensor([[0.0, 0.5], [0.0, 0.0]], device="cuda"))
+    weights.backward(torch.tensor([[2.0, 3.0], [4.0, 5.0]], device="cuda"))
+    torch.testing.assert_close(
+        probs.grad, torch.tensor([[2.0, 0.0, 3.0, 0.0], [0.0] * 4], device="cuda")
+    )
 
 
 def _assert_relative_error(actual, expected, tolerance, name):

@@ -16,7 +16,6 @@ from torch import nn
 from torch.distributed import ProcessGroup
 
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
-from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
 from megatron.core.transformer.moe.megakernel.mok.runtime import _MoKAutograd
 from megatron.core.transformer.moe.megakernel.mok.weights import (
     _native_single_grouped_weight_view,
@@ -28,6 +27,7 @@ from megatron.core.transformer.moe.megakernel.parameter_bridge import (
 from megatron.core.transformer.moe.megakernel.parameter_bridge import (
     main_grad_buffer as _main_grad_buffer,
 )
+from megatron.core.transformer.moe.megakernel.route_adapter import routing_map_to_indices
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -375,7 +375,7 @@ class MoKMegakernel(MegakernelBackend):
 
         # Compact the authoritative route set directly into MOK's fixed [tokens, K]
         # representation. Missing routes are encoded as expert -1 with zero weight.
-        router_weights, top_experts = routing_map_to_mok_inputs(probs, routing_map, self.topk)
+        router_weights, top_experts = routing_map_to_indices(probs, routing_map, self.topk)
 
         output = _MoKAutograd.apply(
             self,

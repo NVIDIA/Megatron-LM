@@ -622,6 +622,14 @@ Token counts and dispatched routing probabilities stay inside the sequence throu
 This path uses NCCL EP communication and TE grouped MLP operations; it does not require
 cuDNN MegaMoE or selection of a whole-MoE fused kernel.
 
+The intended evolution is for TE to implement MegaMoE internally as fused operations,
+including routing, dispatch, expert computation, and combine, using the NCCL EP `EpBuffer`.
+This is a future implementation, not a requirement or an enabled fusion today: routing
+currently runs through `MoELayer.route` in the shared `megakernel_forward` path before
+the TE or MOK backend call, while
+`_make_megamoe_op` constructs the post-router TE sequence. Keeping the routing contract
+and parameter ownership intact allows TE fusion to replace this composition later.
+
 ```bash
 --moe-megakernel-backend te \
 --bf16 --swiglu --disable-bias-linear \

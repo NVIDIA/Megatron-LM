@@ -2,7 +2,7 @@
 
 import torch
 
-from megatron.core.transformer.moe.megakernel.te import routing_map_to_te_inputs
+from megatron.core.transformer.moe.megakernel.te import routing_map_to_indices
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
 
 
@@ -12,7 +12,7 @@ def test_te_route_conversion_replay():
     routes = torch.zeros_like(probs, dtype=torch.bool)
     routes[1:, ::4] = True
     assert_replays_bit_exact(
-        routing_map_to_te_inputs,
+        routing_map_to_indices,
         (probs, routes, 4),
         grad_outputs={"out[0]": torch.randn(128, 4, device="cuda")},
         replays=3,
