@@ -124,12 +124,11 @@ def get_batch(
             config=cfg.model.transformer,
         )
 
-    # The data section's batch flags; the packing path above needs neither them nor the length.
-    flags = cfg.data.batch_flags()
+    # The data section's predicates and the dataset's fields; the packing path above needs
+    # neither them nor the length.
     cp_size = cfg.model.transformer.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    has_cu_seqlens = flags.has_cu_seqlens
-    create_attention_mask_in_dataloader = flags.create_attention_mask
+    has_cu_seqlens = cfg.data.has_cu_seqlens()
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=cfg.model.transformer.pipeline_model_parallel_layout,
         mtp_num_layers=cfg.model.transformer.mtp_num_layers,
@@ -158,6 +157,9 @@ def get_batch(
                 else None
             )
 
+    # Read after the early return above: an intermediate stage without cu_seqlens never looks at
+    # the dataset (a loader-only section has none).
+    create_attention_mask_in_dataloader = cfg.data.dataset.create_attention_mask
     batch = get_batch_on_this_tp_rank(
         batch,
         broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
@@ -196,7 +198,7 @@ def get_batch(
         batch,
         dynamic_cp=False,
         cp_group=get_context_parallel_group(),
-        use_per_sequence_balancing=flags.use_per_sequence_balancing,
+        use_per_sequence_balancing=cfg.data.use_per_sequence_balancing(),
     )
 
     # Return values in BATCH_KEYS order so callers can unpack into the fixed

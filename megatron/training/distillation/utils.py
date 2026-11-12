@@ -239,7 +239,7 @@ def is_packed_sequence_run() -> bool:
     ``CachedLogitsKDLoss``'s sequence-length-trim safety check) so the two can't drift out of
     sync with the batch path.
     """
-    return bool(get_run_config().data.batch_flags().has_cu_seqlens)
+    return bool(get_run_config().data.has_cu_seqlens())
 
 
 def get_consumed_train_samples() -> int:

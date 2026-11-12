@@ -220,4 +220,4 @@ def test_inter_document_masking_on_the_cli_builds_a_valid_section():
     assert args.create_attention_mask_in_dataloader is False
     data = gpt_data_config_from_args(args)
     data.validate()
-    assert data.batch_flags().has_cu_seqlens and not data.batch_flags().create_attention_mask
+    assert data.has_cu_seqlens() and not data.dataset.create_attention_mask

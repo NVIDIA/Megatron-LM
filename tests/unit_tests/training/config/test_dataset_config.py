@@ -18,7 +18,6 @@ from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.training.config import DataConfig, DataloaderConfig
 from megatron.training.config.dataset_config import (
     CONTAINER_WRITTEN_FIELDS,
-    LOADER_ONLY_BATCH_FLAGS,
     dataset_family_from_type,
     dataset_type_from_family,
     has_data_source,
@@ -337,35 +336,34 @@ def test_class_table_and_packedness():
         (dict(blend=BLEND, split="9,1,0", varlen_sbhd_validation=True), VarlenDataset, False, False, False),
     ],
 )  # fmt: skip
-def test_batch_flags_and_the_collate_term_per_family(
+def test_sample_predicates_and_the_collate_term_per_family(
     overrides, dataset_type, is_sft, packed, unpacked
 ):
-    """is_sft is the SFT family exactly, is_packed_sequence the THD metadata (SFT and unpacked
-    varlen), yields_unpacked_samples the loader's identity-collate term (unpacked varlen only):
+    """is_sft() is the SFT family exactly, is_packed_sequence the THD metadata (SFT and unpacked
+    varlen), yields_unpacked_samples() the loader's identity-collate term (unpacked varlen only):
     SFT samples are packed but fixed-width and must go through the default collate."""
     data = DataConfig(dataset=_dataset(**overrides), dataset_type=dataset_type)
-    flags = data.batch_flags()
-    assert (flags.is_sft, flags.is_packed_sequence) == (is_sft, packed)
+    assert data.is_sft() is is_sft
+    assert is_packed_sequence(dataset_type, data.dataset) is packed
     assert data.yields_unpacked_samples() is unpacked
-    assert flags.inter_document_masking is False and flags.create_attention_mask is True
-    assert flags.has_cu_seqlens is is_sft and flags.use_per_sequence_balancing is False
+    assert data.dataset.inter_document_masking is False and data.dataset.create_attention_mask
+    assert data.has_cu_seqlens() is is_sft and data.use_per_sequence_balancing() is False
 
 
-def test_batch_flags_formulas_and_fim():
-    """has_cu_seqlens and use_per_sequence_balancing are get_batch's formulas; the FIM config
+def test_sample_predicate_formulas_and_fim():
+    """has_cu_seqlens() and use_per_sequence_balancing() are get_batch's formulas; the FIM config
     classifies as its class says; the class is resolved read-only when it is not set yet."""
     masked = DataConfig(dataset=_dataset(inter_document_masking=True, create_attention_mask=False))
-    flags = masked.batch_flags()
+    assert masked.has_cu_seqlens() is True and masked.use_per_sequence_balancing() is True
     assert masked.dataset_type is None  # resolved read-only: nothing committed
-    assert (flags.is_sft, flags.is_packed_sequence) == (False, False)
-    assert flags.has_cu_seqlens is True and flags.use_per_sequence_balancing is True
-    assert flags.create_attention_mask is False
+    assert masked.is_sft() is False
+    assert masked.dataset.create_attention_mask is False
     sft_masked = DataConfig(
         dataset=_dataset(inter_document_masking=True), dataset_type=MockSFTDataset
-    ).batch_flags()
-    assert sft_masked.has_cu_seqlens is True and sft_masked.use_per_sequence_balancing is False
+    )
+    assert sft_masked.has_cu_seqlens() is True and sft_masked.use_per_sequence_balancing() is False
     fim = DataConfig(dataset=_fim(), dataset_type=GPTFIMDataset)
-    assert fim.batch_flags().is_packed_sequence is False and not fim.yields_unpacked_samples()
+    assert not is_packed_sequence(GPTFIMDataset, fim.dataset) and not fim.yields_unpacked_samples()
 
 
 def test_inter_document_masking_excludes_the_dataloader_attention_mask():
@@ -379,11 +377,10 @@ def test_inter_document_masking_excludes_the_dataloader_attention_mask():
     ).validate()
 
 
-def test_loader_only_section_reports_the_plain_gpt_batch_flags():
+def test_loader_only_section_reports_the_plain_gpt_predicates():
     data = DataConfig()
-    assert data.batch_flags() == LOADER_ONLY_BATCH_FLAGS
-    assert data.batch_flags().has_cu_seqlens is False
-    assert data.batch_flags().create_attention_mask is True
+    assert data.is_sft() is False and data.has_cu_seqlens() is False
+    assert data.use_per_sequence_balancing() is False
     assert data.yields_unpacked_samples() is False
 
 

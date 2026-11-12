@@ -3257,10 +3257,12 @@ def dummy_train_step(data_iterator):
     """Single dummy training step."""
     cfg = get_run_config()
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    # The data section's batch flags, the model section's parallel values, the container's
-    # sample length (the dataset's, or the model's per-sample maximum for a loader-only section).
-    flags = cfg.data.batch_flags()
-    has_cu_seqlens = flags.has_cu_seqlens
+    # The data section's predicates (the plain-GPT values for a loader-only section), the model
+    # section's parallel values, the container's sample length (the dataset's, or the model's
+    # per-sample maximum for a loader-only section).
+    has_cu_seqlens = cfg.data.has_cu_seqlens()
+    dataset = cfg.data.dataset
+    create_attention_mask = dataset.create_attention_mask if dataset is not None else True
     dynamic_cp = cfg.model.transformer.dynamic_context_parallel
     seq_length = cfg.sample_length
 
@@ -3286,7 +3288,7 @@ def dummy_train_step(data_iterator):
                 broadcast_group=mpu.get_tensor_model_parallel_group(),
                 has_cu_seqlens=has_cu_seqlens,
                 dynamic_cp=dynamic_cp,
-                create_attention_mask_in_dataloader=flags.create_attention_mask,
+                create_attention_mask_in_dataloader=create_attention_mask,
                 cp_size=cfg.model.transformer.context_parallel_size,
                 tp_rank=tp_rank,
                 micro_batch_size=cfg.train.micro_batch_size,
@@ -3395,7 +3397,7 @@ def _get_model_pg_collection(
 def _reduce_microbatch_losses(losses_reduced, *, is_sft, sft_loss_log_mode, group):
     """Average the per-microbatch losses of a step for reporting.
 
-    ``is_sft`` is the data section's SFT family (``cfg.data.batch_flags().is_sft``). For the
+    ``is_sft`` is the data section's SFT family (``cfg.data.is_sft()``). For the
     two-element (numerator, token count) values: SFT runs average over the trainable tokens of
     the global batch (or, with ``--sft-loss-log-mode microbatch``, over the valid per-microbatch
     means), the others take the ratio of the global sums; one-element values keep the legacy
@@ -3760,7 +3762,7 @@ def train_step(
         # Last stage may have no loss (e.g. MIMO encoder-grid ranks).
         loss_reduced = _reduce_microbatch_losses(
             losses_reduced,
-            is_sft=cfg.data.batch_flags().is_sft,
+            is_sft=cfg.data.is_sft(),
             sft_loss_log_mode=args.sft_loss_log_mode,
             group=dp_cp_group,
         )

@@ -18,6 +18,7 @@ from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.utils import Split
 from megatron.core.transformer import TransformerConfig
 from megatron.training.config import DataConfig, DataloaderConfig
+from megatron.training.config.dataset_config import is_packed_sequence
 from megatron.training.datasets.sft_dataset import MockSFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.models import GPTModelConfig
@@ -268,7 +269,7 @@ class TestLoaderSettingsFromTheDataSection:
             config,
         )
         section = _section(run_config, dataset=config, dataset_type=MockSFTDataset)
-        assert section.batch_flags().is_packed_sequence and not section.yields_unpacked_samples()
+        assert is_packed_sequence(MockSFTDataset, config) and not section.yields_unpacked_samples()
         batch = _batch(dataset)
         assert isinstance(batch, dict) and tuple(batch["tokens"].shape) == (1, 16)
         assert "cu_seqlens" in batch
