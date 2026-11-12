@@ -1,6 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from typing import Optional
 from unittest.mock import MagicMock
 
 import torch
@@ -30,16 +29,7 @@ from .utils import are_tensors_nvls_eligible, get_flat_tid, sync_threads
 
 @triton.jit
 def _ag_phase(
-    local_ptr,
-    multicast_ptr,
-    byte_offset,
-    numel,
-    width_128,
-    BLOCK_SIZE,
-    NUMEL_PER_THREAD,
-    RANK,
-    WORLD_SIZE,
-    LAST_DIM: tl.constexpr,
+    local_ptr, multicast_ptr, byte_offset, numel, BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE
 ):
     """
     Core all-gather phase: load from local memory, multicast-store to symmetric buffer.
@@ -48,10 +38,6 @@ def _ag_phase(
     Each thread handles 128-bit (NUMEL_PER_THREAD elements) at a time.
     byte_offset locates the tensor within the multicast buffer.
 
-    By default, each rank's shard lands as one contiguous segment concatenated along dim 0.
-    With LAST_DIM the shard is a `[rows, width_128]` block of 128-bit packs and lands at
-    column block RANK of a `[rows, WORLD_SIZE * width_128]` output:
-    the gather and the rank-major -> row-major transpose fused into one store per pack.
     """
     pid = tl.program_id(axis=0)
     tid = get_flat_tid()
@@ -64,20 +50,14 @@ def _ag_phase(
         offsets = block_start + tid
         mask = offsets < numel_per_rank
 
-        if LAST_DIM:
-            # Masked lanes compute out-of-range addresses but never dereference them.
-            # The flat thread index is unsigned; divide in one signedness.
-            idx = offsets.to(tl.int32)
-            row = idx // width_128
-            col = idx - row * width_128
-            dst = row * (WORLD_SIZE * width_128) + RANK * width_128 + col
-        else:
-            # RANK * numel_per_rank -> start of our rank's segment
-            dst = RANK * numel_per_rank + offsets
-
         # byte_offset // 8 -> converts byte offset to uint64 offset
+        # RANK * numel_per_rank -> start of our rank's segment
         # * 2 -> each 128-bit pack is 2 uint64s
-        multicast_ptrs = multicast_ptr.to(tl.pointer_type(tl.uint64)) + byte_offset // 8 + dst * 2
+        multicast_ptrs = (
+            multicast_ptr.to(tl.pointer_type(tl.uint64))
+            + byte_offset // 8
+            + (RANK * numel_per_rank + offsets) * 2
+        )
         local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
         x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
         st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
@@ -92,13 +72,11 @@ def _multimem_all_gather_kernel(
     signal_pad_ptrs,
     numel,
     byte_offset,
-    width_128,
     BLOCK_SIZE: tl.constexpr,
     NUMEL_PER_THREAD: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
     BARRIER_BEFORE: tl.constexpr,
-    LAST_DIM: tl.constexpr,
 ):
     """Single-tensor multicast all-gather kernel."""
     if BARRIER_BEFORE:
@@ -117,16 +95,7 @@ def _multimem_all_gather_kernel(
         sync_threads()
 
     _ag_phase(
-        local_ptr,
-        multicast_ptr,
-        byte_offset,
-        numel,
-        width_128,
-        BLOCK_SIZE,
-        NUMEL_PER_THREAD,
-        RANK,
-        WORLD_SIZE,
-        LAST_DIM,
+        local_ptr, multicast_ptr, byte_offset, numel, BLOCK_SIZE, NUMEL_PER_THREAD, RANK, WORLD_SIZE
     )
     sync_threads()
     symm_mem_sync(
@@ -167,37 +136,100 @@ def _multimem_all_gather_3_kernel(
         multicast_ptr,
         byte_offset_0,
         numel_0,
-        0,
         BLOCK_SIZE,
         NUMEL_PER_THREAD,
         RANK,
         WORLD_SIZE,
-        False,
     )
     _ag_phase(
         local_ptr_1,
         multicast_ptr,
         byte_offset_1,
         numel_1,
-        0,
         BLOCK_SIZE,
         NUMEL_PER_THREAD,
         RANK,
         WORLD_SIZE,
-        False,
     )
     _ag_phase(
         local_ptr_2,
         multicast_ptr,
         byte_offset_2,
         numel_2,
-        0,
         BLOCK_SIZE,
         NUMEL_PER_THREAD,
         RANK,
         WORLD_SIZE,
-        False,
     )
+    sync_threads()
+    symm_mem_sync(
+        signal_pad_ptrs,
+        None,
+        RANK,
+        WORLD_SIZE,
+        hasPreviousMemAccess=True,
+        hasSubsequentMemAccess=True,
+    )
+
+
+@triton.jit
+def _vocab_parallel_multimem_ag_kernel(
+    local_ptr,
+    multicast_ptr,
+    signal_pad_ptrs,
+    numel,
+    shard_width_128,
+    BLOCK_SIZE: tl.constexpr,
+    NUMEL_PER_THREAD: tl.constexpr,
+    RANK: tl.constexpr,
+    WORLD_SIZE: tl.constexpr,
+):
+    """
+    Vocab-parallel multicast all-gather kernel.
+
+    The local shard is a `[rows, shard_width_128]` block of 128-bit packs.
+    It lands at column block RANK of the `[rows, WORLD_SIZE * shard_width_128]` output:
+    the gather and the rank-major -> row-major transpose fused into one store per pack.
+    """
+    # The output persists across calls and each store follows the previous one, so ensure
+    # every rank has finished reading the previous contents before overwriting them.
+    symm_mem_sync(
+        signal_pad_ptrs,
+        None,
+        RANK,
+        WORLD_SIZE,
+        hasPreviousMemAccess=True,
+        hasSubsequentMemAccess=True,
+    )
+    sync_threads()
+
+    pid = tl.program_id(axis=0)
+    tid = get_flat_tid()
+
+    numel_128 = numel // NUMEL_PER_THREAD
+    numel_per_rank = tl.cdiv(numel_128, WORLD_SIZE)
+    block_start = pid * BLOCK_SIZE
+
+    while block_start < numel_per_rank:
+        offsets = block_start + tid
+        mask = offsets < numel_per_rank
+
+        # Masked lanes compute out-of-range addresses but never dereference them.
+        # The flat thread index is unsigned; divide in one signedness.
+        idx = offsets.to(tl.int32)
+        row = idx // shard_width_128
+        col = idx - row * shard_width_128
+        # Output row `row`, column block RANK, pack `col`.
+        dst = row * (WORLD_SIZE * shard_width_128) + RANK * shard_width_128 + col
+
+        # * 2 -> each 128-bit pack is 2 uint64s
+        multicast_ptrs = multicast_ptr.to(tl.pointer_type(tl.uint64)) + dst * 2
+        local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + offsets * 2
+        x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
+        st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
+
+        block_start += tl.num_programs(axis=0) * BLOCK_SIZE
+
     sync_threads()
     symm_mem_sync(
         signal_pad_ptrs,
@@ -295,7 +327,6 @@ def multimem_all_gather(
     symm_mem_hdl: _SymmetricMemory,
     byte_offset: int = 0,
     barrier_before: bool = False,
-    last_dim_width: Optional[int] = None,
     **kwargs,
 ) -> torch.Tensor:
     """
@@ -308,12 +339,6 @@ def multimem_all_gather(
     It must be set by the caller whenever this all-gather directly follows another
     all-gather on the same symmetric buffer with no reduce-scatter in between (a
     reduce-scatter already establishes that ordering inside its own kernel).
-
-    By default the shards are concatenated along dim 0.
-    With ``last_dim_width`` the input is a contiguous 2D ``[rows, last_dim_width]`` shard
-    that lands at column block ``rank`` of the ``[rows, world_size * last_dim_width]`` output,
-    the gather and the rank-major -> row-major transpose fused into one multicast store per element.
-    Shard rows must then be 16-byte divisible so the column blocks stay 128-bit aligned.
     """
     assert HAVE_TRITON, "Triton is required for multimem all-gather."
     assert are_tensors_nvls_eligible(
@@ -323,18 +348,6 @@ def multimem_all_gather(
         output_tensor.numel() % input_tensor.numel() == 0
         and output_tensor.numel() // input_tensor.numel() == symm_mem_hdl.world_size
     ), "Output numel must be exactly world_size * input numel for all-gather."
-    assert (
-        input_tensor.dtype == output_tensor.dtype
-    ), "Input and output dtypes must match: the multicast store copies raw bytes."
-    if last_dim_width is not None:
-        assert (
-            input_tensor.dim() == 2
-            and input_tensor.is_contiguous()
-            and input_tensor.shape[1] == last_dim_width
-        ), "last_dim_width needs a contiguous 2D [rows, last_dim_width] input."
-        assert (
-            last_dim_width * input_tensor.element_size() % 16 == 0
-        ), "Shard rows must be 16-byte divisible so column blocks stay 128-bit aligned."
 
     numel_per_thread, num_blocks, config = _kernel_launch_config(
         input_tensor.element_size(), output_tensor.numel(), symm_mem_hdl.world_size, **kwargs
@@ -345,13 +358,65 @@ def multimem_all_gather(
         symm_mem_hdl.signal_pad_ptrs_dev,
         numel=output_tensor.numel(),
         byte_offset=byte_offset,
-        width_128=0 if last_dim_width is None else last_dim_width // numel_per_thread,
         BLOCK_SIZE=config["BLOCK_SIZE"],
         NUMEL_PER_THREAD=numel_per_thread,
         RANK=symm_mem_hdl.rank,
         WORLD_SIZE=symm_mem_hdl.world_size,
         BARRIER_BEFORE=barrier_before,
-        LAST_DIM=last_dim_width is not None,
+        num_warps=config["num_warps"],
+    )
+
+    return output_tensor
+
+
+def vocab_parallel_multimem_ag(
+    output_tensor: torch.Tensor,
+    input_tensor: torch.Tensor,
+    symm_mem_hdl: _SymmetricMemory,
+    **kwargs,
+) -> torch.Tensor:
+    """
+    Multicast all-gather of vocab-parallel shards along the last dimension.
+
+    Each rank's contiguous `[rows, vocab / tp]` input lands at column block `rank` of the
+    `[rows, vocab]` output: the gather and the rank-major -> row-major transpose fused into
+    one multicast store per element, so the output needs no rearranging copy.
+
+    The output must start at the beginning of its symmetric memory buffer.
+    Every call barriers first, so every rank has finished reading the output's previous contents
+    before they are overwritten. Shard rows must be 16-byte divisible so the column blocks
+    stay 128-bit aligned.
+    """
+    assert HAVE_TRITON, "Triton is required for multimem all-gather."
+    assert are_tensors_nvls_eligible(
+        input_tensor
+    ), "Input tensor must be 16-byte divisible on Hopper+ for NVLS."
+    world_size = symm_mem_hdl.world_size
+    assert (
+        input_tensor.dim() == 2
+        and input_tensor.is_contiguous()
+        and output_tensor.shape == (input_tensor.shape[0], world_size * input_tensor.shape[1])
+    ), "Needs a contiguous [rows, vocab / tp] input and a [rows, vocab] output."
+    assert (
+        input_tensor.dtype == output_tensor.dtype
+    ), "Input and output dtypes must match: the multicast store copies raw bytes."
+    assert (
+        input_tensor.shape[1] * input_tensor.element_size() % 16 == 0
+    ), "Shard rows must be 16-byte divisible so column blocks stay 128-bit aligned."
+
+    numel_per_thread, num_blocks, config = _kernel_launch_config(
+        input_tensor.element_size(), output_tensor.numel(), world_size, **kwargs
+    )
+    _vocab_parallel_multimem_ag_kernel[(num_blocks, 1, 1)](
+        input_tensor.data_ptr(),
+        symm_mem_hdl.multicast_ptr,
+        symm_mem_hdl.signal_pad_ptrs_dev,
+        numel=output_tensor.numel(),
+        shard_width_128=input_tensor.shape[1] // numel_per_thread,
+        BLOCK_SIZE=config["BLOCK_SIZE"],
+        NUMEL_PER_THREAD=numel_per_thread,
+        RANK=symm_mem_hdl.rank,
+        WORLD_SIZE=world_size,
         num_warps=config["num_warps"],
     )
 

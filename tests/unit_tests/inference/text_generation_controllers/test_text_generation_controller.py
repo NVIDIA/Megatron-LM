@@ -4376,12 +4376,12 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="multimem collectives need CUDA")
-    def test_multimem_all_gather_last_dim_layout(self):
-        """`multimem_all_gather(last_dim_width=...)` lands each rank's shard in its column
-        block of the output; the default layout still concatenates along dim 0."""
+    def test_vocab_parallel_multimem_ag_layout(self):
+        """`vocab_parallel_multimem_ag` lands each rank's shard in its column block of the
+        output."""
         from megatron.core.inference.communication.torch_symm_triton import (
             is_device_nvls_capable,
-            multimem_all_gather,
+            vocab_parallel_multimem_ag,
         )
         from megatron.core.inference.symmetric_memory import (
             HAVE_TORCH_SYMM_MEM,
@@ -4409,15 +4409,9 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
             for r in range(world_size)
         ]
         try:
-            multimem_all_gather(
-                output, shards[rank], handle, barrier_before=True, last_dim_width=width
-            )
+            vocab_parallel_multimem_ag(output, shards[rank], handle)
             torch.cuda.synchronize()
             assert torch.equal(output, torch.cat(shards, dim=-1))
-            flat = output.view(world_size * rows, width)
-            multimem_all_gather(flat, shards[rank], handle, barrier_before=True)
-            torch.cuda.synchronize()
-            assert torch.equal(flat, torch.cat(shards, dim=0))
         finally:
             SymmetricMemoryManager.destroy("test_logits")
 

@@ -1081,19 +1081,13 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 buffer_rows.copy_(logits.squeeze(1))
             else:
                 from megatron.core.inference.communication.torch_symm_triton import (
-                    multimem_all_gather,
+                    vocab_parallel_multimem_ag,
                 )
 
                 # TP > 1 on NVLS: each rank stores its vocab shard into its column block of
-                # every rank's buffer rows (gather and transpose fused); the barrier before the
-                # store orders it after every peer's reads of the previous step's logits.
-                multimem_all_gather(
-                    buffer_rows,
-                    logits.squeeze(1),
-                    multicast_handle,
-                    barrier_before=True,
-                    last_dim_width=logits.shape[-1],
-                )
+                # every rank's buffer rows (gather and transpose fused). The store barriers
+                # first, so it lands after every peer's reads of the previous step's logits.
+                vocab_parallel_multimem_ag(buffer_rows, logits.squeeze(1), multicast_handle)
             logits = buffer_rows.unsqueeze(1)
         gather_output = (
             self.output_layer.gather_output
