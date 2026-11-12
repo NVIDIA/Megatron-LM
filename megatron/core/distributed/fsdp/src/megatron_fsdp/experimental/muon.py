@@ -29,6 +29,21 @@ from .owner_planning import assign_owner_work
 from .parameter_group import FsdpParameterGroup, get_containing_parameter_group
 from .range import Range, intersect_ranges
 
+# Newton-Schulz temporaries grow with the batch, so a batch holds at most this much FP32 input.
+_MAX_BATCH_BYTES = 1 << 30
+
+
+def _batches_by_shape(tensors: dict[int, torch.Tensor]) -> list[list[int]]:
+    """Group the tensors' indices by shape, in batches of at most ``_MAX_BATCH_BYTES`` each."""
+    by_shape: dict[torch.Size, list[int]] = {}
+    for i, tensor in tensors.items():
+        by_shape.setdefault(tensor.shape, []).append(i)
+    batches: list[list[int]] = []
+    for shape, indices in by_shape.items():
+        size = max(1, _MAX_BATCH_BYTES // (shape.numel() * 4))
+        batches += [indices[start : start + size] for start in range(0, len(indices), size)]
+    return batches
+
 
 @dataclass(frozen=True)
 class _FsdpGroupAssignment:
@@ -141,6 +156,11 @@ class FsdpMuon(Muon):
                 f"num_groups_in_flight must be non-negative, got {num_groups_in_flight}."
             )
         self.num_groups_in_flight = num_groups_in_flight
+        # Same-shape tensors share one Newton-Schulz unless a subclass orthogonalizes differently
+        # or SYRK is on, whose kernel takes 2-D inputs only.
+        self._batch_same_shape = type(self).orthogonalize is Muon.orthogonalize and not kwargs.get(
+            "use_syrk", False
+        )
 
         # Preserve discovery order: communication must be posted identically on every rank.
         fsdp_groups: dict[FsdpParameterGroup, None] = {}
@@ -370,16 +390,34 @@ class FsdpMuon(Muon):
         return momentum_inputs
 
     def _orthogonalize_updates(self, group_step: _GroupStep) -> None:
-        """Replace this rank's gathered inputs with full orthogonalized updates."""
+        """Replace this rank's gathered inputs with full orthogonalized updates.
+
+        Tensors of the same shape run one batched Newton-Schulz: a small matrix's Newton-Schulz is
+        dozens of short kernels, too many for the host to launch one matrix at a time. A tensor
+        alone with its shape keeps the per-tensor ``orthogonalize`` call.
+        """
         fsdp_group: FsdpParameterGroup = group_step.assignment.fsdp_group
         tensor_to_optimizer_group_index: dict[int, int] = group_step.tensor_to_optimizer_group_index
         full_updates: dict[int, torch.Tensor] = group_step.full_updates
+        batches: list[list[int]] = (
+            _batches_by_shape(full_updates)
+            if self._batch_same_shape
+            else [[i] for i in full_updates]
+        )
         with eo_utils.fp32_matmul_precision(self.fp32_matmul_prec):
-            for i, update in full_updates.items():
+            for batch in batches:
+                if len(batch) > 1:
+                    inputs = torch.stack([full_updates[i].float() for i in batch])
+                    updates = self.scaled_orthogonalize_fn(inputs).contiguous()
+                    full_updates.update(zip(batch, updates.unbind()))
+                    continue
+                (i,) = batch
                 param: torch.nn.Parameter = fsdp_group.fsdp_parameters[i].sharded
                 group: dict[str, Any] = self.param_groups[tensor_to_optimizer_group_index[i]]
                 kwargs: dict[str, Any] = {k: v for k, v in group.items() if k != "params"}
-                full_updates[i] = self.orthogonalize(param, update.float(), **kwargs).contiguous()
+                full_updates[i] = self.orthogonalize(
+                    param, full_updates[i].float(), **kwargs
+                ).contiguous()
 
     def _apply_updates(self, group_step: _GroupStep) -> None:
         """Wait for a group's scatter, then apply owned result slices and received updates."""
