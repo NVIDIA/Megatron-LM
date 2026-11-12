@@ -6,6 +6,7 @@ from typing import Callable, Dict, List, Optional, Union
 import torch
 from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 
+from megatron.core.distributed.fsdp.mcore_adapter_v2 import FullyShardedDataParallelV2
 from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     uneven_dtensor_to_full_tensor,
 )
@@ -731,6 +732,12 @@ def finalize_model_grads(
         )
 
         wait_for_gtp_grad_reduction_on_current_stream()
+
+    # All local MFSDP chunks share one context and have finished backward.
+    if isinstance(model[0], FullyShardedDataParallelV2):
+        context = model[0].module.context
+        if not context.autograd_completes_execution:
+            context.post_backward()
 
     # All-reduce / reduce-scatter across DP replicas.
     if config.timers is not None:

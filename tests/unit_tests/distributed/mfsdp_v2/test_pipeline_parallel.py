@@ -12,16 +12,26 @@ loop. This test drives the helper directly and asserts that all wrapped chunks
 share the same ``FsdpContext``.
 """
 
+from contextlib import nullcontext
+
 import pytest
 import torch
 import torch.nn as nn
 
 from megatron.core.distributed import DistributedDataParallelConfig, FullyShardedDataParallel
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    GradientFinalizationMode,
+    PrefetchOrder,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
+    ExecutionEvent,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
     current_fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.training.training import wrap_model_chunks_with_ddp
@@ -48,18 +58,13 @@ def _mfsdp_v2_ddp_config() -> DistributedDataParallelConfig:
     )
 
 
-def _compute_config() -> TransformerConfig:
-    """A minimal TransformerConfig accepted by MFSDP v2 validation."""
-    return TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=1)
-
-
 class TestMfsdpV2PipelineSharedContext:
     """MFSDP v2 virtual-pipeline chunks share a single FSDP context."""
 
     def setup_method(self):
-        """Initialize the single-stage process groups the wrapping call needs."""
+        """Initialize two pipeline stages for the wrapping call."""
         Utils.initialize_model_parallel(
-            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=2
         )
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
@@ -69,18 +74,25 @@ class TestMfsdpV2PipelineSharedContext:
 
     @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires at least 2 CUDA devices.")
     def test_shared_context_across_virtual_pipeline_chunks(self, distributed_setup):
-        """Multiple virtual-pipeline chunks wrapped in one call share one FsdpContext."""
+        """Shared chunks record their complete execution across separate backward calls."""
         device = distributed_setup.device
 
-        # virtual_pipeline_model_parallel_size > 1 yields multiple chunks on this
-        # rank; model two virtual-pipeline sub-stages here. The ambient
-        # fully_shard_context is opened for every MFSDP v2 wrap, regardless of the
-        # chunk count.
+        # The ambient context is shared for both ordinary PP and VPP wrapping.
         chunks = [_VirtualPipelineChunk().to(device=device, dtype=torch.bfloat16) for _ in range(2)]
+        config = TransformerConfig(
+            num_layers=4,
+            hidden_size=16,
+            num_attention_heads=1,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            pipeline_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=2,
+        )
 
         wrapped_chunks = wrap_model_chunks_with_ddp(
             chunks,
-            _compute_config(),
+            config,
             _mfsdp_v2_ddp_config(),
             DP=FullyShardedDataParallel,
             pg_collection=self.pg_collection,
@@ -95,14 +107,41 @@ class TestMfsdpV2PipelineSharedContext:
 
         # The whole point of the feature: all chunks share ONE context, so each chunk
         # must report the same context object as the first one.
-        first_context = wrapped_chunks[0].module.context
+        context = wrapped_chunks[0].module.context
         for wrapped_chunk in wrapped_chunks:
-            assert wrapped_chunk.module.context is first_context
+            assert wrapped_chunk.module.context is context
 
         # The shared context was finalized exactly once after the loop, so it is
         # ready to drive forward/backward without an extra finalize.
-        first_context.ensure_finalized()
+        context.ensure_finalized()
 
         # The helper left no ambient context behind: the chunks joined its scope and
         # that scope, which owned the only finalize call, has since exited.
         assert current_fully_shard_context() is None
+
+        assert context.prefetch_order is PrefetchOrder.RECORDED
+        inputs = torch.ones(2, 16, device=device, dtype=torch.bfloat16)
+        expected = (
+            [ExecutionEvent(chunk.module, Phase.FORWARD) for chunk in wrapped_chunks]
+            + [ExecutionEvent(chunk.module, Phase.BACKWARD) for chunk in reversed(wrapped_chunks)]
+        ) * 2
+        with context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER):
+            for _ in range(2):
+                for chunk in wrapped_chunks:
+                    chunk.zero_grad(set_to_none=True)
+                for microbatch in range(2):
+                    with wrapped_chunks[0].no_sync() if microbatch == 0 else nullcontext():
+                        outputs = [chunk(inputs) for chunk in wrapped_chunks]
+                        for output in reversed(outputs):
+                            output.float().sum().backward()
+                context.post_backward()
+                context.finish_grad_sync()
+                assert not context.is_recording_execution_order
+                assert list(context.execution_order) == expected
+                assert context.execution_order.position == 0
+                # Each of two microbatches contributes two to every weight gradient.
+                for chunk in wrapped_chunks:
+                    for parameter in chunk.parameters():
+                        torch.testing.assert_close(
+                            parameter.grad, torch.full_like(parameter.grad, 4), rtol=0, atol=0
+                        )
