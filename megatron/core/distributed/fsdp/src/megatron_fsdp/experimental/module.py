@@ -267,6 +267,9 @@ class FsdpModule:
         # A reentrant checkpoint recomputes before the child module's backward-pre
         # hook runs. The active autograd GraphTask identifies that recomputation.
         is_recomputing = self.phase is Phase.BACKWARD or is_in_backward()
+        # Evaluation has no backward events and must not consume the training
+        # prefetch trace. Training-mode no_grad forwards can be reentrant checkpoints.
+        is_evaluating = not cast(nn.Module, self).training and not torch.is_grad_enabled()
         if self.phase is not Phase.BACKWARD:
             self.phase = Phase.FORWARD
         # forward/backward each span multiple lifecycle methods (pre_forward ->
@@ -279,10 +282,13 @@ class FsdpModule:
 
         # TODO: Recomputation gathers MXFP8 rowwise planes on demand, because backward
         # prefetch gathers only columnwise planes. Thw two planes can be prefetched at once.
-        if context.is_recording_execution_order and not is_recomputing:
+        if context.is_recording_execution_order and not is_recomputing and not is_evaluating:
             context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.FORWARD))
         self.unshard(
-            Phase.FORWARD, prefetch=not is_recomputing and not context.is_recording_execution_order
+            Phase.FORWARD,
+            prefetch=not is_recomputing
+            and not is_evaluating
+            and not context.is_recording_execution_order,
         )
 
     def unshard(self, phase: Phase | None = None, prefetch: bool = False) -> None:
