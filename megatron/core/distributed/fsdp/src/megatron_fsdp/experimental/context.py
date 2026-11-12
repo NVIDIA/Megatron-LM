@@ -77,7 +77,9 @@ class FsdpContext:
         device: torch.device | None = None,
         runtime_policy: RuntimePolicy = RuntimePolicy(),
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
-        gradient_finalization_mode: GradientFinalizationMode = GradientFinalizationMode.REDUCE_OUTER_AND_WAIT,
+        gradient_finalization_mode: GradientFinalizationMode = (
+            GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+        ),
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
