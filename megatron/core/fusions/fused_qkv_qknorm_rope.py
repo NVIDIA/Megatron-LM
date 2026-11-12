@@ -56,6 +56,7 @@ def _rsqrt(x):
     return libdevice.rsqrt(x)
 
 
+# Launches pin enable_fp_fusion=True (Triton's default until 3.10): the TE parity is tested with it.
 # Launch shape: tokens handled per program (looped) and warps per program. Module-level so a
 # benchmark can sweep them; no autotuning, so the first call is safe ahead of CUDA graph capture.
 # Tuned at head dim 128 with 8 and 16 query heads per group.
@@ -320,6 +321,7 @@ class _FusedQKVQKNormRoPE(torch.autograd.Function):
             SAME_FREQS=kf is qf,
             TOKENS=FWD_TOKENS,
             num_warps=FWD_WARPS,
+            enable_fp_fusion=True,
         )
         ctx.save_for_backward(mixed_qkv, qf, kf, q_weight, k_weight)
         ctx.cfg = (nq, eps, zero_centered_gamma)
@@ -365,6 +367,7 @@ class _FusedQKVQKNormRoPE(torch.autograd.Function):
             TOKENS=BWD_TOKENS,
             SAME_FREQS=kf is qf,
             num_warps=BWD_WARPS or (1 if nq <= 8 else 2),
+            enable_fp_fusion=True,
         )
         dqw = dqw_part.sum(0).to(q_weight.dtype)
         dkw = dkw_part.sum(0).to(k_weight.dtype)
