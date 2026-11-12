@@ -189,6 +189,28 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
+        active_context = current_fully_shard_context()
+        use_symmetric_memory = (
+            active_context.use_symmetric_memory
+            if active_context is not None
+            else ddp_config.nccl_ub
+        )
+        if use_symmetric_memory:
+            if ddp_config.num_distributed_optimizer_instances > 1:
+                groups = (pg_collection.inter_dist_opt, pg_collection.intra_dp_cp)
+                if config.num_moe_experts is not None:
+                    groups += (pg_collection.intra_expt_dp,)
+            else:
+                groups = (pg_collection.dp_cp,)
+                if config.num_moe_experts is not None:
+                    groups += (pg_collection.expt_dp,)
+            communication_device = (
+                active_context.allgather_stream.device
+                if active_context is not None
+                else torch.cuda.current_stream(device).device
+            )
+            _initialize_symmetric_memory_communicators(groups, communication_device)
+
         # Optimizer construction reads this attribute; retain the v1 contract for compatibility.
         self.ddp_config = ddp_config
 
@@ -220,43 +242,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             self.mp_policy,
         )
 
-        # Join the caller's ambient context when one is active (VPP chunks); otherwise
-        # open and finalize our own. MCore's finalize_model_grads() owns the wait
-        # after the schedule completes, including delayed wgrad and custom 1F1B work.
-        context = current_fully_shard_context()
-        if context is None:
-            context = FsdpContext(
-                device=device,
-                runtime_policy=RuntimePolicy(
-                    use_symmetric_memory=ddp_config.nccl_ub,
-                    caller_managed_grad_sync=True,
-                    overlap_outer_communication=ddp_config.overlap_outer_communication,
-                ),
-            )
-            construction_context = fully_shard_context(context)
-        else:
-            if not context.caller_managed_grad_sync:
-                raise ValueError(
-                    "MCore MFSDP v2 requires shared contexts to be constructed with "
-                    "RuntimePolicy(caller_managed_grad_sync=True)."
-                )
-            construction_context = nullcontext(context)
-
-        has_outer_dp_axis = ddp_config.num_distributed_optimizer_instances > 1
-        if context.use_symmetric_memory:
-            if has_outer_dp_axis:
-                groups = (pg_collection.inter_dist_opt, pg_collection.intra_dp_cp)
-                if config.num_moe_experts is not None:
-                    groups += (pg_collection.intra_expt_dp,)
-            else:
-                groups = (pg_collection.dp_cp,)
-                if config.num_moe_experts is not None:
-                    groups += (pg_collection.expt_dp,)
-            _initialize_symmetric_memory_communicators(groups, context.allgather_stream.device)
-
         device_type = device.type if device is not None else "cuda"
 
-        if has_outer_dp_axis:
+        if has_outer_dp_axis := ddp_config.num_distributed_optimizer_instances > 1:
             # There is no HSDP/HFSDP special case:
             # each axis takes the placements of its own strategy, so no_shard outer over
             # ZeRO-3 inner is HSDP and ZeRO-1 outer over ZeRO-3 inner is HFSDP.
@@ -305,6 +293,27 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 else ShardLayout.UNPADDED
             ),
         )
+        # Join the caller's ambient context when one is active (VPP chunks); otherwise
+        # open and finalize our own. MCore's finalize_model_grads() owns the wait
+        # after the schedule completes, including delayed wgrad and custom 1F1B work.
+        if active_context is None:
+            construction_context = fully_shard_context(
+                FsdpContext(
+                    device=device,
+                    runtime_policy=RuntimePolicy(
+                        use_symmetric_memory=ddp_config.nccl_ub,
+                        caller_managed_grad_sync=True,
+                        overlap_outer_communication=ddp_config.overlap_outer_communication,
+                    ),
+                )
+            )
+        else:
+            if not active_context.caller_managed_grad_sync:
+                raise ValueError(
+                    "MCore MFSDP v2 requires shared contexts to be constructed with "
+                    "RuntimePolicy(caller_managed_grad_sync=True)."
+                )
+            construction_context = nullcontext(active_context)
         with construction_context:
             collector = FsdpUnitCollector(tuple(fsdp_unit_modules))
             for submodule in collector.collect(module):
