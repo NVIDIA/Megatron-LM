@@ -427,6 +427,27 @@ def test_fully_shard_rejects_child_from_another_context(distributed_setup):
 @pytest.mark.parametrize(
     "mode", [GradientFinalizationMode.SKIP_OUTER, GradientFinalizationMode.REDUCE_OUTER]
 )
+def test_finalize_gradients_scopes_context(distributed_setup, mode):
+    """Nested scopes restore the previous mode, including after an exception."""
+    context = FsdpContext(device=distributed_setup.device)
+    context.finalize()
+    assert context.gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+    with context.finalize_gradients(mode=mode):
+        assert context.gradient_finalization_mode is mode
+        with context.finalize_gradients():
+            assert (
+                context.gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+            )
+        assert context.gradient_finalization_mode is mode
+        with pytest.raises(RuntimeError, match="step failed"), context.finalize_gradients():
+            raise RuntimeError("step failed")
+        assert context.gradient_finalization_mode is mode
+    assert context.gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+
+
+@pytest.mark.parametrize(
+    "mode", [GradientFinalizationMode.SKIP_OUTER, GradientFinalizationMode.REDUCE_OUTER]
+)
 def test_finalize_gradients_restores_automatic_wait(distributed_setup, monkeypatch, mode):
     """Leaving a scope, including on error, restores the default automatic wait."""
     device = distributed_setup.device
