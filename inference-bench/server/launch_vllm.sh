@@ -172,5 +172,5 @@ until grep -q "Application startup complete." "${LOG}" 2>/dev/null; do
 done
 echo "Server ready."
 echo "Server reachable at: http://$(hostname):5000/v1"
-hostname > "${EXP_DIR}/host"
+hostname > "${EXP_DIR}/host.tmp" && mv "${EXP_DIR}/host.tmp" "${EXP_DIR}/host"  # atomic: client.sh reads it
 serve_until_done

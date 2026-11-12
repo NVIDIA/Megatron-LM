@@ -372,7 +372,7 @@ until server_ready; do
 done
 echo "Server ready."
 echo "Server reachable at: http://$(hostname):5000/v1"
-hostname > "${EXP_DIR}/host"
+hostname > "${EXP_DIR}/host.tmp" && mv "${EXP_DIR}/host.tmp" "${EXP_DIR}/host"  # atomic: client.sh reads it
 
 if [ -n "${BENCH:-}" ]; then
     python3 -u inference-bench/server/client.py \

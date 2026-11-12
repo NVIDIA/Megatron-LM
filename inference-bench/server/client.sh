@@ -63,7 +63,7 @@ done
 echo "Server experiment directory: ${EXP_DIR}"
 
 # The launcher writes <exp dir>/host once the HTTP server is up; done means it already exited.
-until [ -f "${EXP_DIR}/host" ]; do
+until [ -s "${EXP_DIR}/host" ]; do
     if [ -f "${EXP_DIR}/done" ]; then
         echo "Server exited before becoming ready; see the server logs in ${EXP_DIR}"
         exit 1
@@ -71,10 +71,9 @@ until [ -f "${EXP_DIR}/host" ]; do
     sleep 10
 done
 SERVER_HOST=$(cat "${EXP_DIR}/host")
-# Cluster DNS occasionally fails to resolve a node name for a moment; a client that starts then
-# would fail its first request and end the run. Wait (up to 5 min) until the name resolves.
+# Make sure the name resolves before the first request (which would otherwise end the run).
 for _ in $(seq 60); do getent hosts "${SERVER_HOST}" > /dev/null && break; sleep 5; done
-getent hosts "${SERVER_HOST}" > /dev/null || echo "warning: ${SERVER_HOST} does not resolve"
+getent hosts "${SERVER_HOST}" > /dev/null || { echo "server host '${SERVER_HOST}' does not resolve"; exit 1; }
 SERVER="http://${SERVER_HOST}:5000"
 TOKENIZER=$(sed -n 's/^TOKENIZER=//p' "${EXP_DIR}/config.env")
 echo "Client on $(hostname), server ${SERVER}"
