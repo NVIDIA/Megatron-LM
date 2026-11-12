@@ -55,7 +55,7 @@ def _expert_parallel_kwargs(moe, world_size):
     return dict(expert_model_parallel_size=2, expert_gtp_remat_size=world_size // 2)
 
 
-def _build_mtp_gpt_model(repeated_layer=False, moe=False):
+def _build_mtp_gpt_model(repeated_layer=False, moe=False, early_backward=False):
     """Full GPTModel (embedding + decoder + output_layer) with an MTP block attached.
 
     ``moe=True`` puts grouped experts in both the decoder and the MTP layer, which is what puts
@@ -101,6 +101,7 @@ def _build_mtp_gpt_model(repeated_layer=False, moe=False):
         attention_backend=AttnBackend.unfused,
         mtp_num_layers=MTP_NUM_LAYERS,
         mtp_use_repeated_layer=repeated_layer,
+        mtp_loss_early_backward=early_backward,
         mtp_loss_scaling_factor=0.1,
         **moe_kwargs,
     )
@@ -202,28 +203,46 @@ def _assert_grouped_chains_used(model, moe):
         assert not grouped_mtp, f"dense variant unexpectedly used grouped chains: {grouped_mtp}"
 
 
-def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, moe=False):
-    """Async reduce-scatter path must produce the same gradients as the sync path, with MTP.
+def _worker_shared_weight_grads(
+    rank, world_size, port, repeated_layer=False, moe=False, early_backward=False, microbatches=1
+):
+    """Overlapped GTP must produce the same loss and gradients as all-synchronous GTP, with MTP.
 
-    Both phases run the SAME model, sharding (gtp_remat=world), init weights and batch -- only
-    ``GTP_CONFIG.async_reduction`` differs. The sync path reduce-scatters and accumulates inline
-    on every wgrad, so it has no deferred cascade and no repeated-backward hazard; it is a
-    trusted reference for exactly the code the async path adds. Holding the sharding identical
-    on both sides also keeps every DP/GTP grad-scaling subtlety out of the comparison.
+    Both phases run the SAME model, sharding (gtp_remat=world), init weights and batches -- only
+    ``GTP_CONFIG.weight_prefetch`` and ``GTP_CONFIG.async_reduction`` differ. The synchronous
+    phase gathers on demand and reduce-scatters and accumulates inline on every wgrad, so it has
+    no prefetch, buffer reuse, deferred drain or repeated-backward hazard; it is a trusted
+    reference for exactly the code the overlapped path adds. Each phase runs three iterations and
+    compares the last: the second records every chain's consumes and its fence builds the
+    prefetch plans, so the third runs planned. Holding the sharding identical on both sides also
+    keeps every DP/GTP grad-scaling subtlety out of the comparison.
+
+    The planned iteration must also leave no on-demand all-gather but the embedding's, whose
+    shard is only final right before the iteration.
     """
     from megatron.core import parallel_state as ps
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTP_CONFIG
     from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
-    saved_async = GTP_CONFIG.async_reduction
-    saved_pad = GTP_CONFIG.pad_for_alignment
+    P = GTPShardedParam
+    o_ondemand = P._all_gather_weight_on_demand
+    on_demand = set()
+
+    def ondemand(self, fwd, recompute=False, recompute_prev=None):
+        if not recompute:
+            on_demand.add(f"{self._debug_name}.{'fwd' if fwd else 'bwd'}")
+        return o_ondemand(self, fwd, recompute, recompute_prev)
+
+    saved = (GTP_CONFIG.pad_for_alignment, GTP_CONFIG.weight_prefetch, GTP_CONFIG.async_reduction)
     grads, losses = {}, {}
     try:
         # pad_for_alignment=0 keeps each shard exactly 1/gtp of the full weight, so the
         # all-gather in _gathered_main_grads reconstructs the unsharded gradient directly.
         GTP_CONFIG.pad_for_alignment = 0
-        for phase, use_async in (("sync_ref", False), ("async", True)):
+        P._all_gather_weight_on_demand = ondemand
+        for phase, overlap in (("sync_ref", False), ("overlap", True)):
+            GTP_CONFIG.weight_prefetch = GTP_CONFIG.async_reduction = overlap
             ps.destroy_model_parallel()
             ps.initialize_model_parallel(
                 tensor_model_parallel_size=1,
@@ -233,9 +252,8 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
             )
             model_parallel_cuda_manual_seed(42)
             torch.manual_seed(42)
-            GTP_CONFIG.async_reduction = use_async
 
-            model = _build_mtp_gpt_model(repeated_layer, moe)
+            model = _build_mtp_gpt_model(repeated_layer, moe, early_backward)
             classify_gtp_remat_chains([model])
             shared = [
                 n
@@ -249,7 +267,10 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
             )
             _assert_grouped_chains_used(model, moe)
 
-            losses[phase] = _forward_backward(model)
+            for _ in range(2):
+                _forward_backward(model, microbatches=microbatches)
+            on_demand.clear()
+            losses[phase] = _forward_backward(model, microbatches=microbatches)
             grads[phase] = _gathered_main_grads(model)
 
             del model
@@ -258,38 +279,25 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
             GTPShardedParam._recompute_chain_state.clear()
             GTPShardedParam._link_tables_flushed = False
     finally:
-        GTP_CONFIG.async_reduction = saved_async
-        GTP_CONFIG.pad_for_alignment = saved_pad
+        P._all_gather_weight_on_demand = o_ondemand
+        GTP_CONFIG.pad_for_alignment, GTP_CONFIG.weight_prefetch, GTP_CONFIG.async_reduction = saved
 
-    if rank != 0:
-        return
-
-    ref, test = grads["sync_ref"], grads["async"]
+    ref, test = grads["sync_ref"], grads["overlap"]
     assert set(ref) == set(test), "param sets differ between phases"
-    torch.testing.assert_close(
-        torch.tensor(losses["async"]), torch.tensor(losses["sync_ref"]), atol=1e-2, rtol=1e-2
+    assert losses["overlap"] == losses["sync_ref"], losses
+    differ = [n for n in ref if not torch.equal(ref[n], test[n])]
+    assert not differ, (
+        f"gradients differ between overlapped and synchronous GTP: {differ}. A weight consumed "
+        f"more than once per forward had a gather read stale, or one of its wgrad "
+        f"reduce-scatters dropped or overwritten."
     )
-
-    max_err, worst = 0.0, None
-    for name in ref:
-        rg, tg = ref[name], test[name]
-        assert rg.shape == tg.shape, f"{name}: {rg.shape} vs {tg.shape}"
-        rel = (rg - tg).abs().max().item() / (rg.abs().max().item() + 1e-8)
-        if "output_layer" in name or "word_embeddings" in name:
-            ratio = (tg.norm() / (rg.norm() + 1e-12)).item()
-            print(
-                f"[mtp-shared] {name:48s} rel_max_err={rel:.3e} "
-                f"norm_ratio(async/sync)={ratio:.4f}",
-                flush=True,
-            )
-        if rel > max_err:
-            max_err, worst = rel, name
-    print(f"[mtp-shared] max relative grad error async-vs-sync = {max_err:.3e} (worst: {worst})")
-
-    assert max_err < 2e-2, (
-        f"MTP shared-weight gradient mismatch between the async and sync GTP reduce-scatter "
-        f"paths (max rel err {max_err:.3e} on {worst}). A weight consumed more than once per "
-        f"forward had one of its wgrad reduce-scatters dropped or overwritten."
+    # The cold start fires once per iteration: a later microbatch's first expert gather per list
+    # finds its buffer busy until the previous use on that list, so it is gathered on demand.
+    later_microbatch = {
+        n for n in on_demand if microbatches > 1 and "decoder.layers.0.mlp.experts" in n
+    }
+    assert on_demand - later_microbatch == {"embedding.word_embeddings.weight.fwd"}, sorted(
+        on_demand
     )
 
 
@@ -507,15 +515,17 @@ def _worker_runs_end_to_end(rank, world_size, port, repeated_layer=False, moe=Fa
         GTP_CONFIG.pad_for_alignment = saved_pad
 
 
-def _worker_repeated_consume_all_gathers(rank, world_size, port, repeated_layer=False, moe=False):
-    """N consumes of a weight need N all-gathers, not the one its chain neighbour issues.
+def _worker_repeated_consume_reads_current_weight(
+    rank, world_size, port, repeated_layer=False, moe=False
+):
+    """Every consume reads its weight's current gather, however often it is consumed per pass.
 
-    The neighbour runs once per pass; MTP consumes shared weights once per prediction head and
-    replays the MTP block once per depth. Extra consumes would ``cache.get()`` a stale buffer --
-    silently, since that keeps the loss finite and merely wrong.
-
-    So: tally all-gathers issued against consumes, and fail if a consume outruns its issues.
-    Behavioural, not structural, so it survives a redesign of how the prefetch is armed.
+    MTP consumes the shared weights once per prediction head and replays the MTP block once per
+    depth, while the chain neighbours run once. A consume that read whatever the shared buffer
+    last held would keep the loss finite and merely wrong -- silently. So every consume served
+    without a gather of its own (a prefetch, or a gather still resident in its buffer) is
+    compared with a fresh all-gather of the weight's current shard, over the default-plan, the
+    recording and the first planned iteration, with the shards changed in between like a step.
 
     Does not cover the recompute chain (separate ``_recompute_*`` slots).
     """
@@ -527,39 +537,24 @@ def _worker_repeated_consume_all_gathers(rank, world_size, port, repeated_layer=
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
     P = GTPShardedParam
-    o_ag = P._all_gather_weight
     o_get = P._get_prefetched_weight
-    o_ondemand = P._all_gather_weight_on_demand
-
-    # Keyed by (name, direction) rather than id(), which can be recycled onto another object.
-    issued, consumed, violations = defaultdict(int), defaultdict(int), []
-
-    # Signatures spelled out, not *args: a signature change should fail loudly, not mis-key.
-    def ag(self, async_op, fwd, nvtx_label=None):
-        issued[(self._debug_name, bool(fwd))] += 1
-        return o_ag(self, async_op, fwd, nvtx_label=nvtx_label)
+    served, violations = defaultdict(int), []
 
     def get_prefetched(self, fwd):
-        key = (self._debug_name, bool(fwd))
-        if consumed[key] >= issued[key]:
-            violations.append(
-                f"{self._debug_name} ({'fwd' if fwd else 'bwd'}): consume "
-                f"#{consumed[key] + 1} but only {issued[key]} all-gather(s) issued"
-            )
-        consumed[key] += 1
-        return o_get(self, fwd)
-
-    def on_demand(self, fwd):
-        # Issues its own AG then consumes it, so both tallies stay balanced on this path.
-        out = o_ondemand(self, fwd)
-        consumed[(self._debug_name, bool(fwd))] += 1
+        out = o_get(self, fwd)
+        for w, got in zip(self._weights, out if self.is_routed_expert else [out]):
+            shard = w.get_padded_shard().detach().contiguous()
+            full = shard.new_empty((shard.shape[0] * w.group.size(), *shard.shape[1:]))
+            dist.all_gather_into_tensor(full, shard, group=w.group)
+            if not torch.equal(got, full[: got.shape[0]]):
+                violations.append(f"{w._debug_name} ({'fwd' if fwd else 'bwd'})")
+        served[(self._debug_name, bool(fwd))] += 1
         return out
 
     saved_pad = GTP_CONFIG.pad_for_alignment
     try:
         GTP_CONFIG.pad_for_alignment = 0
-        P._all_gather_weight, P._get_prefetched_weight = ag, get_prefetched
-        P._all_gather_weight_on_demand = on_demand
+        P._get_prefetched_weight = get_prefetched
 
         ps.destroy_model_parallel()
         ps.initialize_model_parallel(
@@ -573,28 +568,29 @@ def _worker_repeated_consume_all_gathers(rank, world_size, port, repeated_layer=
 
         model = _build_mtp_gpt_model(repeated_layer, moe)
         classify_gtp_remat_chains([model])
-        _forward_backward(model)
+        for _ in range(3):
+            _forward_backward(model)  # ends at the fence, like finalize_model_grads
+            with torch.no_grad():
+                for p in model.parameters():
+                    p.add_(0.01)  # the optimizer step
         del model
     finally:
         # _run_distributed shares ONE process across tests: undo everything even on failure.
-        P._all_gather_weight = o_ag
         P._get_prefetched_weight = o_get
-        P._all_gather_weight_on_demand = o_ondemand
         GTP_CONFIG.pad_for_alignment = saved_pad
         ps.destroy_model_parallel()
         GTPShardedParam._chain_state.clear()
         GTPShardedParam._recompute_chain_state.clear()
         GTPShardedParam._link_tables_flushed = False
 
-    # Every rank asserts: the tallies are rank-local, so rank 0 alone could miss a violation.
-    repeats = {name: n for (name, _), n in consumed.items() if n > 1}
-    assert repeats, (
-        "no GTP weight was consumed more than once per pass, so this test would pass even with "
-        "the prefetch bug present -- check that MTP is still attached and GTP-sharded"
+    # Every rank asserts: the checks are rank-local, so rank 0 alone could miss a violation.
+    assert any(n > 1 for n in served.values()), (
+        "no GTP weight was served more than once without its own gather, so this test would "
+        "pass even with stale reads -- check that MTP is still attached and GTP-sharded"
     )
     assert not violations, (
-        "a GTP weight was consumed without an all-gather issued for that consume, so the GEMM "
-        "read a stale shared buffer (silently wrong weights):\n  " + "\n  ".join(violations)
+        "a GTP weight was consumed from a buffer that did not hold its current gather "
+        "(silently wrong weights):\n  " + "\n  ".join(violations)
     )
 
 
@@ -840,33 +836,39 @@ class TestGTPMTP:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_runs_end_to_end, 4, repeated_layer, moe)
 
+    @pytest.mark.parametrize("microbatches", [1, 3])
+    @pytest.mark.parametrize("early_backward", [False, True], ids=["late_bwd", "early_bwd"])
     @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
     @pytest.mark.parametrize("repeated_layer", [False, True])
-    def test_mtp_shared_weight_grads_match_sync_reduce_scatter(self, repeated_layer, moe):
+    def test_mtp_shared_weight_grads_match_sync_reduce_scatter(
+        self, repeated_layer, moe, early_backward, microbatches
+    ):
         """MTP re-uses embedding/output_layer, so those weights get several backward passes.
 
-        Guards a SILENT failure: a dropped or overwritten wgrad reduce-scatter trains on wrong
-        gradients without raising, so only a numeric comparison catches it. The ``moe`` variant
-        additionally puts the MTP layer's experts on the grouped fc1/fc2 chains, which prefetch
-        one block ahead into a shape-keyed double buffer.
+        Guards a SILENT failure: a stale gather or a dropped or overwritten wgrad reduce-scatter
+        trains on wrong gradients without raising, so only a numeric comparison catches it. The
+        ``moe`` variant additionally puts the MTP layer's experts on the grouped fc1/fc2 chains,
+        which prefetch one block ahead into a shape-keyed double buffer. Compared bit for bit
+        against all-synchronous GTP on the planned iteration.
         """
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
-        _run_distributed(_worker_shared_weight_grads, 4, repeated_layer, moe)
+        _run_distributed(
+            _worker_shared_weight_grads, 4, repeated_layer, moe, early_backward, microbatches
+        )
 
     @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
     @pytest.mark.parametrize("repeated_layer", [False, True])
-    def test_repeated_consume_gets_its_own_all_gather(self, repeated_layer, moe):
-        """A weight consumed N times per pass needs N all-gathers, not one.
+    def test_repeated_consume_reads_current_weight(self, repeated_layer, moe):
+        """Every consume reads its weight's current gather across iterations: default plan,
+        recording and planned, with the shards changed between them like an optimizer step.
 
-        The chain prefetches from a weight's neighbour, which runs once, so every consume past
-        the first used to read whatever the shared buffer last held. Guards a SILENT failure:
-        the stale buffer keeps the loss finite and merely wrong, and the in-tree state guard
-        that would catch it is disabled outside debug builds.
+        A consume may read a gather issued by an earlier consume and still resident in its buffer,
+        so counting one all-gather per consume no longer holds after the first fence.
         """
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
-        _run_distributed(_worker_repeated_consume_all_gathers, 4, repeated_layer, moe)
+        _run_distributed(_worker_repeated_consume_reads_current_weight, 4, repeated_layer, moe)
 
     @pytest.mark.parametrize("repeated_layer", [False, True])
     def test_ddp_grad_ready_counts_with_wgrad_accum(self, repeated_layer):
