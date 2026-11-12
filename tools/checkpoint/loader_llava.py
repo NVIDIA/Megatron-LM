@@ -38,6 +38,13 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         queue: A multiprocessing.Queue (or similar) used to send out loaded tensors.
     """
 
+    def build_model_config(self):
+        """Select LLaVA rather than the converter's legacy GPT family label."""
+        from megatron.training.argument_utils import model_config_from_args
+        from megatron.training.models import LLaVAModelConfig
+
+        return model_config_from_args(self.margs, model_config_cls=LLaVAModelConfig)
+
     def build_sys_argv(self):
         """
         Construct a sys.argv list for Megatron's argument parser.
@@ -149,7 +156,7 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         md.vision_dummy_head_count = self.args.vit_dummy_head_count
         md.vision_linear_bias = vision_config.add_bias_linear
         md.vision_qkv_bias = vision_config.add_qkv_bias
-        md.padded_vocab_size = self.margs.padded_vocab_size
+        md.padded_vocab_size = self.cfg.tokenizer.padded_vocab_size
         if hasattr(vision_config, 'normalization'):
             md.vision_norm_has_bias = vision_config.normalization == "LayerNorm"
         else:
