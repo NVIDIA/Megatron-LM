@@ -25,8 +25,8 @@ ATTENTION_MODES = ("causal", "causal_eod_reset", "isolated_segments")
 # Required by every reader: what token IDs mean (which also bounds target indices),
 # which attention the inputs assume, and whether a prefix of a sample keeps its targets.
 REQUIRED_KEYS = ("tokenizer", "attention_mode", "prefix_stable")
-# Replay dumps also need the writer layout that maps a global sample to its file and row.
-REPLAY_KEYS = ("writers", "writer_mbs", "first_sample")
+# Replay files share an origin; each group index separately records its writer layout.
+REPLAY_KEYS = ("first_sample",)
 # A corpus source also needs its epoch size, which defines when it is complete.
 CORPUS_KEYS = ("num_samples",)
 # These recorded fields become invariants within a single corpus source, but may
@@ -57,7 +57,7 @@ def validate_metadata(meta: dict[str, Any], *, replay: bool = True, corpus: bool
 
     ``meta`` holds ``format_version``, the required settings under ``contract``, and
     optional ``recorded`` and ``provenance`` dictionaries. Corpus files and blend
-    manifests use ``replay=False``: neither requires a teacher writer layout.
+    manifests use ``replay=False``: neither requires a replay sample origin.
     """
     if meta.get("format_version") != FORMAT_VERSION:
         raise ValueError(f"Expected offline KD format version {FORMAT_VERSION} metadata")
@@ -77,9 +77,6 @@ def validate_metadata(meta: dict[str, Any], *, replay: bool = True, corpus: bool
     if type(contract["prefix_stable"]) is not bool:
         raise ValueError("Offline KD metadata prefix_stable must be a boolean")
     if replay:
-        for key in ("writers", "writer_mbs"):
-            if type(contract[key]) is not int or contract[key] < 1:
-                raise ValueError(f"Offline KD metadata {key} must be a positive integer")
         if type(contract["first_sample"]) is not int or contract["first_sample"] < 0:
             raise ValueError("Offline KD metadata first_sample must be a nonnegative integer")
     if corpus and (type(contract["num_samples"]) is not int or contract["num_samples"] < 1):

@@ -15,6 +15,7 @@ from typing import Any
 from ..v3_storage import Storage
 from .arrow import check_index, file_meta
 from .contract import mismatched_corpus_order, mismatched_settings, validate_metadata
+from .inventory import ChunkInventory
 
 CHUNK_VERSION = 1
 
@@ -92,24 +93,24 @@ def publish_chunk(storage: Storage, directory: str, chunk: dict[str, Any]) -> No
 class CorpusInventory:
     """One explicit snapshot of a source's objects and consolidated indexes.
 
-    ``snapshot`` can be broadcast to other ranks, avoiding repeated remote listing
-    and index reads. Mutating a producer's inventory never refreshes a student view.
+    Producer metadata is spooled to local scratch storage and never broadcast.
+    Mutating a producer's inventory never refreshes a student view.
     """
 
     def __init__(self, storage: Storage, snapshot: dict[str, Any] | None = None):
         self.storage = storage
         if snapshot is None:
             objects = storage.list("chunk-*/*")
-            chunks = {
-                os.path.dirname(path): json.loads(storage.read(path))
-                for path in objects
-                if path.endswith("/index.json")
-            }
+            chunks = ChunkInventory()
+            for path in objects:
+                if path.endswith("/index.json"):
+                    chunks[os.path.dirname(path)] = json.loads(storage.read(path))
             snapshot = {"objects": objects, "chunks": chunks}
         self.snapshot = snapshot
         self.chunks = snapshot["chunks"]
         self.metadata = None
-        for directory, chunk in sorted(self.chunks.items()):
+        for directory in self.chunks:
+            chunk = self.chunks[directory]
             relative_path(directory)
             metadata = check_chunk(chunk)
             if self.metadata is not None:
@@ -122,7 +123,8 @@ class CorpusInventory:
     def parts(self) -> list[dict[str, Any]]:
         """Return source-relative paths and cached indexes in stable storage order."""
         result, seen = [], set()
-        for directory, chunk in sorted(self.chunks.items()):
+        for directory in sorted(self.chunks):
+            chunk = self.chunks[directory]
             for part in chunk["parts"]:
                 path = relative_path(f"{directory}/{part['path']}")
                 if path in seen:

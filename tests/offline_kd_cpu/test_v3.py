@@ -35,6 +35,31 @@ replay = importlib.import_module(f"{_namespace}.v3_replay")
 Storage = storage_module.Storage
 
 
+class _ReplayPart(typing.NamedTuple):
+    dp_rank: int
+    start: int
+    end: int
+
+    @property
+    def data(self):
+        return storage_module.replay_data_name(self.dp_rank, self.start, self.end)
+
+    @property
+    def index(self):
+        return storage_module.GroupName(self.start, self.end).index
+
+
+def _read_part_index(storage, part):
+    group = storage_module.read_group(storage, storage_module.GroupName(part.start, part.end))
+    return next(entry["index"] for entry in group["parts"] if entry["writer"] == part.dp_rank)
+
+
+def _read_meta(storage, name):
+    if isinstance(name, _ReplayPart):
+        return arrow.file_meta(_read_part_index(storage, name))
+    return storage_module.read_meta(storage, name)
+
+
 def inputs(ids, length=8, packed=False):
     tokens = torch.tensor(ids).reshape(-1, 1) * 100 + torch.arange(length)
     batch = {
@@ -56,8 +81,6 @@ def settings(dp=2, mbs=2, gbs=8, *, contract=None, recorded=None, provenance=Non
     """
     required = {
         "first_sample": 0,
-        "writers": dp,
-        "writer_mbs": mbs,
         "attention_mode": "causal",
         "prefix_stable": True,
         "tokenizer": {"sha256": "test"},
@@ -128,10 +151,11 @@ def write_flush(
     logprobs=False,
     block_bytes=TEST_BLOCK_BYTES,
     vocab_size=len(TEST_VOCAB),
+    dp=2,
+    mbs=2,
 ):
     """Write one writer's flush exactly as the saver does."""
     contract = metadata["contract"]
-    dp, mbs = contract["writers"], contract["writer_mbs"]
     batches = []
     for iteration in range(begin, finish):
         start = iteration * gbs
@@ -147,8 +171,9 @@ def write_flush(
             )
         )
     data, index = arrow.write_file(batches, metadata, block_bytes=block_bytes)
-    name = storage_module.FileName(rank, begin * gbs, finish * gbs)
-    storage_module.publish(storage, name, data, index)
+    name = _ReplayPart(rank, begin * gbs, finish * gbs)
+    storage.write(name.data, data)
+    return {"writer": rank, "path": name.data, "index": index}
 
 
 def write_cache(
@@ -173,11 +198,17 @@ def write_cache(
         metadata = settings(
             dp, mbs, gbs, contract={**mode, **(contract or {})}, provenance=provenance
         )
+    metadata = json.loads(json.dumps(metadata))
+    metadata["contract"].pop("writers", None)
+    metadata["contract"].pop("writer_mbs", None)
     for begin in range(start, iterations, bundle):
         finish = min(begin + bundle, iterations)
+        name = storage_module.GroupName(begin * gbs, finish * gbs)
+        if storage.exists(name.index):
+            continue
+        parts = []
         for rank in range(dp):
-            name = storage_module.FileName(rank, begin * gbs, finish * gbs)
-            if not storage.exists(name.index):
+            parts.append(
                 write_flush(
                     storage,
                     metadata,
@@ -189,7 +220,23 @@ def write_cache(
                     source=source,
                     logprobs=logprobs,
                     vocab_size=vocab_size,
+                    dp=dp,
+                    mbs=mbs,
                 )
+            )
+        storage.write(
+            name.index,
+            json.dumps(
+                {
+                    "group_version": 1,
+                    "start": name.start,
+                    "end": name.end,
+                    "writers": dp,
+                    "writer_mbs": mbs,
+                    "parts": parts,
+                }
+            ).encode(),
+        )
     return storage, metadata
 
 
@@ -274,7 +321,7 @@ def batch_targets(batch):
 
 def test_files_are_plain_arrow_ipc_with_settings_in_the_schema(tmp_path):
     storage, metadata = write_cache(tmp_path, iterations=2, logprobs=True)
-    name = storage_module.FileName(1, 0, 16)
+    name = _ReplayPart(1, 0, 16)
     table = pa.ipc.open_file(storage.path(name.data)).read_all()
     assert table.schema.names == [
         "tokens",
@@ -289,16 +336,16 @@ def test_files_are_plain_arrow_ipc_with_settings_in_the_schema(tmp_path):
     ]
     assert json.loads(table.schema.metadata[arrow.META_KEY]) == metadata
     assert table.num_rows == 8 and table.column("tokens")[0].as_py() == list(range(200, 208))
-    index = storage_module.read_index(storage, name)
+    index = _read_part_index(storage, name)
     assert index["size"] == storage.size(name.data) and len(index["blocks"]) > 1
     assert sum(block["rows"] for block in index["blocks"]) == 8
-    assert storage_module.read_meta(storage, name) == metadata
+    assert _read_meta(storage, name) == metadata
 
 
 def test_input_only_reads_fetch_one_prefix_range(tmp_path):
     storage, _ = write_cache(tmp_path, iterations=2, logprobs=True)
-    name = storage_module.FileName(0, 0, 16)
-    index = storage_module.read_index(storage, name)
+    name = _ReplayPart(0, 0, 16)
+    index = _read_part_index(storage, name)
     data = (tmp_path / name.data).read_bytes()
     for block, entry in enumerate(index["blocks"]):
         assert entry["input_length"] < entry["length"]
@@ -314,8 +361,8 @@ def test_input_only_reads_fetch_one_prefix_range(tmp_path):
 
 def test_index_is_bound_to_its_data_file(tmp_path):
     storage, metadata = write_cache(tmp_path, iterations=2)
-    name = storage_module.FileName(0, 0, 16)
-    index = storage_module.read_index(storage, name)
+    name = _ReplayPart(0, 0, 16)
+    index = _read_part_index(storage, name)
     arrow.check_index(index, storage.size(name.data))
     with pytest.raises(ValueError, match="another version of the file"):
         arrow.check_index(index, storage.size(name.data) + 1)
@@ -512,7 +559,6 @@ def test_target_encoder_rejects_invalid_ids(index, value):
         {"attention_mode": "unknown"},
         {"prefix_stable": "yes"},
         {"tokenizer": {}},
-        {"writers": 0},
         {"first_sample": -1},
     ],
 )
@@ -673,24 +719,24 @@ def test_malformed_blocks_rejected(case):
         arrow.decode_block(batch)
 
 
-def test_files_are_self_describing_and_immutable(tmp_path):
+def test_files_are_self_describing_and_published_as_groups(tmp_path):
     storage, metadata = write_cache(tmp_path)
     assert storage.list("*") == sorted(
-        name
-        for rank in range(2)
-        for a, b in ((0, 16), (16, 32))
-        for name in (storage_module.data_name(rank, a, b), storage_module.index_name(rank, a, b))
+        [
+            storage_module.replay_data_name(rank, a, b)
+            for rank in range(2)
+            for a, b in ((0, 16), (16, 32))
+        ]
+        + [storage_module.GroupName(a, b).index for a, b in ((0, 16), (16, 32))]
     )
-    name = storage_module.FileName(1, 16, 32)
-    meta = storage_module.read_meta(storage, name)
+    name = _ReplayPart(1, 16, 32)
+    meta = _read_meta(storage, name)
     assert codec.mismatched_settings(meta, metadata) == ([], [])
-    with pytest.raises(RuntimeError, match="replace published"):
-        storage_module.publish(storage, name, b"", {})
     # A data file without an index (an interrupted attempt) is invisible and replaceable.
-    orphan = storage_module.FileName(0, 32, 48)
+    orphan = _ReplayPart(0, 32, 48)
     storage.write(orphan.data, b"partial")
-    assert orphan not in storage_module.list_published(storage)
-    storage_module.publish(storage, orphan, b"data", {"index_version": 1})
+    assert storage_module.GroupName(32, 48) not in storage_module.list_published(storage)
+    storage.write(orphan.data, b"data")
     assert storage.read(orphan.data) == b"data"
 
 
@@ -818,7 +864,7 @@ def test_prefetch_stays_within_iteration_and_preserves_rampup(tmp_path):
         iterator.close()
 
 
-@pytest.mark.parametrize("missing", ["dp1__0-16.index.json", "dp0__0-16.index.json"])
+@pytest.mark.parametrize("missing", ["replay-0-16.index.json"])
 def test_range_is_published_only_when_every_writer_published(tmp_path, missing):
     storage, metadata = write_cache(tmp_path)
     (tmp_path / missing).unlink()
@@ -901,7 +947,7 @@ class _CountingStorage(Storage):
 def test_each_block_is_one_ranged_read(tmp_path, targets):
     write_cache(tmp_path, logprobs=True)
     storage = _CountingStorage(tmp_path)
-    metadata = storage_module.read_meta(storage, storage_module.FileName(0, 0, 16))
+    metadata = _read_meta(storage, _ReplayPart(0, 0, 16))
     live = reader(storage, metadata, targets=targets)
     samples = live.samples(list(range(32)), 32)
     live.close()
@@ -910,8 +956,8 @@ def test_each_block_is_one_ranged_read(tmp_path, targets):
     expected = []
     for start, end in ((0, 16), (16, 32)):
         for rank in range(2):
-            name = storage_module.FileName(rank, start, end)
-            index = storage_module.read_index(storage, name)
+            name = _ReplayPart(rank, start, end)
+            index = _read_part_index(storage, name)
             expected += [
                 (name.data, *arrow.block_range(index, block, inputs_only=not targets))
                 for block in range(len(index["blocks"]))
@@ -935,12 +981,14 @@ def test_files_differing_in_recorded_settings_warn_and_in_required_ones_fail(tmp
         live.close()
 
 
-def test_index_of_another_file_version_is_rejected(tmp_path):
+def test_invalid_group_block_ranges_are_rejected(tmp_path):
     storage, metadata = write_cache(tmp_path, iterations=2)
-    # A retry rewrote the data file, but its index is still the earlier one.
-    (tmp_path / "dp0__0-16.arrow").write_bytes((tmp_path / "dp0__0-16.arrow").read_bytes() + b"x")
+    path = tmp_path / storage_module.GroupName(0, 16).index
+    group = json.loads(path.read_text())
+    group["parts"][0]["index"]["size"] = 1
+    path.write_text(json.dumps(group))
     live = reader(storage, metadata)
-    with pytest.raises(ValueError, match="another version of the file"):
+    with pytest.raises(ValueError, match="Invalid replay byte ranges"):
         live.samples([0], 1)
     live.close()
 
@@ -1106,19 +1154,20 @@ def test_token_maps_match_megatron_cpu_partitioning(packed, layout, monkeypatch)
 
 def test_discard_range_only_touches_its_own_range(tmp_path):
     storage, metadata = write_cache(tmp_path, iterations=6)
-    (tmp_path / "dp1__16-32.index.json").unlink()
-    (tmp_path / "dp0__16-32.arrow.0123456789abcdef0123456789abcdef.tmp").write_bytes(b"x")
+    (tmp_path / "replay-16-32.index.json").unlink()
+    (tmp_path / "replay-16-32.part-000000.arrow.0123456789abcdef0123456789abcdef.tmp").write_bytes(
+        b"x"
+    )
     assert storage_module.object_ranges(storage) == [(0, 16), (16, 32), (32, 48)]
     removed = storage_module.discard_range(storage, 16, 32)
     # Indexes go first, so an interrupted cleanup leaves only unpublished data files.
     assert removed == [
-        "dp0__16-32.index.json",
-        "dp0__16-32.arrow",
-        "dp0__16-32.arrow.0123456789abcdef0123456789abcdef.tmp",
-        "dp1__16-32.arrow",
+        "replay-16-32.part-000000.arrow",
+        "replay-16-32.part-000000.arrow.0123456789abcdef0123456789abcdef.tmp",
+        "replay-16-32.part-000001.arrow",
     ]
     # Another job's range (32-48) is untouched.
-    assert len(storage.list("dp*__32-48.*")) == 4
+    assert len(storage.list("replay-32-48.*")) == 3
 
 
 @pytest.fixture
@@ -1381,11 +1430,11 @@ def test_corpus_sources_must_share_a_tokenizer(tmp_path, runtime_environment, ca
 
 def test_storage_lists_nested_names_relative_to_its_root(tmp_path):
     write_cache(tmp_path / "web" / "train", iterations=2)
-    assert Storage(str(tmp_path)).list("*/*/dp0__*.index.json") == [
-        "web/train/dp0__0-16.index.json"
+    assert Storage(str(tmp_path)).list("*/*/replay-*.index.json") == [
+        "web/train/replay-0-16.index.json"
     ]
-    assert Storage(str(tmp_path / "web" / "train")).list("dp0__*.index.json") == [
-        "dp0__0-16.index.json"
+    assert Storage(str(tmp_path / "web" / "train")).list("replay-*.index.json") == [
+        "replay-0-16.index.json"
     ]
 
 
@@ -1403,6 +1452,7 @@ def finalizing_saver(cls, dp_size=1):
 
 def test_flush_finalizer_confirms_every_writer_upload(runtime_environment):
     saver = finalizing_saver(importlib.import_module(f"{_namespace}.v3_saver").PairedLogitsSaver)
+    saver._publish_flush = lambda *args: None  # Exercise writer agreement independently of storage.
     saver._last_flush = {"key": "k", "start": 0, "end": 2}
     saver._results["k"] = {"start": 0, "end": 2}
     saver.flush_finalize_fn(2)()
@@ -1575,9 +1625,16 @@ def test_blend_plan_is_deterministic_and_follows_the_weights(tmp_path):
     assert (manifest["lanes"], manifest["lane_samples"]) == (4, 10)  # Whole lanes >= budget.
     assert {s["name"]: s["samples"] for s in manifest["sources"]} == {"web": 30, "math": 10}
     assert all(s["passes"] == 1 for s in manifest["sources"])
-    segments = manifest["segments"]
-    lengths = np.bincount(segments[:, 0], weights=segments[:, 4] - segments[:, 3])
-    assert lengths.tolist() == [10, 10, 10, 10]
+    catalog = importlib.import_module(f"{_namespace}.format.disk_plan").Catalog(manifest)
+    try:
+        lengths = (
+            catalog.connection()
+            .execute("SELECT sum(b-a) FROM segments GROUP BY lane ORDER BY lane")
+            .fetchall()
+        )
+        assert lengths == [(10,), (10,), (10,), (10,)]
+    finally:
+        catalog.close_current()
     assert blend.plan(blend_config(tmp_path), budget=38)["hash"] == manifest["hash"]
     assert blend.plan(blend_config(tmp_path, seed=2), budget=38)["hash"] != manifest["hash"]
     assert "web: weight 3, 30 samples (75.0%" in blend.describe(manifest)
@@ -1645,18 +1702,12 @@ def test_corpus_reader_only_opens_the_lanes_of_its_rank(tmp_path):
         live.close()
 
 
-def test_corpus_reader_rejects_invalid_cached_indexes(tmp_path):
+def test_corpus_reader_rejects_a_changed_catalog_identity(tmp_path):
     two_sources(tmp_path)
     manifest = blend.plan(blend_config(tmp_path), budget=40)
-    manifest["files"][0]["index"]["index_version"] = -1
-    live = replay.CorpusReader(str(tmp_path), manifest)
-    file_lanes = {int(lane) for lane, file_id, *_ in manifest["segments"] if file_id == 0}
-    lane = min(file_lanes)
-    try:
-        with pytest.raises(ValueError, match="Unsupported offline KD index version"):
-            live.samples(list(range(lane, 40, 4)), 40)
-    finally:
-        live.close()
+    manifest["hash"] = "changed"
+    with pytest.raises(ValueError, match="catalog differs from the checkpoint"):
+        replay.CorpusReader(str(tmp_path), manifest)
 
 
 def test_student_trains_on_a_corpus_blend_and_resumes_only_on_the_same_plan(
@@ -2130,7 +2181,7 @@ def test_frontier_rejects_changed_published_prefix(tmp_path, runtime_environment
     args.logits_load_shuffle_shards = None
     replay_cache(tmp_path, args, runtime, iterations=2)
     runtime.initialize_replay(args)
-    (tmp_path / "dp1__0-16.index.json").unlink()
+    (tmp_path / "replay-0-16.index.json").unlink()
     args.consumed_train_samples = 16
     with pytest.raises(RuntimeError, match="Previously published"):
         runtime.ensure_replay_frontier(args)
@@ -2446,14 +2497,14 @@ def test_teacher_rewrites_its_range_like_a_checkpoint_resume(tmp_path, runtime_e
     metadata = runtime.initialize_dump_metadata(saver)  # Empty cache.
     assert metadata["contract"]["first_sample"] == 0
     teacher_cache(tmp_path, runtime, args, iterations=8)  # Flushes of samples 0-16, ..., 48-64.
-    (tmp_path / "dp1__48-64.index.json").unlink()  # An interrupted flush.
+    (tmp_path / "replay-48-64.index.json").unlink()  # An interrupted flush.
     storage = storage_module.Storage(str(tmp_path))
     # Restart at iteration 4 (samples 32-64): everything published there is rewritten,
     # including complete flushes, while earlier ranges are kept.
     args.consumed_train_samples = 4 * 8
     runtime.initialize_dump_metadata(saver)
     assert "replacing 2 published flushes (samples 32-64)" in capsys.readouterr().out
-    assert not storage.list("dp*__32-48.*") and not storage.list("dp*__48-64.*")
+    assert not storage.list("replay-32-48.*") and not storage.list("replay-48-64.*")
     assert storage_module.object_ranges(storage) == [(0, 16), (16, 32)]
     # Another job's range (from iteration 8 on) is never touched.
     teacher_cache(tmp_path, runtime, args, start=8, iterations=10)
@@ -2463,11 +2514,10 @@ def test_teacher_rewrites_its_range_like_a_checkpoint_resume(tmp_path, runtime_e
     args.consumed_train_samples = 3 * 8
     with pytest.raises(RuntimeError, match="only partly rewritten"):
         runtime.initialize_dump_metadata(saver)
-    # Kept files must match the job; a rewrite of everything need not.
+    # Writer layout belongs to each group and may change for a later job.
     args.consumed_train_samples = 4 * 8
     args.micro_batch_size = 1
-    with pytest.raises(RuntimeError, match="writer_mbs"):
-        runtime.initialize_dump_metadata(saver)
+    runtime.initialize_dump_metadata(saver)
     args.consumed_train_samples, args.exit_interval = 0, None
     runtime.initialize_dump_metadata(saver)
     assert storage_module.object_ranges(storage) == []
@@ -2554,13 +2604,26 @@ def test_saver_writes_files_readable_by_replay(tmp_path, runtime_environment, mo
             }
     results = {}
     for rank in (0, 1):
-        task = {"key": rank, "start": 0, "end": 2, "path": storage_module.data_name(rank, 0, 16)}
+        task = {
+            "key": rank,
+            "start": 0,
+            "end": 2,
+            "path": storage_module.replay_data_name(rank, 0, 16),
+            "writer": rank,
+            "writers": 2,
+            "writer_mbs": 2,
+            "first_sample": 0,
+            "end_sample": 16,
+        }
         module.PairedLogitsSaver._write_batched_tar(
             str(tmp_path), writes[rank], json.dumps(metadata), task, results, None
         )
-    assert results == {0: {"start": 0, "end": 2}, 1: {"start": 0, "end": 2}}
+    assert [(report["start"], report["end"]) for report in results.values()] == [(0, 2), (0, 2)]
+    saver = finalizing_saver(module.PairedLogitsSaver, dp_size=2)
+    saver.save_dir = str(tmp_path)
+    saver._publish_flush(0, 2, list(results.values()))
     storage = Storage(str(tmp_path))
-    assert storage_module.read_meta(storage, storage_module.FileName(0, 0, 16)) == metadata
+    assert _read_meta(storage, _ReplayPart(0, 0, 16)) == metadata
     live = reader(storage, metadata)
     assert ids_of(live.samples(list(range(16)), 16)) == list(range(16))
     live.close()
@@ -2957,21 +3020,25 @@ def test_msc_opt_in_and_worker_enable_are_preserved(runtime_environment, monkeyp
     with pytest.raises(RuntimeError, match="enable-msc"):
         Storage("msc://test/dump")
     calls = []
-    backend.glob = lambda pattern: calls.append(pattern) or ["msc://test/dump/dp0__0-8.index.json"]
+    backend.glob = lambda pattern: calls.append(pattern) or [
+        "msc://test/dump/replay-0-8.index.json"
+    ]
     module = importlib.import_module(f"{_namespace}.v3_saver")
     monkeypatch.setattr(module, "write_file", lambda *a: (b"", {}))
-    monkeypatch.setattr(module, "publish", lambda *a: None)
+    monkeypatch.setattr(
+        module, "Storage", lambda root: types.SimpleNamespace(write=lambda *a: None)
+    )
     module.PairedLogitsSaver._write_batched_tar(
         "msc://test/dump",
         {0: {"start": 0, "end": 8, "batch": None}},
         "{}",
-        {"key": "k", "start": 0, "end": 1, "path": "dp0__0-8.arrow"},
+        {"key": "k", "start": 0, "end": 1, "path": "replay-0-8.part-000000.arrow", "writer": 0},
         {},
         None,
     )
     assert state["enabled"]
     storage = Storage("msc://test/dump")
-    assert storage_module.list_published(storage) == [storage_module.FileName(0, 0, 8)]
+    assert storage_module.list_published(storage) == [storage_module.GroupName(0, 8)]
     storage_module.list_published(storage)
     assert len(calls) == 2  # Refreshes never reuse a stale application-level listing.
 
@@ -3177,14 +3244,14 @@ def test_v3_async_write_failure_sets_shared_event(runtime_environment, monkeypat
         raise OSError("failed publication")
 
     monkeypatch.setattr(module, "write_file", lambda *a: (b"", {}))
-    monkeypatch.setattr(module, "publish", broken)
+    monkeypatch.setattr(module, "Storage", lambda root: types.SimpleNamespace(write=broken))
     event = types.SimpleNamespace(set=lambda: failures.append(True))
     with pytest.raises(OSError, match="failed publication"):
         module.PairedLogitsSaver._write_batched_tar(
             str(tmp_path),
             {0: {"start": 0, "end": 8, "batch": None}},
             "{}",
-            {"key": "k", "start": 0, "end": 1, "path": "dp0__0-8.arrow"},
+            {"key": "k", "start": 0, "end": 1, "path": "replay-0-8.part-000000.arrow", "writer": 0},
             {},
             event,
         )
@@ -3295,7 +3362,7 @@ def test_golden_fixtures_decode(tmp_path, name):
         build_fixture(golden, name)
     expected_storage, expected_meta = build_fixture(tmp_path, name)
     storage = Storage(str(golden))
-    meta = storage_module.read_meta(storage, storage_module.list_published(storage)[0])
+    meta = _read_meta(storage, storage_module.list_published(storage)[0])
     codec.validate_metadata(meta)
     assert codec.mismatched_settings(meta, expected_meta) == ([], [])
     count = groups(storage, meta)[-1][1]
@@ -3316,7 +3383,8 @@ def test_golden_fixtures_decode(tmp_path, name):
         ):
             assert torch.equal(a[key], b[key]), (name, key)
     first = storage_module.list_published(storage)[0]
-    schema = pa.ipc.open_file(storage.path(first.data)).schema
+    path = storage_module.read_group(storage, first)["parts"][0]["path"]
+    schema = pa.ipc.open_file(storage.path(path)).schema
     assert ("tail" in schema.names) == (name == "u16_logprobs_with_tail")
     if name == "u16_logprobs_with_tail":
         assert schema.field("tail").type == pa.large_list(pa.float32())

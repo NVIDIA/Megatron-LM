@@ -1,17 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Publication and listing of offline KD v3 files.
+"""Storage and atomic replay-group publication for offline KD V3.
 
-A cache is a flat directory of per-writer files, one data file and one index per
-writer and flush (save-interval) range::
-
-    dp{rank}__{start}-{end}.arrow        # samples and their targets (see format.arrow)
-    dp{rank}__{start}-{end}.index.json   # block byte ranges and a footer copy
-
-The index is written after its data file is complete, so its existence publishes the
-range for that writer: local writes are staged and renamed, and remote objects only
-become visible once their upload completes. Data files without an index are ignored
-and replaced by a retry.
+A replay flush has independent ``replay-START-END.part-N.arrow`` files and one
+``replay-START-END.index.json`` published after every upload succeeds. Its explicit
+part paths and per-group writer layout reconstruct the teacher order without fixing
+the whole cache to one teacher DP size. Unindexed parts are ignored on discovery.
 """
 
 import glob
@@ -24,6 +18,27 @@ from typing import Any, NamedTuple
 
 _FILE_NAME = re.compile(r"^dp(\d+)__(\d+)-(\d+)\.(arrow|index\.json)$")
 _STAGED_NAME = re.compile(r"^(.+)\.[0-9a-f]{32}\.tmp$")
+_REPLAY_GROUP = re.compile(r"^replay-(\d+)-(\d+)\.index\.json$")
+_REPLAY_OBJECT = re.compile(
+    r"^replay-(\d+)-(\d+)\.(?:index\.json|part-\d+\.arrow)(?:\.[0-9a-f]{32}\.tmp)?$"
+)
+
+
+class GroupName(NamedTuple):
+    """An atomically published replay flush, addressed in global sample positions."""
+
+    start: int
+    end: int
+
+    @property
+    def index(self) -> str:
+        """The consolidated index published after all writer uploads."""
+        return f"replay-{self.start}-{self.end}.index.json"
+
+
+def replay_data_name(writer: int, start: int, end: int) -> str:
+    """Name one independent replay part; consumers use its explicit index path."""
+    return f"replay-{start}-{end}.part-{writer:06d}.arrow"
 
 
 class FileName(NamedTuple):
@@ -36,26 +51,30 @@ class FileName(NamedTuple):
     @property
     def data(self) -> str:
         """The data file's name."""
-        return data_name(self.dp_rank, self.start, self.end)
+        return replay_data_name(self.dp_rank, self.start, self.end)
 
     @property
     def index(self) -> str:
         """The index's name."""
-        return index_name(self.dp_rank, self.start, self.end)
+        return GroupName(self.start, self.end).index
 
 
 def data_name(dp_rank: int, start: int, end: int) -> str:
     """Name the data file holding one writer's flush range."""
-    return f"dp{dp_rank}__{start}-{end}.arrow"
+    return replay_data_name(dp_rank, start, end)
 
 
 def index_name(dp_rank: int, start: int, end: int) -> str:
     """Name the index published after that data file."""
-    return f"dp{dp_rank}__{start}-{end}.index.json"
+    return GroupName(start, end).index
 
 
 def parse_name(name: str) -> FileName | None:
     """Parse a v3 data file or index name, or return None for other objects."""
+    match = re.fullmatch(r"replay-(\d+)-(\d+)\.part-(\d+)\.arrow", name)
+    if match is not None:
+        start, end, writer = match.groups()
+        return FileName(int(writer), int(start), int(end))
     match = _FILE_NAME.match(name)
     if match is None:
         return None
@@ -159,28 +178,75 @@ class Storage:
         os.replace(self.path(staged), self.path(name))
 
 
-def publish(storage: Storage, name: FileName, data: bytes, index: dict[str, Any]) -> None:
-    """Publish a range: the data file first, then its index.
-
-    A job that rewrites published ranges unpublishes them at startup, so an existing
-    index here means another job is writing the same range. A data file without an
-    index (an interrupted earlier attempt) is overwritten.
-    """
-    if storage.exists(name.index):
-        raise RuntimeError(f"Refusing to replace published offline KD v3 file {name.data}")
-    storage.write(name.data, data)
-    storage.write(name.index, json.dumps(index, separators=(",", ":")).encode())
+def read_index(storage: Storage, name: FileName | GroupName) -> dict[str, Any]:
+    """Read a group, or select one writer's Arrow index from the group."""
+    group = read_group(storage, GroupName(name.start, name.end))
+    return group["parts"][name.dp_rank]["index"] if isinstance(name, FileName) else group
 
 
-def read_index(storage: Storage, name: FileName) -> dict[str, Any]:
-    """Read a published range's index."""
-    return json.loads(storage.read(name.index))
+def read_group(storage: Storage, name: GroupName) -> dict[str, Any]:
+    """Read and validate one complete replay group with one GET, without HEADs."""
+    from .format.arrow import check_index, file_meta
+    from .format.contract import mismatched_settings, validate_metadata
+
+    group = json.loads(storage.read(name.index))
+    if group.get("group_version") != 1 or (group.get("start"), group.get("end")) != tuple(name):
+        raise ValueError(f"Invalid replay group header {name.index}")
+    writers, mbs = group.get("writers"), group.get("writer_mbs")
+    if type(writers) is not int or writers < 1 or type(mbs) is not int or mbs < 1:
+        raise ValueError(f"Invalid replay writer layout in {name.index}")
+    if name.start < 0 or name.end <= name.start or (name.end - name.start) % (writers * mbs):
+        raise ValueError(f"Replay group {name.index} is not whole writer microbatches")
+    if len(group.get("parts", [])) != writers:
+        raise ValueError(f"Replay group {name.index} is missing writer parts")
+    parts, seen, reference = [None] * writers, set(), None
+    for part in group["parts"]:
+        writer, path, index = part.get("writer"), part.get("path"), part.get("index")
+        if type(writer) is not int or not 0 <= writer < writers or parts[writer] is not None:
+            raise ValueError(f"Invalid or duplicate replay writer in {name.index}")
+        if (
+            not isinstance(path, str)
+            or not path
+            or path.startswith("/")
+            or ":" in path
+            or "\\" in path
+            or any(p in ("", ".", "..") for p in path.split("/"))
+            or path in seen
+        ):
+            raise ValueError(f"Invalid or duplicate replay part path in {name.index}")
+        seen.add(path)
+        check_index(index)
+        cursor, byte_end = 0, 0
+        for block in index["blocks"]:
+            if block["first_row"] != cursor or block["rows"] <= 0:
+                raise ValueError(f"Invalid replay block rows in {path}")
+            if (
+                block["offset"] < byte_end
+                or block["length"] <= 0
+                or block["offset"] + block["length"] > index["size"]
+                or not 0 < block["input_length"] <= block["length"]
+            ):
+                raise ValueError(f"Invalid replay byte ranges in {path}")
+            cursor += block["rows"]
+            byte_end = block["offset"] + block["length"]
+        if cursor != (name.end - name.start) // writers:
+            raise ValueError(f"Wrong row count in replay part {path}")
+        metadata = file_meta(index)
+        validate_metadata(metadata)
+        if reference is not None and mismatched_settings(metadata, reference)[0]:
+            raise ValueError(f"Replay group {name.index} mixes incompatible file contracts")
+        reference = metadata
+        parts[writer] = part
+    group["parts"] = parts
+    return group
 
 
-def read_meta(storage: Storage, name: FileName) -> dict[str, Any]:
-    """Read a published file's settings from its index (one small request)."""
+def read_meta(storage: Storage, name: GroupName | FileName) -> dict[str, Any]:
+    """Read a replay group's shared metadata from its first part footer."""
     from .format.arrow import check_index, file_meta
 
+    if isinstance(name, GroupName):
+        return file_meta(read_group(storage, name)["parts"][0]["index"])
     index = read_index(storage, name)
     check_index(index)
     return file_meta(index)
@@ -191,47 +257,42 @@ def has_legacy_tars(storage: Storage) -> bool:
     return bool(storage.list("*.tar"))
 
 
-def list_published(storage: Storage) -> list[FileName]:
-    """List published ranges (those with an index), ignoring staged and other objects."""
-    return sorted(
-        parsed
-        for parsed in map(parse_name, storage.list("dp*__*.index.json"))
-        if parsed is not None
-    )
+def list_published(storage: Storage, *, objects: list[str] | None = None) -> list[GroupName]:
+    """List atomically published groups; incomplete writer uploads have no index."""
+    groups = []
+    for path in storage.list("replay-*.index.json") if objects is None else objects:
+        match = _REPLAY_GROUP.fullmatch(path)
+        if match is not None:
+            groups.append(GroupName(*(int(value) for value in match.groups())))
+    return sorted(groups)
 
 
-def complete_ranges(published: list[FileName], writers: int) -> list[tuple[int, int]]:
-    """Return flush ranges published by every writer."""
-    present: dict[tuple[int, int], set[int]] = {}
-    for name in published:
-        present.setdefault((name.start, name.end), set()).add(name.dp_rank)
-    return sorted(span for span, found in present.items() if set(range(writers)) <= found)
+def complete_ranges(
+    published: list[GroupName], writers: int | None = None
+) -> list[tuple[int, int]]:
+    """A group index already establishes that all of its writers completed."""
+    return [(name.start, name.end) for name in published]
 
 
 def validate_published_ranges(
-    published: list[FileName], writers: int, writer_mbs: int
+    published: list[GroupName], writers: int | None = None, writer_mbs: int | None = None
 ) -> list[tuple[int, int]]:
-    """Validate writer IDs and disjoint microbatch ranges; return complete ranges.
-
-    Partial groups participate in overlap validation too: they must never contribute
-    duplicate rows alongside a complete group with another range.
-    """
-    unit = writers * writer_mbs
-    for name in published:
-        if not 0 <= name.dp_rank < writers:
-            raise ValueError(f"Offline KD v3 file {name.index} has an invalid writer rank")
+    """Reject overlapping groups; each group's own index validates its writer layout."""
     previous = None
-    for start, end in sorted({(name.start, name.end) for name in published}):
-        if start < 0 or end <= start or (end - start) % unit:
-            raise ValueError(f"Offline KD v3 range {start}-{end} is not whole writer microbatches")
-        if previous is not None and start < previous[1]:
-            raise ValueError(f"Overlapping offline KD v3 ranges {previous} and {(start, end)}")
-        previous = (start, end)
-    return complete_ranges(published, writers)
+    for name in sorted(published):
+        if (
+            name.start < 0
+            or name.end <= name.start
+            or previous is not None
+            and name.start < previous
+        ):
+            raise ValueError(f"Invalid or overlapping replay group {name.index}")
+        previous = name.end
+    return complete_ranges(published)
 
 
 def contiguous_end(ranges: list[tuple[int, int]], start: int, end: int | None = None) -> int:
-    """Return the end of the contiguous run of ``ranges`` beginning at ``start``."""
+    """Return the end of the contiguous run beginning at start."""
     by_start = dict(ranges)
     cursor = start
     while cursor in by_start and (end is None or cursor < end):
@@ -239,29 +300,27 @@ def contiguous_end(ranges: list[tuple[int, int]], start: int, end: int | None = 
     return cursor
 
 
-def object_ranges(storage: Storage) -> list[tuple[int, int]]:
-    """Sample ranges of every v3 object, published or not (including staged writes)."""
+def object_ranges(storage: Storage, *, objects: list[str] | None = None) -> list[tuple[int, int]]:
+    """Ranges of replay group indexes, parts and incomplete staged writes."""
     spans = set()
-    for name in storage.list("dp*__*"):
-        match = _STAGED_NAME.match(name)
-        parsed = parse_name(match.group(1) if match else name)
-        if parsed is not None:
-            spans.add((parsed.start, parsed.end))
+    for name in storage.list("replay-*") if objects is None else objects:
+        match = _REPLAY_OBJECT.fullmatch(name)
+        if match is not None:
+            spans.add(tuple(int(value) for value in match.groups()))
     return sorted(spans)
 
 
-def discard_range(storage: Storage, start: int, end: int) -> list[str]:
-    """Delete every object of the ranges starting in ``[start, end)`` before rewriting them.
-
-    Only this job's own range is touched, so parallel dump jobs never interfere.
-    """
+def discard_range(
+    storage: Storage, start: int, end: int, *, objects: list[str] | None = None
+) -> list[str]:
+    """Unpublish selected groups first, then remove their parts before replacement."""
     removed = []
-    # Indexes first: an interrupted cleanup then leaves only unpublished data files.
-    for name in sorted(storage.list("dp*__*"), key=lambda name: ".index.json" not in name):
-        match = _STAGED_NAME.match(name)
-        parsed = parse_name(match.group(1) if match else name)
-        if parsed is not None and start <= parsed.start < end:
-            if match is None or not storage.remote:
-                storage.remove(name)
-                removed.append(name)
+    for name in sorted(
+        storage.list("replay-*") if objects is None else objects,
+        key=lambda name: not name.endswith(".index.json"),
+    ):
+        match = _REPLAY_OBJECT.fullmatch(name)
+        if match is not None and start <= int(match[1]) < end:
+            storage.remove(name)
+            removed.append(name)
     return removed

@@ -19,7 +19,7 @@ from .logits_saver import LogitsSaverHooks
 from .v3_format import MAX_VOCAB_SIZE, capture_batch, finalize_record, join_inputs, tail_logprob
 from .v3_options import get_args
 from .v3_replay import layout_options, token_map
-from .v3_storage import Storage, data_name, parse_name, publish
+from .v3_storage import GroupName, Storage, replay_data_name
 
 TRACKER = "latest_checkpointed_iteration.txt"
 
@@ -224,7 +224,12 @@ class PairedLogitsSaver(LogitsSaverHooks):
             "key": uuid.uuid4().hex,
             "start": start,
             "end": end,
-            "path": data_name(self.dp_rank, first_sample, end_sample),
+            "path": replay_data_name(self.dp_rank, first_sample, end_sample),
+            "writer": self.dp_rank,
+            "writers": self.dp_size,
+            "writer_mbs": get_args().micro_batch_size,
+            "first_sample": first_sample,
+            "end_sample": end_sample,
         }
 
     @staticmethod
@@ -248,15 +253,40 @@ class PairedLogitsSaver(LogitsSaverHooks):
             data, index = write_file(
                 [record["batch"] for record in writes.values()], json.loads(metadata)
             )
-            publish(Storage(root), parse_name(task["path"]), data, index)
-            results[task["key"]] = {"start": task["start"], "end": task["end"]}
+            Storage(root).write(task["path"], data)
+            results[task["key"]] = {
+                **task,
+                "part": {"writer": task["writer"], "path": task["path"], "index": index},
+            }
         except Exception:
             if failure_event is not None:
                 failure_event.set()
             raise
 
     def _publish_flush(self, start: int, end: int, reports: list[dict]) -> None:
-        """Run on one rank once every writer has uploaded; replay writers publish themselves."""
+        """Publish one replay group after every independent writer upload succeeds."""
+        first = reports[0]
+        fields = ("first_sample", "end_sample", "writers", "writer_mbs")
+        if any(any(report[key] != first[key] for key in fields) for report in reports):
+            raise RuntimeError("Replay writers disagree on sample span or writer layout")
+        parts = sorted([report["part"] for report in reports], key=lambda part: part["writer"])
+        if [part["writer"] for part in parts] != list(range(first["writers"])):
+            raise RuntimeError("Replay flush is missing writer parts")
+        span = GroupName(first["first_sample"], first["end_sample"])
+        if (span.end - span.start) % (first["writers"] * first["writer_mbs"]):
+            raise RuntimeError("Replay flush does not cover whole writer microbatches")
+        rows = (span.end - span.start) // first["writers"]
+        if any(sum(block["rows"] for block in part["index"]["blocks"]) != rows for part in parts):
+            raise RuntimeError("Replay flush contains an unexpected writer row count")
+        group = {
+            "group_version": 1,
+            "start": span.start,
+            "end": span.end,
+            "writers": first["writers"],
+            "writer_mbs": first["writer_mbs"],
+            "parts": parts,
+        }
+        Storage(self.save_dir).write(span.index, json.dumps(group, separators=(",", ":")).encode())
 
     def flush_finalize_fn(self, iteration: int) -> Callable[[], None]:
         """Confirm every writer's upload before the progress tracker advances.

@@ -1,39 +1,17 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Plan a blend of corpus sources into a fixed, DP-independent sample schedule.
+"""Plan deterministic corpus blends into immutable disk-backed reader catalogs."""
 
-A blend config names a corpus directory, sources with weights in samples, a seed, and a
-lane count ``L``::
-
-    {"corpus": "/data/corpus", "sources": {"web_crawl": 0.7, "math_sft": 0.3},
-     "seed": 1234, "lanes": 64}
-
-Every source must be complete. The planner picks each source's rows (whole passes over its blocks, then a seeded
-subset), spreads every source evenly along one stream, and cuts the stream into ``L``
-equal lanes. Global sample ``p`` is row ``p // L`` of lane ``p % L``, so the schedule
-does not depend on the student's data-parallel size; when ``L`` is a multiple of DP ×
-MBS, each lane is read by exactly one student rank. Each lane is a list of pieces
-``(file, block, first row, end row)``, so a reader fetches whole blocks and uses the
-pieces' rows.
-"""
-
-import hashlib
 import json
-import os
 from typing import Any
 
-import numpy as np
+from .disk_plan import MANIFEST_VERSION, plan
 
-from ..v3_storage import Storage
-from .contract import blend_contract
-from .corpus import CorpusInventory
-
-MANIFEST_VERSION = 2
 DEFAULTS = {"seed": 1234, "lanes": 64}
 
 
 def load_config(path: str) -> dict[str, Any]:
-    """Read and complete a blend config."""
+    """Read and complete a blend configuration."""
     with open(path) as stream:
         config = {**DEFAULTS, **json.load(stream)}
     if not isinstance(config.get("corpus"), str) or not config.get("sources"):
@@ -45,137 +23,13 @@ def load_config(path: str) -> dict[str, Any]:
     return config
 
 
-def _source_rows(storage: Storage, name: str) -> tuple[dict, list, list]:
-    """Read one immutable inventory and plan all real rows without teacher layout."""
-    inventory = CorpusInventory(storage)
-    if inventory.metadata is None:
-        raise ValueError(f"Corpus source {name} has no published chunks")
-    files = inventory.parts()
-    pieces = [
-        (file_id, block, 0, entry["rows"], entry["supervised"])
-        for file_id, file in enumerate(files)
-        for block, entry in enumerate(file["index"]["blocks"])
-    ]
-    available = sum(b - a for _, _, a, b, _ in pieces)
-    total = inventory.metadata["contract"]["num_samples"]
-    if available != total:
-        raise ValueError(
-            f"Corpus source {name} covers {available} of {total} samples; finish its dump first "
-            "and check for duplicate chunks"
-        )
-    return inventory.metadata, files, pieces
-
-
-def _seed(*parts: Any) -> int:
-    digest = hashlib.sha256(json.dumps(parts, sort_keys=True).encode()).digest()
-    return int.from_bytes(digest[:8], "little")
-
-
-def _select(pieces: list, target: int, seed: int, name: str) -> tuple[list, int]:
-    """Take ``target`` rows: whole seeded passes over the pieces, then a seeded subset."""
-    total = sum(b - a for _, _, a, b, _ in pieces)
-    chosen, remaining, passes = [], target, 0
-    while remaining > 0:
-        order = np.random.RandomState(_seed(seed, name, passes) % (1 << 32)).permutation(
-            len(pieces)
-        )
-        for i in order:
-            file_id, block, a, b, supervised = pieces[i]
-            take = min(b - a, remaining)
-            chosen.append((file_id, block, a, a + take, supervised * take / (b - a)))
-            remaining -= take
-            if not remaining:
-                break
-        passes += 1
-    return chosen, -(-target // total) if total else 0
-
-
-def plan(config: dict[str, Any], *, budget: int) -> dict[str, Any]:
-    """Plan a blend of at least ``budget`` samples into a manifest.
-
-    The manifest holds the settings every file shares, the files it reads, per-source
-    shares, and ``segments``: rows of ``(lane, file id, block, first row, end row)``.
-    """
-    root, seed, lanes = config["corpus"], config["seed"], config["lanes"]
-    weights = config["sources"]
-    total = lanes * -(-budget // lanes)  # Whole lanes, at least the budget.
-    files, sources, streams, reference = [], [], [], None
-    weight_sum = sum(weights.values())
-    targets = {name: int(total * weight / weight_sum) for name, weight in weights.items()}
-    for name in sorted(weights)[: total - sum(targets.values())]:
-        targets[name] += 1  # Distribute the rounding remainder.
-    for name in sorted(weights):
-        folder = name
-        storage = Storage(os.path.join(root, folder))
-        meta, source_files, pieces = _source_rows(storage, name)
-        shared = blend_contract(meta["contract"])
-        if reference is None:
-            reference = shared
-        differing = [key for key in shared if shared[key] != reference[key]]
-        if differing:
-            raise ValueError(f"Corpus source {name} differs on {', '.join(differing)}")
-        offset = len(files)
-        files += [{"folder": folder, **file} for file in source_files]
-        chosen, passes = _select(pieces, targets[name], seed, name)
-        # Spread each source evenly along the stream: sort by position within its source.
-        rng = np.random.RandomState(_seed(seed, name, "spread") % (1 << 32))
-        cursor = 0
-        for file_id, block, a, b, supervised in chosen:
-            key = (cursor + rng.random_sample() * (b - a)) / targets[name]
-            streams.append((key, file_id + offset, block, a, b, len(sources), supervised))
-            cursor += b - a
-        sources.append(
-            {
-                "name": name,
-                "samples": targets[name],
-                "available": sum(b - a for _, _, a, b, _ in pieces),
-                "passes": passes,
-                "supervised": float(sum(piece[4] for piece in chosen)),
-                "teacher": meta.get("recorded", {}).get("teacher"),
-            }
-        )
-    streams.sort()
-    # Cut the stream into equal lanes; a piece crossing a lane boundary is split.
-    per_lane = total // lanes
-    segments, lane, used = [], 0, 0
-    for _, file_id, block, a, b, _, _ in streams:
-        while a < b:
-            take = min(b - a, per_lane - used)
-            segments.append((lane, file_id, block, a, a + take))
-            a += take
-            used += take
-            if used == per_lane:
-                lane, used = lane + 1, 0
-    supervised = sum(source["supervised"] for source in sources) or 1.0
-    for source in sources:
-        source["share"] = source["samples"] / total
-        source["supervised_share"] = source["supervised"] / supervised
-    manifest = {
-        "manifest_version": MANIFEST_VERSION,
-        "config": config,
-        "budget": budget,
-        "lanes": lanes,
-        "lane_samples": per_lane,
-        "contract": reference,
-        "files": files,
-        "sources": sources,
-        "segments": np.asarray(segments, dtype=np.int64).reshape(-1, 5),
-    }
-    manifest["hash"] = manifest_hash(manifest)
-    return manifest
-
-
 def manifest_hash(manifest: dict[str, Any]) -> str:
-    """Identify a manifest's schedule: its files, contract, lanes and segments."""
-    digest = hashlib.sha256()
-    for key in ("contract", "files", "lanes", "lane_samples"):
-        digest.update(json.dumps(manifest[key], sort_keys=True).encode())
-    digest.update(np.ascontiguousarray(manifest["segments"]).tobytes())
-    return digest.hexdigest()
+    """Return the identity streamed over catalog contents and schedule during planning."""
+    return manifest["hash"]
 
 
 def describe(manifest: dict[str, Any]) -> str:
-    """One line per source: requested weight, realized share, passes."""
+    """Describe a plan's source allocations without opening its catalog."""
     lines = [
         f"Offline KD corpus blend {manifest['hash'][:12]}: {manifest['lanes']} lanes x "
         f"{manifest['lane_samples']} samples"

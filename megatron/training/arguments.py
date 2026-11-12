@@ -3686,6 +3686,11 @@ def _add_logits_distillation_args(parser):
                             '(corpus directory, source weights in samples, seed, lanes). '
                             'The schedule is planned at startup for the training budget and '
                             'fixed by the checkpoint.')
+    group.add_argument('--kd-corpus-plan-cache-dir', type=str, default=None, metavar='DIRECTORY',
+                       help='Shared POSIX/Lustre directory for disk-backed corpus catalogs and '
+                            'schedules. Only a small descriptor is broadcast; reader ranks '
+                            'open this catalog on demand. Defaults to --data-cache-path or '
+                            '<--save>/offline-kd-plans for distributed loading.')
     group.add_argument('--logits-load-shuffle-shards', type=int, default=None, metavar='SEED',
                        help='Shuffle v3 teacher flush-range groups using this seed. The '
                             'shuffled extent is fixed at the first launch and restored on '

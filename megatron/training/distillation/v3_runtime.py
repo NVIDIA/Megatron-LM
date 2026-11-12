@@ -269,8 +269,6 @@ def _dump_settings(saver: Any) -> dict[str, Any]:
             # Megatron's position embeddings (learned, rope, yarn, mrope) depend only on
             # the position, so a causal teacher's row t never depends on later tokens.
             "prefix_stable": True,
-            "writers": saver.dp_size,
-            "writer_mbs": args.micro_batch_size,
         },
         "recorded": {
             "teacher": _teacher_identity(args),
@@ -301,8 +299,6 @@ def _dump_settings(saver: Any) -> dict[str, Any]:
         # A corpus source's extent is part of its contract: it defines completeness.
         settings["recorded"].pop("train_samples")
         settings["contract"]["num_samples"] = args.kd_corpus_samples
-        settings["contract"].pop("writers")
-        settings["contract"].pop("writer_mbs")
         settings["recorded"].pop("split")  # A corpus source is never split.
         # A basename is useful provenance for replay, but insufficient to identify a
         # corpus source when appending another job's part of the same epoch.
@@ -348,8 +344,9 @@ def initialize_dump_metadata(saver: Any) -> dict:
                 raise ValueError("Cannot mix legacy and v3 dumps in the same directory")
             start_iteration, end_iteration = dump_range(args)
             start, end = start_iteration * gbs, end_iteration * gbs
-            check_rewrite_bounds(object_ranges(storage), start, end, "samples")
-            published = list_published(storage)
+            objects = storage.list("replay-*")
+            check_rewrite_bounds(object_ranges(storage, objects=objects), start, end, "samples")
+            published = list_published(storage, objects=objects)
             kept = [name for name in published if not start <= name.start < end]
             first_sample = 0 if frozen else args.consumed_train_samples
             differing = []
@@ -378,7 +375,7 @@ def initialize_dump_metadata(saver: Any) -> dict:
             report_replaced(
                 sorted({(n.start, n.end) for n in published if start <= n.start < end}), "samples"
             )
-            discard_range(storage, start, end)
+            discard_range(storage, start, end, objects=objects)
             return {
                 "metadata": {
                     **expected,
@@ -456,7 +453,7 @@ def initialize_replay(args: Any) -> None:
                 raise FileNotFoundError("No v3 files found; input replay requires a v3 dump")
             metadata = read_meta(storage, files[0])
             _check_student_compatibility(args, metadata)
-            groups, hole = discover_groups(storage, metadata)
+            groups, hole = discover_groups(storage, metadata, published=files)
             replay_end = getattr(args, "logits_load_replay_end", None)
             if shuffle:
                 if replay_end is None:
@@ -528,7 +525,22 @@ def _initialize_corpus(args: Any) -> dict:
         try:
             config = load_config(args.kd_corpus_blend)
             budget = args.train_samples or args.train_iters * args.global_batch_size
-            manifest = plan(config, budget=budget)
+            cache_dir = getattr(args, "kd_corpus_plan_cache_dir", None)
+            distributed = dist.is_initialized() and dist.get_world_size() > 1
+            if cache_dir is None and distributed:
+                cache_dir = getattr(args, "data_cache_path", None)
+                if cache_dir is None and getattr(args, "save", None):
+                    cache_dir = os.path.join(args.save, "offline-kd-plans")
+            if cache_dir is not None and "://" in cache_dir:
+                raise ValueError(
+                    "Corpus plan cache must be a shared POSIX directory, not an object-store URI"
+                )
+            if distributed and not cache_dir:
+                raise ValueError(
+                    "Distributed corpus loading requires --kd-corpus-plan-cache-dir on shared "
+                    "POSIX storage (or a shared --data-cache-path / local --save directory)"
+                )
+            manifest = plan(config, budget=budget, cache_dir=cache_dir)
             metadata = {"format_version": FORMAT_VERSION, "contract": manifest["contract"]}
             _check_student_compatibility(args, metadata, replay=False)
             expected = getattr(args, "kd_corpus_manifest_hash", None)
@@ -551,6 +563,20 @@ def _initialize_corpus(args: Any) -> dict:
     if "error" in result[0]:
         raise RuntimeError(result[0]["error"])
     manifest = result[0]["manifest"]
+    if dist.is_initialized():
+        # The descriptor is small; the plan itself must remain on shared storage.
+        # Fail collectively before CP/TP batch collectives if a node cannot see it.
+        readable = torch.tensor(
+            [int(os.access(manifest["catalog"], os.R_OK))],
+            dtype=torch.int,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+        )
+        dist.all_reduce(readable, op=dist.ReduceOp.MIN)
+        if not readable.item():
+            raise RuntimeError(
+                "The corpus plan catalog is not readable on every rank; choose a shared "
+                "POSIX --kd-corpus-plan-cache-dir (for example a Lustre directory)"
+            )
     # Saved with the checkpoint's args so a resume must replay the same schedule.
     args.kd_corpus_manifest_hash = manifest["hash"]
     return {

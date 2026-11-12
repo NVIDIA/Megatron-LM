@@ -17,8 +17,9 @@ import torch
 from .format.arrow import block_range, check_index, decode_block, file_meta, read_block
 from .format.blend import MANIFEST_VERSION
 from .format.contract import blend_contract
+from .format.index_cache import BoundedIndexCache
 from .v3_format import LOGPROB_SENTINEL, TOKEN_FIELDS, mismatched_settings, validate_metadata
-from .v3_storage import FileName, Storage, list_published, read_index, validate_published_ranges
+from .v3_storage import GroupName, Storage, list_published, read_group, validate_published_ranges
 
 
 def merged_boundaries(rows: list[torch.Tensor], sample_lengths: list[int]) -> torch.Tensor:
@@ -134,20 +135,19 @@ def layout_options(args: Any, *, hybrid: bool = False) -> dict[str, Any]:
 
 
 def discover_groups(
-    storage: Storage, metadata: dict
+    storage: Storage, metadata: dict, *, published: list[GroupName] | None = None
 ) -> tuple[list[tuple[int, int]], tuple[int, int, int] | None]:
     """List published indexes once and return the contiguous published prefix.
 
-    A flush range is published when every writer has published its index. Returns ``(groups, hole)`` where ``groups`` are the published
+    A flush range is published when its consolidated index is visible. Returns
+    ``(groups, hole)`` where ``groups`` are the published
     ``(start, end)`` sample ranges from ``first_sample`` without a gap, and
     ``hole`` is ``(gap_start, next_published_start, later_groups)`` when published
     ranges exist beyond a gap (e.g. parallel dump jobs that are still writing).
     """
     validate_metadata(metadata)
     contract = metadata["contract"]
-    ranges = validate_published_ranges(
-        list_published(storage), contract["writers"], contract["writer_mbs"]
-    )
+    ranges = validate_published_ranges(list_published(storage) if published is None else published)
     by_start = dict(ranges)
     groups = []
     cursor = contract["first_sample"]
@@ -321,8 +321,6 @@ class ReplayReader(_BlockReader):
         )
         self.storage = storage
         self.metadata = metadata
-        self.mbs = self.contract["writer_mbs"]
-        self.dp = self.contract["writers"]
         # Recorded settings that differ between files are reported once each, never fatal.
         self.reported_differences: set[str] = set()
         # Each pass replays every group once; shuffled passes draw successive orders from one
@@ -336,8 +334,7 @@ class ReplayReader(_BlockReader):
             self.groups.extend(order)
         # A shuffled or repeated replay covers a fixed extent; only a sequential one grows.
         self.fixed = shuffle or passes > 1
-        self.indexes: dict[tuple[int, int, int], dict] = {}
-        self.index_lock = threading.Lock()
+        self.group_cache = BoundedIndexCache(max(4, prefetch_depth + 2))
         self.closed = False
         self.condition = threading.Condition()
         self._reindex()
@@ -382,26 +379,19 @@ class ReplayReader(_BlockReader):
             )
 
     def index(self, dp_rank: int, span: tuple[int, int]) -> dict:
-        """Load (once) and check a writer's file index for a flush range.
+        """Return a writer's index from one cached group GET, without a data HEAD."""
+        return self._group(span)["parts"][dp_rank]["index"]
 
-        The file's settings are checked against the cache before any of its blocks is
-        used: required differences fail, recorded ones are reported.
-        """
-        key = (dp_rank, *span)
-        with self.index_lock:
-            cached = self.indexes.get(key)
-        if cached is not None:
-            return cached
-        name = FileName(dp_rank, *span)
-        index = read_index(self.storage, name)
-        check_index(index, self.storage.size(name.data))
-        self.check_meta(file_meta(index), dp_rank, span)
-        rows = (span[1] - span[0]) // self.dp
-        if sum(block["rows"] for block in index["blocks"]) != rows:
-            raise ValueError(f"Offline KD v3 file {name.data} does not hold {rows} samples")
-        index["first_rows"] = [block["first_row"] for block in index["blocks"]]
-        with self.index_lock:
-            return self.indexes.setdefault(key, index)
+    def _group(self, span: tuple[int, int]) -> dict:
+        def load() -> dict:
+            group = read_group(self.storage, GroupName(*span))
+            for part in group["parts"]:
+                index = part["index"]
+                self.check_meta(file_meta(index), part["writer"], span)
+                index["first_rows"] = [block["first_row"] for block in index["blocks"]]
+            return group
+
+        return self.group_cache.get_or_load(span, load)
 
     def check_meta(self, meta: dict, dp_rank: int, span: tuple[int, int]) -> None:
         """Validate a file's settings against the cache."""
@@ -422,24 +412,23 @@ class ReplayReader(_BlockReader):
             )
 
     def _lane(self, dp_rank: int, group_index: int, first_block: int) -> _Lane:
-        lane = self.lanes.get(dp_rank)
+        # A lane belongs to one writer part of one logical group. Closing lanes at
+        # a group boundary bounds metadata held outside the LRU and permits a new
+        # group to change its teacher DP without idle old writers scanning ahead.
+        key = (group_index, dp_rank)
+        lane = self.lanes.get(key)
         if lane is None:
+            span = self.groups[group_index]
+            part = self._group(span)["parts"][dp_rank]
+            path, index = part["path"], part["index"]
 
             def items(stopped: threading.Event) -> Any:
-                group = group_index
-                while not stopped.is_set():
-                    span = self.wait_for_group(group, stopped)
-                    if span is None:
+                for block in range(first_block, len(index["blocks"])):
+                    if stopped.is_set():
                         return
-                    name, index = FileName(dp_rank, *span), self.index(dp_rank, span)
-                    label = f"dp{dp_rank} {span[0]}-{span[1]}"
-                    for block in range(
-                        first_block if group == group_index else 0, len(index["blocks"])
-                    ):
-                        yield (group, block), (self.storage, name.data, index, block, label)
-                    group += 1
+                    yield (group_index, block), (self.storage, path, index, block, path)
 
-            lane = self.lanes[dp_rank] = _Lane(self, f"dp{dp_rank}", items)
+            lane = self.lanes[key] = _Lane(self, f"group{group_index}-writer{dp_rank}", items)
         return lane
 
     def samples(self, positions: list[int], available_end: int) -> list[dict[str, Any]]:
@@ -450,10 +439,17 @@ class ReplayReader(_BlockReader):
             group_index = bisect.bisect_right(self.ends, position)
             start, _ = self.groups[group_index]
             end = self.groups[group_index][1]
+            span = (start, end)
+            for key in list(self.lanes):
+                if key[0] != group_index:
+                    self.lanes.pop(key).close()
+            self.group_cache.set_pinned([span])
+            info = self._group(span)
+            writers, mbs = info["writers"], info["writer_mbs"]
             sid = start + position - self.group_starts[group_index]
             offset = sid - start
-            dp_rank = (offset // self.mbs) % self.dp
-            row = (offset // (self.mbs * self.dp)) * self.mbs + offset % self.mbs
+            dp_rank = (offset // mbs) % writers
+            row = (offset // (mbs * writers)) * mbs + offset % mbs
             first_rows = self.index(dp_rank, (start, end))["first_rows"]
             block = bisect.bisect_right(first_rows, row) - 1
             inputs, targets = self._lane(dp_rank, group_index, block).block((group_index, block))
@@ -466,14 +462,11 @@ class ReplayReader(_BlockReader):
             self.closed = True
             self.condition.notify_all()
         super().close()
+        self.group_cache.clear()
 
 
 class CorpusReader(_BlockReader):
-    """Read a planned corpus blend (see :mod:`.format.blend`) by global sample position.
-
-    Global sample ``p`` is row ``p // L`` of lane ``p % L``. Each lane streams its
-    pieces' blocks in order; a rank only creates the lanes its positions fall in.
-    """
+    """Read only active lane pieces and part indexes from a shared disk catalog."""
 
     def __init__(
         self,
@@ -485,6 +478,10 @@ class CorpusReader(_BlockReader):
         prefetch_depth: int = 2,
         vocab_size: int | None = None,
     ):
+        from collections import OrderedDict
+
+        from .format.disk_plan import Catalog
+
         if manifest.get("manifest_version") != MANIFEST_VERSION:
             raise ValueError("Unsupported offline KD corpus manifest version")
         super().__init__(
@@ -494,82 +491,74 @@ class CorpusReader(_BlockReader):
             prefetch_depth=prefetch_depth,
             vocab_size=vocab_size,
         )
-        self.root = root
-        self.manifest = manifest
+        self.root, self.manifest = root, manifest
+        self.catalog = Catalog(manifest)
         self.lanes_count = manifest["lanes"]
-        self.total_samples = manifest["lanes"] * manifest["lane_samples"]
-        segments = manifest["segments"]
-        self.pieces = [segments[segments[:, 0] == lane] for lane in range(self.lanes_count)]
-        self.starts = [
-            np.concatenate(([0], np.cumsum(pieces[:, 4] - pieces[:, 3])))[:-1].tolist()
-            for pieces in self.pieces
-        ]
+        self.total_samples = self.lanes_count * manifest["lane_samples"]
         self.storages: dict[str, Storage] = {}
-        self.indexes: dict[int, dict] = {}
+        self.files = OrderedDict()
         self.index_lock = threading.Lock()
+        self.file_cache_size = max(8, self.prefetch_depth * 2)
 
     def _file(self, file_id: int) -> tuple[Storage, str, dict]:
-        entry = self.manifest["files"][file_id]
-        storage = self.storages.get(entry["folder"])
-        if storage is None:
-            storage = self.storages[entry["folder"]] = Storage(
-                os.path.join(self.root, entry["folder"])
-            )
+        with self.index_lock:
+            entry = self.files.get(file_id)
+            if entry is None:
+                entry = self.catalog.file(file_id)
+                self.files[file_id] = entry
+                while len(self.files) > self.file_cache_size:
+                    self.files.popitem(last=False)
+            else:
+                self.files.move_to_end(file_id)
+            storage = self.storages.get(entry["folder"])
+            if storage is None:
+                storage = self.storages[entry["folder"]] = Storage(
+                    os.path.join(self.root, entry["folder"])
+                )
         return storage, entry["path"], entry
 
     def index(self, file_id: int) -> dict:
-        """Validate the supplied index once, without a second GET or HEAD request."""
-        with self.index_lock:
-            cached = self.indexes.get(file_id)
-        if cached is not None:
-            return cached
-        _, path, entry = self._file(file_id)
-        index = entry["index"]
-        check_index(index)
-        metadata = file_meta(index)
-        validate_metadata(metadata, replay=False, corpus=True)
-        contract = metadata["contract"]
-        shared = blend_contract(contract)
-        differing = [key for key in self.contract if shared.get(key) != self.contract[key]]
-        if differing:
-            raise ValueError(
-                f"Offline KD corpus file {entry['folder']}/{path} differs from the blend on "
-                f"{', '.join(differing)}"
-            )
-        with self.index_lock:
-            return self.indexes.setdefault(file_id, index)
+        """Load a bounded active-file footer; block entries stay in the disk catalog."""
+        return self._file(file_id)[2]["index"]
 
     def _lane(self, lane: int, first_piece: int) -> _Lane:
         stream = self.lanes.get(lane)
         if stream is None:
 
             def items(stopped: threading.Event) -> Any:
-                for piece in range(first_piece, len(self.pieces[lane])):
+                for piece, file_id, block, a, b in self.catalog.lane(lane, first_piece):
                     if stopped.is_set():
                         return
-                    file_id, block = (int(v) for v in self.pieces[lane][piece][1:3])
                     storage, path, entry = self._file(file_id)
-                    label = f"{entry['folder']}/{path}"
-                    yield (piece,), (storage, path, self.index(file_id), block, label)
+                    yield (piece,), (
+                        storage,
+                        path,
+                        entry["index"],
+                        block,
+                        f"{entry['folder']}/{path}",
+                    )
 
             stream = self.lanes[lane] = _Lane(self, f"lane{lane}", items)
         return stream
 
     def samples(self, positions: list[int], available_end: int) -> list[dict[str, Any]]:
-        """Fetch samples at global positions (non-decreasing per lane across calls)."""
+        """Seek directly to each lane cursor without a materialized segments array."""
         if available_end > self.total_samples:
             raise RuntimeError(
-                f"Offline KD corpus blend holds {self.total_samples} samples; requested "
-                f"{available_end}"
+                f"Offline KD corpus blend holds {self.total_samples} samples; requested {available_end}"
             )
         samples = []
         for position in positions:
             lane, offset = position % self.lanes_count, position // self.lanes_count
-            piece = bisect.bisect_right(self.starts[lane], offset) - 1
+            piece, start, file_id, block, a, b = self.catalog.piece(lane, offset)
             inputs, targets = self._lane(lane, piece).block((piece,))
-            row = int(self.pieces[lane][piece][3]) + offset - self.starts[lane][piece]
-            samples.append(self.slice_sample(inputs, targets, row, position))
+            samples.append(self.slice_sample(inputs, targets, a + offset - start, position))
         return samples
+
+    def close(self) -> None:
+        """Stop prefetch/decode work and release this thread's catalog descriptor."""
+        super().close()
+        self.catalog.close_current()
 
 
 def _layout_sample(

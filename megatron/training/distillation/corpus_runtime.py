@@ -45,6 +45,8 @@ def corpus_inventory() -> CorpusInventory:
 def reset_corpus_runtime() -> None:
     """Discard cached producer state on an in-process restart."""
     global _INVENTORY
+    if _INVENTORY is not None and hasattr(_INVENTORY.chunks, "close"):
+        _INVENTORY.chunks.close()
     _INVENTORY = None
 
 
@@ -80,14 +82,15 @@ def initialize_corpus_metadata(saver: Any, expected: dict) -> dict:
                     f"Corpus job starts at iteration {start}, beyond the source epoch "
                     f"({args.train_iters} iterations)"
                 )
-            spans, kept = [], {}
-            for directory, chunk in sorted(inventory.chunks.items()):
+            spans, kept = [], []
+            for directory in sorted(inventory.chunks):
+                chunk = inventory.chunks[directory]
                 a, b = chunk["producer"]["start_iteration"], chunk["producer"]["end_iteration"]
                 if directory != chunk_path(a) or not 0 <= a < b:
                     raise ValueError("Invalid Megatron corpus chunk interval")
                 spans.append((a, b))
                 if not start <= a < end:
-                    kept[directory] = chunk
+                    kept.append(directory)
             previous = 0
             for a, b in spans:
                 if a < previous:
@@ -99,7 +102,8 @@ def initialize_corpus_metadata(saver: Any, expected: dict) -> dict:
             total = expected["contract"]["num_samples"]
             gbs = args.global_batch_size
             recorded_differences = set()
-            for chunk in kept.values():
+            for directory in kept:
+                chunk = inventory.chunks[directory]
                 producer = chunk["producer"]
                 if any(producer.get(key) != value for key, value in settings.items()):
                     raise ValueError(
