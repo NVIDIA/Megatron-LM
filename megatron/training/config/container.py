@@ -361,9 +361,11 @@ class PretrainConfigContainer(ConfigContainerBase):
         """The per-sample sequence length the training loop runs at (what ``--seq-length`` set):
         the dataset's ``sequence_length`` when the data section has a dataset; for a loader-only
         section (an entry point whose datasets come from its own callback), the model's
-        ``transformer.max_seq_length_per_sample``, which the launcher fills from ``--seq-length``.
-        That field is Megatron Core's per-sample maximum, a bound that may exceed the dataset's
-        length, so the loop does not read it for a section with a dataset."""
+        ``transformer.max_seq_length_per_sample``, which the launcher fills from ``--seq-length``
+        and a model config's ``finalize()`` may replace (``LLaVAModelConfig`` sets its resolved
+        decoder length: text, image tokens and padding). That field is Megatron Core's per-sample
+        maximum, a bound that may exceed the dataset's length, so the loop does not read it for a
+        section with a dataset."""
         dataset = self.data.dataset
         if dataset is not None:
             return dataset.sequence_length

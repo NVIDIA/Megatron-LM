@@ -315,6 +315,8 @@ def test_distributed_training_services_require_explicit_opt_in(
                 max_seq_length_per_sample=64,  # the training sequence length (--seq-length)
             ),
             seq_length=1024,  # Position capacity must not be used for buffer sizing.
+            # A VLM's resolved decoder length; its finalize() makes it the per-sample maximum.
+            **({"decoder_seq_length": 96} if vlm else {}),
             tp_comm_overlap_cfg={"qkv_fprop": {"method": "ring_exchange"}},
         )
     else:

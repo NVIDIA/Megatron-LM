@@ -3519,7 +3519,9 @@ def train_step(
                 model,
                 seq_length=cfg.sample_length,
                 micro_batch_size=cfg.train.micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
+                # get_tensor_shapes requires the keyword (ModelOpt forwards it); a single stack has
+                # no second length: seq_length is the sample length (a VLM's decoder length).
+                decoder_seq_length=None,
             )
         else:
             adjust_tensor_shapes_fn = None
@@ -3614,7 +3616,6 @@ def train_step(
                 num_microbatches=scheduled_num_microbatches,
                 seq_length=cfg.sample_length,
                 micro_batch_size=cfg.train.micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
                 forward_only=forward_only,
                 adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
                 force_all_reduce=save_wgrads_in_this_iteration,
@@ -4131,13 +4132,8 @@ def training_log(
         throughput = num_floating_point_operations(
             cfg.model,
             batch_size,
-            # Multimodal --seq-length describes the encoder, while the language model runs at
-            # --decoder-seq-length. Plain language models leave the latter unset.
-            sequence_length=(
-                args.decoder_seq_length
-                if args.decoder_seq_length is not None
-                else cfg.sample_length
-            ),
+            # The container's per-sample length (a VLM's is its resolved decoder length).
+            sequence_length=cfg.sample_length,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
@@ -5532,13 +5528,8 @@ def train(
         num_floating_point_operations_in_batch = num_floating_point_operations(
             cfg.model,
             batch_size,
-            # Multimodal --seq-length describes the encoder, while the language model runs at
-            # --decoder-seq-length. Plain language models leave the latter unset.
-            sequence_length=(
-                args.decoder_seq_length
-                if args.decoder_seq_length is not None
-                else cfg.sample_length
-            ),
+            # The container's per-sample length (a VLM's is its resolved decoder length).
+            sequence_length=cfg.sample_length,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         )
@@ -5872,7 +5863,9 @@ def evaluate(
             model,
             seq_length=cfg.sample_length,
             micro_batch_size=eval_micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
+            # get_tensor_shapes requires the keyword (ModelOpt forwards it); a single stack has
+            # no second length: seq_length is the sample length (a VLM's decoder length).
+            decoder_seq_length=None,
         )
     else:
         adjust_tensor_shapes_fn = None
@@ -5924,7 +5917,6 @@ def evaluate(
                     num_microbatches=scheduled_eval_num_microbatches,
                     seq_length=cfg.sample_length,
                     micro_batch_size=eval_micro_batch_size,
-                    decoder_seq_length=args.decoder_seq_length,
                     forward_only=True,
                     adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
                     pg_collection=pg_collection,
@@ -5985,7 +5977,6 @@ def evaluate(
                 num_microbatches=eval_num_microbatches,
                 seq_length=cfg.sample_length,
                 micro_batch_size=eval_micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,
                 collect_non_loss_data=True,
                 pg_collection=pg_collection,

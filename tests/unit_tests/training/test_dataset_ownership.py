@@ -24,6 +24,7 @@ from megatron.training.argument_utils import (
     _DATASET_FIELD_SOURCES,
     dataloader_config_from_args,
     gpt_data_config_from_args,
+    model_config_from_args,
     pretrain_cfg_container_from_args,
     requested_dataset_family,
 )
@@ -40,7 +41,7 @@ from megatron.training.config import container as container_module
 from megatron.training.config.dataset_config import CONTAINER_WRITTEN_FIELDS
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
-from megatron.training.models import GPTModelConfig
+from megatron.training.models import GPTModelConfig, LLaVAModelConfig
 
 MODEL_ARGV = (
     "--num-layers 2 --hidden-size 128 --num-attention-heads 8 --micro-batch-size 1 "
@@ -1094,6 +1095,38 @@ def test_the_loop_reads_the_dataset_length_and_a_loader_only_section_the_model_m
     loader_only.model.transformer.max_seq_length_per_sample = None
     assert loader_only.sample_length is None
     assert "dl.sequence_length" not in global_vars.build_telemetry_resource_attrs(args)
+
+
+def test_a_vlm_runs_at_its_decoder_length(container_factory, monkeypatch):
+    """A VLM's data section is loader-only, so the loop's length is the model's per-sample
+    maximum. The launcher fills it from --seq-length, the text length; LLaVAModelConfig records
+    the decoder length (text, image tokens, CP/SP padding) and its finalize() makes it the
+    per-sample maximum before the runtime services, so the pipeline shapes, the TP-communicator
+    buffers, the estimators and the counters run at the decoder length."""
+    import pretrain_vlm
+
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
+    args = _validated(
+        ["--seq-length", "64", "--decoder-seq-length", "96", "--max-position-embeddings", "128"]
+    )
+    model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    cfg = pretrain_cfg_container_from_args(args, model_cfg=model)
+    assert cfg.data.dataset is None
+    assert model.decoder_seq_length == 96  # --decoder-seq-length
+    assert cfg.sample_length == 64  # the text length until finalize()
+    cfg.validate()
+    cfg.finalize()
+    assert model.transformer.max_seq_length_per_sample == 96 == cfg.sample_length
+    # Without --decoder-seq-length the VLM resolver derives the length and records it.
+    args = _validated(["--seq-length", "64", "--max-position-embeddings", "128"])
+    model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    assert model.decoder_seq_length is None
+    monkeypatch.setattr(pretrain_vlm, "get_num_image_embeddings", lambda *a, **kw: 4)
+    monkeypatch.setattr(pretrain_vlm.context_parallel, "get_padding", lambda *a: 0)
+    pretrain_vlm.set_vlm_sequence_lengths(args, model)
+    assert args.decoder_seq_length == 68 == model.decoder_seq_length
+    model.finalize()
+    assert model.transformer.max_seq_length_per_sample == 68
 
 
 @pytest.mark.parametrize("entry_point", ["gpt", "hybrid", "hybrid_flex"])

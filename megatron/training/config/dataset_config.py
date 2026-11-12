@@ -20,8 +20,9 @@ follows the family flags, and the provider hands ``cfg.data.dataset`` to the bui
 The loop reads the section through ``batch_flags()`` and ``yields_unpacked_samples()``, never
 through ``args``; the sample length it runs at is the container's ``sample_length``: the dataset's
 ``sequence_length``, or for a loader-only section the model's ``max_seq_length_per_sample``
-(Megatron Core's per-sample maximum, filled from ``--seq-length`` by the launcher; with a dataset
-the container checks that it covers the samples and fills it when unset).
+(Megatron Core's per-sample maximum, filled from ``--seq-length`` by the launcher, a VLM's resolved
+decoder length by its model config's ``finalize()``; with a dataset the container checks that it
+covers the samples and fills it when unset).
 Entry points with their own data pipeline carry a loader-only section (``dataset is None``) and
 nothing here runs for them.
 """
