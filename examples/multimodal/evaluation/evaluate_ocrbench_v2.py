@@ -1,7 +1,14 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import argparse
+import glob
 import json
+import os
+import re
 import subprocess
+import sys
+
 import nltk
+
 nltk.download("wordnet")
 
 from .evaluate_mmmu import get_input_output_paths

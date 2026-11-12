@@ -32,7 +32,7 @@ def convert_to_coco_format(input_path):
     results = list(results.values())
 
     with open(output_file_path, "w") as output_file:
-        json.dump(results, output_file, indent=4, sort_keys=True)
+        json.dump(results, output_file, indent=4)
 
     return output_file_path
 

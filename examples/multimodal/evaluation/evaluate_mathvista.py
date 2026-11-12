@@ -1,10 +1,12 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import argparse
 import json
 import re
 
-from .evaluate_mmmu import get_input_output_paths
-from .mmmu_utils import parse_multi_choice_response
+from MMMU.mmmu.utils.eval_utils import parse_multi_choice_response
 from open_flamingo.eval.vqa_metric import VQAEval
+
+from .evaluate_mmmu import get_input_output_paths
 
 
 def merge_input_files(input_path):
@@ -28,7 +30,7 @@ def merge_input_files(input_path):
     results = list(results.values())
 
     with open(output_file_path, "w") as output_file:
-        json.dump(results, output_file, indent=4, sort_keys=True)
+        json.dump(results, output_file)
 
     return output_file_path
 

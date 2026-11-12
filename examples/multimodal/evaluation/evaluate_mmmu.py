@@ -3,19 +3,17 @@ import argparse
 import glob
 import json
 import os
-import sys
 import re
 import subprocess
+import sys
 
-from .mmmu_utils import parse_multi_choice_response
 # Get the absolute path of the parent directory
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir))
 # Add the parent directory to sys.path
 sys.path.insert(0, parent_dir)
 
-from run_text_generation import get_output_path
 from config import EvaluationConfig
-
+from run_text_generation import get_output_path
 
 
 def get_input_output_paths(input_path, task):
@@ -35,23 +33,6 @@ def get_input_output_paths(input_path, task):
     return input_file_paths, output_file_path
 
 
-def extract_answer(text):
-    import re
-    # Regular expression to find content inside \answer{xxx}
-    match = re.search(r'\\answer\{(.*?)\}', text)
-    if match:
-        return match.group(1)  # Return the content inside the braces
-
-    # Regular expression to find content inside \boxed{xxx}
-    match = re.search(r'\\boxed\{(.*?)\}', text)
-    if match:
-        return match.group(1)  # Return the content inside the braces
-
-    text = text.replace("Answer:", "Answer: ")
-    return text  # Return the original string if no match is found
-
-
-
 def convert_to_mmmu_format(input_path):
     """Convert input files to MMMU compatible format."""
     input_file_paths, output_file_path = get_input_output_paths(input_path, "MMMU")
@@ -66,20 +47,22 @@ def convert_to_mmmu_format(input_path):
                 sample_id = res["sample_id"]
                 prediction = res["prediction"]
 
-                if sample_id in output:
-                    continue
-
                 if res["question_type"] == "multiple-choice":
-                    prediction = extract_answer(prediction)
+                    from MMMU.mmmu.utils.eval_utils import parse_multi_choice_response
+
                     prediction = parse_multi_choice_response(
                         prediction, res["all_choices"], res["index2ans"]
                     )
 
                 # MMMU eval script expects just a sample_id to prediction mapping.
+                # Skip possible duplicates.
+                if sample_id in output:
+                    continue
+
                 output[sample_id] = prediction
 
     with open(output_file_path, "w") as output_file:
-        json.dump(output, output_file, indent=4, sort_keys=True)
+        json.dump(output, output_file)
 
     return output_file_path
 
