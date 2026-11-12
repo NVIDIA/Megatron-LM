@@ -375,9 +375,16 @@ def forward_step(data_iterator, model: HybridModel):
         tokens = batch.get("tokens")
         packed_seq_params = cp_batch.get_packed_seq_params()
         padding_mask = batch.get("padding_mask")
-        if cu_seqlens is not None:
+        # With a sequence packing scheduler, train_step already seeded this iteration's
+        # global FLOPs statistics from the scheduler, and get_batch already prepared the
+        # packed metadata. Adding this microbatch's boundaries would turn the seeded global
+        # values into a sum that consume_seqlen_stats_in_iteration all-reduces again (the
+        # reported FLOPs grow with the world size), and preparing again rebuilds the routes
+        # and DSA tables. Both stay for the get_batch path that builds its batch locally.
+        uses_packing_scheduler = getattr(get_args(), "sequence_packing_scheduler", None) is not None
+        if cu_seqlens is not None and not uses_packing_scheduler:
             update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
-        if packed_seq_params is not None:
+        if packed_seq_params is not None and not uses_packing_scheduler:
             # NOTE(nightly-sync 26_10_2026): restored dev-only hook (dev's forward_step
             # carried it as well as get_batch). This covers the non-packing get_batch path,
             # whose ContextParallelBatch is built locally and so never passes through the

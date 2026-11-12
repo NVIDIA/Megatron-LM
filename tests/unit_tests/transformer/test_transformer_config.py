@@ -1025,6 +1025,21 @@ def test_sequence_packing_moe_hybridep_with_uneven_input_padding_passes():
     assert config.moe_hybridep_pad_uneven_dispatch_inputs is True
 
 
+@requires_te_2_9
+def test_sequence_packing_moe_hybridep_with_max_padded_packs_needs_no_dispatch_padding():
+    # pad_packed_seq_alignment='max' pads every pack to max_seqlen_per_dp_cp_rank tokens per
+    # CP rank, so every dispatcher rank holds the same token count.
+    config = _make_packing_config(
+        num_moe_experts=2,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        pad_packed_seq_alignment="max",
+        max_seqlen_per_dp_cp_rank=4096,
+    )
+
+    assert config.moe_hybridep_pad_variable_tokens is False
+
+
 @pytest.mark.parametrize(
     "dev_flag,main_flag", [(False, False), (True, False), (False, True), (True, True)]
 )

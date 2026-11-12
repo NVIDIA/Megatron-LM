@@ -133,3 +133,44 @@ def test_forward_step_passes_groups_from_wrapped_model(packed_entrypoint, monkey
     assert callable(loss)
     assert fetch.call_args.args == (iterator, 2)
     assert fetch.call_args.kwargs["pg_collection"] is pgs
+
+
+@pytest.mark.parametrize("scheduler", ["default_dynamic_cp", None])
+def test_hybrid_forward_step_leaves_scheduler_batches_to_the_scheduler(monkeypatch, scheduler):
+    """With a packing scheduler, the step's global FLOPs stats and get_batch's metadata stand.
+
+    train_step seeds the iteration's global token statistics from the scheduler, and
+    get_batch prepares the scheduler's packed metadata, so the hybrid forward step neither
+    adds the microbatch's boundaries (which the stats' all-reduce would count again) nor
+    prepares the metadata a second time. Without a scheduler it still does both.
+    """
+    module = pretrain_hybrid
+    monkeypatch.setattr(
+        module, "get_args", lambda: SimpleNamespace(sequence_packing_scheduler=scheduler)
+    )
+    output, iterator = object(), object()
+    model = _Wrapper(
+        _Wrapper(Mock(spec=[], vp_stage=0, pg_collection=None, config=None, return_value=output))
+    )
+    cu_seqlens = torch.tensor([[0, 64, 128]], dtype=torch.int32)
+    packed = object()
+    batch = SimpleNamespace(
+        get_batch=lambda: {"cu_seqlens": cu_seqlens}, get_packed_seq_params=lambda: packed
+    )
+    monkeypatch.setattr(module, "get_batch", Mock(return_value=batch))
+    monkeypatch.setattr(module, "get_timers", lambda: Mock())
+    stimer = MagicMock()
+    stimer.return_value = stimer
+    monkeypatch.setattr(module, "stimer", stimer)
+    stats, prepare = Mock(), Mock()
+    monkeypatch.setattr(module, "update_seqlen_stats_from_cu_seqlens", stats)
+    monkeypatch.setattr(module, "prepare_packed_seq_params", prepare)
+
+    forward_output, _ = module.forward_step(iterator, model)
+    assert forward_output is output
+    if scheduler is None:
+        stats.assert_called_once()
+        assert prepare.call_args.args[0] is packed
+    else:
+        stats.assert_not_called()
+        prepare.assert_not_called()
