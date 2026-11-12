@@ -30,7 +30,9 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
+from megatron.core.transformer.multi_token_prediction import (
+    get_mtp_ranks,
+)
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )

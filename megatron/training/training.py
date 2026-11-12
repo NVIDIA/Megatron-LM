@@ -4264,8 +4264,7 @@ def training_log(
             from megatron.core.telemetry.training_metrics import record_training_metrics
             _avg_loss = _otel_loss_snapshot
             _tokens_per_sec = (
-                batch_size * sequence_length
-                / elapsed_time_per_iteration
+                batch_size * sequence_length / elapsed_time_per_iteration
                 if elapsed_time_per_iteration > 0 else None
             )
             _mem_gb = torch.cuda.max_memory_allocated() / (1024 ** 3) if torch.cuda.is_available() else None
@@ -4287,9 +4286,7 @@ def training_log(
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(
-                    cfg,
-                    sequence_length=sequence_length,
-                    micro_batch_size=cfg.train.micro_batch_size,
+                    cfg, sequence_length=sequence_length, micro_batch_size=cfg.train.micro_batch_size,
                     data_parallel_size=cfg.get_data_parallel_size(), world_size=safe_get_world_size(),
                     num_microbatches=num_microbatches, verbose=True,
                 )

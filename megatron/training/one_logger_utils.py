@@ -1,12 +1,11 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-import os
-import time
+# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import time, os
 
 from megatron.core._rank_utils import safe_get_world_size
+
+from .global_vars import get_one_logger, get_args
 from megatron.training.global_vars import get_run_config
 from megatron.training.sequence_lengths import get_model_input_lengths
-
-from .global_vars import get_args, get_one_logger
 
 _one_logger_utils_version = "1.2.0-mlm"
 
