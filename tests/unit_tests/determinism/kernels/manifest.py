@@ -722,6 +722,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
     ),
     KernelEntry(
+        name="inference_triton_pdl",
+        sources=("megatron/core/inference/triton_pdl.py",),
+        kind="triton",
+        training_path=False,
+        exempt_reason="Launch helper only (griddepcontrol.wait and the PDL launch option of the "
+        "registered inference Triton kernels); its no-op fallback is never compiled.",
+    ),
+    KernelEntry(
         name="sigmoid_topk_router",
         sources=("megatron/core/inference/moe/sigmoid_topk.py",),
         tests=(

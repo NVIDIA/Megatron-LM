@@ -11,6 +11,11 @@ from tests.unit_tests.determinism.kernels.harness import (
     assert_replays_bit_exact,
     seeded,
 )
+from tests.unit_tests.determinism.kernels.pdl_harness import (
+    assert_pdl_launch_bit_exact,
+    requires_pdl,
+    seeded_randn,
+)
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and streamwise_residual_ops.HAVE_STREAMWISE_TRITON),
@@ -107,3 +112,40 @@ def test_fused_streamwise_read_write_replays_fwd_bwd(
     assert set(gradients) == expected_gradients
     for index in (2, 3, *([4] if with_retention else [])):
         assert torch.count_nonzero(gradients[f"in[{index}]"][num_streams:]) == 0
+
+
+@requires_pdl
+@pytest.mark.parametrize("op", ["read", "write"])
+def test_streamwise_sigmoid_pdl_launch_is_bit_exact(op):
+    """Launched with PDL right after a producer that writes the residual late, the fused read
+    and write wait for the producer and match their non-PDL launch byte for byte."""
+    seeded()
+    num_streams, width = 4, 1024
+    hidden = torch.empty(186, num_streams * width, device="cuda", dtype=torch.bfloat16)
+    read_logits = torch.zeros(128, device="cuda", dtype=torch.float32)
+    read_logits[:num_streams] = torch.tensor([-0.7, -0.2, 0.3, 0.9], device="cuda")
+    write_logits = torch.zeros(128, device="cuda", dtype=torch.float32)
+    write_logits[:num_streams] = torch.tensor([0.4, -0.1, 0.2, -0.6], device="cuda")
+    update = seeded_randn(torch.empty(186, width, dtype=torch.bfloat16), 41)
+
+    if op == "read":
+
+        def call():
+            return [
+                streamwise_residual_ops._streamwise_sigmoid_read_triton(
+                    hidden, read_logits, num_streams, torch.bfloat16
+                )
+            ]
+
+    else:
+
+        def call():
+            return [
+                streamwise_residual_ops._streamwise_sigmoid_write_triton(
+                    hidden, update, write_logits, num_streams, None, 0.0
+                )
+            ]
+
+    assert_pdl_launch_bit_exact(
+        call, hidden, lambda i: seeded_randn(hidden, i), what=f"streamwise sigmoid {op}"
+    )

@@ -22,6 +22,8 @@ try:
     import triton
     import triton.language as tl
 
+    from megatron.core.inference.triton_pdl import gdc_wait, pdl_enabled, pdl_launch_kwargs
+
     HAVE_TRITON = True
 except ImportError:
     from unittest.mock import MagicMock
@@ -112,6 +114,17 @@ def _mxfp8_quant_swizzle_row(
 
 
 @triton.jit
+def _mxfp8_zero_scale_cols(row, scale_ptr, n_col_blocks, col_start, col_end, ZBLOCK: tl.constexpr):
+    """Store zero scales for columns [col_start, col_end) of one row in the swizzled layout."""
+    col_offs = col_start + tl.arange(0, ZBLOCK)
+    col_mask = col_offs < col_end
+    local_row = row % 128
+    tile_idx = (row // 128) * n_col_blocks + col_offs // 4
+    swizzled_offs = tile_idx * 512 + (local_row % 32) * 16 + (local_row // 32) * 4 + col_offs % 4
+    tl.store(scale_ptr + swizzled_offs, tl.zeros([ZBLOCK], dtype=tl.uint8), mask=col_mask)
+
+
+@triton.jit
 def _mxfp8_quant_swizzle_kernel(
     out_ptr,  # [M, K] output buffer for float8_e4m3fn quantized data
     scale_ptr,  # 1D output buffer for swizzled uint8 scales (e8m0 exponents)
@@ -121,6 +134,9 @@ def _mxfp8_quant_swizzle_kernel(
     REAL_GROUPS: tl.constexpr,  # actual number of scale groups per row (K // 32)
     BLOCK_K: tl.constexpr,  # next_power_of_2(K) — padded column count for tl.reshape
     BLOCK_GROUPS: tl.constexpr,  # BLOCK_K // 32 — padded group count (must be power of 2)
+    M=None,  # rows of real data; programs >= M only zero their padded scale row
+    ZBLOCK: tl.constexpr = 0,  # next_power_of_2(n_col_blocks * 4); 0 = no padding handled here
+    USE_PDL: tl.constexpr = False,
 ):
     """Each triton block quantizes one row → FP8 e4m3, write scales directly in swizzled layout.
 
@@ -173,10 +189,20 @@ def _mxfp8_quant_swizzle_kernel(
             offset   = tile_idx * 512 + sub_row * 16 + group * 4 + local_col
 
     """
+    if USE_PDL:
+        gdc_wait()
     row = tl.program_id(0).to(tl.int64)
-    _mxfp8_quant_swizzle_row(
-        row, out_ptr, scale_ptr, src_ptr, K, n_col_blocks, REAL_GROUPS, BLOCK_K, BLOCK_GROUPS
-    )
+    if ZBLOCK == 0:
+        _mxfp8_quant_swizzle_row(
+            row, out_ptr, scale_ptr, src_ptr, K, n_col_blocks, REAL_GROUPS, BLOCK_K, BLOCK_GROUPS
+        )
+    elif row < M:
+        _mxfp8_quant_swizzle_row(
+            row, out_ptr, scale_ptr, src_ptr, K, n_col_blocks, REAL_GROUPS, BLOCK_K, BLOCK_GROUPS
+        )
+        _mxfp8_zero_scale_cols(row, scale_ptr, n_col_blocks, REAL_GROUPS, n_col_blocks * 4, ZBLOCK)
+    else:
+        _mxfp8_zero_scale_cols(row, scale_ptr, n_col_blocks, 0, n_col_blocks * 4, ZBLOCK)
 
 
 def mxfp8_quantize_into(x: torch.Tensor, out_data: torch.Tensor, out_scale: torch.Tensor) -> None:
@@ -208,15 +234,15 @@ def mxfp8_quantize_into(x: torch.Tensor, out_data: torch.Tensor, out_scale: torc
     # The kernel reads rows as contiguous storage.
     x = x.contiguous()
 
-    # The quantization kernel only writes logical scale entries. Clear the
-    # padded rows and columns so reused storage matches freshly quantized output.
+    # Reused storage must match freshly quantized output, so the padded scale rows and
+    # columns are zeroed in the same launch: one program per padded row, programs past the
+    # real rows only store zeros (no separate fill kernel).
     out_scale_bytes = out_scale.view(torch.uint8)
-    out_scale_bytes.zero_()
 
     BLOCK_K = triton.next_power_of_2(K)
     BLOCK_GROUPS = BLOCK_K // MXFP8_BLOCK_SIZE
 
-    _mxfp8_quant_swizzle_kernel[(M,)](
+    _mxfp8_quant_swizzle_kernel[(n_row_blocks * MXFP8_SCALE_ROW_BLOCK,)](
         out_data,
         out_scale_bytes,
         x,
@@ -225,6 +251,10 @@ def mxfp8_quantize_into(x: torch.Tensor, out_data: torch.Tensor, out_scale: torc
         REAL_GROUPS=scale_cols,
         BLOCK_K=BLOCK_K,
         BLOCK_GROUPS=BLOCK_GROUPS,
+        M=M,
+        ZBLOCK=triton.next_power_of_2(n_col_blocks * MXFP8_SCALE_COL_BLOCK),
+        USE_PDL=pdl_enabled(),
+        **pdl_launch_kwargs(),
     )
 
 
@@ -240,6 +270,7 @@ def _mxfp8_quant_swizzle_rows_kernel(
     BLOCK_K: tl.constexpr,
     BLOCK_GROUPS: tl.constexpr,
     NUM_PROGRAMS: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     """Persistent variant: a fixed grid quantizes only the first ``n_rows`` rows.
 
@@ -247,6 +278,8 @@ def _mxfp8_quant_swizzle_rows_kernel(
     scales with the live rows instead of the worst-case buffer. Each row runs the same
     code as ``_mxfp8_quant_swizzle_kernel``, so the quantized rows are bitwise equal.
     """
+    if USE_PDL:
+        gdc_wait()
     pid = tl.program_id(0)
     n_rows = tl.load(n_rows_ptr).to(tl.int64)
     for row in tl.range(pid, n_rows, NUM_PROGRAMS):
@@ -297,6 +330,8 @@ def mxfp8_quantize_rows(
         BLOCK_K=BLOCK_K,
         BLOCK_GROUPS=BLOCK_K // MXFP8_BLOCK_SIZE,
         NUM_PROGRAMS=num_programs,
+        USE_PDL=pdl_enabled(),
+        **pdl_launch_kwargs(),
     )
     return out_data, out_scale.view(torch.float8_e8m0fnu)
 

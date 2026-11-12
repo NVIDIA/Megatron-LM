@@ -44,6 +44,8 @@ test.
 
 import torch
 
+from megatron.core.inference.triton_pdl import gdc_wait, pdl_enabled, pdl_launch_kwargs
+
 from .common import HAVE_TRITON, tl, triton
 
 if HAVE_TRITON:
@@ -108,6 +110,7 @@ def gdp_prepare_kernel(
     BP: tl.constexpr,
     BN: tl.constexpr,
     INTERLEAVE_QG: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     """One program per (request-token, Householder copy, block of `BH` heads).
 
@@ -118,6 +121,8 @@ def gdp_prepare_kernel(
     passes `T_CONST == 0` and its packed token count at runtime, so step sizes
     do not each compile a kernel.
     """
+    if USE_PDL:
+        gdc_wait()
     i_nt = tl.program_id(0).to(tl.int64)
     i_m = tl.program_id(1)
     if T_CONST > 0:
@@ -249,6 +254,8 @@ def _launch_prepare(x, ba, A_log, dt_bias, outputs, M, H, G, P, N, interleave_qg
         BN=triton.next_power_of_2(N),
         INTERLEAVE_QG=interleave_qg,
         num_warps=2 if interleave_qg else 4,
+        USE_PDL=pdl_enabled(),
+        **pdl_launch_kwargs(),
     )
 
 

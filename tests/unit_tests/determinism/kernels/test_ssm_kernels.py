@@ -37,6 +37,11 @@ from tests.unit_tests.determinism.kernels.harness import (
     deterministic_algorithms,
     seeded,
 )
+from tests.unit_tests.determinism.kernels.pdl_harness import (
+    assert_pdl_launch_bit_exact,
+    requires_pdl,
+    seeded_randn,
+)
 from tests.unit_tests.test_utilities import Utils
 
 try:
@@ -1128,3 +1133,110 @@ def test_batch_invariant_unfused_mixer_replays_bit_exactly(monkeypatch):
         )
     finally:
         Utils.destroy_model_parallel()
+
+
+# --- Programmatic dependent launch ---------------------------------------------------------
+
+
+def _pdl_causal_conv1d_update():
+    from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
+
+    batch, dim, width = 186, 2048, 4
+    x = torch.empty(batch, dim, device="cuda", dtype=torch.bfloat16)
+    initial_state = seeded_randn(torch.empty(batch, dim, width - 1, dtype=torch.bfloat16), 7)
+    state = torch.empty_like(initial_state)
+    weight = seeded_randn(torch.empty(dim, width, dtype=torch.bfloat16), 8, 0.5)
+    bias = seeded_randn(torch.empty(dim, dtype=torch.bfloat16), 9, 0.1)
+
+    def call():
+        return [causal_conv1d_update(x, state, weight, bias, True, None), state]
+
+    return dict(
+        call=call,
+        root=x,
+        make_input=lambda i: seeded_randn(x, i),
+        reset=lambda: state.copy_(initial_state),
+    )
+
+
+def _pdl_fused_recurrent_update():
+    from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
+
+    batch, heads, value_heads, key_dim, value_dim = 64, 4, 8, 128, 128
+    generator = torch.Generator(device="cuda").manual_seed(13)
+    q = torch.empty(batch, 1, heads, key_dim, device="cuda", dtype=torch.bfloat16)
+    k = seeded_randn(q, 11)
+    v = seeded_randn(torch.empty(batch, 1, value_heads, value_dim, dtype=torch.bfloat16), 12)
+    g = -torch.rand(batch, 1, value_heads, generator=generator, device="cuda")
+    beta = torch.rand(batch, 1, value_heads, generator=generator, device="cuda").bfloat16()
+    initial_state = seeded_randn(
+        torch.empty(80, value_heads, key_dim, value_dim, dtype=torch.float32), 15, 0.1
+    )
+    state = torch.empty_like(initial_state)
+    state_indices = torch.arange(batch, device="cuda", dtype=torch.int32)
+
+    def call():
+        out = fused_recurrent_gated_delta_rule_update(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            use_qk_l2norm_in_kernel=True,
+            state=state,
+            state_indices=state_indices,
+        )[0]
+        return [out, state]
+
+    return dict(
+        call=call,
+        root=q,
+        make_input=lambda i: seeded_randn(q, i),
+        reset=lambda: state.copy_(initial_state),
+    )
+
+
+def _pdl_gdp_decode_prepare():
+    from megatron.core.ssm.ops.gdp.prepare import gdp_decode_prepare
+
+    householder, heads, groups, head_dim, state_dim, tokens = 2, 8, 2, 64, 64, 186
+    conv_dim = heads * head_dim * householder + (householder + 1) * groups * state_dim
+    packed = torch.empty(
+        tokens, 1, conv_dim + (householder + 1) * heads, device="cuda", dtype=torch.bfloat16
+    )
+    a_log = seeded_randn(torch.empty(heads, dtype=torch.float32), 21)
+    dt_bias = seeded_randn(torch.empty(heads, dtype=torch.bfloat16), 22)
+
+    def call():
+        x, ba = torch.split(packed, [conv_dim, (householder + 1) * heads], dim=-1)
+        return list(
+            gdp_decode_prepare(
+                x,
+                ba,
+                A_log=a_log,
+                dt_bias=dt_bias,
+                num_householder=householder,
+                num_heads=heads,
+                num_groups=groups,
+                head_dim=head_dim,
+                state_dim=state_dim,
+            )
+        )
+
+    return dict(call=call, root=packed, make_input=lambda i: seeded_randn(packed, i))
+
+
+_PDL_CASES = {
+    "causal_conv1d_update": _pdl_causal_conv1d_update,
+    "fused_recurrent_gated_delta_rule_update": _pdl_fused_recurrent_update,
+    "gdp_decode_prepare": _pdl_gdp_decode_prepare,
+}
+
+
+@requires_pdl
+@pytest.mark.parametrize("case", sorted(_PDL_CASES))
+def test_ssm_decode_kernel_pdl_launch_is_bit_exact(case):
+    """Launched with PDL right after a producer that writes its input late, each decode kernel
+    waits for the producer and matches its non-PDL launch byte for byte (eager and CUDA graph)."""
+    seeded()
+    assert_pdl_launch_bit_exact(**_PDL_CASES[case](), what=case)

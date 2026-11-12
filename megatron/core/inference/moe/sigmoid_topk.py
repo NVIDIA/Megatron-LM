@@ -23,6 +23,8 @@ try:
     import triton
     import triton.language as tl
 
+    from megatron.core.inference.triton_pdl import gdc_wait, pdl_enabled, pdl_launch_kwargs
+
     HAVE_TRITON = True
 except ImportError:
     HAVE_TRITON = False
@@ -54,6 +56,7 @@ def _sigmoid_topk_kernel(
     USE_TL_TOPK: tl.constexpr,
     APPLY_SCALING: tl.constexpr,
     BLOCK_T: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     """Top-k of sigmoid(logits) + bias, probabilities from sigmoid(logits).
 
@@ -66,6 +69,8 @@ def _sigmoid_topk_kernel(
         generates it, so probabilities match bit for bit. Larger top-k uses a tree
         reduction, which can differ from the compiled sum in the last bit.
     """
+    if USE_PDL:
+        gdc_wait()
     rows = tl.program_id(0) * BLOCK_T + tl.arange(0, BLOCK_T)
     cols = tl.arange(0, EXPERTS_POW2)
     row_mask = rows < num_tokens
@@ -213,5 +218,7 @@ def sigmoid_topk_routing(
         APPLY_SCALING=bool(scaling_factor),
         BLOCK_T=block_tokens,
         num_warps=num_warps,
+        USE_PDL=pdl_enabled(),
+        **pdl_launch_kwargs(),
     )
     return probs, indices

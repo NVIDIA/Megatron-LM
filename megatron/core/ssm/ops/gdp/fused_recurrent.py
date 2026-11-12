@@ -26,6 +26,8 @@ per draft token and no re-read of the running state.
 
 import torch
 
+from megatron.core.inference.triton_pdl import gdc_wait, pdl_enabled, pdl_launch_kwargs
+
 from .common import HAVE_TRITON, exp, softplus, tl, triton
 
 
@@ -83,8 +85,11 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     HAS_DT_BIAS: tl.constexpr,
     APPLY_BETA_SIGMOID: tl.constexpr,
     COMPACT_OUTPUT: tl.constexpr = False,
+    USE_PDL: tl.constexpr = False,
 ):
     """Walk one sequence token by token, carrying the `[K, V]` state."""
+    if USE_PDL:
+        gdc_wait()
     i_v, i_nh = tl.program_id(0), tl.program_id(1)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
@@ -465,5 +470,7 @@ def fused_recurrent_gated_delta_rule_update(
         APPLY_BETA_SIGMOID=use_beta_sigmoid_in_kernel,
         num_warps=1,
         num_stages=3,
+        USE_PDL=pdl_enabled(),
+        **pdl_launch_kwargs(),
     )
     return o, final_state

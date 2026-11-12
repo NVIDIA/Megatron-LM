@@ -6,6 +6,8 @@ try:
     import triton
     import triton.language as tl
 
+    from megatron.core.inference.triton_pdl import gdc_wait, pdl_enabled, pdl_launch_kwargs
+
     HAVE_TRITON = True
 except ImportError:
     from unittest.mock import MagicMock
@@ -45,6 +47,7 @@ def _append_kv_cache_kernel(
     dummy_block_idx: tl.int32,
     # --- Compile-Time Constants ---
     BLOCK_SIZE_H: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     """
     Triton kernel to append key and value vectors to pre-sliced paged KV cache tensors.
@@ -57,6 +60,8 @@ def _append_kv_cache_kernel(
     4. It calculates the destination address in the 4D cache slices.
     5. It writes (scatters) the head vector to its destination in the cache.
     """
+    if USE_PDL:
+        gdc_wait()
 
     token_idx = tl.program_id(0)
     head_idx = tl.program_id(1)
@@ -193,4 +198,6 @@ def triton_append_key_value_cache(
         dummy_block_idx=dummy_block_idx,
         # Compile-time constant
         BLOCK_SIZE_H=BLOCK_SIZE_H,
+        USE_PDL=pdl_enabled(),
+        **pdl_launch_kwargs(),
     )

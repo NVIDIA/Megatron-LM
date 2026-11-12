@@ -23,6 +23,11 @@ from tests.unit_tests.determinism.kernels.harness import (
     count_differing_replays,
     seeded,
 )
+from tests.unit_tests.determinism.kernels.pdl_harness import (
+    assert_pdl_launch_bit_exact,
+    requires_pdl,
+    seeded_randn,
+)
 
 try:
     import triton  # noqa: F401
@@ -1278,3 +1283,122 @@ def test_ep_invariant_topk_replays():
         fn, (rows,), backward=False, contention=True, what="EP-invariant top-k combine"
     )
     assert torch.all(list(ref.values())[1][valid:] == 7.0)
+
+
+# --- Programmatic dependent launch ---------------------------------------------------------
+
+
+def _pdl_zero_padding_rows():
+    from megatron.core.inference.contexts.zero_padding_rows_kernel import zero_padding_rows
+
+    rows = torch.empty(256, 2688, device="cuda", dtype=torch.bfloat16)
+    count = _dev_scalar(186)
+
+    def call():
+        zero_padding_rows(rows, count)
+        return [rows]
+
+    return dict(call=call, root=rows, make_input=lambda i: seeded_randn(rows, i))
+
+
+def _pdl_mask_routing_padding():
+    from megatron.core.transformer.moe.inference_routing_mask_kernel import mask_routing_padding
+
+    routing_map = torch.empty(256, 22, device="cuda", dtype=torch.int64)
+    count = _dev_scalar(186)
+
+    def make_input(i):
+        generator = torch.Generator(device="cuda").manual_seed(i)
+        return torch.randint(0, 512, routing_map.shape, generator=generator, device="cuda")
+
+    def call():
+        mask_routing_padding(routing_map, count)
+        return [routing_map]
+
+    return dict(call=call, root=routing_map, make_input=make_input)
+
+
+def _pdl_sigmoid_topk_routing():
+    from megatron.core.inference.moe.sigmoid_topk import sigmoid_topk_routing
+
+    logits = torch.empty(744, 512, device="cuda", dtype=torch.float32)
+    bias = seeded_randn(torch.empty(512, device="cuda"), 99, 0.1)
+
+    def call():
+        return list(sigmoid_topk_routing(logits, bias, 22, scaling_factor=2.5))
+
+    return dict(call=call, root=logits, make_input=lambda i: seeded_randn(logits, i))
+
+
+def _pdl_mxfp8_quantize_into(rows, cols):
+    import triton
+
+    from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize_into
+
+    x = torch.empty(rows, cols, device="cuda", dtype=torch.bfloat16)
+    data = torch.empty(rows, cols, device="cuda", dtype=torch.float8_e4m3fn)
+    # Swizzled scale layout padded to 128-row tiles; the kernel writes the padding itself.
+    scale = torch.empty(
+        triton.cdiv(rows, 128) * 128 * triton.cdiv(cols, 128) * 4, device="cuda", dtype=torch.uint8
+    )
+
+    def call():
+        mxfp8_quantize_into(x, data, scale)
+        return [data, scale]
+
+    return dict(
+        call=call, root=x, make_input=lambda i: seeded_randn(x, i, 3.0), outputs=(data, scale)
+    )
+
+
+def _pdl_mxfp8_quantize_rows():
+    from megatron.core.inference.quantization.mxfp8_quantize import mxfp8_quantize_rows
+
+    x = torch.empty(2976, 672, device="cuda", dtype=torch.bfloat16)
+    valid_rows = _dev_scalar(744)
+
+    def call():
+        data, scale = mxfp8_quantize_rows(x, valid_rows)
+        return [data[:744], scale]
+
+    return dict(call=call, root=x, make_input=lambda i: seeded_randn(x, i, 3.0))
+
+
+def _pdl_append_key_value_cache():
+    from megatron.core.inference.contexts.fused_kv_append_kernel import (
+        triton_append_key_value_cache,
+    )
+
+    tokens, heads, head_dim = 186, 2, 128
+    memory = torch.empty(2, 2, 4, 256, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    key = torch.empty(tokens, 1, heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    value = seeded_randn(key, 31)
+    token = torch.arange(tokens, device="cuda")
+    block, position = (token // 64).to(torch.int64), (token % 64 * 3).to(torch.int32)
+
+    def call():
+        triton_append_key_value_cache(1, key, value, memory, tokens, block, position, -1)
+        return [memory]
+
+    return dict(call=call, root=key, make_input=lambda i: seeded_randn(key, i), reset=memory.zero_)
+
+
+_PDL_CASES = {
+    "zero_padding_rows": _pdl_zero_padding_rows,
+    "mask_routing_padding": _pdl_mask_routing_padding,
+    "sigmoid_topk_routing": _pdl_sigmoid_topk_routing,
+    "mxfp8_quantize_into_744x672": lambda: _pdl_mxfp8_quantize_into(744, 672),
+    "mxfp8_quantize_into_186x2688": lambda: _pdl_mxfp8_quantize_into(186, 2688),
+    "mxfp8_quantize_into_1x672": lambda: _pdl_mxfp8_quantize_into(1, 672),
+    "mxfp8_quantize_rows": _pdl_mxfp8_quantize_rows,
+    "append_key_value_cache": _pdl_append_key_value_cache,
+}
+
+
+@requires_pdl
+@pytest.mark.parametrize("case", sorted(_PDL_CASES))
+def test_inference_kernel_pdl_launch_is_bit_exact(case):
+    """Launched with PDL right after a producer that writes its input late, each kernel waits
+    for the producer and matches its non-PDL launch byte for byte (eager and CUDA graph)."""
+    seeded()
+    assert_pdl_launch_bit_exact(**_PDL_CASES[case](), what=case)
