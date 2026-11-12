@@ -33,6 +33,7 @@ from megatron.core.transformer.moe.moe_utils import (
     maybe_skip_or_early_return_by_cudagraph,
 )
 from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
@@ -43,6 +44,9 @@ from megatron.core.transformer.moe.token_dispatcher import (
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
+)
+from megatron.core.transformer.moe.training_matches_inference import (
+    training_matches_inference_forward,
 )
 from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -561,13 +565,15 @@ class MoELayer(BaseMoELayer):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        replay_topk_idx: Optional[torch.Tensor] = None,
         token_multiplicities: Optional[torch.Tensor] = None,
     ):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping. The input padding mask is batch-first;
-        routing consumes it sequence-first to align with ``hidden_states``.
+        routing consumes it sequence-first to align with ``hidden_states``. With routing replay,
+        ``replay_topk_idx`` ([num_tokens, topk]) replaces the micro-batch's indices for this call.
         ``token_multiplicities`` (one logical token count per flattened sequence-first row) is
         forwarded to the router only when set, so routers without the argument keep working.
         """
@@ -578,7 +584,12 @@ class MoELayer(BaseMoELayer):
         router_kwargs = {"input_ids": input_ids, "packed_seq_params": packed_seq_params}
         if token_multiplicities is not None:
             router_kwargs["token_multiplicities"] = token_multiplicities
-        probs, routing_map = apply_module(self.router)(hidden_states, padding_mask, **router_kwargs)
+        with RouterReplay.replay_indices_for_call(
+            getattr(self.router, "router_replay", None), replay_topk_idx
+        ):
+            probs, routing_map = apply_module(self.router)(
+                hidden_states, padding_mask, **router_kwargs
+            )
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -759,6 +770,7 @@ class MoELayer(BaseMoELayer):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        replay_topk_idx: Optional[torch.Tensor] = None,
         *,
         shared_prefix_token_multiplicities: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
@@ -777,6 +789,10 @@ class MoELayer(BaseMoELayer):
                                                    False = valid. Defaults to None.
             input_ids (torch.Tensor, optional): Token IDs with shape
                 [batch_size, seq_length]. Required by hash routing.
+            replay_topk_idx (torch.Tensor, optional): Routing replay indices of exactly these
+                tokens, ``[seq_length * bsz, topk]``, replayed in place of the micro-batch's
+                (see ``ChunkedRouterReplay``). Being an argument, they are also what a
+                recompute of this call replays.
             shared_prefix_token_multiplicities (torch.Tensor, optional): Logical token count per
                 flattened sequence-first row of ``hidden_states``, forwarded to the router for
                 expert-bias counts. Only the eager forward reads it; paths that call route()
@@ -807,7 +823,11 @@ class MoELayer(BaseMoELayer):
 
             def megakernel_forward(hidden_states, padding_mask):
                 probs, routing_map = self.route(
-                    hidden_states, padding_mask, input_ids, **route_kwargs
+                    hidden_states,
+                    padding_mask,
+                    input_ids,
+                    replay_topk_idx=replay_topk_idx,
+                    **route_kwargs,
                 )
                 return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
 
@@ -833,8 +853,9 @@ class MoELayer(BaseMoELayer):
                     probs, routing_map = self.route(
                         layer_input,
                         padding_mask,
-                        input_ids=input_ids,
+                        input_ids,
                         packed_seq_params=packed_seq_params,
+                        replay_topk_idx=replay_topk_idx,
                         token_multiplicities=shared_prefix_token_multiplicities,
                     )
                     hidden_states, probs = self.preprocess(
@@ -881,6 +902,11 @@ class MoELayer(BaseMoELayer):
                     return output
 
             return output, mlp_bias
+
+        if self.config.moe_training_matches_inference and not InferenceMode.is_active():
+            return training_matches_inference_forward(
+                self, custom_forward, hidden_states, intermediate_tensors, padding_mask, input_ids
+            )
 
         if self.moe_layer_recompute and self.training:
             outputs = precision_aware_checkpoint(

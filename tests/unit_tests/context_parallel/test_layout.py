@@ -154,6 +154,60 @@ def test_matching_cp_layouts_do_not_convert(monkeypatch):
     assert manager.build_forward_state(None) is None
 
 
+@pytest.mark.parametrize("boundary_layout", ["contiguous", "zigzag"])
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+def test_layer_input_ids_are_cached_per_forward(monkeypatch, boundary_layout, sequence_parallel):
+    target_layout = "zigzag" if boundary_layout == "contiguous" else "contiguous"
+    cp_group = SimpleNamespace(size=lambda: 2)
+    tp_group, tp_cp_group, thd_plan = object(), object(), object()
+    manager = ContextParallelLayoutManager(
+        layer_layouts=(target_layout, target_layout, boundary_layout, target_layout),
+        boundary_layout=boundary_layout,
+        sequence_parallel=sequence_parallel,
+        cp_group=cp_group,
+        tp_group=tp_group,
+        tp_cp_group=tp_cp_group,
+    )
+    calls = []
+
+    def fake_convert(input_, source, target, cp, sp, tp, tp_cp, plan):
+        assert (source, target, cp, sp, tp, tp_cp, plan) == (
+            boundary_layout,
+            target_layout,
+            cp_group,
+            sequence_parallel,
+            tp_group,
+            tp_cp_group,
+            thd_plan,
+        )
+        calls.append(input_.clone())
+        return input_.flip(0)
+
+    monkeypatch.setattr(context_parallel_layout_module, "convert_cp_layout", fake_convert)
+    input_ids = torch.arange(8, dtype=torch.int64).reshape(2, 4)
+    state = manager.build_forward_state(None, thd_plan=thd_plan)
+    assert state.get_layer_input_ids(0, None) is None
+    converted_ids = state.get_layer_input_ids(0, input_ids)
+    torch.testing.assert_close(converted_ids, input_ids.flip(1))
+    assert converted_ids.is_contiguous()
+    assert state.get_layer_input_ids(1, input_ids) is converted_ids
+    assert state.get_layer_input_ids(2, input_ids) is input_ids
+    assert state.get_layer_input_ids(3, input_ids) is converted_ids
+    # Checkpoint replay must reuse the conversion even if its inputs were detached.
+    assert state.get_layer_input_ids(0, input_ids.detach()) is converted_ids
+    assert state.get_layer_input_ids(0, None) is None
+    assert len(calls) == 1
+    torch.testing.assert_close(calls[0], input_ids.T)
+
+    next_input_ids = input_ids + 10
+    next_state = manager.build_forward_state(None, thd_plan=thd_plan)
+    torch.testing.assert_close(
+        next_state.get_layer_input_ids(0, next_input_ids), next_input_ids.flip(1)
+    )
+    assert len(calls) == 2
+    torch.testing.assert_close(calls[1], next_input_ids.T)
+
+
 def test_prebuilt_packed_layout_state_is_reused():
     manager = ContextParallelLayoutManager(
         layer_layouts=("zigzag",),
@@ -181,6 +235,8 @@ def test_prebuilt_packed_layout_state_is_reused():
     zigzag_mask = torch.tensor([True, False])
     masks_by_layout = {"contiguous": contiguous_mask, "zigzag": zigzag_mask}
     assert state.get_layer_padding_mask(0, contiguous_mask, masks_by_layout) is zigzag_mask
+    # A middle pipeline stage without masks carries only the boundary layout's view.
+    assert state.get_layer_padding_mask(0, None, {"contiguous": None}) is None
 
 
 @pytest.mark.parametrize(
