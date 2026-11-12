@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Partial, Replicate
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
@@ -60,6 +61,7 @@ def _train(
     return torch.stack(losses)
 
 
+@pytest.mark.parametrize("dp_mode", ["fsdp", "hsdp", "hfsdp"])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("weight_decay_method", ["decoupled", "independent", "l2", "palm"])
 @pytest.mark.parametrize(
@@ -79,31 +81,42 @@ def _train(
     ],
 )
 def test_muon_matches_reference(
-    distributed_setup, dtype, weight_decay_method, nesterov, kernel_options
+    distributed_setup, dp_mode, dtype, weight_decay_method, nesterov, kernel_options
 ):
-    """FSDP and unsharded Muon should produce identical loss curves."""
+    """FSDP, HSDP, HFSDP, and unsharded Muon should produce identical loss curves."""
     world_size = distributed_setup.world_size
-    if world_size < 2 or world_size % 2:
-        pytest.skip("Requires an even number of ranks for two-rank DP meshes.")
+    if dp_mode == "fsdp":
+        if world_size < 2 or world_size % 2:
+            pytest.skip("Requires an even number of ranks for two-rank DP meshes.")
+        # With more than two GPUs, also exercise meshes whose global ranks do not start at zero.
+        mesh = init_device_mesh("cuda", (world_size // 2, 2), mesh_dim_names=("replica", "dp"))
+        mesh = mesh["dp"]
+        placements = Placements(
+            dp_axes=[0], parameter=[RowAtomic()], gradient=[RowAtomic()], optimizer=[RowAtomic()]
+        )
+    else:
+        if world_size < 4 or world_size % 4:
+            pytest.skip("Requires a multiple of four ranks for (2, 2) DP meshes.")
+        mesh = init_device_mesh(
+            "cuda", (world_size // 4, 2, 2), mesh_dim_names=("replica", "dp_outer", "dp_shard")
+        )
+        mesh = mesh["dp_outer", "dp_shard"]
+        # HSDP replicates the optimizer state across dp_outer; HFSDP also shards it there.
+        outer_optimizer = Replicate() if dp_mode == "hsdp" else RowAtomic()
+        placements = Placements(
+            dp_axes=[0, 1],
+            parameter=[Replicate(), RowAtomic()],
+            gradient=[Partial("avg"), RowAtomic()],
+            optimizer=[outer_optimizer, RowAtomic()],
+        )
     device = distributed_setup.device
-    # With more than two GPUs, also exercise meshes whose global ranks do not start at zero.
-    mesh = init_device_mesh("cuda", (world_size // 2, 2), mesh_dim_names=("replica", "dp"))["dp"]
     torch.manual_seed(1234)
     model = TinyModel().to(device=device, dtype=dtype)
     # Match FSDP's FP32 optimizer weights; autocast handles BF16 computation.
     reference = copy.deepcopy(model).float()
     reference_params = dict(reference.named_parameters())
     with fully_shard_context(FsdpContext(device=device)):
-        fully_shard(
-            model,
-            mesh=mesh,
-            placements=Placements(
-                dp_axes=[0],
-                parameter=[RowAtomic()],
-                gradient=[RowAtomic()],
-                optimizer=[RowAtomic()],
-            ),
-        )
+        fully_shard(model, mesh=mesh, placements=placements)
     params = dict(model.named_parameters())
     kwargs = dict(
         lr=0.05,
