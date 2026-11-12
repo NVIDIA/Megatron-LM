@@ -335,8 +335,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/tensor_parallel/ordered_reduce.py",),
         tests=(K + "test_ordered_reduce_kernels.py",),
         kind="triton",
-        notes="Batch-invariant TP reductions: Triton rank-order fold, symmetric-memory push (learner) and "
-        "pull (inference) kernels, NCCL all-to-all fallback, and the batch_invariant_tp_shards shard GEMM / "
+        notes="Batch-invariant TP reductions: Triton rank-order fold, direct-buffer symmetric-memory "
+        "pull kernels, NCCL all-to-all fallback, and the batch_invariant_tp_shards shard GEMM / "
         "shard-order fold. Fixed fold order by construction; replays cover every path, one and several "
         "partials per rank, and the shard path's stock backward.",
     ),

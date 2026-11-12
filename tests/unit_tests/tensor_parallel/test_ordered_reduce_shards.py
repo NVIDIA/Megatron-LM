@@ -58,12 +58,9 @@ class TestShardReductions:
             assert torch.equal(parts[j], torch.matmul(x[:, sl].contiguous(), w[:, sl].t()))
 
     @pytest.mark.parametrize("tp,shards", [(2, 4), (2, 8), (4, 8), (4, 4), (2, 2)])
-    @pytest.mark.parametrize("path", ["push", "all_to_all"])
-    def test_reduce_scatter_shards_is_the_canonical_value(self, tp, shards, path, monkeypatch):
+    def test_reduce_scatter_shards_is_the_canonical_value(self, tp, shards):
         Utils.initialize_model_parallel(tp, 1)
         group = get_tensor_model_parallel_group_if_none(tp_group=None)
-        if path == "all_to_all":  # no staging -> all-to-all + fold
-            monkeypatch.setattr(orr, "_push_staging", lambda *args, **kwargs: None)
         m, k, n = 64 * tp, 512 * shards, 448
         x, w = _inputs(m, k, n, 1)  # identical on every rank
         r, kl = group.rank(), k // tp
@@ -117,6 +114,9 @@ class TestTERowParallelShards:
     """TERowParallelLinear output is the canonical value at every TP size dividing the shards."""
 
     def teardown_method(self, method):
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize("tp", [1, 2, 4])
@@ -155,7 +155,7 @@ class TestTERowParallelShards:
         r, kl = group.rank(), k // tp
         with torch.no_grad():
             layer.weight.copy_(w[:, r * kl : (r + 1) * kl])
-        with set_batch_invariant_mode(True):
+        with set_batch_invariant_mode(True, backend="te_native"):
             xin = x[:, r * kl : (r + 1) * kl].unsqueeze(1).contiguous()
             for grad in (False, True):
                 xg = xin.clone().requires_grad_(grad)

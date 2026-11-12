@@ -2,7 +2,7 @@
 
 """Bit-exact replay of the batch-invariant ordered TP reductions (tensor_parallel/ordered_reduce.py).
 
-Covers the Triton fold, the symmetric-memory push (learner) and pull (inference) kernels, the
+Covers the Triton fold, the direct-buffer symmetric-memory pull kernels, the
 NCCL all-to-all fallback, the fixed-shard (``batch_invariant_tp_shards``) variants with one
 and several partials per rank, and the forward reductions in ``tensor_parallel/mappings.py``
 that route through them under batch-invariant mode. Multi-rank cases skip below their TP size.
@@ -101,11 +101,8 @@ class TestOrderedReduceKernels:
             )
 
     @_requires_tp(4)
-    @pytest.mark.parametrize("path", ["push", "all_to_all"])
-    def test_ordered_reduce_scatter_replays(self, path, monkeypatch):
+    def test_ordered_reduce_scatter_replays(self):
         group = self._init(4)
-        if path == "all_to_all":
-            monkeypatch.setattr(orr, "_push_staging", lambda *args, **kwargs: None)
         seeded()
         x = _mixed_magnitudes((TOKENS, HIDDEN), 3 + group.rank())
         assert_replays_bit_exact(
@@ -113,18 +110,15 @@ class TestOrderedReduceKernels:
             (x,),
             backward=False,
             contention=True,
-            what=f"ordered_reduce_scatter ({path})",
+            what="ordered_reduce_scatter (all-to-all)",
         )
 
     @_requires_tp(2)
     @pytest.mark.parametrize("tp,shards", [(2, 4), (4, 8)])
-    @pytest.mark.parametrize("path", ["push", "all_to_all"])
-    def test_shard_reduce_scatter_replays(self, tp, shards, path, monkeypatch):
+    def test_shard_reduce_scatter_replays(self, tp, shards):
         if Utils.world_size < tp:
             pytest.skip(f"needs {tp} GPUs")
         group = self._init(tp)
-        if path == "all_to_all":
-            monkeypatch.setattr(orr, "_push_staging", lambda *args, **kwargs: None)
         seeded()
         kl = K * shards // 4 // tp
         x = _mixed_magnitudes((TOKENS, kl), 4 + group.rank())
@@ -137,7 +131,7 @@ class TestOrderedReduceKernels:
             (x, w),
             backward=False,
             contention=True,
-            what=f"ordered_reduce_scatter_shards c={c} ({path})",
+            what=f"ordered_reduce_scatter_shards c={c} (all-to-all)",
         )
 
     @_requires_tp(2)

@@ -139,9 +139,7 @@ class TestOrderedReduce:
                 sin.copy_(x)
                 rs = torch.empty(rows // TP, hidden, dtype=dtype, device="cuda")
                 orr.symm_ordered_reduce_scatter(sin, hdl, rs)
-                with monkeypatch.context() as m:  # no staging -> all-to-all + fold
-                    m.setattr(orr, "_push_staging", lambda *args, **kwargs: None)
-                    ref_rs = orr.ordered_reduce_scatter(x, self.group)
+                ref_rs = orr.ordered_reduce_scatter(x, self.group)
                 assert torch.equal(_bits(rs), _bits(ref_rs))
 
     def test_inference_embedding_reduce_scatter_takes_a_view(self):
@@ -162,26 +160,6 @@ class TestOrderedReduce:
             got = inference_reduce_scatter_to_sequence_parallel_region(x, self.group, config)
             want = orr.ordered_reduce_scatter(x.contiguous(), self.group)
         assert torch.equal(_bits(got), _bits(want))
-
-    def test_symmetric_push_matches_all_to_all(self, monkeypatch):
-        """The learner's symmetric-memory push RS gives the all-to-all path's bits.
-
-        Sizes span one to several staging iterations per block and a ragged tail.
-        """
-        if orr._push_staging(self.group) is None:
-            pytest.skip("symmetric memory is not available")
-        for dtype in (torch.bfloat16, torch.float32):
-            for rows, hidden in ((4, 2688), (12, 1000), (2048, 8192), (8192, 4096)):
-                x = _partials((rows, hidden), dtype, seed=rows + hidden + 1)
-                push = orr.ordered_reduce_scatter(x, self.group)
-                with monkeypatch.context() as m:  # no staging -> all-to-all + fold
-                    m.setattr(orr, "_push_staging", lambda *args, **kwargs: None)
-                    a2a = orr.ordered_reduce_scatter(x, self.group)
-                assert torch.equal(_bits(push), _bits(a2a))
-                ref = _left_fold(_all_partials(x, self.group))
-                k = rows // TP
-                rank = self.group.rank()
-                assert torch.equal(_bits(push), _bits(ref[rank * k : (rank + 1) * k]))
 
     def test_cuda_graph_capture(self):
         x = _partials((256, 4096), torch.bfloat16, seed=5)
@@ -247,6 +225,9 @@ def test_te_row_parallel_linear_ordered_reduction(sequence_parallel):
     try:
         _check_te_row_parallel_linear(sequence_parallel)
     finally:
+        torch.cuda.synchronize()
+        dist.barrier()
+        SymmetricMemoryManager.destroy()
         Utils.destroy_model_parallel()
 
 
@@ -280,18 +261,25 @@ def _check_te_row_parallel_linear(sequence_parallel):
         is_expert=False,
     ).cuda()
     assert layer._bi_tp_forward is _BITPForward.ORDERED_REDUCE
-    # The push staging is allocated at construction, outside any forward or graph capture.
-    assert SymmetricMemoryManager.is_initialized(orr._push_staging_key(layer._tp_group))
+    # The shared GEMM scratch is allocated at construction, outside any forward or graph capture.
+    assert SymmetricMemoryManager.is_initialized(orr._training_buffer_key(layer._tp_group))
     assert layer.weight.shape == (768, cfg.hidden_size // TP)
     assert layer.weight.tensor_model_parallel and layer.weight.partition_dim == 1
     assert layer.bias.sequence_parallel == sequence_parallel
 
-    with set_batch_invariant_mode(True):
+    with set_batch_invariant_mode(True, backend="te_native"):
         x = _partials((64, 2, cfg.hidden_size // TP), torch.bfloat16, seed=21)
+        scratch = SymmetricMemoryManager.get_buffer(
+            orr._training_buffer_key(group)
+        ).maybe_get_tensor((1, *x.shape[:-1], 768), dtype=x.dtype)
+        if scratch["handle"] is not None:
+            scratch["tensor"].fill_(float("nan"))
         out, out_bias = layer(x)
         assert out_bias is None
         with torch.no_grad():
             partial, bias = te.pytorch.Linear.forward(layer, x)
+        if scratch["handle"] is not None:
+            assert torch.equal(_bits(scratch["tensor"][0]), _bits(partial))
         expected = _left_fold(_all_partials(partial, group)) + bias
         if sequence_parallel:
             out = mappings._gather_along_first_dim(out.detach(), group)
@@ -304,10 +292,23 @@ def _check_te_row_parallel_linear(sequence_parallel):
             out_small = mappings._gather_along_first_dim(out_small.detach(), group)
         assert torch.equal(_bits(out_small.detach()), _bits(expected[8:16]))
 
-        # Backward runs on the stock collectives.
+        # Scratch reuse must not change outstanding outputs or saved backward inputs.
         x.requires_grad_()
-        layer(x)[0].float().sum().backward()
-        assert x.grad is not None and layer.weight.grad is not None
+        actual, _ = layer(x)
+        snapshot = actual.detach().clone()
+        layer(x.detach() * 2)
+        assert torch.equal(_bits(actual.detach()), _bits(snapshot))
+        dy = torch.randn_like(actual)
+        actual_grads = torch.autograd.grad(actual, (x, layer.weight, layer.bias), dy)
+        partial, bias = te.pytorch.Linear.forward(layer, x)
+        reference = (
+            mappings.reduce_scatter_to_sequence_parallel_region(partial, group=group)
+            if sequence_parallel
+            else mappings.reduce_from_tensor_model_parallel_region(partial, group)
+        ) + bias
+        reference_grads = torch.autograd.grad(reference, (x, layer.weight, layer.bias), dy)
+        for got, expected_grad in zip(actual_grads, reference_grads):
+            torch.testing.assert_close(got, expected_grad, rtol=0, atol=0)
 
         # A caller that reduces itself (shared-expert overlap) gets this rank's partial.
         no_bias = TERowParallelLinear(
@@ -328,8 +329,33 @@ def _check_te_row_parallel_linear(sequence_parallel):
 
 
 @requires_tp4
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_direct_gemm_falls_back_when_scratch_does_not_fit(dtype):
+    """A larger eager/captured input keeps the same bits through all-to-all."""
+    from transformer_engine.pytorch.cpp_extensions import general_gemm
+
+    Utils.initialize_model_parallel(TP, 1)
+    try:
+        group = get_tensor_model_parallel_group_if_none(tp_group=None)
+        SymmetricMemoryManager.get_buffer(
+            orr._training_buffer_key(group), process_group=group, size_mb=1
+        )
+        x = _partials((2048, 128), dtype, seed=51)
+        weight = _partials((512, 128), dtype, seed=52)
+        out = orr.tp_shard_row_linear(x, weight, group, 1, True, use_te_gemm=True)
+        partial = general_gemm(weight, x, out_dtype=x.dtype)[0]
+        expected = orr.ordered_reduce_scatter(partial, group)
+        assert torch.equal(_bits(out), _bits(expected))
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier()
+        SymmetricMemoryManager.destroy()
+        Utils.destroy_model_parallel()
+
+
+@requires_tp4
 def test_tp3_symmetric_memory_paths():
-    """TP = 3 (not a power of two): push and pull give the left fold, like TP 4."""
+    """TP = 3 (not a power of two): all-to-all and pull give the left fold."""
 
     Utils.initialize_model_parallel(1, 1)
     world = dist.get_world_size()
@@ -338,15 +364,13 @@ def test_tp3_symmetric_memory_paths():
     try:
         if dist.get_rank() >= 3:
             # Symmetric-memory rendezvous counters are per process, not per group: the other
-            # ranks make the same two allocations so every rank's counter stays in step and a
+            # ranks make the same allocation so every rank's counter stays in step and a
             # later rendezvous does not hang.
-            orr._push_staging(rest)
             SymmetricMemoryManager.get_buffer("tp3_test", process_group=rest)
             return
         x = _partials((96, 1024), torch.bfloat16, seed=31)
         rank = group.rank()
         ref = _left_fold(_all_partials(x, group))[rank * 32 : (rank + 1) * 32]
-        assert orr._push_staging(group) is not None
         assert torch.equal(_bits(orr.ordered_reduce_scatter(x, group)), _bits(ref))
 
         symm = SymmetricMemoryManager.get_buffer("tp3_test", process_group=group)
@@ -376,3 +400,73 @@ def test_fold_offsets_past_int32():
     parts[1].copy_(_partials((n,), torch.bfloat16, seed=42))
     out = orr.ordered_fold(parts)
     assert torch.equal(_bits(out), _bits(_left_fold(parts.clone())))
+
+
+@requires_tp4
+@pytest.mark.parametrize("backend", ["te_native", "triton"])
+def test_direct_gemm_fused_main_grad_matches_te(backend):
+    """Direct GEMMs accumulate two microbatches into an existing main_grad like TE."""
+    import transformer_engine as te
+
+    Utils.initialize_model_parallel(TP, 1)
+    try:
+        model_parallel_cuda_manual_seed(123)
+        group = get_tensor_model_parallel_group_if_none(tp_group=None)
+        cfg = TransformerConfig(
+            num_layers=1,
+            hidden_size=512,
+            num_attention_heads=8,
+            tensor_model_parallel_size=TP,
+            sequence_parallel=True,
+            batch_invariant_mode=True,
+            params_dtype=torch.bfloat16,
+            gradient_accumulation_fusion=True,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            hidden_dropout=0,
+            attention_dropout=0,
+        )
+        layer = TERowParallelLinear(
+            512,
+            512,
+            config=cfg,
+            init_method=init_method_normal(0.02),
+            bias=False,
+            input_is_parallel=True,
+            skip_bias_add=False,
+            is_expert=False,
+        ).cuda()
+        reference = te.pytorch.Linear(
+            128,
+            512,
+            bias=False,
+            params_dtype=torch.bfloat16,
+            parallel_mode=None,
+            fuse_wgrad_accumulation=True,
+        ).cuda()
+        with torch.no_grad():
+            reference.weight.copy_(layer.weight)
+        for weight in (layer.weight, reference.weight):
+            weight.main_grad = torch.full_like(weight, 0.75, dtype=torch.float32)
+            weight.grad_added_to_main_grad = False
+            weight.zero_out_wgrad = True
+        with set_batch_invariant_mode(True, backend=backend):
+            for seed in (71, 72):
+                x = _partials((32, 1, 128), torch.bfloat16, seed).requires_grad_()
+                xr = x.detach().clone().requires_grad_()
+                got = layer(x)[0]
+                want = mappings.reduce_scatter_to_sequence_parallel_region(
+                    reference(xr), group=group
+                )
+                dy = _partials(got.shape, got.dtype, seed + 1)
+                got.backward(dy)
+                want.backward(dy)
+                assert torch.equal(_bits(got), _bits(want))
+                assert torch.equal(_bits(x.grad), _bits(xr.grad))
+                assert torch.equal(_bits(layer.weight.main_grad), _bits(reference.weight.main_grad))
+                assert layer.weight.grad_added_to_main_grad
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier()
+        SymmetricMemoryManager.destroy()
+        Utils.destroy_model_parallel()

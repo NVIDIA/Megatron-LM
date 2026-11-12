@@ -1179,8 +1179,8 @@ def test_te_fused_topk_dense_indices_replays(indices_dtype):
 
 @pytest.mark.parametrize(
     "tp,shards,sequence_parallel",
-    [(2, 4, True), (4, None, False)],
-    ids=["tp2-4shards-sp", "tp4-ordered"],
+    [(2, 4, True), (4, None, False), (4, None, True)],
+    ids=["tp2-4shards-sp", "tp4-ordered", "tp4-ordered-sp"],
 )
 def test_te_row_parallel_linear_batch_invariant_replays(tp, shards, sequence_parallel):
     """Batch-invariant row-parallel forward: ordered TP reduction (TP >= 3) and fixed shards.
@@ -1215,7 +1215,7 @@ def test_te_row_parallel_linear_batch_invariant_replays(tp, shards, sequence_par
         x = torch.randn(
             TOKENS // 2, 2, FFN // tp, device="cuda", dtype=torch.bfloat16, requires_grad=True
         )
-        with set_batch_invariant_mode(True):
+        with set_batch_invariant_mode(True, backend="te_native"):
             assert_module_replays_bit_exact(
                 module,
                 (x,),

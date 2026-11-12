@@ -11,9 +11,7 @@ in an fp32 accumulator (fp64 for fp64 inputs) with one final rounding, so the bi
 only on the partials. Training and inference run these same kernels, so they agree bitwise.
 
 Paths (all bitwise identical):
-  * push (training): one kernel stores each peer's rows into its symmetric staging buffer
-    over NVLink and folds them in rank order.
-  * pull (inference): the GEMM writes into a symmetric buffer; one kernel reads the owned
+  * pull (training and inference): the GEMM writes into a symmetric buffer; one kernel reads the owned
     rows from every peer and folds them in rank order.
   * all-to-all + fold: NCCL fallback for groups without symmetric memory.
 
@@ -43,6 +41,7 @@ except ImportError:
     HAVE_GRAD_ACCUM_FUSION = False
 
 try:
+    from transformer_engine.pytorch import cpp_extensions as te_cpp_extensions
     from transformer_engine.pytorch.module.base import get_dummy_wgrad
 
     HAVE_TE = True
@@ -156,7 +155,7 @@ def _ordered_pull_kernel(
       * ``InferenceRowParallelLinear._matmul_shards_reduce`` (``batch_invariant_tp_shards``
         with several shards per rank), via ``symm_ordered_reduce_scatter_shards`` (C > 1).
     Direct-buffer training producers set SYNC_AFTER so every peer has finished reading
-    before the next GEMM overwrites the scratch buffer. Ordinary training tensors use push.
+    before the next GEMM overwrites the scratch buffer. Other producers use all-to-all.
     """
     symm_mem_sync(
         signal_pad_ptrs,
@@ -203,149 +202,6 @@ def _ordered_pull_kernel(
         sync_threads()
 
 
-@triton.jit
-def _push_chunk(
-    src_ptr,
-    stages,
-    n,
-    block_start,
-    slot,
-    pid,
-    nb,
-    lane,
-    RANK: tl.constexpr,
-    WORLD_SIZE: tl.constexpr,
-    BLOCK: tl.constexpr,
-    C: tl.constexpr,
-    src_part_stride,
-):
-    """Store this rank's C partials of chunk [block_start, +BLOCK) into every peer's staging.
-
-    Called by the push kernel for its first chunk and, after each barrier, for the next
-    chunk, so those NVLink stores overlap the fold of the current chunk.
-    """
-    offs = block_start + lane
-    mask = offs < n
-    stage_base = ((slot * nb + pid) * WORLD_SIZE * C).to(tl.int64) * BLOCK
-    for d in tl.static_range(WORLD_SIZE):
-        if d != RANK:
-            dst = stages[d]
-            for j in tl.static_range(C):
-                val = tl.load(src_ptr + j * src_part_stride + d * n + offs, mask=mask)
-                tl.store(dst + stage_base + (RANK * C + j) * BLOCK + lane, val, mask=mask)
-
-
-@triton.jit
-def _ordered_push_fold_kernel(
-    src_ptr,
-    stage_ptrs,
-    out_ptr,
-    signal_pad_ptrs,
-    n,
-    RANK: tl.constexpr,
-    WORLD_SIZE: tl.constexpr,
-    BLOCK: tl.constexpr,
-    ACC_FP64: tl.constexpr,
-    C: tl.constexpr,
-    src_part_stride,
-):
-    """Reduce-scatter of a local (non-symmetric) tensor through symmetric staging buffers.
-
-    src holds this rank's C partials of all WORLD_SIZE output slices (partial j of slice d at
-    j * src_part_stride + d * n). Rank r's staging buffer (base at ``stage_ptrs[r]``) is
-    [2 slots][num_blocks][WORLD_SIZE * C][BLOCK]. Block b stores the
-    BLOCK elements of every peer's slice it handles into that peer's staging (NVLink
-    stores), barriers with block b of every peer, pushes its next chunk into the other
-    slot, then folds the staged partials of the current chunk (its own from src) in rank
-    order. Every block of every rank handles the same element ranges, so after the
-    block-level barrier its inputs are complete. A peer writes slot s again only after
-    passing the barrier that follows this block's fold of slot s. The trailing barrier
-    makes the staging safe to reuse.
-
-    Used by the training forward (learner), whose input is an ordinary tensor (the TE GEMM
-    output): :func:`ordered_reduce_scatter_shards` (and its one-partial case
-    :func:`ordered_reduce_scatter`), through ``_launch_push_fold``.
-    """
-    pid = tl.program_id(0)
-    nb = tl.num_programs(0)
-    # int64: the slice and partial offsets (d * n, j * src_part_stride) pass 2**31 for
-    # large messages.
-    n = tl.cast(n, tl.int64)
-    src_part_stride = tl.cast(src_part_stride, tl.int64)
-    acc_ty = tl.float64 if ACC_FP64 else tl.float32
-    lane = tl.arange(0, BLOCK)
-    # Load every rank's staging address once, outside the chunk loop.
-    stages = ()
-    for r in tl.static_range(WORLD_SIZE):
-        stages = stages + (_peer_ptr(stage_ptrs, r, 0, src_ptr.dtype.element_ty, True),)
-    my_stage = stages[RANK]
-    step = nb.to(tl.int64) * BLOCK
-    first = pid.to(tl.int64) * BLOCK
-    # Software pipeline: chunk k+1 is pushed right after barrier k, so its NVLink stores
-    # are in flight while chunk k is folded.
-    _push_chunk(
-        src_ptr, stages, n, first, 0, pid, nb, lane, RANK, WORLD_SIZE, BLOCK, C, src_part_stride
-    )
-    slot = 0
-    for block_start in range(first, n, step):
-        sync_threads()
-        symm_mem_sync(
-            signal_pad_ptrs,
-            None,
-            RANK,
-            WORLD_SIZE,
-            hasPreviousMemAccess=True,
-            hasSubsequentMemAccess=True,
-        )
-        sync_threads()
-        # Uniform across ranks and threads: every rank runs the same chunk schedule.
-        _push_chunk(
-            src_ptr,
-            stages,
-            n,
-            block_start + step,
-            1 - slot,
-            pid,
-            nb,
-            lane,
-            RANK,
-            WORLD_SIZE,
-            BLOCK,
-            C,
-            src_part_stride,
-        )
-        offs = block_start + lane
-        mask = offs < n
-        stage_base = ((slot * nb + pid) * WORLD_SIZE * C).to(tl.int64) * BLOCK
-        for r in tl.static_range(WORLD_SIZE):
-            for j in tl.static_range(C):
-                if r == RANK:
-                    v = tl.load(src_ptr + j * src_part_stride + r * n + offs, mask=mask).to(acc_ty)
-                else:
-                    v = tl.load(my_stage + stage_base + (r * C + j) * BLOCK + lane, mask=mask).to(
-                        acc_ty
-                    )
-                if r == 0 and j == 0:
-                    acc = v
-                else:
-                    acc += v
-        tl.store(out_ptr + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
-        slot = 1 - slot
-
-    sync_threads()
-    symm_mem_sync(
-        signal_pad_ptrs,
-        None,
-        RANK,
-        WORLD_SIZE,
-        hasPreviousMemAccess=True,
-        hasSubsequentMemAccess=False,
-    )
-
-
-# ── Fold ────────────────────────────────────────────────────────────────────
-
-
 def _fold_launch_config(n: int, element_size: int) -> Tuple[int, int]:
     """(BLOCK, num_warps): 16-byte vectors, one or two per thread, enough CTAs to fill the GPU."""
     vec = 16 // element_size
@@ -390,92 +246,27 @@ def ordered_fold(parts: torch.Tensor, output: Optional[torch.Tensor] = None) -> 
     return output
 
 
-# ── Symmetric-memory push path (learner: local tensor, NVLink group) ────────
-
-# Push staging: 16 warps, up to _PUSH_MAX_VECS 16-byte vectors per thread and peer, two slots
-# per block.
-_PUSH_WARPS = 16
-_PUSH_MAX_VECS = 4
+# ── Training GEMM scratch ─────────────────────────────────────────────────
 
 
-def _push_staging_bytes(world_size: int, num_parts: int) -> int:
-    """Size of the push staging buffer (2 slots x max blocks x peers x partials x block)."""
-    block_bytes = _PUSH_WARPS * 32 * 16 * _PUSH_MAX_VECS
-    return 2 * SYMM_MEM_KERNEL_CONFIG.max_num_blocks * world_size * num_parts * block_bytes
+def _training_buffer_key(group) -> str:
+    return f"tp_ordered_training:{group.group_name}"
 
 
-def _push_staging_key(group, num_parts: int = 1) -> str:
-    return f"tp_ordered_push:{group.group_name}" + (f":x{num_parts}" if num_parts > 1 else "")
+def prepare_ordered_reduce(group) -> None:
+    """Collectively allocate per-TP GEMM scratch before CUDA-graph capture.
 
-
-def prepare_ordered_reduce(group, num_parts: int = 1) -> None:
-    """Allocate the push staging for ``group`` and ``num_parts`` partials per rank.
-
-    Collective over ``group``. Called when a batch-invariant row-parallel layer is built
-    (``TELinear``), so the allocation never happens inside a forward or a CUDA-graph capture.
-    Any other user allocates it on its first eager call.
+    The fixed-capacity pool is shared by row-parallel layers. Outputs do not alias it and
+    backward saves only inputs and weights. Oversized GEMMs and unavailable peer access
+    use the all-to-all fallback, without allocating symmetric memory inside capture.
     """
     if group.size() >= 2:
-        _push_staging(group, num_parts)
-
-
-def _push_staging(group, num_parts: int = 1):
-    """The symmetric staging handle for the push reduce-scatter on ``group``, or None.
-
-    The staging is fixed-size: 2 x max_num_blocks x TP x num_parts x 32 KiB per rank (32 MiB
-    at TP 4 with one partial, 64 MiB at TP 8), independent of the message size. It is
-    allocated (collectively) by :func:`prepare_ordered_reduce` or on the first eager call.
-    None (no symmetric memory for the group, e.g. TP across NVLink domains) makes
-    :func:`ordered_reduce_scatter_shards` take the all-to-all path.
-    """
-    key = _push_staging_key(group, num_parts)
-    if not SymmetricMemoryManager.is_initialized(key):
-        assert not torch.cuda.is_current_stream_capturing(), (
-            "the ordered-reduce push staging is allocated at layer construction "
-            "(prepare_ordered_reduce) or on the first eager call, not during CUDA-graph capture"
-        )
-        size_mb = -(-_push_staging_bytes(group.size(), num_parts) // (1 << 20))
-        hdl = SymmetricMemoryManager.get_buffer(key, process_group=group, size_mb=size_mb)
-        hdl = hdl.symm_mem_hdl
-        # The push kernel states 16-byte alignment of every staging base (_peer_ptr).
-        assert hdl is None or all(
-            ptr % 16 == 0 for ptr in hdl.buffer_ptrs
-        ), "staging buffers must be 16-byte aligned"
-    return SymmetricMemoryManager.get_buffer(key).symm_mem_hdl
-
-
-def _launch_push_fold(
-    input_: torch.Tensor, output: torch.Tensor, hdl, num_parts: int
-) -> torch.Tensor:
-    """Launch the push kernel: ``input_`` holds num_parts partials of all world_size output
-    slices ([num_parts, ws * n]). Called by :func:`ordered_reduce_scatter_shards`."""
-    ws = hdl.world_size
-    n = output.numel()
-    assert input_.numel() == n * ws * num_parts and output.is_contiguous()
-    if n == 0:
-        return output
-    vec = 16 // input_.element_size()
-    # Small messages: more blocks with less work each; larger: fewer barriers per byte.
-    per_thread = 2 if n * input_.element_size() <= (2 << 20) else _PUSH_MAX_VECS
-    block = _PUSH_WARPS * 32 * vec * per_thread
-    num_blocks = max(1, min(triton.cdiv(n, block), SYMM_MEM_KERNEL_CONFIG.max_num_blocks))
-    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
-    acc_fp64 = output.dtype == torch.float64
-    _ordered_push_fold_kernel[(num_blocks, 1, 1)](
-        input_,
-        hdl.buffer_ptrs_dev,
-        output,
-        hdl.signal_pad_ptrs_dev,
-        n,
-        RANK=hdl.rank,
-        WORLD_SIZE=ws,
-        BLOCK=block,
-        ACC_FP64=acc_fp64,
-        C=num_parts,
-        src_part_stride=n * ws,
-        num_warps=_PUSH_WARPS,
-    )
-    return output
+        key = _training_buffer_key(group)
+        assert (
+            SymmetricMemoryManager.is_initialized(key)
+            or not torch.cuda.is_current_stream_capturing()
+        ), "allocate ordered row-linear scratch at layer construction or during eager warmup"
+        SymmetricMemoryManager.get_buffer(key, process_group=group)
 
 
 # ── Ordered reduce-scatter / all-reduce (learner) ───────────────────────────
@@ -486,17 +277,9 @@ def ordered_reduce_scatter(
 ) -> torch.Tensor:
     """Reduce-scatter along dim 0 with the fixed rank-order sum.
 
-    With symmetric memory: the push kernel (see module docstring), which
-    stores (TP-1)/TP of the input over NVLink and uses the fixed-size staging buffer.
-    Otherwise, per rank: one all-to-all of the partials ((TP-1)/TP of the input over the
-    wire, the same as a ring reduce-scatter), one transient receive buffer of the input's
-    size, and one fold pass that reads TP x (output size) and writes the output. Both are
-    CUDA-graph capturable (the staging is allocated before capture, see
-    :func:`prepare_ordered_reduce`). This is the c = 1 case of
-    :func:`ordered_reduce_scatter_shards`.
-
-    Used by the training forward: the sequence-parallel and tensor-parallel reduce-scatters
-    in ``mappings.py`` (TERowParallelLinear's batch-invariant reduction goes through them).
+    Ordinary tensors use all-to-all plus a fixed-order fold. Training row-linear GEMMs
+    write directly into symmetric scratch and use the pull path instead. This function
+    remains the fallback for other producers and groups without peer access.
     """
     return ordered_reduce_scatter_shards(input_.unsqueeze(0), group, output)
 
@@ -514,7 +297,7 @@ def ordered_all_reduce(input_: torch.Tensor, group) -> torch.Tensor:
     return ordered_all_reduce_shards(input_.unsqueeze(0), group)
 
 
-# ── Symmetric-memory pull paths (inference) ─────────────────────────────────
+# ── Symmetric-memory pull paths (training and inference) ─────────────────────────────────
 
 
 def _pull_launch_config(n: int, element_size: int) -> Tuple[int, int, int]:
@@ -678,8 +461,8 @@ def ordered_reduce_scatter_shards(
 
     ``parts`` is ``[c, M, ...]``: this rank's c shard partials. Returns ``[M / TP, ...]``.
     A rank sends c x (TP-1)/TP of one partial's size (c times a reduce-scatter): the fold
-    order cannot be pre-combined per rank without changing the bits. With symmetric memory
-    the push kernel folds the TP x c partials; otherwise one all-to-all and a fold pass.
+    order cannot be pre-combined per rank without changing the bits. One all-to-all
+    exchanges the partials and one fold pass adds them in fixed order.
 
     The one implementation of the ordered reduce-scatter: :func:`ordered_reduce_scatter` is
     the c = 1 case. Also used directly with several shards per rank by the training forward
@@ -696,9 +479,6 @@ def ordered_reduce_scatter_shards(
     parts = parts.contiguous()
     if output is None:
         output = parts.new_empty((rows, *rest))
-    staging = _push_staging(group, num_parts=c)
-    if staging is not None:
-        return _launch_push_fold(parts, output, staging, num_parts=c)
     # all_to_all_single sends dim-0 slice d to rank d, so lay the partials out
     # destination-major, [TP, c, rows, ...] (a free view when c = 1). recv[r, j] is source
     # rank r's partial j of this rank's rows: global shard r * c + j, the fold's order.
@@ -737,12 +517,28 @@ def ordered_all_reduce_shards(parts: torch.Tensor, group) -> torch.Tensor:
     return out[:n].view(shape)
 
 
-def _accumulate_wgrad(weight: torch.Tensor, grad_out2d: torch.Tensor, input2d: torch.Tensor):
+def _accumulate_wgrad(
+    weight: torch.Tensor, grad_out2d: torch.Tensor, input2d: torch.Tensor, use_te_gemm: bool = False
+):
     """Weight gradient with Megatron's main_grad accumulation (as in tensor_parallel.layers)."""
     main_grad = getattr(weight, "main_grad", None)
     if main_grad is None:
+        if use_te_gemm:
+            return te_cpp_extensions.general_gemm(
+                input2d, grad_out2d, layout="NT", out_dtype=weight.dtype, grad=True
+            )[0]
         return grad_out2d.t().matmul(input2d)
-    if HAVE_GRAD_ACCUM_FUSION and main_grad.dtype == torch.float32:
+    if use_te_gemm:
+        te_cpp_extensions.general_gemm(
+            input2d,
+            grad_out2d,
+            layout="NT",
+            out=main_grad,
+            out_dtype=main_grad.dtype,
+            grad=True,
+            accumulate=True,
+        )
+    elif HAVE_GRAD_ACCUM_FUSION and main_grad.dtype == torch.float32:
         fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(input2d, grad_out2d, main_grad)
     elif HAVE_GRAD_ACCUM_FUSION and main_grad.dtype in (torch.float16, torch.bfloat16):
         fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(input2d, grad_out2d, main_grad)
@@ -764,15 +560,48 @@ class _TPShardRowLinear(torch.autograd.Function):
 
     Only the forward is fixed-order. The backward is the stock row-parallel one: all-gather
     the output gradient under sequence parallelism, then the full local-K input and weight
-    gradient GEMMs. Used by ``TERowParallelLinear`` when a rank holds several
-    ``batch_invariant_tp_shards`` (through :func:`tp_shard_row_linear`).
+    gradient GEMMs. ``TERowParallelLinear`` uses TE GEMMs for one local partial and the
+    existing batched GEMM definition for several ``batch_invariant_tp_shards``.
     """
 
     @staticmethod
-    def forward(ctx, x, weight, group, num_shards, sequence_parallel, wgrad_into_main_grad):
+    def forward(
+        ctx, x, weight, group, num_shards, sequence_parallel, wgrad_into_main_grad, use_te_gemm
+    ):
         """Shard partials of x @ weight.T, reduced (SP: reduce-scattered) in shard order."""
-        parts = row_parallel_shard_partials(x, weight, num_shards)
-        if sequence_parallel:
+        shape = (num_shards, *x.shape[:-1], weight.shape[0])
+        scratch = {"tensor": None, "handle": None}
+        key = _training_buffer_key(group)
+        if group.size() > 1 and x.shape[0] % group.size() == 0:
+            if (
+                not SymmetricMemoryManager.is_initialized(key)
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                prepare_ordered_reduce(group)
+            if SymmetricMemoryManager.is_initialized(key):
+                scratch = SymmetricMemoryManager.get_buffer(key).maybe_get_tensor(shape, x.dtype)
+        if use_te_gemm:
+            # Keep TE's GEMM definition: a torch GEMM need not have the same fp32 bits.
+            assert num_shards == 1
+            parts = scratch["tensor"]
+            if parts is None:
+                parts = x.new_empty(shape)
+            te_cpp_extensions.general_gemm(
+                weight,
+                x.reshape(-1, x.shape[-1]).contiguous(),
+                out_dtype=x.dtype,
+                out=parts.view(-1, weight.shape[0]),
+                use_split_accumulator=False,
+            )
+        else:
+            parts = row_parallel_shard_partials(x, weight, num_shards, out=scratch["tensor"])
+        if scratch["handle"] is not None:
+            out = symm_ordered_reduce_scatter_shards(parts, scratch["handle"], sync_after=True)
+            if not sequence_parallel:
+                full = x.new_empty(shape[1:])
+                torch.distributed.all_gather_into_tensor(full, out, group=group)
+                out = full
+        elif sequence_parallel:
             out = ordered_reduce_scatter_shards(parts, group)
         else:
             out = ordered_all_reduce_shards(parts, group)
@@ -780,6 +609,7 @@ class _TPShardRowLinear(torch.autograd.Function):
         ctx.group = group
         ctx.sequence_parallel = sequence_parallel
         ctx.wgrad_into_main_grad = wgrad_into_main_grad
+        ctx.use_te_gemm = use_te_gemm
         return out
 
     @staticmethod
@@ -797,16 +627,28 @@ class _TPShardRowLinear(torch.autograd.Function):
             )
             torch.distributed.all_gather_into_tensor(full, grad_output, group=group)
             grad_output = full
-        g2 = grad_output.reshape(-1, grad_output.shape[-1])
-        x2 = x.reshape(-1, x.shape[-1])
-        grad_input = g2.matmul(weight).view(x.shape) if ctx.needs_input_grad[0] else None
+        g2 = grad_output.reshape(-1, grad_output.shape[-1]).contiguous()
+        x2 = x.reshape(-1, x.shape[-1]).contiguous()
+        grad_input = None
+        if ctx.needs_input_grad[0]:
+            if ctx.use_te_gemm:
+                grad_input = te_cpp_extensions.general_gemm(
+                    weight, g2, layout="NN", out_dtype=x.dtype, grad=True
+                )[0]
+            else:
+                grad_input = g2.matmul(weight)
+            grad_input = grad_input.view(x.shape)
         grad_weight = None
         if ctx.needs_input_grad[1]:
             if ctx.wgrad_into_main_grad:
-                grad_weight = _accumulate_wgrad(weight, g2, x2)
+                grad_weight = _accumulate_wgrad(weight, g2, x2, use_te_gemm=ctx.use_te_gemm)
+            elif ctx.use_te_gemm:
+                grad_weight = te_cpp_extensions.general_gemm(
+                    x2, g2, layout="NT", out_dtype=weight.dtype, grad=True
+                )[0]
             else:
                 grad_weight = g2.t().matmul(x2)
-        return grad_input, grad_weight, None, None, None, None
+        return grad_input, grad_weight, None, None, None, None, None
 
 
 def tp_shard_row_linear(
@@ -816,10 +658,11 @@ def tp_shard_row_linear(
     num_shards: int,
     sequence_parallel: bool,
     wgrad_into_main_grad: bool = False,
+    use_te_gemm: bool = False,
 ) -> torch.Tensor:
     """Row-parallel ``x @ weight.T`` with the fixed-shard forward reduction (see above)."""
     return _TPShardRowLinear.apply(
-        x, weight, group, num_shards, sequence_parallel, wgrad_into_main_grad
+        x, weight, group, num_shards, sequence_parallel, wgrad_into_main_grad, use_te_gemm
     )
 
 
