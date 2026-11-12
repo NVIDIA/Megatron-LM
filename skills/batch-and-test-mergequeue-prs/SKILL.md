@@ -1,14 +1,17 @@
 ---
 name: batch-and-test-mergequeue-prs
-description: Batch fully approved Megatron-LM PRs that are actual merge-queue entries and validate them with Run Merge-Queue jobs. Excludes PRs that only have auto-merge enabled. Also covers landing the original PRs and stopping obsolete CI when requested.
+description: Batch fully approved Megatron-LM PRs that are actual merge-queue entries, approve their batch CI gate, and validate with Run Merge-Queue jobs. Squash-merge the originals after Nemo_CICD_Test succeeds and queue membership and approvals are rechecked. Excludes PRs that only have auto-merge enabled.
 license: Apache-2.0
 ---
 
 # Batch and Test Merge-Queue PRs
 
-Use one batch PR to validate a specific set of source PR heads together. Keep the
-source PRs independently mergeable so GitHub can record their eventual merges.
-Follow repository `AGENTS.md` and the user's requested scope throughout.
+Use one batch PR to validate a specific set of source PR heads together, then
+squash-merge the originals so GitHub records each PR as merged. A full invocation
+includes approving the batch's CI gate and conditionally landing the sources
+after `Nemo_CICD_Test` succeeds. Honor narrower requests such as selection or
+testing only. Follow repository `AGENTS.md` and the user's requested scope
+throughout.
 
 ## Select the sources
 
@@ -114,9 +117,19 @@ auto-sync may be disabled. Verify that a `CICD Megatron-LM` run appears on
 - CI may test a synthetic merge SHA rather than the source head. Record it and
   compare its tree with the expected source patches on its actual upstream base.
   Do not call a different or stale revision validated.
-- Check the `test` environment gate. Honor the approval queue's full-test switch,
-  concurrency limits, and any user authorization to override them. Report a
-  pending gate or queued build accurately; requesting CI is not a passing result.
+- Approve the batch's `cicd-wait-in-queue` job by approving its pending `test`
+  environment deployment. Verify the exact run ID, `pull-request/<batch PR>`
+  ref, and full batch head first; use the live pending deployment's environment
+  ID and review state `approved`. This approval is part of the full workflow.
+  Keep repository-wide full-test switches, concurrency limits, environment
+  protections, and other runs' pending deployments unchanged. If approval is
+  unavailable, report the gate and the reason. Verify that the job completes
+  successfully and subsequent CI starts; an approval request alone is not test
+  success.
+- Monitor that exact batch run through `Nemo_CICD_Test`. Its completed `success`
+  result triggers the fresh source checks and squash merges below. Keep
+  monitoring through this decision and conditional landing; a queued build,
+  pending approval, or skipped core job is not a passing result.
 - When monitoring, report failure and cancellation as terminal states alongside
   success. Identify downstream runs by their exact parent/run metadata; a parent
   finishing or timing out does not guarantee its downstream CI stopped.
@@ -126,23 +139,30 @@ auto-sync may be disabled. Verify that a `CICD Megatron-LM` run appears on
   is unrelated. A targeted retry can check reproducibility; avoid repeated
   retries of the same deterministic failure or unrequested changes to tolerances.
 
-## Land and clean up when requested
+## Land and clean up after core CI succeeds
 
-Do not infer permission to merge, cancel unrelated runs, or notify a team from
-permission to create and test a batch.
+Once the exact batch run's `Nemo_CICD_Test` completes successfully, re-read the
+live main merge queue and source PRs before landing. Failure, cancellation, or a
+skipped core job stops landing. A narrower user request to prepare or test only
+takes precedence. Team notifications require an explicit request.
 
-When the user asks to land the sources:
+For each original source:
 
-- Recheck each source's current head against the validated head and review/merge
-  requirements. Require GraphQL `isInMergeQueue: true`, its actual queue entry,
-  and successful exact-head source approval checks again before dequeueing or
-  merging. If membership or approval is missing, stop and report it. Batch CI
-  success and a generic instruction to merge the batch do not waive source
-  review requirements.
+- If a source has already merged independently, verify and record its expected
+  patch, then continue with the remaining open sources.
+- Recheck that every remaining source is OPEN, non-draft, based on `main`, and
+  still at its validated head with native `reviewDecision=APPROVED`. Require
+  membership in the live GraphQL main queue connection, `isInMergeQueue: true`,
+  and a matching `mergeQueueEntry` in `AWAITING_CHECKS` or `QUEUED` state.
+  Require successful exact-head `codeowners-approval` and
+  `multi-approval-bot-summary` checks again immediately before dequeueing or
+  merging. If any remaining source loses membership, changes head, or lacks
+  approval, stop and report it. Batch CI success does not waive source review
+  requirements.
   Inspect any upstream-main drift. Resolve dependencies before
   merging: open PRs based on `pull-request/<source PR>` must be retargeted to
   `main`, as required by repository guidance.
-- Remove a source from the merge queue when needed for a requested direct merge.
+- Remove a verified source from the merge queue when needed for a direct merge.
   Squash-merge each original PR through GitHub with an exact head guard, such as
   `gh pr merge <number> --repo NVIDIA/Megatron-LM --squash --match-head-commit <SHA>`.
   An authorized administrative bypass may handle queue mechanics or redundant
