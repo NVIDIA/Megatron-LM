@@ -470,9 +470,7 @@ def forward_hybrid_stack_shared_prefix(
                     layer_kwargs["shared_prefix_forest"] = attention_forest
                 if expert_bias_enabled and getattr(layer, "is_moe_layer", False):
                     layer_kwargs["shared_prefix_token_multiplicities"] = token_multiplicities
-                hidden_states = layer(
-                    hidden_states=hidden_states, attention_mask=None, **layer_kwargs
-                )
+                hidden_states = layer(hidden_states, attention_mask=None, **layer_kwargs)
 
             if isinstance(hidden_states, tuple):
                 hidden_states = hidden_states[0]
