@@ -1,0 +1,253 @@
+{
+  "schema_version": 1,
+  "name": "qwen3_h100_p2p",
+  "unit": "ms_per_layer",
+  "domain": {
+    "hardware": "h100",
+    "nodes": 4,
+    "ranks_per_node": 8,
+    "world_size": 32,
+    "ep_size": 8,
+    "tokens_per_rank": 4096,
+    "dataset_alignment": 64,
+    "cp_sizes": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "min_logical_length": 1,
+    "max_logical_length": 16384,
+    "max_group_seqs": 64,
+    "tail_padding": "extend_last",
+    "partition": "zigzag",
+    "config": {
+      "num_layers": 48,
+      "hidden_size": 2048,
+      "ffn_hidden_size": 6144,
+      "num_attention_heads": 32,
+      "num_query_groups": 4,
+      "kv_channels": 128,
+      "num_moe_experts": 128,
+      "moe_ffn_hidden_size": 768,
+      "moe_router_topk": 8,
+      "bf16": true,
+      "fp16": false,
+      "fp8": null,
+      "fp4": null,
+      "tensor_model_parallel_size": 1,
+      "pipeline_model_parallel_size": 1,
+      "virtual_pipeline_model_parallel_size": null,
+      "expert_model_parallel_size": 8,
+      "expert_tensor_parallel_size": 1,
+      "sequence_parallel": false,
+      "qk_layernorm": true,
+      "normalization": "RMSNorm",
+      "experimental_attention_variant": null,
+      "multi_latent_attention": false,
+      "attention_backend": "fused",
+      "recompute_granularity": null,
+      "recompute_method": null,
+      "recompute_num_layers": null,
+      "recompute_modules": [
+        "core_attn"
+      ],
+      "cuda_graph_impl": "none",
+      "moe_token_dispatcher_type": "flex",
+      "moe_flex_dispatcher_backend": "hybridep",
+      "moe_hybridep_pad_variable_tokens": true,
+      "moe_hybridep_pad_uneven_dispatch_inputs": true,
+      "moe_router_force_load_balancing": true,
+      "moe_router_load_balancing_type": "aux_loss",
+      "moe_grouped_gemm": true,
+      "moe_permute_fusion": true,
+      "moe_router_fusion": true,
+      "moe_router_dtype": "fp32",
+      "moe_router_pre_softmax": false,
+      "moe_router_num_groups": null,
+      "moe_router_group_topk": null,
+      "moe_expert_capacity_factor": null,
+      "moe_pad_expert_input_to_capacity": false,
+      "gated_linear_unit": true,
+      "add_bias_linear": false,
+      "cross_entropy_loss_fusion": true,
+      "cross_entropy_fusion_impl": "native",
+      "layernorm_epsilon": 1e-06,
+      "hidden_dropout": 0.0,
+      "attention_dropout": 0.0,
+      "cp_partition_mode": "zigzag",
+      "max_seqlen_per_dp_cp_rank": 4096,
+      "thd_max_packed_sequences": 64
+    },
+    "step_overhead_global_batch_size": 256
+  },
+  "features": {
+    "names": [
+      "bias",
+      "zigzag_max_causal_work",
+      "padded_s2_per_rank",
+      "sequence_count"
+    ],
+    "token_unit": 4096,
+    "zigzag_max_causal_work": "2 * maximum rank sum of valid causal query-key pairs / token_unit^2; ownership uses each sequence's padded physical interval"
+  },
+  "profiles": {
+    "classic_p2p": {
+      "source": {
+        "procedure": "DynamicUSP hot-switch calibration procedure (DynamicUSP commit 18eb0f53dbdb3a13b19e49c02fd1782178947c9a, skills/hot-switch-calibration/SKILL.md), with cost terms defined for classic P2P context parallelism",
+        "gpu": "NVIDIA H100 80GB HBM3",
+        "world_size": 32,
+        "transformer_engine_version": "2.14.1",
+        "module_measurement": {
+          "gradient_accumulation_microbatches": 4,
+          "timed_microbatches": [
+            1,
+            2
+          ],
+          "timed_layers": 48,
+          "measured_steps_per_case": 20,
+          "initial_context_parallel_size": 8,
+          "forced_balanced_routing": true,
+          "learning_rate": 0,
+          "fit": "Independent non-negative least squares per CP size and direction"
+        },
+        "step_measurement": {
+          "global_batch_size": 256,
+          "batches": 3,
+          "warmup_trials_per_microbatch_count": 2,
+          "measured_trials_per_microbatch_count": 5,
+          "fit": "Per-batch intercepts and one shared per-microbatch slope on the residual to the module prediction; the median batch intercept is the iteration tail"
+        },
+        "limitations": [
+          "Module timers can perturb execution; paired uninstrumented runs were recorded.",
+          "Module cases start from a CP8/DP4 input layout, unlike the CP1/DP32 training default.",
+          "Routing is forced-balanced; learned routing is outside the measured domain."
+        ]
+      },
+      "validation": {
+        "training_case_count": 60,
+        "heldout_case_count": 14,
+        "attention_training_errors": {
+          "forward": {
+            "median_absolute_relative_error": 0.005799585650586319,
+            "p95_absolute_relative_error": 0.02369701502109881,
+            "max_absolute_relative_error": 0.0291075288625686
+          },
+          "backward": {
+            "median_absolute_relative_error": 0.01320183437905885,
+            "p95_absolute_relative_error": 0.043493074698054565,
+            "max_absolute_relative_error": 0.07661256466446134
+          }
+        },
+        "attention_heldout_errors": {
+          "forward": {
+            "median_absolute_relative_error": 0.006825671019247279,
+            "p95_absolute_relative_error": 0.01721909344367117,
+            "max_absolute_relative_error": 0.017633088620514444
+          },
+          "backward": {
+            "median_absolute_relative_error": 0.03142969379029297,
+            "p95_absolute_relative_error": 0.11612656898142089,
+            "max_absolute_relative_error": 0.14628424509644392
+          }
+        },
+        "block_heldout_errors": {
+          "forward": {
+            "median_absolute_relative_error": 0.013256739410198438,
+            "p95_absolute_relative_error": 0.025946649364042843,
+            "max_absolute_relative_error": 0.026710775210166106
+          },
+          "backward": {
+            "median_absolute_relative_error": 0.11971795356533764,
+            "p95_absolute_relative_error": 0.1923411235879267,
+            "max_absolute_relative_error": 0.19644557490972803
+          }
+        },
+        "prediction_sensitivity": {
+          "forward": 0.0005938771182816271,
+          "backward": 0.002917092976675195
+        },
+        "step_overhead_fit": {
+          "batch_count": 3,
+          "fitted_rows": 11,
+          "max_absolute_relative_error": 0.007332576263652801,
+          "scope": "Residuals on the rows used for the fit"
+        },
+        "scope": "Module errors are for fixed-layout cases. Step terms are fitted on three recorded global batches of 256 samples; no step-level comparison on other batches is included."
+      },
+      "attention": {
+        "1": {
+          "forward": [
+            2.12730793428303,
+            0.0,
+            0.0,
+            0.0004239240914361891
+          ],
+          "backward": [
+            1.0306029845025635,
+            0.875900108307262,
+            0.0,
+            0.00170841543475267
+          ]
+        },
+        "2": {
+          "forward": [
+            3.446497803715239,
+            0.0,
+            0.0,
+            0.0005150091156908953
+          ],
+          "backward": [
+            1.8540716316982837,
+            0.6743267691894416,
+            0.0,
+            4.026050467613545e-05
+          ]
+        },
+        "4": {
+          "forward": [
+            4.8193701758406196,
+            0.0,
+            0.018548497853986847,
+            0.001985511461360917
+          ],
+          "backward": [
+            3.305029445236436,
+            0.4841677016139169,
+            0.12258936864105967,
+            0.0029387787073995885
+          ]
+        },
+        "8": {
+          "forward": [
+            7.685161770795705,
+            0.0,
+            0.026572334095600617,
+            0.0024149603025550295
+          ],
+          "backward": [
+            6.005560873394247,
+            0.20191854579496202,
+            0.082345209003466,
+            0.003949728981535307
+          ]
+        }
+      },
+      "remainder_ms": {
+        "forward": [
+          5.435122211377207,
+          0.08990617556608711
+        ],
+        "backward": [
+          2.253499527242624,
+          0.39760224705164315
+        ]
+      },
+      "microbatch_overhead_ms": {
+        "forward": 0.0,
+        "backward": 1.1302911411603527
+      },
+      "iteration_tail_ms": 118.4137963013744
+    }
+  }
+}

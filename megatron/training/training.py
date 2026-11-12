@@ -42,7 +42,8 @@ _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core._rank_utils import safe_get_rank
-from megatron.core.datasets.data_schedule import wrap_data_iterator
+from megatron.core.datasets.data_schedule import validate_dynamic_cp_runtime, wrap_data_iterator
+from megatron.core.datasets.dcp_schedule_prefetch import describe_runtime_spec
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
     DistributedDataParallelConfig,
@@ -72,6 +73,7 @@ from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
     get_current_running_global_batch_size,
+    get_global_batch_size_upper_bound,
     get_num_microbatches,
     update_num_microbatches,
 )
@@ -3519,6 +3521,8 @@ def pretrain(
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     model_cfg = get_model_config(model[0])
+    # Every rank validates the runtime DCP scheduler file before data loading and training.
+    _validate_dynamic_cp_runtime_config(model, model_cfg)
 
     callback_manager.callback_context.model = model
     callback_manager.callback_context.optimizer = optimizer
@@ -4841,6 +4845,73 @@ def _get_model_pg_collection(
     return pg_collection
 
 
+def _validate_dynamic_cp_runtime_config(model, config):
+    """Check ``--dynamic-cp-runtime-config`` on this rank with the model's own process groups."""
+    if getattr(config, 'dynamic_cp_runtime_config', None) is None:
+        return
+    pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    spec = validate_dynamic_cp_runtime(config, pg_collection)
+    _check_dynamic_cp_runtime_batch_sizes(spec)
+    # One line in the log saying which scheduler this run uses and with which CP sizes.
+    print_rank_0(describe_runtime_spec(spec))
+
+
+def _check_dynamic_cp_runtime_batch_sizes(spec):
+    """Stop on every rank when a configured batch size is one the cost model does not price.
+
+    A cost model whose step overhead was measured with one global batch size states it in
+    the validated specification (``required_global_batch_size``). The CPU planner rejects
+    any other batch when it is planned; the run configuration already says whether training
+    or evaluation will produce one, so report it before the first step.
+    """
+    required = spec.get('required_global_batch_size')
+    if required is None:
+        return
+    cfg = get_run_config()
+    faults = []
+    if not cfg.validation.skip_train:
+        schedule = cfg.train.step_batch_size_schedule
+        if schedule is not None or cfg.train.decrease_batch_size_if_needed:
+            # The size that runs, now and at most later, differs from --global-batch-size.
+            running = get_current_running_global_batch_size()
+            largest = get_global_batch_size_upper_bound()
+            if schedule is not None and (running != required or largest != required):
+                faults.append(
+                    f'--step-batch-size-schedule {schedule!r} trains with {running} samples '
+                    f'per global batch now and up to {largest} later'
+                )
+            elif schedule is None and running != required:
+                faults.append(
+                    f'--global-batch-size {cfg.train.global_batch_size} with '
+                    f'--decrease-batch-size-if-needed trains with {running} samples per '
+                    'global batch'
+                )
+        elif cfg.train.global_batch_size != required:
+            faults.append(f'--global-batch-size is {cfg.train.global_batch_size}')
+    eval_iters = cfg.validation.eval_iters
+    counts = eval_iters if isinstance(eval_iters, (list, tuple)) else [eval_iters]
+    if cfg.validation.full_validation or any(counts):
+        # Resolved when the arguments are finalized: the training value unless set.
+        eval_batch_size = cfg.validation.eval_global_batch_size
+        if eval_batch_size is None:
+            eval_batch_size = cfg.train.global_batch_size
+        if eval_batch_size != required:
+            faults.append(
+                f'--eval-global-batch-size (by default --global-batch-size) is {eval_batch_size} '
+                f'and evaluation is enabled (--eval-iters {eval_iters}'
+                + (', --full-validation)' if cfg.validation.full_validation else ')')
+            )
+    if faults:
+        raise ValueError(
+            f"The runtime DCP scheduler's {spec['type']!r} cost model ({spec['model']}) was "
+            f'measured with {required} samples per global batch and prices no other batch '
+            f"size: {'; '.join(faults)}. Every global batch that training or evaluation "
+            f'schedules must hold {required} samples'
+        )
+
+
 def train_step(
     forward_step_func,
     data_iterator,
@@ -5040,7 +5111,16 @@ def train_step(
                     data_iterator,
                     config,
                     get_num_microbatches(),
+                    # The model's own groups: the schedule carrier can be a multi-module
+                    # collection, which has no dp_cp group of its own.
                     pg_collection=get_attr_wrapped_model(model[0], "pg_collection"),
+                    prefetch_next=(
+                        iteration is not None
+                        and cfg.train.train_iters is not None
+                        and iteration + 1 < cfg.train.train_iters
+                        and args.dataloader_type != 'external'
+                        and (args.num_workers > 0 or getattr(args, 'use_varlen_dataset', False))
+                    ),
                 )
                 has_wrapped_data_iterator = True
                 rerun_data_iterator = packed_data_iterator

@@ -1,0 +1,296 @@
+{
+  "native_source_capsule_sha256": "6d4b1f7265a969e127f0a8fef6f601fe67d802fab6e25cfa3483ac826e44814d",
+  "native_exports": {
+    "backward_phase_work.py": {
+      "source_sha256": "6e7ec42dae711bf0906b7f6e3b96811fe2fe062371eb62f9c402aaa032c2ea9c",
+      "export_sha256": "66279a7a5c8642f8281194ed906a2356e49239534459c1e7e7a8390ce1a8b631",
+      "symbols": [
+        "phase_work"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "backward_worker_work.py": {
+      "source_sha256": "02fc3c7e8168fbc41ff85f17cd65e2722b7f81836c38a71f4915609279454685",
+      "export_sha256": "17eec8a1a3430484eaf5d5467358008e09124d89c82d291d84b8c309e8335347",
+      "symbols": [
+        "fifo_span"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "cp1_matrix_work.py": {
+      "source_sha256": "614a55a204a55642b0c6e5004f85e3363d1d97f4c6d06e05b7438231d8e6f812",
+      "export_sha256": "24f7f5ca17b2b123e48481cc5e2123b9acffc8ca8267e89a81a39ec6ef19ea30",
+      "symbols": [
+        "GEOMETRIES",
+        "HELPERS",
+        "expected_ops",
+        "panel_pairs",
+        "positive"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "cp1_model.py": {
+      "source_sha256": "7c25d21236b3cf974e7a765b5e33be5fcd7275ee67689a56573ac7315f2b0d7c",
+      "export_sha256": "6eac47472e1e9d304e92c8c3e34a74b143f6eba45aa4273b2c00eef319334542",
+      "symbols": [
+        "features",
+        "tensor_bytes_per_token"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "export_cp1_program_bodies.py": {
+      "source_sha256": "fe80407fee6e5a800da2dcb842d34f473da4796cda40a41f0a56537f7fa658c4",
+      "export_sha256": "39609793cee91815b6da2c324e63d1fc1575aaecdac699ae301a09ddef454828",
+      "symbols": [
+        "require"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "geometry.py": {
+      "source_sha256": "ba3d9e120953bc08cc8f4d6f7ebf2e01faba6eb4626dae868e8c61f344b241e3",
+      "export_sha256": "b5fb509acd2a1a26b972b440da05817b998e48d593f2548f9c5a69b49a8a2aed",
+      "symbols": [
+        "GEOMETRIES",
+        "PACK_LENGTHS",
+        "Pack",
+        "ceil_multiple",
+        "cumulative",
+        "positive_int"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "h100_backward_dispatch.py": {
+      "source_sha256": "77499036765888cef1019f0506588ec259785d11fa38f86bbf52d60867f62348",
+      "export_sha256": "c6795dff006f03f6e0e5fff10f77d2ecba3a84a6031ed5e4f3f4639480818de1",
+      "symbols": [
+        "job_counts"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "h100_causal_loops.py": {
+      "source_sha256": "4ad21c896eeb53fd8b963d0a0e8aa0e8eddd69aa21c8421506a6211a175955d2",
+      "export_sha256": "528608614776e2bb6b0336463e572f28ddd2f499861d6a30bb86c930c2d70313",
+      "symbols": [
+        "consumer_jobs",
+        "consumer_loop_ranges",
+        "work"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "native_query_backward_work.py": {
+      "source_sha256": "d02ad4ff29da520eb3ef6cad3aff00cc82b059f733f05acd21314f4e76300143",
+      "export_sha256": "5ab29d44cafb93bc40b3031ff18030afe4d7575fa0e2d16b9b61684140e498d7",
+      "symbols": [
+        "backward_work"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "native_query_work.py": {
+      "source_sha256": "f92c54f1aad5db76abd41198eb08c6eabdffa76dba76a6ed4b464663b634c4de",
+      "export_sha256": "9e0353d4eeb29dd75667c9a080a1b159ed98390249809463ce31e96b21469ef8",
+      "symbols": [
+        "KEY_TILE",
+        "MATRIX_WARP_INSTRUCTIONS_PER_STEP",
+        "QUERY_TILE",
+        "forward_work"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "native_sdpa_cta_work.py": {
+      "source_sha256": "acbaaf9d99be9005466bdb7392d481343e3154b9883d7535a9158d1fc50c594c",
+      "export_sha256": "3efce83f90bf11aade1742f1398f6cf4583c95a4b832672fd88c4412ad44c46b",
+      "symbols": [
+        "consumer_jobs"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "native_terminal_trace.py": {
+      "source_sha256": "99146a30500fa07f9feff8a5db53b6bbb733b09d951adbc750c2f76abea18ba9",
+      "export_sha256": "c095a7ec927622bece6b9ba2d3f523eaa7efb1cb562a9b98c4658f522b8ecbce",
+      "symbols": [
+        "require"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "prospective_backward_worker_cp1.py": {
+      "source_sha256": "7cde77001473fdc8f2234173171372b059b7a94c7dabba2e32fbde161f9ec899",
+      "export_sha256": "821671e8ce4d812071a0fffb48b714e4f32fdb489952411dd8a9e995deb910ba",
+      "symbols": [
+        "source_stages"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "prospective_disjoint_path_cp1.py": {
+      "source_sha256": "09a5b3d27f2bbb144b46e7022b4eb8a0a05996fdfe5fe43fa64b16b5f6f45cb5",
+      "export_sha256": "2df091804d5e680ee8f83145f62ae8160f10cebde2b543899bec91a19bd6665b",
+      "symbols": [
+        "path_prices",
+        "path_stages",
+        "reduced_coordinates"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "prospective_forward_mask_work.py": {
+      "source_sha256": "2abc91fe95e67294cf6785905834dece75e981fde30acd5e88180a7d6ee5bd75",
+      "export_sha256": "cde54fb0f97140ab02415f52fd15ad9718c63626942d41dac7b6c77b379ff8e8",
+      "symbols": [
+        "panel_split"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "prospective_forward_worker_cp1.py": {
+      "source_sha256": "cf28d0ca555a172689de7c8041a1b9ab87b9121b860428d1b09ea1d8e775de02",
+      "export_sha256": "1191c6dcc8bda68d9e4a959abb783fc54eb336906544c97588c7f4dd7cfd265c",
+      "symbols": [
+        "source_jobs"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "prospective_h100_backward_mask_work.py": {
+      "source_sha256": "d0f59af67d2a65bc585b532e8dfb4bfa8da687b7e31ce4206146984e257839db",
+      "export_sha256": "b486dd26f20eb7a992f6a0a64f09d46d09af9c1290d9c27eab4f73e9a791947f",
+      "symbols": [
+        "split"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "prospective_job_resource_cp1.py": {
+      "source_sha256": "3d155fd0039ad2cc9b2bb23238689c05ca3ee8e5fb3a104dfc2350bcfb895706",
+      "export_sha256": "5f76aaa81a4035239a049e7d4d8018f0ef0e4c7c3f34765aa597ebe56bce1f16",
+      "symbols": [
+        "job_service",
+        "resource_prices",
+        "resource_service_span",
+        "resource_stage_span"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "prospective_source_count_cp1.py": {
+      "source_sha256": "e98794042f8924d1d82066930e9e3092a5271de81d4c3ea3fceeb4e64a5518bb",
+      "export_sha256": "0f2031e386f8844d5d9ac2df2d2196def32bb7ce4aa9bc920338540c705df0ac",
+      "symbols": [
+        "work_counts"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "whole_resource_cp1.py": {
+      "source_sha256": "3c8fa7de80c6471495312f6e7d3e7bf3cc4fdb134cab43ddca30741f06562916",
+      "export_sha256": "61f19ee2f5462e797f3a7e9be602d350d11dee2efe9c2e1c8b043b71e2497b30",
+      "symbols": [
+        "FEATURES",
+        "SCHEMA",
+        "features",
+        "predict_ms"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    }
+  },
+  "legacy_git_commit": "ebd1a1cd551a9c541902540f88d5d71478fed985",
+  "legacy_files": {
+    "attention/__init__.py": "01c8662be3e124d4eae3fa31c64072c2b57eb62f5b9d172078a0c052ce3e8a9a",
+    "attention/backward_model/__init__.py": "a948ea54ef676b574a3bb8b803df4fbaeb9be5c0a3af8d8ead8e140275829508",
+    "attention/backward_model/backward_attention_predictor.py": "741367d0976afaf4e15ea8ffdcee9c05a7ccdbfe1a6569f7d77d1e146548c777",
+    "attention/backward_model/frozen_backward_attention_model.json": "8855910bd77d920663cb037d0eeb8a605dd9ca2567247755cde9c7ccd377e500",
+    "attention/backward_model/frozen_backward_attention_model_h100_v2.json": "d39156b0d2d48ba71d4c6748159cd1e8fbe27270b00480b7bc50a8409893a4ca",
+    "attention/calibration_manifest.json": "9935445cddba4e75c2be066f278cdc8a8dbe62bde9710352f27d7c51e1c583ce",
+    "attention/cp1_gqa_attention_predictor.py": "a44ae025f98815f97d1753169fd0256b34dc17c4db75e43c9c2d6fe520dd616c",
+    "attention/cp1_max_cp_alignment_h100_20260818/frozen_models.json": "497e4cb6f835f1005a9bc663c1a8750a24bef7c7e76b0c4c4468cf07829dd964",
+    "attention/cp1_tail_3k8k_six_geometry_gb200_20260722/frozen_models.json": "9eaccf2b03b10cd8f7d48ce41384f2b736ad4138561baa1dd72487c0a8df91a6",
+    "attention/cp1_tail_3k8k_six_geometry_gb200_20260722/head_dim256_backend_state_models_v2.json": "47bb04e77f3ca763b6b4cdad42f41a929203b62bac2c1452cedf103f80e7dc4f",
+    "attention/cp_gqa_attention_predictor.py": "ece65414c2d9d1fcde51a83182058577d45d35076c1264f2bad6c43d2cb9a9a4",
+    "attention/cp_overlap/models/cp64_20260722_v1_ring/gb200/llama3_70b/final/frozen_cp_gqa_attention_model_cp64.json": "54560ccffa22aa8ea64b071a129771425d6fe945040ad47b006d03e635430d3a",
+    "attention/cp_overlap/models/cp64_20260722_v1_ring/gb200/mixtral_8x7b/final/frozen_cp_gqa_attention_model_cp64.json": "aa5309652a6337cc2201335a1c3bf19464f11ff0826ee4e6145694867110dbe3",
+    "attention/cp_overlap/models/cp64_20260722_v1_ring/gb200/qwen3_235b/final/frozen_cp_gqa_attention_model_cp64.json": "15c960781977b4164fcac3cb183e8a88efffb9d3da3b26a7ecb4cdfc0d25a227",
+    "attention/cp_overlap/models/cp64_20260722_v1_ring/gb200/qwen3_30b/final/frozen_cp_gqa_attention_model_cp64.json": "6f7de0164c989dee7790c6f893dfff0011ef9f3f07a1b8a1cf4bf4c68166086e",
+    "attention/cp_overlap/models/cp64_20260722_v3_ring/h100/llama3_70b/final/frozen_cp_gqa_attention_model_cp64.json": "b016cb2f4f0e53f44359e1aceb919f40cb835dfb9ab1be1de03fc7f53cd919b1",
+    "attention/cp_overlap/models/cp64_20260722_v3_ring/h100/mixtral_8x7b/final/frozen_cp_gqa_attention_model_cp64.json": "8cb53ea4b1f6389721a429c18d9b54b872efd557e69d8aad40a9ce285dbcd1e8",
+    "attention/cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_235b/final/frozen_cp_gqa_attention_model_cp64.json": "e9d37b19f22b86e688b2420cb284f35da78d3e39e9e23f841ad24fe46d4068ae",
+    "attention/cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_30b/final/frozen_cp_gqa_attention_model_cp64.json": "89c90c825090dc178f5e41891133ba63c088b8543d629f41740225023e6b73a1",
+    "attention/cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_5_397b/final/frozen_cp_gqa_attention_model_cp64.json": "d3e44b7b6ffe40a3f5217afbaf7a5c2325b972ebdd06c4dd95e84deb1c3cae90",
+    "attention/cp_overlap/models/cp64_20260722_v3_ring/h100/qwen3_next_80b/final/frozen_cp_gqa_attention_model_cp64.json": "bed69cc4a7ce86203fc6e8eb46faf443fc47e877b8370ac04b0e53472a6b4cc8",
+    "attention/cp_overlap/models/frozen_pre_fresh_holdout_v2/frozen_cp_gqa_attention_model_v2.json": "1a7c629a9cc60b2995b179f1104e545e775e34b0ddf9741b0a1f69d7e7b9cde8",
+    "attention/cp_overlap/models/multi_profile_20260720_v3/llama3_70b/frozen_v3/frozen_cp_gqa_attention_model_v3.json": "4767de9fb6ea1e7ace8419f8f4218e85d0fe873bae5bac2caf2546b8985aa9ea",
+    "attention/cp_overlap/models/multi_profile_20260720_v3/mixtral_8x7b/frozen_v3/frozen_cp_gqa_attention_model_v3.json": "0d5d0eaabec7427f8ee2b0ada8246ef4eda88608a03cdbf899906cd9675c9c6d",
+    "attention/cp_overlap/models/multi_profile_20260720_v3/qwen3_235b/frozen_v3/frozen_cp_gqa_attention_model_v3.json": "85cce9c21bfd60c827b3953687bf27d265c3a2be5c6d89464c79263ede53bdea",
+    "attention/cp_overlap/models/multi_profile_20260720_v3/qwen3_5_397b/frozen_v3/frozen_cp_gqa_attention_model_v3.json": "845c7615984003b2a888ea58aacbd16a47ca347b9e2a354701e2128a923b1c28",
+    "attention/cp_overlap/models/multi_profile_20260720_v3/qwen3_next_80b/frozen_v3/frozen_cp_gqa_attention_model_v3.json": "2003f388f45a2de8f23c11726829fa2dee90c166e44eaa5d27239fa166c97aed",
+    "attention/cp_pipeline.py": "570c1931079f64bad9d8bd101d5cc5e8541c2de33d61789ba7d40de5dd386c15",
+    "attention/cp_round_geometry.py": "b721f18f95e42cfbbbc0451f0df2bfb6ecf3c4929ea4c43a6d5186491453dad4",
+    "attention/estimator.py": "1d90848e8c5c1cff4ea3f1a97e0ad91e95f79064b280f87273b52dfc8b871272",
+    "attention/gb200_cp1_attention_predictor.py": "c07df704b026ee03c9c20f8d076015032058fad8415754da07173b1b37a87f24",
+    "attention/gqa_attention_model_registry.json": "47c9da9962d99fc40267f17d993a5d799a29935897632efc0be28d1678faee21",
+    "attention/hardware_gqa_attention_predictor.py": "ad33c06f761d193bd6274c37a3ef0649d984386d2c3892cd70aa91fcd88ece91",
+    "attention/non_power_cp_20260829/__init__.py": "fe19705a61ce5ba272fa683953d604cca690b9cb5cee913f3cb556144b604cbf",
+    "attention/non_power_cp_20260829/arbitrary_cp_backward_predictor.py": "85e692c7169324a4fc0bc4b18d1e2787e2b04ec38236da69aec42697498eb7a6",
+    "attention/non_power_cp_20260829/models/h100_qwen3_30b_backward_cp1_32_integer_holdout_backed.json": "dcf45814399cb0dd30aeb4c82dd10192a5ff09abab624119475e389351d1d15e",
+    "attention/non_power_cp_20260829/models/h100_qwen3_30b_cp2_32_integer_candidate.json": "dd652e90cf0514f5167ca1de9e6490f5eaaf30d3b113bccb6258a799d4d2f6fa",
+    "attention/placement_calibration.py": "4875c8c24311a0601b2f8e140371032551cce09e78395d31683f89e8b016e207",
+    "attention/qwen35_calibration/gb300_proxy.json": "8825936b21b2a09f4cb3166bd8ce5d1c7e039a64205bac848745b22207c2a27f",
+    "attention/qwen35_calibration/manifest.json": "4c5437a11759527dcf5b2b927455cca10d9e41c97276e6ee67a86b34e9a0e9ea",
+    "attention/qwen35_proxy.py": "684b20d623c79507e6e76f735a12d176f6d48eb9ce09362196ae04a5d5cae612",
+    "attention/qwen3_showcase_calibration/h100-nvl8-paired.json": "1f164cdf3c93ddcc70f11974ad2d2307c4189a4a097d24080b5f43c45ebe2ec8",
+    "attention/qwen3_showcase_calibration/manifest.json": "df699f715ad4c0837c30b391fe0983fc05ff8dd4eeaf7d9169aa564294fea38f",
+    "attention/showcase_profiles.py": "a197fddaf07514b9b1978cf4001ee2673d7dc23b1dce31e8bed5718c304c8016",
+    "attention/singleton_sol_attention_predictor.py": "49ce6305bef6ef2c662a13354ee2cdeb522332018f2c491ad1883a0bc2f693ca",
+    "attention/sol_validation_20260802/singleton_sol_calibration.json": "1391cad1d21cc0949006c55a4d85f8ef390d985b033548f7c4d8eab3ea39390c",
+    "attention/topology.py": "0c0c9e183cdaae15f43639e98b645717e29670d92b4862e92582b3bfd3cf662d",
+    "validation.py": "1a7e96fa09dbc47eb3f1defa635db8caed5e18d2678349213bbc6c391a087312",
+    "rank_timeline.py": "e885052166adaac058e5e4893fd6b224f14d58bc45f0d110001fa5e6af13735e"
+  },
+  "timeline_exports": {
+    "execution_program.py": {
+      "source_sha256": "76f1996402717192ee9075206b0812eb0f0e832b886e62aef5c7586387f9c582",
+      "export_sha256": "7f8cc23ada4312ef4543295277be747cba957befbcac43ab914d49d9ba6416a5",
+      "symbols": [
+        "execute_program",
+        "validate_program"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "rank_timeline.py": {
+      "source_sha256": "e885052166adaac058e5e4893fd6b224f14d58bc45f0d110001fa5e6af13735e",
+      "export_sha256": "8a7f73a197597bc2fdb53b460940001d8a36812be90f43ffad952993a8ce7837",
+      "symbols": [
+        "RankTimelineError",
+        "_is_power_of_two",
+        "rank_intervals",
+        "uses_arbitrary_rank_layout"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    },
+    "training_timeline.py": {
+      "source_sha256": "9e6e023861d5349eeaacfe95277471c75a10f9e7b3b9a76f56db505dbaae11ae",
+      "export_sha256": "299befbf73a7d6690fa3e56339002c2ec6f8c410e42ecd3c60fe58c626115de3",
+      "symbols": [
+        "OperationTimeline",
+        "StageOperation",
+        "TrainingTimeline",
+        "TrainingTimelineError",
+        "_execute_stage_operation",
+        "_finite_nonnegative",
+        "_group_local_non_attention_ms",
+        "_phase_group_cost_ms",
+        "_validate_order",
+        "distribute_layers",
+        "evaluate_training_schedule",
+        "interleaved_one_f_one_b_stage_order",
+        "interleaved_schedule_table",
+        "one_f_one_b_stage_order",
+        "resolve_layers_per_stage",
+        "resolve_microbatch_group_size_per_vp_stage",
+        "resolve_pipeline_layers",
+        "resolve_stage_ep_group_token_models",
+        "resolve_stage_local_token_models",
+        "resolve_stage_values"
+      ],
+      "changes": "unreachable symbols removed; package-relative imports only; formula bodies preserved"
+    }
+  },
+  "diagnostic_reports": {
+    "h100": "61a542b70bcf545cd3317e2e8581ae100a757f3ebde4035e528a15c2d2a13d50",
+    "gb200": "eb5949dc9e74d3c16c7f26c77d541cc61043298c9464cda545d21d38f1140f11"
+  },
+  "no_calibration_or_fit_run": true,
+  "no_solver_or_gpu_benchmark_in_runtime": true,
+  "no_non_attention_model_fitted_or_automatically_loaded": true
+}
