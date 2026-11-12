@@ -46,6 +46,7 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
         FsdpContext,
         Placements,
+        PrefetchOrder,
         RuntimePolicy,
         SchedulePolicy,
         ShardLayout,
@@ -262,11 +263,23 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
         # after the schedule completes, including delayed wgrad and custom 1F1B work.
+        # A shared MTP predictor executes the same sharded units once per depth.
+        # Registration traversal lists each unit once; record actual occurrences
+        # so the second depth is not mistaken for the start of backward.
+        repeated_mtp = config.mtp_use_repeated_layer and (config.mtp_num_layers or 0) > 1
+        if repeated_mtp and config.overlap_moe_expert_parallel_comm:
+            raise ValueError(
+                "Shared MTP requires recorded FSDP execution order, which currently "
+                "requires ordinary module hooks rather than combined 1F1B."
+            )
         active_context = current_fully_shard_context()
         if active_context is None:
             construction_context = fully_shard_context(
                 FsdpContext(
                     device=device,
+                    prefetch_order=(
+                        PrefetchOrder.RECORDED if repeated_mtp else PrefetchOrder.REGISTRATION
+                    ),
                     runtime_policy=RuntimePolicy(
                         use_symmetric_memory=ddp_config.nccl_ub,
                         caller_managed_grad_sync=True,
@@ -275,6 +288,11 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             )
         else:
+            if repeated_mtp and not active_context.is_recording_execution_order:
+                raise ValueError(
+                    "Shared MTP requires the caller's FSDP context to use recorded "
+                    "execution order."
+                )
             if not active_context.caller_managed_grad_sync:
                 raise ValueError(
                     "MCore MFSDP v2 requires shared contexts to be constructed with "
