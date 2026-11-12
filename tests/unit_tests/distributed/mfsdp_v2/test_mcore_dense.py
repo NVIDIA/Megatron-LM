@@ -15,6 +15,7 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradientFinalizationMode,
     fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
@@ -142,6 +143,7 @@ def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(process_grou
         pg_collection=process_group_collection,
     )
 
+    assert wrapped.module.context.gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER
     assert isinstance(wrapped.module, FsdpModule)
 
     parameters = dict(wrapped.module.named_parameters())

@@ -77,6 +77,7 @@ class FsdpContext:
         device: torch.device | None = None,
         runtime_policy: RuntimePolicy = RuntimePolicy(),
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
+        gradient_finalization_mode: GradientFinalizationMode = GradientFinalizationMode.REDUCE_OUTER_AND_WAIT,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
@@ -90,6 +91,9 @@ class FsdpContext:
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
                 that mesh. Every TensorAtomic parameter needs an entry; other entries are
                 ignored. Tensors are packed by owner without changing logical parameter order.
+            gradient_finalization_mode: Initial mode restored when a gradient-finalization
+                scope exits. The default waits automatically; callers that own the wait
+                can select REDUCE_OUTER and call finish_grad_sync() after backward.
         """
         overlap_allgather_reduction = runtime_policy.overlap_allgather_reduction
         overlap_outer_communication = runtime_policy.overlap_outer_communication
@@ -98,7 +102,7 @@ class FsdpContext:
         if device.type != "cuda":
             raise ValueError(f"FsdpContext requires a CUDA device, got {device}.")
 
-        self._gradient_finalization_mode = GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+        self._gradient_finalization_mode = gradient_finalization_mode
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.execution_order = ExecutionOrder()
         self._recording_execution_order = runtime_policy.prefetch_order is PrefetchOrder.RECORDED
@@ -218,7 +222,7 @@ class FsdpContext:
         completion, or REDUCE_OUTER and call finish_grad_sync() after all backward work,
         including backward_dw(). Inner reduction and weight cleanup run in every mode.
 
-        Outside a scope, backward reduces outer gradients and waits automatically.
+        Outside a scope, backward uses the mode selected at context construction.
         Wrap both forward and backward. The scope itself does not launch reductions
         or wait on entry or exit.
 

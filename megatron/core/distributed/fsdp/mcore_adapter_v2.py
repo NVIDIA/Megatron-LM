@@ -257,6 +257,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             construction_context = fully_shard_context(
                 FsdpContext(
                     device=device,
+                    gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
                     runtime_policy=RuntimePolicy(
                         use_symmetric_memory=ddp_config.nccl_ub,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
