@@ -449,6 +449,15 @@ class FsdpParameterGroup:
         for fsdp_parameter in self.fsdp_parameters:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
 
+    def reshard_parameters(self) -> None:
+        """Restore sharded bindings and release gathered weight storage.
+
+        The caller invokes this on the all-gather stream after ordering it behind
+        the last compute consumer. This method does not synchronize streams.
+        """
+        self.bind_sharded_parameters()
+        self.release_unsharded_storage()
+
     def sync_model_weight_from_main_weight(self) -> None:
         """Refresh compute weights from optimizer weights."""
         if isinstance(self.post_optimizer_model_weight, DBuffer):

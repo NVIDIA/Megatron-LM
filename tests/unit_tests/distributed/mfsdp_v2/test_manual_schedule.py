@@ -54,10 +54,9 @@ def prefetch_group(group, allgather_stream):
 
 def reshard_group(group, allgather_stream):
     """Release this group's full weights after their last consumer."""
-    group.bind_sharded_parameters()
     allgather_stream.wait_stream(torch.cuda.current_stream(allgather_stream.device))
     with torch.cuda.stream(allgather_stream):
-        group.release_unsharded_storage()
+        group.reshard_parameters()
 
 
 def reduce_group(group, reduction_stream):
@@ -79,6 +78,7 @@ class ScheduledMLPFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, inputs, weight1, weight2, allgather_stream, reduction_stream):
         """Compute stage one while stage two's weights are being gathered."""
+        ready2 = allgather_stream.record_event()
         group1 = get_containing_parameter_group(weight1)
         group2 = get_containing_parameter_group(weight2)
         ctx.groups = (group1, group2)
@@ -89,7 +89,7 @@ class ScheduledMLPFunction(torch.autograd.Function):
         if group1 is not group2:
             reshard_group(group1, allgather_stream)
         # The first GEMM and activation did not wait for this later gather.
-        group2.wait_for_unshard(None)
+        torch.cuda.current_stream(allgather_stream.device).wait_event(ready2)
         output = F.linear(hidden, weight2)
         ctx.save_for_backward(inputs, hidden)
         return output
@@ -102,10 +102,13 @@ class ScheduledMLPFunction(torch.autograd.Function):
         inputs, hidden = ctx.saved_tensors
         allgather_stream = ctx.allgather_stream
         reduction_stream = ctx.reduction_stream
-        allgather_stream.wait_stream(torch.cuda.current_stream(allgather_stream.device))
+        compute_stream = torch.cuda.current_stream(allgather_stream.device)
+        allgather_stream.wait_stream(compute_stream)
         prefetch_group(group2, allgather_stream)
-        group2.wait_for_unshard(None)
+        ready2 = allgather_stream.record_event()
+        compute_stream.wait_event(ready2)
         prefetch_group(group1, allgather_stream)
+        ready1 = allgather_stream.record_event()
 
         grad_hidden = grad_output.matmul(weight2)
         weight2.grad = grad_output.t().matmul(hidden)
@@ -113,7 +116,7 @@ class ScheduledMLPFunction(torch.autograd.Function):
             reduce_group(group2, reduction_stream)
             reshard_group(group2, allgather_stream)
 
-        group1.wait_for_unshard(None)
+        compute_stream.wait_event(ready1)
         grad_projected = grad_hidden * (1 - hidden.square())
         grad_input = grad_projected.matmul(weight1) if ctx.needs_input_grad[0] else None
         weight1.grad = grad_projected.t().matmul(inputs)
@@ -131,9 +134,11 @@ class ScheduledMLP(MLP):
         """Wait for the first matrix and prefetch the second before stage one."""
         group1 = get_containing_parameter_group(self.weight1)
         group2 = get_containing_parameter_group(self.weight2)
-        allgather_stream.wait_stream(torch.cuda.current_stream(allgather_stream.device))
+        compute_stream = torch.cuda.current_stream(allgather_stream.device)
+        allgather_stream.wait_stream(compute_stream)
         prefetch_group(group1, allgather_stream)
-        group1.wait_for_unshard(None)
+        ready1 = allgather_stream.record_event()
+        compute_stream.wait_event(ready1)
         prefetch_group(group2, allgather_stream)
         output = ScheduledMLPFunction.apply(
             inputs, self.weight1, self.weight2, allgather_stream, reduction_stream

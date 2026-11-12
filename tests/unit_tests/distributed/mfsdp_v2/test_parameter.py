@@ -99,6 +99,16 @@ def test_per_parameter_grouping_preserves_aliases_and_chunk_geometry(distributed
         )
 
     assert len(model.parameter_groups) == 2
+    model.context.allgather_stream.wait_stream(model.context.current_stream())
+    for group in model.parameter_groups:
+        with torch.cuda.stream(model.context.allgather_stream):
+            group.unshard_parameters()
+            group.reshard_parameters()
+        if setup.world_size > 1:
+            assert all(
+                parameter.unsharded.untyped_storage().nbytes() == 0
+                for parameter in group.fsdp_parameters
+            )
     assert model.alias is model.weight
     assert model.parameter_groups[0].fsdp_parameters[0].fqns == ("weight", "alias")
     for name, original in originals.items():
