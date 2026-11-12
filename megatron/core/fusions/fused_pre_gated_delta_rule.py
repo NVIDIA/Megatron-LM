@@ -7,8 +7,8 @@ The public entry point consumes the dense ``qkvzba`` projection and returns
 expected by the gated delta rule. The forward path keeps QK, V, and G/Beta as
 separate streamed scopes and returns Z as a strided view into ``qkvzba`` rather
 than materializing a contiguous gate tensor. The backward mirrors those scopes
-for layout/l2norm/g-beta work, then delegates depthwise conv gradients to the
-``causal_conv1d`` backend.
+for layout/l2norm/g-beta work and runs the depthwise conv + SiLU gradients in a
+channel-last Triton kernel (or, on request, the ``causal_conv1d`` backend).
 
 Unsupported cases are rejected at the Python entry point: CPU tensors,
 conv bias, and ``use_qk_l2norm=False``. Packed THD sequences use separate
@@ -16,6 +16,7 @@ QK/V causal-conv kernels so the dense BSHD kernels stay free of packed
 metadata and runtime branches.
 """
 
+import os
 from contextlib import nullcontext
 from typing import Optional, Tuple
 
@@ -37,6 +38,13 @@ _G_BETA_STREAM_SLOT = 3
 _Z_STREAM_SLOT = 4
 
 _LAYOUT_BLOCK_S = 64
+
+# Conv + SiLU backward implementations of the fused path. ``triton`` is the
+# channel-last kernel in this file; ``causal_conv1d`` delegates to the causal-conv1d
+# package. The environment variable overrides the default for A/B runs.
+_CONV_BACKWARD_IMPLS = ("triton", "causal_conv1d")
+_CONV_BACKWARD_IMPL_ENV = "MEGATRON_GDN_PRE_GDR_CONV_BACKWARD"
+_CONV_BACKWARD_MAX_KERNEL_WIDTH = 4
 
 
 # ---------------------------------------------------------------------------
@@ -992,6 +1000,462 @@ def _conv_silu_boundary_backward_kernel(
         )
 
 
+def _conv_backward_autotune_configs():
+    # BLOCK_C / (32 * num_warps) channels per thread: 2 or 4. Wider channel blocks and
+    # longer token blocks were consistently slower.
+    return [
+        triton.Config({"BLOCK_C": 256, "BLOCK_T": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_C": 512, "BLOCK_T": 64}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_C": 512, "BLOCK_T": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_C": 1024, "BLOCK_T": 128}, num_warps=8, num_stages=2),
+    ]
+
+
+@triton.jit
+def _conv_backward_load_row(ptrs, chan_mask, MASK_CHAN: tl.constexpr):
+    """Load one channel-last row as fp32; unmasked loads of adjacent channels vectorize."""
+
+    if MASK_CHAN:
+        return tl.load(ptrs, mask=chan_mask, other=0.0).to(tl.float32)
+    return tl.load(ptrs).to(tl.float32)
+
+
+@triton.jit
+def _conv_backward_d_acc(d_silu, x0, x1, x2, x3, w0, w1, w2, w3, K_W: tl.constexpr):
+    """``d_silu * silu'(acc)`` of one token; ``x_m`` is input row ``t - (K_W - 1) + m``."""
+
+    acc = w0 * x0
+    if K_W > 1:
+        acc += w1 * x1
+    if K_W > 2:
+        acc += w2 * x2
+    if K_W > 3:
+        acc += w3 * x3
+    # sigmoid(acc) as rsqrt(1 + exp(-acc)) ** 2: two cheap instructions instead of an
+    # IEEE division per element. The difference is a few fp32 ulp, far below the bf16
+    # rounding of the result.
+    rsqrt = tl.rsqrt(1.0 + tl.exp(-acc))
+    sig = rsqrt * rsqrt
+    return d_silu * (sig * (1.0 + acc * (1.0 - sig)))
+
+
+@triton.jit
+def _conv_backward_row_seq_id(
+    seq_idx_ptr, row, seq_len, first_seq_id, virtual_row_begin, IS_PACKED: tl.constexpr
+):
+    """Sequence id of one conv row, or -1 when the row holds no token.
+
+    Rows ``[0, seq_len)`` are local tokens. Rows ``[virtual_row_begin, 0)`` are the
+    left-boundary tokens that belong to the sequence of local token 0; every other row
+    is outside the local shard and its sequence.
+    """
+
+    is_local = (row >= 0) & (row < seq_len)
+    is_virtual = (row < 0) & (row >= virtual_row_begin)
+    if IS_PACKED:
+        safe_row = tl.minimum(tl.maximum(row, 0), seq_len - 1)
+        local_seq_id = tl.load(seq_idx_ptr + safe_row).to(tl.int32)
+    else:
+        local_seq_id = (row * 0).to(tl.int32)
+    local_flag = is_local.to(tl.int32)
+    virtual_flag = is_virtual.to(tl.int32)
+    # The two flags are exclusive, so the last two terms contribute -1 exactly when
+    # neither is set.
+    seq_id = local_flag * local_seq_id + virtual_flag * first_seq_id + (local_flag + virtual_flag)
+    return (seq_id - 1).to(tl.int32)
+
+
+@triton.autotune(
+    configs=_conv_backward_autotune_configs(),
+    key=["seq_len", "num_chan", "K_W", "HAS_LEFT_BOUNDARY", "IS_PACKED", "UNIT_CHAN_STRIDE"],
+    # Every autotune trial atomic-adds into the weight-gradient accumulator.
+    reset_to_zero=["d_weight_accum_ptr"],
+)
+@triton.jit
+def _conv_silu_backward_kernel(
+    qkvzba_ptr,
+    weight_ptr,
+    d_silu_ptr,
+    d_qkvzba_ptr,
+    d_weight_accum_ptr,
+    left_boundary_ptr,
+    d_left_boundary_ptr,
+    seq_idx_ptr,
+    cu_seqlens_ptr,
+    seq_len,
+    num_chan,
+    chan_offset,
+    num_packed_seqs,
+    global_token_offset,
+    global_seq_len,
+    qkvzba_s_stride,
+    qkvzba_b_stride,
+    qkvzba_c_stride,
+    weight_c_stride,
+    weight_w_stride,
+    d_silu_b_stride,
+    d_silu_s_stride,
+    d_silu_c_stride,
+    d_qkvzba_s_stride,
+    d_qkvzba_b_stride,
+    d_qkvzba_c_stride,
+    d_weight_accum_c_stride,
+    d_weight_accum_w_stride,
+    left_boundary_s_stride,
+    left_boundary_b_stride,
+    left_boundary_c_stride,
+    d_left_boundary_s_stride,
+    d_left_boundary_b_stride,
+    d_left_boundary_c_stride,
+    K_W: tl.constexpr,
+    HAS_LEFT_BOUNDARY: tl.constexpr,
+    IS_PACKED: tl.constexpr,
+    UNIT_CHAN_STRIDE: tl.constexpr,
+    CHAN_MULTIPLE: tl.constexpr,
+    BLOCK_C: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+):
+    """Channel-last backward of depthwise causal conv1d + SiLU.
+
+    Grid layout (program_id): 0 = channel block, 1 = token block, 2 = batch.
+
+    Each program owns ``BLOCK_T`` tokens of ``BLOCK_C`` channels and walks them from the
+    last token to the first, so every input row, upstream-gradient row and output row
+    is read or written once. The conv pre-activation gradient of the ``K_W - 1``
+    following tokens and the ``K_W - 1`` preceding input rows stay in registers:
+
+        acc[t]    = sum_m w[m] * x[t - (K_W - 1) + m]
+        d_acc[t]  = d_silu[t] * silu'(acc[t])
+        d_x[r]    = sum_l w[K_W - 1 - l] * d_acc[r + l]
+        d_w[m]    = sum_t d_acc[t] * x[t - (K_W - 1) + m]
+
+    A tap only contributes when both rows belong to the same packed sequence. With
+    ``HAS_LEFT_BOUNDARY`` the rows ``[-(K_W - 1), 0)`` are the previous context-parallel
+    rank's last tokens: they feed ``acc`` and ``d_w``, and their ``d_x`` is written to
+    ``d_left_boundary`` by the program that owns token 0.
+
+    Two scans implement this. Token blocks whose whole conv window lies inside one
+    sequence of the local shard (almost all of them) take the lean one: no row or
+    sequence checks, and, when ``BLOCK_C`` divides the channel count, unmasked loads and
+    stores. It needs unit channel strides (``UNIT_CHAN_STRIDE``). All other blocks (the
+    first one, blocks crossing a document boundary, the left-boundary rows) take the
+    checked scan.
+
+    ``weight_ptr``, ``d_weight_accum_ptr`` and ``d_silu_ptr`` are indexed by the channel
+    within this launch; ``qkvzba``, ``d_qkvzba`` and the boundary tensors by
+    ``chan_offset`` + that channel. ``CHAN_MULTIPLE`` is a power of two that divides
+    ``num_chan``. Supports ``K_W <= 4``.
+    """
+
+    pid_c = tl.program_id(0)
+    # 64-bit row and batch indices: every element offset below is a product with a stride, and
+    # ``row * stride`` passes 2**31 on long sequences.
+    pid_t = tl.program_id(1).to(tl.int64)
+    batch_id = tl.program_id(2).to(tl.int64)
+
+    local_chan = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
+    chan_mask = local_chan < num_chan
+    chan = chan_offset + local_chan
+
+    t_begin = pid_t * BLOCK_T
+    t_end = tl.minimum(t_begin + BLOCK_T, seq_len)
+    # Last token whose d_acc reaches a row owned by this program.
+    t_top = tl.minimum(t_end + (K_W - 1), seq_len) - 1
+    t_low = t_begin
+    zero = (pid_t * 0).to(tl.int32)
+    first_seq_id = zero
+    # No row below 0 holds a token unless a left boundary is attached.
+    virtual_row_begin = zero
+    if IS_PACKED:
+        first_seq_id = tl.load(seq_idx_ptr).to(tl.int32)
+    if HAS_LEFT_BOUNDARY:
+        # The program that owns token 0 also produces the boundary rows' gradient.
+        t_low = t_begin - (K_W - 1) * (pid_t == 0).to(tl.int32)
+        if IS_PACKED:
+            first_seq_start, first_seq_end = _thd_seq_bounds(
+                cu_seqlens_ptr, global_token_offset, global_seq_len, num_packed_seqs
+            )
+            virtual_row_begin = (first_seq_start - global_token_offset).to(tl.int32)
+        else:
+            virtual_row_begin = zero - (K_W - 1)
+
+    # w_m multiplies input row t - (K_W - 1) + m; wr_l multiplies d_acc[r + l].
+    w0 = tl.load(weight_ptr + local_chan * weight_c_stride, mask=chan_mask, other=0.0).to(
+        tl.float32
+    )
+    w1 = w0
+    w2 = w0
+    w3 = w0
+    wr0 = tl.load(
+        weight_ptr + local_chan * weight_c_stride + (K_W - 1) * weight_w_stride,
+        mask=chan_mask,
+        other=0.0,
+    ).to(tl.float32)
+    wr1 = wr0
+    wr2 = wr0
+    wr3 = wr0
+    if K_W > 1:
+        w1 = tl.load(
+            weight_ptr + local_chan * weight_c_stride + weight_w_stride, mask=chan_mask, other=0.0
+        ).to(tl.float32)
+        wr1 = tl.load(
+            weight_ptr + local_chan * weight_c_stride + (K_W - 2) * weight_w_stride,
+            mask=chan_mask,
+            other=0.0,
+        ).to(tl.float32)
+    if K_W > 2:
+        w2 = tl.load(
+            weight_ptr + local_chan * weight_c_stride + 2 * weight_w_stride,
+            mask=chan_mask,
+            other=0.0,
+        ).to(tl.float32)
+        wr2 = tl.load(
+            weight_ptr + local_chan * weight_c_stride + (K_W - 3) * weight_w_stride,
+            mask=chan_mask,
+            other=0.0,
+        ).to(tl.float32)
+    if K_W > 3:
+        w3 = tl.load(
+            weight_ptr + local_chan * weight_c_stride + 3 * weight_w_stride,
+            mask=chan_mask,
+            other=0.0,
+        ).to(tl.float32)
+        wr3 = tl.load(weight_ptr + local_chan * weight_c_stride, mask=chan_mask, other=0.0).to(
+            tl.float32
+        )
+
+    d_w0 = tl.zeros([BLOCK_C], dtype=tl.float32)
+    d_w1 = tl.zeros([BLOCK_C], dtype=tl.float32)
+    d_w2 = tl.zeros([BLOCK_C], dtype=tl.float32)
+    d_w3 = tl.zeros([BLOCK_C], dtype=tl.float32)
+
+    # Whether rows [t_low - (K_W - 1), t_top], i.e. every row this program reads, are
+    # local tokens of one sequence. Sequence ids are non-decreasing along the tokens, so
+    # comparing the two ends is enough.
+    first_row = t_low - (K_W - 1)
+    is_uniform = first_row >= 0
+    if IS_PACKED:
+        first_row_seq_id = tl.load(seq_idx_ptr + tl.maximum(first_row, 0))
+        is_uniform = is_uniform & (first_row_seq_id == tl.load(seq_idx_ptr + t_top))
+    if not UNIT_CHAN_STRIDE:
+        is_uniform = is_uniform & (pid_t < 0)
+
+    if is_uniform:
+        # --- lean scan: no row, sequence or boundary checks ---
+        x_ptrs = qkvzba_ptr + batch_id * qkvzba_b_stride + chan
+        d_silu_ptrs = d_silu_ptr + batch_id * d_silu_b_stride + local_chan
+        d_x_ptrs = d_qkvzba_ptr + batch_id * d_qkvzba_b_stride + chan
+        u1 = tl.zeros([BLOCK_C], dtype=tl.float32)
+        u2 = tl.zeros([BLOCK_C], dtype=tl.float32)
+        u3 = tl.zeros([BLOCK_C], dtype=tl.float32)
+        h1 = tl.zeros([BLOCK_C], dtype=tl.float32)
+        h2 = tl.zeros([BLOCK_C], dtype=tl.float32)
+        h3 = tl.zeros([BLOCK_C], dtype=tl.float32)
+
+        # Tokens after the owned block. The first K_W - 1 iterations only fill the
+        # input-row history; the others produce the d_acc that reaches owned rows.
+        num_halo_iters = t_top + (K_W - 1) - t_end + 1
+        for it in range(0, num_halo_iters):
+            t = t_top + (K_W - 1) - it
+            u0 = _conv_backward_load_row(
+                x_ptrs + (t - (K_W - 1)) * qkvzba_s_stride, chan_mask, BLOCK_C > CHAN_MULTIPLE
+            )
+            d_silu = _conv_backward_load_row(
+                d_silu_ptrs + tl.minimum(t, t_top) * d_silu_s_stride,
+                chan_mask,
+                BLOCK_C > CHAN_MULTIPLE,
+            )
+            h0 = _conv_backward_d_acc(d_silu, u0, u1, u2, u3, w0, w1, w2, w3, K_W)
+            h0 = h0 * (t <= t_top).to(tl.float32)
+            u3 = u2
+            u2 = u1
+            u1 = u0
+            h3 = h2
+            h2 = h1
+            h1 = h0
+
+        # Owned tokens, last to first: every row is an output of this program.
+        for it in range(0, t_end - t_begin):
+            t = t_end - 1 - it
+            u0 = _conv_backward_load_row(
+                x_ptrs + (t - (K_W - 1)) * qkvzba_s_stride, chan_mask, BLOCK_C > CHAN_MULTIPLE
+            )
+            d_silu = _conv_backward_load_row(
+                d_silu_ptrs + t * d_silu_s_stride, chan_mask, BLOCK_C > CHAN_MULTIPLE
+            )
+            h0 = _conv_backward_d_acc(d_silu, u0, u1, u2, u3, w0, w1, w2, w3, K_W)
+
+            d_w0 += h0 * u0
+            if K_W > 1:
+                d_w1 += h0 * u1
+            if K_W > 2:
+                d_w2 += h0 * u2
+            if K_W > 3:
+                d_w3 += h0 * u3
+
+            d_x = wr0 * h0
+            if K_W > 1:
+                d_x += wr1 * h1
+            if K_W > 2:
+                d_x += wr2 * h2
+            if K_W > 3:
+                d_x += wr3 * h3
+            d_x = d_x.to(d_qkvzba_ptr.dtype.element_ty)
+            if BLOCK_C > CHAN_MULTIPLE:
+                tl.store(d_x_ptrs + t * d_qkvzba_s_stride, d_x, mask=chan_mask)
+            else:
+                tl.store(d_x_ptrs + t * d_qkvzba_s_stride, d_x)
+
+            u3 = u2
+            u2 = u1
+            u1 = u0
+            h3 = h2
+            h2 = h1
+            h1 = h0
+    else:
+        # --- checked scan: rows outside the shard, document and CP boundaries ---
+        # Input rows loaded 1, 2 and 3 iterations ago, with their sequence ids.
+        x1 = tl.zeros([BLOCK_C], dtype=tl.float32)
+        x2 = tl.zeros([BLOCK_C], dtype=tl.float32)
+        x3 = tl.zeros([BLOCK_C], dtype=tl.float32)
+        x1_seq_id = zero - 1
+        x2_seq_id = zero - 1
+        x3_seq_id = zero - 1
+        # d_acc of tokens t + 1, t + 2 and t + 3, with their sequence ids.
+        g1 = tl.zeros([BLOCK_C], dtype=tl.float32)
+        g2 = tl.zeros([BLOCK_C], dtype=tl.float32)
+        g3 = tl.zeros([BLOCK_C], dtype=tl.float32)
+        g1_seq_id = zero - 1
+        g2_seq_id = zero - 1
+        g3_seq_id = zero - 1
+
+        # The first K_W - 1 iterations only fill the input-row history for token t_top.
+        num_iters = t_top + (K_W - 1) - t_low + 1
+        for it in range(0, num_iters):
+            t = t_top + (K_W - 1) - it
+            row = t - (K_W - 1)
+
+            # --- newest input row: local token, left-boundary token, or nothing ---
+            x0_seq_id = _conv_backward_row_seq_id(
+                seq_idx_ptr, row, seq_len, first_seq_id, virtual_row_begin, IS_PACKED
+            )
+            row_is_local = (row >= 0) & (row < seq_len)
+            safe_row = tl.minimum(tl.maximum(row, 0), seq_len - 1)
+            x0 = tl.load(
+                qkvzba_ptr
+                + safe_row * qkvzba_s_stride
+                + batch_id * qkvzba_b_stride
+                + chan * qkvzba_c_stride,
+                mask=chan_mask & row_is_local,
+                other=0.0,
+            ).to(tl.float32)
+            if HAS_LEFT_BOUNDARY:
+                boundary_row = row + (K_W - 1)
+                row_is_boundary = (row < 0) & (boundary_row >= 0)
+                safe_boundary_row = tl.minimum(tl.maximum(boundary_row, 0), K_W - 2)
+                # The two masks are exclusive and masked loads return zero.
+                x0 += tl.load(
+                    left_boundary_ptr
+                    + safe_boundary_row * left_boundary_s_stride
+                    + batch_id * left_boundary_b_stride
+                    + chan * left_boundary_c_stride,
+                    mask=chan_mask & row_is_boundary,
+                    other=0.0,
+                ).to(tl.float32)
+
+            t_seq_id = _conv_backward_row_seq_id(
+                seq_idx_ptr, t, seq_len, first_seq_id, virtual_row_begin, IS_PACKED
+            )
+            t_is_output = (t >= 0) & (t <= t_top)
+            t_is_owned = (t >= t_begin) & (t < t_end)
+            safe_t = tl.minimum(tl.maximum(t, 0), seq_len - 1)
+
+            # --- conv pre-activation of token t from same-sequence taps ---
+            tap0 = tl.where(chan_mask & (x0_seq_id == t_seq_id), x0, 0.0)
+            acc = w0 * tap0
+            if K_W > 1:
+                tap1 = tl.where(chan_mask & (x1_seq_id == t_seq_id), x1, 0.0)
+                acc += w1 * tap1
+            if K_W > 2:
+                tap2 = tl.where(chan_mask & (x2_seq_id == t_seq_id), x2, 0.0)
+                acc += w2 * tap2
+            if K_W > 3:
+                tap3 = tl.where(chan_mask & (x3_seq_id == t_seq_id), x3, 0.0)
+                acc += w3 * tap3
+
+            d_silu = tl.load(
+                d_silu_ptr
+                + batch_id * d_silu_b_stride
+                + safe_t * d_silu_s_stride
+                + local_chan * d_silu_c_stride,
+                mask=chan_mask & t_is_output,
+                other=0.0,
+            ).to(tl.float32)
+            sig = tl.sigmoid(acc)
+            # Zero for rows that are not conv outputs of this shard (masked d_silu).
+            g0 = d_silu * (sig * (1.0 + acc * (1.0 - sig)))
+
+            # --- weight gradient: every token is accumulated by its owner only ---
+            g_owned = tl.where(chan_mask & t_is_owned, g0, 0.0)
+            d_w0 += g_owned * tap0
+            if K_W > 1:
+                d_w1 += g_owned * tap1
+            if K_W > 2:
+                d_w2 += g_owned * tap2
+            if K_W > 3:
+                d_w3 += g_owned * tap3
+
+            # --- input gradient of row t from tokens t .. t + K_W - 1 ---
+            d_x = wr0 * g0
+            if K_W > 1:
+                d_x += wr1 * tl.where(chan_mask & (g1_seq_id == t_seq_id), g1, 0.0)
+            if K_W > 2:
+                d_x += wr2 * tl.where(chan_mask & (g2_seq_id == t_seq_id), g2, 0.0)
+            if K_W > 3:
+                d_x += wr3 * tl.where(chan_mask & (g3_seq_id == t_seq_id), g3, 0.0)
+
+            tl.store(
+                d_qkvzba_ptr
+                + safe_t * d_qkvzba_s_stride
+                + batch_id * d_qkvzba_b_stride
+                + chan * d_qkvzba_c_stride,
+                d_x.to(d_qkvzba_ptr.dtype.element_ty),
+                mask=chan_mask & t_is_owned,
+            )
+            if HAS_LEFT_BOUNDARY:
+                safe_boundary_t = tl.minimum(tl.maximum(t + (K_W - 1), 0), K_W - 2)
+                tl.store(
+                    d_left_boundary_ptr
+                    + safe_boundary_t * d_left_boundary_s_stride
+                    + batch_id * d_left_boundary_b_stride
+                    + chan * d_left_boundary_c_stride,
+                    d_x.to(d_left_boundary_ptr.dtype.element_ty),
+                    mask=chan_mask & (t < 0),
+                )
+
+            x3 = x2
+            x2 = x1
+            x1 = x0
+            x3_seq_id = x2_seq_id
+            x2_seq_id = x1_seq_id
+            x1_seq_id = x0_seq_id
+            g3 = g2
+            g2 = g1
+            g1 = g0
+            g3_seq_id = g2_seq_id
+            g2_seq_id = g1_seq_id
+            g1_seq_id = t_seq_id
+
+    d_weight_ptrs = d_weight_accum_ptr + local_chan * d_weight_accum_c_stride
+    tl.atomic_add(d_weight_ptrs, d_w0, mask=chan_mask)
+    if K_W > 1:
+        tl.atomic_add(d_weight_ptrs + d_weight_accum_w_stride, d_w1, mask=chan_mask)
+    if K_W > 2:
+        tl.atomic_add(d_weight_ptrs + 2 * d_weight_accum_w_stride, d_w2, mask=chan_mask)
+    if K_W > 3:
+        tl.atomic_add(d_weight_ptrs + 3 * d_weight_accum_w_stride, d_w3, mask=chan_mask)
+
+
 @triton.autotune(
     configs=_g_beta_autotune_configs(),
     key=["seq_len", "num_v_heads"],
@@ -1458,6 +1922,136 @@ def _triton_conv_silu_boundary_backward(
         num_stages=2,
     )
     return d_left_boundary
+
+
+def _triton_conv_silu_backward(
+    qkvzba: Tensor,
+    conv1d_weight: Tensor,
+    d_silu: Tensor,
+    d_qkvzba: Tensor,
+    d_weight_accum: Tensor,
+    *,
+    chan_offset: int,
+    seq_idx: Optional[Tensor] = None,
+    left_boundary: Optional[Tensor] = None,
+    d_left_boundary: Optional[Tensor] = None,
+    cu_seqlens: Optional[Tensor] = None,
+    global_token_offset: int = 0,
+    global_seq_len: Optional[int] = None,
+    stream: Optional["torch.cuda.Stream"] = None,
+) -> None:
+    """Launch the channel-last conv + SiLU backward for one channel range.
+
+    Args:
+        qkvzba: ``[seq_len, batch, channels]`` forward input.
+        conv1d_weight: ``[conv_dim, 1, k_w]`` depthwise conv weight.
+        d_silu: ``[batch, seq_len, num_chan]`` gradient of ``silu(conv(x))`` for the
+            channels ``[chan_offset, chan_offset + num_chan)``. Any strides.
+        d_qkvzba: ``[seq_len, batch, channels]`` output; this launch stores the channel
+            range's conv input gradient.
+        d_weight_accum: ``[conv_dim, k_w]`` fp32 accumulator, zero-initialized by the
+            caller; this launch adds the channel range's weight gradient.
+        chan_offset: First conv channel of this launch.
+        seq_idx: ``[1, seq_len]`` int32 token-to-sequence map for packed THD input.
+        left_boundary: ``[k_w - 1, batch, conv_dim]`` previous-rank tokens under
+            chunkwise context parallelism.
+        d_left_boundary: Output with the shape of ``left_boundary``; required with it.
+        cu_seqlens: Global packed boundaries; required when both ``seq_idx`` and
+            ``left_boundary`` are given.
+        global_token_offset: Global index of local token 0.
+        global_seq_len: Global token count; defaults to the local ``seq_len``.
+        stream: Optional side stream for the launch.
+    """
+
+    seq_len, batch, _ = qkvzba.shape
+    k_w = conv1d_weight.shape[-1]
+    num_chan = d_silu.shape[2]
+    assert (
+        k_w <= _CONV_BACKWARD_MAX_KERNEL_WIDTH
+    ), f"Channel-last conv backward supports conv kernel width <= 4; got {k_w}."
+    assert d_silu.shape[0] == batch and d_silu.shape[1] == seq_len, (
+        "d_silu must be [batch, seq_len, num_chan]; "
+        f"got {tuple(d_silu.shape)} for {batch=} and {seq_len=}."
+    )
+
+    # Slice the per-channel tensors so the launch (and the autotuner's reset of the
+    # accumulator) only touches its own channel range.
+    weight_2d = conv1d_weight.view(conv1d_weight.shape[0], k_w)[
+        chan_offset : chan_offset + num_chan
+    ]
+    d_weight_accum = d_weight_accum[chan_offset : chan_offset + num_chan]
+
+    has_left_boundary = left_boundary is not None
+    is_packed = seq_idx is not None
+    if has_left_boundary:
+        assert d_left_boundary is not None, "left_boundary requires d_left_boundary."
+        assert not is_packed or cu_seqlens is not None, (
+            "Packed chunkwise CP conv backward requires the global cu_seqlens to mask "
+            "left-boundary taps."
+        )
+    num_packed_seqs = cu_seqlens.shape[0] - 1 if cu_seqlens is not None else 0
+    if global_seq_len is None:
+        global_seq_len = seq_len
+    # Unused pointer arguments still need a tensor; the constexpr flags keep the kernel
+    # from reading them.
+    left_boundary_arg = left_boundary if has_left_boundary else qkvzba
+    d_left_boundary_arg = d_left_boundary if has_left_boundary else qkvzba
+    seq_idx_arg = seq_idx if is_packed else qkvzba
+    cu_seqlens_arg = cu_seqlens if cu_seqlens is not None else qkvzba
+
+    # The lean scan indexes channels without a stride; in the fused path all three
+    # tensors are channel-last with unit stride.
+    unit_chan_stride = qkvzba.stride(2) == 1 and d_silu.stride(2) == 1 and d_qkvzba.stride(2) == 1
+    # Largest power of two dividing num_chan: channel blocks up to this size need no mask.
+    chan_multiple = num_chan & -num_chan
+
+    grid = lambda meta: (
+        triton.cdiv(num_chan, meta["BLOCK_C"]),
+        triton.cdiv(seq_len, meta["BLOCK_T"]),
+        batch,
+    )
+    with _launch_context(qkvzba.device, stream):
+        _conv_silu_backward_kernel[grid](
+            qkvzba,
+            weight_2d,
+            d_silu,
+            d_qkvzba,
+            d_weight_accum,
+            left_boundary_arg,
+            d_left_boundary_arg,
+            seq_idx_arg,
+            cu_seqlens_arg,
+            seq_len,
+            num_chan,
+            chan_offset,
+            num_packed_seqs,
+            global_token_offset,
+            global_seq_len,
+            qkvzba.stride(0),
+            qkvzba.stride(1),
+            qkvzba.stride(2),
+            weight_2d.stride(0),
+            weight_2d.stride(1),
+            d_silu.stride(0),
+            d_silu.stride(1),
+            d_silu.stride(2),
+            d_qkvzba.stride(0),
+            d_qkvzba.stride(1),
+            d_qkvzba.stride(2),
+            d_weight_accum.stride(0),
+            d_weight_accum.stride(1),
+            left_boundary_arg.stride(0),
+            left_boundary_arg.stride(1),
+            left_boundary_arg.stride(2),
+            d_left_boundary_arg.stride(0),
+            d_left_boundary_arg.stride(1),
+            d_left_boundary_arg.stride(2),
+            K_W=k_w,
+            HAS_LEFT_BOUNDARY=has_left_boundary,
+            IS_PACKED=is_packed,
+            UNIT_CHAN_STRIDE=unit_chan_stride,
+            CHAN_MULTIPLE=chan_multiple,
+        )
 
 
 def _triton_g_beta_backward(
@@ -2179,52 +2773,30 @@ def _triton_pre_gated_delta_rule_forward(
     )
 
 
-def _triton_pre_gated_delta_rule_backward(
+def _causal_conv1d_conv_silu_backward(
     qkvzba: Tensor,
     conv1d_weight: Tensor,
-    silu_qk_save: Tensor,
-    dq: Tensor,
-    dk: Tensor,
-    dv: Tensor,
-    dgate: Tensor,
-    dbeta: Tensor,
-    dg: Tensor,
-    A_log: Tensor,
-    dt_bias: Tensor,
+    d_silu_conv: Tensor,
+    d_qkvzba: Tensor,
     *,
-    num_key_heads: int,
-    num_value_heads: int,
-    key_head_dim: int,
-    value_head_dim: int,
-    seq_idx: Optional[Tensor] = None,
-    left_boundary: Optional[Tensor] = None,
-    cu_seqlens: Optional[Tensor] = None,
-    global_token_offset: int = 0,
-    global_seq_len: Optional[int] = None,
-    cp_group=None,
-) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
-    """Triton-backed backward for the pre-gated-delta-rule front-end.
+    seq_idx: Optional[Tensor],
+    left_boundary: Optional[Tensor],
+    cu_seqlens: Optional[Tensor],
+    global_token_offset: int,
+    global_seq_len: int,
+    qk_stream: "torch.cuda.Stream",
+    v_stream: "torch.cuda.Stream",
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """Conv + SiLU backward through the causal-conv1d package.
 
-    Mirror of :func:`_triton_pre_gated_delta_rule_forward`. Takes upstream
-    gradients (``dq``/``dk``/``dv``/``dgate``/``dbeta``/``dg``) plus the
-    saved forward intermediates and returns input/parameter gradients
-    ``(d_qkvzba, d_weight, d_A_log, d_dt_bias, d_left_boundary)``. The
-    last element is ``None`` unless chunkwise CP supplied a left boundary.
-
-    The hand-tuned C++ ``causal_conv1d_bwd_function`` computes the main
-    conv+SiLU input and weight gradients. Chunkwise CP passes the left boundary as
-    causal-conv initial states for the main backward and uses a tiny Triton
-    kernel only for the left-boundary gradient that must be sent to the previous
-    CP rank.
+    ``d_silu_conv`` is the ``(batch, conv_dim, seq_len)`` channel-last gradient of
+    ``silu(conv(x))`` that the side streams filled. Stores the conv input gradient into
+    ``d_qkvzba`` and returns ``(d_weight_accum, d_left_boundary)``.
     """
 
     seq_len, batch, _ = qkvzba.shape
-    qk_channels = num_key_heads * key_head_dim
-    v_channels = num_value_heads * value_head_dim
-    conv_dim = 2 * qk_channels + v_channels
-    z_offset = 2 * qk_channels + v_channels
+    conv_dim = conv1d_weight.shape[0]
     k_w = conv1d_weight.shape[-1]
-    device = qkvzba.device
 
     # Rebuild the conv input as a NON-contiguous (b, c, s) view of qkvzba.
     # ``causal_conv1d_fn`` / ``_bwd_function`` accept inputs where either
@@ -2234,92 +2806,12 @@ def _triton_pre_gated_delta_rule_backward(
     qkvzba_conv = qkvzba[:, :, :conv_dim].permute(1, 2, 0)
     weight_2d = conv1d_weight.view(conv1d_weight.shape[0], k_w)
     initial_states = None if left_boundary is None else left_boundary.permute(1, 2, 0)
-    if global_seq_len is None:
-        global_seq_len = seq_len
-
-    # ``silu_qk_save`` is the (b, 2*qk_channels, s) bf16 buffer the
-    # forward wrote ``silu(conv(x))`` into for QK. Reuse it directly as
-    # the silu input to the l2norm backward.
-    silu_conv = silu_qk_save
-
-    # Allocate d_silu_conv channel-last (stride(1)==1) — that's what
-    # ``causal_conv1d_channellast_bwd_kernel`` consumes natively.
-    d_silu_conv = torch.empty(
-        (batch, seq_len, conv_dim), dtype=qkvzba.dtype, device=device
-    ).permute(0, 2, 1)
-
-    # Use the same stream slots as the forward for the matching scopes.
-    qk_stream = _get_side_stream(device, slot=_QK_STREAM_SLOT)
-    v_stream = _get_side_stream(device, slot=_V_STREAM_SLOT)
-    g_beta_stream = _get_side_stream(device, slot=_G_BETA_STREAM_SLOT)
-    z_stream = _get_side_stream(device, slot=_Z_STREAM_SLOT)
-
-    # Q + K: l2norm + REPEAT backward writes into d_silu_conv's Q/K slices.
-    _triton_qk_l2norm_repeat_backward(
-        dq,
-        dk,
-        silu_conv,
-        d_silu_conv,
-        num_key_heads=num_key_heads,
-        num_value_heads=num_value_heads,
-        key_head_dim=key_head_dim,
-        stream=qk_stream,
-    )
-
-    # V: no l2norm and no REPEAT in forward, so d_silu_conv's V slice is
-    # just dv re-laid-out from (b, s, num_v_heads, value_head_dim) to
-    # (b, v_channels, s).
-    _triton_v_layout_to_conv(
-        dv,
-        d_silu_conv,
-        v_channel_offset=2 * qk_channels,
-        num_value_heads=num_value_heads,
-        value_head_dim=value_head_dim,
-        stream=v_stream,
-    )
-
-    d_qkvzba = torch.empty_like(qkvzba)
-    overlap_boundary_grad_exchange = cp_group is not None and k_w > 1
-    d_A_log_fp32: Optional[Tensor] = None
-    d_dt_bias_fp32: Optional[Tensor] = None
-
-    def _launch_g_beta_and_z_backward() -> Tuple[Tensor, Tensor]:
-        # g + beta backward fully stores d_qkvzba's alpha + beta slices, plus
-        # per-head d_A_log / d_dt_bias. Conv and z slices are filled by the
-        # causal-conv and z kernels, so d_qkvzba does not need a pre-zero.
-        _, d_A_log_fp32, d_dt_bias_fp32 = _triton_g_beta_backward(
-            qkvzba,
-            A_log,
-            dt_bias,
-            dg,
-            dbeta,
-            num_value_heads=num_value_heads,
-            key_head_dim=key_head_dim,
-            value_head_dim=value_head_dim,
-            num_key_heads=num_key_heads,
-            d_qkvzba_out=d_qkvzba,
-            stream=g_beta_stream,
-        )
-
-        # Z slice gradient: stream dgate into d_qkvzba's z slice.
-        _triton_z_layout_to_qkvzba(
-            dgate,
-            d_qkvzba,
-            z_channel_offset=z_offset,
-            num_value_heads=num_value_heads,
-            value_head_dim=value_head_dim,
-            stream=z_stream,
-        )
-        return d_A_log_fp32, d_dt_bias_fp32
-
-    if not overlap_boundary_grad_exchange:
-        d_A_log_fp32, d_dt_bias_fp32 = _launch_g_beta_and_z_backward()
 
     # Join only streams that wrote into d_silu_conv before conv backward.
     # g/beta and z write disjoint outputs: non-CP launches them above to overlap
     # with conv backward, while chunkwise CP delays them below to overlap with
     # boundary-gradient P2P.
-    default_stream = torch.cuda.current_stream(device)
+    default_stream = torch.cuda.current_stream(qkvzba.device)
     _wait_for_streams(default_stream, qk_stream, v_stream)
 
     # Pre-allocate d_x_conv as a strided view INTO d_qkvzba's conv slice.
@@ -2369,6 +2861,245 @@ def _triton_pre_gated_delta_rule_backward(
             global_token_offset=global_token_offset,
             global_seq_len=global_seq_len,
             apply_main_correction=apply_boundary_correction,
+        )
+    return d_weight_accum, d_left_boundary
+
+
+def _triton_conv_silu_backward_qk_v(
+    qkvzba: Tensor,
+    conv1d_weight: Tensor,
+    d_silu_qk: Tensor,
+    dv: Tensor,
+    d_qkvzba: Tensor,
+    *,
+    qk_channels: int,
+    v_channels: int,
+    seq_idx: Optional[Tensor],
+    left_boundary: Optional[Tensor],
+    cu_seqlens: Optional[Tensor],
+    global_token_offset: int,
+    global_seq_len: int,
+    qk_stream: "torch.cuda.Stream",
+    v_stream: "torch.cuda.Stream",
+) -> Tuple[Tensor, Optional[Tensor]]:
+    """Conv + SiLU backward with the channel-last Triton kernel.
+
+    The QK channels run on ``qk_stream`` behind the l2norm backward that fills
+    ``d_silu_qk`` (``(batch, 2 * qk_channels, seq_len)``, channel-last storage). The V
+    channels run on ``v_stream`` and read ``dv`` directly: its
+    ``(batch, seq_len, num_v_heads, value_head_dim)`` layout already is channel-last,
+    so no layout conversion is needed. Both launches store disjoint channel ranges of
+    ``d_qkvzba``, of the fp32 weight accumulator and of the left-boundary gradient.
+
+    Returns ``(d_weight_accum, d_left_boundary)``; the caller joins the two streams.
+    """
+
+    seq_len, batch, _ = qkvzba.shape
+    conv_dim = conv1d_weight.shape[0]
+    k_w = conv1d_weight.shape[-1]
+    device = qkvzba.device
+
+    d_weight_accum = torch.zeros((conv_dim, k_w), dtype=torch.float32, device=device)
+    d_left_boundary = None if left_boundary is None else torch.empty_like(left_boundary)
+    # A view when dv is contiguous over (head, head_dim), as the gated delta rule
+    # backward returns it; otherwise a contiguous copy.
+    d_silu_v = dv.reshape(batch, seq_len, v_channels)
+
+    for d_silu, chan_offset, stream in (
+        (d_silu_qk.permute(0, 2, 1), 0, qk_stream),
+        (d_silu_v, 2 * qk_channels, v_stream),
+    ):
+        _triton_conv_silu_backward(
+            qkvzba,
+            conv1d_weight,
+            d_silu,
+            d_qkvzba,
+            d_weight_accum,
+            chan_offset=chan_offset,
+            seq_idx=seq_idx,
+            left_boundary=left_boundary,
+            d_left_boundary=d_left_boundary,
+            cu_seqlens=cu_seqlens,
+            global_token_offset=global_token_offset,
+            global_seq_len=global_seq_len,
+            stream=stream,
+        )
+    return d_weight_accum, d_left_boundary
+
+
+def _triton_pre_gated_delta_rule_backward(
+    qkvzba: Tensor,
+    conv1d_weight: Tensor,
+    silu_qk_save: Tensor,
+    dq: Tensor,
+    dk: Tensor,
+    dv: Tensor,
+    dgate: Tensor,
+    dbeta: Tensor,
+    dg: Tensor,
+    A_log: Tensor,
+    dt_bias: Tensor,
+    *,
+    num_key_heads: int,
+    num_value_heads: int,
+    key_head_dim: int,
+    value_head_dim: int,
+    seq_idx: Optional[Tensor] = None,
+    left_boundary: Optional[Tensor] = None,
+    cu_seqlens: Optional[Tensor] = None,
+    global_token_offset: int = 0,
+    global_seq_len: Optional[int] = None,
+    cp_group=None,
+    conv_backward_impl: str = "causal_conv1d",
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, Optional[Tensor]]:
+    """Triton-backed backward for the pre-gated-delta-rule front-end.
+
+    Mirror of :func:`_triton_pre_gated_delta_rule_forward`. Takes upstream
+    gradients (``dq``/``dk``/``dv``/``dgate``/``dbeta``/``dg``) plus the
+    saved forward intermediates and returns input/parameter gradients
+    ``(d_qkvzba, d_weight, d_A_log, d_dt_bias, d_left_boundary)``. The
+    last element is ``None`` unless chunkwise CP supplied a left boundary.
+
+    ``conv_backward_impl`` selects the conv + SiLU backward:
+
+    * ``"triton"``: :func:`_triton_conv_silu_backward` reads ``qkvzba``, the QK
+      l2norm gradient and ``dv`` in their native channel-last layouts and produces the
+      input, weight and left-boundary gradients in one pass per channel range.
+    * ``"causal_conv1d"``: the C++ ``causal_conv1d_bwd_function`` computes the main
+      conv+SiLU input and weight gradients. Chunkwise CP passes the left boundary as
+      causal-conv initial states for the main backward and uses a tiny Triton
+      kernel only for the left-boundary gradient that must be sent to the previous
+      CP rank.
+    """
+
+    seq_len, batch, _ = qkvzba.shape
+    qk_channels = num_key_heads * key_head_dim
+    v_channels = num_value_heads * value_head_dim
+    conv_dim = 2 * qk_channels + v_channels
+    z_offset = 2 * qk_channels + v_channels
+    k_w = conv1d_weight.shape[-1]
+    device = qkvzba.device
+
+    if global_seq_len is None:
+        global_seq_len = seq_len
+
+    # ``silu_qk_save`` is the (b, 2*qk_channels, s) bf16 buffer the
+    # forward wrote ``silu(conv(x))`` into for QK. Reuse it directly as
+    # the silu input to the l2norm backward.
+    silu_conv = silu_qk_save
+
+    use_triton_conv_backward = conv_backward_impl == "triton"
+
+    # Allocate d_silu_conv channel-last (stride(1)==1) — that's what both conv
+    # backward implementations consume natively. The Triton conv backward reads the V
+    # gradient straight from ``dv``, so it only needs the QK channels here.
+    d_silu_channels = 2 * qk_channels if use_triton_conv_backward else conv_dim
+    d_silu_conv = torch.empty(
+        (batch, seq_len, d_silu_channels), dtype=qkvzba.dtype, device=device
+    ).permute(0, 2, 1)
+
+    # Use the same stream slots as the forward for the matching scopes.
+    qk_stream = _get_side_stream(device, slot=_QK_STREAM_SLOT)
+    v_stream = _get_side_stream(device, slot=_V_STREAM_SLOT)
+    g_beta_stream = _get_side_stream(device, slot=_G_BETA_STREAM_SLOT)
+    z_stream = _get_side_stream(device, slot=_Z_STREAM_SLOT)
+
+    # Q + K: l2norm + REPEAT backward writes into d_silu_conv's Q/K slices.
+    _triton_qk_l2norm_repeat_backward(
+        dq,
+        dk,
+        silu_conv,
+        d_silu_conv,
+        num_key_heads=num_key_heads,
+        num_value_heads=num_value_heads,
+        key_head_dim=key_head_dim,
+        stream=qk_stream,
+    )
+
+    if not use_triton_conv_backward:
+        # V: no l2norm and no REPEAT in forward, so d_silu_conv's V slice is
+        # just dv re-laid-out from (b, s, num_v_heads, value_head_dim) to
+        # (b, v_channels, s).
+        _triton_v_layout_to_conv(
+            dv,
+            d_silu_conv,
+            v_channel_offset=2 * qk_channels,
+            num_value_heads=num_value_heads,
+            value_head_dim=value_head_dim,
+            stream=v_stream,
+        )
+
+    d_qkvzba = torch.empty_like(qkvzba)
+    overlap_boundary_grad_exchange = cp_group is not None and k_w > 1
+    d_A_log_fp32: Optional[Tensor] = None
+    d_dt_bias_fp32: Optional[Tensor] = None
+
+    def _launch_g_beta_and_z_backward() -> Tuple[Tensor, Tensor]:
+        # g + beta backward fully stores d_qkvzba's alpha + beta slices, plus
+        # per-head d_A_log / d_dt_bias. Conv and z slices are filled by the
+        # causal-conv and z kernels, so d_qkvzba does not need a pre-zero.
+        _, d_A_log_fp32, d_dt_bias_fp32 = _triton_g_beta_backward(
+            qkvzba,
+            A_log,
+            dt_bias,
+            dg,
+            dbeta,
+            num_value_heads=num_value_heads,
+            key_head_dim=key_head_dim,
+            value_head_dim=value_head_dim,
+            num_key_heads=num_key_heads,
+            d_qkvzba_out=d_qkvzba,
+            stream=g_beta_stream,
+        )
+
+        # Z slice gradient: stream dgate into d_qkvzba's z slice.
+        _triton_z_layout_to_qkvzba(
+            dgate,
+            d_qkvzba,
+            z_channel_offset=z_offset,
+            num_value_heads=num_value_heads,
+            value_head_dim=value_head_dim,
+            stream=z_stream,
+        )
+        return d_A_log_fp32, d_dt_bias_fp32
+
+    if not overlap_boundary_grad_exchange:
+        d_A_log_fp32, d_dt_bias_fp32 = _launch_g_beta_and_z_backward()
+
+    default_stream = torch.cuda.current_stream(device)
+    if use_triton_conv_backward:
+        d_weight_accum, d_left_boundary = _triton_conv_silu_backward_qk_v(
+            qkvzba,
+            conv1d_weight,
+            d_silu_conv,
+            dv,
+            d_qkvzba,
+            qk_channels=qk_channels,
+            v_channels=v_channels,
+            seq_idx=seq_idx,
+            left_boundary=left_boundary,
+            cu_seqlens=cu_seqlens,
+            global_token_offset=global_token_offset,
+            global_seq_len=global_seq_len,
+            qk_stream=qk_stream,
+            v_stream=v_stream,
+        )
+        # The conv launches wrote d_qkvzba's conv slice, the weight accumulator and
+        # the left-boundary gradient on the side streams.
+        _wait_for_streams(default_stream, qk_stream, v_stream)
+    else:
+        d_weight_accum, d_left_boundary = _causal_conv1d_conv_silu_backward(
+            qkvzba,
+            conv1d_weight,
+            d_silu_conv,
+            d_qkvzba,
+            seq_idx=seq_idx,
+            left_boundary=left_boundary,
+            cu_seqlens=cu_seqlens,
+            global_token_offset=global_token_offset,
+            global_seq_len=global_seq_len,
+            qk_stream=qk_stream,
+            v_stream=v_stream,
         )
     d_right_boundary = None
     right_boundary_recv_ops = None
@@ -2436,9 +3167,11 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
         num_value_heads,
         key_head_dim,
         value_head_dim,
+        conv_backward_impl,
     ):
         """Run the fused pre-GDR forward path and stash tensors for backward."""
 
+        ctx.conv_backward_impl = conv_backward_impl
         ctx.num_key_heads = num_key_heads
         ctx.num_value_heads = num_value_heads
         ctx.key_head_dim = key_head_dim
@@ -2556,11 +3289,12 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
                 global_token_offset=ctx.global_token_offset,
                 global_seq_len=ctx.global_seq_len,
                 cp_group=ctx.cp_group if ctx.cp_active else None,
+                conv_backward_impl=ctx.conv_backward_impl,
             )
         )
         # Match forward inputs: (qkvzba, conv1d_weight, A_log, dt_bias,
         # cu_seqlens, seq_idx, cp_group, cp_size, num_key_heads, num_value_heads,
-        # key_head_dim, value_head_dim).
+        # key_head_dim, value_head_dim, conv_backward_impl).
         # Non-tensor args get None.
         return (
             d_qkvzba,
@@ -2575,7 +3309,38 @@ class FusedPreGatedDeltaRuleFunction(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )
+
+
+def _resolve_conv_backward_impl(conv_backward_impl: Optional[str], kernel_width: int) -> str:
+    """Pick the conv + SiLU backward implementation of the fused path.
+
+    An explicit argument wins over the ``MEGATRON_GDN_PRE_GDR_CONV_BACKWARD`` environment
+    variable. Without either, the channel-last Triton kernel is used for the kernel
+    widths it supports and the causal-conv1d package otherwise.
+    """
+
+    requested = conv_backward_impl or os.environ.get(_CONV_BACKWARD_IMPL_ENV) or None
+    triton_supported = kernel_width <= _CONV_BACKWARD_MAX_KERNEL_WIDTH
+    if requested is None:
+        requested = "triton" if triton_supported else "causal_conv1d"
+    if requested not in _CONV_BACKWARD_IMPLS:
+        raise ValueError(
+            f"Unknown pre-GDR conv backward implementation {requested!r}; "
+            f"expected one of {_CONV_BACKWARD_IMPLS}."
+        )
+    if requested == "triton" and not triton_supported:
+        raise ValueError(
+            "The Triton pre-GDR conv backward supports conv kernel width <= "
+            f"{_CONV_BACKWARD_MAX_KERNEL_WIDTH}; got {kernel_width}."
+        )
+    if requested == "causal_conv1d" and causal_conv1d_bwd_function is None:
+        raise ImportError(
+            "The causal_conv1d pre-GDR conv backward requires causal-conv1d. "
+            "Install causal-conv1d~=1.6 in environments that select it."
+        )
+    return requested
 
 
 def fused_streamed_pre_gated_delta_rule(
@@ -2593,6 +3358,7 @@ def fused_streamed_pre_gated_delta_rule(
     cu_seqlens: Optional[Tensor] = None,
     seq_idx: Optional[Tensor] = None,
     cp_group=None,
+    conv_backward_impl: Optional[str] = None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
     """Streamed fused pre-gated-delta-rule entry point.
 
@@ -2616,17 +3382,15 @@ def fused_streamed_pre_gated_delta_rule(
             ``[1, seq_len]``. Used by causal-conv backward in packed THD mode.
         cp_group: Optional chunkwise-CP process group. When it has size > 1,
             the fused path prepends a previous-rank conv boundary internally.
+        conv_backward_impl: ``"triton"`` or ``"causal_conv1d"``; see
+            :func:`_resolve_conv_backward_impl` for the default.
 
     Returns:
         ``(query, key, value, gate, beta, g)`` matching the unfused
         :meth:`GatedDeltaNet.pre_gated_delta_rule` API.
     """
 
-    if causal_conv1d_bwd_function is None:
-        raise ImportError(
-            "gdn_pre_gated_delta_rule_fusion requires causal-conv1d. "
-            "Install causal-conv1d~=1.6 in environments that enable this fusion."
-        )
+    conv_backward_impl = _resolve_conv_backward_impl(conv_backward_impl, conv1d_weight.shape[-1])
 
     assert qkvzba.is_cuda, (
         "fused_pre_gated_delta_rule requires CUDA inputs; " f"got qkvzba.device={qkvzba.device}."
@@ -2704,4 +3468,5 @@ def fused_streamed_pre_gated_delta_rule(
         num_value_heads,
         key_head_dim,
         value_head_dim,
+        conv_backward_impl,
     )
