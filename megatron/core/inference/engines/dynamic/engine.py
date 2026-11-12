@@ -1017,7 +1017,7 @@ class DynamicInferenceEngine(
             if self._deferred_cuda_graph_capture:
                 # Media queued before the first resume() was encoded without the weights, and
                 # the capture cleared its context entries: re-encode it in the refresh below.
-                self._invalidate_vision_state(force=True)
+                self._invalidate_vision_state(ignore_allow_stale=True)
                 self._deferred_cuda_graph_capture = False
 
             # Request records outlive the context buffers. Refresh every stale
