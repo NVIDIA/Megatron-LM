@@ -195,8 +195,8 @@ class TestParallelTransformerLayer:
             return torch.zeros_like(hidden_states), None
 
         with patch.object(layer.self_attention, "forward", side_effect=self_attention):
-            layer(hidden_states=hidden_states, attention_mask=None)
-            layer(hidden_states=hidden_states, attention_mask=None, shared_prefix_forest=forest)
+            layer(hidden_states, attention_mask=None)
+            layer(hidden_states, attention_mask=None, shared_prefix_forest=forest)
         assert received == ["omitted", forest]
 
     def test_chunked_mlp(self):
