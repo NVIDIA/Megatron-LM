@@ -83,15 +83,15 @@ class InferenceSetupConfig:
     """Enable dynamic batching mode."""
 
     inference_dynamic_batching_buffer_size_gb: float = 40.0
-    """On-GPU portion of the shared KV cache block pool. The total amount of memory allocated for
-    the KV cache (CPU + GPU memory) depends on the value set for the unified virtual memory (UVM)
-    level (via inference_dynamic_batching_unified_memory_level)."""
+    """Memory of the shared KV cache block pool and, for hybrid models, of the recurrent states.
+    When UVM level is 1, it is unified memory and may exceed GPU memory."""
 
     inference_dynamic_batching_paused_buffer_size_gb: float | None = None
-    """Memory used to derive the paused-request block retention budget. This does not reserve blocks
-    from active requests: active requests may use the entire shared pool of usable KV cache blocks.
-    Under allocation pressure, paused requests retain blocks only within this budget and excess
-    paused requests may be evicted."""
+    """The part of the buffer (inference_dynamic_batching_buffer_size_gb) that paused requests may
+    retain under allocation pressure; its KV share is the paused-request block retention limit.
+    This does not reserve blocks from active requests: active requests may use the entire shared
+    pool of usable KV cache blocks. Under allocation pressure, paused requests retain blocks only
+    within this limit and excess paused requests may be evicted."""
 
     inference_dynamic_batching_mamba_memory_ratio: float | None = None
     """Percentage of memory buffer to allocate for Mamba states. If not specified, allocates Mamba

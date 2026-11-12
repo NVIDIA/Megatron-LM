@@ -1955,24 +1955,17 @@ def _add_inference_args(parser):
                        help='Enable dynamic batching mode.')
     group.add_argument('--inference-dynamic-batching-buffer-size-gb',
                        type=float, default=40.,
-                       help='On-GPU portion of the shared KV cache block pool. '
-                       'The total amount of memory allocated for the KV cache '
-                       '(CPU + GPU memory) depends on the value set for the '
-                       'unified virtual memory (UVM) level (via '
-                       '`--inference-dynamic-batching-unified-memory-level`).'
-                       'If the UVM level is 0, then only GPU memory is used and '
-                       'the total memory equals `buffer_size_gb`. If the UVM '
-                       'level is 1, then additional memory is utilized on the '
-                       'CPU and the total memory equals `buffer_size_gb + '
-                       'paused_buffer_size_gb`.')
+                       help='Memory of the shared KV cache block pool and, for hybrid models, '
+                       'of the recurrent states. If the UVM level is 0, it is GPU memory. '
+                       'If the UVM level is 1, it is unified memory and may exceed GPU memory.')
     group.add_argument('--inference-dynamic-batching-paused-buffer-size-gb',
                        type=float, default=None,
-                       help='Memory used to derive the paused-request block retention '
-                       'budget. This does not reserve blocks from active requests: '
-                       'active requests may use the entire shared pool of usable KV '
-                       'cache blocks. Under allocation pressure, paused requests '
-                       'retain blocks only within this budget and excess paused '
-                       'requests may be evicted.')
+                       help='The part of the buffer (`buffer_size_gb`) that paused requests may '
+                       'retain under allocation pressure; its KV share is the paused-request block '
+                       'retention limit. This does not reserve blocks from active requests: '
+                       'active requests may use the entire shared pool of usable KV cache blocks. '
+                       'Under allocation pressure, paused requests retain blocks only within this '
+                       'limit and excess paused requests may be evicted. ')
     group.add_argument('--inference-dynamic-batching-mamba-memory-ratio', type=float, default=None,
                        help='Percentage of memory buffer to allocate for Mamba states. '
                        'If not specified, allocates Mamba state tensors for each KV cache block. '

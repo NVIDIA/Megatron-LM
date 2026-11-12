@@ -2782,8 +2782,8 @@ class TestDynamicContext:
 
         kv_buffer_bytes = int(buffer_gb * 1024**3)
         kv_paused_bytes = int(paused_gb * 1024**3)
-        total_mem_bytes = kv_buffer_bytes + kv_paused_bytes
-        expected_mamba_mem = total_mem_bytes * ratio
+        # The ratio is a share of the buffer, which contains the paused buffer.
+        expected_mamba_mem = kv_buffer_bytes * ratio
         expected_mamba_max_reqs = int(expected_mamba_mem // mamba_mem_per_req)
 
         # KV block calculation with buffer size reduced by Mamba memory ratio
@@ -2794,7 +2794,6 @@ class TestDynamicContext:
 
         expected_active_blocks = kv_buffer_bytes // kv_block_size_bytes
         expected_paused_blocks = kv_paused_bytes // kv_block_size_bytes
-        expected_total_blocks = expected_active_blocks + expected_paused_blocks
 
         # Check that block allocator received the reduced block counts
         assert context.kv_block_allocator.pool_size == expected_active_blocks
@@ -2802,7 +2801,7 @@ class TestDynamicContext:
 
         # max_requests should be limited by the Mamba calculation if mamba_max_requests is smaller
         # or the block count - 1 if that is smaller
-        expected_limit = min(expected_total_blocks - 1, expected_mamba_max_reqs)
+        expected_limit = min(expected_active_blocks - 1, expected_mamba_max_reqs)
 
         # Apply rounding (REQUEST_ROUNDER = 64 in this test)
         expected_max_requests = (expected_limit // 64) * 64
@@ -2862,21 +2861,21 @@ class TestDynamicContext:
         mamba_mem_per_req = math.prod(mamba_conv_states_shape) + math.prod(mamba_ssm_states_shape)
         mamba_mem_per_req *= dtype_size
 
-        kv_buffer_bytes = int(buffer_gb * 1024**3)
-        kv_paused_bytes = int(paused_gb * 1024**3)
-        total_mem_bytes = kv_buffer_bytes + kv_paused_bytes
+        buffer_bytes = int(buffer_gb * 1024**3)
+        paused_bytes = int(paused_gb * 1024**3)
 
-        # Auto-derived ratio from max_requests.
+        # The recurrent states of max_requests come out of the buffer. The KV cache gets the
+        # rest, and the paused buffer keeps its fraction of it.
         mamba_memory_needed = max_requests * mamba_mem_per_req
-        ratio = mamba_memory_needed / total_mem_bytes
-
-        kv_buffer_bytes = int(kv_buffer_bytes * (1.0 - ratio))
-        kv_paused_bytes = int(kv_paused_bytes * (1.0 - ratio))
+        kv_buffer_bytes = buffer_bytes - mamba_memory_needed
+        kv_paused_bytes = paused_bytes * kv_buffer_bytes // buffer_bytes
 
         kv_block_size_bytes = dtype_size * 2 * 1 * block_size * num_attention_heads * kv_channels
         expected_active_blocks = kv_buffer_bytes // kv_block_size_bytes
+        expected_paused_blocks = kv_paused_bytes // kv_block_size_bytes
 
         assert context.kv_block_allocator.pool_size == expected_active_blocks
+        assert context.kv_block_allocator.paused_limit == expected_paused_blocks
         assert context.max_requests == max_requests
 
         # With max_requests=1, more memory goes to KV blocks than with max_requests=64.

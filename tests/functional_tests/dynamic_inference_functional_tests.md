@@ -81,8 +81,8 @@ CLI flags below are verified to exist in `megatron/training/arguments.py` and/or
 
 | Feature | CLI Flag | Default | Notes |
 |---|---|---|---|
-| Buffer size | `--inference-dynamic-batching-buffer-size-gb` | 40 | KV cache GPU memory |
-| Paused buffer size | `--inference-dynamic-batching-paused-buffer-size-gb` | — | Memory for paused requests |
+| Buffer size | `--inference-dynamic-batching-buffer-size-gb` | 40 | Memory of the KV block pool and, for hybrid models, of the recurrent states |
+| Paused buffer size | `--inference-dynamic-batching-paused-buffer-size-gb` | — | Part of the buffer that paused requests may retain; never adds memory |
 | Unified memory level | `--inference-dynamic-batching-unified-memory-level {0, 1}` | 0 | 0=GPU-only, 1=GPU+CPU UVM |
 | Mamba memory ratio | `--inference-dynamic-batching-mamba-memory-ratio` | None | Mamba state vs KV cache share |
 

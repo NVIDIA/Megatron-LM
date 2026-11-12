@@ -374,9 +374,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     arbitrary sequence length may be added, paused, or removed from the context
     at any step. The only constraint is the maximum number of requests or tokens
     that the context is defined to support. For the block-level KV cache, a memory
-    buffer is allocated up front (size `buffer_size_gb` if `unified_memory_level`
-    == 0, or `buffer_size_gb + paused_buffer_size_gb` if `unified_memory_level` ==
-    1), that is divided into blocks and dynamically assigned to requests. At any
+    buffer is allocated up front (within `buffer_size_gb` at every
+    `unified_memory_level`; `paused_buffer_size_gb` is a part of it and never adds
+    memory), that is divided into blocks and dynamically assigned to requests. At any
     given step, any unassigned blocks equate to unused space.
 
     Args:
@@ -771,9 +771,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             assert self.is_hybrid_model
             assert mamba_memory_ratio > 0 and mamba_memory_ratio < 1
 
-            # Calculate total memory before partition
-            total_memory = buffer_size_bytes + paused_buffer_size_bytes
-            mamba_memory_bytes = total_memory * mamba_memory_ratio
+            # The ratio is a share of the buffer, which contains the paused buffer.
+            mamba_memory_bytes = buffer_size_bytes * mamba_memory_ratio
             mamba_max_requests = (
                 int(mamba_memory_bytes // mamba_states_memory_per_request) - reserved_mamba_slots
             )
@@ -793,23 +792,23 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         elif self.is_hybrid_model and inference_config.max_requests is not None:
             # Auto-derive mamba/KV split from max_requests. Allocate exactly enough
             # mamba memory for max_requests, and give the rest to KV cache blocks.
-            total_memory = buffer_size_bytes + paused_buffer_size_bytes
             mamba_memory_needed = (
                 inference_config.max_requests * mamba_states_memory_per_request
                 + reserved_mamba_bytes
             )
-            assert mamba_memory_needed < total_memory, (
+            assert mamba_memory_needed < buffer_size_bytes, (
                 f"Not enough memory for {inference_config.max_requests} mamba requests "
                 f"plus {reserved_mamba_slots} reserved tp_ep dummy slot(s). "
                 f"Need {mamba_memory_needed / 1024**3:.2f} GB for recurrent states, "
-                f"but total buffer is {total_memory / 1024**3:.2f} GB."
+                f"but the buffer is {buffer_size_bytes / 1024**3:.2f} GB."
             )
             mamba_max_requests = inference_config.max_requests
 
-            # Subtract Mamba memory proportionally from both configured buffer inputs.
-            mamba_memory_ratio = mamba_memory_needed / total_memory
-            buffer_size_bytes = int(buffer_size_bytes * (1.0 - mamba_memory_ratio))
-            paused_buffer_size_bytes = int(paused_buffer_size_bytes * (1.0 - mamba_memory_ratio))
+            # The KV cache gets the bytes of the buffer that the recurrent states leave;
+            # the paused buffer keeps its fraction of them.
+            kv_bytes = buffer_size_bytes - mamba_memory_needed
+            paused_buffer_size_bytes = paused_buffer_size_bytes * kv_bytes // buffer_size_bytes
+            buffer_size_bytes = kv_bytes
 
             block_count = buffer_size_bytes // self.block_size_bytes
             block_count = max(2, block_count)  # need >= 1 usable block + 1 dummy block
@@ -873,12 +872,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     "prefix_caching_mamba_gb unset for memory-only prefix caching."
                 )
 
+        # The paused buffer is a part of the buffer at every unified memory level:
+        # its KV share is the block retention limit of paused requests and adds no block.
+        kv_pool_size = block_count
+        if paused_block_count > kv_pool_size - 2:
+            raise ValueError(
+                f"paused_buffer_size_gb ({inference_config.paused_buffer_size_gb}) lets paused "
+                f"requests retain {paused_block_count} KV blocks, but must leave at least two of "
+                f"the {kv_pool_size} blocks of buffer_size_gb ({inference_config.buffer_size_gb}) "
+                "outside that limit: one usable block and the dummy block."
+            )
+
         # Prefix-cache state lives beside the allocator:
         # the host hash registry is shared with the Mamba cache,
         # and the per-block shadow state exists only when prefix caching is on.
-        kv_pool_size = (
-            block_count if self.unified_memory_level == 0 else block_count + paused_block_count
-        )
         self.prefix_cache_registry = PrefixCacheRegistry()
         pc_state: Optional[PrefixCacheBlockState] = None
         if self.enable_prefix_caching:
