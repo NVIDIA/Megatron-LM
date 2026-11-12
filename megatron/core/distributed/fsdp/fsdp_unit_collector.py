@@ -52,17 +52,18 @@ class FsdpUnitCollector:
                 HyperConnectionHybridLayer,
             )
         self._fsdp_unit_module_types = tuple(fsdp_unit_module_types)
-        self._units: dict[nn.Module, None] = {}
+        self._units: list[nn.Module] = []
         self._partially_recomputed_units: set[nn.Module] = set()
 
     def collect(self, module: nn.Module) -> list[nn.Module]:
         """Return selected modules children before parents, including the root last."""
-        self._units = {}
+        self._units = []
         self._partially_recomputed_units = set()
         self._select_units(module)
-        self._units[module] = None
+        if not isinstance(module, self._fsdp_unit_module_types):
+            self._units.append(module)
         self._visit(module)
-        return list(self._units)
+        return self._units
 
     def is_partially_recomputed(self, unit: nn.Module) -> bool:
         """Whether this unit needs MXFP8 rowwise planes during backward recomputation."""
@@ -144,7 +145,7 @@ class FsdpUnitCollector:
 
     def _collect(self, module: nn.Module) -> None:
         if isinstance(module, self._fsdp_unit_module_types):
-            self._units[module] = None
+            self._units.append(module)
 
     def _visit_transformer(self, layer: TransformerLayer) -> None:
         self._collect_routed_experts(layer)
@@ -173,10 +174,10 @@ class FsdpUnitCollector:
                 # Early replay requires parameterized norms to have their own hooks.
                 for norm in (inner_layer.input_layernorm, inner_layer.pre_mlp_layernorm):
                     if next(norm.parameters(), None) is not None:
-                        self._units[norm] = None
+                        self._units.append(norm)
             self._collect_routed_experts(inner_layer)
         self._collect(mhc_layer)
 
     def _collect_routed_experts(self, layer: TransformerLayer) -> None:
         if layer.is_moe_layer:
-            self._units[layer.mlp.experts] = None
+            self._units.append(layer.mlp.experts)
