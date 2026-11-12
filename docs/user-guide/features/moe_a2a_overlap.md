@@ -408,17 +408,24 @@ root pre/post-backward lifecycle. It also requires:
 - No full activation recomputation with Combined 1F1B.
 - `fsdp_double_buffer=False` in the DDP configuration. Do not enable options that
   implicitly select double buffering, such as the max-pool double-buffer mode.
-- Supported layer-level FSDP units when parameters are sharded. The adapter
-  installs fine-grained parameter hooks because the schedule calls submodules
-  directly instead of `TransformerLayer.forward()`.
+- Supported layer-level FSDP units when parameters are sharded.
 
-The v2 adapter uses `FsdpModule` unshard/reshard hooks and post-accumulate
-callbacks. Its separate restrictions still apply, including disabling gradient
+Combined 1F1B executes layer submodules directly rather than calling the complete
+`TransformerLayer.forward()`. The v1 adapter therefore manages parameter
+availability for those submodule calls and releases gathered parameters through
+callbacks from the overlap schedule. This integration is automatic; users do not
+need to register parameter hooks.
+
+The v2 integration manages parameters at the owning `FsdpModule` unit: it
+unshards the unit before computation, reshards it at the layer's forward boundary,
+and reshards and processes gradients once that unit's backward gradients are
+ready. It does not use v1's fine-grained parameter-gather mechanism. Its separate
+restrictions still apply, including disabling gradient
 accumulation fusion, FP4, and non-MXFP8 FP8 recipes. Do not assume that v1 buffer
 options or its compatibility guarantees apply to v2. The repository includes
 PP=1 eager overlap functional-test configurations for both
-[v1](https://github.com/NVIDIA/Megatron-LM/blob/main/tests/functional_tests/test_cases/moe/deepseek_proxy_mfsdp_v1_ep2_ep_overlap/model_config.yaml)
-and [v2](https://github.com/NVIDIA/Megatron-LM/blob/main/tests/functional_tests/test_cases/moe/deepseek_proxy_mfsdp_v2_ep2_ep_overlap/model_config.yaml).
+[v1](../../../tests/functional_tests/test_cases/moe/deepseek_proxy_mfsdp_v1_ep2_ep_overlap/model_config.yaml)
+and [v2](../../../tests/functional_tests/test_cases/moe/deepseek_proxy_mfsdp_v2_ep2_ep_overlap/model_config.yaml).
 These are CI configurations, not standalone training commands or performance
 benchmarks. See [Megatron-FSDP](megatron_fsdp.md) for the broader setup.
 
