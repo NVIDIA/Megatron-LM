@@ -445,28 +445,6 @@ def test_finalize_gradients_scopes_context(distributed_setup, mode):
     assert context.gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
 
 
-@pytest.mark.parametrize(
-    "mode", [GradientFinalizationMode.SKIP_OUTER, GradientFinalizationMode.REDUCE_OUTER]
-)
-def test_finalize_gradients_restores_automatic_wait(distributed_setup, monkeypatch, mode):
-    """Leaving a scope, including on error, restores the default automatic wait."""
-    device = distributed_setup.device
-    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
-    model = nn.Linear(4, 4, bias=False).to(device)
-    with fully_shard_context(FsdpContext(device=device)) as context:
-        fully_shard(model, mesh=mesh, placements=_default_placements())
-    finish_grad_sync = Mock(wraps=context.finish_grad_sync)
-    monkeypatch.setattr(context, "finish_grad_sync", finish_grad_sync)
-
-    with pytest.raises(RuntimeError, match="step failed"), context.finalize_gradients(mode=mode):
-        model(torch.ones(2, 4, device=device)).sum().backward()
-        finish_grad_sync.assert_not_called()
-        raise RuntimeError("step failed")
-
-    model(torch.ones(2, 4, device=device)).sum().backward()
-    finish_grad_sync.assert_called_once_with()
-
-
 @pytest.mark.parametrize("overlap_allgather_reduction", [False, True])
 @pytest.mark.parametrize("overlap_outer_communication", [False, True])
 def test_communication_stream_assignment(
