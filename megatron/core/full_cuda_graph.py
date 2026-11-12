@@ -340,6 +340,17 @@ class FullCudaGraphWrapper:
                 FullCudaGraphWrapper.result[training_str] = self.forward_backward_func(
                     *args, **kwargs
                 )
+                if not training:
+                    # A forward-only step never reaches finalize_model_grads, which is where
+                    # the GTP side streams are otherwise joined into the capturing stream.
+                    from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+                    if HAVE_GTP:
+                        from megatron.core.tensor_parallel.gtp_api import (
+                            wait_for_gtp_all_gather_on_current_stream,
+                        )
+
+                        wait_for_gtp_all_gather_on_current_stream()
             torch.cuda.synchronize()
             torch.distributed.barrier()
             logger.info(f'CUDA graph capture done for {training_str}!!!')
