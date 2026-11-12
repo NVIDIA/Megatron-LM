@@ -49,13 +49,14 @@ def test_shared_mtp_matches_unsharded_training(distributed_setup):
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     groups = ProcessGroupCollection(dp_cp=mesh.get_group())
     torch.manual_seed(1234)
+    baseline = _SharedPredictor().to(device)
     module = _SharedPredictor().to(device)
+    module.load_state_dict(baseline.state_dict())
     torch.manual_seed(5678 + distributed_setup.rank)
     value = torch.randn(4, 16, device=device)
     expected = run_forward_backward_on_microbatches(
-        module, lambda: module(value), num_microbatches=3
+        baseline, lambda: baseline(value), num_microbatches=3
     )
-    module.zero_grad(set_to_none=True)
     model = FullyShardedDataParallelV2(
         config=_config(),
         ddp_config=_ddp_config(),
