@@ -62,6 +62,7 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_group import (
         sync_model_weights_from_main_weights,
     )
+    from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import TensorAtomic
     from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import get_sharding_strategy
 
     HAVE_MEGATRON_FSDP = True
@@ -238,6 +239,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         expert_dp_mesh, expert_placements = _build_expert_mesh_and_placements(
             config, ddp_config, pg_collection, device_type
         )
+        if ddp_config.megatron_fsdp_tensor_atomic:
+            dense_placements = Placements(
+                dp_axes=[0],
+                parameter=[TensorAtomic()],
+                gradient=[TensorAtomic()],
+                optimizer=[TensorAtomic()],
+            )
         dense_grad_scale, expert_grad_scale = _get_grad_scales(config, dp_mesh, expert_dp_mesh)
 
         # NCCL symmetric memory requires UB. MFSDP v2 intentionally does not support UB
@@ -461,6 +469,15 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if ddp_config.megatron_fsdp_max_pool_double_buffer:
             raise ValueError("MFSDP v2 does not support megatron_fsdp_max_pool_double_buffer.")
+        if ddp_config.megatron_fsdp_tensor_atomic and (
+            ddp_config.data_parallel_sharding_strategy != "optim_grads_params"
+            or ddp_config.num_distributed_optimizer_instances > 1
+            or ddp_config.nccl_ub
+        ):
+            raise ValueError(
+                "MFSDP v2 megatron_fsdp_tensor_atomic replaces optim_grads_params sharding on a "
+                "1-D DP mesh, without nccl_ub (symmetric memory requires equal shard sizes)."
+            )
 
     @contextlib.contextmanager
     def no_sync(self):

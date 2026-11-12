@@ -773,10 +773,12 @@ def test_fully_shard_validates_tensor_atomic_owner_mapping(distributed_setup):
     )
     with pytest.raises(ValueError, match="cannot be mixed"):
         shard(lambda linear: {linear.weight: 1, linear.bias: 0}, placements=mixed)
-    with pytest.raises(ValueError, match="require parameter_to_owner"):
-        shard(None)
-    with pytest.raises(ValueError, match="missing entries.*'bias'"):
-        shard(lambda linear: {linear.weight: 0})
+    # Missing owners go, largest first, to the rank owning the fewest elements so far; the
+    # TensorAtomic layout aligns every rank segment to 128 elements.
+    (group,) = shard(None).parameter_groups
+    assert tuple(group.main_weight.layout.tensor_to_offset) == (0, 128)
+    (group,) = shard(lambda linear: {linear.weight: 1}).parameter_groups
+    assert tuple(group.main_weight.layout.tensor_to_offset) == (128, 0)
     with pytest.raises(ValueError, match="integer within the range"):
         shard(lambda linear: {linear.weight: 0, linear.bias: world_size})
 
