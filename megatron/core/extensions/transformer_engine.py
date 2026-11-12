@@ -1585,7 +1585,11 @@ class TELinear(te.pytorch.Linear):
             self._set_bi_row_parallel_attributes()
 
     def _bi_tp_can_direct(self) -> bool:
-        """Whether this execution mode can use direct-output TE GEMMs and stock TP backward."""
+        """Whether this execution mode can use direct-output TE GEMMs and stock TP backward.
+
+        MXFP8 compute keeps TE's quantizers and autograd, then reduces its BF16 partials
+        through the ordered collective fallback. The direct path accepts unquantized GEMMs.
+        """
         # Backend selection patches these wrappers, so resolve it after module import.
         from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
             get_batch_invariant_backend,

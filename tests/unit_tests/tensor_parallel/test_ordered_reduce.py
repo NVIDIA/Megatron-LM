@@ -6,7 +6,9 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TERowParallelLinear, _BITPForward
+from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.ops.collectives import ordered_reduce as orr
 from megatron.core.ops.linear import ordered as orl
@@ -466,6 +468,93 @@ def test_direct_gemm_fused_main_grad_matches_te(backend):
                 assert torch.equal(_bits(x.grad), _bits(xr.grad))
                 assert torch.equal(_bits(layer.weight.main_grad), _bits(reference.weight.main_grad))
                 assert layer.weight.grad_added_to_main_grad
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier()
+        SymmetricMemoryManager.destroy()
+        Utils.destroy_model_parallel()
+
+
+@requires_tp4
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("sequence_parallel", [False, True], ids=["all_reduce", "reduce_scatter"])
+def test_mxfp8_ordered_linear_matches_te_and_batch_layout(sequence_parallel):
+    """MXFP8 keeps TE's quantized gradients and a row's bits across batch layouts."""
+    import transformer_engine as te
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+    available, reason = FP8GlobalStateManager.is_mxfp8_available()
+    if not available:
+        pytest.skip(reason)
+    Utils.initialize_model_parallel(TP, 1)
+    try:
+        group = get_tensor_model_parallel_group_if_none(tp_group=None)
+        model_parallel_cuda_manual_seed(123)
+        torch.manual_seed(100 + group.rank())
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=1024,
+            num_attention_heads=8,
+            tensor_model_parallel_size=TP,
+            sequence_parallel=sequence_parallel,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            batch_invariant_mode=True,
+            batch_invariant_backend="te_native",
+            flash_attention_version=4,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            fp8="e4m3",
+            fp8_recipe=Fp8Recipe.mxfp8,
+            attention_backend=AttnBackend.flash,
+        )
+        module = TERowParallelLinear(
+            1024,
+            512,
+            config=config,
+            init_method=init_method_normal(0.02),
+            bias=False,
+            input_is_parallel=True,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_group=group,
+        ).cuda()
+        reference = te.pytorch.Linear(256, 512, bias=False, params_dtype=torch.bfloat16).cuda()
+        with torch.no_grad():
+            reference.weight.copy_(module.weight)
+        x = torch.randn(128, 1, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        reference_x = x.detach().clone().requires_grad_(True)
+        with set_batch_invariant_mode(True, backend="te_native"), get_fp8_context(config):
+            output, _ = module(x)
+            assert module.fp8
+            partial = reference(reference_x)
+            reduce = orr.ordered_reduce_scatter if sequence_parallel else orr.ordered_all_reduce
+            assert torch.equal(_bits(output), _bits(reduce(partial.detach(), group)))
+            grad = torch.randn_like(output)
+            reference_grad = grad
+            if sequence_parallel:
+                reference_grad = torch.empty_like(partial)
+                dist.all_gather_into_tensor(reference_grad, grad, group=group)
+            output.backward(grad)
+            partial.backward(reference_grad)
+            assert torch.equal(_bits(x.grad), _bits(reference_x.grad))
+            assert torch.equal(_bits(module.weight.grad), _bits(reference.weight.grad))
+        with (
+            torch.no_grad(),
+            set_batch_invariant_mode(True, backend="te_native"),
+            get_fp8_context(config),
+        ):
+            batch = x.detach().clone()
+            batch[32:] *= 64
+            outputs = []
+            for inputs in (batch[:32].contiguous(), batch):
+                output, _ = module(inputs)
+                if sequence_parallel:
+                    full = torch.empty((inputs.shape[0], 1, 512), device="cuda", dtype=output.dtype)
+                    dist.all_gather_into_tensor(full, output, group=group)
+                    output = full
+                outputs.append(output)
+            assert torch.equal(_bits(outputs[0]), _bits(outputs[1][:32]))
     finally:
         torch.cuda.synchronize()
         dist.barrier()

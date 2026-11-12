@@ -372,7 +372,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="te-wrapper",
         notes="TE Linear / LayerNormLinear / Norm / GroupedLinear / DotProductAttention / fused RoPE replayed standalone; "
-        "FP8/FP4 recipes in the model-level suite. Runtime CP binding and restoration are "
+        "MXFP8 ordered row reductions with BF16 master weights replay through TE autograd; "
+        "other FP8/FP4 recipes are in the model-level suite. Runtime CP binding and restoration are "
         "replayed through packed SelfAttention in test_runtime_cp_attention.py. "
         "QB-capable TE routing replays probabilities, gradients, and atomic histograms.",
     ),

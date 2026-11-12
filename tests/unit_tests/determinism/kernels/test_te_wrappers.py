@@ -1178,34 +1178,51 @@ def test_te_fused_topk_dense_indices_replays(indices_dtype):
 
 
 @pytest.mark.parametrize(
-    "tp,shards,sequence_parallel",
-    [(2, 4, True), (4, None, False), (4, None, True)],
-    ids=["tp2-4shards-sp", "tp4-ordered", "tp4-ordered-sp"],
+    "tp,shards,sequence_parallel,mxfp8",
+    [
+        (2, 4, True, False),
+        (4, None, False, False),
+        (4, None, True, False),
+        pytest.param(4, None, False, True, marks=pytest.mark.launch_on_gb200),
+        pytest.param(4, None, True, True, marks=pytest.mark.launch_on_gb200),
+    ],
+    ids=["tp2-4shards-sp", "tp4-ordered", "tp4-ordered-sp", "tp4-mxfp8", "tp4-mxfp8-sp"],
 )
-def test_te_row_parallel_linear_batch_invariant_replays(tp, shards, sequence_parallel):
+def test_te_row_parallel_linear_batch_invariant_replays(tp, shards, sequence_parallel, mxfp8):
     """Batch-invariant row-parallel forward: ordered TP reduction (TP >= 3) and fixed shards.
 
     With several shards per rank the forward computes the shard partials itself and the
-    backward is the stock row-parallel one; both must replay bit-exactly.
+    backward is the stock row-parallel one; both must replay bit-exactly. MXFP8 with one
+    partial per rank keeps TE quantization and autograd before the ordered reduction.
     """
     if Utils.world_size < tp or Utils.world_size % tp != 0:
         pytest.skip(f"needs a multiple of {tp} GPUs")
+    if mxfp8:
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        available, reason = FP8GlobalStateManager.is_mxfp8_available()
+        if not available:
+            pytest.skip(reason)
     Utils.initialize_model_parallel(tp, 1)
     try:
         model_parallel_cuda_manual_seed(123)
         seeded()
+        config = _config(
+            fp8="e4m3" if mxfp8 else None,
+            fp8_recipe=Fp8Recipe.mxfp8,
+            tensor_model_parallel_size=tp,
+            sequence_parallel=sequence_parallel,
+            batch_invariant_mode=True,
+            batch_invariant_backend="te_native",
+            batch_invariant_tp_shards=shards,
+            add_bias_linear=False,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4 if _IS_BLACKWELL else 3,
+        )
         module = TERowParallelLinear(
             FFN,
             HIDDEN,
-            config=_config(
-                tensor_model_parallel_size=tp,
-                sequence_parallel=sequence_parallel,
-                batch_invariant_mode=True,
-                batch_invariant_tp_shards=shards,
-                add_bias_linear=False,
-                attention_backend=AttnBackend.flash,
-                flash_attention_version=4 if _IS_BLACKWELL else 3,
-            ),
+            config=config,
             init_method=init_method_normal(0.02),
             bias=False,
             input_is_parallel=True,
@@ -1215,13 +1232,13 @@ def test_te_row_parallel_linear_batch_invariant_replays(tp, shards, sequence_par
         x = torch.randn(
             TOKENS // 2, 2, FFN // tp, device="cuda", dtype=torch.bfloat16, requires_grad=True
         )
-        with set_batch_invariant_mode(True, backend="te_native"):
+        with set_batch_invariant_mode(True, backend="te_native"), get_fp8_context(config):
             assert_module_replays_bit_exact(
                 module,
                 (x,),
                 replays=3,
                 contention=True,
-                what=f"TERowParallelLinear batch-invariant tp={tp} shards={shards}",
+                what=f"TERowParallelLinear batch-invariant tp={tp} shards={shards} mxfp8={mxfp8}",
             )
     finally:
         Utils.destroy_model_parallel()
