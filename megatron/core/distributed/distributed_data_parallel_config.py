@@ -113,6 +113,13 @@ class DistributedDataParallelConfig:
     megatron_fsdp_version: int = 1
     """Megatron-FSDP implementation version. Valid values are 1 and 2."""
 
+    fsdp_prefetch_order: str = "registration"
+    """MFSDP v2 prefetch order: 'registration' follows module registration order;
+    'recorded' records the first forward/backward pass and replays its module-call
+    sequence. Select 'recorded' for reused modules such as shared MTP predictors.
+    Recording requires ordinary module hooks and does not support combined 1F1B.
+    Caller-owned FSDP contexts must use the same order."""
+
     overlap_outer_communication: bool = False
     """Overlap MFSDP v2's last-microbatch outer-DP gradient reduction with inner-DP
     reductions on a separate CUDA stream."""
@@ -401,6 +408,12 @@ class DistributedDataParallelConfig:
                 )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
+        if self.fsdp_prefetch_order not in ("registration", "recorded"):
+            raise ValueError("fsdp_prefetch_order must be 'registration' or 'recorded'.")
+        if self.fsdp_prefetch_order == "recorded" and (
+            not self.use_megatron_fsdp or self.megatron_fsdp_version != 2
+        ):
+            raise ValueError("fsdp_prefetch_order='recorded' requires Megatron-FSDP v2.")
         if self.overlap_outer_communication:
             if not self.use_megatron_fsdp:
                 raise ValueError("overlap_outer_communication requires Megatron-FSDP.")

@@ -38,28 +38,31 @@ class _SharedPredictor(nn.Module):
         return value.square().mean()
 
 
-def _config() -> TransformerConfig:
+def _config(repeated_mtp=True) -> TransformerConfig:
     return TransformerConfig(
         num_layers=2,
         hidden_size=16,
         num_attention_heads=4,
-        mtp_num_layers=2,
-        mtp_use_repeated_layer=True,
+        mtp_num_layers=2 if repeated_mtp else None,
+        mtp_use_repeated_layer=repeated_mtp,
     )
 
 
-def _ddp_config() -> DistributedDataParallelConfig:
+def _ddp_config(prefetch_order="recorded") -> DistributedDataParallelConfig:
     return DistributedDataParallelConfig(
         use_megatron_fsdp=True,
         megatron_fsdp_version=2,
+        fsdp_prefetch_order=prefetch_order,
         use_distributed_optimizer=False,
         data_parallel_sharding_strategy="optim_grads_params",
     )
 
 
-@pytest.mark.parametrize("ambient_context", [False, True])
-def test_shared_mtp_matches_unsharded_training(distributed_setup, ambient_context):
-    """Automatic and caller-owned recorded contexts support repeated SGD steps."""
+@pytest.mark.parametrize(
+    "ambient_context,repeated_mtp", [(False, True), (True, True), (False, False)]
+)
+def test_shared_mtp_matches_unsharded_training(distributed_setup, ambient_context, repeated_mtp):
+    """Explicit recording supports reused modules independently of MTP settings."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     groups = ProcessGroupCollection(dp_cp=mesh.get_group())
@@ -81,7 +84,7 @@ def test_shared_mtp_matches_unsharded_training(distributed_setup, ambient_contex
     )
     with construction:
         model = FullyShardedDataParallelV2(
-            config=_config(),
+            config=_config(repeated_mtp),
             ddp_config=_ddp_config(),
             module=module,
             fsdp_unit_modules=[nn.Linear],
@@ -111,20 +114,46 @@ def test_shared_mtp_matches_unsharded_training(distributed_setup, ambient_contex
             torch.testing.assert_close(parameter.full_tensor(), reference)
 
 
-def test_shared_mtp_rejects_registration_context(distributed_setup):
-    """A caller-owned static context cannot represent repeated MTP execution."""
+@pytest.mark.parametrize("prefetch_order", ["registration", "recorded"])
+def test_rejects_mismatched_context(distributed_setup, prefetch_order):
+    """A caller-owned context must honor the explicit prefetch-order selection."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     module = _SharedPredictor().to(device)
     with fully_shard_context(
-        FsdpContext(device=device, runtime_policy=RuntimePolicy(caller_managed_grad_sync=True))
+        FsdpContext(
+            device=device,
+            prefetch_order=(
+                PrefetchOrder.REGISTRATION
+                if prefetch_order == "recorded"
+                else PrefetchOrder.RECORDED
+            ),
+            runtime_policy=RuntimePolicy(caller_managed_grad_sync=True),
+        )
     ):
-        with pytest.raises(ValueError, match="recorded execution order"):
+        with pytest.raises(ValueError, match="must match fsdp_prefetch_order"):
             FullyShardedDataParallelV2(
                 config=_config(),
-                ddp_config=_ddp_config(),
+                ddp_config=_ddp_config(prefetch_order),
                 module=module,
                 fsdp_unit_modules=[nn.Linear],
                 device=device,
                 pg_collection=ProcessGroupCollection(dp_cp=mesh.get_group()),
             )
+
+
+def test_recorded_order_rejects_combined_1f1b(distributed_setup):
+    """Recording cannot work when combined 1F1B bypasses ordinary hooks."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    config = _config(repeated_mtp=False)
+    config.overlap_moe_expert_parallel_comm = True
+    with pytest.raises(ValueError, match="requires ordinary module hooks"):
+        FullyShardedDataParallelV2(
+            config=config,
+            ddp_config=_ddp_config(),
+            module=_SharedPredictor().to(device),
+            fsdp_unit_modules=[nn.Linear],
+            device=device,
+            pg_collection=ProcessGroupCollection(dp_cp=mesh.get_group()),
+        )

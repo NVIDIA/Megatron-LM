@@ -2973,6 +2973,12 @@ def _add_distributed_args(parser):
                        help='Use distributed optimizer.')
     group.add_argument('--megatron-fsdp-version', type=int, default=1, choices=[1, 2],
                        help='Megatron-FSDP implementation version. Defaults to 1.')
+    group.add_argument('--fsdp-prefetch-order', choices=['registration', 'recorded'],
+                       default='registration',
+                       help='Megatron-FSDP v2 prefetch order. Use recorded for reused modules '
+                            'such as shared MTP predictors. Records the first forward/backward '
+                            'pass; later passes must repeat that sequence. Requires ordinary '
+                            'module hooks and does not support combined 1F1B.')
     group.add_argument('--overlap-outer-communication', action='store_true',
                        help="Overlap outer-DP and inner-DP gradient reductions "
                             "with Megatron-FSDP v2.")

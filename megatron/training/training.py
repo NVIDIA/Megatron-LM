@@ -58,6 +58,7 @@ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    PrefetchOrder,
     RuntimePolicy,
     fully_shard_context,
 )
@@ -2543,6 +2544,7 @@ def wrap_model_chunks_with_ddp(
     construction_context = (
         fully_shard_context(
             FsdpContext(
+                prefetch_order=PrefetchOrder[ddp_config.fsdp_prefetch_order.upper()],
                 runtime_policy=RuntimePolicy(
                     use_symmetric_memory=ddp_config.nccl_ub,
                     caller_managed_grad_sync=True,
