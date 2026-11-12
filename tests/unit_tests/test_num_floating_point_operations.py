@@ -2481,36 +2481,17 @@ class TestDSAHelperEdgeCases:
         assert _dsa_sparse_core_scale(0, 0, 2048) == 1.0
         assert _dsa_sparse_core_scale(512, 512 * 4096, None) == 1.0
 
-    def test_hybrid_dsa_rejected(self):
-        """A hybrid layer pattern with DSA must fail loud, not fall through
-        to the dense full-MLA estimate (which overcounts core attention and
-        drops the indexer)."""
-        args, cfg = _make_dsa_args()
+    def test_hybrid_dsa_variant_attribute_ignored(self):
+        """Hybrid DSA accounting keys off the 'D' symbols in the layer pattern, not
+        ``args.experimental_attention_variant``: on the hybrid path a 'D' pattern sets
+        the variant only in the config kwargs (never back onto ``args``), so a real
+        ``--hybrid-layer-pattern "D..."`` launch reaches this code with the attribute
+        still ``None``."""
+        args, cfg = _make_hybrid_dsa_args()
         args.hybrid_layer_pattern = "D-D-"
-        args.mamba_state_dim = 128
-        args.mamba_head_dim = 64
-        args.mamba_num_groups = 8
-        args.mamba_num_heads = 128
-
-        with pytest.raises(AssertionError, match="hybrid-model path"):
-            num_floating_point_operations(args, cfg, 2)
-
-    def test_hybrid_dsa_rejected_without_variant_attribute(self):
-        """The guard must key off the 'D' symbols in the layer pattern, not
-        just ``args.experimental_attention_variant``: on the hybrid path a
-        'D' pattern sets the variant only in the config kwargs (never back
-        onto ``args``), so a real ``--hybrid-layer-pattern "D..."`` launch
-        reaches this code with the attribute still ``None``."""
-        args, cfg = _make_dsa_args()
-        args.experimental_attention_variant = None
-        args.hybrid_layer_pattern = "D-D-"
-        args.mamba_state_dim = 128
-        args.mamba_head_dim = 64
-        args.mamba_num_groups = 8
-        args.mamba_num_heads = 128
-
-        with pytest.raises(AssertionError, match="hybrid-model path"):
-            num_floating_point_operations(args, cfg, 2)
+        with_none = num_floating_point_operations(args, cfg, 2)
+        args.experimental_attention_variant = "dsa"
+        assert num_floating_point_operations(args, cfg, 2) == with_none
 
 
 def _dsa_golden_layer_terms(
@@ -2692,6 +2673,128 @@ class TestDSAFlopsHelpers:
             if name.startswith("dsa_"):
                 delattr(args, name)
         assert num_floating_point_operations(args, cfg, 2) == expected
+
+
+class TestHybridDSA:
+    """'D' layers in ``--hybrid-layer-pattern`` pay DSA attention and indexer FLOPs.
+
+    Removing them from the pattern leaves every other term unchanged, so the difference
+    against the pattern without 'D' isolates exactly the DSA terms.
+    """
+
+    @staticmethod
+    def _delta(args, cfg, pattern_with_d, pattern_without_d, batch=2):
+        args.hybrid_layer_pattern = pattern_without_d
+        base = num_floating_point_operations(args, cfg, batch)
+        args.hybrid_layer_pattern = pattern_with_d
+        return num_floating_point_operations(args, cfg, batch) - base
+
+    @staticmethod
+    def _golden(args, batch, num_dsa_layers, num_indexer_layers):
+        total_tokens = batch * args.seq_length
+        sum_sq = batch * args.seq_length**2
+        token_term, core_term = _dsa_golden_layer_terms(
+            args,
+            total_tokens,
+            sum_sq,
+            num_dsa_layers=num_dsa_layers,
+            num_indexer_layers=num_indexer_layers,
+        )
+        return total_tokens * token_term + sum_sq * core_term
+
+    @pytest.mark.parametrize("loss_coeff", [0.0, 0.01])
+    def test_dsa_terms_golden(self, loss_coeff):
+        """'D' layers add the absorbed-MLA projections, the top-k sparse core and the
+        indexer on top of the same pattern with the 'D' positions removed."""
+        args, cfg = _make_hybrid_dsa_args(dsa_indexer_loss_coeff=loss_coeff)
+        # freq=1 (from _make_dsa_args): both D layers compute their own index.
+        delta = self._delta(args, cfg, "D-D-", "--")
+        assert delta == pytest.approx(self._golden(args, 2, 2, 2))
+
+    def test_core_attention_is_sparse(self):
+        """Past top-k the 'D' layers cost less than the dense MLA layers they used to
+        be counted as."""
+        args, cfg = _make_hybrid_dsa_args(dsa_indexer_loss_coeff=0.0)
+        args.seq_length = 8192
+        dsa_delta = self._delta(args, cfg, "D-D-", "--", batch=1)
+        mla_delta = self._delta(args, cfg, "+-+-", "--", batch=1)
+        assert dsa_delta < mla_delta
+
+    def test_sparse_indexer_loss_shrinks_scoring_backward(self):
+        """Past top-k the sparse KL loss backpropagates through the selected pairs only,
+        so the 'D' delta is smaller than with the dense KL loss."""
+        sparse_args, sparse_cfg = _make_hybrid_dsa_args(dsa_indexer_use_sparse_loss=True)
+        dense_args, dense_cfg = _make_hybrid_dsa_args(dsa_indexer_use_sparse_loss=False)
+        sparse_args.seq_length = dense_args.seq_length = 8192
+
+        sparse_delta = self._delta(sparse_args, sparse_cfg, "D-D-", "--", batch=1)
+        dense_delta = self._delta(dense_args, dense_cfg, "D-D-", "--", batch=1)
+        assert sparse_delta == pytest.approx(self._golden(sparse_args, 1, 2, 2))
+        assert sparse_delta < dense_delta
+
+    def test_index_sharing_pays_only_computing_layers(self):
+        """With cross-layer index sharing only the layers that compute a top-k index pay
+        the indexer. 'DDDDD' with freq=4, offset=1 computes at layers 1 and 5."""
+        args, cfg = _make_hybrid_dsa_args()
+        args.dsa_indexer_topk_freq = 4
+        args.dsa_indexer_skip_topk_offset = 1
+        delta = self._delta(args, cfg, "DDDDD-", "-")
+        assert delta == pytest.approx(self._golden(args, 2, 5, 2))
+
+    def test_mtp_layers_are_numbered_after_the_main_stack(self):
+        """A DSA layer inside a hybrid MTP block is numbered ``num_layers`` plus its
+        position in the block, and index sharing follows that number.
+
+        Main 'D-D' with freq=2, offset=1 computes at layers 1 and 3. Each MTP depth's
+        'D' is layer 3 + 1 = 4, which reuses the index, so 2 of the 4 'D' layers pay.
+        """
+        args, cfg = _make_hybrid_dsa_args()
+        args.num_layers = 3
+        args.dsa_indexer_topk_freq = 2
+        args.dsa_indexer_skip_topk_offset = 1
+        delta = self._delta(args, cfg, "D-D/D-/D-", "-/-/-")
+        assert delta == pytest.approx(self._golden(args, 2, 4, 2))
+
+    @pytest.mark.parametrize("granularity, gate_size", [("elementwise", 8 * 64), ("headwise", 8)])
+    def test_output_gate_adds_the_mla_gate_projection(self, granularity, gate_size):
+        """A gated 'D' layer pays the same hidden -> gate projection as an MLA layer."""
+        args, cfg = _make_hybrid_dsa_args()
+        ungated = self._delta(args, cfg, "D-D-", "--")
+        args.attention_output_gate = True
+        args.gated_attention_proj_granularity = granularity
+        gated = self._delta(args, cfg, "D-D-", "--")
+        total_tokens = 2 * args.seq_length
+        # 2 layers, fwd + bwd (x3), FMA (x2).
+        assert gated - ungated == pytest.approx(
+            2 * 3 * 2 * total_tokens * args.hidden_size * gate_size
+        )
+
+    @pytest.mark.parametrize("sparse_loss", [False, True])
+    @pytest.mark.parametrize("gate", [False, True])
+    def test_matches_standard_model(self, sparse_loss, gate):
+        """A DSA Transformer and the hybrid pattern that spells out the same layers get
+        the same estimate, for BSHD and for packed THD statistics."""
+        standard, standard_cfg = _make_dsa_args(dsa_indexer_use_sparse_loss=sparse_loss)
+        hybrid, hybrid_cfg = _make_hybrid_dsa_args(dsa_indexer_use_sparse_loss=sparse_loss)
+        hybrid.hybrid_layer_pattern = "D-" * standard.num_layers
+        standard.attention_output_gate = hybrid.attention_output_gate = gate
+        batch_size = 4
+
+        assert num_floating_point_operations(hybrid, hybrid_cfg, batch_size) == pytest.approx(
+            num_floating_point_operations(standard, standard_cfg, batch_size), rel=1e-12
+        )
+
+        seq_length = standard.seq_length
+        thd_stats = dict(
+            seqlen_squared_sum_in_batch=batch_size * 4 * (seq_length // 4) ** 2,
+            total_real_tokens_in_batch=batch_size * seq_length * 3 // 4,
+        )
+        assert num_floating_point_operations(
+            hybrid, hybrid_cfg, batch_size, **thd_stats
+        ) == pytest.approx(
+            num_floating_point_operations(standard, standard_cfg, batch_size, **thd_stats),
+            rel=1e-12,
+        )
 
 
 def _kpool_golden_scales(mean_length, pool_size, topk, select_tail):
