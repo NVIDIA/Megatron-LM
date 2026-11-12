@@ -23,7 +23,16 @@ def _segment_shift(mask: torch.Tensor, lengths) -> torch.Tensor:
     return torch.cat(pieces, dim=-1)
 
 
-def _process_mtp_loss(hidden_depths, input_ids, loss_mask, lengths, groups, input_mask=None):
+def _process_mtp_loss(
+    hidden_depths,
+    input_ids,
+    loss_mask,
+    lengths,
+    groups,
+    input_mask=None,
+    *,
+    normalize_by_main_tokens=False,
+):
     from types import SimpleNamespace
 
     from megatron.core.transformer.multi_token_prediction import process_mtp_loss
@@ -48,6 +57,7 @@ def _process_mtp_loss(hidden_depths, input_ids, loss_mask, lengths, groups, inpu
         calculate_per_token_loss=True,
         mtp_detach_heads=False,
         attention_cp_layout="zigzag",
+        mtp_normalize_loss_by_main_tokens=normalize_by_main_tokens,
     )
     return process_mtp_loss(
         hidden_states=torch.cat(hidden_depths, dim=0),
@@ -115,17 +125,27 @@ def _mtp_scale():
 
 @pytest.mark.usefixtures("_mtp_scale")
 @pytest.mark.parametrize("with_input_mask", [False, True], ids=["no-input-mask", "input-mask"])
-def test_grouped_mtp_loss_matches_independent_forwards(with_input_mask):
+@pytest.mark.parametrize(
+    "normalize_by_main_tokens", [False, True], ids=["token-ratio", "main-token-sum"]
+)
+def test_grouped_mtp_loss_matches_independent_forwards(with_input_mask, normalize_by_main_tokens):
     """One grouped call must inject the MTP gradient of one independent call per group.
 
     In the input-mask case the grouped denominator must use the cumulative ``mtp_input_mask``
-    like the ungrouped path.
+    like the ungrouped path. With ``mtp_normalize_loss_by_main_tokens`` the loss stays a sum,
+    which needs no per-group correction.
     """
     pack = _MTPPack()
     input_mask = pack.input_mask if with_input_mask else None
     hidden = [t.clone().requires_grad_() for t in pack.hidden]
     _process_mtp_loss(
-        hidden, pack.input_ids, pack.loss_mask, pack.lengths, pack.groups, input_mask
+        hidden,
+        pack.input_ids,
+        pack.loss_mask,
+        pack.lengths,
+        pack.groups,
+        input_mask,
+        normalize_by_main_tokens=normalize_by_main_tokens,
     ).sum().backward()
     grouped = [t.grad[:, 0] for t in hidden[1:]]
 
@@ -139,6 +159,7 @@ def test_grouped_mtp_loss_matches_independent_forwards(with_input_mask):
             lengths,
             None,
             None if input_mask is None else input_mask[:, group_slice],
+            normalize_by_main_tokens=normalize_by_main_tokens,
         ).sum().backward()
         for depth in range(_DEPTHS):
             independent[depth][group_slice] = hidden[depth + 1].grad[:, 0]
