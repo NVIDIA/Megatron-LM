@@ -514,6 +514,12 @@ class MockVarlenDataset(MockSFTDataset):
         # to make the conversation end on a stop token, mirroring the real
         # VarlenDataset path.
         raw = self.dataset[int(self.indices[idx % len(self.indices)])]
+        # The low-level mock emits ``arange(1, length)``; fold the ids into the vocabulary so
+        # documents longer than the vocabulary (long-context runs, e.g. 256K tokens against a
+        # 248K vocabulary) stay valid embedding indices.
+        vocab_size = getattr(tokenizer, "vocab_size", None)
+        if vocab_size:
+            raw = raw % vocab_size
         tokens_list = raw.tolist()
         tokens_list.append(eod)
         # Mock data uses ``tokens == targets`` (no role masking).
