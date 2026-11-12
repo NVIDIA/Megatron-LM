@@ -456,16 +456,6 @@ class SimplifiedDSGQAIndexer(MegatronModule):
             self.max_seq_length = max_seq_length
 
     def _apply_rope(self, q: torch.Tensor, use_rope: bool, packed_seq_params=None):
-        if getattr(self.config, "batch_invariant_mode", False) and use_rope:
-            # Reuse training path
-            return _apply_rope_at_positions(
-                q,
-                torch.arange(q.size(0), device=q.device, dtype=torch.long),
-                self.index_head_dim,
-                self.index_rotary_dim,
-                self.rotary_pos_emb,
-                self.config.rotary_interleaved,
-            )
         if not use_rope or self.rotary_pos_emb is None or self.index_rotary_dim == 0:
             return q
         rotary_seq_len = self.rotary_pos_emb.get_rotary_seq_len(

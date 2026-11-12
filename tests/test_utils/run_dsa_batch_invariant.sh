@@ -2,17 +2,12 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 set -euo pipefail
 
-TEST_FILE=$1
-ENVIRONMENT=$2
-REPEAT=$3
-LOG_DIR=$4
+ENVIRONMENT=$1
+REPEAT=$2
+LOG_DIR=$3
+TEST_FILE=tests/unit_tests/determinism/kernels/test_dsa_batch_invariant.py
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 
-case "$TEST_FILE" in
-    tests/unit_tests/transformer/experimental_attention_variant/test_dsa_batch_invariant.py|\
-    tests/unit_tests/determinism/kernels/test_dsa_batch_invariant.py) ;;
-    *) echo "Unsupported DSA BI test file: $TEST_FILE" >&2; exit 1 ;;
-esac
 [[ "$ENVIRONMENT" == dev ]]
 [[ "$REPEAT" =~ ^[1-9][0-9]*$ ]]
 mkdir -p "$LOG_DIR"
