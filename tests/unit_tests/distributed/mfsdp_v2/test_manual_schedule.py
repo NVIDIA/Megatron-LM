@@ -46,7 +46,7 @@ class MLP(nn.Module):
         return F.linear(hidden, self.weight2)
 
 
-def prefetch_parameter(parameter, allgather_stream):
+def unshard_parameter(parameter, allgather_stream):
     """Start gathering the parameter's group without waiting on compute."""
     group = get_containing_parameter_group(parameter)
     with torch.cuda.stream(allgather_stream):
@@ -96,10 +96,10 @@ class ScheduledMLPFunction(torch.autograd.Function):
         reduction_stream = ctx.fsdp_context.inner_reduction_stream
         compute_stream = ctx.fsdp_context.current_stream()
         allgather_stream.wait_stream(compute_stream)
-        prefetch_parameter(weight2, allgather_stream)
+        unshard_parameter(weight2, allgather_stream)
         ready2 = allgather_stream.record_event()
         compute_stream.wait_event(ready2)
-        prefetch_parameter(weight1, allgather_stream)
+        unshard_parameter(weight1, allgather_stream)
         ready1 = allgather_stream.record_event()
 
         grad_hidden = grad_output.matmul(weight2)
@@ -125,10 +125,10 @@ class ScheduledMLP(MLP):
         allgather_stream = fsdp_context.allgather_stream
         compute_stream = fsdp_context.current_stream()
         allgather_stream.wait_stream(compute_stream)
-        prefetch_parameter(self.weight1, allgather_stream)
+        unshard_parameter(self.weight1, allgather_stream)
         ready1 = allgather_stream.record_event()
         compute_stream.wait_event(ready1)
-        prefetch_parameter(self.weight2, allgather_stream)
+        unshard_parameter(self.weight2, allgather_stream)
         output = ScheduledMLPFunction.apply(inputs, self.weight1, self.weight2, fsdp_context)
         reshard_parameter(self.weight2, allgather_stream)
         return output
