@@ -59,10 +59,10 @@ class FsdpUnitCollector:
         """Return selected modules children before parents, including the root last."""
         self._units = []
         self._partially_recomputed_units = set()
-        self._select_units(module)
-        if not isinstance(module, self._fsdp_unit_module_types):
-            self._units.append(module)
-        self._visit(module)
+        partially_recomputed = self._visit(module)
+        self._units.append(module)
+        if partially_recomputed:
+            self._partially_recomputed_units.add(module)
         return self._units
 
     def is_partially_recomputed(self, unit: nn.Module) -> bool:
@@ -70,43 +70,37 @@ class FsdpUnitCollector:
         return unit in self._partially_recomputed_units
 
     def _visit(self, module: nn.Module) -> bool:
-        """Propagate recomputation requirements upward until they reach an FSDP unit."""
-        partially_recomputed = False
-        for child in module.children():
-            partially_recomputed |= self._visit(child)
-        partially_recomputed |= self._needs_all_planes(module)
-        if module in self._units:
-            if partially_recomputed:
-                self._partially_recomputed_units.add(module)
-            return False
-        return partially_recomputed
-
-    def _needs_all_planes(self, module: nn.Module) -> bool:
-        """Check only the checkpoints created by this module."""
+        """Return the recomputation requirement for the caller to assign to an FSDP unit."""
+        if isinstance(module, HyperConnectionHybridLayer):
+            return self._visit_mhc(module)
+        if isinstance(module, ShortcutMoEBlock):
+            return self._visit_shortcut(module)
         if isinstance(module, TransformerLayer):
-            if module.config.recompute_granularity == "full":
-                return False
-            return (isinstance(module, MoETransformerLayer) and module.moe_layer_recompute) or (
-                module.recompute_mlp and self._mlp_has_owned_parameters(module.mlp)
-            )
+            return self._visit_transformer(module)
+        if isinstance(module, MambaLayer):
+            if isinstance(module.mixer, (_GDNBase, GatedDeltaProductMixer)):
+                return self._visit(module.mixer)
+            return False
         if isinstance(module, (TransformerBlock, HybridStack)):
+            partially_recomputed = self._visit_children(module)
             config = module.config
-            return (
+            return partially_recomputed or (
                 config.recompute_granularity == "full"
                 and (config.recompute_method != "block" or bool(config.recompute_num_layers))
                 and any(layer not in self._units for layer in module.layers)
             )
         if isinstance(module, MultiTokenPredictionLayer):
-            # GPT MTP checkpoints its projection inside forward; Hybrid MTP delegates
-            # full recompute to its inner stack.
-            return module.config.recompute_granularity == "full" and not module.is_hybrid_mtp
+            partially_recomputed = self._visit_children(module)
+            # GPT MTP checkpoints its projection; Hybrid MTP delegates to its inner stack.
+            return partially_recomputed or (
+                module.config.recompute_granularity == "full" and not module.is_hybrid_mtp
+            )
         if isinstance(module, MoELayer):
             return module.config.recompute_granularity != "full" and (
                 (module.moe_layer_recompute and self._mlp_has_owned_parameters(module))
                 or (
                     module.shared_experts_recompute
                     and module.shared_experts is not None
-                    and module.shared_experts not in self._units
                     and next(module.shared_experts.parameters(), None) is not None
                 )
             )
@@ -118,7 +112,44 @@ class FsdpUnitCollector:
             return module.config.recompute_granularity != "full" and module.recompute_gdn
         if isinstance(module, GatedDeltaProductMixer):
             return module.config.recompute_granularity != "full" and module.recompute_in_proj
-        return False
+        return self._visit_children(module)
+
+    def _collect(self, module: nn.Module, partially_recomputed: bool) -> bool:
+        if isinstance(module, self._fsdp_unit_module_types):
+            self._units.append(module)
+            if partially_recomputed:
+                self._partially_recomputed_units.add(module)
+            return False
+        return partially_recomputed
+
+    def _visit_children(self, module: nn.Module) -> bool:
+        partially_recomputed = False
+        for child in module.children():
+            partially_recomputed |= self._collect(child, self._visit(child))
+        return partially_recomputed
+
+    def _visit_transformer(self, layer: TransformerLayer) -> bool:
+        self._collect_routed_experts(layer)
+        partially_recomputed = False
+        # These are owned parts of the layer, so visit them without collecting extra units.
+        for child in layer.children():
+            if isinstance(
+                child,
+                (
+                    MoELayer,
+                    MultiLatentAttention,
+                    AbsorbedMLASelfAttention,
+                    DSv4HybridAttention,
+                    _GDNBase,
+                    GatedDeltaProductMixer,
+                ),
+            ):
+                partially_recomputed |= self._visit(child)
+        if layer.config.recompute_granularity != "full":
+            partially_recomputed |= (
+                isinstance(layer, MoETransformerLayer) and layer.moe_layer_recompute
+            ) or (layer.recompute_mlp and self._mlp_has_owned_parameters(layer.mlp))
+        return partially_recomputed
 
     def _mlp_has_owned_parameters(self, mlp: nn.Module) -> bool:
         if isinstance(mlp, MoELayer):
@@ -130,40 +161,11 @@ class FsdpUnitCollector:
             )
         return next(mlp.parameters(), None) is not None
 
-    def _select_units(self, module: nn.Module) -> None:
-        if isinstance(module, HyperConnectionHybridLayer):
-            self._visit_mhc(module)
-        elif isinstance(module, ShortcutMoEBlock):
-            self._visit_shortcut(module)
-        elif isinstance(module, TransformerLayer):
-            self._visit_transformer(module)
-        elif isinstance(module, MambaLayer):
-            self._visit_mamba(module)
-        else:
-            self._visit_children(module)
-            self._collect(module)
+    def _visit_shortcut(self, block: ShortcutMoEBlock) -> bool:
+        # Helpers bypass both inner layers' __call__; their experts are still collected.
+        return self._visit(block.compute_layer) | self._visit(block.moe_layer)
 
-    def _collect(self, module: nn.Module) -> None:
-        if isinstance(module, self._fsdp_unit_module_types):
-            self._units.append(module)
-
-    def _visit_transformer(self, layer: TransformerLayer) -> None:
-        self._collect_routed_experts(layer)
-        self._collect(layer)
-
-    def _visit_mamba(self, layer: MambaLayer) -> None:
-        self._collect(layer)
-
-    def _visit_children(self, module: nn.Module) -> None:
-        for child in module.children():
-            self._select_units(child)
-
-    def _visit_shortcut(self, block: ShortcutMoEBlock) -> None:
-        # Helpers bypass both inner layers' __call__, but experts run normally.
-        self._collect_routed_experts(block.moe_layer)
-        self._collect(block)
-
-    def _visit_mhc(self, mhc_layer: HyperConnectionHybridLayer) -> None:
+    def _visit_mhc(self, mhc_layer: HyperConnectionHybridLayer) -> bool:
         inner_layer = mhc_layer.inner_layer
         if isinstance(inner_layer, TransformerLayer):
             config = mhc_layer.config
@@ -175,8 +177,7 @@ class FsdpUnitCollector:
                 for norm in (inner_layer.input_layernorm, inner_layer.pre_mlp_layernorm):
                     if next(norm.parameters(), None) is not None:
                         self._units.append(norm)
-            self._collect_routed_experts(inner_layer)
-        self._collect(mhc_layer)
+        return self._visit(inner_layer)
 
     def _collect_routed_experts(self, layer: TransformerLayer) -> None:
         if layer.is_moe_layer:
