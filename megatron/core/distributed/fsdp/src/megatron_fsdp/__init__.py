@@ -12,10 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .distributed_data_parallel_config import DistributedDataParallelConfig
-from .fully_shard import fully_shard, fully_shard_model, fully_shard_optimizer
-from .megatron_fsdp import MegatronFSDP
-from .mixed_precision import MixedPrecisionPolicy
+from importlib import import_module
+from typing import Any
+
 from .package_info import (
     __contact_emails__,
     __contact_names__,
@@ -29,7 +28,6 @@ from .package_info import (
     __shortversion__,
     __version__,
 )
-from .utils import FSDPDistributedIndex
 
 __all__ = [
     "DistributedDataParallelConfig",
@@ -51,3 +49,29 @@ __all__ = [
     "__shortversion__",
     "__version__",
 ]
+
+
+# Configuration modules must be importable without loading the runtime, which
+# imports MCore's DistributedDataParallelConfig when MCore is installed.
+_RUNTIME_EXPORTS = {
+    "DistributedDataParallelConfig": ".distributed_data_parallel_config",
+    "MegatronFSDP": ".megatron_fsdp",
+    "FSDPDistributedIndex": ".utils",
+    "MixedPrecisionPolicy": ".mixed_precision",
+    "fully_shard": ".fully_shard",
+    "fully_shard_model": ".fully_shard",
+    "fully_shard_optimizer": ".fully_shard",
+}
+
+
+def __getattr__(name: str) -> Any:
+    """Load runtime exports only when requested."""
+    if name not in _RUNTIME_EXPORTS:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name = _RUNTIME_EXPORTS[name]
+    module = import_module(module_name, __name__)
+    # Cache all exports from this module, including functions sharing its name.
+    for export, source in _RUNTIME_EXPORTS.items():
+        if source == module_name:
+            globals()[export] = getattr(module, export)
+    return globals()[name]

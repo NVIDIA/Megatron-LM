@@ -14,23 +14,16 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
-import enum
 from collections.abc import Callable
 from weakref import WeakKeyDictionary
 
 import torch
 from torch import nn
 
+from ..prefetch_order import PrefetchOrder
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .phase import Phase
 from .runtime_policy import RuntimePolicy
-
-
-class PrefetchOrder(enum.Enum):
-    """How to choose the module order used for prefetching."""
-
-    REGISTRATION = enum.auto()
-    RECORDED = enum.auto()
 
 
 class FsdpContext:

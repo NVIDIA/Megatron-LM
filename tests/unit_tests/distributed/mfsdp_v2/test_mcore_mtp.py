@@ -8,6 +8,7 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_adapter_v2 import FullyShardedDataParallelV2
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import PrefetchOrder
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
@@ -33,11 +34,11 @@ def _config() -> TransformerConfig:
     return TransformerConfig(num_layers=2, hidden_size=16, num_attention_heads=4)
 
 
-def _ddp_config(prefetch_order="recorded") -> DistributedDataParallelConfig:
+def _ddp_config() -> DistributedDataParallelConfig:
     return DistributedDataParallelConfig(
         use_megatron_fsdp=True,
         megatron_fsdp_version=2,
-        fsdp_prefetch_order=prefetch_order,
+        fsdp_prefetch_order=PrefetchOrder.RECORDED,
         use_distributed_optimizer=False,
         data_parallel_sharding_strategy="optim_grads_params",
     )

@@ -263,10 +263,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
         # after the schedule completes, including delayed wgrad and custom 1F1B work.
-        prefetch_order = PrefetchOrder[ddp_config.fsdp_prefetch_order.upper()]
+        prefetch_order = ddp_config.fsdp_prefetch_order
+        if prefetch_order is PrefetchOrder.RECORDED and config.pipeline_model_parallel_size != 1:
+            raise ValueError("Recorded FSDP prefetch order currently requires PP=1.")
         if prefetch_order is PrefetchOrder.RECORDED and config.overlap_moe_expert_parallel_comm:
             raise ValueError(
-                "fsdp_prefetch_order='recorded' requires ordinary module hooks "
+                "fsdp_prefetch_order=PrefetchOrder.RECORDED requires ordinary module hooks "
                 "rather than combined 1F1B."
             )
         active_context = current_fully_shard_context()
