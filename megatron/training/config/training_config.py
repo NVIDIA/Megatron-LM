@@ -613,7 +613,7 @@ class CheckpointConfig:
     loading a bit (double rank0 ckpt load).
     """
 
-    ckpt_convert_format: Literal["torch", "torch_dist"] | None = None
+    ckpt_convert_format: Literal["torch", "torch_dist", "fsdp_dtensor"] | None = None
     """Checkpoint format for conversion."""
 
     ckpt_convert_save: str | None = None

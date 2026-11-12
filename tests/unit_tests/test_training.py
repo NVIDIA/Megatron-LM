@@ -318,7 +318,7 @@ class TestTraining:
         set_args(args)
         _set_train_state()
 
-    @pytest.mark.parametrize("ckpt_format", ["torch", "torch_dist"])
+    @pytest.mark.parametrize("ckpt_format", ["torch", "torch_dist", "fsdp_dtensor"])
     @pytest.mark.parametrize("verify_integrity", [False, True])
     def test_checkpoint_conversion_preserves_supported_integrity_settings(
         self, monkeypatch, run_config, ckpt_format, verify_integrity

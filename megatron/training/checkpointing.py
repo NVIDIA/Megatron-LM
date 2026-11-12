@@ -87,10 +87,13 @@ from .one_logger_utils import on_save_checkpoint_start, on_save_checkpoint_succe
 from .utils import append_to_progress_log, is_last_rank, print_rank_0, print_rank_last, warn_rank_0
 
 try:
+    from megatron.core.distributed import DistributedDataParallel, TorchFullyShardedDataParallel
+    from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
     from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
         preprocess_state_dict_for_uneven_dtensor,
     )
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
+        _strip_wrapper_prefixes,
         handle_experts_in_state_dict,
         handle_fp8_extra_state_case,
         handle_mla_down_proj_in_state_dict,
@@ -99,6 +102,8 @@ try:
         print_diff_in_state_dicts,
         validate_fsdp_dtensor_model_load,
     )
+    from megatron.core.transformer.module import Float16Module
+    from megatron.core.transformer.transformer_layer import TransformerLayer
 
     HAVE_MEGATRON_FSDP = True
 except ImportError:
@@ -745,6 +750,22 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
     )
 
 
+def _unwrap_checkpoint_model(model, ckpt_format, ddp_config):
+    """Keep MFSDP v2 checkpoint adapters while removing outer training wrappers."""
+    if ckpt_format != "fsdp_dtensor" or ddp_config is None or ddp_config.megatron_fsdp_version != 2:
+        return unwrap_model(model)
+
+    return unwrap_model(
+        model,
+        module_instances=(
+            DistributedDataParallel,
+            TorchFullyShardedDataParallel,
+            FullyShardedDataParallelV1,
+            Float16Module,
+        ),
+    )
+
+
 def save_checkpoint(
     iteration,
     model,
@@ -831,7 +852,7 @@ def save_checkpoint(
     ft_integration.on_checkpointing_start()
 
     # Only rank zero of the data parallel writes to the disk.
-    model = unwrap_model(model)
+    model = _unwrap_checkpoint_model(model, save_format, cfg.ddp)
 
     # --freeze-all-layers: weights are frozen, so skip the weight write and its finalizers; dump
     # progress is recorded separately via the post-logits finalize (see the async block below).
@@ -1092,7 +1113,9 @@ def save_checkpoint(
                 ensure_directory_exists(checkpoint_name, check_parent=False)
 
             if ckpt_format == 'fsdp_dtensor':
-                state_dict = preprocess_fsdp_dtensor_state_dict(cfg.model.transformer, state_dict, model[0])
+                state_dict = preprocess_fsdp_dtensor_state_dict(
+                    cfg.model.transformer, state_dict, model
+                )
 
             if checkpoint.async_save:
                 from nvidia_resiliency_ext.checkpointing.async_ckpt.filesystem_async import (
@@ -1990,9 +2013,93 @@ def _localize_redundant_extra_states(state_dict):
     dict_list_map_inplace(_maybe_localize, state_dict)
 
 
+def _get_fsdp_dtensor_layer_fqn_map(model):
+    """Map PP/VPP chunk-local layer FQNs to global checkpoint layer FQNs."""
+    layer_names = {}
+    for name, module in model.named_modules():
+        name = _strip_wrapper_prefixes(name)
+        if isinstance(module, TransformerLayer) and "mtp" not in name:
+            global_name = re.sub(r"layers\.(\d+)", f"layers.{module.layer_number - 1}", name)
+            if global_name != name:
+                layer_names[name] = global_name
+    return layer_names
+
+
+def _translate_fsdp_dtensor_fqn(name, layer_names):
+    """Translate local/global FQNs using the layer map, preserving wrappers and parameter suffixes."""
+    local_name = _strip_wrapper_prefixes(name)
+    wrapper = name[: len(name) - len(local_name)]
+    for source, destination in sorted(layer_names.items(), key=lambda item: -len(item[0])):
+        if local_name == source or local_name.startswith(source + "."):
+            return wrapper + destination + local_name[len(source) :]
+    return name
+
+
+def _build_fsdp_dtensor_global_fqn_lookup(config, model_chunks):
+    """Present this rank's model chunks as one model to checkpoint handlers.
+
+    For example, two chunks' local ``decoder.layers.0`` can appear as global
+    ``decoder.layers.0`` and ``decoder.layers.4``. The returned model-like view
+    provides ``get_parameter()`` and ``named_modules()`` over the existing
+    parameters and modules in that shared namespace.
+    """
+    parameters = {}
+    modules = {}
+    for chunk in model_chunks:
+        layer_names = _get_fsdp_dtensor_layer_fqn_map(chunk)
+        for name, parameter in chunk.named_parameters(remove_duplicate=False):
+            name = _strip_wrapper_prefixes(_translate_fsdp_dtensor_fqn(name, layer_names))
+            if name in parameters and parameters[name] is not parameter:
+                raise ValueError(f"Non-unique Megatron-FSDP optimizer parameter name: {name}")
+            parameters[name] = parameter
+        for name, module in chunk.named_modules(remove_duplicate=False):
+            modules[_strip_wrapper_prefixes(_translate_fsdp_dtensor_fqn(name, layer_names))] = (
+                module
+            )
+    if config.num_moe_experts:
+        # Existing SwiGLU handlers also query local expert indices.
+        parameters.update(handle_experts_in_state_dict(parameters, config.num_moe_experts))
+    return types.SimpleNamespace(
+        config=config,
+        parameters_by_fqn=parameters,
+        get_parameter=lambda name: parameters[_strip_wrapper_prefixes(name)],
+        named_modules=modules.items,
+    )
+
+
 def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
+    """Prepare model and optimizer state for ``fsdp_dtensor`` checkpoint save/load.
+
+    1. Merge PP/VPP model chunks under ``model`` using global layer FQNs.
+    2. Apply FP8, SwiGLU, MLA, expert-name and MTP checkpoint transforms using
+       global parameter/module lookups. Optimizer names stay global throughout.
+    3. Preserve optimizer parameter-group metadata.
+    4. Attach DCP chunk metadata for uneven DTensor shards.
+
+    Tensor views share their original storage. The caller performs I/O and
+    restores the raw chunk dictionaries after loading.
+    """
+    model_chunks = model if isinstance(model, (list, tuple)) else [model]
     state_dict = raw_state_dict.copy()
+    model_state_dict = {}
+    for chunk_index, chunk in enumerate(model_chunks):
+        model_key = "model" if len(model_chunks) == 1 else f"model{chunk_index}"
+        if model_key in state_dict:
+            layer_names = _get_fsdp_dtensor_layer_fqn_map(chunk)
+            model_state_dict.update(
+                {
+                    _translate_fsdp_dtensor_fqn(name, layer_names): value
+                    for name, value in state_dict.pop(model_key).items()
+                }
+            )
+    state_dict['model'] = model_state_dict
+    model = _build_fsdp_dtensor_global_fqn_lookup(config, model_chunks)
     handle_fp8_extra_state_case(state_dict['model'])
+
+    if 'optimizer' in state_dict:
+        for name in state_dict['optimizer']['state']:
+            if _strip_wrapper_prefixes(name) not in model.parameters_by_fqn:
+                raise ValueError(f"Megatron-FSDP optimizer parameter has no model owner: {name}")
 
     def apply(handler):
         """Run a state dict handler over the model and, when present, the optimizer state."""
@@ -2460,10 +2567,17 @@ def _load_base_checkpoint(
         raw_optimizer_state_dict = (
             state_dict['optimizer'].copy() if 'optimizer' in state_dict else None
         )
-        raw_model_state_dict = state_dict['model'].copy() if 'model' in state_dict else None
+        raw_model_state_dicts = {
+            key: value.copy() for key, value in state_dict.items() if re.fullmatch(r"model\d*", key)
+        }
         model = state_dict.pop('_model')
+        if gpt_compat_layer_maps is not None and len(model) > 1:
+            raise NotImplementedError(
+                "GPT-to-Hybrid fsdp_dtensor checkpoint loading with virtual pipeline "
+                "parallelism is not supported."
+            )
         cfg = get_run_config()
-        state_dict = preprocess_fsdp_dtensor_state_dict(cfg.model.transformer, state_dict, model[0])
+        state_dict = preprocess_fsdp_dtensor_state_dict(cfg.model.transformer, state_dict, model)
         fs_storage_reader = torch.distributed.checkpoint.FileSystemReader(checkpoint_name)
         state_dict_metadata = fs_storage_reader.read_metadata().state_dict_metadata
         if gpt_compat_layer_maps is not None:
@@ -2512,8 +2626,8 @@ def _load_base_checkpoint(
         if raw_optimizer_state_dict is not None:
             state_dict['optimizer'] = raw_optimizer_state_dict
 
-        if raw_model_state_dict is not None:
-            state_dict['model'] = raw_model_state_dict
+        state_dict.pop("model")
+        state_dict.update(raw_model_state_dicts)
     else:
         raise NotImplementedError(f'checkpoint format {ckpt_format} not supported')
 
@@ -2930,7 +3044,6 @@ def load_checkpoint(
         if train_state is not None:
             train_state.effective_finetune = finetune
 
-    model = unwrap_model(ddp_model)
     # Inference has no training wrapper, but can still load an MFSDP checkpoint.
     use_megatron_fsdp = (
         cfg.ddp.use_megatron_fsdp
@@ -2942,7 +3055,7 @@ def load_checkpoint(
         if hasattr(cfg, "ddp")
         else any(
             get_model_config(chunk).fp8_param or get_model_config(chunk).fp4_param
-            for chunk in model
+            for chunk in ddp_model
         )
     )
 
@@ -2979,6 +3092,8 @@ def load_checkpoint(
             '--inference-shards is incompatible with legacy torch checkpoints; '
             'convert the checkpoint to torch_dist first'
         )
+
+    model = _unwrap_checkpoint_model(ddp_model, ckpt_format, getattr(cfg, "ddp", None))
 
     if model_sharded_state_dict_modifier is not None and ckpt_format != 'torch_dist':
         raise NotImplementedError(
