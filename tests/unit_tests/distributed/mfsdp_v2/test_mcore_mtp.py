@@ -8,7 +8,6 @@ from torch.distributed.device_mesh import init_device_mesh
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_adapter_v2 import FullyShardedDataParallelV2
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import PrefetchOrder
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
@@ -31,21 +30,22 @@ class _SharedPredictor(nn.Module):
 
 
 def _config() -> TransformerConfig:
-    return TransformerConfig(num_layers=2, hidden_size=16, num_attention_heads=4)
+    return TransformerConfig(
+        num_layers=2, hidden_size=16, num_attention_heads=4, mtp_use_repeated_layer=True
+    )
 
 
 def _ddp_config() -> DistributedDataParallelConfig:
     return DistributedDataParallelConfig(
         use_megatron_fsdp=True,
         megatron_fsdp_version=2,
-        fsdp_prefetch_order=PrefetchOrder.RECORDED,
         use_distributed_optimizer=False,
         data_parallel_sharding_strategy="optim_grads_params",
     )
 
 
 def test_shared_mtp_matches_unsharded_training(distributed_setup):
-    """Explicit recording supports reused modules independently of MTP settings."""
+    """Shared MTP selects recorded execution order and matches unsharded losses."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     groups = ProcessGroupCollection(dp_cp=mesh.get_group())

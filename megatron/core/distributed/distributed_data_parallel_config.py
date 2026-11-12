@@ -7,7 +7,6 @@ from typing import Optional, Tuple
 import torch
 
 from ..utils import is_torch_min_version
-from .fsdp.src.megatron_fsdp.prefetch_order import PrefetchOrder
 
 # Sharding strategy names, ordered as the ZeRO ladder: each level shards one more
 # buffer than the last. Both data-parallel axes take a value from this set.
@@ -113,14 +112,6 @@ class DistributedDataParallelConfig:
 
     megatron_fsdp_version: int = 1
     """Megatron-FSDP implementation version. Valid values are 1 and 2."""
-
-    fsdp_prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION
-    """MFSDP v2 prefetch order: REGISTRATION follows module registration order;
-    RECORDED records the first forward/backward pass and replays its module-call
-    sequence. Select RECORDED for reused modules such as shared MTP predictors.
-    Recording currently requires PP=1 and ordinary module hooks; combined 1F1B
-    is unsupported.
-    Caller-owned FSDP contexts must use the same order."""
 
     overlap_outer_communication: bool = False
     """Overlap MFSDP v2's last-microbatch outer-DP gradient reduction with inner-DP
@@ -410,14 +401,6 @@ class DistributedDataParallelConfig:
                 )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
-        if not isinstance(self.fsdp_prefetch_order, PrefetchOrder):
-            raise ValueError("fsdp_prefetch_order must be a PrefetchOrder enum value.")
-        if self.fsdp_prefetch_order is PrefetchOrder.RECORDED and (
-            not self.use_megatron_fsdp or self.megatron_fsdp_version != 2
-        ):
-            raise ValueError(
-                "fsdp_prefetch_order=PrefetchOrder.RECORDED requires Megatron-FSDP v2."
-            )
         if self.overlap_outer_communication:
             if not self.use_megatron_fsdp:
                 raise ValueError("overlap_outer_communication requires Megatron-FSDP.")

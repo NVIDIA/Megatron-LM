@@ -26,7 +26,6 @@ from megatron.core.distributed import (
     DistributedDataParallelConfig,
     TorchFullyShardedDataParallelConfig,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.prefetch_order import PrefetchOrder
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig, WideResidualConfig
@@ -1176,8 +1175,6 @@ def get_megatron_ddp_config(
             tuple(args.ddp_param_name_patterns_for_fp32_local_accumulation)
         kwargs["average_in_collective"] = args.ddp_average_in_collective
         # Megatron-FSDP arguments.
-        if isinstance(kwargs.get("fsdp_prefetch_order"), str):
-            kwargs["fsdp_prefetch_order"] = PrefetchOrder[kwargs["fsdp_prefetch_order"].upper()]
         kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
         kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
         kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype

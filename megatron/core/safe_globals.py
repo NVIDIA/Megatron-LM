@@ -16,7 +16,6 @@ from numpy import dtype, ndarray
 from numpy.core.multiarray import _reconstruct
 from numpy.dtypes import UInt32DType
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.prefetch_order import PrefetchOrder
 from megatron.core.enums import ModelType
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.rerun_state_machine import RerunDiagnostic, RerunMode, RerunState
@@ -40,7 +39,6 @@ SAFE_GLOBALS = [
     CudaGraphScope,
     InferenceCudaGraphScope,
     ModelType,
-    PrefetchOrder,
     OptimizerConfig,
     RerunDiagnostic,
     RerunMode,

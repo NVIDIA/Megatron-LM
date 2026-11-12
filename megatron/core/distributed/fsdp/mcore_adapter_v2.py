@@ -263,12 +263,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
         # after the schedule completes, including delayed wgrad and custom 1F1B work.
-        prefetch_order = ddp_config.fsdp_prefetch_order
+        prefetch_order = self.prefetch_order_for(config)
         if prefetch_order is PrefetchOrder.RECORDED and config.pipeline_model_parallel_size != 1:
             raise ValueError("Recorded FSDP prefetch order currently requires PP=1.")
         if prefetch_order is PrefetchOrder.RECORDED and config.overlap_moe_expert_parallel_comm:
             raise ValueError(
-                "fsdp_prefetch_order=PrefetchOrder.RECORDED requires ordinary module hooks "
+                "Shared MTP requires recorded FSDP execution order and ordinary module hooks "
                 "rather than combined 1F1B."
             )
         active_context = current_fully_shard_context()
@@ -285,12 +285,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             )
         else:
-            if active_context.is_recording_execution_order != (
+            if (
                 prefetch_order is PrefetchOrder.RECORDED
+                and not active_context.is_recording_execution_order
             ):
                 raise ValueError(
-                    "The caller's FSDP context must match fsdp_prefetch_order="
-                    f"{ddp_config.fsdp_prefetch_order!r}."
+                    "Shared MTP requires the caller's FSDP context to use recorded execution order."
                 )
             if not active_context.caller_managed_grad_sync:
                 raise ValueError(
@@ -316,6 +316,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         if config.overlap_moe_expert_parallel_comm:
             register_combined_1f1b_hooks(self.module)
+
+    @staticmethod
+    def prefetch_order_for(config: TransformerConfig) -> "PrefetchOrder":
+        """Record repeated shared-MTP execution instead of using registration order."""
+        if config.mtp_use_repeated_layer:
+            return PrefetchOrder.RECORDED
+        return PrefetchOrder.REGISTRATION
 
     def load_state_dict(self, state_dict, strict=True):
         """Load main weights and refresh the buffers used for forward compute."""
