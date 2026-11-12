@@ -159,8 +159,16 @@ For each original source:
   merging. If any remaining source loses membership, changes head, or lacks
   approval, stop and report it. Batch CI success does not waive source review
   requirements.
-  Inspect any upstream-main drift. Resolve dependencies before
-  merging: open PRs based on `pull-request/<source PR>` must be retargeted to
+- Treat upstream-main drift as informational. Record the tested base and current
+  main, then continue landing the approved source patches on current main.
+  Watchers must continue when main advances, without path/blob allowlists,
+  additional approval, or a CI rerun solely for that drift. Refresh the merge
+  plan if main advances during preparation. Verify each resulting patch against
+  its actual merge parent; keep the frozen batch's CI tree proof separate from
+  verification of the landed patch. Source head, approval, queue membership,
+  and actual merge-conflict checks still apply.
+- Resolve dependencies before merging: open PRs based on
+  `pull-request/<source PR>` must be retargeted to
   `main`, as required by repository guidance.
 - Remove a verified source from the merge queue when needed for a direct merge.
   Squash-merge each original PR through GitHub with an exact head guard, such as
