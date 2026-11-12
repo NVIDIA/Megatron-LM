@@ -48,7 +48,11 @@ from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.hyper_connection_transformer_layer import (
     HyperConnectionTransformerLayer,
 )
-from megatron.core.transformer.module import convert_module_to_dtype_except_fp32_marked
+from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.module import (
+    MegatronModule,
+    convert_module_to_dtype_except_fp32_marked,
+)
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
@@ -717,6 +721,70 @@ def test_mhc_te_repeated_mtp_is_rejected():
             mtp_num_layers=2,
             mtp_use_repeated_layer=True,
         )
+
+
+class _CustomTransformerLayer(TransformerLayer):
+    """A custom layer type that subclasses TransformerLayer and replaces its forward."""
+
+    def __init__(self, config, moe) -> None:
+        MegatronModule.__init__(self, config)
+        self.layer_number = 1
+        self.cuda_graphs = []
+        self.is_moe_layer = moe
+        self.self_attention = IdentityOp() if moe else torch.nn.Identity()
+        self.cross_attention = IdentityOp()
+        self.mlp = torch.nn.Identity() if moe else IdentityOp()
+        self.forward_calls = 0
+
+    def forward(self, hidden_states, **_kwargs):
+        self.forward_calls += 1
+        return hidden_states * 1.25
+
+    def _forward_self_attention_output_with_bias(self, *_args, **_kwargs):
+        raise AssertionError("The custom forward must not be bypassed.")
+
+    def _te_cuda_graph_capture(self, *_args, **_kwargs):
+        raise AssertionError("The custom forward must not be bypassed.")
+
+
+class _CustomTransformerConfig(TransformerConfig):
+    layer_type = _CustomTransformerLayer
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("graphs", ["attention_split", "moe_router"])
+def test_mhc_te_graphs_keep_custom_transformer_layers_eager(graphs):
+    """The wrapper's graph paths call TransformerLayer internals, so custom layers stay eager."""
+    moe = graphs == "moe_router"
+    if moe:
+        root = _config("hybrid_moe", [CudaGraphModule.attn, CudaGraphModule.moe_router])
+    else:
+        root = _split_config(mhc_num_residual_streams=2, mhc_sinkhorn_iterations=3)
+    config = _CustomTransformerConfig.from_config(root)
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        inner = _CustomTransformerLayer(config, moe)
+        wrapper = HyperConnectionHybridLayer(config, inner).cuda()
+        assert not wrapper._is_attention_graph_split()
+        assert not wrapper._is_partial_moe_graph()
+        assert not _layer_is_graphable(wrapper, config)
+
+        hidden = torch.randn(
+            4,
+            2,
+            config.mhc_num_residual_streams * config.hidden_size,
+            dtype=config.params_dtype,
+            device="cuda",
+            requires_grad=True,
+        )
+        output, context = wrapper(hidden, attention_mask=None)
+        assert inner.forward_calls == 1
+        assert context is None
+        assert output.shape == hidden.shape
+        output.float().square().mean().backward()
+        assert hidden.grad is not None and torch.isfinite(hidden.grad).all()
+    finally:
+        Utils.destroy_model_parallel()
 
 
 def _scheduler_thd_split_models(kind, chunks):

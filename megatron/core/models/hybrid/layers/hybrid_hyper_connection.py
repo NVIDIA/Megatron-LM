@@ -95,10 +95,21 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         )
         return inputs
 
+    def _has_custom_inner_layer(self) -> bool:
+        """Whether the inner layer is a custom layer type, which owns its forward.
+
+        The wrapper's TE graph paths call TransformerLayer internals and would bypass a
+        custom forward, so custom layers stay eager.
+        """
+        return (
+            layer_utils.get_custom_layer_type(getattr(self.inner_layer, "config", None)) is not None
+        )
+
     def _is_attention_graph_split(self) -> bool:
         """Whether this wrapper captures only its inner input layernorm and self-attention."""
         return (
             _uses_mhc_attention_cuda_graph_split(self.config)
+            and not self._has_custom_inner_layer()
             and isinstance(self.inner_layer, TransformerLayer)
             and not isinstance(self.inner_layer.self_attention, IdentityOp)
         )
@@ -108,7 +119,8 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
 
     def _is_partial_moe_graph(self) -> bool:
         return (
-            isinstance(self.inner_layer, TransformerLayer)
+            not self._has_custom_inner_layer()
+            and isinstance(self.inner_layer, TransformerLayer)
             and self.inner_layer.is_moe_layer
             and CudaGraphModule.moe_router in self.config.cuda_graph_modules
         )

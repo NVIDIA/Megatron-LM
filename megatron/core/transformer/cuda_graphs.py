@@ -2318,6 +2318,9 @@ def _layer_is_graphable(layer, config):
     from megatron.core.transformer.transformer_layer import TransformerLayer
 
     if isinstance(layer, HyperConnectionHybridLayer):
+        # Custom layer types run eagerly under mHC.
+        if layer._has_custom_inner_layer():
+            return False
         # The wrapper owns capture, but the concrete inner layer determines
         # which configured scopes apply. A MoE-only wrapper has no attention
         # work to graph when only attn is selected.
