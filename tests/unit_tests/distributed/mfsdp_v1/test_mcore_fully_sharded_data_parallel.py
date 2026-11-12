@@ -329,7 +329,11 @@ class TestFullyShardedDataParallel:
         monkeypatch.setattr(
             common_utils, "get_args", lambda: SimpleNamespace(use_megatron_fsdp=True)
         )
-        monkeypatch.setattr(common_utils, "get_run_config", lambda: SimpleNamespace())
+        monkeypatch.setattr(
+            common_utils,
+            "get_run_config",
+            lambda: SimpleNamespace(ddp=SimpleNamespace(use_megatron_fsdp=True)),
+        )
         norm = common_utils.calc_params_l2_norm([fsdp_model])
 
         assert pipeline.bucket_status == status
