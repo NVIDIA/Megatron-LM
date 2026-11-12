@@ -43,8 +43,8 @@ from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.checkpointing import preprocess_fsdp_dtensor_state_dict
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
     run_forward_backward_on_microbatches,
@@ -523,6 +523,8 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
                 moe_aux_loss_coeff=0.0,
                 moe_grouped_gemm=True,
                 moe_ffn_hidden_size=128,
+                gated_linear_unit=True,
+                activation_func=torch.nn.functional.silu,
                 add_bias_linear=False,
                 gradient_accumulation_fusion=False,
                 # GPU initialization uses the expert-parallel RNG stream.
@@ -597,13 +599,29 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
 
         def checkpoint_state(model, optimizer, *, is_loading=False):
             state = {
-                "model": handle_experts_in_state_dict(
-                    model.state_dict_for_save_checkpoint(), model.config.num_moe_experts
-                ),
+                "model": model.state_dict_for_save_checkpoint(),
                 "optimizer": optimizer.sharded_state_dict({}, is_loading=is_loading),
             }
-            preprocess_state_dict_for_uneven_dtensor(state)
-            return state
+            return preprocess_fsdp_dtensor_state_dict(model.config, state, model)
+
+        def training_state(model, optimizer):
+            def clone(value):
+                if isinstance(value, DTensor):
+                    value = value.to_local()
+                return value.detach().clone() if isinstance(value, torch.Tensor) else value
+
+            return (
+                [clone(parameter) for parameter in model.parameters()],
+                [
+                    {
+                        key: clone(value)
+                        for key, value in optimizer.optimizer.state.get(parameter, {}).items()
+                    }
+                    for group in optimizer.optimizer.param_groups
+                    for parameter in group["params"]
+                ],
+                [clone(group.get("step", 0)) for group in optimizer.optimizer.param_groups],
+            )
 
         train(source, source_optimizer)
         with TempNamedDir(tmp_path_dist_ckpt / f"ep{ep_size}_mcore_roundtrip", sync=True) as path:
@@ -615,10 +633,22 @@ def test_ep_fsdp_checkpoint_roundtrip(distributed_setup, tmp_path_dist_ckpt, ep_
             destination.load_state_dict(raw_model_state)
             destination_optimizer.load_state_dict(state["optimizer"])
 
+        torch.testing.assert_close(
+            training_state(destination, destination_optimizer),
+            training_state(source, source_optimizer),
+            rtol=0,
+            atol=0,
+        )
         expected_losses = train(source, source_optimizer)
         actual_losses = train(destination, destination_optimizer)
         torch.testing.assert_close(
             torch.stack(actual_losses), torch.stack(expected_losses), rtol=0, atol=0
+        )
+        torch.testing.assert_close(
+            training_state(destination, destination_optimizer),
+            training_state(source, source_optimizer),
+            rtol=0,
+            atol=0,
         )
     finally:
         Utils.destroy_model_parallel()
