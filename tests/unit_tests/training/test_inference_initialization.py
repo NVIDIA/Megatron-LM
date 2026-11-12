@@ -280,12 +280,12 @@ def test_inference_rejects_training_tp_overlap_before_initialization(monkeypatch
 
 
 @pytest.mark.parametrize("native_model", [False, True])
-@pytest.mark.parametrize("decoder_overlap", [False, True])
+@pytest.mark.parametrize("vlm", [False, True])
 def test_distributed_training_services_require_explicit_opt_in(
-    monkeypatch, run_config, native_model, decoder_overlap
+    monkeypatch, run_config, native_model, vlm
 ):
     from megatron.core.transformer import TransformerConfig
-    from megatron.training.models import GPTModelConfig
+    from megatron.training.models import GPTModelConfig, LLaVAModelConfig
 
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
@@ -298,15 +298,15 @@ def test_distributed_training_services_require_explicit_opt_in(
     args.num_layers, args.hidden_size, args.num_attention_heads = 4, 128, 8
     args.params_dtype = torch.float32
     args.seq_length, args.decoder_seq_length = 64, 96
-    args.decoder_tp_comm_overlap = decoder_overlap
     args.micro_batch_size = 7  # Deliberately stale; cfg.train owns the input.
     args.batch_parallel_size = 1
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     run_config.train.micro_batch_size = 3
+    model_config_cls = LLaVAModelConfig if vlm else GPTModelConfig
     run_config.checkpoint.async_save = True
     run_config.checkpoint.use_persistent_ckpt_worker = True
     if native_model:
-        run_config.model = GPTModelConfig(
+        run_config.model = model_config_cls(
             transformer=TransformerConfig(
                 num_layers=4,
                 hidden_size=128,
@@ -320,7 +320,7 @@ def test_distributed_training_services_require_explicit_opt_in(
     else:
         from megatron.training.argument_utils import model_config_from_args
 
-        run_config.model = model_config_from_args(args)
+        run_config.model = model_config_from_args(args, model_config_cls=model_config_cls)
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     monkeypatch.setattr(initialize, "setup_logging", Mock())
     monkeypatch.setattr(initialize, "print_rank_0", Mock())
@@ -364,7 +364,7 @@ def test_distributed_training_services_require_explicit_opt_in(
     ]
     tp_call = initialize._initialize_tp_communicators.call_args
     assert isinstance(tp_call.args[0], TransformerConfig)
-    assert tp_call.kwargs["sequence_length"] == (96 if decoder_overlap else 64)
+    assert tp_call.kwargs["sequence_length"] == (96 if vlm else 64)
     assert tp_call.kwargs["micro_batch_size"] == 3
     if native_model:
         assert tp_call.args[0] is run_config.model.transformer
