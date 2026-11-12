@@ -216,7 +216,20 @@ def bwd(  # pragma: no cover
     padded_H = max(tilelang.math.next_power_of_2(H_kv), 16)
     block_H = min(_normalize_block_h(max_block_h), padded_H)
     assert padded_H % block_H == 0
-    NH = padded_H // block_H
+    # Tile the head dimension over the REAL head count (ceil-divided), not the power-of-two padded
+    # count. A head_kv that is not a whole number of block_H blocks (e.g. 96 with block_H==64) then
+    # gets a single partial final block rather than launching extra, fully out-of-range head blocks
+    # (which would read/write past the real head count and corrupt dKV). For power-of-two head_kv,
+    # block_H divides head_kv, so this equals padded_H // block_H and the grid is unchanged.
+    NH = tilelang.cdiv(H_kv, block_H)
+    # Whether the final head block is partial and its global head reads/writes must be masked.
+    # False (original unmasked path, bit-identical) for power-of-two head_kv.
+    needs_head_mask = H_kv % block_H != 0
+    if needs_head_mask:
+        assert kv_group == 1, (
+            "non-power-of-two head_kv with head-dim masking is only supported for a single KV "
+            "group (absorbed MLA); got kv_group=" + str(kv_group)
+        )
     BS = block_size
     NS = tilelang.cdiv(topk, block_size)
 
@@ -255,9 +268,31 @@ def bwd(  # pragma: no cover
             acc_dkv_shared = T.alloc_shared([BS // split_store, D], accum_dtype)
             acc_dkv_tail_shared = T.alloc_shared([BS // split_store, D_tail], accum_dtype)
 
-            T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, :D], Q_shared)
-            T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, D:], Q_tail_shared)
-            T.copy(dO[by, s_i, bz * block_H : (bz + 1) * block_H, :D], dO_shared)
+            if not needs_head_mask:
+                T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, :D], Q_shared)
+                T.copy(Q[by, s_i, bz * block_H : (bz + 1) * block_H, D:], Q_tail_shared)
+                T.copy(dO[by, s_i, bz * block_H : (bz + 1) * block_H, :D], dO_shared)
+            else:
+                # Partial final head block: load only real heads (global index < H_kv) and
+                # zero-fill the padded rows. Zeroing is REQUIRED for correctness, not just tidiness:
+                # the padded query-head rows of Q_shared/Q_tail_shared/dO_shared feed the dKV GEMMs
+                # below, and zero rows contribute exactly zero to the accumulated dKV. The clamped
+                # index keeps the global read in bounds for the padded rows.
+                for h_i, d_i in T.Parallel(block_H, D):
+                    g_h = bz * block_H + h_i
+                    Q_shared[h_i, d_i] = T.if_then_else(
+                        g_h < H_kv, Q[by, s_i, T.min(g_h, H_kv - 1), d_i], 0
+                    )
+                for h_i, d_i in T.Parallel(block_H, D_tail):
+                    g_h = bz * block_H + h_i
+                    Q_tail_shared[h_i, d_i] = T.if_then_else(
+                        g_h < H_kv, Q[by, s_i, T.min(g_h, H_kv - 1), D + d_i], 0
+                    )
+                for h_i, d_i in T.Parallel(block_H, D):
+                    g_h = bz * block_H + h_i
+                    dO_shared[h_i, d_i] = T.if_then_else(
+                        g_h < H_kv, dO[by, s_i, T.min(g_h, H_kv - 1), d_i], 0
+                    )
 
             T.clear(acc_dq)
             T.clear(acc_dq_tail)
@@ -296,9 +331,15 @@ def bwd(  # pragma: no cover
                 )
 
                 for h_i, bi_i in T.Parallel(block_H, BS):
+                    lse_h = bz * block_H + h_i
+                    if needs_head_mask:
+                        # Padded rows of a partial block read a clamped (in-bounds) LSE entry; the
+                        # value is discarded since those rows are never stored and contribute zero
+                        # to dKV. For power-of-two head_kv this branch is not taken, so the index
+                        # expression is unchanged.
+                        lse_h = T.min(lse_h, H_kv - 1)
                     acc_p[h_i, bi_i] = T.exp2(
-                        acc_p[h_i, bi_i] * sm_scale_mul_reciprocal_log2
-                        - Lse[by, s_i, bz * block_H + h_i]
+                        acc_p[h_i, bi_i] * sm_scale_mul_reciprocal_log2 - Lse[by, s_i, lse_h]
                     )
 
                 T.copy(acc_p, P_shared_cast)
@@ -313,10 +354,13 @@ def bwd(  # pragma: no cover
                 )
 
                 for h_i, bi_i in T.Parallel(block_H, BS):
+                    delta_h = bz * block_H + h_i
+                    if needs_head_mask:
+                        # Same clamp rationale as the LSE read above; a no-op for power-of-two
+                        # head_kv, where this branch is not taken.
+                        delta_h = T.min(delta_h, H_kv - 1)
                     acc_dp[h_i, bi_i] = (
-                        acc_p[h_i, bi_i]
-                        * (acc_dp[h_i, bi_i] - Delta[by, s_i, bz * block_H + h_i])
-                        * sm_scale
+                        acc_p[h_i, bi_i] * (acc_dp[h_i, bi_i] - Delta[by, s_i, delta_h]) * sm_scale
                     )
 
                 T.copy(acc_dp, dP_shared_cast)
@@ -379,8 +423,20 @@ def bwd(  # pragma: no cover
             T.copy(acc_dq, dQ_shared)
             T.copy(acc_dq_tail, dQ_tail_shared)
 
-            T.copy(dQ_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, :D])
-            T.copy(dQ_tail_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, D:])
+            if not needs_head_mask:
+                T.copy(dQ_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, :D])
+                T.copy(dQ_tail_shared, dQ[by, s_i, bz * block_H : (bz + 1) * block_H, D:])
+            else:
+                # Partial final head block: write back only the real heads (global index < H_kv);
+                # padded rows hold discardable garbage and must not touch out-of-range memory.
+                for h_i, d_i in T.Parallel(block_H, D):
+                    g_h = bz * block_H + h_i
+                    if g_h < H_kv:
+                        dQ[by, s_i, g_h, d_i] = dQ_shared[h_i, d_i]
+                for h_i, d_i in T.Parallel(block_H, D_tail):
+                    g_h = bz * block_H + h_i
+                    if g_h < H_kv:
+                        dQ[by, s_i, g_h, D + d_i] = dQ_tail_shared[h_i, d_i]
 
     return sparse_mla_bwd_kernel
 

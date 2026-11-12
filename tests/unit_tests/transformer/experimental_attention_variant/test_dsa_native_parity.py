@@ -141,6 +141,150 @@ def test_cudnn_indexer_dispatch_declines_explicit_key_positions(monkeypatch):
         )
 
 
+def test_cudnn_sparse_attention_takes_only_head_counts_flash_mla_cannot_align(monkeypatch):
+    """cudnn-frontend's forward is asked only for head counts FlashMLA cannot align."""
+    probed = []
+
+    def fake_probe(device_index, num_heads, head_dim, dtype):
+        probed.append((device_index, num_heads, head_dim, dtype))
+        return num_heads == 96
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_current_sm", lambda: (10, 3))
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_sparse_forward_probe", fake_probe)
+    serves = dsa_cudnn_kernels._cudnn_serves_sparse_attention
+    device = torch.device("cuda", 0)
+
+    # SM100 FlashMLA aligns 64, 128 and their divisors, so those never reach cudnn-frontend.
+    for heads in (16, 32, 64, 128):
+        assert not serves(heads, 576, torch.bfloat16, device)
+    assert not probed
+
+    assert serves(96, 576, torch.bfloat16, device)
+    assert not serves(48, 576, torch.bfloat16, device)
+    assert not serves(96, 576, torch.bfloat16, torch.device("cpu"))
+    assert probed == [(0, 96, 576, torch.bfloat16), (0, 48, 576, torch.bfloat16)]
+
+
+def test_sparse_attention_forward_routes_cudnn_served_heads_unpadded(monkeypatch):
+    """A head count served by cudnn-frontend skips FlashMLA and reaches it unpadded."""
+    sq, skv, heads, dim, d_v, topk = 3, 5, 6, 8, 4, 2
+    calls = []
+
+    def fake_cudnn_fwd(q, kv, topk_idxs, softmax_scale, d_v, attn_sink, topk_length):
+        shapes = tuple(tuple(t.shape) for t in (q, kv, topk_idxs, attn_sink, topk_length))
+        calls.append((*shapes, softmax_scale, d_v))
+        return q.new_zeros((q.size(0), q.size(1), d_v)), torch.zeros((q.size(0), q.size(1)))
+
+    def unexpected_flash_mla(*_args, **_kwargs):
+        raise AssertionError("FlashMLA must not run a head count cudnn-frontend serves")
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_serves_sparse_attention", lambda *_args: True)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_dsa_fwd_cudnn", fake_cudnn_fwd)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_dsa_fwd_flash_mla", unexpected_flash_mla)
+
+    out_flat, lse, q_flat, *_ = dsa_cudnn_kernels._run_sparse_attention_forward(
+        torch.randn(sq, 1, heads, dim),
+        torch.randn(skv, 1, dim),
+        torch.tensor([[[0, 1], [1, 2], [3, 4]]], dtype=torch.int32),
+        0.5,
+        d_v,
+        topk_length=torch.full((1, sq), topk, dtype=torch.int32),
+    )
+
+    assert calls == [((sq, heads, dim), (skv, dim), (sq, topk), (heads,), (sq,), 0.5, d_v)]
+    assert out_flat.shape == (sq, heads, d_v)
+    assert lse.shape == (sq, heads)
+    assert q_flat.shape == (sq, heads, dim)
+
+
+def test_dsa_fwd_cudnn_passes_flat_operands_and_checks_value_channels(monkeypatch):
+    """The cudnn-frontend adapter forwards the flat DSA operands and validates d_v."""
+    seen = {}
+
+    class FakeDSA:
+        @staticmethod
+        def sparse_attention_forward_wrapper(q, kv, topk_idxs, **kwargs):
+            seen.update(q=q, kv=kv, topk_idxs=topk_idxs, **kwargs)
+            return {
+                "out": q.new_zeros((q.size(0), q.size(1), 4)),
+                "lse": torch.zeros((q.size(0), q.size(1))),
+            }
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    q, kv = torch.randn(3, 6, 8), torch.randn(5, 8)
+    topk_idxs = torch.zeros((3, 2), dtype=torch.int32)
+    attn_sink = torch.full((6,), float("-inf"))
+    topk_length = torch.full((3,), 2, dtype=torch.int32)
+
+    out, lse = dsa_cudnn_kernels._dsa_fwd_cudnn(q, kv, topk_idxs, 0.5, 4, attn_sink, topk_length)
+
+    assert out.shape == (3, 6, 4)
+    assert lse.shape == (3, 6)
+    assert seen["q"] is q and seen["kv"] is kv and seen["topk_idxs"] is topk_idxs
+    assert seen["attn_sink"] is attn_sink and seen["topk_length"] is topk_length
+    assert seen["softmax_scale"] == 0.5 and seen["indexer_topk"] == 0
+    with pytest.raises(RuntimeError, match="value channels"):
+        dsa_cudnn_kernels._dsa_fwd_cudnn(q, kv, topk_idxs, 0.5, 8, attn_sink, topk_length)
+
+
+def _sparse_gather_reference(query, key, indices, scale):
+    """FP32 sparse absorbed attention over each row's selected keys (values = first 512 channels)."""
+    query = query.permute(1, 0, 2, 3).float()
+    key = key[:, :, 0].permute(1, 0, 2).float()
+    batch = torch.arange(key.size(0), device=key.device)[:, None, None]
+    selected = key[batch, indices.clamp_min(0).long()]
+    valid = indices >= 0
+    logits = torch.einsum("bshd,bskd->bshk", query, selected) * scale
+    logits = logits.masked_fill(~valid.unsqueeze(2), float("-inf"))
+    # All-invalid rows must produce zero output and zero gradients.
+    logits = torch.where(valid.any(-1)[:, :, None, None], logits, torch.zeros_like(logits))
+    probs = logits.softmax(-1).masked_fill(~valid.unsqueeze(2), 0)
+    return torch.einsum("bshk,bskd->bshd", probs, selected[..., :512]).permute(1, 0, 2, 3)
+
+
+@pytest.mark.parametrize("dim", [512, 576])
+@pytest.mark.parametrize("heads", [64, 96])
+def test_cudnn_absorbed_sparse_attention_matches_reference_on_cuda(heads, dim):
+    """Real-kernel output and both input gradients match an FP32 gather reference.
+
+    On SM100 ``heads=64`` runs FlashMLA's forward, while ``heads=96`` cannot be aligned by
+    FlashMLA and runs cudnn-frontend's forward and backward unpadded.
+    """
+    _skip_if_fused_dsa_unavailable()
+    device = torch.device("cuda", torch.cuda.current_device())
+    if dsa_cudnn_kernels._flash_mla_head_padding(heads) is None and not (
+        dsa_cudnn_kernels._cudnn_serves_sparse_attention(heads, dim, torch.bfloat16, device)
+    ):
+        pytest.skip(f"neither FlashMLA nor the installed cudnn-frontend serves {heads} heads here")
+    torch.manual_seed(17)
+    length, topk, scale = 129, 65, 0.037
+    query = torch.randn(length, 1, heads, dim, device=device, dtype=torch.bfloat16)
+    key = torch.randn(length, 1, 1, dim, device=device, dtype=torch.bfloat16)
+    query.requires_grad_()
+    key.requires_grad_()
+    rows = torch.arange(length, device=device)[:, None]
+    indices = (rows - torch.arange(topk, device=device)[None, :]).clamp_min(-1)
+    indices[0] = -1
+    indices = indices.unsqueeze(0).to(torch.int32)
+
+    output = dsa_cudnn_kernels.run_fused_absorbed_sparse_attention(query, key, indices, scale, 512)
+    assert output is not None, "supported shapes must reach the fused kernel"
+    grad = torch.randn_like(output) * 0.01
+    output.backward(grad)
+
+    q_ref = query.detach().clone().requires_grad_()
+    k_ref = key.detach().clone().requires_grad_()
+    reference = _sparse_gather_reference(q_ref, k_ref, indices, scale)
+    reference.backward(grad.float())
+    for actual, expected in ((output, reference), (query.grad, q_ref.grad), (key.grad, k_ref.grad)):
+        assert torch.isfinite(actual).all()
+        relative_error = (actual.float() - expected.float()).norm() / expected.float().norm()
+        assert relative_error < 0.02
+    assert torch.count_nonzero(output[0]) == 0
+    assert torch.count_nonzero(query.grad[0]) == 0
+
+
 @pytest.mark.parametrize("q_shape", [(3, 1, 1), (2, 3, 1, 1)])
 def test_cudnn_indexer_forward_warns_once_above_shared_row_limit(q_shape, monkeypatch, caplog):
     """Both THD and BSHD DSv3.2 calls use the shared fused-row diagnostic."""
@@ -1194,6 +1338,49 @@ def test_cudnn_cp2_general_thd_without_q_causal_offsets_falls_back(monkeypatch):
     assert topk_length.shape == torch.Size([1, 4])
 
 
+def test_cudnn_single_packed_cp_without_q_causal_offsets_falls_back(monkeypatch):
+    """The halves of a single-sequence pack cannot be scored without Q offsets either."""
+    calls = {"unfused": 0}
+
+    class LegacyDSA:
+        @staticmethod
+        def indexer_forward_wrapper(q, k, weights, ratio, sm_scale):
+            raise AssertionError("the legacy wrapper cannot place a half inside its key prefix")
+
+    def unfused(*_args, **_kwargs):
+        calls["unfused"] += 1
+        return torch.zeros((1, 4, 2), dtype=torch.int32), None
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", LegacyDSA)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_topk_from_score_chunks", unfused)
+    monkeypatch.setattr(
+        dsa_cudnn_kernels,
+        "_indexer_topk_single_packed_cp_segments",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a frontend without Q offsets must not reach the segment scorer")
+        ),
+    )
+
+    topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
+        torch.ones((1, 4, 1, 1)),
+        torch.ones((1, 8, 1)),
+        torch.ones((1, 4, 1)),
+        topk=2,
+        varlen_starts=torch.zeros(4, dtype=torch.int64),
+        varlen_ends=torch.tensor([3, 4, 5, 6], dtype=torch.int64),
+        return_scores=False,
+        use_local_indexer_varlen=True,
+        single_packed_thd_sequence=True,
+        packed_cp_size=2,
+        local_packed_cp_rank=1,
+    )
+
+    assert calls["unfused"] == 1
+    assert topk_indices.shape == torch.Size([1, 4, 2])
+    assert topk_length.shape == torch.Size([1, 4])
+
+
 def test_cudnn_general_thd_rejects_tp_query_slices():
     """THD cu-seqlens describe full Q, so either TP-slice marker must decline."""
     cu_seqlens = torch.tensor([0, 3, 8], dtype=torch.int32)
@@ -1450,18 +1637,34 @@ def test_cudnn_split_topk_threads_multi_packed_cp_metadata(monkeypatch):
     assert loss_on[20:23] == (16, 16, 2)
 
 
+def _fake_causal_indexer_scores(q_bshd, k_bshd, q_causal_offsets):
+    """Scores equal to the key index, masked the way cuDNN's indexer forward masks them.
+
+    Row ``r`` of batch ``b`` is token ``q_causal_offsets[b] + r`` (token ``r`` without
+    offsets) and sees the keys up to and including that token.
+    """
+    b, sq, _, _ = q_bshd.shape
+    sk = k_bshd.shape[1]
+    scores = torch.arange(sk, dtype=torch.float32).view(1, 1, sk).expand(b, sq, sk).clone()
+    offsets = (
+        torch.zeros(b, dtype=torch.int64)
+        if q_causal_offsets is None
+        else q_causal_offsets.to(dtype=torch.int64)
+    )
+    tokens = offsets.view(b, 1) + torch.arange(sq).view(1, sq)
+    scores.masked_fill_(torch.arange(sk).view(1, 1, sk) > tokens.view(b, sq, 1), float("-inf"))
+    return scores
+
+
 def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch):
-    seen = {"forward_shapes": [], "topk_seq_lens": []}
+    seen = {"forward_shapes": [], "q_starts": [], "topk_seq_lens": []}
 
     class FakeDSA:
         @staticmethod
-        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale):
+        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale, q_causal_offsets=None):
             seen["forward_shapes"].append((q_bshd.shape[1], k_bshd.shape[1]))
-            b, sq, _, _ = q_bshd.shape
-            sk = k_bshd.shape[1]
-            return {
-                "scores": torch.arange(sk, dtype=torch.float32).view(1, 1, sk).expand(b, sq, sk)
-            }
+            seen["q_starts"].append(q_causal_offsets.tolist())
+            return {"scores": _fake_causal_indexer_scores(q_bshd, k_bshd, q_causal_offsets)}
 
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
@@ -1494,6 +1697,9 @@ def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch)
     )
 
     assert seen["forward_shapes"] == [(2, 4), (2, 6)]
+    # Each half starts inside its key prefix: the kernel has to be told where, or it
+    # would mask the keys in front of the half's first row.
+    assert seen["q_starts"] == [[2], [4]]
     assert [seq_lens.tolist() for seq_lens in seen["topk_seq_lens"]] == [[3, 4], [5, 6]]
     torch.testing.assert_close(
         topk_indices,
@@ -1507,17 +1713,14 @@ def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch)
 
 
 def test_cudnn_indexer_topk_single_packed_cp_prefix_crops_keys_per_chunk(monkeypatch):
-    seen = {"forward_shapes": []}
+    seen = {"forward_shapes": [], "q_starts": []}
 
     class FakeDSA:
         @staticmethod
-        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale):
+        def indexer_forward_wrapper(q_bshd, k_bshd, w_bsh, ratio, sm_scale, q_causal_offsets=None):
             seen["forward_shapes"].append((q_bshd.shape[1], k_bshd.shape[1]))
-            b, sq, _, _ = q_bshd.shape
-            sk = k_bshd.shape[1]
-            return {
-                "scores": torch.arange(sk, dtype=torch.float32).view(1, 1, sk).expand(b, sq, sk)
-            }
+            seen["q_starts"].append(q_causal_offsets.tolist())
+            return {"scores": _fake_causal_indexer_scores(q_bshd, k_bshd, q_causal_offsets)}
 
         @staticmethod
         def indexer_top_k_wrapper(scores_flat, seq_lens, top_k, next_n, return_val):
@@ -1546,6 +1749,7 @@ def test_cudnn_indexer_topk_single_packed_cp_prefix_crops_keys_per_chunk(monkeyp
     )
 
     assert seen["forward_shapes"] == [(1, 1), (1, 2)]
+    assert seen["q_starts"] == [[0], [1]]
     torch.testing.assert_close(topk_indices, torch.tensor([[[0, -1], [0, 1]]], dtype=torch.int32))
     torch.testing.assert_close(topk_length, torch.tensor([[1, 2]], dtype=torch.int32))
 

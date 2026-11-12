@@ -325,7 +325,12 @@ def run_fused_dsa_attention(
         return None
     if not _supports_flash_mla_value_layout(key.size(-1), latent_v_channels):
         return None
-    if not _flash_mla_supports_head_count(query):
+    # The indexer loss target comes from the cuDNN sparse score recompute, which still takes
+    # FlashMLA-aligned heads; without a loss, cudnn-frontend's own forward may serve the rest.
+    if loss_coeff > 0:
+        if not _flash_mla_supports_head_count(query):
+            return None
+    elif not _sparse_attention_supports_head_count(query):
         return None
     sq, b, num_heads, _ = query.size()
     kv_full = key.squeeze(2).contiguous()
@@ -475,6 +480,66 @@ def _flash_mla_supports_head_count(query: Tensor) -> bool:
     if not query.is_cuda:
         return True
     return _flash_mla_head_padding(query.size(2)) is not None
+
+
+@functools.lru_cache(maxsize=None)
+def _cudnn_sparse_forward_probe(
+    device_index: int, num_heads: int, head_dim: int, dtype: torch.dtype
+) -> bool:
+    """Ask cudnn-frontend whether its own sparse-prefill forward serves ``(num_heads, head_dim)``.
+
+    ``DSA.SparseAttentionForward.check_support()`` validates a shape declaration without
+    compiling a kernel, so the answer follows the installed cudnn-frontend (for example H96 with
+    D512/D576 on SM100) instead of a table duplicated here. Releases without that class, or that
+    reject the shape, answer False.
+    """
+    try:
+        _ensure_dsa_namespace()
+    except ImportError:
+        return False
+    plan_cls = getattr(_cudnn_dsa, "SparseAttentionForward", None)
+    if plan_cls is None:
+        return False
+    device = torch.device("cuda", device_index)
+    try:
+        plan = plan_cls(
+            torch.empty((1, num_heads, head_dim), dtype=dtype, device=device),
+            torch.empty((1, head_dim), dtype=dtype, device=device),
+            torch.zeros((1, 1), dtype=torch.int32, device=device),
+            sample_attn_sink=torch.empty((num_heads,), dtype=torch.float32, device=device),
+            sample_topk_length=torch.ones((1,), dtype=torch.int32, device=device),
+        )
+        return bool(plan.check_support())
+    except (ValueError, RuntimeError, TypeError):
+        return False
+
+
+def _cudnn_serves_sparse_attention(
+    num_heads: int, head_dim: int, dtype: torch.dtype, device: torch.device
+) -> bool:
+    """Whether cudnn-frontend, not FlashMLA, runs sparse attention for this query layout.
+
+    FlashMLA stays the forward kernel wherever it can align the query-head count. cudnn-frontend's
+    own sparse-prefill forward takes over only the head counts FlashMLA cannot align (96 on SM100,
+    for example) and runs them unpadded; its backward handles those head counts natively, so
+    neither direction pads the heads.
+    """
+    if device.type != "cuda" or _flash_mla_head_padding(num_heads) is not None:
+        return False
+    index = torch.cuda.current_device() if device.index is None else device.index
+    return _cudnn_sparse_forward_probe(index, num_heads, head_dim, dtype)
+
+
+def _sparse_attention_supports_head_count(query: Tensor) -> bool:
+    """Whether fused sparse attention can run ``query``'s head count, on FlashMLA or cudnn-frontend.
+
+    ``query`` is the ``(sq, b, heads, d)`` attention query. Paths that also need the cuDNN sparse
+    score recompute (the indexer loss target) keep gating on
+    :func:`_flash_mla_supports_head_count`: that kernel still takes FlashMLA-aligned heads.
+    """
+    if _flash_mla_supports_head_count(query):
+        return True
+    return _cudnn_serves_sparse_attention(query.size(2), query.size(3), query.dtype, query.device)
 
 
 def _bytes_to_chunk_rows(n_rows: int, bytes_per_row: int, max_bytes: int, alignment: int) -> int:
@@ -720,8 +785,20 @@ def _indexer_topk_from_score_chunks(
             None if score_seq_lens is None else score_seq_lens[row_start:row_end].contiguous()
         )
         if bottom_right_key_start is not None:
+            # cuDNN anchors the causal mask at the chunk's first query row, which it takes
+            # to be token 0 unless told otherwise. These rows start further into the key
+            # prefix, so name their first token; without it every row would see only as
+            # many keys as its offset inside the chunk.
+            chunk_q_start = torch.full(
+                (b,), bottom_right_key_start + row_start, dtype=torch.int32, device=q_bshd.device
+            )
             scores_chunk = _indexer_forward_wrapper_with_warning(
-                q_chunk, score_k_bshd, w_chunk, ratio=indexer_ratio, sm_scale=_INDEXER_SOFTMAX_SCALE
+                q_chunk,
+                score_k_bshd,
+                w_chunk,
+                ratio=indexer_ratio,
+                sm_scale=_INDEXER_SOFTMAX_SCALE,
+                q_causal_offsets=chunk_q_start,
             )["scores"]
         elif score_seq_lens is None and row_start == 0 and row_end == sq:
             scores_chunk = _indexer_forward_wrapper_with_warning(
@@ -1174,6 +1251,41 @@ def _ensure_dsa_namespace() -> None:
     _cudnn_dsa = _ns
 
 
+def _dsa_fwd_cudnn(
+    q: Tensor,
+    kv: Tensor,
+    topk_idxs: Tensor,
+    softmax_scale: float,
+    d_v: int,
+    attn_sink: Tensor,
+    topk_length: Tensor,
+) -> Tuple[Tensor, Tensor]:
+    """Sparse-prefill forward on cudnn-frontend, for head counts FlashMLA cannot align.
+
+    Takes the flat operands of :func:`_dsa_fwd_flash_mla` and returns the same ``(out, lse)``.
+    cudnn-frontend pads the top-k width itself and runs the query heads unpadded, so neither is
+    padded here.
+    """
+    _ensure_dsa_namespace()
+    with torch.cuda.nvtx.range("cudnn_sparse_attention_fwd"):
+        result = _cudnn_dsa.sparse_attention_forward_wrapper(
+            q,
+            kv,
+            topk_idxs,
+            attn_sink=attn_sink,
+            topk_length=topk_length,
+            softmax_scale=softmax_scale,
+            indexer_topk=0,
+        )
+    out = result["out"]
+    if out.size(-1) != d_v:
+        raise RuntimeError(
+            f"cudnn-frontend sparse attention returned {out.size(-1)} value channels, "
+            f"expected d_v={d_v}."
+        )
+    return out, result["lse"]
+
+
 def _supports_indexer_q_causal_offsets() -> bool:
     """Whether the installed cuDNN frontend accepts per-segment Q offsets."""
     if _cudnn_dsa is None:
@@ -1506,6 +1618,16 @@ def _indexer_topk_bshd(
         scoring_plan = IndexerScoringDecision(
             IndexerScoringPlan.UNFUSED_BOUNDS,
             "cuDNN indexer_forward_wrapper lacks q_causal_offsets required for CP>1 packed THD",
+        )
+    elif (
+        scoring_plan.plan is IndexerScoringPlan.PACKED_SINGLE_SEGMENTS
+        and not _supports_indexer_q_causal_offsets()
+    ):
+        # The segment scorer has to tell cuDNN where each chunk of query rows starts.
+        scoring_plan = IndexerScoringDecision(
+            IndexerScoringPlan.UNFUSED_BOUNDS,
+            "cuDNN indexer_forward_wrapper lacks q_causal_offsets required for "
+            "single-sequence packs",
         )
     plan = scoring_plan.plan
     report_unfused_scoring_once(scoring_plan, "indexer scoring")
@@ -2358,7 +2480,11 @@ def _run_sparse_attention_forward(
     topk_length: Optional[Tensor] = None,
     sanitize_topk_for_backward_in_place: bool = False,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
-    """Run FlashMLA sparse attention from local DSA top-k indices."""
+    """Run sparse attention from local DSA top-k indices.
+
+    FlashMLA runs it wherever it can align the query-head count; cudnn-frontend's own forward
+    takes the head counts it cannot (see :func:`_cudnn_serves_sparse_attention`).
+    """
     sq, b, num_heads, d = query.shape
     skv = kv_full.shape[0]
 
@@ -2376,7 +2502,12 @@ def _run_sparse_attention_forward(
 
     q_flat = query.reshape(sq * b, num_heads, d)
     kv_flat = kv_full.reshape(skv * b, kv_full.size(-1))
-    out_flat, lse = _dsa_fwd_flash_mla(
+    sparse_fwd = (
+        _dsa_fwd_cudnn
+        if _cudnn_serves_sparse_attention(num_heads, d, query.dtype, query.device)
+        else _dsa_fwd_flash_mla
+    )
+    out_flat, lse = sparse_fwd(
         q_flat,
         kv_flat,
         global_idxs,
@@ -2426,7 +2557,10 @@ def _run_sparse_attention_backward(
     bwd_lse = lse
     bwd_attn_sink = attn_sink
     padded_num_heads = num_heads
-    if q_flat.is_cuda:
+    # Head counts served by cudnn-frontend's forward run unpadded in its backward as well.
+    if q_flat.is_cuda and not _cudnn_serves_sparse_attention(
+        num_heads, q_flat.size(2), q_flat.dtype, q_flat.device
+    ):
         padded_num_heads = _get_head_padding(num_heads)
     if padded_num_heads != num_heads:
         bwd_q_flat = q_flat.new_zeros((q_flat.size(0), padded_num_heads, q_flat.size(2)))
@@ -3020,7 +3154,7 @@ def run_fused_absorbed_sparse_attention(
         return None
     if not _supports_flash_mla_value_layout(key.size(-1), v_channels):
         return None
-    if not _flash_mla_supports_head_count(query):
+    if not _sparse_attention_supports_head_count(query):
         return None
 
     kv_full = key.squeeze(2).contiguous()
