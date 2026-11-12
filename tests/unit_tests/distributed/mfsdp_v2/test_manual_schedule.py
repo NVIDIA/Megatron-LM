@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Loss, gradient, and update parity for module-scheduled MFSDP training.
+"""Loss, gradient, and update parity for parameter-group-scheduled MFSDP training.
 
 One FSDP unit schedules two parameters at distinct compute stages, prefetching
 later weights and reducing completed gradients without execution hooks.
@@ -46,19 +46,48 @@ class MLP(nn.Module):
         return F.linear(hidden, self.weight2)
 
 
+def prefetch_group(group, allgather_stream):
+    """Start a gather without making compute wait for it."""
+    with torch.cuda.stream(allgather_stream):
+        group.unshard_parameters()
+
+
+def reshard_group(group, allgather_stream):
+    """Release this group's full weights after their last consumer."""
+    group.bind_sharded_parameters()
+    allgather_stream.wait_stream(torch.cuda.current_stream(allgather_stream.device))
+    with torch.cuda.stream(allgather_stream):
+        group.release_unsharded_storage()
+
+
+def reduce_group(group, reduction_stream):
+    """Pack completed gradients and reduce on the separate reduction stream."""
+    compute_stream = torch.cuda.current_stream(reduction_stream.device)
+    with torch.cuda.stream(reduction_stream):
+        partial_grad = group.allocate_partial_grad_buffer()
+    compute_stream.wait_stream(reduction_stream)
+    group.copy_gradients_to_partial_buffer(partial_grad)
+    reduction_stream.wait_stream(compute_stream)
+    with torch.cuda.stream(reduction_stream):
+        group.reduce_inner_gradients(partial_grad)
+        group.reduce_outer_gradients()
+
+
 class ScheduledMLPFunction(torch.autograd.Function):
-    """Consume each parameter group only at its stage of forward and backward."""
+    """Schedule parameter groups using tensor handles and caller-owned streams."""
 
     @staticmethod
-    def forward(ctx, inputs, weight1, weight2, module):
+    def forward(ctx, inputs, weight1, weight2, allgather_stream, reduction_stream):
         """Compute stage one while stage two's weights are being gathered."""
         group1 = get_containing_parameter_group(weight1)
         group2 = get_containing_parameter_group(weight2)
-        ctx.module = module
         ctx.groups = (group1, group2)
+        ctx.weights = (weight1, weight2)
+        ctx.allgather_stream = allgather_stream
+        ctx.reduction_stream = reduction_stream
         hidden = torch.tanh(F.linear(inputs, weight1))
         if group1 is not group2:
-            module.reshard_group(group1)
+            reshard_group(group1, allgather_stream)
         # The first GEMM and activation did not wait for this later gather.
         group2.wait_for_unshard(None)
         output = F.linear(hidden, weight2)
@@ -68,70 +97,48 @@ class ScheduledMLPFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Prefetch stage one while computing and reducing stage two's gradients."""
-        module = ctx.module
         group1, group2 = ctx.groups
+        weight1, weight2 = ctx.weights
         inputs, hidden = ctx.saved_tensors
-        module.context.allgather_stream.wait_stream(module.context.current_stream())
-        module.prefetch_group(group2)
+        allgather_stream = ctx.allgather_stream
+        reduction_stream = ctx.reduction_stream
+        allgather_stream.wait_stream(torch.cuda.current_stream(allgather_stream.device))
+        prefetch_group(group2, allgather_stream)
         group2.wait_for_unshard(None)
-        module.prefetch_group(group1)
+        prefetch_group(group1, allgather_stream)
 
-        grad_hidden = grad_output.matmul(module.weight2)
-        module.weight2.grad = grad_output.t().matmul(hidden)
+        grad_hidden = grad_output.matmul(weight2)
+        weight2.grad = grad_output.t().matmul(hidden)
         if group1 is not group2:
-            module.reduce_group(group2)
-            module.reshard_group(group2)
+            reduce_group(group2, reduction_stream)
+            reshard_group(group2, allgather_stream)
 
         group1.wait_for_unshard(None)
         grad_projected = grad_hidden * (1 - hidden.square())
-        grad_input = grad_projected.matmul(module.weight1) if ctx.needs_input_grad[0] else None
-        module.weight1.grad = grad_projected.t().matmul(inputs)
+        grad_input = grad_projected.matmul(weight1) if ctx.needs_input_grad[0] else None
+        weight1.grad = grad_projected.t().matmul(inputs)
         # Packed grouping must wait until both parameter gradients are ready.
-        module.reduce_group(group1)
-        module.reshard_group(group1)
+        reduce_group(group1, reduction_stream)
+        reshard_group(group1, allgather_stream)
         # The group methods install optimizer gradients directly.
-        return grad_input, None, None, None
+        return grad_input, None, None, None, None
 
 
 class ScheduledMLP(MLP):
-    """One FSDP unit that explicitly schedules its parameter groups without hooks."""
+    """Pass parameter tensors and explicit streams to the scheduled computation."""
 
-    def prefetch_group(self, group):
-        """Start a gather without making compute wait for it."""
-        with torch.cuda.stream(self.context.allgather_stream):
-            group.unshard_parameters()
-
-    def reshard_group(self, group):
-        """Release this group's full weights after their last consumer."""
-        group.bind_sharded_parameters()
-        self.context.allgather_stream.wait_stream(self.context.current_stream())
-        with torch.cuda.stream(self.context.allgather_stream):
-            group.release_unsharded_storage()
-
-    def reduce_group(self, group):
-        """Pack completed gradients and reduce on the separate reduction stream."""
-        context = self.context
-        compute_stream = context.current_stream()
-        reduction_stream = context.inner_reduction_stream
-        with torch.cuda.stream(reduction_stream):
-            partial_grad = group.allocate_partial_grad_buffer()
-        compute_stream.wait_stream(reduction_stream)
-        group.copy_gradients_to_partial_buffer(partial_grad)
-        reduction_stream.wait_stream(compute_stream)
-        with torch.cuda.stream(reduction_stream):
-            group.reduce_inner_gradients(partial_grad)
-            group.reduce_outer_gradients()
-
-    def forward(self, inputs):
+    def forward(self, inputs, allgather_stream, reduction_stream):
         """Wait for the first matrix and prefetch the second before stage one."""
         group1 = get_containing_parameter_group(self.weight1)
         group2 = get_containing_parameter_group(self.weight2)
-        self.context.allgather_stream.wait_stream(self.context.current_stream())
-        self.prefetch_group(group1)
+        allgather_stream.wait_stream(torch.cuda.current_stream(allgather_stream.device))
+        prefetch_group(group1, allgather_stream)
         group1.wait_for_unshard(None)
-        self.prefetch_group(group2)
-        output = ScheduledMLPFunction.apply(inputs, self.weight1, self.weight2, self)
-        self.reshard_group(group2)
+        prefetch_group(group2, allgather_stream)
+        output = ScheduledMLPFunction.apply(
+            inputs, self.weight1, self.weight2, allgather_stream, reduction_stream
+        )
+        reshard_group(group2, allgather_stream)
         return output
 
 
@@ -190,7 +197,11 @@ def test_manual_schedule_matches_dense_training(
         reference_loss.backward()
 
         model_inputs = inputs.detach().requires_grad_(inputs.requires_grad)
-        loss = model(model_inputs).square().mean()
+        loss = (
+            model(model_inputs, context.allgather_stream, context.inner_reduction_stream)
+            .square()
+            .mean()
+        )
         torch.testing.assert_close(loss, reference_loss)
         loss.backward()
         context.finish_grad_sync()
