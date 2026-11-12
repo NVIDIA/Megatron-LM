@@ -61,10 +61,9 @@ def test_mhc_pipeline_tensor_shapes(enabled, streams, pp_size, tp_size, cp_size,
     )
     width = 64 * (streams if enabled and pp_size > 1 else 1)
     assert _get_pipeline_hidden_size(config) == width
-    # decoder_seq_length takes precedence; SP/CP affect only the sequence axis.
+    # The caller supplies the pipeline width; SP/CP affect only the sequence axis.
     shape = get_tensor_shapes(
-        seq_length=64,
-        decoder_seq_length=32,
+        seq_length=32,
         micro_batch_size=2,
         config=config,
         tp_group=SimpleNamespace(size=lambda: tp_size),

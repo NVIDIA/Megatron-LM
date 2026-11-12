@@ -3520,9 +3520,8 @@ def train_step(
             # Distillation shape-adjust reads parallel_state; only for modelopt-enabled runs.
             adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
                 model,
-                seq_length=sequence_length,
+                seq_length=decoder_seq_length if decoder_seq_length is not None else sequence_length,
                 micro_batch_size=cfg.train.micro_batch_size,
-                decoder_seq_length=decoder_seq_length,
             )
         else:
             adjust_tensor_shapes_fn = None
@@ -5870,9 +5869,8 @@ def evaluate(
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
         adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
             model,
-            seq_length=sequence_length,
+            seq_length=decoder_seq_length if decoder_seq_length is not None else sequence_length,
             micro_batch_size=eval_micro_batch_size,
-            decoder_seq_length=decoder_seq_length,
         )
     else:
         adjust_tensor_shapes_fn = None

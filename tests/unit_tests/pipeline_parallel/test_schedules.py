@@ -402,8 +402,9 @@ def test_forward_backward_func_without_pipeline_parallel(mocker):
         (MultiModulePipelineCommunicator, True, 2),
     ],
 )
+@pytest.mark.parametrize("decoder_seq_length", [None, 8])
 def test_schedule_enables_grad_sync_on_first_stage(
-    monkeypatch, communicator_base, module_first_stage, pipeline_stages
+    monkeypatch, communicator_base, module_first_stage, pipeline_stages, decoder_seq_length
 ):
     events = []
 
@@ -499,18 +500,34 @@ def test_schedule_enables_grad_sync_on_first_stage(
         pg_collection.tp = SimpleNamespace(size=lambda: 1)
         pg_collection.cp = SimpleNamespace(size=lambda: 1)
 
+    shape_lengths = []
+    get_tensor_shapes = schedule.get_tensor_shapes
+
+    def capture_tensor_shapes(*, seq_length, micro_batch_size, config, tp_group, cp_group):
+        shape_lengths.append(seq_length)
+        return get_tensor_shapes(
+            seq_length=seq_length,
+            micro_batch_size=micro_batch_size,
+            config=config,
+            tp_group=tp_group,
+            cp_group=cp_group,
+        )
+
+    monkeypatch.setattr(schedule, "get_tensor_shapes", capture_tensor_shapes)
     schedule.forward_backward_pipelining_without_interleaving(
         forward_step_func=None,
         data_iterator=None,
         model=model,
         num_microbatches=1,
         seq_length=1,
+        decoder_seq_length=decoder_seq_length,
         micro_batch_size=1,
         p2p_communicator=FakeCommunicator(),
         pg_collection=pg_collection,
     )
 
     assert events == ["enter_no_sync", "exit_no_sync", "backward"]
+    assert shape_lengths == [decoder_seq_length if decoder_seq_length is not None else 1] * 2
 
 
 def test_forward_backward_func_with_pipeline_parallel(mocker):

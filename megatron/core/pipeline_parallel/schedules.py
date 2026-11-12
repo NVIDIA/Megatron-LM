@@ -2124,13 +2124,13 @@ def get_tensor_shapes(
     *,
     seq_length: int,
     micro_batch_size: int,
-    decoder_seq_length: int,
     config,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
-    """Determine tensor shapes for pipeline communication.
+    """Determine tensor shapes for the caller-resolved pipeline sequence length.
 
+    The caller selects the input/decoder length before calling this function.
     Returns [()] for variable_seq_lengths mode (shapes exchanged dynamically),
     or computed shapes for fixed sequence length mode.
     """
@@ -2142,15 +2142,12 @@ def get_tensor_shapes(
         return tensor_shapes
 
     # Fixed sequence lengths - compute shape
-    effective_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
-    effective_seq_length = effective_seq_length // cp_group.size()
+    seq_length = seq_length // cp_group.size()
 
     if config.sequence_parallel:
-        effective_seq_length = effective_seq_length // tp_group.size()
+        seq_length = seq_length // tp_group.size()
 
-    tensor_shapes.append(
-        (effective_seq_length, micro_batch_size, _get_pipeline_hidden_size(config))
-    )
+    tensor_shapes.append((seq_length, micro_batch_size, _get_pipeline_hidden_size(config)))
     return tensor_shapes
 
 
@@ -2323,18 +2320,18 @@ def forward_backward_pipelining_without_interleaving(
     else:
         backward_func = backward_step
 
+    # Preserve the schedule's decoder-length API; the shape helper takes one resolved width.
+    pipeline_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
     recv_tensor_shapes = get_tensor_shapes(
-        seq_length=seq_length,
+        seq_length=pipeline_seq_length,
         micro_batch_size=micro_batch_size,
-        decoder_seq_length=decoder_seq_length,
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
     )
     send_tensor_shapes = get_tensor_shapes(
-        seq_length=seq_length,
+        seq_length=pipeline_seq_length,
         micro_batch_size=micro_batch_size,
-        decoder_seq_length=decoder_seq_length,
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
