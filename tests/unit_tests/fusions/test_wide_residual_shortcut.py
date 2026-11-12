@@ -10,7 +10,7 @@ the interval replay kernel live in ``tests/unit_tests/determinism/kernels/``.
 import gc
 import itertools
 import weakref
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from dataclasses import fields, is_dataclass, replace
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1165,7 +1165,11 @@ def test_native_update_rebinding_and_captured_descriptors(m, h):
 def test_checkpointed_handoff_publishes_one_weight_gradient(native_fp8_weight):
     """A consumer under a reentrant (GDP-style) checkpoint recomputes on the seam's MXFP8
     operand in its inner graph and publishes one weight gradient, equal to the uncheckpointed
-    one: the handoff never touches the GEMMs or their gradient readiness."""
+    one: the handoff never touches the GEMMs or their gradient readiness.
+
+    The last variant drops every reference to the seam's operand and Reader before backward and
+    stashes the checkpoint input through a detaching saved-tensor hook, as a model does: the
+    rebuild then consumes a detached alias, whose lookup must still find the Reader."""
     from megatron.core.tensor_parallel.random import (
         CheckpointWithoutOutput,
         model_parallel_cuda_manual_seed,
@@ -1181,28 +1185,39 @@ def test_checkpointed_handoff_publishes_one_weight_gradient(native_fp8_weight):
         accumulator = torch.autograd.graph.get_gradient_edge(layer.weight).node
         accumulator.register_hook(lambda *unused: observed.append(layer.weight.main_grad.clone()))
         weight_grads = []
-        for checkpointed in (False, True):
+        for checkpointed, drop_operand in ((False, False), (True, False), (True, True)):
             observed.clear()
             layer.weight.main_grad.zero_()
             current, q, router = boundary(mx_inputs(8192, 4096, 2), layer)
             provider = reader_for(q)
             if checkpointed:
                 checkpoint = CheckpointWithoutOutput(fp8=MXFP8BlockScaling())
-                with te.fp8_autocast(enabled=True, fp8_recipe=MXFP8BlockScaling()):
+                stash_hooks = (
+                    torch.autograd.graph.saved_tensors_hooks(lambda t: t.detach(), lambda t: t)
+                    if drop_operand
+                    else nullcontext()
+                )
+                with te.fp8_autocast(enabled=True, fp8_recipe=MXFP8BlockScaling()), stash_hooks:
                     output = checkpoint.checkpoint(lambda value: consume(layer, value), q)
                 loss = output.square().sum()
                 checkpoint.discard_output_and_register_recompute(loss)
             else:
                 loss = consume(layer, q).square().sum()
+            if drop_operand:
+                # Only the checkpoint's detached alias remains; the rebuild must still find the
+                # Reader (otherwise TE's backward lacks the columnwise operand).
+                del q, provider
+                gc.collect()
             torch.autograd.backward(
                 (loss, current, router), (None, torch.ones_like(current), torch.ones_like(router))
             )
-            assert provider.reconstructions == 1
+            if not drop_operand:
+                assert provider.reconstructions == 1
             assert len(observed) == 1
             assert torch.equal(observed[0], layer.weight.main_grad)
             assert torch.count_nonzero(observed[0]) > 0
             weight_grads.append(observed[0])
-        assert torch.equal(*weight_grads)
+        assert all(torch.equal(weight_grads[0], grad) for grad in weight_grads[1:])
     finally:
         Utils.destroy_model_parallel()
 
