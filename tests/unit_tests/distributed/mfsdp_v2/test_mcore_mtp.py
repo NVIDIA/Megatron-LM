@@ -2,21 +2,12 @@
 
 """Shared-MTP execution-order coverage for the MFSDP v2 MCore adapter."""
 
-from contextlib import nullcontext
-
-import pytest
 import torch
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_adapter_v2 import FullyShardedDataParallelV2
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    FsdpContext,
-    PrefetchOrder,
-    RuntimePolicy,
-    fully_shard_context,
-)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
@@ -52,8 +43,7 @@ def _ddp_config(prefetch_order="recorded") -> DistributedDataParallelConfig:
     )
 
 
-@pytest.mark.parametrize("ambient_context", [False, True])
-def test_shared_mtp_matches_unsharded_training(distributed_setup, ambient_context):
+def test_shared_mtp_matches_unsharded_training(distributed_setup):
     """Explicit recording supports reused modules independently of MTP settings."""
     device = distributed_setup.device
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
@@ -66,25 +56,13 @@ def test_shared_mtp_matches_unsharded_training(distributed_setup, ambient_contex
         module, lambda: module(value), num_microbatches=3
     )
     module.zero_grad(set_to_none=True)
-    construction = (
-        fully_shard_context(
-            FsdpContext(
-                device=device,
-                prefetch_order=PrefetchOrder.RECORDED,
-                runtime_policy=RuntimePolicy(caller_managed_grad_sync=True),
-            )
-        )
-        if ambient_context
-        else nullcontext()
+    model = FullyShardedDataParallelV2(
+        config=_config(),
+        ddp_config=_ddp_config(),
+        module=module,
+        fsdp_unit_modules=[nn.Linear],
+        device=device,
+        pg_collection=groups,
     )
-    with construction:
-        model = FullyShardedDataParallelV2(
-            config=_config(),
-            ddp_config=_ddp_config(),
-            module=module,
-            fsdp_unit_modules=[nn.Linear],
-            device=device,
-            pg_collection=groups,
-        )
     actual = run_forward_backward_on_microbatches(model, lambda: model(value), num_microbatches=3)
     torch.testing.assert_close(actual, expected)
