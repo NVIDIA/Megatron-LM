@@ -126,6 +126,12 @@ products:
       - environment: [dev]
         scope: [mr-github-temp-disabled]
         platforms: [dgx_gb200]
+  # FlashAttention 4 training on Blackwell; the only case that opts out of the FA2 pin.
+  - test_case: [gpt3_mcore_te_tp1_pp1_flash_attention_4_1node]
+    products:
+      - environment: [dev]
+        scope: [mr, mr-github]
+        platforms: [dgx_gb200]
   #######################################################################
   # tp1_pp2 variants                                                    #
   #######################################################################
