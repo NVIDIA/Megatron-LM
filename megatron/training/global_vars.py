@@ -29,7 +29,6 @@ _GLOBAL_RUN_CONFIG = None
 _GLOBAL_TRAIN_STATE = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
-_GLOBAL_WANDB_WRITER = None
 _GLOBAL_EXPERIMENT_WRITER = None
 _GLOBAL_ONE_LOGGER = None
 _GLOBAL_ADLR_AUTORESUME = None
@@ -76,11 +75,6 @@ def get_tensorboard_writer():
     """Return tensorboard writer. It can be None so no need
     to check if it is initialized."""
     return _GLOBAL_TENSORBOARD_WRITER
-
-
-def get_wandb_writer():
-    """Return the raw W&B SDK for backend-specific media APIs, or None."""
-    return _GLOBAL_WANDB_WRITER
 
 
 def get_one_logger():
@@ -303,7 +297,6 @@ def unset_global_variables():
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
     global _GLOBAL_TOKENIZER
     global _GLOBAL_TENSORBOARD_WRITER
-    global _GLOBAL_WANDB_WRITER
     global _GLOBAL_ONE_LOGGER
     global _GLOBAL_ADLR_AUTORESUME
     global _GLOBAL_TIMERS
@@ -317,7 +310,6 @@ def unset_global_variables():
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
     _GLOBAL_TOKENIZER = None
     _GLOBAL_TENSORBOARD_WRITER = None
-    _GLOBAL_WANDB_WRITER = None
     _GLOBAL_ONE_LOGGER = None
     _GLOBAL_ADLR_AUTORESUME = None
     _GLOBAL_TIMERS = None
@@ -434,21 +426,18 @@ def _set_experiment_writer(args):
     """Initialize all enabled third-party experiment backends on the reporting rank."""
     global _GLOBAL_EXPERIMENT_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_EXPERIMENT_WRITER, 'experiment writer')
-    _set_wandb_writer(args)
     cfg = get_run_config()
     if (
         cfg.logger.wandb_project or cfg.logger.mlflow_experiment or cfg.logger.comet_project
     ) and args.rank == safe_get_world_size() - 1:
         from megatron.training.logging.experiment_writer import ExperimentWriter
 
-        _GLOBAL_EXPERIMENT_WRITER = ExperimentWriter(cfg, get_wandb_writer())
+        _GLOBAL_EXPERIMENT_WRITER = ExperimentWriter(cfg, _create_wandb_writer(args))
 
 
-def _set_wandb_writer(args):
+def _create_wandb_writer(args):
+    """Construct the optional W&B backend owned by ExperimentWriter."""
     cfg = get_run_config()
-    global _GLOBAL_WANDB_WRITER
-    _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER,
-                                   'wandb writer')
     if cfg.logger.wandb_project and args.rank == (safe_get_world_size() - 1):
         if cfg.logger.wandb_exp_name == '':
             raise ValueError("Please specify the wandb experiment name!")
@@ -488,7 +477,8 @@ def _set_wandb_writer(args):
             wandb_kwargs['entity'] = cfg.logger.wandb_entity
         os.makedirs(wandb_kwargs['dir'], exist_ok=True)
         wandb.init(**wandb_kwargs)
-        _GLOBAL_WANDB_WRITER = wandb
+        return wandb
+    return None
 
 
 def _set_one_logger(args):
@@ -785,9 +775,6 @@ def destroy_global_vars():
 
     global _GLOBAL_TENSORBOARD_WRITER
     _GLOBAL_TENSORBOARD_WRITER = None
-
-    global _GLOBAL_WANDB_WRITER
-    _GLOBAL_WANDB_WRITER = None
 
     global _GLOBAL_ONE_LOGGER
     _GLOBAL_ONE_LOGGER = None

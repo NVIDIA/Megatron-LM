@@ -42,8 +42,8 @@ def _flatten_config(config: dict, prefix: str = "") -> dict:
 class ExperimentWriter:
     """Third-party experiment writer for W&B, Comet, and MLflow.
 
-    Only the reporting rank constructs this object. The ``log`` signature is
-    shared with W&B so existing MoE, MTP and other scalar helpers can reuse it.
+    Only the reporting rank constructs this object. Scalar helpers use ``log``
+    to report metrics to every enabled backend at the supplied step.
     SDK objects are runtime services, never part of a serialized config.
     """
 
@@ -143,17 +143,23 @@ class ExperimentWriter:
         atexit.register(self.finish, "KILLED")
 
     def log(self, metrics: dict[str, Any], step: int) -> None:
-        """Log scalars at the same step as W&B, without changing its metric names."""
-        if self._closed:
-            return
-        if self.wandb is not None:
-            self.wandb.log(metrics, step)
+        """Log scalars to every enabled backend at the supplied training step."""
         self._log_scalars(metrics, step)
 
-    def _log_scalars(self, metrics: dict[str, Any], step: int) -> None:
-        if self.mlflow is None and self.comet is None:
+    def _log_scalars(
+        self, metrics: dict[str, Any], step: int, *, independent_step: bool = False
+    ) -> None:
+        """Dispatch scalars, adapting independent axes to each backend's step API."""
+        if self._closed:
             return
         scalars = {name: float(value) for name, value in metrics.items()}
+        if self.wandb is not None:
+            if independent_step:
+                # Custom axes carry their step in the metrics. Keep W&B's internal
+                # sequence monotonic when inference or older-checkpoint eval runs.
+                self.wandb.log(scalars, commit=True)
+            else:
+                self.wandb.log(scalars, step)
         if self.mlflow is not None:
             # MLflow rejects characters used by some model-specific metric names.
             sanitized = {
@@ -170,6 +176,28 @@ class ExperimentWriter:
             )
         if self.comet is not None:
             self.comet.log_metrics(scalars, step=step)
+
+    @property
+    def supports_media(self) -> bool:
+        """Whether tables and plots can be logged (currently supported by W&B)."""
+        return not self._closed and self.wandb is not None
+
+    def table(self, *, columns: list[str], data: list) -> Any:
+        """Build a table for media logging, or return None when unsupported."""
+        if self.supports_media:
+            return self.wandb.Table(columns=columns, data=data)
+        return None
+
+    def histogram(self, table: Any, column: str, title: str) -> Any:
+        """Build a histogram for media logging, or return None when unsupported."""
+        if self.supports_media and table is not None:
+            return self.wandb.plot.histogram(table, column, title)
+        return None
+
+    def log_media(self, metrics: dict[str, Any], step: int) -> None:
+        """Log tables and plots to W&B; other backends currently receive scalars only."""
+        if self.supports_media and metrics:
+            self.wandb.log(metrics, step=step)
 
     def start_inference_logging(self) -> int:
         """Configure the inference axis and return its last recorded step on resume."""
@@ -194,9 +222,7 @@ class ExperimentWriter:
         """Use an independent inference step without advancing the training axis."""
         if self._closed:
             return
-        if self.wandb is not None:
-            self.wandb.log(metrics, commit=True)
-        self._log_scalars(metrics, int(metrics['inference/inference_step']))
+        self._log_scalars(metrics, int(metrics['inference/inference_step']), independent_step=True)
 
     def log_evaluation(self, metrics: dict[str, Any], iteration: int, standalone=False) -> None:
         """Log evaluation scalars, including evaluations of older checkpoints."""
@@ -211,9 +237,7 @@ class ExperimentWriter:
         }
         if self.wandb is not None:
             self.wandb.define_metric('eval_only/*', step_metric='eval_checkpoint_iter')
-            # W&B requires monotonic steps; use its internal step for standalone eval.
-            self.wandb.log(values)
-        self._log_scalars(values, iteration)
+        self._log_scalars(values, iteration, independent_step=True)
 
     def log_metadata(self, values: dict[str, Any]) -> None:
         """Record mutable run metadata, including the job name after a restart."""

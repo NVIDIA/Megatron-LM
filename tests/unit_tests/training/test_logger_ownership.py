@@ -125,7 +125,6 @@ def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, ru
     monkeypatch.setattr(global_vars, 'safe_get_world_size', lambda: 1)
     wandb = SimpleNamespace(init=Mock())
     monkeypatch.setitem(sys.modules, 'wandb', wandb)
-    monkeypatch.setattr(global_vars, '_GLOBAL_WANDB_WRITER', None)
     config = LoggerConfig(
         wandb_project='project',
         wandb_exp_name='run',
@@ -143,7 +142,7 @@ def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, ru
     before = vars(args).copy()
     run_config.logger = config
     run_config.profiling.run_workload_inspector_server = True
-    global_vars._set_wandb_writer(args)
+    assert global_vars._create_wandb_writer(args) is wandb
     kwargs = wandb.init.call_args.kwargs
     assert kwargs['project'] == 'project' and kwargs['name'] == 'run'
     assert kwargs['entity'] == 'team' and kwargs['dir'] == str(tmp_path)

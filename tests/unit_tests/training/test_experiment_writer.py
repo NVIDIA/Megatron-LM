@@ -117,7 +117,6 @@ def test_runtime_service_is_optional_and_last_rank_only(
     wandb = Mock()
     monkeypatch.setitem(sys.modules, 'wandb', wandb)
     monkeypatch.setattr(global_vars, '_GLOBAL_EXPERIMENT_WRITER', None)
-    monkeypatch.setattr(global_vars, '_GLOBAL_WANDB_WRITER', None)
     monkeypatch.setattr(global_vars, 'safe_get_world_size', lambda: 2)
     try:
         global_vars._set_experiment_writer(Namespace(rank=rank))
@@ -162,6 +161,71 @@ def test_scalar_fanout_and_timer_interface(experiment_writer, tracking_sdks, mon
     comet.Experiment.return_value.log_metrics.assert_called_with({'forward-time': 2.0}, step=8)
 
 
+@pytest.mark.parametrize(
+    'wandb_enabled,mlflow_enabled,comet_enabled', list(product([False, True], repeat=3))
+)
+@pytest.mark.parametrize('mode', ['training', 'evaluation', 'standalone_evaluation', 'inference'])
+def test_scalar_logging_with_independent_backend_selection(
+    run_config, tracking_sdks, wandb_enabled, mlflow_enabled, comet_enabled, mode
+):
+    run_config.logger = LoggerConfig(
+        mlflow_experiment='experiment' if mlflow_enabled else None,
+        mlflow_run_name='run',
+        comet_project='project' if comet_enabled else None,
+        comet_experiment_name='run',
+    )
+    wandb = Mock()
+    client = tracking_sdks[0].tracking.MlflowClient.return_value
+    comet = tracking_sdks[1].Experiment.return_value
+    writer = ExperimentWriter(run_config, wandb_writer=wandb if wandb_enabled else None)
+    try:
+        client.log_batch.reset_mock()
+        metrics = {'loss[layer=0]': torch.tensor(1.5)}
+        expected = {'loss[layer=0]': 1.5}
+        if mode == 'inference':
+            metrics['inference/inference_step'] = 7
+            expected['inference/inference_step'] = 7.0
+            emit = lambda: writer.log_inference(metrics)
+        elif mode == 'standalone_evaluation':
+            expected = {'eval_only/loss[layer=0]': 1.5, 'eval_checkpoint_iter': 7.0}
+            emit = lambda: writer.log_evaluation(metrics, 7, standalone=True)
+        elif mode == 'evaluation':
+            emit = lambda: writer.log_evaluation(metrics, 7)
+        else:
+            emit = lambda: writer.log(metrics, 7)
+
+        emit()
+        # Closing the writer must suppress all subsequent scalar delivery.
+        writer.finish()
+        emit()
+        if wandb_enabled:
+            if mode in ('standalone_evaluation', 'inference'):
+                wandb.log.assert_called_once_with(expected, commit=True)
+            else:
+                wandb.log.assert_called_once_with(expected, 7)
+            assert all(type(value) is float for value in wandb.log.call_args.args[0].values())
+        else:
+            wandb.log.assert_not_called()
+        if mlflow_enabled:
+            client.log_batch.assert_called_once()
+            batch = client.log_batch.call_args
+            assert batch.args == ('run-id',)
+            assert batch.kwargs['synchronous'] is True
+            assert {(m.key, m.value, m.step) for m in batch.kwargs['metrics']} == {
+                (name.replace('[', '_').replace('=', '_').replace(']', '_'), value, 7)
+                for name, value in expected.items()
+            }
+        else:
+            client.log_batch.assert_not_called()
+        if comet_enabled:
+            comet.log_metrics.assert_called_once_with(expected, step=7)
+        else:
+            comet.log_metrics.assert_not_called()
+        assert isinstance(metrics['loss[layer=0]'], torch.Tensor)
+    finally:
+        writer.finish()
+
+
 def test_checkpoint_reporting_and_idempotent_shutdown(experiment_writer, tracking_sdks, tmp_path):
     mlflow, comet = tracking_sdks
     experiment_writer.checkpoint_saved(str(tmp_path), 7)
@@ -185,6 +249,42 @@ def test_checkpoint_reporting_and_idempotent_shutdown(experiment_writer, trackin
     )
     experiment_writer.wandb.finish.assert_called_once_with(exit_code=1)
     comet.Experiment.return_value.end.assert_called_once()
+
+
+@pytest.mark.parametrize('wandb_enabled', [False, True])
+def test_media_uses_shared_writer_without_sending_objects_as_scalars(
+    run_config, tracking_sdks, wandb_enabled
+):
+    run_config.logger = LoggerConfig(
+        mlflow_experiment='experiment', comet_project='project', comet_experiment_name='run'
+    )
+    wandb = Mock()
+    writer = ExperimentWriter(run_config, wandb_writer=wandb if wandb_enabled else None)
+    client = tracking_sdks[0].tracking.MlflowClient.return_value
+    client.log_batch.reset_mock()
+    try:
+        assert writer.supports_media == wandb_enabled
+        table = writer.table(columns=['reward'], data=[[1.0], [2.0]])
+        histogram = writer.histogram(table, 'reward', 'Rewards')
+        writer.log_media({'table': table, 'histogram': histogram}, step=7)
+        writer.finish()
+        assert not writer.supports_media
+        assert writer.table(columns=['reward'], data=[]) is None
+        assert writer.histogram(table, 'reward', 'Rewards') is None
+        writer.log_media({'table': table}, step=8)
+        if wandb_enabled:
+            wandb.Table.assert_called_once_with(columns=['reward'], data=[[1.0], [2.0]])
+            wandb.plot.histogram.assert_called_once_with(table, 'reward', 'Rewards')
+            wandb.log.assert_called_once_with({'table': table, 'histogram': histogram}, step=7)
+        else:
+            assert table is None and histogram is None
+            wandb.Table.assert_not_called()
+            wandb.plot.histogram.assert_not_called()
+            wandb.log.assert_not_called()
+        client.log_batch.assert_not_called()
+        tracking_sdks[1].Experiment.return_value.log_metrics.assert_not_called()
+    finally:
+        writer.finish()
 
 
 @pytest.mark.parametrize('external_run', [False, True])
@@ -373,7 +473,7 @@ def test_evaluation_steps_reach_all_backends(experiment_writer, tracking_sdks, s
         experiment_writer.wandb.define_metric.assert_called_once_with(
             'eval_only/*', step_metric='eval_checkpoint_iter'
         )
-        experiment_writer.wandb.log.assert_called_once_with(values)
+        experiment_writer.wandb.log.assert_called_once_with(values, commit=True)
     else:
         experiment_writer.wandb.log.assert_called_once_with(values, 7)
     tracking_sdks[1].Experiment.return_value.log_metrics.assert_called_once_with(values, step=7)
