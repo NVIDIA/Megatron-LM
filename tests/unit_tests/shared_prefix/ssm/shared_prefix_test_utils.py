@@ -336,13 +336,13 @@ def build_local_mamba_layer(
     False. The shared-prefix code paths are the same for both projection implementations.
     """
     from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+    from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
     from megatron.core.ssm.mamba_mixer import MambaMixer, MambaMixerSubmodules
     from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
     from megatron.core.transformer import TransformerConfig
     from megatron.core.transformer.spec_utils import ModuleSpec
-    from megatron.core.transformer.torch_norm import WrappedTorchNorm
 
     config = TransformerConfig(
         num_layers=1,
