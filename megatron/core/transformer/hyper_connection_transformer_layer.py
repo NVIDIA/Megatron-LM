@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch import Tensor
 
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.hyper_connection import (
@@ -15,6 +16,7 @@ from megatron.core.transformer.hyper_connection import (
     HyperConnectionResidualConnection,
 )
 from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
     ResidualConnection,
@@ -25,9 +27,53 @@ from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.typed_torch import apply_module
+from megatron.core.utils import nvtx_range_pop, nvtx_range_push
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
+
+
+def _uses_mhc_attention_cuda_graph_split(config: TransformerConfig) -> bool:
+    """Whether mHC attention graphs capture only the input layernorm and self-attention.
+
+    ``TransformerConfig`` validates the remaining requirements of
+    ``mhc_recompute_attn_cuda_graph_split``.
+    """
+    return (
+        config.mhc_recompute_attn_cuda_graph_split
+        and config.cuda_graph_impl == "transformer_engine"
+    )
+
+
+def _validate_mhc_te_graph_inputs(
+    kwargs: dict, *, attention_graph_split: bool = False, packed_sequences: bool = False
+) -> None:
+    """Reject eager-only inputs that have no static TE training sample.
+
+    The attention-only graph split keeps the padding mask and the mHC recompute manager
+    outside the graph, where its eager MLP and mHC steps consume them. With scheduler-packed
+    sequences, the split graph also takes their metadata as fixed-capacity offsets.
+    """
+    unsupported = ["packed_sequence_cp_metadata", "inference_context"]
+    if not (attention_graph_split and packed_sequences):
+        unsupported.append("packed_seq_params")
+    if not attention_graph_split:
+        unsupported.append("padding_mask")
+    for name in unsupported:
+        if kwargs.get(name) is not None:
+            raise NotImplementedError(
+                f"mHC TE graphs do not support {name} here. Packed THD sequences require "
+                "mhc_recompute_attn_cuda_graph_split with sequence_packing_scheduler, and "
+                "padding_mask requires the attention graph split."
+            )
+    if attention_graph_split:
+        return
+    if kwargs.get("mhc_recompute_manager") is not None:
+        raise NotImplementedError(
+            "mHC TE graphs support mHC selective recompute only with "
+            "mhc_recompute_attn_cuda_graph_split."
+        )
+    kwargs.pop("mhc_recompute_manager", None)
 
 
 class HyperConnectionTransformerLayer(TransformerLayer):
@@ -82,13 +128,24 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             CudaGraphModule.moe_router,
             CudaGraphModule.moe_preprocess,
         }
+        if self.config.cuda_graph_impl == "transformer_engine":
+            # The TE path explicitly transports subclass MLP state across the
+            # router graph boundary; local graphs retain their existing limits.
+            unsupported_moe_cuda_graph_modules = {CudaGraphModule.moe}
         if self.is_moe_layer and unsupported_moe_cuda_graph_modules.intersection(
             self.config.cuda_graph_modules
         ):
             raise NotImplementedError(
-                "HyperConnectionTransformerLayer does not support MoE CUDA graph "
-                "scopes. Disable the moe, moe_router, and moe_preprocess CUDA graph modules "
-                "when combining mHC with a MoE MLP submodule."
+                "HyperConnectionTransformerLayer does not support the requested MoE CUDA graph "
+                "scopes. TE graphs support moe_router and moe_preprocess; local graphs require "
+                "disabling moe, moe_router, and moe_preprocess for mHC MoE layers."
+            )
+
+        if _uses_mhc_attention_cuda_graph_split(self.config) and not isinstance(
+            self.cross_attention, IdentityOp
+        ):
+            raise NotImplementedError(
+                "mhc_recompute_attn_cuda_graph_split does not support cross-attention."
             )
 
         # GraphableMegatronModule calls create_mcore_cudagraph_manager before the MLP is
@@ -124,6 +181,114 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         # read the same per-call manager from this attribute.
         self._mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None
 
+    def _te_cuda_graph_capture(self, *args, **kwargs):
+        if _uses_mhc_attention_cuda_graph_split(self.config):
+            self._reconstruct_packed_graph_inputs(kwargs)
+            _validate_mhc_te_graph_inputs(
+                kwargs,
+                attention_graph_split=True,
+                packed_sequences=self.config.sequence_packing_scheduler is not None,
+            )
+            return self._forward_mhc_attention_graph(*args, **kwargs)
+        _validate_mhc_te_graph_inputs(kwargs)
+        return super()._te_cuda_graph_capture(*args, **kwargs)
+
+    def _te_cuda_graph_replay(self, *args, **kwargs):
+        if _uses_mhc_attention_cuda_graph_split(self.config):
+            _validate_mhc_te_graph_inputs(
+                kwargs,
+                attention_graph_split=True,
+                packed_sequences=self.config.sequence_packing_scheduler is not None,
+            )
+            return self._replay_mhc_attention_graph_split(*args, **kwargs)
+        _validate_mhc_te_graph_inputs(kwargs)
+        return super()._te_cuda_graph_replay(*args, **kwargs)
+
+    def _forward_mhc_attention_graph(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        rotary_pos_emb: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ) -> tuple[Tensor, ...]:
+        """Captured body of the attention graph split: input layernorm and self-attention.
+
+        Takes the aggregated single-stream input and returns the self-attention output, plus
+        its bias when present. The mHC read and write stay outside the graph.
+        """
+        input_layernorm_output = apply_module(self.input_layernorm)(hidden_states)
+        if isinstance(input_layernorm_output, tuple):
+            raise ValueError(
+                "input_layernorm cannot return a residual when a residual connection "
+                "owns the carried state."
+            )
+        nvtx_range_push(suffix="self_attention")
+        attention_output, attention_bias = self.self_attention(
+            input_layernorm_output,
+            attention_mask=attention_mask,
+            rotary_pos_emb=rotary_pos_emb,
+            packed_seq_params=packed_seq_params,
+        )
+        nvtx_range_pop(suffix="self_attention")
+        if attention_bias is None:
+            return (attention_output,)
+        return attention_output, attention_bias
+
+    def _replay_mhc_attention_graph_split(self, *args, **kwargs):
+        """Run the eager mHC read, attention graph, eager mHC write and MLP."""
+        hidden_states = args[0] if args else kwargs.pop("hidden_states")
+        if kwargs.get("context") is not None:
+            raise NotImplementedError(
+                "mhc_recompute_attn_cuda_graph_split does not support cross-attention."
+            )
+        # The eager MLP consumes these; the attention graph was captured without them, and
+        # takes scheduler-packed metadata as fixed-capacity offsets instead.
+        padding_mask = kwargs.pop("padding_mask", None)
+        input_ids = kwargs.pop("input_ids", None)
+        packed_seq_params = kwargs.get("packed_seq_params")
+        kwargs = self._decompose_packed_graph_inputs(kwargs)
+
+        nvtx_range_push(suffix="self_attention_hyper_connection")
+        # TE copies the aggregate into the graph's static input and keeps that copy for the
+        # graph's backward, so the read is eager rather than checkpointed.
+        aggregated, attn_state = apply_module(self.residual_read_self_attn)(
+            hidden_states,
+            execution_context=HyperConnectionExecutionContext(self.self_attention_hyper_connection),
+        )
+        nvtx_range_pop(suffix="self_attention_hyper_connection")
+
+        graph_outputs = GraphableMegatronModule._te_cuda_graph_replay(self, aggregated, **kwargs)
+        attention_output_with_bias = (
+            graph_outputs[0],
+            graph_outputs[1] if len(graph_outputs) > 1 else None,
+        )
+        nvtx_range_push(suffix="self_attn_bda")
+        with self.bias_dropout_add_exec_handler():
+            hidden_states = self._write_residual_connection(
+                self.residual_write_self_attn,
+                attention_output_with_bias,
+                attn_state,
+                is_mlp=False,
+                recompute_context=None,
+            )
+        nvtx_range_pop(suffix="self_attn_bda")
+        output = self._forward_mlp(
+            hidden_states,
+            padding_mask=padding_mask,
+            input_ids=input_ids,
+            packed_seq_params=packed_seq_params,
+        )
+        return output, None
+
+    def _pack_mlp_cuda_graph_state(self, outputs, residual, mlp_state):
+        # The read state already carries the residual, H_res and H_post.
+        assert len(mlp_state) == 3, "mHC partial MoE graphs require the MLP read state."
+        return list(outputs) + list(mlp_state)
+
+    def _unpack_mlp_cuda_graph_state(self, outputs):
+        h_post, h_res, residual = outputs.pop(), outputs.pop(), outputs.pop()
+        return residual, (residual, h_res, h_post)
+
     def __call__(self, *args, **kwargs):
         # TODO(kwangjuna): Unify this entry point with WR's recompute manager
         # in the follow-up layer PR.
@@ -154,9 +319,15 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         CUDA graph capture creates static buffers whose shapes are determined by
         this method. The base class returns [s, b, C], but mHC layers operate on
-        n-stream hidden states of shape [s, b, n*C].
+        n-stream hidden states of shape [s, b, n*C]. The attention graph split
+        starts from the aggregated [s, b, C] input instead.
         """
         static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
+        if _uses_mhc_attention_cuda_graph_split(self.config):
+            # The eager MLP consumes these; the attention graph is captured without them.
+            static_inputs.pop("input_ids", None)
+            static_inputs.pop("padding_mask", None)
+            return static_inputs
         hs = static_inputs["hidden_states"]
         n = self.config.mhc_num_residual_streams
         static_inputs["hidden_states"] = torch.ones(
@@ -195,12 +366,15 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         """
         submodules = super()._get_submodules_under_cudagraphs()
 
-        if not self.config.cuda_graph_modules:
+        if not self.config.cuda_graph_modules or _uses_mhc_attention_cuda_graph_split(self.config):
+            # The attention graph split runs both hyper connections eagerly.
             return submodules
 
         if CudaGraphModule.attn in self.config.cuda_graph_modules:
             submodules.append(self.self_attention_hyper_connection)
-        if CudaGraphModule.mlp in self.config.cuda_graph_modules and not self.is_moe_layer:
+        if (CudaGraphModule.mlp in self.config.cuda_graph_modules and not self.is_moe_layer) or (
+            self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules
+        ):
             submodules.append(self.mlp_hyper_connection)
         return submodules
 

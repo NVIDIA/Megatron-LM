@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Parameter readiness: ``ensure_params_ready`` and DDP's ``_BucketParamReadyCallback``.
 
@@ -21,6 +21,7 @@ from megatron.core.distributed.distributed_data_parallel import (
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import PARAM_READY_CALLBACK_ATTR, ensure_params_ready
 
@@ -184,3 +185,33 @@ class TestDSAFineGrainedReadiness:
         )
 
         assert DSAttention not in recurse_types
+
+
+class TestHyperConnectionReadiness:
+    def test_mapping_projection_is_published_before_it_is_read(self):
+        """compute_mappings reads mapping_proj.weight without calling mapping_proj."""
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=16,
+            num_attention_heads=1,
+            enable_mhc_connections=True,
+            mhc_num_residual_streams=2,
+            mhc_sinkhorn_iterations=2,
+        )
+        module = HyperConnectionModule(config=config, layer_number=1)
+        weight = module.mapping_proj.weight
+        published = weight.detach().clone()
+        with torch.no_grad():
+            weight.fill_(float("nan"))
+        calls = []
+
+        def publish():
+            with torch.no_grad():
+                weight.copy_(published)
+            calls.append("mapping_proj")
+
+        setattr(weight, PARAM_READY_CALLBACK_ATTR, publish)
+        mappings = module.compute_mappings(torch.randn(3, 2, 2 * config.hidden_size))
+
+        assert calls == ["mapping_proj"]
+        assert all(torch.isfinite(mapping).all() for mapping in mappings)
