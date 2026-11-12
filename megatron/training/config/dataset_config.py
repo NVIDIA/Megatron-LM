@@ -9,8 +9,8 @@ tokenizer (``validate_without_tokenizer()``) run at ``cfg.validate()``, and the 
 ``validate()``, which needs the tokenizer, runs in ``DataConfig.bind_tokenizer`` once the runtime
 services bind the run's tokenizer (the builder runs it again before building).
 ``random_seed`` is Core's required constructor argument, filled from ``--seed`` by the factory and
-saved with the section. Six Core fields are owned by other container sections (the parallel
-layout and the validation flags): the container writes them at ``finalize()``
+saved with the section. Seven Core fields are owned by other container sections (the physical
+pack width, parallel layout and validation flags): the container writes them at ``finalize()``
 (``CONTAINER_WRITTEN_FIELDS``) and they are not serialized with the section.
 
 ``DataConfig`` groups the dataset config, the ``DataloaderConfig`` and ``dataset_type``, the dataset
@@ -19,11 +19,10 @@ serves every GPT entry point: the args-to-config factory forwards every data arg
 follows the family flags, and the provider hands ``cfg.data.dataset`` to the builder unchanged.
 The loop reads the section through its predicates (``is_sft()``, ``has_cu_seqlens()``,
 ``use_per_sequence_balancing()``, ``yields_unpacked_samples()``) and the dataset's fields, never
-through ``args``; the sample length it runs at is the container's ``sample_length``: the dataset's
-``sequence_length``, or for a loader-only section the model's ``max_seq_length_per_sample``
-(Megatron Core's per-sample maximum, filled from ``--seq-length`` by the launcher, a VLM's resolved
-decoder length by its model config's ``finalize()``; with a dataset the container checks that it
-covers the samples and fills it when unset).
+through ``args``. The dataset's ``sequence_length`` controls content truncation/chunking;
+SFT's ``packed_sequence_length`` is derived from the model's execution bound at finalization.
+Callback applications resolve their model input width before startup, including image expansion
+for VLMs. The model's positional capacity is independent of these dataset and execution lengths.
 Entry points with their own data pipeline carry a loader-only section (``dataset is None``) and
 nothing here runs for them.
 """
@@ -50,11 +49,12 @@ DATASET_CLASSES: dict[str, tuple[type, type | None]] = {
 }
 DATASET_FAMILIES = tuple(DATASET_CLASSES)
 
-# Fields of the dataset config that other container sections own: the parallel layout (the model
-# config) and the validation flags (the validation config). PretrainConfigContainer writes them at
+# Fields of the dataset config that other container sections own: the physical pack width and
+# parallel layout (the model config), and validation flags. PretrainConfigContainer writes them at
 # finalize(), the container-oriented factory leaves them unset and the section serializes without
 # them: they are recorded once, in their owning sections.
 CONTAINER_WRITTEN_FIELDS = (
+    "packed_sequence_length",
     "data_parallel_size",
     "context_parallel_size",
     "sequence_parallel_size",

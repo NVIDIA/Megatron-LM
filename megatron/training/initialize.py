@@ -54,6 +54,7 @@ from megatron.training.global_vars import (
     get_train_state,
     initialize_runtime_services,
 )
+from megatron.training.sequence_lengths import get_model_input_lengths
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
@@ -244,12 +245,9 @@ def initialize_megatron(
                 tp_comm_overlap_cfg = args.tp_comm_overlap_cfg
             else:
                 tp_comm_overlap_cfg = cfg.model.tp_comm_overlap_cfg
-            # The model input length: the model config's decoder length when it declares one (a
-            # VLM, whether its data section is loader-only or carries a dataset), otherwise the
-            # sample length. The model's seq_length is position capacity, not a batch length.
             _initialize_tp_communicators(
                 transformer_config,
-                sequence_length=cfg.model_input_length,
+                sequence_length=get_model_input_lengths(cfg.model, cfg.data.dataset)[0],
                 micro_batch_size=cfg.train.micro_batch_size,
                 tp_comm_overlap_cfg=tp_comm_overlap_cfg,
             )

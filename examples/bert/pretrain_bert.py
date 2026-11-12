@@ -7,29 +7,30 @@ from functools import partial
 import torch
 import torch.nn.functional as F
 
-from megatron.training import get_args
-from megatron.training import print_rank_0
-from megatron.training import get_timers
-from megatron.core import tensor_parallel
+from megatron.core import mpu, tensor_parallel
+from megatron.core.datasets.bert_dataset import (
+    BERTMaskedWordPieceDataset,
+    BERTMaskedWordPieceDatasetConfig,
+)
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
+from megatron.core.datasets.utils import get_blend_from_list
 from megatron.core.enums import ModelType
+from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
 from megatron.core.models.bert.bert_model import BertModel
-from megatron.training import pretrain
-from megatron.training.utils import average_losses_across_data_parallel_group
+from megatron.training import get_args, get_timers, pretrain, print_rank_0
+from megatron.training.argument_utils import (
+    model_config_from_args,
+    pretrain_cfg_container_from_args,
+)
 from megatron.training.arguments import parse_and_validate_args
-from megatron.training.argument_utils import pretrain_cfg_container_from_args
-from megatron.training.argument_utils import model_config_from_args
-from megatron.training.models import BertModelConfig
-from megatron.training.vocab_utils import model_vocab_size
 from megatron.training.global_vars import (
     get_run_config,
     get_tokenizer,
     set_run_config,
 )
-from megatron.core.models.bert.bert_layer_specs import bert_layer_with_transformer_engine_spec
-from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.bert_dataset import BERTMaskedWordPieceDataset, BERTMaskedWordPieceDatasetConfig
-from megatron.core.datasets.utils import get_blend_from_list
-from megatron.core import mpu, tensor_parallel
+from megatron.training.models import BertModelConfig
+from megatron.training.utils import average_losses_across_data_parallel_group
+from megatron.training.vocab_utils import model_vocab_size
 
 
 def model_provider(pre_process=True, post_process=True, vp_stage=None, config=None, pg_collection=None):
@@ -139,7 +140,9 @@ def forward_step(data_iterator, model):
     return output_tensor, partial(loss_func, loss_mask, sentence_order)
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
+def train_valid_test_datasets_provider(
+    train_val_test_num_samples, vp_stage=None, *, sequence_length
+):
     """Build train, valid, and test datasets."""
     cfg = get_run_config()
     args = get_args()
@@ -147,12 +150,12 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
 
     config = BERTMaskedWordPieceDatasetConfig(
         random_seed=cfg.rng.seed,
-        sequence_length=args.seq_length,
+        sequence_length=sequence_length,
         blend=get_blend_from_list(args.data_path),
         blend_per_split=[
             get_blend_from_list(args.train_data_path),
             get_blend_from_list(args.valid_data_path),
-            get_blend_from_list(args.test_data_path)
+            get_blend_from_list(args.test_data_path),
         ],
         split=args.split,
         path_to_cache=args.data_cache_path,
@@ -191,6 +194,10 @@ if __name__ == "__main__":
 
     args = parse_and_validate_args(args_defaults={'tokenizer_type': 'BertWordPieceLowerCase'})
     model_cfg = model_config_from_args(args, model_config_cls=BertModelConfig)
+    train_valid_test_datasets_provider = partial(
+        train_valid_test_datasets_provider, sequence_length=args.seq_length
+    )
+    train_valid_test_datasets_provider.is_distributed = True
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
     pretrain(full_config, train_valid_test_datasets_provider,

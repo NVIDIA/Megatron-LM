@@ -975,7 +975,14 @@ class TestRLUtils:
 
         monkeypatch.setattr(rl_utils, "get_args", lambda: args)
         monkeypatch.setattr(rl_utils, "get_train_state", lambda: train_state)
-        monkeypatch.setattr(rl_utils, "get_run_config", lambda: SimpleNamespace(rl=rl_config))
+        monkeypatch.setattr(
+            rl_utils,
+            "get_run_config",
+            lambda: SimpleNamespace(
+                rl=rl_config,
+                model=SimpleNamespace(transformer=SimpleNamespace(max_seq_length_per_sample=SEQ)),
+            ),
+        )
         monkeypatch.setattr(
             rl_utils, "megatron_rl_inference_mode", lambda *_a, **_k: nullcontext(MagicMock())
         )

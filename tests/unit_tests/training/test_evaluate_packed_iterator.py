@@ -47,12 +47,13 @@ def test_evaluate_stops_cleanly_when_packed_iterator_runs_out(monkeypatch, compl
         consumed_valid_samples=0,
     )
     cfg = SimpleNamespace(
+        data=SimpleNamespace(dataset=None),
         get_batch_parallel_size=lambda: 1,
-        sample_length=16,
-        model_input_length=16,
         model=SimpleNamespace(
             transformer=SimpleNamespace(
-                cuda_graph_impl="none", moe_expert_rank_capacity_factor=None
+                cuda_graph_impl="none",
+                moe_expert_rank_capacity_factor=None,
+                max_seq_length_per_sample=8,
             )
         ),
         validation=SimpleNamespace(

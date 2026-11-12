@@ -146,7 +146,7 @@ def get_batch(
         return [None for _ in BATCH_KEYS]
 
     # The sample length: the dataset's (the model's per-sample maximum for a loader-only section).
-    seq_length = cfg.sample_length
+    seq_length = cfg.data.dataset.packed_sequence_length or cfg.data.dataset.sequence_length
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)
@@ -389,7 +389,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     max_seqlen_kv=int(max_seqlen.item()),
                     local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
                     cp_group=dynamic_cp_group,
-                    tokens_per_sample=cfg.sample_length,
+                    tokens_per_sample=cfg.data.dataset.packed_sequence_length
+                    or cfg.data.dataset.sequence_length,
                 )
 
         # Offline logits KD: record this microbatch's global (un-CP-sharded)

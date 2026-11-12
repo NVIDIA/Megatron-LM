@@ -1152,9 +1152,14 @@ def validate_args(args, defaults={}):
         assert args.hidden_size % args.num_attention_heads == 0
         args.kv_channels = args.hidden_size // args.num_attention_heads
 
-    if args.seq_length is not None and args.context_parallel_size > 1:
-        assert args.seq_length % (args.context_parallel_size * 2) == 0, \
-            f"seq-length ({args.seq_length}) must be a multiple of 2 * the resolved " \
+    # SFT pads conversations into a physical pack; its truncation limit need not align.
+    input_length = args.max_seq_length_per_sample if args.sft else None
+    input_length = input_length if input_length is not None else args.seq_length
+    if input_length is None:
+        input_length = args.encoder_seq_length
+    if input_length is not None and args.context_parallel_size > 1:
+        assert input_length % (args.context_parallel_size * 2) == 0, \
+            f"input sequence length ({input_length}) must be a multiple of 2 * the resolved " \
             f"context-parallel group size ({args.context_parallel_size}), " \
             "including GTP sequence shards."
 
@@ -1543,9 +1548,9 @@ def validate_args(args, defaults={}):
             total_cp_ranks = args.context_parallel_size
             if args.sequence_packing_scheduler == 'default_dynamic_cp':
                 total_cp_ranks *= args.data_parallel_size
-            assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= args.seq_length, (
+            assert total_cp_ranks * args.max_seqlen_per_dp_cp_rank >= input_length, (
                 f'Packed sequence buffer size ({total_cp_ranks * args.max_seqlen_per_dp_cp_rank}) '
-                f'must be >= single sequence max length ({args.seq_length})'
+                f'must be >= physical sample length ({input_length})'
             )
 
     if args.sequence_packing_scheduler == "dp_balanced" and args.cuda_graph_impl == "transformer_engine":
@@ -2285,8 +2290,6 @@ def _add_network_size_args(parser):
         "hash_moe_vocab_size",
         "fp8_param",
         "fp4_param",
-        # filled from the explicit --seq-length argument below
-        "max_seq_length_per_sample",
         # incompatible defaults in dataclass
         "gradient_accumulation_fusion",
         "overlap_p2p_comm",

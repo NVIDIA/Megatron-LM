@@ -6,8 +6,6 @@ import time
 
 _PROGRAM_START_TIME = time.time()
 
-import warnings
-from argparse import Namespace
 from copy import deepcopy
 from functools import partial
 
@@ -46,51 +44,6 @@ from megatron.training.vocab_utils import model_vocab_size
 from pretrain_gpt import loss_func
 
 
-def set_vlm_sequence_lengths(args: Namespace, model_config: LLaVAModelConfig) -> None:
-    """Resolve decoder length before TP user-buffer setup, independently of overlap.
-
-    An explicit decoder length includes image tokens and padding. Otherwise, derive
-    the smallest length that fits the text and image and supports CP/SP splitting.
-    The result is recorded on the model config, whose ``finalize()`` makes it the
-    language transformer's per-sample maximum; the namespace copy serves this
-    script's own readers.
-    """
-    if not isinstance(model_config, LLaVAModelConfig):
-        raise TypeError(
-            f"Expected LLaVAModelConfig, got {type(model_config).__name__}"
-        )
-    if getattr(args, "dataloader_seq_length", None) is None:
-        args.dataloader_seq_length = args.seq_length
-    image_tokens = get_num_image_embeddings(
-        model_config.img_h,
-        model_config.img_w,
-        model_config.patch_dim,
-        "clip",
-        model_config.drop_vision_class_token,
-        class_token_len=1,
-        pixel_shuffle=False,
-        use_tile_tags=False,
-    )
-    decoder_length = args.dataloader_seq_length + image_tokens
-    transformer = model_config.transformer
-    requested_length = args.decoder_seq_length
-    padding = context_parallel.get_padding(
-        decoder_length if requested_length is None else requested_length,
-        transformer.context_parallel_size,
-        transformer.tensor_model_parallel_size,
-        transformer.sequence_parallel,
-    )
-    if requested_length is None:
-        args.decoder_seq_length = decoder_length + padding
-    elif requested_length < decoder_length:
-        raise ValueError(
-            f"--decoder-seq-length must be at least {decoder_length} to fit text and image tokens"
-        )
-    elif padding:
-        raise ValueError("--decoder-seq-length must be divisible by the CP/SP padding factor")
-    model_config.decoder_seq_length = args.decoder_seq_length
-
-
 def model_provider(
     pre_process=True,
     post_process=True,
@@ -99,6 +52,7 @@ def model_provider(
     parallel_output=True,
     config=None,
     pg_collection=None,
+    mp_padding_needed=0,
 ) -> LLaVAModel:
     """Builds the model.
 
@@ -142,20 +96,6 @@ def model_provider(
         pixel_shuffle=False,
         use_tile_tags=False,
     )
-
-    old_seq_length = args.seq_length
-    # decoder_seq_len denotes the language model sequence length.
-    decoder_seq_len = args.dataloader_seq_length + num_image_embeddings
-
-    # seq_length and encoder_seq_length denote the vision model sequence length. Override if the user provided something else.
-    args.seq_length = args.encoder_seq_length = num_image_embeddings
-    if torch.distributed.get_rank() == 0 and old_seq_length != args.seq_length:
-        warnings.warn(
-            f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})"
-        )
-    mp_padding_needed = args.decoder_seq_length - decoder_seq_len
-
-    args.max_position_embeddings = max(args.max_position_embeddings, args.decoder_seq_length)
 
     print_rank_0('building a multimodal model ...')
     if config is None:
@@ -242,11 +182,13 @@ def model_provider(
         get_submodules(language_transformer_layer_spec.submodules.mlp)
     )
 
-    language_max_sequence_length = args.decoder_seq_length
+    language_max_sequence_length = cfg.model.transformer.max_seq_length_per_sample
     if language_transformer_config.context_parallel_size > 1:
         if getattr(args, "use_packed_sequence", False) or mp_padding_needed > 0:
             # Use THD data format
-            language_max_sequence_length = args.decoder_seq_length * args.micro_batch_size
+            language_max_sequence_length = (
+                cfg.model.transformer.max_seq_length_per_sample * args.micro_batch_size
+            )
     model = LLaVAModel(
         language_transformer_config=language_transformer_config,
         language_transformer_layer_spec=language_transformer_layer_spec,
@@ -287,7 +229,7 @@ def model_provider(
     return model
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples):
+def train_valid_test_datasets_provider(train_val_test_num_samples, *, sequence_length):
     """Build the train test and validation datasets.
 
     Args:
@@ -306,7 +248,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     config = MultimodalDatasetConfig(
         random_seed=cfg.rng.seed,
         split=args.split,
-        sequence_length=args.dataloader_seq_length,
+        sequence_length=sequence_length,
         tokenizer=get_tokenizer(),
         reset_position_ids=args.reset_position_ids,
         reset_attention_mask=args.reset_attention_mask,
@@ -427,7 +369,7 @@ def get_batch(data_iterator):
             args.tensor_model_parallel_size,
             args.sequence_parallel,
             cfg.model.transformer.tp_comm_overlap,
-            args.decoder_seq_length,
+            cfg.model.transformer.max_seq_length_per_sample,
         )
         if mp_padding_needed_for_text > 0:
             tokens, position_ids, labels, loss_mask = [
@@ -535,6 +477,52 @@ def llava_position_embedding_ranks(pp_ranks):
     return [pp_ranks[0]]
 
 
+def resolve_vlm_sequence_lengths(args):
+    """Resolve text/image widths at the CLI boundary, before config construction."""
+    # Dataset length is text-only here; execution includes the expanded image.
+    text_sequence_length = getattr(args, "dataloader_seq_length", None) or args.seq_length
+    image_sequence_length = get_num_image_embeddings(
+        args.img_h,
+        args.img_w,
+        args.patch_dim,
+        "clip",
+        args.disable_vision_class_token,
+        class_token_len=1,
+        pixel_shuffle=False,
+        use_tile_tags=False,
+    )
+    decoder_sequence_length = text_sequence_length + image_sequence_length
+    requested_length = args.decoder_seq_length
+    alignment_padding = context_parallel.get_padding(
+        decoder_sequence_length if requested_length is None else requested_length,
+        args.context_parallel_size,
+        args.tensor_model_parallel_size,
+        args.sequence_parallel,
+    )
+    if requested_length is None:
+        resolved_length = decoder_sequence_length + alignment_padding
+    elif requested_length < decoder_sequence_length:
+        raise ValueError(
+            f"--decoder-seq-length must be at least {decoder_sequence_length} "
+            "to fit text and image tokens"
+        )
+    elif alignment_padding:
+        raise ValueError("--decoder-seq-length must be divisible by the CP/SP padding factor")
+    else:
+        resolved_length = requested_length
+    padding_needed = resolved_length - decoder_sequence_length
+    decoder_sequence_length = resolved_length
+    if args.max_seq_length_per_sample is None:
+        args.max_seq_length_per_sample = decoder_sequence_length
+    elif args.max_seq_length_per_sample != decoder_sequence_length:
+        raise ValueError(
+            "The mock VLM callback emits fixed-width rows: --max-seq-length-per-sample "
+            "must equal the derived text + image + alignment width"
+        )
+    args.max_position_embeddings = max(args.max_position_embeddings, decoder_sequence_length)
+    return text_sequence_length, padding_needed
+
+
 if __name__ == "__main__":
     # Timestamp right after entering __main__ block (after all imports/library setup)
     _MAIN_ENTRY_TIME = time.time()
@@ -546,11 +534,16 @@ if __name__ == "__main__":
         extra_args_provider=add_vlm_extra_args, args_defaults={'tokenizer_type': 'GPT2BPETokenizer'}
     )
     from megatron.training.argument_utils import model_config_from_args
+
+    text_sequence_length, padding_needed = resolve_vlm_sequence_lengths(args)
     model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    model_provider = partial(model_provider, mp_padding_needed=padding_needed)
+    train_valid_test_datasets_provider = partial(
+        train_valid_test_datasets_provider, sequence_length=text_sequence_length
+    )
+    train_valid_test_datasets_provider.is_distributed = True
     full_config = pretrain_cfg_container_from_args(args, model_cfg)
     set_run_config(full_config)
-    set_vlm_sequence_lengths(args, model_cfg)
-    train_valid_test_datasets_provider.is_distributed = True
     pretrain(
         full_config,
         train_valid_test_datasets_provider,

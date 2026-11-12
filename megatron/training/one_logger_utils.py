@@ -4,6 +4,7 @@ import time
 
 from megatron.core._rank_utils import safe_get_world_size
 from megatron.training.global_vars import get_run_config
+from megatron.training.sequence_lengths import get_model_input_lengths
 
 from .global_vars import get_args, get_one_logger
 
@@ -292,7 +293,7 @@ def on_pretrain_start():
                 'tensor_model_parallel_size': cfg.model.transformer.tensor_model_parallel_size,
                 'expert_model_parallel_size' : cfg.model.transformer.expert_model_parallel_size,
                 'world_size': safe_get_world_size(),
-                'model_seq_length': cfg.model_input_length,
+                'model_seq_length': get_model_input_lengths(cfg.model, cfg.data.dataset)[0],
                 'app_tag_run_name': app_tag_run_name,
                 'app_tag_run_version': app_tag_run_version,
                 'is_log_throughput_enabled': cfg.logger.log_throughput,

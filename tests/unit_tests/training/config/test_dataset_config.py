@@ -183,12 +183,14 @@ def test_container_written_fields_are_the_layout_and_the_validation_flags():
     """The six fields other sections own, left at Megatron Core's defaults until the container
     writes them; the seed is the section's own setting, not one of them."""
     assert CONTAINER_WRITTEN_FIELDS == (
+        "packed_sequence_length",
         "data_parallel_size", "context_parallel_size", "sequence_parallel_size",
         "dynamic_context_parallel",
         "multiple_validation_sets", "full_validation",
     )  # fmt: skip
     defaults = {f.name: f.default for f in fields(GPTDatasetConfig)}
     assert {name: defaults[name] for name in CONTAINER_WRITTEN_FIELDS} == {
+        "packed_sequence_length": None,
         "data_parallel_size": 1, "context_parallel_size": None, "sequence_parallel_size": 0,
         "dynamic_context_parallel": False,
         "multiple_validation_sets": None, "full_validation": None,

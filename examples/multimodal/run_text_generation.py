@@ -5,7 +5,7 @@ import logging
 import os
 import sys
 from functools import partial
-from typing import List, Dict
+from typing import Dict, List
 
 # Add megatron to the path.
 sys.path.append(
@@ -16,37 +16,37 @@ import torch
 import yaml
 from config import EvaluationConfig
 from evaluation.evaluation_datasets import get_evaluation_dataset
-from model import model_provider
+from model import model_provider, resolve_multimodal_sequence_lengths
 from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
-from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
-from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
-from megatron.inference.text_generation.api import generate_and_post_process
-from megatron.inference.text_generation.forward_step import ForwardStep
 from megatron.core.inference.contexts import StaticInferenceContext
-from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.engines import StaticInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest, VLMInferenceRequest
-from megatron.core.inference.text_generation_controllers.vlm_text_generation_controller import (
-    VLMTextGenerationController,
-)
 from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
     InferenceWrapperConfig,
 )
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
 )
-from megatron.training import get_args, get_model, get_tokenizer, print_rank_0, is_last_rank
+from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.vlm_text_generation_controller import (
+    VLMTextGenerationController,
+)
+from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN
+from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
+from megatron.inference.text_generation.api import generate_and_post_process
+from megatron.inference.text_generation.forward_step import ForwardStep
+from megatron.training import get_args, get_model, get_tokenizer, is_last_rank, print_rank_0
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
-from megatron.training.initialize import initialize_megatron
 from megatron.training.global_vars import (
     get_run_config,
     set_run_config,
 )
-from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.initialize import initialize_megatron
 from megatron.training.models import LLaVAModelConfig
 
 
@@ -762,6 +762,7 @@ def run_eval(config, iteration=None):
 
     elif config.task == "MMMU":
         from evaluation.evaluate_mmmu import convert_to_mmmu_format
+
         from examples.multimodal.evaluation.mmmu_utils import mmmu_main_eval
         result_file = convert_to_mmmu_format(config.output_path)
         result = json.load(open(result_file))
@@ -857,6 +858,7 @@ def eval_tasks():
     from megatron.training.argument_utils import model_config_from_args
 
     args = parse_and_validate_args(extra_args_provider=add_text_generation_args)
+    resolve_multimodal_sequence_lengths(args)
     model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
     set_run_config(inference_cfg_container_from_args(args, model_cfg))
     initialize_megatron(training=False)

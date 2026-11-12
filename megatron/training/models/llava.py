@@ -20,11 +20,6 @@ class LLaVAModelConfig:
     seq_length: int
     """Maximum position capacity, not the image or text data sequence length."""
 
-    decoder_seq_length: int | None = None
-    """Language-model input length: the text tokens, the image tokens and the CP/SP padding.
-    ``--decoder-seq-length`` sets it; ``pretrain_vlm.set_vlm_sequence_lengths`` derives it from the
-    data length and the vision geometry when unset. ``finalize()`` makes it the language
-    transformer's per-sample maximum, and the container reports it as ``model_input_length``."""
 
     img_h: int = 224
     """Vision input height, also consumed by image preprocessing."""
@@ -79,15 +74,3 @@ class LLaVAModelConfig:
 
     tp_comm_overlap_cfg: str | dict[str, Any] | None = None
     """Transformer Engine user-buffer overrides, as a YAML path or dictionary."""
-
-    def finalize(self) -> None:
-        """Make the decoder length the language transformer's per-sample maximum.
-
-        The training lifecycle reads ``transformer.max_seq_length_per_sample`` as the per-sample
-        length of a run whose datasets come from the application's callback (the container's
-        ``sample_length``), so the pipeline shapes, the TP-communicator buffers, the estimators and
-        the token counters see the decoder length where the launcher put the text length
-        (``--seq-length``). The container calls this at ``finalize()``, before the runtime services.
-        """
-        if self.decoder_seq_length is not None:
-            self.transformer.max_seq_length_per_sample = self.decoder_seq_length

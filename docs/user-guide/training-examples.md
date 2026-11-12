@@ -75,6 +75,48 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
     --eval-interval 1000
 ```
 
+## Sequence lengths in the training configuration
+
+Dataset content limits and model execution widths have different owners:
+
+- `cfg.data.dataset.sequence_length` limits each GPT/SFT sequence's content. The CLI
+  supplies it with `--seq-length`.
+- `cfg.model.transformer.max_seq_length_per_sample` bounds one physical model input
+  row, or an entire packed THD row, including padding and expanded image tokens.
+  `--max-seq-length-per-sample` sets it explicitly; GPT defaults to `--seq-length`.
+- `cfg.model.seq_length` is the model's position capacity (`--max-position-embeddings`),
+  not a dataset truncation limit. RoPE settings are unchanged.
+- `max_seqlen_per_dp_cp_rank` remains the separate per-rank dynamic-CP packing budget.
+
+For example, `--sft --seq-length 2048 --max-seq-length-per-sample 8192` truncates
+individual conversations at 2048 tokens and emits 8192-token padded packs. The
+container derives the dataset's physical `packed_sequence_length` during startup;
+recipes should set the model bound rather than this derived dataset field. Existing
+`--seq-length`-only runs retain their previous widths and packing behavior.
+
+An oversized allocation bound does not enlarge fixed GPT dataset rows or change
+their token-based batch schedule. T5 retains separate encoder and decoder input
+lengths. Callback datasets such as Energon still own truncation and packing; their
+entrypoints bind those inputs before `pretrain()`, and resolve the model execution
+bound before runtime buffers are initialized. Fixed-width BERT, mock VLM, and
+ModelOpt callbacks reject bounds inconsistent with the rows they actually emit.
+
+`validate()` checks these constraints without mutation. Framework startup calls
+`finalize()` to derive unset/owned fields before any runtime consumer reads them.
+
+### Migration from the data-config PR
+
+The temporary `cfg.sample_length` and `cfg.model_input_length` properties and
+`LLaVAModelConfig.decoder_seq_length` are removed. Python callers and saved
+configurations using those APIs require updating; strict deserialization rejects
+the removed LLaVA field. For LLaVA, move the resolved text + image + padding width
+to `model.transformer.max_seq_length_per_sample` before startup. Do not substitute
+the allocation bound for a fixed GPT dataset's actual row width.
+
+The `--decoder-seq-length` CLI flag remains accepted: VLM entrypoints translate
+it into their execution width, while T5 retains an independent decoder width.
+Decoder-only models do not acquire a second decoder-length config field.
+
 ## GPT-3 Training Example
 
 Train a GPT-3 style model:

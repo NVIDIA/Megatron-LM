@@ -77,6 +77,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     inter_document_masking: bool = False
     """When True, return cu_seqlens marking document boundaries within each sample so
     that attention is restricted to individual documents."""
+
+    packed_sequence_length: Optional[int] = None
+    """Physical output width for SFT packs, including alignment padding. The training container
+    derives this from the model execution bound; ``sequence_length`` limits an individual
+    conversation. Standalone datasets default to ``sequence_length`` for backward compatibility.
+    Ordinary GPT and variable-length datasets do not use this field."""
     sft_mock_dataset_config_json: Optional[str] = None
     """JSON string (or path to a JSON file) configuring the mock SFT dataset's
     sequence-length distribution. Two modes:
