@@ -27,7 +27,7 @@ class PrefetchOrder(enum.Enum):
 
 @dataclass(frozen=True)
 class RuntimePolicy:
-    """Configure communication allocation and streams for an FSDP context."""
+    """Configure communication allocation, streams, and prefetch for an FSDP context."""
 
     use_symmetric_memory: bool = False
     """Allocate communication staging buffers from PyTorch's NCCL symmetric-memory pool."""
@@ -43,3 +43,10 @@ class RuntimePolicy:
     """Run DP-outer reduction on a separate stream, independently of all-gather overlap."""
 
     prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION
+    """``REGISTRATION`` expects a forward/backward pass matching module
+    registration order. ``RECORDED`` gathers parameters on demand and records
+    module calls until the first ``post_backward()``. Subsequent passes must
+    repeat the complete sequence consistently across data-parallel ranks.
+    Recording currently requires the ordinary module hooks; combined 1F1B
+    bypasses them. Discard the context if the recorded pass raises.
+    """

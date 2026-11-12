@@ -83,7 +83,7 @@ class FsdpContext:
         Args:
             device: CUDA device on which this context schedules communication. Defaults to
                 the current CUDA device.
-            runtime_policy: Communication allocation and stream settings shared by all
+            runtime_policy: Communication allocation, stream, and prefetch settings shared by all
                 modules constructed in this context.
             parameter_to_owner: Construction-time owner assignments for TensorAtomic
                 parameters, keyed by the original parameters before sharding. Owners are
