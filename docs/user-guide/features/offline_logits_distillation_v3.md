@@ -34,9 +34,14 @@ A frozen teacher must score deterministically: it still runs in train mode, so s
 `--hidden-dropout 0 --attention-dropout 0` (both default to 0.1); MoE input jitter and
 token dropping (`--moe-expert-capacity-factor`, `--moe-token-dropping`) are rejected too.
 
-A frozen replay-dump teacher resumes from what the cache has actually published, not from its
-progress tracker, so a failed or interrupted flush never leaves a resubmitted job past
-its data. Partial flushes beyond that point are deleted on resume.
+A dump job resumes like a Megatron checkpoint: it starts at `--override-ckpt-iteration`
+if given, else at the iteration in its `--save` progress tracker, else at zero (a training
+teacher resumes from its weight checkpoints as usual). Everything already published from
+that iteration to the job's end (the next multiple of `--exit-interval`, or
+`--train-iters`) is unpublished at startup and rewritten, so an override or an edited
+tracker redoes the data from that point. The tracker advances only after every writer's
+upload of a flush has succeeded, so a failed or interrupted flush is rewritten when the
+job is resubmitted. A start or end inside a published flush is rejected.
 
 Each raw CPU microbatch is captured before TP field filtering, packed flattening, or
 CP partitioning. An explicit token mapping gathers CP outputs back into sample order.
@@ -57,12 +62,17 @@ same `--exit-interval E`, and start job `k` with `--override-ckpt-iteration k*E`
 ```
 
 Megatron exits at the next multiple of `E`, so each job owns
-`[override, next multiple of E)`. `--exit-interval` and `--override-ckpt-iteration` must
+`[start, next multiple of E)`. `--exit-interval` and `--override-ckpt-iteration` must
 be multiples of `--save-interval`, so every job's flushes line up with a single
-sequential dump. Give each job its own `--save` directory. Resubmitting a job with an
-unchanged script resumes inside its own range; a job whose range is already complete
-exits before running a step. Without `--override-ckpt-iteration`, a job is the cache's
-single sequential writer and `--exit-interval` keeps its usual periodic meaning (for
+sequential dump. Give each job its own `--save` directory.
+
+As for Megatron checkpoints, the override always wins: resubmitting a job with its
+override still in the script rewrites its whole range. To continue a preempted job where
+it stopped, pass the override only on its first launch, for example
+`[ -f "$SAVE/latest_checkpointed_iteration.txt" ] || OVERRIDE="--override-ckpt-iteration $((k*E))"`;
+its tracker then supplies the start. Do not resubmit a finished job without its override:
+its tracker points at the next job's range, which it would rewrite. A single sequential
+writer needs no override, and `--exit-interval` keeps its usual periodic meaning (for
 example, to requeue every N iterations).
 
 Every file records the cache settings (see [Metadata](#metadata)). A teacher checks them
@@ -112,20 +122,18 @@ Student blend ordering has its own seed.
 
 #### Corpus resume and replacement
 
-The output `--save/latest_checkpointed_iteration.txt` is authoritative for corpus
-production. It is a teacher iteration, not a stored-row offset. A tracker containing
-`128` means resume at iteration 128: preserve earlier chunks, invalidate chunk indexes
-at or after 128 within this job's assigned range, and regenerate that tail. Editing the
-tracker to an earlier chunk boundary therefore requests a redo; existing completed
-chunks do not advance the cursor. An interruption after index publication but before
-tracker publication also regenerates that chunk on restart.
+Corpus jobs resume and redo exactly like replay dumps: a job starts at
+`--override-ckpt-iteration`, else at its `--save` tracker, else at zero, and unpublishes
+every chunk that starts within its range before regenerating it. The tracker is a teacher
+iteration, not a stored-row offset: `128` means keep the chunks before iteration 128 and
+rewrite from there. An interruption after a chunk's index is published but before the
+tracker advances regenerates that chunk on restart. A start or end inside a chunk is
+rejected.
 
-Every parallel range job needs its own `--save` directory. A tracker cannot skip missing
-work, lie inside a chunk, or fall outside the job's range. If the range already contains
-objects but its tracker is missing, create the tracker at the intended resume boundary;
-the job refuses to guess. Fresh jobs create an initial tracker before uploading data.
-Source and producer compatibility checks run before any indexes are invalidated.
-Concurrent writers to the same range are unsupported.
+Chunks the job keeps must match its settings and global batch size; chunks it rewrites
+need not, so a rewrite of the whole source may change them. These checks run before any
+index is removed. Every parallel range job needs its own `--save` directory, and
+concurrent writers to the same range are unsupported.
 
 Consumers cache an immutable snapshot. Stop affected students and rebuild their
 loading plans before replacing corpus files. A previously trained student's manifest
@@ -189,7 +197,7 @@ tokens:
 - When `lanes` is a multiple of DP × microbatch size, each lane is read by exactly one
   student rank, one ranged read per block. Otherwise ranks share lanes and read the same
   blocks. Each rank keeps about `lanes / DP × --logits-load-msc-prefetch-depth` blocks
-  (16 MiB uncompressed each) in flight.
+  (32 MiB uncompressed each) in flight.
 
 Weights affect the student's consumption only. Every real sample is dumped once,
 regardless of any later blend; the saver excludes final-batch fillers before writing.
@@ -363,7 +371,7 @@ The chunk's `index.json` consolidates all part indexes and publishes the entire 
 
 A data file is an [Arrow IPC file](https://arrow.apache.org/docs/format/Columnar.html#ipc-file-format)
 with zstd-compressed buffers: one row per sample, the input columns first and then the
-target columns, grouped into record batches ("blocks") of at most 16 MiB uncompressed
+target columns, grouped into record batches ("blocks") of at most 32 MiB uncompressed
 (a larger sample gets a block of its own). PyArrow opens the file directly; V3 adapters
 interpret its sample columns and the settings in schema metadata under `offline_kd`.
 
@@ -372,16 +380,18 @@ range for that writer: local writes are staged and renamed, and remote objects b
 visible only when their upload completes. Discovery only lists index names. A complete
 flush group has an index for every writer rank `0..writers-1`. Missing writers or a gap
 prevent replay from advancing through that group; overlapping ranges are rejected.
-A published range is never replaced; a data file without an index (an interrupted attempt) is
+A published range is replaced only by a dump job that rewrites it, which removes its
+indexes (then its data) at startup. A data file without an index (an interrupted attempt) is
 ignored and overwritten by a retry. Temporary local writes may leave
 `<filename>.<uuid>.tmp` files after interruption; they are not published files.
 
-For corpus production, all writers upload their independent parts and return index
-descriptors through the worker result channel. After async completion across ranks,
-the publisher checks all writer results, publishes the consolidated chunk index, then
-advances the tracker. The final partial flush uses the same ordering synchronously.
-Parts without a chunk index are not visible to readers and may be overwritten. A redo
-first removes affected indexes; unreferenced old parts may remain and are ignored.
+Every writer reports its upload through the worker result channel. After async
+completion across ranks, one rank checks that every writer reported success (for corpus
+production it then publishes the consolidated chunk index from the reported part
+indexes), and only then does the tracker advance. The final partial flush uses the same
+ordering synchronously. Corpus parts without a chunk index are not visible to readers
+and may be overwritten. A redo first removes affected indexes; unreferenced old parts
+may remain and are ignored.
 
 Corpus discovery lists once per source snapshot and reads each chunk index once on
 the planning rank. Cached indexes are shared with readers in the manifest: consuming
@@ -566,9 +576,8 @@ decoding or student training; they explain how the stored targets were produced.
 | `cp_size` | Teacher context-parallel size. Diagnostic only: V3 reconstructs canonical samples before storage, so the student need not match it. |
 | `save_interval` | Teacher flush interval in iterations. Readers discover actual sample ranges rather than deriving them from this value. |
 
-The saver also keeps `published_through` in memory to avoid republishing an existing
-prefix after resume. It is stripped from file metadata. There is no `range_end` metadata
-field; the running job derives its end from the current dump-range arguments.
+There is no `range_end` metadata field; the running job derives its range from its start
+iteration and `--exit-interval`.
 
 ### Stored records
 
@@ -870,7 +879,8 @@ re-padding, the Arrow file and index layout, metadata contract, tokenizer finger
 golden fixtures), exact input/target pairing, reshuffling and its checkpointed extent,
 DP/MBS changes, ramp-up, prefix shortening, CP token maps and per-CP-rank target shards,
 publication and holes from parallel jobs, the collective replay frontier, one ranged read
-per block (and input-only prefixes), frozen-teacher range resume and cleanup,
+per block (and input-only prefixes), Megatron-style dump restarts that rewrite their range,
+corpus part upload reports and chunk publication, filler removal,
 mismatched-settings detection, and differentiable sparse KL:
 
 ```sh

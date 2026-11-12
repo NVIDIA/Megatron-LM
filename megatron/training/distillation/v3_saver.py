@@ -3,9 +3,10 @@
 """Paired-input saver extending the existing sparse target hook and async queue."""
 
 import json
-import os
+import multiprocessing as mp
+import uuid
 from collections import OrderedDict
-from typing import Any
+from typing import Any, Callable
 
 import torch
 import torch.distributed as dist
@@ -19,6 +20,8 @@ from .v3_format import MAX_VOCAB_SIZE, capture_batch, finalize_record, join_inpu
 from .v3_options import get_args
 from .v3_replay import layout_options, token_map
 from .v3_storage import Storage, data_name, parse_name, publish
+
+TRACKER = "latest_checkpointed_iteration.txt"
 
 
 class PairedLogitsSaver(LogitsSaverHooks):
@@ -35,6 +38,11 @@ class PairedLogitsSaver(LogitsSaverHooks):
         self._pending_input = None
         self._iteration_records = None
         self._attempt_microbatch = 0
+        # Writers report each upload through a Manager dict, which can travel through the
+        # persistent worker's request queue; the flush finalizer collects the reports.
+        self._result_manager = mp.Manager() if self.tp_rank == self.cp_rank == 0 else None
+        self._results = self._result_manager.dict() if self._result_manager else None
+        self._last_flush = None
 
     def initialize(self) -> None:
         """Initialize metadata after checkpoint restoration, once per run."""
@@ -195,54 +203,128 @@ class PairedLogitsSaver(LogitsSaverHooks):
                     iteration,
                 )
             record = self._iteration_records
-            # Resume can replay a window already published before a weight checkpoint.
-            if record["end"] > self.metadata_dict["published_through"]:
-                self._pending_writes[(record["start"], record["end"])] = record
+            self._pending_writes[(record["start"], record["end"])] = record
             self._iteration_records = None
         self._topp_kept_counts.clear()
 
     def take_pending_data(self) -> tuple:
-        """Transfer ownership to the existing persistent async checkpoint worker."""
-        writes = self._pending_writes
-        self._pending_writes = OrderedDict()
-        name = ""
+        """Transfer ownership of one flush to the existing persistent async checkpoint worker."""
+        writes, self._pending_writes = self._pending_writes, OrderedDict()
+        task = None
         if writes:
             start, end = min(a for a, _ in writes), max(b for _, b in writes)
-            name = os.path.join(self.save_dir, data_name(self.dp_rank, start, end))
-        return (
-            name,
-            writes,
-            self._meta_bytes,
-            self.save_dir.startswith("msc://"),
-            [],
-            self._failure_event,
-        )
+            gbs = get_args().global_batch_size
+            task = self._flush_task(start // gbs, end // gbs, start, end)
+        self._last_flush = task
+        return self.save_dir, writes, self._meta_bytes, task, self._results, self._failure_event
+
+    def _flush_task(self, start: int, end: int, first_sample: int, end_sample: int) -> dict:
+        """Describe one flush of iterations ``[start, end)`` for the async writer."""
+        return {
+            "key": uuid.uuid4().hex,
+            "start": start,
+            "end": end,
+            "path": data_name(self.dp_rank, first_sample, end_sample),
+        }
 
     @staticmethod
     def _write_batched_tar(
-        tar_path: str,
+        root: str,
         writes: OrderedDict,
-        meta_bytes: bytes,
-        msc_enabled: bool = False,
-        existing_tars: Any = None,
-        failure_event: Any = None,
+        metadata: bytes,
+        task: dict | None,
+        results: Any,
+        failure_event: Any,
     ) -> None:
-        if not writes:
+        """Publish one writer's flush and report it, without reading the object back."""
+        if task is None:
             return
         try:
-            if msc_enabled:
+            if root.startswith("msc://"):
                 # Persistent workers do not inherit the main process's feature flags.
                 from megatron.core.msc_utils import MultiStorageClientFeature
 
                 MultiStorageClientFeature.enable()
-            metadata = json.loads(meta_bytes)
-            # Resume-only state is not part of the immutable file metadata.
-            metadata.pop("published_through", None)
-            storage = Storage(os.path.dirname(tar_path))
-            name = parse_name(os.path.basename(tar_path))
-            data, index = write_file([record["batch"] for record in writes.values()], metadata)
-            publish(storage, name, data, index)
+            data, index = write_file(
+                [record["batch"] for record in writes.values()], json.loads(metadata)
+            )
+            publish(Storage(root), parse_name(task["path"]), data, index)
+            results[task["key"]] = {"start": task["start"], "end": task["end"]}
         except Exception:
             if failure_event is not None:
                 failure_event.set()
             raise
+
+    def _publish_flush(self, start: int, end: int, reports: list[dict]) -> None:
+        """Run on one rank once every writer has uploaded; replay writers publish themselves."""
+
+    def flush_finalize_fn(self, iteration: int) -> Callable[[], None]:
+        """Confirm every writer's upload before the progress tracker advances.
+
+        Every rank on the last pipeline stage calls this. Other stages enqueue a
+        matching no-op request so the async queue's world synchronization still pairs.
+        """
+        task = self._last_flush
+        group = src = None
+        if dist.is_initialized():
+            from megatron.core import parallel_state as mpu
+
+            group = mpu.get_tensor_and_data_parallel_group(with_context_parallel=True)
+            src = dist.get_process_group_ranks(group)[0]
+
+        def finalize() -> None:
+            local = None
+            if self.tp_rank == self.cp_rank == 0:
+                try:
+                    if self._failure_event.is_set():
+                        raise RuntimeError("Offline KD v3 upload failed")
+                    if task is not None:
+                        local = self._results.pop(task["key"], None)
+                        if local is None:
+                            raise RuntimeError("Offline KD v3 writer exited without a report")
+                except Exception as error:
+                    local = {"error": f"{type(error).__name__}: {error}"}
+            leader = group is None or dist.get_rank() == src
+            gathered = [local]
+            if group is not None:
+                gathered = [None] * dist.get_world_size(group) if leader else None
+                dist.gather_object(local, gathered, dst=src, group=group)
+            outcome = [None]
+            if leader:
+                try:
+                    reports = [report for report in gathered if report is not None]
+                    errors = [report["error"] for report in reports if "error" in report]
+                    if errors:
+                        raise RuntimeError("; ".join(errors))
+                    if reports:
+                        if len(reports) != self.dp_size:
+                            raise RuntimeError("Missing offline KD v3 writer reports")
+                        starts = {report["start"] for report in reports}
+                        if len(starts) != 1 or any(r["end"] != iteration for r in reports):
+                            raise RuntimeError("Offline KD v3 writers disagree on the flush")
+                        self._publish_flush(starts.pop(), iteration, reports)
+                    outcome[0] = {}
+                except Exception as error:
+                    outcome[0] = {"error": f"{type(error).__name__}: {error}"}
+            if group is not None:
+                dist.broadcast_object_list(outcome, src=src, group=group)
+            if "error" in outcome[0]:
+                raise RuntimeError(outcome[0]["error"])
+
+        return finalize
+
+    def finish(self) -> None:
+        """Publish a final partial flush synchronously, then record a frozen dump's progress.
+
+        A training teacher's tracker belongs to its weight checkpoints, so its final
+        partial flush is simply rewritten on resume.
+        """
+        args = get_args()
+        iteration = args.consumed_train_samples // args.global_batch_size
+        request = self.take_pending_data()
+        finalize = self.flush_finalize_fn(iteration)
+        self._write_batched_tar(*request)
+        finalize()
+        frozen = getattr(args, "freeze_all_layers", False)
+        if frozen and self.tp_rank == self.cp_rank == self.dp_rank == 0:
+            Storage(args.save).write(TRACKER, str(iteration).encode())

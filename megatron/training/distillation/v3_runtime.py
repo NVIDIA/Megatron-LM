@@ -29,11 +29,10 @@ from .v3_replay import (
 )
 from .v3_storage import (
     Storage,
-    complete_ranges,
-    contiguous_end,
-    discard_unpublished,
+    discard_range,
     has_legacy_tars,
     list_published,
+    object_ranges,
     read_meta,
 )
 
@@ -200,63 +199,29 @@ def student_padding_divisor(args: Any) -> int:
     )
 
 
-def dump_range(args: Any) -> tuple[int | None, int]:
-    """Return this dump job's ``(start, end)`` iterations.
+def dump_range(args: Any) -> tuple[int, int]:
+    """Return the ``(start, end)`` iterations this dump job (re)writes.
 
-    A frozen teacher started with ``--override-ckpt-iteration s`` owns
-    ``[s, next multiple of --exit-interval)``; Megatron's own exit-interval check
-    ends it there. Otherwise the job is the cache's single sequential writer and
-    owns everything up to ``--train-iters`` (``start`` is None: the cache start).
+    Like a Megatron checkpoint resume, a job starts at ``--override-ckpt-iteration`` if
+    given, else at the iteration in its ``--save`` progress tracker, else at zero; that
+    is the restored sample cursor. It ends where Megatron stops it: at the next multiple
+    of ``--exit-interval``, or at ``--train-iters``. Everything already published in that
+    range is replaced.
     """
-    start = getattr(args, "logits_save_range_start", None)
-    if start is None:
-        return None, args.train_iters
+    start = args.consumed_train_samples // args.global_batch_size
     if not args.exit_interval:
         return start, args.train_iters
     return start, min((start // args.exit_interval + 1) * args.exit_interval, args.train_iters)
 
 
-def _published_end(storage: Storage, dp_size: int, start: int, end: int) -> int:
-    return contiguous_end(complete_ranges(list_published(storage), dp_size), start, end)
-
-
-def frozen_resume_iteration(args: Any) -> int:
-    """Resume corpus production from its tracker, or replay dumping from publication.
-
-    For replay dumps the cache, not the progress tracker, is the source of truth: a resubmitted
-    parallel job (unchanged ``--override-ckpt-iteration``) continues inside its own
-    range, and periodic ``--exit-interval`` requeues of a single writer advance.
-    """
-    args = runtime_options(args)
-    if not hasattr(args, "logits_save_range_start"):
-        # Record the user's range start once; load_checkpoint then replaces the override.
-        args.logits_save_range_start = args.override_ckpt_iteration
-    if getattr(args, "kd_corpus_dump", None):
-        from .corpus_runtime import resume_corpus_iteration
-
-        return resume_corpus_iteration(args)
-    start_iteration, end_iteration = dump_range(args)
-    gbs = args.global_batch_size
-
-    def resolve() -> dict:
-        try:
-            from megatron.core import parallel_state as mpu
-
-            storage = Storage(args.logits_save_dir)
-            start = (start_iteration or 0) * gbs
-            published = _published_end(
-                storage, mpu.get_data_parallel_world_size(), start, end_iteration * gbs
+def check_rewrite_bounds(spans: list[tuple[int, int]], start: int, end: int, unit: str) -> None:
+    """Reject published spans that a rewrite of ``[start, end)`` would only partly replace."""
+    for a, b in spans:
+        if any(a < edge < b for edge in (start, end)):
+            raise ValueError(
+                f"Published {unit} {a}-{b} would be only partly rewritten by this job ({unit} "
+                f"{start}-{end}); start and end the job on flush boundaries"
             )
-            return {"iteration": published // gbs}
-        except Exception as error:
-            return {"error": f"{type(error).__name__}: {error}"}
-
-    result = [resolve() if not dist.is_initialized() or dist.get_rank() == 0 else None]
-    if dist.is_initialized():
-        dist.broadcast_object_list(result, src=0)
-    if "error" in result[0]:
-        raise RuntimeError(result[0]["error"])
-    return result[0]["iteration"]
 
 
 def _teacher_identity(args: Any) -> str:
@@ -363,7 +328,7 @@ def _report_recorded_differences(differing: list[str], where: str) -> None:
 
 
 def initialize_dump_metadata(saver: Any) -> dict:
-    """Check this dump job against the cache and find where it resumes, collectively."""
+    """Check this dump job against the cache and unpublish what it replaces, collectively."""
     from .utils import _broadcast_without_pp
     from .v3_options import get_args
 
@@ -381,13 +346,22 @@ def initialize_dump_metadata(saver: Any) -> dict:
             storage = Storage(saver.save_dir)
             if has_legacy_tars(storage):
                 raise ValueError("Cannot mix legacy and v3 dumps in the same directory")
-            files = list_published(storage)
+            start_iteration, end_iteration = dump_range(args)
+            start, end = start_iteration * gbs, end_iteration * gbs
+            check_rewrite_bounds(object_ranges(storage), start, end, "samples")
+            published = list_published(storage)
+            kept = [name for name in published if not start <= name.start < end]
             first_sample = 0 if frozen else args.consumed_train_samples
             differing = []
-            if files:
-                existing = read_meta(storage, files[0])
+            if kept:
+                existing = read_meta(storage, kept[0])
                 validate_metadata(existing)
                 first_sample = existing["contract"]["first_sample"]
+                if start < first_sample:
+                    raise ValueError(
+                        f"This job starts at sample {start}, before the cache's first sample "
+                        f"{first_sample}; use a new save directory"
+                    )
                 required, recorded = mismatched_settings(
                     existing,
                     {
@@ -401,22 +375,14 @@ def initialize_dump_metadata(saver: Any) -> dict:
                         "use a new save directory"
                     )
                 differing += recorded
-            start_iteration, end_iteration = dump_range(args)
-            start = first_sample if start_iteration is None else start_iteration * gbs
-            end = end_iteration * gbs
-            published = _published_end(storage, saver.dp_size, start, end)
-            if not start <= args.consumed_train_samples <= published:
-                raise ValueError(
-                    f"Teacher cursor {args.consumed_train_samples} is outside this job's published "
-                    f"range {start}-{published}; resume an earlier checkpoint or use a new cache "
-                    "directory"
-                )
-            discard_unpublished(storage, published, end)
+            report_replaced(
+                sorted({(n.start, n.end) for n in published if start <= n.start < end}), "samples"
+            )
+            discard_range(storage, start, end)
             return {
                 "metadata": {
                     **expected,
                     "contract": {**expected["contract"], "first_sample": first_sample},
-                    "published_through": published,
                 },
                 "differing": differing,
             }
@@ -428,6 +394,16 @@ def initialize_dump_metadata(saver: Any) -> dict:
         raise RuntimeError(result["error"])
     _report_recorded_differences(result["differing"], "dump job and existing v3 files")
     return result["metadata"]
+
+
+def report_replaced(spans: list, unit: str) -> None:
+    """Say which published data a dump job replaces (called on one rank per stage)."""
+    if spans:
+        print(
+            f"Offline KD v3 dump: replacing {len(spans)} published flushes ({unit} "
+            f"{spans[0][0]}-{spans[-1][1]}) from this job's start iteration",
+            flush=True,
+        )
 
 
 def _check_student_compatibility(args: Any, metadata: dict, *, replay: bool = True) -> None:
@@ -635,21 +611,11 @@ def ensure_replay_frontier(args: Any) -> None:
         )
 
 
-def before_train_step(args: Any) -> bool:
-    """Run v3 checks at the top of each training iteration; True means exit cleanly."""
+def before_train_step(args: Any) -> None:
+    """Agree on the replay frontier at the top of each training iteration (collective)."""
     args = runtime_options(args)
-    if getattr(args, "logits_load_inputs", False):
-        initialize_replay(args)  # Once, collectively, before the first replay batch.
-        ensure_replay_frontier(args)
-    if getattr(args, "logits_save_inputs", False):
-        start, end = dump_range(args)
-        if start is not None and args.consumed_train_samples >= end * args.global_batch_size:
-            # Megatron checks --exit-interval only after a step; a resubmitted job whose
-            # range is already published must not dump into the next job's range.
-            if not dist.is_initialized() or dist.get_rank() == 0:
-                print(f"Offline KD v3 dump range {start}-{end} is complete; exiting", flush=True)
-            return True
-    return False
+    initialize_replay(args)  # Once, collectively, before the first replay batch.
+    ensure_replay_frontier(args)
 
 
 def use_hybrid_layout() -> None:
@@ -970,14 +936,10 @@ def finish_dump() -> None:
     """Flush the final teacher tail synchronously after draining async writes."""
     from .logits_saver import get_logits_saver
 
-    saver = get_logits_saver()
-    if saver is None or not hasattr(saver, "commit_attempt"):
-        return
-    saver.initialize()
-    if hasattr(saver, "finish"):
+    saver = get_logits_saver()  # None off the last pipeline stage.
+    if saver is not None:
+        saver.initialize()
         saver.finish()
-        return
-    saver._write_batched_tar(*saver.take_pending_data())
 
 
 def reset_runtime() -> None:

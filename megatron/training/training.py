@@ -5291,13 +5291,11 @@ def train(
         global_batch_size = get_current_global_batch_size()
         update_num_microbatches(train_state.consumed_train_samples, consistency_check=True, verbose=True)
 
-        # Offline KD v3: agree on the replay frontier, or stop a completed dump range.
-        if getattr(args, "logits_load_inputs", False) or getattr(args, "logits_save_inputs", False):
+        # Offline KD v3: agree on the replay frontier before each step.
+        if getattr(args, "logits_load_inputs", False):
             from megatron.training.distillation.v3_runtime import before_train_step
 
-            if before_train_step(args):
-                should_exit = True
-                break
+            before_train_step(args)
 
         # Capture CUDA Graphs. One-off, at the warmup-step boundary -- the actual
         # graph capture (create_cudagraphs) is a notable one-time cost worth its

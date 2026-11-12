@@ -14,6 +14,7 @@ import collections
 import importlib
 import json
 import sys
+import threading
 import types
 import typing
 from pathlib import Path
@@ -1103,11 +1104,12 @@ def test_token_maps_match_megatron_cpu_partitioning(packed, layout, monkeypatch)
         assert torch.equal(mapping, actual)
 
 
-def test_discard_unpublished_only_touches_its_own_range(tmp_path):
+def test_discard_range_only_touches_its_own_range(tmp_path):
     storage, metadata = write_cache(tmp_path, iterations=6)
     (tmp_path / "dp1__16-32.index.json").unlink()
     (tmp_path / "dp0__16-32.arrow.0123456789abcdef0123456789abcdef.tmp").write_bytes(b"x")
-    removed = storage_module.discard_unpublished(storage, 16, 32)
+    assert storage_module.object_ranges(storage) == [(0, 16), (16, 32), (32, 48)]
+    removed = storage_module.discard_range(storage, 16, 32)
     # Indexes go first, so an interrupted cleanup leaves only unpublished data files.
     assert removed == [
         "dp0__16-32.index.json",
@@ -1369,7 +1371,6 @@ def test_corpus_sources_must_share_a_tokenizer(tmp_path, runtime_environment, ca
     other["recorded"]["teacher"] = "/other@1"
     corpus_source(tmp_path, "web", samples=64, iterations=2, metadata=other)
     saver = teacher_saver(runtime, tmp_path / "code")
-    runtime.frozen_resume_iteration(args)
     runtime.initialize_dump_metadata(saver)
     assert "recorded settings (teacher)" in capsys.readouterr().out
     other["contract"]["tokenizer"] = {**other["contract"]["tokenizer"], "sha256": "different"}
@@ -1389,6 +1390,118 @@ def test_storage_lists_nested_names_relative_to_its_root(tmp_path):
 
 
 blend = importlib.import_module(f"{_namespace}.format.blend")
+
+
+def finalizing_saver(cls, dp_size=1):
+    """A writer-rank saver with only the state the flush finalizer and writers use."""
+    saver = cls.__new__(cls)
+    saver.tp_rank = saver.cp_rank = saver.dp_rank = 0
+    saver.dp_size = dp_size
+    saver._results, saver._failure_event = {}, threading.Event()
+    return saver
+
+
+def test_flush_finalizer_confirms_every_writer_upload(runtime_environment):
+    saver = finalizing_saver(importlib.import_module(f"{_namespace}.v3_saver").PairedLogitsSaver)
+    saver._last_flush = {"key": "k", "start": 0, "end": 2}
+    saver._results["k"] = {"start": 0, "end": 2}
+    saver.flush_finalize_fn(2)()
+    assert not saver._results  # Each report confirms exactly one flush.
+    with pytest.raises(RuntimeError, match="exited without a report"):
+        saver.flush_finalize_fn(2)()
+    saver._results["k"] = {"start": 0, "end": 2}
+    with pytest.raises(RuntimeError, match="disagree on the flush"):
+        saver.flush_finalize_fn(4)()
+    saver.dp_size = 2  # The other data-parallel writer never reported.
+    saver._results["k"] = {"start": 0, "end": 2}
+    with pytest.raises(RuntimeError, match="Missing offline KD v3 writer reports"):
+        saver.flush_finalize_fn(2)()
+    saver._failure_event.set()
+    with pytest.raises(RuntimeError, match="upload failed"):
+        saver.flush_finalize_fn(2)()
+
+
+def test_corpus_saver_drops_fillers_by_global_position(runtime_environment):
+    args, _, _ = runtime_environment
+    module = importlib.import_module(f"{_namespace}.corpus_saver")
+    saver = module.CorpusLogitsSaver.__new__(module.CorpusLogitsSaver)
+    saver.dp_rank, saver.dp_size = 1, 2
+    # The last global batch (positions 16-23) of a 20-sample epoch; with MBS 2 this
+    # writer holds positions 18, 19, 22 and 23, in that order.
+    args.kd_corpus_samples, args.consumed_train_samples = 20, 16
+    captured = codec.capture_batch(inputs([18, 19, 22, 23]))
+    ids = captured["tokens"].long().reshape(-1, 1)
+    kept, values, indices, tail = saver._prepare_record(
+        captured, ids.float(), ids, torch.zeros(len(ids))
+    )
+    assert kept["sample_offsets"].tolist() == [0, 8, 16]
+    assert (kept["tokens"][::8] // 100).tolist() == [18, 19]
+    assert torch.equal(indices.reshape(-1), kept["tokens"].long())  # Targets stay aligned.
+    assert values.shape == (16, 1) and tail.shape == (16,)
+
+
+def test_corpus_writers_publish_chunks_that_jobs_rewrite_from_their_start(
+    tmp_path, runtime_environment, capsys
+):
+    args, runtime, _ = runtime_environment
+    corpus_args(args, tmp_path)
+    runtime.validate_options(args)
+    args.kd_corpus_samples, args.train_iters = 20, 3
+    job = teacher_saver(runtime, tmp_path / "web", dp_size=1)
+    metadata = runtime.initialize_dump_metadata(job)  # Empty source.
+    saver = finalizing_saver(
+        importlib.import_module(f"{_namespace}.corpus_saver").CorpusLogitsSaver
+    )
+    saver.save_dir, saver.metadata_dict = args.logits_save_dir, metadata
+    saver._meta_bytes = json.dumps(metadata, sort_keys=True).encode()
+
+    def stage(start, end):  # One writer's real samples of global samples [start, end).
+        record = make_record(
+            codec.capture_batch(inputs(list(range(start, end)))), metadata["contract"]
+        )
+        batch = arrow.samples_batch(*record, vocab_size=len(TEST_VOCAB))
+        saver._pending_writes = collections.OrderedDict({(start, end): {"batch": batch}})
+
+    stage(0, 16)
+    request = saver.take_pending_data()
+    finalize = saver.flush_finalize_fn(2)
+    saver._write_batched_tar(*request)
+    finalize()
+    stage(16, 20)  # The final partial batch, its fillers already dropped.
+    saver._pending_writes = collections.OrderedDict({(16, 24): saver._pending_writes[(16, 20)]})
+    args.consumed_train_samples = 24
+    saver.finish()
+    assert Storage(args.save).read("latest_checkpointed_iteration.txt") == b"3"
+    source = Storage(args.logits_save_dir)
+    assert source.list("chunk-*/index.json") == [
+        "chunk-000000000000/index.json",
+        "chunk-000000000002/index.json",
+    ]
+    manifest = blend.plan(
+        {"corpus": str(tmp_path), "sources": {"web": 1}, "seed": 1, "lanes": 1}, budget=20
+    )
+    live = replay.CorpusReader(str(tmp_path), manifest)
+    try:
+        origins = [int(sample["tokens"][0]) // 100 for sample in live.samples(list(range(20)), 20)]
+    finally:
+        live.close()
+    assert sorted(origins) == list(range(20))
+    # Restarting at iteration 2 (override or tracker) unpublishes and rewrites from there.
+    capsys.readouterr()
+    args.consumed_train_samples = 16
+    runtime.initialize_dump_metadata(job)
+    assert "replacing 1 published flushes (iterations 2-3)" in capsys.readouterr().out
+    assert source.list("chunk-*/index.json") == ["chunk-000000000000/index.json"]
+    args.consumed_train_samples = 8  # Inside the published chunk of iterations 0-2.
+    with pytest.raises(RuntimeError, match="only partly rewritten"):
+        runtime.initialize_dump_metadata(job)
+    args.global_batch_size, args.train_iters = 4, 5  # Kept chunks must agree,
+    args.consumed_train_samples = 16
+    with pytest.raises(RuntimeError, match="producer settings changed"):
+        runtime.initialize_dump_metadata(job)
+    args.consumed_train_samples = 0  # but a rewrite of the whole source may change them.
+    runtime.initialize_dump_metadata(job)
+    assert not source.list("chunk-*/index.json")
 
 
 def corpus_source(root, name, *, samples, iterations, base=0, contract=None, metadata=None):
@@ -2062,21 +2175,37 @@ def test_context_parallel_replay_scatters_shards_and_errors(runtime_environment,
 )
 def test_standard_checkpoint_arg_checks_reject_replay_option_changes(runtime_environment, option):
     args, _, _ = runtime_environment
-    args.num_layers = 2
-    args.hidden_size = 8
-    args.num_attention_heads = 2
+    args.num_layers, args.hidden_size, args.num_attention_heads = 2, 8, 2  # Saved values.
     args.add_position_embedding = True
-    args.vocab_file = None
-    args.data_parallel_random_init = False
     args.phase_transition_iterations = None
-    args.use_dist_ckpt = True
     path = Path(_package.__path__[0]).parent / "checkpointing.py"
     node = next(
         n
         for n in ast.parse(path.read_text()).body
         if isinstance(n, ast.FunctionDef) and n.name == "check_checkpoint_args"
     )
-    namespace = {"get_args": lambda: args, "get_checkpoint_version": lambda: 3.0}
+    section = types.SimpleNamespace
+    config = section(
+        checkpoint=section(ckpt_format="torch_dist"),
+        model=section(
+            seq_length=args.seq_length,
+            transformer=section(
+                num_layers=args.num_layers,
+                hidden_size=args.hidden_size,
+                num_attention_heads=args.num_attention_heads,
+                gdp_num_householder=3,
+                wide_residual=None,
+            ),
+        ),
+        tokenizer=section(vocab_file=None),
+        rng=section(data_parallel_random_init=False),
+    )
+    namespace = {
+        "get_args": lambda: args,
+        "get_run_config": lambda: config,
+        "get_checkpoint_version": lambda: 3.0,
+        "Optional": typing.Optional,
+    }
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
     saved = types.SimpleNamespace(**vars(args))
     namespace["check_checkpoint_args"](saved)
@@ -2290,81 +2419,58 @@ def test_long_single_segment_packed_sample_is_prefix_shortened(prefix_stable):
 
 
 @pytest.mark.parametrize(
-    "override,exit_interval,expected",
+    "start,exit_interval,expected",
     [
-        (None, None, (None, 128)),
+        (0, None, (0, 128)),
         (4, 4, (4, 8)),
         (6, 4, (6, 8)),
         (124, 8, (124, 128)),
         (4, None, (4, 128)),
     ],
 )
-def test_dump_range_uses_override_and_exit_interval(
-    runtime_environment, override, exit_interval, expected
+def test_dump_range_starts_at_the_restored_iteration(
+    runtime_environment, start, exit_interval, expected
 ):
     args, runtime, _ = runtime_environment
-    args.logits_save_range_start = override
+    args.consumed_train_samples = start * args.global_batch_size  # Override, else tracker.
     args.exit_interval = exit_interval
     assert runtime.dump_range(args) == expected
 
 
-def test_frozen_resume_uses_published_range_end(tmp_path, runtime_environment):
-    args, runtime, _ = runtime_environment
-    dump_args(args)
-    args.logits_save_dir = str(tmp_path)
-    args.exit_interval = 4
-    # Job B (iterations 4-8) has published 4-6; job A (0-4) has nothing yet.
-    teacher_cache(tmp_path, runtime, args, start=4, iterations=6)
-    args.override_ckpt_iteration = 4
-    assert runtime.frozen_resume_iteration(args) == 6
-    assert args.logits_save_range_start == 4
-    args.override_ckpt_iteration = 6  # Replaced by load_checkpoint; the range start sticks.
-    assert runtime.frozen_resume_iteration(args) == 6
-    del args.logits_save_range_start
-    args.override_ckpt_iteration = 0
-    assert runtime.frozen_resume_iteration(args) == 0  # Job A starts its own range.
-    del args.logits_save_range_start
-    args.override_ckpt_iteration = None  # A single sequential writer stops at the hole.
-    assert runtime.frozen_resume_iteration(args) == 0
-
-
-def test_completed_range_exits_before_any_step(runtime_environment):
-    args, runtime, _ = runtime_environment
-    dump_args(args)
-    args.logits_load_inputs = False
-    args.exit_interval = 4
-    args.logits_save_range_start = 4
-    args.consumed_train_samples = 7 * 8
-    assert not runtime.before_train_step(args)
-    args.consumed_train_samples = 8 * 8
-    assert runtime.before_train_step(args)
-    args.logits_save_range_start = None  # A sequential writer is bounded by --train-iters.
-    assert not runtime.before_train_step(args)
-
-
-def test_teacher_metadata_checks_cache_and_cleans_only_its_range(tmp_path, runtime_environment):
+def test_teacher_rewrites_its_range_like_a_checkpoint_resume(tmp_path, runtime_environment, capsys):
     args, runtime, _ = runtime_environment
     dump_args(args)
     args.logits_save_dir = str(tmp_path)
     args.exit_interval = 4
     saver = teacher_saver(runtime, tmp_path)
     metadata = runtime.initialize_dump_metadata(saver)  # Empty cache.
-    assert (metadata["published_through"], metadata["contract"]["first_sample"]) == (0, 0)
-    teacher_cache(tmp_path, runtime, args, start=4, iterations=8)
-    (tmp_path / "dp1__48-64.index.json").unlink()  # Job B's interrupted tail.
-    args.logits_save_range_start = 4
-    args.consumed_train_samples = 6 * 8
-    metadata = runtime.initialize_dump_metadata(saver)
-    assert metadata["published_through"] == 48
-    assert not storage_module.Storage(str(tmp_path)).list("dp*__48-64.*")
-    assert len(storage_module.Storage(str(tmp_path)).list("dp*__32-48.*")) == 4
-    args.consumed_train_samples = 8 * 8
-    with pytest.raises(RuntimeError, match="outside this job's published range"):
+    assert metadata["contract"]["first_sample"] == 0
+    teacher_cache(tmp_path, runtime, args, iterations=8)  # Flushes of samples 0-16, ..., 48-64.
+    (tmp_path / "dp1__48-64.index.json").unlink()  # An interrupted flush.
+    storage = storage_module.Storage(str(tmp_path))
+    # Restart at iteration 4 (samples 32-64): everything published there is rewritten,
+    # including complete flushes, while earlier ranges are kept.
+    args.consumed_train_samples = 4 * 8
+    runtime.initialize_dump_metadata(saver)
+    assert "replacing 2 published flushes (samples 32-64)" in capsys.readouterr().out
+    assert not storage.list("dp*__32-48.*") and not storage.list("dp*__48-64.*")
+    assert storage_module.object_ranges(storage) == [(0, 16), (16, 32)]
+    # Another job's range (from iteration 8 on) is never touched.
+    teacher_cache(tmp_path, runtime, args, start=8, iterations=10)
+    runtime.initialize_dump_metadata(saver)
+    assert storage_module.object_ranges(storage) == [(0, 16), (16, 32), (64, 80)]
+    # A start inside a published flush would leave half of it stale.
+    args.consumed_train_samples = 3 * 8
+    with pytest.raises(RuntimeError, match="only partly rewritten"):
         runtime.initialize_dump_metadata(saver)
-    args.consumed_train_samples = 6 * 8
+    # Kept files must match the job; a rewrite of everything need not.
+    args.consumed_train_samples = 4 * 8
     args.micro_batch_size = 1
     with pytest.raises(RuntimeError, match="writer_mbs"):
         runtime.initialize_dump_metadata(saver)
+    args.consumed_train_samples, args.exit_interval = 0, None
+    runtime.initialize_dump_metadata(saver)
+    assert storage_module.object_ranges(storage) == []
 
 
 def test_unfrozen_teacher_recovers_first_sample(tmp_path, runtime_environment):
@@ -2377,9 +2483,9 @@ def test_unfrozen_teacher_recovers_first_sample(tmp_path, runtime_environment):
     assert runtime.initialize_dump_metadata(saver)["contract"]["first_sample"] == 16
     teacher_cache(tmp_path, runtime, args, first_sample=16, start=2, iterations=4)
     args.load = "resumed-training-checkpoint"
-    args.consumed_train_samples = 24
+    args.consumed_train_samples = 32
     metadata = runtime.initialize_dump_metadata(saver)
-    assert (metadata["contract"]["first_sample"], metadata["published_through"]) == (16, 32)
+    assert metadata["contract"]["first_sample"] == 16
     assert metadata["recorded"]["teacher"] == "resumed-training-checkpoint"
 
 
@@ -2393,7 +2499,7 @@ def test_teacher_attempt_commit_discards_rerun_data(runtime_environment, monkeyp
     saver.tp_rank = saver.cp_rank = saver.dp_rank = 0
     saver.cp_size = saver.dp_size = 1
     saver._initialized = True
-    saver.metadata_dict = {"published_through": 0, "contract": {"attention_mode": "causal"}}
+    saver.metadata_dict = {"contract": {"attention_mode": "causal"}}
     saver._real_vocab_size = 1 << 17
     saver._captured = []
     saver._pending_writes = collections.OrderedDict()
@@ -2446,14 +2552,15 @@ def test_saver_writes_files_readable_by_replay(tmp_path, runtime_environment, mo
                 "end": end,
                 "batch": arrow.samples_batch(*record, vocab_size=1 << 17),
             }
-    meta = json.dumps({**metadata, "published_through": 0})
+    results = {}
     for rank in (0, 1):
+        task = {"key": rank, "start": 0, "end": 2, "path": storage_module.data_name(rank, 0, 16)}
         module.PairedLogitsSaver._write_batched_tar(
-            str(tmp_path / storage_module.data_name(rank, 0, 16)), writes[rank], meta
+            str(tmp_path), writes[rank], json.dumps(metadata), task, results, None
         )
+    assert results == {0: {"start": 0, "end": 2}, 1: {"start": 0, "end": 2}}
     storage = Storage(str(tmp_path))
-    meta = storage_module.read_meta(storage, storage_module.FileName(0, 0, 16))
-    assert meta == metadata  # Resume-only state is not stored.
+    assert storage_module.read_meta(storage, storage_module.FileName(0, 0, 16)) == metadata
     live = reader(storage, metadata)
     assert ids_of(live.samples(list(range(16)), 16)) == list(range(16))
     live.close()
@@ -2819,7 +2926,7 @@ def test_top_p_metric_is_committed_only_for_accepted_attempt(runtime_environment
     saver = module.PairedLogitsSaver.__new__(module.PairedLogitsSaver)
     saver.tp_rank = saver.cp_rank = saver.dp_rank = 0
     saver._initialized = True
-    saver.metadata_dict = {"published_through": 0}
+    saver.metadata_dict = {}
     saver._captured = []
     saver._pending_writes = {}
     saver._topp_kept_counts = [99.0]
@@ -2855,10 +2962,12 @@ def test_msc_opt_in_and_worker_enable_are_preserved(runtime_environment, monkeyp
     monkeypatch.setattr(module, "write_file", lambda *a: (b"", {}))
     monkeypatch.setattr(module, "publish", lambda *a: None)
     module.PairedLogitsSaver._write_batched_tar(
-        "msc://test/dump/dp0__0-8.arrow",
+        "msc://test/dump",
         {0: {"start": 0, "end": 8, "batch": None}},
         "{}",
-        msc_enabled=True,
+        {"key": "k", "start": 0, "end": 1, "path": "dp0__0-8.arrow"},
+        {},
+        None,
     )
     assert state["enabled"]
     storage = Storage("msc://test/dump")
@@ -3072,10 +3181,12 @@ def test_v3_async_write_failure_sets_shared_event(runtime_environment, monkeypat
     event = types.SimpleNamespace(set=lambda: failures.append(True))
     with pytest.raises(OSError, match="failed publication"):
         module.PairedLogitsSaver._write_batched_tar(
-            str(tmp_path / "dp0__0-8.arrow"),
+            str(tmp_path),
             {0: {"start": 0, "end": 8, "batch": None}},
             "{}",
-            failure_event=event,
+            {"key": "k", "start": 0, "end": 1, "path": "dp0__0-8.arrow"},
+            {},
+            event,
         )
     assert failures == [True]
 

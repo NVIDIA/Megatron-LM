@@ -160,10 +160,11 @@ class Storage:
 
 
 def publish(storage: Storage, name: FileName, data: bytes, index: dict[str, Any]) -> None:
-    """Publish an immutable range: the data file first, then its index.
+    """Publish a range: the data file first, then its index.
 
-    A published range is never replaced. A data file without an index (an interrupted
-    earlier attempt) is overwritten.
+    A job that rewrites published ranges unpublishes them at startup, so an existing
+    index here means another job is writing the same range. A data file without an
+    index (an interrupted earlier attempt) is overwritten.
     """
     if storage.exists(name.index):
         raise RuntimeError(f"Refusing to replace published offline KD v3 file {name.data}")
@@ -238,18 +239,28 @@ def contiguous_end(ranges: list[tuple[int, int]], start: int, end: int | None = 
     return cursor
 
 
-def discard_unpublished(storage: Storage, published_through: int, end: int) -> list[str]:
-    """Delete a resuming job's partial tail in ``[published_through, end)``.
+def object_ranges(storage: Storage) -> list[tuple[int, int]]:
+    """Sample ranges of every v3 object, published or not (including staged writes)."""
+    spans = set()
+    for name in storage.list("dp*__*"):
+        match = _STAGED_NAME.match(name)
+        parsed = parse_name(match.group(1) if match else name)
+        if parsed is not None:
+            spans.add((parsed.start, parsed.end))
+    return sorted(spans)
+
+
+def discard_range(storage: Storage, start: int, end: int) -> list[str]:
+    """Delete every object of the ranges starting in ``[start, end)`` before rewriting them.
 
     Only this job's own range is touched, so parallel dump jobs never interfere.
-    Readers cannot have consumed these objects: they lie beyond a hole.
     """
     removed = []
     # Indexes first: an interrupted cleanup then leaves only unpublished data files.
     for name in sorted(storage.list("dp*__*"), key=lambda name: ".index.json" not in name):
         match = _STAGED_NAME.match(name)
         parsed = parse_name(match.group(1) if match else name)
-        if parsed is not None and published_through <= parsed.start < end:
+        if parsed is not None and start <= parsed.start < end:
             if match is None or not storage.remote:
                 storage.remove(name)
                 removed.append(name)

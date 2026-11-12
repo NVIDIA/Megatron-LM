@@ -13,7 +13,8 @@ consolidated chunk index:
   ``--split`` partition or additional sample permutation.
 
 The epoch is padded to whole global batches for execution. The corpus saver removes
-filler samples before writing. Its progress tracker controls resume and replacement.
+filler samples before writing. Like a replay dump, a job rewrites the source from its
+start iteration (``--override-ckpt-iteration``, else its ``--save`` progress tracker).
 """
 
 import json
@@ -25,27 +26,26 @@ import torch.distributed as dist
 
 from .format.arrow import file_meta
 from .format.contract import blend_contract, mismatched_corpus_order, mismatched_settings
-from .format.corpus import CorpusInventory, check_chunk
+from .format.corpus import CorpusInventory, check_chunk, chunk_path
 from .v3_options import runtime_options
 from .v3_storage import Storage
 
 # Placeholder budget until the epoch length is known (set once the dataset is built).
 _UNTIL_EPOCH_END = 1 << 40
 _INVENTORY = None
-_TRACKER_PRESENT = False
 
 
 def corpus_inventory() -> CorpusInventory:
-    """Return the producer snapshot established collectively during checkpoint load."""
+    """Return the source inventory of the rank that publishes chunk indexes."""
     if _INVENTORY is None:
-        raise RuntimeError("Corpus inventory was not initialized during checkpoint restoration")
+        raise RuntimeError("Corpus inventory was not initialized with the dump metadata")
     return _INVENTORY
 
 
 def reset_corpus_runtime() -> None:
     """Discard cached producer state on an in-process restart."""
-    global _INVENTORY, _TRACKER_PRESENT
-    _INVENTORY, _TRACKER_PRESENT = None, False
+    global _INVENTORY
+    _INVENTORY = None
 
 
 def producer_settings(args: Any) -> dict:
@@ -57,97 +57,61 @@ def producer_settings(args: Any) -> dict:
     return {"name": "megatron", "global_batch_size": args.global_batch_size}
 
 
-def resume_corpus_iteration(args: Any) -> int:
-    """Use the output tracker as the authoritative cursor, without deleting data yet."""
-    args = runtime_options(args)
-    from .v3_runtime import dump_range
-
-    global _INVENTORY, _TRACKER_PRESENT
-    rank = dist.get_rank() if dist.is_initialized() else 0
-    result = [None]
-    if rank == 0:
-        try:
-            inventory = CorpusInventory(Storage(args.logits_save_dir))
-            start, end = dump_range(args)
-            start = start or 0
-            settings = producer_settings(args)
-            spans = []
-            for directory, chunk in sorted(inventory.chunks.items()):
-                producer = chunk.get("producer", {})
-                if any(producer.get(key) != value for key, value in settings.items()):
-                    raise ValueError("Corpus producer settings changed; use a new source directory")
-                a, b = producer["start_iteration"], producer["end_iteration"]
-                if directory != f"chunk-{a:012d}" or not 0 <= a < b:
-                    raise ValueError("Invalid Megatron corpus chunk interval")
-                total = inventory.metadata["contract"]["num_samples"]
-                rows = sum(
-                    block["rows"] for part in chunk["parts"] for block in part["index"]["blocks"]
-                )
-                gbs = args.global_batch_size
-                if rows != min(total, b * gbs) - min(total, a * gbs):
-                    raise ValueError("Corpus chunk has the wrong number of real source rows")
-                spans.append((a, b))
-            previous = 0
-            for a, b in sorted(spans):
-                if a < previous:
-                    raise ValueError("Overlapping Megatron corpus chunks")
-                if a < start < b or a < end < b:
-                    raise ValueError("A corpus chunk crosses this job's assigned range boundary")
-                previous = b
-            try:
-                raw = Storage(args.save).read("latest_checkpointed_iteration.txt").decode().strip()
-            except FileNotFoundError:
-                raw = None
-            cursor = int(raw) if raw is not None else start
-            if not start <= cursor <= end:
-                raise ValueError(
-                    f"Corpus tracker {cursor} is outside this job's range {start}-{end}"
-                )
-            owned = [
-                path
-                for path in inventory.snapshot["objects"]
-                if start <= int(os.path.dirname(path).removeprefix("chunk-")) < end
-            ]
-            if raw is None and owned:
-                raise ValueError(
-                    "Existing corpus chunks have no progress tracker; create "
-                    "latest_checkpointed_iteration.txt in --save at the intended resume iteration"
-                )
-            covered = start
-            for a, b in sorted(spans):
-                if a == covered and b <= cursor:
-                    covered = b
-            if covered != cursor:
-                raise ValueError("Corpus tracker skips missing work or lies inside a chunk")
-            result[0] = {
-                "iteration": cursor,
-                "present": raw is not None,
-                "snapshot": inventory.snapshot,
-            }
-        except Exception as error:
-            result[0] = {"error": f"{type(error).__name__}: {error}"}
-    if dist.is_initialized():
-        dist.broadcast_object_list(result, src=0)
-    if "error" in result[0]:
-        raise RuntimeError(result[0]["error"])
-    _INVENTORY = CorpusInventory(Storage(args.logits_save_dir), result[0]["snapshot"])
-    _TRACKER_PRESENT = result[0]["present"]
-    return result[0]["iteration"]
-
-
 def initialize_corpus_metadata(saver: Any, expected: dict) -> dict:
-    """Validate the source, then unpublish only this job's selected replacement tail."""
+    """Validate the source, then unpublish the chunks this job rewrites (collective)."""
     from .utils import _broadcast_without_pp
     from .v3_options import get_args
-    from .v3_runtime import _report_recorded_differences, dump_range
+    from .v3_runtime import (
+        _report_recorded_differences,
+        check_rewrite_bounds,
+        dump_range,
+        report_replaced,
+    )
 
     args = get_args()
 
     def initialize() -> dict:
+        global _INVENTORY
         try:
-            inventory = corpus_inventory()
+            inventory = CorpusInventory(Storage(args.logits_save_dir))
+            start, end = dump_range(args)
+            if start > args.train_iters:
+                raise ValueError(
+                    f"Corpus job starts at iteration {start}, beyond the source epoch "
+                    f"({args.train_iters} iterations)"
+                )
+            spans, kept = [], {}
+            for directory, chunk in sorted(inventory.chunks.items()):
+                a, b = chunk["producer"]["start_iteration"], chunk["producer"]["end_iteration"]
+                if directory != chunk_path(a) or not 0 <= a < b:
+                    raise ValueError("Invalid Megatron corpus chunk interval")
+                spans.append((a, b))
+                if not start <= a < end:
+                    kept[directory] = chunk
+            previous = 0
+            for a, b in spans:
+                if a < previous:
+                    raise ValueError("Overlapping Megatron corpus chunks")
+                previous = b
+            check_rewrite_bounds(spans, start, end, "iterations")
+            # Chunks this job keeps must agree with it; the ones it rewrites need not.
+            settings = producer_settings(args)
+            total = expected["contract"]["num_samples"]
+            gbs = args.global_batch_size
             recorded_differences = set()
-            for chunk in inventory.chunks.values():
+            for chunk in kept.values():
+                producer = chunk["producer"]
+                if any(producer.get(key) != value for key, value in settings.items()):
+                    raise ValueError(
+                        "Corpus producer settings changed; rewrite the whole source or use a new "
+                        "source directory"
+                    )
+                a, b = producer["start_iteration"], producer["end_iteration"]
+                rows = sum(
+                    block["rows"] for part in chunk["parts"] for block in part["index"]["blocks"]
+                )
+                if rows != min(total, b * gbs) - min(total, a * gbs):
+                    raise ValueError("Corpus chunk has the wrong number of real source rows")
                 for part in chunk["parts"]:
                     meta = file_meta(part["index"])
                     differing, recorded = mismatched_settings(meta, expected)
@@ -173,24 +137,10 @@ def initialize_corpus_metadata(saver: Any, expected: dict) -> dict:
                     raise ValueError(f"Corpus source {source} uses a different tokenizer")
                 if meta.get("recorded", {}).get("teacher") != expected["recorded"]["teacher"]:
                     recorded_differences.add("teacher")
-            _, end = dump_range(args)
-            cursor = args.consumed_train_samples // args.global_batch_size
-            if not 0 <= cursor <= min(end, args.train_iters):
-                raise ValueError("Corpus tracker lies beyond the source epoch")
-            # Establish the initial tracker before uploads, so an interrupted first
-            # launch is distinguishable from a missing tracker on an existing source.
-            if not _TRACKER_PRESENT:
-                Storage(args.save).write("latest_checkpointed_iteration.txt", str(cursor).encode())
-            directories = {
-                os.path.dirname(path)
-                for path in inventory.snapshot["objects"]
-                if cursor <= int(os.path.dirname(path).removeprefix("chunk-")) < end
-            }
-            inventory.invalidate(directories)
-            return {
-                "metadata": {**expected, "published_through": args.consumed_train_samples},
-                "differing": sorted(recorded_differences),
-            }
+            report_replaced([span for span in spans if start <= span[0] < end], "iterations")
+            inventory.invalidate(set(inventory.chunks) - set(kept))
+            _INVENTORY = inventory  # Only this rank publishes chunk indexes.
+            return {"metadata": expected, "differing": sorted(recorded_differences)}
         except Exception as error:
             return {"error": f"{type(error).__name__}: {error}"}
 

@@ -33,7 +33,7 @@ from .contract import (
 META_KEY = b"offline_kd"
 INPUT_COLUMNS = ("tokens", "labels", "position_ids", "loss_mask", "segments")
 TOKEN_COLUMNS = ("tokens", "labels", "position_ids", "loss_mask")
-DEFAULT_BLOCK_BYTES = 16 << 20
+DEFAULT_BLOCK_BYTES = 32 << 20
 INDEX_VERSION = 1
 _MAGIC_BYTES = 8  # "ARROW1" plus padding at the start of an IPC file.
 
