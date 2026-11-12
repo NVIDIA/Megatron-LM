@@ -365,11 +365,25 @@ class PretrainConfigContainer(ConfigContainerBase):
         and a model config's ``finalize()`` may replace (``LLaVAModelConfig`` sets its resolved
         decoder length: text, image tokens and padding). That field is Megatron Core's per-sample
         maximum, a bound that may exceed the dataset's length, so the loop does not read it for a
-        section with a dataset."""
+        section with a dataset. The data side reads this length; the model side reads
+        ``model_input_length``."""
         dataset = self.data.dataset
         if dataset is not None:
             return dataset.sequence_length
         return self.model.transformer.max_seq_length_per_sample
+
+    @property
+    def model_input_length(self) -> int | None:
+        """The length of one sample's input to the model: the model config's ``decoder_seq_length``
+        when it declares one (a VLM: the text tokens, the image tokens and the CP/SP padding),
+        otherwise the sample length. The pipeline shapes, the TP-communicator buffers, the FLOPs and
+        memory estimators, the kernel warmups and the run-level metrics read it; the data side (the
+        micro-batch calculator, ``get_batch``, the token counters, the loader telemetry) reads
+        ``sample_length``, which is the text length when a VLM's data section carries a dataset."""
+        declared = getattr(self.model, "decoder_seq_length", None)
+        if declared is not None:
+            return declared
+        return self.sample_length
 
     def _optimizer_with_model_precision(self) -> OptimizerConfig:
         """Return an optimizer copy with authoritative model precision, without mutation."""

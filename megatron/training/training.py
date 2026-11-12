@@ -1900,7 +1900,7 @@ def pretrain(
 
     set_jit_fusion_options(
         cfg_container.model.transformer,
-        sequence_length=cfg_container.sample_length,
+        sequence_length=cfg_container.model_input_length,
         micro_batch_size=cfg_container.train.micro_batch_size,
         tp_size=cfg_container.model.transformer.tensor_model_parallel_size,
     )
@@ -1923,7 +1923,7 @@ def pretrain(
     warmup_training_kernels(
         cfg_container.model,
         warmup_tp_group,
-        seq_length=cfg_container.sample_length,
+        seq_length=cfg_container.model_input_length,
         micro_batch_size=cfg_container.train.micro_batch_size,
     )
     print_rank_0("Finished training-kernel warmup.")
@@ -3519,7 +3519,7 @@ def train_step(
             # Distillation shape-adjust reads parallel_state; only for modelopt-enabled runs.
             adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
                 model,
-                seq_length=cfg.sample_length,
+                seq_length=cfg.model_input_length,
                 micro_batch_size=cfg.train.micro_batch_size,
                 # get_tensor_shapes requires the keyword (ModelOpt forwards it); a single stack has
                 # no second length: seq_length is the sample length (a VLM's decoder length).
@@ -3616,7 +3616,7 @@ def train_step(
                 data_iterator=forward_backward_data_iterator,
                 model=model,
                 num_microbatches=scheduled_num_microbatches,
-                seq_length=cfg.sample_length,
+                seq_length=cfg.model_input_length,
                 micro_batch_size=cfg.train.micro_batch_size,
                 forward_only=forward_only,
                 adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
@@ -3927,7 +3927,7 @@ def training_log(
     )
 
     # Track app tag & app tag ID
-    one_logger_utils.track_app_tag(batch_size, safe_get_world_size(), cfg.sample_length)
+    one_logger_utils.track_app_tag(batch_size, safe_get_world_size(), cfg.model_input_length)
 
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
     if packed_sequence_stats and wandb_writer:
@@ -4134,8 +4134,8 @@ def training_log(
         throughput = num_floating_point_operations(
             cfg.model,
             batch_size,
-            # The container's per-sample length (a VLM's is its resolved decoder length).
-            sequence_length=cfg.sample_length,
+            # The model input length (a VLM's decoder length; the sample length otherwise).
+            sequence_length=cfg.model_input_length,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
@@ -4265,7 +4265,7 @@ def training_log(
             from megatron.core.telemetry.training_metrics import record_training_metrics
             _avg_loss = _otel_loss_snapshot
             _tokens_per_sec = (
-                batch_size * cfg.sample_length
+                batch_size * cfg.model_input_length
                 / elapsed_time_per_iteration
                 if elapsed_time_per_iteration > 0 else None
             )
@@ -4289,7 +4289,7 @@ def training_log(
                 num_microbatches = get_num_microbatches()
                 report_theoretical_memory(
                     cfg,
-                    sequence_length=cfg.sample_length,
+                    sequence_length=cfg.model_input_length,
                     micro_batch_size=cfg.train.micro_batch_size,
                     data_parallel_size=cfg.get_data_parallel_size(), world_size=safe_get_world_size(),
                     num_microbatches=num_microbatches, verbose=True,
@@ -4974,7 +4974,7 @@ def train(
         iteration=iteration,
         consumed_train_samples=train_state.consumed_train_samples,
         train_samples=cfg.train.train_samples,
-        seq_length=cfg.sample_length,
+        seq_length=cfg.model_input_length,
         train_iters=cfg.train.train_iters,
         save=cfg.checkpoint.save,
         async_save=cfg.checkpoint.async_save,
@@ -5117,7 +5117,7 @@ def train(
             'num_floating_point_operations_so_far': train_state.num_floating_point_operations_so_far,
             'consumed_train_samples': train_state.consumed_train_samples,
             'world_size': cfg.get_model_world_size(),
-            'seq_length': cfg.sample_length,
+            'seq_length': cfg.model_input_length,
         }
 
     # Cache into one-logger for callback.
@@ -5184,7 +5184,7 @@ def train(
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
-            seq_length=cfg.sample_length,
+            seq_length=cfg.model_input_length,
             micro_batch_size=cfg.train.micro_batch_size,
             optimizers=[optimizer],
         )
@@ -5530,8 +5530,8 @@ def train(
         num_floating_point_operations_in_batch = num_floating_point_operations(
             cfg.model,
             batch_size,
-            # The container's per-sample length (a VLM's is its resolved decoder length).
-            sequence_length=cfg.sample_length,
+            # The model input length (a VLM's decoder length; the sample length otherwise).
+            sequence_length=cfg.model_input_length,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         )
@@ -5863,7 +5863,7 @@ def evaluate(
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
         adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
             model,
-            seq_length=cfg.sample_length,
+            seq_length=cfg.model_input_length,
             micro_batch_size=eval_micro_batch_size,
             # get_tensor_shapes requires the keyword (ModelOpt forwards it); a single stack has
             # no second length: seq_length is the sample length (a VLM's decoder length).
@@ -5917,7 +5917,7 @@ def evaluate(
                     data_iterator=packed_data_iterator,
                     model=model,
                     num_microbatches=scheduled_eval_num_microbatches,
-                    seq_length=cfg.sample_length,
+                    seq_length=cfg.model_input_length,
                     micro_batch_size=eval_micro_batch_size,
                     forward_only=True,
                     adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
@@ -5977,7 +5977,7 @@ def evaluate(
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
-                seq_length=cfg.sample_length,
+                seq_length=cfg.model_input_length,
                 micro_batch_size=eval_micro_batch_size,
                 forward_only=True,
                 collect_non_loss_data=True,

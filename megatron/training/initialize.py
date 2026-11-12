@@ -244,12 +244,12 @@ def initialize_megatron(
                 tp_comm_overlap_cfg = args.tp_comm_overlap_cfg
             else:
                 tp_comm_overlap_cfg = cfg.model.tp_comm_overlap_cfg
-            # The container's per-sample length: the dataset's, or for a loader-only section the
-            # model's per-sample maximum (a VLM's resolved decoder length, which its model config
-            # sets at finalize()). The model's seq_length is position capacity, not a batch length.
+            # The model input length: the model config's decoder length when it declares one (a
+            # VLM, whether its data section is loader-only or carries a dataset), otherwise the
+            # sample length. The model's seq_length is position capacity, not a batch length.
             _initialize_tp_communicators(
                 transformer_config,
-                sequence_length=cfg.sample_length,
+                sequence_length=cfg.model_input_length,
                 micro_batch_size=cfg.train.micro_batch_size,
                 tp_comm_overlap_cfg=tp_comm_overlap_cfg,
             )

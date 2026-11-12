@@ -313,6 +313,7 @@ def pretrain_until_warmup(monkeypatch, run_config):
             model=model_config,
             # The container's rule for a loader-only section: the model's per-sample maximum.
             sample_length=model_config.transformer.max_seq_length_per_sample,
+            model_input_length=model_config.transformer.max_seq_length_per_sample,
             fault_tolerance=run_config.fault_tolerance,
             checkpoint=run_config.checkpoint,
             train=Namespace(micro_batch_size=9),

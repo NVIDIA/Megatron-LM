@@ -644,6 +644,7 @@ def test_the_model_per_sample_maximum_covers_the_dataset(container_factory, monk
     cfg.finalize()
     assert cfg.model.transformer.max_seq_length_per_sample == 128  # kept, not overwritten
     assert cfg.sample_length == 64  # the loop runs at the dataset's length
+    assert cfg.model_input_length == 64  # a GPT model declares no decoder length
     cfg.model = _layout(max_seq_length_per_sample=32)
     with pytest.raises(ValueError, match="max_seq_length_per_sample=32 is smaller than"):
         cfg.validate()
@@ -1114,9 +1115,27 @@ def test_a_vlm_runs_at_its_decoder_length(container_factory, monkeypatch):
     assert cfg.data.dataset is None
     assert model.decoder_seq_length == 96  # --decoder-seq-length
     assert cfg.sample_length == 64  # the text length until finalize()
+    assert cfg.model_input_length == 96  # the model side sees the decoder length from the start
     cfg.validate()
     cfg.finalize()
     assert model.transformer.max_seq_length_per_sample == 96 == cfg.sample_length
+    assert cfg.model_input_length == 96
+    # A VLM whose data section carries a dataset: the data side keeps the text length, the model
+    # side the decoder length, before and after finalize(); the bound becomes the decoder length.
+    args = _validated(
+        ["--seq-length", "64", "--decoder-seq-length", "96", "--max-position-embeddings", "128",
+         "--mock-data"]
+    )  # fmt: skip
+    model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    cfg = pretrain_cfg_container_from_args(
+        args, model_cfg=model, data_cfg=gpt_data_config_from_args(args)
+    )
+    assert cfg.data.dataset.sequence_length == 64 == cfg.sample_length
+    assert cfg.model_input_length == 96
+    cfg.validate()
+    cfg.finalize()
+    assert model.transformer.max_seq_length_per_sample == 96
+    assert cfg.sample_length == 64 and cfg.model_input_length == 96
     # Without --decoder-seq-length the VLM resolver derives the length and records it.
     args = _validated(["--seq-length", "64", "--max-position-embeddings", "128"])
     model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)

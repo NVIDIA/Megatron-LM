@@ -24,7 +24,7 @@ class LLaVAModelConfig:
     """Language-model input length: the text tokens, the image tokens and the CP/SP padding.
     ``--decoder-seq-length`` sets it; ``pretrain_vlm.set_vlm_sequence_lengths`` derives it from the
     data length and the vision geometry when unset. ``finalize()`` makes it the language
-    transformer's per-sample maximum."""
+    transformer's per-sample maximum, and the container reports it as ``model_input_length``."""
 
     img_h: int = 224
     """Vision input height, also consumed by image preprocessing."""
