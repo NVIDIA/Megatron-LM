@@ -6,6 +6,7 @@ from packaging import version
 from torch import testing
 
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.distributed.distributed_data_parallel import _delayed_wgrad_hook_targets
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
@@ -237,3 +238,160 @@ class TestExpertGradientScalingFactorGTPRemat:
             f"gtp={gtp} egtp={egtp}: expert_gradient_scaling_factor={expert_factor} != "
             f"(1/dp_cp_group.size()={1.0/dp_cp_size}) * (egtp/gtp={expected_correction})"
         )
+
+
+class _HookModule(torch.nn.Module):
+    """Module that records delayed weight-grad hook registration."""
+
+    def __init__(self, name, *params):
+        super().__init__()
+        self.name = name
+        for index, param in enumerate(params):
+            self.register_parameter(f"p{index}", param)
+        self.registered = []
+
+    def register_wgrad_accumulation_and_reduce_hooks(self, hook):
+        self.registered.append(hook)
+
+
+def _mark(param, skip=True, requires_grad=True):
+    param.requires_grad_(requires_grad)
+    if skip:
+        param.skip_backward_post_hook = True
+    return param
+
+
+def _reference_delayed_wgrad_targets(root):
+    """Previous per-parameter search over the module tree."""
+    targets = []
+    for param in root.parameters():
+        if not param.requires_grad or not getattr(param, "skip_backward_post_hook", False):
+            continue
+        for module in root.modules():
+            if not hasattr(module, "register_wgrad_accumulation_and_reduce_hooks"):
+                continue
+            for param_value in module.parameters():
+                if param is param_value:
+                    targets.append((param, module))
+                    break
+    return targets
+
+
+def _target_names(targets):
+    return [(id(param), module.name) for param, module in targets]
+
+
+def test_delayed_wgrad_hook_targets_match_per_parameter_search():
+    """One tree walk registers the same modules as the previous nested search."""
+    shared = _mark(torch.nn.Parameter(torch.zeros(2)))
+    parent_only = _mark(torch.nn.Parameter(torch.zeros(2)))
+    child_only = _mark(torch.nn.Parameter(torch.zeros(2)))
+    plain = _mark(torch.nn.Parameter(torch.zeros(2)))
+    frozen = _mark(torch.nn.Parameter(torch.zeros(2)), requires_grad=False)
+    unmarked = torch.nn.Parameter(torch.zeros(2))
+
+    root = _HookModule("root", parent_only)
+    root.left = _HookModule("left", shared)
+    root.right = _HookModule("right", shared, child_only)
+    root.plain = torch.nn.Linear(2, 2)
+    root.plain.weight = plain
+    root.frozen = _HookModule("frozen", frozen)
+    root.unmarked = _HookModule("unmarked", unmarked)
+
+    optimized = _delayed_wgrad_hook_targets(root)
+    reference = _reference_delayed_wgrad_targets(root)
+    assert _target_names(optimized) == _target_names(reference)
+    assert [module.name for param, module in optimized if param is shared] == [
+        "root",
+        "left",
+        "right",
+    ]
+    assert [module.name for param, module in optimized if param is plain] == ["root"]
+    assert all(param is not frozen for param, _ in optimized)
+    assert all(param is not unmarked for param, _ in optimized)
+
+
+def test_delayed_wgrad_hook_targets_register_a_module_once_per_parameter():
+    """A parameter yielded twice by one module still registers that module once."""
+
+    class _DuplicateParameters(_HookModule):
+        def parameters(self, recurse=True):
+            yield from super().parameters(recurse=recurse)
+            yield from super().parameters(recurse=recurse)
+
+    weight = _mark(torch.nn.Parameter(torch.zeros(2)))
+    root = torch.nn.Module()
+    root.child = _DuplicateParameters("child", weight)
+    optimized = _delayed_wgrad_hook_targets(root)
+    assert _target_names(optimized) == _target_names(_reference_delayed_wgrad_targets(root))
+    assert [module.name for _, module in optimized] == ["child"]
+
+
+class _CountParameters(torch.nn.Module):
+    """Record each ``parameters`` call and whether it recurses."""
+
+    def __init__(self, name, *params):
+        super().__init__()
+        self.name = name
+        for index, param in enumerate(params):
+            self.register_parameter(f"p{index}", param)
+        self.reads = []
+
+    def parameters(self, recurse=True):
+        self.reads.append(recurse)
+        yield from super().parameters(recurse=recurse)
+
+
+class _CountHookParameters(_CountParameters):
+    """Hook module that records direct parameter reads."""
+
+    def __init__(self, name, *params):
+        super().__init__(name, *params)
+        self.registered = []
+
+    def register_wgrad_accumulation_and_reduce_hooks(self, hook):
+        self.registered.append(hook)
+
+
+def test_delayed_wgrad_hook_targets_read_direct_parameters_once():
+    """A qualifying chain reads each module's own parameters once."""
+    shared = _mark(torch.nn.Parameter(torch.zeros(2)))
+    parent_only = _mark(torch.nn.Parameter(torch.zeros(2)))
+    child_only = _mark(torch.nn.Parameter(torch.zeros(2)))
+    orphan_weight = _mark(torch.nn.Parameter(torch.zeros(2)))
+
+    root = _CountHookParameters("root", parent_only)
+    root.left = _CountHookParameters("left", shared)
+    root.right = _CountHookParameters("right", shared, child_only)
+    container = _CountParameters("container")
+    container.hooked = root
+    container.orphan = _CountParameters("orphan", orphan_weight)
+
+    optimized = _delayed_wgrad_hook_targets(container)
+    assert root.reads == [False]
+    assert root.left.reads == [False]
+    assert root.right.reads == [False]
+    assert container.reads == []
+    assert container.orphan.reads == []
+    assert _target_names(optimized) == _target_names(_reference_delayed_wgrad_targets(container))
+
+
+def test_delayed_wgrad_hook_targets_keep_both_parents_of_a_shared_module():
+    """A module attached under two parents keeps both qualifying ancestors."""
+    weight = _mark(torch.nn.Parameter(torch.zeros(2)))
+    shared = _HookModule("shared", weight)
+    root = _HookModule("root")
+    root.left = _HookModule("left")
+    root.right = _HookModule("right")
+    root.left.child = shared
+    root.right.child = shared
+
+    assert _target_names(_delayed_wgrad_hook_targets(root)) == _target_names(
+        _reference_delayed_wgrad_targets(root)
+    )
+    assert [module.name for _, module in _delayed_wgrad_hook_targets(root)] == [
+        "root",
+        "left",
+        "shared",
+        "right",
+    ]

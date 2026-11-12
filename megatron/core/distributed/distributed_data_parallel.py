@@ -27,6 +27,65 @@ from .param_and_grad_buffer import _ParamAndGradBuffer, group_params_for_buffers
 logger = logging.getLogger(__name__)
 
 
+def _delayed_wgrad_hook_targets(root: torch.nn.Module):
+    """Pair delayed weight parameters with the modules that register their grad hooks.
+
+    A module qualifies when it implements ``register_wgrad_accumulation_and_reduce_hooks``
+    and recursive ``parameters()`` would yield the parameter. Qualifying ancestors stay on
+    a stack, so each module reads only its direct parameters. Each module is paired at most
+    once, in ``modules()`` order. Parameters that do not require grad, or are not marked
+    ``skip_backward_post_hook``, are omitted.
+
+    Returns:
+        ``(parameter, module)`` pairs in ``root.parameters()`` order.
+    """
+    owners: dict[int, list] = {}
+    order = []
+    hook_stack = []
+
+    def walk(module, path):
+        module_id = id(module)
+        if module_id in path:
+            return
+        path.add(module_id)
+        qualifies = hasattr(module, "register_wgrad_accumulation_and_reduce_hooks")
+        if qualifies:
+            hook_stack.append(module)
+        try:
+            if hook_stack:
+                seen: set[int] = set()
+                for param in module.parameters(recurse=False):
+                    param_id = id(param)
+                    if param_id in seen:
+                        continue
+                    seen.add(param_id)
+                    if not param.requires_grad or not getattr(
+                        param, "skip_backward_post_hook", False
+                    ):
+                        continue
+                    bucket = owners.get(param_id)
+                    if bucket is None:
+                        order.append(param)
+                        owners[param_id] = list(hook_stack)
+                        continue
+                    known = {id(owner) for owner in bucket}
+                    for owner in hook_stack:
+                        owner_id = id(owner)
+                        if owner_id in known:
+                            continue
+                        known.add(owner_id)
+                        bucket.append(owner)
+            for child in module.children():
+                walk(child, path)
+        finally:
+            if qualifies:
+                hook_stack.pop()
+            path.remove(module_id)
+
+    walk(root, set())
+    return [(param, module) for param in order for module in owners[id(param)]]
+
+
 class _BucketParamReadyCallback:
     """Publishes one bucket group's parameters on demand.
 
@@ -494,47 +553,38 @@ class DistributedDataParallel(_BaseDataParallel):
 
             self.module.apply(unmap_weight_tensor)
 
-        # Register backward hook.
-        # Accumulation function for the gradients need to be stored so they
-        # don't go out of scope.
+        # Delayed weight grads are produced in backward_dw(), so those parameters
+        # register the bucket hook on the owning module instead of AccumulateGrad.
+        # grad_accs keeps the accumulator nodes alive.
         self.grad_accs = []
+        if self.ddp_config.delay_wgrad_compute:
+            for param, module in _delayed_wgrad_hook_targets(self.module):
+                module.register_wgrad_accumulation_and_reduce_hooks(
+                    self._make_backward_post_hook(param)
+                )
         for param in self.module.parameters():
-            if param.requires_grad:
-                # When delay_wgrad_compute is True and the param is marked with
-                # skip_backward_post_hook, register the backward post hook for its module
-                # instead of the param so that the wgrad accumulation and reduce will be performed
-                # in backward_dw() method of the module instead of the hook of backward() method.
-                # Otherwise, register the backward post hook for the param.
-                if self.ddp_config.delay_wgrad_compute and getattr(
-                    param, 'skip_backward_post_hook', False
-                ):
-                    for module in self.module.modules():
-                        if hasattr(module, "register_wgrad_accumulation_and_reduce_hooks"):
-                            for param_value in module.parameters():
-                                if param is param_value:
-                                    module.register_wgrad_accumulation_and_reduce_hooks(
-                                        self._make_backward_post_hook(param)
-                                    )
-                                    break
-                else:
-                    # Expand so we get access to grad_fn.
-                    param_tmp = param.expand_as(param)
-                    # Get the gradient accumulator function.
-                    grad_acc = param_tmp.grad_fn.next_functions[0][0]
-                    if getattr(param, 'is_gtp_weight_remat', False) and hasattr(
-                        param, 'register_grad_accum_hook'
-                    ):
-                        # GTP_remat computes wgrad via an async reduce-scatter, so autograd's
-                        # AccumulateGrad sees only a dummy; grad-ready is driven manually from
-                        # _handle_megatron_grad_accum (the hook passed here). RETAINING the node
-                        # keeps it on the capture stream for full-iteration CUDA-graph capture.
-                        # No autograd hook or grad_accs entry: either would fire on a stale grad.
-                        param.register_grad_accum_hook(
-                            grad_acc, self._make_backward_post_hook(param)
-                        )
-                    else:
-                        grad_acc.register_hook(self._make_backward_post_hook(param))
-                        self.grad_accs.append(grad_acc)
+            if not param.requires_grad:
+                continue
+            if self.ddp_config.delay_wgrad_compute and getattr(
+                param, 'skip_backward_post_hook', False
+            ):
+                continue
+            # Expand so we get access to grad_fn.
+            param_tmp = param.expand_as(param)
+            # Get the gradient accumulator function.
+            grad_acc = param_tmp.grad_fn.next_functions[0][0]
+            if getattr(param, 'is_gtp_weight_remat', False) and hasattr(
+                param, 'register_grad_accum_hook'
+            ):
+                # GTP_remat computes wgrad via an async reduce-scatter, so autograd's
+                # AccumulateGrad sees only a dummy; grad-ready is driven manually from
+                # _handle_megatron_grad_accum (the hook passed here). RETAINING the node
+                # keeps it on the capture stream for full-iteration CUDA-graph capture.
+                # No autograd hook or grad_accs entry: either would fire on a stale grad.
+                param.register_grad_accum_hook(grad_acc, self._make_backward_post_hook(param))
+            else:
+                grad_acc.register_hook(self._make_backward_post_hook(param))
+                self.grad_accs.append(grad_acc)
 
         # Note: overlap_param_gather covers both the distributed optimizer and the
         # layer-wise optimizer cases; the latter sets overlap_param_gather=True
