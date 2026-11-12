@@ -1,8 +1,9 @@
-# MLflow and Comet logging
+# Experiment logging
 
 MLflow and Comet are optional experiment backends alongside W&B and TensorBoard.
 Only the last global rank creates an experiment and reports metrics, following
-W&B's convention. Neither backend requires TensorBoard or W&B to be enabled.
+W&B's convention. W&B, Comet, and MLflow share one experiment writer and do not
+require TensorBoard to be enabled. TensorBoard uses its own writer.
 Install the selected SDK (`pip install mlflow` or `pip install comet-ml`) in the
 training environment. Disabled backends do not import their SDKs.
 
@@ -35,26 +36,32 @@ config still contains it, so do not embed credentials in the URI.
 
 ## Metrics and checkpoints
 
-Both backends receive the training/evaluation scalar metrics sent to W&B,
+All three experiment backends receive the same training/evaluation scalar metrics,
 including loss, learning rate, gradient norm, throughput and timer metrics.
 Existing logging intervals and metric-selection flags apply, including
 `--tensorboard-log-interval` and `--log-timers-to-tensorboard`. The latter also
 controls experiment-backend timers despite its historical name. MLflow metric
 names replace unsupported characters with `_`; W&B/Comet names stay unchanged.
-Training tensor-metric observers also use these backends. W&B-specific media
-and custom callbacks that access `get_wandb_writer()` remain W&B-only; custom
-scalar callbacks can instead use `get_experiment_writer()`.
+Training tensor-metric observers, RL scalar metrics, and inference metrics also
+use these backends. The existing `--inference-wandb-logging` flag enables
+inference reporting to any configured experiment backend. Basic W&B training
+and evaluation scalars now log without TensorBoard, including when evaluation
+sets `write_to_tensorboard=False`; TensorBoard output remains unchanged.
+W&B-specific media and custom callbacks that access `get_wandb_writer()` remain W&B-only; custom
+scalar callbacks can use `get_experiment_writer()`, which returns the shared
+writer even when only W&B is configured. It provides `log(metrics, step)` and
+`log_metadata(values)`; normal shutdown closes all enabled backends together.
 
 Config parameters are flattened and summarized (values capped at 500 characters).
 Full config remains in the checkpoint's `run_config.yaml`. Runtime SDK objects
 are never stored in the config or checkpoint.
 
-After a persistent checkpoint finishes, MLflow uploads its directory and Comet
-records its path and iteration. MLflow uploads can be expensive for large
-models: set `--no-mlflow-log-artifacts` or
+After a persistent checkpoint finishes, all three backends record its path and
+iteration, and MLflow optionally uploads its directory. MLflow uploads can be
+expensive for large models: set `--no-mlflow-log-artifacts` or
 `cfg.logger.mlflow_log_artifacts = False` to disable them. Non-persistent/local
 checkpoints are not uploaded; MSC remote paths are not downloaded for upload.
-Both backends record the checkpoint path selected on successful load.
+All three backends record the checkpoint path selected on successful load.
 Artifact/reporting failures warn without invalidating a successfully saved checkpoint.
 
 ## Resume and shutdown
@@ -63,10 +70,16 @@ Use `--mlflow-run-id` to resume an existing run; MLflow's `MLFLOW_RUN_ID`
 environment variable is also supported. Names alone do not identify a run to
 resume. Existing MLflow parameters are retained because the SDK treats them as
 immutable; metrics continue using the restored training iteration. An already
-active MLflow run is reused and left open for its owner to close. As in Bridge,
+active MLflow run is reused and left open for its owner to close. Internally owned
+MLflow runs use explicit run IDs, so cleanup from a restart thread closes the
+correct run without leaving a thread-local active run behind. As in Bridge,
 Comet creates a new experiment for each invocation; restoring a checkpoint does
 not reattach to an earlier Comet experiment.
 
 Owned runs finish after pending asynchronous checkpoints complete. Early training
 exit marks them killed (failed for a nonzero exit code), and uncaught Python
-exceptions mark them failed. Abrupt termination such as SIGKILL cannot flush an SDK.
+exceptions mark them failed. Explicit nonzero exits during initialization or
+checkpoint loading also mark them failed. If shutdown bypasses the training
+lifecycle, the process-exit fallback records an interrupted run, never a
+successful completion. W&B represents unsuccessful endings through a nonzero
+exit code. Abrupt termination such as SIGKILL cannot flush an SDK.

@@ -67,7 +67,7 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.config import CheckpointConfig, PretrainConfigContainer, TokenizerConfig
 from megatron.training.global_vars import (
-    get_external_experiment_writer,
+    get_experiment_writer,
     get_run_config,
     get_tokenizer,
     get_train_state,
@@ -1395,10 +1395,10 @@ def save_checkpoint(
         else:
             onelogger_finalize_fn()
 
-    experiment_writer = get_external_experiment_writer()
+    experiment_writer = get_experiment_writer()
     experiment_finalize_fn = None
     if (
-        (cfg.logger.mlflow_experiment or cfg.logger.comet_project)
+        (cfg.logger.wandb_project or cfg.logger.mlflow_experiment or cfg.logger.comet_project)
         and not skip_weight_ckpt
         and not non_persistent_ckpt
     ):
@@ -3861,7 +3861,7 @@ def load_checkpoint(
     if has_nvidia_modelopt:
         print_distributed_quant_summary(model, msg='After loading checkpoint')
 
-    experiment_writer = get_external_experiment_writer()
+    experiment_writer = get_experiment_writer()
     if experiment_writer is not None:
         experiment_writer.checkpoint_loaded(checkpoint_name, load_dir)
 

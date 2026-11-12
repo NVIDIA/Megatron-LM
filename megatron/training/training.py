@@ -201,7 +201,7 @@ from .global_vars import (
     get_tensorboard_writer,
     get_timers,
     get_train_state,
-    get_wandb_writer,
+    with_experiment_logging,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -1743,6 +1743,7 @@ def _get_train_full_dataset_sample_count(args, dataset_provider):
     return int(total_num_samples)
 
 
+@with_experiment_logging
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
@@ -1792,7 +1793,7 @@ def pretrain(
         process_non_loss_data_func: a function to post process outputs of the
             network. It can be used for dumping output tensors (e.g images) to
             tensorboard. It takes `collected data`(list of tensors),
-            `current iteration index` and `tensorboard writer` as arguments.
+            `current iteration index` and `TensorBoard writer` as arguments.
         extra_args_provider: a function that takes a parser and adds arguments
             to it. It is used for programs to add their own arguments.
         args_defaults: a dictionary from argument-name to argument-value. It
@@ -1858,7 +1859,7 @@ def pretrain(
     # Multimodal MiMo seeds each module's RNG in its builder; a plain collection seeds stock here.
     skip_random_seed = isinstance(pg_collection, MultiModuleProcessGroupCollection)
 
-    # Initalize and get arguments, timers, and Tensorboard writer.
+    # Initalize and get arguments, timers, and TensorBoard writer.
     initialize_megatron(
         training=True,
         build_tokenizer=build_tokenizer,
@@ -2266,13 +2267,9 @@ def pretrain(
     one_logger = get_one_logger()
     one_logger and one_logger.log_metrics(app_metrics)
 
-    wandb_writer = get_wandb_writer()
-    if wandb_writer:
-        # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
-        # A relaunch resumes the same wandb run, which may hold an earlier job name.
-        wandb_writer.config.update(
-            {'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")}, allow_val_change=True
-        )
+    experiment_writer = get_experiment_writer()
+    if experiment_writer:
+        experiment_writer.log_metadata({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
 
     # OTel: megatron.startup deliberately stays open into train() -- its
     # preamble (weight-hash check, sniff test, cuda-graph setup) is init, not
@@ -2386,10 +2383,6 @@ def pretrain(
             callback_manager=callback_manager,
             is_test=True,
         )
-
-    wandb_writer = get_wandb_writer()
-    if wandb_writer:
-        wandb_writer.finish()
 
     ft_integration.on_checkpointing_start()
     maybe_finalize_async_save(blocking=True, terminate=True)
@@ -3827,8 +3820,8 @@ def training_log(
     # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
     timers = get_timers()
-    writer = get_tensorboard_writer()
-    wandb_writer = get_experiment_writer()
+    tensorboard_writer = get_tensorboard_writer()
+    experiment_writer = get_experiment_writer()
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
 
@@ -3909,8 +3902,8 @@ def training_log(
     one_logger_utils.track_app_tag(batch_size, safe_get_world_size(), args.seq_length)
 
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
-    if packed_sequence_stats and wandb_writer:
-        wandb_writer.log(packed_sequence_stats, iteration)
+    if packed_sequence_stats and experiment_writer:
+        experiment_writer.log(packed_sequence_stats, iteration)
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
     _lr_mp_group = pg_collection.mp if pg_collection is not None else None
@@ -3920,82 +3913,82 @@ def training_log(
     if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
     # Scalar backends do not require TensorBoard to be enabled.
-    if (writer or wandb_writer) and (iteration % cfg.logger.tensorboard_log_interval == 0):
-        if wandb_writer:
-            wandb_writer.log({'samples vs steps': train_state.consumed_train_samples}, iteration)
+    if (tensorboard_writer or experiment_writer) and (iteration % cfg.logger.tensorboard_log_interval == 0):
+        if experiment_writer:
+            experiment_writer.log({'samples vs steps': train_state.consumed_train_samples}, iteration)
         if learning_rate is not None:
-            if writer:
-                writer.add_scalar('learning-rate', learning_rate, iteration)
-                writer.add_scalar('learning-rate vs samples', learning_rate, train_state.consumed_train_samples)
-            if wandb_writer:
-                wandb_writer.log({'learning-rate': learning_rate}, iteration)
+            if tensorboard_writer:
+                tensorboard_writer.add_scalar('learning-rate', learning_rate, iteration)
+                tensorboard_writer.add_scalar('learning-rate vs samples', learning_rate, train_state.consumed_train_samples)
+            if experiment_writer:
+                experiment_writer.log({'learning-rate': learning_rate}, iteration)
         if train_state.skipped_train_samples > 0:
-            if writer:
-                writer.add_scalar('skipped-train-samples', train_state.skipped_train_samples, iteration)
-            if wandb_writer:
-                wandb_writer.log({'skipped-train-samples': train_state.skipped_train_samples}, iteration)
-        if writer:
-            writer.add_scalar('batch-size', batch_size, iteration)
-            writer.add_scalar('batch-size vs samples', batch_size, train_state.consumed_train_samples)
-        if wandb_writer:
-            wandb_writer.log({'batch-size': batch_size}, iteration)
+            if tensorboard_writer:
+                tensorboard_writer.add_scalar('skipped-train-samples', train_state.skipped_train_samples, iteration)
+            if experiment_writer:
+                experiment_writer.log({'skipped-train-samples': train_state.skipped_train_samples}, iteration)
+        if tensorboard_writer:
+            tensorboard_writer.add_scalar('batch-size', batch_size, iteration)
+            tensorboard_writer.add_scalar('batch-size vs samples', batch_size, train_state.consumed_train_samples)
+        if experiment_writer:
+            experiment_writer.log({'batch-size': batch_size}, iteration)
         for key in loss_dict:
-            if writer:
-                writer.add_scalar(key, loss_dict[key], iteration)
-                writer.add_scalar(key + ' vs samples', loss_dict[key], train_state.consumed_train_samples)
-            if wandb_writer:
-                wandb_writer.log({key: loss_dict[key]}, iteration)
+            if tensorboard_writer:
+                tensorboard_writer.add_scalar(key, loss_dict[key], iteration)
+                tensorboard_writer.add_scalar(key + ' vs samples', loss_dict[key], train_state.consumed_train_samples)
+            if experiment_writer:
+                experiment_writer.log({key: loss_dict[key]}, iteration)
         if cfg.logger.log_loss_scale_to_tensorboard:
-            if writer:
-                writer.add_scalar('loss-scale', loss_scale, iteration)
-                writer.add_scalar('loss-scale vs samples', loss_scale, train_state.consumed_train_samples)
-            if wandb_writer:
-                wandb_writer.log({'loss-scale': loss_scale}, iteration)
+            if tensorboard_writer:
+                tensorboard_writer.add_scalar('loss-scale', loss_scale, iteration)
+                tensorboard_writer.add_scalar('loss-scale vs samples', loss_scale, train_state.consumed_train_samples)
+            if experiment_writer:
+                experiment_writer.log({'loss-scale': loss_scale}, iteration)
         if cfg.logger.log_world_size_to_tensorboard:
-            if writer:
-                writer.add_scalar('world-size', safe_get_world_size(), iteration)
-                writer.add_scalar('world-size vs samples', safe_get_world_size(), train_state.consumed_train_samples)
-            if wandb_writer:
-                wandb_writer.log({'world-size': safe_get_world_size()}, iteration)
+            if tensorboard_writer:
+                tensorboard_writer.add_scalar('world-size', safe_get_world_size(), iteration)
+                tensorboard_writer.add_scalar('world-size vs samples', safe_get_world_size(), train_state.consumed_train_samples)
+            if experiment_writer:
+                experiment_writer.log({'world-size': safe_get_world_size()}, iteration)
         if grad_norm is not None:
-            if writer:
-                writer.add_scalar('grad-norm', grad_norm, iteration)
-                writer.add_scalar('grad-norm vs samples', grad_norm, train_state.consumed_train_samples)
-            if wandb_writer:
-                wandb_writer.log({'grad-norm': grad_norm}, iteration)
+            if tensorboard_writer:
+                tensorboard_writer.add_scalar('grad-norm', grad_norm, iteration)
+                tensorboard_writer.add_scalar('grad-norm vs samples', grad_norm, train_state.consumed_train_samples)
+            if experiment_writer:
+                experiment_writer.log({'grad-norm': grad_norm}, iteration)
         if num_zeros_in_grad is not None:
-            if writer:
-                writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
-                writer.add_scalar(
+            if tensorboard_writer:
+                tensorboard_writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
+                tensorboard_writer.add_scalar(
                     'num-zeros vs samples', num_zeros_in_grad, train_state.consumed_train_samples
                 )
-            if wandb_writer:
-                wandb_writer.log({'num-zeros': num_zeros_in_grad}, iteration)
+            if experiment_writer:
+                experiment_writer.log({'num-zeros': num_zeros_in_grad}, iteration)
         if params_norm is not None:
-            if writer:
-                writer.add_scalar('params-norm', params_norm, iteration)
-                writer.add_scalar('params-norm vs samples', params_norm, train_state.consumed_train_samples)
-            if wandb_writer:
-                wandb_writer.log({'params-norm': params_norm}, iteration)
-        if writer and cfg.logger.log_memory_to_tensorboard:
+            if tensorboard_writer:
+                tensorboard_writer.add_scalar('params-norm', params_norm, iteration)
+                tensorboard_writer.add_scalar('params-norm vs samples', params_norm, train_state.consumed_train_samples)
+            if experiment_writer:
+                experiment_writer.log({'params-norm': params_norm}, iteration)
+        if tensorboard_writer and cfg.logger.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
-            writer.add_scalar(
+            tensorboard_writer.add_scalar(
                 "mem-reserved-bytes", mem_stats["reserved_bytes.all.current"], iteration
             )
-            writer.add_scalar(
+            tensorboard_writer.add_scalar(
                 "mem-allocated-bytes", mem_stats["allocated_bytes.all.current"], iteration
             )
-            writer.add_scalar(
+            tensorboard_writer.add_scalar(
                 "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
             )
-            writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
+            tensorboard_writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
         model_config = get_model_config(model[0]) if model else getattr(cfg.model, 'transformer', None)
         if model_config is not None and model_config.log_max_attention_logit:
-            if writer:
-                writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
-            if wandb_writer:
-                wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
-        if writer:
+            if tensorboard_writer:
+                tensorboard_writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
+            if experiment_writer:
+                experiment_writer.log({'max_attention_logit': max_attention_logit}, iteration)
+        if tensorboard_writer:
             callback_manager.callback_context.batch_size = batch_size
             callback_manager.trigger("on_tensorboard_log")
     # Log MoE metrics.
@@ -4058,8 +4051,8 @@ def training_log(
         moe_log_string = get_moe_metrics_tracker().report(
             loss_scale=moe_loss_scale,
             iteration=iteration,
-            writer=writer,
-            wandb_writer=wandb_writer,
+            writer=tensorboard_writer,
+            wandb_writer=experiment_writer,
             per_layer_logging=cfg.model.transformer.moe_per_layer_logging,
             force_initialize=True,
             track_names=track_names,
@@ -4075,7 +4068,7 @@ def training_log(
     if cfg.model.transformer.mtp_num_layers is not None:
         mtp_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         MTPLossLoggingHelper.track_mtp_metrics(
-            mtp_loss_scale, iteration, writer, wandb_writer, total_loss_dict
+            mtp_loss_scale, iteration, tensorboard_writer, experiment_writer, total_loss_dict
         )
 
     # Track sparse attention indexer loss.
@@ -4099,9 +4092,9 @@ def training_log(
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
             iteration=iteration,
-            writer=writer,
+            writer=tensorboard_writer,
             pg_collection=pg_collection,
-            wandb_writer=wandb_writer,
+            wandb_writer=experiment_writer,
             total_loss_dict=total_loss_dict,
             num_layers=indexer_tracker_layers,
             num_indexer_layers=indexer_layer_count,
@@ -4135,10 +4128,10 @@ def training_log(
         # to document initialization overhead. Log statistics to TensorBoard and
         # WandB according to the regular schedule.
         if cfg.logger.log_timers_to_tensorboard and not is_first_iteration:
-            if writer:
-                writer.add_scalar('iteration-time', elapsed_time_per_iteration, iteration)
-            if wandb_writer:
-                wandb_writer.log({'iteration-time': elapsed_time_per_iteration}, iteration)
+            if tensorboard_writer:
+                tensorboard_writer.add_scalar('iteration-time', elapsed_time_per_iteration, iteration)
+            if experiment_writer:
+                experiment_writer.log({'iteration-time': elapsed_time_per_iteration}, iteration)
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}]"
         log_string += ' iteration {:8d}/{:8d} |'.format(iteration, cfg.train.train_iters)
         if cfg.train.train_samples:
@@ -4157,21 +4150,21 @@ def training_log(
         if cfg.logger.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
             if cfg.logger.log_timers_to_tensorboard:
-                if writer:
-                    writer.add_scalar('throughput', throughput, iteration)
-                if wandb_writer:
-                    wandb_writer.log({'throughput': throughput}, iteration)
+                if tensorboard_writer:
+                    tensorboard_writer.add_scalar('throughput', throughput, iteration)
+                if experiment_writer:
+                    experiment_writer.log({'throughput': throughput}, iteration)
         if cfg.logger.log_energy:
             energy = (energy_monitor.lap() / total_iterations) / safe_get_world_size()
             power = energy / elapsed_time_per_iteration
             log_string += f' energy per GPU (J/iter/GPU): {energy:.1f} |'
             log_string += f' power per GPU (W/GPU): {power:.1f} |'
-            if writer:
-                writer.add_scalar('iter-energy/gpu', energy, iteration)
-                writer.add_scalar('power/gpu', power, iteration)
-            if wandb_writer:
-                wandb_writer.log({'iter-energy/gpu': energy}, iteration)
-                wandb_writer.log({'power/gpu': power}, iteration)
+            if tensorboard_writer:
+                tensorboard_writer.add_scalar('iter-energy/gpu', energy, iteration)
+                tensorboard_writer.add_scalar('power/gpu', power, iteration)
+            if experiment_writer:
+                experiment_writer.log({'iter-energy/gpu': energy}, iteration)
+                experiment_writer.log({'power/gpu': power}, iteration)
         # Decoupled_learning_rate should be not None only on first and last pipeline stage.
         if learning_rate is not None:
             log_string += f' learning rate: {learning_rate:.6E} |'
@@ -4297,8 +4290,8 @@ def training_log(
             )
         # Write timers to wandb, don't reset the counts.
         if cfg.logger.log_timers_to_tensorboard:
-            timers.write(timers_to_log, writer, iteration, normalizer=cfg.logger.log_interval, reset=False)
-            timers.write(timers_to_log, wandb_writer, iteration, normalizer=cfg.logger.log_interval, reset=False)
+            timers.write(timers_to_log, tensorboard_writer, iteration, normalizer=cfg.logger.log_interval, reset=False)
+            timers.write(timers_to_log, experiment_writer, iteration, normalizer=cfg.logger.log_interval, reset=False)
         # Log timers to stdout
         timers.log(timers_to_log, normalizer=cfg.logger.log_interval, reset=should_reset)
 
@@ -5557,13 +5550,13 @@ def train(
                 and iteration % cfg.logger.log_interval == 0
             ):
                 embedding_min_norm_metrics = _consume_embedding_min_norm_metrics(optimizer)
-                writer = get_tensorboard_writer()
-                if writer:
+                tensorboard_writer = get_tensorboard_writer()
+                if tensorboard_writer:
                     for name, value in embedding_min_norm_metrics.items():
-                        writer.add_scalar(name, value, iteration)
-                wandb_writer = get_experiment_writer()
-                if wandb_writer:
-                    wandb_writer.log(embedding_min_norm_metrics, iteration)
+                        tensorboard_writer.add_scalar(name, value, iteration)
+                experiment_writer = get_experiment_writer()
+                if experiment_writer:
+                    experiment_writer.log(embedding_min_norm_metrics, iteration)
 
             if _should_compute_params_norm(args, iteration, is_first_iteration):
                 # Cross-rank param L2 norm (--log-params-norm): a full-model reduction
@@ -5697,10 +5690,10 @@ def train(
 
     one_logger_utils.track_e2e_metrics()
 
-    # Flush TensorBoard, WandB writers and one-logger.
-    writer = get_tensorboard_writer()
-    if writer:
-        writer.flush()
+    # Flush TensorBoard before draining checkpoints and finishing experiment writers.
+    tensorboard_writer = get_tensorboard_writer()
+    if tensorboard_writer:
+        tensorboard_writer.flush()
 
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
@@ -5743,9 +5736,6 @@ def train(
         one_logger and one_logger.log_metrics(
             {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
         )
-        wandb_writer = get_wandb_writer()
-        if wandb_writer:
-            wandb_writer.finish()
         finish_experiment_logging("FAILED" if exit_code else "KILLED")
         ft_integration.shutdown()
         one_logger_utils.finish()
@@ -6028,14 +6018,14 @@ def evaluate_and_print_results(
     args = get_args()
     train_state = get_train_state()
     if write_to_tensorboard:
-        writer = get_tensorboard_writer()
+        tensorboard_writer = get_tensorboard_writer()
     else:
-        writer = None
+        tensorboard_writer = None
 
     start_event = "on_test_start" if is_test else "on_eval_start"
     end_event = "on_test_end" if is_test else "on_eval_end"
 
-    wandb_writer = get_experiment_writer()
+    experiment_writer = get_experiment_writer()
 
     data_iterators = data_iterator if cfg.validation.multiple_validation_sets else [data_iterator]
 
@@ -6099,25 +6089,25 @@ def evaluate_and_print_results(
             string += '{} value: {:.6E} | '.format(key, total_loss_dict[key].item())
             ppl = math.exp(min(20, total_loss_dict[key].item()))
             string += '{} PPL: {:.6E} | '.format(key, ppl)
-            if writer:
-                writer.add_scalar('{} validation{}'.format(key, suffix), total_loss_dict[key].item(), iteration)
-                writer.add_scalar(
+            if tensorboard_writer:
+                tensorboard_writer.add_scalar('{} validation{}'.format(key, suffix), total_loss_dict[key].item(), iteration)
+                tensorboard_writer.add_scalar(
                     '{} validation{} vs samples'.format(key, suffix),
                     total_loss_dict[key].item(),
                     train_state.consumed_train_samples,
                 )
                 if cfg.logger.log_validation_ppl_to_tensorboard:
-                    writer.add_scalar('{} validation{} ppl'.format(key, suffix), ppl, iteration)
-                    writer.add_scalar(
+                    tensorboard_writer.add_scalar('{} validation{} ppl'.format(key, suffix), ppl, iteration)
+                    tensorboard_writer.add_scalar(
                         '{} validation{} ppl vs samples'.format(key, suffix), ppl, train_state.consumed_train_samples
                     )
-            if wandb_writer and is_last_rank():
-                wandb_writer.log(
+            if experiment_writer and is_last_rank():
+                experiment_writer.log(
                     {'{} validation{}'.format(key, suffix): total_loss_dict[key].item()}, iteration
                 )
 
-        if process_non_loss_data_func is not None and writer and is_last_rank():
-            process_non_loss_data_func(collected_non_loss_data, iteration, writer)
+        if process_non_loss_data_func is not None and tensorboard_writer and is_last_rank():
+            process_non_loss_data_func(collected_non_loss_data, iteration, tensorboard_writer)
 
         length = len(string) + 1
         print_rank_last('-' * length)

@@ -8,6 +8,7 @@ import signal
 import sys
 from argparse import Namespace
 from datetime import timedelta
+from functools import wraps
 
 import torch
 
@@ -78,8 +79,7 @@ def get_tensorboard_writer():
 
 
 def get_wandb_writer():
-    """Return tensorboard writer. It can be None so no need
-    to check if it is initialized."""
+    """Return the raw W&B SDK for backend-specific media APIs, or None."""
     return _GLOBAL_WANDB_WRITER
 
 
@@ -90,19 +90,36 @@ def get_one_logger():
 
 
 def get_experiment_writer():
-    """Return the scalar writer for enabled experiment backends, or None."""
-    return _GLOBAL_EXPERIMENT_WRITER or get_wandb_writer()
-
-
-def get_external_experiment_writer():
-    """Return the optional MLflow/Comet service for checkpoint reporting."""
+    """Return the third-party experiment writer (W&B, Comet, MLflow), or None."""
     return _GLOBAL_EXPERIMENT_WRITER
 
 
 def finish_experiment_logging(status="FINISHED"):
-    """Flush optional experiment backends after pending checkpoints complete."""
+    """Finish all experiment backends after pending checkpoints complete."""
     if _GLOBAL_EXPERIMENT_WRITER is not None:
         _GLOBAL_EXPERIMENT_WRITER.finish(status)
+
+
+def with_experiment_logging(fn):
+    """Close experiment writers on training failures, including explicit exits.
+
+    The normal path finishes after checkpoint finalization. Catch BaseException
+    here so checkpoint-loader SystemExit and interrupted attempts are not recorded
+    as successful runs, even when an in-process restarter catches the exception.
+    """
+
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except BaseException as exc:
+            status = "KILLED" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "FAILED"
+            if isinstance(exc, SystemExit) and exc.code not in (None, 0):
+                status = "FAILED"
+            finish_experiment_logging(status)
+            raise
+
+    return wrapped
 
 
 def get_adlr_autoresume():
@@ -224,7 +241,6 @@ def initialize_runtime_services(
     if build_tokenizer or cfg.tokenizer.padded_vocab_size is not None:
         resolve_tokenizer_vocab_size(cfg)
     _bind_dataset_tokenizer(cfg)
-    _set_wandb_writer(args)
     _set_experiment_writer(args)
     _set_telemetry(args, include_training=training)
 
@@ -278,7 +294,7 @@ def unset_global_variables():
     Useful for multiple runs. See `tests/unit_tests/ckpt_converter/test_ckpt_converter.py` for an example.
     """
 
-    finish_experiment_logging()
+    finish_experiment_logging("KILLED")
     global _GLOBAL_EXPERIMENT_WRITER
     _GLOBAL_EXPERIMENT_WRITER = None
     global _GLOBAL_ARGS
@@ -415,12 +431,14 @@ def _wandb_run_id(exp_name: str) -> str:
 
 
 def _set_experiment_writer(args):
+    """Initialize all enabled third-party experiment backends on the reporting rank."""
     global _GLOBAL_EXPERIMENT_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_EXPERIMENT_WRITER, 'experiment writer')
+    _set_wandb_writer(args)
     cfg = get_run_config()
-    if (cfg.logger.mlflow_experiment or cfg.logger.comet_project) and args.rank == (
-        safe_get_world_size() - 1
-    ):
+    if (
+        cfg.logger.wandb_project or cfg.logger.mlflow_experiment or cfg.logger.comet_project
+    ) and args.rank == safe_get_world_size() - 1:
         from megatron.training.logging.experiment_writer import ExperimentWriter
 
         _GLOBAL_EXPERIMENT_WRITER = ExperimentWriter(cfg, get_wandb_writer())
@@ -749,7 +767,7 @@ def _set_telemetry(args, *, include_training: bool = True):
 
 
 def destroy_global_vars():
-    finish_experiment_logging()
+    finish_experiment_logging("KILLED")
     global _GLOBAL_EXPERIMENT_WRITER
     _GLOBAL_EXPERIMENT_WRITER = None
 

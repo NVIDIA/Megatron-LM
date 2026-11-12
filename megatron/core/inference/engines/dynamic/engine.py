@@ -270,13 +270,13 @@ class DynamicInferenceEngine(
             self._get_and_clear_stop_word_finished_ids
         )
 
-        # Configure wandb to use separate step counter for inference metrics (only once)
+        # Configure a separate step counter for inference metrics (only once)
         if self.logging_step_interval > 0 and self.metrics_writer is not None:
             logger.info(
                 f"\033[1;93m[INFERENCE]\033[0m "
-                f"\033[1;95mLogging inference metrics to wandb (rank {self.rank})\033[0m"
+                f"\033[1;95mLogging inference metrics (rank {self.rank})\033[0m"
             )
-            if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
+            if HAVE_WANDB and getattr(self.metrics_writer, "__name__", None) == "wandb":
                 # Make all inference/* metrics use inference_step as their x-axis
                 # This allows inference and training to have independent step counters
                 context.metrics_writer.define_metric(
@@ -294,6 +294,8 @@ class DynamicInferenceEngine(
                         if isinstance(val, (int, float)) and int(val) > max_step:
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
+            elif hasattr(self.metrics_writer, "start_inference_logging"):
+                self.inference_step_offset = self.metrics_writer.start_inference_logging()
 
         # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
         InferenceMode.set_active()

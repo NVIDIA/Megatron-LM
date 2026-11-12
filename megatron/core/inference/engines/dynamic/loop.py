@@ -370,7 +370,7 @@ class EngineLoopMixin:
             self.context.prefix_cache_prefill_computed_tokens = 0
             self.context.prefix_cache_prefill_skipped_tokens = 0
 
-        # Log KV cache utilization stats to W&B
+        # Log KV cache utilization stats to the configured experiment writer
         nvtx_range_push("wandb_logging")
         if context_state["kv_stats"] is not None:
             # Prepare metrics dictionary with all stats
@@ -418,8 +418,10 @@ class EngineLoopMixin:
                     self._prefix_cache_blocks_matched
                 )
 
-            if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
+            if HAVE_WANDB and getattr(self.metrics_writer, "__name__", None) == "wandb":
                 self.metrics_writer.log(metrics, commit=True)
+            elif hasattr(self.metrics_writer, "log_inference"):
+                self.metrics_writer.log_inference(metrics)
             else:
                 raise ValueError(f"Unsupported metrics writer type: {type(self.metrics_writer)}")
         nvtx_range_pop("wandb_logging")

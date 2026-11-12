@@ -2,6 +2,7 @@
 
 """Unit tests for wandb logging functionality in inference."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, create_autospec, patch
 
 import pytest
@@ -273,9 +274,15 @@ class TestInferenceWandbLogging:
         set_rounder(64)  # back to the class's pin
 
     @pytest.mark.internal
-    def test_metrics_writer_none_handling(self):
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_metrics_writer_none_handling(self, enabled):
         """Test that engine handles None metrics_writer gracefully."""
-        dynamic_context = self._get_dynamic_context(logging_step_interval=10, metrics_writer=None)
+        writer = (
+            SimpleNamespace(start_inference_logging=Mock(return_value=17), log_inference=Mock())
+            if enabled
+            else None
+        )
+        dynamic_context = self._get_dynamic_context(logging_step_interval=10, metrics_writer=writer)
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
@@ -293,4 +300,7 @@ class TestInferenceWandbLogging:
 
         # Verify engine was created successfully
         assert engine.logging_step_interval == 10
-        assert engine.metrics_writer is None
+        assert engine.metrics_writer is writer
+        if enabled:
+            writer.start_inference_logging.assert_called_once_with()
+            assert engine.inference_step_offset == 17

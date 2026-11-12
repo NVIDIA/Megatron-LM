@@ -1090,7 +1090,7 @@ def test_experiment_reporting_waits_for_checkpoint(
     writer = mock.Mock()
     reporting_rank = torch.distributed.get_rank() == torch.distributed.get_world_size() - 1
     monkeypatch.setattr(
-        checkpointing, 'get_external_experiment_writer', lambda: writer if reporting_rank else None
+        checkpointing, 'get_experiment_writer', lambda: writer if reporting_rank else None
     )
 
     def check_completed(path, iteration):

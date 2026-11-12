@@ -3,7 +3,8 @@
 import warnings
 from dataclasses import InitVar, dataclass, field, replace
 from enum import Enum
-from typing import TYPE_CHECKING, List, Literal, Optional, Sequence, Tuple, Union
+from types import ModuleType
+from typing import TYPE_CHECKING, List, Literal, Optional, Protocol, Sequence, Tuple, Union
 
 import torch
 
@@ -13,6 +14,18 @@ from megatron.core.utils import get_attr_wrapped_model
 
 if TYPE_CHECKING:
     from megatron.core.inference.shards_spec import InferenceShardSpec
+
+
+class InferenceMetricsWriter(Protocol):
+    """Scalar logging interface with a separate inference step counter."""
+
+    def start_inference_logging(self) -> int:
+        """Return the last inference step recorded before a restart."""
+        ...
+
+    def log_inference(self, metrics: dict[str, float]) -> None:
+        """Record inference scalars, including inference/inference_step."""
+        ...
 
 
 @dataclass
@@ -800,12 +813,12 @@ class InferenceConfig:
     timestamp, useful for per-token latency analysis.
     """
 
-    metrics_writer: Optional["WandbModule"] = None
-    """Wandb module for writing metrics."""
+    metrics_writer: Optional[Union[InferenceMetricsWriter, ModuleType]] = None
+    """Experiment writer with start_inference_logging/log_inference, or a W&B module."""
 
     logging_step_interval: int = 0
     """
-    The step interval at which to log inference metrics to wandb.
+    The step interval at which to log inference metrics.
     Defaults to 0, which means no logging.
     """
 

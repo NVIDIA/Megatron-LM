@@ -632,10 +632,10 @@ def _write_scalar_results(
     if tensorboard_writer is not None:
         for tag, value in scalars.items():
             tensorboard_writer.add_scalar(tag, value, iteration)
-    wandb_writer = get_experiment_writer()
-    if wandb_writer is not None and scalars:
-        wandb_writer.log(scalars, iteration)
-    if scalars and tensorboard_writer is None and wandb_writer is None and _is_last_rank():
+    experiment_writer = get_experiment_writer()
+    if experiment_writer is not None and scalars:
+        experiment_writer.log(scalars, iteration)
+    if scalars and tensorboard_writer is None and experiment_writer is None and _is_last_rank():
         printable_scalars = {tag: value.item() for tag, value in scalars.items()}
         print(f"tensor metrics at iteration {iteration}: {printable_scalars}", flush=True)
 

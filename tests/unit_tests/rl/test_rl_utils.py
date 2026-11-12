@@ -989,7 +989,7 @@ class TestRLUtils:
         monkeypatch.setattr(
             rl_utils, "EvaluationRequest", lambda **kwargs: SimpleNamespace(**kwargs)
         )
-        monkeypatch.setattr(rl_utils, "get_wandb_writer", lambda: wandb_writer)
+        monkeypatch.setattr(rl_utils, "get_experiment_writer", lambda: wandb_writer)
         monkeypatch.setattr(rl_utils, "lang_rl_log_dir", None)
         monkeypatch.setattr(rl_utils.dist, "get_rank", lambda: 0)
         monkeypatch.setattr(
@@ -1000,16 +1000,9 @@ class TestRLUtils:
             model=[MagicMock()], optimizer=MagicMock(), iteration=7, write_to_tensorboard=False
         )
 
-        if do_train:
-            wandb_writer.log.assert_called_once_with({"env_eval_mean_reward": 0.75}, step=7)
-            wandb_writer.define_metric.assert_not_called()
-        else:
-            wandb_writer.define_metric.assert_called_once_with(
-                "eval_only/*", step_metric="eval_checkpoint_iter"
-            )
-            wandb_writer.log.assert_called_once_with(
-                {"eval_checkpoint_iter": 7, "eval_only/env_eval_mean_reward": 0.75}
-            )
+        wandb_writer.log_evaluation.assert_called_once_with(
+            {"env_eval_mean_reward": 0.75}, 7, standalone=not do_train
+        )
 
     @pytest.mark.parametrize("template_dtype", [torch.float32, torch.bfloat16])
     def test_align_unpacked_inference_logprobs_rides_in_float32(self, template_dtype):
@@ -2527,6 +2520,26 @@ class TestRLUtils:
             rollout_statuses=rollout_statuses,
             failure_reasons=failure_reasons,
         )
+        scalar_metrics = rl_utils.prep_wandb_metrics(
+            None,
+            traj_lens,
+            turn_lens,
+            rewards,
+            num_turns,
+            advantages,
+            policy_epoch_segments=policy_epoch_segments,
+            kv_cache_epoch_segments=kv_cache_epoch_segments,
+            completed_epochs=completed_epochs,
+            num_evictions=num_evictions,
+            current_iteration=current_iteration,
+            rollout_statuses=rollout_statuses,
+            failure_reasons=failure_reasons,
+        )
+        assert scalar_metrics == {
+            key: value
+            for key, value in metrics.items()
+            if isinstance(value, (int, float, bool, np.number))
+        }
         assert metrics["failed_rollouts/count"] == (4 if inject_placeholders else 0)
         assert metrics["failed_rollouts/ratio"] == (0.5 if inject_placeholders else 0.0)
         assert metrics["rollout/count"] == (8 if inject_placeholders else 4)

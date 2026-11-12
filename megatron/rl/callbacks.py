@@ -17,10 +17,10 @@ from megatron.rl.sequence_packing_utils import (
 from megatron.training.callbacks import Callback, CallbackContext
 from megatron.training.global_vars import (
     get_args,
+    get_experiment_writer,
     get_tensorboard_writer,
     get_timers,
     get_train_state,
-    get_wandb_writer,
 )
 from megatron.training.utils import print_rank_0
 
@@ -47,7 +47,7 @@ class RLLoggingCallback(Callback):
         profile_dir = maybe_initialize_rl_profiler(
             self._rl_config,
             self._save_dir,
-            log_to_wandb=get_wandb_writer() is not None,
+            log_to_wandb=get_experiment_writer() is not None,
             log_to_tensorboard=get_tensorboard_writer() is not None,
         )
         if profile_dir is not None:
@@ -61,24 +61,24 @@ class RLLoggingCallback(Callback):
             )
 
     def on_tensorboard_log(self, context: CallbackContext) -> None:
-        writer = get_tensorboard_writer()
-        wandb_writer = get_wandb_writer()
+        tensorboard_writer = get_tensorboard_writer()
+        experiment_writer = get_experiment_writer()
         iteration = get_train_state().iteration
         if self._rl_config.rl_use_sequence_packing:
             metrics = get_sequence_packing_tensorboard_metrics(
                 rl_utils.get_rl_runtime_state().consumed_train_bins, self._micro_batch_size
             )
             for name, value in metrics.items():
-                writer.add_scalar(name, value, iteration)
-            if wandb_writer and metrics:
-                wandb_writer.log(metrics, iteration)
+                tensorboard_writer.add_scalar(name, value, iteration)
+            if experiment_writer and metrics:
+                experiment_writer.log(metrics, iteration)
         grpo_collection_iteration = iteration // self._iterations_per_collection
-        writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
-        if wandb_writer:
-            wandb_writer.log({'grpo_collection_iteration': grpo_collection_iteration}, iteration)
+        tensorboard_writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
+        if experiment_writer:
+            experiment_writer.log({'grpo_collection_iteration': grpo_collection_iteration}, iteration)
 
     def on_log(self, context: CallbackContext) -> None:
-        wandb_writer = get_wandb_writer()
+        experiment_writer = get_experiment_writer()
         iteration = get_train_state().iteration
         context.timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
         if self._rl_config.rl_use_sequence_packing:
@@ -91,7 +91,7 @@ class RLLoggingCallback(Callback):
                 context.batch_size,
                 context.elapsed_time_per_iteration,
                 iteration,
-                wandb_writer,
+                experiment_writer,
             )
         )
         if self._rl_config.rl_profile:
@@ -102,7 +102,7 @@ class RLLoggingCallback(Callback):
                 elapsed_time_ms=context.elapsed_time_per_iteration * 1000.0,
                 throughput_tflops=context.throughput,
                 global_batch_size=context.batch_size,
-                wandb_writer=wandb_writer,
+                wandb_writer=experiment_writer,
                 tb_writer=get_tensorboard_writer(),
             )
 

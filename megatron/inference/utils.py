@@ -21,9 +21,9 @@ from megatron.core.inference.quantization.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank, unwrap_model
-from megatron.training import get_args
+from megatron.training import get_args, get_experiment_writer
 from megatron.training import get_model as _get_model
-from megatron.training import get_run_config, get_wandb_writer
+from megatron.training import get_run_config
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.checkpointing import (
     get_checkpoint_name,
@@ -468,13 +468,13 @@ def get_inference_config_from_model_and_args(model: MegatronModule, args):
         and args.inference_wandb_logging
         and args.rank == (args.world_size - 1)
     ):
-        metrics_writer = get_wandb_writer()
+        metrics_writer = get_experiment_writer()
         if metrics_writer is None:
             log_single_rank(
                 logger,
                 logging.WARNING,
                 "WARNING: --rl-inference-logging-step-interval is set but no metrics writer "
-                "wandb module is available. Inference logging will be disabled.",
+                "experiment backend is available. Inference logging will be disabled.",
             )
 
     setup_cfg = inference_cfg_from_args(args)
