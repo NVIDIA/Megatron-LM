@@ -70,6 +70,11 @@ def save_dist_opt_checkpoint(
     """Save model and DistributedOptimizer state through mcore dist_checkpointing."""
 
     os.makedirs(checkpoint_dir, exist_ok=True)
+    # With overlapped parameter gathering, the last step's updates reach the other
+    # replicas only at the next forward; finish the gather so every replica saves them.
+    for chunk in [model] if isinstance(model, nn.Module) else model:
+        if callable(getattr(chunk, "start_param_sync", None)):
+            chunk.start_param_sync(force_sync=True)
     metadata = _dist_opt_checkpoint_metadata(optimizer)
     model_sd = _model_sharded_state_dict(model) if save_model or save_optimizer else {}
     state_dict: dict[str, Any] = {"step": int(step)}
@@ -85,10 +90,7 @@ def save_dist_opt_checkpoint(
         finally:
             _restore_state_dict_patches(patches)
     dist_checkpointing.save(
-        state_dict,
-        checkpoint_dir,
-        validate_access_integrity=False,
-        content_metadata=metadata,
+        state_dict, checkpoint_dir, validate_access_integrity=False, content_metadata=metadata
     )
 
 
@@ -267,7 +269,8 @@ def _dist_opt_checkpoint_metadata(optimizer: Any) -> dict[str, Any]:
     dist_opts = tuple(_iter_distributed_optimizers(optimizer))
     return {
         **_DISTOPT_METADATA,
-        "distrib_optim_fully_reshardable_mem_efficient": bool(dist_opts) and all(getattr(opt, "data_parallel_group_gloo", None) is not None for opt in dist_opts),
+        "distrib_optim_fully_reshardable_mem_efficient": bool(dist_opts)
+        and all(getattr(opt, "data_parallel_group_gloo", None) is not None for opt in dist_opts),
     }
 
 
