@@ -37,6 +37,11 @@ class Reader:
         self.consumer = ref(consumer)
         # The weak reference prevents StorageImpl address reuse without retaining bytes.
         _READERS[StorageWeakRef(tensor._rowwise_data.untyped_storage())] = self
+        # Pin the Reader on the rowwise data tensor, which detached aliases share, rather than
+        # only on this wrapper: a checkpointed consumer (e.g. GatedDeltaProduct's gdp_in_proj
+        # recompute) drops this wrapper after its no-grad first pass and, in backward, re-runs
+        # on a detached alias, whose lookup must still find the Reader.
+        tensor._rowwise_data._shortcut_mxfp8_reader = self
         tensor._shortcut_mxfp8_reader = self
 
 
