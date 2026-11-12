@@ -267,7 +267,9 @@ teardown. See https://github.com/NVIDIA/Megatron-LM/pull/6230.
 
 ### FsdpContext
 
-Context-wide options are grouped in an immutable `RuntimePolicy`:
+`FsdpContext` shares communication streams and prefetch state across FSDP modules.
+`fully_shard_context` associates newly sharded modules with the context and finalizes
+its roots and prefetch orders on exit. Runtime options live in an immutable `RuntimePolicy`:
 
 ```python
 context = FsdpContext(
@@ -281,12 +283,6 @@ with fully_shard_context(context):
     fully_shard(model, mesh=mesh, placements=placements)
 ```
 
-`device` and the construction-only `parameter_to_owner` map remain separate
-`FsdpContext` arguments. Runtime-policy booleans default to `False`, except
-`overlap_allgather_reduction`, which defaults to `True`. Gradient finalization is selected
-at execution time with `context.finalize_gradients(mode=...)`. Outside a scope, backward
-uses `GradientFinalizationMode.REDUCE_OUTER_AND_WAIT`.
-
 For delayed weight gradients, keep both backward and `backward_dw()` inside the scope,
 then wait before the optimizer step:
 
@@ -299,25 +295,10 @@ context.finish_grad_sync()
 optimizer.step()
 ```
 
-MCore's training loop selects `REDUCE_OUTER` around its schedule call. The schedule uses
-`SKIP_OUTER` within existing `no_sync()` scopes and waits in `finalize_model_grads()` after
-all backward work. Other callers select the mode explicitly with the same context manager.
-
-- Pass an `FsdpContext` to `fully_shard_context(context)` to share it with every
-  `FsdpModule` constructed in that scope. On exit, the scope finalizes the FSDP roots
-  and static forward and backward prefetch orders.
-- Per-device all-gather and reduce-scatter streams. Module compute runs on PyTorch’s
-  current stream.
-- Scope the gradient synchronization mode with
-  `with context.finalize_gradients(mode=GradientFinalizationMode.SKIP_OUTER):` around forward
-  and backward. `SKIP_OUTER` skips outer reduction and the automatic wait during
-  accumulation; inner reduction and weight cleanup still run. On the last backward
-  before the optimizer step, `REDUCE_OUTER` launches outer reduction and leaves the
-  completion wait to the caller. `REDUCE_OUTER_AND_WAIT` also waits for all gradient
-  reductions at autograd completion. The scope restores the previous mode on exit
-  and does not itself launch reductions or wait. `finish_grad_sync()` only waits
-  for submitted reductions; it does not launch skipped outer reductions.
-- An optional PyTorch NCCL symmetric-memory pool for communication staging buffers.
+The MCore adapter starts in `REDUCE_OUTER` mode. Its `no_sync()` scopes temporarily
+select `SKIP_OUTER` for accumulation, and `finalize_model_grads()` waits after all
+backward work. Scopes restore the previous mode; `finish_grad_sync()` waits for
+submitted reductions without launching skipped ones.
 
 ### FsdpModule
 
