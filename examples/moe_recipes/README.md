@@ -2,7 +2,7 @@
 
 This directory contains self-contained MoE training recipes. Each YAML file includes:
 
-- `DEPENDENCIES`: PyTorch base image and Dockerfile content used for the recipe.
+- `DEPENDENCIES`: Base image and Dockerfile or qualified runtime artifact requirements.
 - `ENV_VARS`: Environment variables expected by the runtime.
 - `ARGS`: Megatron-LM training arguments.
 
@@ -185,6 +185,31 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>4/512/4096</td>
       <td>MXFP8; paged stash; full CG</td>
       <td>646.8</td>
+    </tr>
+    <tr>
+      <td rowspan="3"><a href="glm5_3_flash/README.md">GLM-5.3-Flash</a></td>
+      <td><a href="glm5_3_flash/gb300/fp8_SL4K_64GPU_TP1PP2EP32.yaml">GB300 FP8 4K</a></td>
+      <td>64</td>
+      <td>1/2/32/1/1</td>
+      <td>1/2560/4096</td>
+      <td>KDA + DSA hybrid; KPool cuDNN selection; mHC; TE attention CG; HybridEP; selective mHC recompute</td>
+      <td>315.3 frozen indexer, 310.7 trained (<a href="glm5_3_flash/README.md#validation-scope">validation</a>)</td>
+    </tr>
+    <tr>
+      <td><a href="glm5_3_flash/gb300/fp8_SL128K_64GPU_TP1PP2EP32CP8.yaml">GB300 FP8 128K</a></td>
+      <td>64</td>
+      <td>1/2/32/8/1</td>
+      <td>1/64/131072</td>
+      <td>KDA + DSA hybrid; KPool cuDNN selection; mHC; HybridEP; selective recompute; Long Context</td>
+      <td>344.5 frozen indexer, 339.9 trained (<a href="glm5_3_flash/README.md#validation-scope">validation</a>)</td>
+    </tr>
+    <tr>
+      <td><a href="glm5_3_flash/gb300/fp8_SL1M_64GPU_TP1PP1EP32CP64.yaml">GB300 FP8 1M</a></td>
+      <td>64</td>
+      <td>1/1/32/64/1</td>
+      <td>1/16/1048576</td>
+      <td>KDA + DSA hybrid; KPool cuDNN selection with DeepSelect; mHC; HybridEP; selective recompute; linear CE; optimizer-state offload; Long Context</td>
+      <td>354.8 frozen indexer, 348.5 trained (<a href="glm5_3_flash/README.md#validation-scope">validation</a>)</td>
     </tr>
   </tbody>
 </table>

@@ -1,0 +1,217 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+DEPENDENCIES:
+  pytorch_base_image: nvcr.io/nvidia/pytorch:26.04-py3
+  container_image: >-
+    gitlab-master.nvidia.com:5005/arch_moe_exploration/agentic-mcore-dev/dsv4-gb200-torch2604-nvrx060-tepr2831@sha256:e598e2a568fbf34e4471bb8e84c9f260e3698982eb3b06bd87bfee877e9b2455
+  hardware:
+    gpu: GB300
+    cpu_arch: aarch64
+    num_gpus: 64
+    num_nodes: 16
+    gpus_per_node: 4
+    nvl_domains: 1
+  runtime_artifacts:
+    # Internal qualified artifacts: obtain and verify them as described in ../README.md.
+    # The base image alone does not supply this runtime stack.
+    dependency_stack:
+      # GLM53_FLASH_DEPENDENCIES: env/ (entry point) and site/ of deps-fe131-dsl46.
+      name: deps-fe131-dsl46
+      manifest_sha256: cfab368e02095de972c50f2834c642aea78d999f96a75893a59f68f0db56ad84
+      cudnn_frontend_version: 1.31.0
+      cudnn_payload_sha256: be284950746367cb85ebe0cdfe56fc0898cc7bdad6263ea6088a3b99fe5ab077
+      cutlass_dsl_version: 4.6.2
+    deepselect:
+      # GLM53_FLASH_DEEPSELECT: site/ds_tune (dsa_indexer_topk_backend: deepselect).
+      repo: https://github.com/deepseek-ai/DeepSelect.git
+      commit: bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18
+      package: ds_tune 0.1.0+bfa4507.p3
+      manifest_sha256: 63f253bcfc5f511e09c706ce1ab5fe440039e56f01e2301f04e41962a14de918
+      extension_path: site/ds_tune/ds_tune_cuda.cpython-312-aarch64-linux-gnu.so
+      extension_sha256: d393ce337024901a1d0599f7c532acb29207b1d1d877592dcc8cdba837ef7033
+    flash_linear_attention:
+      # GLM53_FLASH_FLA: python/ holds the pure-Python fla-core 0.5.1 wheel's package (KDA kernels).
+      package: fla-core 0.5.1
+      source: https://pypi.org/project/fla-core/0.5.1/
+      manifest_sha256: e4284e126fae00d828956159094b7eb721468fcff30ff723f5354ac4ba254a00
+ENV_VARS:
+  CUDA_DEVICE_MAX_CONNECTIONS: '1'
+  FLA_TILELANG: '0'
+  NCCL_GRAPH_REGISTER: '0'
+  NCCL_NVLS_ENABLE: '0'
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: '1'
+  NVTE_FUSED_ATTN: '1'
+  NVTE_NORM_BWD_USE_CUDNN: '1'
+  NVTE_NORM_FWD_USE_CUDNN: '1'
+  CUDNN_PATH: /usr/lib/aarch64-linux-gnu
+  PYTORCH_CUDA_ALLOC_CONF: expandable_segments:True
+  TRITON_CACHE_AUTOTUNING: '1'
+  PYTHONDONTWRITEBYTECODE: '1'
+  PYTHONPATH: >-
+    ${GLM53_FLASH_FLA}/python:${GLM53_FLASH_DEPENDENCIES}/env:${GLM53_FLASH_DEEPSELECT}/site:${MEGATRON_ROOT}
+  WANDB_MODE: disabled
+ARGS:
+  tokenizer_type: "NullTokenizer"
+  vocab_size: 154880
+  make_vocab_size_divisible_by: 128
+  num_layers: 90
+  hybrid_layer_pattern: "K-K-K-DEKEKEKEDEKEKEKEDEKEKEKEDEKEKEKEDEKEKEKEDE|KEKEKEDEKEKEKEDEKEKEKEDEKEKEKEDEKEKEKEDEKE/DE"
+  spec: ["megatron.core.models.hybrid.hybrid_layer_specs", "hybrid_glm53_stack_spec"]
+  hidden_size: 4096
+  ffn_hidden_size: 12288
+  num_attention_heads: 64
+  kv_channels: 256
+  max_position_embeddings: 1048576
+  normalization: "RMSNorm"
+  norm_epsilon: "1e-05"
+  rmsnorm_cast_before_weight: true
+  swiglu: true
+  activation_func_clamp_value: "10.0"
+  disable_bias_linear: true
+  untie_embeddings_and_output_weights: true
+  position_embedding_type: "none"
+  multi_latent_attention: true
+  q_lora_rank: 1536
+  kv_lora_rank: 512
+  qk_head_dim: 256
+  qk_pos_emb_head_dim: 0
+  v_head_dim: 256
+  qk_layernorm: true
+  experimental_attention_variant: "dsa"
+  linear_conv_kernel_dim: 4
+  linear_key_head_dim: 128
+  linear_value_head_dim: 128
+  linear_num_key_heads: 64
+  linear_num_value_heads: 64
+  kda_two_stage_gates: true
+  kda_disable_fp8: true
+  kda_conv_in_fp32: true
+  kda_core_in_fp32: true
+  kda_safe_gate: true
+  kda_lower_bound: "-5.0"
+  kda_beta_sigmoid_in_projection_dtype: true
+  transformer_impl: "transformer_engine"
+  attention_backend: "fused"
+  dsa_kernel_backend: "cudnn"
+  dsa_indexer_n_heads: 32
+  dsa_indexer_head_dim: 128
+  dsa_indexer_topk: 2048
+  dsa_indexer_topk_freq: 1
+  dsa_indexer_kpool: 4
+  dsa_indexer_kpool_key_dtype_compression: true
+  dsa_indexer_hf_scoring: true
+  no_dsa_indexer_qk_proj_use_quantization: true
+  no_mla_proj_use_quantization: true
+  no_dsa_indexer_rotate_activation: true
+  dsa_indexer_k_norm_epsilon: "1e-06"
+  no_dsa_indexer_weights_proj_use_quantization: true
+  dsa_indexer_weights_proj_output_dtype: "bf16"
+  dsa_indexer_loss_coeff: "0.0"
+  dsa_indexer_use_sparse_loss: false
+  # KPool selection: cuDNN indexer kernel at ratio 4 over the pooled keys, DeepSelect top-k
+  # where a call is wide enough (1M; narrower calls keep the cuDNN top-k).
+  dsa_indexer_kpool_scorer_backend: "cudnn"
+  dsa_indexer_topk_backend: "deepselect"
+  enable_hyper_connections: true
+  num_residual_streams: 4
+  mhc_sinkhorn_iterations: 20
+  mhc_init_gating_factor: "1.0"
+  mhc_norm_eps_inside_sqrt: true
+  mhc_normalize_before_projection: true
+  mhc_keep_pre_in_fp32: true
+  mhc_preserve_activation_dtype_rounding: true
+  no_mhc_learned_output_contract: true
+  num_experts: 288
+  moe_ffn_hidden_size: 2048
+  moe_shared_expert_intermediate_size: 2048
+  moe_router_load_balancing_type: "seq_aux_loss"
+  moe_router_topk: 8
+  moe_router_num_groups: 1
+  moe_router_group_topk: 1
+  moe_router_topk_scaling_factor: "2.5"
+  moe_router_score_function: "sigmoid"
+  moe_router_dtype: "fp32"
+  moe_router_enable_expert_bias: true
+  moe_router_bias_update_rate: "0.001"
+  moe_aux_loss_coeff: "0.001"
+  moe_grouped_gemm: true
+  mtp_num_layers: 1
+  mtp_loss_scaling_factor: "0.1"
+  no_mtp_enable_hyper_connections: true
+  attention_dropout: "0.0"
+  hidden_dropout: "0.0"
+  mock_data: true
+  seq_length: 4096
+  moe_router_force_load_balancing: true
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 2
+  expert_model_parallel_size: 32
+  context_parallel_size: 1
+  expert_tensor_parallel_size: 1
+  use_distributed_optimizer: true
+  sequence_parallel: true
+  overlap_grad_reduce: true
+  overlap_param_gather: true
+  moe_token_dispatcher_type: "flex"
+  moe_flex_dispatcher_backend: "hybridep"
+  moe_permute_fusion: true
+  moe_router_fusion: true
+  use_mcore_models: true
+  use_flash_attn: true
+  micro_batch_size: 1
+  global_batch_size: 2560
+  train_samples: 51200
+  no_create_attention_mask_in_dataloader: true
+  cross_entropy_loss_fusion: true
+  cross_entropy_fusion_impl: "native"
+  manual_gc: true
+  manual_gc_interval: 5
+  seed: 1234
+  lr: "0.00012"
+  min_lr: "1.2e-05"
+  lr_decay_style: "cosine"
+  lr_decay_samples: 255126953
+  lr_warmup_samples: 162761
+  weight_decay: "0.1"
+  clip_grad: "1.0"
+  adam_beta1: "0.9"
+  adam_beta2: "0.95"
+  init_method_std: "0.02"
+  eval_iters: 0
+  eval_interval: 500
+  ckpt_format: "torch_dist"
+  dist_ckpt_strictness: "raise_all"
+  log_throughput: true
+  log_interval: 1
+  log_num_zeros_in_grad: true
+  log_params_norm: true
+  enable_experimental: true
+  distributed_timeout_minutes: 30
+  bf16: true
+  fp8_recipe: "blockwise"
+  fp8_format: "e4m3"
+  fp8_param_gather: true
+  use_precision_aware_optimizer: true
+  main_grads_dtype: "fp32"
+  main_params_dtype: "fp32"
+  exp_avg_dtype: "bf16"
+  exp_avg_sq_dtype: "bf16"
+  cuda_graph_impl: "transformer_engine"
+  cuda_graph_modules: "attn"
+  cuda_graph_warmup_steps: 3
+  te_rng_tracker: true
+  moe_permute_fusion_into_hybridep: true
+  moe_flex_dispatcher_num_sms: 32
+  logging_level: 20
+  recompute_granularity: "selective"
+  recompute_modules: "mhc"
+  mhc_recompute_attn_cuda_graph_split: true
+  log_memory_interval: 5
+  log_device_memory_used: true
+VARIANTS:
+  # run.py --variant trainable_indexer: a positive indexer loss coefficient with the sparse
+  # pool-level loss trains the KPool indexer (its projections, gate and pool position embedding);
+  # with cuDNN frontend 1.31 and the cuDNN KPool scorer the loss runs on cuDNN frontend kernels.
+  trainable_indexer:
+    dsa_indexer_loss_coeff: "1e-2"
+    dsa_indexer_use_sparse_loss: true
