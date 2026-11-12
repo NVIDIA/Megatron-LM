@@ -781,6 +781,25 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     f"mamba_memory_ratio {mamba_memory_ratio} leaves no request capacity after "
                     f"reserving {reserved_mamba_slots} recurrent-state dummy slot(s)"
                 )
+            # An explicit max_requests is used verbatim to size the recurrent-state tensors,
+            # so a request count beyond this capacity would allocate more than the ratio's share.
+            if (
+                inference_config.max_requests is not None
+                and inference_config.max_requests > mamba_max_requests
+            ):
+                reserved_slot_note = (
+                    f" after reserving {reserved_mamba_slots} recurrent-state dummy slot(s)"
+                    if reserved_mamba_slots
+                    else ""
+                )
+                raise ValueError(
+                    f"max_requests {inference_config.max_requests} does not fit in "
+                    f"mamba_memory_ratio {mamba_memory_ratio}: that share of the memory buffer "
+                    f"holds the recurrent states of {mamba_max_requests} request(s) at "
+                    f"{mamba_states_memory_per_request} bytes each{reserved_slot_note}. "
+                    "Raise mamba_memory_ratio or buffer_size_gb, lower max_requests, or leave "
+                    "mamba_memory_ratio unset to size the recurrent states from max_requests."
+                )
 
             # Reduce buffer sizes for KV cache
             buffer_size_bytes = int(buffer_size_bytes * (1.0 - mamba_memory_ratio))
