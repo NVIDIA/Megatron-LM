@@ -204,10 +204,6 @@ def _read_item_fields(item):
     )
 
 
-@pytest.mark.skipif(
-    not is_torch_min_version("2.6a0"),
-    reason="CheckpointableShardedTensor requires PyTorch 2.6 or later",
-)
 class TestPrependedAxisLoadPlan:
     """MCoreLoadPlanner must plan the same reads as the default DCP load plan."""
 
@@ -217,7 +213,7 @@ class TestPrependedAxisLoadPlan:
         local_experts = num_experts // ep_size
         return [
             ShardedTensor.from_rank_offsets(
-                "experts.fc1",
+                'experts.fc1',
                 torch.empty(8 // tp_size, 6),
                 (0, layer, num_layers),
                 (1, expert, num_experts),
@@ -235,7 +231,7 @@ class TestPrependedAxisLoadPlan:
         bounds = list(offsets) + [20]
         return [
             ShardedTensor(
-                "bucket",
+                'bucket',
                 torch.empty(end - start),
                 torch.float32,
                 (end - start,),
@@ -272,9 +268,9 @@ class TestPrependedAxisLoadPlan:
         ]
         metadata = Metadata(
             state_dict_metadata={
-                "experts.fc1": self.tensor_metadata(saved_experts),
-                "bucket": self.tensor_metadata(self.flat_shards([0, 5, 12])),
-                "obj": BytesStorageMetadata(),
+                'experts.fc1': self.tensor_metadata(saved_experts),
+                'bucket': self.tensor_metadata(self.flat_shards([0, 5, 12])),
+                'obj': BytesStorageMetadata(),
             }
         )
 
@@ -282,11 +278,11 @@ class TestPrependedAxisLoadPlan:
         for ep_rank in range(load_ep):
             for tp_rank in range(load_tp):
                 state_dict = {
-                    "experts.fc1": self.local_shards(
+                    'experts.fc1': self.local_shards(
                         self.expert_shards(load_ep, ep_rank, load_tp, tp_rank)
                     ),
-                    "bucket": self.local_shards(self.flat_shards([0, 3, 9])[1:]),
-                    "obj": io.BytesIO(),
+                    'bucket': self.local_shards(self.flat_shards([0, 3, 9])[1:]),
+                    'obj': io.BytesIO(),
                 }
                 planner = MCoreLoadPlanner(flatten_state_dict=False, flatten_sharded_tensors=False)
                 planner.set_up_planner(state_dict, metadata)
