@@ -745,3 +745,26 @@ def test_dynamic_cp_rejects_unsupported_config(overrides, message):
             sequence_packing_scheduler="default_dynamic_cp",
             **overrides,
         )
+
+
+@pytest.mark.parametrize(
+    "load_balancing_type, error",
+    [
+        ("global_aux_loss", None),
+        (["aux_loss", "global_aux_loss"], None),
+        ("aux_loss", "requires the global_aux_loss load balancing"),
+    ],
+)
+def test_moe_router_defer_global_aux_loss_requires_global_aux_loss(load_balancing_type, error):
+    with pytest.raises(ValueError, match=error) if error else nullcontext():
+        TransformerConfig(
+            num_layers=2,
+            hidden_size=16,
+            num_attention_heads=4,
+            num_moe_experts=4,
+            moe_router_load_balancing_type=load_balancing_type,
+            moe_aux_loss_coeff=(
+                [1e-2] * len(load_balancing_type) if isinstance(load_balancing_type, list) else 1e-2
+            ),
+            moe_router_defer_global_aux_loss=True,
+        )

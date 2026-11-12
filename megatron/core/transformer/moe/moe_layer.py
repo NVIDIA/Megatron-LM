@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Optional, Protocol
 
@@ -819,7 +820,7 @@ class MoELayer(BaseMoELayer):
             return output, None
 
         # MoE forward: route -> dispatch -> compute -> combine
-        def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+        def moe_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
             shared_expert_output = None
             try:
                 if "route" in self.fwd_execution_map:
@@ -866,6 +867,8 @@ class MoELayer(BaseMoELayer):
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
                 output = self.combine(output)
+                if self.config.moe_router_defer_global_aux_loss:
+                    output = self.router.finish_deferred_global_aux_loss(output)
 
                 if intermediate_tensors is not None:
                     return output, mlp_bias
@@ -880,6 +883,19 @@ class MoELayer(BaseMoELayer):
                     return output
 
             return output, mlp_bias
+
+        def custom_forward(hidden_states, intermediate_tensors=None, padding_mask=None):
+            # moe_router_defer_global_aux_loss: the router may defer its global aux loss only
+            # when this call runs route through combine, which finishes the deferred loss.
+            with (
+                self.router.defer_global_aux_loss()
+                if self.config.moe_router_defer_global_aux_loss
+                and intermediate_tensors is None
+                and "route" in self.fwd_execution_map
+                and "expert_compute" in self.fwd_execution_map
+                else nullcontext()
+            ):
+                return moe_forward(hidden_states, intermediate_tensors, padding_mask)
 
         if self.config.moe_training_matches_inference and not InferenceMode.is_active():
             return training_matches_inference_forward(
