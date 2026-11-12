@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextlib import nullcontext
+from dataclasses import dataclass, field
 
 import pytest
 import torch
@@ -309,6 +310,49 @@ def test_from_config_creates_independent_target_config_without_reinitializing():
 
     layer_config.dynamic_value["items"].append("changed")
     assert config.dynamic_value == {"items": []}
+
+
+def test_from_config_initializes_subclass_defaults_and_preserves_existing_values():
+    @dataclass
+    class LayerConfig(TransformerConfig):
+        scale: float = 1.5
+        annotations: list = field(default_factory=list)
+        values: list = field(default_factory=list)
+
+        def __post_init__(self):
+            raise AssertionError("from_config must not reinitialize the target config")
+
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    config.values = [3]
+    config.values_alias = config.values
+
+    first = LayerConfig.from_config(config)
+    second = LayerConfig.from_config(config)
+
+    assert first.scale == 1.5
+    assert first.annotations == []
+    assert first.annotations is not second.annotations
+    assert first.values == [3]
+    assert first.values is first.values_alias
+    assert first.values is not config.values
+    assert first.ffn_hidden_size == config.ffn_hidden_size
+
+    first.values = [4]
+    copied = LayerConfig.from_config(first)
+    assert copied.values == [4]
+    assert copied.values is not first.values
+    assert copied.values_alias == [3]
+
+
+def test_from_config_rejects_missing_required_subclass_fields():
+    @dataclass(kw_only=True)
+    class LayerConfig(TransformerConfig):
+        required_value: int
+
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+
+    with pytest.raises(TypeError, match="requires a value for 'required_value'"):
+        LayerConfig.from_config(config)
 
 
 def _make_softcap_config(attn_logit_softcapping) -> TransformerConfig:
