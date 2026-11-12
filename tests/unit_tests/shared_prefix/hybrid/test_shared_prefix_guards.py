@@ -235,6 +235,7 @@ _REJECTED_CONFIGS = [
     ({"wide_residual": object()}, NotImplementedError, "wide residual streams"),
     ({"enable_mhc_connections": True}, NotImplementedError, "mHC connections"),
     ({"attn_logit_softcapping": 30.0}, NotImplementedError, "logit softcapping"),
+    ({"dynamic_context_parallel": True}, NotImplementedError, "dynamic context parallelism"),
     (
         {"batch_invariant_mode": True, "flash_attention_version": 3},
         NotImplementedError,
@@ -286,6 +287,15 @@ _REJECTED_MOE_CONFIGS = [
 def test_unsupported_stack_config_rejected(overrides, error, message):
     stack = _stack(_config(**overrides))
     with pytest.raises(error, match=message):
+        _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
+
+
+def test_custom_hybrid_layers_rejected():
+    """A custom layer is called through its own adapter, which the shared forward does not use."""
+    config = _config()
+    stack = _stack(config, [_attention_layer(config)])
+    stack._has_custom_layers = True
+    with pytest.raises(NotImplementedError, match="custom hybrid layers"):
         _validate_hybrid_stack(stack, _LAYOUT, physical_len=_PHYSICAL_LEN[1])
 
 
@@ -516,9 +526,9 @@ def test_layer_calls_carry_their_shared_prefix_arguments(forest):
     received = {}
     for name, layer in layers.items():
 
-        def forward(*, name=name, **kwargs):
+        def forward(hidden_states, *, name=name, **kwargs):
             received[name] = kwargs
-            return kwargs["hidden_states"]
+            return hidden_states
 
         layer.side_effect = forward
     rotary_pos_emb = torch.zeros(1)
@@ -531,8 +541,8 @@ def test_layer_calls_carry_their_shared_prefix_arguments(forest):
         validated_physical_len=12,
     )
 
-    attention_args = {"hidden_states", "attention_mask", "rotary_pos_emb", "shared_prefix_forest"}
-    moe_args = {"hidden_states", "attention_mask", "shared_prefix_token_multiplicities"}
+    attention_args = {"attention_mask", "rotary_pos_emb", "shared_prefix_forest"}
+    moe_args = {"attention_mask", "shared_prefix_token_multiplicities"}
     assert set(received["attention"]) == attention_args
     assert set(received["moe"]) == moe_args
     assert set(received["both"]) == attention_args | moe_args
@@ -564,9 +574,9 @@ def test_full_recompute_replays_each_layer_call_with_its_arguments(monkeypatch):
     calls = {name: [] for name in layers}
     for name, layer in layers.items():
 
-        def forward(*, name=name, **kwargs):
+        def forward(hidden_states, *, name=name, **kwargs):
             calls[name].append(kwargs)
-            return 2 * kwargs["hidden_states"]
+            return 2 * hidden_states
 
         layer.side_effect = forward
     # Megatron's checkpoint needs the CUDA RNG tracker; torch's replays the callable the same way.

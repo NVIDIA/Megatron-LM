@@ -156,7 +156,8 @@ validates a request once, before the embedding, from the configuration, process
 groups, layer types and global physical length.
 
 Unsupported combinations fail explicitly, including `hybrid_layer_config_list`
-(use `hybrid_layer_pattern`), hash routing, quantization recipes, fp8/fp4, wide
+(use `hybrid_layer_pattern`), custom hybrid layers, dynamic context parallelism,
+hash routing, quantization recipes, fp8/fp4, wide
 residual streams, mHC, multi-latent attention, attention-logit softcapping,
 QK-clip statistics, selective core-attention recomputation, sliding-window
 attention, external attention/padding masks, inference contexts, fine-grained

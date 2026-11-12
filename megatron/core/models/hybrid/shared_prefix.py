@@ -178,6 +178,15 @@ def _validate_hybrid_stack(
         raise NotImplementedError("shared-prefix Hybrid does not yet support mHC connections")
     if getattr(stack.config, "attn_logit_softcapping", None) is not None:
         raise NotImplementedError("shared-prefix attention does not yet support logit softcapping")
+    # The shared forward runs on the build-time CP group and takes no packed_seq_params, so it
+    # cannot follow the group a dynamic-CP scheduler picks for a microbatch.
+    if getattr(stack.config, "dynamic_context_parallel", False):
+        raise NotImplementedError(
+            "shared-prefix Hybrid does not yet support dynamic context parallelism"
+        )
+    # A custom layer is called through its own adapter with inputs the shared forward lacks.
+    if getattr(stack, "_has_custom_layers", False):
+        raise NotImplementedError("shared-prefix Hybrid does not yet support custom hybrid layers")
     # Batch-invariant mode promises bitwise training/inference agreement. Shared-prefix attention
     # runs FlashAttention 2 passes although this mode pins version 3 or 4, and shared-prefix Mamba
     # applies its gate to the rounded scan output instead of inside the scan.

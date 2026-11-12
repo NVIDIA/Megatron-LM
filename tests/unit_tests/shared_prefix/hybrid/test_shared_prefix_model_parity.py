@@ -131,9 +131,9 @@ class TestSharedPrefixMoELayerExactness:
     def test_moe_layer_matches_dense_rows(self):
         from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
         from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
+        from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
         from megatron.core.transformer import TransformerConfig
         from megatron.core.transformer.moe.moe_utils import router_gating_token_blocks
-        from megatron.core.transformer.torch_norm import WrappedTorchNorm
         from megatron.core.transformer.transformer_layer import (
             MoETransformerLayer,
             TransformerLayerSubmodules,
