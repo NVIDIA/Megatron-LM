@@ -1,7 +1,8 @@
 """Prefill-decode interference: aggregated vs disaggregated (PD) serving, narrow vs wide EP.
 
 Reads the steady-state client's raw output of each run (steady.jsonl windows, steady.requests.jsonl
-per-request times, config.env GPU counts) and writes, for runs labeled {narrow,wide}_{agg,pd}:
+per-request times, config.env GPU counts) and writes, for runs labeled {narrow,wide}_{agg,pd} (plus
+{narrow,wide}_agg_nopc, an aggregated control without prefix caching):
 
   pareto.png    total (input + output) tok/s/GPU vs p90 interactivity (tok/s/user of the slowest
                 10% of requests: 1000 / p90 of end-to-end latency per output token)
@@ -38,9 +39,14 @@ import matplotlib.pyplot as plt  # noqa: E402
 BLUE, ORANGE, AQUA, YELLOW = "#2a78d6", "#eb6834", "#1baf7a", "#eda100"
 TEXT, MUTED, GRID = "#0b0b0b", "#52514e", "#e4e3df"
 WIDTH_COLOR = {"wide": BLUE, "narrow": ORANGE}
-MODE_STYLE = {"agg": ("o", "-", "aggregated"), "pd": ("s", "--", "disaggregated (PD)")}
+MODE_STYLE = {
+    "agg": ("o", "-", "aggregated"),
+    "agg_nopc": ("D", ":", "aggregated, no prefix caching"),
+    "pd": ("s", "--", "disaggregated (PD)"),
+}
 WIDTH_NAME = {"wide": "Wide EP (EP64)", "narrow": "Narrow EP (EP8)"}
-STEP_CLASSES = [  # stacking order, bottom to top
+STEP_CLASSES = [  # stacking order, bottom to top; main has no per-step EP split, so plain "decode"
+    ("decode", "decode", BLUE),
     ("decode_clean", "decode, no prefill in EP group", BLUE),
     ("decode_interfered", "decode, another EP rank prefills", ORANGE),
     ("mixed", "prefill + decode in batch", AQUA),
@@ -108,7 +114,7 @@ def summarize(label, run_dir, prefill_gpus_per_64):
         wall = sum(d["wall_ms"] for d in mix.get(scope, {}).values()) or float("nan")
         steps = sum(d["steps"] for d in mix.get(scope, {}).values()) or float("nan")
         row = {
-            "run": label, "dir": run_dir, "concurrency": c, "concurrency_per_64": c * 64 // gpus, "requests_per_gpu": c / gpus,
+            "run": label, "dataset": cfg.get("STEADY_DATASET", "math"), "dir": run_dir, "concurrency": c, "concurrency_per_64": c * 64 // gpus, "requests_per_gpu": c / gpus,
             "decode_gpus": gpus, "prefill_gpus": prefill_gpus, "charged_gpus": charged,
             "as_run_gpus": gpus + prefill_gpus, "window_s": span, "requests": len(done),
             "cold_start_requests_excluded": len(finished) - len(done),
@@ -135,6 +141,13 @@ def summarize(label, run_dir, prefill_gpus_per_64):
     return rows
 
 
+def marker_colors(color, mode):
+    """Filled markers with a surface ring; the control is hollow so its twin shows through."""
+    if mode == "agg_nopc":
+        return {"markerfacecolor": "white", "markeredgecolor": color, "markeredgewidth": 1.5}
+    return {"markeredgecolor": "white", "markeredgewidth": 1.5}
+
+
 def style_axes(ax):
     ax.grid(True, color=GRID, linewidth=0.8)
     ax.set_axisbelow(True)
@@ -148,22 +161,25 @@ def style_axes(ax):
 def plot_pareto(rows_by_run, path):
     fig, ax = plt.subplots(figsize=(7.5, 5))
     for label, rows in rows_by_run.items():
-        width, mode = label.split("_")
+        width, _, mode = label.partition("_")
         marker, line, mode_name = MODE_STYLE[mode]
         xs = [r["user_tok_s_p90"] for r in rows]
         ys = [r["total_tok_s_per_gpu"] for r in rows]
         ax.plot(xs, ys, line, color=WIDTH_COLOR[width], marker=marker, markersize=8, linewidth=2,
-                markeredgecolor="white", markeredgewidth=1.5,
+                **marker_colors(WIDTH_COLOR[width], mode),
                 label=f"{WIDTH_NAME[width]}, {mode_name}")
         # Aggregated labels above-right, PD below-left, so paired points don't collide.
         offset, ha = ((6, 4), "left") if mode == "agg" else ((-6, -12), "right")
         for r, x, y in zip(rows, xs, ys):
+            if mode == "agg_nopc":
+                continue  # sits on its aggregated twin; its levels match
             ax.annotate(f"{r['requests_per_gpu']:g}/GPU", (x, y), textcoords="offset points",
                         xytext=offset, ha=ha, fontsize=8, color=MUTED)
     style_axes(ax)
     ax.set_xlabel("p90 interactivity (tok/s/user, slowest 10% of requests)", color=TEXT)
     ax.set_ylabel("Throughput, input + output (tok/s/GPU)", color=TEXT)
-    ax.set_title("Super v3 on math: aggregated vs disaggregated, narrow vs wide EP\n"
+    dataset = next(iter(rows_by_run.values()))[0]["dataset"]
+    ax.set_title(f"Super v3 on {dataset}: aggregated vs disaggregated, narrow vs wide EP\n"
                  "labels: concurrent requests per decode GPU", fontsize=10, color=TEXT)
     ax.legend(frameon=False, fontsize=9)
     fig.tight_layout()
@@ -175,11 +191,13 @@ def plot_step_mix(rows_by_run, path):
     """One panel per run (shared y): stacked share of engine time by step class per level."""
     fig, axes = plt.subplots(1, len(rows_by_run), figsize=(3 * len(rows_by_run), 4.2), sharey=True)
     axes = list(axes) if len(rows_by_run) > 1 else [axes]
+    present = [sc for sc in STEP_CLASSES
+               if any(r[f"{sc[0]}_step_share"] > 0 for rows in rows_by_run.values() for r in rows)]
     for ax, (label, rows) in zip(axes, rows_by_run.items()):
-        width, mode = label.split("_")
+        width, _, mode = label.partition("_")
         xs = range(len(rows))
         bottom = [0.0] * len(rows)
-        for step_class, name, color in STEP_CLASSES:
+        for step_class, name, color in present:
             values = [100 * r[f"{step_class}_time_share"] for r in rows]
             values = [0.0 if v != v else v for v in values]  # NaN -> 0
             ax.bar(xs, values, bottom=bottom, color=color, width=0.7, edgecolor="white",
@@ -192,7 +210,7 @@ def plot_step_mix(rows_by_run, path):
     axes[0].set_ylabel("Share of engine time (%)", color=TEXT)
     axes[0].set_ylim(0, 100)
     handles, names = axes[0].get_legend_handles_labels()
-    fig.legend(handles, names, frameon=False, fontsize=8, ncol=4, loc="lower center")
+    fig.legend(handles, names, frameon=False, fontsize=8, ncol=len(present), loc="lower center")
     fig.suptitle("Engine time by step class (PD runs: decode pool)", fontsize=10, color=TEXT)
     fig.tight_layout(rect=(0, 0.07, 1, 1))
     fig.savefig(path, dpi=160)
@@ -204,11 +222,11 @@ def plot_latency(rows_by_run, path):
     for ax, key, title in ((axes[0], "ttft_ms_p90", "p90 time to first token (ms)"),
                            (axes[1], "decode_tpot_ms_p90", "p90 time per output token after the first (ms)")):
         for label, rows in rows_by_run.items():
-            width, mode = label.split("_")
+            width, _, mode = label.partition("_")
             marker, line, mode_name = MODE_STYLE[mode]
             ax.plot([r["requests_per_gpu"] for r in rows], [r[key] for r in rows], line,
                     color=WIDTH_COLOR[width], marker=marker, markersize=8, linewidth=2,
-                    markeredgecolor="white", markeredgewidth=1.5,
+                    **marker_colors(WIDTH_COLOR[width], mode),
                     label=f"{WIDTH_NAME[width]}, {mode_name}")
         style_axes(ax)
         ax.set_xscale("log", base=2)
@@ -224,7 +242,7 @@ def plot_latency(rows_by_run, path):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", action="append", required=True,
-                    help="{narrow,wide}_{agg,pd}=<experiment dir>; repeat per run")
+                    help="{narrow,wide}_{agg,agg_nopc,pd}=<experiment dir>; repeat per run")
     ap.add_argument("--prefill-gpus-per-64", type=float, default=None,
                     help="prefill GPUs charged per 64 decode GPUs (default: the run's prefill pool)")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -248,7 +266,7 @@ def main():
     plot_step_mix(rows_by_run, os.path.join(args.out, "step_mix.png"))
     plot_latency(rows_by_run, os.path.join(args.out, "latency.png"))
     for r in rows:
-        print(f"{r['run']:11s} c={r['concurrency']:5d} ({r['requests_per_gpu']:g}/GPU)  "
+        print(f"{r['run']:16s} c={r['concurrency']:5d} ({r['requests_per_gpu']:g}/GPU)  "
               f"{r['total_tok_s_per_gpu']:8.1f} tok/s/GPU  p90 {r['user_tok_s_p90']:6.1f} tok/s/user  "
               f"TTFT p90 {r['ttft_ms_p90']:8.0f} ms  interfered {100 * r['decode_interfered_time_share']:5.1f}% "
               f"mixed {100 * r['mixed_time_share']:5.1f}%  ({r['requests']} requests)")
