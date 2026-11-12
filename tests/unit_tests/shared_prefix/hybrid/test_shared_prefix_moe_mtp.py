@@ -222,8 +222,8 @@ MTP_PATTERN = "M*EM*E/*E/*E"
 # A forest whose MTP count ratios (original / rolled loss-mask count) differ from 1, so every
 # loss grouping gives different weights. Each MTP roll drops the counted token that reaches a
 # branch start: the 1-token prompt loses one token per branch at depth 0 and two at depth 1, the
-# 2-token prompt one at depth 1, the 37-token prompt none. At CP2 the zigzag split also moves
-# rolled tokens between ranks, which changes the CP-local counts of every root.
+# 2-token prompt one at depth 1, the 37-token prompt none. The counts are summed over the CP
+# group, so the ratios do not depend on the CP size.
 MTP_GROUPED_FOREST = ((1, (13, 30, 22)), (2, (9, 41)), (37, (20, 45)))
 
 
@@ -241,9 +241,9 @@ def _expected_mtp_weights(problem, groups, depths, factor, cp_size, cp_rank) -> 
     """Expected ``normalized MTP loss / CE`` per depth on one CP rank's packed dense branches.
 
     ``process_mtp_loss`` derives the labels by rolling the loss mask once (the original count),
-    then rolls it once more per depth (the rolled count); both counts cover the tokens this CP rank
-    owns. A group's counted tokens get ``factor / depths * original / rolled``, with both counts
-    summed over the group's branches.
+    then rolls it once more per depth (the rolled count). Both counts are summed over the group's
+    branches and over the CP group, so a group has one ratio on every CP rank. A group's counted
+    tokens get ``factor / depths * original / rolled``.
     The pack is branch-major and holds each branch's CP-local zigzag share.
     """
 
@@ -252,18 +252,16 @@ def _expected_mtp_weights(problem, groups, depths, factor, cp_size, cp_rank) -> 
             return torch.arange(length)
         return SharedPrefixLayout.cp_local_indices(length, cp_size, cp_rank, "cpu")
 
-    # rolled[row][k]: this rank's share of the row's loss mask rolled k + 1 times.
+    # rolled[row][k]: the row's whole loss mask rolled k + 1 times.
     rolled = []
     for row in problem.rows:
         mask = torch.zeros(row.dense_len, dtype=torch.float64)
         mask[row.prefix_len : row.prefix_len + row.logical_len] = 1
-        local = owned(row.dense_len)
-        rolled.append(
-            [torch.cat([mask[k:], mask.new_zeros(k)])[local] for k in range(1, depths + 2)]
-        )
+        rolled.append([torch.cat([mask[k:], mask.new_zeros(k)]) for k in range(1, depths + 2)])
+    local = [owned(row.dense_len) for row in problem.rows]
     offsets = [0]
-    for masks in rolled:
-        offsets.append(offsets[-1] + masks[0].numel())
+    for indices in local:
+        offsets.append(offsets[-1] + indices.numel())
     weights = [torch.zeros(offsets[-1], dtype=torch.float64) for _ in range(depths)]
     for group in groups:
         original = sum(float(rolled[index][0].sum()) for index in group)
@@ -271,7 +269,11 @@ def _expected_mtp_weights(problem, groups, depths, factor, cp_size, cp_rank) -> 
             count = sum(float(rolled[index][depth + 1].sum()) for index in group)
             for index in group:
                 weights[depth][offsets[index] : offsets[index + 1]] = (
-                    rolled[index][depth + 1] * factor / depths * original / max(count, 1.0)
+                    rolled[index][depth + 1][local[index]]
+                    * factor
+                    / depths
+                    * original
+                    / max(count, 1.0)
                 )
     return weights
 
@@ -462,10 +464,11 @@ class TestSharedPrefixMTPParity:
         _check_grouped_mtp_normalization(monkeypatch, root_counts)
 
 
-# MTP loss normalization uses CP-local token counts, so grouped (shared) and per-row (dense)
-# normalization agree at CP>1 only when every row's local count ratio is 1. These lengths satisfy
-# that at CP2 with padding multiple 8, making a direct shared-vs-dense comparison valid. Non-unit
-# ratios are checked against the analytic grouped weights instead
+# MTP loss normalization uses one original/rolled token-count ratio per forward or loss group.
+# The dense run has one forward per row and the shared run one loss group per root, so the two
+# agree only when those ratios match. These prompts are longer than the MTP depth, so no roll
+# drops a counted token and every ratio is 1, making a direct shared-vs-dense comparison valid.
+# Non-unit ratios are checked against the analytic grouped weights instead
 # (test_grouped_mtp_normalization_*).
 MTP_CP2_STAR = ((64, (203, 260, 333, 190)),)
 MTP_CP2_FOREST = ((48, (150, 177)), (40, (131, 160)))
@@ -602,7 +605,7 @@ class TestSharedPrefixMTPDistributedParity:
     @pytest.mark.usefixtures("_mtp_scale")
     @pytest.mark.parametrize("root_counts", [(), (2, 1)], ids=["per-root", "explicit-2-1"])
     def test_grouped_mtp_normalization_tp2_sp_cp2(self, root_counts, monkeypatch):
-        """CP-local loss groups (``length // cp_size``) under zigzag ownership and SP."""
+        """CP-local loss groups (``length // cp_size``) with counts summed over the CP group."""
         if Utils.world_size < 4 or Utils.world_size % 4:
             pytest.skip("requires a world size divisible by 4")
         Utils.initialize_model_parallel(2, 1, context_parallel_size=2)
