@@ -7,6 +7,7 @@ from torch import Tensor
 
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.models.hybrid.layers import utils as layer_utils
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
 from megatron.core.transformer import TransformerConfig
@@ -239,6 +240,17 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
+        if layer_utils.get_custom_layer_type(getattr(self.inner_layer, "config", None)) is not None:
+            output = layer_utils.invoke_custom_layer(
+                self.inner_layer,
+                hidden_states,
+                attention_mask=attention_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                packed_seq_params=packed_seq_params,
+                padding_mask=padding_mask,
+                input_ids=input_ids,
+            )
+            return output, None
         from megatron.core.transformer.cuda_graphs import is_graph_capturing
 
         inner = self.inner_layer.forward if is_graph_capturing() else self.inner_layer
@@ -290,6 +302,8 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         own that operation directly.
         """
         if not isinstance(self.inner_layer, TransformerLayer):
+            return None
+        if layer_utils.get_custom_layer_type(self.inner_layer.config) is not None:
             return None
 
         layer = self.inner_layer

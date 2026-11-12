@@ -1002,7 +1002,7 @@ class TorchDistLoadShardedStrategy:
     def load_tensors_metadata(self, checkpoint_dir: Path, metadata: Metadata = None):
         """Uses tensors metadata stored in the metadata file."""
         if metadata is None:
-            fs_reader = _get_filesystem_reader(checkpoint_dir)
+            fs_reader = _get_filesystem_reader(checkpoint_dir, cache_metadata=self.cache_metadata)
             metadata = fs_reader.read_metadata()
 
         mcore_data = getattr(metadata, 'mcore_data', {})
@@ -1019,7 +1019,7 @@ class TorchDistLoadShardedStrategy:
 
     def load_sharded_metadata(self, checkpoint_dir: Path) -> ShardedStateDict:
         """Uses tensors and objects metadata stored in the metadata file."""
-        fs_reader = _get_filesystem_reader(checkpoint_dir)
+        fs_reader = _get_filesystem_reader(checkpoint_dir, cache_metadata=self.cache_metadata)
         metadata = fs_reader.read_metadata()
 
         sharded_metadata = {}
