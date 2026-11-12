@@ -346,6 +346,7 @@ class TestHybridStackMHC:
         hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
         input_ids = torch.arange(8, device="cuda").repeat(2, 1)
         seen_input_ids = []
+        seen_validation = []
         original = HyperConnectionHybridLayer._call_inner_transformer_layer_without_local_bda
 
         def record_input_ids(
@@ -359,8 +360,10 @@ class TestHybridStackMHC:
             padding_mask,
             input_ids=None,
             mhc_recompute_manager=None,
+            strict_runtime_validation=None,
         ):
             seen_input_ids.append(input_ids)
+            seen_validation.append(strict_runtime_validation)
             return original(
                 layer,
                 hidden_states,
@@ -372,6 +375,7 @@ class TestHybridStackMHC:
                 padding_mask,
                 input_ids,
                 mhc_recompute_manager,
+                strict_runtime_validation=strict_runtime_validation,
             )
 
         monkeypatch.setattr(
@@ -385,6 +389,7 @@ class TestHybridStackMHC:
 
         assert len(seen_input_ids) == 2
         assert all(captured is None for captured in seen_input_ids)
+        assert seen_validation == [True, True]
 
     @pytest.mark.parametrize("recompute_method", ["uniform", "block"])
     @pytest.mark.parametrize(
