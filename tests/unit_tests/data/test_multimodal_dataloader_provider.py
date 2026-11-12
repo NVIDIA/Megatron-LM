@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import sys
 from pathlib import Path
@@ -46,7 +46,6 @@ def test_new_dataloader_prefetch_factor(
     values = {
         "dataloader_seed": 0,
         "encoder_pipeline_model_parallel_size": 0,
-        "load": None,
         "num_workers": num_workers,
         "packing_buffer_size": 10000,
     }
@@ -56,6 +55,8 @@ def test_new_dataloader_prefetch_factor(
     loader_kwargs = {}
 
     monkeypatch.setattr(dataloader_provider, "get_args", lambda: args)
+    # The provider reads the checkpoint policy from the run config's checkpoint section.
+    monkeypatch.setattr(dataloader_provider, "get_run_config", lambda: _run_config(load=None))
     monkeypatch.setattr(dataloader_provider, "is_dataloader_rank", lambda _, **kwargs: True)
     monkeypatch.setattr(dataloader_provider.parallel_state, "get_data_parallel_rank", lambda: 0)
     monkeypatch.setattr(
@@ -105,22 +106,33 @@ def test_new_dataloader_rejects_non_positive_prefetch_factor(monkeypatch):
         )
 
 
+def _run_config(load, pretrained_checkpoint=None):
+    """The run config the provider reads its checkpoint policy from."""
+    return SimpleNamespace(
+        checkpoint=SimpleNamespace(load=load, pretrained_checkpoint=pretrained_checkpoint)
+    )
+
+
 @pytest.fixture
 def strict_resume_provider(monkeypatch):
     args = SimpleNamespace(
-        load="/checkpoints/model",
         dataloader_save="/checkpoints/dataloader",
         strict_dataloader_state_load=True,
         num_workers=0,
         dataloader_seed=0,
         packing_buffer_size=10000,
     )
-    train_state = SimpleNamespace(iteration=100)
+    # The resume facts come from the train state (the primary load's classification included)
+    # and the checkpoint section, not from args.
+    train_state = SimpleNamespace(iteration=100, effective_finetune=False)
     loader = MagicMock()
     loader.__len__.return_value = 42
     checkpoint_name = Mock(return_value="/checkpoints/dataloader/iter_0000100/state.pt")
     load_state = Mock(return_value={"dataloader_state_dict": "saved-state"})
     monkeypatch.setattr(dataloader_provider, "get_args", lambda: args)
+    monkeypatch.setattr(
+        dataloader_provider, "get_run_config", lambda: _run_config(load="/checkpoints/model")
+    )
     monkeypatch.setattr(dataloader_provider, "get_train_state", lambda: train_state)
     monkeypatch.setattr(dataloader_provider, "is_dataloader_rank", lambda *a, **kw: True)
     for name, value in (
@@ -176,6 +188,20 @@ def test_probe_does_not_disable_strict_restore(monkeypatch, strict_resume_provid
     )
     with pytest.raises(FileNotFoundError, match="refusing to resume"):
         dataloader_provider.train_valid_test_dataloaders_provider(None, task_encoder=object())
+    assert args.strict_dataloader_state_load
+    load_state.assert_not_called()
+    loader.restore_state_rank.assert_not_called()
+
+
+def test_initial_finetune_load_tolerates_missing_state(monkeypatch, strict_resume_provider):
+    """A primary load that applied finetune semantics starts the dataloader from the beginning
+    when its state is missing, strict restore or not; the provider learns it from the train
+    state, not from the namespace."""
+    args, loader, _, load_state, train_state = strict_resume_provider
+    train_state.iteration = 0
+    train_state.effective_finetune = True
+    monkeypatch.setattr(dataloader_provider.os.path, "exists", lambda _: False)
+    dataloader_provider.train_valid_test_dataloaders_provider(None, task_encoder=object())
     assert args.strict_dataloader_state_load
     load_state.assert_not_called()
     loader.restore_state_rank.assert_not_called()
