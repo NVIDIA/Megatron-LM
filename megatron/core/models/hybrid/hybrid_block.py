@@ -217,6 +217,11 @@ class HybridStack(MegatronModule):
         self.pg_collection = pg_collection
 
         self._mhc_block_end_plan: Optional[Tuple[bool, ...]] = None
+        # Per layer, the submodules that share packed-sequence metadata across the layers
+        # of one forward pass; resolved on first use.
+        self._shared_packed_seq_metadata_consumers: Optional[Tuple[Tuple[nn.Module, ...], ...]] = (
+            None
+        )
 
         self.layer_config_list = layer_config_list
         self._has_custom_layers = any(
@@ -672,6 +677,31 @@ class HybridStack(MegatronModule):
         """Finalize the current mHC recompute block when its last layer finishes."""
         finalize_recompute_block(manager, hidden_states, is_block_end)
 
+    def _attach_shared_packed_seq_metadata(
+        self, layer_idx: int, packed_seq_params: Optional[PackedSeqParams], cache: dict
+    ) -> Optional[PackedSeqParams]:
+        """Let a layer's submodules attach metadata shared across this forward pass.
+
+        A submodule opts in by defining ``attach_shared_packed_seq_metadata(
+        packed_seq_params, cache)``. ``cache`` lives for one forward pass of the stack,
+        so metadata that depends only on the packing is built by the first layer that
+        needs it and reused by the following ones.
+        """
+        if packed_seq_params is None:
+            return None
+        if self._shared_packed_seq_metadata_consumers is None:
+            self._shared_packed_seq_metadata_consumers = tuple(
+                tuple(
+                    module
+                    for module in layer.modules()
+                    if hasattr(module, "attach_shared_packed_seq_metadata")
+                )
+                for layer in self.layers
+            )
+        for module in self._shared_packed_seq_metadata_consumers[layer_idx]:
+            packed_seq_params = module.attach_shared_packed_seq_metadata(packed_seq_params, cache)
+        return packed_seq_params
+
     def forward(
         self,
         hidden_states: Union[Tensor, WrappedTensor],
@@ -840,6 +870,8 @@ class HybridStack(MegatronModule):
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                 )
             else:
+                # Packed-sequence metadata shared by the layers of this forward pass.
+                shared_packed_seq_metadata: dict = {}
                 # A layer whose TE CUDA graph also covers the next layer (an mHC attention
                 # wrapper grouped with the following MoE router prefix) returns that layer's
                 # output; the grouped layer is then skipped here.
@@ -900,6 +932,9 @@ class HybridStack(MegatronModule):
                             hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
                                 physical_layer_idx, hidden_states
                             )
+                        layer_packed_seq_params = self._attach_shared_packed_seq_metadata(
+                            layer_idx, layer_packed_seq_params, shared_packed_seq_metadata
+                        )
                         # Keep both residuals in the layer's layout, inside the CP conversions.
                         residual_accumulator = hidden_states
                         layer_padding_mask = padding_mask

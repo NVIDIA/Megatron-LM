@@ -7,6 +7,7 @@
 
 # pylint: disable=unused-import
 
+import copy
 import logging
 import warnings
 from contextlib import nullcontext
@@ -86,6 +87,32 @@ except ImportError:
 # ``fla.modules.conv``'s ``BT`` default; the chunk_indices tables we build below are
 # consumed by both.
 _FLA_CHUNK_SIZE = 64
+
+# Instance attribute (deliberately not a dataclass field) under which a layer stack hands
+# GDN layers the varlen chunk metadata it built for the current forward pass; see
+# ``_GDNBase.attach_shared_packed_seq_metadata``.
+_SHARED_CHUNK_METADATA_ATTR = "_gdn_shared_chunk_metadata"
+
+
+@dataclass(frozen=True)
+class GDNSharedChunkMetadata:
+    """Varlen chunk metadata built once per forward pass and shared by GDN layers.
+
+    Attributes:
+        cu_seqlens: The tensor object the table was built from. A consumer only uses the
+            table when it is about to run on this very tensor.
+        chunk_indices: ``_GDNBase._fixed_shape_chunk_indices(cu_seqlens)``.
+    """
+
+    cu_seqlens: torch.Tensor
+    chunk_indices: torch.Tensor
+
+
+def get_shared_chunk_metadata(
+    packed_seq_params: Optional[PackedSeqParams],
+) -> Optional[GDNSharedChunkMetadata]:
+    """Return the chunk metadata a layer stack attached to ``packed_seq_params``, if any."""
+    return getattr(packed_seq_params, _SHARED_CHUNK_METADATA_ATTR, None)
 
 
 @lru_cache(maxsize=1)
@@ -273,6 +300,10 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
     A_log: nn.Parameter
 
     gated_delta_rule: GatedDeltaRuleInterface
+
+    # Whether the variant forwards :meth:`_fla_varlen_kwargs` to its kernels and can
+    # therefore use a table shared through :meth:`attach_shared_packed_seq_metadata`.
+    consumes_shared_chunk_metadata: bool = False
 
     @classmethod
     def _estimate_flops(
@@ -834,6 +865,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         cp_context=None,
         extra_tokens: int = 0,
         cu_seqlens_unpadded: Optional[torch.Tensor] = None,
+        shared_chunk_metadata: Optional[GDNSharedChunkMetadata] = None,
     ) -> dict:
         """Capture-safe varlen metadata to forward to fla's chunked kernels.
 
@@ -865,6 +897,9 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                 non-zero. Passing it lets the CPU mirror be taken from the buffer both
                 call sites share, so the padded variant is host-side arithmetic on a cache
                 hit instead of a second D2H sync that evicts the unpadded entry.
+            shared_chunk_metadata: The table a layer stack built for this forward pass
+                (:meth:`attach_shared_packed_seq_metadata`). Used instead of building
+                one when it was derived from this very ``cu_seqlens`` tensor.
         """
         assert extra_tokens == 0 or cu_seqlens_unpadded is not None, (
             "cu_seqlens_unpadded is required when extra_tokens is non-zero, otherwise the "
@@ -897,6 +932,13 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                 )
             return {}
 
+        if (
+            shared_chunk_metadata is not None
+            and extra_tokens == 0
+            and shared_chunk_metadata.cu_seqlens is cu_seqlens
+        ):
+            return {"chunk_indices": shared_chunk_metadata.chunk_indices}
+
         chunk_indices = self._fixed_shape_chunk_indices(cu_seqlens, extra_tokens=extra_tokens)
         if chunk_indices is not None:
             return {"chunk_indices": chunk_indices}
@@ -907,6 +949,83 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                 cu_seqlens_unpadded, extra_tokens=extra_tokens
             )
         }
+
+    def attach_shared_packed_seq_metadata(
+        self, packed_seq_params: Optional[PackedSeqParams], cache: dict
+    ) -> Optional[PackedSeqParams]:
+        """Attach this forward pass's varlen chunk metadata to ``packed_seq_params``.
+
+        The ``chunk_indices`` table of :meth:`_fixed_shape_chunk_indices` depends only on
+        ``cu_seqlens`` and on config constants, so every GDN layer of a stack builds the
+        same one for a microbatch. A layer stack calls this hook right before each layer
+        with a ``cache`` dict that lives for exactly one of its forward passes: the first
+        GDN layer builds the table, the following ones reuse the tensor.
+
+        The table travels on a shallow copy of ``packed_seq_params`` as a plain instance
+        attribute. The caller's object is left alone, because it can outlive the forward
+        pass while its ``cu_seqlens`` buffer is refilled in place for the next microbatch.
+        Anything that rebuilds the dataclass (``dataclasses.replace``, the per-layer CUDA
+        graph input mapping) drops the attribute, and the layer then builds its own table
+        as before.
+
+        Capture safety: the table is only ever read in the forward pass that built it.
+
+        * Eager: nothing is kept across forward passes.
+        * Full-iteration CUDA graph: the build is captured once per microbatch in the
+          stack's forward and every GDN layer of the graph reads that tensor, so a replay
+          recomputes it from the current contents of the static ``cu_seqlens`` buffer.
+        * Per-layer CUDA graphs that capture attention: not shared. Such a graph only
+          takes the ``cu_seqlens`` tensors as inputs and bakes in the address of anything
+          else it reads, so a table built outside of it would be frozen at the capture
+          step's packing. Each graph keeps building its own table.
+        * Chunkwise context parallelism: not shared; fla derives the table from the
+          rank-local ``cu_seqlens`` (see :meth:`_fla_varlen_kwargs`).
+
+        Args:
+            packed_seq_params: The packed-sequence parameters the layer is about to get.
+            cache: Per-forward-pass dict owned by the caller.
+
+        Returns:
+            ``packed_seq_params`` itself when nothing is shared, else a shallow copy
+            carrying the metadata.
+        """
+        if packed_seq_params is None or packed_seq_params.qkv_format != 'thd':
+            return packed_seq_params
+        if not self.consumes_shared_chunk_metadata:
+            return packed_seq_params
+        if self.gdn_backend not in ("fla", "cudnn") or self.chunkwise_context_parallel:
+            return packed_seq_params
+        if self._attention_in_per_layer_cuda_graph(self.config):
+            return packed_seq_params
+        cu_seqlens = (
+            packed_seq_params.cu_seqlens_q_padded
+            if packed_seq_params.cu_seqlens_q_padded is not None
+            else packed_seq_params.cu_seqlens_q
+        )
+        if cu_seqlens is None:
+            return packed_seq_params
+
+        # The cached entry keeps cu_seqlens alive, so its id cannot be reused by another
+        # tensor for as long as the cache lives.
+        key = (_SHARED_CHUNK_METADATA_ATTR, id(cu_seqlens))
+        metadata = cache.get(key)
+        if metadata is None:
+            chunk_indices = self._fixed_shape_chunk_indices(cu_seqlens)
+            if chunk_indices is None:
+                return packed_seq_params
+            metadata = GDNSharedChunkMetadata(cu_seqlens=cu_seqlens, chunk_indices=chunk_indices)
+            cache[key] = metadata
+
+        shared_packed_seq_params = copy.copy(packed_seq_params)
+        setattr(shared_packed_seq_params, _SHARED_CHUNK_METADATA_ATTR, metadata)
+        return shared_packed_seq_params
+
+    @staticmethod
+    def _attention_in_per_layer_cuda_graph(config) -> bool:
+        """Whether a per-layer (``local`` / ``transformer_engine``) graph captures attention."""
+        return config.cuda_graph_impl in ("local", "transformer_engine") and (
+            not config.cuda_graph_modules or CudaGraphModule.attn in config.cuda_graph_modules
+        )
 
     @staticmethod
     def _check_fla_tensor_cache_disabled(config) -> None:
@@ -949,9 +1068,9 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         if not is_thd:
             return
 
-        captures_attention = config.cuda_graph_impl == "full_iteration" or (
-            config.cuda_graph_impl in ("local", "transformer_engine")
-            and (not config.cuda_graph_modules or CudaGraphModule.attn in config.cuda_graph_modules)
+        captures_attention = (
+            config.cuda_graph_impl == "full_iteration"
+            or _GDNBase._attention_in_per_layer_cuda_graph(config)
         )
         if not captures_attention:
             return

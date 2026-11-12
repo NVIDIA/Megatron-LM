@@ -29,6 +29,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     causal_conv1d,
     chunk_gated_delta_rule,
     get_parameter_local_cp,
+    get_shared_chunk_metadata,
     l2norm,
     resolve_gdn_kernel_backend,
 )
@@ -91,6 +92,8 @@ def get_parameter_local_cp_headwise(
 
 class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
     # pylint: disable=missing-class-docstring
+    consumes_shared_chunk_metadata = True
+
     @classmethod
     def estimate_flops(
         cls,
@@ -348,6 +351,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 cu_seqlens_q, seq_len_global, batch, cp_group_chunkwise
             )
 
+        # Varlen chunk metadata the layer stack built once for this forward pass, if any.
+        shared_chunk_metadata = get_shared_chunk_metadata(packed_seq_params)
+
         # Input projection
         nvtx_range_push(suffix="in_proj")
         qkvzba, _ = self.in_proj(hidden_states)
@@ -402,6 +408,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 cp_group_headwise,
                 cu_seqlens_q,
                 chunkwise_cp_context=chunkwise_cp_context,
+                shared_chunk_metadata=shared_chunk_metadata,
             )
             kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
             nvtx_range_pop(suffix="pre_gated_delta_rule")
@@ -439,7 +446,11 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         # chunk metadata (above); fla's chunk_indices / cu_seqlens_cpu are extra options it
         # would decline and fall back on.
         gdr_varlen_kwargs = (
-            self._fla_varlen_kwargs(cu_seqlens_q, cp_context=chunkwise_cp_context)
+            self._fla_varlen_kwargs(
+                cu_seqlens_q,
+                cp_context=chunkwise_cp_context,
+                shared_chunk_metadata=shared_chunk_metadata,
+            )
             if self.gdn_backend in ("fla", "cudnn")
             else {}
         )
@@ -773,12 +784,15 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         cp_group,
         cu_seqlens_q=None,
         chunkwise_cp_context=None,
+        shared_chunk_metadata=None,
     ):
         """Prepare QKV, gate, beta, and decay tensors before the gated delta rule.
 
         ``cp_size``/``cp_group`` are the headwise CP size and group (1/None under chunkwise
         CP); ``chunkwise_cp_context`` is the FLA CP context for chunkwise CP, which lets the
         causal convolution read the preceding rank's boundary tokens.
+        ``shared_chunk_metadata`` is the varlen chunk metadata of this forward pass when the
+        layer stack built it (see ``_GDNBase.attach_shared_packed_seq_metadata``).
         """
 
         # Transpose: s b x --> b s x
@@ -841,7 +855,11 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             # causal_conv1d host-builds chunk_indices from cu_seqlens contents just like
             # chunk_gated_delta_rule does; hand it the capture-safe varlen metadata.
             conv_cp_kwargs.update(
-                self._fla_varlen_kwargs(cu_seqlens_q, cp_context=chunkwise_cp_context)
+                self._fla_varlen_kwargs(
+                    cu_seqlens_q,
+                    cp_context=chunkwise_cp_context,
+                    shared_chunk_metadata=shared_chunk_metadata,
+                )
             )
             qkv, _ = causal_conv1d(
                 x=qkv,  # FLA conv1d accepts [b, s, d] format input
