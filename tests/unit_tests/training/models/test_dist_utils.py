@@ -631,11 +631,9 @@ class TestDdpWrapBucketSize:
         self.model = [_make_model_module()]
 
     def _ddp_config(self, **overrides):
-        cfg = Mock()
-        cfg.num_buckets = None
-        cfg.bucket_size = None
-        cfg.overlap_grad_reduce = True
-        cfg.use_distributed_optimizer = False
+        from megatron.core.distributed import DistributedDataParallelConfig
+
+        cfg = DistributedDataParallelConfig(overlap_grad_reduce=True)
         for k, v in overrides.items():
             setattr(cfg, k, v)
         return cfg
@@ -724,18 +722,17 @@ class TestDdpWrapFullParamLayout:
         self._opt_patcher.stop()
 
     def _ddp_config(self, **overrides):
-        cfg = Mock()
-        cfg.num_buckets = None
-        cfg.bucket_size = 8_000
-        cfg.overlap_grad_reduce = True
-        cfg.use_distributed_optimizer = True
+        from megatron.core.distributed import DistributedDataParallelConfig
+
+        cfg = DistributedDataParallelConfig(
+            bucket_size=8_000, overlap_grad_reduce=True, use_distributed_optimizer=True
+        )
         for k, v in overrides.items():
             setattr(cfg, k, v)
         return cfg
 
     def _make_chunk_with_params(self):
-        p = Mock()
-        p.requires_grad = True
+        p = torch.nn.Parameter(torch.zeros(1))
         chunk = Mock()
         chunk.parameters.return_value = [p]
         chunk.modules.return_value = []
@@ -875,10 +872,8 @@ class TestDdpWrapFullParamLayout:
     ):
         mock_ctx.return_value.__enter__ = Mock(return_value=None)
         mock_ctx.return_value.__exit__ = Mock(return_value=False)
-        p_grad = Mock()
-        p_grad.requires_grad = True
-        p_no_grad = Mock()
-        p_no_grad.requires_grad = False
+        p_grad = torch.nn.Parameter(torch.zeros(1))
+        p_no_grad = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
         chunk = Mock()
         chunk.parameters.return_value = [p_grad, p_no_grad]
         chunk.modules.return_value = []
