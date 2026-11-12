@@ -3,7 +3,6 @@
 import warnings
 from dataclasses import InitVar, dataclass, field, replace
 from enum import Enum
-from types import ModuleType
 from typing import TYPE_CHECKING, List, Literal, Optional, Protocol, Sequence, Tuple, Union
 
 import torch
@@ -813,8 +812,8 @@ class InferenceConfig:
     timestamp, useful for per-token latency analysis.
     """
 
-    metrics_writer: Optional[Union[InferenceMetricsWriter, ModuleType]] = None
-    """Experiment writer with start_inference_logging/log_inference, or a W&B module."""
+    metrics_writer: Optional[InferenceMetricsWriter] = None
+    """Experiment writer implementing the inference scalar logging interface."""
 
     logging_step_interval: int = 0
     """

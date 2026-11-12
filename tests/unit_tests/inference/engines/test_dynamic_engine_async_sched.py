@@ -18,6 +18,7 @@ from megatron.core.inference.config import (
     AsyncScheduleMode,
     CudaGraphSizingDistribution,
     InferenceConfig,
+    InferenceMetricsWriter,
     KVCacheManagementMode,
     PrefixCachingEvictionPolicy,
 )
@@ -373,9 +374,9 @@ def test_async_forward_routes_one_controller_iteration(
 
 
 @pytest.mark.parametrize("track_paused_request_events", [False, True])
-@pytest.mark.parametrize("backend", [None, "wandb", "experiment"])
+@pytest.mark.parametrize("logging_enabled", [False, True])
 def test_async_bookkeep_uses_consumed_chunked_prefill_request_id(
-    track_paused_request_events, backend
+    track_paused_request_events, logging_enabled
 ):
     """Bookkeeping uses consumed-forward state and records requested pause events."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
@@ -405,10 +406,9 @@ def test_async_bookkeep_uses_consumed_chunked_prefill_request_id(
         "kv_stats": None,
     }
 
-    if backend is not None:
-        engine.metrics_writer = SimpleNamespace(log=mock.Mock(), log_inference=mock.Mock())
-        if backend == "wandb":
-            engine.metrics_writer.__name__ = "wandb"
+    engine.metrics_writer = None
+    if logging_enabled:
+        engine.metrics_writer = mock.Mock(spec=InferenceMetricsWriter)
         engine.waiting_request_ids = []
         engine.inference_step_offset = 7
         engine._spec_tokens_proposed_per_pos = []
@@ -421,10 +421,8 @@ def test_async_bookkeep_uses_consumed_chunked_prefill_request_id(
     ):
         asyncio.run(engine.async_bookkeep(step_result, context_state, 0.0))
 
-    if backend is not None:
-        log = (
-            engine.metrics_writer.log if backend == "wandb" else engine.metrics_writer.log_inference
-        )
+    if logging_enabled:
+        log = engine.metrics_writer.log_inference
         log.assert_called_once()
         metrics = log.call_args.args[0]
         assert metrics["inference/inference_step"] == 8

@@ -52,6 +52,11 @@ scalar callbacks can use `get_experiment_writer()`, which returns the shared
 writer even when only W&B is configured. It provides `log(metrics, step)` and
 `log_metadata(values)`; normal shutdown closes all enabled backends together.
 
+Direct dynamic-engine callers supply an `InferenceMetricsWriter` through
+`InferenceConfig.metrics_writer`. This interface provides
+`start_inference_logging()` and `log_inference(metrics)`. The shared
+`ExperimentWriter` implements it for all three backends, including W&B.
+
 Config parameters are flattened and summarized (values capped at 500 characters).
 Full config remains in the checkpoint's `run_config.yaml`. Runtime SDK objects
 are never stored in the config or checkpoint.
