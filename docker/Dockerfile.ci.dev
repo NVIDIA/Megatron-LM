@@ -117,6 +117,8 @@ COPY pyproject.toml uv.lock /workspace/
 COPY docker/patches/mamba-cxx20.patch /workspace/mamba-cxx20.patch
 COPY megatron/core/__init__.py /workspace/megatron/core/
 COPY megatron/core/package_info.py /workspace/megatron/core/
+# pyproject's py-modules name megatron.rl modules; setuptools needs their package dir.
+COPY megatron/rl/__init__.py /workspace/megatron/rl/
 ARG IMAGE_TYPE=dev
 ENV IMAGE_TYPE=${IMAGE_TYPE}
 ENV NVTE_BUILD_NUM_PHILOX_ROUNDS=3

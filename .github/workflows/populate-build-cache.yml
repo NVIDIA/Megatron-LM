@@ -26,6 +26,7 @@ on:
       - "docker/**"
       - "megatron/core/__init__.py"
       - "megatron/core/package_info.py"
+      - "megatron/rl/__init__.py"
       - "pyproject.toml"
       - "tests/test_utils/python_scripts/download_unit_tests_dataset.py"
       - "uv.lock"

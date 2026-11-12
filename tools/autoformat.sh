@@ -17,7 +17,8 @@ SKIP_DOCS=${SKIP_DOCS:-false}
 BASE_REF=${BASE_REF:-main}
 git remote add autoformatter-remote "https://github.com/NVIDIA/Megatron-LM.git" || true
 git fetch autoformatter-remote ${BASE_REF}
-CHANGED_FILES=$(git diff --name-only --diff-filter=d --merge-base autoformatter-remote/${BASE_REF} megatron/core tests/ | grep '\.py$' || true)
+# megatron/rl ships only its shared-prefix packing modules in the wheel; lint those with core.
+CHANGED_FILES=$(git diff --name-only --diff-filter=d --merge-base autoformatter-remote/${BASE_REF} megatron/core 'megatron/rl/shared_prefix_*.py' megatron/rl/tree_layout.py tests/ | grep '\.py$' || true)
 ADDITIONAL_ARGS=""
 ADDITIONAL_BLACK_ARGS=""
 ADDITIONAL_PYLINT_ARGS=""
