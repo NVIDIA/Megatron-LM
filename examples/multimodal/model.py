@@ -302,7 +302,9 @@ def model_provider(
         use_loss_scaling=args.use_loss_scaling,
         temporal_patch_dim=getattr(args, "video_temporal_patch_size", 1),
         separate_video_embedder=getattr(args, "separate_video_embedder", False),
-        temporal_ckpt_compat=getattr(args, "allow_checkpoint_without_temporal_compression", False),
+        temporal_ckpt_compat=getattr(
+            args, "allow_checkpoint_without_temporal_compression", False
+        ),
         balance_vision_context_parallel_by_tokens=getattr(
             args, "balance_vision_context_parallel_by_tokens", False
         ),

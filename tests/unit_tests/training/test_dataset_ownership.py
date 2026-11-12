@@ -858,7 +858,9 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
         training,
         "get_run_config",
         lambda: SimpleNamespace(
-            model=SimpleNamespace(transformer=transformer), data=DataConfig(), train=train
+            model=SimpleNamespace(transformer=transformer),
+            data=DataConfig(),
+            train=train,
         ),
     )
     training.dummy_train_step(None)

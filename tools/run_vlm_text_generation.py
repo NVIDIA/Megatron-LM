@@ -19,12 +19,12 @@ from torchvision.transforms import Compose, Resize, ToPILImage
 from megatron.inference.text_generation.api import generate_and_post_process
 from megatron.inference.text_generation.forward_step import ForwardStep
 from megatron.training import get_args, get_model, print_rank_0
-from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.global_vars import set_run_config
 from megatron.training.initialize import initialize_megatron
 from pretrain_vlm import model_provider, resolve_vlm_sequence_lengths
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def add_text_generation_args(parser):

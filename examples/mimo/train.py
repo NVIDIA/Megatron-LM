@@ -9,30 +9,32 @@ import sys
 from functools import partial
 from typing import Any, Dict, Iterator
 
-import torch
-
-from megatron.core.parallel_state import (
-    get_context_parallel_group,
-    get_data_parallel_group,
-    get_tensor_model_parallel_group,
-    get_tensor_model_parallel_rank,
-    get_tensor_model_parallel_src_rank,
-)
-from megatron.training import get_args, pretrain
 from megatron.training.argument_utils import (
     model_config_from_args,
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import parse_and_validate_args
+import torch
+from megatron.training import get_args, pretrain, print_rank_0
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.models import MimoBuildConfig
+
+from megatron.core.parallel_state import (
+    get_tensor_model_parallel_group,
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_src_rank,
+    get_context_parallel_group,
+    get_data_parallel_group,
+)
 
 sys.path.append(
     os.path.abspath(os.path.join(os.path.dirname(__file__), os.path.pardir, os.path.pardir))
 )
 from data.energon_avlm_task_encoder import llava_avlm_dataloader_provider
 from data.energon_vlm_task_encoder import llava_vlm_dataloader_provider
-from data.mock import train_valid_test_datasets_provider as mock_train_valid_test_datasets_provider
+from data.mock import (
+    train_valid_test_datasets_provider as mock_train_valid_test_datasets_provider,
+)
 from model_providers.llava_avlm import model_provider_llava_avlm
 from model_providers.llava_vlm import model_provider_llava_vlm
 from model_providers.mock import model_provider_mock_vlm_single_encoder
@@ -106,6 +108,7 @@ def add_mimo_args(parser):
     group.add_argument('--packing-buffer-size', type=int, default=None, help='Packing buffer size when using sequence packing')
     
     return parser
+
 
 
 def get_batch(data_iterator: Iterator[Dict[str, Any]]):
@@ -229,6 +232,8 @@ def train_valid_test_datasets_provider(*provider_args, **provider_kwargs):
         dataset_provider = _DATASET_PROVIDERS[runtime_args.dataset_provider]
         if runtime_args.dataset_provider != "mock":
             max_seq_length = get_run_config().model.transformer.max_seq_length_per_sample
+            print_rank_0(f"MIMO Training: Using max_seq_length = {max_seq_length} "
+                f"(total_seq_length: {max_seq_length})")
 
             # Add configs to provider_kwargs
             provider_kwargs['max_seq_length'] = max_seq_length
@@ -297,7 +302,7 @@ def model_provider(
     )
 
 if __name__ == "__main__":
-
+    
     train_valid_test_datasets_provider.is_distributed = True
     args = parse_and_validate_args(args_defaults={}, extra_args_provider=add_mimo_args)
     _DATASET_PROVIDERS["mock"] = partial(

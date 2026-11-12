@@ -420,7 +420,7 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     # Combine transfomer config with model parallel args
     args = SimpleNamespace(**vars(getattr(args, transfomer_key)), **vars(args.model_parallel))
     # Translate args to core transformer configuration
-    kw_args = core_config_from_args(args, TransformerConfig)
+    kw_args = core_config_from_args(args, TransformerConfig)    
     kw_args['max_seq_length_per_sample'] = execution_bound
     
     # Hardcoded 

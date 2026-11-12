@@ -12,20 +12,21 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 import datasets
 import torch
 import transformers
-from utils import build_lm_batch, get_eos_token_id, get_hf_tokenizer
 
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.core.models.gpt import GPTModel
-from megatron.core.parallel_state import get_context_parallel_group
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.loss_func import loss_func
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.post_training.non_loss_data_func import report_draft_acceptance_length
 from megatron.training import get_args, get_timers, pretrain
-from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.utils import print_rank_0
+from megatron.training.global_vars import get_run_config, set_run_config
+from utils import build_lm_batch, get_eos_token_id, get_hf_tokenizer
 from model_provider import model_provider
+from megatron.core.parallel_state import get_context_parallel_group
+
 
 REMOVE_THINK_CHAT_TEMPLATE = (
     "{% if '</think>' in content %}{% set content = content.split('</think>')[-1] %}{% endif %}"
@@ -505,6 +506,7 @@ def get_batch(data_iterator):
         datatype = torch.bfloat16
         feature_b = tensor_parallel.broadcast_data(keys, data, datatype)
 
+
     sample_loss_mask = data_b.get("loss_mask")
     batch = build_lm_batch(
         data_b["input_ids"],
@@ -519,9 +521,7 @@ def get_batch(data_iterator):
 
     if args.export_offline_model:
         sequence_length = cfg.model.transformer.max_seq_length_per_sample
-        batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[
-            :sequence_length
-        ]
+        batch["aux_hidden_states"] = feature_b["aux_hidden_states"].transpose(0, 1)[:sequence_length]
         batch["hidden_states"] = feature_b["hidden_states"].transpose(0, 1)[:sequence_length]
 
     return batch
@@ -535,6 +535,7 @@ def non_loss_data_func(model: GPTModel):
             report_draft_acceptance_length(model)
         except Exception as e:
             print(e)
+
 
 
 def forward_step(data_iterator, model: GPTModel):

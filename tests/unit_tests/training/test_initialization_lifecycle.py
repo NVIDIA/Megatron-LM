@@ -468,7 +468,10 @@ def test_runtime_service_order_and_microbatch_inputs(
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
     cfg.model = GPTModelConfig(
         transformer=TransformerConfig(
-            num_layers=2, hidden_size=32, num_attention_heads=4, max_seq_length_per_sample=32
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            max_seq_length_per_sample=32,
         ),
         seq_length=32,
         vocab_size=128,

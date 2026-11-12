@@ -224,8 +224,8 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 self.manual_prompts = json.load(f)
         self.dataloader_seq_length = sequence_length  # Always return samples of this length.
         self.packing_seq_length = (
-            packing_sequence_length  # Packing sequence length, if packing is enabled.
-        )
+            packing_sequence_length
+        )  # Packing sequence length, if packing is enabled.
         self.is_packing_enabled = (
             self.args.packing_buffer_size is not None and self.args.packing_buffer_size > 0
         )
@@ -626,9 +626,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             max_num_tiles = self.args.max_num_tiles
             # We keep a buffer of 4 tokens for the question,
             # the rest can be used for image tokens.
-            max_image_token_allowed = (
-                self.max_seq_length_per_sample - len(input_ids) - 4
-            )
+            max_image_token_allowed = self.max_seq_length_per_sample - len(input_ids) - 4
             # We start by extracting as many tiles per image as possible, and decrease the max
             # number of tiles if there are too many image tokens.
             while True:
