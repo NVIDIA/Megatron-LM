@@ -72,6 +72,9 @@ def test_collects_routed_experts_before_transformer_layer(
     assert collector.is_partially_recomputed(layer) == bool(recompute_modules)
     assert not collector.is_partially_recomputed(experts)
     assert not collector.is_partially_recomputed(root)
+    # The root layer follows the same collection and policy path as a nested layer.
+    assert collector.collect(layer) == [experts, layer]
+    assert collector.is_partially_recomputed(layer) == bool(recompute_modules)
 
 
 @pytest.mark.parametrize("pattern", ["*E*", "MEM"], ids=["attention", "mamba"])
