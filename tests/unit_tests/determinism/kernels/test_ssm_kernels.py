@@ -1004,13 +1004,24 @@ def test_batch_invariant_unfused_mixer_replays_bit_exactly(monkeypatch):
         Utils.destroy_model_parallel()
 
 
-def test_kda_pre_gdr_fusion_is_rejected_under_deterministic_mode():
-    """The streamed pre-GDR fusion for KDA never runs under ``--deterministic-mode``.
+@pytest.mark.parametrize(
+    "non_deterministic_kernels",
+    [
+        {"gdn_pre_gated_delta_rule_fusion": True},
+        {"kda_kernel_backend": "cudnn", "kda_lower_bound": -5.0},
+    ],
+    ids=["pre-gdr-fusion", "cudnn-backend"],
+)
+def test_kda_non_deterministic_kernels_are_rejected_under_deterministic_mode(
+    non_deterministic_kernels,
+):
+    """KDA's non-deterministic kernels never run under ``--deterministic-mode``.
 
     ``gdn_pre_gated_delta_rule_fusion`` reuses the pre-GDR module's timing-based autotuned
-    convolution kernels and atomic boundary-gradient reductions, so KimiDeltaAttention
-    refuses to build with both switches on instead of silently replacing the replayed torch
-    conv1d / L2-norm / ``chunk_kda`` path.
+    convolution kernels and atomic boundary-gradient reductions, and ``kda_kernel_backend='cudnn'``
+    selects cudnn-frontend's kernels, which are not bit-exact. KimiDeltaAttention refuses to
+    build with either of them instead of silently replacing the replayed torch conv1d /
+    L2-norm / ``chunk_kda`` path.
     """
     from megatron.core import parallel_state
     from megatron.core.extensions.transformer_engine import HAVE_TE
@@ -1043,8 +1054,8 @@ def test_kda_pre_gdr_fusion_is_rejected_under_deterministic_mode():
             experimental_attention_variant="kda",
             is_hybrid_model=True,
             transformer_impl="transformer_engine",
-            gdn_pre_gated_delta_rule_fusion=True,
             deterministic_mode=True,
+            **non_deterministic_kernels,
         )
         spec = hybrid_stack_spec.submodules.kda_layer.submodules.self_attention
         with pytest.raises(ValueError, match="deterministic_mode"):

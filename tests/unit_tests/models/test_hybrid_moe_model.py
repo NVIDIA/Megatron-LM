@@ -200,6 +200,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "is_hybrid_model": True,
     "kda_f_lora_rank": None,
     "kda_gate_lora_rank": None,
+    "kda_kernel_backend": "fla",
     "kda_lower_bound": None,
     "kda_safe_gate": False,
     "kitchen_attention_backend": "sdpa",

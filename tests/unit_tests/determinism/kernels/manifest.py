@@ -737,6 +737,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "are covered by tests/unit_tests/ssm/gated_delta_net/test_kda_fusion.py.",
     ),
     KernelEntry(
+        name="kda_cudnn_backend",
+        sources=("megatron/core/ssm/gated_delta_net/cudnn_kda.py",),
+        kind="external-lib",
+        exempt_reason="kda_kernel_backend='cudnn' is explicitly rejected with "
+        "deterministic_mode=True (KimiDeltaAttention._setup_variant_attrs). cudnn-frontend's KDA "
+        "kernels need a Blackwell GPU and are not bit-exact, and the Triton fold of the "
+        "chunkwise-CP span summaries only runs with them; parity with the FLA backend and "
+        "chunkwise-CP correctness are covered by "
+        "tests/unit_tests/ssm/gated_delta_net/test_kda_cudnn.py.",
+    ),
+    KernelEntry(
         name="gdn_gated_output_norm_fusion",
         sources=("megatron/core/fusions/fused_gated_norm.py",),
         tests=(K + "test_gated_norm.py",),
