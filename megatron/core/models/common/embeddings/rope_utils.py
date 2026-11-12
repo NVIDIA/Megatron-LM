@@ -76,9 +76,11 @@ __all__ = [
 
 def _is_raw_mrope_freqs(t: Tensor, freqs: Tensor, config: TransformerConfig) -> bool:
     """Return whether freqs is the raw 3-axis mRoPE tensor for fused apply."""
-    if config.mrope_section is None or freqs.dim() != 4 or freqs.shape[0] != 3:
+    # Minimal configs (e.g. SimpleNamespace in unit tests) may omit mrope_section.
+    mrope_section = getattr(config, "mrope_section", None)
+    if mrope_section is None or freqs.dim() != 4 or freqs.shape[0] != 3:
         return False
-    if sum(config.mrope_section) != freqs.shape[-1] or freqs.shape[-1] * 2 > t.shape[-1]:
+    if sum(mrope_section) != freqs.shape[-1] or freqs.shape[-1] * 2 > t.shape[-1]:
         return False
     if t.dim() == 4:
         return freqs.shape[1] == t.shape[1] and freqs.shape[2] == t.shape[0]
@@ -91,13 +93,15 @@ def _is_raw_mrope_freqs_thd(
     t: Tensor, freqs: Tensor, cu_seqlens: Tensor, config: TransformerConfig, cp_size: int
 ) -> bool:
     """Return whether freqs is raw mRoPE for THD layout, or fail on raw-like bad shapes."""
-    if config.mrope_section is None or freqs.dim() != 4 or freqs.shape[0] != 3:
+    # Minimal configs (e.g. SimpleNamespace in unit tests) may omit mrope_section.
+    mrope_section = getattr(config, "mrope_section", None)
+    if mrope_section is None or freqs.dim() != 4 or freqs.shape[0] != 3:
         return False
     if t.dim() != 3:
         raise ValueError(
             f"raw mRoPE THD expects t with shape [tokens, heads, head_dim], got {tuple(t.shape)}"
         )
-    if sum(config.mrope_section) != freqs.shape[-1] or freqs.shape[-1] * 2 > t.shape[-1]:
+    if sum(mrope_section) != freqs.shape[-1] or freqs.shape[-1] * 2 > t.shape[-1]:
         return False
 
     if freqs.shape[1] != 1:

@@ -254,6 +254,7 @@ def _maybe_prefetch_separate_inference_model_weights(model_core, *, to_cpu: bool
 def verify_model_weights_swap(
     train_model: LanguageModule,
     inference_model: LanguageModule,
+    padded_vocab_size: int = 128256,
     seq_len: int = 8,
     batch_size: int = 2,
     atol: float = 1e-4,
@@ -269,6 +270,7 @@ def verify_model_weights_swap(
     Args:
         train_model: The training model (source of weights).
         inference_model: The inference model (target of weights).
+        padded_vocab_size: Vocabulary size used to generate verification tokens.
         seq_len: Sequence length for test input.
         batch_size: Batch size for test input.
         atol: Absolute tolerance for comparing outputs.
@@ -286,7 +288,6 @@ def verify_model_weights_swap(
     train_core = unwrap_model(train_lm)
     inf_core = unwrap_model(inf_lm)
 
-    actual_vocab_size = getattr(args, 'padded_vocab_size', 128256)
     actual_seq_len = min(seq_len, getattr(args, 'seq_length', seq_len))
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
@@ -294,7 +295,7 @@ def verify_model_weights_swap(
     torch.manual_seed(1234)
     test_tokens = torch.randint(
         low=0,
-        high=actual_vocab_size,
+        high=padded_vocab_size,
         size=(batch_size, actual_seq_len),
         device=device,
         dtype=torch.long,
@@ -872,7 +873,11 @@ def colocated_inference(
         num_dst_pools = refit_inference_model(model, inference_model, args)
         if cfg.rl.rl_verify_model_weights_swap and num_dst_pools == 1:
             verify_model_weights_swap(
-                train_model=model, inference_model=inference_model, atol=0.1, rtol=5e-4
+                train_model=model,
+                inference_model=inference_model,
+                padded_vocab_size=cfg.tokenizer.padded_vocab_size,
+                atol=0.1,
+                rtol=5e-4,
             )
     else:
         inference_model = model

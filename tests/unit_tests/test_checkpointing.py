@@ -40,7 +40,7 @@ from megatron.training.checkpointing import (
     set_checkpoint_version,
 )
 from megatron.training.config import InferenceConfigContainer, InferenceSetupConfig, ProfilingConfig
-from megatron.training.global_vars import set_args
+from megatron.training.global_vars import get_run_config, set_args
 from megatron.training.state import TrainState
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -622,7 +622,11 @@ def test_check_checkpoint_args_rejects_wide_residual_mismatch():
 
 @pytest.mark.parametrize(
     "section,name,current,other",
-    [("train", "global_batch_size", 8, 16), ("rng", "data_parallel_random_init", True, False)],
+    [
+        ("train", "global_batch_size", 8, 16),
+        ("rng", "data_parallel_random_init", True, False),
+        ("tokenizer", "tokenizer_type", "GPT2BPETokenizer", "SentencePieceTokenizer"),
+    ],
 )
 @pytest.mark.parametrize(
     "saved_source", ["legacy", "missing_section", "missing_field", "config", "config_only"]
@@ -642,6 +646,10 @@ def test_check_checkpoint_args_uses_config_owner(
         **{name: other},
     )
     owner = getattr(run_config, section)
+    if section == "tokenizer":
+        run_config.tokenizer.vocab_file = "vocab.json"
+        args.max_position_embeddings = 128
+        args.make_vocab_size_divisible_by = 128
     assert hasattr(owner, name)
     setattr(owner, name, current)
     checkpoint_args = SimpleNamespace(**vars(args))
@@ -809,7 +817,6 @@ def create_ckpt_load_args(create_args):
     args.hidden_size = 2
     args.num_attention_heads = 1
     args.add_position_embedding = False
-    args.vocab_file = None
     args.tensor_model_parallel_size = 1
     args.pipeline_model_parallel_size = 1
     args.ckpt_assume_constant_structure = False
@@ -820,6 +827,9 @@ def create_ckpt_load_args(create_args):
     args.use_megatron_fsdp = False
     args.strict_fsdp_dtensor_load = True
     args.phase_transition_iterations = None
+
+    cfg = get_run_config()
+    cfg.tokenizer.vocab_file = None
 
     yield args
 
@@ -1004,6 +1014,8 @@ def test_load_checkpoint(
 ):
     """Test load_checkpoint."""
     args = create_ckpt_load_args
+    args.padded_vocab_size = None
+    run_config.tokenizer.padded_vocab_size = 128
     args.ckpt_format = ckpt_format
     args.use_distributed_optimizer = ckpt_format != "torch_dcp"
     args.use_dist_ckpt = ckpt_format != "torch"
@@ -1053,7 +1065,10 @@ def test_load_checkpoint(
         # With TP=PP=1, rank 0 writes the checkpoint. Other ranks can still call
         # torch.save internally while serializing RNG tensors for all_gather_object.
         if torch.distributed.get_rank() == 0:
-            assert serialized.call_args.args[0]["args"] is args
+            saved_args = serialized.call_args.args[0]["args"]
+            assert saved_args is not args
+            assert vars(saved_args) == {**vars(args), "padded_vocab_size": 128}
+        assert args.padded_vocab_size is None
         with open(ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml") as f:
             saved_config = yaml.safe_load(f)
         for field in fields(rng_config):

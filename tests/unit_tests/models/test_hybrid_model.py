@@ -36,6 +36,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 )
 from megatron.core.models.hybrid.hybrid_model import HybridModel, _hybrid_logging_pg_kwargs
 from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
 from megatron.core.tensor_observation import capture_tensor_observations
@@ -50,6 +51,7 @@ from megatron.core.transformer.experimental_attention_variant.dsv4_layer_config 
 from megatron.core.transformer.mla_layer_config import MLALayerConfig
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import divide, is_fa_min_version, is_torch_min_version
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.test_utilities import Utils
@@ -1120,10 +1122,23 @@ class TestHybridModel:
             layout_manager.build_forward_state = lambda *args, **kwargs: layout_state
             monkeypatch.setattr(decoder, "_cp_layout_manager", layout_manager)
 
+        backward_layers = []
+
+        def check_activation_gradient(layer, grad_input, _grad_output):
+            assert grad_input and grad_input[0] is not None
+            backward_layers.append(layer)
+
+        boundary_layers = [
+            layer for layer in decoder.layers if isinstance(layer, (TransformerLayer, MambaLayer))
+        ]
+        backward_hooks = [
+            layer.register_full_backward_hook(check_activation_gradient)
+            for layer in boundary_layers
+        ]
         expected_residuals = {}
 
         def record_layer_residuals(layer, args, kwargs, output):
-            accumulator = kwargs["hidden_states"].detach().clone()
+            accumulator = args[0].detach().clone()
             output = output[0] if isinstance(output, tuple) else output
             # Keep the original forward values; backward recomputation must not be observed.
             expected_residuals.setdefault((layer, "residual_accumulator"), accumulator)
@@ -1153,8 +1168,9 @@ class TestHybridModel:
             )
             logits.sum().backward()
 
-        for hook in hooks:
+        for hook in hooks + backward_hooks:
             hook.remove()
+        assert set(backward_layers) == set(boundary_layers)
 
         assert logits.shape[0] == micro_batch_size
         assert logits.shape[1] == sequence_length

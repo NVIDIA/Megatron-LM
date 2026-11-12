@@ -38,7 +38,7 @@ from tests.unit_tests.dist_checkpointing import (
     init_checkpointing_mock_args,
 )
 from tests.unit_tests.test_utilities import Utils
-from tests.unit_tests.transformer.test_multi_latent_attention import make_test_packed_seq_params
+from tests.unit_tests.transformer.packed_seq_test_utils import make_test_packed_seq_params
 
 pytestmark = pytest.mark.usefixtures("run_config")
 

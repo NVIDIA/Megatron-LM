@@ -33,7 +33,7 @@ from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
@@ -211,6 +211,7 @@ class HybridStack(MegatronModule):
             else boundary_layout
         )
         self.mtp_layer_number = mtp_layer_number
+        self.boundary_layout = boundary_layout
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -226,24 +227,24 @@ class HybridStack(MegatronModule):
         self._mhc_block_end_plan: Optional[Tuple[bool, ...]] = None
 
         self.layer_config_list = layer_config_list
-        self._has_linear_layer_with_chunkwise_cp = self.cp_group.size() > 1 and any(
+        self._has_linear_layer_with_chunkwise_cp = any(
             type(layer_config) is layer_utils.MambaLayerConfig
             and layer_config.linear_cp_mode == "chunkwise"
             for layer_config in self.layer_config_list
         )
+        self.layer_cp_layouts = tuple(
+            (
+                layer_config.attention_cp_layout
+                if type(layer_config) in layer_utils.Symbols.ATTENTION_LAYER_CONFIGS
+                else layer_config.linear_cp_layout
+            )
+            for layer_config in self.layer_config_list
+        )
         self._cp_layout_manager = None
         if self.cp_group.size() > 1 and uses_stack_cp_layout:
-            layer_layouts = tuple(
-                (
-                    layer_config.attention_cp_layout
-                    if type(layer_config) in layer_utils.Symbols.ATTENTION_LAYER_CONFIGS
-                    else layer_config.linear_cp_layout
-                )
-                for layer_config in self.layer_config_list
-            )
             self._cp_layout_manager = ContextParallelLayoutManager(
-                layer_layouts=layer_layouts,
-                boundary_layout=boundary_layout,
+                layer_layouts=self.layer_cp_layouts,
+                boundary_layout=self.boundary_layout,
                 sequence_parallel=self.config.sequence_parallel,
                 cp_group=self.cp_group,
                 tp_group=self.tp_group,
@@ -267,6 +268,15 @@ class HybridStack(MegatronModule):
                 "enable_attention_residuals does not support the per-layer CP layout manager "
                 "(explicit linear_cp_layout / attention_cp_layout): depth sources stay in the "
                 "stack boundary layout and would not follow per-layer layout conversions."
+            )
+            # Dynamic CP builds the same manager per microbatch in _resolve_runtime_cp_layout,
+            # even when the static CP group has size 1, so the check above cannot see it.
+            assert not (
+                getattr(self.config, "dynamic_context_parallel", False) and uses_stack_cp_layout
+            ), (
+                "enable_attention_residuals does not support dynamic_context_parallel with an "
+                "explicit linear_cp_layout: each microbatch builds the per-layer CP layout "
+                "manager at runtime, and depth sources would not follow its layout conversions."
             )
         # Build layers from the pre-selected segment
         self.layers = nn.ModuleList()
@@ -549,6 +559,39 @@ class HybridStack(MegatronModule):
         router = getattr(getattr(inner_layer, "mlp", None), "router", None)
         return bool(getattr(router, "is_hash_layer", False))
 
+    def _resolve_runtime_cp_layout(
+        self, packed_seq_params: PackedSeqParams | None
+    ) -> tuple[torch.distributed.ProcessGroup, ContextParallelLayoutManager | None]:
+        """Resolve the CP group and layout manager for one microbatch."""
+        runtime_cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
+        assert runtime_cp_group is not None, "HybridStack requires a context-parallel group"
+
+        if packed_seq_params is None or packed_seq_params.local_cp_size is None:
+            return runtime_cp_group, self._cp_layout_manager
+
+        if runtime_cp_group.size() == 1 or not getattr(
+            self.config, "_linear_cp_layout_explicit", True
+        ):
+            # Without an explicit stack layout (DSv4), the attention modules own the
+            # runtime-CP boundaries, matching the static manager gate in __init__.
+            return runtime_cp_group, None
+
+        runtime_tp_cp_group = resolve_tp_cp_group(
+            self.tp_cp_group,
+            packed_seq_params,
+            sequence_parallel=self.config.sequence_parallel,
+            tp_group=self.tp_group,
+        )
+
+        return runtime_cp_group, ContextParallelLayoutManager(
+            layer_layouts=self.layer_cp_layouts,
+            boundary_layout=self.boundary_layout,
+            sequence_parallel=self.config.sequence_parallel,
+            cp_group=runtime_cp_group,
+            tp_group=self.tp_group,
+            tp_cp_group=runtime_tp_cp_group,
+        )
+
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
 
@@ -670,39 +713,35 @@ class HybridStack(MegatronModule):
         inference_context = deprecate_inference_params(inference_context, inference_params)
         packed_seq_params = self._stage_te_cuda_graph_route_metadata(packed_seq_params)
 
+        runtime_cp_group, cp_layout_manager = self._resolve_runtime_cp_layout(packed_seq_params)
+
         cp_layout_state = None
-        if self._cp_layout_manager is not None:
-            cp_layout_state = self._cp_layout_manager.build_forward_state(
+        if cp_layout_manager is not None:
+            cp_layout_state = cp_layout_manager.build_forward_state(
                 packed_seq_params,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 thd_plan=cp_layout_plan,
             )
 
         input_ids_by_layout = None
-        if cp_layout_state is not None:
-            layouts = set(cp_layout_state.manager.layer_layouts)
-            if input_ids is not None:
-                input_ids_by_layout = {
-                    layout: cp_layout_state.convert_sequence_metadata(input_ids, layout)
-                    for layout in layouts
-                }
-            if padding_mask_by_layout is None and padding_mask is not None:
-                # HybridModel supplies per-layout masks when it has a dynamic-CP batch,
-                # where each layout can carry its own padded length. Otherwise derive
-                # them from the contiguous mask.
-                padding_mask_by_layout = {
-                    layout: cp_layout_state.convert_sequence_metadata(padding_mask, layout)
-                    for layout in layouts
-                }
+        if cp_layout_state is not None and input_ids is not None:
+            input_ids_by_layout = {
+                layout: cp_layout_state.convert_sequence_metadata(input_ids, layout)
+                for layout in set(cp_layout_state.manager.layer_layouts)
+            }
 
         packed_sequence_cp_metadata = None
-        if self._has_linear_layer_with_chunkwise_cp and packed_seq_params is not None:
+        if (
+            self._has_linear_layer_with_chunkwise_cp
+            and runtime_cp_group.size() > 1
+            and packed_seq_params is not None
+        ):
             if packed_seq_params.seq_idx is None:
                 raise ValueError("Packed chunkwise CP requires packed_seq_params.seq_idx")
             packed_sequence_cp_metadata = build_packed_sequence_cp_metadata(
                 packed_seq_params.seq_idx,
-                cp_rank=self.cp_group.rank(),
-                cp_size=self.cp_group.size(),
+                cp_rank=runtime_cp_group.rank(),
+                cp_size=runtime_cp_group.size(),
             )
 
         if not self.pre_process:
@@ -712,6 +751,28 @@ class HybridStack(MegatronModule):
         # Delete the obsolete reference to the initial input tensor if necessary
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
+
+        if (
+            cp_layout_state is not None
+            and padding_mask_by_layout is None
+            and padding_mask is not None
+        ):
+            # HybridModel supplies per-layout masks when it has a dynamic-CP batch,
+            # where each layout can carry its own padded length. Otherwise derive
+            # them from the contiguous mask. HybridModel and MTP callers may already
+            # have scattered that mask into the activations' sequence-parallel frame.
+            metadata_kwargs = {}
+            if (
+                cp_layout_state.manager.sequence_parallel
+                and padding_mask.shape[1] == hidden_states.shape[0]
+            ):
+                metadata_kwargs["sequence_parallel_local"] = True
+            padding_mask_by_layout = {
+                layout: cp_layout_state.convert_sequence_metadata(
+                    padding_mask, layout, **metadata_kwargs
+                )
+                for layout in set(cp_layout_state.manager.layer_layouts)
+            }
 
         if self.config.enable_mhc_connections and self.pre_process and not self.is_mtp_layer:
             hidden_states = HyperConnectionModule.input_expand(
@@ -957,7 +1018,6 @@ class HybridStack(MegatronModule):
                                 hidden_states = layer(**layer_kwargs)
                             elif isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                                 layer_kwargs = dict(
-                                    hidden_states=hidden_states,
                                     attention_mask=attention_mask,
                                     inference_context=inference_context,
                                     rotary_pos_emb=rotary_pos_emb,
@@ -1005,12 +1065,13 @@ class HybridStack(MegatronModule):
                                     layer._mhc_recompute_manager = layer_kwargs.pop(
                                         "mhc_recompute_manager", None
                                     )
-                                    hidden_states, _ = nn.Module.__call__(layer, **layer_kwargs)
+                                    hidden_states, _ = nn.Module.__call__(
+                                        layer, hidden_states, **layer_kwargs
+                                    )
                                 else:
-                                    hidden_states, _ = layer(**layer_kwargs)
+                                    hidden_states, _ = layer(hidden_states, **layer_kwargs)
                             elif isinstance(layer, MambaLayer):
                                 layer_kwargs = dict(
-                                    hidden_states=hidden_states,
                                     attention_mask=attention_mask,
                                     inference_context=inference_context,
                                     packed_seq_params=layer_packed_seq_params,
@@ -1021,7 +1082,7 @@ class HybridStack(MegatronModule):
                                     layer_kwargs["residual_stream_recompute_context"] = (
                                         residual_stream_recompute_context
                                     )
-                                hidden_states = layer(**layer_kwargs)
+                                hidden_states = layer(hidden_states, **layer_kwargs)
                             else:  # Expert or MLP
                                 if residual_stream_recompute_context is not None:
                                     raise TypeError(

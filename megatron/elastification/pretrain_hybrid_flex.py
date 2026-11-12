@@ -55,7 +55,7 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets
-from megatron.training.global_vars import set_run_config
+from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.utils import is_first_or_last_pipeline_stage
 
 # modelopt distillation
@@ -118,6 +118,7 @@ def model_provider(
         HybridModel: The returned model
     """
     args = get_args()
+    cfg_container = get_run_config()
     if has_nvidia_modelopt:
 
         model = model_provider_modelopt(
@@ -161,7 +162,7 @@ def model_provider(
     model = HybridModel(
         config=config,
         hybrid_stack_spec=hybrid_stack_spec,
-        vocab_size=args.padded_vocab_size,
+        vocab_size=cfg_container.tokenizer.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
         hybrid_layer_pattern=args.hybrid_layer_pattern,
@@ -336,7 +337,8 @@ def loss_func(
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
-    if args.check_for_nan_in_loss_and_grad:
+    cfg = get_run_config()
+    if cfg.rerun_state_machine.check_for_nan_in_loss:
         rerun_state_machine.validate_result(
             result=loss,
             rejection_func=torch.isnan,
@@ -352,7 +354,7 @@ def loss_func(
             fatal=True,
         )
     # Check for spiky loss
-    if args.check_for_spiky_loss:
+    if cfg.rerun_state_machine.check_for_spiky_loss:
         rerun_state_machine.validate_result(
             result=loss,
             rejection_func=partial(

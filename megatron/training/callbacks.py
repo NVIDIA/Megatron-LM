@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from megatron.core.optimizer import MegatronOptimizer
     from megatron.core.optimizer_param_scheduler import OptimizerParamScheduler
     from megatron.core.transformer import MegatronModule
+    from megatron.training.state import TrainState
 
 
 logger: logging.Logger = logging.getLogger(__name__)
@@ -79,6 +80,7 @@ class CallbackContext:
         user_state: Mutable dict for storing user data across callback invocations.
         optimizer: Optimizer instance. Available during training events only.
         scheduler: Learning rate scheduler. Available during training events only.
+        train_state: Mutable and checkpointable training state. Available across training lifecycle.
         loss_dict: Reduced losses from training step. Available in on_train_step_end.
         grad_norm: Gradient norm. Available in on_train_step_end if computed.
         skipped_iter: Whether the iteration was skipped. Available in on_train_step_end.
@@ -97,6 +99,7 @@ class CallbackContext:
 
     optimizer: MegatronOptimizer | None = None
     scheduler: OptimizerParamScheduler | None = None
+    train_state: TrainState | None = None
 
     loss_dict: dict[str, torch.Tensor] | None = None
     grad_norm: float | None = None
@@ -253,6 +256,7 @@ class CallbackManager:
 
         Field Availability by Event:
             user_state: Available in all events.
+            train_state: Available from on_setup_start onward.
             model, optimizer, scheduler: Available from on_data_init_start onward.
             checkpointing_context: Available from on_setup_start onward.
             batch_size, elapsed_time_per_iteration, throughput: Available in on_log.

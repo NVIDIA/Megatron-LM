@@ -100,7 +100,10 @@ def test_layerwise_fraction_zero_skips_offload_specific_child_inspection(monkeyp
         use_layer_wise_param_layout=False,
     )
 
-    optimizer = LayerWiseDistributedOptimizer([object()], config)
+    # The bf16 constructor path marks main params DP-sharded by iterating each
+    # child's param_groups; expose only that attribute so any other child
+    # inspection still fails loudly.
+    optimizer = LayerWiseDistributedOptimizer([SimpleNamespace(param_groups=[])], config)
 
     assert optimizer._managed_optimizer_state_offload_child_indices() == ()
     LayerWiseDistributedOptimizer._before_child_step(optimizer, 0)
@@ -125,7 +128,9 @@ def test_layerwise_offload_rejects_multiple_nonempty_muon_children(monkeypatch):
     raw_optimizers = []
     for _ in range(2):
         raw_optimizer = object.__new__(TensorParallelMuon)
-        raw_optimizer.param_groups = [{"params": [object()]}]
+        # Main #7132 marks bf16 main params during construction, so the stub params need
+        # tensor attributes (requires_grad/type) before the Muon-child schema check runs.
+        raw_optimizer.param_groups = [{"params": [torch.nn.Parameter(torch.empty(1))]}]
         raw_optimizers.append(raw_optimizer)
 
     monkeypatch.setattr(
@@ -169,7 +174,9 @@ def test_layerwise_offload_rejects_padded_param_layout(monkeypatch):
         self.expt_dp_params_list = []
 
     raw_optimizer = object.__new__(TensorParallelMuon)
-    raw_optimizer.param_groups = [{"params": [object()]}]
+    # Main #7132 marks bf16 main params during construction, so the stub param needs
+    # tensor attributes (requires_grad/type) before the padded-layout check runs.
+    raw_optimizer.param_groups = [{"params": [torch.nn.Parameter(torch.empty(1))]}]
 
     monkeypatch.setattr(
         "megatron.core.optimizer.layer_wise_optimizer.Float16OptimizerWithFloat16Params",

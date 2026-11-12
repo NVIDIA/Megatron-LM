@@ -2111,6 +2111,33 @@ class TestAttnResHybridBlock:
         assert [layer.attn_res_num_sources for layer in block.layers] == [1, 1, 2, 2]
         assert isinstance(block.final_attn_res, torch.nn.Module)
 
+    @pytest.mark.parametrize("linear_cp_layout", ["contiguous", "zigzag", None])
+    def test_dynamic_cp_rejects_runtime_layout_manager(self, linear_cp_layout):
+        """AttnRes rejects the layout manager that dynamic CP builds per microbatch.
+
+        The static CP group has size 1 here, so the static layout manager is never built and
+        only the dynamic-CP guard can reject an explicit stack layout. Without an explicit
+        linear_cp_layout the attention modules own the CP boundaries and the stack builds.
+        """
+        layer_type_list = validate_segment_layers(
+            Symbols.ATTENTION + Symbols.MLP + Symbols.ATTENTION + Symbols.MLP
+        )
+        layout_kwargs = {} if linear_cp_layout is None else {"linear_cp_layout": linear_cp_layout}
+        config = self._make_config(
+            len(layer_type_list),
+            block_layers=2,
+            dynamic_context_parallel=True,
+            calculate_per_token_loss=True,
+            max_seqlen_per_dp_cp_rank=128,
+            **layout_kwargs,
+        )
+        if linear_cp_layout is None:
+            block = self._make_stack(config, layer_type_list)
+            assert block._cp_layout_manager is None
+        else:
+            with pytest.raises(AssertionError, match="dynamic_context_parallel"):
+                self._make_stack(config, layer_type_list)
+
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
     def test_mtp_source_bridge_and_nested_partial_stack(self):
         """Outer source history is reused by every nested MTP hybrid entry."""
