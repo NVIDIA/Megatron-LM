@@ -114,7 +114,6 @@ def main() -> None:
     (args.output_dir / f"rank-{rank}.json").write_text(json.dumps(result, indent=2) + "\n")
     dist.barrier(device_ids=[device.index])
     dist.destroy_process_group()
-    print(json.dumps(result), flush=True)
     assert result["values_match"], "All-gather returned incorrect rank-dependent values."
     assert result[
         "symmetric_allgather"
