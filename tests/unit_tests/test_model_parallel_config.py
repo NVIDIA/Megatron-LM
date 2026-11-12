@@ -31,18 +31,11 @@ def test_default_dynamic_cp_scheduler_requires_dynamic_cp():
         )
 
 
-@pytest.mark.parametrize("use_legacy_alias", [False, True])
-def test_dynamic_cp_rejects_deterministic_mode(use_legacy_alias):
-    options = {"hybrid_context_parallel" if use_legacy_alias else "dynamic_context_parallel": True}
-    if use_legacy_alias:
-        with pytest.warns(DeprecationWarning, match="deprecated"):
-            with pytest.raises(ValueError, match="does not support deterministic_mode"):
-                ModelParallelConfig(
-                    **options, deterministic_mode=True, max_seqlen_per_dp_cp_rank=4096
-                )
-    else:
-        with pytest.raises(ValueError, match="does not support deterministic_mode"):
-            ModelParallelConfig(**options, deterministic_mode=True, max_seqlen_per_dp_cp_rank=4096)
+def test_dynamic_cp_rejects_deterministic_mode():
+    with pytest.raises(ValueError, match="does not support deterministic_mode"):
+        ModelParallelConfig(
+            dynamic_context_parallel=True, deterministic_mode=True, max_seqlen_per_dp_cp_rank=4096
+        )
 
 
 def test_static_packing_preserves_deterministic_mode():
@@ -54,15 +47,6 @@ def test_static_packing_preserves_deterministic_mode():
 
     assert config.deterministic_mode
     assert not config.dynamic_context_parallel
-
-
-def test_hybrid_cp_alias_normalizes_to_dynamic_cp():
-    with pytest.warns(DeprecationWarning, match="deprecated"):
-        config = ModelParallelConfig(hybrid_context_parallel=True, max_seqlen_per_dp_cp_rank=4096)
-
-    assert config.dynamic_context_parallel is True
-    assert config.hybrid_context_parallel is False
-    assert config.sequence_packing_scheduler == "default_dynamic_cp"
 
 
 @pytest.mark.parametrize("alignment", [None, "32", "max"])
@@ -128,3 +112,32 @@ def test_te_cross_entropy_loss_fusion_requires_te_2_19(monkeypatch):
 
     with pytest.raises(AssertionError, match="disabled due to stability issues"):
         validate_args(args)
+
+
+@pytest.mark.parametrize("cp_size", [1, 2])
+@pytest.mark.parametrize(
+    "alignment,capacity,valid",
+    [("max", 18, False), ("max", 24, True), (6, 24, True), (8, 24, True)],
+)
+def test_packed_padding_preserves_sequence_parallel_divisibility(
+    cp_size, alignment, capacity, valid
+):
+    kwargs = dict(
+        tensor_model_parallel_size=4,
+        context_parallel_size=cp_size,
+        sequence_packing_scheduler="dp_balanced",
+        pad_packed_seq_alignment=alignment,
+        max_seqlen_per_dp_cp_rank=capacity,
+    )
+    # Without sequence parallelism, TP does not constrain the padded token length.
+    ModelParallelConfig(**kwargs)
+    if valid:
+        config = ModelParallelConfig(sequence_parallel=True, **kwargs)
+        from megatron.core.datasets.data_schedule_utils import get_packed_sequence_alignment
+
+        effective_alignment, _ = get_packed_sequence_alignment(config, 4)
+        assert effective_alignment % 4 == 0
+        assert capacity % effective_alignment == 0
+    else:
+        with pytest.raises(AssertionError, match="sequence-parallel TP divisibility"):
+            ModelParallelConfig(sequence_parallel=True, **kwargs)

@@ -29,6 +29,8 @@ MODEL_ARGS:
   --linear-num-value-heads: 8
   # Add MoE args
   --num-experts: 32
+  --moe-token-dispatcher-type: allgather
+  --no-moe-grouped-gemm: true
   --moe-ffn-hidden-size: 64
   --moe-shared-expert-intermediate-size: 64
   --moe-shared-expert-gate: true
