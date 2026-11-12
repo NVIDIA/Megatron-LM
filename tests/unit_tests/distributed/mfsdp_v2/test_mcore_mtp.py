@@ -7,7 +7,6 @@ from copy import deepcopy
 
 import pytest
 import torch
-import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 
@@ -22,6 +21,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
+from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import run_training_steps
 
 
 class _SharedPredictor(nn.Module):
@@ -91,24 +91,14 @@ def test_shared_mtp_matches_unsharded_training(distributed_setup, ambient_contex
             device=device,
             pg_collection=groups,
         )
-    reference_optimizer = torch.optim.SGD(baseline.parameters(), lr=0.05)
+    expected = run_training_steps(
+        baseline,
+        lambda: baseline(value),
+        torch.optim.SGD(baseline.parameters(), lr=0.05),
+        num_steps=3,
+        data_parallel_group=groups.dp_cp,
+    )
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
     fully_shard_optimizer(optimizer)
-
-    for _ in range(3):
-        reference_optimizer.zero_grad()
-        optimizer.zero_grad()
-        expected = baseline(value)
-        expected.backward()
-        for parameter in baseline.parameters():
-            dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG, group=groups.dp_cp)
-        actual = model(value)
-        actual.backward()
-        model.finish_grad_sync()
-        torch.testing.assert_close(actual, expected)
-        for parameter, reference in zip(model.parameters(), baseline.parameters(), strict=True):
-            torch.testing.assert_close(parameter.grad.full_tensor(), reference.grad)
-        reference_optimizer.step()
-        optimizer.step()
-        for parameter, reference in zip(model.parameters(), baseline.parameters(), strict=True):
-            torch.testing.assert_close(parameter.full_tensor(), reference)
+    actual = run_training_steps(model, lambda: model(value), optimizer, num_steps=3)
+    torch.testing.assert_close(actual, expected)
