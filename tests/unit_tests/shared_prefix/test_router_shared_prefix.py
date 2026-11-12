@@ -223,7 +223,7 @@ def test_transformer_layer_routes_multiplicities_to_moe_layer(overrides):
         router.local_tokens_per_expert.zero_()
         with patch.object(layer.mlp, "forward", wraps=layer.mlp.forward) as moe_forward:
             output, _ = layer(
-                hidden_states=hidden_states,
+                hidden_states,
                 attention_mask=None,
                 shared_prefix_token_multiplicities=multiplicities,
             )
@@ -259,7 +259,7 @@ def test_transformer_layer_rejects_multiplicities_for_dense_mlp():
         hidden_states = torch.randn(6, 2, 12, device="cuda")
         with pytest.raises(ValueError, match="requires an MoE MLP"):
             layer(
-                hidden_states=hidden_states,
+                hidden_states,
                 attention_mask=None,
                 shared_prefix_token_multiplicities=torch.ones(12, device="cuda"),
             )
