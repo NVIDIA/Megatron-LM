@@ -58,10 +58,15 @@ def _describe(action):
 
 
 def test_every_legacy_data_argument_is_unchanged():
+    """Every legacy action keeps its dest, default, nargs, type, choices, action class, required
+    flag and const, and every legacy option string is still accepted; an action may carry more
+    spellings than the legacy parser (the factory's store-false flags also take ``--disable-*``)."""
     actions = _actions_by_dest(_full_parser())
     for dest, legacy in LEGACY.items():
         assert dest in actions, dest
-        assert _describe(actions[dest]) == legacy, dest
+        current = _describe(actions[dest])
+        assert set(legacy["option_strings"]) <= set(current.pop("option_strings")), dest
+        assert current == {key: value for key, value in legacy.items() if key != "option_strings"}
 
 
 def test_full_parser_has_no_duplicate_option_strings():
@@ -211,6 +216,10 @@ def test_loader_options_are_generated_from_the_dataloader_config():
     assert {f.name for f in fields(DataloaderConfig)} == set(helps) | {"drop_last"}
     for dest, prefix in helps.items():
         assert actions[dest].help.startswith(prefix), (dest, actions[dest].help)
+    # The three store-false flags carry the factory's two spellings (no metadata narrows them).
+    for dest in ("data_sharding", "pin_memory", "persistent_workers"):
+        name = dest.replace("_", "-")
+        assert set(actions[dest].option_strings) == {f"--no-{name}", f"--disable-{name}"}, dest
 
 
 def test_inter_document_masking_on_the_cli_builds_a_valid_section():

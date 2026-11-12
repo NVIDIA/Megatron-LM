@@ -65,7 +65,8 @@ CONTAINER_WRITTEN_FIELDS = (
 @dataclass(kw_only=True)
 class DataloaderConfig:
     """Settings for building torch DataLoaders on top of a dataset. The CLI options are generated
-    from these fields (``ArgumentGroupFactory`` in ``_add_data_args``), except ``drop_last``."""
+    from these fields (``ArgumentGroupFactory`` in ``_add_data_args``), except ``drop_last``; the
+    three store-false flags take the factory's ``--no-*`` and ``--disable-*`` spellings."""
 
     dataloader_type: str | None = field(
         default=None, metadata={"argparse_meta": {"choices": list(DATALOADER_TYPES)}}
@@ -76,19 +77,13 @@ class DataloaderConfig:
     num_workers: int = 2
     """Dataloader number of workers."""
 
-    data_sharding: bool = field(
-        default=True, metadata={"argparse_meta": {"arg_names": ["--no-data-sharding"]}}
-    )
+    data_sharding: bool = True
     """Shard the dataset per data-parallel rank before shuffling (cyclic sampler only)."""
 
-    pin_memory: bool = field(
-        default=True, metadata={"argparse_meta": {"arg_names": ["--no-pin-memory"]}}
-    )
+    pin_memory: bool = True
     """Pin host memory in the torch DataLoader (``--no-pin-memory`` turns it off)."""
 
-    persistent_workers: bool = field(
-        default=True, metadata={"argparse_meta": {"arg_names": ["--no-persistent-workers"]}}
-    )
+    persistent_workers: bool = True
     """Keep the DataLoader workers alive between passes (``--no-persistent-workers`` turns it off).
     Forced to False when ``num_workers == 0``: there are no workers to keep."""
 
