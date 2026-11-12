@@ -15,11 +15,14 @@ Each tensor's owner holds a shard, so any peer pair shares at most one tensor ac
 disjoint buffer ranges. Tensor traversal order therefore need not match across ranks.
 
 Operations are posted on the current CUDA stream and return their P2P works without waiting.
+A `Transport` can move the same transfers instead of NCCL P2P; see `copy_engine`.
 Waiting on a work orders the stream it is called on after the transfer, so the caller decides
 when to wait. Multiple parameter groups can be pipelined by posting several before waiting, or by
 executing the functions in different streams. Callers explicitly wait for inputs to be ready on
 each stream and for results to be ready before consuming them on another stream.
 """
+
+from typing import NamedTuple, Protocol
 
 import torch
 import torch.distributed as dist
@@ -27,6 +30,34 @@ from torch.distributed.tensor import Shard
 
 from .dbuffer import DBuffer
 from .range import Range, intersect_ranges
+
+
+class Transfer(NamedTuple):
+    """A chunk this rank sends to or receives from `peer`."""
+
+    is_send: bool
+    chunk: torch.Tensor
+    peer: int
+    # The chunk's offset in the peer's sharded local buffer, when the peer holds the sharded side.
+    peer_offset: int | None = None
+
+
+class Transport(Protocol):
+    """Moves a gather's or a scatter's transfers instead of NCCL P2P."""
+
+    def post_gather(self, source: DBuffer, transfers: list[Transfer]) -> list:
+        """Post a gather's transfers; return works whose `wait` orders the current stream."""
+
+    def post_scatter(self, destination: DBuffer, transfers: list[Transfer]) -> list:
+        """Post a scatter's transfers; return works whose `wait` orders the current stream."""
+
+
+def _post_p2p(transfers: list[Transfer]) -> list[dist.Work]:
+    """Post the transfers as one batch of NCCL P2P."""
+    ops = [
+        dist.P2POp(dist.isend if t.is_send else dist.irecv, t.chunk, peer=t.peer) for t in transfers
+    ]
+    return dist.batch_isend_irecv(ops) if ops else []
 
 
 def get_shard_ranks(buffer: DBuffer) -> list[int]:
@@ -65,6 +96,7 @@ def gather(
     *,
     tensor_to_owner: dict[int, int],
     rank_ranges: dict[int, Range] | None = None,
+    transport: Transport | None = None,
 ) -> list[dist.Work]:
     """Gather full tensors from local chunks to their owners via P2P.
 
@@ -86,6 +118,7 @@ def gather(
         tensor_to_owner: Participating tensor index to owner global rank. Each owner must
             hold a nonempty shard of its tensor; see `assign_owner_work`.
         rank_ranges: `get_sorted_rank_ranges(source)`, if the caller already has it.
+        transport: Moves the transfers instead of NCCL P2P.
 
     Returns:
         The posted P2P works, empty if this rank has none. Wait on each before using the
@@ -97,14 +130,14 @@ def gather(
     if rank_ranges is None:
         rank_ranges = get_sorted_rank_ranges(source)
 
-    # Build the P2P ops: send non-owned chunks to their owners, receive owned ones.
-    ops: list[dist.P2POp] = []
+    # Send non-owned chunks to their owners, receive owned ones.
+    transfers: list[Transfer] = []
     for i, owner_rank in tensor_to_owner.items():
         tensor_range = layout.get_tensor_range(i)
         if owner_rank != this_rank:
             if intersect_ranges(tensor_range, rank_ranges[this_rank]).numel > 0:
                 chunk = source.get_tensor_view(i).flatten()
-                ops.append(dist.P2POp(dist.isend, chunk, peer=owner_rank))
+                transfers.append(Transfer(True, chunk, owner_rank))
             continue
 
         target = destination[i]
@@ -127,9 +160,10 @@ def gather(
             if src_rank == this_rank:
                 chunk.copy_(source.get_tensor_view(i).flatten())
             else:
-                ops.append(dist.P2POp(dist.irecv, chunk, peer=src_rank))
+                peer_offset = shard_range.start - rank_range.start
+                transfers.append(Transfer(False, chunk, src_rank, peer_offset))
 
-    return dist.batch_isend_irecv(ops) if ops else []
+    return _post_p2p(transfers) if transport is None else transport.post_gather(source, transfers)
 
 
 def scatter(
@@ -138,6 +172,7 @@ def scatter(
     *,
     tensor_to_owner: dict[int, int],
     rank_ranges: dict[int, Range] | None = None,
+    transport: Transport | None = None,
 ) -> list[dist.Work]:
     """Scatter full result tensors from the owners to the other ranks via P2P.
 
@@ -160,6 +195,7 @@ def scatter(
         tensor_to_owner: Participating tensor index to owner global rank. Each owner must
             hold a nonempty shard of its tensor; see `assign_owner_work`.
         rank_ranges: `get_sorted_rank_ranges(destination)`, if the caller already has it.
+        transport: Moves the transfers instead of NCCL P2P.
 
     Returns:
         The posted P2P works, empty if this rank has none. Wait on each before using the
@@ -171,14 +207,14 @@ def scatter(
     if rank_ranges is None:
         rank_ranges = get_sorted_rank_ranges(destination)
 
-    # Build the P2P ops: send owned result chunks, receive the ones held here.
-    ops: list[dist.P2POp] = []
+    # Send owned result chunks, receive the ones held here.
+    transfers: list[Transfer] = []
     for i, owner in tensor_to_owner.items():
         tensor_range = layout.get_tensor_range(i)
         if owner != this_rank:
             if intersect_ranges(tensor_range, rank_ranges[this_rank]).numel > 0:
                 chunk = destination.get_tensor_view(i).flatten()
-                ops.append(dist.P2POp(dist.irecv, chunk, peer=owner))
+                transfers.append(Transfer(False, chunk, owner))
             continue
 
         tensor = source[i]
@@ -199,6 +235,9 @@ def scatter(
             offset = shard_range.start - tensor_range.start
             if numel == 0:
                 continue
-            ops.append(dist.P2POp(dist.isend, flat[offset : offset + numel], peer=dest))
+            peer_offset = shard_range.start - rank_ranges[dest].start
+            transfers.append(Transfer(True, flat[offset : offset + numel], dest, peer_offset))
 
-    return dist.batch_isend_irecv(ops) if ops else []
+    if transport is None:
+        return _post_p2p(transfers)
+    return transport.post_scatter(destination, transfers)

@@ -306,11 +306,12 @@ class FsdpMuon(Muon):
                 )
                 for i in owned
             }
-            works = (gather if copy_engine is None else copy_engine.gather)(
+            works = gather(
                 momentum_inputs,
                 full_updates,
                 tensor_to_owner=tensor_to_owner,
                 rank_ranges=assignment.rank_ranges,
+                transport=copy_engine,
             )
         else:
             full_updates = {
@@ -341,11 +342,12 @@ class FsdpMuon(Muon):
         else:
             # The owners have read the momentum inputs, so their slot receives the updates.
             local_updates = group_step.sharded
-        works = (scatter if self._copy_engine is None else self._copy_engine.scatter)(
+        works = scatter(
             group_step.full_updates,
             local_updates,
             tensor_to_owner=group_step.tensor_to_owner,
             rank_ranges=group_step.assignment.rank_ranges,
+            transport=self._copy_engine,
         )
         return replace(group_step, works=works, sharded=local_updates)
 

@@ -22,7 +22,7 @@ import torch.distributed as dist
 import torch.distributed._symmetric_memory as symm_mem
 
 from .dbuffer import DBuffer
-from .range import Range, intersect_ranges
+from .gather_scatter import Transfer
 
 _READY, _DONE = 0, 1
 
@@ -45,7 +45,8 @@ class CopyEngineP2P:
     `empty` hands out slots round robin. A slot must stay in use from its group's gather until
     its received updates are applied, so `num_slots` must cover every group in flight at once.
     A group's scatter reuses the slot of its gather: by then the owners have read their inputs.
-    Every rank must construct this, and call `empty`, `gather`, and `scatter` in the same order.
+    Pass it as the `transport` of `gather_scatter.gather` and `gather_scatter.scatter`. Every rank
+    must construct this, and call `empty`, `gather`, and `scatter` in the same order.
     """
 
     def __init__(self, num_slots: int, slot_numel: int, device: torch.device) -> None:
@@ -107,91 +108,47 @@ class CopyEngineP2P:
             local_buffer=self._slots[slot, :numel],
         )
 
-    def gather(
-        self,
-        source: DBuffer,
-        destination: dict[int, torch.Tensor],
-        *,
-        tensor_to_owner: dict[int, int],
-        rank_ranges: dict[int, Range],
-    ) -> list[CopyEngineWork]:
-        """Pull the chunks of owned tensors from their holders' slots; see `gather_scatter.gather`.
+    def post_gather(self, source: DBuffer, transfers: list[Transfer]) -> list[CopyEngineWork]:
+        """Holders signal READY to their owners; owners pull each chunk from the holder's slot.
 
-        `source` must come from `empty`. Holders signal READY to the owners they hold chunks for.
+        `source` must come from `empty`.
         """
         slot = self._slot_of(source)
-        chunks, owners = self._chunks(source, slot, destination, tensor_to_owner, rank_ranges)
         # The inputs and the destinations' memory come from the current stream.
         self.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.stream):
             # Signal before waiting: owners wait for each other's chunks.
-            for owner in owners:
+            for owner in {t.peer for t in transfers if t.is_send}:
                 self._signal(owner, slot, _READY)
-            for holder, chunk, holder_chunk in chunks:
-                if holder != self.this_rank:
-                    self._wait(holder, slot, _READY)
-                chunk.copy_(holder_chunk)
+            for t in transfers:
+                if not t.is_send:
+                    self._wait(t.peer, slot, _READY)
+                    t.chunk.copy_(self._peer_chunk(t, slot))
         return [CopyEngineWork(self.stream)]
 
-    def scatter(
-        self,
-        source: dict[int, torch.Tensor],
-        destination: DBuffer,
-        *,
-        tensor_to_owner: dict[int, int],
-        rank_ranges: dict[int, Range],
-    ) -> list[CopyEngineWork]:
-        """Push owned results into their holders' slots; see `gather_scatter.scatter`.
+    def post_scatter(self, destination: DBuffer, transfers: list[Transfer]) -> list[CopyEngineWork]:
+        """Owners push each chunk into the holder's slot and signal DONE; holders wait for it.
 
-        `destination` must be the gather's `source`. Owners signal DONE to the holders they push to.
+        `destination` must be the gather's `source`: by now the owners have read their inputs.
         """
         slot = self._slot_of(destination)
-        chunks, owners = self._chunks(destination, slot, source, tensor_to_owner, rank_ranges)
-        # The owner keeps its own result chunk.
-        chunks = [chunk for chunk in chunks if chunk[0] != self.this_rank]
         # The results come from the current stream.
         self.stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.stream):
-            for _, chunk, holder_chunk in chunks:
-                holder_chunk.copy_(chunk)
-            for holder in {chunk[0] for chunk in chunks}:
+            for t in transfers:
+                if t.is_send:
+                    self._peer_chunk(t, slot).copy_(t.chunk)
+            for holder in {t.peer for t in transfers if t.is_send}:
                 self._signal(holder, slot, _DONE)
-            for owner in owners:
+            for owner in {t.peer for t in transfers if not t.is_send}:
                 self._wait(owner, slot, _DONE)
         return [CopyEngineWork(self.stream)]
 
-    def _chunks(
-        self,
-        sharded: DBuffer,
-        slot: int,
-        full_tensors: dict[int, torch.Tensor],
-        tensor_to_owner: dict[int, int],
-        rank_ranges: dict[int, Range],
-    ) -> tuple[list[tuple[int, torch.Tensor, torch.Tensor]], set[int]]:
-        """Match the chunks of this rank's full tensors with their holders' slots.
-
-        Returns:
-            `(holder, chunk of a full tensor, the holder's chunk in its slot)` for every chunk of
-            the tensors this rank owns, and the owners of the other tensors this rank holds.
-        """
-        chunks: list[tuple[int, torch.Tensor, torch.Tensor]] = []
-        owners: set[int] = set()
-        for i, owner in tensor_to_owner.items():
-            tensor_range = sharded.layout.get_tensor_range(i)
-            if owner != self.this_rank:
-                if intersect_ranges(tensor_range, rank_ranges[self.this_rank]).numel > 0:
-                    owners.add(owner)
-                continue
-            full = full_tensors[i].view(tensor_range.numel)
-            for holder, rank_range in rank_ranges.items():
-                shard = intersect_ranges(tensor_range, rank_range)
-                if shard.numel > 0:
-                    chunk = full.narrow(0, shard.start - tensor_range.start, shard.numel)
-                    holder_chunk = self._peer_slots[holder][slot].narrow(
-                        0, shard.start - rank_range.start, shard.numel
-                    )
-                    chunks.append((holder, chunk, holder_chunk))
-        return chunks, owners
+    def _peer_chunk(self, transfer: Transfer, slot: int) -> torch.Tensor:
+        """The transfer's chunk in the peer's slot."""
+        return self._peer_slots[transfer.peer][slot].narrow(
+            0, transfer.peer_offset, transfer.chunk.numel()
+        )
 
     def _slot_of(self, buffer: DBuffer) -> int:
         """Index of the slot holding `buffer`'s local buffer."""
