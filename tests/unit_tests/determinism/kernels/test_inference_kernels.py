@@ -1412,3 +1412,60 @@ def test_flashinfer_nvfp4_moe_is_batch_invariant(gated):
             f"FlashInfer NVFP4 MoE output changed at batch {name}; max abs diff: "
             f"{(output_alone.float() - output.float()).abs().max().item()}"
         )
+
+
+def _ep_invariant_case(num_tokens=4096, valid=3000, hidden=512, num_local=24, topk=6):
+    """Fixed routing over 24 local experts (8 leaves of 3), some slots routed elsewhere,
+    tokens past ``valid`` dead; expert-grouped rows with their inverse map."""
+    seeded()
+    start = 24
+    routing = torch.stack([torch.randperm(96, device="cuda")[:topk] for _ in range(num_tokens)]).to(
+        torch.int64
+    )
+    inverse_map = torch.full((num_tokens, num_local), -1, device="cuda", dtype=torch.int32)
+    lid = routing[:valid] - start
+    local = (lid >= 0) & (lid < num_local)
+    tok = torch.arange(valid, device="cuda")[:, None].expand_as(lid)[local]
+    n_rows = int(local.sum())
+    inverse_map[tok, lid[local]] = torch.randperm(n_rows, device="cuda").int()
+    rows = torch.randn(n_rows + 64, hidden, device="cuda", dtype=torch.bfloat16)
+    return rows, inverse_map, routing, start, num_local, _dev_scalar(valid), valid
+
+
+def test_ep_invariant_dense_map_replays():
+    """moe_ep_invariant_combine on the torch backend (dense inverse map, 8 leaves of 3
+    experts): live rows replay bit-exactly and rows past the valid prefix stay untouched."""
+    from megatron.core.inference.moe import batch_invariant
+
+    rows, inverse_map, _, _, _, valid_t, valid = _ep_invariant_case()
+
+    def fn(rows):
+        out = torch.full((inverse_map.shape[0], rows.shape[1]), 7.0, device="cuda")
+        return batch_invariant.unpermute_tokens_in_expert_order(
+            rows, inverse_map, valid_t, out, ep_invariant_leaves=8
+        )
+
+    ref, _ = assert_replays_bit_exact(
+        fn, (rows,), backward=False, contention=True, what="EP-invariant dense-map combine"
+    )
+    assert torch.all(next(iter(ref.values()))[valid:] == 7.0)
+
+
+def test_ep_invariant_topk_replays():
+    """moe_ep_invariant_combine on the top-k layout (vLLM, and mcore at expert TP > 1):
+    the slot reorder and the subtree replay bit-exactly; rows past the prefix stay untouched."""
+    from megatron.core.inference.moe.fused_moe import _rows_in_topk_order
+    from megatron.core.transformer.moe import ep_invariant_combine as eic
+
+    rows, inverse_map, routing, start, num_local, valid_t, valid = _ep_invariant_case()
+
+    def fn(rows):
+        slot_rows = _rows_in_topk_order(rows, inverse_map, routing, start, num_local)
+        out = torch.full((routing.shape[0], rows.shape[1]), 7.0, device="cuda")
+        eic.tree_combine_topk_forward(slot_rows, routing, start, num_local, 8, valid_t, out)
+        return slot_rows, out
+
+    ref, _ = assert_replays_bit_exact(
+        fn, (rows,), backward=False, contention=True, what="EP-invariant top-k combine"
+    )
+    assert torch.all(list(ref.values())[1][valid:] == 7.0)
