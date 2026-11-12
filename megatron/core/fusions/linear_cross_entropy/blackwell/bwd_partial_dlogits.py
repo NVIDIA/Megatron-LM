@@ -361,7 +361,7 @@ try:
                 )
                 tTMEM_load_cAcc = thr_copy_t2r.partition_D(tCcAcc_epi)
                 tTMEM_load_cAcc_shape = cute.select(tTMEM_load_cAcc.shape, mode=[0, 1, 2])
-                tTMEM_load_rAcc = cute.make_fragment(tTMEM_load_cAcc_shape, self.acc_dtype)
+                tTMEM_load_rAcc = cute.make_rmem_tensor(tTMEM_load_cAcc_shape, self.acc_dtype)
 
                 copy_atom_g2r_int64 = cute.make_copy_atom(
                     cute.nvgpu.CopyUniversalOp(), mLabels.element_type
@@ -387,7 +387,7 @@ try:
                 # slice along M direction
                 tMCAcc = thr_copy_g2r_int64.partition_S(cAcc)[(None, None, 0)]
                 # [(1, 1), 1]
-                tMCAcc_mask = cute.make_fragment(tMCAcc.shape, cutlass.Boolean)
+                tMCAcc_mask = cute.make_rmem_tensor(tMCAcc.shape, cutlass.Boolean)
                 # to align shape with gMax and gAccu
                 tMCAcc_mask = cute.append_ones(tMCAcc_mask)
                 tMCAcc_mask[0] = cute.elem_less(
@@ -395,16 +395,16 @@ try:
                 )
                 # [(1, 1), 1, 1]
                 tMgLabels = thr_copy_g2r_int64.partition_S(cute.append_ones(gLabels))
-                tMrLabels = cute.make_fragment(tMgLabels.shape, tMgLabels.element_type)
+                tMrLabels = cute.make_rmem_tensor(tMgLabels.shape, tMgLabels.element_type)
                 cute.copy(tiled_copy_g2r_int64, tMgLabels, tMrLabels, pred=tMCAcc_mask)
                 tMgMaximum = thr_copy_g2r_fp32.partition_S(cute.append_ones(gMaximum))
-                tMrMaximum = cute.make_fragment(tMgMaximum.layout, tMgMaximum.element_type)
+                tMrMaximum = cute.make_rmem_tensor(tMgMaximum.layout, tMgMaximum.element_type)
                 cute.copy(tiled_copy_g2r_fp32, tMgMaximum, tMrMaximum, pred=tMCAcc_mask)
                 tMgAccu = thr_copy_g2r_fp32.partition_S(cute.append_ones(gAccu))
-                tMrAccu = cute.make_fragment(tMgAccu.layout, tMgAccu.element_type)
+                tMrAccu = cute.make_rmem_tensor(tMgAccu.layout, tMgAccu.element_type)
                 cute.copy(tiled_copy_g2r_fp32, tMgAccu, tMrAccu, pred=tMCAcc_mask)
 
-                tMrDlogprobs = cute.make_fragment(tMgAccu.layout, mDlogprobs.element_type)
+                tMrDlogprobs = cute.make_rmem_tensor(tMgAccu.layout, mDlogprobs.element_type)
                 if cutlass.const_expr(self.REDUCTION == 2):
                     # mean reduction
                     num_valid_tokens = cute.make_tensor(scalarNumValidTokens, layout=(1,))
@@ -440,7 +440,7 @@ try:
 
                 # [CPY, loopM, loopN]
                 tR2GCAcc = thr_copy_r2g.partition_S(cAcc)
-                tR2GCAcc_pred = cute.make_fragment(tR2GCAcc.shape, cutlass.Boolean)
+                tR2GCAcc_pred = cute.make_rmem_tensor(tR2GCAcc.shape, cutlass.Boolean)
                 for elem in cutlass.range(cute.size(tR2GCAcc_pred, mode=[0])):
                     for row in cutlass.range(cute.size(tR2GCAcc_pred, mode=[1])):
                         for col in cutlass.range(cute.size(tR2GCAcc_pred, mode=[2])):
@@ -457,7 +457,9 @@ try:
                 tR2GgDlogits = thr_copy_r2g.partition_D(gDlogits_partial)
 
                 # for type conversion
-                dLogits_half = cute.make_fragment(tTMEM_load_rAcc.shape, tR2GgDlogits.element_type)
+                dLogits_half = cute.make_rmem_tensor(
+                    tTMEM_load_rAcc.shape, tR2GgDlogits.element_type
+                )
                 dLogits_half = cute.tiled_divide(
                     dLogits_half, (cute.size(tR2GgDlogits, mode=[0]), 1)
                 )
