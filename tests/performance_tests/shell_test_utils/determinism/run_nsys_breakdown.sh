@@ -1,7 +1,7 @@
 #!/bin/bash
 # Wrap a Python entry point under nsys twice (det + nondet) and print the
 # per-NVTX-range diff. Entry point reads DETERMINISM_PERF_MODE and must call
-# cudaProfilerStart/Stop (Megatron's --profile flag handles this).
+# cudaProfilerStart/Stop (Megatron's --profile flag handles this), then exit on its own.
 # Usage: bash run_nsys_breakdown.sh OUTDIR -- CMD...
 set -euo pipefail
 OUT_ARG="${1:?usage: $0 OUTDIR -- CMD...}"; shift
