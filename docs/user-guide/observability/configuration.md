@@ -15,9 +15,10 @@
 |---|---|---|
 | `--otel-enabled` | flag | Enable OTel telemetry |
 | `--otel-service-name NAME` | string | Override `OTEL_SERVICE_NAME` |
-| `--otel-span-groups SPEC` | string | Comma-separated span-group spec (see [Span Groups](span-groups.md)) |
 
-These flags are processed in `megatron/training/global_vars.py:_set_telemetry()` and override the corresponding env vars.
+These flags are processed in `megatron/training/global_vars.py:_set_telemetry()`
+and override the corresponding env vars. Span groups are configured through
+`MEGATRON_OTEL_SPAN_GROUPS` or the shared fallback `NEMO_LENS_SPAN_GROUPS`.
 
 ## Megatron-specific environment variables
 
@@ -26,26 +27,15 @@ Each `MEGATRON_OTEL_*` variable is an **alias** for the corresponding [`NemoLens
 | Variable | Default | Description |
 |---|---|---|
 | `MEGATRON_OTEL_ENABLED` | `0` | Master toggle; must be set to `1` to activate |
-| `MEGATRON_OTEL_RANK_STRATEGY` | `single_rank` | `single_rank`, `all_ranks`, `sampled`, `first_rank_per_node`, or any name registered via `register_rank_strategy()` |
-| `MEGATRON_OTEL_EXPORT_RANK` | `-1` | For `single_rank`: which rank exports. `-1` = last rank |
-| `MEGATRON_OTEL_EXPORT_SAMPLE_RATE` | `1.0` | For `sampled`: fraction in `[0.0, 1.0]` |
-| `MEGATRON_OTEL_SAMPLING_STRATEGY` | (empty) | `rank_aware` or any name registered via `register_sampling_strategy()`. Empty leaves the OTel SDK default sampler in place. |
 | `MEGATRON_OTEL_TRACES_ENABLED` | `1` | Enable trace spans |
 | `MEGATRON_OTEL_METRICS_ENABLED` | `1` | Enable metrics instruments |
 | `MEGATRON_OTEL_LOGS_ENABLED` | `0` | Enable OTel log bridge |
 | `MEGATRON_OTEL_SPAN_GROUPS` | `default` | Span granularity spec (see [Span Groups](span-groups.md)) |
 | `MEGATRON_OTEL_EXPORTER` | `otlp` | Exporter backend: `otlp` or `console` |
-| `NEMO_LENS_RUN_ID` | (auto) | Unique run identifier. Auto-detected from `SLURM_JOB_ID` or generated UUID |
 | `NEMO_LENS_USER_ID` | (empty) | Optional user/team label |
 
 For the full config model, field semantics, and validation rules, see
 [lens: configuration](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/configuration.md).
-
-## Rank strategy
-
-Controls which ranks actually send telemetry. Four strategies are available: `single_rank` (default), `all_ranks`, `sampled`, and `first_rank_per_node`, configured via `MEGATRON_OTEL_RANK_STRATEGY` above.
-
-See [lens: sampling](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/sampling.md) for detailed semantics, when to use each, and how they compose with OTel SDK samplers.
 
 ## Standard OTel SDK variables
 
@@ -60,41 +50,80 @@ All standard OTel SDK env vars are honoured by the SDK directly:
 | `OTEL_TRACES_SAMPLER` | `parentbased_traceidratio` |
 | `OTEL_TRACES_SAMPLER_ARG` | `0.1` |
 
-## Run Identification
+## Run identification
 
-Each training run is automatically assigned a unique `nemo.run.id` resource attribute that flows to all backends.
+`nv.dl.run.uuid` is the unique execution-instance identifier shared by the
+processes and ranks participating in that execution. Megatron preserves an
+inherited launcher value. When no value is inherited, Megatron telemetry setup
+uses Lens to derive the attempt identity from Slurm or TorchElastic runtime
+information. If neither scheduler nor local run identity is available, the
+attribute is omitted. The submitted-job identity, `nv.dl.job.uuid`, comes from
+inherited launcher data or Lens Slurm detection.
 
-**Priority order:**
-
-1. `NEMO_LENS_RUN_ID` env var (explicit, highest priority)
-2. `SLURM_JOB_ID` env var (auto-detected on SLURM clusters)
-3. Auto-generated 12-character UUID (fallback)
-
-All ranks in a distributed job share the same `run_id`. Each rank gets a unique `service.instance.id` of `{run_id}-rank{rank}`.
-
-Filter by `nemo.run.id` in Jaeger, Grafana, Kibana to isolate a specific run.
+All ranks in one run should share `nv.dl.run.uuid`; each process is distinguished
+by `nv.dl.rank`, `nv.dl.world_size`, and `nv.dl.local_rank`.
 
 ## Resource attributes
 
-Megatron's `_set_telemetry()` sets training-config attributes on the OTel `Resource` so they appear as Jaeger "Process" tags across every span in the run:
+Megatron's `_set_telemetry()` supplies trainer Resource attributes so they
+appear as process-level tags across every span in the run. It uses Lens's shared
+dictionary composition once: trainer argument and locally detected GPU values
+are defaults, decoded inherited launcher values are current, and Lens Slurm and
+Kubernetes detector results plus trainer-owned identity are overrides. Later
+layers win, including when a current value is empty. Megatron sets
+`nv.dl.role=trainer`. Parent `host.name`, `process.pid`, and `host.gpu.count`
+values are removed after composition so Lens detects them for the current
+trainer process.
 
-| Attribute | Megatron source |
+The service name resolves in this order: nonempty `--otel-service-name`,
+non-whitespace `OTEL_SERVICE_NAME`, inherited `service.name`, then
+`megatron-lm`.
+
+When telemetry is enabled, Megatron passes this composed application map to
+Lens's exact publication context for the trainer lifetime. Spawned workers
+therefore inherit the same resolved input. Telemetry shutdown first shuts down
+Lens and then exits the publication context, which restores the exact incoming
+environment state, including the difference between an absent variable and an
+empty one.
+
+| Attribute | Source |
 |---|---|
-| `dl.local_rank` | `args.local_rank` |
-| `dl.tensor_parallel.size` | `args.tensor_model_parallel_size` |
-| `dl.pipeline_parallel.size` | `args.pipeline_model_parallel_size` |
-| `dl.data_parallel.size` | `args.data_parallel_size` |
-| `dl.batch_size` | `args.global_batch_size` |
-| `dl.sequence_length` | `args.seq_length` |
-| `megatron.num_layers` | `args.num_layers` |
-| `megatron.hidden_size` | `args.hidden_size` |
-| `megatron.num_attention_heads` | `args.num_attention_heads` |
-| `megatron.train_iters` | `args.train_iters` |
-| `megatron.micro_batch_size` | `args.micro_batch_size` |
-| `megatron.ckpt_format` | `args.ckpt_format` |
-| `megatron.precision` | `fp16` / `bf16` / `fp32` |
+| `nv.dl.rank` | `args.rank` |
+| `nv.dl.world_size` | `args.world_size` |
+| `nv.dl.local_rank` | `args.local_rank` |
+| `nv.dl.role` | `trainer` |
+| `nv.dl.provider.name` | `mcore` |
+| `nv.dl.run.uuid` | inherited launcher environment, otherwise Lens-derived attempt identity |
+| `nv.dl.topology.size.tp` | `args.tensor_model_parallel_size` |
+| `nv.dl.topology.size.pp` | `args.pipeline_model_parallel_size` |
+| `nv.dl.topology.size.dp` | `args.data_parallel_size` |
+| `nv.dl.training.config.global_batch_size` | `args.global_batch_size` |
+| `nv.dl.training.config.micro_batch_size` | `args.micro_batch_size` |
+| `nv.dl.training.config.sequence_length` | `args.seq_length` |
+| `nv.dl.training.config.optimizer` | `args.optimizer` |
+| `nv.dl.training.config.recompute_granularity` | `args.recompute_granularity` |
+| `nv.dl.training.target.train_iters` | `args.train_iters` |
+| `nv.dl.training.target.train_samples` | `args.train_samples`, or derived from iterations and batch size |
+| `nv.dl.training.target.train_tokens` | `args.train_tokens`, or derived from samples and sequence length |
+| `nv.dl.software.torch` | PyTorch version |
+| `nv.dl.software.cuda` | PyTorch CUDA version |
+| `nv.dl.software.nccl` | PyTorch NCCL version |
+| `nv.dl.software.transformer_engine` | Transformer Engine package version |
+| `nv.mcore.version` | Megatron Core package version |
+| `nv.gpu.index` | inherited value or Lens GPU detector called by Megatron |
+| `nv.gpu.model` | inherited value or Lens GPU detector called by Megatron |
+| `nv.gpu.uuid` | inherited value or Lens GPU detector called by Megatron |
+| `nv.gpu.serial` | inherited value or Lens GPU detector called by Megatron |
+| `nv.gpu.pci_bus_id` | inherited value or Lens GPU detector called by Megatron |
+| `nv.gpu.compute_capability` | inherited value or Lens GPU detector called by Megatron |
+| `nv.gpu.memory_total` | inherited value or Lens GPU detector called by Megatron |
+| `nv.gpu.driver_version` | inherited value or Lens GPU detector called by Megatron |
 
-Plus auto-detected attributes from lens's [resource detection](https://github.com/NVIDIA-NeMo/Lens/blob/main/docs/user-guide/resources.md): hostname, PID, GPU count, SLURM metadata, Kubernetes metadata.
+Lens Slurm detection can also add scheduler Resource attributes such as
+`slurm.job.id`, `slurm.job.id.raw`, `slurm.array.job_id`,
+`slurm.array.task_id`, `slurm.array.count`, `slurm.sluid`,
+`slurm.array.sluid`, `slurm.cluster.name`, `slurm.partition`,
+`slurm.nnodes`, `slurm.ntasks`, and `slurm.restart_count`.
 
 ## Typical configurations
 
