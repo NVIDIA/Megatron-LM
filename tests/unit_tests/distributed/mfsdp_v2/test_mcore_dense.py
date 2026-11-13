@@ -103,6 +103,21 @@ def test_mxfp8_parameters(process_group_collection):
     assert any(isinstance(p, MXFP8Tensor) for p in parameters)
 
 
+def test_meta_materialization_preserves_tied_parameters(distributed_setup):
+    model = torch.nn.Module()
+    with torch.device("meta"):
+        model.embedding = torch.nn.Embedding(16, 8)
+        model.output_layer = torch.nn.Linear(8, 16, bias=False)
+    model.output_layer.weight = model.embedding.weight
+    parameter = model.embedding.weight
+
+    mcore_adapter_v2._materialize_owned_meta_modules(model, distributed_setup.device)
+
+    assert model.embedding.weight is model.output_layer.weight is parameter
+    assert not parameter.is_meta
+    assert torch.isfinite(parameter).all()
+
+
 def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(process_group_collection):
     """init_model_with_meta_device should materialize FSDP v2 parameters with configured values."""
 
