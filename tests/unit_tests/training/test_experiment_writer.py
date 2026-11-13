@@ -34,12 +34,16 @@ def tracking_sdks(monkeypatch):
     comet = Mock()
     monkeypatch.setitem(sys.modules, 'mlflow', mlflow)
     monkeypatch.setitem(sys.modules, 'comet_ml', comet)
+    monkeypatch.setitem(sys.modules, 'wandb', Mock())
     return mlflow, comet
 
 
 @pytest.fixture
-def experiment_writer(run_config, tracking_sdks):
+def experiment_writer(run_config, tracking_sdks, tmp_path):
     run_config.logger = LoggerConfig(
+        wandb_project='project',
+        wandb_exp_name='run',
+        wandb_save_dir=str(tmp_path),
         mlflow_experiment='experiment',
         mlflow_run_name='run',
         mlflow_tracking_uri='https://tracking.example',
@@ -49,7 +53,7 @@ def experiment_writer(run_config, tracking_sdks):
         comet_workspace='workspace',
         comet_tags=['training'],
     )
-    writer = ExperimentWriter(run_config, wandb_writer=Mock())
+    writer = ExperimentWriter(run_config)
     yield writer
     writer.finish()
 
@@ -113,7 +117,7 @@ def test_runtime_service_is_optional_and_last_rank_only(
         comet_project='project' if comet_enabled else None,
         comet_experiment_name='run',
     )
-    wandb = Mock()
+    wandb = sys.modules['wandb']
     monkeypatch.setitem(sys.modules, 'wandb', wandb)
     monkeypatch.setattr(global_vars, '_GLOBAL_EXPERIMENT_WRITER', None)
     monkeypatch.setattr(global_vars, 'safe_get_world_size', lambda: 2)
@@ -131,9 +135,11 @@ def test_runtime_service_is_optional_and_last_rank_only(
         global_vars.finish_experiment_logging()
 
 
-@pytest.mark.parametrize('backend', ['mlflow', 'comet_ml'])
+@pytest.mark.parametrize('backend', ['wandb', 'mlflow', 'comet_ml'])
 def test_enabled_backend_requires_sdk(monkeypatch, run_config, backend):
     run_config.logger = LoggerConfig(
+        wandb_project='project' if backend == 'wandb' else None,
+        wandb_exp_name='run',
         mlflow_experiment='experiment' if backend == 'mlflow' else None,
         mlflow_run_name='run',
         comet_project='project' if backend == 'comet_ml' else None,
@@ -142,6 +148,109 @@ def test_enabled_backend_requires_sdk(monkeypatch, run_config, backend):
     monkeypatch.setitem(sys.modules, backend, None)
     with pytest.raises(ImportError, match='pip install'):
         ExperimentWriter(run_config)
+
+
+@pytest.mark.parametrize('explicit_id', [None, 'original-run-id'])
+@pytest.mark.parametrize('directory', ['configured', 'checkpoint', 'unset'])
+def test_wandb_initialization_preserves_run_identity(
+    run_config, tracking_sdks, tmp_path, explicit_id, directory
+):
+    run_config.logger = LoggerConfig(
+        wandb_project='project',
+        wandb_exp_name='runs/trial:one',
+        wandb_run_id=explicit_id,
+        wandb_save_dir=str(tmp_path / 'configured') if directory == 'configured' else None,
+    )
+    run_config.checkpoint.save = str(tmp_path) if directory == 'checkpoint' else None
+    writer = ExperimentWriter(run_config)
+    try:
+        kwargs = writer.wandb.init.call_args.kwargs
+        assert kwargs['id'] == (explicit_id or 'runs-trial-one')
+        assert kwargs['name'] == 'runs/trial:one'
+        assert kwargs['resume'] == 'allow'
+        assert (
+            kwargs['dir']
+            == {
+                'configured': str(tmp_path / 'configured'),
+                'checkpoint': str(tmp_path / 'wandb'),
+                'unset': None,
+            }[directory]
+        )
+    finally:
+        writer.finish()
+
+
+@pytest.mark.parametrize('failed_backend', ['mlflow', 'comet'])
+def test_initialization_failure_closes_started_backends(
+    run_config, tracking_sdks, tmp_path, failed_backend
+):
+    run_config.logger = LoggerConfig(
+        wandb_project='project',
+        wandb_save_dir=str(tmp_path),
+        mlflow_experiment='experiment',
+        comet_project='project',
+        comet_experiment_name='run',
+    )
+    mlflow, comet = tracking_sdks
+    failing_call = mlflow.set_experiment if failed_backend == 'mlflow' else comet.Experiment
+    error = RuntimeError('backend initialization failed')
+    failing_call.side_effect = error
+    with pytest.raises(RuntimeError) as raised:
+        ExperimentWriter(run_config)
+    assert raised.value is error
+    sys.modules['wandb'].finish.assert_called_once_with(exit_code=1)
+    client = mlflow.tracking.MlflowClient.return_value
+    if failed_backend == 'comet':
+        client.set_terminated.assert_called_once_with('run-id', status='FAILED')
+    else:
+        client.set_terminated.assert_not_called()
+        comet.Experiment.assert_not_called()
+
+
+def test_backends_log_structured_config(monkeypatch, run_config, tracking_sdks, tmp_path):
+    class BrokenText:
+        def __str__(self):
+            raise TypeError('cannot stringify')
+
+    run_config.logger = LoggerConfig(
+        wandb_project='project',
+        wandb_save_dir=str(tmp_path),
+        mlflow_experiment='experiment',
+        comet_project='project',
+        comet_experiment_name='run',
+    )
+    monkeypatch.setattr(
+        run_config,
+        'to_dict',
+        lambda: {
+            'model': {'dtype': torch.bfloat16, 'options': BrokenText(), 'layers': {0: 32}},
+            'logger': {'mlflow_tracking_uri': 'private-uri', 'log_interval': 17},
+            'services': [{'api_key': 'private-key', 'enabled': True}],
+        },
+    )
+    writer = ExperimentWriter(run_config)
+    try:
+        expected = {
+            'model': {'dtype': 'torch.bfloat16', 'options': '<BrokenText>', 'layers': {'0': 32}},
+            'logger': {'log_interval': 17},
+            'services': [{'enabled': True}],
+        }
+        assert writer.wandb.init.call_args.kwargs['config'] == expected
+        tracking_sdks[1].Experiment.return_value.log_parameters.assert_called_once_with(expected)
+        params = {
+            p.key: p.value
+            for call in writer.mlflow.log_batch.call_args_list
+            for p in call.kwargs.get('params', [])
+        }
+        assert params == {
+            'model.dtype': 'torch.bfloat16',
+            'model.options': '<BrokenText>',
+            'model.layers.0': '32',
+            'logger.log_interval': '17',
+            'services': "[{'enabled': True}]",
+        }
+    finally:
+        writer.finish()
 
 
 def test_scalar_fanout_and_timer_interface(experiment_writer, tracking_sdks, monkeypatch):
@@ -165,18 +274,21 @@ def test_scalar_fanout_and_timer_interface(experiment_writer, tracking_sdks, mon
 )
 @pytest.mark.parametrize('mode', ['training', 'evaluation', 'standalone_evaluation', 'inference'])
 def test_scalar_logging_with_independent_backend_selection(
-    run_config, tracking_sdks, wandb_enabled, mlflow_enabled, comet_enabled, mode
+    run_config, tracking_sdks, tmp_path, wandb_enabled, mlflow_enabled, comet_enabled, mode
 ):
     run_config.logger = LoggerConfig(
+        wandb_project='project' if wandb_enabled else None,
+        wandb_exp_name='run',
+        wandb_save_dir=str(tmp_path),
         mlflow_experiment='experiment' if mlflow_enabled else None,
         mlflow_run_name='run',
         comet_project='project' if comet_enabled else None,
         comet_experiment_name='run',
     )
-    wandb = Mock()
+    wandb = sys.modules['wandb']
     client = tracking_sdks[0].tracking.MlflowClient.return_value
     comet = tracking_sdks[1].Experiment.return_value
-    writer = ExperimentWriter(run_config, wandb_writer=wandb if wandb_enabled else None)
+    writer = ExperimentWriter(run_config)
     try:
         client.log_batch.reset_mock()
         metrics = {'loss[layer=0]': torch.tensor(1.5)}
@@ -260,13 +372,18 @@ def test_checkpoint_reporting_and_idempotent_shutdown(experiment_writer, trackin
 
 @pytest.mark.parametrize('wandb_enabled', [False, True])
 def test_media_uses_shared_writer_without_sending_objects_as_scalars(
-    run_config, tracking_sdks, wandb_enabled
+    run_config, tracking_sdks, tmp_path, wandb_enabled
 ):
     run_config.logger = LoggerConfig(
-        mlflow_experiment='experiment', comet_project='project', comet_experiment_name='run'
+        wandb_project='project' if wandb_enabled else None,
+        wandb_exp_name='run',
+        wandb_save_dir=str(tmp_path),
+        mlflow_experiment='experiment',
+        comet_project='project',
+        comet_experiment_name='run',
     )
-    wandb = Mock()
-    writer = ExperimentWriter(run_config, wandb_writer=wandb if wandb_enabled else None)
+    wandb = sys.modules['wandb']
+    writer = ExperimentWriter(run_config)
     client = tracking_sdks[0].tracking.MlflowClient.return_value
     client.log_batch.reset_mock()
     try:

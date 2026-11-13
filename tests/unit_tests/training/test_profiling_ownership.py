@@ -76,7 +76,7 @@ def inline_profiler(monkeypatch, run_config):
     monkeypatch.setattr(training, "should_disable_forward_pre_hook", lambda *_: False)
     monkeypatch.setattr(training, "_otel_managed_span", lambda *a, **kw: nullcontext())
     for name in (
-        "write_args_to_tensorboard",
+        "write_config_to_tensorboard",
         "print_datetime",
         "_end_otel_startup_span",
         "_start_otel_train_span",

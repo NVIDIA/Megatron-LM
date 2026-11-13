@@ -17,18 +17,16 @@ import time
 from threading import Lock
 from typing import Any
 
+from megatron.training.logging.config import serialize_config_for_logging
+
 logger = logging.getLogger(__name__)
 
 
 def _flatten_config(config: dict, prefix: str = "") -> dict:
-    """Flatten serialized config into tracking parameters, omitting credentials."""
+    """Flatten serialized config into bounded MLflow parameter strings."""
     result = {}
     for key, value in config.items():
         key = str(key)
-        if key == "mlflow_tracking_uri" or any(
-            part in key.lower() for part in ("password", "secret", "api_key", "access_token")
-        ):
-            continue
         name = f"{prefix}.{key}" if prefix else key
         if isinstance(value, dict):
             result.update(_flatten_config(value, name))
@@ -46,8 +44,8 @@ class ExperimentWriter:
     SDK objects are runtime services, never part of a serialized config.
     """
 
-    def __init__(self, cfg, wandb_writer=None) -> None:
-        self.wandb = wandb_writer
+    def __init__(self, cfg) -> None:
+        self.wandb = None
         self.mlflow = None
         self.comet = None
         self._owns_mlflow_run = False
@@ -56,23 +54,52 @@ class ExperimentWriter:
         self._closed = False
         self._previous_excepthook = None
         self._failure_hook = None
-        settings = cfg.logger
-        # Do not serialize runtime objects or the legacy args namespace.
-        params = _flatten_config(cfg.to_dict())
+        logger_cfg = cfg.logger
+        config = serialize_config_for_logging(cfg)
         try:
-            if settings.mlflow_experiment:
+            if logger_cfg.wandb_project:
+                if logger_cfg.wandb_exp_name == "":
+                    raise ValueError("Please specify the wandb experiment name!")
+                try:
+                    import wandb
+                except ImportError as exc:
+                    raise ImportError("W&B logging requires 'pip install wandb'.") from exc
+                save_dir = logger_cfg.wandb_save_dir
+                if not save_dir and cfg.checkpoint.save:
+                    save_dir = os.path.join(cfg.checkpoint.save, "wandb")
+                if save_dir:
+                    os.makedirs(save_dir, exist_ok=True)
+                # Preserve stable run IDs across restarts, replacing URL delimiters
+                # in derived IDs while keeping the displayed experiment name intact.
+                run_id = logger_cfg.wandb_run_id or (
+                    re.sub(r"[/\\#?%:]", "-", logger_cfg.wandb_exp_name)
+                    if logger_cfg.wandb_exp_name
+                    else None
+                )
+                wandb.init(
+                    dir=save_dir,
+                    id=run_id,
+                    name=logger_cfg.wandb_exp_name,
+                    project=logger_cfg.wandb_project,
+                    entity=logger_cfg.wandb_entity,
+                    config=config,
+                    resume="allow",
+                )
+                self.wandb = wandb
+            if logger_cfg.mlflow_experiment:
+                params = _flatten_config(config)
                 try:
                     import mlflow
                 except ImportError as exc:
                     raise ImportError("MLflow logging requires 'pip install mlflow'.") from exc
                 # Address every operation by run ID. Fluent active runs are thread-local,
                 # but in-process restart finalization can run on a different thread.
-                if settings.mlflow_tracking_uri:
-                    mlflow.set_tracking_uri(settings.mlflow_tracking_uri)
+                if logger_cfg.mlflow_tracking_uri:
+                    mlflow.set_tracking_uri(logger_cfg.mlflow_tracking_uri)
                 self.mlflow = mlflow.tracking.MlflowClient()
                 self._mlflow_entities = mlflow.entities
                 active_run = mlflow.active_run()
-                run_id = settings.mlflow_run_id or os.environ.get("MLFLOW_RUN_ID")
+                run_id = logger_cfg.mlflow_run_id or os.environ.get("MLFLOW_RUN_ID")
                 if active_run is not None:
                     if run_id and active_run.info.run_id != run_id:
                         raise ValueError("The active MLflow run differs from logger.mlflow_run_id.")
@@ -82,20 +109,20 @@ class ExperimentWriter:
                     self._mlflow_run_id = run_id
                     self._owns_mlflow_run = True
                 else:
-                    experiment = mlflow.set_experiment(settings.mlflow_experiment)
-                    tags = dict(settings.mlflow_tags or {})
-                    if settings.mlflow_description:
-                        tags["mlflow.note.content"] = settings.mlflow_description
+                    experiment = mlflow.set_experiment(logger_cfg.mlflow_experiment)
+                    tags = dict(logger_cfg.mlflow_tags or {})
+                    if logger_cfg.mlflow_description:
+                        tags["mlflow.note.content"] = logger_cfg.mlflow_description
                     run = self.mlflow.create_run(
-                        experiment.experiment_id, tags=tags, run_name=settings.mlflow_run_name
+                        experiment.experiment_id, tags=tags, run_name=logger_cfg.mlflow_run_name
                     )
                     self._mlflow_run_id = run.info.run_id
                     self._owns_mlflow_run = True
-                if self._owns_mlflow_run and settings.mlflow_description:
+                if self._owns_mlflow_run and logger_cfg.mlflow_description:
                     self.mlflow.set_tag(
-                        self._mlflow_run_id, "mlflow.note.content", settings.mlflow_description
+                        self._mlflow_run_id, "mlflow.note.content", logger_cfg.mlflow_description
                     )
-                for name, value in (settings.mlflow_tags or {}).items():
+                for name, value in (logger_cfg.mlflow_tags or {}).items():
                     self.mlflow.set_tag(self._mlflow_run_id, name, value)
                 # Parameters are immutable across resumes. Keep original values and
                 # record only newly introduced keys when attaching to an existing run.
@@ -109,21 +136,21 @@ class ExperimentWriter:
                     self.mlflow.log_batch(
                         self._mlflow_run_id, params=items[start : start + 100], synchronous=True
                     )
-            if settings.comet_project:
+            if logger_cfg.comet_project:
                 try:
                     import comet_ml
                 except ImportError as exc:
                     raise ImportError("Comet logging requires 'pip install comet-ml'.") from exc
                 self.comet = comet_ml.Experiment(
-                    project_name=settings.comet_project,
-                    workspace=settings.comet_workspace,
+                    project_name=logger_cfg.comet_project,
+                    workspace=logger_cfg.comet_workspace,
                     auto_metric_logging=False,
                     auto_param_logging=False,
                 )
-                self.comet.set_name(settings.comet_experiment_name)
-                if settings.comet_tags:
-                    self.comet.add_tags(settings.comet_tags)
-                self.comet.log_parameters(params)
+                self.comet.set_name(logger_cfg.comet_experiment_name)
+                if logger_cfg.comet_tags:
+                    self.comet.add_tags(logger_cfg.comet_tags)
+                self.comet.log_parameters(config)
         except BaseException:
             self.finish("FAILED")
             raise

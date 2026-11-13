@@ -3,7 +3,6 @@
 """Megatron global variables."""
 
 import os
-import re
 import signal
 import sys
 from argparse import Namespace
@@ -389,16 +388,6 @@ def _set_tensorboard_writer(args):
                   'no TensorBoard logs will be written.', flush=True)
 
 
-def _wandb_run_id(exp_name: str) -> str:
-    """A wandb run id derived from the experiment name.
-
-    The id is part of the run URL, so wandb rejects the characters that would be
-    ambiguous there. Experiment names are often paths, so substitute rather than fail;
-    the unmodified name is still what gets displayed.
-    """
-    return re.sub(r"[/\\#?%:]", "-", exp_name)
-
-
 def _set_experiment_writer(args):
     """Initialize all enabled third-party experiment backends on the reporting rank."""
     global _GLOBAL_EXPERIMENT_WRITER
@@ -409,53 +398,7 @@ def _set_experiment_writer(args):
     ) and args.rank == safe_get_world_size() - 1:
         from megatron.training.logging.experiment_writer import ExperimentWriter
 
-        _GLOBAL_EXPERIMENT_WRITER = ExperimentWriter(cfg, _create_wandb_writer(args))
-
-
-def _create_wandb_writer(args):
-    """Construct the optional W&B backend owned by ExperimentWriter."""
-    cfg = get_run_config()
-    if cfg.logger.wandb_project and args.rank == (safe_get_world_size() - 1):
-        if cfg.logger.wandb_exp_name == '':
-            raise ValueError("Please specify the wandb experiment name!")
-
-        import wandb
-        if cfg.logger.wandb_save_dir:
-            save_dir = cfg.logger.wandb_save_dir
-        else:
-            # Defaults to the save dir.
-            save_dir = os.path.join(cfg.checkpoint.save, 'wandb')
-        # Private attributes are runtime state rather than configuration and can be large; keep
-        # them out of the wandb config. Copy so the kitchen contents added below stay off args.
-        wandb_config = {k: v for k, v in vars(args).items() if not k.startswith('_')}
-        if 'kitchen_config_file' in wandb_config and wandb_config['kitchen_config_file'] is not None:
-            # Log the contents of the config for discovery of what the quantization
-            # settings were.
-            with open(wandb_config['kitchen_config_file'], "r") as f:
-                wandb_config['kitchen_config_file_contents'] = f.read()
-        # wandb.init() creates a new run unless it is given an id to resume, and this
-        # runs on every process start. A long job restarts many times -- a requeue, a
-        # node failure, an in-job restarter -- and each restart would otherwise open a
-        # fresh run, scattering one training run across many and leaving every chart
-        # covering only the stretch between two failures. Deriving a stable id from the
-        # experiment name and resuming it keeps them a single timeline. An unnamed run has
-        # nothing stable to derive an id from, so wandb assigns one as before.
-        run_id = cfg.logger.wandb_run_id or (
-            _wandb_run_id(cfg.logger.wandb_exp_name) if cfg.logger.wandb_exp_name else None
-        )
-        wandb_kwargs = {
-            'dir': save_dir,
-            "id": run_id,
-            'name': cfg.logger.wandb_exp_name,
-            'project': cfg.logger.wandb_project,
-            'config': wandb_config,
-            "resume": "allow"}
-        if cfg.logger.wandb_entity:
-            wandb_kwargs['entity'] = cfg.logger.wandb_entity
-        os.makedirs(wandb_kwargs['dir'], exist_ok=True)
-        wandb.init(**wandb_kwargs)
-        return wandb
-    return None
+        _GLOBAL_EXPERIMENT_WRITER = ExperimentWriter(cfg)
 
 
 def _set_one_logger(args):

@@ -59,7 +59,12 @@ Direct dynamic-engine callers supply an `InferenceMetricsWriter` through
 `start_inference_logging()` and `log_inference(metrics)`. The shared
 `ExperimentWriter` implements it for all three backends, including W&B.
 
-Config parameters are flattened and summarized (values capped at 500 characters).
+All backends log the structured `cfg.to_dict()` configuration rather than the
+legacy command-line args namespace. W&B and Comet receive nested JSON-compatible
+config; MLflow receives flattened parameter strings (values capped at 500
+characters). TensorBoard records the config as JSON under its `config` text tag.
+Non-JSON values are converted to text and credential fields are omitted. Legacy
+args-only fields and the separate kitchen-file contents snapshot are not logged.
 Full config remains in the checkpoint's `run_config.yaml`. Runtime SDK objects
 are never stored in the config or checkpoint.
 

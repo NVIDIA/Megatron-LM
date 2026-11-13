@@ -163,7 +163,7 @@ from megatron.training.datasets.data_samplers import build_pretraining_data_load
 from megatron.training.initialize import (
     initialize_megatron,
     set_jit_fusion_options,
-    write_args_to_tensorboard,
+    write_config_to_tensorboard,
 )
 from megatron.training.kernel_warmup import warmup_training_kernels
 from megatron.training.logging.dsa_flops import dsa_indexer_flops, dsa_layer_flops
@@ -4936,7 +4936,7 @@ def train(
             print_rank_0("workload inspector module not found.")
 
     # Write args to tensorboard
-    write_args_to_tensorboard()
+    write_config_to_tensorboard()
 
     # Turn on training mode which enables dropout.
     for model_module in model:
