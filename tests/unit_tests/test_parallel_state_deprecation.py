@@ -28,6 +28,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state, process_groups_config
+from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.parallel_state import ParallelStateDeprecationWarning
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
@@ -748,11 +749,11 @@ def test_pretrain_builds_its_collection_from_the_registered_grid_without_a_warni
     """The collection that pretrain() runs on is read from the registry at bootstrap: no
     deprecation or fallback warning, also under strict fallbacks."""
     registered = _register_data_parallel_groups(monkeypatch)
-    args = SimpleNamespace(create_all_gather_group=False)
+    ddp_config = DistributedDataParallelConfig(create_all_gather_group=False)
 
     with _recorded_warnings() as record:
         enable_strict_process_group_fallbacks()
-        pg_collection = training._build_pg_collection_from_parallel_state(args)
+        pg_collection = training._build_pg_collection_from_parallel_state(ddp_config)
 
     assert pg_collection.dp is registered.dp
     assert _deprecated_calls(record) == []
@@ -764,7 +765,7 @@ def test_finetuning_builds_its_model_on_the_collection_of_the_registered_grid(mo
     """finetune() builds its model and optimizer on the collection that pretrain() builds from the
     registered grid, so setup_model_and_optimizer() does not fall back to the global grid."""
     registered = _register_data_parallel_groups(monkeypatch)
-    args = SimpleNamespace(epochs=0, create_all_gather_group=False, pretrained_checkpoint=None)
+    args = SimpleNamespace(epochs=0, pretrained_checkpoint=None)
     monkeypatch.setattr(finetune_utils, "get_args", lambda: args)
     monkeypatch.setattr(finetune_utils, "get_train_state", lambda: SimpleNamespace(iteration=1))
     monkeypatch.setattr(finetune_utils, "get_timers", Mock)
@@ -794,7 +795,7 @@ def test_finetuning_on_an_unregistered_grid_warns_as_setup_model_and_optimizer_d
     monkeypatch.setattr(
         ProcessGroupCollection, "use_mpu_process_groups", Mock(return_value=global_groups)
     )
-    args = SimpleNamespace(epochs=0, create_all_gather_group=False, pretrained_checkpoint=None)
+    args = SimpleNamespace(epochs=0, pretrained_checkpoint=None)
     monkeypatch.setattr(finetune_utils, "get_args", lambda: args)
     monkeypatch.setattr(finetune_utils, "get_train_state", lambda: SimpleNamespace(iteration=1))
     monkeypatch.setattr(finetune_utils, "get_timers", Mock)

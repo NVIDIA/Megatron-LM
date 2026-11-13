@@ -248,7 +248,9 @@ def test_get_model_without_a_collection_warns_and_builds_one(monkeypatch, run_co
     model_provider = mock.Mock(side_effect=_GlobalRead)
 
     _assert_warns_then_reads_global("get_model", lambda: training.get_model(model_provider))
-    build.assert_called_once_with(args, config=run_config.model.transformer, owner="get_model")
+    build.assert_called_once_with(
+        run_config.ddp, config=run_config.model.transformer, owner="get_model"
+    )
     assert model_provider.call_args.kwargs["pg_collection"] is built
 
 

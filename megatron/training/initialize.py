@@ -60,6 +60,7 @@ from megatron.training.global_vars import (
     get_train_state,
     initialize_runtime_services,
 )
+from megatron.training.models import LLaVAModelConfig
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
@@ -205,6 +206,11 @@ def initialize_megatron(
             # Only seeding from the grid reads the groups of a grid set up before this call.
             read_initialized_grid=not skip_random_seed and seed_pg_collection is None,
             model_config=model_config,
+            num_distributed_optimizer_instances=(
+                cfg.ddp.num_distributed_optimizer_instances
+                if isinstance(cfg, PretrainConfigContainer)
+                else 1
+            ),
         )
 
         # Single-rank log helpers write on rank 0 by default. Non-colocated MIMO puts the
@@ -288,7 +294,7 @@ def initialize_megatron(
             # VLM overlap uses the padded text+image decoder length.
             sequence_length = (
                 args.decoder_seq_length
-                if getattr(args, "decoder_tp_comm_overlap", False)
+                if isinstance(cfg.model, LLaVAModelConfig)
                 else args.seq_length
             )
             _initialize_tp_communicators(
@@ -453,7 +459,7 @@ def _registered_pg_collection(owner, argument="pg_collection"):
 
 def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, store,
                             skip_model_parallel_init=False, read_initialized_grid=True,
-                            *, model_config=None):
+                            *, model_config=None, num_distributed_optimizer_instances=1):
     """Initialize torch.distributed and core model parallel.
 
     Returns the ProcessGroupCollection of the parallel grid that this call
@@ -596,7 +602,7 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
                 dynamic_context_parallel=model_config.dynamic_context_parallel,
                 min_dynamic_context_parallel_size=model_config.min_dynamic_context_parallel_size,
                 expert_model_parallel_size=model_config.expert_model_parallel_size,
-                num_distributed_optimizer_instances=args.num_distributed_optimizer_instances,
+                num_distributed_optimizer_instances=num_distributed_optimizer_instances,
                 expert_tensor_parallel_size=model_config.expert_tensor_parallel_size,
                 distributed_timeout_minutes=cfg.dist.distributed_timeout_minutes,
                 nccl_communicator_config_path=cfg.dist.nccl_communicator_config_path,

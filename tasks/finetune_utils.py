@@ -282,7 +282,7 @@ def finetune(train_valid_datasets_provider, model_provider,
     # back to the global grid.
     timers('model and optimizer', log_level=0).start()
     pg_collection = _build_pg_collection_from_parallel_state(
-        args, owner='setup_model_and_optimizer'
+        get_run_config().ddp, owner='setup_model_and_optimizer'
     )
     model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
         model_type, model_provider, pg_collection=pg_collection

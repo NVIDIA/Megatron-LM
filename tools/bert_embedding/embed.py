@@ -12,6 +12,7 @@ from torch.utils.data import BatchSampler, DataLoader, SequentialSampler, Subset
 from torch.utils.data._utils.collate import default_collate
 
 from megatron.training import get_args, get_tokenizer, print_rank_0
+from megatron.training.global_vars import get_run_config
 from megatron import core
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core import parallel_state
@@ -384,7 +385,7 @@ class BertEmbedder:
         # without registering one warns, as before, that setup_model_and_optimizer() falls back
         # to the global grid.
         pg_collection = _build_pg_collection_from_parallel_state(
-            args, owner="setup_model_and_optimizer"
+            get_run_config().ddp, owner="setup_model_and_optimizer"
         )
         self.models, optimizer, opt_param_scheduler = setup_model_and_optimizer(
             ModelType.encoder_or_decoder, model_provider, pg_collection=pg_collection

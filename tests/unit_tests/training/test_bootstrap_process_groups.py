@@ -31,6 +31,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state, process_groups_config
+from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.parallel_state import ParallelStateDeprecationWarning
 from megatron.core.process_groups_config import (
@@ -407,11 +408,11 @@ class TestBootstrapReads:
     def test_pretrain_builds_its_collection_from_the_registry(self, monkeypatch):
         registered = _register(**_data_parallel_groups(), tp=_Group(), pp=_Group())
         self._forbid_the_shim(monkeypatch)
-        args = SimpleNamespace(create_all_gather_group=False)
+        ddp_config = DistributedDataParallelConfig(create_all_gather_group=False)
 
         with _recorded_warnings() as record:
             enable_strict_process_group_fallbacks()
-            pg_collection = training._build_pg_collection_from_parallel_state(args)
+            pg_collection = training._build_pg_collection_from_parallel_state(ddp_config)
 
         assert pg_collection is not registered
         assert set(vars(pg_collection)) == FIELDS
@@ -718,10 +719,10 @@ class TestStandardGrid:
         Utils.initialize_model_parallel(**kwargs)
         # The expert all-gather group follows the model config's expert-parallel size.
         run_config.model.transformer.expert_model_parallel_size = 2
-        args = SimpleNamespace(create_all_gather_group=True)
+        ddp_config = DistributedDataParallelConfig(create_all_gather_group=True)
 
         with _recorded_warnings() as record:
-            pg_collection = training._build_pg_collection_from_parallel_state(args)
+            pg_collection = training._build_pg_collection_from_parallel_state(ddp_config)
 
         assert _fallbacks(record) == []
         for name in ("dp_cp", "expt_dp"):
