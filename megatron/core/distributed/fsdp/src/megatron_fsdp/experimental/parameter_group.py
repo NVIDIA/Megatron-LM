@@ -36,6 +36,9 @@ from .module_utils import copy_parameter_attributes, get_parameter_owner
 from .phase import Phase
 from .placement import BlockAtomic, RowAtomic, ShardLayout, TensorAtomic
 
+# HAVE_TE is a runtime flag, so mypy considers both branches and rejects their
+# different class definitions and function signatures. TYPE_CHECKING selects
+# the quantized definitions for mypy; the no-TE fallback remains unchecked.
 if TYPE_CHECKING or HAVE_TE:
     from .quantized_dbuffer import QuantizedDBuffer, effective_dtype, update_mxfp8_tensor
 else:
