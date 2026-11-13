@@ -107,6 +107,36 @@ class ProfilingConfig:
 class DistributedInitConfig:
     """Configuration settings for distributed training initialization."""
 
+    use_torch_fsdp2: bool = False
+    """Select a training driver's Torch FSDP2 model wrapping path."""
+
+    external_gpu_device_mapping: bool = False
+    """Use device zero when an external launcher exposes exactly one GPU per process."""
+
+    gtp_remat_reduce_scatter_with_fp32_accumulation: bool = False
+    """Accumulate rematerialized GTP reduce-scatter contributions in FP32."""
+
+    gtp_remat_nccl_ub: bool = False
+    """Use an NCCL symmetric-memory user buffer for GTP rematerialization."""
+
+    enable_megatron_core_experimental: bool = False
+    """Enable the driver's Megatron Core experimental feature gate."""
+
+    use_decentralized_pg: bool = False
+    """Use process-group collections passed explicitly through the training driver."""
+
+    eval_context_parallel_size: int | None = None
+    """Optional evaluation context-parallel degree in drivers supporting group rebinding."""
+
+    @property
+    def lazy_init(self) -> bool:
+        """Compatibility spelling for lazy_mpu_init."""
+        return self.lazy_mpu_init
+
+    @lazy_init.setter
+    def lazy_init(self, value: bool) -> None:
+        self.lazy_mpu_init = value
+
     distributed_backend: Literal["nccl", "gloo"] = "nccl"
     """Which backend to use for distributed training."""
 

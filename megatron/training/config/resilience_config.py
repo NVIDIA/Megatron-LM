@@ -39,6 +39,9 @@ class FaultToleranceConfig:
 class RerunStateMachineConfig:
     """Configuration for the rerun state machine used for result validation or stats."""
 
+    spiky_loss_factor: float = 10.0
+    """Loss-growth threshold used by drivers enabling spiky-loss rejection."""
+
     error_injection_rate: int = 0
     """Rate at which to inject unexpected results, e.g. 1000 means
     once every 1000 result validations"""
@@ -85,6 +88,9 @@ class RerunStateMachineConfig:
 @dataclass(kw_only=True)
 class StragglerDetectionConfig:
     """Configuration settings for detecting and logging GPU stragglers."""
+
+    enable_straggler_on_startup: bool = True
+    """Legacy positive spelling retained for saved driver configurations."""
 
     log_straggler: bool = False
     """If set, tracks and logs straggler per GPU."""

@@ -2491,7 +2491,9 @@ def _add_wide_residual_args(parser):
 def _add_straggler_detector_args(parser):
     from megatron.training.config import StragglerDetectionConfig
 
-    straggler_factory = ArgumentGroupFactory(StragglerDetectionConfig)
+    straggler_factory = ArgumentGroupFactory(
+        StragglerDetectionConfig, exclude=['enable_straggler_on_startup']
+    )
     group = straggler_factory.build_group(parser, "straggler")
 
     return parser
@@ -2563,7 +2565,24 @@ def _add_fault_tolerance_args(parser):
 def _add_logging_args(parser):
     from megatron.training.config import LoggerConfig
 
-    log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath"])
+    log_factory = ArgumentGroupFactory(
+        LoggerConfig,
+        exclude=[
+            'log_throughput_to_tensorboard',
+            'throughput_window_size',
+            'memory_keys',
+            'log_l2_norm_grad_to_tensorboard',
+            'log_runtime_to_tensorboard',
+            'runtime_time_unit',
+            'filter_warnings',
+            'modules_to_filter',
+            'set_level_for_all_loggers',
+            'save_config_filepath',
+            'skip_train_metrics_log',
+            'comet_api_key',
+            'mlflow_log_artifacts',
+        ],
+    )
     group = log_factory.build_group(parser, title="logging")
 
     return parser
@@ -2693,7 +2712,18 @@ def _add_training_args(parser):
                        'options should be specified in commandline.')
 
     # Keep the legacy vision CLI master switch/defaults at their existing boundary.
-    train_factory = ArgumentGroupFactory(TrainingConfig, exclude=["vision_pretraining_type"])
+    train_factory = ArgumentGroupFactory(
+        TrainingConfig,
+        exclude=[
+            'vision_pretraining_type',
+            'num_epochs',
+            'check_optimizer_step_success',
+            'skip_sync_grad_norm_across_mp',
+            'eval_iters',
+            'eval_interval',
+            'skip_train',
+        ],
+    )
     group = train_factory.build_group(parser, "training")
 
     # Keep this CLI-only until dataset options have their own config dataclass.
@@ -2795,7 +2825,9 @@ def _add_training_args(parser):
 def _add_rerun_machine_args(parser):
     from megatron.training.config import RerunStateMachineConfig
 
-    rerun_factory = ArgumentGroupFactory(RerunStateMachineConfig, exclude=["check_for_nan_in_loss"])
+    rerun_factory = ArgumentGroupFactory(
+        RerunStateMachineConfig, exclude=['check_for_nan_in_loss', 'spiky_loss_factor']
+    )
     group = rerun_factory.build_group(parser, "rerun engine")
 
     return parser
@@ -2816,7 +2848,7 @@ def _add_initialization_args(parser):
 def _add_learning_rate_args(parser):
     from megatron.training.config import SchedulerConfig
 
-    sched_factory = ArgumentGroupFactory(SchedulerConfig)
+    sched_factory = ArgumentGroupFactory(SchedulerConfig, exclude=['max_steps'])
     group = sched_factory.build_group(parser, title="learning rate and weight decay")
 
     group.add_argument('--lr', type=float, default=None,
@@ -2843,7 +2875,26 @@ def _add_learning_rate_args(parser):
 def _add_checkpointing_args(parser):
     from megatron.training.config import CheckpointConfig
 
-    ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_optim", "save_rng", "load_optim", "load_rng"])
+    ckpt_factory = ArgumentGroupFactory(
+        CheckpointConfig,
+        exclude=[
+            'most_recent_k',
+            'save_optim',
+            'save_rng',
+            'load_optim',
+            'load_rng',
+            'stage_precision_aware_optimizer_state_on_cpu',
+            'storage_writers_per_rank',
+            'async_write_results_mp_mode',
+            'save_rng_state_per_dp_rank',
+            'custom_manager_class',
+            'also_save_hf_checkpoint',
+            'hf_source_path',
+            'hf_trust_remote_code',
+            'hf_distributed_save',
+            'hf_save_every_n_ranks',
+        ],
+    )
     group = ckpt_factory.build_group(parser, "checkpointing")
 
     group.add_argument('--no-save-optim', action='store_true', default=None,
@@ -2908,7 +2959,18 @@ def _add_mixed_precision_args(parser):
 def _add_distributed_args(parser):
     from megatron.training.config import DistributedInitConfig
 
-    dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
+    dist_init_factory = ArgumentGroupFactory(
+        DistributedInitConfig,
+        exclude=[
+            'use_torch_fsdp2',
+            'external_gpu_device_mapping',
+            'gtp_remat_reduce_scatter_with_fp32_accumulation',
+            'gtp_remat_nccl_ub',
+            'enable_megatron_core_experimental',
+            'use_decentralized_pg',
+            'eval_context_parallel_size',
+        ],
+    )
     group = dist_init_factory.build_group(parser, "distributed init")
 
     group.add_argument('--use-torch-fsdp2', action='store_true', default=False,
