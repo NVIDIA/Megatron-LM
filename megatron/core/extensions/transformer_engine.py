@@ -39,6 +39,12 @@ from megatron.core.parallel_state import (
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
 from megatron.core.quantization.quant_config import QuantizationConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
+from megatron.core.ssm.mamba_context_parallel import (
+    _all_to_all_cp2hp,
+    _all_to_all_hp2cp,
+    _redo_attention_load_balancing,
+    _undo_attention_load_balancing,
+)
 from megatron.core.tensor_observation import suspend_tensor_observations
 from megatron.core.tensor_parallel.layers import (
     _initialize_affine_weight_cpu,
@@ -2778,13 +2784,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         sequence of 1/CP of the heads, restores the original token order, and runs TE's CP=1
         attention on it, so every head sees the same kernel call as without CP.
         """
-        from megatron.core.ssm.mamba_context_parallel import (
-            _all_to_all_cp2hp,
-            _all_to_all_hp2cp,
-            _redo_attention_load_balancing,
-            _undo_attention_load_balancing,
-        )
-
         assert (
             attention_bias is None
         ), "Batch-invariant context parallelism does not support attention_bias."
