@@ -227,7 +227,8 @@ def test_csa_sparse_attn_flattens_and_restores_sbhd_layout():
     assert torch.equal(actual, flat_output.reshape(sq, batch, heads * value_dim))
 
 
-def test_flash_mla_adapter_pads_and_restores_small_head_count(monkeypatch):
+@pytest.mark.parametrize("actual_heads", [2, 64])
+def test_flash_mla_adapter_pads_and_restores_small_head_count(monkeypatch, actual_heads):
     seen = {}
 
     def fake_flash(q, _kv, _indices, _scale, **kwargs):
@@ -236,6 +237,7 @@ def test_flash_mla_adapter_pads_and_restores_small_head_count(monkeypatch):
         rows, heads, _ = q.shape
         out = torch.arange(rows * heads * 3, dtype=q.dtype).reshape(rows, heads, 3)
         lse = torch.arange(rows * heads, dtype=torch.float32).reshape(rows, heads)
+        seen["out"] = out
         lse_indexer = lse + 1000
         return out, torch.empty(0), lse, lse_indexer
 
@@ -243,28 +245,32 @@ def test_flash_mla_adapter_pads_and_restores_small_head_count(monkeypatch):
     monkeypatch.setattr(fused_csa, "_get_head_padding", lambda _heads: 64)
     monkeypatch.setattr(fused_csa, "_get_topk_alignment", lambda: 1)
 
-    q = torch.randn(3, 2, 8)
+    q = torch.randn(3, actual_heads, 8)
     kv = torch.randn(5, 8)
     indices = torch.zeros(3, 4, dtype=torch.int32)
-    sink = torch.tensor([0.25, -0.5])
+    sink = torch.linspace(-0.5, 0.25, actual_heads)
 
     out, lse, lse_indexer = fused_csa._csa_fwd_flash_mla(
         q, kv, indices, 0.125, d_v=3, attn_sink=sink, indexer_topk=1
     )
 
     assert seen["q"].shape == (3, 64, 8)
-    assert torch.equal(seen["q"][:, :2], q)
-    assert torch.count_nonzero(seen["q"][:, 2:]) == 0
-    assert torch.equal(seen["sink"][:2], sink)
-    assert torch.all(seen["sink"][2:] == float("-inf"))
-    assert out.shape == (3, 2, 3)
-    assert lse.shape == (3, 2)
-    assert lse_indexer.shape == (3, 2)
-    expected_out = torch.arange(3 * 64 * 3, dtype=q.dtype).reshape(3, 64, 3)[:, :2]
-    expected_lse = torch.arange(3 * 64, dtype=torch.float32).reshape(3, 64)[:, :2]
+    assert torch.equal(seen["q"][:, :actual_heads], q)
+    assert torch.count_nonzero(seen["q"][:, actual_heads:]) == 0
+    assert torch.equal(seen["sink"][:actual_heads], sink)
+    assert torch.all(seen["sink"][actual_heads:] == float("-inf"))
+    assert out.shape == (3, actual_heads, 3)
+    assert lse.shape == (3, actual_heads)
+    assert lse_indexer.shape == (3, actual_heads)
+    expected_out = torch.arange(3 * 64 * 3, dtype=q.dtype).reshape(3, 64, 3)[:, :actual_heads]
+    expected_lse = torch.arange(3 * 64, dtype=torch.float32).reshape(3, 64)[:, :actual_heads]
     assert torch.equal(out, expected_out)
     assert torch.equal(lse, expected_lse)
     assert torch.equal(lse_indexer, expected_lse + 1000)
+
+    assert out.is_contiguous()
+    if actual_heads == 64:
+        assert out is seen["out"]
 
 
 def test_attn_target_pads_small_head_count(monkeypatch):
@@ -567,7 +573,7 @@ def test_zero_indexer_loss_skips_teacher_and_preserves_gradients(
         out = q + kv.mean(dim=0) + attn_sink.view(1, -1, 1)
         return out, q.new_zeros(q.shape[:2]), None
 
-    def fake_attention_backward(q, kv, _out, d_out, _lse, _sink, *_args):
+    def fake_attention_backward(q, kv, _out, d_out, _lse, _sink, *_args, **_kwargs):
         d_kv = d_out.sum(dim=(0, 1)).unsqueeze(0).expand_as(kv) / kv.shape[0]
         return d_out.clone(), d_kv, d_out.sum(dim=(0, 2))
 
@@ -649,6 +655,7 @@ def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatc
         dsa_indexer_loss_coeff=0.0,
         dsa_indexer_use_sparse_loss=False,
         calculate_per_token_loss=False,
+        deterministic_mode=False,
         num_layers=1,
         mtp_num_layers=0,
     )
@@ -698,6 +705,109 @@ def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatc
 
     assert actual is expected
     fused_call.assert_called_once()
+
+
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("loss_coeff", [0.0, 0.3])
+def test_ratio4_no_grad_and_training_forward_key_order(monkeypatch, deterministic, loss_coeff):
+    """Exercise both real dispatch paths; only the backend computations are mocked."""
+    from megatron.core.transformer.experimental_attention_variant import csa as csa_module
+
+    sequence, batch, heads, dim = 8, 2, 2, 4
+    selected = torch.full((batch, sequence, 3), -1, dtype=torch.int32)
+    selected[:, 3:, 0] = 0
+    selected[:, 7:, 1] = 1
+    q_indexer = torch.zeros(sequence, batch, heads, dim)
+    k_indexer = torch.zeros(sequence // 4, batch, dim)
+    weights = torch.zeros(sequence, batch, heads)
+    module = csa_module.CompressedSparseAttention.__new__(csa_module.CompressedSparseAttention)
+    torch.nn.Module.__init__(module)
+    module.use_fused_kernels = True
+    module.compress_ratio = 4
+    module.window_size = 3
+    module.softmax_scale = 0.5
+    module.attn_sink = torch.nn.Parameter(torch.zeros(heads))
+    module.num_attention_heads = heads
+    module.layer_number = 1
+    module.config = SimpleNamespace(
+        dsa_indexer_loss_coeff=loss_coeff,
+        dsa_indexer_use_sparse_loss=True,
+        calculate_per_token_loss=False,
+        deterministic_mode=deterministic,
+        num_layers=1,
+        mtp_num_layers=0,
+    )
+    module.__dict__["compressor"] = lambda x: x.new_zeros(sequence // 4, batch, dim)
+    module.__dict__["indexer"] = SimpleNamespace(
+        index_topk=selected.shape[-1],
+        softmax_scale=0.5,
+        forward_before_topk=lambda _x, _qr: (q_indexer, k_indexer, weights),
+    )
+    module.train()
+    topk_modes = []
+
+    def fake_topk(_q, _k, _w, _topk, _ratio, *, deterministic=False):
+        topk_modes.append(deterministic)
+        return selected.clone(), (selected >= 0).sum(-1).int(), torch.zeros(batch, sequence, 2)
+
+    captured = []
+
+    def fake_flash(query, _kv, indices, _scale, *, topk_length, **_kwargs):
+        captured.append((indices.clone(), topk_length.clone()))
+        # Make the fake result sensitive to slot order as the real online softmax is.
+        slots = torch.arange(1, indices.shape[-1] + 1)
+        value = (indices.clamp_min(0) * slots).sum(-1).to(query.dtype)
+        output = value[:, None, None].expand_as(query).clone()
+        return output, query.new_zeros(query.shape[:2]), None
+
+    monkeypatch.setattr(fused_csa, "_indexer_topk_bshd", fake_topk)
+    monkeypatch.setattr(fused_csa, "_csa_fwd_flash_mla", fake_flash)
+    monkeypatch.setattr(
+        fused_csa, "_compute_attn_target", lambda *_args, **_kwargs: (selected >= 0).float() * 0.5
+    )
+    monkeypatch.setattr(
+        fused_csa,
+        "_DSA",
+        SimpleNamespace(
+            indexer_backward_wrapper=lambda q, w, k, *_args, **_kwargs: {
+                "d_index_q": torch.zeros_like(q),
+                "d_index_k": torch.zeros_like(k),
+                "d_weights": torch.zeros_like(w),
+            }
+        ),
+    )
+    monkeypatch.setattr(csa_module, "nvtx_range_push", lambda *_args: None)
+    monkeypatch.setattr(csa_module, "nvtx_range_pop", lambda *_args: None)
+    monkeypatch.setattr(
+        csa_module.DSAIndexerLossLoggingHelper, "save_loss_to_tracker", lambda **_kwargs: None
+    )
+    query = torch.zeros(sequence, batch, heads, dim, requires_grad=True)
+    key = torch.zeros(sequence, batch, 1, dim)
+    x = torch.zeros(sequence, batch, dim)
+    outputs = []
+    for grad_enabled in (False, True, False, True):
+        with torch.set_grad_enabled(grad_enabled):
+            output = module(query, key, key, None, x=x, qr=x)
+        assert output.requires_grad == grad_enabled
+        outputs.append(output.detach())
+
+    window = csa_module.get_window_topk_idxs(module.window_size, batch, sequence, query.device)
+    compressed = torch.where(selected >= 0, selected + sequence, -1)
+    training_order, expected_lengths = fused_csa.build_flat_topk_idxs(
+        compressed, window, batch_size=batch, compact=True
+    )
+    default_order, _ = fused_csa.build_flat_topk_idxs(
+        window, compressed, batch_size=batch, compact=True
+    )
+    assert not torch.equal(training_order, default_order)
+    assert (training_order == -1).any()
+    for position, (indices, lengths) in enumerate(captured):
+        expected = training_order if deterministic or position % 2 else default_order
+        assert torch.equal(indices, expected), "no-grad and training key order differ"
+        assert torch.equal(lengths, expected_lengths)
+    assert topk_modes == [deterministic] * 4
+    assert torch.equal(outputs[0], outputs[2]) and torch.equal(outputs[1], outputs[3])
+    assert torch.equal(outputs[0], outputs[1]) == deterministic
 
 
 def test_public_surface_is_csa_namespaced_and_sbhd_only():
@@ -777,9 +887,12 @@ def test_real_fused_sbhd_forward_backward_matches_native_reference(num_heads):
     query = torch.randn(seq, 1, num_heads, 512, device="cuda", dtype=torch.bfloat16) * 0.05
     kv = torch.randn(seq, 1, 512, device="cuda", dtype=torch.bfloat16) * 0.05
     sink = torch.zeros(num_heads, device="cuda", dtype=torch.float32)
-    query_native = query.detach().clone().requires_grad_(True)
+    # Gather backward accumulates repeated-key contributions in the leaf dtype.
+    # Keep the reference leaves FP32 so BF16 indexed accumulation does not obscure
+    # fused-kernel errors; both paths still start from the same BF16 input values.
+    query_native = query.detach().clone().float().requires_grad_(True)
     query_fused = query.detach().clone().requires_grad_(True)
-    kv_native = kv.detach().clone().requires_grad_(True)
+    kv_native = kv.detach().clone().float().requires_grad_(True)
     kv_fused = kv.detach().clone().requires_grad_(True)
     sink_native = sink.detach().clone().requires_grad_(True)
     sink_fused = sink.detach().clone().requires_grad_(True)

@@ -162,6 +162,17 @@ def _free_storage(tensor: torch.Tensor):
                 tensor._typed_storage()._resize_(0)
 
 
+def _materialize_meta_tensors(module: torch.nn.Module, device: torch.device) -> None:
+    """Replace ``module``'s own meta parameters and buffers with uninitialized tensors on
+    ``device``, leaving its tensors that are already on a device unchanged.
+    """
+
+    def materialize(tensor: torch.Tensor) -> torch.Tensor:
+        return torch.empty_like(tensor, device=device) if tensor.is_meta else tensor
+
+    module._apply(materialize, recurse=False)
+
+
 TensorItemIndex = namedtuple(
     "TensorItemIndex", ["global_data_index", "size", "item_id", "bucket_id", "shape"]
 )
@@ -1272,6 +1283,8 @@ class DataParallelBuffer:
         self.temporary_bucket_allocator = (
             temporary_bucket_allocator if temporary_bucket_allocator else TemporaryBucketAllocator()
         )
+        # Stream that allocated the temporary bucket, if one is allocated.
+        self.bucket_allocation_stream = None
         self.is_transpose_buffer = is_transpose_buffer
         self.gradient_scaling_factor = gradient_scaling_factor
         self.mem_alloc_context = mem_alloc_context if mem_alloc_context else nullcontext
@@ -1428,6 +1441,8 @@ class DataParallelBuffer:
             dtype = self.dtype
         if device is None:
             device = self.device
+        if self.bucket_allocation_stream is None:
+            self.bucket_allocation_stream = torch.cuda.current_stream()
         # Allocate temporary storage using standardized sizes.
         alloc_size = self.shard_bucket_index.size if shard else self.bucket_index.size
         bucket = self.temporary_bucket_allocator.allocate(
@@ -1452,6 +1467,7 @@ class DataParallelBuffer:
         Release the storage of a temporarily-allocated communication bucket.
         """
         self.temporary_bucket_allocator.free(self.bucket_index.bucket_id)
+        self.bucket_allocation_stream = None
 
     def reset_param_main_grad(self):
         """
@@ -2465,9 +2481,11 @@ class ParamAndGradBuffer:
         2. Gradients:
             - During backward for each micro-batch, gradients are accumulated into
                 the `hfsdp_helper_gbuf` in inner-DP layout.
-            - On the last micro-batch backward of the iteration, instead of a DP
-                all-reduce, we perform a reduce-scatter that maps the DP gradient
-                layout back into outer-DP gradient shards.
+            - Once every micro-batch backward of the iteration has been reduced over
+                inner-DP (in finish_grad_sync()), instead of a DP all-reduce, we perform
+                a reduce-scatter that maps the DP gradient layout back into outer-DP
+                gradient shards. It runs once per iteration, because it reads the
+                helper buffer it writes into.
             - Because the model gradient buffer is a view of `hfsdp_helper_gbuf`
                 in the current design, the reduced / scattered results effectively
                 update both the helper buffer and the model-gradient-buffer view.
@@ -2508,7 +2526,7 @@ class ParamAndGradBuffer:
                 parameters into inner-DP shards in `hfsdp_helper_wbuf` and then
                 viewing them through the model weight buffer.
             - "grad sync" path:
-                - At the last micro-batch backward, we reduce-scatter gradients from
+                - After the last micro-batch backward, we reduce-scatter gradients from
                 the inner-DP layout into model gradient buffer as DP shards. Because
                 the model gradient buffer is a view of `hfsdp_helper_gbuf`, the
                 reduced results are immediately visible through the model gradient buffer
@@ -2589,6 +2607,30 @@ class ParamAndGradBuffer:
         # Set ParameterGroup.grad_dtype.
         for group in self.parameter_groups:
             group.grad_dtype = self._resolve_group_grad_dtype(group, meta_device_init_fp8_params)
+
+        if self.ddp_config.gradient_reduce_div_fusion:
+            # PyTorch uses the first bucket's ReduceOp for the entire coalesced call.
+            # Mixing BF16 (pre-scaled SUM) with other dtypes (PREMUL_SUM) is unsafe.
+            requires_grad_only = (
+                self.only_create_grad_buffer_and_main_weight_buffer_for_param_requires_grad
+            )
+            for bucket_id, bucket_group in self.bucket_to_bucket_group.items():
+                if bucket_id != bucket_group[0]:
+                    continue
+                grad_comm_dtypes = {
+                    self.mp_policy.grad_comm_dtype or self.parameter_groups[i].grad_dtype
+                    for i in bucket_group
+                    if self.parameter_groups[i].requires_grad or not requires_grad_only
+                }
+                if len(grad_comm_dtypes) > 1:
+                    raise ValueError(
+                        "[Megatron-FSDP] gradient_reduce_div_fusion=True is not supported with "
+                        "mixed gradient communication dtypes in a coalesced bucket group "
+                        f"({', '.join(sorted(str(dtype) for dtype in grad_comm_dtypes))}). "
+                        "Set gradient_reduce_div_fusion=False "
+                        "(--no-gradient-reduce-div-fusion) or use a single grad_comm_dtype."
+                    )
+
         if self.ddp_config.fsdp_double_buffer and len(self.bucketing_policy.fsdp_unit_modules) > 0:
             # Double Buffering
             UB_BUFFER_NUM = 2
@@ -3003,7 +3045,7 @@ class ParamAndGradBuffer:
                                 gc.collect()
                                 torch.cuda.empty_cache()
 
-                            m.to_empty(device=self.device, recurse=False)
+                            _materialize_meta_tensors(m, self.device)
                             if (
                                 HAVE_TE
                                 and is_te_min_version("0.9.0")
@@ -4051,6 +4093,8 @@ class GradReducePipeline:
         }
         # Track the number of parameters in each bucket that are ready for gradient reduce-scatter.
         self.bucket_grad_ready_params = [set() for _ in range(self.buffer.num_buckets)]
+        # Bucket groups whose DP-Outer reduction waits for the end of the cycle.
+        self.pending_outer_fsdp_group_grad_reduce: List[Tuple[int, ...]] = []
         self.rs_stream = rs_stream
         self.check_nans = check_nans
 
@@ -4223,6 +4267,117 @@ class GradReducePipeline:
             return param_group.hfsdp_helper_gbuf
         return param_group.main_grad_buffer
 
+    def reduce_outer_fsdp_group_gradients(self):
+        """Reduce the DP-Shard gradient shards over DP-Outer, once per optimization step."""
+        pending = self.pending_outer_fsdp_group_grad_reduce
+        if not pending:
+            return
+        self.pending_outer_fsdp_group_grad_reduce = []
+        ddp_config = self.buffer.ddp_config
+        mp_policy = self.buffer.mp_policy
+        # Wait on the DP-Shard reductions, which the current stream has waited for.
+        self.outer_fsdp_group_grad_reduce_stream.wait_stream(torch.cuda.current_stream())
+        for bucket_group in pending:
+            # Expert and non-expert parameters have their own DP-Outer groups, and a bucket
+            # group is homogeneous in that respect (its DP-Shard group is also taken from its
+            # first bucket).
+            outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
+                is_expert_parallel=self.buffer.parameter_groups[bucket_group[0]].is_expert_param
+            )
+            with torch.cuda.stream(self.outer_fsdp_group_grad_reduce_stream):
+                with _coalescing_manager(outer_fsdp_group):
+                    # List of gradient accumulation closure tasks.
+                    # (grad_buffer, reduced_grad)
+                    grad_accum_closure = []
+                    for bucket_id in bucket_group:
+                        # Skip gradient scaling for DP-Outer, because the
+                        # (DP-Shard, DP-Outer) scaling is already applied.
+                        if ddp_config.average_in_collective:
+                            reduce_op = torch.distributed.ReduceOp.AVG
+                        else:
+                            reduce_op = torch.distributed.ReduceOp.SUM
+
+                        # (DP-Shard, DP-Outer) if HFSDP, otherwise just DP-Shard for HSDP
+                        main_grad_buffer = self.buffer.parameter_groups[bucket_id].main_grad_buffer
+
+                        # FSDP buffer can be un-sharded or sharded for HSDP, but sharded for HFSDP.
+                        # TODO(@cspades): For `optim`, we don't need to reduce the local un-sharded
+                        # gradient, just the shard updated via reduce-scatter.
+                        fsdp_grad_buffer = self.get_fsdp_buffer(bucket_id)
+                        unreduced_grad = fsdp_grad_buffer.data
+                        assert (
+                            main_grad_buffer.dtype == fsdp_grad_buffer.dtype
+                        ), "Main and DP-Shard gradient buffer must share the exact same dtype."
+
+                        # Cast DP-Shard gradient to communication dtype if specified and necessary.
+                        custom_grad_comm_dtype = (
+                            mp_policy.grad_comm_dtype is not None
+                            and unreduced_grad.dtype != mp_policy.grad_comm_dtype
+                        )
+                        if custom_grad_comm_dtype:
+                            # Allocate a custom communication buffer with the HSDP gradient
+                            # communication buffer. Introduces copy and memory overhead.
+                            hsdp_comm_gbuf = self.buffer.parameter_groups[bucket_id].hsdp_comm_gbuf
+                            unreduced_grad = hsdp_comm_gbuf.allocate_bucket_storage(
+                                # Allocate memory for the sharded or un-sharded
+                                # gradient reduced over DP-Shard.
+                                shard=fsdp_grad_buffer.is_data_distributed,
+                                dtype=mp_policy.grad_comm_dtype,
+                                device=unreduced_grad.device,
+                                init_values=unreduced_grad,
+                            ).data
+
+                        # All-reduce or reduce-scatter the DP-Shard gradients across DP-Outer.
+                        if ddp_config.outer_dp_sharding_strategy != "no_shard":
+                            # Retrieve the (DP-Outer, DP-Shard) gradient shard from the
+                            # main gradient buffer which shards across the entire DP group,
+                            # i.e. across all DP-Shard and DP-Outer ranks.
+                            main_grad_shard = main_grad_buffer.get_shard_from_local_buffer()
+                            if custom_grad_comm_dtype:
+                                # Scatter back into communication buffer.
+                                dp_outer_rank = outer_fsdp_group.rank()
+                                output_buffer = unreduced_grad[
+                                    dp_outer_rank
+                                    * main_grad_shard.numel() : (dp_outer_rank + 1)
+                                    * main_grad_shard.numel()
+                                ]
+                            else:
+                                # Scatter directly into the main gradient buffer.
+                                output_buffer = main_grad_shard
+                            # Reduce-scatter the FSDP gradient buffer shard further
+                            # into the (DP-Outer, DP-Shard) gradient shard.
+                            torch.distributed.reduce_scatter_tensor(
+                                output=output_buffer,
+                                input=unreduced_grad,
+                                op=reduce_op,
+                                group=outer_fsdp_group,
+                            )
+                            if custom_grad_comm_dtype:
+                                # Reduce-scatter output was a temporary communication buffer.
+                                grad_accum_closure.append((main_grad_shard, output_buffer))
+                        else:  # HSDP -> main_grad_buffer = (DP-Shard,)
+                            # No DP-Outer sharding, so all-reduce FSDP gradients across DP-Outer.
+                            # All FSDP buffers will have reduced un-sharded or sharded gradients.
+                            torch.distributed.all_reduce(
+                                unreduced_grad, group=outer_fsdp_group, op=reduce_op
+                            )
+                            if custom_grad_comm_dtype:
+                                # Reduction used a temporary communication buffer.
+                                grad_accum_closure.append((main_grad_buffer.data, unreduced_grad))
+
+                for main_grad_buffer, reduced_grad in grad_accum_closure:
+                    # Update the (DP-Outer, DP-Shard) gradient shard in the main gradient buffer.
+                    # No accumulation should happen in the (DP-Shard, DP-Outer) gradient buffer.
+                    main_grad_buffer.copy_(reduced_grad)
+
+        torch.cuda.current_stream().wait_stream(self.outer_fsdp_group_grad_reduce_stream)
+        for bucket_group in pending:
+            for bucket_id in bucket_group:
+                hsdp_comm_gbuf = self.buffer.parameter_groups[bucket_id].hsdp_comm_gbuf
+                if hsdp_comm_gbuf is not None:
+                    # Free the communication buffers used for H(F)SDP.
+                    hsdp_comm_gbuf.free_bucket_storage()
+
     def _bucket_group_gradient_reduce(
         self,
         bucket_group: List[int],
@@ -4361,101 +4516,10 @@ class GradReducePipeline:
 
         # DP-Outer Gradient Reduction
         if outer_fsdp_group_grad_reduce:
-            # Wait on the DP-Shard reduction before further reduction.
-            self.outer_fsdp_group_grad_reduce_stream.wait_stream(reduce_scatter_stream)
-            # Expert and non-expert parameters have their own DP-Outer groups, and a bucket
-            # group is homogeneous in that respect (the DP-Shard group above is also taken
-            # from its first bucket).
-            outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
-                is_expert_parallel=self.buffer.parameter_groups[bucket_group[0]].is_expert_param
-            )
-            with torch.cuda.stream(self.outer_fsdp_group_grad_reduce_stream):
-                with _coalescing_manager(outer_fsdp_group):
-                    # List of gradient accumulation closure tasks.
-                    # (grad_buffer, reduced_grad)
-                    grad_accum_closure = []
-                    for bucket_id in bucket_group:
-                        # Skip gradient scaling for DP-Outer, because the
-                        # (DP-Shard, DP-Outer) scaling is already applied.
-                        if ddp_config.average_in_collective:
-                            reduce_op = torch.distributed.ReduceOp.AVG
-                        else:
-                            reduce_op = torch.distributed.ReduceOp.SUM
-
-                        # (DP-Shard, DP-Outer) if HFSDP, otherwise just DP-Shard for HSDP
-                        main_grad_buffer = self.buffer.parameter_groups[bucket_id].main_grad_buffer
-
-                        # FSDP buffer can be un-sharded or sharded for HSDP, but sharded for HFSDP.
-                        # TODO(@cspades): For `optim`, we don't need to reduce the local un-sharded
-                        # gradient, just the shard updated via reduce-scatter.
-                        fsdp_grad_buffer = self.get_fsdp_buffer(bucket_id)
-                        unreduced_grad = fsdp_grad_buffer.data
-                        assert (
-                            main_grad_buffer.dtype == fsdp_grad_buffer.dtype
-                        ), "Main and DP-Shard gradient buffer must share the exact same dtype."
-
-                        # Cast DP-Shard gradient to communication dtype if specified and necessary.
-                        custom_grad_comm_dtype = (
-                            mp_policy.grad_comm_dtype is not None
-                            and unreduced_grad.dtype != mp_policy.grad_comm_dtype
-                        )
-                        if custom_grad_comm_dtype:
-                            # Allocate a custom communication buffer with the HSDP gradient
-                            # communication buffer. Introduces copy and memory overhead.
-                            hsdp_comm_gbuf = self.buffer.parameter_groups[bucket_id].hsdp_comm_gbuf
-                            unreduced_grad = hsdp_comm_gbuf.allocate_bucket_storage(
-                                # Allocate memory for the sharded or un-sharded
-                                # gradient reduced over DP-Shard.
-                                shard=fsdp_grad_buffer.is_data_distributed,
-                                dtype=mp_policy.grad_comm_dtype,
-                                device=unreduced_grad.device,
-                                init_values=unreduced_grad,
-                            ).data
-
-                        # All-reduce or reduce-scatter the DP-Shard gradients across DP-Outer.
-                        if ddp_config.outer_dp_sharding_strategy != "no_shard":
-                            # Retrieve the (DP-Outer, DP-Shard) gradient shard from the
-                            # main gradient buffer which shards across the entire DP group,
-                            # i.e. across all DP-Shard and DP-Outer ranks.
-                            main_grad_shard = main_grad_buffer.get_shard_from_local_buffer()
-                            if custom_grad_comm_dtype:
-                                # Scatter back into communication buffer.
-                                dp_outer_rank = outer_fsdp_group.rank()
-                                output_buffer = unreduced_grad[
-                                    dp_outer_rank
-                                    * main_grad_shard.numel() : (dp_outer_rank + 1)
-                                    * main_grad_shard.numel()
-                                ]
-                            else:
-                                # Scatter directly into the main gradient buffer.
-                                output_buffer = main_grad_shard
-                            # Reduce-scatter the FSDP gradient buffer shard further
-                            # into the (DP-Outer, DP-Shard) gradient shard.
-                            torch.distributed.reduce_scatter_tensor(
-                                output=output_buffer,
-                                input=unreduced_grad,
-                                op=reduce_op,
-                                group=outer_fsdp_group,
-                            )
-                            if custom_grad_comm_dtype:
-                                # Reduce-scatter output was a temporary communication buffer.
-                                grad_accum_closure.append((main_grad_shard, output_buffer))
-                        else:  # HSDP -> main_grad_buffer = (DP-Shard,)
-                            # No DP-Outer sharding, so all-reduce FSDP gradients across DP-Outer.
-                            # All FSDP buffers will have reduced un-sharded or sharded gradients.
-                            torch.distributed.all_reduce(
-                                unreduced_grad, group=outer_fsdp_group, op=reduce_op
-                            )
-                            if custom_grad_comm_dtype:
-                                # Reduction used a temporary communication buffer.
-                                grad_accum_closure.append((main_grad_buffer.data, unreduced_grad))
-
-                for main_grad_buffer, reduced_grad in grad_accum_closure:
-                    # Update the (DP-Outer, DP-Shard) gradient shard in the main gradient buffer.
-                    # No accumulation should happen in the (DP-Shard, DP-Outer) gradient buffer.
-                    main_grad_buffer.copy_(reduced_grad)
-
-            reduce_scatter_view_out_event = self.outer_fsdp_group_grad_reduce_stream.record_event()
+            # The in-place DP-Outer reduction must run once per step, even if the last
+            # microbatch reduces this bucket several times, so defer it.
+            if tuple(bucket_group) not in self.pending_outer_fsdp_group_grad_reduce:
+                self.pending_outer_fsdp_group_grad_reduce.append(tuple(bucket_group))
 
         free_up_grad_bucket_func = {}
         for bucket_id in bucket_group:
@@ -4465,16 +4529,24 @@ class GradReducePipeline:
                     # Empty the set of parameters that are ready for gradient reduction.
                     self.bucket_grad_ready_params[bucket_id] = set()
                     gbuf = self.get_fsdp_buffer(bucket_id)
+                    # The allocating stream can differ from the current one under the 1F1B
+                    # overlap schedule, which runs some gradient hooks on its communication
+                    # stream. PyTorch's caching allocator, which backs the temporary bucket,
+                    # lets the allocating stream reuse the memory as soon as it is freed, so
+                    # that stream must wait for the reduce-scatter first, or it could
+                    # overwrite the bucket while the reduce-scatter still reads it.
+                    allocation_stream = gbuf.bucket_allocation_stream
+                    if (
+                        allocation_stream is not None
+                        and allocation_stream != torch.cuda.current_stream()
+                    ):
+                        allocation_stream.wait_event(reduce_scatter_view_out_event)
                     # Free the memory backing the temporarily-allocated communication
                     # bucket associated with this buffer. Only exists for sharded
                     # gradient buffers, or if a custom gradient data-type is used!
                     gbuf.free_bucket_storage()
                     # Gradient reduction completed, can de-reference param.main_grad.
                     gbuf.reset_param_main_grad()
-                    hsdp_comm_gbuf = self.buffer.parameter_groups[bucket_id].hsdp_comm_gbuf
-                    if hsdp_comm_gbuf is not None:
-                        # Also de-allocate any communication buffers used for H(F)SDP.
-                        hsdp_comm_gbuf.free_bucket_storage()
                     # Mark the bucket as deallocated / empty.
                     self.bucket_status[bucket_id] = BucketStatus.EMPTY
 
@@ -4524,6 +4596,8 @@ class AllGatherPipeline:
         self.param_gather_event_map: Dict[Tuple[int, bool], Tuple[Any, Callable[[], None]]] = {}
         # One DP-Outer event may be shared by all buckets in a coalesced group.
         self.outer_bucket_ready_events: Dict[Tuple[int, bool], torch.cuda.Event] = {}
+        # Buckets whose row-wise weights are re-gathered by activation recompute in backward.
+        self.recompute_buckets: set = set()
         # All buckets are initially deallocated / empty after initialization of ParamAndGradBuffer.
         self.bucket_status = {}
         for i in range(self.buffer.num_buckets):
@@ -4679,23 +4753,23 @@ class AllGatherPipeline:
         prefetch_order: PrefetchOrder,
         suggested_prefetch_size: Optional[int],
         double_buffer_units: set,
+        outer_fsdp_group_param_gather: bool = False,
     ) -> List[int]:
-        """Extend a bucket list using the communication-size heuristic."""
+        """Extend a bucket list using the communication-size heuristic. Buckets that need
+        neither a DP-Outer nor a DP-Shard all-gather count zero toward the size. Extension
+        stops once the prefetched size reaches `suggested_prefetch_size`, so the last bucket
+        group added may exceed it."""
         parameter_groups = self.buffer.parameter_groups
-        result = list(bucket_ids)
+        allgathered_bucket_ids = set(bucket_ids)
 
         def next_bucket_id():
             if prefetch_order == PrefetchOrder.FORWARD_PASS_ORDER:
-                candidate = result[0] + 1
-                for existing_bucket_id in result[1:]:
-                    if existing_bucket_id != candidate:
-                        break
+                candidate = min(allgathered_bucket_ids) + 1
+                while candidate in allgathered_bucket_ids:
                     candidate += 1
             else:
-                candidate = result[-1] - 1
-                for existing_bucket_id in reversed(result[:-1]):
-                    if existing_bucket_id != candidate:
-                        break
+                candidate = max(allgathered_bucket_ids) - 1
+                while candidate in allgathered_bucket_ids:
                     candidate -= 1
             if candidate < 0 or candidate >= self.buffer.num_buckets:
                 return None
@@ -4704,33 +4778,38 @@ class AllGatherPipeline:
         if suggested_prefetch_size is None:
             suggested_prefetch_size = 500_000_000
 
-        base_all_gather_size = sum(
-            parameter_groups[bucket_id].model_weight_buffer.bucket_index.size
-            for bucket_id in result
-        )
-        bucket_id = next_bucket_id()
-        while bucket_id is not None:
-            prefetched_size = (
-                sum(
-                    parameter_groups[result_bucket_id].model_weight_buffer.bucket_index.size
-                    for result_bucket_id in result
-                )
-                - base_all_gather_size
+        def needs_outer_gather(bucket_id):
+            group = parameter_groups[bucket_id]
+            if not outer_fsdp_group_param_gather or group.hfsdp_helper_wbuf is None:
+                return False
+            outer_fsdp_group = self.buffer.dist_index.get_outer_fsdp_group(
+                is_expert_parallel=group.is_expert_param
             )
-            if prefetched_size >= suggested_prefetch_size:
-                break
+            return outer_fsdp_group.size() > 1
 
+        def all_gather_size(bucket_id):
+            if not (
+                needs_outer_gather(bucket_id) or self.get_fsdp_buffer(bucket_id).is_data_distributed
+            ):
+                return 0
+            return parameter_groups[bucket_id].model_weight_buffer.bucket_index.size
+
+        prefetched_size = 0
+        bucket_id = next_bucket_id()
+        while bucket_id is not None and prefetched_size < suggested_prefetch_size:
             if self.buffer.ddp_config.fsdp_double_buffer:
                 fsdp_unit_id = parameter_groups[bucket_id].fsdp_unit_id
                 double_buffer_units.add(fsdp_unit_id)
                 if len(double_buffer_units) > 2:
                     break
 
-            result.extend(self.buffer.bucket_to_bucket_group[bucket_id])
-            result = list(sorted(set(result)))
+            new_bucket_ids = set(self.buffer.bucket_to_bucket_group[bucket_id])
+            new_bucket_ids -= allgathered_bucket_ids
+            prefetched_size += sum(all_gather_size(new_id) for new_id in new_bucket_ids)
+            allgathered_bucket_ids |= new_bucket_ids
             bucket_id = next_bucket_id()
 
-        return result
+        return sorted(allgathered_bucket_ids)
 
     def _group_buckets(self, bucket_ids: List[int]) -> Dict[int, List[int]]:
         """Group selected buckets by their coalesced collective group."""
@@ -4796,6 +4875,7 @@ class AllGatherPipeline:
         async_param_gather: bool = True,
         outer_fsdp_group_param_gather: bool = False,
         bwd: bool = False,
+        recompute: bool = False,
     ):
         """All-gather the params. If prefetch is enabled, prefetch next buckets
         in the order of `prefetch_order`.
@@ -4812,10 +4892,72 @@ class AllGatherPipeline:
             bwd (bool, optional):
                 Whether to all-gather column-wise parameters instead of row-wise parameters
                 for the backward pass for formats that require a transpose buffer like MXFP8.
+            recompute (bool, optional): Whether this is a row-wise (`bwd=False`) gather for
+                the forward that activation recompute re-runs during the backward pass. The
+                gathered buckets that have a transpose buffer are recorded, and later backward
+                gathers also gather the row-wise weights of recorded buckets in their window.
         """
+        assert not (bwd and recompute), "Recompute gathers are row-wise (bwd=False)."
         if len(params) == 0:
             return
 
+        gather_kwargs = dict(
+            prefetch_order=prefetch_order,
+            suggested_AG_prefetch_size=suggested_AG_prefetch_size,
+            async_param_gather=async_param_gather,
+            outer_fsdp_group_param_gather=outer_fsdp_group_param_gather,
+        )
+        window = self._all_gather_bucket_window(params, prefetch=prefetch, bwd=bwd, **gather_kwargs)
+        if recompute:
+            self._record_recompute_buckets(window)
+        elif bwd:
+            self._gather_recompute_buckets(window, gather_kwargs)
+
+    def _record_recompute_buckets(self, bucket_ids: List[int]) -> None:
+        """Record the buckets whose row-wise weights a recomputed forward re-gathered.
+        Buckets without a transpose buffer use the same weights in forward and backward.
+        Nothing is recorded with double buffering, whose pool holds at most two FSDP units."""
+        if self.buffer.ddp_config.fsdp_double_buffer:
+            return
+        parameter_groups = self.buffer.parameter_groups
+        self.recompute_buckets.update(
+            bucket_id
+            for bucket_id in bucket_ids
+            if parameter_groups[bucket_id].transpose_weight_buffer is not None
+        )
+
+    def _gather_recompute_buckets(self, bucket_ids: List[int], gather_kwargs: dict) -> None:
+        """Gather the row-wise weights of the recorded buckets among `bucket_ids` that are
+        not already gathered, so that their recomputed forward does not wait on them."""
+        pending = [
+            bucket_id
+            for bucket_id in bucket_ids
+            if bucket_id in self.recompute_buckets
+            and self.bucket_status[self.get_bucket_key(bucket_id, bwd=False)]
+            in (BucketStatus.EMPTY, BucketStatus.PRESERVED)
+        ]
+        if not pending:
+            return
+        params = [
+            param
+            for bucket_id in pending
+            for param in self.buffer.parameter_groups[bucket_id].params
+        ]
+        self._all_gather_bucket_window(params, prefetch=False, bwd=False, **gather_kwargs)
+
+    def _all_gather_bucket_window(
+        self,
+        params: List[torch.Tensor],
+        prefetch: bool = False,
+        prefetch_order: PrefetchOrder = PrefetchOrder.FORWARD_PASS_ORDER,
+        suggested_AG_prefetch_size: Optional[int] = None,
+        async_param_gather: bool = True,
+        outer_fsdp_group_param_gather: bool = False,
+        bwd: bool = False,
+    ) -> List[int]:
+        """All-gather the buckets of `params` and, if `prefetch`, the buckets prefetched after
+        them, as described in `all_gather_params`. Return all of these bucket IDs, including
+        those that were already gathered."""
         ag_buckets = [self.buffer.param_to_param_group[item] for item in params]
         ag_buckets = list(sorted(set(ag_buckets)))  # Sort in order of unique bucket ID.
         parameter_groups = self.buffer.parameter_groups
@@ -4858,7 +5000,11 @@ class AllGatherPipeline:
 
         if should_prefetch:
             ag_buckets = self._extend_by_prefetch_size(
-                ag_buckets, prefetch_order, suggested_AG_prefetch_size, double_buf_units
+                ag_buckets,
+                prefetch_order,
+                suggested_AG_prefetch_size,
+                double_buf_units,
+                outer_fsdp_group_param_gather=outer_fsdp_group_param_gather,
             )
 
         if pipeline_hfsdp_gathers and outer_fsdp_group_param_gather:
@@ -4869,6 +5015,7 @@ class AllGatherPipeline:
         if outer_ag_buckets:
             self._launch_outer_prefetches(outer_ag_buckets, bwd)
 
+        extended_buckets = ag_buckets
         # Only all-gather on buckets that have not been allocated yet or whose
         # persistent storage was preserved but is not ready for use.
         ag_buckets = [
@@ -4878,7 +5025,7 @@ class AllGatherPipeline:
             in (BucketStatus.EMPTY, BucketStatus.PRESERVED)
         ]
         if len(ag_buckets) == 0:
-            return
+            return extended_buckets
 
         # Divide buckets into aggregate groups. We need to reconstruct the bucket groups
         # because the all-gather parameter groups may be a subset of the buckets.
@@ -4928,6 +5075,8 @@ class AllGatherPipeline:
         if not async_param_gather:
             for bucket_id in buckets:
                 self.wait_bucket_ready(bucket_id, bwd)
+
+        return extended_buckets
 
     def wait_bucket_ready(self, bucket_id, bwd, empty_ok=False):
         """Wait for the bucket to be ready."""
@@ -5085,7 +5234,23 @@ def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config, group_s
     """
     Gradient reduce preprocessing for gradient averaging and gradient scaling.
 
-    ``group_size`` is the reduction group's rank count; None skips the one-rank case below.
+    Scales ``grad_data`` in place wherever the returned reduce operation cannot apply the
+    scaling itself.
+
+    Args:
+        grad_data (torch.Tensor): The unreduced gradient, scaled in place if needed.
+        scaling_factor (Optional[float]): The scale to apply to the gradient sum over the
+            reduction group, or None to sum the gradients without scaling. With
+            ``average_in_collective``, the AVG reduction already divides by the group size,
+            so this is the residual scale applied on top of it instead: 1.0 for non-expert
+            parameters, and the expert data parallel size divided by the data parallel size
+            for expert parameters.
+        ddp_config (DistributedDataParallelConfig): The gradient reduction configuration.
+        group_size (Optional[int]): The reduction group's rank count; None skips the
+            one-rank case below.
+
+    Returns:
+        torch.distributed.ReduceOp: The operation to reduce ``grad_data`` with.
     """
 
     # TODO(@cspades): Clean up this logic in conjunction with
@@ -5095,7 +5260,13 @@ def gradient_reduce_preprocessing(grad_data, scaling_factor, ddp_config, group_s
         # No scaling - use SUM reduction.
         reduce_op = torch.distributed.ReduceOp.SUM
     elif ddp_config.average_in_collective:
-        # Scaling overridden by AVG reduction.
+        # AVG divides by the group size, so any residual scale has to be applied here.
+        # Expert gradients are averaged over the expert data parallel group, which is
+        # narrower than the data parallel group the loss is averaged over, and dropping
+        # their residual scale leaves them too large by that ratio. MCore DDP likewise
+        # applies any non-unit scale before its AVG reduction.
+        if scaling_factor != 1.0:
+            grad_data.mul_(scaling_factor)
         reduce_op = torch.distributed.ReduceOp.AVG
     elif group_size == 1:
         # A reduction over a single rank degenerates into a copy, which does not necessarily
