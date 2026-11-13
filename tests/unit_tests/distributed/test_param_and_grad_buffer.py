@@ -575,7 +575,7 @@ class TestFP32LocalGradAccumulation:
         with pytest.raises(AssertionError):
             DistributedDataParallelConfig(
                 grad_reduce_in_fp32=True, param_name_patterns_for_fp32_local_accumulation=('all',)
-            )
+            ).validate()
 
     def test_pattern_matching_creates_fp32_main_grad(self):
         """Params matching patterns should get a float32 main_grad and a
