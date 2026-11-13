@@ -594,6 +594,43 @@ class TestPackedSampleAccounting:
             destroy_num_microbatches_calculator()
             set_args(previous)
 
+    def test_sample_schedule_count_leaves_an_existing_calculator(self):
+        """The iteration count follows the training schedule, not the runtime calculator."""
+        from megatron.core.num_microbatches_calculator import (
+            destroy_num_microbatches_calculator,
+            get_current_global_batch_size,
+            init_num_microbatches_calculator,
+            update_num_microbatches,
+        )
+        from megatron.training.config import container
+
+        previous = get_args() if is_args_initialized() else None
+        destroy_num_microbatches_calculator()
+        set_args(SimpleNamespace(seq_length=None))
+        init_num_microbatches_calculator(
+            rank=-1,
+            micro_batch_size=1,
+            data_parallel_size=1,
+            global_batch_size=32,
+            step_batch_size_schedule="0:8 100:32",
+        )
+        update_num_microbatches(100, consistency_check=False)
+        assert get_current_global_batch_size() == 32
+        train = TrainingConfig(
+            micro_batch_size=2,
+            global_batch_size=16,
+            train_samples=65,
+            step_batch_size_schedule="0:8 32:16",
+        )
+        try:
+            container.update_train_iters(train)
+            # 4 * 8 + 3 * 16 = 80. The runtime calculator stays on its own schedule.
+            assert train.train_iters == 7
+            assert get_current_global_batch_size() == 32
+        finally:
+            destroy_num_microbatches_calculator()
+            set_args(previous)
+
     def test_sample_schedule_counts_token_thresholds_from_seq_length(self):
         """Token thresholds use args.seq_length: 32 tokens at length 4 is 8 samples."""
         from megatron.core.num_microbatches_calculator import (
