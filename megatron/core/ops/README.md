@@ -267,15 +267,10 @@ below), not by an operation constructor. Say a library `foo` provides both.
 
 ## Liger RMSNorm
 
-Install `pip install liger-kernel==0.8.5` or a newer compatible release. Use
-`--transformer-impl local --normalization RMSNorm --use-liger` for standard GPT
-training, or set those fields in `TransformerConfig` and pass
-`get_gpt_decoder_block_spec(config, use_transformer_engine=False)` to `GPTModel`.
-The block spec covers layer, final and MTP norms; a bare layer spec does not
-choose the final norm. Checkpoint keys, zero-centered gamma and sequence-parallel
-gradient marking are preserved. Other norms, Kitchen, TE/inference providers,
-Hybrid and unsupported default GPT specs reject the option. Custom specs own
-their norm choices. Cross entropy is unchanged.
+Install `pip install liger-kernel==0.8.5` (or a newer compatible release) and select
+`--transformer-impl local --normalization RMSNorm --use-liger`. The local GPT block spec
+(`get_gpt_decoder_block_spec`) then uses it for the layer, final and MTP norms; custom
+specs choose their own norms.
 
 ## Dependency checks
 

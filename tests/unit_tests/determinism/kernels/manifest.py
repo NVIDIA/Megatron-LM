@@ -281,7 +281,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Fused streamwise read/write with fixed-order controller-gradient reductions; "
         "replay covers identity carry and learned retention.",
     ),
-    # ---------------------------------------------------------------- external norms, apex CUDA extensions and local TP layers
+    # ---------------------------------------------------------------- apex CUDA extensions and local TP layers
     KernelEntry(
         name="liger_rmsnorm",
         sources=("megatron/core/ops/norm/liger_norm.py",),

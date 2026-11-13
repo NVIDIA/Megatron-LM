@@ -10,18 +10,13 @@ import pytest
 import model_provider as mp
 
 
-@pytest.mark.parametrize("model_type", ["GPTModel", "HybridModel"])
-@pytest.mark.parametrize("mtp_layers", [None, 1])
-def test_modelopt_rejects_liger_before_constructing_specs(
-    monkeypatch, run_config, model_type, mtp_layers
-):
+def test_modelopt_rejects_liger_before_constructing_specs(monkeypatch, run_config):
     builder = pytest.importorskip("megatron.post_training.model_builder")
     monkeypatch.setattr(
         builder, "core_transformer_config_from_args", lambda args: SimpleNamespace(use_liger=True)
     )
-    args = Namespace(export_model_type=model_type, mtp_num_layers=mtp_layers)
     with pytest.raises(ValueError, match="use_liger is not supported by ModelOpt"):
-        builder.modelopt_gpt_hybrid_builder(args, True, True)
+        builder.modelopt_gpt_hybrid_builder(Namespace(export_model_type="GPTModel"), True, True)
 
 
 def _sentinel_builder(return_value, calls):

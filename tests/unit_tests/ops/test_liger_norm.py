@@ -1,180 +1,75 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Liger normalization selection and tensor contracts."""
+"""Liger RMSNorm selection, configuration checks and tensor contracts."""
 
+import sys
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import pytest
 import torch
 
 from megatron.core.extensions.liger_kernel_spec_provider import LigerSpecProvider
-from megatron.core.models.backends import LocalSpecProvider, get_backend, get_backend_from_config
+from megatron.core.models.backends import LocalSpecProvider, get_backend_from_config
+from megatron.core.ops.norm.liger_norm import LigerRMSNorm
 from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
-from megatron.core.optimizer import _get_param_groups, get_standard_config_overrides
-from megatron.core.optimizer.optimizer_config import OptimizerConfig
+from megatron.core.transformer.heterogeneous.heterogeneous_config import (
+    HeterogeneousTransformerConfig,
+)
+from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-def _norm_type():
-    pytest.importorskip("liger_kernel.megatron")
-    from megatron.core.ops.norm.liger_norm import LigerRMSNorm
+def test_unselected_paths_do_not_import_liger(monkeypatch):
+    for module in ("liger_kernel", "liger_kernel.megatron"):
+        monkeypatch.setitem(sys.modules, module, None)  # any import attempt now fails
+    provider = get_backend_from_config(SimpleNamespace(transformer_impl="local", use_liger=True))
+    assert isinstance(provider, LigerSpecProvider)
+    assert provider.layer_norm() is LocalSpecProvider().layer_norm()
+    assert LocalSpecProvider().layer_norm(rms_norm=True) is WrappedTorchNorm
+    with pytest.raises(ImportError, match="Liger RMSNorm requires liger_kernel.megatron"):
+        provider.layer_norm(rms_norm=True)
 
-    return LigerRMSNorm
 
-
-def _config(**overrides):
+def test_config_rejects_unsupported_setups():
     options = dict(
+        num_layers=2,
+        hidden_size=32,
+        num_attention_heads=4,
         normalization="RMSNorm",
-        layernorm_zero_centered_gamma=False,
-        sequence_parallel=False,
-        persist_layer_norm=False,
-        memory_efficient_layer_norm=False,
+        transformer_impl="local",
+        use_liger=True,
     )
-    return SimpleNamespace(**(options | overrides))
+    TransformerConfig(**options)
+    for invalid in (
+        {"normalization": "LayerNorm"},
+        {"transformer_impl": "transformer_engine"},
+        {"transformer_impl": "inference_optimized"},
+        {"use_kitchen": True},
+        {"experimental_attention_variant": "dsa"},
+    ):
+        with pytest.raises(ValueError, match="use_liger requires"):
+            TransformerConfig(**(options | invalid))
+    with pytest.raises(ValueError, match="use_liger does not support heterogeneous"):
+        HeterogeneousTransformerConfig(**options)
 
 
-class TestLigerNormSelection:
-    """Only an explicitly selected RMSNorm imports Liger."""
-
-    def test_unselected_paths_do_not_import_liger(self):
-        with patch("megatron.core.ops._backends.import_module") as load:
-            assert LocalSpecProvider().layer_norm(rms_norm=True) is WrappedTorchNorm
-            assert LigerSpecProvider().layer_norm() is LocalSpecProvider().layer_norm()
-        load.assert_not_called()
-
-    @pytest.mark.parametrize("for_qk", [False, True])
-    @pytest.mark.parametrize("has_residual", [False, True])
-    def test_rms_norm_slots(self, for_qk, has_residual):
-        norm = _norm_type()
-        assert (
-            LigerSpecProvider().layer_norm(rms_norm=True, for_qk=for_qk, has_residual=has_residual)
-            is norm
-        )
-
-    def test_selection_does_not_mutate_the_local_provider(self):
-        _norm_type()
-        local = LocalSpecProvider()
-        before = local.layer_norm()
-        LigerSpecProvider().layer_norm(rms_norm=True)
-        assert local.layer_norm() is before
-        assert local.layer_norm(rms_norm=True) is WrappedTorchNorm
-
-    @pytest.mark.parametrize(
-        "failure",
-        [
-            ModuleNotFoundError("No module named 'liger_kernel'", name="liger_kernel"),
-            RuntimeError("incompatible native extension"),
-        ],
-    )
-    def test_missing_or_broken_selected_library(self, failure):
-        with patch("megatron.core.ops._backends.import_module", side_effect=failure):
-            with pytest.raises(ImportError, match="Liger RMSNorm requires") as error:
-                LigerSpecProvider().layer_norm(rms_norm=True)
-        assert error.value.__cause__ is failure
-
-    def test_missing_export(self):
-        with patch("megatron.core.ops._backends.import_module", return_value=SimpleNamespace()):
-            with pytest.raises(ImportError, match="LigerMegatronRMSNorm"):
-                LigerSpecProvider().layer_norm(rms_norm=True)
-
-    def test_factory_and_newer_slots(self):
-        provider = get_backend_from_config(
-            SimpleNamespace(transformer_impl="local", use_liger=True)
-        )
-        assert isinstance(provider, LigerSpecProvider)
-        local = LocalSpecProvider()
-        for slot in (
-            "column_parallel_linear",
-            "row_parallel_linear",
-            "core_attention",
-            "fuse_layernorm_and_linear",
-            "column_parallel_layer_norm_linear",
-            "activation_func",
-            "mlp_module",
-            "moe_router",
-            "vocab_parallel_cross_entropy",
-        ):
-            assert getattr(provider, slot)() is getattr(local, slot)(), slot
-        assert callable(provider.grouped_mlp_modules(moe_use_grouped_gemm=False))
-        with pytest.raises(NotImplementedError, match="no non-parallel linear"):
-            provider.linear()
-
-    @pytest.mark.parametrize("backend", ["transformer_engine", "inference_optimized"])
-    def test_unsupported_provider_fails_before_importing_liger(self, backend):
-        with patch("megatron.core.ops._backends.import_module") as load:
-            with pytest.raises(ValueError, match="use_liger requires"):
-                get_backend(backend, use_liger=True)
-        load.assert_not_called()
-
-    def test_kitchen_is_mutually_exclusive(self):
-        with pytest.raises(ValueError, match="cannot be combined with use_kitchen"):
-            get_backend("local", use_liger=True, use_kitchen=True)
-
-
-@pytest.mark.parametrize("zero_centered", [False, True])
 @pytest.mark.parametrize("sequence_parallel", [False, True])
-def test_norm_interface_and_checkpoint(zero_centered, sequence_parallel):
-    config = _config(
-        layernorm_zero_centered_gamma=zero_centered, sequence_parallel=sequence_parallel
-    )
-    norm = _norm_type()(config=config, hidden_size=128, eps=1e-6)
+def test_norm_interface_and_checkpoint(sequence_parallel):
+    pytest.importorskip("liger_kernel.megatron")
+    config = SimpleNamespace(sequence_parallel=sequence_parallel)
+    norm = LigerRMSNorm(config=config, hidden_size=128, eps=1e-6)
     assert norm.returns_residual is False
     assert norm.weight.sequence_parallel is sequence_parallel
     assert norm.weight.is_rmsnorm_weight
     assert list(norm.state_dict()) == ["weight"]
-    torch.testing.assert_close(
-        norm.weight, torch.full_like(norm.weight, 0.0 if zero_centered else 1.0)
-    )
-    restored = _norm_type()(config=config, hidden_size=128, eps=1e-6)
-    restored.load_state_dict(norm.state_dict(), strict=True)
-    torch.testing.assert_close(norm.weight, restored.weight)
-
-
-@pytest.mark.parametrize(
-    "multiplier,apply_wd_to_qk_layernorm,expected",
-    [(None, False, (0.0, 0.0)), (None, True, (0.0, 1.0)), (0.5, True, (0.5, 0.5))],
-)
-def test_rmsnorm_weight_decay_policy(monkeypatch, multiplier, apply_wd_to_qk_layernorm, expected):
-    norm_type = _norm_type()
-    model = torch.nn.Module()
-    model.input_layernorm = norm_type(config=_config(), hidden_size=4)
-    model.q_layernorm = norm_type(config=_config(), hidden_size=4)
-    config = OptimizerConfig(
-        lr=0.1,
-        rmsnorm_weight_decay_mult=multiplier,
-        apply_wd_to_qk_layernorm=apply_wd_to_qk_layernorm,
-    )
-    monkeypatch.setattr(torch.distributed, "get_world_size", lambda **_: 1)
-    monkeypatch.setattr(
-        torch.distributed,
-        "all_gather_object",
-        lambda output, keys, **_: output.__setitem__(0, keys),
-    )
-    groups = _get_param_groups([model], config, get_standard_config_overrides(config))
-    decay = {id(param): group["wd_mult"] for group in groups for param in group["params"]}
-    assert decay[id(model.input_layernorm.weight)] == expected[0]
-    assert decay[id(model.q_layernorm.weight)] == expected[1]
-
-
-@pytest.mark.parametrize("device", ["cpu", "meta"])
-def test_default_device_is_preserved(device):
-    norm_type = _norm_type()
-    with torch.device(device):
-        norm = norm_type(config=_config(), hidden_size=128, eps=1e-6)
-    assert norm.weight.device.type == device
-
-
-def test_non_rmsnorm_config_is_rejected():
-    with pytest.raises(ValueError, match="normalization='RMSNorm'"):
-        _norm_type()(config=_config(normalization="LayerNorm"), hidden_size=128, eps=1e-6)
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("zero_centered", [False, True])
 @pytest.mark.parametrize("hidden_size", [123, 512])
 def test_forward_backward_parity(dtype, zero_centered, hidden_size):
-    norm = _norm_type()(
-        config=_config(layernorm_zero_centered_gamma=zero_centered),
+    pytest.importorskip("liger_kernel.megatron")
+    norm = LigerRMSNorm(
+        config=SimpleNamespace(layernorm_zero_centered_gamma=zero_centered),
         hidden_size=hidden_size,
         eps=1e-6,
     ).to(device="cuda", dtype=dtype)

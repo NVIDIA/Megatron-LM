@@ -361,15 +361,11 @@ def get_gpt_layer_local_submodules(
         multi_latent_attention (bool, optional): To use MLA. Defaults to False.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
         qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
-        use_liger (bool, optional): Use Liger for RMSNorm slots. Requires
-            normalization="RMSNorm" and use_kitchen=False. Defaults to False.
+        use_liger (bool, optional): Use Liger for RMSNorm slots. Defaults to False.
 
     Returns:
         TransformerLayerSubmodules: Megatron-Core modules to construct a TransformerLayer
     """
-
-    if use_liger and (normalization != "RMSNorm" or use_kitchen):
-        raise ValueError("use_liger requires normalization='RMSNorm' and use_kitchen=False.")
 
     backend = get_backend(
         "local",

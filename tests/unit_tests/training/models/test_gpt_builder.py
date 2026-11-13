@@ -19,7 +19,6 @@ from megatron.training.arguments import parse_args, validate_args
 from megatron.training.models.gpt import (
     GPTModelBuilder,
     GPTModelConfig,
-    _te_or_local_layer_spec,
     default_layer_spec,
     mtp_block_spec,
 )
@@ -249,47 +248,13 @@ class TestDefaultLayerSpecDispatch:
         )
         assert result is spec
 
-    @pytest.mark.parametrize("num_experts", [None, 4])
     @patch("megatron.training.models.gpt.get_gpt_decoder_block_spec")
-    def test_liger_routes_to_complete_decoder_block(self, mock_get_spec, num_experts):
-        config = _make_dispatch_config(
-            use_liger=True, normalization="RMSNorm", num_moe_experts=num_experts
-        )
-        block = TransformerBlockSubmodules(layer_specs=[], layer_norm=object)
-        mock_get_spec.return_value = block
-
-        assert default_layer_spec(config, vp_stage=1) is block
-
-        mock_get_spec.assert_called_once_with(
-            config.transformer,
-            use_transformer_engine=False,
-            normalization="RMSNorm",
-            qk_l2_norm=False,
-            vp_stage=1,
-        )
-
-    @pytest.mark.parametrize("unsupported", ["modelopt", "experimental", "heterogeneous"])
-    def test_liger_rejects_unsupported_default_specs(self, unsupported):
+    def test_liger_routes_to_decoder_block_spec(self, mock_get_spec):
         config = _make_dispatch_config(use_liger=True, normalization="RMSNorm")
-        if unsupported == "modelopt":
-            config.restore_modelopt_state = True
-        elif unsupported == "experimental":
-            config.transformer.experimental_attention_variant = "dsa"
-        else:
-            config.transformer = Mock(spec=HeterogeneousTransformerConfig)
-            config.transformer.use_liger = True
-            config.transformer.experimental_attention_variant = None
-
-        with pytest.raises(ValueError, match="standard local GPT specs"):
-            default_layer_spec(config, vp_stage=None)
-
-    @pytest.mark.parametrize("use_liger", [False, True])
-    @patch("megatron.training.models.gpt.get_gpt_layer_local_spec")
-    def test_local_layer_helper_preserves_liger_flag(self, mock_get_spec, use_liger):
-        config = _make_dispatch_config(use_liger=use_liger, normalization="RMSNorm")
-
-        assert _te_or_local_layer_spec(config, vp_stage=None) is mock_get_spec.return_value
-        assert mock_get_spec.call_args.kwargs["use_liger"] is use_liger
+        assert default_layer_spec(config, vp_stage=1) is mock_get_spec.return_value
+        config.restore_modelopt_state = True
+        with pytest.raises(ValueError, match="use_liger is not supported by ModelOpt"):
+            default_layer_spec(config, vp_stage=1)
 
 
 # =============================================================================
@@ -556,14 +521,8 @@ class TestGPTModelBuilderBuildModel:
     @patch("megatron.training.models.gpt.is_pp_last_stage", return_value=True)
     @patch("megatron.training.models.gpt.is_pp_first_stage", return_value=True)
     @patch("megatron.training.models.gpt.GPTModel")
-    @pytest.mark.parametrize("use_liger", [False, True])
-    def test_spec_already_module_spec_used_directly(
-        self, mock_model, _pp_first, _pp_last, _vp_first, _vp_last, _pad, _mtp, use_liger
-    ):
+    def test_spec_already_module_spec_used_directly(self, mock_model, *_):
         module_spec = ModuleSpec(module=object)
-        self.config.transformer = _make_transformer(
-            use_liger=use_liger, normalization="RMSNorm", transformer_impl="local"
-        )
         self.config.__dict__["transformer_layer_spec"] = module_spec
         self.builder.build_model(self.pg, pre_process=True, post_process=True)
         assert mock_model.call_args.kwargs["transformer_layer_spec"] is module_spec

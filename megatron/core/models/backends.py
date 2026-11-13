@@ -317,14 +317,9 @@ def get_backend(
 
     Kitchen is enabled independently of ``transformer_impl``. It overrides selected
     operations and delegates the rest to the chosen base provider through ``fallback``.
-    ``use_te_op_fuser`` applies only to the Transformer Engine provider.
-    Liger RMSNorm is supported by the local provider only, separately from the
-    cross-entropy choice, and cannot be combined with Kitchen.
+    ``use_te_op_fuser`` applies only to the Transformer Engine provider, ``use_liger``
+    (Liger RMSNorm) only to the local one.
     """
-    if use_liger and (transformer_impl != "local" or use_kitchen):
-        raise ValueError(
-            "use_liger requires transformer_impl='local' and cannot be combined with use_kitchen."
-        )
     if transformer_impl == "transformer_engine":
         from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 

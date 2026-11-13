@@ -54,15 +54,8 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
     """Determine the most appropriate layer specification based on availability."""
     transformer_cfg = config.transformer
-    if transformer_cfg.use_liger and (
-        config.restore_modelopt_state
-        or transformer_cfg.experimental_attention_variant is not None
-        or isinstance(transformer_cfg, HeterogeneousTransformerConfig)
-    ):
-        raise ValueError(
-            "use_liger currently supports standard local GPT specs, not ModelOpt, "
-            "experimental attention, or heterogeneous specs."
-        )
+    if transformer_cfg.use_liger and config.restore_modelopt_state:
+        raise ValueError("use_liger is not supported by ModelOpt GPT specs.")
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
     if (
         transformer_cfg.transformer_impl == "inference_optimized"

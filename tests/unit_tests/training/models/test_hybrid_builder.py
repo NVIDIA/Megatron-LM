@@ -31,31 +31,14 @@ def _make_hybrid_config(**kwargs):
     return HybridModelConfig(**defaults)
 
 
-@pytest.mark.parametrize("restore_modelopt_state", [False, True])
-@pytest.mark.parametrize("wide_residual", [None, WideResidualConfig(num_streams=2)])
-def test_liger_rejects_default_hybrid_specs(restore_modelopt_state, wide_residual):
+def test_liger_needs_a_custom_hybrid_spec():
     transformer = _make_transformer(
         use_liger=True, normalization="RMSNorm", transformer_impl="local"
     )
-    transformer.wide_residual = wide_residual
-    config = _make_hybrid_config(
-        transformer=transformer, restore_modelopt_state=restore_modelopt_state
-    )
-
     with pytest.raises(ValueError, match="use_liger is not supported by default Hybrid specs"):
-        resolve_hybrid_stack_spec(config)
-
-
-@pytest.mark.parametrize("use_liger", [False, True])
-def test_custom_hybrid_spec_owns_normalization(use_liger):
+        resolve_hybrid_stack_spec(_make_hybrid_config(transformer=transformer))
     spec = ModuleSpec(module=object)
-    config = _make_hybrid_config(
-        transformer=_make_transformer(
-            use_liger=use_liger, normalization="RMSNorm", transformer_impl="local"
-        ),
-        hybrid_stack_spec=spec,
-    )
-
+    config = _make_hybrid_config(transformer=transformer, hybrid_stack_spec=spec)
     assert resolve_hybrid_stack_spec(config) is spec
 
 

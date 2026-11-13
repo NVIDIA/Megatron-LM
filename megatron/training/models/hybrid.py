@@ -123,7 +123,7 @@ class HybridModelConfig(ModelConfig):
 
 
 def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
-    """Resolve the stack spec; explicit custom specs own their normalization."""
+    """Return the configured stack spec, or the default one for the transformer config."""
     if model_config.hybrid_stack_spec is not None:
         return model_config.hybrid_stack_spec
     if model_config.transformer.use_liger:
