@@ -55,9 +55,16 @@ def _assert_relative_rms_close(
     ), f"{name} relative RMS error {relative_rms:.4g} exceeds tolerance {tolerance}"
 
 
-def _make_gdn_variant_stub(backend: str, *, deterministic_mode: bool = False) -> SimpleNamespace:
+class _GDNVariantStub(SimpleNamespace):
+    """Use the real runtime geometry helpers when testing backend selection."""
+
+    _get_feat_dim_split = GatedDeltaNet._get_feat_dim_split
+    _validate_runtime_cp_size = GatedDeltaNet._validate_runtime_cp_size
+
+
+def _make_gdn_variant_stub(backend: str, *, deterministic_mode: bool = False) -> _GDNVariantStub:
     """Build the minimal state needed to exercise GDN backend selection."""
-    stub = SimpleNamespace(
+    stub = _GDNVariantStub(
         config=SimpleNamespace(
             deterministic_mode=deterministic_mode,
             gdn_kernel_backend=backend,
@@ -68,6 +75,7 @@ def _make_gdn_variant_stub(backend: str, *, deterministic_mode: bool = False) ->
         v_dim_local_tp=128,
         tp_size=1,
         cp_size=1,
+        num_k_heads_local_tp=1,
         num_v_heads_local_tp=2,
         key_head_dim=64,
         value_head_dim=64,
