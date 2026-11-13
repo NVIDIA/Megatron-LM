@@ -167,8 +167,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             device: Device used to construct the data-parallel mesh and, when this wrapper
                 opens its own ``fully_shard_context``, that context's device. Defaults to
                 CUDA. When the caller has already opened an ambient context (multi-chunk
-                wrapping), this wrapper joins it and the ambient context's device and
-                ``use_symmetric_memory`` settings apply instead.
+                wrapping), this wrapper joins it and uses that context's device. The
+                context's symmetric-memory setting must match ``ddp_config.nccl_ub``.
             pg_collection: Explicit process groups. The ``dp_cp`` group defines the
                 data-parallel mesh.
 
@@ -177,6 +177,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ValueError: If required process groups are missing or the configuration
                 requests a feature unsupported by MFSDP v2.
         """
+
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
         if pg_collection is None:
@@ -188,12 +189,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
-        active_context = current_fully_shard_context()
-        use_symmetric_memory = (
-            active_context.use_symmetric_memory
-            if active_context is not None
-            else ddp_config.nccl_ub
-        )
+        use_symmetric_memory = ddp_config.nccl_ub
         if use_symmetric_memory:
             if ddp_config.num_distributed_optimizer_instances > 1:
                 groups = (pg_collection.inter_dist_opt, pg_collection.intra_dp_cp)
@@ -293,6 +289,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
         # after the schedule completes, including delayed wgrad and custom 1F1B work.
+        active_context = current_fully_shard_context()
         if active_context is None:
             construction_context = fully_shard_context(
                 FsdpContext(

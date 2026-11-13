@@ -7,16 +7,12 @@ from dataclasses import replace
 import pytest
 import torch
 import torch.distributed as dist
-import torch.distributed._symmetric_memory as symm_mem
 import transformer_engine.pytorch as te
 from torch.distributed.tensor import DTensor
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 import megatron.core.distributed.fsdp.mcore_adapter_v2 as mcore_adapter_v2
 from megatron.core.distributed import DistributedDataParallelConfig
-from megatron.core.distributed.fsdp.mcore_adapter_v2 import (
-    _initialize_symmetric_memory_communicators,
-)
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
@@ -249,24 +245,6 @@ def test_nccl_ub_enables_symmetric_memory(process_group_collection, monkeypatch)
     )
 
     assert fully_shard_context_calls == [True]
-
-
-def test_symmetric_memory_rendezvous_requires_initialized_communicator(distributed_setup):
-    """A cold group's window registration succeeds after its communicator is initialized."""
-    if distributed_setup.world_size < 2:
-        pytest.skip("Requires at least two ranks.")
-    if not dist.is_initialized():
-        dist.init_process_group(backend="nccl")
-    device = distributed_setup.device
-    group = dist.new_group(backend="nccl")
-    with torch.cuda.use_mem_pool(symm_mem.get_mem_pool(device)):
-        buffer = torch.empty(1024, device=device)
-
-    with pytest.raises(dist.DistBackendError, match="Failed to window register"):
-        symm_mem.rendezvous(buffer, group=group.group_name)
-
-    _initialize_symmetric_memory_communicators((group,), device)
-    assert symm_mem.rendezvous(buffer, group=group.group_name) is not None
 
 
 def test_unpadded_shards_pack_parameter_groups_without_padding(process_group_collection):
@@ -504,8 +482,9 @@ def test_delayed_wgrad_matches_immediate(
     torch.testing.assert_close(delayed_losses, immediate_losses, rtol=0, atol=0)
 
 
-def test_build_train_and_step(process_group_collection):
-    """Match eager training against an MFSDP v2 train-and-step sequence."""
+@pytest.mark.parametrize("nccl_ub", [False, True], ids=["ordinary", "symmetric"])
+def test_build_train_and_step(process_group_collection, nccl_ub):
+    """Match eager training with MFSDP v2, including a cold symmetric-memory communicator."""
     config = TransformerConfig(
         num_layers=2,
         hidden_size=16,
@@ -527,6 +506,9 @@ def test_build_train_and_step(process_group_collection):
     # requires DDP/FSDP buffer metadata, but the optimizer factory still expects
     # every model chunk to expose ddp_config.
     reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+    if nccl_ub:
+        # Leave the fresh DP communicator's initialization to the adapter.
+        process_group_collection.dp_cp = dist.new_group(backend="nccl")
     model = FullyShardedDataParallel(
         config=config,
         ddp_config=DistributedDataParallelConfig(
@@ -534,6 +516,7 @@ def test_build_train_and_step(process_group_collection):
             megatron_fsdp_version=2,
             use_distributed_optimizer=False,
             data_parallel_sharding_strategy="optim_grads_params",
+            nccl_ub=nccl_ub,
         ),
         module=model,
         pg_collection=process_group_collection,
