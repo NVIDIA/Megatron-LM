@@ -222,7 +222,16 @@ def _enable_checkpoint_expert_bias(args):
     can hold trained biases while its saved args disable them (e.g. quantile balancing that
     estimates expert_bias from global-batch histograms), and --use-checkpoint-args would then
     build routers without them.
+
+    Global-batch quantile balancing registers and applies expert_bias without this flag, and
+    config validation rejects enabling both, so such checkpoints are left unchanged.
     """
+    balancing = getattr(args, "moe_router_load_balancing_type", None)
+    if (
+        balancing in ("quantile_balancing", ["quantile_balancing"])
+        and getattr(args, "moe_router_quantile_balancing_estimation_scope", None) == "global_batch"
+    ):
+        return
     if any(key.endswith('router.expert_bias') for key in _checkpoint_tensor_keys(args)):
         if not args.moe_router_enable_expert_bias:
             print_rank_0(
