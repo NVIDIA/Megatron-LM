@@ -201,7 +201,6 @@ from .global_vars import (
     get_tensorboard_writer,
     get_timers,
     get_train_state,
-    with_experiment_logging,
 )
 from .theoretical_memory_usage import report_theoretical_memory
 from .utils import (
@@ -1743,7 +1742,6 @@ def _get_train_full_dataset_sample_count(args, dataset_provider):
     return int(total_num_samples)
 
 
-@with_experiment_logging
 def pretrain(
     cfg_container: PretrainConfigContainer,
     train_valid_test_dataset_provider,
@@ -1828,584 +1826,593 @@ def pretrain(
         suppress_microbatch_rampup_handling: skip the automatic checkpoint on mid-loop
             microbatch changes (for data sources that reconfigure microbatches every iteration).
     """
-    # Capture timestamp right at top of pretrain, before initialize_megatron
-    global _STARTUP_TIMESTAMPS
-    _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
+    try:
+        # Capture timestamp right at top of pretrain, before initialize_megatron
+        global _STARTUP_TIMESTAMPS
+        _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
 
-    cfg_container.validate()
+        cfg_container.validate()
 
-    callback_manager = normalize_callbacks(callbacks)
+        callback_manager = normalize_callbacks(callbacks)
 
-    if inprocess_call_wrapper is not None:
-        iteration = inprocess_call_wrapper.iteration
-        store = torch.distributed.PrefixStore(str(iteration), store)
+        if inprocess_call_wrapper is not None:
+            iteration = inprocess_call_wrapper.iteration
+            store = torch.distributed.PrefixStore(str(iteration), store)
 
-    timestamp_after_inprocess_setup = time.time()
+        timestamp_after_inprocess_setup = time.time()
 
-    # Finalize the registered configuration before anything reads it: fault tolerance captures
-    # the checkpoint policy (save directory, async mode) and must see the derived values.
-    # initialize_megatron() re-enters the idempotent finalize later.
-    cfg_container.finalize()
+        # Finalize the registered configuration before anything reads it: fault tolerance captures
+        # the checkpoint policy (save directory, async mode) and must see the derived values.
+        # initialize_megatron() re-enters the idempotent finalize later.
+        cfg_container.finalize()
 
-    # Early fault tolerance setup - must be done before initialize_megatron
-    # to enable monitoring of the initialization process
-    ft_integration.setup(
-        cfg_container.fault_tolerance,
-        checkpoint_dir=cfg_container.checkpoint.save,
-        async_save=cfg_container.checkpoint.async_save,
-    )
-    timestamp_after_in_job_setup = time.time()
-
-    # Multimodal MiMo seeds each module's RNG in its builder; a plain collection seeds stock here.
-    skip_random_seed = isinstance(pg_collection, MultiModuleProcessGroupCollection)
-
-    # Initalize and get arguments, timers, and TensorBoard writer.
-    initialize_megatron(
-        training=True,
-        build_tokenizer=build_tokenizer,
-        get_embedding_ranks=get_embedding_ranks,
-        get_position_embedding_ranks=get_position_embedding_ranks,
-        store=store,
-        skip_model_parallel_init=skip_model_parallel_init,
-        skip_random_seed=skip_random_seed,
-        seed_pp_group=getattr(pg_collection, "pp", None),
-        seed_dp_group=getattr(pg_collection, "dp", None),
-        seed_tp_group=getattr(pg_collection, "tp", None),
-        seed_ep_group=getattr(pg_collection, "ep", None),
-        seed_etp_group=getattr(pg_collection, "expt_tp", None),
-    )
-
-    timestamp_after_initialize_megatron = time.time()
-
-    # Temporary args/config duplication during the training-loop refactor:
-    # migrated settings use cfg_container; remaining settings still use legacy args.
-    args = get_args()
-    train_state = get_train_state()
-    timers = get_timers()
-
-    if tensor_metric_observer is None and cfg_container.logger.tensor_metrics:
-        from .tensor_metrics.observer import build_tensor_metric_observer
-
-        tensor_metric_observer = build_tensor_metric_observer(cfg_container.logger.tensor_metrics)
-
-    # OTel span setup (_start_otel_job_spans) is deferred until after
-    # kernel warmup below, where program_start/main_entry/pretrain_entry
-    # and the other startup timestamps are all available -- see the block right
-    # after those are extracted from _STARTUP_TIMESTAMPS.
-
-    if cfg_container.model.transformer.fine_grained_activation_offloading:
-        from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
-        set_ideal_affinity_for_current_gpu()
-
-
-    if cfg_container.logger.log_progress:
-        append_to_progress_log(cfg_container.checkpoint.save, "Starting job")
-
-    set_jit_fusion_options(
-        cfg_container.model.transformer,
-        sequence_length=args.seq_length,
-        micro_batch_size=cfg_container.train.micro_batch_size,
-        tp_size=cfg_container.model.transformer.tensor_model_parallel_size,
-    )
-
-    # MIMO hands a per-module collection, which holds one ProcessGroupCollection
-    # per module and has no tp of its own. The cross-entropy warmup is vocab
-    # parallel, so it belongs to the language model's tensor-parallel group;
-    # a rank carrying only encoders warms its own module's shapes instead.
-    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
-        warmup_pg_collection = (
-            pg_collection.get_language_model_collection()
-            if pg_collection.has_language_model()
-            else next(iter(pg_collection))
+        # Early fault tolerance setup - must be done before initialize_megatron
+        # to enable monitoring of the initialization process
+        ft_integration.setup(
+            cfg_container.fault_tolerance,
+            checkpoint_dir=cfg_container.checkpoint.save,
+            async_save=cfg_container.checkpoint.async_save,
         )
-        warmup_tp_group = warmup_pg_collection.tp
-    elif pg_collection is not None:
-        warmup_tp_group = pg_collection.tp
-    else:
-        warmup_tp_group = mpu.get_tensor_model_parallel_group()
-    warmup_training_kernels(
-        cfg_container.model,
-        warmup_tp_group,
-        seq_length=args.seq_length,
-        micro_batch_size=cfg_container.train.micro_batch_size,
-    )
-    print_rank_0("Finished training-kernel warmup.")
+        timestamp_after_in_job_setup = time.time()
 
-    timestamp_after_set_jit_fusion_options = time.time()
+        # Multimodal MiMo seeds each module's RNG in its builder; a plain collection seeds stock here.
+        skip_random_seed = isinstance(pg_collection, MultiModuleProcessGroupCollection)
 
-    # Adjust the startup time so it reflects the global minimum.
-    # This will be closer to what scheduler will see (outside of
-    # image ... launches).
-    program_start = _STARTUP_TIMESTAMPS.get('program_start')
-    main_entry = _STARTUP_TIMESTAMPS.get('main_entry')
-    pretrain_entry = _STARTUP_TIMESTAMPS.get('pretrain_entry')
+        # Initalize and get arguments, timers, and TensorBoard writer.
+        initialize_megatron(
+            training=True,
+            build_tokenizer=build_tokenizer,
+            get_embedding_ranks=get_embedding_ranks,
+            get_position_embedding_ranks=get_position_embedding_ranks,
+            store=store,
+            skip_model_parallel_init=skip_model_parallel_init,
+            skip_random_seed=skip_random_seed,
+            seed_pp_group=getattr(pg_collection, "pp", None),
+            seed_dp_group=getattr(pg_collection, "dp", None),
+            seed_tp_group=getattr(pg_collection, "tp", None),
+            seed_ep_group=getattr(pg_collection, "ep", None),
+            seed_etp_group=getattr(pg_collection, "expt_tp", None),
+        )
 
-    # OTel: emit the backdated pre_startup span and open this incarnation's
-    # megatron.startup trace (its own trace_id -- there are no run-long umbrella spans;
-    # see _start_otel_job_spans()'s docstring and the module comment above it for the
-    # full picture and why these use the explicit span API and backdating instead of
-    # managed_span). The megatron.startup.* spans below then nest inside that trace.
-    # The per-interval megatron.train blocks are separate traces again, chained by
-    # Links -- see _end_otel_startup_span(), called right before train()'s loop.
-    _start_otel_job_spans(model_type, program_start)
+        timestamp_after_initialize_megatron = time.time()
 
-    _backdated_otel_span('megatron.startup.imports', program_start, main_entry)
-    _backdated_otel_span('megatron.startup.arg_parse', main_entry, pretrain_entry)
-    _backdated_otel_span(
-        'megatron.startup.inprocess_setup', pretrain_entry, timestamp_after_inprocess_setup
-    )
-    _backdated_otel_span(
-        'megatron.startup.in_job_setup',
-        timestamp_after_inprocess_setup,
-        timestamp_after_in_job_setup,
-    )
-    _backdated_otel_span(
-        'megatron.startup.initialize_megatron',
-        timestamp_after_in_job_setup,
-        timestamp_after_initialize_megatron,
-    )
-    _backdated_otel_span(
-        'megatron.startup.jit_fusion_options',
-        timestamp_after_initialize_megatron,
-        timestamp_after_set_jit_fusion_options,
-    )
+        # Temporary args/config duplication during the training-loop refactor:
+        # migrated settings use cfg_container; remaining settings still use legacy args.
+        args = get_args()
+        train_state = get_train_state()
+        timers = get_timers()
 
-    # Both hooks below exist ONLY to flush telemetry, and both are process-global side
-    # effects, so they are installed only when telemetry is actually active. With it off
-    # there is nothing to flush and Megatron must behave exactly as it does upstream --
-    # in particular it must NOT grow a Python-level SIGTERM handler it never had, which
-    # would change EINTR behaviour and splice us into the ft_launcher/torchelastic
-    # handler chain. _otel_exit_hooks_installed keeps the installation itself idempotent.
-    global _otel_exit_hooks_installed
-    if _otel_telemetry_active() and not _otel_exit_hooks_installed:
-        _otel_exit_hooks_installed = True
+        if tensor_metric_observer is None and cfg_container.logger.tensor_metrics:
+            from .tensor_metrics.observer import build_tensor_metric_observer
 
-        # An atexit fallback in case pretrain() exits via unhandled exception --
-        # ensures both spans still get ended and telemetry flushed. Idempotent, so
-        # this doesn't double-flush if _end_otel_job_spans() already ran normally.
-        import atexit
-        atexit.register(_end_otel_job_spans)
+            tensor_metric_observer = build_tensor_metric_observer(cfg_container.logger.tensor_metrics)
 
-        # atexit does NOT run on SIGTERM (CPython terminates without unwinding), and the
-        # ft_launcher tears down ranks with SIGTERM-then-SIGKILL on a fault/restart -- so
-        # without a SIGTERM handler, megatron.train (and the open span tree) leaks as a
-        # never-exported span in exactly the faulted runs we care about.
-        import signal as _signal
+        # OTel span setup (_start_otel_job_spans) is deferred until after
+        # kernel warmup below, where program_start/main_entry/pretrain_entry
+        # and the other startup timestamps are all available -- see the block right
+        # after those are extracted from _STARTUP_TIMESTAMPS.
 
-        _otel_prev_sigterm = _signal.getsignal(_signal.SIGTERM)
-        # with --exit-signal-handler, SIGTERM means "finish the current iteration, save a final
-        # checkpoint, then exit" (DistributedSignalHandler drain -> should_exit). We must not end
-        # spans / shut down the provider in that case -- that truncates megatron.train and drops the
-        # final-iteration + final-checkpoint spans; the normal should_exit path runs
-        # _end_otel_job_spans. There we only bounded-flush so nothing already-ended is lost if
-        # SIGKILL beats the drain.
-        # For an immediate/hard terminate (SIG_DFL / ft hard kill) we end + export the tree now.
-        _otel_graceful_drain = cfg_container.train.exit_signal_handler
-        _otel_sigterm_fired = [False]  # re-entry guard so a 2nd SIGTERM can't re-enter shutdown()
+        if cfg_container.model.transformer.fine_grained_activation_offloading:
+            from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
+            set_ideal_affinity_for_current_gpu()
 
-        def _otel_force_flush():
-            try:
-                from opentelemetry import trace as _ot
-                _prov = _ot.get_tracer_provider()
-                if hasattr(_prov, 'force_flush'):
-                    _prov.force_flush()
-            except Exception:
-                pass
 
-        def _otel_sigterm_handler(signum, frame):
-            if not _otel_sigterm_fired[0]:
-                _otel_sigterm_fired[0] = True
+        if cfg_container.logger.log_progress:
+            append_to_progress_log(cfg_container.checkpoint.save, "Starting job")
+
+        set_jit_fusion_options(
+            cfg_container.model.transformer,
+            sequence_length=args.seq_length,
+            micro_batch_size=cfg_container.train.micro_batch_size,
+            tp_size=cfg_container.model.transformer.tensor_model_parallel_size,
+        )
+
+        # MIMO hands a per-module collection, which holds one ProcessGroupCollection
+        # per module and has no tp of its own. The cross-entropy warmup is vocab
+        # parallel, so it belongs to the language model's tensor-parallel group;
+        # a rank carrying only encoders warms its own module's shapes instead.
+        if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+            warmup_pg_collection = (
+                pg_collection.get_language_model_collection()
+                if pg_collection.has_language_model()
+                else next(iter(pg_collection))
+            )
+            warmup_tp_group = warmup_pg_collection.tp
+        elif pg_collection is not None:
+            warmup_tp_group = pg_collection.tp
+        else:
+            warmup_tp_group = mpu.get_tensor_model_parallel_group()
+        warmup_training_kernels(
+            cfg_container.model,
+            warmup_tp_group,
+            seq_length=args.seq_length,
+            micro_batch_size=cfg_container.train.micro_batch_size,
+        )
+        print_rank_0("Finished training-kernel warmup.")
+
+        timestamp_after_set_jit_fusion_options = time.time()
+
+        # Adjust the startup time so it reflects the global minimum.
+        # This will be closer to what scheduler will see (outside of
+        # image ... launches).
+        program_start = _STARTUP_TIMESTAMPS.get('program_start')
+        main_entry = _STARTUP_TIMESTAMPS.get('main_entry')
+        pretrain_entry = _STARTUP_TIMESTAMPS.get('pretrain_entry')
+
+        # OTel: emit the backdated pre_startup span and open this incarnation's
+        # megatron.startup trace (its own trace_id -- there are no run-long umbrella spans;
+        # see _start_otel_job_spans()'s docstring and the module comment above it for the
+        # full picture and why these use the explicit span API and backdating instead of
+        # managed_span). The megatron.startup.* spans below then nest inside that trace.
+        # The per-interval megatron.train blocks are separate traces again, chained by
+        # Links -- see _end_otel_startup_span(), called right before train()'s loop.
+        _start_otel_job_spans(model_type, program_start)
+
+        _backdated_otel_span('megatron.startup.imports', program_start, main_entry)
+        _backdated_otel_span('megatron.startup.arg_parse', main_entry, pretrain_entry)
+        _backdated_otel_span(
+            'megatron.startup.inprocess_setup', pretrain_entry, timestamp_after_inprocess_setup
+        )
+        _backdated_otel_span(
+            'megatron.startup.in_job_setup',
+            timestamp_after_inprocess_setup,
+            timestamp_after_in_job_setup,
+        )
+        _backdated_otel_span(
+            'megatron.startup.initialize_megatron',
+            timestamp_after_in_job_setup,
+            timestamp_after_initialize_megatron,
+        )
+        _backdated_otel_span(
+            'megatron.startup.jit_fusion_options',
+            timestamp_after_initialize_megatron,
+            timestamp_after_set_jit_fusion_options,
+        )
+
+        # Both hooks below exist ONLY to flush telemetry, and both are process-global side
+        # effects, so they are installed only when telemetry is actually active. With it off
+        # there is nothing to flush and Megatron must behave exactly as it does upstream --
+        # in particular it must NOT grow a Python-level SIGTERM handler it never had, which
+        # would change EINTR behaviour and splice us into the ft_launcher/torchelastic
+        # handler chain. _otel_exit_hooks_installed keeps the installation itself idempotent.
+        global _otel_exit_hooks_installed
+        if _otel_telemetry_active() and not _otel_exit_hooks_installed:
+            _otel_exit_hooks_installed = True
+
+            # An atexit fallback in case pretrain() exits via unhandled exception --
+            # ensures both spans still get ended and telemetry flushed. Idempotent, so
+            # this doesn't double-flush if _end_otel_job_spans() already ran normally.
+            import atexit
+            atexit.register(_end_otel_job_spans)
+
+            # atexit does NOT run on SIGTERM (CPython terminates without unwinding), and the
+            # ft_launcher tears down ranks with SIGTERM-then-SIGKILL on a fault/restart -- so
+            # without a SIGTERM handler, megatron.train (and the open span tree) leaks as a
+            # never-exported span in exactly the faulted runs we care about.
+            import signal as _signal
+
+            _otel_prev_sigterm = _signal.getsignal(_signal.SIGTERM)
+            # with --exit-signal-handler, SIGTERM means "finish the current iteration, save a final
+            # checkpoint, then exit" (DistributedSignalHandler drain -> should_exit). We must not end
+            # spans / shut down the provider in that case -- that truncates megatron.train and drops the
+            # final-iteration + final-checkpoint spans; the normal should_exit path runs
+            # _end_otel_job_spans. There we only bounded-flush so nothing already-ended is lost if
+            # SIGKILL beats the drain.
+            # For an immediate/hard terminate (SIG_DFL / ft hard kill) we end + export the tree now.
+            _otel_graceful_drain = cfg_container.train.exit_signal_handler
+            _otel_sigterm_fired = [False]  # re-entry guard so a 2nd SIGTERM can't re-enter shutdown()
+
+            def _otel_force_flush():
                 try:
-                    if _otel_graceful_drain:
-                        _otel_force_flush()      # graceful drain: flush only, keep provider alive
-                    else:
-                        _end_otel_job_spans()    # hard terminate: end + export the tree now
+                    from opentelemetry import trace as _ot
+                    _prov = _ot.get_tracer_provider()
+                    if hasattr(_prov, 'force_flush'):
+                        _prov.force_flush()
                 except Exception:
                     pass
-            # chain to whatever handler was already installed (ft/torchelastic drain, or default)
-            if callable(_otel_prev_sigterm):
-                _otel_prev_sigterm(signum, frame)
-            elif _otel_prev_sigterm == _signal.SIG_DFL:
-                _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
-                os.kill(os.getpid(), signum)
-            # SIG_IGN: previous handler ignored SIGTERM -> nothing more to do.
 
-        try:
-            _signal.signal(_signal.SIGTERM, _otel_sigterm_handler)
-        except (ValueError, OSError):
-            # Not the main thread / platform unsupported -> atexit remains the fallback.
-            pass
+            def _otel_sigterm_handler(signum, frame):
+                if not _otel_sigterm_fired[0]:
+                    _otel_sigterm_fired[0] = True
+                    try:
+                        if _otel_graceful_drain:
+                            _otel_force_flush()      # graceful drain: flush only, keep provider alive
+                        else:
+                            _end_otel_job_spans()    # hard terminate: end + export the tree now
+                    except Exception:
+                        pass
+                # chain to whatever handler was already installed (ft/torchelastic drain, or default)
+                if callable(_otel_prev_sigterm):
+                    _otel_prev_sigterm(signum, frame)
+                elif _otel_prev_sigterm == _signal.SIG_DFL:
+                    _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+                    os.kill(os.getpid(), signum)
+                # SIG_IGN: previous handler ignored SIGTERM -> nothing more to do.
 
-    # Initialize program_start_global with a fallback value in case set_startup_timestamps() wasn't called
-    program_start_global = _TRAIN_START_TIME
-    if _STARTUP_TIMESTAMPS['program_start'] is not None:
-        program_start_global = torch.tensor([_STARTUP_TIMESTAMPS['program_start']], dtype=torch.double, device='cuda')
-        torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN)
-        program_start_global = program_start_global.item()
-    set_startup_timestamps(program_start=program_start_global)
-
-    global _LEGACY_TRAIN_START_TIME
-    start_time_tensor = torch.tensor([_LEGACY_TRAIN_START_TIME], dtype=torch.double, device='cuda')
-    torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
-    _LEGACY_TRAIN_START_TIME = start_time_tensor.item()
-
-    # Capture megatron init end time (matches original time.time() placement)
-    megatron_init_end = time.time()
-
-    app_metrics = {}
-    app_metrics['app_start_time'] = round(program_start_global * 1000.0)
-    app_metrics['app_model_init_start_time'] = round(program_start_global * 1000.0)
-
-    # Print basic megatron init time (using global min start)
-    # NOTE(asolergi-nv): This is not entirely accurate, but we keep it for backwards compatibility.
-    print_rank_0(
-        'time to initialize megatron (seconds): {:.3f}'.format(megatron_init_end - _LEGACY_TRAIN_START_TIME)
-    )
-
-    # Note, not entirely accurate as rank 0 might not be the first or last to hit these timestamps
-    print_datetime('after in-process setup and before initialize_megatron', timestamp_after_inprocess_setup)
-    print_datetime('after in-job setup and before initialize_megatron', timestamp_after_in_job_setup)
-
-    if program_start is not None and main_entry is not None and pretrain_entry is not None:
-        # Inject startup deltas into timers
-        startup_timers = {
-            'startup-program-entry-spread': program_start - program_start_global, # Local program start timestamp vs the global earliest program start timestamp
-            'startup-library-setup': main_entry - program_start, # Local library imports
-            'startup-program-setup': pretrain_entry - main_entry, # Local __main__ entry to pretrain entry
-            'startup-in-process-setup': timestamp_after_inprocess_setup - pretrain_entry, # Local in-process setup
-            'startup-in-job-setup': timestamp_after_in_job_setup - timestamp_after_inprocess_setup, # Local in-job setup
-            'startup-initialize-megatron': timestamp_after_initialize_megatron - timestamp_after_in_job_setup, # Local initialize megatron
-            'startup-set-jit-fusion-options': timestamp_after_set_jit_fusion_options - timestamp_after_initialize_megatron, # Local set JIT fusion options
-            'all-reduce-start-timestamps-tensor': megatron_init_end - timestamp_after_set_jit_fusion_options, # 2x All-reduce, first collective call
-            'startup-megatron-init-local': megatron_init_end - pretrain_entry, # Local megatron init
-            'startup-megatron-init-global': megatron_init_end - program_start_global, # Local megatron init vs the global earliest program start timestamp
-        }
-        for name, delta in startup_timers.items():
-            timers(name, log_level=0).set_elapsed(delta)
-        timers.log(list(startup_timers.keys()), barrier=True)
-
-        # Print rank 0's absolute timestamps
-        startup_timestamps = {
-            'before library-setup': program_start,
-            'after library-setup': main_entry,
-            'before megatron-init': pretrain_entry,
-        }
-        for name, ts in startup_timestamps.items():
-            ts_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f')
-            print_rank_0(f'[{name}] datetime: {ts_str}')
-
-    print_datetime('after megatron is initialized')
-    app_metrics['app_model_init_finish_time'] = one_logger_utils.get_timestamp_in_ms()
-
-    # Track E2E metrics on pretrain start
-    one_logger_utils.on_pretrain_start()
-
-    # Context used for persisting some state between checkpoint saves.
-    if cfg_container.checkpoint.non_persistent_ckpt_type == 'local':
-        try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
-                LocalCheckpointManager,
-            )
-            from nvidia_resiliency_ext.checkpointing.local.replication.group_utils import (
-                GroupWrapper,
-                parse_group_sequence,
-            )
-            from nvidia_resiliency_ext.checkpointing.local.replication.strategies import (
-                CliqueReplicationStrategy,
-            )
-        except ModuleNotFoundError:
-            raise RuntimeError(
-                "The 'nvidia_resiliency_ext' module is required for local "
-                "checkpointing but was not found. Please ensure it is installed."
-            )
-
-        if cfg_container.checkpoint.replication:
-            repl_strategy = CliqueReplicationStrategy.from_replication_params(
-                cfg_container.checkpoint.replication_jump, cfg_container.checkpoint.replication_factor
-            )
-        else:
-            repl_strategy = None
-
-        checkpointing_context = {
-            'local_checkpoint_manager': LocalCheckpointManager(
-                cfg_container.checkpoint.non_persistent_local_ckpt_dir, repl_strategy=repl_strategy
-            )
-        }
-    else:
-        checkpointing_context = {}
-
-    callback_manager.callback_context.train_state = train_state
-    callback_manager.callback_context.checkpointing_context = checkpointing_context
-    callback_manager.trigger("on_setup_start")
-
-    if args.train_full_dataset:
-        # The scheduler must know the training horizon before model and optimizer setup.
-        cfg_container.train.train_samples = _get_train_full_dataset_sample_count(
-            args, train_valid_test_dataset_provider
-        )
-
-    # Model, optimizer, and learning rate.
-    timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-    with _otel_managed_span('model_init', 'megatron.startup.model_init', is_goodput_span=True):
-        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-            model_type,
-            model_provider_func=model_provider,
-            checkpointing_context=checkpointing_context,
-            cfg_container=cfg_container,
-            # TODO (@maanug): temporary until initialize.py builds a pgcollection as bridge does.
-            pg_collection=(
-                pg_collection
-                if pg_collection is not None
-                else ProcessGroupCollection.use_mpu_process_groups()
-            ),
-            run_train_loop_without_updates=run_train_loop_without_updates,
-        )
-    timers('model-and-optimizer-setup').stop()
-    print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
-    model_cfg = get_model_config(model[0])
-
-    callback_manager.callback_context.model = model
-    callback_manager.callback_context.optimizer = optimizer
-    callback_manager.callback_context.scheduler = opt_param_scheduler
-    callback_manager.trigger("on_data_init_start")
-
-    # Data stuff. Dataset index / dataloader construction (GPTDataset/BlendedDataset
-    # index building or loading from the cache) can be a multi-second chunk of
-    # startup on its own -- the 'data_loading' span group exists exactly for this.
-    # This shares scope with the existing perfetto-native trace_region; the two
-    # tracing systems are independent.
-    app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
-    timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
-    if next_train_iterator is None or train_valid_test_dataset_provider is not None:
-        with _otel_managed_span(
-            'data_loading', 'megatron.startup.dataloader', is_goodput_span=True
-        ):
-            # A caller-provided next_train_iterator owns the training data;
-            # the provider's validation/test data (and the default run_eval over it) still works.
-            build_train = next_train_iterator is None
-            if cfg_container.model.transformer.virtual_pipeline_model_parallel_size is not None:
-                train_data_iterator = []
-                valid_data_iterator = []
-                test_data_iterator = []
-                for vp_stage in range(len(model)):
-                    dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
-                    assert "vp_stage" in dataset_provider_parameters, \
-                        "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
-                    vp_stage_train_valid_test_dataset_provider = \
-                        functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
-                    if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
-                        vp_stage_train_valid_test_dataset_provider.is_distributed = True
-                    iterators = build_train_valid_test_data_iterators(
-                        vp_stage_train_valid_test_dataset_provider,
-                        build_train_dataloader=build_train,
-                    )
-                    train_data_iterator.append(iterators[0])
-                    valid_data_iterator.append(iterators[1])
-                    test_data_iterator.append(iterators[2])
-            else:
-                train_data_iterator, valid_data_iterator, test_data_iterator = (
-                    build_train_valid_test_data_iterators(
-                        train_valid_test_dataset_provider, build_train_dataloader=build_train
-                    )
-                )
-            if not build_train:
-                train_data_iterator = None
-    else:
-        # Caller-managed training data with no datasets at all (e.g. RL rollouts).
-        # The flags follow the hooks: train when there are iterations, validate only when
-        # the caller supplied run_eval (no data exists for the default one), never test.
-        backfill_consumed_samples_from_iteration()
-        train_data_iterator = valid_data_iterator = test_data_iterator = None
-        broadcast_data_flags(
-            do_train=(cfg_container.train.train_iters or 0) > 0,
-            do_valid=run_eval is not None
-            and (
-                cfg_container.validation.full_validation or cfg_container.validation.eval_iters > 0
-            ),
-            do_test=False,
-        )
-    timers('train/valid/test-data-iterators-setup').stop()
-    print_datetime('after dataloaders are built')
-    app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
-
-    # The dataloader path's hooks:
-    # keep the iterator the loop started with and validate with evaluate_and_print_results.
-    if next_train_iterator is None:
-
-        def next_train_iterator(iteration, current_iterator):
-            return current_iterator
-
-    if run_eval is None:
-        run_eval = functools.partial(
-            evaluate_and_print_results,
-            forward_step_func=forward_step_func,
-            data_iterator=valid_data_iterator,
-            model=model,
-            process_non_loss_data_func=process_non_loss_data_func,
-            config=model_cfg,
-            non_loss_data_func=non_loss_data_func,
-            pg_collection=pg_collection,
-            p2p_communicator=p2p_communicator,
-            callback_manager=callback_manager,
-            is_test=False,
-        )
-
-    # Track if training is enabled. Can only be done once train_state.do_train is assigned after dataloader is built.
-    one_logger_utils.track_config_flags(
-        cfg_container.train.train_iters,
-        cfg_container.validation.skip_train,
-        train_state.do_train,
-        train_state.do_valid,
-        train_state.do_test,
-        args.dataloader_type,
-    )
-
-    # Print setup timing.
-    print_rank_0('done with setup ...')
-    timers.log(['model-and-optimizer-setup', 'train/valid/test-data-iterators-setup'], barrier=True)
-
-    one_logger = get_one_logger()
-    one_logger and one_logger.log_metrics(app_metrics)
-
-    experiment_writer = get_experiment_writer()
-    if experiment_writer:
-        experiment_writer.log_metadata({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
-
-    # OTel: megatron.startup deliberately stays open into train() -- its
-    # preamble (weight-hash check, sniff test, cuda-graph setup) is init, not
-    # the loop, so it should parent to startup. train() ends startup and starts
-    # megatron.train itself, right before its loop. If train() isn't called
-    # (do_train False), _end_otel_job_spans() ends startup as an idempotent
-    # fallback.
-
-    # --skip-train never enters the loop; rollout-only iterates it without updates.
-    if not cfg_container.validation.skip_train:
-        if run_train_loop_without_updates:
-            print_rank_0('rollout-only mode: entering the train loop without updates ...')
-        else:
-            print_rank_0('training ...')
-
-        iteration = 0
-        args.curr_iteration = iteration
-        # Mirrors train()'s own loop-entry condition, so the "misaligned save_interval"
-        # fallback below can skip when there was nothing left to train this invocation
-        # (e.g. resubmitting an already-finished job) instead of redoing a redundant save.
-        has_iterations_remaining = train_state.iteration < (cfg_container.train.train_iters or 0)
-        if train_state.do_train and (cfg_container.train.train_iters or 0) > 0:
             try:
-                iteration, num_floating_point_operations_so_far = train(
-                    forward_step_func,
+                _signal.signal(_signal.SIGTERM, _otel_sigterm_handler)
+            except (ValueError, OSError):
+                # Not the main thread / platform unsupported -> atexit remains the fallback.
+                pass
+
+        # Initialize program_start_global with a fallback value in case set_startup_timestamps() wasn't called
+        program_start_global = _TRAIN_START_TIME
+        if _STARTUP_TIMESTAMPS['program_start'] is not None:
+            program_start_global = torch.tensor([_STARTUP_TIMESTAMPS['program_start']], dtype=torch.double, device='cuda')
+            torch.distributed.all_reduce(program_start_global, op=torch.distributed.ReduceOp.MIN)
+            program_start_global = program_start_global.item()
+        set_startup_timestamps(program_start=program_start_global)
+
+        global _LEGACY_TRAIN_START_TIME
+        start_time_tensor = torch.tensor([_LEGACY_TRAIN_START_TIME], dtype=torch.double, device='cuda')
+        torch.distributed.all_reduce(start_time_tensor, op=torch.distributed.ReduceOp.MIN)
+        _LEGACY_TRAIN_START_TIME = start_time_tensor.item()
+
+        # Capture megatron init end time (matches original time.time() placement)
+        megatron_init_end = time.time()
+
+        app_metrics = {}
+        app_metrics['app_start_time'] = round(program_start_global * 1000.0)
+        app_metrics['app_model_init_start_time'] = round(program_start_global * 1000.0)
+
+        # Print basic megatron init time (using global min start)
+        # NOTE(asolergi-nv): This is not entirely accurate, but we keep it for backwards compatibility.
+        print_rank_0(
+            'time to initialize megatron (seconds): {:.3f}'.format(megatron_init_end - _LEGACY_TRAIN_START_TIME)
+        )
+
+        # Note, not entirely accurate as rank 0 might not be the first or last to hit these timestamps
+        print_datetime('after in-process setup and before initialize_megatron', timestamp_after_inprocess_setup)
+        print_datetime('after in-job setup and before initialize_megatron', timestamp_after_in_job_setup)
+
+        if program_start is not None and main_entry is not None and pretrain_entry is not None:
+            # Inject startup deltas into timers
+            startup_timers = {
+                'startup-program-entry-spread': program_start - program_start_global, # Local program start timestamp vs the global earliest program start timestamp
+                'startup-library-setup': main_entry - program_start, # Local library imports
+                'startup-program-setup': pretrain_entry - main_entry, # Local __main__ entry to pretrain entry
+                'startup-in-process-setup': timestamp_after_inprocess_setup - pretrain_entry, # Local in-process setup
+                'startup-in-job-setup': timestamp_after_in_job_setup - timestamp_after_inprocess_setup, # Local in-job setup
+                'startup-initialize-megatron': timestamp_after_initialize_megatron - timestamp_after_in_job_setup, # Local initialize megatron
+                'startup-set-jit-fusion-options': timestamp_after_set_jit_fusion_options - timestamp_after_initialize_megatron, # Local set JIT fusion options
+                'all-reduce-start-timestamps-tensor': megatron_init_end - timestamp_after_set_jit_fusion_options, # 2x All-reduce, first collective call
+                'startup-megatron-init-local': megatron_init_end - pretrain_entry, # Local megatron init
+                'startup-megatron-init-global': megatron_init_end - program_start_global, # Local megatron init vs the global earliest program start timestamp
+            }
+            for name, delta in startup_timers.items():
+                timers(name, log_level=0).set_elapsed(delta)
+            timers.log(list(startup_timers.keys()), barrier=True)
+
+            # Print rank 0's absolute timestamps
+            startup_timestamps = {
+                'before library-setup': program_start,
+                'after library-setup': main_entry,
+                'before megatron-init': pretrain_entry,
+            }
+            for name, ts in startup_timestamps.items():
+                ts_str = datetime.fromtimestamp(ts).strftime('%Y-%m-%d %H:%M:%S.%f')
+                print_rank_0(f'[{name}] datetime: {ts_str}')
+
+        print_datetime('after megatron is initialized')
+        app_metrics['app_model_init_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+
+        # Track E2E metrics on pretrain start
+        one_logger_utils.on_pretrain_start()
+
+        # Context used for persisting some state between checkpoint saves.
+        if cfg_container.checkpoint.non_persistent_ckpt_type == 'local':
+            try:
+                from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
+                    LocalCheckpointManager,
+                )
+                from nvidia_resiliency_ext.checkpointing.local.replication.group_utils import (
+                    GroupWrapper,
+                    parse_group_sequence,
+                )
+                from nvidia_resiliency_ext.checkpointing.local.replication.strategies import (
+                    CliqueReplicationStrategy,
+                )
+            except ModuleNotFoundError:
+                raise RuntimeError(
+                    "The 'nvidia_resiliency_ext' module is required for local "
+                    "checkpointing but was not found. Please ensure it is installed."
+                )
+
+            if cfg_container.checkpoint.replication:
+                repl_strategy = CliqueReplicationStrategy.from_replication_params(
+                    cfg_container.checkpoint.replication_jump, cfg_container.checkpoint.replication_factor
+                )
+            else:
+                repl_strategy = None
+
+            checkpointing_context = {
+                'local_checkpoint_manager': LocalCheckpointManager(
+                    cfg_container.checkpoint.non_persistent_local_ckpt_dir, repl_strategy=repl_strategy
+                )
+            }
+        else:
+            checkpointing_context = {}
+
+        callback_manager.callback_context.train_state = train_state
+        callback_manager.callback_context.checkpointing_context = checkpointing_context
+        callback_manager.trigger("on_setup_start")
+
+        if args.train_full_dataset:
+            # The scheduler must know the training horizon before model and optimizer setup.
+            cfg_container.train.train_samples = _get_train_full_dataset_sample_count(
+                args, train_valid_test_dataset_provider
+            )
+
+        # Model, optimizer, and learning rate.
+        timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
+        with _otel_managed_span('model_init', 'megatron.startup.model_init', is_goodput_span=True):
+            model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+                model_type,
+                model_provider_func=model_provider,
+                checkpointing_context=checkpointing_context,
+                cfg_container=cfg_container,
+                # TODO (@maanug): temporary until initialize.py builds a pgcollection as bridge does.
+                pg_collection=(
+                    pg_collection
+                    if pg_collection is not None
+                    else ProcessGroupCollection.use_mpu_process_groups()
+                ),
+                run_train_loop_without_updates=run_train_loop_without_updates,
+            )
+        timers('model-and-optimizer-setup').stop()
+        print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
+        model_cfg = get_model_config(model[0])
+
+        callback_manager.callback_context.model = model
+        callback_manager.callback_context.optimizer = optimizer
+        callback_manager.callback_context.scheduler = opt_param_scheduler
+        callback_manager.trigger("on_data_init_start")
+
+        # Data stuff. Dataset index / dataloader construction (GPTDataset/BlendedDataset
+        # index building or loading from the cache) can be a multi-second chunk of
+        # startup on its own -- the 'data_loading' span group exists exactly for this.
+        # This shares scope with the existing perfetto-native trace_region; the two
+        # tracing systems are independent.
+        app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
+        timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
+        if next_train_iterator is None or train_valid_test_dataset_provider is not None:
+            with _otel_managed_span(
+                'data_loading', 'megatron.startup.dataloader', is_goodput_span=True
+            ):
+                # A caller-provided next_train_iterator owns the training data;
+                # the provider's validation/test data (and the default run_eval over it) still works.
+                build_train = next_train_iterator is None
+                if cfg_container.model.transformer.virtual_pipeline_model_parallel_size is not None:
+                    train_data_iterator = []
+                    valid_data_iterator = []
+                    test_data_iterator = []
+                    for vp_stage in range(len(model)):
+                        dataset_provider_parameters = inspect.signature(train_valid_test_dataset_provider).parameters
+                        assert "vp_stage" in dataset_provider_parameters, \
+                            "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
+                        vp_stage_train_valid_test_dataset_provider = \
+                            functools.partial(train_valid_test_dataset_provider, vp_stage=vp_stage)
+                        if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
+                            vp_stage_train_valid_test_dataset_provider.is_distributed = True
+                        iterators = build_train_valid_test_data_iterators(
+                            vp_stage_train_valid_test_dataset_provider,
+                            build_train_dataloader=build_train,
+                        )
+                        train_data_iterator.append(iterators[0])
+                        valid_data_iterator.append(iterators[1])
+                        test_data_iterator.append(iterators[2])
+                else:
+                    train_data_iterator, valid_data_iterator, test_data_iterator = (
+                        build_train_valid_test_data_iterators(
+                            train_valid_test_dataset_provider, build_train_dataloader=build_train
+                        )
+                    )
+                if not build_train:
+                    train_data_iterator = None
+        else:
+            # Caller-managed training data with no datasets at all (e.g. RL rollouts).
+            # The flags follow the hooks: train when there are iterations, validate only when
+            # the caller supplied run_eval (no data exists for the default one), never test.
+            backfill_consumed_samples_from_iteration()
+            train_data_iterator = valid_data_iterator = test_data_iterator = None
+            broadcast_data_flags(
+                do_train=(cfg_container.train.train_iters or 0) > 0,
+                do_valid=run_eval is not None
+                and (
+                    cfg_container.validation.full_validation or cfg_container.validation.eval_iters > 0
+                ),
+                do_test=False,
+            )
+        timers('train/valid/test-data-iterators-setup').stop()
+        print_datetime('after dataloaders are built')
+        app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
+
+        # The dataloader path's hooks:
+        # keep the iterator the loop started with and validate with evaluate_and_print_results.
+        if next_train_iterator is None:
+
+            def next_train_iterator(iteration, current_iterator):
+                return current_iterator
+
+        if run_eval is None:
+            run_eval = functools.partial(
+                evaluate_and_print_results,
+                forward_step_func=forward_step_func,
+                data_iterator=valid_data_iterator,
+                model=model,
+                process_non_loss_data_func=process_non_loss_data_func,
+                config=model_cfg,
+                non_loss_data_func=non_loss_data_func,
+                pg_collection=pg_collection,
+                p2p_communicator=p2p_communicator,
+                callback_manager=callback_manager,
+                is_test=False,
+            )
+
+        # Track if training is enabled. Can only be done once train_state.do_train is assigned after dataloader is built.
+        one_logger_utils.track_config_flags(
+            cfg_container.train.train_iters,
+            cfg_container.validation.skip_train,
+            train_state.do_train,
+            train_state.do_valid,
+            train_state.do_test,
+            args.dataloader_type,
+        )
+
+        # Print setup timing.
+        print_rank_0('done with setup ...')
+        timers.log(['model-and-optimizer-setup', 'train/valid/test-data-iterators-setup'], barrier=True)
+
+        one_logger = get_one_logger()
+        one_logger and one_logger.log_metrics(app_metrics)
+
+        experiment_writer = get_experiment_writer()
+        if experiment_writer:
+            experiment_writer.log_metadata({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
+
+        # OTel: megatron.startup deliberately stays open into train() -- its
+        # preamble (weight-hash check, sniff test, cuda-graph setup) is init, not
+        # the loop, so it should parent to startup. train() ends startup and starts
+        # megatron.train itself, right before its loop. If train() isn't called
+        # (do_train False), _end_otel_job_spans() ends startup as an idempotent
+        # fallback.
+
+        # --skip-train never enters the loop; rollout-only iterates it without updates.
+        if not cfg_container.validation.skip_train:
+            if run_train_loop_without_updates:
+                print_rank_0('rollout-only mode: entering the train loop without updates ...')
+            else:
+                print_rank_0('training ...')
+
+            iteration = 0
+            args.curr_iteration = iteration
+            # Mirrors train()'s own loop-entry condition, so the "misaligned save_interval"
+            # fallback below can skip when there was nothing left to train this invocation
+            # (e.g. resubmitting an already-finished job) instead of redoing a redundant save.
+            has_iterations_remaining = train_state.iteration < (cfg_container.train.train_iters or 0)
+            if train_state.do_train and (cfg_container.train.train_iters or 0) > 0:
+                try:
+                    iteration, num_floating_point_operations_so_far = train(
+                        forward_step_func,
+                        model,
+                        optimizer,
+                        opt_param_scheduler,
+                        train_data_iterator,
+                        model_cfg,
+                        checkpointing_context,
+                        next_train_iterator=next_train_iterator,
+                        run_eval=run_eval,
+                        p2p_communicator=p2p_communicator,
+                        pg_collection=pg_collection,
+                        callback_manager=callback_manager,
+                        tensor_metric_observer=tensor_metric_observer,
+                        run_train_loop_without_updates=run_train_loop_without_updates,
+                        suppress_microbatch_rampup_handling=suppress_microbatch_rampup_handling,
+                    )
+                except Exception:
+                    # OTel: an uncaught training exception (a real hardware/CUDA/NCCL
+                    # fault, or an injected fault) would skip the _end_otel_job_spans()
+                    # at the bottom of pretrain(), leaving the in-flight megatron.train block
+                    # unended -> unexported (only the graceful-SIGTERM and normal-exit paths
+                    # flush it today). End + flush the open spans here, then re-raise so the
+                    # process still dies exactly as before. Idempotent -> no double-flush.
+                    # (SystemExit from the exit-interval path is NOT caught here; it already
+                    # flushed before sys.exit(). SIGKILL is unrecoverable regardless.)
+                    _end_otel_job_spans()
+                    raise
+
+            print_datetime('after training is done')
+
+            # Without a periodic interval the end of training is the one save of the run.
+            if (
+                # No updates, nothing new to save.
+                not run_train_loop_without_updates
+                and cfg_container.checkpoint.save
+                and iteration != 0
+                and has_iterations_remaining
+                and (
+                    not cfg_container.checkpoint.save_interval
+                    or iteration % cfg_container.checkpoint.save_interval != 0
+                )
+            ):
+                save_checkpoint_and_time(
+                    iteration,
                     model,
                     optimizer,
                     opt_param_scheduler,
-                    train_data_iterator,
-                    model_cfg,
+                    num_floating_point_operations_so_far,
                     checkpointing_context,
-                    next_train_iterator=next_train_iterator,
-                    run_eval=run_eval,
-                    p2p_communicator=p2p_communicator,
-                    pg_collection=pg_collection,
+                    train_data_iterator=train_data_iterator,
                     callback_manager=callback_manager,
-                    tensor_metric_observer=tensor_metric_observer,
-                    run_train_loop_without_updates=run_train_loop_without_updates,
-                    suppress_microbatch_rampup_handling=suppress_microbatch_rampup_handling,
                 )
-            except Exception:
-                # OTel: an uncaught training exception (a real hardware/CUDA/NCCL
-                # fault, or an injected fault) would skip the _end_otel_job_spans()
-                # at the bottom of pretrain(), leaving the in-flight megatron.train block
-                # unended -> unexported (only the graceful-SIGTERM and normal-exit paths
-                # flush it today). End + flush the open spans here, then re-raise so the
-                # process still dies exactly as before. Idempotent -> no double-flush.
-                # (SystemExit from the exit-interval path is NOT caught here; it already
-                # flushed before sys.exit(). SIGKILL is unrecoverable regardless.)
-                _end_otel_job_spans()
-                raise
 
-        print_datetime('after training is done')
-
-        # Without a periodic interval the end of training is the one save of the run.
-        if (
-            # No updates, nothing new to save.
-            not run_train_loop_without_updates
-            and cfg_container.checkpoint.save
-            and iteration != 0
-            and has_iterations_remaining
-            and (
-                not cfg_container.checkpoint.save_interval
-                or iteration % cfg_container.checkpoint.save_interval != 0
+            one_logger and one_logger.log_metrics(
+                {'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()}
             )
-        ):
-            save_checkpoint_and_time(
-                iteration,
+
+        else:
+            print_rank_0('skipping training (--skip-train is on) ...')
+
+            iteration = train_state.iteration
+
+        if train_state.do_valid:
+            prefix = f'iteration {iteration} on validation set'
+            run_eval(
+                prefix=prefix,
+                iteration=iteration,
+                verbose=True,
+                write_to_tensorboard=not cfg_container.validation.skip_train,
+            )
+
+        if train_state.do_test:
+            prefix = f'iteration {iteration} on test set'
+            evaluate_and_print_results(
+                prefix,
+                forward_step_func,
+                test_data_iterator,
                 model,
-                optimizer,
-                opt_param_scheduler,
-                num_floating_point_operations_so_far,
-                checkpointing_context,
-                train_data_iterator=train_data_iterator,
+                iteration,
+                process_non_loss_data_func,
+                model_cfg,
+                verbose=True,
+                write_to_tensorboard=not cfg_container.validation.skip_train,
+                non_loss_data_func=non_loss_data_func,
+                pg_collection=pg_collection,
+                p2p_communicator=p2p_communicator,
                 callback_manager=callback_manager,
+                is_test=True,
             )
+
+        ft_integration.on_checkpointing_start()
+        maybe_finalize_async_save(blocking=True, terminate=True)
+        ft_integration.on_checkpointing_end(is_async_finalization=True)
+        finish_experiment_logging()
 
         one_logger and one_logger.log_metrics(
-            {'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()}
+            {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
         )
 
-    else:
-        print_rank_0('skipping training (--skip-train is on) ...')
+        if cfg_container.model.transformer.gtp_remat_nccl_ub or cfg_container.model.transformer.gtp_expert_remat_nccl_ub:
+            from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
 
-        iteration = train_state.iteration
+            # Deregister the GTP symmetric-memory pools: windows left registered when the
+            # process groups are destroyed make NCCL abort.
+            deregister_and_clear_gtp_symm_pools()
 
-    if train_state.do_valid:
-        prefix = f'iteration {iteration} on validation set'
-        run_eval(
-            prefix=prefix,
-            iteration=iteration,
-            verbose=True,
-            write_to_tensorboard=not cfg_container.validation.skip_train,
-        )
+        ft_integration.shutdown()
+        one_logger_utils.finish()
 
-    if train_state.do_test:
-        prefix = f'iteration {iteration} on test set'
-        evaluate_and_print_results(
-            prefix,
-            forward_step_func,
-            test_data_iterator,
-            model,
-            iteration,
-            process_non_loss_data_func,
-            model_cfg,
-            verbose=True,
-            write_to_tensorboard=not cfg_container.validation.skip_train,
-            non_loss_data_func=non_loss_data_func,
-            pg_collection=pg_collection,
-            p2p_communicator=p2p_communicator,
-            callback_manager=callback_manager,
-            is_test=True,
-        )
-
-    ft_integration.on_checkpointing_start()
-    maybe_finalize_async_save(blocking=True, terminate=True)
-    ft_integration.on_checkpointing_end(is_async_finalization=True)
-    finish_experiment_logging()
-
-    one_logger and one_logger.log_metrics(
-        {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
-    )
-
-    if cfg_container.model.transformer.gtp_remat_nccl_ub or cfg_container.model.transformer.gtp_expert_remat_nccl_ub:
-        from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
-
-        # Deregister the GTP symmetric-memory pools: windows left registered when the
-        # process groups are destroyed make NCCL abort.
-        deregister_and_clear_gtp_symm_pools()
-
-    ft_integration.shutdown()
-    one_logger_utils.finish()
-
-    # OTel: close any still-open span (interval block / startup) and flush all pending
-    # telemetry data.
-    _end_otel_job_spans()
+        # OTel: close any still-open span (interval block / startup) and flush all pending
+        # telemetry data.
+        _end_otel_job_spans()
+    except BaseException as exc:
+        # A restarter may catch the exception without exiting Python, so close
+        # this attempt's experiment writers here before propagating the failure.
+        status = "KILLED" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "FAILED"
+        if isinstance(exc, SystemExit) and exc.code not in (None, 0):
+            status = "FAILED"
+        finish_experiment_logging(status)
+        raise
 
 
 def wrap_model_chunks_with_ddp(

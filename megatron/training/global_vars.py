@@ -8,7 +8,6 @@ import signal
 import sys
 from argparse import Namespace
 from datetime import timedelta
-from functools import wraps
 
 import torch
 
@@ -92,28 +91,6 @@ def finish_experiment_logging(status="FINISHED"):
     """Finish all experiment backends after pending checkpoints complete."""
     if _GLOBAL_EXPERIMENT_WRITER is not None:
         _GLOBAL_EXPERIMENT_WRITER.finish(status)
-
-
-def with_experiment_logging(fn):
-    """Close experiment writers on training failures, including explicit exits.
-
-    The normal path finishes after checkpoint finalization. Catch BaseException
-    here so checkpoint-loader SystemExit and interrupted attempts are not recorded
-    as successful runs, even when an in-process restarter catches the exception.
-    """
-
-    @wraps(fn)
-    def wrapped(*args, **kwargs):
-        try:
-            return fn(*args, **kwargs)
-        except BaseException as exc:
-            status = "KILLED" if isinstance(exc, (KeyboardInterrupt, SystemExit)) else "FAILED"
-            if isinstance(exc, SystemExit) and exc.code not in (None, 0):
-                status = "FAILED"
-            finish_experiment_logging(status)
-            raise
-
-    return wrapped
 
 
 def get_adlr_autoresume():

@@ -431,17 +431,22 @@ def test_finish_from_another_thread_uses_owned_run(experiment_writer, tracking_s
         (RuntimeError('training failed'), 'FAILED'),
     ],
 )
+@pytest.mark.parametrize('failure_stage', ['validation', 'initialization'])
 def test_training_boundary_records_failed_attempt(
-    monkeypatch, experiment_writer, tracking_sdks, error, status
+    monkeypatch, experiment_writer, tracking_sdks, error, status, failure_stage
 ):
     monkeypatch.setattr(global_vars, '_GLOBAL_EXPERIMENT_WRITER', experiment_writer)
+    cfg = Mock()
+    initialize = Mock(side_effect=error)
+    monkeypatch.setattr(training, 'initialize_megatron', initialize)
+    monkeypatch.setattr(training.ft_integration, 'setup', Mock())
+    if failure_stage == 'validation':
+        cfg.validate.side_effect = error
 
-    @global_vars.with_experiment_logging
-    def training_attempt():
-        raise error
-
-    with pytest.raises(type(error)):
-        training_attempt()
+    with pytest.raises(type(error)) as raised:
+        training.pretrain(cfg, None, None, None)
+    assert raised.value is error
+    assert initialize.call_count == int(failure_stage == 'initialization')
     tracking_sdks[0].tracking.MlflowClient.return_value.set_terminated.assert_called_once_with(
         'run-id', status=status
     )
