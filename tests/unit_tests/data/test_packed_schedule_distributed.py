@@ -142,6 +142,7 @@ def test_packed_schedule_pipeline_cp_and_hybrid_sp(dynamic_cp, cp_size, hybrid):
                 config=router_config,
                 decoder=decoder,
                 hybrid_layer_config_list=None,
+                _has_custom_layers=False,
                 position_embedding_type='none',
                 pre_process=pg.pp.rank() == 0,
                 post_process=False,

@@ -285,15 +285,18 @@ def test_mxfp8_mlp_training_matches_reference(distributed_setup, placements, sha
 @requires_mxfp8
 @pytest.mark.parametrize("placements", _MXFP8_2D_PLACEMENTS)
 @pytest.mark.parametrize("num_microbatches", [1, 3])
+@pytest.mark.parametrize("inner_dp_size", [1, 4])
 def test_mxfp8_mlp_training_on_2d_mesh_matches_reference(
-    distributed_setup, placements, num_microbatches
+    distributed_setup, placements, num_microbatches, inner_dp_size
 ):
     """MXFP8 MLP losses on a 2-D DP mesh track an independently trained unsharded model."""
     world_size = distributed_setup.world_size
-    if world_size < 4 or world_size % 2 != 0:
-        pytest.skip("A 2-D DP mesh requires an even number of at least 4 ranks.")
+    if world_size < 2 * inner_dp_size or world_size % inner_dp_size != 0:
+        pytest.skip("Requires at least two outer ranks and world size divisible by inner DP size.")
     mesh = init_device_mesh(
-        distributed_setup.device.type, (2, world_size // 2), mesh_dim_names=("dp_outer", "dp_inner")
+        distributed_setup.device.type,
+        (world_size // inner_dp_size, inner_dp_size),
+        mesh_dim_names=("dp_outer", "dp_inner"),
     )
     _check_mxfp8_mlp_matches_reference(distributed_setup, mesh, placements, num_microbatches)
 
