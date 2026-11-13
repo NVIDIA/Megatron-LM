@@ -310,6 +310,12 @@ class TestDefaultCollection:
         hidden_states = torch.randn(16, 2, config.hidden_size, device="cuda")
         block(hidden_states, attention_mask=None).sum().backward()
         block.sharded_state_dict()
+        if realtime_tests:
+            # SelfAttention compares over dp when dp_gtp_remat is unset, which would skip the
+            # GTP-remat peers: the fallback collection must carry dp_gtp_remat.
+            dp_gtp_remat = vars(block.pg_collection)["dp_gtp_remat"]
+            for layer in block.layers:
+                assert layer.self_attention._realtime_test_dp_group() is dp_gtp_remat
         if moe:
             mlp = block.layers[0].mlp
             assert mlp.ep_group is parallel_state.get_expert_model_parallel_group()
