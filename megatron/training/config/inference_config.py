@@ -143,6 +143,11 @@ class InferenceSetupConfig:
     down to tp_size, giving a log-spaced distribution with bounded relative padding. "linear" uses
     varying linear strides across the range."""
 
+    inference_dynamic_batching_dsa_backend: Literal["triton", "flashinfer"] = "triton"
+    """Kernels for DSA-over-GQA attention in dynamic batching, for decode, prefill and mixed steps
+    (CUDA-graph safe): "triton" (Megatron's Triton/Gluon kernels; KV blocks a multiple of 128
+    tokens) or "flashinfer" (FlashInfer's DSA kernels and FA4)."""
+
     inference_dynamic_batching_sampling_backend: Literal["torch", "flashinfer"] = "flashinfer"
     """Which sampling kernels to use during inference. Defaults to "flashinfer" and falls back to
     "torch" with a warning if the flashinfer package is not installed."""
@@ -494,6 +499,7 @@ class InferenceSetupConfig:
             mamba_replay_ssm=self.mamba_replay_ssm,
             mamba_replay_buffer_len=self.mamba_replay_buffer_len,
             use_synchronous_zmq_collectives=self.inference_use_synchronous_zmq_collectives,
+            dsa_backend=self.inference_dynamic_batching_dsa_backend,
             sampling_backend=self.inference_dynamic_batching_sampling_backend,
             offset_sampling_seed_by_dp_rank=self.offset_sampling_seed_by_dp_rank,
             async_sched_mode=AsyncScheduleMode(self.inference_dynamic_batching_async_sched_mode),

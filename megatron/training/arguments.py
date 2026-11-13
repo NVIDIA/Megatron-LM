@@ -2147,6 +2147,13 @@ def _add_inference_args(parser):
                        help='Which sampling kernels to use during inference. '
                             'Falls back to "torch" with a warning if "flashinfer" '
                             'is requested but the package is not installed.')
+    group.add_argument('--inference-dynamic-batching-dsa-backend',
+                       type=str, default='triton',
+                       choices=['triton', 'flashinfer'],
+                       help='Kernels for DSA-over-GQA attention with the simplified indexer in '
+                            'dynamic batching: "triton" (Megatron\'s Triton kernels; KV blocks '
+                            'a multiple of 128 tokens) or "flashinfer" (FlashInfer\'s DSA '
+                            'kernels and FA4).')
     group.add_argument('--use-same-sampling-seed-across-dp-ranks',
                        action='store_false', dest='offset_sampling_seed_by_dp_rank',
                        default=True,
