@@ -152,19 +152,8 @@ def test_realtime_tests_compare_within_module_groups(module_groups):
         attention.run_realtime_tests()
 
 
-def test_realtime_tests_gather_over_module_groups():
-    """The check gathers over the collection's dp_gtp_remat group, then over its TP group.
-
-    The collection also sets dp, the replicate group without GTP-remat peers. The check must not
-    use it: the layernorm parameters are replicated across those peers too, and dp_gtp_remat, like
-    get_data_parallel_group(), includes them.
-    """
-    tp_group = _StandInGroup(rank=1, size=TP_SIZE)
-    dp_group = _StandInGroup(rank=0, size=3)
-    pg_collection = ProcessGroupCollection(
-        tp=tp_group, cp=_StandInGroup(), dp=_StandInGroup(), dp_gtp_remat=dp_group, gtp_remat=None
-    )
-    attention = _build_attention(pg_collection, on_gpu=False, qk_layernorm=True, test_mode=True)
+def _gathers_of_realtime_tests(attention):
+    """Run the check on CPU and return the (group, size) of each all_gather, in order."""
     gathers = []
 
     def all_gather(tensor_list, tensor, group=None, async_op=False):
@@ -176,6 +165,24 @@ def test_realtime_tests_gather_over_module_groups():
         # get_pg_rank() and get_pg_size() read a group only once torch.distributed is initialized.
         with mock.patch.object(torch.distributed, "is_initialized", return_value=True):
             attention.run_realtime_tests()
+    return gathers
+
+
+def test_realtime_tests_gather_over_module_groups():
+    """The check gathers over the collection's dp_gtp_remat group, then over its TP group.
+
+    The collection also sets dp, the replicate group without GTP-remat peers. The check must not
+    use it while dp_gtp_remat is set: the layernorm parameters are replicated across those peers
+    too, and dp_gtp_remat, like get_data_parallel_group(), includes them.
+    """
+    tp_group = _StandInGroup(rank=1, size=TP_SIZE)
+    dp_group = _StandInGroup(rank=0, size=3)
+    pg_collection = ProcessGroupCollection(
+        tp=tp_group, cp=_StandInGroup(), dp=_StandInGroup(), dp_gtp_remat=dp_group, gtp_remat=None
+    )
+    attention = _build_attention(pg_collection, on_gpu=False, qk_layernorm=True, test_mode=True)
+
+    gathers = _gathers_of_realtime_tests(attention)
 
     assert len(gathers) == 2
     assert gathers[0][0] is dp_group and gathers[0][1] == dp_group.size()
@@ -183,22 +190,37 @@ def test_realtime_tests_gather_over_module_groups():
 
 
 @pytest.mark.parametrize("dp_gtp_remat", ["unset", None])
-def test_realtime_tests_require_data_parallel_group(dp_gtp_remat):
-    """Without dp_gtp_remat the module is rejected when it is built, before any forward could
-    run a collective over WORLD.
+def test_realtime_tests_gather_over_dp_without_dp_gtp_remat(dp_gtp_remat):
+    """A collection built for a custom grid may set only dp; the check then gathers over it."""
+    tp_group = _StandInGroup(rank=1, size=TP_SIZE)
+    dp_group = _StandInGroup(rank=0, size=3)
+    groups = {"tp": tp_group, "cp": _StandInGroup(), "dp": dp_group, "gtp_remat": None}
+    if dp_gtp_remat != "unset":
+        groups["dp_gtp_remat"] = dp_gtp_remat
+    attention = _build_attention(
+        ProcessGroupCollection(**groups), on_gpu=False, qk_layernorm=True, test_mode=True
+    )
 
-    The collection sets dp, which does not stand in for dp_gtp_remat.
+    gathers = _gathers_of_realtime_tests(attention)
+
+    assert len(gathers) == 2
+    assert gathers[0][0] is dp_group and gathers[0][1] == dp_group.size()
+    assert gathers[1][0] is tp_group and gathers[1][1] == tp_group.size()
+
+
+@pytest.mark.parametrize("dp", ["unset", None])
+@pytest.mark.parametrize("dp_gtp_remat", ["unset", None])
+def test_realtime_tests_require_data_parallel_group(dp, dp_gtp_remat):
+    """Without dp_gtp_remat and dp the module is rejected when it is built, before any forward
+    could run a collective over WORLD.
     """
-    groups = {
-        "tp": _StandInGroup(),
-        "cp": _StandInGroup(),
-        "dp": _StandInGroup(),
-        "gtp_remat": None,
-    }
+    groups = {"tp": _StandInGroup(), "cp": _StandInGroup(), "gtp_remat": None}
+    if dp != "unset":
+        groups["dp"] = dp
     if dp_gtp_remat != "unset":
         groups["dp_gtp_remat"] = dp_gtp_remat
 
-    with pytest.raises(ValueError, match="dp_gtp_remat"):
+    with pytest.raises(ValueError, match="requires a dp process group"):
         _build_attention(
             ProcessGroupCollection(**groups),
             tensor_model_parallel_size=1,
@@ -222,7 +244,7 @@ def test_realtime_tests_require_tensor_parallel_group():
     attention.tp_group = None
 
     with mock.patch.object(torch.distributed, "all_gather") as all_gather:
-        with pytest.raises(ValueError, match="must set tp and dp_gtp_remat"):
+        with pytest.raises(ValueError, match="must set tp and dp_gtp_remat or dp"):
             attention.run_realtime_tests()
     all_gather.assert_not_called()
 

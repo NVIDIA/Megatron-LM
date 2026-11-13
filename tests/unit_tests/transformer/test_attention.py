@@ -109,7 +109,7 @@ class TestParallelAttention:
         test_mode_config.test_mode = True
         test_mode_config.qk_layernorm = True
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
-        with pytest.raises(ValueError, match='must set tp and dp_gtp_remat'):
+        with pytest.raises(ValueError, match='requires a dp process group'):
             SelfAttention(
                 test_mode_config,
                 get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
