@@ -502,6 +502,9 @@ class LoggerConfig:
     Equivalent to MEGATRON_OTEL_SPAN_GROUPS env var.
     """
 
+    mlflow_log_artifacts: bool = True
+    """Whether to upload checkpoint artifacts to MLFlow via HTTP after each save."""
+
     def validate(self) -> None:
         """Check logging requirements shared by CLI and native configurations."""
         if self.log_memory_interval is not None:
