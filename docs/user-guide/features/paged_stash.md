@@ -13,7 +13,7 @@
 
 **Paged stash** = **sync-free** expert execution + **paged stashing** (packing routed-expert activations for backward into paged buffers).
 
-**Sync-free:** `--moe-flex-dispatcher-backend hybridep`, `--use-transformer-engine-op-fuser`, and `--moe-expert-rank-capacity-factor` pre-size dispatch and fused grouped expert buffers from a user-controlled capacity, avoiding a per-step device query / realloc loop for buffer sizing.
+**Sync-free:** `--moe-flex-dispatcher-backend hybridep` and `--moe-expert-rank-capacity-factor` pre-size dispatch and grouped expert buffers from a user-controlled capacity, avoiding a per-step device query / realloc loop for buffer sizing. Expert compute can use either `--use-transformer-engine-op-fuser` or the device-initiated Transformer Engine GroupedTensor path (`--moe-grouped-gemm --moe-use-grouped-tensor`).
 
 **Paged stashing:** `--moe-paged-stash` stores those activations in paged CUDA buffers (optional pinned host spill). It helps save activation memory; sync-free still works without it, at the cost of higher activation memory use.
 
@@ -21,19 +21,35 @@ Whenever `moe_expert_rank_capacity_factor` is set, a **runner** wraps forward-ba
 
 ## Prerequisites
 
-HybridEP + TE fused grouped experts are required whenever `moe_expert_rank_capacity_factor` is set. With `moe_paged_stash` enabled: capacity factor must be set; no `cpu_offloading`; `offload_modules` must not include `expert_fc1`, `moe_act`, or `fused_group_mlp`. The runner is active whenever capacity factor is set (even without `--moe-paged-stash`) for over-budget reruns; stash overflow is checked only when paged stashing is on.
+HybridEP and TE grouped experts are required whenever `moe_expert_rank_capacity_factor` is set. The non-op-fuser path requires a Transformer Engine version whose GroupedLinear marks saved GroupedTensor activation buffers for paged stashing. It currently supports only fused SwiGLU or QuickGeGLU (`bias_activation_fusion=True`) without GLU interleaving; restricting the activation contract keeps dynamic-tensor marking at the fused autograd boundaries. With `moe_paged_stash` enabled: capacity factor must be set; no `cpu_offloading`; `offload_modules` must not include `expert_fc1`, `moe_act`, or `fused_group_mlp`. The runner is active whenever capacity factor is set (even without `--moe-paged-stash`) for over-budget reruns; stash overflow is checked only when paged stashing is on.
 
 ## Configuration
 
 ```bash
-# Sync-free
+# Common static-budget configuration
+--moe-token-dispatcher-type flex
 --moe-flex-dispatcher-backend hybridep
---use-transformer-engine-op-fuser
 --moe-expert-rank-capacity-factor <float>
 
 # Paged stashing (to avoid memory waste due to fragmentation)
 --moe-paged-stash
+
+# Choose one expert-compute path:
+
+# A. TE operation fuser (used by the full-iteration CUDA graph + CuTe DSL route)
+--use-transformer-engine-op-fuser
+
+# B. Device-initiated GroupedLinear, without the operation fuser
+--moe-grouped-gemm
+--moe-use-grouped-tensor
+--swiglu  # Keep fusion enabled; do not pass --no-bias-swiglu-fusion.
 ```
+
+Path B removes host-device synchronization from grouped GEMM split metadata, but FC1, activation,
+and FC2 remain separate launches. Without a full-iteration CUDA graph it can therefore retain
+significant CPU launch overhead even though the expert path is host-device sync-free.
+The legacy multi-stream cuBLAS GroupedLinear path is not supported because it materializes split
+metadata on the host; paged stashing would not make that expert path sync-free.
 
 ## Tuning (paged stashing only)
 
@@ -45,6 +61,15 @@ HybridEP + TE fused grouped experts are required whenever `moe_expert_rank_capac
 # Host spill (0 = off); same sign rule as CUDA
 --moe-paged-stash-buffer-size-factor-cpu 0.0
 ```
+
+The copy/pop kernels use fixed launch sizes based on the current CUDA device:
+4096 elements per program per iteration and at most 8192 programs on Rubin (SM107),
+and 1024 elements and at most 2048 programs on other GPUs. There are no configuration
+options for these launch sizes.
+
+The stash copy/pop kernels are memory-bound; with 1024/2048, wide activations (thousands of
+elements per token) do not saturate DRAM bandwidth. For example, on VR200 with DeepSeek-V3
+(hidden size 7168), using 4096/8192 makes the stash kernels ~2.3x faster.
 
 ## What `moe_expert_rank_capacity_factor` and `moe_paged_stash_buffer_size_factor_cuda` mean
 

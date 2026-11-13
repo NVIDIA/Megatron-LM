@@ -1,8 +1,11 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import logging
 import re
+from contextlib import nullcontext
 from copy import deepcopy
 from functools import partial
+from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import patch
 
@@ -11,10 +14,26 @@ import torch
 from torch.optim import Adam
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing import ShardedTensor, load, load_plain_tensors, save
+from megatron.core.dist_checkpointing import (
+    LocalNonpersistentObject,
+    ShardedObject,
+    ShardedTensor,
+    load,
+    load_common_state_dict,
+    load_content_metadata,
+    load_plain_tensors,
+    load_tensors_metadata,
+    save,
+)
 from megatron.core.dist_checkpointing.dict_utils import diff, nested_values
+from megatron.core.dist_checkpointing.mapping import (
+    ShardedTensorFactory,
+    get_checkpoint_parameter_id,
+    set_checkpoint_parameter_id,
+)
 from megatron.core.dist_checkpointing.optimizer import (
     get_param_id_to_sharded_param_map,
+    make_sharded_optimizer_tensor,
     optim_state_to_sharding_state,
 )
 from megatron.core.dist_checkpointing.utils import add_prefix_for_sharding, extract_sharded_tensors
@@ -25,11 +44,11 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import HAVE_EMERGING_OPTIMIZERS, ChainedOptimizer
-from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer, get_legacy_grad_dtypes
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MLATransformerConfig, TransformerConfig
 from megatron.core.transformer.mlp import apply_swiglu_sharded_factory
-from megatron.core.utils import is_torch_min_version
+from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.arguments import parse_args
 from megatron.training.checkpointing import load_checkpoint, save_checkpoint
 from tests.unit_tests.dist_checkpointing import (
@@ -40,7 +59,28 @@ from tests.unit_tests.dist_checkpointing import (
     setup_model_and_optimizer,
     setup_moe_model_and_optimizer,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.dist_checkpointing.utils import initialize_quantized_gpt_model
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
+
+
+def _quantized_param_storage_support(precision, recipe):
+    """(available, reason) for keeping GEMM weights in `precision`/`recipe` storage here."""
+    try:
+        from transformer_engine.pytorch import fp8 as te_fp8
+    except ImportError:
+        return False, 'Transformer Engine is not installed'
+    if precision == 'fp8':
+        available, reason = te_fp8.check_fp8_support()
+        if available and recipe == 'mxfp8':
+            check_mxfp8_support = getattr(te_fp8, 'check_mxfp8_support', None)
+            if check_mxfp8_support is None:
+                return False, 'Transformer Engine without MXFP8 support'
+            available, reason = check_mxfp8_support()
+        return available, reason
+    check_nvfp4_support = getattr(te_fp8, 'check_nvfp4_support', None)
+    if check_nvfp4_support is None or not is_te_min_version("2.7.0.dev0"):
+        return False, 'NVFP4 requires Transformer Engine >= 2.7.0.dev0'
+    return check_nvfp4_support()
 
 
 class Model(torch.nn.Module):
@@ -77,6 +117,21 @@ class Model(torch.nn.Module):
             'proj.bias', sharded_state_dict['proj.bias'], (0, Utils.rank, Utils.world_size)
         )
         return sharded_state_dict
+
+
+def iter_state_dict_keys(value, path=()):
+    """Iterate over keys from nested checkpoint mappings, including wrapped object data."""
+    if isinstance(value, ShardedObject):
+        yield from iter_state_dict_keys(value.data, path + ('<sharded_object_data>',))
+    elif isinstance(value, LocalNonpersistentObject):
+        yield from iter_state_dict_keys(value.unwrap(), path + ('<local_nonpersistent>',))
+    elif isinstance(value, dict):
+        for key, item in value.items():
+            yield path, key
+            yield from iter_state_dict_keys(item, path + (key,))
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            yield from iter_state_dict_keys(item, path + (index,))
 
 
 class NativeFp32Model(torch.nn.Module):
@@ -144,7 +199,9 @@ class SwigluFactoryModel(torch.nn.Module):
         return sharded_state_dict
 
 
-class SwigluFactoryModel(torch.nn.Module):
+class PPAgnosticModel(torch.nn.Module):
+    """Like SwigluFactoryModel, but the linear weight is TP-replicated (no sharded axis)."""
+
     def __init__(self, pp_separate_model: bool = False):
         super().__init__()
         self.linear = torch.nn.Linear(5, 64, bias=False)
@@ -358,7 +415,7 @@ def initialize_pp_agnostic_model(pre_process=True, post_process=True, seed=0, **
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
 
-    return SwigluFactoryModel(False)
+    return PPAgnosticModel(False)
 
 
 def initialize_pp_agnostic_gpt_model(pre_process=True, post_process=True, seed=0, **config_kwargs):
@@ -458,8 +515,7 @@ def initialize_real_model(
 
 def load_checkpoint_no_arg_checks(*args, **kwargs):
     with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
-        with mock.patch('megatron.training.checkpointing.update_num_microbatches'):
-            return load_checkpoint(*args, **kwargs)
+        return load_checkpoint(*args, restore_training_state=True, **kwargs)
 
 
 class TestDistributedOptimizer:
@@ -468,6 +524,381 @@ class TestDistributedOptimizer:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"),
+        reason="distributed optimizer torch_dist formats require PyTorch 2.6a0 or later",
+    )
+    @pytest.mark.parametrize(
+        'sharding_type',
+        [
+            'dp_reshardable',
+            'dp_zero_gather_scatter',
+            'fully_reshardable',
+            # fsdp_dtensor uses a separate optimizer path. fully_sharded_model_space is
+            # deprecated and cannot be constructed with the current ShardedTensor API.
+        ],
+    )
+    def test_torch_dist_optimizer_state_dict_key_types(self, sharding_type):
+        """torch_dist optimizer checkpoints use only string or integer mapping keys."""
+        # PP=2 keeps DP at world_size / 2: with DP == world_size the last rank's slice of the
+        # single grad bucket of this tiny model is empty on 8 GPUs ('empty bucket encountered').
+        Utils.initialize_model_parallel(1, 2)
+        model, optimizer = setup_model_and_optimizer(
+            seed=2, tp=1, pp=2, bf16=True, dist_opt=True, initialize_fn=initialize_pp_agnostic_model
+        )
+        distributed_optimizer = self._unwrap_distributed_optimizer(optimizer)
+        runtime_dtype_keys = [
+            dtype
+            for per_buffer_numel in distributed_optimizer.per_bucket_numel
+            for dtype in per_buffer_numel
+        ]
+        assert runtime_dtype_keys
+        assert set(runtime_dtype_keys) == {'param_torch:bfloat16'}
+        metadata = {
+            'distrib_optim_sharding_type': sharding_type,
+            'distrib_optim_fully_reshardable_mem_efficient': False,
+        }
+
+        optim_sd = optimizer.sharded_state_dict(model[0].sharded_state_dict(), metadata=metadata)
+        unsupported_keys = [
+            (path, key)
+            for path, key in iter_state_dict_keys(optim_sd)
+            if not isinstance(key, (str, int))
+        ]
+
+        assert not unsupported_keys
+        runtime_dtype_keys = [
+            dtype
+            for per_buffer_numel in distributed_optimizer.per_bucket_numel
+            for dtype in per_buffer_numel
+        ]
+        assert runtime_dtype_keys and all(isinstance(key, str) for key in runtime_dtype_keys)
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"),
+        reason="distributed optimizer torch_dist formats require PyTorch 2.6a0 or later",
+    )
+    @pytest.mark.parametrize('sharding_type', ['dp_reshardable', 'dp_zero_gather_scatter'])
+    @pytest.mark.parametrize('legacy_keys', [False, True])
+    @pytest.mark.parametrize('grad_dtype_change', [False, True])
+    def test_optimizer_checkpoint_key_compatibility(
+        self, tmp_path_dist_ckpt, sharding_type, legacy_keys, grad_dtype_change
+    ):
+        """String- and tuple-key checkpoints load without compatibility settings.
+
+        With `grad_dtype_change` the checkpoint is saved with bf16 main grads and loaded by an
+        optimizer using fp32 main grads: the optimizer state does not depend on the grad dtype,
+        so the load must succeed for both key spellings.
+        """
+        # PP=2 keeps DP at world_size / 2 (see test_torch_dist_optimizer_state_dict_key_types).
+        Utils.initialize_model_parallel(1, 2)
+        checkpoint_version = 3.0 if legacy_keys else 3.1
+        metadata = {'distrib_optim_sharding_type': sharding_type}
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt
+            / f'test_key_compatibility_{sharding_type}_{legacy_keys}_{grad_dtype_change}',
+            sync=True,
+        ) as ckpt_dir:
+            # Legacy (pre-3.1) keys carried the grad dtype of the saving run (bf16 here).
+            dtype_key_context = (
+                mock.patch(
+                    'megatron.core.optimizer.distrib_optimizer._get_dtype_key',
+                    side_effect=lambda param_dtype: (param_dtype, torch.bfloat16),
+                )
+                if legacy_keys
+                else nullcontext()
+            )
+            with dtype_key_context:
+                model_A, optimizer_A = setup_model_and_optimizer(
+                    seed=2,
+                    tp=1,
+                    pp=2,
+                    bf16=True,
+                    dist_opt=True,
+                    initialize_fn=initialize_pp_agnostic_model,
+                )
+                optim_sd = optimizer_A.sharded_state_dict(
+                    model_A[0].sharded_state_dict(), metadata=metadata
+                )
+
+            has_tuple_key = torch.tensor(
+                any(isinstance(key, tuple) for _, key in iter_state_dict_keys(optim_sd)),
+                device='cuda',
+                dtype=torch.int,
+            )
+            torch.distributed.all_reduce(has_tuple_key, op=torch.distributed.ReduceOp.MAX)
+            assert bool(has_tuple_key.item()) == legacy_keys
+
+            save(
+                {'checkpoint_version': checkpoint_version, 'optimizer': optim_sd},
+                ckpt_dir,
+                content_metadata=metadata,
+            )
+            optim_param_state_A = get_param_state_dp_zero(optimizer_A)
+
+            model_B, optimizer_B = setup_model_and_optimizer(
+                seed=3,
+                tp=1,
+                pp=2,
+                bf16=True,
+                dist_opt=True,
+                initialize_fn=initialize_pp_agnostic_model,
+                grad_reduce_in_fp32=grad_dtype_change,
+            )
+            distributed_optimizer_B = self._unwrap_distributed_optimizer(optimizer_B)
+            assert all(
+                buffer.grad_dtype == (torch.float32 if grad_dtype_change else torch.bfloat16)
+                for buffer in distributed_optimizer_B.buffers
+            )
+            common_state = load_common_state_dict(ckpt_dir)
+            assert common_state['checkpoint_version'] == checkpoint_version
+            loaded_metadata = load_content_metadata(preloaded_state_dict=common_state)
+            loaded_metadata['checkpoint_version'] = common_state['checkpoint_version']
+            if legacy_keys:
+                # What `load_checkpoint` derives from the checkpoint for pre-3.1 optimizer FQNs.
+                # Only dp_reshardable puts the dtype into ShardedTensor FQNs; dp_zero_gather_scatter
+                # keeps it as dict keys inside a ShardedObject, which load_state_dict normalizes.
+                loaded_metadata['legacy_grad_dtypes'] = get_legacy_grad_dtypes(
+                    load_tensors_metadata(ckpt_dir).keys()
+                )
+                assert loaded_metadata['legacy_grad_dtypes'] == (
+                    {'torch.bfloat16': 'torch.bfloat16'}
+                    if sharding_type == 'dp_reshardable'
+                    else {}
+                )
+            load_sharded_state_dict = {
+                'optimizer': optimizer_B.sharded_state_dict(
+                    model_B[0].sharded_state_dict(), metadata=loaded_metadata, is_loading=True
+                )
+            }
+            if sharding_type == 'dp_reshardable':
+                uses_legacy_dtype_fqn = any(
+                    '.dtype_(torch.' in value.key
+                    for value in nested_values(load_sharded_state_dict)
+                    if isinstance(value, ShardedTensor)
+                )
+                assert uses_legacy_dtype_fqn == legacy_keys
+            loaded_state_dict = load(load_sharded_state_dict, ckpt_dir)
+            loaded_has_tuple_key = torch.tensor(
+                any(isinstance(key, tuple) for _, key in iter_state_dict_keys(loaded_state_dict)),
+                device='cuda',
+                dtype=torch.int,
+            )
+            torch.distributed.all_reduce(loaded_has_tuple_key, op=torch.distributed.ReduceOp.MAX)
+            assert bool(loaded_has_tuple_key.item()) == legacy_keys
+
+            optimizer_B.load_state_dict(loaded_state_dict['optimizer'])
+            optim_param_state_B = get_param_state_dp_zero(optimizer_B)
+
+            # The compatibility boundary normalizes old state before the regular loader sees it.
+            loaded_has_tuple_key = torch.tensor(
+                any(isinstance(key, tuple) for _, key in iter_state_dict_keys(loaded_state_dict)),
+                device='cuda',
+                dtype=torch.int,
+            )
+            torch.distributed.all_reduce(loaded_has_tuple_key, op=torch.distributed.ReduceOp.MAX)
+            assert not bool(loaded_has_tuple_key.item())
+
+            if legacy_keys:
+                distributed_optimizer_A = self._unwrap_distributed_optimizer(optimizer_A)
+                distributed_optimizer_A._back_compat_normalize_loaded_dtype_keys(
+                    optim_param_state_A, checkpoint_version
+                )
+
+            assert self.check_equal_dp_zero_state(
+                optim_param_state_A,
+                optim_param_state_B,
+                same_dp_group=True,
+                raise_if_different=True,
+            )
+
+            # Loading a tuple-key checkpoint must not affect subsequent checkpoint saves.
+            resaved_optim_sd = optimizer_B.sharded_state_dict(
+                model_B[0].sharded_state_dict(), metadata=metadata
+            )
+            assert all(
+                isinstance(key, (str, int)) for _, key in iter_state_dict_keys(resaved_optim_sd)
+            )
+
+    def test_optimizer_load_template_without_checkpoint_version_warns(self, caplog):
+        """A loading template built without metadata['checkpoint_version'] says so loudly.
+
+        The legacy (pre-3.1) key mapping is selected by that version. Without it the template
+        silently uses the current key spelling and a pre-3.1 checkpoint fails later with an opaque
+        'missing key' error, so the optimizer now warns at template-construction time.
+        """
+        Utils.initialize_model_parallel(1, 2)
+        model, optimizer = setup_model_and_optimizer(
+            seed=2, tp=1, pp=2, bf16=True, dist_opt=True, initialize_fn=initialize_pp_agnostic_model
+        )
+        model_sd = model[0].sharded_state_dict()
+        logger_name = 'megatron.core.optimizer.distrib_optimizer'
+
+        def version_warnings():
+            return [r for r in caplog.records if "metadata['checkpoint_version']" in r.getMessage()]
+
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            optimizer.sharded_state_dict(
+                model_sd,
+                is_loading=True,
+                metadata={'distrib_optim_sharding_type': 'dp_reshardable'},
+            )
+        # log_single_rank only emits on rank 0.
+        assert bool(version_warnings()) == (Utils.rank == 0)
+
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger=logger_name):
+            optimizer.sharded_state_dict(
+                model_sd,
+                is_loading=True,
+                metadata={
+                    'distrib_optim_sharding_type': 'dp_reshardable',
+                    'checkpoint_version': 3.1,
+                },
+            )
+        assert not version_warnings()
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.6a0"),
+        reason="distributed optimizer torch_dist formats require PyTorch 2.6a0 or later",
+    )
+    @pytest.mark.parametrize('sharding_type', ['dp_reshardable', 'dp_zero_gather_scatter'])
+    @pytest.mark.parametrize('legacy_keys', [False, True])
+    @pytest.mark.parametrize(
+        ('precision', 'recipe'), [('fp8', 'delayed'), ('fp8', 'mxfp8'), ('fp4', 'nvfp4')]
+    )
+    def test_optimizer_checkpoint_key_compatibility_quantized_params(
+        self, tmp_path_dist_ckpt, sharding_type, legacy_keys, precision, recipe
+    ):
+        """fp8 / nvfp4 parameters live in torch.uint8 buffers next to the bf16 ones.
+
+        Saves with bf16 main grads and loads with fp32 main grads, with the string keys and with
+        the legacy tuple keys, so both buffer kinds and the uint8-aware code (key spelling,
+        `split_state_dict_if_needed` detection on the dp_zero path) are exercised.
+        """
+        available, reason = _quantized_param_storage_support(precision, recipe)
+        if not available:
+            pytest.skip(f'{precision}/{recipe} parameter storage not available here: {reason}')
+        Utils.initialize_model_parallel(1, 2)
+        checkpoint_version = 3.0 if legacy_keys else 3.1
+        metadata = {'distrib_optim_sharding_type': sharding_type}
+        initialize_fn = partial(initialize_quantized_gpt_model, precision=precision, recipe=recipe)
+        gather_kwargs = {
+            'fp8_param_gather': precision == 'fp8',
+            'fp4_param_gather': precision == 'fp4',
+            'reuse_grad_buf_for_mxfp8_param_ag': recipe == 'mxfp8',
+        }
+
+        with TempNamedDir(
+            tmp_path_dist_ckpt
+            / f'test_key_compatibility_{precision}_{recipe}_{sharding_type}_{legacy_keys}',
+            sync=True,
+        ) as ckpt_dir:
+            # Legacy (pre-3.1) keys carried the grad dtype of the saving run (bf16 here).
+            dtype_key_context = (
+                mock.patch(
+                    'megatron.core.optimizer.distrib_optimizer._get_dtype_key',
+                    side_effect=lambda param_dtype: (param_dtype, torch.bfloat16),
+                )
+                if legacy_keys
+                else nullcontext()
+            )
+            with dtype_key_context:
+                model_A, optimizer_A = setup_model_and_optimizer(
+                    seed=2,
+                    tp=1,
+                    pp=2,
+                    bf16=True,
+                    dist_opt=True,
+                    initialize_fn=initialize_fn,
+                    **gather_kwargs,
+                )
+                optim_sd = optimizer_A.sharded_state_dict(
+                    model_A[0].sharded_state_dict(), metadata=metadata
+                )
+            distributed_optimizer_A = self._unwrap_distributed_optimizer(optimizer_A)
+            assert {buffer.param_dtype for buffer in distributed_optimizer_A.buffers} == {
+                torch.uint8,
+                torch.bfloat16,
+            }
+            runtime_keys = {
+                key
+                for per_buffer_numel in distributed_optimizer_A.per_bucket_numel
+                for key in per_buffer_numel
+            }
+            if legacy_keys:
+                assert runtime_keys == {
+                    (torch.uint8, torch.bfloat16),
+                    (torch.bfloat16, torch.bfloat16),
+                }
+            else:
+                assert runtime_keys == {'param_torch:uint8', 'param_torch:bfloat16'}
+
+            save(
+                {'checkpoint_version': checkpoint_version, 'optimizer': optim_sd},
+                ckpt_dir,
+                content_metadata=metadata,
+            )
+            optim_param_state_A = get_param_state_dp_zero(optimizer_A)
+
+            model_B, optimizer_B = setup_model_and_optimizer(
+                seed=3,
+                tp=1,
+                pp=2,
+                bf16=True,
+                dist_opt=True,
+                initialize_fn=initialize_fn,
+                grad_reduce_in_fp32=True,
+                **gather_kwargs,
+            )
+            distributed_optimizer_B = self._unwrap_distributed_optimizer(optimizer_B)
+            assert all(
+                buffer.grad_dtype == torch.float32 for buffer in distributed_optimizer_B.buffers
+            )
+            common_state = load_common_state_dict(ckpt_dir)
+            loaded_metadata = load_content_metadata(preloaded_state_dict=common_state)
+            loaded_metadata['checkpoint_version'] = common_state['checkpoint_version']
+            if legacy_keys:
+                loaded_metadata['legacy_grad_dtypes'] = get_legacy_grad_dtypes(
+                    load_tensors_metadata(ckpt_dir).keys()
+                )
+                if sharding_type == 'dp_reshardable':
+                    assert loaded_metadata['legacy_grad_dtypes'] == {
+                        'torch.uint8': 'torch.bfloat16',
+                        'torch.bfloat16': 'torch.bfloat16',
+                    }
+            load_sharded_state_dict = {
+                'optimizer': optimizer_B.sharded_state_dict(
+                    model_B[0].sharded_state_dict(), metadata=loaded_metadata, is_loading=True
+                )
+            }
+            if sharding_type == 'dp_reshardable':
+                legacy_fqns = [
+                    value.key
+                    for value in nested_values(load_sharded_state_dict)
+                    if isinstance(value, ShardedTensor) and '.dtype_(torch.' in value.key
+                ]
+                assert bool(legacy_fqns) == legacy_keys
+                if legacy_keys:
+                    assert any(
+                        '.dtype_(torch.uint8, torch.bfloat16).' in key for key in legacy_fqns
+                    )
+            loaded_state_dict = load(load_sharded_state_dict, ckpt_dir)
+            optimizer_B.load_state_dict(loaded_state_dict['optimizer'])
+            optim_param_state_B = get_param_state_dp_zero(optimizer_B)
+
+            if legacy_keys:
+                distributed_optimizer_A._back_compat_normalize_loaded_dtype_keys(
+                    optim_param_state_A, checkpoint_version
+                )
+            assert self.check_equal_dp_zero_state(
+                optim_param_state_A,
+                optim_param_state_B,
+                same_dp_group=True,
+                raise_if_different=True,
+            )
 
     @pytest.mark.parametrize("fully_parallel", [False, True])
     @pytest.mark.parametrize(
@@ -543,6 +974,7 @@ class TestDistributedOptimizer:
                 init_checkpointing_mock_args(mock_args, ckpt_dir, fully_parallel=fully_parallel)
                 from megatron.training.training import preprocess_common_state_dict
 
+                sync_checkpoint_config(mock_args)
                 save_checkpoint(
                     10,
                     model,
@@ -565,6 +997,7 @@ class TestDistributedOptimizer:
                         seed=3, tp=tp, pp=pp, initialize_fn=initialize_fn
                     )
                 # Load optimizer B from checkpoint
+                sync_checkpoint_config(mock_args)
                 load_checkpoint_no_arg_checks(model, optimizer_B, None)
                 if test_step:
                     # Complete "step" for comparison
@@ -587,7 +1020,7 @@ class TestDistributedOptimizer:
         [((2, 2), (2, 4), False), ((1, 8), (4, 1), True), ((2, 4), (4, 2), False)],
     )
     def test_finetune_doesnt_load_optimizer(
-        self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_glu
+        self, tmp_path_dist_ckpt, src_tp_pp, dest_tp_pp, use_glu, run_config
     ):
         """Test finetuning doesn't try to load the optimizer."""
         Utils.initialize_model_parallel(*src_tp_pp)
@@ -607,6 +1040,8 @@ class TestDistributedOptimizer:
                     initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
                 )
 
+                run_config.model.transformer = model[0].config
+                sync_checkpoint_config(mock_args)
                 save_checkpoint(10, model, optimizer, None, 0)
                 Utils.destroy_model_parallel()
 
@@ -619,11 +1054,13 @@ class TestDistributedOptimizer:
                     pp=dest_tp_pp[1],
                     initialize_fn=partial(initialize_gpt_model, use_glu=use_glu),
                 )
+                run_config.model.transformer = model[0].config
                 model_unloaded_state_dict = deepcopy(model[0].state_dict())
                 optim_unloaded_state_dict = deepcopy(optimizer.state_dict())
 
                 # Load with different TPxPP should raise DistributeOptimizer error
                 with pytest.raises(RuntimeError) as exc_info:
+                    sync_checkpoint_config(mock_args)
                     load_checkpoint_no_arg_checks(model, optimizer, None)
                 # "(TP, PP) mismatch" check is for backwards compatibility tests
                 assert "(TP, PP) mismatch" in str(
@@ -636,6 +1073,7 @@ class TestDistributedOptimizer:
 
                 # Now test the same with a `finetune` flag
                 mock_args.finetune = True
+                sync_checkpoint_config(mock_args)
                 load_checkpoint_no_arg_checks(model, optimizer, None)
 
                 # Model weights should be different, but optimizer state is unchanged
@@ -655,6 +1093,7 @@ class TestDistributedOptimizer:
                 mock_args.finetune = False
                 mock_args.no_load_optim = True
                 mock_args.no_load_rng = True
+                sync_checkpoint_config(mock_args)
                 load_checkpoint_no_arg_checks(model, optimizer, None)
 
                 # Model weights should be different, but optimizer state is unchanged
@@ -790,6 +1229,9 @@ class TestDistributedOptimizer:
             plain_state_dict_A = load_plain_tensors(ckpt_dir_A)
             plain_state_dict_B = load_plain_tensors(ckpt_dir_B)
             torch.distributed.barrier()
+
+            assert any('.dtype_param_torch:bfloat16.' in key for key in plain_state_dict_B)
+            assert not any('.dtype_(torch.' in key for key in plain_state_dict_B)
 
             # We test only the `plain_state_dict_B` keys because of decreasing PP
             for key in list(plain_state_dict_B.keys()):
@@ -1491,3 +1933,167 @@ class TestOptimizerResharding:
                 diffs = diff(plain_state_dict_A, plain_state_dict_B)
                 assert not any(map(bool, diffs)), diffs
                 Utils.destroy_model_parallel()
+
+
+@pytest.mark.launch_on_gb200
+class TestCheckpointParameterIdentity:
+    @pytest.mark.parametrize("factory", [False, True])
+    def test_optimizer_maps_original_parameter_and_keeps_moment_dtype(self, factory):
+        param = torch.nn.Parameter(torch.ones(2, 4))
+        payload = param.detach().to(torch.bfloat16)
+        set_checkpoint_parameter_id(payload, param)
+        entry = ShardedTensor.from_rank_offsets("weight", payload)
+        if factory:
+            entry = ShardedTensorFactory(
+                "weight",
+                payload,
+                lambda key, data, replica_id, _: [
+                    ShardedTensor.from_rank_offsets(key, data, replica_id=replica_id)
+                ],
+                lambda parts: parts[0],
+            )
+        other = torch.nn.Parameter(torch.ones_like(param))
+        other_entry = ShardedTensor.from_rank_offsets("other", other)
+        mapping = get_param_id_to_sharded_param_map(
+            {"w": entry, "other": other_entry}, [other, param]
+        )
+        assert mapping == {0: other_entry, 1: entry}
+        moment = torch.full_like(param, 123, dtype=torch.float32)
+        optimizer_entry = make_sharded_optimizer_tensor(mapping[1], moment, "optimizer.exp_avg")
+        if factory:
+            optimizer_entry = optimizer_entry.build()[0]
+        assert optimizer_entry.key == "optimizer.exp_avg.weight"
+        assert optimizer_entry.data is moment
+        assert get_checkpoint_parameter_id(optimizer_entry.data) == id(moment)
+        assert optimizer_entry.dtype == torch.float32
+        assert optimizer_entry.global_shape == param.shape
+
+    @pytest.fixture
+    def native_mxfp8_entry(self):
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import MXFP8BlockScaling
+        from transformer_engine.pytorch import fp8_autocast, fp8_model_init, is_mxfp8_available
+
+        from megatron.core.fp8_utils import is_float8tensor
+        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP, attach_gtp_to_presharded_module
+        from megatron.core.utils import make_tp_sharded_tensor_for_checkpoint
+
+        available, reason = is_mxfp8_available(return_reason=True)
+        if not HAVE_GTP or not available:
+            pytest.skip(f"Native MXFP8 GTP unavailable: {reason}")
+        Utils.initialize_model_parallel()
+        try:
+            gtp_group = torch.distributed.group.WORLD
+            if gtp_group.size() < 2:
+                pytest.skip("Requires at least two GTP ranks")
+            tp_group = parallel_state.get_tensor_model_parallel_group()
+            recipe = MXFP8BlockScaling()
+            with fp8_model_init(enabled=True, recipe=recipe, preserve_high_precision_init_val=True):
+                layer = te.Linear(128, 32, bias=False, params_dtype=torch.bfloat16, device="cuda")
+            layer.gtp_remat_size = gtp_group.size()
+            attach_gtp_to_presharded_module(layer, gtp_group, 0, replica_group=tp_group)
+            with fp8_autocast(enabled=True, fp8_recipe=recipe):
+                layer(torch.randn(32, 128, dtype=torch.bfloat16, device="cuda"))
+            param = layer.weight
+            entry = make_tp_sharded_tensor_for_checkpoint(
+                param, "weight", tp_group=tp_group, dp_cp_group=tp_group
+            )
+            assert is_float8tensor(param)
+            assert entry.data is not param and not is_float8tensor(entry.data)
+            assert entry.data._gtp_dequant_src is param
+            yield param, entry, tp_group, gtp_group
+        finally:
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("layout", ["fully_reshardable", "fs_model_space"])
+    def test_native_mxfp8_distributed_optimizer_mapping(self, native_mxfp8_entry, layout):
+        param, entry, _, _ = native_mxfp8_entry
+        if layout == "fs_model_space":
+            # Flattened optimizer ranges require factory-backed model metadata.
+            entry = apply_swiglu_sharded_factory(entry, ())
+        del entry.data._gtp_dequant_src
+        master = torch.zeros(param.numel(), device=entry.data.device, dtype=torch.float32)
+        moment = torch.full_like(master, 123)
+        param_range = SimpleNamespace(start=0, end=param.numel())
+        ranges = [{torch.float32: [{"param_map": {param: {"param": param_range}}}]}]
+        buffer = SimpleNamespace(buckets=[None], param_index_map={param: (0, param.numel(), 0)})
+        optimizer = SimpleNamespace(
+            gbuf_ranges=ranges,
+            buffers=[buffer],
+            distributed_optimizer_instance_id=0,
+            get_parameter_state_dp_zero=lambda **kwargs: {0: {torch.float32: {"exp_avg": moment}}},
+            _get_main_param_and_optimizer_states=lambda _: {"param": master, "exp_avg": moment},
+        )
+        method = getattr(DistributedOptimizer, f"sharded_param_state_{layout}")
+        state = method(optimizer, {"w": entry}, metadata={})
+        saved_moment = state[0]["exp_avg"]
+        assert saved_moment.key == "optimizer.state.exp_avg.weight"
+        assert saved_moment.data.dtype == torch.float32
+        assert torch.equal(saved_moment.data.flatten(), moment)
+        assert saved_moment.replica_id == entry.replica_id
+
+    def test_native_mxfp8_checkpoint_roundtrip(self, native_mxfp8_entry, tmp_path_dist_ckpt):
+        param, entry, _, _ = native_mxfp8_entry
+        del entry.data._gtp_dequant_src
+        assert get_param_id_to_sharded_param_map({"w": entry}, [param]) == {0: entry}
+        moment = torch.full_like(entry.data, 123, dtype=torch.float32)
+        optimizer_entry = make_sharded_optimizer_tensor(entry, moment, "optimizer.exp_avg")
+        with TempNamedDir(tmp_path_dist_ckpt / "gtp_parameter_identity", sync=True) as path:
+            save({"weight": entry, "moment": optimizer_entry}, path)
+            loaded = load_plain_tensors(path)
+        start = entry.global_offset[0]
+        torch.testing.assert_close(
+            loaded["weight"][start : start + param.shape[0]].cpu(), entry.data.cpu(), rtol=0, atol=0
+        )
+        assert loaded["optimizer.exp_avg.weight"].dtype == torch.float32
+        assert torch.all(loaded["optimizer.exp_avg.weight"] == 123)
+        assert not hasattr(loaded["weight"], "_checkpoint_parameter_id")
+
+    def test_native_mxfp8_muon_checkpoint_mapping(self, native_mxfp8_entry):
+        from megatron.core.optimizer import OptimizerConfig
+        from megatron.core.optimizer.emerging_optimizers import (
+            HAVE_EMERGING_OPTIMIZERS,
+            TensorParallelMuon,
+        )
+        from megatron.core.optimizer.optimizer import Float16OptimizerWithFloat16Params
+        from megatron.core.process_groups_config import ProcessGroupCollection
+
+        if not HAVE_EMERGING_OPTIMIZERS:
+            pytest.skip("Muon requires emerging_optimizers")
+        param, entry, tp_group, gtp_group = native_mxfp8_entry
+        del entry.data._gtp_dequant_src
+        groups = ProcessGroupCollection(tp=tp_group, expt_tp=tp_group, gtp_remat=gtp_group)
+        raw_optimizer = TensorParallelMuon([param], pg_collection=groups)
+        optimizer = Float16OptimizerWithFloat16Params(
+            raw_optimizer, OptimizerConfig(bf16=True), None, None
+        )
+        master = raw_optimizer.param_groups[0]["params"][0]
+        momentum = torch.full_like(master, 123)
+        raw_optimizer.state[master]["momentum_buffer"] = momentum
+        # Generic matching must succeed before Muon's GTP-specific fallback.
+        with patch(
+            "megatron.core.tensor_parallel.gtp_api.is_gtp_param",
+            side_effect=AssertionError("Unexpected GTP backfill"),
+        ):
+            state = optimizer.sharded_state_dict({"w": entry})
+        saved_momentum = state["optimizer"]["state"][0]["momentum_buffer"]
+        assert saved_momentum.data is momentum
+        assert saved_momentum.dtype == torch.float32
+        assert saved_momentum.key == "optimizer.state.momentum_buffer.weight"
+
+    def test_checkpoint_parameter_registration_is_explicit_and_composable(self):
+        param = torch.nn.Parameter(torch.ones(2, 4))
+        payload = param.detach().to(torch.bfloat16)
+        set_checkpoint_parameter_id(payload, param)
+        converted = payload.float()
+        set_checkpoint_parameter_id(converted, payload)
+        assert get_checkpoint_parameter_id(converted) == id(param)
+        # GDP uses a fresh view to keep its semantic factory out of optimizer matching.
+        view = payload.view_as(payload)
+        assert get_checkpoint_parameter_id(view) == id(view)
+        assert get_checkpoint_parameter_id(param) == id(param)
+
+    def test_checkpoint_parameter_registration_rejects_changed_shape(self):
+        param = torch.nn.Parameter(torch.ones(2, 4))
+        with pytest.raises(ValueError, match="same shape"):
+            set_checkpoint_parameter_id(param.flatten(), param)

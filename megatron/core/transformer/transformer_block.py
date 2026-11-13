@@ -15,9 +15,10 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.ops.norm.fused_layer_norm import FusedLayerNorm
+from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -25,14 +26,10 @@ from megatron.core.recompute import checkpointed_forward
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.transformer.cuda_graphs import annotate_first_last_layer
 from megatron.core.transformer.enums import InferenceCudaGraphScope, LayerType
-from megatron.core.transformer.hyper_connection import (
-    HyperConnectionModule,
-    build_mhc_recompute_layer_plan,
-    finalize_mhc_recompute_layer,
-)
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
 from megatron.core.transformer.module import GraphableMegatronModule, MegatronModule
+from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
@@ -66,7 +63,7 @@ elif HAVE_APEX:
     LayerNormImpl = FusedLayerNorm
 
 else:
-    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+    from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 
     LayerNormImpl = WrappedTorchNorm
 
@@ -635,6 +632,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
             hidden_states = HyperConnectionModule.input_expand(
                 hidden_states, self.mhc_num_residual_streams
             )  # [s, b, C] -> [s, b, n*C]
+            # An embedding-only stage sends this tensor without executing a
+            # layer. Expansion returns a view, which pipeline output
+            # deallocation cannot release; keep the autograd path viewless.
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
 
         if self.config.sequence_parallel:
             rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
@@ -676,10 +679,12 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                 "recompute-block boundary, so gradients entering from an extracted "
                 "intermediate layer can reach discarded activations before they are restored."
             )
-        mhc_layer_managers, mhc_is_last_in_recompute_block = build_mhc_recompute_layer_plan(
-            num_layers=len(self.layers),
-            mhc_recompute_layer_num=self.config.mhc_recompute_layer_num,
-            use_mhc_recompute=use_mhc_recompute,
+        mhc_layer_contexts = (
+            build_residual_stream_recompute_plan(
+                num_layers=len(self.layers), block_size=self.config.mhc_recompute_layer_num
+            )
+            if use_mhc_recompute
+            else [None] * len(self.layers)
         )
 
         with rng_context, outer_quantization_context:
@@ -724,22 +729,17 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                     else:
                         inner_quantization_context = nullcontext()
 
-                    mhc_manager = mhc_layer_managers[l_no]
-                    if mhc_manager is not None:
-                        mhc_manager.is_last_layer_in_recompute_block = (
-                            mhc_is_last_in_recompute_block[l_no]
-                        )
-
-                    # Only thread mhc_recompute_manager when the layer is mHC and a
-                    # manager actually exists. Plain TransformerLayer (and its
-                    # MoETransformerLayer subclass) doesn't accept this kwarg, and
-                    # its CUDA-graph machinery rejects unrecognized non-tensor kwargs.
+                    mhc_context = mhc_layer_contexts[l_no]
+                    # Contexts exist only while mHC replay is active; then every layer receives
+                    # one. HyperConnectionTransformerLayer removes it before CUDA-graph dispatch.
                     extra_layer_kwargs = (
-                        {"mhc_recompute_manager": mhc_manager} if mhc_manager is not None else {}
+                        {"residual_stream_recompute_context": mhc_context}
+                        if mhc_context is not None
+                        else {}
                     )
                     with self.offload_context, inner_quantization_context:
                         hidden_states, context = layer(
-                            hidden_states=hidden_states,
+                            hidden_states,
                             attention_mask=attention_mask,
                             context=context,
                             context_mask=context_mask,
@@ -755,11 +755,8 @@ class TransformerBlock(GraphableMegatronModule, MegatronModule):
                             **extra_layer_kwargs,
                         )
                     observe_layer_residuals(layer, residual_accumulator, hidden_states)
-                    finalize_mhc_recompute_layer(
-                        mhc_manager=mhc_manager,
-                        hidden_states=hidden_states,
-                        is_last_in_recompute_block=mhc_is_last_in_recompute_block[l_no],
-                    )
+                    if mhc_context is not None:
+                        mhc_context.finalize(hidden_states)
 
                     if (
                         torch.is_grad_enabled()

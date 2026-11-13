@@ -1159,7 +1159,7 @@ def _load_tensor_path_group_fast(
 
     partial_state_dict = _multi_path_state_dict(path_leaves)
     force_all_tensors_to_non_fp8(partial_state_dict)
-    loaded = sharded_strategy.load(partial_state_dict, checkpoint_dir, async_strategy="mcore")
+    loaded = sharded_strategy.load(partial_state_dict, checkpoint_dir)
     return {path: _get_path(loaded, path) for path, _ in path_leaves}
 
 

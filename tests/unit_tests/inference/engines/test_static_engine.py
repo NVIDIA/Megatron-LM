@@ -50,6 +50,7 @@ class StaticInferenceEngineTestHarness:
         self.vocab_size = vocab_size
         self.sequence_length = 64
         transformer_config = TransformerConfig(
+            flash_attention_version=2,
             num_layers=4,
             hidden_size=self.hidden_size,
             num_attention_heads=4,
@@ -355,8 +356,7 @@ class TestStaticInferenceEngineParallel(StaticInferenceEngineTestHarness):
     def test_parallel_inference(self, tp_size, pp_size, ep_size, sequence_parallel):
         if tp_size == 1 and pp_size == 1 and ep_size == 1:
             pytest.skip(reason="Test requires tp_size > 1 or pp_size > 1 or ep_size > 1")
-        elif not torch.distributed.is_initialized():
-            pytest.skip("Distributed not initialized")
+        Utils.initialize_distributed()
         world_size = torch.distributed.get_world_size()
         min_world_size = tp_size * pp_size * ep_size
         if world_size < min_world_size:

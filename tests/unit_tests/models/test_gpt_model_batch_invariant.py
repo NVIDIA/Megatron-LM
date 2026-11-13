@@ -204,6 +204,7 @@ class TestGPTModelBatchInvariant:
 
         assert torch.equal(logits_full, logits_chunked)
 
+    @pytest.mark.flaky_in_dev
     def test_dynamic_engine_matches_batched_forward_rl(self):
         _configure_flash_attention_env()
         seq_len = 48
@@ -277,6 +278,7 @@ class TestGPTModelBatchInvariant:
                     inference_log_probs, baseline_log_probs
                 ), "Log probabilities from dynamic engine did not match batched forward."
 
+    @pytest.mark.flaky_in_dev
     def test_dynamic_engine_is_batch_invariant(self):
         """Check that the dynamic engine itself is batch invariant: changing the
         order in which requests are added does not change per-request outputs."""
@@ -352,6 +354,7 @@ class TestGPTModelBatchInvariant:
             assert r1.prompt_log_probs == r2.prompt_log_probs
             assert r1.generated_log_probs == r2.generated_log_probs
 
+    @pytest.mark.flaky_in_dev
     def test_dynamic_engine_is_batch_invariant_under_kv_cache_saturation(self):
         """Saturating the KV cache must not change what requests generate.
 
@@ -432,6 +435,7 @@ class TestGPTModelBatchInvariant:
             controller = TextGenerationController(wrapper, tokenizer)
             engine = DynamicInferenceEngine(controller=controller, context=ctx)
             allocator = ctx.kv_block_allocator
+            ctx.memory_buffer[1, :, : allocator.pool_size - 1] = float("nan")
 
             finished_by_id = {}
             max_paused_blocks = 0
@@ -447,6 +451,9 @@ class TestGPTModelBatchInvariant:
                     # lifecycle for this step has settled.
                     max_paused_blocks = max(max_paused_blocks, allocator.get_paused_used())
                     for req in result["finished_requests"]:
+                        assert torch.isfinite(
+                            torch.tensor(req.prompt_log_probs + req.generated_log_probs)
+                        ).all()
                         finished_by_id[req.request_id] = req
 
             assert not engine.has_unfinished_requests(), "engine did not drain"

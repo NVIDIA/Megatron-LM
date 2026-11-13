@@ -55,7 +55,9 @@ def _expert_parallel_kwargs(moe, world_size):
     return dict(expert_model_parallel_size=2, expert_gtp_remat_size=world_size // 2)
 
 
-def _build_mtp_gpt_model(repeated_layer=False, moe=False):
+def _build_mtp_gpt_model(
+    repeated_layer=False, moe=False, kv_channels=HIDDEN // NUM_HEADS, ffn_hidden_size=FFN_HIDDEN
+):
     """Full GPTModel (embedding + decoder + output_layer) with an MTP block attached.
 
     ``moe=True`` puts grouped experts in both the decoder and the MTP layer, which is what puts
@@ -86,8 +88,8 @@ def _build_mtp_gpt_model(repeated_layer=False, moe=False):
         num_layers=NUM_LAYERS,
         hidden_size=HIDDEN,
         num_attention_heads=NUM_HEADS,
-        kv_channels=HIDDEN // NUM_HEADS,
-        ffn_hidden_size=FFN_HIDDEN,
+        kv_channels=kv_channels,
+        ffn_hidden_size=ffn_hidden_size,
         use_cpu_initialization=False,
         params_dtype=dtype,
         bf16=True,
@@ -118,30 +120,42 @@ def _build_mtp_gpt_model(repeated_layer=False, moe=False):
     ).cuda()
 
 
-def _forward_backward(model):
-    """One fwd+bwd on a fixed batch, then drain in-flight GTP comms the way production does."""
-    from megatron.core.tensor_parallel.generalized_tensor_parallelism import wait_async_comms
+def _forward_backward(model, main_grad_dtype=torch.float32, microbatches=1):
+    """``microbatches`` fwd+bwd on fixed batches, then drain GTP comms the way production does.
+
+    ``main_grad_dtype`` picks the wgrad branch: fp32 against bf16 activations widens the GEMM
+    epilogue, bf16 makes the dtypes match and selects the zero-copy write into the reduce-scatter
+    send buffer. Production spells these --accumulate-allreduce-grads-in-fp32 and
+    --grad-reduce-in-bf16 respectively.
+
+    main_grad is zeroed ONCE and the drain runs ONCE after the loop, mirroring
+    finalize_model_grads_func being called outside the microbatch loop in
+    pipeline_parallel/schedules.py. That is what makes an accumulation window span the whole
+    iteration rather than a single microbatch.
+    """
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+        wait_for_gtp_grad_reduction_on_current_stream,
+    )
 
     for p in model.parameters():
-        p.main_grad = torch.zeros(p.shape, dtype=torch.float32, device='cuda')
+        p.main_grad = torch.zeros(p.shape, dtype=main_grad_dtype, device='cuda')
 
     gen = torch.Generator(device='cuda').manual_seed(7)
-    input_ids = torch.randint(0, VOCAB, (BATCH, SEQ), device='cuda', generator=gen)
     position_ids = torch.arange(SEQ, device='cuda').unsqueeze(0).expand(BATCH, SEQ)
-    labels = torch.randint(0, VOCAB, (BATCH, SEQ), device='cuda', generator=gen)
-
-    # TE rejects fp32 activations against bf16 params outside an autocast region.
-    with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-        loss = model(input_ids, position_ids, attention_mask=None, labels=labels).mean()
-    loss.backward()
-    # Match the eager production path: finalize_model_grads reaches
-    # wait_for_gtp_grad_reduction_on_current_stream, which calls wait_async_comms() WITHOUT
-    # finalize_after_drain. So a reduce-scatter still pending here is waited on but never
-    # accumulated, and its gradient is lost. Draining with finalize_after_drain=True would
-    # rescue exactly that case and hide it from the comparison below.
-    wait_async_comms()
+    losses = []
+    for _ in range(microbatches):
+        # Fresh data per microbatch: identical batches would hide an ordering bug.
+        input_ids = torch.randint(0, VOCAB, (BATCH, SEQ), device='cuda', generator=gen)
+        labels = torch.randint(0, VOCAB, (BATCH, SEQ), device='cuda', generator=gen)
+        # TE rejects fp32 activations against bf16 params outside an autocast region.
+        with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+            loss = model(input_ids, position_ids, attention_mask=None, labels=labels).mean()
+        loss.backward()
+        losses.append(float(loss.item()))
+    # The production fence. Without it an accumulated wgrad never flushes and main_grad stays 0.
+    wait_for_gtp_grad_reduction_on_current_stream()
     torch.cuda.synchronize()
-    return float(loss.item())
+    return sum(losses) / len(losses)
 
 
 def _gathered_main_grads(model):
@@ -190,7 +204,25 @@ def _assert_grouped_chains_used(model, moe):
         assert not grouped_mtp, f"dense variant unexpectedly used grouped chains: {grouped_mtp}"
 
 
-def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, moe=False):
+def _assert_eh_proj_shares_rs_key_with_attention_proj(model):
+    """The MTP eh_proj and attention output projection draw RS outputs from one cache key, so
+    the shapes test keeps exercising the buffer collision it guards against."""
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import get_global_GTP_cache
+
+    params = dict(model.named_parameters())
+    eh_proj = [p for n, p in params.items() if n.startswith("mtp.") and "eh_proj" in n]
+    proj = [
+        p for n, p in params.items() if n.startswith("mtp.") and "self_attention.linear_proj" in n
+    ]
+    assert len(eh_proj) == 1 and len(proj) == 1, (sorted(params), eh_proj, proj)
+    slots = get_global_GTP_cache()._slots
+    keys = [slots[p._rs_ticket].key for p in (eh_proj[0], proj[0])]
+    assert keys[0] == keys[1], f"eh_proj and linear_proj RS cache keys differ: {keys}"
+
+
+def _worker_shared_weight_grads(
+    rank, world_size, port, repeated_layer=False, moe=False, shapes=None
+):
     """Async reduce-scatter path must produce the same gradients as the sync path, with MTP.
 
     Both phases run the SAME model, sharding (gtp_remat=world), init weights and batch -- only
@@ -223,9 +255,8 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
             torch.manual_seed(42)
             GTP_CONFIG.async_reduction = use_async
 
-            model = _build_mtp_gpt_model(repeated_layer, moe)
+            model = _build_mtp_gpt_model(repeated_layer, moe, **(shapes or {}))
             classify_gtp_remat_chains([model])
-
             shared = [
                 n
                 for n, p in model.named_parameters()
@@ -240,11 +271,13 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
 
             losses[phase] = _forward_backward(model)
             grads[phase] = _gathered_main_grads(model)
+            if shapes is not None and use_async:
+                _assert_eh_proj_shares_rs_key_with_attention_proj(model)
 
             del model
             ps.destroy_model_parallel()
-            GTPShardedParam._chain_state = {}
-            GTPShardedParam._recompute_chain_state = {}
+            GTPShardedParam._chain_state.clear()
+            GTPShardedParam._recompute_chain_state.clear()
             GTPShardedParam._link_tables_flushed = False
     finally:
         GTP_CONFIG.async_reduction = saved_async
@@ -275,11 +308,181 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
             max_err, worst = rel, name
     print(f"[mtp-shared] max relative grad error async-vs-sync = {max_err:.3e} (worst: {worst})")
 
-    assert max_err < 2e-2, (
+    assert max_err < 1e-4, (
         f"MTP shared-weight gradient mismatch between the async and sync GTP reduce-scatter "
         f"paths (max rel err {max_err:.3e} on {worst}). A weight consumed more than once per "
         f"forward had one of its wgrad reduce-scatters dropped or overwritten."
     )
+
+
+def _worker_wgrad_accum_matches_per_backward_rs(
+    rank,
+    world_size,
+    port,
+    repeated_layer=False,
+    moe=False,
+    symm=False,
+    microbatches=1,
+    iterations=1,
+):
+    """Summing a weight's repeated backwards before ONE reduce-scatter must not change grads.
+
+    output_layer takes one backward per MTP depth plus one for the main head. Today each issues
+    its own reduce-scatter and adds the resulting shard into main_grad. With
+    accumulation on, the GEMM epilogue sums them in the wgrad buffer instead and a
+    single RS runs at the end-of-backward flush. Same total, different order of summation, so the
+    reduced gradients must agree -- and output_layer's RS count must actually drop, or the test
+    is passing on a feature that never ran.
+
+    ``symm=True`` covers the OTHER wgrad path. Which branch of the backward computes the wgrad is
+    chosen by dtype: fp32 main_grad against bf16 activations widens the GEMM epilogue, while a
+    main_grad matching the activation dtype writes straight into the registered reduce-scatter
+    send buffer (use_zero_copy_wgrad). Both consume the accumulate flag, and only the first is
+    reachable with this file's default fp32 main_grad -- so without this variant the zero-copy
+    path, which is what --grad-reduce-in-bf16 plus --gtp-remat-nccl-ub actually runs, would have
+    no coverage at all. The path taken is asserted below, not assumed.
+    """
+    from megatron.core import parallel_state as ps
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+        GTP_CONFIG,
+        wait_for_gtp_grad_reduction_on_current_stream,
+    )
+    from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
+    from megatron.core.tensor_parallel.gtp_symmetric_memory import (
+        deregister_and_clear_gtp_symm_pools,
+        register_gtp_symm_pool,
+    )
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+
+    saved_pad = GTP_CONFIG.pad_for_alignment
+    orig_rs = GTPShardedParam._reduce_scatter
+    grads, losses, rs_counts = {}, {}, {}
+    zero_copy_seen = {}
+    try:
+        GTP_CONFIG.pad_for_alignment = 0
+        for phase, accum in (("per_backward_rs", False), ("accumulated", True)):
+            counts = {}
+
+            def _counting_rs(self, wgrads, *a, _counts=counts, **kw):
+                _counts[self._debug_name] = _counts.get(self._debug_name, 0) + 1
+                return orig_rs(self, wgrads, *a, **kw)
+
+            GTPShardedParam._reduce_scatter = _counting_rs
+
+            ps.destroy_model_parallel()
+            ps.initialize_model_parallel(
+                tensor_model_parallel_size=1,
+                pipeline_model_parallel_size=1,
+                gtp_remat_size=world_size,
+                **_expert_parallel_kwargs(moe, world_size),
+            )
+            model_parallel_cuda_manual_seed(42)
+            torch.manual_seed(42)
+            if symm:
+                # use_zero_copy_wgrad needs the symmetric pool (--gtp-remat-nccl-ub).
+                register_gtp_symm_pool(ps.get_gtp_weight_remat_group())
+
+            model = _build_mtp_gpt_model(repeated_layer, moe)
+            classify_gtp_remat_chains([model])
+            # _wgrad_accum_enabled is the only switch; clear it for the baseline phase.
+            if not accum:
+                for p in model.parameters():
+                    if isinstance(p, GTPShardedParam):
+                        p._wgrad_accum_enabled = False
+            # The count is learned at the end of iteration 1, so the early flush is unreachable
+            # in a single-iteration test. Warm up, then measure the LAST iteration.
+            for _ in range(iterations - 1):
+                _forward_backward(
+                    model,
+                    main_grad_dtype=torch.bfloat16 if symm else torch.float32,
+                    microbatches=microbatches,
+                )
+            counts.clear()
+            losses[phase] = _forward_backward(
+                model,
+                main_grad_dtype=torch.bfloat16 if symm else torch.float32,
+                microbatches=microbatches,
+            )
+            zero_copy_seen[phase] = {
+                n: p.use_zero_copy_wgrad(torch.bfloat16)
+                for n, p in model.named_parameters()
+                if n.endswith("output_layer.weight") and hasattr(p, "use_zero_copy_wgrad")
+            }
+            wait_for_gtp_grad_reduction_on_current_stream()
+            grads[phase] = _gathered_main_grads(model)
+            rs_counts[phase] = dict(counts)
+
+            del model
+            ps.destroy_model_parallel()
+            if symm:
+                # The pool outlives the process group; the next phase reuses the name.
+                deregister_and_clear_gtp_symm_pools()
+            GTPShardedParam._chain_state = {}
+            GTPShardedParam._recompute_chain_state = {}
+            GTPShardedParam._link_tables_flushed = False
+    finally:
+        GTPShardedParam._reduce_scatter = orig_rs
+        GTP_CONFIG.pad_for_alignment = saved_pad
+        if symm:
+            deregister_and_clear_gtp_symm_pools()
+
+    if rank != 0:
+        return
+
+    ref_counts, acc_counts = rs_counts["per_backward_rs"], rs_counts["accumulated"]
+    ol = [n for n in ref_counts if n.endswith("output_layer.weight")]
+    assert len(ol) == 1, f"expected one output_layer weight, got {ol}"
+    name = ol[0]
+
+    # The wgrad path is selected by dtype + pool registration, so assert the intended branch was
+    # reached -- otherwise the variant silently re-tests the default one.
+    for phase, seen in zero_copy_seen.items():
+        assert seen, f"{phase}: no output_layer GTPShardedParam found to check the wgrad path"
+        assert all(v is symm for v in seen.values()), (
+            f"{phase}: expected use_zero_copy_wgrad=={symm} for output_layer, got {seen}. "
+            f"symm={symm} must select the {'zero-copy' if symm else 'epilogue-widening'} "
+            "wgrad branch, or this variant covers the wrong code path."
+        )
+    assert ref_counts[name] > 1, (
+        f"baseline issued only {ref_counts[name]} reduce-scatter(s) for {name}; MTP should give "
+        "it several backwards, so there is nothing to collapse and the test is vacuous"
+    )
+    # One RS for the whole iteration, across ALL microbatches.
+    assert acc_counts.get(name, 0) == 1, (
+        f"accumulated phase issued {acc_counts.get(name, 0)} reduce-scatters for {name}, "
+        f"expected exactly 1 (baseline had {ref_counts[name]})"
+    )
+    assert ref_counts[name] >= microbatches, (
+        f"baseline issued {ref_counts[name]} reduce-scatters for {name} across {microbatches} "
+        "microbatches; expected at least one per microbatch, so the loop is not running"
+    )
+
+    ref, test = grads["per_backward_rs"], grads["accumulated"]
+    assert set(ref) == set(test), "param sets differ between phases"
+    torch.testing.assert_close(
+        torch.tensor(losses["accumulated"]),
+        torch.tensor(losses["per_backward_rs"]),
+        atol=1e-2,
+        rtol=1e-2,
+    )
+    max_err, worst = 0.0, None
+    for n, g in ref.items():
+        denom = g.abs().max().item()
+        if denom < 1e-30:
+            continue
+        rel = (g - test[n]).abs().max().item() / denom
+        if rel > max_err:
+            max_err, worst = rel, n
+    print(
+        f"[wgrad-accum repeated={repeated_layer} moe={moe}] "
+        f"RS {ref_counts[name]} -> {acc_counts[name]} for output_layer; "
+        f"max rel grad diff={max_err:.3e} ({worst})",
+        flush=True,
+    )
+    # Tolerance, not equality: summation order differs. A dropped contribution lands near 1.0.
+    assert (
+        max_err < 2e-2
+    ), f"wgrad accumulation changed gradients (max rel {max_err:.3e} on {worst})"
 
 
 def _worker_runs_end_to_end(rank, world_size, port, repeated_layer=False, moe=False):
@@ -319,8 +522,8 @@ def _worker_runs_end_to_end(rank, world_size, port, repeated_layer=False, moe=Fa
 
         del model
         ps.destroy_model_parallel()
-        GTPShardedParam._chain_state = {}
-        GTPShardedParam._recompute_chain_state = {}
+        GTPShardedParam._chain_state.clear()
+        GTPShardedParam._recompute_chain_state.clear()
         GTPShardedParam._link_tables_flushed = False
     finally:
         GTP_CONFIG.pad_for_alignment = saved_pad
@@ -401,8 +604,8 @@ def _worker_repeated_consume_all_gathers(rank, world_size, port, repeated_layer=
         P._all_gather_weight_on_demand = o_ondemand
         GTP_CONFIG.pad_for_alignment = saved_pad
         ps.destroy_model_parallel()
-        GTPShardedParam._chain_state = {}
-        GTPShardedParam._recompute_chain_state = {}
+        GTPShardedParam._chain_state.clear()
+        GTPShardedParam._recompute_chain_state.clear()
         GTPShardedParam._link_tables_flushed = False
 
     # Every rank asserts: the tallies are rank-local, so rank 0 alone could miss a violation.
@@ -417,7 +620,7 @@ def _worker_repeated_consume_all_gathers(rank, world_size, port, repeated_layer=
     )
 
 
-def _worker_ddp_grad_ready_counts(rank, world_size, port, repeated_layer=False):
+def _worker_ddp_grad_ready_counts(rank, world_size, port, repeated_layer=False, accumulate=False):
     """A weight consumed N times per forward fires DDP grad-ready N times, not once.
 
     Each consume finalizes the previous reduce-scatter, and every finalize calls the param's
@@ -435,7 +638,10 @@ def _worker_ddp_grad_ready_counts(rank, world_size, port, repeated_layer=False):
     from megatron.core import parallel_state as ps
     from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
     from megatron.core.distributed import param_and_grad_buffer as pgb
-    from megatron.core.tensor_parallel.generalized_tensor_parallelism import GTP_CONFIG
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+        GTP_CONFIG,
+        wait_for_gtp_grad_reduction_on_current_stream,
+    )
     from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 
@@ -452,6 +658,10 @@ def _worker_ddp_grad_ready_counts(rank, world_size, port, repeated_layer=False):
 
         model = _build_mtp_gpt_model(repeated_layer=repeated_layer, moe=False)
         classify_gtp_remat_chains([model])
+        if not accumulate:
+            for p in model.parameters():
+                if isinstance(p, GTPShardedParam):
+                    p._wgrad_accum_enabled = False
         name_of = {p: n for n, p in model.named_parameters()}
 
         counts = collections.Counter()
@@ -465,7 +675,11 @@ def _worker_ddp_grad_ready_counts(rank, world_size, port, repeated_layer=False):
         ddp = DistributedDataParallel(
             model.config,
             DistributedDataParallelConfig(
-                use_distributed_optimizer=False, overlap_grad_reduce=True
+                use_distributed_optimizer=False,
+                overlap_grad_reduce=True,
+                # fp32 main_grad vs bf16 activations selects the widening wgrad path; the bf16
+                # default would exercise a path where accumulation never engages.
+                grad_reduce_in_fp32=accumulate,
             ),
             model,
         )
@@ -483,14 +697,16 @@ def _worker_ddp_grad_ready_counts(rank, world_size, port, repeated_layer=False):
             with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
                 loss = ddp(input_ids, position_ids, attention_mask=None, labels=labels).mean()
             loss.backward()
+            # Production order: fence, then finish_grad_sync.
+            wait_for_gtp_grad_reduction_on_current_stream()
             ddp.finish_grad_sync()  # raises if a bucket never reached its golden count
             torch.cuda.synchronize()
             per_iter.append(dict(counts))
 
         del model, ddp
         ps.destroy_model_parallel()
-        GTPShardedParam._chain_state = {}
-        GTPShardedParam._recompute_chain_state = {}
+        GTPShardedParam._chain_state.clear()
+        GTPShardedParam._recompute_chain_state.clear()
         GTPShardedParam._link_tables_flushed = False
     finally:
         pgb._ParamAndGradBucketGroup.register_grad_ready = orig_register
@@ -499,11 +715,16 @@ def _worker_ddp_grad_ready_counts(rank, world_size, port, repeated_layer=False):
     if rank != 0:
         return
 
-    expected = 1 + MTP_NUM_LAYERS  # main head + one per MTP depth
-    for name in ("embedding.word_embeddings.weight", "output_layer.weight"):
+    # DDP's golden gate needs the count IDENTICAL every iteration, not equal to 1.
+    # Scoped to output_layer, so only it collapses; the embedding keeps one fire per backward.
+    expected = {
+        "embedding.word_embeddings.weight": 1 + MTP_NUM_LAYERS,
+        "output_layer.weight": 1 if accumulate else 1 + MTP_NUM_LAYERS,
+    }
+    for name, exp in expected.items():
         got = [it.get(name, 0) for it in per_iter]
         print(f"[ddp-grad-ready] {name:38s} fires per iteration={got}", flush=True)
-        assert got[0] == expected, f"{name}: {got[0]} grad-ready fires, expected {expected}"
+        assert got[0] == exp, f"{name}: {got[0]} grad-ready fires, expected {exp}"
 
     assert per_iter[1] == per_iter[0] and per_iter[2] == per_iter[0], (
         f"grad-ready counts vary across iterations {per_iter}; DDP's golden gate would never "
@@ -606,6 +827,29 @@ def _worker_dummy_wgrad_not_leaked(rank, world_size, port, repeated_layer=False)
 
 
 class TestGTPMTP:
+    def test_wgrad_accum_steady_state(self):
+        # Iterations 2+ take the early flush; a single-iteration test never reaches it.
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        _run_distributed(_worker_wgrad_accum_matches_per_backward_rs, 4, False, False, False, 1, 3)
+
+    def test_wgrad_accum_spans_microbatches(self):
+        # finalize_model_grads runs once per ITERATION, so the accumulation window covers every
+        # microbatch, not one.
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        _run_distributed(_worker_wgrad_accum_matches_per_backward_rs, 4, False, False, False, 4)
+
+    # symm = the zero-copy branch (--grad-reduce-in-bf16 + --gtp-remat-nccl-ub); default = the
+    # epilogue-widening branch. Both must collapse the RS.
+    @pytest.mark.parametrize("symm", [False, True], ids=["widen", "zerocopy"])
+    @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
+    @pytest.mark.parametrize("repeated_layer", [False, True])
+    def test_wgrad_accum_matches_per_backward_rs(self, repeated_layer, moe, symm):
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        _run_distributed(_worker_wgrad_accum_matches_per_backward_rs, 4, repeated_layer, moe, symm)
+
     @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
     @pytest.mark.parametrize("repeated_layer", [False, True])
     def test_gtp_mtp_runs_end_to_end(self, repeated_layer, moe):
@@ -632,6 +876,19 @@ class TestGTPMTP:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_shared_weight_grads, 4, repeated_layer, moe)
 
+    def test_mtp_grads_match_sync_when_eh_proj_shares_rs_buffer(self):
+        """eh_proj and the MTP attention output projection with one shape share an RS buffer key.
+
+        That needs num_heads * kv_channels == 2 * hidden (asserted on the RS cache keys), and an FFN
+        width unlike eh_proj's so no buffer parity separates eh_proj from its chain predecessor. eh_proj's
+        depth-2 reduce-scatter stays pending across the whole depth-1 block, so the projection's
+        depth-1 reduce-scatter must not write into that pending output.
+        """
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        shapes = dict(kv_channels=2 * HIDDEN // NUM_HEADS, ffn_hidden_size=3 * HIDDEN)
+        _run_distributed(_worker_shared_weight_grads, 4, True, False, shapes)
+
     @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
     @pytest.mark.parametrize("repeated_layer", [False, True])
     def test_repeated_consume_gets_its_own_all_gather(self, repeated_layer, moe):
@@ -645,6 +902,13 @@ class TestGTPMTP:
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_repeated_consume_all_gathers, 4, repeated_layer, moe)
+
+    @pytest.mark.parametrize("repeated_layer", [False, True])
+    def test_ddp_grad_ready_counts_with_wgrad_accum(self, repeated_layer):
+        """Collapsing 3 reduce-scatters into 1 also collapses grad-ready 3 -> 1; DDP must cope."""
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        _run_distributed(_worker_ddp_grad_ready_counts, 4, repeated_layer, True)
 
     @pytest.mark.parametrize("repeated_layer", [False, True])
     def test_mtp_shared_weight_ddp_grad_ready_counts(self, repeated_layer):

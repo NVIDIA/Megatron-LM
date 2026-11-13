@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2025, Songlin Yang, Jan Kautz, Ali Hatamizadeh.
 
 # Some of this code was adopted from https://github.com/huggingface/transformers
@@ -8,26 +8,28 @@
 # pylint: disable=unused-import
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Callable, Optional, Protocol, Union
+from typing import Optional, Protocol, Union
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from megatron.core.fp8_utils import get_fp8_align_size
+from megatron.core import tensor_parallel
+from megatron.core.fp8_utils import get_fp8_align_size, get_fp8_disabled_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.jit import jit_fuser
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.kda_layer_config import KDALayerConfig
 from megatron.core.ssm.mamba_context_parallel import (
     _all_to_all_cp2hp,
     _all_to_all_hp2cp,
     _redo_attention_load_balancing,
     _undo_attention_load_balancing,
 )
-from megatron.core.ssm.utils import _split_tensor_factory
+from megatron.core.ssm.utils import _split_tensor_factory, _validate_dynamic_cp_head_geometry
 from megatron.core.tensor_parallel import get_cuda_rng_tracker
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.identity_op import IdentityOp
@@ -38,7 +40,7 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
-from megatron.core.utils import nvtx_range_pop, nvtx_range_push
+from megatron.core.utils import get_pg_size, nvtx_range_pop, nvtx_range_push
 
 try:
     from fla.modules.convolution import causal_conv1d
@@ -53,7 +55,59 @@ except ImportError:
 
     HAVE_FLA = False
 
+try:
+    from fla.ops.cp import build_cp_context
+except ImportError:
+    build_cp_context = None
+
 logger = logging.getLogger(__name__)
+
+
+class _TorchL2Norm(torch.autograd.Function):
+    """Match FLA's saved-output gradient without its timing-based autotuning."""
+
+    @staticmethod
+    def forward(ctx, x, eps):
+        """Normalize in FP32 and save the rounded output used by FLA's backward."""
+        x_float = x.float()
+        rstd = 1.0 / torch.sqrt((x_float * x_float).sum(dim=-1, keepdim=True) + eps)
+        y = (x_float * rstd).to(x.dtype)
+        ctx.save_for_backward(y, rstd)
+        return y
+
+    @staticmethod
+    def backward(ctx, dy):
+        """Apply the saved-output gradient formula in FP32."""
+        y, rstd = ctx.saved_tensors
+        y_float, dy_float = y.float(), dy.float()
+        dx = dy_float * rstd - (dy_float * y_float).sum(dim=-1, keepdim=True) * y_float * rstd
+        return dx.to(y.dtype), None
+
+
+def torch_l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """Normalize the last dimension with FLA-compatible epsilon and dtype semantics.
+
+    Both passes compute in FP32. Backward uses the normalized output rounded to
+    the input dtype, matching FLA rather than differentiating an unrounded norm.
+    This path avoids timing-selected reduction layouts in deterministic training.
+    """
+    return _TorchL2Norm.apply(x, eps)
+
+
+def _kda_fp8_disabled(config: TransformerConfig) -> bool:
+    # Copied GDN layer configs can carry KDA settings from the stack config too.
+    return isinstance(config, KDALayerConfig) and config.kda_disable_fp8
+
+
+def _build_with_kda_fp8_disabled(fp8_config, module_spec, *args, **kwargs):
+    """Build a KDA projection without quantized parameter initialization when requested."""
+    init_context = (
+        get_fp8_disabled_context(fp8_config, is_init=True)
+        if _kda_fp8_disabled(fp8_config)
+        else nullcontext()
+    )
+    with init_context:
+        return build_module(module_spec, *args, **kwargs)
 
 
 @dataclass
@@ -146,8 +200,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                 ignored; GDN implements context parallelism with its own all-to-alls rather
                 than the attention CP communication schemes.
             pp_layer_offset: Offset of this pipeline stage's first global layer.
+            is_mtp_layer (bool): Whether this module is inside an MTP prediction depth.
         """
-        del is_mtp_layer
         if not HAVE_FLA:
             raise ImportError(
                 "FLA is not installed. Please install it with "
@@ -159,6 +213,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         # Attributes from arguments
         self.layer_number = layer_number
         self.pp_layer_offset = pp_layer_offset
+        self.is_mtp_layer = is_mtp_layer
         self.bias = bias
         self.conv_bias = conv_bias
         self.conv_init = conv_init
@@ -190,29 +245,45 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         self.num_v_heads_local_tp = self.num_value_heads // self.tp_size
         self.num_k_heads_local_tp = self.num_key_heads // self.tp_size
 
+        # Chunkwise KDA partitions tokens and keeps all TP-local heads, so only
+        # headwise variants require divisibility by the selected CP group size.
+        if not (isinstance(config, KDALayerConfig) and config.linear_cp_mode == "chunkwise"):
+            _validate_dynamic_cp_head_geometry(
+                config,
+                self.pg_collection,
+                head_counts={
+                    "GDN key heads": self.num_k_heads_local_tp,
+                    "GDN value heads": self.num_v_heads_local_tp,
+                },
+            )
+            self._validate_runtime_cp_size(self.cp_size)
+
         attrs_to_check = (
             "dt_bias_dim",
             "a_log_dim",
             "in_proj_extra_dim",
             "in_proj_split_names",
             "in_proj_split_sections",
-            "feat_dim_split",
             "gated_delta_rule",
         )
         self._setup_variant_attrs()
         for attr in attrs_to_check:
             assert getattr(self, attr, None) is not None, f"Attribute {attr} for GDN is not set"
-        # QK, V, gate, shared across all variants
-        self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
+        # Two-stage gates use separate projections; in_proj emits QKV only.
+        if getattr(self, "two_stage_gates", False):
+            self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim
+        else:
+            self.in_proj_qkvg_dim = self.qk_dim * 2 + self.v_dim * 2
         self.in_proj_dim = self.in_proj_qkvg_dim + self.in_proj_extra_dim
 
-        if self.config.fp8:
+        if self.config.fp8 and not _kda_fp8_disabled(self.config):
             fp8_align_size = get_fp8_align_size(self.config.fp8_recipe)
             assert self.in_proj_dim % fp8_align_size == 0, (
                 "For FP8, the innermost dimension of the GDN layer "
                 "input projection output tensor must be a multiple of 16."
             )
-        self.in_proj = build_module(
+        self.in_proj = _build_with_kda_fp8_disabled(
+            self.config,
             submodules.in_proj,
             self.hidden_size,
             self.in_proj_dim,
@@ -249,7 +320,9 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         self.dt_bias = nn.Parameter(
             torch.empty(
-                self.dt_bias_dim, dtype=self.config.params_dtype, device=torch.cuda.current_device()
+                self.dt_bias_dim,
+                dtype=getattr(self, "gate_params_dtype", self.config.params_dtype),
+                device=torch.cuda.current_device(),
             )
         )
         setattr(self.dt_bias, "tensor_model_parallel", True)
@@ -257,7 +330,9 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         self.A_log = nn.Parameter(
             torch.empty(
-                self.a_log_dim, dtype=self.config.params_dtype, device=torch.cuda.current_device()
+                self.a_log_dim,
+                dtype=getattr(self, "gate_params_dtype", self.config.params_dtype),
+                device=torch.cuda.current_device(),
             )
         )
         setattr(self.A_log, "tensor_model_parallel", True)
@@ -270,12 +345,21 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             hidden_size=self.value_head_dim,
             eps=self.config.layernorm_epsilon,
         )
+
+        # out_norm's parameters are shared by all heads, but TP splits the heads, so each
+        # rank's gradient is a partial sum. Tag them so finalize_model_grads sums them.
+        for param in self.out_norm.parameters():
+            setattr(param, "sum_gradients_across_tp_domain", True)
+
         self.recompute_norm_out = False
         self.norm_out_checkpoint = None
-        if self.config.recompute_granularity == "selective":
+        self.recompute_gdn = False
+        if self.config.recompute_granularity == "selective" and self.config.recompute_modules:
             self.recompute_norm_out = "gdn_norm_out" in self.config.recompute_modules
+            self.recompute_gdn = "gdn" in self.config.recompute_modules
 
-        self.out_proj = build_module(
+        self.out_proj = _build_with_kda_fp8_disabled(
+            self.config,
             submodules.out_proj,
             self.v_dim,
             self.hidden_size,
@@ -289,11 +373,15 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             tp_group=self.pg_collection.tp,
             name=(name + ".out_proj") if name is not None else None,
         )
+        # TODO: Packed sequence cu_seqlens can vary per batch; cache only static SBHD
+        # cp_context entries here and revisit routing metadata lifetime in the CP layout refactor.
+        self._chunkwise_cp_context_cache: dict[tuple[int, int], tuple[torch.Tensor, object]] = {}
+
         self.reset_parameters()
 
     def supports_two_stage_attention(self) -> bool:
-        """Output-norm recomputation requires the original atomic forward path."""
-        return not self.recompute_norm_out
+        """Recomputation requires the original atomic forward path."""
+        return not (self.recompute_norm_out or self.recompute_gdn)
 
     def forward_post_core_attn(
         self, norm_out: torch.Tensor
@@ -307,6 +395,18 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             self.norm_out_checkpoint.discard_output_and_register_recompute(out)
 
         return out, out_bias
+
+    def _validate_runtime_cp_size(self, cp_size: int) -> None:
+        """Require a nonempty integer key/value head shard for the runtime topology."""
+        for name, count in (
+            ("key", self.num_k_heads_local_tp),
+            ("value", self.num_v_heads_local_tp),
+        ):
+            if count < 1 or count % cp_size:
+                raise ValueError(
+                    f"GDN TP-local {name} head count {count} must be positive and "
+                    f"divisible by runtime CP size {cp_size}"
+                )
 
     def _setup_variant_attrs(self):
         """Set variant specifics on the module. Called once from ``__init__``.
@@ -362,6 +462,34 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Run a GDN variant's recurrence followed by its output projection."""
+        if self.recompute_gdn and self.training:
+
+            def _checkpointed_forward(hidden_states):
+                norm_out = self.forward_pre_attn_and_core_attn(
+                    hidden_states,
+                    attention_mask,
+                    inference_context=inference_context,
+                    packed_seq_params=packed_seq_params,
+                    sequence_len_offset=sequence_len_offset,
+                    inference_params=inference_params,
+                    **kwargs,
+                )
+                return self.forward_post_core_attn(norm_out)
+
+            if self.config.fp8 or self.config.fp4:
+                from megatron.core.extensions.transformer_engine import te_checkpoint
+
+                return te_checkpoint(
+                    _checkpointed_forward,
+                    self.config.distribute_saved_activations,
+                    get_cuda_rng_tracker,
+                    self.pg_collection.tp,
+                    hidden_states,
+                )
+            return tensor_parallel.checkpoint(
+                _checkpointed_forward, self.config.distribute_saved_activations, hidden_states
+            )
+
         norm_out = self.forward_pre_attn_and_core_attn(
             hidden_states,
             attention_mask,
@@ -380,6 +508,8 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         thd_cp_a2a_inv: torch.Tensor | None,
         batch: int,
         seq_len: int,
+        cp_size: int,
+        cp_group: Optional[torch.distributed.ProcessGroup],
         packed_seq_params: PackedSeqParams | None = None,
     ) -> torch.Tensor:
         # RMSNorm
@@ -392,9 +522,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         norm_out_hp = norm_out_hp.reshape(batch, seq_len, -1)
         norm_out_hp = norm_out_hp.transpose(0, 1).contiguous()
 
-        return a2a_hp_to_cp(
-            norm_out_hp, self.cp_size, self.pg_collection.cp, packed_seq_params, thd_cp_a2a_inv
-        )
+        return a2a_hp_to_cp(norm_out_hp, cp_size, cp_group, packed_seq_params, thd_cp_a2a_inv)
 
     @jit_fuser
     def _apply_gated_norm(self, x, gate):
@@ -418,6 +546,7 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
         batch: int,
         seq_len: int,
         *gate_feats: tuple[torch.Tensor],
+        cp_size_headwise: int | None = None,
     ) -> dict[str, torch.Tensor]:
         """
         Prepare all gated delta rule kernel inputs.
@@ -431,11 +560,10 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
             ``k``, ``v``, ``g``, plus the variant-specific gates), and the output
             gate (z) tensor under the ``gate`` key, which is not a kernel input.
         """
+        cp_size = self.cp_size if cp_size_headwise is None else cp_size_headwise
         # Split qkv into query_key and value
         query_key, value = torch.split(
-            qkv,
-            [2 * self.qk_dim_local_tp // self.cp_size, self.v_dim_local_tp // self.cp_size],
-            dim=-1,
+            qkv, [2 * self.qk_dim_local_tp // cp_size, self.v_dim_local_tp // cp_size], dim=-1
         )
 
         # Reshape query_key and value
@@ -444,10 +572,11 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
         # Apply L2 norm to query and key
         if self.use_qk_l2norm:
-            query_key = l2norm(query_key.contiguous())
+            normalize = torch_l2norm if self.config.deterministic_mode else l2norm
+            query_key = normalize(query_key.contiguous())
 
         # Split query and key
-        split_size = self.qk_dim_local_tp // self.key_head_dim // self.cp_size
+        split_size = self.qk_dim_local_tp // self.key_head_dim // cp_size
         query, key = torch.split(query_key, [split_size, split_size], dim=2)
 
         # Expand query and key if needed (grouped query attention)
@@ -557,6 +686,12 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
                     tp_group=tp_group,
                     dp_cp_group=metadata['dp_cp_group'],
                 )
+            elif name == "core_attention":
+                # The TE backend adds a parameter-free TEGatedDeltaNetAttention wrapper around
+                # GatedDeltaNetAttention solely as a kernel adapter. Its TE runtime/extra state is
+                # not part of the learned GDN state and has no FLA counterpart, so omit it to
+                # keep checkpoints portable between the TransformerEngine and FLA backends.
+                continue
             else:
                 module_sharded_sd = sharded_state_dict_default(
                     module, f"{prefix}{name}.", sharded_offsets, metadata, tp_group=tp_group
@@ -676,7 +811,7 @@ def _build_head_perm_for_split_sections(
 def get_parameter_local_cp(
     param: torch.Tensor,
     dim: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: torch.distributed.ProcessGroup | None,
     split_sections: Optional[list[int]] = None,
 ) -> torch.Tensor:
     """Get the local parameter for the current context parallel rank.
@@ -694,12 +829,14 @@ def get_parameter_local_cp(
         torch.Tensor: The local parameter for the current context parallel rank.
     """
 
-    cp_size = cp_group.size()
-    cp_rank = cp_group.rank()
+    cp_size = cp_group.size() if cp_group is not None else 1
 
     # No need to split if CP size is 1.
     if cp_size == 1:
         return param
+
+    assert cp_group is not None
+    cp_rank = cp_group.rank()
 
     # Split first if needed.
     if split_sections is not None:
@@ -722,7 +859,7 @@ def tensor_a2a_cp2hp(
     tensor: torch.Tensor,
     seq_dim: int,
     head_dim: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: torch.distributed.ProcessGroup | None,
     split_sections: Optional[list[int]] = None,
     undo_attention_load_balancing: bool = True,
 ):
@@ -743,11 +880,13 @@ def tensor_a2a_cp2hp(
         torch.Tensor: The all-to-all tensor.
     """
 
-    cp_size = cp_group.size()
+    cp_size = cp_group.size() if cp_group is not None else 1
 
     # No need to all-to-all if CP size is 1.
     if cp_size == 1:
         return tensor
+
+    assert cp_group is not None
 
     # Limitations of mamba_context_parallel._all_to_all_cp2hp.
     assert seq_dim == 0, f"tensor_a2a_cp2hp only supports seq_dim == 0 for now, but got {seq_dim=}"
@@ -785,7 +924,7 @@ def tensor_a2a_hp2cp(
     tensor: torch.Tensor,
     seq_dim: int,
     head_dim: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: torch.distributed.ProcessGroup | None,
     split_sections: Optional[list[int]] = None,
     redo_attention_load_balancing: bool = True,
 ):
@@ -806,11 +945,13 @@ def tensor_a2a_hp2cp(
         torch.Tensor: The all-to-all tensor.
     """
 
-    cp_size = cp_group.size()
+    cp_size = cp_group.size() if cp_group is not None else 1
 
     # No need to all-to-all if CP size is 1.
     if cp_size == 1:
         return tensor
+
+    assert cp_group is not None
 
     # Limitations of mamba_context_parallel._all_to_all_hp2cp.
     assert seq_dim == 0, f"tensor_a2a_hp2cp only supports seq_dim == 0 for now, but got {seq_dim=}"
@@ -849,7 +990,7 @@ def a2a_cp_to_hp(
     qkvzba: torch.Tensor,
     in_proj_split_sections: tuple[int, ...],
     cp_size: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: Optional[torch.distributed.ProcessGroup],
     cu_seqlens_q: torch.Tensor | None,
     seq_len: int,
     packed_seq_params: PackedSeqParams | None,
@@ -898,7 +1039,7 @@ def a2a_cp_to_hp(
 def a2a_hp_to_cp(
     norm_out: torch.Tensor,
     cp_size: int,
-    cp_group: torch.distributed.ProcessGroup,
+    cp_group: Optional[torch.distributed.ProcessGroup],
     packed_seq_params: PackedSeqParams | None,
     thd_cp_a2a_inv: torch.Tensor | None,
 ) -> torch.Tensor:

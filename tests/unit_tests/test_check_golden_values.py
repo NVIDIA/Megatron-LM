@@ -24,6 +24,12 @@ MODEL_ARGS:
 TEST_TYPE: regular
 """
 
+RL_CONFIG = """ENV_VARS:
+  NVTE_ALLOW_NONDETERMINISTIC_ALGO: 0
+TEST_TYPE: frozen-start
+MODE: rl
+"""
+
 FULL = check_golden_values.FULL_PRECISION
 LEGACY = check_golden_values.LEGACY_PRECISION
 
@@ -77,6 +83,21 @@ class TestComparesDeterministically:
             "ENV_VARS:\n  NON_DETERMINSTIC_RESULTS: 0\n"
         )
 
+    @pytest.mark.parametrize(
+        "line", ["MODE: rl", "MODE: 'rl'", '"MODE": "rl"', "MODE: rl # GRPO validator"]
+    )
+    def test_rl_mode_uses_separate_validator(self, line):
+        assert not check_golden_values.compares_deterministically(
+            DETERMINISTIC_CONFIG + line + "\n"
+        )
+
+    @pytest.mark.parametrize("line", ["MODE: pretraining", "MODE: rl-other", "# MODE: rl"])
+    def test_only_explicit_rl_mode_opts_out(self, line):
+        assert check_golden_values.compares_deterministically(DETERMINISTIC_CONFIG + line + "\n")
+
+    def test_nested_mode_does_not_change_validator(self):
+        assert check_golden_values.compares_deterministically("ENV_VARS:\n  MODE: rl\n")
+
 
 class TestFindLegacyPrecisionMetrics:
     def test_unmarked_metric_is_legacy(self):
@@ -123,6 +144,18 @@ class TestMain:
             tmp_path, APPROXIMATE_CONFIG, {"lm loss": _metric({1: 10.96462, 2: 10.95232})}
         )
         assert check_golden_values.main([str(golden_file)]) == 0
+
+    @pytest.mark.parametrize("precision", [None, LEGACY])
+    def test_legacy_rl_case_passes(self, tmp_path, precision):
+        golden_file = _write_case(
+            tmp_path, RL_CONFIG, {"mem-allocated-bytes": _metric({1: 10.96462}, precision)}
+        )
+        assert check_golden_values.main([str(golden_file)]) == 0
+
+    @pytest.mark.parametrize("value", ["nan", "+Infinity", float("nan"), float("inf")])
+    def test_rl_non_finite_values_still_fail(self, tmp_path, value):
+        golden_file = _write_case(tmp_path, RL_CONFIG, {"iteration-time": _metric({1: value})})
+        assert check_golden_values.main([str(golden_file)]) == 1
 
     def test_full_precision_deterministic_case_passes(self, tmp_path):
         golden_file = _write_case(

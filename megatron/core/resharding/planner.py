@@ -10,6 +10,8 @@ from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 
+from megatron.core.utils import unwrap_model
+
 from .shard_planner import plan_sharded_transfer
 from .utils import (
     ParameterMetadata,
@@ -50,7 +52,9 @@ def _find_source_metadata(
     """Find source metadata, including the tied-output embedding alias."""
     src_meta_list = src_param_metadata.get(resolved_name)
     if not src_meta_list and resolved_name.endswith("output_layer.weight"):
-        for embedding_name in ("embedding.word_embeddings.weight", "word_embeddings.weight"):
+        prefix = resolved_name.removesuffix("output_layer.weight")
+        for suffix in ("embedding.word_embeddings.weight", "word_embeddings.weight"):
+            embedding_name = prefix + suffix
             src_meta_list = src_param_metadata.get(embedding_name)
             if src_meta_list:
                 break
@@ -731,30 +735,51 @@ def _build_tensor_reshard_specs(
 def _extract_module_metadata(
     module, owner_rank, num_experts, rank_offset, rank_list_cache
 ) -> list[ParameterMetadata]:
-    """Metadata for a module's params and persistent buffers, or [] if None.
-
-    Persistent buffers travel too so training state (e.g. MoE router expert_bias)
-    refits with the weights.
-    """
+    """Extract metadata with native or model-declared names and ownership."""
     if module is None:
         return []
-    pg = getattr(module, "pg_collection", None)
-    if pg is None:
-        raise ValueError("Module must have pg_collection")
-    layer_prefix_map = _build_layer_module_prefix_map(module)
-    return [
-        extract_param_metadata(
-            p,
-            name,
-            owner_rank,
-            pg,
-            num_experts=num_experts,
-            layer_module_prefix_map=layer_prefix_map,
-            rank_offset=rank_offset,
-            _rank_list_cache=rank_list_cache,
-        )
-        for name, p in named_refit_tensors(module)
-    ]
+    provider = getattr(module, "refit_modules", None)
+    components = provider() if provider else [("", module, getattr(module, "pg_collection", None))]
+    paths = {id(child): name for name, child in module.named_modules()} if provider else {}
+    metadata = []
+    for label, child, pg in components:
+        storage_prefix = ""
+        if provider:
+            child = unwrap_model(child)
+            path = paths.get(id(child))
+            if path is None:
+                raise ValueError("Refit modules must belong to the original model")
+            storage_prefix = path + "." if path else ""
+            experts = getattr(getattr(child, "config", None), "num_moe_experts", None)
+        else:
+            experts = num_experts
+        if pg is None:
+            raise ValueError("Module must have pg_collection")
+        layer_prefix_map = _build_layer_module_prefix_map(child)
+        for name, tensor in named_refit_tensors(child):
+            entry = extract_param_metadata(
+                tensor,
+                name,
+                owner_rank,
+                pg,
+                num_experts=experts,
+                layer_module_prefix_map=layer_prefix_map,
+                rank_offset=rank_offset,
+                _rank_list_cache=rank_list_cache,
+            )
+            if label:
+                entry.resolved_name = label + "." + (entry.resolved_name or entry.name)
+            entry.name = storage_prefix + entry.name
+            metadata.append(entry)
+    if provider:
+        names = {entry.name for entry in metadata}
+        if len(names) != len(metadata) or names != {
+            name for name, _ in named_refit_tensors(module)
+        }:
+            raise ValueError("Refit metadata must cover every parameter and persistent buffer once")
+        if len({entry.resolved_name for entry in metadata}) != len(metadata):
+            raise ValueError("Refit metadata contains duplicate matching tensor names")
+    return metadata
 
 
 def index_metadata_rosters(gathered_pairs: list):

@@ -16,17 +16,14 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelGroupedLinear,
     TERowParallelLinear,
 )
-from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-from megatron.core.models.backends import (
-    BackendSpecProvider,
-    CrossEntropyTarget,
-    select_cross_entropy,
-)
+from megatron.core.models.backends import BackendSpecProvider
+from megatron.core.ops.loss.backends import CrossEntropyTarget, select_cross_entropy
+from megatron.core.ops.norm.fused_layer_norm import FusedLayerNorm
+from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
 from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, SequentialMLP, TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
-from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.utils import get_te_version, is_te_min_version
 
 
@@ -160,8 +157,6 @@ class TESpecProvider(BackendSpecProvider):
 
         Which one depends on the config rather than on this being the TE provider, so the
         same settings give the same kernel whichever backend supplies the rest of the model.
-        ``megatron/training/arguments.py`` rejects ``cross_entropy_fusion_impl='te'``, but a
-        config built directly can still ask for it.
         """
         return select_cross_entropy(
             self._cross_entropy_loss_fusion, self._cross_entropy_fusion_impl, self._cuda_graph_impl

@@ -226,6 +226,8 @@ def count_zeros_fp32(
     use_decoupled_grad: bool = False,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     expert_tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    gtp_group: Optional[torch.distributed.ProcessGroup] = None,
+    expert_gtp_group: Optional[torch.distributed.ProcessGroup] = None,
 ) -> float:
     """Counts the number of zero values in the gradients of the given parameters.
 
@@ -274,7 +276,9 @@ def count_zeros_fp32(
         is_not_tp_duplicate = param_is_not_tensor_parallel_duplicate(
             param, tp_group=tp_group, expert_tp_group=expert_tp_group
         )
-        is_not_gtp_duplicate = param_is_not_gtp_duplicate(param)
+        is_not_gtp_duplicate = param_is_not_gtp_duplicate(
+            param, gtp_group=gtp_group, expert_gtp_group=expert_gtp_group
+        )
         if grad_not_none and is_not_shared and is_not_tp_duplicate and is_not_gtp_duplicate:
             grad_obj = getattr(param, grad_attr)
             data_parallel_group = get_data_parallel_group_if_dtensor(grad_obj, data_parallel_group)

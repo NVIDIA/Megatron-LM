@@ -44,6 +44,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import (
     WrappedTensor,
     deprecate_inference_params,
+    get_pg_rank,
     is_using_quantization_scales,
     log_single_rank,
 )
@@ -129,6 +130,11 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             "features. Please reference the migration guide "
             "`docs/user-guide/hybrid-model-migration.md` for details on how to use `HybridModel`",
         )
+        if config.moe_num_hash_layers > 0:
+            raise ValueError(
+                "Hash-routed MoE is supported only by HybridModel because GPTModel does not "
+                "forward token IDs to transformer layers."
+            )
         super().__init__(config=config, pg_collection=pg_collection)
         # MTP depth is model-wide; non-MTP pipeline stages still freeze their backbone.
         if self.config.freeze_base_model_for_mtp and (
@@ -143,6 +149,15 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             raise ValueError(
                 "mtp_hybrid_override_pattern is not supported by GPTModel. "
                 "For GPT models, define MTP layers through mtp_block_spec."
+            )
+        if (
+            self.config.enable_mhc_connections
+            and self.config.pipeline_model_parallel_size > 1
+            and self.config.mtp_num_layers
+        ):
+            raise NotImplementedError(
+                "GPTModel does not support mHC with pipeline parallelism and MTP. "
+                "The decoder contracts the residual before the multi-stream MTP block."
             )
 
         if has_config_logger_enabled(config):
@@ -418,15 +433,19 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 # Flash decoding uses precomputed cos and sin for RoPE
                 if self.config.flash_decode:
                     rotary_pos_cos, rotary_pos_sin = self.rotary_pos_emb_cache.setdefault(
-                        inference_context.max_sequence_length,
-                        self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
+                        inference_context.max_sequence_length_for_model,
+                        self.rotary_pos_emb.get_cos_sin(
+                            inference_context.max_sequence_length_for_model
+                        ),
                     )
                 elif use_flash_infer_fused_rope:
                     assert not self.mtp_process, "MTP not tested with flashinfer_fused_rope"
                     rotary_pos_cos_sin = self.rotary_pos_emb_cache.setdefault(
-                        inference_context.max_sequence_length,
+                        inference_context.max_sequence_length_for_model,
                         torch.cat(
-                            self.rotary_pos_emb.get_cos_sin(inference_context.max_sequence_length),
+                            self.rotary_pos_emb.get_cos_sin(
+                                inference_context.max_sequence_length_for_model
+                            ),
                             -1,
                         ),
                     )
@@ -461,6 +480,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 rotary_pos_emb = self.rotary_pos_emb(
                     position_ids,
                     self.mrope_section,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
             else:
@@ -487,13 +508,20 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
 
         if in_inference_mode:
             # Clear the outputs for padding tokens when using dynamic batching with
-            # quantization scales to avoid corrupting amax calculations
+            # quantization scales to avoid corrupting amax calculations. Under sequence
+            # parallelism, decoder_input holds this rank's shard of the tokens.
             if (
-                inference_context is not None
+                decoder_input is not None
+                and inference_context is not None
                 and inference_context.is_dynamic_batching()
                 and is_using_quantization_scales(self.config)
             ):
-                decoder_input[inference_context.padding_slice] = 0.0
+                inference_context.zero_padding_tokens(
+                    decoder_input,
+                    sequence_parallel_rank=(
+                        get_pg_rank(self.pg_collection.tp) if self.config.sequence_parallel else 0
+                    ),
+                )
 
             # Wrap decoder_input to allow the decoder (TransformerBlock) to delete the
             # reference held by this caller function, enabling early garbage collection for
@@ -529,6 +557,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             delta_offload_bytes_across_pp_ranks=self.config.delta_offload_bytes_across_pp_ranks,
             activation_offload_fraction=self.config.activation_offload_fraction,
             max_inflight_offloads=self.config.fine_grained_offloading_max_inflight_offloads,
+            buffer_size_gib=self.config.fine_grained_offloading_buffer_size_gib,
         )
         if self.disable_param_offloading:
             for param in self.decoder.parameters():
@@ -781,7 +810,6 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     loss_mask=loss_mask,
                     output_layer=self.output_layer,
                     output_weight=output_weight,
-                    runtime_gather_output=runtime_gather_output,
                     is_training=self.training,
                     compute_language_model_loss=self.compute_language_model_loss,
                     config=self.config,
@@ -841,12 +869,26 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
+        # Inference consumes logits in fp32: emit them so when the head can, upcast otherwise.
+        emit_fp32 = in_inference_mode and self.lm_head_can_emit_fp32
         logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            hidden_states,
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+            output_dtype=torch.float32 if emit_fp32 else None,
         )
 
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
+        if in_inference_mode:
+            logits = logits.float()
+        # Dynamic inference under CUDA graphs: write the logits into the controller's
+        # persistent buffer and return a view of it, so no graph pins its own copy.
+        logits_buffer = getattr(inference_context, "logits_output_buffer", None)
+        if logits_buffer is not None:
+            buffer_rows = logits_buffer[0, : logits.shape[0]]
+            buffer_rows.copy_(logits.squeeze(1))
+            logits = buffer_rows.unsqueeze(1)
         gather_output = (
             self.output_layer.gather_output
             if runtime_gather_output is None
@@ -991,8 +1033,9 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         # Old GPT checkpoints only stored the output layer weight key. So we remove the
         # _extra_state key but check that it doesn't contain any data anyway
         output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
-        assert not (
-            output_extra_state and output_extra_state.data
+        data = output_extra_state.data if output_extra_state is not None else None
+        assert data is None or (
+            data.numel() == 0 if isinstance(data, torch.Tensor) else not data
         ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
 
         return sharded_state_dict

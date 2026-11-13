@@ -1,6 +1,7 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 import inspect
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import (
     _allreduce_non_tensor_model_parallel_grads,
     _allreduce_word_embedding_grads,
+    _update_router_expert_bias,
     _update_router_qb_beta,
     finalize_model_grads,
     reset_model_temporary_tensors,
@@ -42,6 +44,30 @@ class _RouterExpertBiasModel(torch.nn.Module):
     def finish_grad_sync(self, force_all_reduce=False):
         del force_all_reduce
         self.finish_grad_sync_calls += 1
+
+
+class _HashRouterWithoutExpertBias(torch.nn.Module):
+    """Match hash-router layers, which intentionally do not own expert-bias state."""
+
+    def __init__(self):
+        super().__init__()
+        self.expert_bias = None
+        self.local_tokens_per_expert = None
+
+
+def test_hash_router_without_expert_bias_is_ignored():
+    router = _HashRouterWithoutExpertBias()
+    config = SimpleNamespace(
+        moe_router_enable_expert_bias=True,
+        moe_router_load_balancing_type="none",
+        moe_router_bias_update_rate=0.25,
+    )
+
+    reset_model_temporary_tensors(config, [router])
+    _update_router_expert_bias([router], config)
+
+    assert router.expert_bias is None
+    assert router.local_tokens_per_expert is None
 
 
 def _router_expert_bias_config():
@@ -295,3 +321,59 @@ class TestAllReduceLNGrads:
         embd_group = parallel_state.get_embedding_group()
 
         _allreduce_word_embedding_grads([self.model], self.transformer_config, embd_group, pp_group)
+
+
+class _TPGradSumModel(torch.nn.Module):
+    """One parameter tagged for a TP gradient sum, plus an untagged control."""
+
+    def __init__(self, mark_sequence_parallel: bool):
+        super().__init__()
+        device = torch.cuda.current_device()
+        self.summed = torch.nn.Parameter(torch.zeros(4, device=device))
+        self.untouched = torch.nn.Parameter(torch.zeros(4, device=device))
+        setattr(self.summed, "sum_gradients_across_tp_domain", True)
+        if mark_sequence_parallel:
+            # TENorm tags its parameters like this when SP is on. A parameter carrying
+            # both tags must still be summed exactly once.
+            setattr(self.summed, "sequence_parallel", True)
+
+
+class TestSumGradientsAcrossTPDomain:
+
+    def setup_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("sequence_parallel", [False, True])
+    def test_tagged_grads_are_summed_exactly_once(self, sequence_parallel):
+        tp_size = 2
+        Utils.initialize_model_parallel(tensor_model_parallel_size=tp_size)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=8,
+            num_attention_heads=2,
+            tensor_model_parallel_size=tp_size,
+            sequence_parallel=sequence_parallel,
+        )
+        model = _TPGradSumModel(mark_sequence_parallel=sequence_parallel)
+        model.ddp_config = DistributedDataParallelConfig()
+
+        # Rank-dependent gradients, so every wrong behavior gives a different value:
+        # left alone -> 1 or 2, averaged -> 1.5, summed once -> 3, summed twice -> 6.
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        local_value = float(tp_rank + 1)
+        model.summed.grad = torch.full_like(model.summed, local_value)
+        model.untouched.grad = torch.full_like(model.untouched, local_value)
+
+        _allreduce_non_tensor_model_parallel_grads(
+            [model], config, parallel_state.get_tensor_model_parallel_group()
+        )
+
+        expected_sum = float(sum(range(1, tp_size + 1)))
+        torch.testing.assert_close(model.summed.grad, torch.full_like(model.summed, expected_sum))
+        # Untagged parameters must keep their local gradient.
+        torch.testing.assert_close(
+            model.untouched.grad, torch.full_like(model.untouched, local_value)
+        )

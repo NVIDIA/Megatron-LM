@@ -1,4 +1,4 @@
-# Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # Copyright (c) 2024, Tri Dao, Albert Gu.
 
 # Some of this code was adopted from https://github.com/state-spaces/mamba/
@@ -32,10 +32,11 @@ from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
 )
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
+from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.tensor_observation import observe_layer_residuals
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer import TransformerConfig
@@ -44,8 +45,13 @@ from megatron.core.transformer.hyper_connection import (
     HyperConnectionModule,
     learned_output_contract,
 )
-from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.residual_recompute import (
+    build_recompute_block_end_plan,
+    build_recompute_layer_managers,
+    build_residual_stream_recompute_plan,
+    finalize_recompute_block,
+)
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import (
@@ -53,6 +59,12 @@ from megatron.core.transformer.utils import (
     make_sharded_tensors_for_checkpoint,
     sharded_state_dict_default,
 )
+from megatron.core.transformer.wide_residual import (
+    build_wide_residual_readout,
+    expand_wide_residual_stream,
+    wide_residual_recompute_enabled,
+)
+from megatron.core.typed_torch import apply_module
 from megatron.core.utils import WrappedTensor, deprecate_inference_params, make_viewless_tensor
 
 
@@ -62,18 +74,20 @@ class HybridStackSubmodules:
     A class for the module specs for the HybridStack.
     """
 
-    mamba_layer: Union[ModuleSpec, type] = IdentityOp
-    gdn_layer: Union[ModuleSpec, type] = IdentityOp
+    mamba_layer: ModuleSpec | type | None = None
+    gdn_layer: ModuleSpec | type | None = None
     gdn2_layer: ModuleSpec | None = None
-    attention_layer: Union[ModuleSpec, type] = IdentityOp
-    dsa_layer: Union[ModuleSpec, type] = IdentityOp
+    kda_layer: ModuleSpec | type | None = None
+    attention_layer: ModuleSpec | type | None = None
+    dsa_layer: ModuleSpec | type | None = None
     csa_layer: ModuleSpec | type | None = None
     csa_qk_layernorm_layer: ModuleSpec | type | None = None
-    mla_layer: Union[ModuleSpec, type] = IdentityOp
+    mla_layer: ModuleSpec | type | None = None
     mla_fused_down_proj_layer: ModuleSpec | None = None
-    mlp_layer: Union[ModuleSpec, type] = IdentityOp
-    moe_layer: Union[ModuleSpec, type] = IdentityOp
-    mtp_block_spec: Optional[ModuleSpec] = None
+    mlp_layer: ModuleSpec | type | None = None
+    moe_layer: ModuleSpec | type | None = None
+    mtp_block_spec: ModuleSpec | None = None
+    mtp_stack_submodules: "HybridStackSubmodules | None" = None
 
 
 class HybridStack(MegatronModule):
@@ -104,6 +118,9 @@ class HybridStack(MegatronModule):
             process groups to use.
         is_mtp_layer (bool, optional): whether this is an MTP layer. Defaults to False.
         boundary_layout (CPLayout, optional): CP layout at the stack boundary.
+        mtp_layer_number (int, optional): enclosing MTP depth for nested MoE metrics.
+        hash_moe_layer_threshold (int, optional): global Hybrid layer-number threshold used
+            to select hash-routed MoE layers.
     """
 
     def __init__(
@@ -119,6 +136,8 @@ class HybridStack(MegatronModule):
         dtype=None,
         pg_collection: ProcessGroupCollection = None,
         is_mtp_layer: bool = False,
+        mtp_layer_number: Optional[int] = None,
+        hash_moe_layer_threshold: Optional[int] = None,
         name: str | None = None,
         layer_config_list: Sequence[TransformerConfig] | None = None,
         boundary_layout: CPLayout | None = None,
@@ -144,20 +163,27 @@ class HybridStack(MegatronModule):
             layer_config_list = validate_segment_layers(segment, config)
 
         for layer_config in layer_config_list:
-            layer_utils.validate_tp_comm_overlap(
-                layer_config,
-                layer_utils.get_layer_symbol_from_config(layer_config),
-                has_mtp=is_mtp_layer,
-            )
+            if layer_utils.get_custom_layer_type(layer_config) is None:
+                segment = layer_utils.get_layer_symbol_from_config(layer_config)
+            else:
+                # Custom layers have no built-in symbol. An empty segment skips symbol-specific
+                # checks while preserving MTP validation.
+                segment = ""
+            layer_utils.validate_tp_comm_overlap(layer_config, segment, has_mtp=is_mtp_layer)
 
         super().__init__(config=config)
         self.pre_process = pre_process
         self.post_layer_norm = post_layer_norm
         self.post_process = post_process
         self.is_mtp_layer = is_mtp_layer
+        # MTP consumes the decoder readout and shifted-token embedding at hidden_size.
+        # Its auxiliary stack therefore remains ordinary width when the decoder is wide.
+        self.uses_wide_residual_stream = self.config.wide_residual is not None and not is_mtp_layer
         boundary_layout = (
             self.config.linear_cp_layout if boundary_layout is None else boundary_layout
         )
+        self.mtp_layer_number = mtp_layer_number
+        self.boundary_layout = boundary_layout
 
         assert pg_collection is not None, "pg_collection must be provided for HybridStack"
 
@@ -170,27 +196,31 @@ class HybridStack(MegatronModule):
         self.input_tensor = None
         self.pg_collection = pg_collection
 
-        self._mhc_block_end_plan: Optional[List[bool]] = None
+        self._mhc_block_end_plan: Optional[Tuple[bool, ...]] = None
 
         self.layer_config_list = layer_config_list
-        self._has_linear_layer_with_chunkwise_cp = self.cp_group.size() > 1 and any(
+        self._has_custom_layers = any(
+            layer_utils.get_custom_layer_type(layer_config) is not None
+            for layer_config in self.layer_config_list
+        )
+        self._has_linear_layer_with_chunkwise_cp = any(
             type(layer_config) is layer_utils.MambaLayerConfig
             and layer_config.linear_cp_mode == "chunkwise"
             for layer_config in self.layer_config_list
         )
+        self.layer_cp_layouts = tuple(
+            (
+                layer_config.attention_cp_layout
+                if type(layer_config) in layer_utils.Symbols.ATTENTION_LAYER_CONFIGS
+                else layer_config.linear_cp_layout
+            )
+            for layer_config in self.layer_config_list
+        )
         self._cp_layout_manager = None
         if self.cp_group.size() > 1:
-            layer_layouts = tuple(
-                (
-                    layer_config.attention_cp_layout
-                    if type(layer_config) in layer_utils.Symbols.ATTENTION_LAYER_CONFIGS
-                    else layer_config.linear_cp_layout
-                )
-                for layer_config in self.layer_config_list
-            )
             self._cp_layout_manager = ContextParallelLayoutManager(
-                layer_layouts=layer_layouts,
-                boundary_layout=boundary_layout,
+                layer_layouts=self.layer_cp_layouts,
+                boundary_layout=self.boundary_layout,
                 sequence_parallel=self.config.sequence_parallel,
                 cp_group=self.cp_group,
                 tp_group=self.tp_group,
@@ -211,16 +241,39 @@ class HybridStack(MegatronModule):
             else:
                 quant_init_context = nullcontext()
             with quant_init_context:
-                if type(layer_config) is layer_utils.MambaLayerConfig:
+                custom_layer_type = layer_utils.get_custom_layer_type(layer_config)
+                if custom_layer_type is not None:
+                    layer = custom_layer_type(
+                        config=layer_config,
+                        pg_collection=pg_collection,
+                        layer_number=layer_number,
+                        pp_layer_offset=pp_layer_offset,
+                        is_mtp_layer=is_mtp_layer,
+                        mtp_layer_number=mtp_layer_number,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
+                    if (
+                        layer.config is not layer_config
+                        or getattr(layer, "layer_number", None) != layer_number
+                    ):
+                        raise ValueError(
+                            "Custom layers must preserve the supplied config and layer number."
+                        )
+                    if getattr(layer, "tp_group", None) is not pg_collection.tp:
+                        raise ValueError("Custom layers must retain the supplied tp_group.")
+                elif type(layer_config) is layer_utils.MambaLayerConfig:
+                    self._assert_submodule_configured(submodules, "mamba_layer")
                     layer = build_module(
                         submodules.mamba_layer,
                         config=layer_config,
                         layer_number=layer_number,
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.AttentionLayerConfig:
+                    self._assert_submodule_configured(submodules, "attention_layer")
                     layer = build_module(
                         submodules.attention_layer,
                         config=layer_config,
@@ -232,6 +285,7 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.DSALayerConfig:
+                    self._assert_submodule_configured(submodules, "dsa_layer")
                     layer = build_module(
                         submodules.dsa_layer,
                         config=layer_config,
@@ -243,16 +297,11 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.CSALayerConfig:
-                    csa_layer_spec = (
-                        submodules.csa_qk_layernorm_layer
-                        if layer_config.qk_layernorm
-                        else submodules.csa_layer
+                    csa_layer_spec_name = (
+                        "csa_qk_layernorm_layer" if layer_config.qk_layernorm else "csa_layer"
                     )
-                    if csa_layer_spec is None:
-                        raise ValueError(
-                            "C/H/W layers require the hybrid stack spec to provide `csa_layer` "
-                            "or, with qk_layernorm enabled, `csa_qk_layernorm_layer`."
-                        )
+                    self._assert_submodule_configured(submodules, csa_layer_spec_name)
+                    csa_layer_spec = getattr(submodules, csa_layer_spec_name)
                     layer = build_module(
                         csa_layer_spec,
                         config=layer_config,
@@ -264,17 +313,13 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
                 elif type(layer_config) is layer_utils.MLALayerConfig:
-                    mla_layer_spec = (
-                        submodules.mla_fused_down_proj_layer
+                    mla_layer_spec_name = (
+                        "mla_fused_down_proj_layer"
                         if getattr(layer_config, "mla_down_proj_fusion", False)
-                        else submodules.mla_layer
+                        else "mla_layer"
                     )
-                    # Only error if we actually try to use the MLA layer spec.
-                    if mla_layer_spec is None:
-                        raise ValueError(
-                            "`mla_down_proj_fusion=True` requires the hybrid stack spec to provide "
-                            "the fused MLA layer spec under `mla_fused_down_proj_layer`."
-                        )
+                    self._assert_submodule_configured(submodules, mla_layer_spec_name)
+                    mla_layer_spec = getattr(submodules, mla_layer_spec_name)
                     layer = build_module(
                         mla_layer_spec,
                         config=layer_config,
@@ -285,17 +330,9 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                     )
                 elif type(layer_config) is layer_utils.MLPLayerConfig:
+                    self._assert_submodule_configured(submodules, "mlp_layer")
                     layer = build_module(
                         submodules.mlp_layer,
-                        config=layer_config,
-                        layer_number=layer_number,
-                        pg_collection=pg_collection,
-                        add_layer_offset=False,
-                        name=(name + f".layers.{i}") if name is not None else None,
-                    )
-                elif type(layer_config) is layer_utils.MoELayerConfig:
-                    layer = build_module(
-                        submodules.moe_layer,
                         config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
@@ -303,21 +340,45 @@ class HybridStack(MegatronModule):
                         add_layer_offset=False,
                         name=(name + f".layers.{i}") if name is not None else None,
                     )
+                elif type(layer_config) is layer_utils.MoELayerConfig:
+                    self._assert_submodule_configured(submodules, "moe_layer")
+                    layer = build_module(
+                        submodules.moe_layer,
+                        config=layer_config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        add_layer_offset=False,
+                        hash_moe_layer_threshold=hash_moe_layer_threshold,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
                 elif type(layer_config) is layer_utils.GDNLayerConfig:
-                    gdn_layer_spec = submodules.gdn_layer
-                    if layer_config.experimental_attention_variant == "gdn2":
-                        # Only error if we actually try to use the GDN2 layer spec.
-                        if submodules.gdn2_layer is None:
-                            raise ValueError(
-                                "`experimental_attention_variant='gdn2'` requires the hybrid "
-                                "stack spec to provide the GDN2 layer spec under `gdn2_layer`."
-                            )
-                        gdn_layer_spec = submodules.gdn2_layer
+                    gdn_layer_spec_name = (
+                        "gdn2_layer"
+                        if layer_config.experimental_attention_variant == "gdn2"
+                        else "gdn_layer"
+                    )
+                    self._assert_submodule_configured(submodules, gdn_layer_spec_name)
+                    gdn_layer_spec = getattr(submodules, gdn_layer_spec_name)
                     layer = build_module(
                         gdn_layer_spec,
                         config=layer_config,
                         layer_number=layer_number,
                         pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
+                        # Set to False as we do not want to change offset.
+                        add_layer_offset=False,
+                        pp_layer_offset=pp_layer_offset,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
+                elif type(layer_config) is layer_utils.KDALayerConfig:
+                    self._assert_submodule_configured(submodules, "kda_layer")
+                    layer = build_module(
+                        submodules.kda_layer,
+                        config=layer_config,
+                        layer_number=layer_number,
+                        pg_collection=pg_collection,
+                        is_mtp_layer=is_mtp_layer,
                         # Set to False as we do not want to change offset.
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
@@ -327,7 +388,17 @@ class HybridStack(MegatronModule):
                     raise ValueError(
                         f"Unexpected hybrid layer config type: {type(layer_config).__name__}"
                     )
+            if self.is_mtp_layer and self.mtp_layer_number is not None:
+                self._set_mtp_layer_number_for_moe_metrics(layer, self.mtp_layer_number)
 
+            if self.uses_wide_residual_stream and not getattr(
+                layer, "supports_wide_residual_connections", False
+            ):
+                raise ValueError(
+                    "wide_residual requires HybridStack layer specs to name explicit "
+                    "wide-residual layer classes; "
+                    f"layer {layer_number} constructed {type(layer).__name__}."
+                )
             if self.config.enable_mhc_connections:
                 layer = HyperConnectionHybridLayer(config=layer_config, layer=layer)
             self.layers.append(layer)
@@ -337,6 +408,12 @@ class HybridStack(MegatronModule):
 
         # Required for activation recomputation
         self.num_layers_per_pipeline_rank = len(self.layers)
+
+        self.residual_stream_readout = (
+            build_wide_residual_readout(self.config)
+            if self.post_process and self.uses_wide_residual_stream
+            else None
+        )
 
         if self.post_process and self.post_layer_norm:
             # Final layer norm before output.
@@ -349,19 +426,20 @@ class HybridStack(MegatronModule):
         if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
             hc_mult = self.config.mhc_num_residual_streams
             hc_dim = self.config.hidden_size * hc_mult
-            self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
-            self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
-            self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
-            nn.init.xavier_uniform_(self.hc_head_fn)
-            if self.config.sequence_parallel:
-                setattr(self.hc_head_fn, 'sequence_parallel', True)
-                setattr(self.hc_head_base, 'sequence_parallel', True)
-                setattr(self.hc_head_scale, 'sequence_parallel', True)
+            if self.config.mhc_learned_output_contract:
+                self.hc_head_fn = mark_keep_in_fp32(nn.Parameter(torch.randn(hc_mult, hc_dim)))
+                self.hc_head_base = mark_keep_in_fp32(nn.Parameter(torch.zeros(hc_mult)))
+                self.hc_head_scale = mark_keep_in_fp32(nn.Parameter(torch.ones(1)))
+                nn.init.xavier_uniform_(self.hc_head_fn)
+                if self.config.sequence_parallel:
+                    setattr(self.hc_head_fn, 'sequence_parallel', True)
+                    setattr(self.hc_head_base, 'sequence_parallel', True)
+                    setattr(self.hc_head_scale, 'sequence_parallel', True)
 
         self._execution_layer_indices = list(range(len(self.layers)))
         if self.config.moe_shortcut_connection:
             self.layers = group_layers_into_shortcut_blocks(
-                self.layers, self.layer_type_list, self.config, pp_layer_offset=pp_layer_offset
+                self.layers, self.layer_config_list, self.config, pp_layer_offset=pp_layer_offset
             )
             self._execution_layer_indices = [
                 (
@@ -371,9 +449,33 @@ class HybridStack(MegatronModule):
                 )
                 for layer in self.layers
             ]
+        self._residual_stream_atomic_layer_pairs = self._shortcut_layer_pairs()
         self._execution_layer_config_list = [
             self.layer_config_list[layer_index] for layer_index in self._execution_layer_indices
         ]
+
+    def _assert_submodule_configured(
+        self, submodules: HybridStackSubmodules, attr_name: str
+    ) -> None:
+        if getattr(submodules, attr_name, None) is None:
+            raise ValueError(
+                f"Tried to build a `{attr_name}` for `{self.__class__.__name__}`, but the "
+                f"`{submodules.__class__.__name__}` doesn't have a `{attr_name}` spec configured."
+            )
+
+    def _shortcut_layer_pairs(self) -> tuple[tuple[int, int], ...]:
+        """Return physical layer indices that must share one residual replay block."""
+
+        pairs = []
+        for layer in self.layers:
+            if not isinstance(layer, ShortcutMoEBlock):
+                continue
+            if layer.attn_local_idx is None or layer.moe_local_idx is None:
+                raise RuntimeError("A registered ShortcutMoEBlock is missing physical indices.")
+            if layer.moe_local_idx != layer.attn_local_idx + 1:
+                raise RuntimeError("A ShortcutMoEBlock must contain adjacent physical layers.")
+            pairs.append((layer.attn_local_idx, layer.moe_local_idx))
+        return tuple(pairs)
 
     @property
     def layer_type_list(self) -> list[str]:
@@ -385,6 +487,54 @@ class HybridStack(MegatronModule):
         """
         return get_layer_type_list_from_layer_config_list(self.layer_config_list)
 
+    @staticmethod
+    def _set_mtp_layer_number_for_moe_metrics(
+        layer: torch.nn.Module, mtp_layer_number: int
+    ) -> None:
+        """Propagate the enclosing MTP depth to nested MTP MoE routers."""
+        for module in layer.modules():
+            router = getattr(module, "router", None)
+            if router is not None and getattr(router, "is_mtp_layer", False):
+                router.mtp_layer_number = mtp_layer_number
+
+    @staticmethod
+    def _uses_hash_routing(layer: torch.nn.Module) -> bool:
+        """Return whether a (possibly mHC-wrapped) TransformerLayer uses hash routing."""
+        inner_layer = getattr(layer, "inner_layer", layer)
+        if not isinstance(inner_layer, TransformerLayer):
+            return False
+        router = getattr(getattr(inner_layer, "mlp", None), "router", None)
+        return bool(getattr(router, "is_hash_layer", False))
+
+    def _resolve_runtime_cp_layout(
+        self, packed_seq_params: PackedSeqParams | None
+    ) -> tuple[torch.distributed.ProcessGroup, ContextParallelLayoutManager | None]:
+        """Resolve the CP group and layout manager for one microbatch."""
+        runtime_cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
+        assert runtime_cp_group is not None, "HybridStack requires a context-parallel group"
+
+        if packed_seq_params is None or packed_seq_params.local_cp_size is None:
+            return runtime_cp_group, self._cp_layout_manager
+
+        if runtime_cp_group.size() == 1:
+            return runtime_cp_group, None
+
+        runtime_tp_cp_group = resolve_tp_cp_group(
+            self.tp_cp_group,
+            packed_seq_params,
+            sequence_parallel=self.config.sequence_parallel,
+            tp_group=self.tp_group,
+        )
+
+        return runtime_cp_group, ContextParallelLayoutManager(
+            layer_layouts=self.layer_cp_layouts,
+            boundary_layout=self.boundary_layout,
+            sequence_parallel=self.config.sequence_parallel,
+            cp_group=runtime_cp_group,
+            tp_group=self.tp_group,
+            tp_cp_group=runtime_tp_cp_group,
+        )
+
     def set_input_tensor(self, input_tensor: Tensor):
         """Set input tensor to be used instead of forward()'s input.
 
@@ -395,12 +545,27 @@ class HybridStack(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
+    def physical_layers(self) -> tuple[nn.Module, ...]:
+        """Return one layer per layer_type_list entry, in execution order.
+
+        self.layers holds what runs: Shortcut-MoE registers each paired layer and the MoE
+        after it as a single ShortcutMoEBlock. This unpacks those pairs, so the result lines up
+        index-for-index with layer_type_list and layer_config_list.
+        """
+        physical_layers = []
+        for layer in self.layers:
+            if isinstance(layer, ShortcutMoEBlock):
+                physical_layers.extend((layer.compute_layer, layer.moe_layer))
+            else:
+                physical_layers.append(layer)
+        return tuple(physical_layers)
+
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """
         Returns the recurrent mixer's conv and SSM state shapes per input sequence
         if this block contains Mamba or GDN layers (this may not be the case with PP > 1).
         """
-        for layer_config, layer in zip(self.layer_config_list, self.layers, strict=True):
+        for layer_config, layer in zip(self.layer_config_list, self.physical_layers(), strict=True):
             if type(layer_config) is layer_utils.MambaLayerConfig:
                 return layer.mamba_state_shapes_per_request()
             if type(layer_config) is layer_utils.GDNLayerConfig:
@@ -411,20 +576,9 @@ class HybridStack(MegatronModule):
                 return layer.self_attention.mamba_state_shapes_per_request()
         return None
 
-    def _compute_mhc_block_end_plan(self) -> List[bool]:
+    def _compute_mhc_block_end_plan(self) -> Tuple[bool, ...]:
         """Compute deterministic per-layer mHC recompute block boundaries."""
-        num_layers = len(self.layers)
-        block_ends: List[bool] = [False] * num_layers
-        if num_layers == 0:
-            return block_ends
-
-        layers_per_block = self.config.mhc_recompute_layer_num
-        for layer_idx in range(num_layers):
-            is_last_in_stack = layer_idx == num_layers - 1
-            block_ends[layer_idx] = is_last_in_stack or (
-                layers_per_block is not None and (layer_idx + 1) % layers_per_block == 0
-            )
-        return block_ends
+        return build_recompute_block_end_plan(len(self.layers), self.config.mhc_recompute_layer_num)
 
     def _build_mhc_recompute_layer_plan(
         self, use_mhc_recompute: bool
@@ -438,21 +592,14 @@ class HybridStack(MegatronModule):
             self._mhc_block_end_plan = self._compute_mhc_block_end_plan()
         block_ends = self._mhc_block_end_plan
 
-        layer_managers: List[Optional[CheckpointWithoutOutputManager]] = [None] * num_layers
-        manager = CheckpointWithoutOutputManager()
-        for layer_idx in range(num_layers):
-            layer_managers[layer_idx] = manager
-            if block_ends[layer_idx] and layer_idx != num_layers - 1:
-                manager = CheckpointWithoutOutputManager()
-        return layer_managers, block_ends
+        return build_recompute_layer_managers(block_ends), list(block_ends)
 
     @staticmethod
     def _finalize_mhc_recompute_layer(
         manager: Optional[CheckpointWithoutOutputManager], hidden_states: Tensor, is_block_end: bool
     ) -> None:
         """Finalize the current mHC recompute block when its last layer finishes."""
-        if manager is not None and is_block_end:
-            manager.discard_all_outputs_and_register_unified_recompute(hidden_states)
+        finalize_recompute_block(manager, hidden_states, is_block_end)
 
     def forward(
         self,
@@ -464,8 +611,10 @@ class HybridStack(MegatronModule):
         inference_params: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask=None,
+        padding_mask_by_layout: dict[CPLayout, Tensor | None] | None = None,
         packed_seq_params_by_layout: dict[CPLayout, PackedSeqParams | None] | None = None,
         cp_layout_plan: THDCPLayoutPlan | None = None,
+        input_ids: Optional[Tensor] = None,
     ):
         """
         Forward function of the HybridStack class.
@@ -481,33 +630,39 @@ class HybridStack(MegatronModule):
             inference_context (BaseInferenceContext): the inference parameters.
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
                 Defaults to None.
+            input_ids (Tensor, optional): Token IDs forwarded to hash-routed
+                TransformerLayer instances and custom layers. Defaults to None.
+                Custom layers must accept None; HybridModel does not forward IDs to MTP stacks.
         Returns:
             Tensor: the output tensor.
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        if self._has_custom_layers and (inference_context is not None or InferenceMode.is_active()):
+            raise ValueError("Custom hybrid layers do not support inference contexts yet.")
 
-        if self._has_linear_layer_with_chunkwise_cp and padding_mask is not None:
-            raise NotImplementedError(
-                "Hybrid chunkwise context parallelism does not support padding masks."
-            )
+        runtime_cp_group, cp_layout_manager = self._resolve_runtime_cp_layout(packed_seq_params)
 
         cp_layout_state = None
-        if self._cp_layout_manager is not None:
-            cp_layout_state = self._cp_layout_manager.build_forward_state(
+        if cp_layout_manager is not None:
+            cp_layout_state = cp_layout_manager.build_forward_state(
                 packed_seq_params,
                 packed_seq_params_by_layout=packed_seq_params_by_layout,
                 thd_plan=cp_layout_plan,
             )
 
         packed_sequence_cp_metadata = None
-        if self._has_linear_layer_with_chunkwise_cp and packed_seq_params is not None:
+        if (
+            self._has_linear_layer_with_chunkwise_cp
+            and runtime_cp_group.size() > 1
+            and packed_seq_params is not None
+        ):
             if packed_seq_params.seq_idx is None:
                 raise ValueError("Packed chunkwise CP requires packed_seq_params.seq_idx")
             packed_sequence_cp_metadata = build_packed_sequence_cp_metadata(
                 packed_seq_params.seq_idx,
-                cp_rank=self.cp_group.rank(),
-                cp_size=self.cp_group.size(),
+                cp_rank=runtime_cp_group.rank(),
+                cp_size=runtime_cp_group.size(),
             )
 
         if not self.pre_process:
@@ -521,6 +676,10 @@ class HybridStack(MegatronModule):
         if self.config.enable_mhc_connections and self.pre_process and not self.is_mtp_layer:
             hidden_states = HyperConnectionModule.input_expand(
                 hidden_states, self.config.mhc_num_residual_streams
+            )
+        elif self.uses_wide_residual_stream and self.pre_process:
+            hidden_states = expand_wide_residual_stream(
+                hidden_states, self.config.wide_residual.num_streams
             )
 
         if inference_context and inference_context.is_static_batching():
@@ -577,6 +736,19 @@ class HybridStack(MegatronModule):
             and "mhc" in self.config.recompute_modules
         )
         mhc_layer_managers, mhc_block_ends = self._build_mhc_recompute_layer_plan(use_mhc_recompute)
+        use_residual_stream_recompute = (
+            self.uses_wide_residual_stream
+            and wide_residual_recompute_enabled(self.config, self.training)
+        )
+        residual_stream_recompute_plan = (
+            build_residual_stream_recompute_plan(
+                self.num_layers_per_pipeline_rank,
+                self.config.residual_stream_recompute_num_layers,
+                atomic_layer_pairs=self._residual_stream_atomic_layer_pairs,
+            )
+            if use_residual_stream_recompute
+            else [None] * self.num_layers_per_pipeline_rank
+        )
 
         with outer_fp8_context:
             if self.config.recompute_granularity == 'full' and self.training:
@@ -590,6 +762,8 @@ class HybridStack(MegatronModule):
                     attention_bias=None,
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
+                    input_ids=input_ids,
+                    padding_mask_by_layout=padding_mask_by_layout,
                     use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
@@ -604,6 +778,9 @@ class HybridStack(MegatronModule):
                     )
                 ):
                     layer_packed_seq_params = packed_seq_params
+                    residual_stream_recompute_context = residual_stream_recompute_plan[
+                        physical_layer_idx
+                    ]
                     mhc_manager = mhc_layer_managers[layer_idx]
                     if mhc_manager is not None:
                         mhc_manager.is_last_layer_in_recompute_block = mhc_block_ends[layer_idx]
@@ -615,6 +792,11 @@ class HybridStack(MegatronModule):
                     )
 
                     if isinstance(layer, ShortcutMoEBlock):
+                        if layer.moe_local_idx is None:
+                            raise RuntimeError(
+                                "A registered ShortcutMoEBlock is missing its MoE physical index."
+                            )
+                        moe_recompute_context = residual_stream_recompute_plan[layer.moe_local_idx]
                         hidden_states = layer(
                             hidden_states=hidden_states,
                             attention_mask=attention_mask,
@@ -626,7 +808,11 @@ class HybridStack(MegatronModule):
                             quant_context_factory=get_inner_quant_context,
                             cp_layout_state=cp_layout_state,
                             packed_sequence_cp_metadata=layer_cp_metadata,
+                            attn_recompute_context=residual_stream_recompute_context,
+                            moe_recompute_context=moe_recompute_context,
+                            padding_mask_by_layout=padding_mask_by_layout,
                         )
+                        residual_stream_recompute_context = moe_recompute_context
                     else:
                         if cp_layout_state is not None:
                             hidden_states, layer_packed_seq_params = cp_layout_state.prepare_layer(
@@ -634,37 +820,89 @@ class HybridStack(MegatronModule):
                             )
                         # Keep both residuals in the layer's layout, inside the CP conversions.
                         residual_accumulator = hidden_states
+                        layer_padding_mask = padding_mask
+                        if cp_layout_state is not None:
+                            layer_padding_mask = cp_layout_state.get_layer_padding_mask(
+                                physical_layer_idx, padding_mask, padding_mask_by_layout
+                            )
                         # Layers have 1-indexed layer numbers attribute.
                         inner_quant_context = get_inner_quant_context(
                             layer_config, layer.layer_number - 1
                         )
+                        is_custom_layer = (
+                            layer_utils.get_custom_layer_type(layer_config) is not None
+                        )
+                        layer_input_ids = input_ids
+                        if is_custom_layer and cp_layout_state is not None:
+                            layer_input_ids = cp_layout_state.get_layer_input_ids(
+                                physical_layer_idx, input_ids
+                            )
                         with inner_quant_context:
-                            if isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
+                            if is_custom_layer and not isinstance(
+                                layer, HyperConnectionHybridLayer
+                            ):
+                                hidden_states = layer_utils.invoke_custom_layer(
+                                    layer,
+                                    hidden_states,
+                                    attention_mask=attention_mask,
+                                    rotary_pos_emb=rotary_pos_emb,
+                                    packed_seq_params=layer_packed_seq_params,
+                                    padding_mask=layer_padding_mask,
+                                    input_ids=layer_input_ids,
+                                )
+                            elif isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                                 layer_kwargs = dict(
-                                    hidden_states=hidden_states,
                                     attention_mask=attention_mask,
                                     inference_context=inference_context,
                                     rotary_pos_emb=rotary_pos_emb,
                                     sequence_len_offset=sequence_len_offset,
                                     packed_seq_params=layer_packed_seq_params,
-                                    padding_mask=padding_mask,
+                                    padding_mask=layer_padding_mask,
                                 )
                                 if layer_cp_metadata is not None:
                                     layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
+                                if residual_stream_recompute_context is not None:
+                                    if isinstance(layer, HyperConnectionHybridLayer):
+                                        raise TypeError(
+                                            "'residual_stream' recomputation cannot be applied to "
+                                            "HyperConnectionHybridLayer. Wide residuals replay "
+                                            "connection reads, connected norms, and writes "
+                                            "through ResidualStreamRecomputeContext, while mHC "
+                                            "uses its own mhc_recompute_manager. For mHC, select "
+                                            "'mhc' in recompute_modules and configure "
+                                            "mhc_recompute_layer_num instead."
+                                        )
+                                    layer_kwargs["residual_stream_recompute_context"] = (
+                                        residual_stream_recompute_context
+                                    )
                                 if mhc_manager is not None and isinstance(
                                     layer, HyperConnectionHybridLayer
                                 ):
                                     layer_kwargs["mhc_recompute_manager"] = mhc_manager
-                                hidden_states, _ = layer(**layer_kwargs)
-                            elif layer_cp_metadata is not None:
-                                hidden_states = layer(
-                                    hidden_states=hidden_states,
+                                if input_ids is not None and (
+                                    is_custom_layer or self._uses_hash_routing(layer)
+                                ):
+                                    layer_kwargs["input_ids"] = layer_input_ids
+                                hidden_states, _ = layer(hidden_states, **layer_kwargs)
+                            elif isinstance(layer, MambaLayer):
+                                layer_kwargs = dict(
                                     attention_mask=attention_mask,
                                     inference_context=inference_context,
                                     packed_seq_params=layer_packed_seq_params,
-                                    packed_sequence_cp_metadata=layer_cp_metadata,
                                 )
-                            else:  # MambaLayer, Expert, or MLP
+                                if layer_cp_metadata is not None:
+                                    layer_kwargs["packed_sequence_cp_metadata"] = layer_cp_metadata
+                                if residual_stream_recompute_context is not None:
+                                    layer_kwargs["residual_stream_recompute_context"] = (
+                                        residual_stream_recompute_context
+                                    )
+                                hidden_states = layer(hidden_states, **layer_kwargs)
+                            else:  # Expert or MLP
+                                if residual_stream_recompute_context is not None:
+                                    raise TypeError(
+                                        "Residual-stream recomputation in HybridStack supports "
+                                        "TransformerLayer and MambaLayer modules only."
+                                    )
                                 hidden_states = layer(
                                     hidden_states=hidden_states,
                                     attention_mask=attention_mask,
@@ -680,24 +918,38 @@ class HybridStack(MegatronModule):
                                 physical_layer_idx, hidden_states
                             )
 
+                    if residual_stream_recompute_context is not None:
+                        residual_stream_recompute_context.finalize(hidden_states)
                     self._finalize_mhc_recompute_layer(
                         manager=mhc_manager,
                         hidden_states=hidden_states,
                         is_block_end=mhc_block_ends[layer_idx],
                     )
 
+        if self.residual_stream_readout is not None:
+            hidden_states = apply_module(self.residual_stream_readout)(hidden_states)
+
         mhc_multistream = None
         if self.config.enable_mhc_connections and self.post_process and not self.is_mtp_layer:
             if (self.config.mtp_num_layers or 0) > 0:
                 mhc_multistream = hidden_states
-            hidden_states = learned_output_contract(
-                hidden_states,
-                self.hc_head_fn,
-                self.hc_head_base,
-                self.hc_head_scale,
-                self.config.mhc_num_residual_streams,
-                self.config.layernorm_epsilon,
-            )
+            if self.config.mhc_learned_output_contract:
+                hidden_states = learned_output_contract(
+                    hidden_states,
+                    self.hc_head_fn,
+                    self.hc_head_base,
+                    self.hc_head_scale,
+                    self.config.mhc_num_residual_streams,
+                    self.config.layernorm_epsilon,
+                )
+            else:
+                n = self.config.mhc_num_residual_streams
+                hidden_states = (
+                    hidden_states.unflatten(-1, (n, self.config.hidden_size))
+                    .float()
+                    .mean(dim=-2)
+                    .to(hidden_states.dtype)
+                )
 
         # Final layer norm.
         if self.post_process and self.post_layer_norm:
@@ -708,6 +960,12 @@ class HybridStack(MegatronModule):
         hidden_states = make_viewless_tensor(
             inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
         )
+
+        if not self.pre_process and not self.post_process and len(self.layers) == 0:
+            # The schedule may pseudo-deallocate our output after sending it. An
+            # empty stage must not return the input object itself: its shape and
+            # storage are still needed to receive and propagate the gradient.
+            hidden_states = hidden_states.clone()
 
         if mhc_multistream is not None:
             return hidden_states, mhc_multistream
@@ -738,6 +996,13 @@ class HybridStack(MegatronModule):
         sharded_offsets = sharded_offsets or ()
         sharded_state_dict = {}
         layer_prefix = f'{prefix}layers.'
+
+        if self._has_custom_layers:
+            metadata = dict(metadata or {})
+            if metadata.get("dp_cp_group") is None:
+                metadata["dp_cp_group"] = getattr(self.pg_collection, "dp_cp", None)
+            if metadata["dp_cp_group"] is None:
+                raise ValueError("Custom layer checkpoints require pg_collection.dp_cp.")
 
         for local_layer_idx, layer in enumerate(self.layers):
 

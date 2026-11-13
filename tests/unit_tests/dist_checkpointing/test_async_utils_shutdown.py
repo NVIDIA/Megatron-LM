@@ -12,17 +12,14 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core.dist_checkpointing.strategies.async_utils import (
-    PersistentAsyncCaller,
-    TemporalAsyncCaller,
-)
-
 
 class TestPersistentAsyncCallerShutdown:
     """Verify ``PersistentAsyncCaller`` does not crash during GC shutdown."""
 
     def test_close_without_process_group(self):
         """Calling close() after process group destruction must not raise."""
+        from nvidia_resiliency_ext.checkpointing.async_ckpt.core import PersistentAsyncCaller
+
         caller = PersistentAsyncCaller()
         # Simulate the state where no process was ever spawned (process is None)
         # but close() still logs with the rank.
@@ -32,6 +29,8 @@ class TestPersistentAsyncCallerShutdown:
 
     def test_del_without_process_group(self):
         """``__del__`` must not raise when dist is uninitialised."""
+        from nvidia_resiliency_ext.checkpointing.async_ckpt.core import PersistentAsyncCaller
+
         caller = PersistentAsyncCaller()
         with mock.patch("torch.distributed.is_initialized", return_value=False):
             # Must not raise
@@ -43,6 +42,8 @@ class TestTemporalAsyncCallerShutdown:
 
     def test_close_without_process_group(self):
         """Calling close() after process group destruction must not raise."""
+        from nvidia_resiliency_ext.checkpointing.async_ckpt.core import TemporalAsyncCaller
+
         caller = TemporalAsyncCaller()
         with mock.patch("torch.distributed.is_initialized", return_value=False):
             caller.close()

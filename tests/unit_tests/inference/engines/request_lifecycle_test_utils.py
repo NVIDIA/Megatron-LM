@@ -26,7 +26,7 @@ from tests.unit_tests.inference.engines.test_dynamic_engine import (
 from tests.unit_tests.inference.engines.test_dynamic_engine import (
     DynamicInferenceEngineTestBase as _DynamicInferenceEngineTestBase,
 )
-from tests.unit_tests.inference.engines.test_dynamic_engine import set_rounder as _set_rounder
+from tests.unit_tests.inference.engines.test_dynamic_engine import reset_rounder as _reset_rounder
 from tests.unit_tests.inference.engines.test_dynamic_engine_async_sched import (
     _BASE_PAIR_CONFIG,
     _assert_request_parity,
@@ -456,7 +456,7 @@ class RequestLifecyclePairwiseBase(_DynamicInferenceEngineTestBase):
     @classmethod
     def teardown_class(cls):
         delete_cuda_graphs()
-        _set_rounder(64)
+        _reset_rounder()
         Utils.destroy_model_parallel()
 
     @staticmethod
