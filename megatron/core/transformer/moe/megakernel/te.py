@@ -64,6 +64,11 @@ class TEMegakernel(MegakernelBackend):
         """Native expert modules own the canonical checkpoint entries."""
         return {}
 
+    def invalidate_ep_bootstrap(self) -> None:
+        """Discard per-layer state before the runner releases the shared EP context."""
+        self._ep_config = None
+        self._mega_op = None
+
     def _initialize_ep(self, num_tokens: int) -> None:
         """Size the NCCL EP context once and verify its explicit process-group owner."""
         from transformer_engine.common.recipe import MXFP8BlockScaling
@@ -202,8 +207,28 @@ class TEMegakernel(MegakernelBackend):
         context = (
             nullcontext() if fc1_recipe is None else _get_fp8_autocast_for_quant_recipe(fc1_recipe)
         )
-        with context:
+        stash_context = nullcontext()
+        if self.config.moe_paged_stash:
+            from megatron.core.transformer.moe.paged_stash import (
+                get_paged_stash_context,
+                paged_stash_group_commit,
+                paged_stash_group_start,
+            )
+
+            tokens = paged_stash_group_start(tokens)
+            stash_context = get_paged_stash_context(
+                name="megamoe",
+                max_num_tokens=config.recv_capacity_per_rank,
+                num_tokens_tensor=buffer.total_recv_tokens,
+                clone_num_tokens=False,
+                avg_num_tokens=int(
+                    config.recv_capacity_per_rank / self.config.moe_expert_rank_capacity_factor
+                ),
+            )
+        with context, stash_context:
             output = mega_op(tokens, indices, weights, indices).view(shape)
+        if self.config.moe_paged_stash:
+            output = paged_stash_group_commit(output, name="megamoe")
         if shared_experts is not None:
             output = output + shared_experts(hidden_states)
         return output

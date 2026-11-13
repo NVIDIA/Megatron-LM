@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import pytest
 import torch
 
 from megatron.core.transformer.moe.paged_stash import PagedStashManager, PagedStashRunner
@@ -79,7 +80,13 @@ class _FakeModelChunk(torch.nn.Module):
 
 
 def _run_retry(
-    monkeypatch, training_config, model_config, decoder_config, mtp_config, nested_mtp=False
+    monkeypatch,
+    training_config,
+    model_config,
+    decoder_config,
+    mtp_config,
+    nested_mtp=False,
+    megakernel=False,
 ):
     monkeypatch.setattr(
         "megatron.core.transformer.multi_token_prediction.MultiTokenPredictionLayer",
@@ -87,6 +94,10 @@ def _run_retry(
     )
     decoder_moe = _FakeMoELayer(decoder_config)
     mtp_moe = _FakeMoELayer(mtp_config)
+    if megakernel:
+        for moe_layer in (decoder_moe, mtp_moe):
+            moe_layer.megakernel_experts = moe_layer.token_dispatcher
+            moe_layer.token_dispatcher = None
     model = _FakeModelChunk(model_config, decoder_moe, mtp_moe, nested_mtp=nested_mtp)
 
     values_seen_by_forward = []
@@ -134,7 +145,8 @@ def _run_retry(
     )
 
 
-def test_retry_preserves_shared_root_config_behavior(monkeypatch):
+@pytest.mark.parametrize("megakernel", [False, True])
+def test_retry_preserves_shared_root_config_behavior(monkeypatch, megakernel):
     """Models whose MoE modules share the root config retain their existing behavior."""
     training_config = _config(True)
     model_config = _config(True)
@@ -145,9 +157,13 @@ def test_retry_preserves_shared_root_config_behavior(monkeypatch):
         model_config=model_config,
         decoder_config=model_config,
         mtp_config=model_config,
+        megakernel=megakernel,
     )
 
-    assert run.runner.moe_layers == [run.decoder_moe, run.mtp_moe]
+    assert run.runner.moe_layers == ([] if megakernel else [run.decoder_moe, run.mtp_moe])
+    assert run.runner.megakernel_moe_layers == (
+        [run.decoder_moe, run.mtp_moe] if megakernel else []
+    )
     assert [id(config) for config in run.runner._configs_to_sync_moe_paged_stash] == [
         id(training_config),
         id(model_config),
@@ -156,12 +172,11 @@ def test_retry_preserves_shared_root_config_behavior(monkeypatch):
     assert run.result == 2
     assert run.model.zero_grad_count == 1
     assert len(run.release_stash_buffer_calls) == 1
-    assert run.decoder_moe.token_dispatcher.reset_count == 1
-    assert run.mtp_moe.token_dispatcher.reset_count == 1
-    assert run.decoder_moe.token_dispatcher.invalidate_count == 2
-    assert run.mtp_moe.token_dispatcher.invalidate_count == 2
-    assert run.decoder_moe.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor == 1.5
-    assert run.mtp_moe.token_dispatcher._comm_manager.moe_expert_rank_capacity_factor == 1.5
+    for moe_layer in (run.decoder_moe, run.mtp_moe):
+        backend = moe_layer.megakernel_experts if megakernel else moe_layer.token_dispatcher
+        assert backend.reset_count == (0 if megakernel else 1)
+        assert backend.invalidate_count == 2
+        assert backend._comm_manager.moe_expert_rank_capacity_factor == 1.5
     assert training_config.moe_paged_stash is True
     assert model_config.moe_paged_stash is True
 
@@ -228,6 +243,7 @@ def test_retry_stages_only_overlapped_reused_mxfp8_buffers(monkeypatch):
     stash_manager = SimpleNamespace(overflow=None, host_spill=None, release_stash_buffers=Mock())
     runner = PagedStashRunner.__new__(PagedStashRunner)
     runner.moe_layers = []
+    runner.megakernel_moe_layers = []
     runner._required_recv_capacity = None
     runner.stash_manager = stash_manager
     runner.copy_main_params = True

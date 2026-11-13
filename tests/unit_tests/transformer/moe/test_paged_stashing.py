@@ -254,6 +254,10 @@ class MoEModelTestContainer:
         _set_random_seed(seed_=123, data_parallel_random_init=data_parallel_random_init)
         self.config = TransformerConfig(
             params_dtype=test_dtype,
+            bf16=kwargs.get("bf16", False),
+            fp8_param=kwargs.get("fp8_param", False),
+            moe_megakernel_backend=kwargs.get("moe_megakernel_backend", None),
+            moe_single_grouped_weight=kwargs.get("moe_single_grouped_weight", False),
             tensor_model_parallel_size=tp_size,
             expert_model_parallel_size=ep_size,
             pipeline_model_parallel_size=pp_size,
@@ -971,7 +975,8 @@ class TestNcclEpPagedStashing:
     @pytest.mark.internal
     @pytest.mark.parametrize("zero_copy", [False, True])
     @pytest.mark.parametrize("wire_dtype", ["bf16", "mxfp8"])
-    def test_forward_backward_4_layers(self, zero_copy, wire_dtype):
+    @pytest.mark.parametrize("megakernel_backend", [None, "te"])
+    def test_forward_backward_4_layers(self, zero_copy, wire_dtype, megakernel_backend):
         """Test paged stashing with 4 MoE layers on ncclep static shape: two passes match.
 
         zero_copy=True additionally exercises the ncclEP symm-mem zero-copy IO under paged stash.
@@ -982,7 +987,13 @@ class TestNcclEpPagedStashing:
             pytest.skip("NCCL EP is not available")
         if zero_copy and not is_nccl_ep_zero_copy_available():
             pytest.skip("NCCL EP zero-copy TE API is not available")
-        if wire_dtype == "mxfp8" and not is_nccl_ep_fp8_dispatch_available():
+        if zero_copy and megakernel_backend == "te":
+            pytest.skip("The TE megakernel backend does not support zero-copy")
+        if (
+            megakernel_backend is None
+            and wire_dtype == "mxfp8"
+            and not is_nccl_ep_fp8_dispatch_available()
+        ):
             pytest.skip("NCCL EP MXFP8 wire needs EpBuffer quant-recipe support and MXFP8 hardware")
 
         config.ENABLE_EXPERIMENTAL = True
@@ -1000,13 +1011,17 @@ class TestNcclEpPagedStashing:
             hidden_size=1024,
             moe_flex_dispatcher_backend="ncclep",
             test_dtype=torch.bfloat16,
+            bf16=megakernel_backend == "te",
+            fp8_param=megakernel_backend == "te" and wire_dtype == "mxfp8",
+            moe_megakernel_backend=megakernel_backend,
+            moe_single_grouped_weight=megakernel_backend == "te",
             moe_grouped_gemm=True,
             moe_use_legacy_grouped_gemm=False,
             moe_paged_stash=True,
             moe_expert_rank_capacity_factor=1.5,
             use_transformer_engine_op_fuser=True,
             moe_mlp_glu_interleave_size=32,
-            moe_router_padding_for_quantization=True,
+            moe_router_padding_for_quantization=megakernel_backend != "te",
             gated_linear_unit=True,
             activation_func=F.silu,
             moe_ncclep_zero_copy=zero_copy,
@@ -1026,6 +1041,14 @@ class TestNcclEpPagedStashing:
         output_ref, hidden_states_grad_ref, routing_map_ref, tokens_per_expert_ref = (
             _forward_backward_all_layers(self.container, hidden_states)
         )
+        stash_manager = PagedStashManager.get_instance()
+        assert stash_manager.max_tokens_across_vp_stages
+        parameter_grads_ref = [
+            parameter.grad.clone()
+            for layer in self.container.moe_layers
+            for parameter in layer.parameters()
+            if parameter.grad is not None
+        ]
 
         self.container.zero_grad()
 
@@ -1038,6 +1061,16 @@ class TestNcclEpPagedStashing:
 
         overflow = check_paged_stash_overflow()
         assert overflow.any().item() == 0
+        assert stash_manager.host_spill.any().item() == 1
+        parameter_grads = [
+            parameter.grad
+            for layer in self.container.moe_layers
+            for parameter in layer.parameters()
+            if parameter.grad is not None
+        ]
+        assert len(parameter_grads) == len(parameter_grads_ref)
+        for actual, expected in zip(parameter_grads, parameter_grads_ref):
+            torch.testing.assert_close(actual, expected, atol=1e-4, rtol=1e-4)
 
         assert torch.allclose(
             output, output_ref, atol=1e-4, rtol=1e-4

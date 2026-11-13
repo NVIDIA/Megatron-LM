@@ -649,9 +649,10 @@ divisible by 512. Dispatch backward and combine forward retain BF16 communicatio
 Without a rank capacity factor, NCCL EP sizes receive tensors from actual token counts.
 `moe_expert_rank_capacity_factor` selects a fixed receive allocation, rounded to the
 grouped-MLP token alignment. It must include expert padding and the worst expected routing
-imbalance: overflow fails instead of silently dropping tokens. Paged stashing, zero-copy
+imbalance: overflow fails instead of silently dropping tokens. Zero-copy
 communication, delayed wgrad, native communication overlap, latent MoE,
-GTP weight rematerialization, and activation offloading are not supported by this initial adapter.
+GTP weight rematerialization, `--cpu-offloading`, and fine-grained activation offloading
+are not supported by this initial adapter.
 Optional shared experts execute through their native MCore module and are added after combine.
 The token bound defaults to the first forward's maximum token count across EP ranks,
 rounded up to a multiple of 64; later layers share that bound.
@@ -660,6 +661,17 @@ CUDA graph capture requires a fixed receive capacity via `moe_expert_rank_capaci
 and warmup before capture. Dynamic receive sizing synchronizes with the host and cannot
 be captured. Capture the whole MoE operation or full iteration; partial `moe_router` and
 `moe_preprocess` scopes are not supported by this backend.
+
+With fixed receive capacity, `--moe-paged-stash` packs marked expert activations into
+the existing paged CUDA pool. Set `--moe-paged-stash-buffer-size-factor-cpu` above
+zero to spill to pinned host memory when CUDA pages are exhausted; reloading uses
+the existing paged-stash pipeline schedule. This host-spill path is separate from
+`--cpu-offloading` and fine-grained expert activation offloading, which must not
+claim the same tensors. NCCL EP supplies the active row count after dispatch, and
+stashing uses the existing activation markers from TE's fused grouped MLP.
+On stash exhaustion, the runner retries without stashing and rebuilds the EP context.
+The TE backend retains its fixed receive budget during that retry; receive-capacity
+overflow still fails rather than silently dropping tokens.
 
 The distributed numerical suite compares the MegaMoE op with native all-to-all plus TE grouped
 MLP, including two outstanding forwards before backward, masked routes, empty experts,
