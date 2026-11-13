@@ -420,6 +420,21 @@ class OptimizerConfig:
     pin_cpu_params: bool = True
     """If True, pin the optimizer parameters to CPU memory."""
 
+    main_params_rounding: str = 'nearest'
+    """How FP32 main params are rounded when copied back to BF16 model params after each
+    optimizer step: 'nearest' (round-to-nearest-even, the default) or 'stochastic'.
+
+    Stochastic rounding keeps the BF16 weights equal to the main params in expectation, so
+    updates smaller than half a BF16 ULP are not lost (useful at the small learning rates of
+    RL post-training, see arXiv:2611.13545). It changes training numerics and adds zero-mean
+    noise of up to one BF16 ULP to the model weights. Supported with the distributed
+    optimizer, with or without optimizer CPU offload; not with FP8/FP4 parameters, Megatron
+    FSDP, or the precision-aware optimizer without CPU offload."""
+
+    main_params_rounding_seed: int = 0
+    """Seed for stochastic main params rounding. Rounding is a deterministic function of
+    (main param value, element index, seed), so no RNG state needs to be checkpointed."""
+
     ################
     # Miscellaneous
     ################
@@ -473,6 +488,23 @@ class OptimizerConfig:
             or self.rmsnorm_weight_decay_mult < 0.0
         ):
             raise ValueError("rmsnorm_weight_decay_mult must be a finite nonnegative value")
+
+        if self.main_params_rounding not in ('nearest', 'stochastic'):
+            raise ValueError(
+                f"main_params_rounding must be 'nearest' or 'stochastic', "
+                f"got {self.main_params_rounding!r}"
+            )
+        if self.main_params_rounding == 'stochastic':
+            if not self.use_distributed_optimizer:
+                raise ValueError(
+                    "main_params_rounding='stochastic' requires the distributed optimizer"
+                )
+            if self.use_precision_aware_optimizer and not self.optimizer_cpu_offload:
+                # TE FusedAdam keeps the main params and writes the model params itself.
+                raise ValueError(
+                    "main_params_rounding='stochastic' is not supported with the precision-aware "
+                    "optimizer unless optimizer CPU offload is enabled"
+                )
 
         if self.optimizer == 'dist_muon':
             logger.warning(
@@ -605,6 +637,16 @@ class OptimizerConfig:
         ckpt_format: str | None,
     ) -> None:
         """Check settings shared with DDP and checkpointing without modifying them."""
+        if self.main_params_rounding == 'stochastic':
+            assert not (
+                ddp_config.use_megatron_fsdp
+                or ddp_config.fp8_param_gather
+                or ddp_config.fp4_param_gather
+            ), (
+                "main_params_rounding='stochastic' is not supported with Megatron FSDP or "
+                "FP8/FP4 parameters"
+            )
+
         if self.optimizer_cpu_offload:
             assert not ddp_config.fp8_param_gather or self.fp8_recipe == "delayed", (
                 "When `--fp8-param-gather` is enabled, the optimizer cpu offload "
