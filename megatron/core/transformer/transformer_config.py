@@ -1904,7 +1904,11 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_router_dtype == "fp64":
             raise ValueError("The TE MoE backend requires FP32 router probabilities")
         if self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph:
-            raise ValueError("The TE MoE backend currently supports eager execution only")
+            if self.moe_expert_rank_capacity_factor is None:
+                raise ValueError(
+                    "The TE MoE backend requires fixed receive capacity for CUDA graphs; "
+                    "set moe_expert_rank_capacity_factor"
+                )
         if self.moe_expert_rank_capacity_factor is not None and (
             not math.isfinite(self.moe_expert_rank_capacity_factor)
             or self.moe_expert_rank_capacity_factor <= 0
@@ -4310,6 +4314,15 @@ class TransformerConfig(ModelParallelConfig):
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
 
+        if self.moe_megakernel_backend == "te" and self.cuda_graph_impl != "none":
+            if {CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess} & set(
+                self.cuda_graph_modules
+            ):
+                raise ValueError(
+                    "The TE MoE backend requires whole-MoE CUDA graph capture; "
+                    "moe_router/moe_preprocess scopes are not supported"
+                )
+
         if self.moe_megakernel_backend == "mok":
             if self.cuda_graph_impl in ("local", "transformer_engine"):
                 # Empty modules mean whole-layer capture here, not full_iteration.
@@ -4396,7 +4409,7 @@ class TransformerConfig(ModelParallelConfig):
                             'virtual-expert load balancing supports the moe CUDA graph scope only; '
                             'moe_router and moe_preprocess are not supported.'
                         )
-                    elif (
+                    elif self.moe_megakernel_backend != "te" and (
                         self.moe_expert_capacity_factor is None
                         or not self.moe_pad_expert_input_to_capacity
                     ):

@@ -63,7 +63,7 @@ def test_te_backend_precision_config(precision):
         ({"fp8": "e4m3", "fp8_recipe": "blockwise"}, "mxfp8|MXFP8"),
         ({"moe_router_dtype": "fp64"}, "FP32"),
         ({"moe_apply_probs_on_input": True}, "moe_apply_probs_on_input"),
-        ({"cuda_graph_impl": "full_iteration"}, "eager"),
+        ({"cuda_graph_impl": "full_iteration"}, "fixed receive capacity"),
         ({"moe_megakernel_backend_config": {"max_tokens_per_rank": 0}}, "positive integer"),
         ({"moe_megakernel_backend_config": {"max_tokens_per_rank": True}}, "positive integer"),
         ({"moe_megakernel_backend_config": {"unknown": 64}}, "only max_tokens_per_rank"),
@@ -72,6 +72,25 @@ def test_te_backend_precision_config(precision):
 def test_te_backend_rejects_unsupported_config(overrides, match):
     with pytest.raises((ValueError, AssertionError), match=match):
         te_config(**overrides)
+
+
+@pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine", "full_iteration"])
+def test_te_fixed_capacity_cuda_graph_config(cuda_graph_impl):
+    te_config(
+        cuda_graph_impl=cuda_graph_impl,
+        cuda_graph_modules=[] if cuda_graph_impl == "full_iteration" else ["moe"],
+        moe_expert_rank_capacity_factor=16.0,
+    )
+
+
+@pytest.mark.parametrize("scope", ["moe_router", "moe_preprocess"])
+def test_te_cuda_graph_rejects_partial_moe_scope(scope):
+    with pytest.raises(ValueError, match="whole-MoE"):
+        te_config(
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[scope],
+            moe_expert_rank_capacity_factor=16.0,
+        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -104,7 +123,7 @@ def _assert_relative_error(actual, expected, tolerance, name):
 @pytest.mark.parametrize("precision", ["bf16", "mxfp8", "mxfp8_params", "mxfp8_wire"])
 @pytest.mark.parametrize("static_capacity", [False, True])
 @pytest.mark.parametrize("accumulate_main_grad", [False, True])
-def test_te_sequence_matches_native_moe(
+def test_te_mega_op_matches_native_moe(
     precision, static_capacity, accumulate_main_grad, monkeypatch
 ):
     """Compare two in-flight microbatches and all gradients against native all-to-all."""
@@ -205,9 +224,9 @@ def test_te_sequence_matches_native_moe(
                 reference_out, _ = reference(reference_hidden)
             with get_fp8_context(candidate_config):
                 candidate_out, _ = candidate(candidate_hidden)
-            sequence = candidate.megakernel_experts._sequence[0]
-            assert sequence[0].buffer is sequence[-1].buffer
-            buffers.append(sequence[0].buffer)
+            mega_op = candidate.megakernel_experts._mega_op[0]
+            assert mega_op[0].buffer is mega_op[-1].buffer
+            buffers.append(mega_op[0].buffer)
             tolerance = 0.12 if precision == "mxfp8_wire" else 0.02
             _assert_relative_error(candidate_out, reference_out, tolerance, "output")
             records.append(
