@@ -609,9 +609,12 @@ class HyperConnectionHybridLayer(TECudaGraphMixin, GraphableMegatronModule):
             return self._replay_mhc_attention_cuda_graph(args, kwargs)
 
         group_tail = self._get_te_cuda_graph_group_tail()
+        # Validation is Python control flow used by eager forward/capture, not a
+        # tensor input to the captured graph.
+        graph_kwargs = {k: v for k, v in kwargs.items() if k != "strict_runtime_validation"}
         # Replay only the graph: delayed expert offload is outside Hybrid CUDA Graph support,
         # so the mixin's delayed-offload queue handling in _te_cuda_graph_replay is skipped.
-        cuda_graph_output = list(self._te_cuda_graph_replay_graph(*args, **kwargs))
+        cuda_graph_output = list(self._te_cuda_graph_replay_graph(*args, **graph_kwargs))
         padding_mask = kwargs.get("padding_mask")
 
         if group_tail is not None:
