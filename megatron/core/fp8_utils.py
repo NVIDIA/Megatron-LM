@@ -873,33 +873,6 @@ if HAVE_TE:
 
         return fp8_context
 
-    def get_fp8_disabled_context(config: TransformerConfig, is_init: bool = False):
-        """Return a context manager that disables TE quantization.
-
-        Use this around submodule construction or execution that must stay in a higher
-        precision while its enclosing module uses an FP8 or FP4 context.
-
-        Args:
-            config: Transformer configuration that controls quantization.
-            is_init: Whether to disable the parameter-initialization context instead of
-                the forward autocast context.
-
-        Returns:
-            A disabled TE quantization context when quantization is active, otherwise a
-            no-op context.
-        """
-        if config.custom_recipe is not None:
-            from megatron.core.quantization.te_recipe import get_quantization_disabled_context
-
-            return get_quantization_disabled_context(config, is_init)
-        if is_init:
-            if not (config.fp8_param or config.fp4_param):
-                return nullcontext()
-            return transformer_engine.pytorch.fp8_model_init(enabled=False)
-        if not (config.fp8 or config.fp4):
-            return nullcontext()
-        return transformer_engine.pytorch.fp8_autocast(enabled=False)
-
 else:
 
     def get_fp8_recipe(config: TransformerConfig):
@@ -918,9 +891,15 @@ else:
         """Returns dummy fp8 context manager since TE is not available."""
         return nullcontext()
 
-    def get_fp8_disabled_context(config: TransformerConfig, is_init: bool = False):
-        """Return a no-op context manager since TE is not available."""
-        return nullcontext()
+
+def get_fp8_disabled_context(config: TransformerConfig, is_init: bool = False):
+    """Compatibility alias for the format-neutral quantization-disabled context.
+
+    New callers should use ``quantization.te_recipe.get_quantization_disabled_context``.
+    """
+    from megatron.core.quantization.te_recipe import get_quantization_disabled_context
+
+    return get_quantization_disabled_context(config, is_init)
 
 
 if HAVE_TE:

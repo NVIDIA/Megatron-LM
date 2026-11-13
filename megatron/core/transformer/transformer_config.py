@@ -763,9 +763,12 @@ class TransformerConfig(ModelParallelConfig):
     custom recipe. Providing this path enables custom quantization and cannot be combined with FP8
     or FP4 mode.
 
-    The factory receives a ``QuantizerRole`` whose ``name`` is the module's global path, for
-    example ``decoder.layers.3.mlp.linear_fc1``. The layer index is global, so a name-selective
-    factory picks the same layers regardless of the pipeline/virtual-pipeline split.
+    The factory receives a ``QuantizerRole`` whose ``name`` is the module path relative to
+    the model root, for example ``decoder.layers.3.mlp.linear_fc1``. Model entry points use
+    ``encoder`` and ``decoder`` for their corresponding stacks and ``mtp`` for prediction
+    heads, independently of the selected recipe. Vision transformer stacks also use
+    ``decoder``. Layer indices are global across pipeline/virtual-pipeline splits, so a
+    name-selective factory targets the same semantic location across supported models.
 
     Known limitation: a factory that returns *stateful* (delayed-scaling) quantizers is not yet
     supported with ``recompute_granularity="full"``; Transformer Engine raises a ``KeyError`` for

@@ -21,8 +21,24 @@ from tests.unit_tests.test_utilities import Utils
 RECORDED_ROLES = []
 
 
+def current_scaling_test_factory(role):
+    """Current scaling for linears and QKV, with TE's native S/dP attention policy."""
+    from transformer_engine.pytorch.constants import DType
+    from transformer_engine.pytorch.tensor.float8_tensor import Float8CurrentScalingQuantizer
+
+    RECORDED_ROLES.append(role)
+    if role is not None and role.module_type == "dpa" and role.tensor_type in ("s", "dp"):
+        # cuDNN's FP8 attention kernel requires shared delayed-scaling buffers for
+        # these internal slots, including when QKV uses current scaling.
+        from transformer_engine.common.recipe import Format
+        from transformer_engine.pytorch.quantization import DelayedScalingRequest
+
+        return DelayedScalingRequest(fp8_format=Format.HYBRID)
+    return Float8CurrentScalingQuantizer(DType.kFloat8E4M3, device=torch.device("cuda"))
+
+
 def delayed_scaling_test_factory(role):
-    """Pinned-TE-compatible factory used by real MCore execution tests."""
+    """Stateful factory used only to test delayed-scaling limitations."""
     from transformer_engine.common.recipe import Format
     from transformer_engine.pytorch.quantization import DelayedScalingRequest
 
@@ -30,7 +46,8 @@ def delayed_scaling_test_factory(role):
     return DelayedScalingRequest(fp8_format=Format.HYBRID)
 
 
-TEST_FACTORY_PATH = f"{__name__}.delayed_scaling_test_factory"
+TEST_FACTORY_PATH = f"{__name__}.current_scaling_test_factory"
+DELAYED_FACTORY_PATH = f"{__name__}.delayed_scaling_test_factory"
 
 
 def test_resolve_quantizer_factory_returns_callable():
@@ -110,7 +127,7 @@ def test_legacy_custom_recipe_paths_forward_attention_flags(config_kwargs, recip
         cached_recipe = get_fp4_recipe(config)
 
     assert cached_recipe is recipe
-    assert recipe.qfactory is delayed_scaling_test_factory
+    assert recipe.qfactory is current_scaling_test_factory
     assert recipe.fp8_dpa is True
     assert recipe.fp8_mha is True
 
@@ -163,7 +180,7 @@ def test_per_module_custom_recipe_uses_format_neutral_autocast():
         context = te_extension._get_fp8_autocast_for_quant_recipe(config)
 
     assert context is expected_context
-    assert autocast.call_args.kwargs["recipe"].qfactory is delayed_scaling_test_factory
+    assert autocast.call_args.kwargs["recipe"].qfactory is current_scaling_test_factory
 
 
 @pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
@@ -197,7 +214,7 @@ def test_get_quantization_context_uses_format_neutral_te_api():
     call_kwargs = autocast.call_args.kwargs
     assert call_kwargs["enabled"] is True
     assert call_kwargs["amax_reduction_group"] is None
-    assert call_kwargs["recipe"].qfactory is delayed_scaling_test_factory
+    assert call_kwargs["recipe"].qfactory is current_scaling_test_factory
     assert call_kwargs["recipe"].fp8_dpa is True
     assert call_kwargs["recipe"].fp8_mha is True
 
@@ -361,7 +378,10 @@ def _skip_unless_fp8_available():
 
 @pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_custom_recipe_dense_forward_backward_receives_semantic_role_names():
+@pytest.mark.parametrize(
+    "factory_path", [TEST_FACTORY_PATH, DELAYED_FACTORY_PATH], ids=["current", "delayed-fallback"]
+)
+def test_custom_recipe_dense_forward_backward_receives_semantic_role_names(factory_path):
     _skip_unless_fp8_available()
 
     Utils.initialize_model_parallel(1, 1)
@@ -376,7 +396,7 @@ def test_custom_recipe_dense_forward_backward_receives_semantic_role_names():
             attention_dropout=0.0,
             hidden_dropout=0.0,
             params_dtype=torch.bfloat16,
-            custom_recipe=TEST_FACTORY_PATH,
+            custom_recipe=factory_path,
             fp8_dot_product_attention=True,
         )
         block = TransformerBlock(
@@ -393,7 +413,7 @@ def test_custom_recipe_dense_forward_backward_receives_semantic_role_names():
             warnings.simplefilter("always")
             output = block(hidden_states=hidden_states, attention_mask=None)
         output.float().square().mean().backward()
-        if linear_proj.save_original_input:
+        if linear_proj.save_original_input and factory_path == DELAYED_FACTORY_PATH:
             # The delayed-scaling test factory cannot requantize deterministically, so TE must
             # downgrade the optimization with a warning rather than fail or silently drift.
             assert any("save_original_input" in str(w.message) for w in caught)
@@ -415,14 +435,17 @@ def test_custom_recipe_dense_forward_backward_receives_semantic_role_names():
 
 @pytest.mark.skipif(not te_extension.HAVE_TE, reason="Transformer Engine is not installed")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
-def test_custom_recipe_grouped_moe_checkpoint_extra_state_is_stateless():
+@pytest.mark.parametrize(
+    "factory_path", [TEST_FACTORY_PATH, DELAYED_FACTORY_PATH], ids=["current", "delayed-state-loss"]
+)
+def test_custom_recipe_grouped_moe_checkpoint_extra_state_is_stateless(factory_path):
     """Grouped experts must checkpoint without unpickling the CustomRecipe factory.
 
     TE stores the CustomRecipe object, including its quantizer factory, in the TE extra
     state, exactly as it does for the built-in recipes. MCore's own ``SafeUnpickler`` cannot
     decode an arbitrary factory, so the per-GEMM split used by distributed checkpointing
-    stores an empty extra state. That is lossless for a stateless factory; this test uses a
-    delayed-scaling factory, so it must also warn that amax history is being dropped.
+    stores an empty extra state. This is lossless for current scaling; delayed scaling
+    must warn that its amax history is being dropped.
     """
     _skip_unless_fp8_available()
 
@@ -438,7 +461,7 @@ def test_custom_recipe_grouped_moe_checkpoint_extra_state_is_stateless():
             hidden_dropout=0.0,
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
-            custom_recipe=TEST_FACTORY_PATH,
+            custom_recipe=factory_path,
             num_moe_experts=2,
             moe_ffn_hidden_size=256,
             moe_grouped_gemm=True,
@@ -457,12 +480,13 @@ def test_custom_recipe_grouped_moe_checkpoint_extra_state_is_stateless():
         output = block(hidden_states=hidden_states, attention_mask=None)
         output.float().square().mean().backward()
 
-        # Distributed-checkpoint save path: one extra state per expert GEMM. This factory
-        # produces delayed-scaling quantizers, whose state cannot be split per GEMM, so the
-        # save must say so rather than drop amax history silently.
+        # Only a stateful factory loses amax history in the per-expert split.
         te_extension._warn_custom_recipe_extra_state_dropped.cache_clear()
-        with pytest.warns(UserWarning, match="delayed-scaling state"):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
             sharded_state_dict = block.sharded_state_dict()
+        state_loss_warnings = [w for w in caught if "delayed-scaling state" in str(w.message)]
+        assert len(state_loss_warnings) == (1 if factory_path == DELAYED_FACTORY_PATH else 0)
         grouped_extra_states = {
             key: value
             for key, value in sharded_state_dict.items()
@@ -652,3 +676,60 @@ def test_layer_names_are_global_across_virtual_pipeline_stages():
         assert len(set(flat)) == len(flat), seen
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(not te_recipe.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.parametrize(
+    "quant_kwargs",
+    [
+        pytest.param({"fp8": "e4m3", "fp8_recipe": "mxfp8"}, id="fp8"),
+        pytest.param({"fp4": "e2m1", "fp4_recipe": "nvfp4"}, id="fp4"),
+        pytest.param({"custom_recipe": TEST_FACTORY_PATH}, id="custom"),
+    ],
+)
+@pytest.mark.parametrize("compatibility_api", [False, True], ids=["canonical", "fp8-wrapper"])
+def test_disabled_quantization_context_restores_enclosing_recipe(quant_kwargs, compatibility_api):
+    from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+    from megatron.core.fp8_utils import get_fp8_disabled_context
+
+    _skip_unless_fp8_available()
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4, **quant_kwargs)
+    recipe = te_recipe.get_te_quantization_recipe(config)
+    disable = (
+        get_fp8_disabled_context
+        if compatibility_api
+        else te_recipe.get_quantization_disabled_context
+    )
+    with te_extension.te.pytorch.autocast(enabled=True, recipe=recipe):
+        assert FP8GlobalStateManager.is_fp8_enabled()
+        with disable(config):
+            assert not FP8GlobalStateManager.is_fp8_enabled()
+        assert FP8GlobalStateManager.is_fp8_enabled()
+        assert FP8GlobalStateManager.get_fp8_recipe() is recipe
+
+
+@pytest.mark.skipif(not te_recipe.HAVE_TE, reason="Transformer Engine is not installed")
+@pytest.mark.parametrize("precision", ["fp8", "fp4"])
+@pytest.mark.parametrize("compatibility_api", [False, True], ids=["canonical", "fp8-wrapper"])
+def test_disabled_quantization_init_restores_parameter_storage(precision, compatibility_api):
+    from transformer_engine.pytorch.quantization import FP8GlobalStateManager
+
+    from megatron.core.fp8_utils import get_fp8_disabled_context
+
+    quant_kwargs = (
+        {"fp8": "e4m3", "fp8_recipe": "mxfp8", "fp8_param": True}
+        if precision == "fp8"
+        else {"fp4": "e2m1", "fp4_recipe": "nvfp4", "fp4_param": True}
+    )
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4, **quant_kwargs)
+    disable = (
+        get_fp8_disabled_context
+        if compatibility_api
+        else te_recipe.get_quantization_disabled_context
+    )
+    with te_recipe.get_quantization_context(config, is_init=True):
+        assert FP8GlobalStateManager.with_fp8_parameters()
+        with disable(config, is_init=True):
+            assert not FP8GlobalStateManager.with_fp8_parameters()
+        assert FP8GlobalStateManager.with_fp8_parameters()

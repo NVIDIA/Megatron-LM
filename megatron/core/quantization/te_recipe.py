@@ -156,6 +156,8 @@ def get_quantization_disabled_context(
     config: TransformerConfig, is_init: bool = False
 ) -> ContextManager[Any]:
     """Return a context that disables the active Transformer Engine quantization mode."""
+    if not HAVE_TE:
+        return nullcontext()
     if is_init:
         if not (config.fp8_param or config.fp4_param):
             return nullcontext()

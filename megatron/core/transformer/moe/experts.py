@@ -664,6 +664,8 @@ class TEGroupedMLP(MegatronModule):
             single_grouped_bias: bool,
         ) -> None:
             """Give a fused op the weights exposed by its source GroupedLinear."""
+            # Quantizers are materialized lazily by the op, using this semantic name.
+            op.name = getattr(linear, "name", None)
             if single_grouped_weight:
                 op.register_parameter("weight", linear.get_parameter("weight"))
                 for idx in range(linear.num_gemms):
