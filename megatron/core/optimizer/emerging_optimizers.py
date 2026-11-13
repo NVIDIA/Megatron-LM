@@ -10,6 +10,7 @@ To add a new emerging optimizer:
 
 import inspect
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Literal, Optional, get_args
 
@@ -150,6 +151,16 @@ def _create_fsdp_emerging_optimizer(
     kwargs["weight_decay_method"] = "decoupled" if config.decoupled_weight_decay else "l2"
     optimizer = FsdpMuon(param_groups, **kwargs)
     if config.optimizer_cuda_graph:
+        # The captured step holds FsdpMuon's NCCL P2P, so the same constraint as for TE CUDA graphs
+        # (TECudaGraphHelper) applies.
+        if (
+            "expandable_segments:True" in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
+            and os.getenv("NCCL_GRAPH_REGISTER") != "0"
+        ):
+            raise ValueError(
+                "Set NCCL_GRAPH_REGISTER=0 to avoid illegal memory access when capturing FsdpMuon "
+                "in the optimizer CUDA graph with PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True."
+            )
         # A captured step reads the learning rate from device memory, which the scheduler
         # updates in place; a Python number would stay at its value during capture.
         for group in optimizer.param_groups:
