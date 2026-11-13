@@ -648,6 +648,25 @@ class TestGlobalProcessGroupFallbacks:
                     with_context_parallel=True, tp_only_amax_red=tp_only_amax_red
                 )
 
+    @pytest.mark.skipif(not HAVE_TE, reason="the T5 cross-attention spec needs Transformer Engine")
+    def test_cross_attention_without_collection_builds_before_initialization(self):
+        """Before initialize_model_parallel() the cross-attention linears get no collection."""
+        Utils.destroy_model_parallel()
+        config = TransformerConfig(
+            num_layers=1, hidden_size=64, num_attention_heads=4, use_cpu_initialization=True
+        )
+        decoder_layer = decoder_model_with_transformer_engine_default_spec().submodules
+        with pytest.warns(FutureWarning) as record:
+            attention = CrossAttention(
+                config, decoder_layer.cross_attention.submodules, layer_number=1
+            )
+        _fallback_warning(record, "CrossAttention")
+        assert attention.tp_group is None
+        # As for SelfAttention: with the fallback's all-None collection a per-module FP8/FP4
+        # recipe would raise for its missing amax group at forward time.
+        for linear in (attention.linear_q, attention.linear_kv, attention.linear_proj):
+            assert linear._pg_collection is None
+
     @requires_te_hierarchical_cp
     def test_self_attention_without_collection_supports_hierarchical_cp(self):
         Utils.initialize_model_parallel(
