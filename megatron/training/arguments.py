@@ -2763,6 +2763,14 @@ def _add_training_args(parser):
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
                        help='Disable pinning of CPU memory for parameters.')
+    group.add_argument('--main-params-rounding', type=str, default='nearest',
+                       choices=['nearest', 'stochastic'],
+                       help='Rounding used when copying FP32 main params back to BF16 model '
+                       'params after each optimizer step. "stochastic" keeps BF16 weights equal '
+                       'to the main params in expectation so small updates are not lost; it '
+                       'changes training numerics. Requires the distributed optimizer.')
+    group.add_argument('--main-params-rounding-seed', type=int, default=0,
+                       help='Seed for --main-params-rounding stochastic.')
     group.add_argument('--dataloader-type', type=str, default=None,
                        choices=['single', 'cyclic', 'external'],
                        help='Single pass vs multiple pass data loader')
