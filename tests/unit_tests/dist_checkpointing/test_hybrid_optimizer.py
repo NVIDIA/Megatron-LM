@@ -77,14 +77,24 @@ class HybridOptimizerModel(torch.nn.Module):
         }
 
 
+@pytest.mark.parametrize('offload_fraction', [0.5, 1.0], ids=['partial_offload', 'full_offload'])
 @pytest.mark.parametrize('precision_aware,mixed', [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize(
     'checkpoint_format', ['dp_reshardable', 'fully_reshardable', 'dp_zero_gather_scatter', 'torch']
 )
 def test_hybrid_checkpoint_continuation(
-    tmp_path_dist_ckpt, monkeypatch, precision_aware: bool, mixed: bool, checkpoint_format: str
+    tmp_path_dist_ckpt,
+    monkeypatch,
+    precision_aware: bool,
+    mixed: bool,
+    checkpoint_format: str,
+    offload_fraction: float,
 ) -> None:
-    """Restore step two and compare all owner states after steps three through five."""
+    """Restore step two and compare all owner states after steps three through five.
+
+    Full offload places the native FP32 parameters of the mixed model on the CPU
+    optimizer, so a stale CPU copy would overwrite the restored model weights.
+    """
     if Utils.world_size < 2 or Utils.world_size % 2:
         pytest.skip('Requires an even world size for DP=2')
     tp = Utils.world_size // 2
@@ -108,14 +118,19 @@ def test_hybrid_checkpoint_continuation(
                 use_distributed_optimizer=True,
                 use_precision_aware_optimizer=precision_aware,
                 optimizer_cpu_offload=True,
-                optimizer_offload_fraction=0.5,
+                optimizer_offload_fraction=offload_fraction,
                 overlap_cpu_optimizer_d2h_h2d=True,
                 clip_grad=0.0,
             ),
             [model],
         )
         inner = optimizer.chained_optimizers[0].optimizer
-        assert inner.cpu_optimizers and inner.gpu_optimizer is not None
+        assert inner.cpu_optimizers
+        assert (inner.gpu_optimizer is None) == (offload_fraction == 1.0)
+        if mixed and offload_fraction == 1.0:
+            assert any(
+                parameter.dtype == torch.float32 for parameter in inner.gpu_params_map_cpu_copy
+            ), 'Expected a CPU-owned native FP32 parameter'
         return model, optimizer
 
     def train_step(model, optimizer, step):
@@ -127,7 +142,8 @@ def test_hybrid_checkpoint_continuation(
         assert success
         torch.cuda.synchronize()
         inner = optimizer.chained_optimizers[0].optimizer
-        assert all(group['step'] == step for group in inner.gpu_optimizer.param_groups)
+        if inner.gpu_optimizer is not None:
+            assert all(group['step'] == step for group in inner.gpu_optimizer.param_groups)
         for child in inner.cpu_optimizers:
             assert all(state['step'].item() == step for state in child.state.values())
 
@@ -164,7 +180,7 @@ def test_hybrid_checkpoint_continuation(
                 monkeypatch.delenv('TORCH_FORCE_WEIGHTS_ONLY_LOAD', raising=False)
                 monkeypatch.setenv('TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD', '1')
             args.optimizer_cpu_offload = True
-            args.optimizer_offload_fraction = 0.5
+            args.optimizer_offload_fraction = offload_fraction
             args.overlap_cpu_optimizer_d2h_h2d = True
             args.use_precision_aware_optimizer = precision_aware
 
