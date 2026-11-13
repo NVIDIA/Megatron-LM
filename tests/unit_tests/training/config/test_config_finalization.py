@@ -28,7 +28,7 @@ from megatron.training.models import (
     T5ModelConfig,
 )
 from megatron.training.models.base import ModelConfig
-from megatron.training.sequence_lengths import get_model_input_lengths
+from megatron.training.sequence_lengths import get_model_input_length
 
 
 @pytest.mark.parametrize("packed", [False, True])
@@ -54,14 +54,11 @@ def test_dataset_content_limit_and_execution_bound_are_distinct(run_config, pack
     cfg.finalize()
     assert cfg.data.dataset.sequence_length == 8
     assert cfg.model.transformer.max_seq_length_per_sample == 32
-    assert get_model_input_lengths(cfg.model, cfg.data.dataset) == (32 if packed else 8, None)
+    assert get_model_input_length(cfg.model, cfg.data.dataset) == (32 if packed else 8)
     saved = cfg.to_dict()
     restored = type(cfg).from_dict(saved)
     restored.finalize()
-    assert get_model_input_lengths(restored.model, restored.data.dataset) == (
-        32 if packed else 8,
-        None,
-    )
+    assert get_model_input_length(restored.model, restored.data.dataset) == (32 if packed else 8)
     assert restored.to_dict() == saved
 
 
@@ -77,7 +74,7 @@ def test_t5_input_widths_do_not_follow_position_capacity():
     )
     model.validate()
     model.finalize()
-    assert get_model_input_lengths(model) == (16, 32)
+    assert get_model_input_length(model) == 16
     model.transformer.max_seq_length_per_sample = 16
     with pytest.raises(ValueError, match="decoder_seq_length"):
         model.validate()

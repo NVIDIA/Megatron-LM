@@ -173,8 +173,8 @@ from megatron.training.logging.packed_sequence_stats import (
     consume_packed_sequence_stats_in_iteration,
     update_packed_sequence_stats,
 )
-from megatron.training.models import ModelConfig
-from megatron.training.sequence_lengths import get_model_input_lengths
+from megatron.training.models import ModelConfig, T5ModelConfig
+from megatron.training.sequence_lengths import get_model_input_length
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
@@ -895,7 +895,8 @@ def num_floating_point_operations(
 
     Args:
         model_config: Model configuration containing the resolved TransformerConfig.
-        sequence_length: Actual data/decoder length, distinct from position capacity.
+        sequence_length: Actual input length, distinct from position capacity. T5 uses its
+            configured decoder length when present, preserving the existing FLOPs estimate.
         batch_size: Global batch size (samples per iteration). Only used to
             compute the default token counts for the BSHD path -- with THD
             both ``total_real_tokens_in_batch`` and ``seqlen_squared_sum_in_batch``
@@ -920,6 +921,9 @@ def num_floating_point_operations(
 
     transformer_cfg = model_config.transformer
     llm_seq_length = sequence_length
+    if isinstance(model_config, T5ModelConfig) and model_config.decoder_seq_length is not None:
+        # Preserve T5's decoder-based estimate without exposing it to pipeline sizing.
+        llm_seq_length = model_config.decoder_seq_length
     group_query_attention = transformer_cfg.num_query_groups != transformer_cfg.num_attention_heads
     swiglu = transformer_cfg.gated_linear_unit and transformer_cfg.activation_func is torch.nn.functional.silu
     vocab_size = model_vocab_size(
@@ -1899,7 +1903,7 @@ def pretrain(
     if cfg_container.logger.log_progress:
         append_to_progress_log(cfg_container.checkpoint.save, "Starting job")
 
-    sequence_length, _ = get_model_input_lengths(cfg_container.model, cfg_container.data.dataset)
+    sequence_length = get_model_input_length(cfg_container.model, cfg_container.data.dataset)
     set_jit_fusion_options(
         cfg_container.model.transformer,
         sequence_length=sequence_length,
@@ -3258,7 +3262,7 @@ def setup_model_and_optimizer(
 def dummy_train_step(data_iterator):
     """Single dummy training step."""
     cfg = get_run_config()
-    sequence_length, _ = get_model_input_lengths(cfg.model, cfg.data.dataset)
+    sequence_length = get_model_input_length(cfg.model, cfg.data.dataset)
     tp_rank = mpu.get_tensor_model_parallel_rank()
     # Data predicates and model parallelism describe the batch transfer.
     has_cu_seqlens = cfg.data.has_cu_seqlens()
@@ -3482,8 +3486,7 @@ def train_step(
     """
     args = get_args()
     cfg = get_run_config()
-    sequence_length, decoder_seq_length = get_model_input_lengths(cfg.model, cfg.data.dataset)
-    pipeline_seq_length = decoder_seq_length if decoder_seq_length is not None else sequence_length
+    sequence_length = get_model_input_length(cfg.model, cfg.data.dataset)
     timers = get_timers()
 
     # OTel: set up per-step sub-span support.
@@ -3521,7 +3524,7 @@ def train_step(
             # Distillation shape-adjust reads parallel_state; only for modelopt-enabled runs.
             adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
                 model,
-                seq_length=pipeline_seq_length,
+                seq_length=sequence_length,
                 micro_batch_size=cfg.train.micro_batch_size,
             )
         else:
@@ -3615,7 +3618,7 @@ def train_step(
                 data_iterator=forward_backward_data_iterator,
                 model=model,
                 num_microbatches=scheduled_num_microbatches,
-                seq_length=pipeline_seq_length,
+                seq_length=sequence_length,
                 micro_batch_size=cfg.train.micro_batch_size,
                 forward_only=forward_only,
                 adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
@@ -3846,7 +3849,7 @@ def training_log(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
-    sequence_length, decoder_seq_length = get_model_input_lengths(cfg.model, cfg.data.dataset)
+    sequence_length = get_model_input_length(cfg.model, cfg.data.dataset)
     timers = get_timers()
     writer = get_tensorboard_writer()
     wandb_writer = get_wandb_writer()
@@ -4134,7 +4137,7 @@ def training_log(
         throughput = num_floating_point_operations(
             cfg.model,
             batch_size,
-            sequence_length=decoder_seq_length or sequence_length,
+            sequence_length=sequence_length,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
@@ -4365,7 +4368,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     sequence_length = (
         dataset.packed_sequence_length or dataset.sequence_length
         if dataset is not None
-        else get_model_input_lengths(cfg.model)[0]
+        else get_model_input_length(cfg.model)
     )
     checkpoint = cfg.checkpoint
     train_state = get_train_state()
@@ -4892,7 +4895,7 @@ def train(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
-    sequence_length, decoder_seq_length = get_model_input_lengths(cfg.model, cfg.data.dataset)
+    sequence_length = get_model_input_length(cfg.model, cfg.data.dataset)
     timers = get_timers()
     train_state = get_train_state()
 
@@ -5533,7 +5536,7 @@ def train(
         num_floating_point_operations_in_batch = num_floating_point_operations(
             cfg.model,
             batch_size,
-            sequence_length=decoder_seq_length or sequence_length,
+            sequence_length=sequence_length,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
         )
@@ -5802,8 +5805,7 @@ def evaluate(
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     cfg = get_run_config()
-    sequence_length, decoder_seq_length = get_model_input_lengths(cfg.model, cfg.data.dataset)
-    pipeline_seq_length = decoder_seq_length if decoder_seq_length is not None else sequence_length
+    sequence_length = get_model_input_length(cfg.model, cfg.data.dataset)
     timers = get_timers()
     train_state = get_train_state()
 
@@ -5867,7 +5869,7 @@ def evaluate(
         # [ModelOpt]: Pipeline-parallel Distillation stacks student and teacher tensors
         adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
             model,
-            seq_length=pipeline_seq_length,
+            seq_length=sequence_length,
             micro_batch_size=eval_micro_batch_size,
         )
     else:
@@ -5918,7 +5920,7 @@ def evaluate(
                     data_iterator=packed_data_iterator,
                     model=model,
                     num_microbatches=scheduled_eval_num_microbatches,
-                    seq_length=pipeline_seq_length,
+                    seq_length=sequence_length,
                     micro_batch_size=eval_micro_batch_size,
                     forward_only=True,
                     adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
@@ -5978,7 +5980,7 @@ def evaluate(
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
-                seq_length=pipeline_seq_length,
+                seq_length=sequence_length,
                 micro_batch_size=eval_micro_batch_size,
                 forward_only=True,
                 collect_non_loss_data=True,

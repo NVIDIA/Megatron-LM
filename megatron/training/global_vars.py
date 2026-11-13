@@ -21,7 +21,7 @@ from megatron.core.num_microbatches_calculator import (
     unset_num_microbatches_calculator,
 )
 from megatron.training.dist_signal_handler import DistributedSignalHandler
-from megatron.training.sequence_lengths import get_model_input_lengths
+from megatron.training.sequence_lengths import get_model_input_length
 from megatron.training.state import TrainState
 
 _GLOBAL_ARGS = None
@@ -240,7 +240,7 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         seq_length=(
             dataset.packed_sequence_length or dataset.sequence_length
             if dataset is not None
-            else get_model_input_lengths(cfg.model)[0]
+            else get_model_input_length(cfg.model)
         ),
     )
     _set_tensorboard_writer(args)
@@ -601,7 +601,7 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
         sequence_length = (
             dataset.packed_sequence_length or dataset.sequence_length
             if dataset is not None
-            else get_model_input_lengths(cfg.model)[0]
+            else get_model_input_length(cfg.model)
         )
     else:
         sequence_length = getattr(args, 'seq_length', None)

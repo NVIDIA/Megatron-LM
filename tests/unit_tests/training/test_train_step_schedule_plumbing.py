@@ -109,7 +109,7 @@ def test_train_step_forwards_schedule_plumbing(run_config, encoder_decoder):
     p2p, pg = object(), object()
     captured = _run(p2p_communicator=p2p, pg_collection=pg)
     assert captured["p2p_communicator"] is p2p and captured["pg_collection"] is pg
-    assert captured["seq_length"] == (16 if encoder_decoder else 32)
+    assert captured["seq_length"] == 32
     assert "decoder_seq_length" not in captured
 
 
