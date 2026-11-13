@@ -325,12 +325,9 @@ class DBuffer:
             self.layout,
         )
 
-    def is_alias_of(self, other: object) -> bool:
+    def is_alias_of(self, other: "DBuffer") -> bool:
         """Whether the local buffers share backing storage, including distinct views."""
-        return (
-            isinstance(other, DBuffer)
-            and self.local_buffer.untyped_storage() is other.local_buffer.untyped_storage()
-        )
+        return self.local_buffer.untyped_storage() is other.local_buffer.untyped_storage()
 
     @classmethod
     def distribute_tensors(

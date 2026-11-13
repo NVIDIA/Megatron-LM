@@ -463,10 +463,19 @@ class FsdpParameterGroup:
         )
 
     @property
+    def _unsharded_model_weight_is_alias(self) -> bool:
+        """Whether gathered compute weights alias their sharded storage."""
+        buffer = self._unsharded_model_weight
+        # Sharded and unsharded compute weights always share a representation.
+        if isinstance(buffer, DBuffer):
+            return buffer.is_alias_of(cast(DBuffer, self.model_weight))
+        return buffer.is_alias_of(cast(QuantizedDBuffer, self.model_weight))
+
+    @property
     def is_rowwise_unsharded(self) -> bool:
         """Whether MXFP8 rowwise planes occupy temporary gathered storage."""
         buffer = self._unsharded_model_weight
-        if buffer.is_alias_of(self.model_weight):
+        if self._unsharded_model_weight_is_alias:
             return False
         # QuantizedDBuffer aliases DBuffer when TE is unavailable.
         if isinstance(buffer, DBuffer):
@@ -500,7 +509,7 @@ class FsdpParameterGroup:
             self._model_weight_is_stale = False
 
         ready_phases: tuple[Phase, ...]
-        if self._unsharded_model_weight.is_alias_of(self.model_weight):
+        if self._unsharded_model_weight_is_alias:
             ready_phases = (Phase.FORWARD, Phase.BACKWARD)
         elif isinstance(self._unsharded_model_weight, DBuffer):
             self._allgather_model_weight()
@@ -602,7 +611,7 @@ class FsdpParameterGroup:
 
         # Clear readiness so the next unshard refreshes Parameter data/scales,
         # but never free persistent compute weights or their padded scale copies.
-        if unsharded_model_weight.is_alias_of(self.model_weight):
+        if self._unsharded_model_weight_is_alias:
             return
         if isinstance(unsharded_model_weight, DBuffer):
             assert not rowwise_only
