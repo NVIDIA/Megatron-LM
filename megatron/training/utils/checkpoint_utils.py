@@ -29,7 +29,7 @@ from megatron.training.utils.common_utils import print_rank_0
 CONFIG_FILE = "run_config.yaml"
 TRAIN_STATE_FILE = "train_state.pt"
 _RUNTIME_ONLY_TARGETS = frozenset({"megatron.core.timers.Timers"})
-RUN_CONFIG_RECORD_TYPE = "RunConfigRecord"
+ROOT_CONFIG_CONTAINER_TYPE = "RootConfigContainer"
 
 logger = logging.getLogger(__name__)
 
@@ -264,9 +264,9 @@ def _sanitize_run_config_object(obj: Any) -> Any:
 
 
 def run_config_sections(run_config: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
-    """Return the run config's sections from a checkpoint's configuration record."""
+    """Return the run config's sections from a checkpoint's saved configuration."""
     if isinstance(run_config, dict) and str(run_config.get("_target_", "")).endswith(
-        "." + RUN_CONFIG_RECORD_TYPE
+        "." + ROOT_CONFIG_CONTAINER_TYPE
     ):
         return run_config.get("training")
     return run_config

@@ -47,7 +47,13 @@ from megatron.training.vocab_utils import (
 @pytest.fixture
 def isolated_globals(monkeypatch):
     """Avoid changing services owned by the distributed test harness."""
-    for name in ("_GLOBAL_ARGS", "_GLOBAL_RUN_CONFIG", "_GLOBAL_TOKENIZER", "_GLOBAL_TRAIN_STATE"):
+    for name in (
+        "_GLOBAL_ARGS",
+        "_GLOBAL_RUN_CONFIG",
+        "_GLOBAL_ROOT_CONFIG_CONTAINER",
+        "_GLOBAL_TOKENIZER",
+        "_GLOBAL_TRAIN_STATE",
+    ):
         monkeypatch.setattr(global_vars, name, None)
 
 
@@ -1435,8 +1441,12 @@ def test_training_tokenizer_padding_uses_model_inputs(
         tokenizer=_default_config_from_args(TokenizerConfig, args),
         dist=DistributedInitConfig(),
     )
+    # A registered root container's deployment with its own copy of the model config, taken
+    # before the tokenizer exists; it shares the run's tokenizer section (an RL rollout layout).
+    deployment = SimpleNamespace(model=deepcopy(model), tokenizer=cfg.tokenizer)
     global_vars.set_args(args)
     global_vars.set_run_config(cfg)
+    global_vars.set_root_config_container(SimpleNamespace(training=cfg, inference=deployment))
     for service in ("_set_wandb_writer", "_set_telemetry", "initialize_training_runtime_services"):
         monkeypatch.setattr(global_vars, service, Mock())
 
@@ -1447,6 +1457,8 @@ def test_training_tokenizer_padding_uses_model_inputs(
     assert cfg.tokenizer.padded_vocab_size == expected
     assert args.padded_vocab_size == padded_vocab
     assert cfg.model.vocab_size == (129 if expected is None else expected)
+    # The services bound the deployment's copy too, for the saved run config.
+    assert deployment.model.vocab_size == cfg.model.vocab_size
     assert global_vars.get_tokenizer().vocab_size == 129
     assert args.tensor_model_parallel_size == 1
     assert args.make_vocab_size_divisible_by == 128
@@ -1863,7 +1875,7 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
         InferenceConfigContainer,
         InferenceSetupConfig,
         RLConfig,
-        RunConfigRecord,
+        RootConfigContainer,
     )
 
     args = Namespace(reset_attention_mask=False, batch_invariant_mode=False)
@@ -1874,8 +1886,8 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
     cfg.train.micro_batch_size = 1
     cfg.train.global_batch_size = 8
     cfg.train.train_iters = 10
-    # The entrypoint composes the run's record from the parsed args: the run config, the rollout
-    # engine's deployment and the RL section; the two builders are stubbed, like the args.
+    # The entrypoint composes the run's root container from the parsed args: the run config, the
+    # rollout engine's deployment and the RL section; the two builders are stubbed, like the args.
     deployment = InferenceConfigContainer(
         model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
     )
@@ -1891,7 +1903,7 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
     )
     monkeypatch.setattr(argument_utils, "_default_config_from_args", Mock(return_value=rl_section))
     register = Mock()
-    monkeypatch.setattr(rl_config_module, "set_run_config_record", register)
+    monkeypatch.setattr(rl_config_module, "set_root_config_container", register)
     services = Mock(side_effect=AssertionError("entrypoint initialized services before pretrain"))
     monkeypatch.setattr(global_vars, "initialize_runtime_services", services)
     pretrain = Mock()
@@ -1917,11 +1929,11 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
     assert callable(kwargs["next_train_iterator"]) and callable(kwargs["run_eval"])
     assert global_vars.get_run_config() is cfg
     register.assert_called_once()
-    record = register.call_args.args[0]
-    assert isinstance(record, RunConfigRecord)
-    assert record.training is cfg and record.inference is deployment
-    assert record.algorithm.rl is rl_section
-    assert deployment._finalized  # the entrypoint finalized the record
+    root = register.call_args.args[0]
+    assert isinstance(root, RootConfigContainer)
+    assert root.training is cfg and root.inference is deployment
+    assert root.algorithm.rl is rl_section
+    assert deployment._finalized  # the entrypoint finalized the root container
     assert global_vars._GLOBAL_TOKENIZER is None
     services.assert_not_called()
     # A run the RL rules reject fails before the try whose finally exits with code 0: 128

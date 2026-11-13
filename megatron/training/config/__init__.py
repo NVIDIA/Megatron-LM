@@ -5,7 +5,7 @@ from megatron.training.config.container import (
     AlgorithmConfigContainer,
     InferenceConfigContainer,
     PretrainConfigContainer,
-    RunConfigRecord,
+    RootConfigContainer,
 )
 from megatron.training.config.dataset_config import DataConfig, DataloaderConfig
 from megatron.training.config.inference_config import InferenceSetupConfig

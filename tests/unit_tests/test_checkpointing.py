@@ -48,7 +48,7 @@ from megatron.training.config import (
     InferenceConfigContainer,
     InferenceSetupConfig,
     ProfilingConfig,
-    RunConfigRecord,
+    RootConfigContainer,
 )
 from megatron.training.global_vars import get_args, get_run_config, set_args
 from megatron.training.models import (
@@ -1162,7 +1162,7 @@ def test_load_checkpoint(
             saved_config = yaml.safe_load(f)
         for field in fields(rng_config):
             assert saved_config["training"]["rng"][field.name] == getattr(rng_config, field.name)
-        restored_config = RunConfigRecord.from_yaml(
+        restored_config = RootConfigContainer.from_yaml(
             ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml"
         ).training
         assert type(restored_config.model) is model_cls

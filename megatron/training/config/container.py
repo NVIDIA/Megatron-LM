@@ -920,13 +920,14 @@ class AlgorithmConfigContainer(ConfigContainerBase):
 
 
 @dataclass(kw_only=True)
-class RunConfigRecord(ConfigContainerBase):
-    """The configuration record of a run (`run_config.yaml`).
+class RootConfigContainer(ConfigContainerBase):
+    """Container of config containers: a run's whole configuration, saved as `run_config.yaml`.
 
-    A training run records `training`, an inference run records `inference`,
-    an RL run records `training`, `inference`, and `algorithm`.
+    Each member is itself a container (the other containers hold config sections).
+    A training run sets `training`, an inference run sets `inference`,
+    an RL run sets `training`, `inference`, and `algorithm`.
 
-    Records written before this type, a container serialized flat, still load through
+    A run config saved before this type, one container serialized flat, still loads through
     `megatron.training.utils.checkpoint_utils.run_config_sections` (backwards compatibility).
     """
 
@@ -941,7 +942,7 @@ class RunConfigRecord(ConfigContainerBase):
 
     @classmethod
     def wrap(cls, run_config: ConfigContainerBase) -> ConfigContainerBase:
-        """Wrap a lone run config under its record member; return other types as is."""
+        """Wrap a lone run config as the matching member; return other types as is."""
         if isinstance(run_config, PretrainConfigContainer):
             return cls(training=run_config)
         if isinstance(run_config, InferenceConfigContainer):
@@ -956,6 +957,8 @@ class RunConfigRecord(ConfigContainerBase):
             owner = "training" if self.training is not None else "inference"
             member = getattr(self, owner)
             if member is None:
-                raise ValueError("RunConfigRecord has no run config member to apply overrides to")
+                raise ValueError(
+                    "RootConfigContainer has no run config member to apply overrides to"
+                )
             document[owner] = member.to_dict(**section_overrides)
         return document

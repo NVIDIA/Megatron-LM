@@ -22,7 +22,7 @@ from megatron.training.config import (
     InferenceConfigContainer,
     InferenceSetupConfig,
     RLConfig,
-    RunConfigRecord,
+    RootConfigContainer,
 )
 from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -72,7 +72,7 @@ def _set_minimal_args():
     pretrain.tokenizer = TokenizerConfig(vocab_size=VOCAB)
     set_global_variables(args, pretrain, build_tokenizer=False)
     set_rl_run_config(
-        RunConfigRecord(
+        RootConfigContainer(
             training=pretrain,
             inference=InferenceConfigContainer(
                 model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()

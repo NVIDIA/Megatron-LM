@@ -3,14 +3,21 @@
 """Disaggregated prefill/decode rollouts for RL."""
 
 import copy
+from argparse import Namespace
+from contextlib import AbstractContextManager
 
+import torch
 import torch.distributed as dist
 
+from megatron.core.enums import ModelType
 from megatron.core.inference.shards import build_inference_pg_collections_for_shards
 from megatron.core.inference.shards_spec import (
     resolve_inference_shard,
     spec_declares_disaggregation,
 )
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.config import RLConfig
+from megatron.training.models.base import ModelConfig
 
 
 def disagg_refit_pools(
@@ -26,8 +33,14 @@ def disagg_refit_pools(
 
 
 def build_disagg_inference_model(
-    args, model_type, transformer_config, *, rl_config, model_config, model_alloc_ctx
-):
+    args: Namespace,
+    model_type: ModelType,
+    transformer_config: TransformerConfig,
+    *,
+    rl_config: RLConfig,
+    model_config: ModelConfig,
+    model_alloc_ctx: AbstractContextManager,
+) -> list[torch.nn.Module]:
     """Build this rank's disaggregated RL inference shard."""
     if rl_config.rl_verify_model_weights_swap:
         raise ValueError(

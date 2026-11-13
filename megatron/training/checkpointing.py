@@ -69,12 +69,12 @@ from megatron.training.argument_utils import (
 from megatron.training.config import (
     CheckpointConfig,
     PretrainConfigContainer,
-    RunConfigRecord,
+    RootConfigContainer,
     TokenizerConfig,
 )
 from megatron.training.global_vars import (
+    get_root_config_container,
     get_run_config,
-    get_run_config_record,
     get_tokenizer,
     get_train_state,
 )
@@ -758,10 +758,10 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
 
 
 
-def _run_config_record():
-    """The record `save_checkpoint` writes."""
-    record = get_run_config_record()
-    return record if record is not None else RunConfigRecord.wrap(get_run_config())
+def _root_config_container():
+    """The root container `save_checkpoint` writes."""
+    root = get_root_config_container()
+    return root if root is not None else RootConfigContainer.wrap(get_run_config())
 
 def save_checkpoint(
     iteration,
@@ -1172,8 +1172,8 @@ def save_checkpoint(
                 f'rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt '
             )
             if ckpt_type == CheckpointType.LOCAL:
-                # Local checkpoints have no YAML sidecar; persist the run config record here.
-                state_dict['run_config'] = _run_config_record().to_dict(checkpoint=save_policy)
+                # Local checkpoints have no YAML sidecar; persist the root config container here.
+                state_dict['run_config'] = _root_config_container().to_dict(checkpoint=save_policy)
                 try:
                     from megatron.core.dist_checkpointing.tensor_aware_state_dict import (
                         MCoreTensorAwareStateDict,
@@ -1318,7 +1318,7 @@ def save_checkpoint(
                 # unit tests that do not create a config container.
                 # in the future, run_config.to_yaml() should always run.
                 try:
-                    run_config = _run_config_record()
+                    run_config = _root_config_container()
                 except AssertionError as e:
                     if str(e) != 'run config is not initialized.':
                         raise

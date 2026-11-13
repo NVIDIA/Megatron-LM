@@ -74,7 +74,7 @@ from megatron.training.config import (
     InferenceConfigContainer,
     InferenceSetupConfig,
     RLConfig,
-    RunConfigRecord,
+    RootConfigContainer,
 )
 from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
@@ -88,8 +88,8 @@ VOCAB = 768
 
 
 def _rl_run_config(args, pretrain):
-    """The RL run's record for a colocated run whose engine shares the training model."""
-    return RunConfigRecord(
+    """The root container of a colocated RL run whose engine shares the training model."""
+    return RootConfigContainer(
         training=pretrain,
         inference=InferenceConfigContainer(
             model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
@@ -1429,7 +1429,7 @@ class TestRLUtils:
         monkeypatch.setattr(train_rl, "get_logprobs", lambda *a, **k: values)
         monkeypatch.setattr(train_rl, "calculate_grpo_loss", lambda **k: (values,) * 6)
         # The loss function reads the rerun flags through the pretrain run config (the fixture);
-        # forward_step reads the RL section through the record.
+        # forward_step reads the RL section through the root container.
         run_config.rerun_state_machine.check_for_nan_in_loss = False
         monkeypatch.setattr(train_rl, "get_args", SimpleNamespace)
         monkeypatch.setattr(

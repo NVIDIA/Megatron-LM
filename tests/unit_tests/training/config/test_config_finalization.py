@@ -17,7 +17,7 @@ from megatron.training.config import (
     InferenceConfigContainer,
     InferenceSetupConfig,
     RLConfig,
-    RunConfigRecord,
+    RootConfigContainer,
 )
 from megatron.training.models import (
     BertModelConfig,
@@ -62,7 +62,7 @@ def test_validation_is_read_only_and_finalization_runs_once(
         cfg.train.global_batch_size = 8
         # validate_rl_run checks the RL section; finalize_rl_run applies its DDP layout. The
         # deployment shares the training model and the run's RNG section, as the entry point's.
-        rl_run = RunConfigRecord(
+        rl_run = RootConfigContainer(
             training=cfg,
             inference=InferenceConfigContainer(
                 model=cfg.model,
@@ -215,7 +215,7 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     run_config.model = GPTModelConfig(transformer=transformer, vocab_size=128, seq_length=16)
     run_config.train.micro_batch_size = 1
     run_config.train.global_batch_size = 8
-    rl_run = RunConfigRecord(
+    rl_run = RootConfigContainer(
         training=run_config,
         inference=InferenceConfigContainer(
             model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
@@ -240,7 +240,7 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
         error, message = AssertionError, "Make sure the number of model chunks"
     before = copy.deepcopy(run_config.to_dict())
     if invalid_policy == "ddp_offload":
-        # The RL rule lives on the record, not on the pretrain container.
+        # The RL rule lives on the root container, not on the pretrain container.
         checks = [
             lambda: validate_rl_run(rl_run),
             lambda: validate_rl_run(rl_run),
