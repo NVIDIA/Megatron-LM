@@ -269,6 +269,8 @@ class MaskedWordPieceDataset(MegatronDataset):
         #    -> boundaries: [1, 1, 0, 0, 1, 0, 1, 1, 0, 1]
         #    -> candidates with whole word masking: [[1, 2, 3], [4, 5], [7, 8]]
         #    -> candidates sans whole word masking: [[1], [2], [3], [4], [5], [7], [8]]
+        # Read once: BertWordPiece cls and sep call convert_tokens_to_ids on
+        # every access, and the first inv_vocab access builds the reverse map.
         cls_id = self.config.tokenizer.cls
         sep_id = self.config.tokenizer.sep
         inv_vocab = self.config.tokenizer.inv_vocab
