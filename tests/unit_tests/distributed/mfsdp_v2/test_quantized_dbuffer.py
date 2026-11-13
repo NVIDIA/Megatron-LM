@@ -11,6 +11,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.dbuffer impor
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
     BlockAtomic,
     RowAtomic,
+    ShardLayout,
 )
 
 quantized_dbuffer = pytest.importorskip(
@@ -51,7 +52,12 @@ requires_mxfp8 = pytest.mark.skipif(
         pytest.param(lambda num_ranks: [(32, 128)] * num_ranks, id="short_tensors"),
     ],
 )
-def test_quantized_dbuffer_quantization_matches_te(distributed_setup, placements, make_shapes):
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_quantized_dbuffer_quantization_matches_te(
+    distributed_setup, placements, make_shapes, shard_layout
+):
     """Quantizing a sharded view matches TE and writes only this rank's shard.
 
     The view is taken from a replicated buffer filled with a canary, so any write
@@ -67,7 +73,11 @@ def test_quantized_dbuffer_quantization_matches_te(distributed_setup, placements
         mesh = init_device_mesh(device.type, (2, world_size // 2))
     shapes = make_shapes(mesh.size())
     canary = 0xAA
-    replicated = QuantizedDBuffer.empty(mesh, [Replicate()] * mesh.ndim, shapes, device)
+    replicated = QuantizedDBuffer.empty(
+        mesh, [Replicate()] * mesh.ndim, shapes, device, shard_layout=shard_layout
+    )
+    if shard_layout is ShardLayout.UNPADDED:
+        assert replicated.rowwise_data.layout.size == sum(rows * cols for rows, cols in shapes)
     for plane in replicated.planes:
         plane.local_buffer.fill_(canary)
     quantized = replicated.view(placements)
@@ -254,6 +264,50 @@ def test_quantized_dbuffer_partial_updated_tensor_supports_gemm(distributed_setu
         torch.testing.assert_close(actual[0], expected[0], rtol=0, atol=0)
 
 
+def test_quantized_dbuffer_is_alias_of(distributed_setup):
+    """Views alias every plane across storage release; independent buffers do not."""
+    mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
+    source = QuantizedDBuffer.empty(
+        mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+    )
+    view = source.view([BlockAtomic(32)])
+    separate = QuantizedDBuffer.empty(
+        mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+    )
+
+    assert source.is_alias_of(view)
+    assert view.is_alias_of(source)
+    assert not source.is_alias_of(separate)
+
+    source.release_storage()
+    separate.release_storage()
+    assert source.is_alias_of(view)
+    assert not source.is_alias_of(separate)
+
+    source.reallocate_storage()
+    assert source.is_alias_of(view)
+    assert not source.is_alias_of(separate)
+
+
+@pytest.mark.parametrize("mesh_axis", ["dp", "local"])
+def test_quantized_dbuffer_can_redistribute_locally(distributed_setup, mesh_axis):
+    """Replication can be sliced locally; gathering shards requires a singleton mesh."""
+    mesh = init_device_mesh(
+        distributed_setup.device.type,
+        (distributed_setup.world_size, 1),
+        mesh_dim_names=("dp", "local"),
+    )[mesh_axis]
+    source = QuantizedDBuffer.empty(
+        mesh, [Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+    )
+    view = source.view([BlockAtomic(32)])
+
+    assert source.can_redistribute_locally([Replicate()])
+    assert source.can_redistribute_locally([BlockAtomic(32)])
+    assert view.can_redistribute_locally([BlockAtomic(32)])
+    assert view.can_redistribute_locally([Replicate()]) == (mesh.size() == 1)
+
+
 def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
     """A sharded view aliases exactly this rank's slice of each replicated plane."""
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
@@ -281,37 +335,67 @@ def test_quantized_dbuffer_view_shares_every_plane(distributed_setup):
 
 
 @pytest.mark.parametrize("use_out", [False, True])
-def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out):
-    """All-gather preserves rank order in every plane, with or without an output buffer."""
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_quantized_dbuffer_allgathers_every_plane(distributed_setup, use_out, shard_layout):
+    """All-gather preserves rank order in every plane, with or without an output buffer.
+
+    Unpadded planes have unequal, possibly empty, rank segments; the scale planes
+    follow the data partition in 32x smaller coordinates.
+    """
     if distributed_setup.world_size < 2:
         pytest.skip("QuantizedDBuffer all-gather requires at least two ranks.")
     mesh = init_device_mesh(distributed_setup.device.type, (distributed_setup.world_size,))
-    shapes = [(128, 64), (32, 128)]
-    source = QuantizedDBuffer.empty(mesh, [BlockAtomic(32)], shapes, distributed_setup.device)
+    shapes = [(96, 64), (32, 128)]
+    source = QuantizedDBuffer.empty(
+        mesh, [BlockAtomic(32)], shapes, distributed_setup.device, shard_layout=shard_layout
+    )
+    data_layout = source.rowwise_data.layout
+    assert source.columnwise_data.layout == data_layout
+    assert data_layout.has_equal_shard_sizes == (shard_layout is ShardLayout.PADDED)
+    if shard_layout is ShardLayout.UNPADDED:
+        assert data_layout.size == 96 * 64 + 32 * 128
+
     for index, plane in enumerate(source.planes):
         plane.local_buffer.fill_(index * mesh.size() + mesh.get_local_rank())
     if use_out:
-        destination = QuantizedDBuffer.empty(mesh, [Replicate()], shapes, distributed_setup.device)
+        destination = QuantizedDBuffer.empty(
+            mesh, [Replicate()], shapes, distributed_setup.device, shard_layout=shard_layout
+        )
         result = source.allgather(0, out=destination)
         assert result is destination
     else:
         result = source.allgather(0)
+
     for index, plane in enumerate(result.planes):
         assert plane.placements == (Replicate(),)
-        chunks = plane.local_buffer.view(mesh.size(), -1)
+        layout = plane.layout
         for rank in range(mesh.size()):
-            assert chunks[rank].eq(index * mesh.size() + rank).all()
+            chunk = plane.local_buffer.narrow(
+                0, layout.rank_to_offset[rank], layout.rank_size(rank)
+            )
+            assert chunk.eq(index * mesh.size() + rank).all()
 
 
 @pytest.mark.parametrize("use_out", [False, True])
-def test_quantized_dbuffer_allgathers_every_plane_on_2d_mesh(distributed_setup, use_out):
+@pytest.mark.parametrize(
+    "shard_layout", [ShardLayout.PADDED, ShardLayout.UNPADDED], ids=["padded", "unpadded"]
+)
+def test_quantized_dbuffer_allgathers_every_plane_on_2d_mesh(
+    distributed_setup, use_out, shard_layout
+):
     """Gather an axis iterator in every plane, allocating or reusing output."""
     world_size = distributed_setup.world_size
     if world_size < 2 or world_size % 2:
         pytest.skip("Requires an even world size of at least two.")
     mesh = init_device_mesh(distributed_setup.device.type, (2, world_size // 2))
     source = QuantizedDBuffer.empty(
-        mesh, [BlockAtomic(32), BlockAtomic(32)], [(128, 64), (32, 128)], distributed_setup.device
+        mesh,
+        [BlockAtomic(32), BlockAtomic(32)],
+        [(128, 64), (32, 128)],
+        distributed_setup.device,
+        shard_layout=shard_layout,
     )
     for index, plane in enumerate(source.planes):
         values = (
@@ -321,7 +405,11 @@ def test_quantized_dbuffer_allgathers_every_plane_on_2d_mesh(distributed_setup, 
     # A one-shot iterator must be reusable across all four planes.
     if use_out:
         out = QuantizedDBuffer.empty(
-            mesh, [Replicate(), Replicate()], [(128, 64), (32, 128)], distributed_setup.device
+            mesh,
+            [Replicate(), Replicate()],
+            [(128, 64), (32, 128)],
+            distributed_setup.device,
+            shard_layout=shard_layout,
         )
         result = source.allgather(iter((0, 1)), out=out)
         assert result is out

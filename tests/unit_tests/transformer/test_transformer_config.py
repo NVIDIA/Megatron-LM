@@ -1,5 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from contextlib import nullcontext
+from dataclasses import dataclass, field
+
 import pytest
 import torch
 
@@ -83,8 +86,30 @@ def test_inactive_glu_interleave_accepts_fp32_model_parameters(overrides):
     assert config.params_dtype == torch.float32
 
 
-def _make_overlap_config(mtp_num_layers: int | None) -> TransformerConfig:
-    return TransformerConfig(
+@pytest.mark.parametrize(
+    "size_gib, offload, error",
+    [(size, True, None) for size in (0, 0.5, 8, 3, 152)]
+    + [
+        (size, True, "Pinned offload buffer")
+        for size in (-1, float("nan"), float("inf"), 0.1, 1000 / 2**30, 2**-24)
+    ]
+    + [(0, False, None), (1.5, False, "requires fine_grained_activation_offloading")],
+)
+def test_pinned_offload_buffer_config(size_gib, offload, error):
+    with pytest.raises(ValueError, match=error) if error else nullcontext():
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=8,
+            fine_grained_activation_offloading=offload,
+            offload_modules=["moe_act"],
+            fine_grained_offloading_buffer_size_gib=size_gib,
+        )
+        assert config.fine_grained_offloading_buffer_size_gib == size_gib
+
+
+def _make_overlap_config(mtp_num_layers: int | None, **overrides) -> TransformerConfig:
+    kwargs = dict(
         num_layers=1,
         hidden_size=128,
         num_attention_heads=4,
@@ -95,19 +120,50 @@ def _make_overlap_config(mtp_num_layers: int | None) -> TransformerConfig:
         bf16=True,
         mtp_num_layers=mtp_num_layers,
     )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
 
 
-@pytest.mark.parametrize("mtp_num_layers", [None, 0, 1])
+_FULL_RECOMPUTE_OVERRIDES = dict(
+    recompute_granularity="full",
+    recompute_method="uniform",
+    recompute_num_layers=1,
+    attention_dropout=0.0,
+    hidden_dropout=0.0,
+)
+
+
+@pytest.mark.parametrize("mtp_num_layers", [None, 0, 1, 2, 3])
 def test_ep_a2a_overlap_accepts_supported_mtp_layer_counts(mtp_num_layers: int | None):
     config = _make_overlap_config(mtp_num_layers)
 
     assert config.mtp_num_layers == mtp_num_layers
 
 
-@pytest.mark.parametrize("mtp_num_layers", [-1, 2])
-def test_ep_a2a_overlap_rejects_unsupported_mtp_layer_counts(mtp_num_layers: int):
-    with pytest.raises(AssertionError, match="MTP supports at most one layer"):
-        _make_overlap_config(mtp_num_layers)
+def test_ep_a2a_overlap_rejects_negative_mtp_layer_count():
+    with pytest.raises(AssertionError, match="mtp_num_layers must be non-negative"):
+        _make_overlap_config(-1)
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"mtp_use_repeated_layer": True}, "mtp_use_repeated_layer with mtp_num_layers > 1"),
+        ({"mtp_hsm": True}, "mtp_hsm is not yet supported"),
+        ({"enable_mhc_connections": True}, "enable_mhc_connections with mtp_num_layers > 1"),
+        (_FULL_RECOMPUTE_OVERRIDES, "full recompute with mtp_num_layers > 1"),
+    ],
+)
+def test_ep_a2a_overlap_rejects_unsupported_multi_mtp_features(overrides: dict, match: str):
+    with pytest.raises(AssertionError, match=match):
+        _make_overlap_config(2, **overrides)
+
+
+@pytest.mark.parametrize("overrides", [{"mtp_use_repeated_layer": True}, _FULL_RECOMPUTE_OVERRIDES])
+def test_ep_a2a_overlap_keeps_single_mtp_layer_features(overrides: dict):
+    config = _make_overlap_config(1, **overrides)
+
+    assert config.mtp_num_layers == 1
 
 
 def test_batch_invariant_backend_rejects_unknown_value_at_construction():
@@ -127,6 +183,19 @@ def test_mhc_fused_backend_defaults_to_auto():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
 
     assert config.mhc_fused_backend == "auto"
+
+
+@pytest.mark.parametrize("flag", ["mhc_norm_eps_inside_sqrt", "mhc_keep_mappings_in_fp32"])
+def test_mhc_fused_rejects_unsupported_precision_at_construction(flag):
+    with pytest.raises(ValueError, match="use_fused_mhc does not support"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            use_fused_mhc=True,
+            **{flag: True},
+        )
 
 
 def _make_dsa_kpool_config(**overrides) -> TransformerConfig:
@@ -188,6 +257,21 @@ def test_explicit_mhc_fused_backend_requires_fused_mhc():
         )
 
 
+def test_mhc_full_recompute_with_distributed_activations_is_configurable():
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        enable_mhc_connections=True,
+        recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=1,
+        distribute_saved_activations=True,
+    )
+    assert config.recompute_granularity == "full"
+    assert config.distribute_saved_activations
+
+
 def test_gdp_num_householder_defaults_to_three():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
 
@@ -226,6 +310,49 @@ def test_from_config_creates_independent_target_config_without_reinitializing():
 
     layer_config.dynamic_value["items"].append("changed")
     assert config.dynamic_value == {"items": []}
+
+
+def test_from_config_initializes_subclass_defaults_and_preserves_existing_values():
+    @dataclass
+    class LayerConfig(TransformerConfig):
+        scale: float = 1.5
+        annotations: list = field(default_factory=list)
+        values: list = field(default_factory=list)
+
+        def __post_init__(self):
+            raise AssertionError("from_config must not reinitialize the target config")
+
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    config.values = [3]
+    config.values_alias = config.values
+
+    first = LayerConfig.from_config(config)
+    second = LayerConfig.from_config(config)
+
+    assert first.scale == 1.5
+    assert first.annotations == []
+    assert first.annotations is not second.annotations
+    assert first.values == [3]
+    assert first.values is first.values_alias
+    assert first.values is not config.values
+    assert first.ffn_hidden_size == config.ffn_hidden_size
+
+    first.values = [4]
+    copied = LayerConfig.from_config(first)
+    assert copied.values == [4]
+    assert copied.values is not first.values
+    assert copied.values_alias == [3]
+
+
+def test_from_config_rejects_missing_required_subclass_fields():
+    @dataclass(kw_only=True)
+    class LayerConfig(TransformerConfig):
+        required_value: int
+
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+
+    with pytest.raises(TypeError, match="requires a value for 'required_value'"):
+        LayerConfig.from_config(config)
 
 
 def _make_softcap_config(attn_logit_softcapping) -> TransformerConfig:

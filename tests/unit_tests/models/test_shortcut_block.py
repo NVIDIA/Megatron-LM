@@ -17,8 +17,8 @@ from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualConnection
 
 # The shortcut-owned norms are Transformer Engine norms, which need a full TransformerConfig to
 # build and a GPU to run.
@@ -109,7 +109,7 @@ class _FakeMoE(torch.nn.Module):
         """Stand-in for the layer protocol: norm output, residual, and an empty payload."""
         return hidden_states, hidden_states, ()
 
-    def _get_mlp_residual_connection(self, operation):
+    def _get_residual_connection_for_mlp(self, operation):
         if self.config.wide_residual is None:
             return None
         match operation:
@@ -141,7 +141,10 @@ def test_group_layers_into_shortcut_blocks(compute_symbol, parallel):
 
     grouped = group_layers_into_shortcut_blocks(
         torch.nn.ModuleList([leading_moe, compute, paired_moe, trailing_layer]),
-        [LayerSymbols.MOE, compute_symbol, LayerSymbols.MOE, LayerSymbols.MLP],
+        [
+            LayerSymbols.LAYER_CONFIG_MAP[symbol].from_config(config)
+            for symbol in (LayerSymbols.MOE, compute_symbol, LayerSymbols.MOE, LayerSymbols.MLP)
+        ],
         config,
     )
 
@@ -352,7 +355,9 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
     compute_layer = _FakeCompute(config)
     moe_layer = _FakeMoE(config)
     block = ShortcutMoEBlock(compute_layer, moe_layer, overlap_a2a=False)
-    inference_context = object()
+    inference_context = SimpleNamespace(
+        config=SimpleNamespace(inference_shortcut_moe_overlap=False)
+    )
     observed = {}
 
     def compute_forward(hidden_states, **kwargs):
@@ -458,7 +463,10 @@ def test_group_layers_rejects_invalid_shortcut_pair(compute_symbol, compute, err
     with pytest.raises(ValueError, match=error):
         group_layers_into_shortcut_blocks(
             torch.nn.ModuleList([compute(config), _FakeMoE(config)]),
-            [compute_symbol, LayerSymbols.MOE],
+            [
+                LayerSymbols.LAYER_CONFIG_MAP[symbol].from_config(config)
+                for symbol in (compute_symbol, LayerSymbols.MOE)
+            ],
             config,
         )
 
@@ -469,7 +477,10 @@ def test_group_layers_rejects_pair_split_across_pipeline_stages():
     with pytest.raises(ValueError, match="cannot cross pipeline-stage boundaries"):
         group_layers_into_shortcut_blocks(
             torch.nn.ModuleList([_FakeMoE(config, layer_number=5), _FakeCompute(config)]),
-            [LayerSymbols.MOE, LayerSymbols.MAMBA],
+            [
+                LayerSymbols.LAYER_CONFIG_MAP[symbol].from_config(config)
+                for symbol in (LayerSymbols.MOE, LayerSymbols.MAMBA)
+            ],
             config,
             pp_layer_offset=4,
         )
@@ -706,9 +717,11 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
         torch.ones_like(hidden_states),
         torch.ones_like(hidden_states, dtype=torch.bool),
     )
-    mlp.preprocess = lambda hidden_states, probs, routing_map, padding_mask=None: (
-        hidden_states,
-        probs,
+    mlp.preprocess = (
+        lambda hidden_states, probs, routing_map, padding_mask=None, packed_seq_params=None: (
+            hidden_states,
+            probs,
+        )
     )
     mlp.dispatch = lambda hidden_states, probs: (hidden_states, probs)
     mlp.routed_experts_compute = lambda hidden_states, probs: (hidden_states + probs, None)

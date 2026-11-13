@@ -38,7 +38,11 @@ try:
 except ImportError:
     correct_amax_history_if_needed = None
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_context
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
+    RuntimePolicy,
+    fully_shard_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -310,22 +314,10 @@ def _ddp_wrap(
 
 
     if not use_torch_fsdp2:
-        if ddp_config.num_buckets is not None:
-            num_parameters = sum(
-                [sum([p.nelement() for p in model_module.parameters()]) for model_module in model]
-            )
-            ddp_config.bucket_size = num_parameters // ddp_config.num_buckets
-
-        # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
-        # If bucket_size is not provided as an input, use sane default.
-        # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
-        # ring-reduce implementations are large enough to remain bandwidth-bound rather than
-        # latency-bound.
-        if ddp_config.bucket_size is None:
-            ddp_config.bucket_size = max(40000000, 1000000 * pg_collection.dp_cp.size())
-        # Set bucket_size to infinity if overlap_grad_reduce is False.
-        if not ddp_config.overlap_grad_reduce:
-            ddp_config.bucket_size = None
+        num_parameters = sum(p.nelement() for chunk in model for p in chunk.parameters())
+        ddp_config.resolve_bucket_size(
+            num_parameters=num_parameters, data_parallel_size=pg_collection.dp_cp.size()
+        )
 
     # Argument validation converts --use-distributed-optimizer into
     # use_layer_wise_distributed_optimizer and clears the original, so re-enable it here:
@@ -384,7 +376,15 @@ def _ddp_wrap(
             DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2
         ) and ddp_config.megatron_fsdp_version == 2
         construction_context = (
-            fully_shard_context(use_symmetric_memory=ddp_config.nccl_ub, caller_managed_grad_sync=True)
+            fully_shard_context(
+                FsdpContext(
+                    runtime_policy=RuntimePolicy(
+                        use_symmetric_memory=ddp_config.nccl_ub,
+                        caller_managed_grad_sync=True,
+                        overlap_outer_communication=ddp_config.overlap_outer_communication,
+                    )
+                )
+            )
             if is_mfsdp_v2
             else nullcontext()
         )
