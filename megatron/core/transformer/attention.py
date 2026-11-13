@@ -331,13 +331,14 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
 
         if pg_collection is None:
             warn_global_process_group_fallback(type(self).__name__)
-            # hcp feeds TEDotProductAttention's a2a+p2p path. The data-parallel groups are
-            # resolved only in test_mode, so a model built outside it needs no DP group.
-            required_pgs = ['tp', 'cp', 'hcp'] + (['dp'] if self.config.test_mode else [])
-            if self.config.test_mode and self.config.qk_layernorm:
-                # SelfAttention.run_realtime_tests compares the Q/K layernorm parameters across
-                # the data-parallel group as well.
-                required_pgs.append('dp_gtp_remat')
+            # hcp feeds TEDotProductAttention's a2a+p2p path. The data-parallel groups are only
+            # read by SelfAttention.run_realtime_tests, which runs with test_mode and qk_layernorm,
+            # so they are resolved only then: their accessors assert before
+            # initialize_model_parallel(), and a module built earlier must not need them.
+            needs_dp = (
+                self.attention_type == "self" and self.config.test_mode and self.config.qk_layernorm
+            )
+            required_pgs = ['tp', 'cp', 'hcp'] + (['dp', 'dp_gtp_remat'] if needs_dp else [])
             # The Transformer Engine linears built below reduce FP8/FP4 amaxes over these groups.
             required_pgs += ['tp_cp', 'tp_dp_cp']
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
@@ -401,7 +402,11 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             attention_type=self.attention_type,
             cp_comm_type=cp_comm_type,
             softmax_scale=self.config.softmax_scale,
-            pg_collection=self.pg_collection,
+            # tp is None only for the deprecated fallback before initialize_model_parallel(); an
+            # explicit collection without tp is rejected above. Core attention then resolves its
+            # own fallback, which lets Transformer Engine defer its groups, instead of rejecting
+            # this collection as an explicit one without tp.
+            pg_collection=self.pg_collection if self.tp_group is not None else None,
         )
 
         self.checkpoint_core_attention = (
@@ -1883,17 +1888,15 @@ class SelfAttention(Attention):
         )
 
         # run_realtime_tests, which test_mode runs on every forward when qk_layernorm is on, is the
-        # only reader of the data-parallel group, dp_gtp_remat. Check for it here rather than on
-        # the first forward.
+        # only reader of the DP group. Check for it here rather than on the first forward.
         if (
             self.config.test_mode
             and self.config.qk_layernorm
-            and vars(self.pg_collection).get('dp_gtp_remat') is None
+            and self._realtime_test_dp_group() is None
         ):
             raise ValueError(
-                "SelfAttention with config.test_mode and qk_layernorm compares the Q/K layernorm "
-                "parameters across the tensor- and data-parallel groups; pg_collection must set "
-                "tp and dp_gtp_remat"
+                "SelfAttention with test_mode and qk_layernorm requires a dp process group; "
+                "pass one via pg_collection.dp_gtp_remat or pg_collection.dp"
             )
 
         self.linear_qkv_out_dim = self.query_projection_size + 2 * self.kv_projection_size
@@ -1960,6 +1963,17 @@ class SelfAttention(Attention):
             else None
         )
 
+    def _realtime_test_dp_group(self) -> torch.distributed.ProcessGroup | None:
+        """Return the data-parallel group that run_realtime_tests compares over.
+
+        dp_gtp_remat holds every data-parallel replica of the Q/K layernorm parameters, GTP-remat
+        peers included, which is the group the global accessors resolved by default. A collection
+        built for a custom grid may set only dp.
+        """
+        groups = vars(self.pg_collection)
+        dp_group = groups.get('dp_gtp_remat')
+        return dp_group if dp_group is not None else groups.get('dp')
+
     def run_realtime_tests(self):
         """Performs a consistency check.
 
@@ -1975,15 +1989,14 @@ class SelfAttention(Attention):
         if not self.config.qk_layernorm:
             return
 
-        # dp_gtp_remat holds the data-parallel replicas of these parameters, GTP-remat peers
-        # included. __init__ has already checked that it is there; a group removed since then
+        # __init__ has already checked that the DP group is there; a group removed since then
         # must not reach torch.distributed, which reads None as WORLD.
-        dp_group = self.pg_collection.dp_gtp_remat
+        dp_group = self._realtime_test_dp_group()
         if self.tp_group is None or dp_group is None:
             raise ValueError(
                 "SelfAttention with config.test_mode and qk_layernorm compares the Q/K layernorm "
                 "parameters across the tensor- and data-parallel groups; pg_collection must set "
-                "tp and dp_gtp_remat"
+                "tp and dp_gtp_remat or dp"
             )
 
         # check that all tensor parallel and data parallel ranks have the same
