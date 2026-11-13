@@ -136,6 +136,15 @@ def test_cli_exposes_liger_norm_option():
     assert args.use_liger
 
 
+@pytest.fixture
+def full_fp32_matmuls():
+    """TF32 would turn tiny norm differences into visible output-layer gradient gaps."""
+    precision = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
+    yield
+    torch.set_float32_matmul_precision(precision)
+
+
 def _model(config):
     block = get_gpt_decoder_block_spec(config, use_transformer_engine=False)
     return GPTModel(
@@ -164,18 +173,20 @@ def _inputs():
 
 @pytest.mark.parametrize("model_parallel", [1, 2], indirect=True)
 @pytest.mark.parametrize("mtp_layers", [None, 1])
-def test_gpt_forward_backward_parity(model_parallel, mtp_layers):
+def test_gpt_forward_backward_parity(model_parallel, mtp_layers, full_fp32_matmuls):
     if mtp_layers:
         pytest.importorskip(
             "transformer_engine",
             reason="MTP construction currently checks TE inference-layer types",
         )
-    norm = _liger_norm()
+    _liger_norm()
+    from liger_kernel.megatron import LigerMegatronRMSNorm
+
     config = _config(tensor_model_parallel_size=model_parallel, mtp_num_layers=mtp_layers)
     actual = _model(config)
     reference = _model(replace(config, use_liger=False))
     reference.load_state_dict(actual.state_dict(), strict=True)
-    assert isinstance(actual.decoder.final_layernorm, norm)
+    assert isinstance(actual.decoder.final_layernorm, LigerMegatronRMSNorm)
     tokens, positions, mask, labels = _inputs()
     expected_loss = reference(tokens, positions, mask, labels=labels)
     actual_loss = actual(tokens, positions, mask, labels=labels)
@@ -195,7 +206,9 @@ def test_gpt_forward_backward_parity(model_parallel, mtp_layers):
 
 @pytest.mark.parametrize("model_parallel", [2], indirect=True)
 def test_sequence_parallel_gpt_backward(model_parallel):
-    norm = _liger_norm()
+    _liger_norm()
+    from liger_kernel.megatron import LigerMegatronRMSNorm as norm
+
     model = _model(_config(tensor_model_parallel_size=model_parallel, sequence_parallel=True))
     tokens, positions, mask, labels = _inputs()
     loss = model(tokens, positions, mask, labels=labels)

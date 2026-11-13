@@ -75,6 +75,7 @@ def test_dense_builder_norm_routing(use_liger, config_source, run_config):
             normalization="RMSNorm",
             qk_l2_norm=False,
             vp_stage=1,
+            pp_rank=None,
         )
         assert model.call_args.kwargs["transformer_layer_spec"] is block
     else:

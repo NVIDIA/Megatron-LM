@@ -12,7 +12,9 @@ import model_provider as mp
 
 @pytest.mark.parametrize("model_type", ["GPTModel", "HybridModel"])
 @pytest.mark.parametrize("mtp_layers", [None, 1])
-def test_modelopt_rejects_liger_before_constructing_specs(monkeypatch, model_type, mtp_layers):
+def test_modelopt_rejects_liger_before_constructing_specs(
+    monkeypatch, run_config, model_type, mtp_layers
+):
     builder = pytest.importorskip("megatron.post_training.model_builder")
     monkeypatch.setattr(
         builder, "core_transformer_config_from_args", lambda args: SimpleNamespace(use_liger=True)

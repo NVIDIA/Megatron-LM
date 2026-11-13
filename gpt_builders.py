@@ -60,6 +60,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                 normalization=args.normalization,
                 qk_l2_norm=args.qk_l2_norm,
                 vp_stage=vp_stage,
+                pp_rank=pg_collection.pp.rank() if pg_collection is not None else None,
             )
         elif args.heterogeneous_layers_config_path is not None:
             assert not (config.transformer_impl == "inference_optimized")
