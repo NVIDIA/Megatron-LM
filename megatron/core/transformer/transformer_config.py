@@ -3370,10 +3370,11 @@ class TransformerConfig(ModelParallelConfig):
                         "norms, and writes. Fine-grained activation offloading will skip "
                         f"{sorted(replay_owned_norms)} only on connected branches."
                     )
-            if self.cuda_graph_impl != "none":
+            if self.cuda_graph_impl not in ("none", "full_iteration"):
                 raise ValueError(
-                    "'residual_stream' recomputation requires cuda_graph_impl='none' because "
-                    "its Python checkpoint manager remains outside CUDA graph capture."
+                    "'residual_stream' recomputation requires cuda_graph_impl='none' or "
+                    "'full_iteration': its Python checkpoint manager spans layers, so it cannot "
+                    "sit outside a per-layer CUDA graph, but a whole-step graph captures it."
                 )
         elif self.residual_stream_recompute_num_layers is not None:
             raise ValueError(
