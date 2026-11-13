@@ -297,7 +297,11 @@ def test_shared_mtp_backward_matches_baseline(distributed_setup):
     torch.manual_seed(1234)
     model = TinySharedMTP(width, vocab_size).to(device)
     # Registration order contains the shared block once; execution calls it twice.
-    with fully_shard_context(FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)):
+    with fully_shard_context(
+        FsdpContext(
+            device=device, runtime_policy=RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)
+        )
+    ):
         fully_shard(model.shared_block, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
