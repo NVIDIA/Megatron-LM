@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
 from typing import Any
 
@@ -30,7 +30,7 @@ from megatron.energon import (
     get_val_datasets,
 )
 from megatron.energon.errors import log_exception
-from megatron.training import get_args
+from megatron.training import get_args, get_run_config, get_train_state
 from megatron.training.checkpointing import get_checkpoint_name
 
 
@@ -192,19 +192,22 @@ def train_valid_test_dataloaders_provider(
     # The full-dataset length probe runs before model checkpoint loading. Its
     # temporary loader must not restore state; the real loader below model setup
     # uses the checkpoint's resolved iteration and retains strict restore checks.
-    if restore_dataloader_state and args.load is not None:
+    checkpoint = get_run_config().checkpoint
+    if restore_dataloader_state and checkpoint.load is not None:
         if getattr(args, "dataloader_save", None):
+            train_state = get_train_state()
+            iteration = train_state.iteration
             dp_rank = parallel_state.get_data_parallel_rank()
             strict_load = should_strictly_load_dataloader_state(args)
             data_save_name = get_checkpoint_name(
                 args.dataloader_save,
-                args.iteration,
+                iteration,
                 expert_parallel=False,
                 pipeline_rank=0,  # Only the first pipeline parallel rank stores the dataloader checkpoint.
                 basename=f"train_dataloader_dprank{dp_rank:03d}.pt",
             )
             if not os.path.exists(data_save_name):
-                if is_initial_checkpoint_load_without_dataloader_state(args):
+                if is_initial_checkpoint_load_without_dataloader_state(train_state, checkpoint):
                     if dp_rank == 0:
                         print(
                             f"Dataset state {data_save_name} does not exist for the initial "

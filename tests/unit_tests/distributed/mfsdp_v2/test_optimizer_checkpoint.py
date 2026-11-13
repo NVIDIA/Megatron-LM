@@ -2,7 +2,6 @@
 
 """``fsdp_dtensor`` checkpoint round-trip tests for the MFSDP v2 MCore optimizer."""
 
-import os
 from pathlib import Path
 from typing import Any
 
@@ -17,19 +16,27 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import (
     preprocess_state_dict_for_uneven_dtensor,
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
-from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.fsdp_dtensor_checkpoint import get_global_unique_param_name
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import destroy_model_parallel
 from tests.unit_tests.test_utilities import Utils
+
+
+@pytest.fixture
+def process_group_collection(distributed_setup):
+    """Set up model parallelism and clean up its process groups after each checkpoint test."""
+    Utils.initialize_model_parallel(1, 1)
+    process_group_collection = ProcessGroupCollection.use_mpu_process_groups()
+    model_parallel_cuda_manual_seed(1234)
+    yield process_group_collection
+    destroy_model_parallel()
 
 
 def _transformer_config() -> TransformerConfig:
@@ -72,7 +79,7 @@ def _shard_and_build_optimizer(
 
     Args:
         precision_aware: Keep the optimizer state in the lower ``exp_avg_dtype`` /
-            ``exp_avg_sq_dtype`` precision, as ``test_mcore_adapter.py`` trains MFSDP v2.
+            ``exp_avg_sq_dtype`` precision, as ``test_mcore_dense.py`` trains MFSDP v2.
     """
     model = FullyShardedDataParallel(
         config=config,
@@ -151,6 +158,7 @@ def _train_step(
     optimizer.zero_grad(set_to_none=True)
     batch = torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
     model(hidden_states=batch, attention_mask=None).square().mean().backward()
+    model.finish_grad_sync()
     success, _, _ = optimizer.step()
     assert success
 
@@ -262,263 +270,168 @@ def _assert_optimizer_matches_snapshot(
     assert param_group_snapshot == _snapshot_param_group_hyperparameters(optimizer)
 
 
-class TestOptimizerCheckpoint:
-    """Round-trip an MFSDP v2 transformer block and its optimizer through a DCP checkpoint."""
+@pytest.mark.parametrize("precision_aware", [False, True], ids=["fp32_state", "bf16_state"])
+def test_checkpoint_roundtrip(
+    process_group_collection, tmp_path_dist_ckpt: Path, precision_aware: bool
+) -> None:
+    """Model weights and optimizer state survive an ``fsdp_dtensor`` round trip.
 
-    def setup_method(self):
-        Utils.initialize_model_parallel(1, 1)
-        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        model_parallel_cuda_manual_seed(1234)
+    The source trains a few steps and is checkpointed the way the training loop does it
+    (``state_dict_for_save_checkpoint`` for the model, :meth:`FullyShardedOptimizer.
+    sharded_state_dict` for the optimizer, then the uneven-DTensor preprocessing). The
+    destination starts from zeroed weights and trains a *different* number of steps, so
+    a dropped or mis-serialized ``step`` (and the stale momentum that comes with it)
+    fails the comparison instead of matching by construction.
 
-    def teardown_method(self):
-        Utils.destroy_model_parallel()
+    With >=2 ranks this also covers checkpointing zero-sized local shards.
 
-    @pytest.mark.parametrize("precision_aware", [False, True], ids=["fp32_state", "bf16_state"])
-    def test_checkpoint_roundtrip(self, tmp_path_dist_ckpt: Path, precision_aware: bool) -> None:
-        """Model weights and optimizer state survive an ``fsdp_dtensor`` round trip.
+    ``precision_aware`` keeps the optimizer state in bf16 rather than fp32, which is how
+    ``test_mcore_dense.py`` trains MFSDP v2. It changes the state tensors' dtype but not
+    their shape or their keys, so the same round trip has to hold.
+    """
+    config = _transformer_config()
+    world_size = torch.distributed.get_world_size()
+    source_steps, destination_steps = 3, 1
 
-        The source trains a few steps and is checkpointed the way the training loop does it
-        (``state_dict_for_save_checkpoint`` for the model, :meth:`FullyShardedOptimizer.
-        sharded_state_dict` for the optimizer, then the uneven-DTensor preprocessing). The
-        destination starts from zeroed weights and trains a *different* number of steps, so
-        a dropped or mis-serialized ``step`` (and the stale momentum that comes with it)
-        fails the comparison instead of matching by construction.
+    source_model, source_optimizer = _build_model_and_optimizer(
+        config, process_group_collection, zero_init=False, precision_aware=precision_aware
+    )
+    for _ in range(source_steps):
+        _train_step(config, source_model, source_optimizer)
 
-        With >=2 ranks this also covers the empty-local placeholder path: under TE < 2.18
-        MFSDP v2 filters empty-local shards out of the base optimizer per rank, so the
-        placeholders are what keep the DTensor keyspace identical across ranks.
+    model_snapshot = _snapshot_model_state(source_model)
+    state_snapshot = _snapshot_optimizer_state(source_optimizer)
+    param_group_snapshot = _snapshot_param_group_hyperparameters(source_optimizer)
+    assert {group["step"] for group in param_group_snapshot} == {source_steps}
 
-        ``precision_aware`` keeps the optimizer state in bf16 rather than fp32, which is how
-        ``test_mcore_adapter.py`` trains MFSDP v2. It changes the state tensors' dtype but not
-        their shape or their keys, so the same round trip has to hold.
-        """
-        config = _transformer_config()
-        world_size = torch.distributed.get_world_size()
-        source_steps, destination_steps = 3, 1
-
-        source_model, source_optimizer = _build_model_and_optimizer(
-            config, self.pg_collection, zero_init=False, precision_aware=precision_aware
+    if world_size > 1:
+        # Ensure the round trip exercises zero-sized local shards.
+        empty_local = sum(
+            1
+            for param in source_model.parameters()
+            if param.requires_grad and isinstance(param, DTensor) and param.to_local().numel() == 0
         )
-        for _ in range(source_steps):
-            _train_step(config, source_model, source_optimizer)
-
-        model_snapshot = _snapshot_model_state(source_model)
-        state_snapshot = _snapshot_optimizer_state(source_optimizer)
-        param_group_snapshot = _snapshot_param_group_hyperparameters(source_optimizer)
-        assert {group["step"] for group in param_group_snapshot} == {source_steps}
-
-        if world_size > 1:
-            # Confirm the placeholder path is not vacuous: at least one rank must own an
-            # empty local shard, which is what the TE < 2.18 filter drops from its optimizer.
-            # Count empty local shards directly, which is that exact condition, over the
-            # trainable parameters, which are the only ones the optimizer is ever given.
-            empty_local = sum(
-                1
-                for param in source_model.parameters()
-                if param.requires_grad
-                and isinstance(param, DTensor)
-                and param.to_local().numel() == 0
-            )
-            empty_local_counts = [None] * world_size
-            torch.distributed.all_gather_object(empty_local_counts, empty_local)
-            assert any(empty_local_counts), (
-                "No rank had an empty local shard, so the placeholder path is untested for "
-                f"this config. empty_local_counts={empty_local_counts}"
-            )
-
-        directory = f"fsdp_dtensor_optimizer_{'bf16' if precision_aware else 'fp32'}_state"
-        with TempNamedDir(tmp_path_dist_ckpt / directory, sync=True) as ckpt_dir:
-            save_state_dict = {
-                "model": source_model.state_dict_for_save_checkpoint(),
-                "optimizer": source_optimizer.sharded_state_dict({}),
-            }
-            preprocess_state_dict_for_uneven_dtensor(save_state_dict)
-            dcp.save(save_state_dict, checkpoint_id=ckpt_dir)
-
-            destination_model, destination_optimizer = _build_model_and_optimizer(
-                config, self.pg_collection, zero_init=True, precision_aware=precision_aware
-            )
-            for _ in range(destination_steps):
-                _train_step(config, destination_model, destination_optimizer)
-
-            load_state_dict = {
-                "model": destination_model.state_dict_for_save_checkpoint(),
-                "optimizer": destination_optimizer.sharded_state_dict({}, is_loading=True),
-            }
-            preprocess_state_dict_for_uneven_dtensor(load_state_dict)
-            # DCP writes into the exposed DTensors in place, so the model weights and the
-            # optimizer's momentum buffers are restored by this call alone; load_state_dict
-            # then reinstalls the param-group hyperparameters.
-            dcp.load(load_state_dict, checkpoint_id=ckpt_dir)
-            destination_optimizer.load_state_dict(load_state_dict["optimizer"])
-
-        local_nonempty = _assert_model_matches_snapshot(destination_model, model_snapshot)
-        _assert_optimizer_matches_snapshot(
-            destination_optimizer, state_snapshot, param_group_snapshot
+        empty_local_counts = [None] * world_size
+        torch.distributed.all_gather_object(empty_local_counts, empty_local)
+        assert any(empty_local_counts), (
+            "No rank had an empty local shard, so empty-shard checkpointing is untested for "
+            f"this config. empty_local_counts={empty_local_counts}"
         )
 
-        # At least one rank must have held non-empty local shards for the check to be meaningful.
-        nonempty_flags = [None] * world_size
-        torch.distributed.all_gather_object(nonempty_flags, local_nonempty)
-        assert any(nonempty_flags), "All ranks had empty local shards."
+    directory = f"fsdp_dtensor_optimizer_{'bf16' if precision_aware else 'fp32'}_state"
+    with TempNamedDir(tmp_path_dist_ckpt / directory, sync=True) as ckpt_dir:
+        save_state_dict = {
+            "model": source_model.state_dict_for_save_checkpoint(),
+            "optimizer": source_optimizer.sharded_state_dict({}),
+        }
+        preprocess_state_dict_for_uneven_dtensor(save_state_dict)
+        dcp.save(save_state_dict, checkpoint_id=ckpt_dir)
 
-    def test_sharded_state_dict_before_any_step_has_no_state(self) -> None:
-        """A save before the first optimizer step emits no per-parameter state at all.
-
-        Nothing has stepped, so no parameter has ``exp_avg``/``exp_avg_sq`` on any rank. The
-        entries must then be absent rather than present-and-empty: the ``fsdp_dtensor``
-        handlers in :mod:`megatron.core.transformer.fsdp_dtensor_checkpoint` check ``state``
-        for emptiness as a whole and then index ``exp_avg`` per entry, so a mapping of empty
-        mappings raises ``KeyError`` where an empty mapping is handled. ``--ckpt-convert-format``
-        saves exactly here, before training starts.
-        """
-        config = _transformer_config()
-        model, optimizer = _build_model_and_optimizer(config, self.pg_collection, zero_init=False)
-
-        state_dict = optimizer.sharded_state_dict({})
-
-        assert state_dict["state"] == {}, (
-            "An un-stepped optimizer must contribute no per-parameter state, got "
-            f"{ {fqn: sorted(entry) for fqn, entry in state_dict['state'].items()} }"
+        destination_model, destination_optimizer = _build_model_and_optimizer(
+            config, process_group_collection, zero_init=True, precision_aware=precision_aware
         )
-        # The param groups are still described, which is what carries the hyperparameters.
-        assert state_dict["param_to_group_meta"], "param_to_group_meta should still be emitted"
+        for _ in range(destination_steps):
+            _train_step(config, destination_model, destination_optimizer)
 
-    def test_tied_parameter_roundtrip(self, tmp_path_dist_ckpt: Path) -> None:
-        """A tied weight is saved once, under one of its FQNs, and restored bit-exactly.
+        load_state_dict = {
+            "model": destination_model.state_dict_for_save_checkpoint(),
+            "optimizer": destination_optimizer.sharded_state_dict({}, is_loading=True),
+        }
+        preprocess_state_dict_for_uneven_dtensor(load_state_dict)
+        # DCP writes into the exposed DTensors in place, so the model weights and the
+        # optimizer's momentum buffers are restored by this call alone; load_state_dict
+        # then reinstalls the param-group hyperparameters.
+        dcp.load(load_state_dict, checkpoint_id=ckpt_dir)
+        destination_optimizer.load_state_dict(load_state_dict["optimizer"])
 
-        Two Linears sharing one ``nn.Parameter`` give the model state dict two keys but the
-        optimizer exactly one state entry. ``_param_to_fqn`` keys by parameter identity, so the
-        tie resolves to a single name -- the same one on save and on load, and the same one
-        :class:`DistributedOptimizer`'s ``param_to_name`` picks for v1. This asserts the
-        optimizer subtree really is singular while the model subtree carries both names, and
-        that the shared weight and its momentum survive the round trip.
-        """
-        config = _transformer_config()
-        source_steps, destination_steps = 3, 1
+    local_nonempty = _assert_model_matches_snapshot(destination_model, model_snapshot)
+    _assert_optimizer_matches_snapshot(destination_optimizer, state_snapshot, param_group_snapshot)
 
-        source_model, source_optimizer = _build_tied_model_and_optimizer(
-            config, self.pg_collection, zero_init=False
+    # At least one rank must have held non-empty local shards for the check to be meaningful.
+    nonempty_flags = [None] * world_size
+    torch.distributed.all_gather_object(nonempty_flags, local_nonempty)
+    assert any(nonempty_flags), "All ranks had empty local shards."
+
+
+def test_sharded_state_dict_before_any_step_has_no_state(process_group_collection) -> None:
+    """A save before the first optimizer step emits no per-parameter state at all.
+
+    Nothing has stepped, so no parameter has ``exp_avg``/``exp_avg_sq`` on any rank. The
+    entries must then be absent rather than present-and-empty: the ``fsdp_dtensor``
+    handlers in :mod:`megatron.core.transformer.fsdp_dtensor_checkpoint` check ``state``
+    for emptiness as a whole and then index ``exp_avg`` per entry, so a mapping of empty
+    mappings raises ``KeyError`` where an empty mapping is handled. ``--ckpt-convert-format``
+    saves exactly here, before training starts.
+    """
+    config = _transformer_config()
+    model, optimizer = _build_model_and_optimizer(config, process_group_collection, zero_init=False)
+
+    state_dict = optimizer.sharded_state_dict({})
+
+    assert state_dict["state"] == {}, (
+        "An un-stepped optimizer must contribute no per-parameter state, got "
+        f"{ {fqn: sorted(entry) for fqn, entry in state_dict['state'].items()} }"
+    )
+    # The param groups are still described, which is what carries the hyperparameters.
+    assert state_dict["param_to_group_meta"], "param_to_group_meta should still be emitted"
+
+
+def test_tied_parameter_roundtrip(process_group_collection, tmp_path_dist_ckpt: Path) -> None:
+    """A tied weight is saved once, under one of its FQNs, and restored bit-exactly.
+
+    Two Linears sharing one ``nn.Parameter`` give the model state dict two keys but the
+    optimizer exactly one state entry. ``_param_to_fqn`` keys by parameter identity, so the
+    tie resolves to a single name -- the same one on save and on load, and the same one
+    :class:`DistributedOptimizer`'s ``param_to_name`` picks for v1. This asserts the
+    optimizer subtree really is singular while the model subtree carries both names, and
+    that the shared weight and its momentum survive the round trip.
+    """
+    config = _transformer_config()
+    source_steps, destination_steps = 3, 1
+
+    source_model, source_optimizer = _build_tied_model_and_optimizer(
+        config, process_group_collection, zero_init=False
+    )
+    for _ in range(source_steps):
+        _train_step(config, source_model, source_optimizer)
+
+    model_snapshot = _snapshot_model_state(source_model)
+    state_snapshot = _snapshot_optimizer_state(source_optimizer)
+    param_group_snapshot = _snapshot_param_group_hyperparameters(source_optimizer)
+
+    with TempNamedDir(tmp_path_dist_ckpt / "fsdp_dtensor_tied", sync=True) as ckpt_dir:
+        optimizer_state_dict = source_optimizer.sharded_state_dict({})
+        save_state_dict = {
+            "model": source_model.state_dict_for_save_checkpoint(),
+            "optimizer": optimizer_state_dict,
+        }
+
+        tied_fqns = _tied_parameter_names(source_model)
+        assert len(tied_fqns) == 2, f"The weight should be tied under two names, got {tied_fqns}"
+        # The model subtree is keyed by the wrapped module's own names, without the
+        # ``module.`` prefix the optimizer's FQNs carry.
+        model_keys = save_state_dict["model"].keys()
+        assert {"fc1.weight", "fc2.weight"} <= model_keys, "The tie should surface twice"
+        assert (
+            len(tied_fqns & optimizer_state_dict["state"].keys()) == 1
+        ), "A tied parameter has one optimizer state entry, so it must be saved under one FQN"
+
+        preprocess_state_dict_for_uneven_dtensor(save_state_dict)
+        dcp.save(save_state_dict, checkpoint_id=ckpt_dir)
+
+        destination_model, destination_optimizer = _build_tied_model_and_optimizer(
+            config, process_group_collection, zero_init=True
         )
-        for _ in range(source_steps):
-            _train_step(config, source_model, source_optimizer)
+        for _ in range(destination_steps):
+            _train_step(config, destination_model, destination_optimizer)
 
-        model_snapshot = _snapshot_model_state(source_model)
-        state_snapshot = _snapshot_optimizer_state(source_optimizer)
-        param_group_snapshot = _snapshot_param_group_hyperparameters(source_optimizer)
+        load_state_dict = {
+            "model": destination_model.state_dict_for_save_checkpoint(),
+            "optimizer": destination_optimizer.sharded_state_dict({}, is_loading=True),
+        }
+        preprocess_state_dict_for_uneven_dtensor(load_state_dict)
+        dcp.load(load_state_dict, checkpoint_id=ckpt_dir)
+        destination_optimizer.load_state_dict(load_state_dict["optimizer"])
 
-        with TempNamedDir(tmp_path_dist_ckpt / "fsdp_dtensor_tied", sync=True) as ckpt_dir:
-            optimizer_state_dict = source_optimizer.sharded_state_dict({})
-            save_state_dict = {
-                "model": source_model.state_dict_for_save_checkpoint(),
-                "optimizer": optimizer_state_dict,
-            }
-
-            tied_fqns = _tied_parameter_names(source_model)
-            assert (
-                len(tied_fqns) == 2
-            ), f"The weight should be tied under two names, got {tied_fqns}"
-            # The model subtree is keyed by the wrapped module's own names, without the
-            # ``module.`` prefix the optimizer's FQNs carry.
-            model_keys = save_state_dict["model"].keys()
-            assert {"fc1.weight", "fc2.weight"} <= model_keys, "The tie should surface twice"
-            assert (
-                len(tied_fqns & optimizer_state_dict["state"].keys()) == 1
-            ), "A tied parameter has one optimizer state entry, so it must be saved under one FQN"
-
-            preprocess_state_dict_for_uneven_dtensor(save_state_dict)
-            dcp.save(save_state_dict, checkpoint_id=ckpt_dir)
-
-            destination_model, destination_optimizer = _build_tied_model_and_optimizer(
-                config, self.pg_collection, zero_init=True
-            )
-            for _ in range(destination_steps):
-                _train_step(config, destination_model, destination_optimizer)
-
-            load_state_dict = {
-                "model": destination_model.state_dict_for_save_checkpoint(),
-                "optimizer": destination_optimizer.sharded_state_dict({}, is_loading=True),
-            }
-            preprocess_state_dict_for_uneven_dtensor(load_state_dict)
-            dcp.load(load_state_dict, checkpoint_id=ckpt_dir)
-            destination_optimizer.load_state_dict(load_state_dict["optimizer"])
-
-        _assert_model_matches_snapshot(destination_model, model_snapshot)
-        _assert_optimizer_matches_snapshot(
-            destination_optimizer, state_snapshot, param_group_snapshot
-        )
-
-
-class TestOptimizerCheckpointExpertParallel:
-    """Expert parallelism is refused, until implemented, rather than mis-checkpointed."""
-
-    def setup_method(self):
-        world_size = int(os.environ.get("WORLD_SIZE", "1"))
-        if world_size < 2 or world_size % 2:
-            pytest.skip("MFSDP v2 EP requires an even world size of at least two.")
-        Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=2)
-        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        model_parallel_cuda_manual_seed(1234)
-
-    def teardown_method(self):
-        Utils.destroy_model_parallel()
-
-    def test_sharded_state_dict_rejects_expert_parallelism(self) -> None:
-        """Building the state dict raises instead of writing a rank-inconsistent checkpoint.
-
-        MFSDP v2 shards expert parameters over the expert-DP mesh and everything else over the
-        DP mesh, and expert parallelism gives each rank a different set of expert FQNs, so the
-        rank-identical DTensor keyspace this format needs cannot be assembled by gathering over
-        one mesh. Until that is implemented, a save has to fail loudly: the alternative is a
-        rank-dependent keyspace, which deadlocks the uneven-DTensor preprocessing.
-        """
-        config = TransformerConfig(
-            num_layers=2,
-            hidden_size=64,
-            num_attention_heads=4,
-            num_moe_experts=4,
-            expert_model_parallel_size=2,
-            moe_layer_freq=[0, 1],
-            moe_token_dispatcher_type="alltoall",
-            moe_router_topk=2,
-            moe_grouped_gemm=True,
-            moe_ffn_hidden_size=128,
-            add_bias_linear=False,
-            use_cpu_initialization=True,
-            params_dtype=torch.float32,
-            attention_dropout=0.0,
-            hidden_dropout=0.0,
-            gradient_accumulation_fusion=False,
-            attention_backend=AttnBackend.unfused,
-        )
-        model = HybridModel(
-            config=config,
-            hybrid_stack_spec=hybrid_stack_spec,
-            vocab_size=128,
-            max_sequence_length=8,
-            hybrid_layer_pattern="*E",
-            pg_collection=self.pg_collection,
-        ).cuda()
-        model = FullyShardedDataParallel(
-            config=config,
-            ddp_config=DistributedDataParallelConfig(
-                use_megatron_fsdp=True,
-                megatron_fsdp_version=2,
-                use_distributed_optimizer=False,
-                data_parallel_sharding_strategy="optim_grads_params",
-                fsdp_all_gather_in_start_param_sync=False,
-            ),
-            module=model,
-            pg_collection=self.pg_collection,
-        )
-        optimizer = get_megatron_optimizer(
-            OptimizerConfig(
-                lr=1.0e-3, weight_decay=0.0, use_distributed_optimizer=False, clip_grad=0.0
-            ),
-            [model],
-            use_gloo_process_groups=False,
-        )
-        assert isinstance(optimizer, FullyShardedOptimizer)
-
-        with pytest.raises(NotImplementedError, match="expert parallelism"):
-            optimizer.sharded_state_dict({})
+    _assert_model_matches_snapshot(destination_model, model_snapshot)
+    _assert_optimizer_matches_snapshot(destination_optimizer, state_snapshot, param_group_snapshot)

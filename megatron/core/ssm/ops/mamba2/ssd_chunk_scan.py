@@ -317,10 +317,18 @@ def _chunk_scan_fwd_kernel(
         acc += x_residual * D
 
     if HAS_Z:
-        z_ptr += chunk_seqlen_start * stride_z_seqlen + pid_h * stride_z_head
-        z_ptrs = z_ptr + (
-            stride_z_seqlen * offs_out_m[:, None] + stride_z_hdim * offs_out_n[None, :]
-        )
+        if HAS_TARGET_ROWS:
+            # z holds only each entry's target row (nchunks, nheads, hdim):
+            # every M-lane reads it (row stride 0). The gate is row-local and
+            # only the target lane is stored, so the target row's arithmetic
+            # is unchanged.
+            z_ptr += pid_c * stride_z_seqlen + pid_h * stride_z_head
+            z_ptrs = z_ptr + (offs_out_m[:, None] * 0 + stride_z_hdim * offs_out_n[None, :])
+        else:
+            z_ptr += chunk_seqlen_start * stride_z_seqlen + pid_h * stride_z_head
+            z_ptrs = z_ptr + (
+                stride_z_seqlen * offs_out_m[:, None] + stride_z_hdim * offs_out_n[None, :]
+            )
         z = tl.load(
             z_ptrs,
             mask=(offs_out_m[:, None] < chunk_size_limit) & (offs_out_n[None, :] < hdim),
@@ -385,7 +393,12 @@ def _chunk_scan_fwd(
     if D is not None:
         assert D.shape == (nheads, headdim) or D.shape == (nheads,)
     if z is not None:
-        assert z.shape == x.shape
+        if has_target_rows:
+            # Target-rows mode gates only the target row of each entry, so z
+            # is that row alone: (nchunks, nheads, headdim).
+            assert z.shape == (nchunks, nheads, headdim)
+        else:
+            assert z.shape == x.shape
     assert dt.shape == (nheads, nchunks, chunk_size)
     assert dA_cumsum.shape == (nheads, nchunks, chunk_size)
     assert states.shape == (nchunks, nheads, headdim, dstate)

@@ -6,13 +6,13 @@ import pytest
 
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection_transformer_layer import (
+    HyperConnectionTransformerLayer,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
-from megatron.core.transformer.transformer_layer import (
-    HyperConnectionTransformerLayer,
-    TransformerLayer,
-)
+from megatron.core.transformer.transformer_layer import TransformerLayer
 
 # ---------------------------------------------------------------------------
 # Helpers: fake backend and config builders

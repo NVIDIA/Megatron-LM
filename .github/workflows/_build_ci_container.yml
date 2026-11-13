@@ -143,7 +143,8 @@ jobs:
       fail-fast: false
       matrix: ${{ fromJSON(needs.cicd-compute-build-matrix.outputs.matrix) }}
     runs-on: >-
-      ${{ inputs.is-maintainer && matrix.cloud == 'gb-gpu' && 'nvidia-ci-aws-cpu-arm64'
+      ${{ inputs.is-maintainer && matrix.cloud == 'aws-h100' && 'nvidia-ci-aws-cpu'
+          || inputs.is-maintainer && matrix.cloud == 'gb-gpu' && 'nvidia-ci-aws-cpu-arm64'
           || matrix.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     env:
@@ -294,7 +295,6 @@ jobs:
               docker/common/install_nccl.sh
               docker/common/install_nccl_m2n.sh
               docker/common/install_mok.sh
-              docker/patches/mok.patch
               docker/patches/deepep.patch
               docker/patches/deepep-nvshmem.patch
               megatron/core/__init__.py

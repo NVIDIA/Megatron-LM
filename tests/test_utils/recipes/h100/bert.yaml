@@ -8,7 +8,7 @@ spec:
   nodes: 1
   build: mcore-pyt-{environment}
   gpus: 8
-  platforms: dgx_a100
+  platforms: dgx_h100
   time_limit:
   n_repeat:
   script_setup: |
@@ -45,7 +45,6 @@ spec:
     set -euo pipefail
     ls
     cd /opt/megatron-lm
-    NAME=$(echo {test_case}_{environment} | sed 's/dgx_h100/dgx_a100/g')
     ARGUMENTS=(
         "DATA_PATH=/mnt/artifacts"
         "DATA_CACHE_PATH=/workspace/data/cache" 

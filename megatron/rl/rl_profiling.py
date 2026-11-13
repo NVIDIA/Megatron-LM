@@ -677,6 +677,32 @@ def initialize_rl_profiler(
     return _RL_PROFILER
 
 
+def maybe_initialize_rl_profiler(
+    rl_config, save_dir: Optional[str], *, log_to_wandb: bool, log_to_tensorboard: bool
+) -> Optional[str]:
+    """Start the profiler when ``--rl-profile`` is set; returns its output directory, else None.
+
+    Profiles go under ``--rl-profile-dir``, else ``<save_dir>/profiles``, else ``./profiles``; the
+    run id is the SLURM job id or a timestamp.
+    """
+    if not rl_config.rl_profile:
+        return None
+    profile_dir = rl_config.rl_profile_dir
+    if profile_dir is None:
+        profile_dir = os.path.join(save_dir, 'profiles') if save_dir else './profiles'
+    run_id = os.getenv("SLURM_JOB_ID", None)
+    if run_id is None:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    initialize_rl_profiler(
+        output_dir=profile_dir,
+        run_id=run_id,
+        enabled=True,
+        log_to_wandb=log_to_wandb,
+        log_to_tensorboard=log_to_tensorboard,
+    )
+    return profile_dir
+
+
 def log_iteration_profile(
     iteration: int,
     timers,
