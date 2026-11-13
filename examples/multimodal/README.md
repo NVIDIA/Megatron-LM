@@ -43,6 +43,20 @@ examples/multimodal/combine_lm_vision_checkpoints.sh /path/to/mistral/model /pat
 
 ## Training
 
+### TP communication overlap and decoder length
+
+Use `--tp-comm-overlap` to enable overlap for the language decoder. The vision
+encoder and projection keep overlap disabled. `--decoder-tp-comm-overlap` has
+been removed; replace it with `--tp-comm-overlap` in existing commands.
+
+In the mock VLM entrypoint (`pretrain_vlm.py`), `--decoder-seq-length` specifies
+the combined text-plus-image length, including padding. An explicit value is
+honored whether overlap is enabled or disabled. It must fit the text and image
+tokens and satisfy the CP/SP divisibility requirements. If omitted, the entrypoint
+calculates the smallest compatible length before initializing TP user buffers.
+This intentionally changes the old behavior, which could ignore the supplied
+length unless the decoder-specific overlap flag was set.
+
 ### Pretraining
 
 1. Download the LLavA-Pretrain dataset from Hugging Face and unzip the images folder (NOTE: 79GB of disk space required):
