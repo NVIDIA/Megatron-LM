@@ -482,3 +482,21 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # The mHC training-parity files run many DDP iterations per case. Under the
+  # transformer bucket's non-blocking NCCL communicators they hang intermittently
+  # in the watchdog's NCCL error polling (#7744), so they run on their own with
+  # blocking communicators.
+  - test_case: [tests/unit_tests/transformer/test_mhc_full_iteration_training.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/transformer/test_mhc_te_pipeline_training.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
