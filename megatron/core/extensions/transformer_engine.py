@@ -235,6 +235,16 @@ class TEQuantizationRecipe:
     """
     If cast the initialized parameters to fp4 precision and all-gather weights in FP4.
     """
+    param_storage_follows_model_init: bool = False
+    """
+    With ``fp8_param`` or ``fp4_param``: store the parameters in this recipe's format only when
+    the enclosing model-init context stores quantized parameters, and in high precision
+    otherwise. A global policy that keeps some layers' parameters in high precision (such as
+    ``first_last_layers_bf16``) then stays in control of whether a module stores quantized
+    parameters, while this recipe chooses their format. For example, the non-expert linears of
+    an FP4 model can store MXFP8 parameters without giving the BF16 first and last layers MXFP8
+    parameters.
+    """
 
     @classmethod
     def parse_from_config(
@@ -244,10 +254,12 @@ class TEQuantizationRecipe:
         Parse config from quantization dictionary.
         """
         if quant_config.get("inherit_model_init_context", False) and any(
-            field in quant_config for field in ("fp8_param", "fp4_param")
+            field in quant_config
+            for field in ("fp8_param", "fp4_param", "param_storage_follows_model_init")
         ):
             raise ValueError(
-                "inherit_model_init_context cannot be combined with fp8_param or fp4_param."
+                "inherit_model_init_context cannot be combined with fp8_param, fp4_param or "
+                "param_storage_follows_model_init."
             )
         kwargs = {}
         class_keys = cls.get_config_keys()
@@ -271,6 +283,8 @@ class TEQuantizationRecipe:
         instance = TEQuantizationRecipe(**kwargs)
         if not isinstance(instance.fp8_param, bool):
             raise ValueError("fp8_param must be a bool (true or false).")
+        if not isinstance(instance.param_storage_follows_model_init, bool):
+            raise ValueError("param_storage_follows_model_init must be a bool (true or false).")
         if instance.fp8_quantization_recipe == Fp8Recipe.delayed:
             raise ValueError("Delayed scaling not in scope of te per-module quantization config.")
         if (
@@ -401,6 +415,10 @@ def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
     if quant_recipe is not None and qrecipe.recipe_attrs is not None:
         for key, val in qrecipe.recipe_attrs.items():
             setattr(quant_recipe, key, val)
+
+    if qrecipe.param_storage_follows_model_init and not FP8GlobalStateManager.with_fp8_parameters():
+        # Evaluated while the module is constructed, inside the enclosing model-init context.
+        enabled = False
 
     return fp8_model_init(
         enabled=enabled,

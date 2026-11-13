@@ -3308,15 +3308,27 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         Copy FP32 main params directly to param buffer for param all-gather since
         param buffer is not mapped to model params for MXFP8 case.
 
+        In an FP4 model with MXFP8 non-expert params (fp4_param_gather), the NVFP4 params keep
+        their packed param buffer and are quantized from their main params instead.
         """
         if self.ddp_config.use_megatron_fsdp:
             raise NotImplementedError(
                 "_copy_main_params_to_param_buffer not supported for Megatron-FSDP."
             )
+        if self.config.use_precision_aware_optimizer_no_fp8_or_ds_fp8:
+            # FusedAdam holds the master weights, so shard_fp32_from_float16_groups is all None.
+            raise NotImplementedError(
+                "reuse_grad_buf_for_mxfp8_param_ag is not supported with the precision-aware "
+                "optimizer in this precision mode (use_precision_aware_optimizer without an "
+                "FP8 recipe other than delayed, non-FP32 main params, or optimizer CPU offload)."
+            )
         for shard_main_group, model_group in zip(
             self.shard_fp32_from_float16_groups, self.model_float16_groups
         ):
             for shard_main_param, model_param in zip(shard_main_group, model_group):
+                if is_nvfp4tensor(model_param) or self._is_grouped_nvfp4_param(model_param):
+                    # Quantized below.
+                    continue
                 # Get position in param buffer
                 param_range_map = self._get_model_param_range_map(model_param)
                 world_range = param_range_map["gbuf_world_in_bucket"]
@@ -3329,6 +3341,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 shard_param_buffer = param_buffer.view(-1)[world_range.start : world_range.end]
 
                 shard_param_buffer.copy_(shard_main_param)
+
+        if self.ddp_config.fp4_param_gather:
+            # Quantize FP32 master shards back to the NVFP4 model params (rowwise only), whose
+            # packed storage is the param buffer, as _copy_main_params_to_model_params does.
+            quantize_nvfp4_param_shard(
+                *self._get_nvfp4_params_and_shard_fp32_from_nvfp4(), self.data_parallel_group
+            )
 
         # Staging params into the DDP param buffer invalidates any prior "already
         # dispatched" state. The next forward pre-hook must run post-sync cleanup,

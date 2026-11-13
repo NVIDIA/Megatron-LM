@@ -357,6 +357,63 @@ class TestTEWrappers:
         if "zero_tensor" in inspect.signature(get_dummy_wgrad).parameters:
             assert head.weight.grad._is_zerotensor()
 
+    @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 and NVFP4 require Blackwell")
+    @pytest.mark.parametrize("fp8_param", [False, True], ids=["bf16-param", "mxfp8-param"])
+    def test_fp4_model_mxfp8_linear_replays(self, fp8_param):
+        """A non-expert linear of an FP4 model that quant_recipe runs in MXFP8 inside the NVFP4
+        autocast (examples/quantization/fp4_experts_mxfp8_other_linears.yaml)."""
+        from megatron.core.fp4_utils import get_fp4_context
+        from megatron.core.quantization.quant_config import RecipeConfig
+
+        training_recipe = {"fp8_quantization_recipe": "mxfp8"}
+        if fp8_param:
+            training_recipe.update(fp8_param=True, param_storage_follows_model_init=True)
+        recipe = RecipeConfig.from_config_dict(
+            {
+                "configs": {
+                    "mxfp8": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": training_recipe,
+                    }
+                },
+                "matchers": {
+                    "all": {"type": "glob", "enabled": True, "pattern": "*", "config": "mxfp8"}
+                },
+            }
+        )
+        seeded()
+        config = _config(fp4="e2m1", fp4_param=fp8_param, quant_recipe=recipe)
+        with get_fp4_context(config, is_init=True):
+            module = TELayerNormColumnParallelLinear(
+                HIDDEN,
+                FFN,
+                config=config,
+                init_method=init_method_normal(0.02),
+                gather_output=False,
+                bias=False,
+                skip_bias_add=False,
+                is_expert=False,
+                name="decoder.layers.0.self_attention.linear_qkv",
+            ).cuda()
+        assert is_mxfp8tensor(module.weight) is fp8_param
+
+        class UnderFp4Autocast(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = module
+
+            def forward(self, x):
+                with get_fp4_context(config):
+                    return self.linear(x)[0]
+
+        x = torch.randn(
+            TOKENS // 2, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        assert_module_replays_bit_exact(
+            UnderFp4Autocast(), (x,), replays=3, contention=True, what="FP4-model MXFP8 linear"
+        )
+        assert module.fp8_meta["recipe"].mxfp8()
+
     @pytest.mark.parametrize(
         "backend", ["te", "torch"], ids=["te-general-gemm", "torch-mm-fallback"]
     )

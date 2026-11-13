@@ -359,11 +359,19 @@ class _ParamAndGradBucketGroup:
                     param.data.copy_(gathered_param)
 
         if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            persistent_quantized_params = []
             for bucket in self.buckets:
                 if bucket.param_data is None:
                     # LayerWise variable-size gather path: params are already updated via
                     # unflatten + copy_ in finish_param_sync, and there is no param_data
                     # buffer to copy back from.
+                    continue
+                if not bucket.uses_mxfp8_grad_buf_ag:
+                    # Persistent param_data (NVFP4 or high precision): the all-gather wrote in
+                    # place, so only the regular post-processing is needed.
+                    persistent_quantized_params.extend(
+                        param for param in bucket.params if _param_uses_quantized_storage(param)
+                    )
                     continue
                 has_non_quantized_weight = False
                 quantized_params = []
@@ -390,6 +398,8 @@ class _ParamAndGradBucketGroup:
                 # correspond to multiple param buffers. If we zero out the entire grad buffer,
                 # it would clear the data of those param buffers that have not yet completed AG.
                 bucket.param_data.zero_()
+            if persistent_quantized_params:
+                post_all_gather_processing(persistent_quantized_params)
             return
 
         quantized_params = []
@@ -952,13 +962,16 @@ def group_params_for_buffers(
 ) -> Dict['BufferKey', Tuple[List[torch.nn.Parameter], List[int]]]:
     """Group parameters by buffer identity for buffer allocation.
 
-    Each distinct buffer is identified by a BufferKey with three dimensions:
+    Each distinct buffer is identified by a BufferKey with these dimensions:
     - param_dtype: storage dtype (torch.uint8 for FP8/NVFP4 parameters, else param.dtype).
     - grad_dtype: gradient reduction dtype (torch.float if grad_reduce_in_fp32, else param.dtype).
     - is_expert_parallel: whether the parameter uses the expert topology (param.allreduce == False),
       which requires a separate buffer for the expert data-parallel group. This is true for experts
       when expert-parallelism > 1, expert-tensor-parallelism != tensor-parallelism, or expert-GTP
       != GTP.
+    - is_managed_by_layer_wise_optimizer: whether LayerWiseDistributedOptimizer owns the param.
+    - is_nvfp4: whether the parameter is NVFP4, which keeps NVFP4 params apart from other uint8
+      (e.g. MXFP8) params.
 
     The param_indices track each parameter's position among same-dtype params (using
     the "fake" high-precision dtype for FP8/NVFP4 params), needed for loading non-native-fp8
@@ -990,7 +1003,11 @@ def group_params_for_buffers(
         )
 
         key = BufferKey(
-            param_dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+            param_dtype,
+            grad_dtype,
+            is_expert_parallel,
+            is_managed_by_layer_wise_optimizer,
+            is_nvfp4=is_nvfp4tensor(param) or is_grouped_nvfp4tensor(param),
         )
         param_list = key_to_params.get(key, [])
         param_list.append(param)
@@ -1210,9 +1227,33 @@ class _ParamAndGradBuffer:
         self.nccl_mem_pool: Optional["torch.cuda.MemPool"] = None
         self.param_nccl_mem_pool: Optional["torch.cuda.MemPool"] = None
         self.nccl_grad_pool_is_separate: bool = self.nccl_ub and self.ddp_config.grad_buffer_offload
-        uses_shared_param_grad_buffer = self.ddp_config.use_distributed_optimizer and any(
-            is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params
+        has_mxfp8_params = any(is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params)
+        if (
+            self.ddp_config.fp4_param_gather
+            and has_mxfp8_params
+            and not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+        ):
+            # The FP4 optimizer path re-quantizes only the NVFP4 params from their main params,
+            # so MXFP8 params would never receive their updated values.
+            raise ValueError(
+                "MXFP8 params in an FP4 model (a quant_recipe entry with fp8_quantization_recipe "
+                "mxfp8 and fp8_param) with fp4_param_gather require "
+                "reuse_grad_buf_for_mxfp8_param_ag."
+            )
+        uses_shared_param_grad_buffer = (
+            self.ddp_config.use_distributed_optimizer and has_mxfp8_params
         )
+        # Whether the param all-gather of this buffer reuses grad_data. In an FP4 model with MXFP8
+        # non-expert params (fp4_param_gather), only the buffers holding MXFP8 params do; NVFP4
+        # and high-precision buffers keep their persistent param_data.
+        self.uses_mxfp8_grad_buf_ag = self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag and (
+            not self.ddp_config.fp4_param_gather or has_mxfp8_params
+        )
+        if self.uses_mxfp8_grad_buf_ag and self.has_nvfp4_params:
+            raise ValueError(
+                "A buffer cannot hold both MXFP8 and NVFP4 params with "
+                "reuse_grad_buf_for_mxfp8_param_ag."
+            )
         if self.ddp_config.grad_buffer_offload and uses_shared_param_grad_buffer:
             raise ValueError(
                 "Gradient-buffer offload is incompatible with MXFP8 parameters because "
@@ -1386,10 +1427,7 @@ class _ParamAndGradBuffer:
             #   TE GroupedTensor + NVFP4      -> remap packed rowwise bytes
             #   TE GroupedTensor + MXFP8      -> unsupported here; require grad-buffer AG reuse
             #   TE GroupedTensor + BF16/FP16  -> remap grouped rowwise_data
-            if (
-                not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
-                or not _param_uses_quantized_storage(param)
-            ):
+            if not self.uses_mxfp8_grad_buf_ag or not _param_uses_quantized_storage(param):
                 if self.param_data is not None:
                     if not is_grouped_tensor(param):
                         # Plain NVFP4: remap packed rowwise bytes only.
@@ -1734,6 +1772,7 @@ class _ParamAndGradBuffer:
             param_index_map=self.param_index_map,
             params_with_extra_main_grads=bucket_params_with_extra_main_grads,
         )
+        bucket.uses_mxfp8_grad_buf_ag = self.uses_mxfp8_grad_buf_ag
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket
             self.param_to_bucket[bucket_param] = bucket
@@ -1944,14 +1983,10 @@ def partition_buckets(
             )
         ]
 
-    # At most one fp8 (uint8) buffer is allowed; Cases 2 and 3 below branch on
-    # whether one is present. Non-uint8 dtypes can legitimately appear in
-    # multiple buffers, so the uniqueness check is restricted to uint8.
-    fp8_buffer = None
-    for buffer in buffers:
-        if buffer.param_dtype == torch.uint8:
-            assert fp8_buffer is None
-            fp8_buffer = buffer
+    # Cases 2 and 3 below branch on whether an fp8 (uint8) buffer is present. An FP4 model with
+    # MXFP8 non-expert params has two uint8 buffers (NVFP4 and MXFP8) when the experts share the
+    # dense data-parallel group; their buckets are treated as one sequence of fp8 buckets.
+    fp8_buffers = [buffer for buffer in buffers if buffer.param_dtype == torch.uint8]
 
     # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.
     if force_single_bucket_group:
@@ -1970,7 +2005,7 @@ def partition_buckets(
         )
         return [bucket_group]
 
-    if fp8_buffer is None:
+    if not fp8_buffers:
         # Case 2: When there is no fp8 buffer in the input buffers, let each bucket group have
         #         only one bucket.
         bucket_groups = []
@@ -1993,9 +2028,10 @@ def partition_buckets(
                 for bucket in buffer.buckets:
                     non_fp8_buckets.append(bucket)
 
+        fp8_buckets = [(bucket, buffer) for buffer in fp8_buffers for bucket in buffer.buckets]
         bucket_groups = []
-        for bucket in fp8_buffer.buckets:
-            if len(bucket_groups) == len(fp8_buffer.buckets) - 1:
+        for fp8_bucket_idx, (bucket, buffer) in enumerate(fp8_buckets):
+            if fp8_bucket_idx == len(fp8_buckets) - 1:
                 # reduce_scatter_with_fp32_accumulation requires exactly one bucket
                 # per group (see assert in _ParamAndGradBucketGroup.reduce_scatter).
                 # Without this flag the non-FP8 buckets would be merged into the last

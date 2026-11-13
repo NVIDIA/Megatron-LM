@@ -1,0 +1,35 @@
+# Per-module precision for an FP4 MoE model (--fp4-format e2m1 --fp4-recipe nvfp4): the routed
+# experts keep the global FP4 recipe, and every other TE linear (attention, dense MLPs, shared
+# experts, MTP projections) runs in MXFP8. Pass with --te-precision-config-file.
+#
+# With --fp4-param-gather, the MXFP8 linears keep MXFP8 parameters (fp8_param), all-gathered
+# through the gradient buffer: set --reuse-grad-buf-for-mxfp8-param-ag. Layers that the global
+# policy keeps in BF16 (--first-last-layers-bf16) keep BF16 parameters
+# (param_storage_follows_model_init). To keep BF16 parameters plus an MXFP8 weight cache instead,
+# drop fp8_param and param_storage_follows_model_init.
+#
+# Matchers are tried in order; the first match wins.
+configs:
+  global_recipe:
+    # No override: the global FP4 recipe, and its parameter storage.
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe:
+      override_quantized_autocast: false
+      inherit_model_init_context: true
+  mxfp8:
+    transformer_engine_config_type: TEQuantizationParams
+    training_recipe:
+      fp8_quantization_recipe: mxfp8
+      fp8_param: true
+      param_storage_follows_model_init: true
+matchers:
+  routed_experts:
+    type: glob
+    pattern: "*.mlp.experts.*"
+    config: global_recipe
+    enabled: true
+  other_linears:
+    type: glob
+    pattern: "*"
+    config: mxfp8
+    enabled: true

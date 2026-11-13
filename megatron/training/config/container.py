@@ -548,7 +548,11 @@ class PretrainConfigContainer(ConfigContainerBase):
                     "--reuse-grad-buf-for-mxfp8-param-ag: "
                     "parameters share the gradient-buffer storage that offload releases."
                 )
-            assert self.ddp.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
+            # With fp4_param_gather, the MXFP8 params are linears that the quant_recipe gives
+            # MXFP8 params in an FP4 model.
+            assert (
+                self.ddp.fp8_param_gather or self.ddp.fp4_param_gather
+            ), "Reuse grad buffer only when keeping params in MXFP8."
         transformer = getattr(self.model, "transformer", None)
         if isinstance(self.ddp, TorchFullyShardedDataParallelConfig):
             if self.ddp.use_megatron_fsdp:

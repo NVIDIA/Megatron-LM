@@ -58,12 +58,16 @@ class BufferKey:
             managed by :class:`LayerWiseDistributedOptimizer` (shard-aligned layout
             so each whole param lives in one shard). Non-LayerWise params get
             :class:`DistributedOptimizer`'s byte-level layout in a separate buffer.
+        is_nvfp4: Whether the buffer holds NVFP4 parameters. NVFP4 and other quantized
+            parameters (e.g. the MXFP8 non-expert linears of an FP4 model) share the uint8
+            param_dtype but need separate buffers: NVFP4 packs two values per byte.
     """
 
     param_dtype: torch.dtype
     grad_dtype: torch.dtype
     is_expert_parallel: bool
     is_managed_by_layer_wise_optimizer: bool = False
+    is_nvfp4: bool = False
 
 
 @dataclass
