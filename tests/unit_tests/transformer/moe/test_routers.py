@@ -31,6 +31,8 @@ from megatron.core.transformer.moe.moe_utils import (
     get_default_pg_collection,
     get_tokens_per_expert_and_token_count,
     get_updated_expert_bias,
+    is_compact_route_probs,
+    mark_compact_route_probs,
     router_gating_linear,
     topk_routing_with_score_function,
 )
@@ -1619,6 +1621,7 @@ class TestFusedAuxScoresRouter:
         x = hidden.detach().clone().requires_grad_(True)
         probs, routing_map = router(x)
         assert routing_map.dtype == torch.int64 and routing_map.shape == (self.num_tokens, 8)
+        assert is_compact_route_probs(probs) == fused
         if fused:
             assert probs.shape == (self.num_tokens, 8) and probs.dtype == torch.float32
             route_probs = probs
@@ -1716,7 +1719,7 @@ def test_flex_dispatcher_compact_probs_match_dense_probs(tp_size):
     indices = torch.stack(
         [torch.randperm(num_experts, generator=generator)[:topk] for _ in range(num_tokens)]
     )
-    compact = dense.gather(1, indices)
+    compact = mark_compact_route_probs(dense.gather(1, indices))
     dispatcher = SimpleNamespace(
         tp_size=tp_size, ep_size=ep_size, num_local_experts=num_experts // ep_size
     )
@@ -1737,6 +1740,47 @@ def test_flex_dispatcher_compact_probs_match_dense_probs(tp_size):
             managers.append(manager)
         assert torch.equal(managers[0].token_indices, managers[1].token_indices)
         assert torch.equal(managers[0].token_probs, managers[1].token_probs)
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_flex_dispatcher_full_width_probs_with_topk_equal_num_experts(tp_size):
+    """With topk == num_experts the router's full-width probs have the shape of the dense
+    indices. Unless tagged compact they must still be gathered at the (permuted) indices, so
+    every weight pairs with its own expert."""
+    num_tokens, num_experts, ep_size = 16, 8, 2
+    topk = num_experts
+    generator = torch.Generator().manual_seed(1)
+    dense = torch.rand(num_tokens, num_experts, generator=generator)
+    indices = torch.stack(
+        [torch.randperm(num_experts, generator=generator) for _ in range(num_tokens)]
+    )
+    assert dense.shape == indices.shape == (num_tokens, topk)
+    dispatcher = SimpleNamespace(
+        tp_size=tp_size, ep_size=ep_size, num_local_experts=num_experts // ep_size
+    )
+    init = token_dispatcher_module.MoEFlexTokenDispatcher._initialize_metadata
+    full = init(dispatcher, indices, dense)
+    compact = init(dispatcher, indices, mark_compact_route_probs(dense.gather(1, indices)))
+    for manager_cls in (
+        token_dispatcher_module._NCCLEPManager,
+        token_dispatcher_module._DeepepManager,
+    ):
+        managers = []
+        for routing_map, probs in (full, compact):
+            manager = SimpleNamespace(capacity_factor=None)
+            manager_cls.setup_metadata(manager, routing_map, probs)
+            managers.append(manager)
+        assert torch.equal(managers[0].token_indices, managers[1].token_indices)
+        assert torch.equal(managers[0].token_probs, managers[1].token_probs)
+
+
+def test_compact_route_probs_tag_requires_index_shape():
+    """Tagged compact probs whose shape differs from the dense indices are rejected."""
+    indices = torch.zeros(4, 2, dtype=torch.int64)
+    probs = mark_compact_route_probs(torch.rand(4, 8))
+    with pytest.raises(AssertionError, match="compact route probs must be"):
+        token_dispatcher_module._is_compact_route_probs(indices, probs)
+    assert not token_dispatcher_module._is_compact_route_probs(indices, torch.rand(4, 2))
 
 
 @pytest.mark.internal

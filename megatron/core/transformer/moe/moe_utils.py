@@ -1748,6 +1748,23 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         return grad_input, grad_weight, grad_bias, None
 
 
+_COMPACT_ROUTE_PROBS_ATTR = "_moe_compact_route_probs"
+
+
+def mark_compact_route_probs(probs: torch.Tensor) -> torch.Tensor:
+    """Tag ``probs`` as compact per-route weights: [num_tokens, topk], aligned with the dense
+    top-k indices returned with them (see TopKRouter's moe_router_fused_aux_scores), instead of
+    the full [num_tokens, num_experts] weights. The tag is explicit because the two can have the
+    same shape (topk == num_experts). Returns ``probs``."""
+    setattr(probs, _COMPACT_ROUTE_PROBS_ATTR, True)
+    return probs
+
+
+def is_compact_route_probs(probs: torch.Tensor) -> bool:
+    """Whether ``probs`` was tagged by :func:`mark_compact_route_probs`."""
+    return getattr(probs, _COMPACT_ROUTE_PROBS_ATTR, False)
+
+
 def router_gating_linear(
     inp: torch.Tensor, weight: torch.Tensor, bias: Optional[torch.Tensor], router_dtype: torch.dtype
 ) -> torch.Tensor:

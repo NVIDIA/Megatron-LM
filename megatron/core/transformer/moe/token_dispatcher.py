@@ -43,6 +43,8 @@ from megatron.core.transformer.moe.moe_utils import (
     ProcessGroupCollection,
     get_align_size_for_quantization,
     get_capacity,
+    is_compact_route_probs,
+    mark_compact_route_probs,
     maybe_move_tensor_to_cpu,
     pad_routing_map,
     permute,
@@ -981,15 +983,22 @@ class MoEAlltoAllTokenDispatcher(MoETokenDispatcher):
 
 
 def _is_compact_route_probs(routing_map: torch.Tensor, probs: torch.Tensor) -> bool:
-    """Whether probs are per-route weights aligned with dense top-k indices.
+    """Whether probs are compact per-route weights aligned with dense top-k indices.
 
     Routers may hand the 'deepep' / 'ncclep' managers [num_tokens, topk] probabilities in the
     order of the dense [num_tokens, topk] indices (see TopKRouter's moe_router_fused_aux_scores)
-    instead of the full [num_tokens, num_experts] weights. Such probabilities are 2-D with the
-    shape of the indices; the full weights reach the managers 3-D from _initialize_metadata.
+    instead of the full [num_tokens, num_experts] weights. They are tagged explicitly
+    (mark_compact_route_probs): with topk == num_experts the full weights have the same shape.
     Routes marked -1 must already carry zero weight.
     """
-    return routing_map.dtype != torch.bool and probs.dim() == 2 and probs.shape == routing_map.shape
+    if not is_compact_route_probs(probs):
+        return False
+    assert routing_map.dtype != torch.bool and probs.shape == routing_map.shape, (
+        "compact route probs must be [num_tokens, topk] like the dense top-k indices, got "
+        f"probs {tuple(probs.shape)} and routing map {tuple(routing_map.shape)} "
+        f"({routing_map.dtype})"
+    )
+    return True
 
 
 class _DispatchManager(ABC):
@@ -2404,7 +2413,7 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             )
         if compact_probs:
             if self.tp_size > 1:
-                probs = (
+                probs = mark_compact_route_probs(
                     probs.unsqueeze(-1).expand(-1, -1, self.tp_size).reshape(num_local_tokens, -1)
                 )
             return routing_map, probs

@@ -32,6 +32,7 @@ from megatron.core.transformer.moe.moe_utils import (
     fused_topk_with_aux_loss_scores_is_supported,
     fused_topk_with_score_function_supports_topk_indices,
     get_tokens_per_expert_and_token_count,
+    mark_compact_route_probs,
     qb_dual_update,
     router_gating_linear,
     sinkhorn,
@@ -1200,7 +1201,7 @@ class TopKRouter(Router):
         probs = self._apply_global_aux_loss(
             probs, scores_for_aux_loss, None, local_tokens_per_expert=aux_tokens_per_expert
         )
-        return probs, top_indices
+        return mark_compact_route_probs(probs), top_indices
 
     def routing(
         self,
