@@ -1184,7 +1184,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         This method calls the core computation of a transformer layer, including
         self-attention, cross-attention (if applicable), and feed-forward operations.
+
+        Besides the ``_forward_attention`` arguments, it accepts the keyword-only
+        ``shared_prefix_token_multiplicities`` (one logical token count per flattened
+        sequence-first row), which it routes to the MoE MLP only.
         """
+        shared_prefix_token_multiplicities = kwargs.pop("shared_prefix_token_multiplicities", None)
         with _otel_managed_span(
             'layer', 'megatron.layer.forward', **{'megatron.layer_number': self.layer_number}
         ):
@@ -1203,6 +1208,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     )
                 if kwargs.get("input_ids", None) is not None:
                     mlp_kwargs["input_ids"] = kwargs["input_ids"]
+                if shared_prefix_token_multiplicities is not None:
+                    mlp_kwargs["shared_prefix_token_multiplicities"] = (
+                        shared_prefix_token_multiplicities
+                    )
                 output = self._forward_mlp(
                     hidden_states, kwargs.get("inference_context", None), **mlp_kwargs
                 )
@@ -1401,6 +1410,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         packed_seq_params=None,
         input_ids: Optional[Tensor] = None,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        *,
+        shared_prefix_token_multiplicities: Optional[Tensor] = None,
     ) -> Tensor | list[Tensor | None]:
         """
         Perform a forward pass through the feed-forward layer.
@@ -1419,6 +1430,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 Required by hash-routed MoE layers.
             residual_stream_recompute_context: Call-local ordered replay state for the
                 configured MLP residual connection.
+            shared_prefix_token_multiplicities (Tensor, optional): Logical token count per
+                flattened sequence-first row, forwarded to the MoE layer for expert-bias counts.
+                Rejected for a dense MLP.
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
         """
@@ -1444,6 +1458,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             inference_context,
             input_ids=input_ids,
             packed_seq_params=packed_seq_params,
+            shared_prefix_token_multiplicities=shared_prefix_token_multiplicities,
         )
 
         if moe_unflatten_mbs is not None:
@@ -1486,6 +1501,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         inference_context: BaseInferenceContext | None,
         input_ids: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        *,
+        shared_prefix_token_multiplicities: Optional[Tensor] = None,
     ):
         """Execute the MLP submodule with the appropriate variant.
 
@@ -1521,6 +1538,16 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             moe_kwargs["input_ids"] = input_ids
         if self.is_moe_layer:
             moe_kwargs["packed_seq_params"] = packed_seq_params
+        if shared_prefix_token_multiplicities is not None:
+            if not self.is_moe_layer:
+                raise ValueError("shared_prefix_token_multiplicities requires an MoE MLP")
+            if packed_seq_params is not None:
+                # The multiplicities index the caller's flattened rows; packed sequences may be
+                # un-flattened and reordered before the MoE layer.
+                raise ValueError(
+                    "shared_prefix_token_multiplicities cannot be combined with packed_seq_params"
+                )
+            moe_kwargs["shared_prefix_token_multiplicities"] = shared_prefix_token_multiplicities
 
         if self.recompute_mlp:
             mlp_output_with_bias = precision_aware_checkpoint(
@@ -1542,6 +1569,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     if should_chunk_mlp_for_prefill
                     else self.config.mlp_chunks_for_training
                 ),
+                shared_prefix_token_multiplicities=shared_prefix_token_multiplicities,
             )
         else:
             if using_fused_tp_inference_kernel:
@@ -1562,6 +1590,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         input_ids: Optional[Tensor],
         packed_seq_params: Optional[PackedSeqParams],
         num_chunks: int,
+        *,
+        shared_prefix_token_multiplicities: Optional[Tensor] = None,
     ) -> tuple[Tensor, Tensor | None]:
         """Run the MLP over ``num_chunks`` sequence chunks of ``hidden_states`` ([s, b, h]).
 
@@ -1569,7 +1599,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         the same number of calls whatever its local sequence length. The input is therefore
         always split into exactly ``num_chunks`` non-empty chunks: a sequence shorter than that
         is padded with masked dummy tokens, whose outputs are dropped. With routing replay, each
-        chunk replays its own tokens' indices (see ``ChunkedRouterReplay``).
+        chunk replays its own tokens' indices (see ``ChunkedRouterReplay``). Shared-prefix
+        token multiplicities (one per flattened sequence-first row) are split the same way; the
+        dummy tokens count zero logical tokens.
 
         Returns:
             ``mlp_output_with_bias``: tuple of (mlp_output, mlp_bias).
@@ -1600,6 +1632,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             padding_mask = torch.nn.functional.pad(padding_mask, (0, pad), value=True)
             if input_ids is not None:
                 input_ids = torch.nn.functional.pad(input_ids, (0, pad))
+            if shared_prefix_token_multiplicities is not None:
+                shared_prefix_token_multiplicities = torch.nn.functional.pad(
+                    shared_prefix_token_multiplicities.reshape(-1), (0, pad * batch_size)
+                )
 
         # tensor_split, unlike chunk, always returns exactly num_chunks pieces.
         chunks = hidden_states.tensor_split(num_chunks, dim=0)
@@ -1613,6 +1649,14 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if self.is_moe_layer and input_ids is not None
             else (None,) * num_chunks
         )
+        # Sequence chunks own contiguous ranges of the flattened sequence-first rows.
+        multiplicity_chunks = (
+            shared_prefix_token_multiplicities.reshape(-1).split(
+                [chunk.shape[0] * batch_size for chunk in chunks]
+            )
+            if shared_prefix_token_multiplicities is not None
+            else (None,) * num_chunks
+        )
         replay = ChunkedRouterReplay(
             getattr(router, "router_replay", None),
             [chunk.shape[0] * batch_size for chunk in chunks],
@@ -1623,8 +1667,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         # Compute outputs for each chunk, preserving sequence-aligned MoE metadata.
         outputs = []
-        for i, (chunk, padding_mask_chunk, input_id_chunk) in enumerate(
-            zip(chunks, padding_mask_chunks, input_id_chunks)
+        for i, (chunk, padding_mask_chunk, input_id_chunk, multiplicity_chunk) in enumerate(
+            zip(chunks, padding_mask_chunks, input_id_chunks, multiplicity_chunks)
         ):
             chunk_moe_kwargs = {}
             if input_id_chunk is not None:
@@ -1634,6 +1678,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             replay_topk_idx = replay.chunk_indices(i)
             if replay_topk_idx is not None:
                 chunk_moe_kwargs["replay_topk_idx"] = replay_topk_idx
+            if multiplicity_chunk is not None:
+                chunk_moe_kwargs["shared_prefix_token_multiplicities"] = multiplicity_chunk
             outputs.append(
                 apply_module(self.mlp)(chunk, padding_mask=padding_mask_chunk, **chunk_moe_kwargs)
             )
@@ -2611,6 +2657,8 @@ class MoETransformerLayer(TransformerLayer):
         padding_mask=None,
         packed_seq_params=None,
         input_ids=None,
+        *,
+        shared_prefix_token_multiplicities=None,
     ):
         """
         Orchestrates the MLP forward pass, handling partial CUDA graph execution logic.
@@ -2652,6 +2700,11 @@ class MoETransformerLayer(TransformerLayer):
             )
 
         if self.use_partial_cudagraphs:
+            if shared_prefix_token_multiplicities is not None:
+                raise ValueError(
+                    "shared_prefix_token_multiplicities is not supported with partial MoE "
+                    "CUDA graphs"
+                )
             hidden_states, padding_mask, input_ids, moe_unflatten_mbs = (
                 self._maybe_unflatten_for_moe(
                     hidden_states, padding_mask, input_ids, packed_seq_params
@@ -2681,6 +2734,7 @@ class MoETransformerLayer(TransformerLayer):
                 padding_mask=padding_mask,
                 packed_seq_params=packed_seq_params,
                 input_ids=input_ids,
+                shared_prefix_token_multiplicities=shared_prefix_token_multiplicities,
             )
 
 
