@@ -108,9 +108,7 @@ class FsdpModule:
             )
         self._parameter_groups = tuple(parameter_groups)
         self._trainable_parameter_countdown = Countdown(
-            schedule_policy.grad_accumulation_count
-            if schedule_policy.grad_accumulation_count is not None
-            else sum(1 for _ in self._trainable_fsdp_parameters())
+            sum(1 for _ in self._trainable_fsdp_parameters())
         )
         # The state-dict safety hook is registered unconditionally. It is still
         # required to keep loading a state dict safe when ``schedule_policy.register_hooks`` is
