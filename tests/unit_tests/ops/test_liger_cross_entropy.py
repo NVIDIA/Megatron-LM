@@ -2,38 +2,27 @@
 
 """Selection without Liger installed, and GPU parity with the optional Liger backend."""
 
-import builtins
-from unittest.mock import Mock
+import sys
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 from megatron.core.models.backends import get_backend
-from megatron.core.ops import _backends
 from megatron.core.ops.loss import backends
 from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
 from tests.unit_tests.test_utilities import Utils
 
-_ADAPTER = "megatron.core.ops.loss.liger_cross_entropy"
 _LIBRARY = "liger_kernel.megatron"
 
 
-@pytest.mark.parametrize("fusion,impl", [(False, "liger"), (True, "native")])
-def test_unselected_never_imports_liger(monkeypatch, fusion, impl):
-    original_import = builtins.__import__
-
-    def guarded_import(name, *args, **kwargs):
-        assert not name.startswith("liger_kernel") and name != _ADAPTER
-        return original_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", guarded_import)
-    monkeypatch.setattr(
-        _backends, "import_module", Mock(side_effect=AssertionError("unexpected import"))
-    )
-    target = backends.select_cross_entropy(fusion, impl)
-    assert target is (backends._fused_ce if fusion else backends.unfused_cross_entropy)
-    _backends.import_module.assert_not_called()
+def test_liger_is_imported_only_when_selected(monkeypatch):
+    for module in ("liger_kernel", _LIBRARY):
+        monkeypatch.setitem(sys.modules, module, None)  # any import attempt now fails
+    assert backends.select_cross_entropy(False, "liger") is backends.unfused_cross_entropy
+    assert backends.select_cross_entropy(True, "native") is backends._fused_ce
+    with pytest.raises(ImportError, match="Liger vocab-parallel cross entropy requires"):
+        backends.select_cross_entropy(True, "liger")
 
 
 @pytest.mark.parametrize("backend", ["local", "transformer_engine", "inference_optimized"])

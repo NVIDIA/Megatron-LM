@@ -23,8 +23,7 @@ CrossEntropyTarget = Callable[
 """``loss = target(logits, labels, tp_group)``, with ``logits`` [s, b, vocab/tp] and the
 target owning every reduction over ``tp_group``. Targets may *consume* ``logits``, replacing
 them with softmax intermediates or gradients, so a caller that needs them afterwards passes
-a clone. Targets supporting ``return_argmax=True`` return ``(loss, original_global_argmax)``,
-with ``None`` predictions when unavailable.
+a clone.
 """
 
 
