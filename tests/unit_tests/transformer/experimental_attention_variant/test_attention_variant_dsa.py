@@ -217,7 +217,7 @@ class TestDSAIndexShareHelpers:
             attn_mask_type=AttnMaskType.causal,
             attention_type="self",
             softmax_scale=1.0,
-            pg_collection=SimpleNamespace(),
+            pg_collection=SimpleNamespace(tp=None, cp=None),
         )
         recomputed_supports = []
 
