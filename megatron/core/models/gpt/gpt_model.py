@@ -871,24 +871,38 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
 
         # Inference consumes logits in fp32: emit them so when the head can, upcast otherwise.
         emit_fp32 = in_inference_mode and self.lm_head_can_emit_fp32
-        logits, _ = self.output_layer(
-            hidden_states,
-            weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
-            output_dtype=torch.float32 if emit_fp32 else None,
-        )
-
-        # Apply MuP output scaling to logits
-        logits = self._scale_logits(logits)
-        if in_inference_mode:
-            logits = logits.float()
-        # Dynamic inference under CUDA graphs: write the logits into the controller's
-        # persistent buffer and return a view of it, so no graph pins its own copy.
+        output_dtype = torch.float32 if emit_fp32 else None
         logits_buffer = getattr(inference_context, "logits_output_buffer", None)
-        if logits_buffer is not None:
-            buffer_rows = logits_buffer[0, : logits.shape[0]]
-            buffer_rows.copy_(logits.squeeze(1))
-            logits = buffer_rows.unsqueeze(1)
+        if emit_fp32 and logits_buffer is not None and inference_context.logits_output_in_place:
+            # The GEMM writes directly into the buffer for TP1.
+            buffer_rows = logits_buffer[0, : hidden_states.shape[0]]
+            logits, _ = self.output_layer(
+                hidden_states,
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                output_dtype=output_dtype,
+                out=buffer_rows.unsqueeze(1),
+            )
+            if self.config.use_mup and self.config.mup_output_mult != 1.0:
+                logits.mul_(self.config.mup_output_mult)
+        else:
+            logits, _ = self.output_layer(
+                hidden_states,
+                weight=output_weight,
+                runtime_gather_output=runtime_gather_output,
+                output_dtype=output_dtype,
+            )
+
+            # Apply MuP output scaling to logits
+            logits = self._scale_logits(logits)
+            if in_inference_mode:
+                logits = logits.float()
+            if logits_buffer is not None:
+                # Dynamic inference under CUDA graphs: write the logits into the controller's
+                # persistent buffer and return a view of it, so no graph pins its own copy.
+                buffer_rows = logits_buffer[0, : logits.shape[0]]
+                buffer_rows.copy_(logits.squeeze(1))
+                logits = buffer_rows.unsqueeze(1)
         gather_output = (
             self.output_layer.gather_output
             if runtime_gather_output is None
