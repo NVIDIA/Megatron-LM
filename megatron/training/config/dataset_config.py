@@ -3,14 +3,15 @@
 settings and the dataset class.
 
 ``DataConfig.dataset`` is ``megatron.core.datasets.gpt_dataset.GPTDatasetConfig`` itself (or its FIM
-subclass), the object ``BlendedMegatronDatasetBuilder`` consumes, constructed from the arguments or
+subclass, or training's ``SFTDatasetConfig``), the object ``BlendedMegatronDatasetBuilder`` consumes,
+constructed from the arguments or
 a YAML file before the tokenizer exists: nothing runs at construction, Core's checks that need no
 tokenizer (``validate_without_tokenizer()``) run at ``cfg.validate()``, and the complete
 ``validate()``, which needs the tokenizer, runs in ``DataConfig.bind_tokenizer`` once the runtime
 services bind the run's tokenizer (the builder runs it again before building).
 ``random_seed`` is Core's required constructor argument, filled from ``--seed`` by the factory and
-saved with the section. Seven Core fields are owned by other container sections (the physical
-pack width, parallel layout and validation flags): the container writes them at ``finalize()``
+saved with the section. Parallel layout, validation flags and SFT's physical pack width are owned
+by other container sections: the container writes them at ``finalize()``
 (``CONTAINER_WRITTEN_FIELDS``) and they are not serialized with the section.
 
 ``DataConfig`` groups the dataset config, the ``DataloaderConfig`` and ``dataset_type``, the dataset
@@ -33,7 +34,7 @@ from typing import Any, Literal, get_args
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.config.utils import serialize_value
-from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset, SFTDatasetConfig
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 
 DataloaderType = Literal["single", "cyclic", "external"]
@@ -160,7 +161,8 @@ def resolve_dataset_class(
     Read-only: ``DataConfig.validate()`` calls it and ``DataConfig.finalize()`` commits its result.
     With no class given, a ``GPTFIMDatasetConfig`` with a source resolves to ``GPTFIMDataset``, a
     plain config with a source to ``GPTDataset`` and a plain config without one to
-    ``MockGPTDataset``; sft and varlen share the plain config class and are always explicit. An
+    ``MockGPTDataset``. ``SFTDatasetConfig`` resolves to the SFT family; legacy SFT callers using
+    a plain config and varlen callers must select their dataset class explicitly. An
     explicit class must match the config (mock without a source, real with one, the FIM class with
     the FIM config); nothing is silently rewritten.
     """
@@ -170,6 +172,8 @@ def resolve_dataset_class(
         return None
     source = has_data_source(dataset)
     config_family = "fim" if isinstance(dataset, GPTFIMDatasetConfig) else None
+    if isinstance(dataset, SFTDatasetConfig):
+        config_family = "sft"
     if dataset_type is None:
         family = config_family or "gpt"
         if source:
@@ -202,6 +206,8 @@ def resolve_dataset_class(
             f"class and only GPTFIMDataset reads them (got {dataset_type.__name__} with "
             f"{type(dataset).__name__})."
         )
+    if config_family == "sft" and family != "sft":
+        raise ValueError("SFTDatasetConfig requires SFTDataset or MockSFTDataset.")
     if dataset.varlen_sbhd_validation and family == "varlen" and mock:
         raise ValueError("varlen_sbhd_validation requires real data (VarlenDataset, not its mock).")
     return dataset_type
@@ -216,7 +222,7 @@ class DataConfig:
     """
 
     dataset: GPTDatasetConfig | None = None
-    """Megatron Core's GPT dataset config (or ``GPTFIMDatasetConfig``), handed to
+    """GPT dataset config (or ``GPTFIMDatasetConfig`` / ``SFTDatasetConfig``), handed to
     ``BlendedMegatronDatasetBuilder`` as is."""
 
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)

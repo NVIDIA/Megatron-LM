@@ -90,9 +90,12 @@ Dataset content limits and model execution widths have different owners:
 
 For example, `--sft --seq-length 2048 --max-seq-length-per-sample 8192` truncates
 individual conversations at 2048 tokens and emits 8192-token padded packs. The
-container derives the dataset's physical `packed_sequence_length` during startup;
+container derives `SFTDatasetConfig.packed_sequence_length` during startup;
 recipes should set the model bound rather than this derived dataset field. Existing
 `--seq-length`-only runs retain their previous widths and packing behavior.
+The SFT-specific config lives alongside `SFTDataset`; Core's `GPTDatasetConfig`
+has no pack-width field. Legacy SFT callers supplying a plain `GPTDatasetConfig`
+retain its single `sequence_length` as the output pack width.
 
 An oversized allocation bound does not enlarge fixed GPT dataset rows or change
 their token-based batch schedule. T5 retains separate encoder and decoder input

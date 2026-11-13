@@ -34,7 +34,7 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.config import container as container_module
 from megatron.training.datasets import providers, sft_dataset, varlen_dataset
-from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset, SFTDatasetConfig
 from megatron.training.models import GPTModelConfig
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.training import legacy_dataset_factories as legacy
@@ -46,7 +46,7 @@ def test_sft_truncates_conversations_before_packing():
         eod=99,
         tokenize_conversation=lambda *a, **kw: (torch.arange(1, 11), torch.arange(1, 11)),
     )
-    config = GPTDatasetConfig(
+    config = SFTDatasetConfig(
         random_seed=1234,
         sequence_length=4,
         packed_sequence_length=12,
@@ -377,7 +377,7 @@ def test_entry_points_build_the_dataset_config_pretrain_gpt_built(
         names = [f.name for f in fields(expected)]
     if dataset_class in (SFTDataset, MockSFTDataset):
         # Physical pack width is now derived independently of the content limit.
-        expected.packed_sequence_length = expected.sequence_length
+        assert actual.packed_sequence_length == expected.sequence_length
     assert _signature(actual, names) == _signature(expected, names)
     if entry_point == "prepare_cache":
         return
@@ -446,7 +446,7 @@ def test_hybrid_flex_rejects_the_varlen_family(monkeypatch, warnings_log, corpus
     assert warnings_log == []
     _, cfg, _ = _prepare(monkeypatch, *corpus["sft"], "hybrid_flex")
     data = _ready(cfg)
-    assert data.dataset_type is SFTDataset and type(data.dataset) is GPTDatasetConfig
+    assert data.dataset_type is SFTDataset and type(data.dataset) is SFTDatasetConfig
 
 
 @pytest.mark.parametrize("entry_point", ["gpt", "hybrid", "hybrid_flex"])

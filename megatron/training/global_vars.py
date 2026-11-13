@@ -21,7 +21,7 @@ from megatron.core.num_microbatches_calculator import (
     unset_num_microbatches_calculator,
 )
 from megatron.training.dist_signal_handler import DistributedSignalHandler
-from megatron.training.sequence_lengths import get_model_input_length
+from megatron.training.sequence_lengths import get_dataset_input_length, get_model_input_length
 from megatron.training.state import TrainState
 
 _GLOBAL_ARGS = None
@@ -238,7 +238,7 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
         step_batch_size_schedule=cfg.train.step_batch_size_schedule,
         seq_length=(
-            dataset.packed_sequence_length or dataset.sequence_length
+            get_dataset_input_length(dataset)
             if dataset is not None
             else get_model_input_length(cfg.model)
         ),
@@ -599,7 +599,7 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     if include_training:
         dataset = cfg.data.dataset
         sequence_length = (
-            dataset.packed_sequence_length or dataset.sequence_length
+            get_dataset_input_length(dataset)
             if dataset is not None
             else get_model_input_length(cfg.model)
         )

@@ -18,7 +18,7 @@ from megatron.training.config import (
     RLConfig,
 )
 from megatron.training.config.dataset_config import DataConfig
-from megatron.training.datasets.sft_dataset import MockSFTDataset
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDatasetConfig
 from megatron.training.models import (
     BertModelConfig,
     GPTModelConfig,
@@ -38,7 +38,7 @@ def test_dataset_content_limit_and_execution_bound_are_distinct(run_config, pack
     cfg.model.seq_length = 64
     cfg.model.transformer.max_seq_length_per_sample = 32
     cfg.data = DataConfig(
-        dataset=GPTDatasetConfig(
+        dataset=(SFTDatasetConfig if packed else GPTDatasetConfig)(
             random_seed=1234,
             sequence_length=8,
             reset_position_ids=False,
@@ -50,7 +50,10 @@ def test_dataset_content_limit_and_execution_bound_are_distinct(run_config, pack
     before = copy.deepcopy(cfg.to_dict())
     cfg.validate()
     assert cfg.to_dict() == before
-    assert cfg.data.dataset.packed_sequence_length is None
+    if packed:
+        assert cfg.data.dataset.packed_sequence_length is None
+    else:
+        assert not hasattr(cfg.data.dataset, "packed_sequence_length")
     cfg.finalize()
     assert cfg.data.dataset.sequence_length == 8
     assert cfg.model.transformer.max_seq_length_per_sample == 32
@@ -58,6 +61,7 @@ def test_dataset_content_limit_and_execution_bound_are_distinct(run_config, pack
     saved = cfg.to_dict()
     restored = type(cfg).from_dict(saved)
     restored.finalize()
+    assert type(restored.data.dataset) is (SFTDatasetConfig if packed else GPTDatasetConfig)
     assert get_model_input_length(restored.model, restored.data.dataset) == (32 if packed else 8)
     assert restored.to_dict() == saved
 
@@ -90,7 +94,7 @@ def test_sft_pack_validates_physical_shape(run_config, bound, capacity, error):
     cfg.model.transformer.max_seq_length_per_sample = bound
     cfg.model.transformer.context_parallel_size = 2
     cfg.data = DataConfig(
-        dataset=GPTDatasetConfig(
+        dataset=SFTDatasetConfig(
             random_seed=1234,
             sequence_length=9,
             reset_position_ids=False,

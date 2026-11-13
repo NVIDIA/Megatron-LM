@@ -54,6 +54,7 @@ from megatron.training.config import (
     ValidationConfig,
 )
 from megatron.training.config.dataset_config import dataset_type_from_family
+from megatron.training.datasets.sft_dataset import SFTDatasetConfig
 from megatron.training.models import (
     BertModelConfig,
     GPTModelConfig,
@@ -1066,11 +1067,6 @@ def _container_written_fields_from_args(args: Namespace) -> dict[str, Any]:
     """What a standalone (container-less) dataset config takes from ``args`` for the fields the
     container writes otherwise (pack width, layout, and validation flags)."""
     return {
-        "packed_sequence_length": (
-            getattr(args, "max_seq_length_per_sample", None) or args.seq_length
-            if requested_dataset_family(args) == "sft"
-            else None
-        ),
         "data_parallel_size": args.data_parallel_size,
         "context_parallel_size": args.context_parallel_size,
         "sequence_parallel_size": args.tensor_model_parallel_size * int(bool(args.sequence_parallel)),
@@ -1126,7 +1122,13 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
     kwargs["sequences_per_dataset"] = sequences_per_dataset
     if standalone:
         kwargs.update(_container_written_fields_from_args(args))
-    if family == "fim":
+    if family == "sft":
+        if standalone:
+            kwargs["packed_sequence_length"] = (
+                getattr(args, "max_seq_length_per_sample", None) or args.seq_length
+            )
+        dataset = SFTDatasetConfig(**kwargs)
+    elif family == "fim":
         kwargs.update(
             fim_rate=args.fim_rate,
             fim_spm_rate=args.fim_spm_rate,

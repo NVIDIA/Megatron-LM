@@ -56,6 +56,7 @@ from megatron.training.config.utils import (
     serialize_value,
 )
 from megatron.training.config.yaml_utils import safe_yaml_representers
+from megatron.training.datasets.sft_dataset import SFTDatasetConfig
 from megatron.training.models import (
     BertModelConfig,
     LLaVAModelConfig,
@@ -692,14 +693,21 @@ class PretrainConfigContainer(ConfigContainerBase):
         if dataset is None:
             return
         execution_bound = self.model.transformer.max_seq_length_per_sample
-        if dataset.packed_sequence_length not in (None, execution_bound):
+        if isinstance(dataset, SFTDatasetConfig) and dataset.packed_sequence_length not in (
+            None,
+            execution_bound,
+        ):
             raise ValueError(
                 "data.dataset.packed_sequence_length is derived from "
                 "model.transformer.max_seq_length_per_sample; leave it unset"
             )
         dataset_type = resolve_dataset_class(dataset, self.data.dataset_type)
         if dataset_family_from_type(dataset_type)[0] == "sft":
-            pack_length = execution_bound or dataset.sequence_length
+            pack_length = (
+                execution_bound or dataset.sequence_length
+                if isinstance(dataset, SFTDatasetConfig)
+                else dataset.sequence_length
+            )
             transformer = self.model.transformer
             cp_multiple = (
                 2 * transformer.context_parallel_size
@@ -973,7 +981,7 @@ class PretrainConfigContainer(ConfigContainerBase):
             # from the validation config, the layout from the required model config.
             if transformer.max_seq_length_per_sample is None:
                 transformer.max_seq_length_per_sample = dataset.sequence_length
-            if self.data.is_sft():
+            if isinstance(dataset, SFTDatasetConfig):
                 dataset.packed_sequence_length = transformer.max_seq_length_per_sample
             dataset.full_validation = self.validation.full_validation
             dataset.multiple_validation_sets = self.validation.multiple_validation_sets

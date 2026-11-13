@@ -58,7 +58,6 @@ LAYOUT_FIELDS = (
 )  # fmt: skip
 # Megatron Core's defaults for the fields the container writes: what an unset field holds.
 CORE_DEFAULTS = {
-    "packed_sequence_length": None,
     "data_parallel_size": 1, "context_parallel_size": None, "sequence_parallel_size": 0,
     "dynamic_context_parallel": False,
     "multiple_validation_sets": None, "full_validation": None,
@@ -66,7 +65,7 @@ CORE_DEFAULTS = {
 
 
 def _written_fields(dataset):
-    return {name: getattr(dataset, name) for name in CONTAINER_WRITTEN_FIELDS}
+    return {name: getattr(dataset, name) for name in CORE_DEFAULTS}
 
 
 @pytest.fixture(scope="module")
@@ -376,8 +375,8 @@ def test_standalone_config_takes_the_container_written_fields_from_args():
     owned = gpt_data_config_from_args(args).dataset
     assert _written_fields(owned) == CORE_DEFAULTS
     assert owned.random_seed == 99  # the seed is the section's own setting
-    assert set(argument_utils._container_written_fields_from_args(args)) == set(
-        CONTAINER_WRITTEN_FIELDS
+    assert set(argument_utils._container_written_fields_from_args(args)) == (
+        set(CONTAINER_WRITTEN_FIELDS) - {"packed_sequence_length"}
     )
     sft_args = _validated(["--mock-data", "--sft", "--max-seq-length-per-sample", "64"])
     standalone_sft = gpt_data_config_from_args(sft_args, standalone=True).dataset

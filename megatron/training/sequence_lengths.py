@@ -5,6 +5,15 @@
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 
 
+def get_dataset_input_length(dataset: GPTDatasetConfig) -> int:
+    """Return a dataset's output row width, not an SFT conversation truncation limit."""
+    from megatron.training.datasets.sft_dataset import SFTDatasetConfig
+
+    if isinstance(dataset, SFTDatasetConfig):
+        return dataset.packed_sequence_length or dataset.sequence_length
+    return dataset.sequence_length
+
+
 def get_model_input_length(model, dataset: GPTDatasetConfig | None = None) -> int | None:
     """Return the configured input width for shared training runtime consumers.
 
@@ -27,5 +36,5 @@ def get_model_input_length(model, dataset: GPTDatasetConfig | None = None) -> in
         # The application resolves the padded execution width before startup.
         return model.transformer.max_seq_length_per_sample
     if dataset is not None:
-        return dataset.packed_sequence_length or dataset.sequence_length
+        return get_dataset_input_length(dataset)
     return model.transformer.max_seq_length_per_sample

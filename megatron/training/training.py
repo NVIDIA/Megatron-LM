@@ -174,7 +174,7 @@ from megatron.training.logging.packed_sequence_stats import (
     update_packed_sequence_stats,
 )
 from megatron.training.models import ModelConfig, T5ModelConfig
-from megatron.training.sequence_lengths import get_model_input_length
+from megatron.training.sequence_lengths import get_dataset_input_length, get_model_input_length
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
@@ -4366,7 +4366,7 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     cfg = get_run_config()
     dataset = cfg.data.dataset
     sequence_length = (
-        dataset.packed_sequence_length or dataset.sequence_length
+        get_dataset_input_length(dataset)
         if dataset is not None
         else get_model_input_length(cfg.model)
     )
