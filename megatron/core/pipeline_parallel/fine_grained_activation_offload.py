@@ -15,11 +15,6 @@ from megatron.core.tensor_parallel.random import is_checkpoint_without_output_te
 DEBUG = False
 DEBUG_RANK = 0
 
-try:
-    from nemo.lens.helpers import trace_fn as _otel_trace_fn
-except ImportError:
-    from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
-
 from megatron.core.pipeline_parallel.pinned_activation_buffer import PinnedActivationBuffer
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.utils import nvtx_range_pop, nvtx_range_push
@@ -981,7 +976,6 @@ class ChunkOffloadHandler:
     # view spans most of the storage.
     BASE_OFFLOAD_MIN_COVERAGE = 0.5
 
-    @_otel_trace_fn('activation_offload', 'megatron.activation.offload')
     def offload(self, src_tensor, pin_memory=True, use_cpu_pool=True, stream=None):
         """Offload.
 
@@ -1041,7 +1035,6 @@ class ChunkOffloadHandler:
             cpu_backup.size(), dtype=cpu_backup.dtype, layout=cpu_backup.layout, device=dev
         )
 
-    @_otel_trace_fn('activation_offload', 'megatron.activation.reload')
     def reload(self, state, non_blocking=None, stream=None, *, destination=None):
         """Copy an offloaded ``state`` back to the GPU on the current stream.
 

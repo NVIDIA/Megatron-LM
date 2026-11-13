@@ -1,25 +1,15 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Training metric instruments (megatron.training.* namespace).
-
-Self-contained copy of the metric recording logic from nemo.lens so that
-Megatron-LM can emit training metrics without a hard dependency on nemo-lens.
-"""
+"""Failure-isolated processed-token metric owned by Megatron-LM."""
 
 from __future__ import annotations
 
 import logging
+import math
 import weakref
+from typing import Any
 
-# Metric name constants (mirrors nemo.lens.semconv).
-MEGATRON_TRAINING_STEP_DURATION_MS = "megatron.training.step_duration_ms"
-MEGATRON_TRAINING_LOSS = "megatron.training.loss"
-MEGATRON_TRAINING_THROUGHPUT_TFLOPS = "megatron.training.throughput_tflops"
-MEGATRON_TRAINING_GRAD_NORM = "megatron.training.grad_norm"
-MEGATRON_TRAINING_SKIPPED_ITERS = "megatron.training.skipped_iters"
-MEGATRON_TRAINING_LEARNING_RATE = "megatron.training.learning_rate"
-MEGATRON_TRAINING_TOKENS_PER_SEC = "megatron.training.tokens_per_sec"
-MEGATRON_TRAINING_MEMORY_ALLOCATED_GB = "megatron.training.memory_allocated_gb"
+NV_DL_TRAINING_TOKENS_PROCESSED = "nv.dl.training.tokens.processed"
 
 try:
     from opentelemetry import metrics
@@ -30,64 +20,49 @@ _logger = logging.getLogger(__name__)
 _TRAINING_INSTRUMENTS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
-def _get_training_instruments(meter) -> dict:
+def _get_training_instruments(meter: Any) -> dict:
     instruments = _TRAINING_INSTRUMENTS.get(meter)
     if instruments is None:
         instruments = {
-            "step_duration_ms": meter.create_histogram(
-                name=MEGATRON_TRAINING_STEP_DURATION_MS,
-                unit="ms",
-                description="Duration of one training step in milliseconds.",
-            ),
-            "loss": meter.create_gauge(
-                name=MEGATRON_TRAINING_LOSS, description="Training loss value at each log interval."
-            ),
-            "throughput_tflops": meter.create_gauge(
-                name=MEGATRON_TRAINING_THROUGHPUT_TFLOPS,
-                description="Training throughput in TFLOP/s/GPU.",
-            ),
-            "grad_norm": meter.create_gauge(
-                name=MEGATRON_TRAINING_GRAD_NORM, description="Global gradient norm."
-            ),
-            "skipped_iters": meter.create_counter(
-                name=MEGATRON_TRAINING_SKIPPED_ITERS,
-                description="Number of training iterations skipped.",
-            ),
-            "learning_rate": meter.create_gauge(
-                name=MEGATRON_TRAINING_LEARNING_RATE, description="Current learning rate."
-            ),
-            "tokens_per_sec": meter.create_gauge(
-                name=MEGATRON_TRAINING_TOKENS_PER_SEC,
-                description="Training throughput in tokens/second.",
-            ),
-            "memory_allocated_gb": meter.create_gauge(
-                name=MEGATRON_TRAINING_MEMORY_ALLOCATED_GB,
-                description="Peak GPU memory allocated in GB.",
-            ),
+            "tokens_processed": meter.create_counter(
+                name=NV_DL_TRAINING_TOKENS_PROCESSED,
+                unit="{token}",
+                description="Global tokens processed per executed training iteration.",
+            )
         }
         _TRAINING_INSTRUMENTS[meter] = instruments
     return instruments
 
 
-def record_training_metrics(
-    meter,
-    step_duration_ms: float | None = None,
-    loss: float | None = None,
-    throughput_tflops: float | None = None,
-    grad_norm: float | None = None,
-    skipped_iters: int | None = None,
-    learning_rate: float | None = None,
-    tokens_per_sec: float | None = None,
-    memory_allocated_gb: float | None = None,
-) -> None:
-    """Record training metrics to the OTel meter.
+def processed_token_increment(
+    global_batch_size: int, sequence_length: int, packed_token_count: float | None = None
+) -> int | None:
+    """Return the global integer token increment for one executed iteration.
 
-    All arguments are optional; ``None`` values are silently skipped.
-    Safe to call when telemetry is disabled (meter is no-op).
+    Packed training passes the already-global host value materialized by the
+    existing sequence-length statistics path. Invalid packed values are skipped
+    so telemetry cannot affect training.
+    """
+    if packed_token_count is None:
+        return int(global_batch_size) * int(sequence_length)
+    if (
+        isinstance(packed_token_count, bool)
+        or not isinstance(packed_token_count, (int, float))
+        or not math.isfinite(packed_token_count)
+        or not float(packed_token_count).is_integer()
+        or packed_token_count < 0
+    ):
+        _logger.warning("Skipping invalid packed processed-token count %r", packed_token_count)
+        return None
+    return int(packed_token_count)
+
+
+def record_processed_tokens(meter: Any, token_count: int | None = None) -> None:
+    """Add one global token increment to this rank's monotonic counter.
 
     If ``opentelemetry`` is not installed, this function is a no-op.
     """
-    if metrics is None:
+    if metrics is None or token_count is None:
         return
 
     try:
@@ -96,19 +71,30 @@ def record_training_metrics(
         _logger.warning("Failed to create training metric instruments", exc_info=True)
         return
 
-    if step_duration_ms is not None:
-        instruments["step_duration_ms"].record(step_duration_ms)
-    if loss is not None:
-        instruments["loss"].set(loss)
-    if throughput_tflops is not None:
-        instruments["throughput_tflops"].set(throughput_tflops)
-    if grad_norm is not None:
-        instruments["grad_norm"].set(float(grad_norm))
-    if skipped_iters is not None and skipped_iters > 0:
-        instruments["skipped_iters"].add(skipped_iters)
-    if learning_rate is not None:
-        instruments["learning_rate"].set(learning_rate)
-    if tokens_per_sec is not None:
-        instruments["tokens_per_sec"].set(tokens_per_sec)
-    if memory_allocated_gb is not None:
-        instruments["memory_allocated_gb"].set(memory_allocated_gb)
+    try:
+        instruments["tokens_processed"].add(token_count)
+    except Exception:
+        _logger.warning("Failed to record processed-token metric", exc_info=True)
+
+
+def record_processed_tokens_for_iteration(
+    telemetry_handle: Any | None,
+    *,
+    global_batch_size: int,
+    sequence_length: int,
+    packed_token_count: float | None = None,
+) -> None:
+    """Record tokens for a model-work iteration committed by the trainer."""
+    if telemetry_handle is None:
+        return
+
+    try:
+        if not telemetry_handle.is_exporting:
+            return
+        meter = telemetry_handle.meter
+    except Exception:
+        _logger.warning("Failed to inspect telemetry handle for processed tokens", exc_info=True)
+        return
+
+    token_count = processed_token_increment(global_batch_size, sequence_length, packed_token_count)
+    record_processed_tokens(meter, token_count)
