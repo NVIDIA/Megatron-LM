@@ -53,7 +53,7 @@ jobs:
           persist-credentials: false
 
       - name: Checkout frozen version content
-        run: python3 docs/fern/scripts/fern_versions.py extract-content
+        run: python3 fern/scripts/fern_versions.py extract-content
 
       - name: Set up Fern CLI
         uses: ./.github/actions/setup-fern
@@ -61,7 +61,7 @@ jobs:
       - name: Publish Docs
         env:
           FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
-        working-directory: ./docs/fern
+        working-directory: ./fern
         run: |
           set -o pipefail
           fern generate --docs 2>&1 | tee /tmp/fern-output.log
