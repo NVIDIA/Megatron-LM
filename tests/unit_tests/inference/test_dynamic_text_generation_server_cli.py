@@ -32,7 +32,7 @@ def test_deferred_bootstrap_resolves_detected_model(monkeypatch, family, padded_
     args.pad_vocab_size = True
     args.padded_vocab_size = padded_vocab_size
     args.make_vocab_size_divisible_by = 128
-    for name in ("_GLOBAL_RUN_CONFIG", "_GLOBAL_TOKENIZER"):
+    for name in ("_GLOBAL_ROOT_CONFIG_CONTAINER", "_GLOBAL_TOKENIZER"):
         monkeypatch.setattr(global_vars, name, None)
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     monkeypatch.setattr(legacy_server, "parse_and_validate_args", lambda **kwargs: args)

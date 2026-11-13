@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
+import importlib
 import logging
 import os
 from dataclasses import dataclass, field
@@ -104,6 +105,13 @@ class ConfigContainerBase:
         finalize_model = getattr(getattr(self, "model", None), "finalize", None)
         if callable(finalize_model):
             finalize_model()
+
+    def resolve_tokenizer_vocab_size(self) -> None:
+        """Bind tokenizer-derived vocabulary on every member container."""
+        for config_field in dataclass_fields(self):
+            member = getattr(self, config_field.name)
+            if isinstance(member, ConfigContainerBase):
+                member.resolve_tokenizer_vocab_size()
 
     @classmethod
     def from_dict(
@@ -843,6 +851,13 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.data.finalize()
         self.ddp.finalize()
 
+    def resolve_tokenizer_vocab_size(self) -> None:
+        """Bind the model's vocabulary from this container's tokenizer section."""
+        # Imported lazily: megatron.training.argument_utils imports megatron.training.config.
+        from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+
+        resolve_tokenizer_vocab_size(self)
+
 
 def update_train_iters(train: TrainingConfig) -> None:
     """Resolve the sample-based training horizon on the supplied training config."""
@@ -873,7 +888,7 @@ def update_train_iters(train: TrainingConfig) -> None:
 
 @dataclass(kw_only=True)
 class InferenceConfigContainer(ConfigContainerBase):
-    """Top-level container for inference entry points.
+    """Container for inference entry points.
 
     This is the inference counterpart to :class:`PretrainConfigContainer`. It holds only the
     configs that inference actually needs and is intentionally shaped differently from the
@@ -910,13 +925,39 @@ class InferenceConfigContainer(ConfigContainerBase):
             # instead of loading random weights, as validate_args derives it.
             self.checkpoint.exit_on_missing_checkpoint = True
 
+    def resolve_tokenizer_vocab_size(self) -> None:
+        """Bind the model's vocabulary from this container's tokenizer section."""
+        # Imported lazily: megatron.training.argument_utils imports megatron.training.config.
+        from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+
+        resolve_tokenizer_vocab_size(self)
+
 
 @dataclass(kw_only=True)
 class AlgorithmConfigContainer(ConfigContainerBase):
-    """Top-level container for the algorithm sections a run adds on top of `training`."""
+    """Container for the algorithm sections a run adds on top of `training`.
+
+    Each section names the module holding its rules against the run's other containers
+    (`run_rules`); the root container applies them when it validates and finalizes.
+    """
 
     rl: RLConfig | None = None
     """The RL loop's section; `None` for a run without RL."""
+
+    def _run_rules(self) -> list:
+        """The rules modules of the sections this run has."""
+        sections = (getattr(self, f.name) for f in dataclass_fields(self) if f.init)
+        return [importlib.import_module(s.run_rules) for s in sections if s is not None]
+
+    def validate_run(self, root: "RootConfigContainer") -> None:
+        """Check each section's rules against the run's other containers."""
+        for rules in self._run_rules():
+            rules.validate_run(root)
+
+    def finalize_run(self, root: "RootConfigContainer") -> None:
+        """Apply each section's derivations to the run's other containers."""
+        for rules in self._run_rules():
+            rules.finalize_run(root)
 
 
 @dataclass(kw_only=True)
@@ -940,25 +981,62 @@ class RootConfigContainer(ConfigContainerBase):
     algorithm: AlgorithmConfigContainer | None = None
     """The algorithm sections a run adds on top of `training` (the RL section)."""
 
+    def validate(self) -> None:
+        """Check the algorithm sections' rules against the run, then validate every member."""
+        if self.algorithm is not None:
+            self.algorithm.validate_run(self)
+        super().validate()
+
+    def _finalize(self) -> None:
+        """Apply the algorithm sections' rules, then finalize the members."""
+        if self.algorithm is not None:
+            self.algorithm.finalize_run(self)
+        # The run config last: an RL run finalizes its rollout deployment before training.
+        run_config = self.run_config
+        for config_field in dataclass_fields(self):
+            member = getattr(self, config_field.name)
+            if isinstance(member, ConfigContainerBase) and member is not run_config:
+                member.finalize()
+        if run_config is not None:
+            run_config.finalize()
+
     @classmethod
-    def wrap(cls, run_config: ConfigContainerBase) -> ConfigContainerBase:
-        """Wrap a lone run config as the matching member; return other types as is."""
+    def wrap(cls, run_config: ConfigContainerBase) -> "RootConfigContainer":
+        """Return a run's root container: a root as is, a lone run config as the matching member."""
+        if isinstance(run_config, cls):
+            return run_config
         if isinstance(run_config, PretrainConfigContainer):
             return cls(training=run_config)
         if isinstance(run_config, InferenceConfigContainer):
             return cls(inference=run_config)
-        return run_config
+        raise TypeError(
+            "A run config is a PretrainConfigContainer or an InferenceConfigContainer, "
+            f"got {type(run_config).__qualname__}"
+        )
+
+    @classmethod
+    def run_config_member(cls, members: Mapping[str, Any]) -> str | None:
+        """The name of the member a process runs on (`training`, else `inference`), given a root
+        container's members or its saved document."""
+        return next(
+            (name for name in ("training", "inference") if members.get(name) is not None), None
+        )
+
+    @property
+    def run_config(self) -> PretrainConfigContainer | InferenceConfigContainer | None:
+        """The container the process runs on."""
+        member = self.run_config_member(vars(self))
+        return None if member is None else getattr(self, member)
 
     def to_dict(self, **section_overrides: Mapping[str, Any]) -> dict[str, Any]:
         """The document holds only the members the run has. Section overrides (a checkpoint save's
         own directory and format) reach the member that is the run config."""
         document = {key: value for key, value in super().to_dict().items() if value is not None}
         if section_overrides:
-            owner = "training" if self.training is not None else "inference"
-            member = getattr(self, owner)
-            if member is None:
+            owner = self.run_config_member(vars(self))
+            if owner is None:
                 raise ValueError(
                     "RootConfigContainer has no run config member to apply overrides to"
                 )
-            document[owner] = member.to_dict(**section_overrides)
+            document[owner] = getattr(self, owner).to_dict(**section_overrides)
         return document

@@ -16,8 +16,7 @@ from megatron.core.inference.shards_spec import (
     spec_declares_disaggregation,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.training.config import RLConfig
-from megatron.training.models.base import ModelConfig
+from megatron.training.config import InferenceConfigContainer, RLConfig
 
 
 def disagg_refit_pools(
@@ -38,7 +37,7 @@ def build_disagg_inference_model(
     transformer_config: TransformerConfig,
     *,
     rl_config: RLConfig,
-    model_config: ModelConfig,
+    inference_container: InferenceConfigContainer,
     model_alloc_ctx: AbstractContextManager,
 ) -> list[torch.nn.Module]:
     """Build this rank's disaggregated RL inference shard."""
@@ -51,11 +50,12 @@ def build_disagg_inference_model(
             "--refit-method=nixl does not support multiple disaggregated destination pools; "
             "use a supported refit backend such as nccl"
         )
-    if not args.inference_dynamic_batching_enable_prefix_caching:
+    setup = inference_container.inference
+    if not setup.inference_dynamic_batching_enable_prefix_caching:
         raise ValueError("disaggregated RL rollouts require prefix caching")
     shards = build_inference_pg_collections_for_shards(
         total_world_size=args.world_size,
-        shards=args.inference_shards,
+        shards=setup.inference_shards,
         use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
     )
     local_shards = [shard for shard in shards if shard.pg_collection is not None]
@@ -77,7 +77,7 @@ def build_disagg_inference_model(
         cfg.expert_tensor_parallel_size = my_spec.expt_tp
 
     with model_alloc_ctx:
-        shard_model_config = copy.deepcopy(model_config)
+        shard_model_config = copy.deepcopy(inference_container.model)
         shard_model_config.transformer = cfg
         model = shard_model_config.get_builder_cls()(shard_model_config).build_distributed_models(
             pg_collection=my_pg, wrap_with_ddp=False, model_type=model_type

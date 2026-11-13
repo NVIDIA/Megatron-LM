@@ -738,7 +738,12 @@ def test_set_global_variables_finalizes_a_dataset_section(
 ):
     """The compatibility bootstrap finalizes the container before the runtime services bind the
     tokenizer (every PretrainConfigContainer, loader-only ones included, since upstream #8149)."""
-    globals_ = ("_GLOBAL_ARGS", "_GLOBAL_RUN_CONFIG", "_GLOBAL_TOKENIZER", "_GLOBAL_TRAIN_STATE")
+    globals_ = (
+        "_GLOBAL_ARGS",
+        "_GLOBAL_ROOT_CONFIG_CONTAINER",
+        "_GLOBAL_TOKENIZER",
+        "_GLOBAL_TRAIN_STATE",
+    )
     for name in globals_:
         monkeypatch.setattr(global_vars, name, None)
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)

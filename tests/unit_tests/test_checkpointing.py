@@ -1543,9 +1543,11 @@ def test_checkpoint_load_without_microbatch_calculator(
 
             # Converters restore consumed-sample metadata without a training config.
             monkeypatch.setattr(
-                "megatron.training.global_vars._GLOBAL_RUN_CONFIG",
-                inference_cfg_container_from_args(
-                    args, model_cfg=run_config.model, build_model_config=False
+                "megatron.training.global_vars._GLOBAL_ROOT_CONFIG_CONTAINER",
+                RootConfigContainer.wrap(
+                    inference_cfg_container_from_args(
+                        args, model_cfg=run_config.model, build_model_config=False
+                    )
                 ),
             )
         if is_inference:

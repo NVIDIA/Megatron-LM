@@ -69,7 +69,6 @@ from megatron.training.argument_utils import (
 from megatron.training.config import (
     CheckpointConfig,
     PretrainConfigContainer,
-    RootConfigContainer,
     TokenizerConfig,
 )
 from megatron.training.global_vars import (
@@ -757,12 +756,6 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
     )
 
 
-
-def _root_config_container():
-    """The root container `save_checkpoint` writes."""
-    root = get_root_config_container()
-    return root if root is not None else RootConfigContainer.wrap(get_run_config())
-
 def save_checkpoint(
     iteration,
     model,
@@ -1173,7 +1166,9 @@ def save_checkpoint(
             )
             if ckpt_type == CheckpointType.LOCAL:
                 # Local checkpoints have no YAML sidecar; persist the root config container here.
-                state_dict['run_config'] = _root_config_container().to_dict(checkpoint=save_policy)
+                state_dict['run_config'] = get_root_config_container().to_dict(
+                    checkpoint=save_policy
+                )
                 try:
                     from megatron.core.dist_checkpointing.tensor_aware_state_dict import (
                         MCoreTensorAwareStateDict,
@@ -1318,7 +1313,7 @@ def save_checkpoint(
                 # unit tests that do not create a config container.
                 # in the future, run_config.to_yaml() should always run.
                 try:
-                    run_config = _root_config_container()
+                    run_config = get_root_config_container()
                 except AssertionError as e:
                     if str(e) != 'run config is not initialized.':
                         raise

@@ -410,7 +410,7 @@ def test_set_global_variables_finalizes_an_inference_container(monkeypatch):
     for name, value in _conversion().items():
         setattr(cfg.checkpoint, name, value)
     assert cfg.checkpoint.exit_on_missing_checkpoint is False
-    for name in ("_GLOBAL_ARGS", "_GLOBAL_RUN_CONFIG"):
+    for name in ("_GLOBAL_ARGS", "_GLOBAL_ROOT_CONFIG_CONTAINER"):
         monkeypatch.setattr(global_vars, name, None)
     services = Mock()
     monkeypatch.setattr(global_vars, "initialize_runtime_services", services)

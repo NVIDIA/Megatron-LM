@@ -157,11 +157,15 @@ def inference_model_alloc_context():
     return nullcontext()
 
 
-def refit_inference_model(model, inference_model, args) -> int:
+def refit_inference_model(
+    model, inference_model, args, *, inference_container: InferenceConfigContainer
+) -> int:
     """Copy training weights and return the number of destination pools."""
 
     rl_config = get_rl_config()
-    num_dst_pools, dst_pool_index = disagg_refit_pools(args.inference_shards, args.world_size)
+    num_dst_pools, dst_pool_index = disagg_refit_pools(
+        inference_container.inference.inference_shards, args.world_size
+    )
     prepare_swap_model_weights(
         src_model=model,
         target_model=inference_model,
@@ -702,7 +706,7 @@ def get_inference_interface(args, loop, model, inference_container):
                 inference_container,
                 host='0.0.0.0',
                 port=8294,
-                verbose=args.inference_text_gen_server_logging)
+                verbose=inference_container.inference.inference_text_gen_server_logging)
         )
     return _INFERENCE_INTERFACE
 
@@ -860,7 +864,9 @@ def colocated_inference(
         with nvtx_range("rl/prefetch-weights-to-gpu", time=True):
             inf_core = unwrap_model(inference_model[0])
             _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-        num_dst_pools = refit_inference_model(model, inference_model, args)
+        num_dst_pools = refit_inference_model(
+            model, inference_model, args, inference_container=inference_container
+        )
         if rl_cfg.rl_verify_model_weights_swap and num_dst_pools == 1:
             verify_model_weights_swap(
                 train_model=model,
@@ -912,7 +918,7 @@ def colocated_inference(
                     samples_per_group,
                     generation_args={
                         'temperature': rl_cfg.rl_default_temperature,
-                        'max_tokens': args.inference_max_seq_length,
+                        'max_tokens': inference_container.inference.inference_max_seq_length,
                         'top_p': rl_cfg.rl_default_top_p,
                         'top_k': rl_cfg.rl_default_top_k,
                     },
@@ -3135,7 +3141,9 @@ def evaluate_rollouts(
         # Swap the training weights onto the inference model first.
         inf_core = unwrap_model(inference_model[0])
         _maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-        refit_inference_model(model, inference_model, get_args())
+        refit_inference_model(
+            model, inference_model, get_args(), inference_container=inference_container
+        )
         eval_model, training_model = inference_model, model
     evaluate_and_print_results_rl(
         eval_model,

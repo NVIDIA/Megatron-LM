@@ -9,7 +9,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.rl import rl_utils
-from megatron.rl.config import set_rl_run_config, unset_rl_run_config
+from megatron.rl.config import unset_rl_run_config
 from megatron.rl.sequence_packing_utils import SequencePacker, create_packed_seq_params_for_bin
 from megatron.training.argument_utils import (
     _default_config_from_args,
@@ -70,15 +70,16 @@ def _set_minimal_args():
     args = validate_args(args)
     pretrain = pretrain_cfg_container_from_args(args)
     pretrain.tokenizer = TokenizerConfig(vocab_size=VOCAB)
-    set_global_variables(args, pretrain, build_tokenizer=False)
-    set_rl_run_config(
+    set_global_variables(
+        args,
         RootConfigContainer(
             training=pretrain,
             inference=InferenceConfigContainer(
                 model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
             ),
             algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
-        )
+        ),
+        build_tokenizer=False,
     )
 
 

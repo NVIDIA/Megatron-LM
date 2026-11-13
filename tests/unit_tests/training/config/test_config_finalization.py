@@ -9,7 +9,6 @@ import pytest
 
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
-from megatron.rl.config import finalize_rl_run, validate_rl_run
 from megatron.training import global_vars
 from megatron.training.config import (
     AlgorithmConfigContainer,
@@ -60,7 +59,7 @@ def test_validation_is_read_only_and_finalization_runs_once(
     if not inference:
         cfg.train.micro_batch_size = 1
         cfg.train.global_batch_size = 8
-        # validate_rl_run checks the RL section; finalize_rl_run applies its DDP layout. The
+        # The root container checks the RL section and applies its DDP layout. The
         # deployment shares the training model and the run's RNG section, as the entry point's.
         rl_run = RootConfigContainer(
             training=cfg,
@@ -78,7 +77,7 @@ def test_validation_is_read_only_and_finalization_runs_once(
     for _ in range(2):
         cfg.validate()
         if rl_run is not None:
-            validate_rl_run(rl_run)
+            rl_run.validate()
         assert cfg.to_dict() == before
         assert not cfg._finalized
 
@@ -88,7 +87,7 @@ def test_validation_is_read_only_and_finalization_runs_once(
     model_finalize = Mock(wraps=model.finalize)
     monkeypatch.setattr(model, "finalize", model_finalize)
     if rl_run is not None:
-        finalize_rl_run(rl_run)
+        rl_run.finalize()
         assert cfg.ddp.grad_buffer_offload
     cfg.finalize()
     assert cfg._finalized
@@ -241,11 +240,7 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
     before = copy.deepcopy(run_config.to_dict())
     if invalid_policy == "ddp_offload":
         # The RL rule lives on the root container, not on the pretrain container.
-        checks = [
-            lambda: validate_rl_run(rl_run),
-            lambda: validate_rl_run(rl_run),
-            lambda: finalize_rl_run(rl_run),
-        ]
+        checks = [lambda: rl_run.validate(), lambda: rl_run.validate(), lambda: rl_run.finalize()]
     else:
         checks = [run_config.validate, run_config.validate, run_config.finalize]
     for check in checks:
@@ -266,8 +261,7 @@ def test_invalid_configuration_is_not_partially_finalized(monkeypatch, run_confi
         run_config.optimizer.reuse_grad_buf_for_mxfp8_param_ag = False
     else:
         transformer.virtual_pipeline_model_parallel_size = 2
-    finalize_rl_run(rl_run)
-    run_config.finalize()
+    rl_run.finalize()
     assert run_config._finalized
     assert run_config.ddp.grad_buffer_offload
     assert run_config.rng.te_rng_tracker

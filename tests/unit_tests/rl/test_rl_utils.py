@@ -53,13 +53,7 @@ from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelpe
 from megatron.core.utils import get_pg_size
 from megatron.rl import rl_utils, training_setup
 from megatron.rl.agent.api import Rollout, RolloutGroup, TokenRollout
-from megatron.rl.config import (
-    add_rl_args,
-    finalize_rl_run,
-    set_rl_run_config,
-    unset_rl_run_config,
-    validate_rl_run,
-)
+from megatron.rl.config import add_rl_args, unset_rl_run_config
 from megatron.rl.inference import ReturnsRaw
 from megatron.rl.sequence_packing_utils import get_default_packed_seq_params
 from megatron.training.argument_utils import (
@@ -99,18 +93,25 @@ def _rl_run_config(args, pretrain):
 
 
 def test_disagg_refit_reads_migrated_rl_config(monkeypatch):
-    """Refit uses RLConfig while shard layout remains a launch argument."""
+    """Refit reads the RL section and the shard layout of the rollout deployment."""
     rl_config = RLConfig(refit_method="nccl", refit_execution_batch_bytes=4096)
     monkeypatch.setattr(rl_utils, "get_rl_config", lambda: rl_config)
-    args = SimpleNamespace(inference_shards="tp=1,role=prefill+tp=1,role=decode", world_size=2)
+    args = SimpleNamespace(world_size=2)
+    shards = "tp=1,role=prefill+tp=1,role=decode"
+    deployment = SimpleNamespace(inference=SimpleNamespace(inference_shards=shards))
     model, inference_model = object(), object()
     with (
         patch.object(rl_utils, "disagg_refit_pools", return_value=(2, 1)) as pools,
         patch.object(rl_utils, "prepare_swap_model_weights") as prepare,
         patch.object(rl_utils, "swap_model_weights") as swap,
     ):
-        assert rl_utils.refit_inference_model(model, inference_model, args) == 2
-    pools.assert_called_once_with(args.inference_shards, args.world_size)
+        assert (
+            rl_utils.refit_inference_model(
+                model, inference_model, args, inference_container=deployment
+            )
+            == 2
+        )
+    pools.assert_called_once_with(shards, args.world_size)
     prepare.assert_called_once_with(
         src_model=model,
         target_model=inference_model,
@@ -266,7 +267,11 @@ def test_evaluate_rollouts_refits_before_scoring(monkeypatch, separate):
         lambda core, *, to_cpu: calls.append(("prefetch", core, to_cpu)),
     )
     monkeypatch.setattr(
-        rl_utils, "refit_inference_model", lambda m, im, a: calls.append(("refit", m, im, a))
+        rl_utils,
+        "refit_inference_model",
+        lambda m, im, a, *, inference_container: calls.append(
+            ("refit", m, im, a, inference_container)
+        ),
     )
 
     def evaluate(*args, **kwargs):
@@ -295,7 +300,7 @@ def test_evaluate_rollouts_refits_before_scoring(monkeypatch, separate):
         assert calls == [
             ("unwrap", "inf"),
             ("prefetch", inf_core, False),
-            ("refit", ["train"], ["inf"], "args"),
+            ("refit", ["train"], ["inf"], "args", "deployment"),
             ("eval", (["inf"], "optimizer", 3), eval_kwargs),
         ]
     else:
@@ -578,8 +583,7 @@ class TestRLUtils:
         args = validate_args(args)
         pretrain = pretrain_cfg_container_from_args(args)
         pretrain.tokenizer = TokenizerConfig(vocab_size=VOCAB)
-        set_global_variables(args, pretrain, build_tokenizer=False)
-        set_rl_run_config(_rl_run_config(args, pretrain))
+        set_global_variables(args, _rl_run_config(args, pretrain), build_tokenizer=False)
         return args
 
     @pytest.mark.parametrize(
@@ -826,12 +830,12 @@ class TestRLUtils:
         rl_run = _rl_run_config(args, pretrain)
         assert not pretrain.ddp.grad_buffer_offload
         rl_run.algorithm.rl.rl_offload_optimizer_during_inference = False
-        validate_rl_run(rl_run)
+        rl_run.validate()
         assert not pretrain.ddp.grad_buffer_offload
         rl_run.algorithm.rl.rl_offload_optimizer_during_inference = True
-        validate_rl_run(rl_run)
+        rl_run.validate()
         assert not pretrain.ddp.grad_buffer_offload
-        finalize_rl_run(rl_run)
+        rl_run.finalize()
         assert pretrain.ddp.grad_buffer_offload
 
     def test_rl_optimizer_offload_rejects_mxfp8_grad_buffer_aliasing(self):
@@ -849,7 +853,7 @@ class TestRLUtils:
         pretrain.optimizer.reuse_grad_buf_for_mxfp8_param_ag = True
         rl_run = _rl_run_config(args, pretrain)
         with pytest.raises(ValueError, match="parameters share the gradient-buffer storage"):
-            validate_rl_run(rl_run)
+            rl_run.validate()
         assert not pretrain.ddp.grad_buffer_offload
 
     @pytest.mark.parametrize(

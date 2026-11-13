@@ -21,7 +21,6 @@ from megatron.core.resharding.copy_services.nvshmem_copy_service import NVSHMEMC
 from megatron.core.resharding.refit import swap_model_weights
 from megatron.rl.config import (
     add_rl_args,
-    finalize_rl_run,
     get_rl_config,
     get_rl_run_config,
     rollout_inference_container_from_args,
@@ -38,7 +37,7 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.config import AlgorithmConfigContainer, RLConfig, RootConfigContainer
-from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.global_vars import get_run_config
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import is_hybrid_model
 
@@ -443,7 +442,6 @@ def main():
     # the training sections (the benchmark builds its models so they carry no model config),
     # the destination deployment described like the RL loop's rollout engine, and the RL section.
     pretrain_container = pretrain_cfg_container_from_args(args)
-    set_run_config(pretrain_container)
     model_cfg = (
         hybrid_config_from_args(args) if is_hybrid_model(args) else gpt_config_from_args(args)
     )
@@ -454,7 +452,7 @@ def main():
         ),
         algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
     )
-    finalize_rl_run(root)
+    root.finalize()
     set_rl_run_config(root)
     # This synthetic benchmark does not construct datasets, so it does not
     # require the native dataset index helper.

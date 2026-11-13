@@ -24,7 +24,6 @@ from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.state import TrainState
 
 _GLOBAL_ARGS = None
-_GLOBAL_RUN_CONFIG = None
 _GLOBAL_ROOT_CONFIG_CONTAINER = None
 _GLOBAL_TRAIN_STATE = None
 _GLOBAL_TOKENIZER = None
@@ -44,19 +43,19 @@ def get_args():
 
 
 def get_run_config():
-    """Return the full pretrain config container."""
-    _ensure_var_is_initialized(_GLOBAL_RUN_CONFIG, 'run config')
-    return _GLOBAL_RUN_CONFIG
+    """Return the run config: the root container's training member, else its inference member."""
+    return get_root_config_container().run_config
 
 
 def get_root_config_container():
-    """Return the root container an entry point registered with `set_root_config_container`."""
+    """Return the run's root container; every entry point registers one."""
+    _ensure_var_is_initialized(_GLOBAL_ROOT_CONFIG_CONTAINER, 'run config')
     return _GLOBAL_ROOT_CONFIG_CONTAINER
 
 
 def is_run_config_initialized() -> bool:
     """Whether argument adapters have a run-owned config available yet."""
-    return _GLOBAL_RUN_CONFIG is not None
+    return _GLOBAL_ROOT_CONFIG_CONTAINER is not None
 
 
 def get_train_state():
@@ -171,22 +170,26 @@ def _graceful_shutdown(signum, frame):
 
 
 def set_global_variables(args, cfg_container, build_tokenizer=True):
-    """Register caller-provided args/config and construct their runtime services."""
+    """Register caller-provided args/config and construct their runtime services.
 
-    from megatron.training.config import PretrainConfigContainer
+    `cfg_container` is the run config, or the run's root container.
+    """
+
+    from megatron.training.config import PretrainConfigContainer, RootConfigContainer
 
     assert args is not None
     assert cfg_container is not None
 
     _ensure_var_is_not_initialized(_GLOBAL_ARGS, 'args')
-    training = isinstance(cfg_container, PretrainConfigContainer)
-    cfg_container.validate()
-    set_run_config(cfg_container)
+    root = RootConfigContainer.wrap(cfg_container)
+    training = isinstance(root.run_config, PretrainConfigContainer)
+    root.validate()
+    set_root_config_container(root)
     set_args(args)
     # Every container is finalized here: the checkpoint derivations apply to inference containers
     # too, and the checkpoint converters bootstrap through this function without reaching
     # initialize_megatron. Finalizing constructs no runtime service.
-    cfg_container.finalize()
+    root.finalize()
     initialize_runtime_services(
         args,
         build_tokenizer=build_tokenizer,
@@ -201,19 +204,15 @@ def initialize_runtime_services(
     args: Namespace, *, build_tokenizer: bool = True, training: bool = False
 ) -> None:
     """Build services from finalized config; normally called by initialize_megatron."""
-    from megatron.training.argument_utils import resolve_tokenizer_vocab_size
-
     cfg = get_run_config()
     if build_tokenizer:
         _build_tokenizer(cfg, args)
     # Tokenizer-free bootstrap may discover the model family and rebuild the
     # tokenizer later. Bind known sizes now; otherwise defer until that rebuild.
     if build_tokenizer or cfg.tokenizer.padded_vocab_size is not None:
-        resolve_tokenizer_vocab_size(cfg)
-        # A registered root container's inference member may hold its own copy of the model config.
-        root = get_root_config_container()
-        if root is not None and root.inference is not None:
-            resolve_tokenizer_vocab_size(root.inference)
+        # Every container of the run that carries a model (an RL rollout deployment may hold its
+        # own copy of the model config).
+        get_root_config_container().resolve_tokenizer_vocab_size()
     _bind_dataset_tokenizer(cfg)
     _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)
@@ -269,7 +268,6 @@ def unset_global_variables():
     """
 
     global _GLOBAL_ARGS
-    global _GLOBAL_RUN_CONFIG
     global _GLOBAL_ROOT_CONFIG_CONTAINER
     global _GLOBAL_TRAIN_STATE
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
@@ -284,7 +282,6 @@ def unset_global_variables():
     global _GLOBAL_TELEMETRY_HANDLE
 
     _GLOBAL_ARGS = None
-    _GLOBAL_RUN_CONFIG = None
     _GLOBAL_ROOT_CONFIG_CONTAINER = None
     _GLOBAL_TRAIN_STATE = None
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
@@ -307,20 +304,21 @@ def set_args(args):
 
 
 def set_run_config(cfg_container):
-    global _GLOBAL_RUN_CONFIG
-    _ensure_var_is_not_initialized(_GLOBAL_RUN_CONFIG, 'run config')
-    _GLOBAL_RUN_CONFIG = cfg_container
+    """Register a run by its run config, wrapped in the run's root container."""
+    from megatron.training.config import RootConfigContainer
+
+    set_root_config_container(RootConfigContainer.wrap(cfg_container))
 
 
-def set_root_config_container(cfg_container):
+def set_root_config_container(root):
     """Register the run's root container."""
     global _GLOBAL_ROOT_CONFIG_CONTAINER
-    _ensure_var_is_not_initialized(_GLOBAL_ROOT_CONFIG_CONTAINER, 'root config container')
-    _GLOBAL_ROOT_CONFIG_CONTAINER = cfg_container
+    _ensure_var_is_not_initialized(_GLOBAL_ROOT_CONFIG_CONTAINER, 'run config')
+    _GLOBAL_ROOT_CONFIG_CONTAINER = root
 
 
 def unset_root_config_container():
-    """Forget the root config container."""
+    """Forget the run's root container."""
     global _GLOBAL_ROOT_CONFIG_CONTAINER
     _GLOBAL_ROOT_CONFIG_CONTAINER = None
 
@@ -742,9 +740,7 @@ def destroy_global_vars():
     global _GLOBAL_ARGS
     _GLOBAL_ARGS = None
 
-    global _GLOBAL_RUN_CONFIG
     global _GLOBAL_ROOT_CONFIG_CONTAINER
-    _GLOBAL_RUN_CONFIG = None
     _GLOBAL_ROOT_CONFIG_CONTAINER = None
 
     global _GLOBAL_TRAIN_STATE

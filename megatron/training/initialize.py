@@ -50,6 +50,7 @@ from megatron.training.argument_utils import (
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.config import PretrainConfigContainer
 from megatron.training.global_vars import (
+    get_root_config_container,
     get_run_config,
     get_train_state,
     initialize_runtime_services,
@@ -97,9 +98,9 @@ def initialize_megatron(
 
     args = get_args()
 
-    cfg = get_run_config()
     # Resolve runtime config before distributed initialization and RNG setup.
-    cfg.finalize()
+    get_root_config_container().finalize()
+    cfg = get_run_config()
     # Inference's args-only entrypoints keep their existing input boundary. Training
     # supplies a typed model config, including callback-based applications.
     model_config = cfg.model.transformer if training else args
