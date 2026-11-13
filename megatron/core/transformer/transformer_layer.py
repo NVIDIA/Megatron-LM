@@ -2468,8 +2468,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
         # The graph only takes padding_mask when it was captured with that input; the eager MoE
         # steps after the graph keep using the caller's mask from `kwargs`.
+        # Keep the validation control flag available to eager attention, but do
+        # not pass Python control flow into the captured graph's tensor inputs.
         graph_kwargs = {
-            k: v for k, v in kwargs.items() if k not in ("padding_mask", "packed_seq_params")
+            k: v
+            for k, v in kwargs.items()
+            if k not in ("padding_mask", "packed_seq_params", "strict_runtime_validation")
         }
         hidden_states = args[0]
         graph_padding_mask = self._te_cuda_graph_padding_mask(

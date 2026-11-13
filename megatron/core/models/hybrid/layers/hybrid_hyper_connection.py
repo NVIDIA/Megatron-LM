@@ -573,7 +573,10 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             return self._replay_mhc_attention_cuda_graph(args, kwargs)
 
         group_tail = self._get_te_cuda_graph_group_tail()
-        cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
+        # Validation is Python control flow used by eager forward/capture, not a
+        # tensor input to the captured graph.
+        graph_kwargs = {k: v for k, v in kwargs.items() if k != "strict_runtime_validation"}
+        cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **graph_kwargs))
 
         if group_tail is not None:
             return group_tail._resume_partial_moe_cuda_graph(cuda_graph_output)
