@@ -2769,7 +2769,6 @@ wheels = [
 [[package]]
 name = "megatron-core"
 source = { editable = "." }
-default-groups = ["build", "linting", "test"]
 dependencies = [
     { name = "numpy" },
     { name = "packaging" },
