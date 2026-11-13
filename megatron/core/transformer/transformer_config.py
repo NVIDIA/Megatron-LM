@@ -1,4 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# CLI changes adapted from https://github.com/021ai/ZJ-Megatron-LM at
+# a06c53757f6bc636db3a88f5dfca99f5b3ee6030 (BSD-3-Clause, repository LICENSE).
 
 import logging
 import math
@@ -380,6 +382,17 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_topk_freq: int = 1
     """Frequency of DSA indexer top-k computation across layers.
     A value greater than 1 enables cross-layer top-k sharing."""
+
+    dsa_indexer_cross_layer_distillation: bool = False
+    """Train an IndexShare owner against the sum of its group's sparse attention KL losses.
+
+    Opt-in SM90 cuDNN training path. Requires TP=1, microbatch size 1, sparse loss,
+    flat search, and full uniform activation recomputation with one layer per chunk.
+    Dense warm-up and cross-depth MTP sharing are not supported.
+    """
+
+    dsa_indexer_cross_layer_distillation_chunk_size: int = 512
+    """Query rows per chunk when accumulating cross-layer teacher targets."""
 
     dsa_indexer_skip_topk_offset: int = 0
     """Layer offset for DSA cross-layer top-k sharing."""
@@ -2127,6 +2140,41 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"dsa_indexer_topk_freq must be positive, got {self.dsa_indexer_topk_freq}."
                 )
+            if self.dsa_indexer_cross_layer_distillation and self.dsa_indexer_topk_freq == 1:
+                raise ValueError(
+                    "dsa_indexer_cross_layer_distillation requires " "dsa_indexer_topk_freq > 1."
+                )
+            if self.dsa_indexer_cross_layer_distillation_chunk_size < 1:
+                raise ValueError(
+                    "dsa_indexer_cross_layer_distillation_chunk_size must be positive, got "
+                    f"{self.dsa_indexer_cross_layer_distillation_chunk_size}."
+                )
+            if self.dsa_indexer_cross_layer_distillation and (
+                self.experimental_attention_variant != "dsa"
+                or self.recompute_granularity != "full"
+                or self.recompute_method != "uniform"
+                or self.recompute_num_layers != 1
+                or not self.dsa_indexer_use_sparse_loss
+                or self.dsa_kernel_backend != "cudnn"
+            ):
+                raise ValueError(
+                    "DSA cross-layer distillation requires sparse DSA training with the "
+                    "cuDNN flat-search backend, full uniform recompute, and "
+                    "recompute_num_layers=1."
+                )
+            if self.dsa_indexer_cross_layer_distillation:
+                if self.tensor_model_parallel_size != 1:
+                    raise ValueError(
+                        "Sparse DSA CLI currently requires tensor_model_parallel_size=1"
+                    )
+                if self.dsa_indexer_topk is None or self.dsa_indexer_topk % 256:
+                    raise ValueError("Sparse DSA CLI requires a positive Top-K divisible by 256")
+                if self.deterministic_mode:
+                    raise ValueError(
+                        "Sparse DSA CLI indexer backward does not support deterministic_mode"
+                    )
+                if getattr(self, "dsa_indexer_kpool", 1) != 1:
+                    raise ValueError("Sparse DSA CLI does not support pooled indexer selection")
             if self.dsa_indexer_skip_topk_offset < 0:
                 raise ValueError(
                     "dsa_indexer_skip_topk_offset must be non-negative, got "

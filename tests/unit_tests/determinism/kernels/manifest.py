@@ -109,6 +109,21 @@ R = "tests/unit_tests/context_parallel/runtime/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
+        name="dsa_cli_target_accumulation",
+        sources=("megatron/core/ops/attention/dsa/cli_target.py",),
+        tests=(K + "test_dsa_cli.py",),
+        kind="tilelang",
+        notes="No-atomic teacher normalization/accumulation replays, including empty rows.",
+    ),
+    KernelEntry(
+        name="dsa_cli_cudnn_dispatch",
+        sources=("megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py",),
+        tests=(K + "test_dsa_cli.py",),
+        kind="dispatch",
+        notes="SM90 teacher output replays. Existing indexer/backward atomics do not promise "
+        "bit-exact model gradients; CLI rejects deterministic_mode.",
+    ),
+    KernelEntry(
         name="csa_output_rope_reconstruction",
         sources=("megatron/core/ops/attention/csa/output_rope.py",),
         tests=(K + "test_csa_output_rope.py",),
@@ -891,7 +906,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="dsa_indexer_weights_projection",
         sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
-        tests=(K + "test_te_wrappers.py",),
+        tests=(K + "test_te_wrappers.py", K + "test_dsa_cli.py"),
         kind="dispatch",
         notes="Dispatches the non-quantized FP32 indexer projection to TE general_gemm when "
         "supported or FP32 torch.mm otherwise; the replay covers both forward routes and the "
@@ -1078,7 +1093,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="dsa_dispatch",
         sources=("megatron/core/transformer/experimental_attention_variant/dsa.py",),
-        tests=(K + "test_fused_triton_kernels.py", R + 'test_indexer_replay.py'),
+        tests=(
+            K + "test_fused_triton_kernels.py",
+            R + 'test_indexer_replay.py',
+            K + "test_dsa_cli.py",
+        ),
         kind="dispatch",
         notes="DSA weights projection dispatches Transformer Engine general_gemm when available; "
         "replay covers the selected GEMM, deterministic torch fallback, and chunked KPool top-k.",

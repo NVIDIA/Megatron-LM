@@ -99,6 +99,8 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "disable_parameter_transpose_cache": False,
     "distribute_saved_activations": False,
     "dsa_fwd_use_dense_attn": False,
+    "dsa_indexer_cross_layer_distillation": False,
+    "dsa_indexer_cross_layer_distillation_chunk_size": 512,
     "dsa_indexer_head_dim": None,
     "dsa_indexer_k_norm_epsilon": None,
     "dsa_indexer_k_norm_fp32": False,
