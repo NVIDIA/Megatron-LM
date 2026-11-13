@@ -12,7 +12,11 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import (
+    InferenceConfig,
+    KVCacheManagementMode,
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts import zero_padding_rows_kernel
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
@@ -25,6 +29,7 @@ from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.inference.paged_attention_test_utils import reference_paged_attention
@@ -274,6 +279,7 @@ class TestDynamicContext:
         expert_tensor_parallel_size: int = None,
         reserve_recurrent_state_dummy_slot: bool = False,
         mamba_memory_ratio: float = None,
+        kv_cache_management_mode: KVCacheManagementMode = KVCacheManagementMode.PERSIST,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -319,6 +325,7 @@ class TestDynamicContext:
                 max_requests=max_requests,
                 reserve_recurrent_state_dummy_slot=reserve_recurrent_state_dummy_slot,
                 mamba_memory_ratio=mamba_memory_ratio,
+                kv_cache_management_mode=kv_cache_management_mode,
             ),
         )
         return dynamic_context
@@ -745,6 +752,37 @@ class TestDynamicContext:
         expected[dynamic_context.padding_slice] = 0.0
         dynamic_context.zero_padding_tokens(activations)
         assert torch.equal(activations, expected)
+
+    @pytest.mark.internal
+    def test_nvls_routing_mask_reads_the_token_count_after_a_recompute_resume(self, monkeypatch):
+        """A RECOMPUTE resume rebuilds gpu_view; the NVLS dispatcher must read the new one."""
+        monkeypatch.setattr(NVLSAllGatherVDispatcher, "_real_token_count_tensor", None)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.bfloat16,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=256,
+            buffer_size_gb=0.05,
+            block_size_tokens=256,
+            max_tokens=None,
+            max_requests=16,
+            kv_cache_management_mode=KVCacheManagementMode.RECOMPUTE,
+        )
+        # The dispatcher itself needs an EP group; binding its mask only needs this flag.
+        dynamic_context._nvls_dispatcher = True
+        dynamic_context.deallocate_inference_state_buffers()
+        dynamic_context.reinitialize_inference_state_buffers()
+
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(5, device="cuda"),
+                sampling_params=SamplingParams(num_tokens_to_generate=2, termination_id=-1),
+            )
+        )
+        dynamic_context.initialize_attention_state()
+        assert NVLSAllGatherVDispatcher._real_token_count_tensor.item() == 5
 
     @pytest.mark.internal
     @rounder_override(8)

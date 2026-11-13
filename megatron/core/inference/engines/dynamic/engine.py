@@ -166,6 +166,8 @@ class DynamicInferenceEngine(
     # object.__new__), and admitting a request reads this. An int is immutable, so
     # the += in resume() still rebinds onto the instance.
     _weight_epoch: int = 0
+    # True while a start_suspended engine awaits its first resume().
+    _deferred_cuda_graph_capture: bool = False
 
     # Defaults for instances created without __init__ (tests build the engine via __new__).
     payload_stager: Optional[RequestPayloadStager] = None
@@ -230,6 +232,7 @@ class DynamicInferenceEngine(
         self.metrics_writer = inference_config.metrics_writer
         self.logging_step_interval = inference_config.logging_step_interval
         self.unified_memory_level = inference_config.unified_memory_level
+        start_suspended = inference_config.start_suspended
         self.use_synchronous_zmq_collectives = inference_config.use_synchronous_zmq_collectives
         self.ep_consensus_interval = inference_config.ep_consensus_interval
         self.gc_mode = inference_config.gc_mode
@@ -295,13 +298,31 @@ class DynamicInferenceEngine(
                             max_step = int(val)
                     self.inference_step_offset = int(max_step)
 
-        # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
-        InferenceMode.set_active()
+        if start_suspended:
+            # The weights may not be present yet, so CUDA-graph capture waits for the first
+            # resume(), and gc_mode entry follows capture as on every resume(). Requests can
+            # still be queued. The buffers follow kv_cache_management_mode, as after a suspend().
+            self._deferred_cuda_graph_capture = True
+            InferenceMode.unset_active()
+            self.context.deallocate_inference_state_buffers()
+            self.resume_request_ids = []
+            self.state = EngineState.SUSPENDED
+            self._state_events[EngineState.RUNNING].clear()
+            # PAUSED too, as after pause() then suspend(), so a pause() before resume() returns.
+            self._state_events[EngineState.PAUSED].set()
+            self._state_events[EngineState.SUSPENDED].set()
+            logger.info(
+                "> dynamic_engine.py: constructed suspended; "
+                "the first resume() captures cuda graphs."
+            )
+        else:
+            # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
+            InferenceMode.set_active()
 
-        # Create cuda graphs.
-        self.create_cuda_graphs()
+            # Create cuda graphs.
+            self.create_cuda_graphs()
 
-        self._enter_custom_gc_mode()
+            self._enter_custom_gc_mode()
 
     def _initialize_disaggregation_state(self) -> None:
         """Hook overridden by the KV-handoff engine composition."""
@@ -990,12 +1011,18 @@ class DynamicInferenceEngine(
             alloc_time = time.time() - alloc_time
 
             capture_time = time.time()
-            if (
+            if self._deferred_cuda_graph_capture or (
                 self.context.kv_cache_management_mode != KVCacheManagementMode.PERSIST
                 and not self.context.static_kv_memory_pointers
             ):
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
+
+            if self._deferred_cuda_graph_capture:
+                # Media queued before the first resume() was encoded without the weights, and
+                # the capture cleared its context entries: re-encode it in the refresh below.
+                self._invalidate_vision_state(ignore_allow_stale=True)
+                self._deferred_cuda_graph_capture = False
 
             # Request records outlive the context buffers. Refresh every stale
             # VLM record, including PERSIST/OFFLOAD requests that need not be
