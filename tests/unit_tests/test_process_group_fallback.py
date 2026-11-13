@@ -551,6 +551,9 @@ class TestGlobalProcessGroupFallbacks:
         _fallback_warning(record, "SelfAttention")
         # Core attention is handed no collection, so it takes its own fallback and warns as well.
         _fallback_warning(record, "TEDotProductAttention")
+        # So do the linears: handed no collection, each warns for its GTP weight-remat group.
+        _fallback_warning(record, "TERowParallelLinear")
+        _fallback_warning(record, "TELayerNormColumnParallelLinear")
         assert attention.tp_group is None
         assert attention.core_attention._tp_group is None
         # The linears are handed no collection either. With the fallback's all-None collection
@@ -715,6 +718,9 @@ class TestGlobalProcessGroupFallbacks:
                 config, decoder_layer.cross_attention.submodules, layer_number=1
             )
         _fallback_warning(record, "CrossAttention")
+        # The linears are handed no collection, so each warns for its GTP weight-remat group.
+        _fallback_warning(record, "TEColumnParallelLinear")
+        _fallback_warning(record, "TERowParallelLinear")
         assert attention.tp_group is None
         # As for SelfAttention: with the fallback's all-None collection a per-module FP8/FP4
         # recipe would raise for its missing amax group at forward time.

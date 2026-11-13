@@ -331,10 +331,12 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
 
         if pg_collection is None:
             warn_global_process_group_fallback(type(self).__name__)
-            # hcp feeds TEDotProductAttention's a2a+p2p path. The linear projections take their
-            # GTP weight-remat group from gtp_remat, so they do not fall back for it and warn
-            # again; with dense GTP weight remat on, their Transformer Engine linears still warn
-            # for the dp_cp replica group, which this collection leaves unset.
+            # hcp feeds TEDotProductAttention's a2a+p2p path. On an initialized grid the linear
+            # projections take their GTP weight-remat group from gtp_remat, so they do not fall
+            # back for it and warn again; with dense GTP weight remat on, their Transformer Engine
+            # linears still warn for the dp_cp replica group, which this collection leaves unset.
+            # Before initialize_model_parallel() no group exists: core attention and the linears
+            # are handed no collection (see below), so each takes its own fallback and warns.
             # The data-parallel groups are only read by SelfAttention.run_realtime_tests, which
             # runs with test_mode and qk_layernorm, so they are resolved only then: their
             # accessors assert before initialize_model_parallel(), and a module built earlier
