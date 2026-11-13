@@ -653,6 +653,35 @@ class TestParallelTransformerBlockCudagraphs:
         not (HAVE_TE and is_te_min_version("1.5.0")),
         reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
     )
+    def test_delete_cuda_graphs_drops_runners(self):
+        """A reset runner still references what it was captured with, so after
+        `delete_cuda_graphs()` no manager holds one and the next forward pass creates a new one."""
+        block = self.parallel_transformer_block
+        block.cuda()
+        hidden_states = torch.ones((32, 2, block.config.hidden_size)).cuda()
+        attention_mask = torch.ones((1, 1, 32, 32), dtype=bool).cuda()
+        managers = [layer.cudagraph_manager for layer in block.layers]
+
+        block(hidden_states=hidden_states, attention_mask=attention_mask)
+        old_runners = [manager.cudagraph_runners[0] for manager in managers]
+
+        delete_cuda_graphs()
+
+        for manager in managers:
+            assert not manager.cudagraph_runners
+            assert not manager.custom_cudagraphs_lookup_table
+
+        block(hidden_states=hidden_states, attention_mask=attention_mask)
+        for manager, old_runner in zip(managers, old_runners):
+            assert len(manager.cudagraph_runners) == 1
+            assert manager.cudagraph_runners[0] is not old_runner
+
+        delete_cuda_graphs()
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("1.5.0")),
+        reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
+    )
     def test_dense_mlp_scope_constructs(self):
         config = TransformerConfig(
             num_layers=8,
