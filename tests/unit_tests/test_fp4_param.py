@@ -66,6 +66,42 @@ def disable_forward_pre_hook(model_chunks, param_sync=True):
 
 
 _SEED = 1234
+
+# examples/quantization/fp4_experts_mxfp8_other_linears.yaml: routed experts keep the FP4 recipe,
+# the other linears run in MXFP8.
+_EXPERTS_FP4_OTHERS_MXFP8_YAML = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "..",
+    "..",
+    "examples",
+    "quantization",
+    "fp4_experts_mxfp8_other_linears.yaml",
+)
+
+
+def _experts_fp4_others_mxfp8_recipe(path, mxfp8_params: bool) -> str:
+    """Writes the example recipe to path; without mxfp8_params the MXFP8 linears keep BF16
+    params. Returns path."""
+    import yaml
+
+    with open(_EXPERTS_FP4_OTHERS_MXFP8_YAML) as f:
+        recipe = yaml.safe_load(f)
+    if not mxfp8_params:
+        training = recipe["configs"]["mxfp8"]["training_recipe"]
+        del training["fp8_param"], training["param_storage_follows_model_init"]
+    with open(path, "w") as f:
+        yaml.safe_dump(recipe, f, sort_keys=False)
+    return str(path)
+
+
+def _recipe_has_mxfp8_params(args) -> bool:
+    import yaml
+
+    with open(args.te_precision_config_file) as f:
+        training = yaml.safe_load(f)["configs"]["mxfp8"]["training_recipe"]
+    return bool(training.get("fp8_param", False))
+
+
 is_nvfp4_available, reason_for_no_nvfp4 = check_nvfp4_support()
 
 
@@ -231,6 +267,7 @@ class TestFP4Param:
             )
         assert len(gpt_model) == 1  # Assume only one model in the model provider.
 
+        dense_mxfp8 = args.te_precision_config_file is not None
         num_fp4_params = 0
         num_mxfp8_params = 0
         for name, param in gpt_model[0].named_parameters():
@@ -239,7 +276,7 @@ class TestFP4Param:
                 assert param.main_grad is not None
             if is_nvfp4tensor(param) or is_grouped_nvfp4tensor(param):
                 num_fp4_params += 1
-                assert not args.fp4_dense_mxfp8 or ".experts." in name, name
+                assert not dense_mxfp8 or ".experts." in name, name
             if is_mxfp8tensor(param):
                 num_mxfp8_params += 1
                 assert ".experts." not in name, name
@@ -249,11 +286,11 @@ class TestFP4Param:
         if kwargs.get("first_last_layers_bf16", False):
             fp4_layers -= kwargs["num_layers_at_start_in_bf16"]
             fp4_layers -= kwargs["num_layers_at_end_in_bf16"]
-        if args.fp4_dense_mxfp8:
+        if dense_mxfp8:
             # Non-expert linears are MXFP8 (qkv and proj per layer); routed experts keep NVFP4.
             if fp4_param_gather:
                 assert num_fp4_params > 0
-            if args.fp4_dense_mxfp8_param:
+            if fp4_param_gather and _recipe_has_mxfp8_params(args):
                 # Layers kept in BF16 by first_last_layers_bf16 keep BF16 weights.
                 assert num_mxfp8_params == 2 * fp4_layers
             else:
@@ -426,8 +463,9 @@ class TestFP4Param:
     @pytest.mark.parametrize("dense_param", [False, True])
     @pytest.mark.parametrize("dp_overlap", [(False, False), (True, True)])
     @pytest.mark.parametrize("ep_size", [1, 2])
-    def test_nvfp4_moe_dense_mxfp8(self, dense_param, dp_overlap, ep_size):
-        """MXFP8 non-expert linears with NVFP4 routed experts (fp4_dense_mxfp8).
+    def test_nvfp4_moe_dense_mxfp8(self, tmp_path, dense_param, dp_overlap, ep_size):
+        """MXFP8 non-expert linears with NVFP4 routed experts, through quant_recipe
+        (examples/quantization/fp4_experts_mxfp8_other_linears.yaml).
 
         With dense_param, the non-expert linears keep MXFP8 params, all-gathered through the
         grad buffer, next to the NVFP4 expert params on their own param buffer. Losses must match
@@ -447,16 +485,24 @@ class TestFP4Param:
             "moe_router_load_balancing_type": "none",
             "moe_aux_loss_coeff": 0.0,
             "moe_ffn_hidden_size": 256,
-            "fp4_dense_mxfp8": True,
         }
         loss_list = self._run_test_helper(
             1,
             fp4_param_gather=True,
-            fp4_dense_mxfp8_param=dense_param,
+            te_precision_config_file=_experts_fp4_others_mxfp8_recipe(
+                tmp_path / "recipe.yaml", mxfp8_params=dense_param
+            ),
             reuse_grad_buf_for_mxfp8_param_ag=dense_param,
             **kwargs,
         )
-        loss_list_ref = self._run_test_helper(1, fp4_param_gather=False, **kwargs)
+        loss_list_ref = self._run_test_helper(
+            1,
+            fp4_param_gather=False,
+            te_precision_config_file=_experts_fp4_others_mxfp8_recipe(
+                tmp_path / "recipe_ref.yaml", mxfp8_params=False
+            ),
+            **kwargs,
+        )
         torch.testing.assert_close(loss_list, loss_list_ref, atol=1e-2, rtol=1e-2)
 
     def run_determinism_test(self, tp_size, fp4_param_gather: bool, **kwargs):

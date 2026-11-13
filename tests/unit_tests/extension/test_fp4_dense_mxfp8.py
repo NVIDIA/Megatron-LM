@@ -1,7 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for fp4_dense_mxfp8: MXFP8 non-expert linears in an FP4 model."""
+"""MXFP8 non-expert linears in an FP4 model, configured through quant_recipe
+(examples/quantization/fp4_experts_mxfp8_other_linears.yaml): the routed experts keep the FP4
+recipe, the other linears run in MXFP8 and may keep MXFP8 parameters."""
 
+import copy
+import pathlib
 from types import SimpleNamespace
 
 import pytest
@@ -15,8 +19,7 @@ from megatron.core.extensions.transformer_engine import (
     TELinear,
     TEQuantizationParams,
     TEQuantizationRecipe,
-    _fp4_dense_mxfp8_param_storage,
-    _fp4_dense_mxfp8_quant_params,
+    _get_fp8_model_init_for_quant_recipe,
 )
 from megatron.core.fp4_utils import get_fp4_context, is_grouped_nvfp4tensor, is_nvfp4tensor
 from megatron.core.fp8_utils import is_mxfp8tensor
@@ -24,37 +27,115 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transfor
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
-from megatron.core.quantization.quant_config import RecipeConfig
+from megatron.core.quantization.quant_config import MatchContext, RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 if HAVE_TE:
-    from transformer_engine.pytorch.fp8 import fp8_model_init
+    from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, fp8_model_init
+
+_RECIPE_YAML = (
+    pathlib.Path(__file__).resolve().parents[3]
+    / "examples"
+    / "quantization"
+    / "fp4_experts_mxfp8_other_linears.yaml"
+)
 
 _IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_properties(0).major >= 10
 
 
-class TestFp4DenseMxfp8ConfigValidation:
-    def _config(self, **overrides):
-        kwargs = dict(num_layers=2, hidden_size=128, num_attention_heads=4, fp4="e2m1")
-        kwargs.update(overrides)
-        return TransformerConfig(**kwargs)
+def _recipe_dict(fp8_param=True, overrides=()):
+    """The example recipe as a dict; with fp8_param=False the MXFP8 linears keep BF16 params.
+    overrides: (pattern, training_recipe) pairs matched before the example's matchers."""
+    import yaml
 
-    def test_accepts_fp4(self):
-        config = self._config(fp4_dense_mxfp8=True, fp4_param=True, fp4_dense_mxfp8_param=True)
-        assert config.fp4_dense_mxfp8 and config.fp4_dense_mxfp8_param
+    recipe = yaml.safe_load(_RECIPE_YAML.read_text())
+    if not fp8_param:
+        training = recipe["configs"]["mxfp8"]["training_recipe"]
+        del training["fp8_param"], training["param_storage_follows_model_init"]
+    matchers = {}
+    for i, (pattern, training_recipe) in enumerate(overrides):
+        key = f"override_{i}"
+        recipe["configs"][key] = {
+            "transformer_engine_config_type": "TEQuantizationParams",
+            "training_recipe": training_recipe,
+        }
+        matchers[key] = {"type": "glob", "enabled": True, "pattern": pattern, "config": key}
+    recipe["matchers"] = {**matchers, **recipe["matchers"]}
+    return recipe
 
-    def test_requires_fp4(self):
-        with pytest.raises(ValueError, match="fp4_dense_mxfp8 must be used together with fp4"):
-            self._config(fp4=None, fp4_dense_mxfp8=True)
 
-    @pytest.mark.parametrize(
-        "overrides", [dict(fp4_param=True), dict(fp4_dense_mxfp8=True, fp4_param=False)]
-    )
-    def test_param_requires_dense_mxfp8_and_fp4_param(self, overrides):
-        with pytest.raises(ValueError, match="fp4_dense_mxfp8_param requires"):
-            self._config(fp4_dense_mxfp8_param=True, **overrides)
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine not installed")
+class TestExampleRecipe:
+    def test_loads_and_matches(self):
+        recipe = RecipeConfig.from_yaml_file(str(_RECIPE_YAML))
+        assert (
+            recipe.as_dict()["configs"]
+            == RecipeConfig.from_config_dict(_recipe_dict()).as_dict()["configs"]
+        )
+        cases = {
+            "decoder.layers.1.mlp.experts.linear_fc1": "global_recipe",
+            "mtp.layers.0.mtp_model_layer.mlp.experts.linear_fc2": "global_recipe",
+            "decoder.layers.1.mlp.shared_experts.linear_fc1": "mxfp8",
+            "decoder.layers.0.self_attention.linear_qkv": "mxfp8",
+            "decoder.layers.0.mlp.linear_fc2": "mxfp8",
+            "mtp.layers.0.eh_proj": "mxfp8",
+        }
+        for path, key in cases.items():
+            config = recipe.match(MatchContext(module_path=path, layer_number=None))
+            assert config.config_key == key, path
+            params = TEQuantizationParams.parse_from_config(config)
+            training = params.training_recipe
+            if key == "mxfp8":
+                assert training.fp8_quantization_recipe == Fp8Recipe.mxfp8, path
+                assert training.fp8_param and training.param_storage_follows_model_init, path
+            else:
+                assert training.fp8_quantization_recipe is None, path
+                assert training.fp4_quantization_recipe is None, path
+                assert training.inherit_model_init_context, path
+                assert not training.override_quantized_autocast, path
+
+
+@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine not installed")
+class TestParamStorageFollowsModelInit:
+    """param_storage_follows_model_init: quantized parameters only inside a model-init context
+    that stores quantized parameters (so first_last_layers_bf16 layers keep BF16 weights)."""
+
+    @staticmethod
+    def _parse(**training):
+        return TEQuantizationRecipe.parse_from_config(training)
+
+    def test_parse(self):
+        recipe = self._parse(
+            fp8_quantization_recipe="mxfp8", fp8_param=True, param_storage_follows_model_init=True
+        )
+        assert recipe.param_storage_follows_model_init
+        assert not self._parse(fp8_quantization_recipe="mxfp8").param_storage_follows_model_init
+
+    def test_rejects_inherit_model_init_context(self):
+        with pytest.raises(ValueError, match="inherit_model_init_context cannot be combined"):
+            self._parse(inherit_model_init_context=True, param_storage_follows_model_init=True)
+
+    def test_rejects_non_bool(self):
+        with pytest.raises(ValueError, match="param_storage_follows_model_init must be a bool"):
+            self._parse(fp8_quantization_recipe="mxfp8", param_storage_follows_model_init="yes")
+
+    @pytest.mark.parametrize("follows", [False, True])
+    @pytest.mark.parametrize("fp8_param", [False, True])
+    @pytest.mark.parametrize("stores_quantized_weights", [False, True])
+    def test_storage(self, follows, fp8_param, stores_quantized_weights):
+        recipe = TEQuantizationRecipe(
+            fp8_quantization_recipe=Fp8Recipe.mxfp8,
+            fp8_param=fp8_param,
+            param_storage_follows_model_init=follows,
+        )
+        with fp8_model_init(enabled=stores_quantized_weights):
+            # Decided when the context is built (in the module constructor), as TELinear does.
+            context = _get_fp8_model_init_for_quant_recipe(recipe)
+        with context:
+            stored = FP8GlobalStateManager.with_fp8_parameters()
+        assert stored is (fp8_param and (stores_quantized_weights or not follows))
 
 
 class TestReuseGradBufForFp4ParamGather:
@@ -134,74 +215,6 @@ class TestReuseGradBufWithPrecisionAwareOptimizer:
             DistributedOptimizer._copy_main_params_to_param_buffer(optimizer)
 
 
-@pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine not installed")
-class TestFp4DenseMxfp8QuantParams:
-    """The override applies to non-expert linears only, and an explicit override wins."""
-
-    @staticmethod
-    def _config(**overrides):
-        kwargs = dict(fp4="e2m1", fp4_dense_mxfp8=True, fp4_dense_mxfp8_param=False)
-        kwargs.update(overrides)
-        return SimpleNamespace(**kwargs)
-
-    @pytest.mark.parametrize("fp8_param", [False, True])
-    def test_non_expert_linear_gets_mxfp8(self, fp8_param):
-        params = _fp4_dense_mxfp8_quant_params(
-            self._config(), is_expert=False, current=None, fp8_param=fp8_param
-        )
-        assert params.training_recipe.fp8_quantization_recipe == Fp8Recipe.mxfp8
-        assert params.training_recipe.fp8_param is fp8_param
-        assert params.evaluation_recipe is None
-
-    def test_expert_linear_keeps_model_recipe(self):
-        params = _fp4_dense_mxfp8_quant_params(
-            self._config(), is_expert=True, current=None, fp8_param=True
-        )
-        assert params is None
-
-    def test_disabled(self):
-        config = self._config(fp4_dense_mxfp8=False)
-        params = _fp4_dense_mxfp8_quant_params(
-            config, is_expert=False, current=None, fp8_param=True
-        )
-        assert params is None
-
-    def test_explicit_override_wins(self):
-        explicit = TEQuantizationParams(
-            training_recipe=TEQuantizationRecipe(), evaluation_recipe=None
-        )
-        params = _fp4_dense_mxfp8_quant_params(
-            self._config(), is_expert=False, current=explicit, fp8_param=True
-        )
-        assert params is explicit
-
-    @pytest.mark.parametrize("dense_param", [False, True])
-    @pytest.mark.parametrize("stores_quantized_weights", [False, True])
-    def test_param_storage_follows_model_init_context(self, dense_param, stores_quantized_weights):
-        """MXFP8 weights only inside a model-init context that stores quantized weights, so the
-        layers kept in BF16 by first_last_layers_bf16 (no such context) keep BF16 weights."""
-        config = self._config(fp4_dense_mxfp8_param=dense_param)
-        with fp8_model_init(enabled=stores_quantized_weights):
-            storage = _fp4_dense_mxfp8_param_storage(config)
-        assert storage is (dense_param and stores_quantized_weights)
-
-
-def _bf16_recipe(pattern):
-    return RecipeConfig.from_config_dict(
-        {
-            "configs": {
-                "bf16": {
-                    "transformer_engine_config_type": "TEQuantizationParams",
-                    "training_recipe": {},
-                }
-            },
-            "matchers": {
-                "bf16": {"type": "glob", "enabled": True, "pattern": pattern, "config": "bf16"}
-            },
-        }
-    )
-
-
 @pytest.mark.internal
 @pytest.mark.skipif(not HAVE_TE, reason="Transformer Engine not installed")
 @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 and NVFP4 require Blackwell (SM >= 10)")
@@ -225,7 +238,7 @@ class TestFp4DenseMxfp8Model:
             bf16=True,
             add_bias_linear=False,
             fp4="e2m1",
-            fp4_dense_mxfp8=True,
+            quant_recipe=RecipeConfig.from_config_dict(_recipe_dict()),
         )
         if num_moe_experts is not None:
             kwargs.update(
@@ -251,18 +264,17 @@ class TestFp4DenseMxfp8Model:
             name: module
             for name, module in model.named_modules()
             if isinstance(module, (TELinear, TELayerNormColumnParallelLinear))
-            and not module._is_expert_linear
+            and ".experts." not in name
         }
 
     @pytest.mark.parametrize("dense_param", [False, True])
     def test_moe_model_params(self, dense_param):
-        """Non-expert linears get the MXFP8 override (after GPTModel re-runs finish_init) and,
-        with fp4_dense_mxfp8_param, MXFP8 weights; routed experts keep NVFP4 weights."""
+        """Non-expert linears get the MXFP8 recipe (after GPTModel re-runs finish_init) and,
+        with fp8_param, MXFP8 weights; routed experts keep NVFP4 weights. A matcher placed
+        before the example's matchers overrides a module."""
+        recipe = _recipe_dict(dense_param, overrides=[("*self_attention.linear_proj", {})])
         model = self._model(
-            num_moe_experts=4,
-            fp4_param=True,
-            fp4_dense_mxfp8_param=dense_param,
-            quant_recipe=_bf16_recipe("*self_attention.linear_proj"),
+            num_moe_experts=4, fp4_param=True, quant_recipe=RecipeConfig.from_config_dict(recipe)
         )
         dense = self._dense_linears(model)
         assert "decoder.layers.0.self_attention.linear_qkv" in dense
@@ -287,7 +299,6 @@ class TestFp4DenseMxfp8Model:
             num_moe_experts=4,
             num_layers=4,
             fp4_param=True,
-            fp4_dense_mxfp8_param=True,
             first_last_layers_bf16=True,
             num_layers_at_start_in_bf16=1,
             num_layers_at_end_in_bf16=1,
@@ -297,11 +308,10 @@ class TestFp4DenseMxfp8Model:
         assert any(name.startswith(bf16_layers) for name in dense)
         for name, module in dense.items():
             assert name.startswith("decoder.layers."), name
-            # GPTModel re-runs finish_init outside any model-init context; the override must
-            # keep the storage choice made at construction.
+            # GPTModel re-runs finish_init outside any model-init context; that must not change
+            # the storage chosen at construction.
             recipe = module.te_quant_params.training_recipe
             assert recipe.fp8_quantization_recipe == Fp8Recipe.mxfp8, name
-            assert recipe.fp8_param is (not name.startswith(bf16_layers)), name
             if name.startswith(bf16_layers):
                 assert not is_mxfp8tensor(module.weight), name
                 assert module.weight.dtype == torch.bfloat16, name

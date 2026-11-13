@@ -1106,7 +1106,7 @@ def _nvfp4_and_mxfp8_supported():
 def test_fp4_model_mxfp8_and_nvfp4_params_get_separate_buffers(
     reuse_grad_buf_for_mxfp8_param_ag: bool,
 ):
-    """An FP4 model with MXFP8 non-expert params (fp4_dense_mxfp8_param) and experts on the dense
+    """An FP4 model with MXFP8 non-expert params (quant_recipe fp8_param) and experts on the dense
     data-parallel group (EP=1): NVFP4 and MXFP8 params are both stored as uint8, but need separate
     buffers. The MXFP8 params also require reuse_grad_buf_for_mxfp8_param_ag."""
     import transformer_engine.pytorch as te

@@ -235,6 +235,16 @@ class TEQuantizationRecipe:
     """
     If cast the initialized parameters to fp4 precision and all-gather weights in FP4.
     """
+    param_storage_follows_model_init: bool = False
+    """
+    With ``fp8_param`` or ``fp4_param``: store the parameters in this recipe's format only when
+    the enclosing model-init context stores quantized parameters, and in high precision
+    otherwise. A global policy that keeps some layers' parameters in high precision (such as
+    ``first_last_layers_bf16``) then stays in control of whether a module stores quantized
+    parameters, while this recipe chooses their format. For example, the non-expert linears of
+    an FP4 model can store MXFP8 parameters without giving the BF16 first and last layers MXFP8
+    parameters.
+    """
 
     @classmethod
     def parse_from_config(
@@ -244,10 +254,12 @@ class TEQuantizationRecipe:
         Parse config from quantization dictionary.
         """
         if quant_config.get("inherit_model_init_context", False) and any(
-            field in quant_config for field in ("fp8_param", "fp4_param")
+            field in quant_config
+            for field in ("fp8_param", "fp4_param", "param_storage_follows_model_init")
         ):
             raise ValueError(
-                "inherit_model_init_context cannot be combined with fp8_param or fp4_param."
+                "inherit_model_init_context cannot be combined with fp8_param, fp4_param or "
+                "param_storage_follows_model_init."
             )
         kwargs = {}
         class_keys = cls.get_config_keys()
@@ -271,6 +283,8 @@ class TEQuantizationRecipe:
         instance = TEQuantizationRecipe(**kwargs)
         if not isinstance(instance.fp8_param, bool):
             raise ValueError("fp8_param must be a bool (true or false).")
+        if not isinstance(instance.param_storage_follows_model_init, bool):
+            raise ValueError("param_storage_follows_model_init must be a bool (true or false).")
         if instance.fp8_quantization_recipe == Fp8Recipe.delayed:
             raise ValueError("Delayed scaling not in scope of te per-module quantization config.")
         if (
@@ -353,42 +367,6 @@ class TEQuantizationParams:
             raise NotImplementedError(f"Unhandled configuration type {config_type}")
 
 
-def _fp4_dense_mxfp8_quant_params(
-    config: TransformerConfig,
-    is_expert: bool,
-    current: Optional[TEQuantizationParams],
-    fp8_param: bool,
-) -> Optional[TEQuantizationParams]:
-    """MXFP8 quantization override for a non-expert linear of an FP4 model.
-
-    With ``config.fp4_dense_mxfp8`` the non-expert linears run in MXFP8 while the routed experts
-    keep the FP4 recipe. An explicit per-module override from ``config.quant_recipe`` wins.
-    ``fp8_param`` selects MXFP8 weight storage; see ``_fp4_dense_mxfp8_param_storage``.
-    """
-    if current is not None or is_expert or not getattr(config, "fp4_dense_mxfp8", False):
-        return current
-    return TEQuantizationParams(
-        training_recipe=TEQuantizationRecipe(
-            fp8_quantization_recipe=Fp8Recipe.mxfp8, fp8_param=fp8_param
-        ),
-        evaluation_recipe=None,
-    )
-
-
-def _fp4_dense_mxfp8_param_storage(config: TransformerConfig) -> bool:
-    """Whether a non-expert linear built now should keep MXFP8 weights (fp4_dense_mxfp8_param).
-
-    Only when the enclosing model-init context stores quantized weights: the layers that
-    first_last_layers_bf16 keeps in BF16 open no such context (get_fp4_context(is_init=True)
-    returns a null context for them), so they keep BF16 weights. Must be called while the
-    module is constructed, since GPTModel re-runs finish_init outside any model-init context.
-    """
-    return bool(
-        getattr(config, "fp4_dense_mxfp8_param", False)
-        and FP8GlobalStateManager.with_fp8_parameters()
-    )
-
-
 def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
     if qrecipe.inherit_model_init_context:
         # Preserve both the enclosing recipe and whether storage is enabled. In
@@ -437,6 +415,10 @@ def _get_fp8_model_init_for_quant_recipe(qrecipe: TEQuantizationRecipe):
     if quant_recipe is not None and qrecipe.recipe_attrs is not None:
         for key, val in qrecipe.recipe_attrs.items():
             setattr(quant_recipe, key, val)
+
+    if qrecipe.param_storage_follows_model_init and not FP8GlobalStateManager.with_fp8_parameters():
+        # Evaluated while the module is constructed, inside the enclosing model-init context.
+        enabled = False
 
     return fp8_model_init(
         enabled=enabled,
@@ -1495,8 +1477,6 @@ class TELinear(te.pytorch.Linear):
                 tp_group_for_te = None
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
-        self._is_expert_linear = is_expert
-        self._fp4_dense_mxfp8_param = _fp4_dense_mxfp8_param_storage(config)
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
@@ -1555,9 +1535,6 @@ class TELinear(te.pytorch.Linear):
             self.te_quant_params = TEQuantizationParams.parse_from_config(
                 quantization_config, model_config=self.config
             )
-        self.te_quant_params = _fp4_dense_mxfp8_quant_params(
-            self.config, self._is_expert_linear, self.te_quant_params, self._fp4_dense_mxfp8_param
-        )
 
     def will_execute_quantized(self, is_context_quantized: bool) -> bool:
         """Returns whether the module is configured to execute quantized."""
@@ -1727,8 +1704,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
         self.stride = stride
 
         self.te_quant_params: Optional[TEQuantizationParams] = None
-        self._is_expert_linear = is_expert
-        self._fp4_dense_mxfp8_param = _fp4_dense_mxfp8_param_storage(config)
         quant_config = get_quant_config_or_none(name, config.quant_recipe)
         self.finish_init(quant_config)
         init_quant_context = _get_fp8_model_init_for_quant_params(
@@ -1812,9 +1787,6 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             self.te_quant_params = TEQuantizationParams.parse_from_config(
                 quantization_config, model_config=self.config
             )
-        self.te_quant_params = _fp4_dense_mxfp8_quant_params(
-            self.config, self._is_expert_linear, self.te_quant_params, self._fp4_dense_mxfp8_param
-        )
 
     def will_execute_quantized(self, is_context_quantized: bool) -> bool:
         """Returns whether the module is configured to execute quantized."""

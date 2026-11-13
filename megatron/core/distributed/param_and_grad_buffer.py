@@ -1235,8 +1235,9 @@ class _ParamAndGradBuffer:
             # The FP4 optimizer path re-quantizes only the NVFP4 params from their main params,
             # so MXFP8 params would never receive their updated values.
             raise ValueError(
-                "MXFP8 params in an FP4 model (TransformerConfig.fp4_dense_mxfp8_param) with "
-                "fp4_param_gather require reuse_grad_buf_for_mxfp8_param_ag."
+                "MXFP8 params in an FP4 model (a quant_recipe entry with fp8_quantization_recipe "
+                "mxfp8 and fp8_param) with fp4_param_gather require "
+                "reuse_grad_buf_for_mxfp8_param_ag."
             )
         uses_shared_param_grad_buffer = (
             self.ddp_config.use_distributed_optimizer and has_mxfp8_params
