@@ -4117,6 +4117,9 @@ try:
 except ImportError:
     fused_permute_and_pad_with_probs = None
 
+# The label TE's cross entropy skips (the default of its CrossEntropyFunction).
+_TE_CROSS_ENTROPY_IGNORE_INDEX = -100
+
 try:
     from transformer_engine.pytorch.cross_entropy import parallel_cross_entropy
 
@@ -4154,8 +4157,7 @@ try:
         if _TE_SUPPORTS_CG_CAPTURABLE:
             # Use the CUDA graph-capturable version of the loss function.
             parallel_cross_entropy_kwargs["is_cg_capturable"] = is_cg_capturable
-            # According to TE CrossEntropyFunction, ignore_idx defaults to -100
-            parallel_cross_entropy_kwargs["ignore_idx"] = -100
+            parallel_cross_entropy_kwargs["ignore_idx"] = _TE_CROSS_ENTROPY_IGNORE_INDEX
         if return_argmax:
             if not _TE_FUSED_PARALLEL_CE_RETURN_ARGMAX:
                 return parallel_cross_entropy(logits, labels, **parallel_cross_entropy_kwargs), None
@@ -4182,6 +4184,10 @@ def te_cross_entropy(
     if te_parallel_cross_entropy is None:
         raise RuntimeError("Trying to use a TE block when it's not present.")
     labels = torch.as_strided(labels, labels.size(), (labels.size()[1], 1))
+    # TE skips only its ignore index. Callers mark the positions their loss mask drops with any id
+    # outside the vocabulary (the null tokenizer pads with -1); TE would index the logits with it
+    # and return a NaN there, which the mask cannot remove (NaN * 0).
+    labels = labels.masked_fill(labels < 0, _TE_CROSS_ENTROPY_IGNORE_INDEX)
     return te_parallel_cross_entropy(
         logits,
         labels,

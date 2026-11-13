@@ -867,6 +867,33 @@ class TestTEWrappers:
             what="te_fused_cross_entropy",
         )
 
+    @pytest.mark.parametrize("masked_label", [-1, -100])
+    def test_te_cross_entropy_ignores_negative_labels(self, masked_label):
+        """A masked position labelled with any negative id gives a zero loss and no gradient."""
+        seeded()
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        vocab, masked_rows = 32768, slice(-4, None)
+        logits = torch.randn(64, 1, vocab, device="cuda", dtype=torch.bfloat16)
+        target = torch.randint(0, vocab * tp_group.size(), (64, 1), device="cuda")
+
+        def run(labels):
+            leaf = logits.clone().requires_grad_(True)
+            loss = te_cross_entropy(leaf, labels, tp_group, overwrite_input=False)
+            loss.float().sum().backward()
+            return loss.detach().float(), leaf.grad.float()
+
+        reference_loss, reference_grad = run(target)
+        masked = target.clone()
+        masked[masked_rows] = masked_label
+        loss, grad = run(masked)
+
+        assert masked[masked_rows].eq(masked_label).all(), "the caller's labels are not modified"
+        assert torch.isfinite(loss).all()
+        assert loss[masked_rows].eq(0).all()
+        assert grad[masked_rows].eq(0).all()
+        assert torch.equal(loss[:-4], reference_loss[:-4])
+        assert torch.equal(grad[:-4], reference_grad[:-4])
+
     @pytest.mark.parametrize("backend", ["fused", "flash"])
     def test_te_dot_product_attention_replays(self, backend, monkeypatch):
         """GQA causal attention; TE must pick a deterministic backward (NVTE_ALLOW_NONDETERMINISTIC_ALGO=0)."""
