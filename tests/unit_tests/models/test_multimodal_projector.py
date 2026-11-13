@@ -78,7 +78,7 @@ class TestMultimodalProjector:
 
         self.affine.load_state_dict(torch.load(path))
 
-    def test_nemotron_fast_gelu_recipe_forward_backward(self):
+    def test_nemotron_fast_gelu_recipe_forward_backward(self, monkeypatch):
         """The decoder-width recipe matches explicit two-linear math and all gradients."""
         from examples.mimo.model_providers.nemotron_moe_vlm import _nemotron_projection_spec
         from megatron.core.transformer.spec_utils import build_module
@@ -86,6 +86,10 @@ class TestMultimodalProjector:
         args = SimpleNamespace(hidden_size=96, vision_projection_type="mlp2")
         config = TransformerConfig(
             num_layers=1, hidden_size=96, num_attention_heads=4, use_cpu_initialization=True
+        )
+        monkeypatch.setattr(
+            "examples.mimo.model_providers.nemotron_moe_vlm.get_run_config",
+            lambda: SimpleNamespace(model=SimpleNamespace(transformer=config)),
         )
         projector = build_module(_nemotron_projection_spec(args, 64, 1, None, config)).cuda()
         fc1 = projector.encoder.linear_fc1.weight
@@ -125,7 +129,9 @@ class TestMultimodalProjector:
             ("mlp_fast_gelu_1x_decoder_hidden_width", "mlp2"),
         ],
     )
-    def test_nemotron_recipe_alias_checkpoint(self, tmp_path, saved_recipe, restored_recipe):
+    def test_nemotron_recipe_alias_checkpoint(
+        self, tmp_path, saved_recipe, restored_recipe, monkeypatch
+    ):
         """Both spellings strictly restore identical weights and outputs within a recipe."""
         from examples.mimo.model_providers.nemotron_moe_vlm import _nemotron_projection_spec
         from megatron.core.transformer.spec_utils import build_module
@@ -133,6 +139,10 @@ class TestMultimodalProjector:
         args = SimpleNamespace(hidden_size=96, vision_projection_type=saved_recipe)
         config = TransformerConfig(
             num_layers=1, hidden_size=96, num_attention_heads=4, use_cpu_initialization=True
+        )
+        monkeypatch.setattr(
+            "examples.mimo.model_providers.nemotron_moe_vlm.get_run_config",
+            lambda: SimpleNamespace(model=SimpleNamespace(transformer=config)),
         )
         original = build_module(_nemotron_projection_spec(args, 64, 1, None, config)).cuda()
         path = tmp_path / "projection.pt"
