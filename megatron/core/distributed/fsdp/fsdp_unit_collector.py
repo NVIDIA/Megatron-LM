@@ -15,42 +15,29 @@
 """Select MCore modules for MFSDP v2 sharding."""
 
 from collections.abc import Sequence
-from typing import NamedTuple
+from enum import IntEnum
 
 from torch import nn
 
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
+from megatron.core.ssm.gated_delta_net.common import _GDNBase
+from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.transformer.attention import Attention
+from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 from megatron.core.transformer.transformer_block import TransformerBlock
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
 
 
-class _SelectiveRecompute(NamedTuple):
-    """A module's selective recompute, which reruns part of its forward in backward.
+class RecomputeType(IntEnum):
+    """Recompute requirements, ordered so internal replay takes precedence when combined."""
 
-    The rerun recomputes activations with the rerun part's weights but does not call the
-    forward hooks of the FSDP unit owning those weights.
-    """
-
-    # Name of the bool attribute a module sets to True at construction when it recomputes,
-    # e.g. "recompute_mlp" for TransformerLayer.
-    recompute_flag_name: str
-    # Name of the module's attribute holding the child that the recompute reruns, e.g. "mlp"
-    # for TransformerLayer, or None when the module reruns itself.
-    recomputed_submodule_name: str | None
-
-
-_SELECTIVE_RECOMPUTES = (
-    _SelectiveRecompute("recompute_mlp", "mlp"),  # TransformerLayer, "mlp"
-    _SelectiveRecompute("moe_layer_recompute", None),  # MoELayer or MoETransformerLayer, "moe"
-    _SelectiveRecompute("shared_experts_recompute", "shared_experts"),  # MoELayer
-    _SelectiveRecompute("recompute_up_proj", None),  # MLA variants, "mla_up_proj"
-    _SelectiveRecompute("recompute_gdn", None),  # Gated delta net variants, "gdn"
-    _SelectiveRecompute("recompute_in_proj", "in_proj"),  # GatedDeltaProductMixer, "gdp_in_proj"
-)
+    NONE = 0
+    FULL = 1  # Whole layers replay through their forward hooks.
+    PARTIAL = 2  # Internal replay needs weights without re-entering the owning unit.
 
 
 class FsdpUnitCollector:
@@ -69,80 +56,122 @@ class FsdpUnitCollector:
             )
         self._fsdp_unit_module_types = tuple(fsdp_unit_module_types)
         self._units: list[nn.Module] = []
-        # Maps each collected unit to itself and its descendants outside nested units.
-        self._owned_modules_by_unit: dict[nn.Module, dict[nn.Module, None]] = {}
+        self._partially_recomputed_units: set[nn.Module] = set()
 
     def collect(self, module: nn.Module) -> list[nn.Module]:
         """Return selected modules children before parents, including the root last."""
         self._units = []
-        self._visit(module)
-        if not isinstance(module, self._fsdp_unit_module_types):
-            self._units.append(module)
-        self._owned_modules_by_unit = {unit: {} for unit in self._units}
-        for unit, owned in self._owned_modules_by_unit.items():
-            owned[unit] = None
-            pending = list(unit.children())
-            while pending:
-                submodule = pending.pop()
-                if submodule not in self._owned_modules_by_unit:
-                    owned[submodule] = None
-                    pending.extend(submodule.children())
+        self._partially_recomputed_units = set()
+        self._visit(module, is_root=True)
         return self._units
 
     def is_partially_recomputed(self, unit: nn.Module) -> bool:
-        """Whether activation recomputation reruns part of this unit's forward without calling
-        the unit.
+        """Whether this unit needs MXFP8 rowwise planes during backward recomputation."""
+        return unit in self._partially_recomputed_units
 
-        The rerun uses the unit's weights without its hooks, so the unit needs
-        SchedulePolicy.unshard_all_planes_in_backward. Modules inside a nested unit don't
-        count: their own hooks run during recomputation.
-        """
-        owned = self._owned_modules_by_unit[unit]
-        for module in owned:
-            for rerun in _rerun_submodules(module):
-                for submodule in rerun.modules():
-                    # Skip modules of nested units, which own their weights.
-                    if submodule not in owned:
-                        continue
-                    # Skip parameterless modules, e.g. an IdentityOp MLP.
-                    if next(submodule.parameters(recurse=False), None) is not None:
-                        return True
-        return False
-
-    def _visit(self, module: nn.Module) -> None:
+    def _visit(self, module: nn.Module, *, is_root: bool = False) -> RecomputeType:
+        """Collect this unit, or propagate its recompute type to its parent."""
         if isinstance(module, HyperConnectionHybridLayer):
-            self._visit_mhc(module)
+            recompute_type = self._visit_mhc(module)
         elif isinstance(module, ShortcutMoEBlock):
-            self._visit_shortcut(module)
+            recompute_type = self._visit_shortcut(module)
         elif isinstance(module, TransformerLayer):
-            self._visit_transformer(module)
+            recompute_type = self._visit_transformer(module)
         elif isinstance(module, MambaLayer):
-            self._visit_mamba(module)
+            recompute_type = self._visit_mamba(module)
+        elif isinstance(module, (TransformerBlock, HybridStack)):
+            recompute_type = self._visit_children(module)
+            config = module.config
+            # Independently sharded layers consume their replay requirements themselves.
+            if (
+                config.recompute_granularity == "full"
+                and config.recompute_num_layers
+                and any(layer not in self._units for layer in module.layers)
+            ):
+                recompute_type = RecomputeType.PARTIAL
+        elif isinstance(module, MultiTokenPredictionLayer):
+            recompute_type = self._visit_children(module)
+            # GPT MTP checkpoints its projection; Hybrid MTP delegates to its inner stack.
+            if module.config.recompute_granularity == "full" and not module.is_hybrid_mtp:
+                recompute_type = RecomputeType.PARTIAL
         else:
-            self._visit_children(module)
-            self._collect(module)
+            recompute_type = max(
+                self._visit_children(module), self._component_recompute_type(module)
+            )
 
-    def _collect(self, module: nn.Module) -> None:
-        if isinstance(module, self._fsdp_unit_module_types):
+        if is_root or isinstance(module, self._fsdp_unit_module_types):
             self._units.append(module)
+            if recompute_type is RecomputeType.PARTIAL:
+                self._partially_recomputed_units.add(module)
+            return RecomputeType.NONE
+        return recompute_type
 
-    def _visit_transformer(self, layer: TransformerLayer) -> None:
-        self._collect_routed_experts(layer)
-        self._collect(layer)
+    def _component_recompute_type(self, module: nn.Module) -> RecomputeType:
+        """Check the current component's checkpoint flags without visiting its children."""
+        if isinstance(module, MoELayer):
+            # The flags already encode selective recompute. Whole-MoE replay uses the
+            # router's weights even though routed experts have their own FSDP hooks.
+            if module.moe_layer_recompute:
+                return RecomputeType.PARTIAL
+            if module.shared_experts_recompute and module.shared_experts is not None:
+                return RecomputeType.PARTIAL
+            return RecomputeType.NONE
+        elif isinstance(module, Attention):
+            # MLA variants share Attention but no narrower base. They expose this checkpoint
+            # flag; other attention implementations may omit it.
+            partially_recomputed = getattr(module, "recompute_up_proj", False)
+        elif isinstance(module, _GDNBase):
+            partially_recomputed = (
+                module.config.recompute_granularity != "full" and module.recompute_gdn
+            )
+        elif isinstance(module, GatedDeltaProductMixer):
+            partially_recomputed = (
+                module.config.recompute_granularity != "full" and module.recompute_in_proj
+            )
+        else:
+            return RecomputeType.NONE
+        return RecomputeType.PARTIAL if partially_recomputed else RecomputeType.NONE
 
-    def _visit_mamba(self, layer: MambaLayer) -> None:
-        self._collect(layer)
-
-    def _visit_children(self, module: nn.Module) -> None:
+    def _visit_children(self, module: nn.Module) -> RecomputeType:
+        recompute_type = RecomputeType.NONE
         for child in module.children():
-            self._visit(child)
+            recompute_type = max(recompute_type, self._visit(child))
+        return recompute_type
 
-    def _visit_shortcut(self, block: ShortcutMoEBlock) -> None:
-        # Helpers bypass both inner layers' __call__, but experts run normally.
-        self._collect_routed_experts(block.moe_layer)
-        self._collect(block)
+    def _visit_transformer(self, layer: TransformerLayer) -> RecomputeType:
+        self._collect_routed_experts(layer)
+        recompute_type = (
+            RecomputeType.FULL
+            if layer.config.recompute_granularity == "full"
+            else RecomputeType.NONE
+        )
+        # These components belong to the layer; check their flags without collecting them.
+        for child in layer.children():
+            recompute_type = max(recompute_type, self._component_recompute_type(child))
+        if layer.config.recompute_granularity != "full" and (
+            (isinstance(layer, MoETransformerLayer) and layer.moe_layer_recompute)
+            or (layer.recompute_mlp and next(layer.mlp.parameters(), None) is not None)
+        ):
+            recompute_type = RecomputeType.PARTIAL
+        return recompute_type
 
-    def _visit_mhc(self, mhc_layer: HyperConnectionHybridLayer) -> None:
+    def _visit_mamba(self, layer: MambaLayer) -> RecomputeType:
+        return max(
+            (
+                RecomputeType.FULL
+                if layer.config.recompute_granularity == "full"
+                else RecomputeType.NONE
+            ),
+            self._component_recompute_type(layer.mixer),
+        )
+
+    def _visit_shortcut(self, block: ShortcutMoEBlock) -> RecomputeType:
+        # Helpers bypass both inner layers' __call__; their experts are still collected.
+        return max(
+            self._visit_inner_layer(block.compute_layer), self._visit_inner_layer(block.moe_layer)
+        )
+
+    def _visit_mhc(self, mhc_layer: HyperConnectionHybridLayer) -> RecomputeType:
         inner_layer = mhc_layer.inner_layer
         if isinstance(inner_layer, TransformerLayer):
             config = mhc_layer.config
@@ -154,41 +183,16 @@ class FsdpUnitCollector:
                 for norm in (inner_layer.input_layernorm, inner_layer.pre_mlp_layernorm):
                     if next(norm.parameters(), None) is not None:
                         self._units.append(norm)
-            self._collect_routed_experts(inner_layer)
-        self._collect(mhc_layer)
+        return self._visit_inner_layer(inner_layer)
+
+    def _visit_inner_layer(self, layer: nn.Module) -> RecomputeType:
+        """Visit a wrapper-owned layer without collecting it as an independent unit."""
+        if isinstance(layer, TransformerLayer):
+            return self._visit_transformer(layer)
+        if isinstance(layer, MambaLayer):
+            return self._visit_mamba(layer)
+        return self._component_recompute_type(layer)
 
     def _collect_routed_experts(self, layer: TransformerLayer) -> None:
         if layer.is_moe_layer:
             self._units.append(layer.mlp.experts)
-
-
-def _rerun_submodules(module: nn.Module) -> list[nn.Module]:
-    """Return the parts of this module's forward that its own checkpoints rerun in backward."""
-    # Read the module's own config: hybrid layers may each have one.
-    config = getattr(module, "config", None)
-    if config is not None and config.recompute_granularity == "full":
-        if isinstance(module, (TransformerBlock, HybridStack)):
-            # Block recompute may checkpoint a prefix of the layers; FP8 can shift it at
-            # runtime, so conservatively take all layers.
-            if config.recompute_method == "block" and not config.recompute_num_layers:
-                return []
-            return list(module.layers)
-        # GPT MTP layers checkpoint eh_proj together with their inner layer. Hybrid MTP
-        # layers delegate full recompute to their inner stack.
-        if isinstance(module, MultiTokenPredictionLayer) and not module.is_hybrid_mtp:
-            return [module]
-        return []
-
-    # Selective recompute flags are set from each module's own config.
-    rerun = []
-    for recompute in _SELECTIVE_RECOMPUTES:
-        if getattr(module, recompute.recompute_flag_name, False) is not True:
-            continue
-        if recompute.recomputed_submodule_name is None:
-            rerun.append(module)
-            continue
-        # The submodule may be absent, e.g. shared_experts is None without shared experts.
-        submodule = getattr(module, recompute.recomputed_submodule_name, None)
-        if submodule is not None:
-            rerun.append(submodule)
-    return rerun

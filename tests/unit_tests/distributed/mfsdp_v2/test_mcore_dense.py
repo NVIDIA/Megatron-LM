@@ -218,6 +218,14 @@ _GPT_MTP_LAYERS = {"decoder.layers.0", "decoder.layers.1", "mtp.layers.0.mtp_mod
             _GPT_MTP_LAYERS,
             id="selective_mlp",
         ),
+        # With no layer units, the root owns the selectively recomputed MLP weights.
+        pytest.param(
+            "gpt",
+            dict(**_SELECTIVE, recompute_modules=["mlp"]),
+            [],
+            {""},
+            id="selective_mlp_no_layer_units",
+        ),
         pytest.param(
             "mla",
             dict(**_MLA, **_SELECTIVE, recompute_modules=["mla_up_proj"]),

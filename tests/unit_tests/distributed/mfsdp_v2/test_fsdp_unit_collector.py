@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Default FSDP unit selection for real MCore layers."""
+"""FSDP unit selection and recomputation ownership for MCore layers."""
 
 import pytest
 import torch
@@ -34,7 +34,10 @@ def process_group_collection(distributed_setup):
 
 
 @pytest.mark.parametrize("grouped_gemm", [True, False], ids=["grouped", "sequential"])
-def test_collects_routed_experts_before_transformer_layer(process_group_collection, grouped_gemm):
+@pytest.mark.parametrize("recompute_modules", [[], ["shared_experts"], ["moe"]])
+def test_collects_routed_experts_before_transformer_layer(
+    process_group_collection, grouped_gemm, recompute_modules
+):
     """Transformer layers select routed experts directly and own their remaining internals."""
     config = TransformerConfig(
         num_layers=1,
@@ -43,6 +46,8 @@ def test_collects_routed_experts_before_transformer_layer(process_group_collecti
         num_moe_experts=2,
         moe_ffn_hidden_size=128,
         moe_shared_expert_intermediate_size=128,
+        recompute_granularity="selective",
+        recompute_modules=recompute_modules,
         moe_grouped_gemm=grouped_gemm,
         moe_token_dispatcher_type="alltoall",
         add_bias_linear=False,
@@ -64,10 +69,17 @@ def test_collects_routed_experts_before_transformer_layer(process_group_collecti
     collector = FsdpUnitCollector()
 
     assert collector.collect(root) == [experts, layer, root]
+    assert collector.is_partially_recomputed(layer) == bool(recompute_modules)
+    assert not collector.is_partially_recomputed(experts)
+    assert not collector.is_partially_recomputed(root)
+    # The root layer follows the same collection and policy path as a nested layer.
+    assert collector.collect(layer) == [experts, layer]
+    assert collector.is_partially_recomputed(layer) == bool(recompute_modules)
 
 
 @pytest.mark.parametrize("pattern", ["*E*", "MEM"], ids=["attention", "mamba"])
-def test_shortcut_owns_helper_called_layers(process_group_collection, pattern):
+@pytest.mark.parametrize("recompute_modules", [[], ["shared_experts"]])
+def test_shortcut_owns_helper_called_layers(process_group_collection, pattern, recompute_modules):
     """Wrapper units keep helper-called layers and leave expert units independent."""
     config = TransformerConfig(
         num_layers=3,
@@ -75,6 +87,9 @@ def test_shortcut_owns_helper_called_layers(process_group_collection, pattern):
         num_attention_heads=4,
         num_moe_experts=2,
         moe_ffn_hidden_size=512,
+        moe_shared_expert_intermediate_size=512,
+        recompute_granularity="selective",
+        recompute_modules=recompute_modules,
         moe_grouped_gemm=True,
         moe_token_dispatcher_type="alltoall",
         moe_shortcut_connection=True,
@@ -96,3 +111,16 @@ def test_shortcut_owns_helper_called_layers(process_group_collection, pattern):
     collector = FsdpUnitCollector()
 
     assert collector.collect(model) == [block.moe_layer.mlp.experts, block, sibling, model]
+    assert collector.is_partially_recomputed(block) == bool(recompute_modules)
+    for unit in (block.moe_layer.mlp.experts, sibling, model):
+        assert not collector.is_partially_recomputed(unit)
+
+
+def test_unrelated_recompute_attributes_do_not_enable_policy():
+    """A flag on an unknown module does not imply a known checkpoint boundary."""
+    module = nn.Linear(4, 4)
+    module.recompute_gdn = True
+    collector = FsdpUnitCollector()
+
+    assert collector.collect(module) == [module]
+    assert not collector.is_partially_recomputed(module)
