@@ -252,6 +252,7 @@ class TestMoELayerInit:
                 torch.testing.assert_close(
                     param.main_grad, reference[name].grad, rtol=3e-4, atol=2e-5
                 )
+
     def test_default_moe_backends(self):
         Utils.initialize_model_parallel(1, 1)
         try:

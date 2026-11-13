@@ -1716,7 +1716,7 @@ class TestDDPConfigMapping:
     """Test argparse Namespace → DistributedDataParallelConfig mapping."""
 
     def test_cpu_backup_disable_fields_map_from_args(self):
-        from megatron.training.training import get_megatron_ddp_config
+        from megatron.training.argument_utils import get_megatron_ddp_config
 
         args = _make_ddp_args(
             disable_grad_buffers_cpu_backup=True, disable_param_buffers_cpu_backup=True
@@ -1728,8 +1728,8 @@ class TestDDPConfigMapping:
         assert config.disable_param_buffers_cpu_backup is True
 
     def test_cpu_backup_disable_cli_flags_map_to_ddp_config(self):
+        from megatron.training.argument_utils import get_megatron_ddp_config
         from megatron.training.arguments import _add_distributed_args
-        from megatron.training.training import get_megatron_ddp_config
 
         parser = _add_distributed_args(ArgumentParser())
         parsed_args = parser.parse_args(

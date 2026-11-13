@@ -331,11 +331,6 @@ def _build_tokenizer(cfg, args):
         cfg.tokenizer, make_vocab_size_divisible_by, tp_size
     )
 
-    # TODO (@maanug): remove this WAR once all reads from args.padded_vocab_size
-    # have been updated to read from cfg.tokenizer.padded_vocab_size
-    if getattr(args, "padded_vocab_size", None) is None:
-        args.padded_vocab_size = cfg.tokenizer.padded_vocab_size
-
     # Legacy bootstrap callers may still need this binding. Config-first callers
     # already resolve hash vocabulary in the args adapter, without global services.
     # The tokenizer includes added tokens; padded_vocab_size also includes TP padding.

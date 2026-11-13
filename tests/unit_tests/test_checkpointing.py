@@ -961,6 +961,7 @@ def test_async_save_rejects_reusable_chunked_optimizer_buffers(create_args):
 
     create_args.async_save = True
     create_args.ckpt_format = 'torch_dist'
+    sync_checkpoint_config(create_args)
     optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
     with (
         mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
@@ -973,6 +974,7 @@ def test_checkpoint_save_rejects_mutated_format_with_chunked_optimizer_offload(c
     """Checkpoint entry revalidates the format after resume-time argument restoration."""
 
     create_args.ckpt_format = 'torch'
+    sync_checkpoint_config(create_args)
     optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
     with (
         mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
@@ -986,6 +988,7 @@ def test_checkpoint_save_treats_zero_offload_fraction_as_disabled(create_args):
 
     create_args.async_save = True
     create_args.ckpt_format = 'torch'
+    sync_checkpoint_config(create_args)
     optimizer = SimpleNamespace(
         config=SimpleNamespace(
             chunked_optimizer_state_offload=True, optimizer_state_offload_fraction=0.0
@@ -1008,6 +1011,7 @@ def test_checkpoint_save_skips_offload_guards_without_optimizer_state(create_arg
     create_args.async_save = True
     create_args.ckpt_format = 'torch_dist'
     create_args.no_save_optim = True
+    sync_checkpoint_config(create_args)
     optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
     with (
         mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
@@ -1025,6 +1029,7 @@ def test_checkpoint_save_allows_legacy_format_without_optimizer_state(create_arg
 
     create_args.ckpt_format = 'torch'
     create_args.no_save_optim = True
+    sync_checkpoint_config(create_args)
     optimizer = SimpleNamespace(config=SimpleNamespace(chunked_optimizer_state_offload=True))
     with (
         mock.patch("megatron.training.checkpointing.get_args", return_value=create_args),
@@ -1225,6 +1230,7 @@ def test_kd_teacher_flag_does_not_reenter_removed_modelopt_loader(
         0,
         run_config,
         {},
+        model_cls=GPTModelConfig,
     )
 
 

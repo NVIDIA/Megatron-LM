@@ -2696,8 +2696,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
     def __call__(self, *args, **kwargs):
         # Extract mhc_recompute_manager before CUDA graph manager processes kwargs,
-        # since MHCCheckpointManager is not a CUDA-graph-supported type.
-        self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
+        # since MHCCheckpointManager is not a CUDA-graph-supported type. mHC layers
+        # take it in their own __call__ and arrive here without the kwarg, so keep
+        # the manager they already stored.
+        if "mhc_recompute_manager" in kwargs or not self.supports_mhc_connections:
+            self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
         kwargs.pop("is_last_layer_in_recompute_block", None)
 
         if self._should_call_local_cudagraph(*args, **kwargs):

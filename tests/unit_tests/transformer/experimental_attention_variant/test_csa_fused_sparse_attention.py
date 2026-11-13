@@ -764,7 +764,11 @@ def test_ratio4_training_dispatch_never_touches_native_dense_fallback(monkeypatc
 @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("loss_coeff", [0.0, 0.3])
 def test_ratio4_no_grad_and_training_forward_key_order(monkeypatch, deterministic, loss_coeff):
-    """Exercise both real dispatch paths; only the backend computations are mocked."""
+    """Exercise both real dispatch paths; only the backend computations are mocked.
+
+    Dev lowers the forward-only path like the grad-enabled path (compressed ids, then
+    window ids), so FlashMLA sees one key order with and without grad in every mode.
+    """
     from megatron.core.transformer.experimental_attention_variant import csa as csa_module
 
     sequence, batch, heads, dim = 8, 2, 2, 4
@@ -782,6 +786,8 @@ def test_ratio4_no_grad_and_training_forward_key_order(monkeypatch, deterministi
     module.softmax_scale = 0.5
     module.attn_sink = torch.nn.Parameter(torch.zeros(heads))
     module.num_attention_heads = heads
+    module.n_local_heads = heads
+    module.pg_collection = SimpleNamespace(cp=None)
     module.layer_number = 1
     module.config = SimpleNamespace(
         dsa_indexer_loss_coeff=loss_coeff,
@@ -790,19 +796,25 @@ def test_ratio4_no_grad_and_training_forward_key_order(monkeypatch, deterministi
         deterministic_mode=deterministic,
         num_layers=1,
         mtp_num_layers=0,
+        cuda_graph_impl="none",
+        dsa_indexer_precision="bf16",
     )
     module.__dict__["compressor"] = lambda x: x.new_zeros(sequence // 4, batch, dim)
     module.__dict__["indexer"] = SimpleNamespace(
         index_topk=selected.shape[-1],
         softmax_scale=0.5,
-        forward_before_topk=lambda _x, _qr: (q_indexer, k_indexer, weights),
+        forward_before_topk=lambda _x, _qr, *_args: (q_indexer, k_indexer, weights),
     )
     module.train()
+    monkeypatch.setattr(module, "_get_bshd_compact_indexer_workspace", lambda *_a, **_k: None)
     topk_modes = []
 
-    def fake_topk(_q, _k, _w, _topk, _ratio, *, deterministic=False):
+    # Dev routes both the forward-only ``indexer_topk`` and the fused training
+    # Function through ``_indexer_topk_core``.
+    def fake_topk(_q, _k, _w, topk, ratio=4, *, deterministic=False, return_softmax=False, **_kw):
         topk_modes.append(deterministic)
-        return selected.clone(), (selected >= 0).sum(-1).int(), torch.zeros(batch, sequence, 2)
+        predict = (selected >= 0).float() * 0.5 if return_softmax else None
+        return selected.clone(), (selected >= 0).sum(-1).int(), None, predict
 
     captured = []
 
@@ -814,8 +826,10 @@ def test_ratio4_no_grad_and_training_forward_key_order(monkeypatch, deterministi
         output = value[:, None, None].expand_as(query).clone()
         return output, query.new_zeros(query.shape[:2]), None
 
-    monkeypatch.setattr(fused_csa, "_indexer_topk_bshd", fake_topk)
+    monkeypatch.setattr(fused_csa, "_indexer_topk_core", fake_topk)
     monkeypatch.setattr(fused_csa, "_csa_fwd_flash_mla", fake_flash)
+    # Compare ids at their natural width on any device; FlashMLA alignment pads with -1.
+    monkeypatch.setattr(fused_csa, "get_flash_mla_topk_alignment", lambda: 1)
     monkeypatch.setattr(
         fused_csa, "_compute_attn_target", lambda *_args, **_kwargs: (selected >= 0).float() * 0.5
     )
@@ -829,6 +843,13 @@ def test_ratio4_no_grad_and_training_forward_key_order(monkeypatch, deterministi
                 "d_weights": torch.zeros_like(w),
             }
         ),
+    )
+    # Dev applies the inverse output RoPE from rotary_pos_emb; keep it out of this
+    # key-order check so the output stays the order-sensitive fake value.
+    monkeypatch.setattr(
+        csa_module,
+        "_OutputInverseRope",
+        lambda *_args, **_kwargs: SimpleNamespace(fused_params=None, apply=lambda t: t),
     )
     monkeypatch.setattr(csa_module, "nvtx_range_push", lambda *_args: None)
     monkeypatch.setattr(csa_module, "nvtx_range_pop", lambda *_args: None)
@@ -855,13 +876,13 @@ def test_ratio4_no_grad_and_training_forward_key_order(monkeypatch, deterministi
     )
     assert not torch.equal(training_order, default_order)
     assert (training_order == -1).any()
-    for position, (indices, lengths) in enumerate(captured):
-        expected = training_order if deterministic or position % 2 else default_order
-        assert torch.equal(indices, expected), "no-grad and training key order differ"
+    assert len(captured) == 4
+    for indices, lengths in captured:
+        assert torch.equal(indices, training_order), "no-grad and training key order differ"
         assert torch.equal(lengths, expected_lengths)
     assert topk_modes == [deterministic] * 4
     assert torch.equal(outputs[0], outputs[2]) and torch.equal(outputs[1], outputs[3])
-    assert torch.equal(outputs[0], outputs[1]) == deterministic
+    assert torch.equal(outputs[0], outputs[1])
 
 
 def test_public_surface_is_csa_namespaced_and_keeps_dev_cp_entrypoint():

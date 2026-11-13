@@ -496,6 +496,7 @@ def test_training_log_resets_first_iteration_when_log_interval_is_one(monkeypatc
     args = SimpleNamespace(
         consumed_train_samples=0,
         data_parallel_size=1,
+        decoder_seq_length=None,
         dsa_indexer_loss_coeff=None,
         gtp_weight_remat_size=1,
         log_energy=False,
@@ -631,6 +632,10 @@ def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatc
     )
     run_config.logger = args
     run_config.train = TrainingConfig(micro_batch_size=args.micro_batch_size)
+    # training_log sizes the batch from the model grid; use the test's launch size.
+    from megatron.training.config import container as config_container
+
+    monkeypatch.setattr(config_container, "safe_get_world_size", lambda: args.world_size)
 
     monkeypatch.setattr(training_module, "get_args", lambda: args)
     train_state = TrainState()
@@ -657,6 +662,24 @@ def test_training_log_uses_nominal_microbatches_and_dynamic_cp_parent(monkeypatc
     )
 
     def run_training_log(schedule=schedule_pg_collection):
+        # training_log reads model settings from cfg.model, so mirror the args there.
+        transformer = run_config.model.transformer
+        for name in (
+            "context_parallel_size",
+            "csa_compress_ratios",
+            "csa_dense_mode",
+            "cuda_graph_impl",
+            "dsa_indexer_loss_coeff",
+            "dsa_indexer_skip_topk_offset",
+            "dsa_indexer_topk_freq",
+            "dynamic_context_parallel",
+            "gtp_weight_remat_size",
+            "mtp_num_layers",
+            "mtp_use_repeated_layer",
+            "num_layers",
+        ):
+            setattr(transformer, name, getattr(args, name))
+        run_config.model.hybrid_layer_pattern = getattr(args, "hybrid_layer_pattern", None)
         training_module.training_log(
             {},
             {},

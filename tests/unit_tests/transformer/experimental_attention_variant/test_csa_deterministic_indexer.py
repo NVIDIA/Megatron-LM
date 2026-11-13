@@ -544,7 +544,9 @@ def test_deterministic_dense_indexer_loss_fails_before_launch(monkeypatch):
     from types import SimpleNamespace
 
     monkeypatch.setattr(dk, "_DSA", SimpleNamespace())
-    empty = torch.empty(0)
+    # The guard rejects the dense cuDNN indexer backward when the indexer gradients are
+    # consumed; dev's forward-only dense-loss path (no indexer grads) stays allowed.
+    empty = torch.empty(0, requires_grad=True)
     with pytest.raises(RuntimeError, match="requires dsa_indexer_use_sparse_loss=True"):
         dk.fused_csa_indexer_sparse_attn(
             *([empty] * 7),

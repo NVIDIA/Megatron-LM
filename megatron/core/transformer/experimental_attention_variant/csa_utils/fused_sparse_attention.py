@@ -1612,6 +1612,16 @@ def _deterministic_sparse_bwd_kwargs(
         )
     if not retained_workspace:
         return {"deterministic": True}
+    # NOTE(nightly-sync 2026-11-12): ``_csa_sparse_attention_backward`` hands cuDNN head-padded
+    # operands (FlashMLA pads e.g. 16 query heads to 64 on SM100, exercised by main's #7708
+    # test_non_cp_sparse_attention_backward_reference_and_replay), so size the retained scratch
+    # for that padded problem. The unpadded LSE can also be a strided view of the forward's
+    # padded LSE, which cuDNN's SparseAttentionBackward rejects.
+    padded_num_heads = _get_head_padding(num_heads) if q_flat.is_cuda else num_heads
+    if padded_num_heads != num_heads:
+        q_flat, out_flat, lse, attn_sink = _pad_sparse_attention_heads(
+            padded_num_heads, q_flat, out_flat, lse, attn_sink
+        )
     return {
         "deterministic": True,
         "workspace": _get_deterministic_sparse_attention_workspace(
@@ -3133,7 +3143,14 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
 
-        if deterministic and loss_coeff > 0 and not sparse_loss:
+        # The dense cuDNN indexer backward has no deterministic kernel. It only produces the
+        # indexer gradients, so reject it only when those gradients are consumed.
+        if (
+            deterministic
+            and loss_coeff > 0
+            and not sparse_loss
+            and any(ctx.needs_input_grad[index] for index in (4, 5, 6))
+        ):
             raise RuntimeError(
                 "deterministic CSA indexer backward requires dsa_indexer_use_sparse_loss=True; "
                 "the dense cuDNN indexer backward is not supported in deterministic mode."
@@ -3308,7 +3325,9 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         out_flat, lse, _ = _csa_fwd_flash_mla(
             q_flat,
             kv_flat,
-            global_idxs,
+            # Same aligned width as CSASparseAttnFunc: forward-only and training
+            # passes must hand FlashMLA the identical id tensor.
+            _align_topk_width(global_idxs),
             softmax_scale,
             attn_sink=attn_sink,
             topk_length=topk_length,
@@ -4496,6 +4515,27 @@ __all__ = [
 ]
 
 
+def _pad_sparse_attention_heads(
+    padded_num_heads: int, q: Tensor, out: Tensor, lse: Tensor, attn_sink: Tensor
+) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Pad sparse-attention backward operands to ``padded_num_heads`` query heads.
+
+    Padded query/output rows and LSE entries are zero and padded sinks are ``-inf``, so the extra
+    heads contribute nothing. ``_csa_sparse_attention_backward`` and the retained deterministic
+    workspace sizing share this, so cuDNN sizes its scratch for the operands it actually receives.
+    """
+    actual_num_heads = q.size(1)
+    q_padded = q.new_zeros((q.size(0), padded_num_heads, q.size(2)))
+    q_padded[:, :actual_num_heads, :] = q
+    out_padded = out.new_zeros((out.size(0), padded_num_heads, out.size(2)))
+    out_padded[:, :actual_num_heads, :] = out
+    lse_padded = lse.new_zeros((lse.size(0), padded_num_heads))
+    lse_padded[:, :actual_num_heads] = lse
+    attn_sink_padded = attn_sink.new_full((padded_num_heads,), float("-inf"))
+    attn_sink_padded[:actual_num_heads] = attn_sink
+    return q_padded, out_padded, lse_padded, attn_sink_padded
+
+
 def _csa_sparse_attention_backward(
     q: Tensor,
     kv: Tensor,
@@ -4506,42 +4546,26 @@ def _csa_sparse_attention_backward(
     topk_idxs: Tensor,
     softmax_scale: float,
     topk_length: Optional[Tensor],
-    deterministic: bool = False,
     **backward_kwargs,
 ) -> Tuple[Tensor, Tensor, Tensor]:
     """Run cuDNN sparse-attention backward with FlashMLA-compatible head padding.
 
-    ``deterministic`` selects cuDNN's deterministic kernel with a per-call scratch workspace.
-    Callers that retain a workspace pass the full ``_deterministic_sparse_bwd_kwargs`` result
-    through ``backward_kwargs`` instead.
+    Deterministic execution travels in ``backward_kwargs``: callers pass the
+    ``_deterministic_sparse_bwd_kwargs`` result (with or without a retained workspace), or a bare
+    ``deterministic=True`` for cuDNN's deterministic kernel with a per-call scratch workspace.
     """
     _ensure_dsa_namespace()
 
     actual_num_heads = q.size(1)
     padded_num_heads = _get_head_padding(actual_num_heads) if q.is_cuda else actual_num_heads
     if padded_num_heads != actual_num_heads:
-        q_padded = q.new_zeros((q.size(0), padded_num_heads, q.size(2)))
-        q_padded[:, :actual_num_heads, :] = q
-        q = q_padded
-
-        out_padded = out.new_zeros((out.size(0), padded_num_heads, out.size(2)))
-        out_padded[:, :actual_num_heads, :] = out
-        out = out_padded
-
+        q, out, lse, attn_sink = _pad_sparse_attention_heads(
+            padded_num_heads, q, out, lse, attn_sink
+        )
         d_out_padded = d_out.new_zeros((d_out.size(0), padded_num_heads, d_out.size(2)))
         d_out_padded[:, :actual_num_heads, :] = d_out
         d_out = d_out_padded
 
-        lse_padded = lse.new_zeros((lse.size(0), padded_num_heads))
-        lse_padded[:, :actual_num_heads] = lse
-        lse = lse_padded
-
-        attn_sink_padded = attn_sink.new_full((padded_num_heads,), float("-inf"))
-        attn_sink_padded[:actual_num_heads] = attn_sink
-        attn_sink = attn_sink_padded
-
-    if deterministic and "deterministic" not in backward_kwargs:
-        backward_kwargs.update(_deterministic_sparse_bwd_kwargs(q, requested=True))
     result = _DSA.sparse_attention_backward_wrapper(
         q,
         kv,

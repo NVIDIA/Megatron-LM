@@ -342,10 +342,7 @@ class HybridStack(MegatronModule):
                     if csa_layer_spec is None and submodules.csa_layer is not None:
                         csa_layer_spec = submodules.csa_layer
                     if csa_layer_spec is None:
-                        raise ValueError(
-                            "C/H/W layers require the hybrid stack spec to provide `csa_layer` "
-                            "or, with qk_layernorm enabled, `csa_qk_layernorm_layer`."
-                        )
+                        self._assert_submodule_configured(submodules, csa_layer_spec_name)
                     layer = build_module(
                         csa_layer_spec,
                         config=layer_config,

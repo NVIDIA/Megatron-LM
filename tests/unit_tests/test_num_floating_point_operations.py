@@ -224,8 +224,7 @@ def _flops(args, cfg, batch_size, **kwargs):
         kwargs.setdefault("vision_args", args)
     decoder_seq_length = getattr(args, "decoder_seq_length", None)
     kwargs.setdefault(
-        "sequence_length",
-        decoder_seq_length if decoder_seq_length is not None else args.seq_length,
+        "sequence_length", decoder_seq_length if decoder_seq_length is not None else args.seq_length
     )
     return num_floating_point_operations(model_config, batch_size, **kwargs)
 
@@ -263,9 +262,9 @@ def test_situ_glu_counts_the_same_ffn_gemms_as_swiglu():
     situ_glu_args, situ_glu_cfg = _make_gpt_args(swiglu=False)
     situ_glu_args.situ_glu = True
 
-    assert _flops(
-        situ_glu_args, situ_glu_cfg, batch_size=8
-    ) == _flops(swiglu_args, swiglu_cfg, batch_size=8)
+    assert _flops(situ_glu_args, situ_glu_cfg, batch_size=8) == _flops(
+        swiglu_args, swiglu_cfg, batch_size=8
+    )
 
 
 def _enable_qwen35_vision_flops(args, validate=True):
@@ -461,13 +460,9 @@ class TestQwen35VisionFlops:
         common = dict(vision_total_tokens_in_batch=32, vision_merged_tokens_in_batch=8)
 
         # T=1, 4x8 grid: one 32-long sequence -> sum(L^2) = 1024.
-        one_frame = _flops(
-            args, cfg, 2, vision_seqlen_squared_sum_in_batch=1024, **common
-        )
+        one_frame = _flops(args, cfg, 2, vision_seqlen_squared_sum_in_batch=1024, **common)
         # T=4, 4x2 grid: four 8-long sequences -> sum(L^2) = 4 * 64 = 256.
-        four_frames = _flops(
-            args, cfg, 2, vision_seqlen_squared_sum_in_batch=256, **common
-        )
+        four_frames = _flops(args, cfg, 2, vision_seqlen_squared_sum_in_batch=256, **common)
         # Only the attention term differs: 2 layers * 3 * 4 * dsum * proj(=8).
         assert one_frame - four_frames == 2 * 12 * (1024 - 256) * 8
 
@@ -720,9 +715,7 @@ class TestHybridMatchesStandard:
         batch_size = 4
 
         # BSHD: closed-form defaults.
-        assert _flops(
-            standard, standard_cfg, batch_size
-        ) == _flops(hybrid, hybrid_cfg, batch_size)
+        assert _flops(standard, standard_cfg, batch_size) == _flops(hybrid, hybrid_cfg, batch_size)
 
         # THD: both paths must consume the ragged stats identically.
         s = standard.seq_length
@@ -916,9 +909,7 @@ class TestKimiDeltaAttentionFlops:
         )
         logits_forward = 2 * total_tokens * args.hidden_size * cfg.tokenizer.padded_vocab_size
 
-        assert _flops(args, cfg, batch_size) == 3 * (
-            kda_forward + logits_forward
-        )
+        assert _flops(args, cfg, batch_size) == 3 * (kda_forward + logits_forward)
 
 
 class TestMLAHeadwiseOutputGateFlops:
@@ -928,12 +919,8 @@ class TestMLAHeadwiseOutputGateFlops:
         args, cfg = _make_mla_hybrid_args()
         batch_size = 2
         bshd_sum = batch_size * args.seq_length**2
-        flops_full = _flops(
-            args, cfg, batch_size, seqlen_squared_sum_in_batch=bshd_sum
-        )
-        flops_half = _flops(
-            args, cfg, batch_size, seqlen_squared_sum_in_batch=bshd_sum // 2
-        )
+        flops_full = _flops(args, cfg, batch_size, seqlen_squared_sum_in_batch=bshd_sum)
+        flops_half = _flops(args, cfg, batch_size, seqlen_squared_sum_in_batch=bshd_sum // 2)
         expected_delta = (
             3
             * (bshd_sum // 2)
@@ -1023,9 +1010,7 @@ class TestAttentionResidualFlops:
         disabled_args = SimpleNamespace(**vars(args))
         disabled_args.enable_attention_residuals = False
         disabled_args.attn_res_block_layers = None
-        disabled_flops = _flops(
-            disabled_args, cfg, batch_size, **flops_kwargs
-        )
+        disabled_flops = _flops(disabled_args, cfg, batch_size, **flops_kwargs)
         enabled_args = SimpleNamespace(**vars(args))
         enabled_args.enable_attention_residuals = True
         enabled_args.attn_res_block_layers = block_layers
@@ -2212,9 +2197,7 @@ class TestDSv4HybridMatchesStandard:
         batch_size = 2
 
         # BSHD (closed-form defaults).
-        assert _flops(
-            standard, standard_cfg, batch_size
-        ) == _flops(hybrid, hybrid_cfg, batch_size)
+        assert _flops(standard, standard_cfg, batch_size) == _flops(hybrid, hybrid_cfg, batch_size)
 
         # THD: both paths must consume the ragged stats identically.
         s = standard.seq_length

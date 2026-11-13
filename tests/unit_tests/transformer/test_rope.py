@@ -90,6 +90,7 @@ def _cpu_multimodal_rope(kv_channels: int = 64) -> MultimodalRotaryEmbedding:
     torch.nn.Module.__init__(emb)
     dim = kv_channels
     emb.rotary_interleaved = False
+    emb.interleaved_mrope = False
     emb.seq_len_interpolation_factor = None
     emb.inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
     emb.cp_group = None
