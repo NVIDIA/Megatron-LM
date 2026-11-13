@@ -12,9 +12,11 @@ dtype (TE RMSNorm output), then RoPE runs in fp32 on the rounded value (TE fused
 backward mirrors it: RoPE dgrad rounded to the activation dtype, then RMSNorm dgrad in fp32 from
 the saved input with rsigma recomputed. dgamma is reduced per program into one fp32 row of a
 buffer, then a second kernel sums the rows in a fixed order, so it is deterministic. Q/K/V dgrads
-are written straight into one [sq, b, ng, (nq + 2) * hn] tensor: no concat.
+are written straight into one [sq, b, ng, (nq + 2) * hn] tensor: no concat. The backward's tokens
+per program follow the work per SM, so its dgamma summation order is fixed per shape and GPU model.
 """
 
+import functools
 from typing import Optional, Tuple
 from unittest.mock import MagicMock
 
@@ -59,10 +61,10 @@ def _rsqrt(x):
 # Launches pin enable_fp_fusion=True (Triton's default until 3.10): the TE parity is tested with it.
 # Launch shape: tokens handled per program (looped) and warps per program. Module-level so a
 # benchmark can sweep them; no autotuning, so the first call is safe ahead of CUDA graph capture.
-# Tuned at head dim 128 with 8 and 16 query heads per group.
-# BWD_WARPS None: 1 warp up to 8 query heads per group, else 2.
+# Tuned at head dim 128 with 4 to 16 query heads per group.
+# BWD_TOKENS None: see _bwd_tokens. BWD_WARPS None: 1 warp up to 8 query heads per group, else 2.
 FWD_TOKENS, FWD_WARPS = 1, 1
-BWD_TOKENS, BWD_WARPS = 16, None
+BWD_TOKENS, BWD_WARPS = None, None
 # Norm-weight grad reduction: rows of partials and grad columns per program, and warps.
 RED_ROWS, RED_COLS, RED_WARPS = 4096, 2, 8
 
@@ -287,6 +289,23 @@ def _norm_weight_grad_reduce_kernel(
     tl.store(dw_ptr + cols, tl.sum(acc, axis=0).to(dw_ptr.dtype.element_ty), mask=cols < W)
 
 
+@functools.lru_cache(maxsize=None)
+def _num_sms(device_index: int) -> int:
+    return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def _bwd_tokens(tokens_per_rank: int, ng: int, num_sms: int) -> int:
+    """Backward tokens per program: BWD_TOKENS if set, else the largest power of 2 up to 8 that
+    leaves at least 32 programs per SM. The kernel is latency-bound, so it needs many programs in
+    flight; fewer tokens per program costs more weight loads and partial rows."""
+    if BWD_TOKENS:
+        return BWD_TOKENS
+    tokens = 1
+    while tokens < 8 and tokens_per_rank * ng >= 2 * tokens * 32 * num_sms:
+        tokens *= 2
+    return tokens
+
+
 def _freqs_2d(freqs: torch.Tensor, sq: int, hn: int) -> torch.Tensor:
     """[sq', 1, 1, hn] (or [sq', hn]) fp32 RoPE angles -> [sq, hn] view with unit last stride."""
     f = freqs.reshape(freqs.shape[0], -1)
@@ -355,7 +374,8 @@ class _FusedQKVQKNormRoPE(torch.autograd.Function):
         sq, b, ng, row = mixed_qkv.shape
         hn = row // (nq + 2)
         T = sq * b
-        n_t = triton.cdiv(T, BWD_TOKENS)
+        tokens = _bwd_tokens(T, ng, _num_sms(mixed_qkv.device.index))
+        n_t = triton.cdiv(T, tokens)
         dqkv = mixed_qkv.new_empty(sq, b, ng, row)
         P = n_t * ng
         dw_part = torch.empty(P, 2 * hn, device=mixed_qkv.device, dtype=torch.float32)
@@ -383,7 +403,7 @@ class _FusedQKVQKNormRoPE(torch.autograd.Function):
             NQ=nq,
             NQ_P2=triton.next_power_of_2(nq),
             HN=hn,
-            TOKENS=BWD_TOKENS,
+            TOKENS=tokens,
             SAME_FREQS=kf is qf,
             num_warps=BWD_WARPS or (1 if nq <= 8 else 2),
             enable_fp_fusion=True,

@@ -11,6 +11,7 @@ try:
 except ImportError:
     HAVE_TE = False
 
+from megatron.core.fusions import fused_qkv_qknorm_rope as fused_module
 from megatron.core.fusions.fused_qkv_qknorm_rope import HAVE_TRITON, fused_qkv_qknorm_rope
 
 pytestmark = pytest.mark.skipif(
@@ -51,7 +52,10 @@ def _fp64_oracle(mixed, freqs, qw, kw, nq, hn, eps, zc):
     "sq,b,ng,nq,hn", [(256, 2, 4, 8, 128), (128, 3, 2, 4, 64), (64, 1, 1, 1, 128)]
 )
 @pytest.mark.parametrize("zc", [False, True])
-def test_matches_unfused_te_path(sq, b, ng, nq, hn, zc):
+# None: automatic (1 token per program at these sizes); 7: the last program gets a partial block.
+@pytest.mark.parametrize("bwd_tokens", [None, 7])
+def test_matches_unfused_te_path(sq, b, ng, nq, hn, zc, bwd_tokens, monkeypatch):
+    monkeypatch.setattr(fused_module, "BWD_TOKENS", bwd_tokens)
     torch.manual_seed(0)
     eps = 1e-6
     row = (nq + 2) * hn
@@ -91,6 +95,15 @@ def test_matches_unfused_te_path(sq, b, ng, nq, hn, zc):
     ora = _fp64_oracle(mixed, freqs, qn.weight, kn.weight, nq, hn, eps, zc)
     for o, r, x in zip(out, ref, ora):
         assert (o.double() - x).abs().max() <= (r.double() - x).abs().max() * 1.01 + 1e-6
+
+
+def test_bwd_tokens_follow_work_per_sm(monkeypatch):
+    monkeypatch.setattr(fused_module, "BWD_TOKENS", None)
+    # Largest power of 2 up to 8 leaving at least 32 programs per SM.
+    picks = [fused_module._bwd_tokens(t, 4, 100) for t in (1024, 1600, 3200, 6400, 65536)]
+    assert picks == [1, 2, 4, 8, 8]
+    monkeypatch.setattr(fused_module, "BWD_TOKENS", 16)
+    assert fused_module._bwd_tokens(1024, 4, 100) == 16
 
 
 def test_value_and_layout_copy_exact():

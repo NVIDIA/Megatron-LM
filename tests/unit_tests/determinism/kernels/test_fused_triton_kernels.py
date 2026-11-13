@@ -16,8 +16,8 @@
   first call chose.
 * Fused QKV split + Q/K RMSNorm + RoPE (``fused_qkv_qknorm_rope``): per-head ``tl.sum``
   reductions in forward and backward, and the Q/K norm-weight grads reduced from per-program
-  partials; forward and backward replay at both backward warp settings, with a partial last
-  token block and a strided input.
+  partials; forward and backward replay at both backward warp settings, at the automatic and a
+  forced 16 tokens per backward program (a partial last block), and with a strided input.
 * mHC hyper-connection kernels (``fused_mhc_kernels``): Sinkhorn, h-aggregate and h-post-BDA
   contain real ``tl.sum`` reductions under autotune, on the Triton, native (``torch.compile``)
   and, when available, cuTile backends.
@@ -54,9 +54,10 @@ except ImportError:
     HAVE_TRITON = False
 
 try:
+    from megatron.core.fusions import fused_qkv_qknorm_rope as fused_qkv_qknorm_rope_module
     from megatron.core.fusions.fused_qkv_qknorm_rope import fused_qkv_qknorm_rope
 except ImportError:
-    fused_qkv_qknorm_rope = None
+    fused_qkv_qknorm_rope = fused_qkv_qknorm_rope_module = None
 
 try:
     from megatron.core.fusions import fused_mla_yarn_rope_apply as fused_mla_rope_module
@@ -362,9 +363,11 @@ def test_fused_moe_residual_add_replays_and_matches_unfused_adds(dtype):
 @pytest.mark.skipif(fused_qkv_qknorm_rope is None, reason="fused QKV QK-norm RoPE unavailable")
 @pytest.mark.parametrize("num_query_heads_per_group", [8, 16])  # 1 and 2 backward warps
 @pytest.mark.parametrize("strided", [False, True])
-def test_fused_qkv_qknorm_rope_replays(num_query_heads_per_group, strided):
+@pytest.mark.parametrize("bwd_tokens", [None, 16])
+def test_fused_qkv_qknorm_rope_replays(num_query_heads_per_group, strided, bwd_tokens, monkeypatch):
+    monkeypatch.setattr(fused_qkv_qknorm_rope_module, "BWD_TOKENS", bwd_tokens)
     seeded()
-    # 257 x 2 tokens: the last backward program covers a partial token block.
+    # 257 x 2 tokens: at 16 per program, the last backward program covers a partial block.
     sq, b, ng, hn = 257, 2, 2, 128
     row = (num_query_heads_per_group + 2) * hn
     pad = 64 if strided else 0
