@@ -23,10 +23,12 @@ import pretrain_hybrid
 import pretrain_vlm
 from megatron.core import parallel_state, process_groups_config, tensor_parallel
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training import global_vars, training
 from megatron.training import utils as training_utils
 from megatron.training.config import TrainingConfig, ValidationConfig
 from megatron.training.datasets import data_samplers, providers
+from megatron.training.models import LLaVAModelConfig
 from megatron.training.state import TrainState
 from megatron.training.utils import is_first_or_last_pipeline_stage
 from tests.unit_tests.test_utilities import Utils
@@ -294,9 +296,15 @@ def test_dataset_provider_builds_on_the_supplied_groups(
 # The VLM training script
 
 
+def _vlm_run_config(**fields):
+    """A run config with the LLaVA model config that the VLM entry points require."""
+    transformer = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=2)
+    return SimpleNamespace(model=LLaVAModelConfig(transformer=transformer, seq_length=16), **fields)
+
+
 def _stub_vlm_dataset_inputs(monkeypatch):
     monkeypatch.setattr(pretrain_vlm, "print_rank_0", lambda message: None)
-    monkeypatch.setattr(pretrain_vlm, "get_run_config", lambda: SimpleNamespace(rng=Mock()))
+    monkeypatch.setattr(pretrain_vlm, "get_run_config", lambda: _vlm_run_config(rng=Mock()))
     monkeypatch.setattr(pretrain_vlm, "get_args", Mock)
     monkeypatch.setattr(pretrain_vlm, "get_tokenizer", Mock)
     monkeypatch.setattr(pretrain_vlm, "MultimodalDatasetConfig", Mock)
@@ -499,6 +507,7 @@ def test_vlm_get_batch_without_groups_warns_and_uses_the_global_group(monkeypatc
         "get_args",
         lambda: SimpleNamespace(context_parallel_size=1, sequence_parallel=False),
     )
+    monkeypatch.setattr(pretrain_vlm, "get_run_config", _vlm_run_config)
     groups = []
 
     def broadcast_data(keys, data, datatype, tp_group=None):
@@ -518,7 +527,7 @@ def test_vlm_model_provider_without_groups_warns_before_using_the_global_groups(
         pass
 
     monkeypatch.setattr(pretrain_vlm, "get_args", Mock)
-    monkeypatch.setattr(pretrain_vlm, "get_run_config", Mock)
+    monkeypatch.setattr(pretrain_vlm, "get_run_config", _vlm_run_config)
     monkeypatch.setattr(
         ProcessGroupCollection, "use_mpu_process_groups", Mock(side_effect=GlobalGroupsRead)
     )
