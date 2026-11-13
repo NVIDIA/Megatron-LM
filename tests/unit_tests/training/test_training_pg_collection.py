@@ -77,9 +77,9 @@ class TestTrainingPgCollection:
         Utils.initialize_model_parallel(expert_model_parallel_size=2)
         # The expert all-gather group follows the model config's expert-parallel size.
         run_config.model.transformer.expert_model_parallel_size = 2
-        args = SimpleNamespace(create_all_gather_group=create_all_gather_group)
+        ddp_config = DistributedDataParallelConfig(create_all_gather_group=create_all_gather_group)
 
-        pg_collection = training._build_pg_collection_from_parallel_state(args)
+        pg_collection = training._build_pg_collection_from_parallel_state(ddp_config)
 
         if not create_all_gather_group:
             assert pg_collection.dp_cp_ag is None and pg_collection.expt_dp_ag is None
@@ -108,20 +108,20 @@ class TestTrainingPgCollection:
         monkeypatch.setattr(
             training, "create_all_gather_groups", lambda **kwargs: all_gather_groups
         )
-        args = SimpleNamespace(create_all_gather_group=True)
+        ddp_config = DistributedDataParallelConfig(create_all_gather_group=True)
 
         with pytest.raises(ValueError, match="all-gather groups whose ranks differ"):
-            training._build_pg_collection_from_parallel_state(args)
+            training._build_pg_collection_from_parallel_state(ddp_config)
 
     @pytest.mark.usefixtures("run_config")
     def test_all_gather_groups_reject_several_optimizer_instances(self):
         # Megatron-FSDP then shards over the intra-instance group, which has half of the
         # data-parallel ranks that the all-gather group spans.
         Utils.initialize_model_parallel(num_distributed_optimizer_instances=2)
-        args = SimpleNamespace(create_all_gather_group=True)
+        ddp_config = DistributedDataParallelConfig(create_all_gather_group=True)
 
         with pytest.raises(ValueError, match="--num-distributed-optimizer-instances > 1"):
-            training._build_pg_collection_from_parallel_state(args)
+            training._build_pg_collection_from_parallel_state(ddp_config)
 
     @pytest.mark.usefixtures("run_config")
     def test_get_model_wraps_ddp_with_the_given_collection(self, monkeypatch):
