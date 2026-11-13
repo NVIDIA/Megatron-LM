@@ -52,7 +52,6 @@ skill keyword — infer it from the artifact you read.
 
 - After editing imports in any Python files, always run `uv run isort` on those files to fix import order before committing.
 - Do not bypass Testmon cache identity/restoration or force full execution for individual test buckets.
-  Honor the requested Testmon mode and preserve the standard fallback when a compatible baseline is unavailable.
 
 ### Megatron Core Process Groups
 
