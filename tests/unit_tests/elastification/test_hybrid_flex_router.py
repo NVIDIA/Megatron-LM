@@ -95,8 +95,10 @@ class TestFlextronRouter:
         # it with curr_iteration. Since start=end=1.0 the values are all 1.0
         # regardless of length, so overshooting is free.
         _megatron_training.get_args = lambda: Namespace(
-            curr_iteration=0, train_iters=1000, train_samples=1000, global_batch_size=1
+            train_iters=1000, train_samples=1000, global_batch_size=1
         )
+        self._orig_get_train_state = _megatron_training.get_train_state
+        _megatron_training.get_train_state = lambda: Namespace(iteration=0)
         # The router's __init__ also reads global microbatch state via
         # get_current_global_batch_size / get_micro_batch_size. These return
         # None outside a full Megatron initialize — stub them at the module
@@ -109,6 +111,7 @@ class TestFlextronRouter:
     def teardown_method(self, method):
         FlextronRouter._sync_router_weights = self._orig_sync
         _megatron_training.get_args = self._orig_get_args
+        _megatron_training.get_train_state = self._orig_get_train_state
         _router_module.get_current_global_batch_size = self._orig_gbs
         _router_module.get_micro_batch_size = self._orig_mbs
         Utils.destroy_model_parallel()
@@ -209,8 +212,9 @@ class TestFlextronRouter:
         # that is the only thing that varies. train_iters must stay >=
         # curr_iteration (matches setup-method stub length).
         _megatron_training.get_args = lambda: Namespace(
-            curr_iteration=100, train_iters=1000, train_samples=1000, global_batch_size=1
+            train_iters=1000, train_samples=1000, global_batch_size=1
         )
+        _megatron_training.get_train_state = lambda: Namespace(iteration=100)
         router.fwd_pass_count = 0
         out_iter_100 = router(1.0)
 

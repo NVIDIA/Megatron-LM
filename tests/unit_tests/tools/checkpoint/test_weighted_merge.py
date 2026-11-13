@@ -20,6 +20,7 @@ from megatron.core.models.gpt import GPTModel
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.test_utilities import Utils
 from tools.checkpoint import weighted_merge as weighted_merge_module
 from tools.checkpoint.weighted_merge import (
     WeightedMergeError,
@@ -30,12 +31,16 @@ from tools.checkpoint.weighted_merge import (
 
 @pytest.fixture
 def process_group():
-    already_initialized = dist.is_available() and dist.is_initialized()
+    if torch.cuda.is_available():
+        Utils.initialize_distributed()
+        yield
+        return
+    # CPU-only run: create a one-rank gloo group and destroy it afterwards.
+    created = not dist.is_initialized()
     weighted_merge_module._ensure_process_group()
     yield
-    if not already_initialized and dist.is_available() and dist.is_initialized():
-        if dist.get_world_size() == 1:
-            dist.destroy_process_group()
+    if created:
+        dist.destroy_process_group()
 
 
 def _configured_world_size():

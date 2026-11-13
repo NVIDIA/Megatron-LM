@@ -335,7 +335,10 @@ def test_mfsdp_v2_rejects_custom_recipe_at_startup():
     config = TransformerConfig(
         num_layers=1, hidden_size=128, num_attention_heads=4, custom_recipe=TEST_FACTORY_PATH
     )
-    ddp_config = DistributedDataParallelConfig(data_parallel_sharding_strategy="optim_grads_params")
+    ddp_config = DistributedDataParallelConfig(
+        data_parallel_sharding_strategy="optim_grads_params",
+        expert_outer_dp_sharding_strategy="no_shard",
+    )
     pg_collection = SimpleNamespace(
         dp_cp=object(), tp=None, pp=None, cp=None, ep=None, expt_dp=None
     )

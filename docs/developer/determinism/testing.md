@@ -52,6 +52,11 @@ non-empty `tests` tuple or an explicit `exempt_reason` (for example a
 multi-rank NVLS collective that needs an NVLink peer group, or an allocator
 with no compute kernel). Exemptions are visible coverage debt, not silence.
 
+The shared unit-test fixtures restore the saved cuDNN flags inside PyTorch's
+scoped backend-mutation context. This allows teardown after importing
+`torch.testing._internal.common_utils`, which freezes bare flag assignments,
+while preserving the frozen state outside restoration.
+
 ## Golden-value error diagnostics
 
 The functional comparison logs differences even when they pass tolerance. For
@@ -97,8 +102,8 @@ error never updates a golden value.
      one of its determinism tests. Override with the `determinism-exempt`
      PR label when the change cannot affect numerics (comment-only edits,
      refactors); the check then logs the exemption instead of failing.
-3. **Review**: the PR template checkbox and the `/claude review` prompt ask
-   for the test explicitly.
+3. **Review**: the PR template checkbox and the `/review` rubric
+   (`skills/pr-review/references/light.md`) ask for the test explicitly.
 
 The kernel bucket runs in the H100 unit-test recipe
 (`tests/test_utils/recipes/h100/unit-tests.yaml`). Hardware-specific

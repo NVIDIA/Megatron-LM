@@ -9,17 +9,34 @@ from pytest_mock import mocker
 
 import megatron.core.pipeline_parallel.schedules as schedule
 from megatron.core import ModelParallelConfig
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
+from megatron.core.full_cuda_graph import (
+    FullCudaGraphWrapper,
+    StaticBufferLoader,
+    get_shared_capture_stream,
+)
+from megatron.core.rerun_state_machine import RerunMode, RerunStateMachine
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
-    initialize_rng_tracker,
     model_parallel_cuda_manual_seed,
+    prime_cuda_rng_states_for_graph_capture,
 )
-from megatron.core.utils import is_te_min_version
+from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.models.dist_utils import _ddp_wrap
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
+
+
+@pytest.fixture(autouse=True)
+def reset_full_cuda_graph_state():
+    """The wrapper keeps its graph and static buffers on the class."""
+    # Select each rank's device before a test creates the shared capture stream.
+    Utils.initialize_distributed()
+    yield
+    FullCudaGraphWrapper.curr_iteration = {'training': 0, 'validation': 0}
+    FullCudaGraphWrapper.cuda_graph = {'training': None, 'validation': None}
+    FullCudaGraphWrapper.result = {'training': None, 'validation': None}
+    StaticBufferLoader.static_buffers = {'training': [], 'validation': []}
 
 
 def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
@@ -90,6 +107,102 @@ def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
     assert all(param.grad is not None for param in wrapped_model.parameters())
 
 
+def test_full_cuda_graph_warmup_with_retained_none_grad_leaf(mocker):
+    """Warmup-created leaves returning None must retain the stream used for capture."""
+
+    class FusedWeightGrad(torch.autograd.Function):
+        """Model fused wgrad writing main_grad and returning no autograd gradient."""
+
+        @staticmethod
+        def forward(ctx, weight, inputs, main_grad):
+            """Save the inputs needed to compute the weight gradient."""
+            ctx.save_for_backward(inputs)
+            ctx.main_grad = main_grad
+            return weight * inputs
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            """Write the real gradient without returning a dummy weight gradient."""
+            (inputs,) = ctx.saved_tensors
+            ctx.main_grad.copy_(grad_output * inputs)
+            return None, None, None
+
+    mocker.patch("megatron.core.full_cuda_graph.get_all_rng_states", return_value={})
+    mocker.patch(
+        "megatron.core.full_cuda_graph.get_rerun_state_machine",
+        return_value=RerunStateMachine(mode=RerunMode.DISABLED),
+    )
+    # Stream alignment must work without changing PyTorch's process-global override.
+    mocker.patch("torch.autograd.graph.set_override_stale_capture_stream", create=True)
+    Utils.initialize_model_parallel()
+    weight = torch.ones(8, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    inputs = torch.empty_like(weight)
+    main_grad = torch.empty_like(weight)
+    accumulators = []
+
+    def forward_backward(**_):
+        assert torch.cuda.current_stream() == get_shared_capture_stream()
+        if not accumulators:
+            # Retain a lazily created leaf, as MoonEP/TE do during eager warmup.
+            accumulators.append(weight.expand_as(weight).grad_fn.next_functions[0][0])
+        loss = FusedWeightGrad.apply(weight, inputs, main_grad).sum()
+        loss.backward()
+        return loss.detach()
+
+    warmup_steps = 2
+    wrapper = FullCudaGraphWrapper(forward_backward, cuda_graph_warmup_steps=warmup_steps)
+    wrapper.reset_cuda_graph()
+    try:
+        for value in range(1, warmup_steps + 4):
+            inputs.fill_(value)
+            main_grad.zero_()
+            loss = wrapper(
+                model=[torch.nn.Identity()],
+                data_iterator=None,
+                num_microbatches=1,
+                seq_length=8,
+                forward_only=False,
+            )
+            torch.testing.assert_close(loss, inputs.sum(), rtol=0, atol=0)
+            torch.testing.assert_close(main_grad, inputs, rtol=0, atol=0)
+            assert weight.grad is None
+        assert wrapper.cuda_graph["training"] is not None
+    finally:
+        wrapper.reset_cuda_graph()
+        accumulators.clear()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.skipif(
+    not is_torch_min_version("2.14.0a0"),
+    reason="Generator capture state is created lazily only on PyTorch >= 2.14",
+)
+def test_prime_cuda_rng_states_for_graph_capture():
+    """The first RNG use in a capture must not poll an event on a newly captured stream."""
+    side_stream = torch.cuda.Stream()
+    pending = torch.empty(1024, device="cuda")
+    # Recorded before capture, so the allocator still holds this use when the block is freed.
+    pending.record_stream(side_stream)
+
+    cuda_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(
+        cuda_graph, stream=torch.cuda.Stream(), capture_error_mode="thread_local"
+    ):
+        prime_cuda_rng_states_for_graph_capture()
+        # side_stream is not captured yet, so the allocator defers this free.
+        del pending
+        # side_stream joins the capture, as an NCCL stream does on a pipeline recv.
+        side_stream.wait_stream(torch.cuda.current_stream())
+        # Unprimed, this RNG use creates its capture state on the default stream; that allocation
+        # records and queries an event on side_stream and fails with cudaErrorCapturedEvent.
+        sample = torch.rand(8, device="cuda")
+        torch.cuda.current_stream().wait_stream(side_stream)
+
+    cuda_graph.replay()
+    torch.cuda.synchronize()
+    assert bool(((sample >= 0) & (sample < 1)).all())
+
+
 @pytest.mark.skipif(
     not (HAVE_TE and is_te_min_version("1.5.0")),
     reason="use_te_rng_tracker requires TransformerEngine version >= 1.5",
@@ -97,8 +210,8 @@ def test_ddp_grad_accumulators_share_full_cuda_graph_stream():
 def test_forward_backward_func_with_full_cuda_graph(mocker):
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
-    initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
     Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
+    model_parallel_cuda_manual_seed(123, te_rng_tracker=True, force_reset_rng=True)
 
     def forward_step_func(data_iterator, model):
         import os

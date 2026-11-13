@@ -20,6 +20,7 @@ class Connection(IntEnum):
 
     CONNECT = 0
     CONNECT_ACK = 1
+    REGISTER_ROLE_ACK = 2
 
 
 class Request(IntEnum):
@@ -32,6 +33,17 @@ class Request(IntEnum):
     SUBMIT_REQUEST_WITH_KV = 24  # Decode-side KV import.
     RELEASE_KV = 25  # Free pinned handoff blocks.
     SEND_KV = 26  # Tell the prefill engine to send a handoff's KV.
+    REGISTER_ROLE = 27  # Engine announces its prefill/decode role.
+    KV_READ_DONE = 28  # Decode finished importing a handoff.
+    REQUEST_ERROR = 29  # Terminal request failure.
+    KV_TRANSFER_READY = 30  # Decode committed destinations for a two-sided transfer.
+    REQUEST_ABORTED = 31  # Engine confirms cancellation is safe to finalize.
+    RELEASE_KV_ACK = 32  # Coordinator accepted a fenced source release.
+    REGISTER_KV = 33  # Source engine retained a handoff.
+    CLAIM_KV = 34  # Decode attempt claims source state before importing it.
+    CLAIM_KV_ACK = 35
+    RELEASE_KV_OWNER = 36  # Supervisor confirms all ranks of an attempt exited.
+    RELEASE_KV_OWNER_ACK = 37
 
 
 class Control(IntEnum):

@@ -1,10 +1,12 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
 
 from megatron.core.extensions.transformer_engine import te_general_gemm
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
     _wgrad_gemm,
@@ -162,6 +164,83 @@ def test_column_parallel_linear_checks_shape_for_non_gtp_weight():
         layer(torch.zeros(2, 4), weight=weight)
 
 
+@pytest.mark.parametrize("output_dtype", [None, torch.float32])
+def test_column_parallel_linear_forward_output_dtype_override(output_dtype):
+    """A per-call `output_dtype` replaces the constructor's for that call; None keeps it."""
+    layer = _make_column_parallel_linear_for_weight_shape_check()
+    layer.output_dtype = torch.bfloat16
+    seen = {}
+    layer._forward_impl = lambda **kwargs: seen.update(kwargs) or kwargs["input"]
+
+    layer(torch.zeros(2, 4), weight=torch.zeros(8, 4), output_dtype=output_dtype)
+
+    assert seen["output_dtype"] is (torch.bfloat16 if output_dtype is None else output_dtype)
+
+
+@pytest.mark.parametrize(
+    "inference_optimized,inference_active,expected",
+    [(True, True, "inference"), (True, False, "default"), (False, True, "default")],
+)
+def test_column_parallel_linear_gather_tensor_parallel_output_dispatch(
+    inference_optimized, inference_active, expected
+):
+    layer = _make_column_parallel_linear_for_weight_shape_check()
+    layer.use_inference_optimized_all_gather = inference_optimized
+    output_parallel = torch.zeros(2, 8)
+    gathered = {"inference": torch.ones(2, 16), "default": torch.full((2, 16), 2.0)}
+
+    with (
+        mock.patch.object(InferenceMode, "_is_active", inference_active),
+        mock.patch(
+            "megatron.core.tensor_parallel.inference_layers."
+            "inference_all_gather_from_tensor_model_parallel_region",
+            return_value=gathered["inference"],
+        ) as inference_gather,
+        mock.patch(
+            "megatron.core.tensor_parallel.layers.gather_from_tensor_model_parallel_region",
+            return_value=gathered["default"],
+        ) as default_gather,
+    ):
+        assert layer.gather_tensor_parallel_output(output_parallel, barrier_before=True) is (
+            gathered[expected]
+        )
+        if expected == "inference":
+            assert inference_gather.call_args.kwargs == {"barrier_before": True}
+        # forward(gather_output=True) must take the same path.
+        for inference_tp_ag_barrier in (False, True):
+            output, _bias = layer(
+                torch.zeros(2, 4),
+                weight=torch.zeros(8, 4),
+                runtime_gather_output=True,
+                inference_tp_ag_barrier=inference_tp_ag_barrier,
+            )
+            assert output is gathered[expected]
+            if expected == "inference":
+                assert inference_gather.call_args.kwargs == {
+                    "barrier_before": inference_tp_ag_barrier
+                }
+
+    if expected == "inference":
+        assert inference_gather.call_count == 3 and default_gather.call_count == 0
+        assert inference_gather.call_args.args[1:] == (layer.tp_group, layer.config)
+    else:
+        assert default_gather.call_count == 3 and inference_gather.call_count == 0
+        assert default_gather.call_args.kwargs == {"group": layer.tp_group}
+
+    # Omitting the argument keeps forward's gather barrier-free.
+    with (
+        mock.patch.object(InferenceMode, "_is_active", inference_active),
+        mock.patch(
+            "megatron.core.tensor_parallel.inference_layers."
+            "inference_all_gather_from_tensor_model_parallel_region",
+            return_value=gathered["inference"],
+        ) as inference_gather,
+    ):
+        layer(torch.zeros(2, 4), weight=torch.zeros(8, 4), runtime_gather_output=True)
+    if expected == "inference":
+        assert inference_gather.call_args.kwargs == {"barrier_before": False}
+
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
 def test_linear_default_output_dtype_preserves_input_dtype(dtype):
     Utils.initialize_model_parallel(1, 1)
@@ -285,12 +364,12 @@ def test_linear_with_grad_accumulation_supports_fp32_output_and_bf16_backward():
 @pytest.mark.parametrize("cross_entropy_fusion", [False, True])
 def test_fp32_linear_output_is_an_inplace_safe_ce_workspace(frozen_weight, cross_entropy_fusion):
     """FP32 output logits should be one owning allocation reusable by cross entropy."""
-    from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
-    from megatron.core.parallel_state import get_tensor_model_parallel_group
-    from megatron.core.tensor_parallel.cross_entropy import (
+    from megatron.core.ops.loss.cross_entropy import (
         VocabParallelCrossEntropy,
         vocab_parallel_cross_entropy,
     )
+    from megatron.core.ops.loss.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+    from megatron.core.parallel_state import get_tensor_model_parallel_group
 
     Utils.initialize_model_parallel(1, 1)
 

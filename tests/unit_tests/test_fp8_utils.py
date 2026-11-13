@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 
 from megatron.core import fp8_utils
+from megatron.core.transformer import TransformerConfig
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.test_utilities import Utils
 
@@ -62,6 +63,31 @@ def test_get_fp8_disabled_context_uses_disabled_te_context(is_init, config_value
 
     assert result is disabled_context
     te_context.assert_called_once_with(enabled=False)
+
+
+def _dummy_quantizer_factory(*args, **kwargs):
+    return None
+
+
+@pytest.mark.skipif(not fp8_utils.HAVE_TE, reason="Transformer Engine required")
+def test_custom_fp8_recipe_uses_recipe_attrs():
+    if not hasattr(fp8_utils.transformer_engine.common.recipe, "CustomRecipe"):
+        pytest.skip("CustomRecipe requires newer Transformer Engine")
+
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=64,
+        num_attention_heads=4,
+        fp8="e4m3",
+        fp8_recipe="custom",
+        fp8_quantizer_factory="tests.unit_tests.test_fp8_utils._dummy_quantizer_factory",
+        fp8_recipe_attrs={"_test_recipe_flag": "set"},
+    )
+
+    recipe = fp8_utils.get_fp8_recipe(config)
+
+    assert isinstance(recipe, fp8_utils.transformer_engine.common.recipe.CustomRecipe)
+    assert recipe._test_recipe_flag == "set"
 
 
 class MockTELinear(nn.Module):
