@@ -1155,7 +1155,9 @@ def process_mtp_loss(
             gradient as its teacher signal. Both paths must share the output projection,
             logit scaling, labels, loss mask and CP layout. Main-loss reduction must follow
             ``config.calculate_per_token_loss``; backward scaling must match
-            ``MTPLossAutoScaler``. Must be True when Soft-MTP is active.
+            ``MTPLossAutoScaler``. Must be True when Soft-MTP is active. With context
+            parallelism, ``validate_soft_mtp_config`` requires ``linear_cp_layout ==
+            attention_cp_layout``, because ``main_hidden_states`` keeps the main layout.
 
             TODO(kwangjuna): In a follow-up, check the loss selected by
             ``pretrain_hybrid.forward_step`` and pass this tag through ``HybridModel.forward``.
@@ -1414,12 +1416,12 @@ def process_mtp_loss(
         #   per-token: c_k = base * N0 / max(Nk, 1)  (counts summed over CP)
         #   mean:      c_k = base / max(Nk, 1)
 
-        # For Soft-MTP, compute head_loss_coefficient = c_k once for both the head loss
-        # and teacher correction. See "Multi-Token Prediction Done Right", Appendix B.5:
-        # https://arxiv.org/abs/2610.38331
+        # The head loss always keeps these standard expressions, so with Soft-MTP its forward
+        # value and hard-label gradients match standard MTP bit for bit. The router's
+        # correction uses c_k, computed separately and equal up to rounding. See "Multi-Token
+        # Prediction Done Right", Appendix B.5: https://arxiv.org/abs/2610.38331
         # The router undoes any main-loss mean via soft_source_count, then subtracts
         # α * c_k times the aligned NTP gradient, preserving shared backward scaling.
-        # Keep the inactive path's operation order unchanged for bitwise compatibility.
         if config.calculate_per_token_loss and getattr(
             config, "mtp_normalize_loss_by_main_tokens", False
         ):
@@ -1427,10 +1429,9 @@ def process_mtp_loss(
             # Preserve the loss as a sum. Gradient finalization divides the accumulated main
             # and MTP gradients once by the global main-loss token count, making the result
             # invariant to rank and microbatch partitioning.
+            mtp_loss_normalized = mtp_loss_scale * mtp_loss
             if soft_mtp:
                 head_loss_coefficient = mtp_loss.new_full((), mtp_loss_scale)
-            else:
-                mtp_loss_normalized = mtp_loss_scale * mtp_loss
         elif config.calculate_per_token_loss:
             # Case 2: per-token loss, adjusted by the CP-summed main/head token ratio.
             # finalize_model_grads divides by the global main-loss token count.
@@ -1447,26 +1448,22 @@ def process_mtp_loss(
             # Clamp only after the collective; empty ranks must participate too.
             # This preserves CP partition invariance, not a global MTP-token mean
             # across different DP microbatches with different main/MTP ratios.
+            mtp_loss_normalized = (
+                mtp_loss_scale * mtp_loss * (main_num_tokens / mtp_num_tokens.clamp(min=1))
+            )
             if soft_mtp:
                 # Form the ratio in the count dtype before casting, preserving its rounding.
                 head_loss_coefficient = mtp_loss_scale * (
                     main_num_tokens / mtp_num_tokens.clamp(min=1)
                 ).to(mtp_loss.dtype)
-            else:
-                mtp_loss_normalized = (
-                    mtp_loss_scale * mtp_loss * (main_num_tokens / mtp_num_tokens.clamp(min=1))
-                )
         else:
             # Case 3: mean loss, divided by this head's valid-token count.
             safe_num_tokens = num_tokens.clamp(min=1)
+            mtp_loss_normalized = mtp_loss_scale * mtp_loss / safe_num_tokens
             if soft_mtp:
                 head_loss_coefficient = mtp_loss_scale / safe_num_tokens.to(mtp_loss.dtype)
-            else:
-                mtp_loss_normalized = mtp_loss_scale * mtp_loss / safe_num_tokens
 
         if soft_mtp:
-            # Use the same coefficient for the hard-label loss and its teacher correction.
-            mtp_loss_normalized = head_loss_coefficient * mtp_loss
             # Save α * head loss weight at valid positions for the router's correction.
             # Use a boolean mask: the NTP gradient already contains the target's loss-mask weight.
             # Multiplying by 0.5 again, for example, would turn that target's weight into 0.25.

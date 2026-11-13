@@ -58,6 +58,15 @@ def validate_soft_mtp_config(config: TransformerConfig) -> None:
     enabled = [name for name, value in unsupported.items() if value]
     if enabled:
         raise ValueError(f"soft_mtp_weight > 0 does not support {', '.join(enabled)}.")
+    # The router shifts the main model's gradient to align it with each MTP head's targets.
+    # With CP, the main states use linear_cp_layout and MTP uses attention_cp_layout.
+    # These layouts must match, or the correction can be applied to the wrong tokens.
+    context_parallel = config.context_parallel_size > 1 or config.dynamic_context_parallel
+    if context_parallel and config.linear_cp_layout != config.attention_cp_layout:
+        raise ValueError(
+            "soft_mtp_weight > 0 with context parallelism requires linear_cp_layout == "
+            "attention_cp_layout."
+        )
 
 
 class SoftMTPGradientRouter(torch.autograd.Function):

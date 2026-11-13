@@ -81,6 +81,9 @@ def make_config(depth=3, weight=0.35, reduction="per_token", layout="zigzag", **
         quant_recipe=None,
         mtp_grad_scale_func=None,
         sequence_parallel=False,
+        context_parallel_size=1,
+        dynamic_context_parallel=False,
+        linear_cp_layout=layout,
         attention_cp_layout=layout,
     )
     for name, value in overrides.items():
@@ -307,6 +310,52 @@ def test_pure_teacher_cancels_hard_gradient_with_bf16_mask(reduction, monkeypatc
     )
 
 
+@pytest.mark.parametrize("alpha", [0.35, 1.0])
+@pytest.mark.parametrize("reduction", ["mean", "per_token", "summed"])
+def test_head_losses_and_projection_gradients_match_standard_mtp(reduction, alpha, monkeypatch):
+    """Soft-MTP changes only the heads' representation gradients.
+
+    The head losses and each output-projection call's weight gradient equal α = 0 bit for
+    bit, with a non-power-of-two loss scale and counts so any reordered arithmetic shows.
+    """
+    apply_head_loss = mtp.MTPLossAutoScaler.apply
+    torch.manual_seed(5)
+    tokens = torch.randint(0, 9, (12, 2))
+    labels, mask, input_mask = make_batch("holes")
+
+    def run(weight):
+        torch.manual_seed(6)
+        model = TinySequentialMTP(3).double()
+        head_losses, projection_grads = [], {}
+
+        def record_head_loss(hidden_states, head_loss):
+            head_losses.append(head_loss.detach().clone())
+            return apply_head_loss(hidden_states, head_loss)
+
+        def project(hidden, **kwargs):
+            # A per-call view of W, so each call's weight-gradient contribution is recorded.
+            call, projection = len(projection_grads), model.weight.view_as(model.weight)
+            projection_grads[call] = None
+            projection.register_hook(lambda grad: projection_grads.__setitem__(call, grad))
+            return F.linear(hidden, projection), None
+
+        monkeypatch.setattr(mtp.MTPLossAutoScaler, "apply", record_head_loss)
+        model.project = project
+        config = make_config(3, weight, reduction)
+        _, loss = production_loss(model, model.states(tokens), labels, mask, input_mask, config)
+        (loss * GRADIENT_SCALE).backward()
+        return head_losses, projection_grads, model.layers[0].weight.grad
+
+    losses, grads, layer_grad = run(alpha)
+    expected_losses, expected_grads, expected_layer_grad = run(0.0)
+    assert not torch.equal(layer_grad, expected_layer_grad), "Soft-MTP did not route"
+    assert len(losses) == len(expected_losses) == 3 and len(grads) == len(expected_grads) == 4
+    for actual, expected in zip(losses, expected_losses):
+        assert torch.equal(actual, expected)
+    for call, expected in expected_grads.items():
+        assert torch.equal(grads[call], expected), f"projection call {call}"
+
+
 def test_router_scales_low_precision_gradients_in_fp32():
     """BF16 gradients are scaled in FP32 and cast back to each head's dtype, bit for bit."""
     torch.manual_seed(4)
@@ -425,6 +474,19 @@ def test_validator_rejects_unsupported_settings(case):
     name, value = UNSUPPORTED_SETTINGS[case]
     with pytest.raises(ValueError, match=f"soft_mtp_weight > 0 .*{name}"):
         validate_soft_mtp_config(make_config(**{name: value}))
+
+
+@pytest.mark.parametrize(
+    "context_parallel",
+    [{"context_parallel_size": 2}, {"dynamic_context_parallel": True}],
+    ids=["fixed", "dynamic"],
+)
+def test_validator_requires_one_cp_layout(context_parallel):
+    """Context parallelism with different main and MTP layouts would misroute the gradient."""
+    with pytest.raises(ValueError, match="linear_cp_layout == attention_cp_layout"):
+        validate_soft_mtp_config(make_config(linear_cp_layout="contiguous", **context_parallel))
+    validate_soft_mtp_config(make_config(**context_parallel))
+    validate_soft_mtp_config(make_config(linear_cp_layout="contiguous"))
 
 
 def soft_mtp_call(config, labels, loss_mask, soft_mtp_compatible_loss=True, **kwargs):
