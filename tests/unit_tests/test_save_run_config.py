@@ -120,7 +120,8 @@ def test_save_checkpoint_without_optimizer(
         cfg = InferenceConfigContainer(
             model=None, checkpoint=checkpoint, inference=InferenceSetupConfig()
         )
-        monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+        monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
+        global_vars.set_run_config(cfg)
         model = MockModel(TransformerConfig(num_layers=1, kv_channels=1))
         save_checkpoint(123, [model], None, None, 0)
 

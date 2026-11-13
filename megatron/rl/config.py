@@ -25,9 +25,11 @@ _DEPLOYMENT_ARGS = {
 # the overridable parallelism, plus the CP that context-parallel training forces to 1.
 ROLLOUT_LAYOUT_FIELDS = (*_DEPLOYMENT_ARGS, "context_parallel_size")
 # What a separately built rollout model takes from its deployment:
-# the layout, plus the weight-shard counts derived with it.
+# the layout, plus the fields `rollout_inference_container_from_args` derives with it.
 ROLLOUT_MODEL_LAYOUT_FIELDS = (
     *ROLLOUT_LAYOUT_FIELDS,
+    "sequence_parallel",
+    "tensor_parallel_num_sequence_shards",
     "tensor_parallel_num_weight_shards",
     "expert_tensor_parallel_num_weight_shards",
 )
@@ -125,12 +127,13 @@ def rollout_inference_container_from_args(
     )
 
 
-def validate_rl_run(root: RootConfigContainer, *, global_batch_size: int | None = None) -> None:
-    """Validate an RL run's root container."""
+def validate_run(root: RootConfigContainer, *, global_batch_size: int | None = None) -> None:
+    """The RL section's rules against the run's training container and rollout deployment
+    (`RLConfig.run_rules`; the root container calls this before validating its members)."""
     training, inference, rl = root.training, root.inference, root.algorithm.rl
     if global_batch_size is None:
         global_batch_size = training.train.global_batch_size
-    # The offload `finalize_rl_run` will request, checked like the offload the DDP section
+    # The offload `finalize_run` will request, checked like the offload the DDP section
     # requests (`PretrainConfigContainer._validate_ddp_config`).
     if (
         rl.requires_grad_buffer_offload
@@ -142,7 +145,6 @@ def validate_rl_run(root: RootConfigContainer, *, global_batch_size: int | None 
             "--reuse-grad-buf-for-mxfp8-param-ag: "
             "parameters share the gradient-buffer storage that offload releases."
         )
-    root.validate()
     transformer = getattr(training.model, "transformer", None)
     cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
     rl.validate_run(
@@ -166,20 +168,19 @@ def validate_rl_run(root: RootConfigContainer, *, global_batch_size: int | None 
         )
 
 
-def finalize_rl_run(root: RootConfigContainer) -> None:
-    """Validate the root container, then finalize the deployment."""
-    global_batch_size = root.training.train.global_batch_size
+def finalize_run(root: RootConfigContainer) -> None:
+    """Apply the RL section to the run's training container (`RLConfig.run_rules`; the root
+    container calls this before finalizing its members)."""
+    training = root.training
+    global_batch_size = training.train.global_batch_size
     if global_batch_size is None:
         # The training container derives an unset global batch size when it finalizes,
         # after this call; check the RL rules against the size it will derive.
-        global_batch_size, _, _ = root.training._resolve_batch_sizes(
-            root.training.get_batch_parallel_size()
-        )
-    validate_rl_run(root, global_batch_size=global_batch_size)
-    root.inference.finalize()
+        global_batch_size, _, _ = training._resolve_batch_sizes(training.get_batch_parallel_size())
+    validate_run(root, global_batch_size=global_batch_size)
     if root.algorithm.rl.requires_grad_buffer_offload:
         # Applied before the training container finalizes its DDP section.
-        root.training.ddp.grad_buffer_offload = True
+        training.ddp.grad_buffer_offload = True
 
 
 def add_rl_args(parser: ArgumentParser) -> ArgumentParser:
@@ -231,7 +232,7 @@ def get_rl_run_config() -> RootConfigContainer:
     """Return the registered RL run's root container."""
     root = get_root_config_container()
     assert (
-        root is not None and root.algorithm is not None and root.algorithm.rl is not None
+        root.algorithm is not None and root.algorithm.rl is not None
     ), "RL run config is not initialized."
     return root
 
@@ -242,5 +243,5 @@ def get_rl_config() -> RLConfig:
 
 
 def unset_rl_run_config() -> None:
-    """Forget the registered root container (tests and multi-run processes)."""
+    """Forget the run's root container (tests and multi-run processes)."""
     unset_root_config_container()

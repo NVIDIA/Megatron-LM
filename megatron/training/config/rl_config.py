@@ -2,7 +2,7 @@
 
 import argparse
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import ClassVar, Literal
 
 SubmissionGranularity = Literal["R", "G", "B"]
 ConsumptionGranularity = Literal["G", "B"]
@@ -13,6 +13,10 @@ _BOOL_OPTIONAL = {"argparse_meta": {"action": argparse.BooleanOptionalAction}}
 @dataclass(kw_only=True)
 class RLConfig:
     """Configuration settings for the built-in RL training loop (GRPO)."""
+
+    run_rules: ClassVar[str] = "megatron.rl.config"
+    """Module with this section's rules against the run's other containers, `validate_run(root)`
+    and `finalize_run(root)`; `AlgorithmConfigContainer` imports it on use."""
 
     perform_rl_step: bool = False
     """Use the RL training step."""

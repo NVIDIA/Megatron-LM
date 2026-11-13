@@ -10,10 +10,10 @@ import pytest
 
 from megatron.inference.utils import add_inference_args
 from megatron.rl.config import (
+    ROLLOUT_MODEL_LAYOUT_FIELDS,
     add_rl_args,
     rollout_inference_container_from_args,
     rollout_model_is_separate,
-    validate_rl_run,
 )
 from megatron.training.argument_utils import (
     _default_config_from_args,
@@ -143,7 +143,7 @@ def test_weight_placement_is_the_rl_sections():
         training=pretrain, inference=deployment, algorithm=AlgorithmConfigContainer(rl=rl)
     )
     with pytest.raises(ValueError, match="requires a separate inference model"):
-        validate_rl_run(run)
+        run.validate()
     args, pretrain, deployment = _containers(
         "--rl-inference-model-unified-memory-level",
         "1",
@@ -151,13 +151,11 @@ def test_weight_placement_is_the_rl_sections():
         "--rl-inference-tensor-model-parallel-size",
         "2",
     )
-    validate_rl_run(
-        RootConfigContainer(
-            training=pretrain,
-            inference=deployment,
-            algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
-        )
-    )
+    RootConfigContainer(
+        training=pretrain,
+        inference=deployment,
+        algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
+    ).validate()
 
 
 def test_finalize_applies_the_training_rng_policy_to_the_rollout_model():
@@ -223,6 +221,13 @@ def test_deployment_round_trips_through_the_container_serialization(
     deployment = rollout_inference_container_from_args(args, pretrain)
     serialized = deployment.to_dict()
     assert serialized["_target_"].endswith("InferenceConfigContainer")
+    # A separately built rollout model takes from the deployment every field in which it differs
+    # from training's (`build_rollout_inference_model`).
+    declared = serialized["model"]["transformer"]
+    trained = pretrain.to_dict()["model"]["transformer"]
+    differing = {name for name in trained if declared[name] != trained[name]}
+    assert differing <= set(ROLLOUT_MODEL_LAYOUT_FIELDS)
+    assert ("sequence_parallel" in differing) is (sequence_parallel and rollout_tp == 1)
     deployment.to_yaml(str(tmp_path / "deployment.yaml"))
     rebuilt = InferenceConfigContainer.from_yaml(str(tmp_path / "deployment.yaml"))
     assert rebuilt.to_dict() == serialized

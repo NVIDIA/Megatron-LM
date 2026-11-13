@@ -119,7 +119,7 @@ def test_fault_tolerance_setup_uses_config(
     saved_timeouts = {"section_timeouts": {"setup": 123, "step": 45}}
     (tmp_path / "ft_state.json").write_text(json.dumps(saved_timeouts))
 
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
     ft_integration.setup(
         run_config.fault_tolerance,
         checkpoint_dir=run_config.checkpoint.save,

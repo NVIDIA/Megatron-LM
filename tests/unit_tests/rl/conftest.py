@@ -7,6 +7,6 @@ from megatron.rl.config import unset_rl_run_config
 
 @pytest.fixture(autouse=True)
 def reset_rl_run_config():
-    """The RL run's root container is a process global like the run config; never leak it."""
+    """The run's root container is a process global; never leak it."""
     yield
     unset_rl_run_config()

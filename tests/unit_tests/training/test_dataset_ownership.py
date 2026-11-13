@@ -612,7 +612,12 @@ def test_set_global_variables_finalizes_a_dataset_section(
 ):
     """The compatibility bootstrap finalizes the container before the runtime services bind the
     tokenizer (every PretrainConfigContainer, loader-only ones included, since upstream #8149)."""
-    globals_ = ("_GLOBAL_ARGS", "_GLOBAL_RUN_CONFIG", "_GLOBAL_TOKENIZER", "_GLOBAL_TRAIN_STATE")
+    globals_ = (
+        "_GLOBAL_ARGS",
+        "_GLOBAL_ROOT_CONFIG_CONTAINER",
+        "_GLOBAL_TOKENIZER",
+        "_GLOBAL_TRAIN_STATE",
+    )
     for name in globals_:
         monkeypatch.setattr(global_vars, name, None)
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
@@ -966,7 +971,8 @@ def test_runtime_services_read_config_lengths_not_legacy_args(container_factory,
     cfg.finalize()
     assert cfg.model.transformer.max_seq_length_per_sample == 16
     args.seq_length = 64  # stale, must not be read
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
+    global_vars.set_run_config(cfg)
     assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 16
     calls = []
     monkeypatch.setattr(
@@ -995,7 +1001,8 @@ def test_runtime_services_read_config_lengths_not_legacy_args(container_factory,
     assert loader_only.data.dataset is None
     assert loader_only.model.transformer.max_seq_length_per_sample == 64
     args.seq_length = 999  # stale
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", loader_only)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
+    global_vars.set_run_config(loader_only)
     assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 64
     global_vars.initialize_training_runtime_services(args)
     assert calls.pop()["seq_length"] == 64
@@ -1058,7 +1065,8 @@ def test_vlm_resolves_expanded_width_before_startup(monkeypatch, decoder_length)
         config=model.transformer,
         **groups,
     )
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
+    global_vars.set_run_config(cfg)
     assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 64
     saved = cfg.to_dict()
     assert "decoder_seq_length" not in saved["model"]

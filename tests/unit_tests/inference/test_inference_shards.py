@@ -22,8 +22,8 @@ from megatron.core.inference.shards_spec import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.utils import unwrap_model
-from megatron.training.argument_utils import tokenizer_config_from_args
-from megatron.training.config import RLConfig
+from megatron.training.argument_utils import inference_cfg_from_args, tokenizer_config_from_args
+from megatron.training.config import CheckpointConfig, InferenceConfigContainer, RLConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -74,7 +74,11 @@ def test_serving_and_rl_build_shard_models_with_global_parallel_args(monkeypatch
             ModelType.encoder_or_decoder,
             training_config.transformer,
             rl_config=RLConfig(),
-            model_config=training_config,
+            inference_container=InferenceConfigContainer(
+                model=training_config,
+                checkpoint=CheckpointConfig(),
+                inference=inference_cfg_from_args(args),
+            ),
             model_alloc_ctx=nullcontext(),
         )[0]
         for model in (serving, rl):
@@ -105,7 +109,7 @@ def test_disagg_rl_rejects_ignored_overrides(field):
     setattr(config, field, "nixl" if field == "refit_method" else True)
     with pytest.raises(ValueError, match=field.replace("_", "-")):
         build_disagg_inference_model(
-            None, None, None, rl_config=config, model_config=None, model_alloc_ctx=None
+            None, None, None, rl_config=config, inference_container=None, model_alloc_ctx=None
         )
 
 

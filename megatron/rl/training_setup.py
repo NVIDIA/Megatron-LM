@@ -46,7 +46,7 @@ def build_rollout_inference_model(
     model_type: ModelType,
 ) -> Optional[list[torch.nn.Module]]:
     """Build the rollout engine's separately parallelized model, if the deployment needs one."""
-    if spec_declares_disaggregation(args.inference_shards):
+    if spec_declares_disaggregation(inference_container.inference.inference_shards):
         # Disaggregated rollouts build this rank's prefill/decode model on
         # the shard process groups maintained by the per-pool refit path.
         return build_disagg_inference_model(
@@ -54,7 +54,7 @@ def build_rollout_inference_model(
             model_type,
             config,
             rl_config=get_rl_config(),
-            model_config=inference_container.model,
+            inference_container=inference_container,
             model_alloc_ctx=inference_model_alloc_context(),
         )
     if not rollout_model_is_separate(inference_container, get_run_config().model):

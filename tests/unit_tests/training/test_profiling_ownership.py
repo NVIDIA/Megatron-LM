@@ -13,7 +13,14 @@ import pytest
 
 from megatron.training import argument_utils, arguments, checkpointing, global_vars, training
 from megatron.training.argument_utils import profiling_config_from_args
-from megatron.training.config import ProfilingConfig, StragglerDetectionConfig
+from megatron.training.config import (
+    CheckpointConfig,
+    InferenceConfigContainer,
+    InferenceSetupConfig,
+    ProfilingConfig,
+    RootConfigContainer,
+    StragglerDetectionConfig,
+)
 from megatron.training.config.container import ConfigContainerBase
 from megatron.training.state import TrainState
 from megatron.training.utils import start_memory_history_recording
@@ -34,25 +41,31 @@ def remove_profiling_args(args):
 
 @pytest.mark.parametrize("cleanup", ["unset_global_variables", "destroy_global_vars"])
 def test_run_config_lifecycle(monkeypatch, cleanup):
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
     monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
-    with pytest.raises(AssertionError, match="run config is not initialized"):
-        global_vars.get_run_config()
-    config = SimpleNamespace(profiling=ProfilingConfig())
-    global_vars.set_run_config(config)
-    assert global_vars.get_run_config() is config
-    with pytest.raises(AssertionError, match="run config is already initialized"):
+    for getter in (global_vars.get_run_config, global_vars.get_root_config_container):
+        with pytest.raises(AssertionError, match="run config is not initialized"):
+            getter()
+    with pytest.raises(TypeError, match="PretrainConfigContainer or an InferenceConfigContainer"):
         global_vars.set_run_config(SimpleNamespace(profiling=ProfilingConfig()))
-    root = SimpleNamespace(training=config)
-    global_vars.set_root_config_container(root)
-    with pytest.raises(AssertionError, match="root config container is already initialized"):
-        global_vars.set_root_config_container(root)
-    # Both cleanup paths clear the owner and the root container before a subsequent run.
+    config = InferenceConfigContainer(
+        model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
+    )
+    global_vars.set_run_config(config)
+    # A run has one root container; its run config is the member the process runs on.
+    root = global_vars.get_root_config_container()
+    assert isinstance(root, RootConfigContainer) and root.inference is config
+    assert global_vars.get_run_config() is config
+    for register, registered in (
+        (global_vars.set_run_config, config),
+        (global_vars.set_root_config_container, root),
+    ):
+        with pytest.raises(AssertionError, match="run config is already initialized"):
+            register(registered)
+    # Both cleanup paths clear the root container before a subsequent run.
     getattr(global_vars, cleanup)()
     with pytest.raises(AssertionError, match="run config is not initialized"):
         global_vars.get_run_config()
-    assert global_vars.get_root_config_container() is None
-    global_vars.set_run_config(config)
+    global_vars.set_root_config_container(root)
     assert global_vars.get_run_config() is config
 
 
