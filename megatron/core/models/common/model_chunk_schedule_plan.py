@@ -7,7 +7,7 @@ from torch import Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
-    finish_fsdp_backward,
+    post_fsdp_backward,
     register_fsdp_schedule_hooks,
 )
 from megatron.core.pipeline_parallel.utils import (
@@ -331,11 +331,14 @@ class TransformerLayerSchedulePlan:
         explicit release hooks to individual schedule nodes so that all-gathered
         parameters are freed at the right time.
 
+        The post-backward callback belongs to ``pre_dispatch_computation``, the
+        first forward node and last backward node. ``TransformerLayerNode`` fires
+        it after ``backward()``, or after ``backward_dw()`` when wgrad is delayed.
+
         Args:
-            post_forward_hook: Callable(module) that releases forward-pass params
-                (bwd=False). Typically ``fsdp_wrapper.post_forward_release_module``.
-            post_backward_hook: Callable(module) that releases backward-pass params
-                (bwd=True). Typically ``fsdp_wrapper.post_backward_release_module``.
+            post_forward_hook: Callable(module) invoked after the last forward node.
+            post_backward_hook: Callable(module) invoked after the last backward
+                operation, including delayed weight-gradient computation.
         """
         from megatron.core.models.hybrid.hybrid_block import HybridStack
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
@@ -924,7 +927,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         if b_schedule_plan:
             b_schedule_plan.wait_current_stream()
             for unit in b_schedule_plan._fsdp_remaining_modules:
-                finish_fsdp_backward(unit)
+                post_fsdp_backward(unit)
             model = b_schedule_plan._model_chunk_state.model
             if isinstance(model, FsdpModule):
                 # This schedule bypasses the root's autograd completion callback.

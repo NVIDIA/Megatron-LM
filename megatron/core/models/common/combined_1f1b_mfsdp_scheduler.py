@@ -41,8 +41,8 @@ def _module_post_forward_hook(module: FsdpModule, _args, _output) -> None:
         module.reshard()
 
 
-def finish_fsdp_backward(module: FsdpModule) -> None:
-    """Release weights and reduce gradients after all scheduled consumers finish."""
+def post_fsdp_backward(module: FsdpModule) -> None:
+    """Reshard the unit and submit gradient reductions after its last backward use."""
     module.reshard()
     module.post_accumulate_grad()
 
@@ -115,7 +115,7 @@ def register_fsdp_schedule_hooks(model: nn.Module, layer_plans) -> tuple[FsdpMod
 
         def finish_layer(_module, units=units):
             for unit in units:
-                finish_fsdp_backward(unit)
+                post_fsdp_backward(unit)
 
         plan.set_fsdp_reshard_hooks(reshard_fsdp_module, finish_layer)
     return tuple(remaining)

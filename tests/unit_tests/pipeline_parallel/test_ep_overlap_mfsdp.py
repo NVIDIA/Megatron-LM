@@ -29,7 +29,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.parameter_gro
     FsdpParameterGroup,
 )
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
-    finish_fsdp_backward,
+    post_fsdp_backward,
     register_combined_1f1b_hooks,
 )
 from megatron.core.models.common.model_chunk_schedule_plan import TransformerModelChunkSchedulePlan
@@ -239,7 +239,7 @@ def test_train_validate_train_reshards_and_matches_dense(distributed_setup, tied
                 actual.square().mean().backward()
                 expected.square().mean().backward()
                 for unit in units:
-                    finish_fsdp_backward(unit)
+                    post_fsdp_backward(unit)
                 model.context.finish_grad_sync()
                 for parameter in reference.parameters():
                     dist.all_reduce(parameter.grad, op=dist.ReduceOp.AVG)
@@ -319,7 +319,7 @@ def test_schedule_finishes_shared_and_nested_units_once(repeated, wrapped):
     plans[0].finish()
     (root.weight * 7).backward()
     for unit in remaining:
-        finish_fsdp_backward(unit)
+        post_fsdp_backward(unit)
     expected_shared = 8.0 if repeated else 3.0
     assert reductions == [
         ("other", 4.0),
