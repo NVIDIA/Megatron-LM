@@ -1397,20 +1397,11 @@ def save_checkpoint(
 
     experiment_writer = get_experiment_writer()
     experiment_finalize_fn = None
-    if (
-        (cfg.logger.wandb_project or cfg.logger.mlflow_experiment or cfg.logger.comet_project)
-        and not skip_weight_ckpt
-        and not non_persistent_ckpt
-    ):
-        artifact_dir = get_checkpoint_name(save_dir, iteration, release=release, return_base_dir=True)
+    if experiment_writer is not None and not skip_weight_ckpt and not non_persistent_ckpt:
+        checkpoint_dir = get_checkpoint_name(save_dir, iteration, release=release, return_base_dir=True)
 
         def experiment_finalize_fn():
-            # Rank 0 writes config/tracker files in its preceding finalize callback.
-            # The reporting rank must see those writes before uploading artifacts.
-            if checkpoint.async_save and torch.distributed.is_initialized():
-                torch.distributed.barrier()
-            if experiment_writer is not None:
-                experiment_writer.checkpoint_saved(artifact_dir, iteration)
+            experiment_writer.checkpoint_saved(checkpoint_dir, iteration)
 
         if checkpoint.async_save:
             assert async_save_request is not None

@@ -14,7 +14,6 @@ import os
 import re
 import sys
 import time
-from pathlib import Path
 from threading import Lock
 from typing import Any
 
@@ -57,7 +56,6 @@ class ExperimentWriter:
         self._closed = False
         self._previous_excepthook = None
         self._failure_hook = None
-        self.log_artifacts = cfg.logger.mlflow_log_artifacts
         settings = cfg.logger
         # Do not serialize runtime objects or the legacy args namespace.
         params = _flatten_config(cfg.to_dict())
@@ -271,15 +269,6 @@ class ExperimentWriter:
                 self.mlflow.set_tag(self._mlflow_run_id, "last_saved_iteration", iteration)
             except Exception:
                 logger.warning("Failed to record checkpoint in MLflow", exc_info=True)
-        if self.mlflow is not None and self.log_artifacts:
-            try:
-                # MSC URIs are already remotely stored and are not local artifact directories.
-                if "://" not in path:
-                    self.mlflow.log_artifacts(
-                        self._mlflow_run_id, path, artifact_path=f"checkpoints/{Path(path).name}"
-                    )
-            except Exception:
-                logger.warning("Failed to upload checkpoint artifacts to MLflow", exc_info=True)
         if self.comet is not None:
             try:
                 self.comet.log_other("last_saved_checkpoint", path)

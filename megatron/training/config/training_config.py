@@ -439,9 +439,6 @@ class LoggerConfig:
     mlflow_description: str | None = None
     """Description for a new MLflow run."""
 
-    mlflow_log_artifacts: bool = True
-    """Upload completed persistent checkpoint directories to MLflow."""
-
     comet_project: str | None = None
     """Comet project name. Unset disables Comet logging; use COMET_API_KEY for credentials."""
 

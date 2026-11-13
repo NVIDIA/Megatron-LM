@@ -65,7 +65,6 @@ def test_cli_config_initializes_backends(monkeypatch, run_config, tracking_sdks)
             'run',
             '--mlflow-tags',
             '{"team": "training"}',
-            '--no-mlflow-log-artifacts',
             '--comet-project',
             'project',
             '--comet-experiment-name',
@@ -229,19 +228,27 @@ def test_scalar_logging_with_independent_backend_selection(
 def test_checkpoint_reporting_and_idempotent_shutdown(experiment_writer, tracking_sdks, tmp_path):
     mlflow, comet = tracking_sdks
     experiment_writer.checkpoint_saved(str(tmp_path), 7)
-    mlflow.tracking.MlflowClient.return_value.log_artifacts.assert_called_once_with(
-        'run-id', str(tmp_path), artifact_path=f'checkpoints/{tmp_path.name}'
+    mlflow.tracking.MlflowClient.return_value.set_tag.assert_any_call(
+        'run-id', 'last_saved_checkpoint', str(tmp_path)
+    )
+    mlflow.tracking.MlflowClient.return_value.set_tag.assert_any_call(
+        'run-id', 'last_saved_iteration', 7
+    )
+    experiment_writer.wandb.config.update.assert_called_once_with(
+        {'last_saved_checkpoint': str(tmp_path), 'last_saved_iteration': 7}, allow_val_change=True
     )
     comet.Experiment.return_value.log_other.assert_any_call('last_saved_iteration', 7)
     experiment_writer.checkpoint_loaded('msc://store/checkpoint', 'msc://store')
     mlflow.tracking.MlflowClient.return_value.set_tag.assert_any_call(
         'run-id', 'last_loaded_checkpoint', 'msc://store/checkpoint'
     )
-    mlflow.tracking.MlflowClient.return_value.log_artifacts.side_effect = RuntimeError(
+    mlflow.tracking.MlflowClient.return_value.set_tag.side_effect = RuntimeError(
         'tracking service unavailable'
     )
-    # Artifact failures must not strand other ranks at a checkpoint barrier.
+    # A reporting failure must not interrupt checkpoint finalization or other backends.
     experiment_writer.checkpoint_saved(str(tmp_path), 8)
+    comet.Experiment.return_value.log_other.assert_any_call('last_saved_iteration', 8)
+    mlflow.tracking.MlflowClient.return_value.log_artifacts.assert_not_called()
     experiment_writer.finish('KILLED')
     experiment_writer.finish()
     mlflow.tracking.MlflowClient.return_value.set_terminated.assert_called_once_with(

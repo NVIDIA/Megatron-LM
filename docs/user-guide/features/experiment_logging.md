@@ -64,12 +64,10 @@ Full config remains in the checkpoint's `run_config.yaml`. Runtime SDK objects
 are never stored in the config or checkpoint.
 
 After a persistent checkpoint finishes, all three backends record its path and
-iteration, and MLflow optionally uploads its directory. MLflow uploads can be
-expensive for large models: set `--no-mlflow-log-artifacts` or
-`cfg.logger.mlflow_log_artifacts = False` to disable them. Non-persistent/local
-checkpoints are not uploaded; MSC remote paths are not downloaded for upload.
+iteration. Checkpoint files are not uploaded to experiment backends. Reporting
+adds no distributed barrier; metadata SDK calls still run during finalization.
 All three backends record the checkpoint path selected on successful load.
-Artifact/reporting failures warn without invalidating a successfully saved checkpoint.
+Reporting failures warn without invalidating a successfully saved checkpoint.
 
 ## Resume and shutdown
 

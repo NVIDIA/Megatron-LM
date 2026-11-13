@@ -1073,7 +1073,7 @@ def test_save_checkpoint(
 def test_experiment_reporting_waits_for_checkpoint(
     init_model_parallel, create_args, tmp_path_dist_ckpt, run_config, monkeypatch, async_save
 ):
-    """The reporting rank sees the completed weights and rank-0 metadata, once."""
+    """Report path and iteration once after saving, without reading checkpoint files."""
     from megatron.training.async_utils import maybe_finalize_async_save
 
     args = create_args
@@ -1093,14 +1093,6 @@ def test_experiment_reporting_waits_for_checkpoint(
         checkpointing, 'get_experiment_writer', lambda: writer if reporting_rank else None
     )
 
-    def check_completed(path, iteration):
-        assert iteration == 7
-        assert os.path.isfile(os.path.join(path, 'run_config.yaml'))
-        assert os.path.isfile(os.path.join(path, '.metadata'))
-        with open(os.path.join(os.path.dirname(path), 'latest_checkpointed_iteration.txt')) as f:
-            assert f.read() == '7'
-
-    writer.checkpoint_saved.side_effect = check_completed
     with TempNamedDir(tmp_path_dist_ckpt / 'experiment_reporting', sync=True) as save_dir:
         args.save = str(save_dir)
         set_args(args)
@@ -1110,6 +1102,10 @@ def test_experiment_reporting_waits_for_checkpoint(
             writer.checkpoint_saved.assert_not_called()
             maybe_finalize_async_save(blocking=True, terminate=True)
         assert writer.checkpoint_saved.call_count == int(reporting_rank)
+        if reporting_rank:
+            writer.checkpoint_saved.assert_called_once_with(
+                checkpointing.get_checkpoint_name(str(save_dir), 7, return_base_dir=True), 7
+            )
 
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
