@@ -61,6 +61,27 @@ def test_checkpoint_detection(checkpoint_keys):
         vlm._mimo_checkpoint_prefix_map(args)
 
 
+@pytest.mark.parametrize(
+    ("balancing", "scope", "expected"),
+    [
+        ("quantile_balancing", "global_batch", False),
+        (["quantile_balancing"], "global_batch", False),
+        ("quantile_balancing", "micro_batch", True),
+        ("aux_loss", None, True),
+    ],
+)
+def test_checkpoint_expert_bias_with_balancing(checkpoint_keys, balancing, scope, expected):
+    """Global-batch quantile balancing applies expert_bias without the flag."""
+    checkpoint_keys.append("language_model.module.module.decoder.layers.1.mlp.router.expert_bias")
+    args = SimpleNamespace(
+        moe_router_enable_expert_bias=False,
+        moe_router_load_balancing_type=balancing,
+        moe_router_quantile_balancing_estimation_scope=scope,
+    )
+    vlm._enable_checkpoint_expert_bias(args)
+    assert args.moe_router_enable_expert_bias is expected
+
+
 @pytest.mark.parametrize("vision", [False, True], ids=["text", "vision"])
 def test_checkpoint_without_saved_args_uses_cli_vision_args(tmp_path, monkeypatch, vision):
     """Without saved args (e.g. Megatron-Bridge), --vision-model-type selects the VLM."""
