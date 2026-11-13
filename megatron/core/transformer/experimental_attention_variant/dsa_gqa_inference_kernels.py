@@ -95,13 +95,13 @@ if HAVE_GLUON:
         request = gl.load(Requests + block)
         if BATCH_INVARIANT:
             first_row = gl.load(BlockStarts + block)
-            num_query_tokens_in_block = gl.load(BlockRows + block)
+            num_rows = gl.load(BlockRows + block)
         else:
             first_row = block
-            num_query_tokens_in_block = 1
-        for row_start in range(0, num_query_tokens_in_block, SCORE_ROWS):
+            num_rows = 1
+        for row_start in range(0, num_rows, SCORE_ROWS):
             row = first_row + row_start
-            valid_rows = gl.minimum(num_query_tokens_in_block - row_start, SCORE_ROWS)
+            valid_rows = gl.minimum(num_rows - row_start, SCORE_ROWS)
             worker = gl.program_id(1)
             if BATCH_INVARIANT:
                 offsets = gl.arange(0, SCORE_ROWS, layout=gl.BlockedLayout([1], [32], [4], [0]))
@@ -262,11 +262,11 @@ if HAVE_TRITON:
         worker = tl.program_id(0)
         block = tl.program_id(1)
         workers = tl.num_programs(0)
-        num_query_tokens_in_block = tl.load(block_rows + block)
+        num_rows = tl.load(block_rows + block)
         request = tl.load(block_requests + block).to(tl.int64)
         row_in_block = tl.arange(0, ROW_BLOCK)
         rows = (tl.load(block_starts + block) + row_in_block).to(tl.int64)
-        row_valid = row_in_block < num_query_tokens_in_block
+        row_valid = row_in_block < num_rows
         out_rows = rows
         if WINDOWED:
             # Only rows inside this call's window [row_offset, row_offset + num_out_rows) are
@@ -288,7 +288,7 @@ if HAVE_TRITON:
         if WINDOWED:
             num_valid = tl.sum(row_valid.to(tl.int32), axis=0)
         else:
-            num_valid = num_query_tokens_in_block
+            num_valid = num_rows
         limit = tl.where(num_valid > 0, width, 0) if FILL_INVALID else longest
         for start in range(worker * BLOCK_T, limit, workers * BLOCK_T):
             positions = start + tl.arange(0, BLOCK_T)
@@ -533,9 +533,9 @@ def _num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
 
 
-def _num_slices(num_query_tokens: int, num_groups: int, topk: int, num_sms: int) -> int:
+def _num_slices(num_rows: int, num_groups: int, topk: int, num_sms: int) -> int:
     """Power-of-two slice count near ATTENTION_PROGRAMS_PER_SM per SM, each at least one tile."""
-    target = max(1, (ATTENTION_PROGRAMS_PER_SM * num_sms) // max(1, num_query_tokens * num_groups))
+    target = max(1, (ATTENTION_PROGRAMS_PER_SM * num_sms) // max(1, num_rows * num_groups))
     slices = 1
     while slices * 2 <= target and topk // (slices * 2) >= BLOCK_N:
         slices *= 2
@@ -607,7 +607,7 @@ def dsa_gqa_indexer_scores(
     )
     if query.dtype != torch.bfloat16 or query.dim() != 2 or query.stride(-1) != 1:
         raise TypeError("query must be BF16 [rows,index_dim] with dense rows.")
-    num_query_tokens, index_dim = query.shape
+    num_rows, index_dim = query.shape
     if (
         key_cache.dtype != torch.bfloat16
         or key_cache.dim() != 3
@@ -616,7 +616,7 @@ def dsa_gqa_indexer_scores(
     ):
         raise TypeError("key_cache must be BF16 [pages,page_size,index_dim] matching query.")
     _require_block_table(block_table)
-    _require_int32_vector("row_lengths", row_lengths, num_query_tokens)
+    _require_int32_vector("row_lengths", row_lengths, num_rows)
     num_blocks = block_starts.numel()
     for name, tensor in (
         ("block_starts", block_starts),
@@ -626,10 +626,9 @@ def dsa_gqa_indexer_scores(
         _require_int32_vector(name, tensor, num_blocks)
     if out.dtype != torch.float32 or out.dim() != 2 or out.stride(-1) != 1:
         raise TypeError("out must be FP32 [out_rows,width] with dense rows.")
-    if row_offset < 0 or row_offset + out.size(0) > num_query_tokens:
+    if row_offset < 0 or row_offset + out.size(0) > num_rows:
         raise ValueError(
-            f"Score window [{row_offset}, {row_offset + out.size(0)}) "
-            f"exceeds {num_query_tokens} rows."
+            f"Score window [{row_offset}, {row_offset + out.size(0)}) exceeds {num_rows} rows."
         )
     width = out.size(1)
     if num_blocks == 0 or width == 0:
@@ -656,17 +655,15 @@ def dsa_gqa_indexer_scores(
         key_desc = TensorDescriptor.from_tensor(
             key_cache.reshape(-1, index_dim).contiguous(), [128, index_dim], shared_layout
         )
-        direct_rows = (
-            row_requests is not None and row_offset == 0 and out.size(0) == num_query_tokens
-        )
-        work_blocks = num_query_tokens if direct_rows else num_blocks
+        direct_rows = row_requests is not None and row_offset == 0 and out.size(0) == num_rows
+        work_blocks = num_rows if direct_rows else num_blocks
         # Workers only assign independent 128-key score tiles to CTAs. Each score's MMA
         # and rounding remain identical when the grid changes with query scheduling.
         parallel_workers = max(1, _num_sms(query.device.index) // work_blocks)
         workers = workers or min(
             128, triton.cdiv(width, 128), max(8, 1 << (parallel_workers.bit_length() - 1))
         )
-        score_tcgen[(num_query_tokens if direct_rows else num_blocks, workers)](
+        score_tcgen[(num_rows if direct_rows else num_blocks, workers)](
             query_desc,
             key_desc,
             block_table,
@@ -693,7 +690,7 @@ def dsa_gqa_indexer_scores(
     # Size the per-block parallelism by the blocks that can overlap the window: all of them
     # when it covers every row, else (windows split long prefill rows) about one per
     # SCORE_ROW_BLOCK rows. Blocks outside the window exit at once.
-    if out.size(0) == num_query_tokens:
+    if out.size(0) == num_rows:
         active_blocks = num_blocks
     else:
         active_blocks = min(num_blocks, triton.cdiv(out.size(0), SCORE_ROW_BLOCK) + 1)
@@ -726,7 +723,7 @@ def dsa_gqa_indexer_scores(
         BLOCK_T=SCORE_BLOCK_T,
         FILL_INVALID=fill_invalid,
         # A call that covers every row compiles without the window checks.
-        WINDOWED=out.size(0) != num_query_tokens,
+        WINDOWED=out.size(0) != num_rows,
         num_warps=4,
         num_stages=2,
     )
@@ -769,7 +766,7 @@ def dsa_gqa_sparse_attention(
     )
     if query.dtype != torch.bfloat16 or query.dim() != 3 or query.stride(-1) != 1:
         raise TypeError("query must be BF16 [rows,heads,head_dim] with contiguous head rows.")
-    num_query_tokens, num_query_heads, head_dim = query.shape
+    num_rows, num_query_heads, head_dim = query.shape
     for name, cache in (("key_cache", key_cache), ("value_cache", value_cache)):
         if cache.dtype != torch.bfloat16 or cache.dim() != 4 or cache.stride(-1) != 1:
             raise TypeError(f"{name} must be BF16 [pages,page_size,groups,dim], last dim dense.")
@@ -779,12 +776,12 @@ def dsa_gqa_sparse_attention(
     if num_query_heads % num_groups != 0:
         raise ValueError("Query heads must be divisible by the number of KV groups.")
     _require_block_table(block_table)
-    _require_int32_vector("row_requests", row_requests, num_query_tokens)
-    _require_int32_vector("row_lengths", row_lengths, num_query_tokens)
+    _require_int32_vector("row_requests", row_requests, num_rows)
+    _require_int32_vector("row_lengths", row_lengths, num_rows)
     if (
         topk_indices.dtype != torch.int32
         or topk_indices.dim() != 2
-        or topk_indices.size(0) != num_query_tokens
+        or topk_indices.size(0) != num_rows
         or topk_indices.size(1) == 0
         or topk_indices.stride(-1) != 1
     ):
@@ -792,11 +789,11 @@ def dsa_gqa_sparse_attention(
     value_dim = value_cache.size(-1)
     if (
         out.dtype != torch.bfloat16
-        or out.shape != (num_query_tokens, num_query_heads, value_dim)
+        or out.shape != (num_rows, num_query_heads, value_dim)
         or out.stride(-1) != 1
     ):
         raise TypeError("out must be BF16 [rows,heads,value_head_dim] with dense rows.")
-    if num_query_tokens == 0:
+    if num_rows == 0:
         return
     topk = topk_indices.size(1)
     heads_per_group = num_query_heads // num_groups
@@ -805,14 +802,14 @@ def dsa_gqa_sparse_attention(
     slices = (
         (topk // BLOCK_N if topk == 2048 and head_dim == 128 else triton.cdiv(topk, 256))
         if batch_invariant
-        else _num_slices(num_query_tokens, num_groups, topk, _num_sms(query.device.index))
+        else _num_slices(num_rows, num_groups, topk, _num_sms(query.device.index))
     )
     slice_len = triton.cdiv(topk, slices)
-    partial_rows = num_query_tokens * slices * num_query_heads
+    partial_rows = num_rows * slices * num_query_heads
     partial_out = torch.empty(partial_rows, value_dim, dtype=torch.float32, device=query.device)
     partial_max = torch.empty(partial_rows, dtype=torch.float32, device=query.device)
     partial_sum = torch.empty(partial_rows, dtype=torch.float32, device=query.device)
-    _partial_kernel[(num_query_tokens, num_groups, slices)](
+    _partial_kernel[(num_rows, num_groups, slices)](
         query,
         key_cache,
         value_cache,
@@ -853,7 +850,7 @@ def dsa_gqa_sparse_attention(
     )
     # Every BI schedule uses the same tree over the model's fixed support partition.
     combine = _combine_fixed_kernel if batch_invariant else _combine_kernel
-    combine[(num_query_tokens, num_query_heads)](
+    combine[(num_rows, num_query_heads)](
         partial_out,
         partial_max,
         partial_sum,

@@ -126,7 +126,7 @@ class DSAMetadata(MetadataBase):
             query_lengths_cpu, kv_lengths_cpu
         )
         real_tokens, num_blocks = row_requests.numel(), block_starts.numel()
-        self.num_padded_query_tokens = padded_tokens
+        self.num_rows = padded_tokens
         self._decode_rows = min(padded_tokens, padded_requests)
         self._decode_only = decode_only
         self._cpu_row_requests[:real_tokens] = row_requests
@@ -163,8 +163,8 @@ class DSAMetadata(MetadataBase):
         """Return the row backend's GPU plan for the padded step."""
         assert self._block_table is not None, "transfer() must bind the step's block table first."
         return DSARowPlan(
-            row_requests=self.row_requests[: self.num_padded_query_tokens],
-            row_lengths=self.row_lengths[: self.num_padded_query_tokens],
+            row_requests=self.row_requests[: self.num_rows],
+            row_lengths=self.row_lengths[: self.num_rows],
             block_starts=self.block_starts[: self.num_score_blocks],
             block_rows=self.block_rows[: self.num_score_blocks],
             block_requests=self.block_requests[: self.num_score_blocks],
@@ -176,7 +176,7 @@ class DSAMetadata(MetadataBase):
     def reset(self) -> None:
         """Forget the step while preserving graph-owned metadata and shared top-k scratch."""
         self._step = DSAStepInfo(0, 0, 0, 0, ())
-        self.num_padded_query_tokens = 0
+        self.num_rows = 0
         self.num_score_blocks = 0
         self._decode_rows = 0
         self._decode_only = True
@@ -204,11 +204,11 @@ def build_row_metadata(
     query_lengths = query_lengths.to(torch.int64)
     kv_lengths = kv_lengths.to(torch.int64)
     num_requests = query_lengths.numel()
-    num_query_tokens = int(query_lengths.sum())
+    num_rows = int(query_lengths.sum())
     request_ids = torch.arange(num_requests)
     first_row = torch.cumsum(query_lengths, 0) - query_lengths
     row_requests = torch.repeat_interleave(request_ids, query_lengths)
-    within = torch.arange(num_query_tokens) - first_row[row_requests]
+    within = torch.arange(num_rows) - first_row[row_requests]
     row_lengths = (kv_lengths - query_lengths)[row_requests] + within + 1
     blocks_per_request = (query_lengths + row_block - 1) // row_block
     block_requests = torch.repeat_interleave(request_ids, blocks_per_request)
