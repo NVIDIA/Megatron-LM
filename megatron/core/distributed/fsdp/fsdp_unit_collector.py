@@ -82,15 +82,13 @@ class FsdpUnitCollector:
         elif isinstance(module, (TransformerBlock, HybridStack)):
             recompute_type = self._visit_children(module)
             config = module.config
-            if config.recompute_granularity == "full" and (
-                config.recompute_method != "block" or config.recompute_num_layers
+            # Independently sharded layers consume their replay requirements themselves.
+            if (
+                config.recompute_granularity == "full"
+                and config.recompute_num_layers
+                and any(layer not in self._units for layer in module.layers)
             ):
-                block_recompute_type = (
-                    RecomputeType.PARTIAL
-                    if any(layer not in self._units for layer in module.layers)
-                    else RecomputeType.FULL
-                )
-                recompute_type = max(recompute_type, block_recompute_type)
+                recompute_type = RecomputeType.PARTIAL
         elif isinstance(module, MultiTokenPredictionLayer):
             recompute_type = self._visit_children(module)
             # GPT MTP checkpoints its projection; Hybrid MTP delegates to its inner stack.
