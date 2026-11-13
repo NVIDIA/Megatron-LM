@@ -319,10 +319,12 @@ def deregister_and_clear_gtp_symm_pools() -> None:
         if group in dist.distributed_c10d._world.pg_map:
             vmm_symm_allocator.deregister_mem_pool(_pools[name], group)
         del _registered[name]
-    for (pool, _), group in _registered_ext_pools.items():
+    for key in list(_registered_ext_pools):
+        group = _registered_ext_pools[key]
         # The same holds for a pool that is owned elsewhere.
         if group in dist.distributed_c10d._world.pg_map:
-            vmm_symm_allocator.deregister_mem_pool(pool, group)
+            vmm_symm_allocator.deregister_mem_pool(key[0], group)
+        del _registered_ext_pools[key]
     # Only now drop the buffers and the pools; the windows are gone, so the memory
     # is safe to release.
     symmetric_wgrad_pool.clear()
