@@ -5,7 +5,7 @@ import math
 import os
 import warnings
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from typing import Any, Callable, Dict, List, Literal, Optional, Self, Tuple, Union
 
 import torch
@@ -1459,16 +1459,17 @@ class TransformerConfig(ModelParallelConfig):
     """
 
     mhc_recompute_layer_num: Optional[int] = None
-    """Number of layers per MHC recompute block.
+    """Number of layers per mHC recompute block, used when 'mhc' is in recompute_modules.
 
-    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
-    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
-    layer in the transformer block) will:
-    - NOT checkpoint its final MLP BDA
-    - Register the unified recompute hook on its MLP BDA output
-    - A new CheckpointWithoutOutputManager is created for subsequent layers
+    Each TransformerBlock or HybridStack instance splits the layers it holds, in order, into
+    blocks of this many layers; its last layer always ends a block, so blocks never cross a
+    pipeline stage boundary. Within a block, mHC checkpoints its residual-stream operations
+    and separate norms into one CheckpointWithoutOutputManager. The block's last residual
+    write is not checkpointed; its output is the block boundary. After that layer, the
+    manager releases the checkpointed outputs and registers one hook on the boundary that
+    recomputes them during backward.
 
-    If None, all layers in the transformer block share a single recompute block.
+    If None, all layers of a TransformerBlock or HybridStack form a single recompute block.
 
     Must be a positive integer when set."""
 
@@ -1825,9 +1826,11 @@ class TransformerConfig(ModelParallelConfig):
     def from_config(cls, config: "TransformerConfig") -> Self:
         """Create this config type from an existing normalized transformer config.
 
-        The source config's complete instance state is deep-copied without invoking
+        The source config's instance dictionary is deep-copied without invoking
         the target class's initializer or ``__post_init__``. This preserves normalized
         values and dynamically added attributes while producing an independent config.
+        Fields introduced by the target class receive their declared defaults;
+        required new fields must be supplied by constructing the target config directly.
 
         Args:
             config: The transformer config to copy.
@@ -1836,7 +1839,23 @@ class TransformerConfig(ModelParallelConfig):
             An independent copy of ``config`` whose type is ``cls``.
         """
         new_config = cls.__new__(cls)
-        new_config.__dict__ = deepcopy(config.__dict__, {id(config): new_config})
+        memo = {id(config): new_config}
+        new_config.__dict__ = deepcopy(config.__dict__, memo)
+
+        for target_field in fields(cls):
+            name = target_field.name
+            if name in new_config.__dict__:
+                continue
+            if target_field.default is not MISSING:
+                value = deepcopy(target_field.default, memo)
+            elif target_field.default_factory is not MISSING:
+                value = target_field.default_factory()
+            else:
+                raise TypeError(
+                    f"{cls.__name__}.from_config requires a value for {name!r}; "
+                    "construct the config directly."
+                )
+            setattr(new_config, name, value)
         return new_config
 
     def _validate_cp_layouts(self) -> None:
@@ -3349,10 +3368,9 @@ class TransformerConfig(ModelParallelConfig):
                 "The fused inference TP path assumes single-stream residual tensors."
             )
 
-        # Note: mHC + MoE is deliberately NOT rejected here. HyperConnectionTransformerLayer
-        # raises for a MoE MLP submodule at build time, which is the precise check; a
-        # config-level `num_moe_experts` guard would also block the documented composition
-        # (wrapping MoE as a HybridStack layer via HyperConnectionHybridLayer).
+        # Note: mHC + MoE is supported, so it is not rejected here. HyperConnectionTransformerLayer
+        # accepts MoE MLPs and rejects only MoE CUDA-graph scopes, at build time once the MLP type
+        # is known. HybridStack can also wrap MoE layers via HyperConnectionHybridLayer.
 
         if self.enable_mhc_connections:
             if self.pipeline_model_parallel_size > 1 and self.overlap_moe_expert_parallel_comm:
@@ -4597,11 +4615,37 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.moe_shared_expert_overlap
             ), 'disable moe_shared_expert_overlap when enabling overlap_moe_expert_parallel_comm'
-            assert self.mtp_num_layers in (
-                None,
-                0,
-                1,
-            ), 'MTP supports at most one layer when enabling overlap_moe_expert_parallel_comm.'
+            assert self.mtp_num_layers is None or self.mtp_num_layers >= 0, (
+                "mtp_num_layers must be non-negative when enabling "
+                "overlap_moe_expert_parallel_comm."
+            )
+            if self.mtp_num_layers is not None and self.mtp_num_layers > 1:
+                # The schedule plan runs each MTP layer module as its own layer plan and
+                # chains the depths in its callables instead of calling
+                # MultiTokenPredictionBlock.forward, so depth-level features that live in
+                # that forward (or need a cross-depth hand-off) are gated here.
+                assert not self.mtp_use_repeated_layer, (
+                    "mtp_use_repeated_layer with mtp_num_layers > 1 is not yet supported with "
+                    "overlap_moe_expert_parallel_comm: the schedule plan builds one layer plan "
+                    "per MTP layer module, so a shared layer would run only one depth."
+                )
+                assert not self.mtp_hsm, (
+                    "mtp_hsm is not yet supported with overlap_moe_expert_parallel_comm: the "
+                    "hidden-state mixing runs in MultiTokenPredictionBlock.forward, which the "
+                    "overlap schedule does not call."
+                )
+                assert not self.enable_mhc_connections, (
+                    "enable_mhc_connections with mtp_num_layers > 1 is not yet supported with "
+                    "overlap_moe_expert_parallel_comm: the overlap schedule feeds each MTP depth "
+                    "the contracted, normalized output of the previous depth instead of its "
+                    "multi-stream output."
+                )
+                assert self.recompute_granularity != "full", (
+                    "full recompute with mtp_num_layers > 1 is not yet supported with "
+                    "overlap_moe_expert_parallel_comm: each MTP depth is its own recompute "
+                    "segment, and replaying a later depth would reuse the no-grad outputs of "
+                    "the earlier depths and drop their loss gradients."
+                )
 
             # NCCL EP (ncclep flex backend) mirrors hybridep's comm/compute overlap, but a few
             # configs are not yet safe under the 1F1B split and are gated here.
