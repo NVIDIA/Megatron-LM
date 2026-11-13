@@ -1421,6 +1421,7 @@ class MegatronFSDP(torch.nn.Module):
             # Asynchronous reduce-scatter from overlap_grad_reduce=True,
             # i.e. when sharding optimizer and gradients.
             self.grad_reduce_pipeline.wait_for_previous_grad_reduce(0)
+            self.grad_reduce_pipeline.reduce_outer_fsdp_group_gradients()
             self.grad_reduce_pipeline.reset()
         else:
             assert not any_sharding_strategy_in(
