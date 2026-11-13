@@ -22,6 +22,7 @@ from megatron.training.argument_utils import (
     TypeInferenceError,
     _default_config_from_args,
     core_transformer_config_from_args,
+    gpt_data_config_from_args,
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
@@ -81,6 +82,24 @@ def _minimal_training_args(monkeypatch):
     args.tokenizer_type = 'NullTokenizer'
     args.vocab_size = 1024
     return args
+
+
+def test_sft_context_parallel_checks_pack_width_not_truncation_limit(monkeypatch):
+    monkeypatch.setenv("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+    args = _minimal_training_args(monkeypatch)
+    args.freeze_base_model_for_mtp = False
+    args.sft = True
+    args.seq_length = 33
+    args.max_seq_length_per_sample = 64
+    args.context_parallel_size = 2
+    args.world_size = 2
+    args.bf16 = True
+    args.create_attention_mask_in_dataloader = False
+    validate_args(args)
+    cfg = pretrain_cfg_container_from_args(args, data_cfg=gpt_data_config_from_args(args))
+    cfg.validate()
+    assert cfg.data.dataset.sequence_length == 33
+    assert cfg.model.transformer.max_seq_length_per_sample == 64
 
 
 @pytest.mark.parametrize("version", [1, 2])
@@ -214,7 +233,10 @@ def test_deallocate_pipeline_outputs_follows_mfsdp_version(fsdp_kwargs, expected
         ({"use_megatron_fsdp": True, "megatron_fsdp_version": 2}, False),
     ],
 )
-def test_yaml_deallocate_pipeline_outputs_follows_mfsdp_version(fsdp_kwargs, expected):
+@pytest.mark.parametrize("execution_bound", [None, 128])
+def test_yaml_deallocate_pipeline_outputs_follows_mfsdp_version(
+    fsdp_kwargs, expected, execution_bound
+):
     """The YAML path reads the FSDP flags from the outer namespace before rebinding."""
     language_model = Namespace(
         **vars(TransformerConfig(num_layers=2, hidden_size=64, num_attention_heads=4))
@@ -222,6 +244,7 @@ def test_yaml_deallocate_pipeline_outputs_follows_mfsdp_version(fsdp_kwargs, exp
     language_model.params_dtype = torch.float32
     language_model.activation_func = "gelu"
     language_model.embedding_init_method = "xavier_uniform"
+    language_model.max_seq_length_per_sample = execution_bound
 
     # ``core_transformer_config_from_yaml`` merges the ``language_model`` and
     # ``model_parallel`` sections, and this fixture already carries every
@@ -234,6 +257,7 @@ def test_yaml_deallocate_pipeline_outputs_follows_mfsdp_version(fsdp_kwargs, exp
     config = core_transformer_config_from_yaml(args)
 
     assert config.deallocate_pipeline_outputs is expected
+    assert config.max_seq_length_per_sample == execution_bound
 
 
 def test_wide_residual_cli_builds_typed_config():

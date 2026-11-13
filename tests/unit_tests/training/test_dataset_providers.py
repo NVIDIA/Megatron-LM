@@ -34,10 +34,38 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.config import container as container_module
 from megatron.training.datasets import providers, sft_dataset, varlen_dataset
-from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset, SFTDatasetConfig
 from megatron.training.models import GPTModelConfig
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.training import legacy_dataset_factories as legacy
+
+
+def test_sft_truncates_conversations_before_packing():
+    tokenizer = SimpleNamespace(
+        pad=0,
+        eod=99,
+        tokenize_conversation=lambda *a, **kw: (torch.arange(1, 11), torch.arange(1, 11)),
+    )
+    config = SFTDatasetConfig(
+        random_seed=1234,
+        sequence_length=4,
+        packed_sequence_length=12,
+        tokenizer=tokenizer,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        create_attention_mask=False,
+    )
+    dataset = object.__new__(SFTDataset)
+    dataset.config = config
+    dataset.dataset = [[{"role": "system"}, {"role": "user"}, {"role": "system"}, {"role": "user"}]]
+    dataset.indices = [0]
+    dataset.padding_divisor = 1
+    sample = dataset[0]
+    assert sample["tokens"].tolist() == [1, 2, 3, 4, 1, 2, 3, 4, 0, 0, 0, 0]
+    assert sample["cu_seqlens"][:3].tolist() == [0, 4, 12]
+    assert sample["loss_mask"][-4:].tolist() == [0, 0, 0, 0]
+
 
 MODEL_ARGV = (
     "--num-layers 2 --hidden-size 128 --num-attention-heads 8 --micro-batch-size 1 "
@@ -347,6 +375,9 @@ def test_entry_points_build_the_dataset_config_pretrain_gpt_built(
     else:
         assert isinstance(actual, type(expected))
         names = [f.name for f in fields(expected)]
+    if dataset_class in (SFTDataset, MockSFTDataset):
+        # Physical pack width is now derived independently of the content limit.
+        assert actual.packed_sequence_length == expected.sequence_length
     assert _signature(actual, names) == _signature(expected, names)
     if entry_point == "prepare_cache":
         return
@@ -415,7 +446,7 @@ def test_hybrid_flex_rejects_the_varlen_family(monkeypatch, warnings_log, corpus
     assert warnings_log == []
     _, cfg, _ = _prepare(monkeypatch, *corpus["sft"], "hybrid_flex")
     data = _ready(cfg)
-    assert data.dataset_type is SFTDataset and type(data.dataset) is GPTDatasetConfig
+    assert data.dataset_type is SFTDataset and type(data.dataset) is SFTDatasetConfig
 
 
 @pytest.mark.parametrize("entry_point", ["gpt", "hybrid", "hybrid_flex"])

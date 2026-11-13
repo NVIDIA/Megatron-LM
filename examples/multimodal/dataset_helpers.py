@@ -197,7 +197,9 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             structured_conversation.append(turn)
         return structured_conversation
 
-    def __init__(self):
+    def __init__(
+        self, *, sequence_length=None, packing_sequence_length=None, image_token_budget=None
+    ):
         super().__init__()
 
         self.args = get_args()
@@ -213,15 +215,16 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         self.patch_dim = cfg.model.patch_dim
         self.drop_vision_class_token = cfg.model.drop_vision_class_token
         self.freeze_language_model = cfg.model.freeze_language_model
+        self.max_seq_length_per_sample = cfg.model.transformer.max_seq_length_per_sample
 
         self.tokenizer = get_tokenizer()
         self.manual_prompts = {}
         if self.args.prompt_path:
             with open(self.args.prompt_path, "r") as f:
                 self.manual_prompts = json.load(f)
-        self.dataloader_seq_length = self.args.dataloader_seq_length  # Always return samples of this length.
+        self.dataloader_seq_length = sequence_length  # Always return samples of this length.
         self.packing_seq_length = (
-            self.args.packing_seq_length
+            packing_sequence_length
         )  # Packing sequence length, if packing is enabled.
         self.is_packing_enabled = (
             self.args.packing_buffer_size is not None and self.args.packing_buffer_size > 0
@@ -281,7 +284,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             dynamic_resolution=self.args.dynamic_resolution,
             res_step=self.patch_dim,
             min_num_patches=self.args.dynamic_resolution_min_patches,
-            max_num_patches=self.args.seq_length
+            max_num_patches=image_token_budget
             - (
                 1 if not self.drop_vision_class_token else 0
             ),  # TODO: handle class toekn length correctly(not just use 1)
@@ -467,8 +470,9 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             input_ids, target = self._truncate_for_packing(input_ids, target, num_tiles, imgs)
 
         assert (
-            self._get_total_seq_length(input_ids, num_tiles, imgs) < self.args.decoder_seq_length
-        ), f"total sequence length {self._get_total_seq_length(input_ids, num_tiles, imgs)} needs to be less than {self.args.decoder_seq_length}"
+            self._get_total_seq_length(input_ids, num_tiles, imgs)
+            < self.max_seq_length_per_sample
+        ), f"total sequence length {self._get_total_seq_length(input_ids, num_tiles, imgs)} needs to be less than {self.max_seq_length_per_sample}"
 
         return ImageTaskSample(
             __key__=sample.__key__,
@@ -622,7 +626,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
             max_num_tiles = self.args.max_num_tiles
             # We keep a buffer of 4 tokens for the question,
             # the rest can be used for image tokens.
-            max_image_token_allowed = self.args.decoder_seq_length - len(input_ids) - 4
+            max_image_token_allowed = self.max_seq_length_per_sample - len(input_ids) - 4
             # We start by extracting as many tiles per image as possible, and decrease the max
             # number of tiles if there are too many image tokens.
             while True:
@@ -718,8 +722,9 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         ), "Sample has no trainable tokens."
 
         assert (
-            self._get_total_seq_length(input_ids, num_tiles, imgs) < self.args.decoder_seq_length
-        ), f"total sequence length {self._get_total_seq_length(input_ids, num_tiles, imgs)} needs to be less than {self.args.decoder_seq_length}"
+            self._get_total_seq_length(input_ids, num_tiles, imgs)
+            < self.max_seq_length_per_sample
+        ), f"total sequence length {self._get_total_seq_length(input_ids, num_tiles, imgs)} needs to be less than {self.max_seq_length_per_sample}"
 
         # Context parallel and FP8 require padding.
         # TODO: Total sample len and padded len are kept the same here.
@@ -736,7 +741,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 self.args.tensor_model_parallel_size,
                 self.args.sequence_parallel,
                 self.args.tp_comm_overlap,
-                self.args.decoder_seq_length,
+                self.max_seq_length_per_sample,
                 fp8_enabled=False,
             )
             padding_input = np.ones(padding_needed) * self.tokenizer.pad
@@ -762,7 +767,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         self._verify_no_temporal_compression()
 
         # Compute the loss mask based on extending the image tags with the proper
-        # number of image tokens, extracting the first self.args.decoder_seq_length tokens, and
+        # number of image tokens, extracting the first self.max_seq_length_per_sample tokens, and
         # ensuring that some of these tokens have a loss mask > 0.
         # Note that this is a bit hacky because we reproduce here parts of the logics which are in
         # the model itself. Ideally, the data sampler would return the already processed inputs
@@ -793,7 +798,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         loss_mask[expanded_target == self.tokenizer.pad] = 0.0  # mask paddings
         loss_mask[expanded_target == IGNORE_INDEX] = 0.0  # mask prompts
         loss_mask = torch.cat((loss_mask[1:], torch.zeros((1,))))
-        loss_mask = loss_mask[: self.args.decoder_seq_length]
+        loss_mask = loss_mask[: self.max_seq_length_per_sample]
         return torch.sum(loss_mask) > 0
 
     def replace_value_with_repetition(self, arr, token_to_replace, num_repetition, new_token):
@@ -1117,7 +1122,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 self.args.tensor_model_parallel_size,
                 self.args.sequence_parallel,
                 self.args.tp_comm_overlap,
-                self.args.decoder_seq_length,
+                self.max_seq_length_per_sample,
                 fp8_enabled=has_fp8,
             )
             if padding_needed > 0:
@@ -1163,7 +1168,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
                 self.args.tensor_model_parallel_size,
                 self.args.sequence_parallel,
                 self.args.tp_comm_overlap,
-                self.args.decoder_seq_length,
+                self.max_seq_length_per_sample,
                 fp8_enabled=has_fp8,
             )
             if padding_needed > 0:

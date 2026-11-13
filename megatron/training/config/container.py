@@ -56,6 +56,7 @@ from megatron.training.config.utils import (
     serialize_value,
 )
 from megatron.training.config.yaml_utils import safe_yaml_representers
+from megatron.training.datasets.sft_dataset import SFTDatasetConfig
 from megatron.training.models import (
     BertModelConfig,
     LLaVAModelConfig,
@@ -66,7 +67,6 @@ from megatron.training.models.base import ModelConfig
 
 T = TypeVar("T", bound="ConfigContainerBase")
 logger = logging.getLogger(__name__)
-
 
 @dataclass(kw_only=True)
 class ConfigContainerBase:
@@ -142,9 +142,7 @@ class ConfigContainerBase:
 
         if extra_keys:
             if mode == InstantiationMode.STRICT:
-                raise ValueError(
-                    f"Dictionary contains extra keys not in {cls.__qualname__}: {extra_keys}"
-                )
+                raise ValueError(f"Dictionary contains extra keys not in {cls.__qualname__}: {extra_keys}")
             else:
                 # In lenient mode, remove extra keys
                 for key in extra_keys:
@@ -156,9 +154,7 @@ class ConfigContainerBase:
         return instance
 
     @classmethod
-    def from_yaml(
-        cls: Type[T], yaml_path: str, mode: InstantiationMode = InstantiationMode.LENIENT
-    ) -> T:
+    def from_yaml(cls: Type[T], yaml_path: str, mode: InstantiationMode = InstantiationMode.LENIENT) -> T:
         """
         Create a config container from a YAML file.
 
@@ -248,7 +244,8 @@ class ConfigContainerBase:
         """
         if not HAVE_YAML:
             raise ImportError(
-                "PyYAML is required to save a config to YAML. " "Install via `pip install pyyaml`."
+                "PyYAML is required to save a config to YAML. "
+                "Install via `pip install pyyaml`."
             )
 
         config_dict = self.to_dict(**section_overrides)
@@ -263,7 +260,8 @@ class ConfigContainerBase:
         """
         if not HAVE_YAML:
             raise ImportError(
-                "PyYAML is required to print a config as YAML. " "Install via `pip install pyyaml`."
+                "PyYAML is required to print a config as YAML. "
+                "Install via `pip install pyyaml`."
             )
 
         config_dict = self.to_dict()
@@ -356,35 +354,6 @@ class PretrainConfigContainer(ConfigContainerBase):
         """Return independent batch partitions, including GTP batch shards but not CP."""
         return self.get_parallel_layout(self.get_model_world_size()).batch_parallel_size
 
-    @property
-    def sample_length(self) -> int | None:
-        """The per-sample sequence length the training loop runs at (what ``--seq-length`` set):
-        the dataset's ``sequence_length`` when the data section has a dataset; for a loader-only
-        section (an entry point whose datasets come from its own callback), the model's
-        ``transformer.max_seq_length_per_sample``, which the launcher fills from ``--seq-length``
-        and a model config's ``finalize()`` may replace (``LLaVAModelConfig`` sets its resolved
-        decoder length: text, image tokens and padding). That field is Megatron Core's per-sample
-        maximum, a bound that may exceed the dataset's length, so the loop does not read it for a
-        section with a dataset. The data side reads this length; the model side reads
-        ``model_input_length``."""
-        dataset = self.data.dataset
-        if dataset is not None:
-            return dataset.sequence_length
-        return self.model.transformer.max_seq_length_per_sample
-
-    @property
-    def model_input_length(self) -> int | None:
-        """The length of one sample's input to the model: the model config's ``decoder_seq_length``
-        when it declares one (a VLM: the text tokens, the image tokens and the CP/SP padding),
-        otherwise the sample length. The pipeline shapes, the TP-communicator buffers, the FLOPs and
-        memory estimators, the kernel warmups and the run-level metrics read it; the data side (the
-        micro-batch calculator, ``get_batch``, the token counters, the loader telemetry) reads
-        ``sample_length``, which is the text length when a VLM's data section carries a dataset."""
-        declared = getattr(self.model, "decoder_seq_length", None)
-        if declared is not None:
-            return declared
-        return self.sample_length
-
     def _optimizer_with_model_precision(self) -> OptimizerConfig:
         """Return an optimizer copy with authoritative model precision, without mutation."""
         precision = {
@@ -454,23 +423,15 @@ class PretrainConfigContainer(ConfigContainerBase):
         if self.train.train_iters:
             if self.scheduler.lr_decay_iters is None:
                 self.scheduler.lr_decay_iters = self.train.train_iters
-            self.scheduler.lr_decay_steps = (
-                self.scheduler.lr_decay_iters * self.train.global_batch_size
-            )
+            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_iters * self.train.global_batch_size
             self.scheduler.wd_incr_steps = self.train.train_iters * self.train.global_batch_size
             self.scheduler.wsd_decay_steps = None
             if self.scheduler.lr_wsd_decay_iters is not None:
-                self.scheduler.wsd_decay_steps = (
-                    self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
-                )
+                self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
             if self.scheduler.lr_warmup_fraction is not None:
-                self.scheduler.lr_warmup_steps = (
-                    self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
-                )
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
             else:
-                self.scheduler.lr_warmup_steps = (
-                    self.scheduler.lr_warmup_iters * self.train.global_batch_size
-                )
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_iters * self.train.global_batch_size
         # Sample-based training.
         elif self.train.train_samples:
             # We need to set training iters for later use. Technically
@@ -483,9 +444,7 @@ class PretrainConfigContainer(ConfigContainerBase):
             self.scheduler.wd_incr_steps = self.train.train_samples
             self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_samples
             if self.scheduler.lr_warmup_fraction is not None:
-                self.scheduler.lr_warmup_steps = (
-                    self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
-                )
+                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
             else:
                 self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
 
@@ -501,6 +460,11 @@ class PretrainConfigContainer(ConfigContainerBase):
         # Config-only topology checks also run when validating a recipe off-cluster.
         # Launch world-size checks remain in the runtime parallel-size helpers.
         transformer = self.model.transformer
+        if (
+            transformer.max_seq_length_per_sample is not None
+            and transformer.max_seq_length_per_sample <= 0
+        ):
+            raise ValueError("model.transformer.max_seq_length_per_sample must be positive")
         tp = transformer.tensor_model_parallel_size
         pp = transformer.pipeline_model_parallel_size
         cp = transformer.context_parallel_size
@@ -683,12 +647,13 @@ class PretrainConfigContainer(ConfigContainerBase):
         With a model section, dataset or not: dynamic CP needs the single loader, and a packing
         scheduler needs per-token loss and ``variable_seq_lengths`` (Core derives the latter at
         construction; a scheduler selected afterwards must set it). With a dataset: the model capacity covers the sample
-        length, a value given for one of the six fields other sections own
+        length, a value given for one of the fields other sections own
         (``CONTAINER_WRITTEN_FIELDS``) must agree with that section (the container writes them at
         ``finalize()``; the arguments and the saved file leave them at Megatron Core's defaults),
         and the model section's ``max_seq_length_per_sample``, Megatron Core's per-sample maximum,
         covers the dataset's samples when given (the container fills an unset one from the dataset
-        at ``finalize()``; the loop reads the dataset's length through ``sample_length``).
+        at ``finalize()``). SFT's physical pack width is derived from that maximum,
+        independently of its dataset's per-conversation truncation limit.
         With both: SBHD validation excludes a scheduler, a packed varlen dataset needs one, and the
         sample length is a multiple of ``2 * cp`` under context parallelism. Each is the condition
         ``validate_args`` enforces on the CLI; here it holds for a Python or YAML container too.
@@ -727,6 +692,42 @@ class PretrainConfigContainer(ConfigContainerBase):
         dataset = self.data.dataset
         if dataset is None:
             return
+        execution_bound = self.model.transformer.max_seq_length_per_sample
+        if isinstance(dataset, SFTDatasetConfig) and dataset.packed_sequence_length not in (
+            None,
+            execution_bound,
+        ):
+            raise ValueError(
+                "data.dataset.packed_sequence_length is derived from "
+                "model.transformer.max_seq_length_per_sample; leave it unset"
+            )
+        dataset_type = resolve_dataset_class(dataset, self.data.dataset_type)
+        if dataset_family_from_type(dataset_type)[0] == "sft":
+            pack_length = (
+                execution_bound or dataset.sequence_length
+                if isinstance(dataset, SFTDatasetConfig)
+                else dataset.sequence_length
+            )
+            transformer = self.model.transformer
+            cp_multiple = (
+                2 * transformer.context_parallel_size
+                if transformer.context_parallel_size > 1
+                else 1
+            )
+            sp_multiple = (
+                transformer.tensor_model_parallel_size if transformer.sequence_parallel else 1
+            )
+            if pack_length % (cp_multiple * sp_multiple):
+                raise ValueError(
+                    "SFT pack width must satisfy the dataset's CP/SP padding alignment"
+                )
+            if (
+                self.model.position_embedding_type == "learned_absolute"
+                and self.model.seq_length < pack_length
+            ):
+                raise ValueError(
+                    "Learned position capacity must cover the SFT pack's padded positions"
+                )
         capacity = getattr(self.model, "seq_length", None)
         if isinstance(capacity, int) and isinstance(dataset.sequence_length, int):
             if capacity < dataset.sequence_length:
@@ -812,7 +813,11 @@ class PretrainConfigContainer(ConfigContainerBase):
                 "for --use-varlen-dataset, a Python or YAML container sets it explicitly."
             )
         context_parallel_size = transformer.context_parallel_size
-        if context_parallel_size > 1 and dataset.sequence_length % (2 * context_parallel_size):
+        if (
+            family != "sft"
+            and context_parallel_size > 1
+            and dataset.sequence_length % (2 * context_parallel_size)
+        ):
             raise ValueError(
                 f"data.dataset.sequence_length ({dataset.sequence_length}) must be a multiple of "
                 f"2 * model.transformer.context_parallel_size ({context_parallel_size})."
@@ -852,11 +857,16 @@ class PretrainConfigContainer(ConfigContainerBase):
                 total_cp_ranks = transformer.context_parallel_size * (
                     data_parallel_size if scheduler == "default_dynamic_cp" else 1
                 )
-                if total_cp_ranks * budget < dataset.sequence_length:
+                input_length = (
+                    transformer.max_seq_length_per_sample or dataset.sequence_length
+                    if self.data.is_sft()
+                    else dataset.sequence_length
+                )
+                if total_cp_ranks * budget < input_length:
                     raise ValueError(
                         f"The packed-sequence buffer ({total_cp_ranks} ranks * "
                         f"max_seqlen_per_dp_cp_rank {budget} = {total_cp_ranks * budget}) must "
-                        f"cover one sample (data.dataset.sequence_length {dataset.sequence_length})."
+                        f"cover one physical sample ({input_length})."
                     )
         batch_sizes = self._resolve_batch_sizes(self.get_batch_parallel_size())
         self._validate_rl_config(batch_sizes[0])
@@ -967,14 +977,12 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
         self._resolve_scheduler_step_fields()
         if dataset is not None:
-            # The six fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
+            # Fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
             # from the validation config, the layout from the required model config.
-            # In the other direction, Megatron Core's per-sample maximum (NCCL EP sizes its
-            # packed-input buffers from it) defaults to the dataset's length, which bounds every
-            # sample; an explicit larger value stays. The loop reads the length through
-            # sample_length, not from this bound.
             if transformer.max_seq_length_per_sample is None:
                 transformer.max_seq_length_per_sample = dataset.sequence_length
+            if isinstance(dataset, SFTDatasetConfig):
+                dataset.packed_sequence_length = transformer.max_seq_length_per_sample
             dataset.full_validation = self.validation.full_validation
             dataset.multiple_validation_sets = self.validation.multiple_validation_sets
             dataset.data_parallel_size = data_parallel_size

@@ -233,7 +233,6 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
                 num_microbatches=1,
                 seq_length=64,
                 micro_batch_size=8,
-                decoder_seq_length=64,
                 forward_only=False)
         
             optim.step()

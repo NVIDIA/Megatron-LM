@@ -27,7 +27,7 @@ from megatron.training.config.dataset_config import (
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
 from megatron.training.config.utils import sanitize_dataclass_config, serialize_value
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset, SFTDatasetConfig
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 
 BOOLS = dict(reset_position_ids=False, reset_attention_mask=False, eod_mask_loss=False)
@@ -183,12 +183,14 @@ def test_container_written_fields_are_the_layout_and_the_validation_flags():
     """The six fields other sections own, left at Megatron Core's defaults until the container
     writes them; the seed is the section's own setting, not one of them."""
     assert CONTAINER_WRITTEN_FIELDS == (
+        "packed_sequence_length",
         "data_parallel_size", "context_parallel_size", "sequence_parallel_size",
         "dynamic_context_parallel",
         "multiple_validation_sets", "full_validation",
     )  # fmt: skip
-    defaults = {f.name: f.default for f in fields(GPTDatasetConfig)}
+    defaults = {f.name: f.default for f in fields(SFTDatasetConfig)}
     assert {name: defaults[name] for name in CONTAINER_WRITTEN_FIELDS} == {
+        "packed_sequence_length": None,
         "data_parallel_size": 1, "context_parallel_size": None, "sequence_parallel_size": 0,
         "dynamic_context_parallel": False,
         "multiple_validation_sets": None, "full_validation": None,
@@ -260,6 +262,12 @@ def test_data_section_round_trips_through_yaml_with_the_class():
 
 
 def test_implicit_class_resolution():
+    sft = SFTDatasetConfig(random_seed=1, sequence_length=16, **BOOLS)
+    assert resolve_dataset_class(sft, None) is MockSFTDataset
+    sft.blend, sft.split = BLEND, "1,1,1"
+    assert resolve_dataset_class(sft, None) is SFTDataset
+    with pytest.raises(ValueError, match="SFTDatasetConfig requires"):
+        resolve_dataset_class(sft, GPTDataset)
     assert resolve_dataset_class(_dataset(blend=BLEND, split="1,1,1"), None) is GPTDataset
     assert resolve_dataset_class(_dataset(), None) is MockGPTDataset
     assert (

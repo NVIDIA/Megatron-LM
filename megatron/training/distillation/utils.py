@@ -1,4 +1,4 @@
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 """Storage helpers for cached-logit tar shards.
 
@@ -409,7 +409,10 @@ def pad_and_stack_cu_seqlens(cu_seqlens_list: List[torch.Tensor]) -> torch.Tenso
 
 
 def slice_tensor_for_cp_rank(
-    tensor: torch.Tensor, cp_rank: int, cp_size: int, cu_seqlens: Optional[torch.Tensor] = None
+    tensor: torch.Tensor,
+    cp_rank: int,
+    cp_size: int,
+    cu_seqlens: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Return this CP rank's zigzag sequence slice from a full sequence tensor.
 

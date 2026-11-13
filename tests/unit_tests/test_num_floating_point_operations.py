@@ -23,7 +23,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import gdp_stack_spec
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.training.logging.dsa_flops import dsa_indexer_flops, dsa_layer_flops
-from megatron.training.models import GPTModelConfig, HybridModelConfig
+from megatron.training.models import GPTModelConfig, HybridModelConfig, T5ModelConfig
 from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
     num_floating_point_operations,
@@ -86,6 +86,21 @@ def _make_hybrid_config(*, num_layers=4, hidden_size=512, num_attention_heads=8,
 
 class TestBSHDBackwardCompat:
     """For unpacked BSHD, the new optional arg must not change the result."""
+
+    @pytest.mark.parametrize("decoder_length,expected_length", [(None, 32), (16, 16)])
+    def test_t5_preserves_decoder_length_estimate(self, decoder_length, expected_length):
+        reference = _make_gpt_config()
+        model = T5ModelConfig(
+            transformer=reference.transformer,
+            seq_length=reference.seq_length,
+            vocab_size=reference.vocab_size,
+            encoder_num_layers=4,
+            encoder_seq_length=32,
+            decoder_seq_length=decoder_length,
+        )
+        assert num_floating_point_operations(model, 2, sequence_length=32) == (
+            num_floating_point_operations(reference, 2, sequence_length=expected_length)
+        )
 
     def test_default_matches_explicit_bshd(self):
         args = _make_gpt_config()

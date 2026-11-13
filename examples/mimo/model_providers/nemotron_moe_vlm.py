@@ -278,7 +278,7 @@ def language_model_spec(
                 make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
                 tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
             ),
-            "max_sequence_length": args.seq_length,
+            "max_sequence_length": cfg.model.transformer.max_seq_length_per_sample,
             "pre_process": pp_rank == 0,
             "post_process": pp_rank == pp_size - 1,
             "hybrid_layer_pattern": cfg.model.hybrid_layer_pattern,

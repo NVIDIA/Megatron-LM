@@ -58,6 +58,7 @@ from megatron.training.argument_utils import (  # noqa: F401  (core_gpt_dataset_
 from megatron.training.arguments import parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets, is_dataset_built_on_rank
 from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.sequence_lengths import get_dataset_input_length
 from megatron.training.training import update_seqlen_stats_from_cu_seqlens
 from megatron.training.utils import is_first_or_last_pipeline_stage
 from model_provider import model_provider
@@ -145,7 +146,7 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         )
 
     # The sample length: the dataset's (the model's per-sample maximum for a loader-only section).
-    seq_length = cfg.sample_length
+    seq_length = get_dataset_input_length(cfg.data.dataset)
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)

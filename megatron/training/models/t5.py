@@ -19,6 +19,12 @@ class T5ModelConfig:
     encoder_num_layers: int
     """Number of encoder layers; the decoder uses transformer.num_layers."""
 
+    encoder_seq_length: int | None = None
+    """Encoder input width, independent of the position-embedding capacity."""
+
+    decoder_seq_length: int | None = None
+    """T5's independent decoder input width; not a decoder-only model's execution length."""
+
     vocab_size: int | None = None
     """Model vocabulary, or None until tokenizer initialization."""
 
@@ -51,3 +57,25 @@ class T5ModelConfig:
 
     tp_comm_overlap_cfg: str | dict[str, Any] | None = None
     """Transformer Engine user-buffer overrides, as a YAML path or dictionary."""
+
+    def validate(self) -> None:
+        """Check the independent encoder and decoder execution widths."""
+        for name in ("encoder_seq_length", "decoder_seq_length"):
+            value = getattr(self, name)
+            if value is not None and value <= 0:
+                raise ValueError(f"{name} must be positive")
+            bound = self.transformer.max_seq_length_per_sample
+            if value is not None and bound is not None and value > bound:
+                raise ValueError(f"max_seq_length_per_sample must cover {name}")
+
+    def finalize(self) -> None:
+        """Resolve the encoder width before shared runtime services read the model."""
+        if self.encoder_seq_length is None:
+            self.encoder_seq_length = self.transformer.max_seq_length_per_sample
+        if (
+            self.transformer.max_seq_length_per_sample is None
+            and self.encoder_seq_length is not None
+        ):
+            self.transformer.max_seq_length_per_sample = max(
+                self.encoder_seq_length, self.decoder_seq_length or self.encoder_seq_length
+            )

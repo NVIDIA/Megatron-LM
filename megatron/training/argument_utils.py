@@ -54,6 +54,7 @@ from megatron.training.config import (
     ValidationConfig,
 )
 from megatron.training.config.dataset_config import dataset_type_from_family
+from megatron.training.datasets.sft_dataset import SFTDatasetConfig
 from megatron.training.models import (
     BertModelConfig,
     GPTModelConfig,
@@ -430,9 +431,10 @@ def core_transformer_config_from_args(args, config_class=None):
     for f in dataclasses.fields(config_class):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
-    # The training sequence length, not max_position_embeddings (which GPTModelConfig.seq_length
-    # carries): core modules that size buffers per sample (NCCL EP) read it from the config.
-    kw_args['max_seq_length_per_sample'] = args.seq_length
+    # Keep the physical row/pack bound separate from the dataset's truncation limit.
+    # Existing scripts specifying only --seq-length retain their original execution width.
+    if kw_args.get('max_seq_length_per_sample') is None:
+        kw_args['max_seq_length_per_sample'] = args.seq_length
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['deallocate_pipeline_outputs'] = not _mfsdp_v2_disables_pipeline_output_dealloc(args)
     kw_args['pipeline_dtype'] = args.params_dtype
@@ -842,7 +844,26 @@ def model_config_from_args(
         return hybrid_config_from_args(args, model_config_cls=model_config_cls)
     if issubclass(model_config_cls, BertModelConfig):
         return bert_config_from_args(args, model_config_cls=model_config_cls)
-    return model_config_cls(**_model_config_kwargs_from_args(args, model_config_cls))
+    kwargs = _model_config_kwargs_from_args(args, model_config_cls)
+    if (
+        issubclass(model_config_cls, T5ModelConfig)
+        and getattr(args, "max_seq_length_per_sample", None) is None
+    ):
+        lengths = [
+            length
+            for length in (args.encoder_seq_length, args.decoder_seq_length)
+            if length is not None
+        ]
+        if lengths:
+            kwargs["transformer"].max_seq_length_per_sample = max(lengths)
+    if (
+        issubclass(model_config_cls, LLaVAModelConfig)
+        and getattr(args, "max_seq_length_per_sample", None) is None
+    ):
+        # Legacy VLM launchers name the language execution width --decoder-seq-length.
+        if args.decoder_seq_length is not None:
+            kwargs["transformer"].max_seq_length_per_sample = args.decoder_seq_length
+    return model_config_cls(**kwargs)
 
 
 def bert_config_from_args(
@@ -855,6 +876,12 @@ def bert_config_from_args(
     if args.spec is not None:
         kwargs["transformer_layer_spec"] = (
             bert_layer_local_spec if args.spec[0] == "local" else import_module(args.spec)
+        )
+    bound = kwargs["transformer"].max_seq_length_per_sample
+    if args.seq_length is not None and bound != args.seq_length:
+        raise ValueError(
+            "The BERT callback emits fixed-width rows: --max-seq-length-per-sample "
+            "must equal --seq-length"
         )
     return model_config_cls(**kwargs)
 
@@ -1038,7 +1065,7 @@ def _resolve_data_sources(args: Namespace):
 
 def _container_written_fields_from_args(args: Namespace) -> dict[str, Any]:
     """What a standalone (container-less) dataset config takes from ``args`` for the fields the
-    container writes otherwise (``CONTAINER_WRITTEN_FIELDS``: the layout, the validation flags)."""
+    container writes otherwise (pack width, layout, and validation flags)."""
     return {
         "data_parallel_size": args.data_parallel_size,
         "context_parallel_size": args.context_parallel_size,
@@ -1095,7 +1122,13 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
     kwargs["sequences_per_dataset"] = sequences_per_dataset
     if standalone:
         kwargs.update(_container_written_fields_from_args(args))
-    if family == "fim":
+    if family == "sft":
+        if standalone:
+            kwargs["packed_sequence_length"] = (
+                getattr(args, "max_seq_length_per_sample", None) or args.seq_length
+            )
+        dataset = SFTDatasetConfig(**kwargs)
+    elif family == "fim":
         kwargs.update(
             fim_rate=args.fim_rate,
             fim_spm_rate=args.fim_spm_rate,

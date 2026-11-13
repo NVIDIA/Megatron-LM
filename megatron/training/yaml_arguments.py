@@ -412,10 +412,16 @@ def core_transformer_config_from_yaml(args, transfomer_key = "language_model"):
     rng = _model_rng_config(args)
     # Read the distributed-init args before the rebind below hides them.
     disable_pipeline_output_dealloc = _mfsdp_v2_disables_pipeline_output_dealloc(args)
+    execution_bound = getattr(args.model_parallel, "max_seq_length_per_sample", None)
+    if execution_bound is None:
+        execution_bound = getattr(getattr(args, transfomer_key), "max_seq_length_per_sample", None)
+    if execution_bound is None:
+        execution_bound = getattr(args, "seq_length", None)
     # Combine transfomer config with model parallel args
     args = SimpleNamespace(**vars(getattr(args, transfomer_key)), **vars(args.model_parallel))
     # Translate args to core transformer configuration
     kw_args = core_config_from_args(args, TransformerConfig)    
+    kw_args['max_seq_length_per_sample'] = execution_bound
     
     # Hardcoded 
     kw_args['deallocate_pipeline_outputs'] = not disable_pipeline_output_dealloc

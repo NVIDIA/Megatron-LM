@@ -16,7 +16,7 @@ import torch
 import yaml
 from config import EvaluationConfig
 from evaluation.evaluation_datasets import get_evaluation_dataset
-from model import model_provider
+from model import model_provider, resolve_multimodal_sequence_lengths
 from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import parallel_state
@@ -857,6 +857,7 @@ def eval_tasks():
     from megatron.training.argument_utils import model_config_from_args
 
     args = parse_and_validate_args(extra_args_provider=add_text_generation_args)
+    resolve_multimodal_sequence_lengths(args)
     model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
     set_run_config(inference_cfg_container_from_args(args, model_cfg))
     initialize_megatron(training=False)

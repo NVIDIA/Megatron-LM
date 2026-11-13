@@ -1,6 +1,4 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION.  All rights reserved.
-import logging
-import warnings
 from copy import deepcopy
 
 import torch
@@ -22,11 +20,46 @@ from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
 from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
 from megatron.core.transformer.spec_utils import import_module
-from megatron.core.utils import log_single_rank
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.global_vars import get_run_config
 from megatron.training.models import LLaVAModelConfig
 from megatron.training.vocab_utils import model_vocab_size
+
+
+def resolve_multimodal_sequence_lengths(args):
+    """Resolve language/image capacity before constructing training or inference configs."""
+    # Validate modality capacity at the application boundary, before runtime setup.
+    if args.dynamic_resolution:
+        max_image_tokens = args.seq_length
+        if args.pixel_shuffle:
+            max_image_tokens //= 4
+        if getattr(args, "conv_merging", False):
+            max_image_tokens //= 4
+    else:
+        if getattr(args, "video_temporal_patch_size", 1) != 1:
+            raise NotImplementedError("Temporal compression requires --dynamic-resolution")
+        max_image_tokens = get_num_image_embeddings(
+            args.img_h,
+            args.img_w,
+            args.patch_dim,
+            args.vision_model_type,
+            args.disable_vision_class_token,
+            class_token_len=getattr(args, "class_token_len", None) or 1,
+            pixel_shuffle=args.pixel_shuffle,
+            use_tile_tags=args.use_tile_tags,
+            max_num_tiles=args.max_num_tiles,
+            tokenizer_type=args.tokenizer_prompt_format,
+        ) * max(args.max_num_tiles + int(args.use_thumbnail), args.num_frames)
+    # Resolve the language execution width before runtime buffers or loaders exist.
+    # --seq-length is an image-token budget in dynamic-resolution recipes, not
+    # the language sequence length.
+    if args.max_seq_length_per_sample is None:
+        args.max_seq_length_per_sample = args.decoder_seq_length
+    if args.max_seq_length_per_sample is None:
+        raise ValueError("Provide --decoder-seq-length or --max-seq-length-per-sample")
+    if args.max_seq_length_per_sample <= max_image_tokens:
+        raise ValueError("Language execution width must exceed the maximum image-token count")
+    args.max_position_embeddings = max(args.max_position_embeddings, args.max_seq_length_per_sample)
 
 
 def model_provider(
@@ -60,58 +93,6 @@ def model_provider(
     use_te = args.use_te
 
     print_rank_0('building a multimodal model ...')
-
-    if getattr(args, 'dynamic_resolution', False):
-        max_num_image_embeddings = args.seq_length
-        num_image_embeddings = args.seq_length
-        if args.pixel_shuffle:
-            max_num_image_embeddings //= 4
-            num_image_embeddings //= 4
-        if getattr(args, 'conv_merging', False):
-            max_num_image_embeddings //= 4
-            num_image_embeddings //= 4
-    else:
-        temporal_patch_dim = getattr(args, 'video_temporal_patch_size', 1)
-        if temporal_patch_dim != 1:
-            raise NotImplementedError(
-                "Temporal compression currently requires --dynamic-resolution. "
-                f"Found --video-temporal-patch-size={temporal_patch_dim}."
-            )
-
-        num_image_embeddings = get_num_image_embeddings(
-            img_h=cfg.model.img_h,
-            img_w=cfg.model.img_w,
-            patch_dim=cfg.model.patch_dim,
-            vision_model_type=args.vision_model_type,
-            disable_vision_class_token=cfg.model.drop_vision_class_token,
-            class_token_len=getattr(args, 'class_token_len', None) or 1,
-            pixel_shuffle=args.pixel_shuffle,
-            use_tile_tags=args.use_tile_tags,
-            max_num_tiles=args.max_num_tiles,
-            tokenizer_type=cfg.tokenizer.tokenizer_prompt_format,
-        )
-        old_seq_length = args.seq_length
-        args.seq_length = args.encoder_seq_length = num_image_embeddings
-        if old_seq_length != args.seq_length:
-            log_single_rank(
-                logging.getLogger(__name__),
-                logging.WARNING,
-                f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})"
-            )
-
-        max_num_image_embeddings = max((args.max_num_tiles + int(args.use_thumbnail)), args.num_frames) * num_image_embeddings
-
-    assert (
-        args.decoder_seq_length is not None
-    ), "Please provide --decoder-seq-length to set the language model sequence length"
-    assert (
-        args.decoder_seq_length > max_num_image_embeddings
-    ), "Language model sequence length must be greater than the maximum number of image embeddings"
-    if args.decoder_seq_length > args.max_position_embeddings:
-        args.max_position_embeddings = args.decoder_seq_length
-        warnings.warn(
-            f"Expanded max_position_embeddings to {args.max_position_embeddings} to accommodate the maximum language model sequence length"
-        )
 
     language_model_type = args.language_model_type
     vision_model_type = args.vision_model_type
@@ -279,7 +260,7 @@ def model_provider(
             make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
             tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
         ),
-        language_max_sequence_length=args.decoder_seq_length,
+        language_max_sequence_length=cfg.model.transformer.max_seq_length_per_sample,
         vision_transformer_config=vision_config,
         vision_transformer_layer_spec=vision_transformer_layer_spec,
         drop_vision_class_token=cfg.model.drop_vision_class_token,

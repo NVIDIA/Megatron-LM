@@ -286,7 +286,7 @@ def _collate_mock_batch(batch: list[dict[str, object]]) -> dict[str, object]:
 
 
 def build_train_valid_test_data_loaders(
-    args: argparse.Namespace, topology: HeteroTopology
+    args: argparse.Namespace, topology: HeteroTopology, *, image_sequence_length: int | None = None
 ) -> tuple[Optional[DataLoader], Optional[DataLoader], Optional[DataLoader]]:
     """Build independent mock DataLoaders for the data-consuming rank role."""
     cfg = get_run_config()
@@ -333,6 +333,7 @@ def build_train_valid_test_data_loaders(
             pg_collection=encoder_pgc,
             module_seed_offset=_ENCODER_SEED_OFFSET,
             encoder_name=encoder_name,
+            image_sequence_length=image_sequence_length,
         )
     if language_needs_data:
         return _build_split_loaders(
@@ -341,6 +342,7 @@ def build_train_valid_test_data_loaders(
             pg_collection=language_pgc,
             module_seed_offset=_LANGUAGE_SEED_OFFSET,
             encoder_name=None,
+            image_sequence_length=image_sequence_length,
         )
     return (None, None, None)
 
@@ -352,11 +354,12 @@ def _build_split_loaders(
     pg_collection,
     module_seed_offset: int,
     encoder_name: Optional[str],
+    image_sequence_length: int | None = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """Build split-local datasets with deterministic module/DP/split seeds."""
     cfg = get_run_config()
     base_seed = cfg.rng.seed + module_seed_offset + get_data_lane_rank(pg_collection)
-    common = _mock_loader_kwargs(cfg, args, encoder_name)
+    common = _mock_loader_kwargs(cfg, args, encoder_name, image_sequence_length)
     return tuple(
         _build_mock_vlm_dataloader(
             batch_size=batch_size,
@@ -368,9 +371,11 @@ def _build_split_loaders(
     )
 
 
-def _mock_loader_kwargs(cfg, args: argparse.Namespace, encoder_name: Optional[str]) -> dict:
+def _mock_loader_kwargs(
+    cfg, args: argparse.Namespace, encoder_name: Optional[str], image_sequence_length: int | None
+) -> dict:
     """Translate parsed training arguments to the reusable mock loader."""
-    seq_len = args.seq_length
+    seq_len = cfg.model.transformer.max_seq_length_per_sample
     dtype = getattr(args, "params_dtype", None)
     if dtype is None:
         dtype = torch.bfloat16 if getattr(args, "bf16", False) else torch.float32
@@ -381,7 +386,7 @@ def _mock_loader_kwargs(cfg, args: argparse.Namespace, encoder_name: Optional[st
     num_image_tiles = getattr(args, "num_image_tiles", 1)
     pixel_shuffle = bool(getattr(args, "pixel_shuffle", False))
     dynamic_resolution = bool(getattr(args, "dynamic_resolution", False))
-    image_seq_length = getattr(args, "image_seq_length", None)
+    image_seq_length = image_sequence_length
     if image_seq_length is None:
         image_seq_length = (
             seq_len // 2

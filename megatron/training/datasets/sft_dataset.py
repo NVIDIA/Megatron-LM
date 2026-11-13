@@ -4,6 +4,7 @@ import atexit
 import csv
 import math
 from collections import Counter
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
@@ -13,8 +14,19 @@ from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split
 from megatron.training.datasets.utils import load_json_arg
+from megatron.training.sequence_lengths import get_dataset_input_length
 
 IGNORE_INDEX = -100
+
+
+@dataclass
+class SFTDatasetConfig(GPTDatasetConfig):
+    """SFT conversation limits and physical pack width."""
+
+    packed_sequence_length: Optional[int] = None
+    """Physical output width, including alignment padding. The training container derives this
+    from the model execution bound; inherited ``sequence_length`` limits each conversation.
+    Standalone datasets default to ``sequence_length`` when this is unset."""
 
 
 class SFTLowLevelDataset:
@@ -116,7 +128,7 @@ class SFTDataset(MegatronDataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
 
         tokenizer = self.config.tokenizer
-        pack_length = self.config.sequence_length
+        pack_length = get_dataset_input_length(self.config)
 
         merged_conversations = self.dataset[int(self.indices[idx % len(self.indices)])]
         split_conversations = self._split_conversations(merged_conversations)
@@ -142,6 +154,11 @@ class SFTDataset(MegatronDataset):
             tokens_list = tokens.tolist()
             targets_list = targets.tolist()
 
+            # Truncate each conversation before packing; the physical pack width
+            # and its alignment padding are independent of this content limit.
+            if self.config.sequence_length < pack_length:
+                tokens_list = tokens_list[: self.config.sequence_length]
+                targets_list = targets_list[: self.config.sequence_length]
 
             pack_tokens.extend(tokens_list)
             pack_targets.extend(targets_list)
@@ -329,7 +346,7 @@ class MockSFTDataset(SFTDataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
 
         tokenizer = self.config.tokenizer
-        pack_length = self.config.sequence_length
+        pack_length = get_dataset_input_length(self.config)
         eod = tokenizer.eod
         pad = tokenizer.pad
 
@@ -342,6 +359,8 @@ class MockSFTDataset(SFTDataset):
 
         # Convert tokens to list and add EOD
         tokens_list = tokens.tolist()
+        if self.config.sequence_length < pack_length and len(tokens_list) >= self.config.sequence_length:
+            tokens_list = tokens_list[: self.config.sequence_length - 1] + [eod]
         if tokens_list[-1] != eod:
             tokens_list.append(eod)
         targets_list = list(tokens_list)

@@ -54,6 +54,7 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets
 from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.sequence_lengths import get_dataset_input_length
 from megatron.training.utils import is_first_or_last_pipeline_stage
 
 # modelopt distillation
@@ -217,7 +218,7 @@ def get_batch(data_iterator, vp_stage=None):
         cp_size=cp_size,
         tp_rank=tp_rank,
         micro_batch_size=cfg.train.micro_batch_size,
-        seq_length=cfg.sample_length,
+        seq_length=get_dataset_input_length(cfg.data.dataset),
         mtp_on_this_rank=mtp_on_this_rank,
         pipeline_model_parallel_size=config.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),

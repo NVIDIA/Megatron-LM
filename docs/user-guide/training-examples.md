@@ -75,6 +75,68 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
     --eval-interval 1000
 ```
 
+## Sequence lengths in the training configuration
+
+Dataset content limits and model execution widths have different owners:
+
+- `cfg.data.dataset.sequence_length` limits each GPT/SFT sequence's content. The CLI
+  supplies it with `--seq-length`.
+- `cfg.model.transformer.max_seq_length_per_sample` bounds one physical model input
+  row, or an entire packed THD row, including padding and expanded image tokens.
+  `--max-seq-length-per-sample` sets it explicitly; GPT defaults to `--seq-length`.
+- `cfg.model.seq_length` is the model's position capacity (`--max-position-embeddings`),
+  not a dataset truncation limit. RoPE settings are unchanged.
+- `max_seqlen_per_dp_cp_rank` remains the separate per-rank dynamic-CP packing budget.
+
+For example, `--sft --seq-length 2048 --max-seq-length-per-sample 8192` truncates
+individual conversations at 2048 tokens and emits 8192-token padded packs. The
+container derives `SFTDatasetConfig.packed_sequence_length` during startup;
+recipes should set the model bound rather than this derived dataset field. Existing
+`--seq-length`-only runs retain their previous widths and packing behavior.
+The SFT-specific config lives alongside `SFTDataset`; Core's `GPTDatasetConfig`
+has no pack-width field. Legacy SFT callers supplying a plain `GPTDatasetConfig`
+retain its single `sequence_length` as the output pack width.
+
+An oversized allocation bound does not enlarge fixed GPT dataset rows or change
+their token-based batch schedule. T5 retains separate encoder and decoder input
+lengths. Callback datasets such as Energon still own truncation and packing; their
+entrypoints bind those inputs before `pretrain()`, and resolve the model execution
+bound before runtime buffers are initialized. Fixed-width BERT, mock VLM, and
+ModelOpt callbacks reject bounds inconsistent with the rows they actually emit.
+
+`validate()` checks these constraints without mutation. Framework startup calls
+`finalize()` to derive unset/owned fields before any runtime consumer reads them.
+
+### Python API compatibility
+
+`LLaVAModelConfig.decoder_seq_length` is removed. Python callers and saved
+configurations using this field require updating; strict deserialization rejects
+the removed LLaVA field. For LLaVA, move the resolved text + image + padding width
+to `model.transformer.max_seq_length_per_sample` before startup. Do not substitute
+the allocation bound for a fixed GPT dataset's actual row width.
+
+The `--decoder-seq-length` CLI flag remains accepted: VLM entrypoints translate
+it into their execution width, while T5 retains an independent decoder width.
+Decoder-only models do not acquire a second decoder-length config field.
+
+`megatron.core.pipeline_parallel.schedules.get_tensor_shapes()` and all three
+forward/backward schedules use one resolved `seq_length`. Their optional
+`decoder_seq_length` argument is deprecated and will be removed in the 0.22 release.
+For compatibility, a non-None value still overrides `seq_length` in the shape helper
+and non-interleaved schedule; the no-pipeline and interleaved schedules continue
+to ignore it. Supplying a non-None value emits a `FutureWarning` on the logging ranks.
+Callers should select the pipeline width before calling them, including when
+forwarding keywords through ModelOpt's distillation shape adapter. For VLMs, pass
+the expanded LM input width. When migrating an ignored argument, simply remove it.
+T5 retains separate model/dataset encoder and decoder lengths; its entrypoint
+does not support pipeline parallelism. External callers (including Bridge) should
+stop passing the deprecated keyword before upgrading to 0.22.
+
+Direct Python callers of the migrated callback dataset providers and task encoders
+must pass their length inputs explicitly instead of relying on global arguments.
+The supplied application entrypoints bind these inputs before `pretrain()`; their
+existing CLI invocations remain supported.
+
 ## GPT-3 Training Example
 
 Train a GPT-3 style model:
