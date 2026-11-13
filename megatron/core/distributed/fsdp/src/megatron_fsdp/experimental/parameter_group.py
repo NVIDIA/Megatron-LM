@@ -105,9 +105,6 @@ class FsdpParameterGroup:
     dtype: torch.dtype
     requires_grad: bool
     main_weight: DBuffer
-    # All compute-weight buffers share one concrete type. Mypy does not track
-    # this invariant across union-typed attributes, so redistribution below
-    # uses a targeted arg-type ignore.
     model_weight: DBuffer | QuantizedDBuffer
     # Optimizer-layout representation of model_weight after an optimizer step.
     post_optimizer_model_weight: DBuffer | QuantizedDBuffer
@@ -494,6 +491,9 @@ class FsdpParameterGroup:
             return
 
         if self._model_weight_is_stale:
+            # post_optimizer_model_weight and model_weight always have the same
+            # concrete type (DBuffer or QuantizedDBuffer). Mypy does not track this
+            # relationship across union-typed attributes, hence the arg-type ignore.
             self.post_optimizer_model_weight.redistribute(
                 self.model_weight.placements, out=self.model_weight  # type: ignore[arg-type]
             )
