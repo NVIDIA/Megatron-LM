@@ -95,7 +95,7 @@ class TestGradientReducePreprocessing:
 class ToyMoELayer(torch.nn.Module):
     """A layer of experts that every token is routed to, so that every expert gets a gradient."""
 
-    def __init__(self, dim: int = DIM_SIZE, num_experts: int = 2):
+    def __init__(self, dim: int = DIM_SIZE, num_experts: int = 2) -> None:
         super().__init__()
         self.experts = torch.nn.ModuleList([torch.nn.Linear(dim, dim) for _ in range(num_experts)])
 
@@ -111,7 +111,7 @@ class ToyExpertParallelModel(torch.nn.Module):
     its name, so the experts are nested in a submodule to put that infix in their names.
     """
 
-    def __init__(self, dim: int = DIM_SIZE):
+    def __init__(self, dim: int = DIM_SIZE) -> None:
         super().__init__()
         self.dense = torch.nn.Linear(dim, dim)
         self.mlp = ToyMoELayer(dim)
