@@ -512,6 +512,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # CPU, avoiding a per-step NCCL AllReduce kernel on the compute stream.
         self._ep_zmq_communicator = None
 
+        # Persistent logits destination the controller installs under CUDA graphs.
+        # The controller owns it, so it is exempt from asserts and deallocation.
+        self.logits_output_buffer = None
+
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
         self.is_hybrid_model = mamba_inference_state_config is not None
@@ -1409,6 +1413,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         # Validate no tensors allocated prior to this method.
         for key in vars(self).keys():
+            if key == "logits_output_buffer":
+                continue
             value = getattr(self, key)
             assert not isinstance(value, torch.Tensor), (
                 "All tensors should be allocated within `initialize_all_tensors()`. "
@@ -1959,6 +1965,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         elif self.kv_cache_management_mode == KVCacheManagementMode.RECOMPUTE:
             # TODO(@lmcafee): check that device == 'cuda'?
             for key in list(vars(self).keys()):
+                if key == "logits_output_buffer":
+                    continue
                 value = getattr(self, key)
                 if isinstance(value, torch.Tensor):
                     delattr(self, key)
