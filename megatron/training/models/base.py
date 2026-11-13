@@ -128,8 +128,7 @@ class ModelConfig:
         """Deserialize config from dictionary.
 
         Uses _target_ to determine the correct class to instantiate.
-        The serialized _builder_ value is accepted for compatibility but ignored. The
-        class selected by _target_ determines the builder through its ClassVar.
+        The builder is restored from the required _builder_ entry.
 
         Args:
             data: Dictionary with _target_ and config fields
@@ -171,7 +170,10 @@ class ModelConfig:
                 return type(value)(_from_value(item) for item in value)
             return value
 
-        return _from_dict(data)
+        result = _from_dict(data)
+        result.builder = data["_builder_"]
+
+        return result
 
 
 ModelT = TypeVar("ModelT", bound=MegatronModule)

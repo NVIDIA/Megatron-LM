@@ -245,10 +245,10 @@ class TestModelConfigFromDict:
         assert cfg.value == 55
         assert cfg.name == "reconstructed"
 
-    def test_serialized_builder_ignored(self):
+    def test_builder_restored(self):
         d = self._dummy_dict(_builder_="fake.builder.string")
         cfg = ModelConfig.from_dict(d)
-        assert cfg.builder == DummyModelConfig.builder
+        assert cfg.builder == "fake.builder.string"
 
     def test_ignores_unknown_fields(self):
         d = self._dummy_dict(unknown_field="should_be_ignored", another_unknown=123)
@@ -264,10 +264,11 @@ class TestModelConfigFromDict:
         with pytest.raises(ValueError):
             ModelConfig.from_dict(d)
 
-    def test_builder_entry_optional(self):
+    def test_raises_if_builder_missing(self):
         d = self._dummy_dict()
         del d["_builder_"]
-        assert ModelConfig.from_dict(d).builder == DummyModelConfig.builder
+        with pytest.raises(KeyError, match="_builder_"):
+            ModelConfig.from_dict(d)
 
     def test_round_trip_flat(self):
         original = DummyModelConfig(value=21, name="round_trip")

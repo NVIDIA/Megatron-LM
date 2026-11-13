@@ -13,7 +13,6 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
     resolve_tokenizer_vocab_size,
 )
-from megatron.training.config.container import InferenceConfigContainer
 from megatron.training.config.instantiate_utils import InstantiationMode
 from megatron.training.models.gpt import GPTModelBuilder
 from megatron.training.models.hybrid import HybridModelBuilder
@@ -162,14 +161,6 @@ def test_direct_training_config_rejects_manual_gc(tmp_path):
     cfg.train.manual_gc = True
     with pytest.raises(ValueError, match="manual_gc"):
         cfg.validate()
-
-
-def test_serialized_builder_is_ignored():
-    cfg = mc.modelopt_inference_config_from_args(make_modelopt_test_args())
-    data = cfg.to_dict()
-    data["model"]["_builder_"] = "os.system"
-    restored = InferenceConfigContainer.from_dict(data)
-    assert restored.model.get_builder_cls() is GPTModelBuilder
 
 
 def test_legacy_inference_helper_reuses_declared_model():

@@ -273,6 +273,7 @@ class GPTModelConfig(ModelConfig):
 
     def validate(self) -> None:
         """Check model layout without mutation or runtime-derived RNG settings."""
+        super().validate()
         vp_size = self.transformer.virtual_pipeline_model_parallel_size
         is_pipeline_asymmetric = (
             self.transformer.account_for_embedding_in_pipeline_split
