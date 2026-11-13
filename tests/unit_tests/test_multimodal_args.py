@@ -29,3 +29,10 @@ def test_vision_projection_type_defaults_to_mlp():
 
 def test_vision_projection_type_accepts_affine():
     assert _parse_args("--vision-projection-type", "affine").vision_projection_type == "affine"
+
+
+def test_help_renders():
+    """argparse %-formats help text, so a bare '%' or a non-string help breaks --help."""
+    help_text = add_multimodal_extra_args(ArgumentParser()).format_help()
+    assert "(80%)" in help_text
+    assert "and the area covered by the tiles" in help_text
