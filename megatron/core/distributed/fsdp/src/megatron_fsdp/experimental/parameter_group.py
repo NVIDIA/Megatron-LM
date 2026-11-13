@@ -105,6 +105,9 @@ class FsdpParameterGroup:
     dtype: torch.dtype
     requires_grad: bool
     main_weight: DBuffer
+    # All compute-weight buffers share one concrete type. Mypy does not track
+    # this invariant across union-typed attributes, so paired calls below use
+    # targeted arg-type ignores.
     model_weight: DBuffer | QuantizedDBuffer
     # Optimizer-layout representation of model_weight after an optimizer step.
     post_optimizer_model_weight: DBuffer | QuantizedDBuffer
@@ -466,19 +469,10 @@ class FsdpParameterGroup:
         )
 
     @property
-    def _unsharded_model_weight_is_alias(self) -> bool:
-        """Whether gathered compute weights alias their sharded storage."""
-        buffer = self._unsharded_model_weight
-        # Sharded and unsharded compute weights always share a representation.
-        if isinstance(buffer, DBuffer):
-            return buffer.is_alias_of(cast(DBuffer, self.model_weight))
-        return buffer.is_alias_of(cast(QuantizedDBuffer, self.model_weight))
-
-    @property
     def is_rowwise_unsharded(self) -> bool:
         """Whether MXFP8 rowwise planes occupy temporary gathered storage."""
         buffer = self._unsharded_model_weight
-        if self._unsharded_model_weight_is_alias:
+        if buffer.is_alias_of(self.model_weight):  # type: ignore[arg-type]
             return False
         # QuantizedDBuffer aliases DBuffer when TE is unavailable.
         if isinstance(buffer, DBuffer):
@@ -500,19 +494,13 @@ class FsdpParameterGroup:
             return
 
         if self._model_weight_is_stale:
-            # Compute-weight buffers always have the same representation.
-            if isinstance(self.model_weight, DBuffer):
-                cast(DBuffer, self.post_optimizer_model_weight).redistribute(
-                    self.model_weight.placements, out=self.model_weight
-                )
-            else:
-                cast(QuantizedDBuffer, self.post_optimizer_model_weight).redistribute(
-                    self.model_weight.placements, out=self.model_weight
-                )
+            self.post_optimizer_model_weight.redistribute(
+                self.model_weight.placements, out=self.model_weight  # type: ignore[arg-type]
+            )
             self._model_weight_is_stale = False
 
         ready_phases: tuple[Phase, ...]
-        if self._unsharded_model_weight_is_alias:
+        if self._unsharded_model_weight.is_alias_of(self.model_weight):  # type: ignore[arg-type]
             ready_phases = (Phase.FORWARD, Phase.BACKWARD)
         elif isinstance(self._unsharded_model_weight, DBuffer):
             self._allgather_model_weight()
@@ -614,7 +602,7 @@ class FsdpParameterGroup:
 
         # Clear readiness so the next unshard refreshes Parameter data/scales,
         # but never free persistent compute weights or their padded scale copies.
-        if self._unsharded_model_weight_is_alias:
+        if unsharded_model_weight.is_alias_of(self.model_weight):  # type: ignore[arg-type]
             return
         if isinstance(unsharded_model_weight, DBuffer):
             assert not rowwise_only
