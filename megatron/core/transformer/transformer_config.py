@@ -4383,14 +4383,15 @@ class TransformerConfig(ModelParallelConfig):
 
         assert not (
             self.moe_shortcut_connection
-            and self.cuda_graph_impl != "none"
+            and self.cuda_graph_impl not in ("none", "full_iteration")
             and not (
                 self.cuda_graph_impl == "local"
                 and self.inference_cuda_graph_scope == InferenceCudaGraphScope.block
             )
         ), (
             "moe_shortcut_connection supports CUDA graphs only with "
-            "cuda_graph_impl='local' and inference_cuda_graph_scope='block'."
+            "cuda_graph_impl='full_iteration', or cuda_graph_impl='local' with "
+            "inference_cuda_graph_scope='block'."
         )
 
         if self.cuda_graph_impl != "none":
