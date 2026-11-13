@@ -21,9 +21,11 @@ from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
     StreamwiseSigmoidWideResidualRead,
     expand_wide_residual_stream,
+    has_combined_residual_keys,
 )
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.core.transformer.wide_residual_transformer_layer import WideResidualTransformerLayer
+from tests.unit_tests.test_utilities import Utils
 
 
 def _wide_config(
@@ -954,3 +956,29 @@ class TestWideResidualLayerIntegration:
             ("mlp", "read"),
             ("mlp", "write"),
         ]
+
+
+def test_sharded_state_dict_addresses_combined_residual_keys():
+    """torch_dist loads must address residual_connection_{branch} tensors when told to."""
+    Utils.initialize_model_parallel(1, 1)
+    try:
+        layer = build_module(
+            TestWideResidualLayerIntegration._layer_spec(),
+            config=_wide_config(learned_retention=True),
+            layer_number=1,
+            add_layer_offset=False,
+            pg_collection=_process_groups(),
+        )
+        sharded = layer.sharded_state_dict(
+            "decoder.layers.0.", metadata={"combined_residual_keys": True}
+        )
+    finally:
+        Utils.destroy_model_parallel()
+    keys = {key: value.key for key, value in sharded.items()}
+    assert keys["decoder.layers.0.residual_read_mlp.read_map.logit"] == (
+        "decoder.layers.0.residual_connection_mlp.read_map.logit"
+    )
+    assert keys["decoder.layers.0.residual_write_self_attn.retention.retention_logit"] == (
+        "decoder.layers.0.residual_connection_self_attn.retention.retention_logit"
+    )
+    assert has_combined_residual_keys(keys.values())
