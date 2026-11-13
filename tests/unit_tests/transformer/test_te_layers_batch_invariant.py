@@ -16,6 +16,7 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     HAVE_DEEPGEMM_BF16,
     assert_te_supports_batch_invariant_attention,
@@ -891,3 +892,73 @@ def test_bik_te_general_gemm_deepgemm_backend_supports_fp32_router():
         )
 
     assert torch.equal(full, chunks)
+
+
+requires_deepgemm = pytest.mark.skipif(
+    not HAVE_DEEPGEMM_BF16, reason="DeepGEMM bf16 bindings are unavailable"
+)
+
+
+@pytest.mark.parametrize(
+    "backend,dtype",
+    [
+        ("triton", torch.float32),
+        ("triton", torch.bfloat16),
+        pytest.param("deepgemm", torch.float32, marks=requires_deepgemm),
+        pytest.param("deepgemm", torch.bfloat16, marks=requires_deepgemm),
+    ],
+)
+@pytest.mark.parametrize("case", ["rows", "unaligned_rows", "addmm", "resized", "aliased"])
+def test_gemm_out_overloads_run_the_substituted_kernel(monkeypatch, backend, dtype, case):
+    """`torch.matmul(..., out=)` and `torch.addmm(..., out=)` reach `aten::mm.out` and
+    `aten::addmm.out`, operators of their own that the mode substitutes too: the product has
+    the bits of the same product without `out=`. The kernel writes a suitable `out` itself;
+    an `out` that must be resized, that is an operand, or (DeepGEMM) whose rows are not 16
+    bytes apart receives a copy of the kernel's own result."""
+    torch.manual_seed(7)
+    vocab = 250 if case == "unaligned_rows" else 256
+    a = torch.randn(37, 128, **_device(dtype))
+    weight = torch.randn(vocab, 128, **_device(dtype))
+    square = torch.randn(128, 128, **_device(dtype))
+    bias = torch.randn(vocab, **_device(dtype))
+    buffer = torch.zeros(64, vocab, **_device(dtype))
+    # The LM-head shape: a 3-D input into rows of a larger buffer, with a strided weight.
+    rows = (lambda out: torch.matmul(a.unsqueeze(1), weight.t(), out=out), buffer[:37, None], True)
+    product, out, written_by_kernel = {
+        "rows": rows,
+        "unaligned_rows": rows,
+        "addmm": (lambda out: torch.addmm(bias, a, weight.t(), out=out), buffer[:37], True),
+        "resized": (lambda out: torch.mm(a, weight.t(), out=out), a.new_empty(0), False),
+        "aliased": (lambda out: torch.mm(a, square, out=out), a, False),
+    }[case]
+    uses_deepgemm = backend == "deepgemm" and dtype == torch.bfloat16
+    written_by_kernel &= not (uses_deepgemm and case == "unaligned_rows")
+
+    launches = []  # Per kernel launch, the tensor it was told to write (None: its own).
+    triton_gemm = bik.matmul_persistent
+
+    def witness_triton(a, b, bias=None, out=None):
+        launches.append(out)
+        return triton_gemm(a, b, bias=bias, out=out)
+
+    monkeypatch.setattr(bik, "matmul_persistent", witness_triton)
+    if uses_deepgemm:
+        deepgemm_gemm = bik.deep_gemm.bf16_gemm_nn
+
+        def witness_deepgemm(a, b, d):
+            launches.append(d)
+            return deepgemm_gemm(a, b, d)
+
+        monkeypatch.setattr(bik.deep_gemm, "bf16_gemm_nn", witness_deepgemm)
+
+    with set_batch_invariant_mode(True, backend=backend):
+        expected = product(None)  # The substituted `aten::mm` / `aten::addmm`.
+        launches.clear()
+        output = product(out)
+        wrote_out = [t is not None and t.data_ptr() == out.data_ptr() for t in launches]
+        with pytest.raises(RuntimeError, match="dtype"):  # As the native kernel does.
+            product(torch.empty_like(expected, dtype=torch.float64))
+
+    assert output is out and torch.equal(out, expected)
+    assert wrote_out == [written_by_kernel]
+    assert not buffer[37:].any()

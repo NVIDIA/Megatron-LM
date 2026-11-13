@@ -222,8 +222,16 @@ def get_compute_units():
     return NUM_SMS
 
 
-def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None):
-    """Persistent matmul kernel used by batch-invariant GEMM."""
+def matmul_persistent(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+):
+    """Persistent matmul kernel used by batch-invariant GEMM.
+
+    `out`, when given, receives the result in place of a new allocation.
+    """
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
@@ -235,8 +243,13 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
-    # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
+    if out is None:
+        # Allocates output.
+        c = torch.empty((M, N), device=a.device, dtype=dtype)
+    else:
+        assert out.shape == (M, N), f"`out` has shape {tuple(out.shape)}, expected {(M, N)}"
+        assert out.dtype == dtype and out.device == a.device, "Incompatible `out`"
+        c = out
 
     # 1D launch kernel where each block gets its own program.
     def grid(META):
@@ -531,11 +544,14 @@ _BATCH_INVARIANT_BACKENDS = ("deepgemm", "triton", "te_native")
 _BATCH_INVARIANT_BACKEND: str = "deepgemm"
 
 
-def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor | None = None) -> torch.Tensor:
     """`a @ b` via DeepGEMM `bf16_gemm_nn`. Both inputs are row-major.
 
     Bitwise-identical to `torch.mm` on Hopper/Blackwell, deterministic across
     runs, batch-invariant.
+
+    `out`, when given, receives the result: written by the kernel when its layout meets the
+    TMA stride requirement, copied from an aligned temporary otherwise as though no `out` was given.
     """
     if a.dtype != torch.bfloat16:
         raise RuntimeError(
@@ -557,35 +573,73 @@ def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     b = _align_outer_stride(b)
     M = a.shape[0]
     N = b.shape[1]
+    if out is not None and out.stride(1) == 1 and out.stride(0) % stride_alignment == 0:
+        deep_gemm.bf16_gemm_nn(a, b, out)
+        return out
     output_stride = (N + stride_alignment - 1) // stride_alignment * stride_alignment
     d = a.new_empty_strided((M, N), (output_stride, 1))
     deep_gemm.bf16_gemm_nn(a, b, d)
-    return d.contiguous()
+    return d.contiguous() if out is None else out.copy_(d)
 
 
-def mm_batch_invariant(a, b):
-    """Batch-invariant replacement for `aten::mm`."""
+def _gemm_out_takes_result(out: torch.Tensor, a: torch.Tensor, b: torch.Tensor, *others) -> bool:
+    """Whether a GEMM kernel can write `a @ b` straight into `out`."""
+    if out.shape != (a.shape[0], b.shape[1]) or out.dtype != a.dtype or out.device != a.device:
+        return False
+    storage = out.untyped_storage().data_ptr()
+    return all(t is None or t.untyped_storage().data_ptr() != storage for t in (a, b, *others))
+
+
+def _gemm_result_to_out(result: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """Finish an `out=` GEMM as the native kernel does: resize `out` if needed, then copy."""
+    if out.dtype != result.dtype or out.device != result.device:
+        raise RuntimeError(
+            f"Expected out tensor to have dtype {result.dtype} on {result.device}, "
+            f"but got {out.dtype} on {out.device} instead"
+        )
+    if out.shape != result.shape:
+        out.resize_(result.shape)
+    return out.copy_(result)
+
+
+def mm_batch_invariant(a, b, out=None):
+    """Batch-invariant replacement for `aten::mm` and, with `out`, for `aten::mm.out`."""
+    target = out if out is not None and _gemm_out_takes_result(out, a, b) else None
     if (
         _BATCH_INVARIANT_BACKEND == "deepgemm"
         and a.dtype == torch.bfloat16
         and b.dtype == torch.bfloat16
     ):
-        return _mm_deepgemm(a, b)
-    return matmul_persistent(a, b)
+        result = _mm_deepgemm(a, b, out=target)
+    else:
+        result = matmul_persistent(a, b, out=target)
+    return result if out is target else _gemm_result_to_out(result, out)
 
 
-def addmm_batch_invariant(bias, a, b):
-    """Batch-invariant replacement for `aten::addmm`."""
+def addmm_batch_invariant(bias, a, b, out=None):
+    """Batch-invariant replacement for `aten::addmm` and, with `out`, for `aten::addmm.out`."""
+    target = out if out is not None and _gemm_out_takes_result(out, a, b, bias) else None
     if (
         _BATCH_INVARIANT_BACKEND == "deepgemm"
         and a.dtype == torch.bfloat16
         and b.dtype == torch.bfloat16
     ):
-        out = _mm_deepgemm(a, b)
+        result = _mm_deepgemm(a, b, out=target)
         if bias is not None:
-            out = out + bias
-        return out
-    return matmul_persistent(a, b, bias=bias)
+            result = result + bias if target is None else result.add_(bias)
+    else:
+        result = matmul_persistent(a, b, bias=bias, out=target)
+    return result if out is target else _gemm_result_to_out(result, out)
+
+
+def mm_out_batch_invariant(a, b, *, out):
+    """Batch-invariant replacement for `aten::mm.out`, a separate operator from `aten::mm`."""
+    return mm_batch_invariant(a, b, out=out)
+
+
+def addmm_out_batch_invariant(bias, a, b, *, out):
+    """Batch-invariant replacement for `aten::addmm.out`."""
+    return addmm_batch_invariant(bias, a, b, out=out)
 
 
 def _log_softmax_batch_invariant(input, dim, _half_to_float):
@@ -1877,6 +1931,8 @@ def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "o
     else:
         _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
         _batch_invariant_LIB.impl("aten::addmm", addmm_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl("aten::mm.out", mm_out_batch_invariant, dispatch_key)
+        _batch_invariant_LIB.impl("aten::addmm.out", addmm_out_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::_log_softmax", _log_softmax_batch_invariant, dispatch_key)
     _batch_invariant_LIB.impl("aten::mean.dim", mean_batch_invariant, dispatch_key)
     # Also patch Transformer Engine kernels when available. Under te_native
