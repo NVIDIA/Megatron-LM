@@ -3,7 +3,6 @@
 """Megatron arguments."""
 
 import argparse
-import dataclasses
 import json
 import os
 import re
@@ -13,6 +12,7 @@ from pathlib import Path
 import torch
 
 from megatron.core.config import set_experimental_flag
+from megatron.core.model_parallel_config import normalize_gtp_nccl_ub
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
@@ -65,7 +65,6 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_validation_args(parser)
     parser = _add_data_args(parser)
     parser = _add_tokenizer_args(parser)
-    parser = _add_autoresume_args(parser)
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
     parser = _add_mla_args(parser)
@@ -79,7 +78,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_transformer_engine_args(parser)
     parser = _add_experimental_args(parser)
     parser = _add_inprocess_restart_args(parser)
-    parser = _add_ft_package_args(parser)
+    parser = _add_fault_tolerance_args(parser)
     parser = _add_rerun_machine_args(parser)
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
@@ -600,7 +599,7 @@ def validate_args(args, defaults={}):
         for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) or \
             args.per_split_data_args_path is not None
     if use_per_split_data_path:
-         # Exactly one of the two has to be None if we use it.
+        # Exactly one of the two has to be None if we use it.
         assert any(elt is not None
                    for elt in [args.train_data_path, args.valid_data_path, args.test_data_path]) is False or \
             args.per_split_data_args_path is None
@@ -1021,9 +1020,8 @@ def validate_args(args, defaults={}):
                 "GroupedTensor param buffers."
             )
         # Optimizer compatibility check.
-        assert args.optimizer in ('sgd', 'adam') or (
-            args.megatron_fsdp_version == 2 and args.optimizer == 'muon'
-        ), f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
+        assert args.optimizer in ('sgd', 'adam'), \
+            f"Megatron-FSDP does not support the {args.optimizer} optimizer yet."
 
         # Expert parameters may be sharded differently from non-expert parameters, in which
         # case both strategies have to be considered by model-wide checks.
@@ -1047,12 +1045,10 @@ def validate_args(args, defaults={}):
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
             'FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.'
 
-        if args.nccl_ub:
-            # In Megatron-LM, required implementation for manual registration is already provided.
-            # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
+        if args.nccl_ub and args.megatron_fsdp_version == 1:
+            # V1 supplies manual registration; v2 uses symmetric-memory registration instead.
             args.fsdp_manual_registration = True
-            args.fsdp_double_buffer = True
-            warn_rank_0('FSDP double buffer and manual registration is enabled by default when --nccl-ub is enabled!')
+            warn_rank_0('FSDP manual registration is enabled by default when --nccl-ub is enabled!')
 
         if args.megatron_fsdp_max_pool_double_buffer:
             # MaxPoolAllocator is a type of FSDP double buffer.
@@ -1126,7 +1122,6 @@ def validate_args(args, defaults={}):
     # data
     assert args.num_dataset_builder_threads > 0
 
-
     if args.num_layers is not None:
         assert args.encoder_num_layers is None, \
             'cannot have both num-layers and encoder-num-layers specified'
@@ -1193,7 +1188,7 @@ def validate_args(args, defaults={}):
         assert args.fp16 or args.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
 
-    if args.moe_grouped_gemm:
+    if args.num_experts is not None and args.moe_grouped_gemm and args.transformer_impl != "local":
         dc = torch.cuda.get_device_capability()
         assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
 
@@ -1316,7 +1311,6 @@ def validate_args(args, defaults={}):
         if args.expert_model_parallel_size  > 1 and 'ep_dp' not in args.high_priority_stream_groups:
             args.high_priority_stream_groups.append('ep_dp')
 
-
     # Derive the internal expert_gtp_weight_remat_size from the
     # user-facing --expert-tensor-parallel-num-weight-shards (expert_tensor_parallel_size is
     # defaulted earlier in validate_args). expert_gtp_weight_remat_size has no CLI flag.
@@ -1402,14 +1396,21 @@ def validate_args(args, defaults={}):
                 "buffer via replace_raw_data is unsupported)."
             )
 
+        for attr in ("gtp_remat_nccl_ub", "gtp_expert_remat_nccl_ub"):
+            setattr(args, attr, normalize_gtp_nccl_ub(getattr(args, attr, None)))
+
+        gtp_ub_collectives = (args.gtp_remat_nccl_ub or []) + (args.gtp_expert_remat_nccl_ub or [])
+
         # GTP symmetric memory registers pools with symmetric=True (NVLS needs symmetric
         # windows), which contradicts --disable-symmetric-registration.
-        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+        if gtp_ub_collectives:
             assert not getattr(args, 'disable_symmetric_registration', False), (
                 "--gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require symmetric window registration and "
                 "cannot be combined with --disable-symmetric-registration."
             )
-            if getattr(args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False):
+            if "rs" in gtp_ub_collectives and getattr(
+                args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
+            ):
                 print_rank_0(
                     "WARNING: --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub take precedence over "
                     "--gtp-remat-reduce-scatter-with-fp32-accumulation on their groups: NVLS "
@@ -1607,12 +1608,8 @@ def validate_args(args, defaults={}):
 
     if args.optimizer not in ('sgd', 'adam'):
         assert not args.use_torch_fsdp2, "Emerging optimizer does not support Torch-FSDP2 for now."
-        if args.use_megatron_fsdp:
-            # The Megatron-FSDP checks above already cover v2, Muon and fsdp_dtensor checkpoints.
-            assert not args.muon_split_qkv, \
-                "MFSDP v2 Muon requires --muon-no-split-qkv."
-        else:
-            assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
+        assert not args.use_megatron_fsdp, "Emerging optimizer does not support Megatron-FSDP for now."
+        assert args.ckpt_format in ["torch", "torch_dist"], "Emerging optimizer supports torch and torch_dist checkpoint format."
 
     # Make sure all functionality that requires Gloo process groups is disabled.
     if not args.use_gloo_process_groups:
@@ -2037,6 +2034,19 @@ def _add_inference_args(parser):
                        help="Enable chunked prefill (disabled by default)")
     group.add_argument('--num-speculative-tokens', type=int, default=0,
                        help='Number of speculative tokens generated during decode')
+    group.add_argument('--mamba-replay-ssm',
+                       dest='mamba_replay_ssm',
+                       action='store_true', default=False,
+                       help='For Mamba speculative decoding: enable ReplaySSM state management '
+                            '(checkpoint SSM state + ring buffer of cached post-conv inputs, '
+                            'output-only decode, flush-on-buffer-full, pointer-move rollback). '
+                            'Requires a per-head scalar A (Mamba-2 / TIE_HDIM).')
+    group.add_argument('--mamba-replay-buffer-len',
+                       dest='mamba_replay_buffer_len',
+                       type=int, default=16,
+                       help='ReplaySSM committed-history buffer length B (tokens). Logical flush '
+                            'threshold is B + (1 + num_speculative_tokens); must satisfy '
+                            'B >= 1 + num_speculative_tokens.')
     group.add_argument('--inference-dynamic-batching-prefix-caching',
                        dest='inference_dynamic_batching_enable_prefix_caching',
                        action=argparse.BooleanOptionalAction,
@@ -2541,19 +2551,12 @@ def _add_inprocess_restart_args(parser):
                        help='Release all unoccupied cached GPU memory on every in-process restart.')
     return parser
 
-def _add_ft_package_args(parser):
-    group = parser.add_argument_group(title='ft_package')
-    group.add_argument('--enable-ft-package', action='store_true',
-                       help='If set, Fault Tolerance package is enabled. '
-                       'Note: This feature is for Nvidia internal use only.')
-    group.add_argument('--calc-ft-timeouts', action='store_true',
-                       help='If set, FT package will try to automatically compute the timeouts. '
-                       'Note: This feature is for Nvidia internal use only.')
-    group.add_argument('--ft-num-warmup-iters', type=int, default=5,
-                       help='Number of warmup iterations before monitoring step section and '
-                       'out-of-section timeouts. The first N iterations are excluded from '
-                       'timeout monitoring as they can be significantly slower than steady-state. '
-                       'Default: 5. Note: This feature is for Nvidia internal use only.')
+def _add_fault_tolerance_args(parser):
+    from megatron.training.config import FaultToleranceConfig
+
+    ArgumentGroupFactory(FaultToleranceConfig, exclude=["fault_injector"]).build_group(
+        parser, "fault tolerance"
+    )
     return parser
 
 
@@ -2689,7 +2692,8 @@ def _add_training_args(parser):
                        help='Enable nsys profiling. When using this option, nsys '
                        'options should be specified in commandline.')
 
-    train_factory = ArgumentGroupFactory(TrainingConfig)
+    # Keep the legacy vision CLI master switch/defaults at their existing boundary.
+    train_factory = ArgumentGroupFactory(TrainingConfig, exclude=["vision_pretraining_type"])
     group = train_factory.build_group(parser, "training")
 
     # Keep this CLI-only until dataset options have their own config dataclass.
@@ -2906,6 +2910,9 @@ def _add_distributed_args(parser):
 
     dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
     group = dist_init_factory.build_group(parser, "distributed init")
+
+    group.add_argument('--use-torch-fsdp2', action='store_true', default=False,
+                       help="Use PyTorch FSDP2. Cannot be used together with use_megatron_fsdp.")
 
     group.add_argument('--use-megatron-fsdp', action='store_true', default=False,
                        help="Use Megatron's Fully Sharded Data Parallel. Cannot be used together with use_torch_fsdp2.")
@@ -3219,18 +3226,6 @@ def _add_data_args(parser):
     return parser
 
 
-def _add_autoresume_args(parser):
-    group = parser.add_argument_group(title='autoresume')
-
-    group.add_argument('--adlr-autoresume', action='store_true',
-                       help='Enable autoresume on adlr cluster.')
-    group.add_argument('--adlr-autoresume-interval', type=int, default=1000,
-                       help='Intervals over which check for autoresume'
-                       'termination signal')
-
-    return parser
-
-
 def _add_vision_args(parser):
     group = parser.add_argument_group(title="vision")
 
@@ -3301,6 +3296,14 @@ def _add_vision_args(parser):
 def _add_moe_args(parser):
     group = parser.add_argument_group(title="moe")
     # General arguments
+    # TransformerConfig generates --no-moe-grouped-gemm / --disable-moe-grouped-gemm
+    # now that grouped GEMM defaults to True. Keep the existing positive flag too.
+    group.add_argument(
+        "--moe-grouped-gemm",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Enable grouped GEMM for MoE experts (enabled by default).",
+    )
     group.add_argument('--num-experts', type=int, default=None,
                        help='Number of Experts in MoE (None means no MoE)')
     group.add_argument('--moe-layer-freq', type=moe_freq_type, default=1,

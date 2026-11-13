@@ -34,7 +34,11 @@ from typing import Tuple
 # (refactors, comment-only edits). Maintainers create it once in the repository.
 EXEMPT_LABEL = "determinism-exempt"
 
-# Directories whose every ``.py`` file (``__init__.py`` excluded) must be registered.
+# Directories whose every ``.py`` file must be registered, except ``__init__.py`` and a deprecated
+# import path left by a move, which only forwards to the module that now holds the kernel.
+# ``megatron/core/ops`` is not one: its families keep operation modules (such as the norm
+# modules) beside their kernels. Its kernel files are registered below by path, and new ones are
+# found by ``KERNEL_CONTENT_PATTERNS``.
 KERNEL_DIRECTORIES: Tuple[str, ...] = ("megatron/core/fusions", "megatron/core/ssm/ops")
 
 # Regular expressions (``re.MULTILINE``) that mark a source file as kernel-bearing wherever
@@ -162,7 +166,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=(
             "megatron/core/activations.py",
             "megatron/core/transformer/utils.py",
-            "megatron/core/transformer/torch_norm.py",
+            "megatron/core/ops/norm/torch_norm.py",
         ),
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
@@ -182,7 +186,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="fused_vocab_parallel_cross_entropy",
-        sources=("megatron/core/fusions/fused_cross_entropy.py",),
+        sources=("megatron/core/ops/loss/fused_cross_entropy.py",),
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
         notes="Rejected by --deterministic-mode (op catalog); the replay test records its status as xfail(strict=False).",
@@ -280,7 +284,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     # ---------------------------------------------------------------- apex CUDA extensions and local TP layers
     KernelEntry(
         name="fused_layer_norm",
-        sources=("megatron/core/fusions/fused_layer_norm.py",),
+        sources=("megatron/core/ops/norm/fused_layer_norm.py",),
         tests=(K + "test_tensor_parallel_kernels.py",),
         kind="cuda-ext",
         notes="apex FastLayerNormFN / FusedLayerNormAffineFunction; dgamma/dbeta cross-row reduction.",
@@ -309,7 +313,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="vocab_parallel_cross_entropy",
-        sources=("megatron/core/tensor_parallel/cross_entropy.py",),
+        sources=("megatron/core/ops/loss/cross_entropy.py",),
         tests=(K + "test_tensor_parallel_kernels.py",),
         kind="torch-op",
     ),
@@ -467,10 +471,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="moe_ep_invariant_combine",
         sources=("megatron/core/transformer/moe/ep_invariant_combine.py",),
-        tests=("tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",),
+        tests=(
+            "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
+            "tests/unit_tests/inference/test_ep_invariant_ordered_rsv.py",
+            K + "test_moe_kernels.py",
+            K + "test_inference_kernels.py",
+        ),
         kind="triton",
-        notes="Fixed expert-order leaves and pairwise FP32 tree; bit-exact forward and "
-        "gradient replay, plus parity across EP sizes and training/inference paths.",
+        notes="Fixed expert-order leaves and pairwise FP32 tree; parity across EP sizes and "
+        "training/inference paths. Bit-exact replay of the training tree (forward, row and "
+        "probability gradients) in test_ep_invariant_tree_replays and of the dense-map and "
+        "top-k inference combines in test_ep_invariant_{dense_map,topk}_replays.",
     ),
     KernelEntry(
         name="moe_batch_invariant_unpermute",
@@ -540,6 +551,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=("tests/unit_tests/ssm/ops/mamba2/test_batch_invariant_decode.py",),
         kind="triton",
         training_path=False,
+    ),
+    KernelEntry(
+        name="ssm_mamba2_replayssm_spec",
+        sources=("megatron/core/ssm/ops/mamba2/mamba_ssm_replay.py",),
+        tests=(K + "test_ssm_kernels.py",),
+        kind="triton",
+        training_path=False,
+        notes="ReplaySSM speculative decode: fused scatter + B.C precompute, verify, flush and "
+        "cursor-commit kernels. Fixed launch configs (no autotuning) and no atomics; one step "
+        "with verify, flush and padding rows is replayed and its output, SSM checkpoint, ring "
+        "caches and cursors compared.",
     ),
     KernelEntry(
         name="ssm_common_kernels",
@@ -634,7 +656,6 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_optimizer_kernels.py",
             "tests/unit_tests/optimizer/test_grad_norm_gtp_invariance.py",
-            "tests/unit_tests/distributed/mfsdp_v2/test_mcore_muon.py",
         ),
         kind="external-lib",
         notes="multi_tensor l2norm / scale (TE, apex or local fallback) and fused Adam; "
@@ -810,7 +831,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Selects the pip causal_conv1d / mamba_ssm kernels (causal_conv1d_fn, "
         "mamba_chunk_scan_combined, mamba_split_conv1d_scan_combined, causal_conv1d_update_cuda) or "
         "the Megatron forks (ops/common, ops/mamba2: varlen scan, causal_conv1d_update, "
-        "selective_state_update). Module-level replay: test_ssm_conv1d.py::TestMambaMixerDeterminism; "
+        "selective_state_update, ReplaySSM spec decode). Module-level replay: "
+        "test_ssm_conv1d.py::TestMambaMixerDeterminism; "
         "kernels replayed piecewise in test_ssm_kernels.py. Runtime helper projections, "
         "convolution and CP collectives are replayed in runtime/test_ssm_replay.py.",
     ),
@@ -1009,6 +1031,22 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_muon_matches_reference checks weights, momentum, and forward outputs bitwise "
         "against unsharded Muon across multiple steps, including an optimizer-state reload. "
         "Tests exercise the default GEMM path with FP32 and BF16 model weights.",
+    ),
+    KernelEntry(
+        name="csa_deterministic_attention_and_indexer",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py",
+        ),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa_deterministic_indexer.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa_fused_sparse_attention.py",
+        ),
+        kind="dispatch",
+        notes="Stable TopK and fixed-order sparse indexer dK/dW, with batch-local reference/replay; "
+        "real non-CP attention replay exercises deterministic cuDNN backward independently. "
+        "Deterministic learned-indexer SBHD forwards preserve key order and output bits across "
+        "no-grad and training dispatch, including zero and positive sparse indexer loss.",
     ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(

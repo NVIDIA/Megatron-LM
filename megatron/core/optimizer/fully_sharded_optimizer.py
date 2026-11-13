@@ -54,10 +54,6 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
     MFSDP-specific storage operations explicit.
     """
 
-    # DTensor replication must be counted by this wrapper even when chained
-    # optimizers share the same final reduction group.
-    requires_individual_grad_stats = True
-
     @override
     def __init__(
         self,
