@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import os
+import warnings
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -341,7 +342,8 @@ def test_get_pipeline_parallel_order(
     Utils.destroy_model_parallel()
 
 
-def test_forward_backward_func_without_pipeline_parallel(mocker):
+@pytest.mark.parametrize("decoder_seq_length", [None, 8])
+def test_forward_backward_func_without_pipeline_parallel(mocker, decoder_seq_length):
     from megatron.core.pipeline_parallel import get_forward_backward_func
 
     Utils.initialize_model_parallel(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
@@ -379,6 +381,7 @@ def test_forward_backward_func_without_pipeline_parallel(mocker):
         num_microbatches=4,
         seq_length=None,
         micro_batch_size=None,
+        decoder_seq_length=decoder_seq_length,
         forward_only=True,
     )
 
@@ -402,9 +405,15 @@ def test_forward_backward_func_without_pipeline_parallel(mocker):
         (MultiModulePipelineCommunicator, True, 2),
     ],
 )
-@pytest.mark.parametrize("seq_length", [1, 8])
+@pytest.mark.parametrize("seq_length,decoder_seq_length,expected_length", [(1, None, 1), (8, 4, 4)])
 def test_schedule_enables_grad_sync_on_first_stage(
-    monkeypatch, communicator_base, module_first_stage, pipeline_stages, seq_length
+    monkeypatch,
+    communicator_base,
+    module_first_stage,
+    pipeline_stages,
+    seq_length,
+    decoder_seq_length,
+    expected_length,
 ):
     events = []
 
@@ -520,13 +529,62 @@ def test_schedule_enables_grad_sync_on_first_stage(
         model=model,
         num_microbatches=1,
         seq_length=seq_length,
+        decoder_seq_length=decoder_seq_length,
         micro_batch_size=1,
         p2p_communicator=FakeCommunicator(),
         pg_collection=pg_collection,
     )
 
     assert events == ["enter_no_sync", "exit_no_sync", "backward"]
-    assert shape_lengths == [seq_length] * 2
+    assert shape_lengths == [expected_length] * 2
+
+
+@pytest.mark.parametrize(
+    "decoder_kwargs,expected_length",
+    [
+        ({}, 64),
+        ({"decoder_seq_length": None}, 64),
+        ({"decoder_seq_length": 64}, 64),
+        ({"decoder_seq_length": 32}, 32),
+    ],
+)
+@pytest.mark.parametrize("logging_rank", [False, True])
+def test_deprecated_decoder_length_shapes_and_warning(
+    monkeypatch, decoder_kwargs, expected_length, logging_rank
+):
+    monkeypatch.setattr(
+        "megatron.core._rank_utils._DEFAULT_LOG_RANKS", (rank,) if logging_rank else ()
+    )
+    schedule._warn_decoder_seq_length_deprecated.cache_clear()
+    config = SimpleNamespace(
+        hidden_size=64,
+        pipeline_model_parallel_size=2,
+        variable_seq_lengths=False,
+        sequence_parallel=True,
+        enable_mhc_connections=False,
+    )
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            for _ in range(2):
+                shape = schedule.get_tensor_shapes(
+                    seq_length=64,
+                    micro_batch_size=2,
+                    config=config,
+                    tp_group=SimpleNamespace(size=lambda: 2),
+                    cp_group=SimpleNamespace(size=lambda: 2),
+                    **decoder_kwargs,
+                )
+                assert shape == [(expected_length // 4, 2, 64)]
+        assert len(caught) == int(
+            logging_rank and decoder_kwargs.get("decoder_seq_length") is not None
+        )
+        if caught:
+            assert caught[0].category is FutureWarning
+            assert "will be removed in the 0.22 release" in str(caught[0].message)
+            assert caught[0].filename == __file__
+    finally:
+        schedule._warn_decoder_seq_length_deprecated.cache_clear()
 
 
 def test_forward_backward_func_with_pipeline_parallel(mocker):
@@ -654,6 +712,7 @@ def test_forward_backward_func_with_interleaving(mocker):
         num_microbatches=micro_batch_size,
         seq_length=sequence_length,
         micro_batch_size=micro_batch_size,
+        decoder_seq_length=256,  # Deprecated and ignored: the pipeline width remains 512.
         forward_only=True,
     )
 
