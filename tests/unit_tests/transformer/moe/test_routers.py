@@ -2057,6 +2057,11 @@ def test_moe_router_aux_loss_fusion_defaults_to_router_fusion():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+@pytest.mark.skipif(
+    moe_utils.te_general_gemm is None,
+    reason="requires Transformer Engine: without it the pre-fix code also falls back "
+    "to torch.mm, so this test cannot catch the regression",
+)
 def test_router_gating_linear_fp32_contract():
     """FP32 routers must get true-FP32 GEMM numerics, not TF32-grade.
 
