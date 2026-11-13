@@ -734,15 +734,19 @@ class TestWideResidualStaticConstruction:
         [
             {"cuda_graph_impl": "local"},
             {"cuda_graph_impl": "transformer_engine"},
-            {"cuda_graph_impl": "full_iteration"},
             {"enable_cuda_graph": True},
             {"external_cuda_graph": True},
         ],
-        ids=("local", "transformer_engine", "full_iteration", "legacy_local", "legacy_te"),
+        ids=("local", "transformer_engine", "legacy_local", "legacy_te"),
     )
     def test_wide_residual_rejects_cuda_graphs(self, config_overrides):
         with pytest.raises(NotImplementedError, match="supports CUDA graphs only"):
             _wide_config(**config_overrides)
+
+    def test_wide_residual_accepts_full_iteration_cuda_graphs(self):
+        """A whole-step graph captures the residual streams along with everything else."""
+        config = _wide_config(cuda_graph_impl="full_iteration")
+        assert config.cuda_graph_impl == "full_iteration"
 
     def test_wide_residual_accepts_local_block_cuda_graphs(self):
         config = _wide_config(cuda_graph_impl="local", inference_cuda_graph_scope="block")
