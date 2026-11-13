@@ -109,7 +109,9 @@ def test_recorded_execution_order(distributed_setup):
     model = Model().to(device)
     unsharded_weights = {layer: layer.weight for layer in model.children()}
     with fully_shard_context(
-        FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)
+        FsdpContext(
+            device=device, runtime_policy=RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)
+        )
     ) as context:
         for layer in model.children():
             fully_shard(layer, mesh, _default_placements())
