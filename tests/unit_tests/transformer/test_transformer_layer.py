@@ -39,6 +39,7 @@ from megatron.core.transformer.residual_recompute import (
     ResidualStreamRecomputeContext,
     build_residual_stream_recompute_plan,
 )
+from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     MoETransformerLayer,
@@ -977,7 +978,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         assert layer.is_moe_layer
         assert (layer.self_attention_hyper_connection is None) == (stages == "mlp")
         assert not hasattr(layer, "cudagraph_manager")
-        assert layer.mlp_hyper_connection not in layer._get_submodules_under_cudagraphs()
+        assert not hasattr(layer, "_get_submodules_under_cudagraphs")
 
     @pytest.mark.parametrize(
         "cuda_graph_module",
@@ -1227,7 +1228,7 @@ class TestMHCWithCudaGraph:
     def _create_mhc_layer(self, hidden_size=64, num_streams=4, **extra_config):
         config = _make_mhc_config(hidden_size=hidden_size, num_streams=num_streams, **extra_config)
         layer_spec = _make_mhc_layer_spec()
-        layer = HyperConnectionTransformerLayer(config, layer_spec.submodules)
+        layer = build_module(layer_spec, config=config)
         layer.cuda()
         return layer, config
 
@@ -1238,7 +1239,7 @@ class TestMHCWithCudaGraph:
         this method. If the shape is [s, b, C] instead of [s, b, n*C], the graph
         capture will produce a shape mismatch at the first hyper connection module.
         """
-        layer, config = self._create_mhc_layer()
+        layer, config = self._create_mhc_layer(cuda_graph_impl="transformer_engine")
         seq_length = 32
         micro_batch_size = 2
 
@@ -1262,7 +1263,8 @@ class TestMHCWithCudaGraph:
         graph replay, leading to stale parameter values.
         """
         layer, config = self._create_mhc_layer(
-            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.mlp]
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.mlp],
         )
 
         submodules = layer._get_submodules_under_cudagraphs()
@@ -1277,7 +1279,7 @@ class TestMHCWithCudaGraph:
         For mHC layers, the input must be n-stream [s, b, n*C] and output must
         also be [s, b, n*C].
         """
-        layer, config = self._create_mhc_layer()
+        layer, config = self._create_mhc_layer(cuda_graph_impl="transformer_engine")
         layer.eval()
 
         seq_len = 8

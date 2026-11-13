@@ -6,7 +6,6 @@ from __future__ import annotations
 import warnings
 from typing import Optional
 
-import torch
 from torch import Tensor
 
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -188,24 +187,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         """
         return False
 
-    def get_layer_static_inputs(self, seq_length, micro_batch_size):
-        """Override to produce n-stream hidden_states of shape [s, b, n*C].
-
-        CUDA graph capture creates static buffers whose shapes are determined by
-        this method. The base class returns [s, b, C], but mHC layers operate on
-        n-stream hidden states of shape [s, b, n*C].
-        """
-        static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
-        hs = static_inputs["hidden_states"]
-        n = self.config.mhc_num_residual_streams
-        static_inputs["hidden_states"] = torch.ones(
-            (hs.shape[0], hs.shape[1], n * self.config.hidden_size),
-            dtype=hs.dtype,
-            requires_grad=hs.requires_grad,
-            device=hs.device,
-        )
-        return static_inputs
-
     def create_mcore_cudagraph_manager(self, config):
         """Create only CUDA graph managers compatible with this mHC layer."""
         # The first call comes from GraphableMegatronModule before TransformerLayer has
@@ -229,32 +210,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 return
 
         super().create_mcore_cudagraph_manager(config)
-
-    def _get_submodules_under_cudagraphs(self):
-        """Override to include hyper connection modules.
-
-        The base TransformerLayer._get_submodules_under_cudagraphs does not include
-        self_attention_hyper_connection / mlp_hyper_connection. Their learnable
-        parameters (mapping_proj, alpha_*, bias) need manual pre-forward hooks
-        during CUDA graph replay so that parameter all-gathers are triggered.
-        """
-        submodules = super()._get_submodules_under_cudagraphs()
-
-        if not self.config.cuda_graph_modules:
-            return submodules
-
-        if (
-            CudaGraphModule.attn in self.config.cuda_graph_modules
-            and self.self_attention_hyper_connection is not None
-        ):
-            submodules.append(self.self_attention_hyper_connection)
-        if (
-            CudaGraphModule.mlp in self.config.cuda_graph_modules
-            and not self.is_moe_layer
-            and self.mlp_hyper_connection is not None
-        ):
-            submodules.append(self.mlp_hyper_connection)
-        return submodules
 
     def _read_residual_connection(
         self,
