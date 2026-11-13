@@ -50,6 +50,26 @@ def get_shared_graph_pool():
     return _shared_graph_pool
 
 
+def release_shared_graph_pool_if_unused():
+    """Forget the shared pool handle once no captured graph uses it any more.
+
+    The allocator retires a graph pool when its last graph is destroyed. Capturing into the
+    retired handle again trips an internal assert in the CUDA caching allocator, so the next
+    capture must start from a fresh handle. Call after a graph that may have been the pool's
+    last user has been deleted.
+    """
+    global _shared_graph_pool
+    if _shared_graph_pool is None:
+        return
+    if any(graph is not None for graph in FullCudaGraphWrapper.cuda_graph.values()):
+        return
+    # Local import: optimizer_cuda_graph imports this module.
+    from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+
+    if OptimizerCudaGraphWrapper.cuda_graph is None:
+        _shared_graph_pool = None
+
+
 def get_graph_pool(use_single_mempool):
     """Return graph pool handle for full-iter/optimizer graph capture.
 
@@ -381,6 +401,20 @@ class FullCudaGraphWrapper:
             FullCudaGraphWrapper.result['training'] = None
             FullCudaGraphWrapper.curr_iteration['training'] = 0
             get_rerun_state_machine().clear_deferred_validations("training")
+            if self.use_single_mempool:
+                # Graphs sharing a pool are only safe in capture order. A training graph
+                # captured after the optimizer graph may place its outputs (the losses read
+                # after optimizer.step) on memory the older optimizer graph still uses as
+                # scratch, and the optimizer replay then overwrites them. Drop the optimizer
+                # graph too, so it is captured again after the new training graph.
+                # Local import: optimizer_cuda_graph imports this module.
+                from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+
+                if OptimizerCudaGraphWrapper.cuda_graph is not None:
+                    logger.warning(
+                        'Discarding the optimizer CUDA graph along with the training graph'
+                    )
+                    OptimizerCudaGraphWrapper.reset_cuda_graph()
         if stage is None or stage == 'validation':
             if FullCudaGraphWrapper.cuda_graph['validation'] is not None:
                 del FullCudaGraphWrapper.cuda_graph['validation']
@@ -391,3 +425,5 @@ class FullCudaGraphWrapper:
         if captured:
             symmetric_wgrad_pool.reset_completed_reuse_events()
         gc.collect()
+        # After the collection, so a graph dropped above no longer counts as a pool user.
+        release_shared_graph_pool_if_unused()

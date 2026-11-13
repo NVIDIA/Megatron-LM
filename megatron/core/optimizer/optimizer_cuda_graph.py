@@ -59,6 +59,15 @@ class OptimizerCudaGraphWrapper:
         """Increment current training iteration."""
         OptimizerCudaGraphWrapper.curr_iteration += 1
 
+    @classmethod
+    def reset_cuda_graph(cls):
+        """Drop the captured optimizer graph; it is captured again after the usual warmup."""
+        if cls.cuda_graph is not None:
+            del cls.cuda_graph
+            cls.cuda_graph = None
+        cls.result = None
+        cls.curr_iteration = 0
+
     def __del__(self):
         logger.info(f"Destructor called for {type(self.optimizer_step_func).__name__} optimizer!!!")
         if OptimizerCudaGraphWrapper.cuda_graph is not None:
