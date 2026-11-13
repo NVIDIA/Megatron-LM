@@ -15,6 +15,7 @@ import importlib
 import json
 import sys
 import threading
+import time
 import types
 import typing
 from pathlib import Path
@@ -35,29 +36,22 @@ replay = importlib.import_module(f"{_namespace}.v3_replay")
 Storage = storage_module.Storage
 
 
-class _ReplayPart(typing.NamedTuple):
-    dp_rank: int
-    start: int
-    end: int
-
-    @property
-    def data(self):
-        return storage_module.replay_data_name(self.dp_rank, self.start, self.end)
-
-    @property
-    def index(self):
-        return storage_module.GroupName(self.start, self.end).index
+def flush_path(begin, finish, name=storage_module.INDEX):
+    """A replay flush object for teacher iterations ``[begin, finish)``."""
+    return f"{storage_module.flush_dir(storage_module.REPLAY, begin, finish)}/{name}"
 
 
-def _read_part_index(storage, part):
-    group = storage_module.read_group(storage, storage_module.GroupName(part.start, part.end))
-    return next(entry["index"] for entry in group["parts"] if entry["writer"] == part.dp_rank)
+def part_path(rank, begin, finish):
+    """One teacher DP writer's replay part."""
+    return flush_path(begin, finish, storage_module.part_name(rank))
 
 
-def _read_meta(storage, name):
-    if isinstance(name, _ReplayPart):
-        return arrow.file_meta(_read_part_index(storage, name))
-    return storage_module.read_meta(storage, name)
+def _read_part_index(storage, rank, begin, finish):
+    return storage_module.read_group(storage, (begin, finish))["parts"][rank]["index"]
+
+
+def _read_meta(storage, span):
+    return storage_module.read_meta(storage, span)
 
 
 def inputs(ids, length=8, packed=False):
@@ -80,7 +74,8 @@ def settings(dp=2, mbs=2, gbs=8, *, contract=None, recorded=None, provenance=Non
     Overrides of recorded keys may also be passed through ``contract`` for brevity.
     """
     required = {
-        "first_sample": 0,
+        "first_iteration": 0,
+        "global_batch_size": gbs,
         "attention_mode": "causal",
         "prefix_stable": True,
         "tokenizer": {"sha256": "test"},
@@ -171,9 +166,8 @@ def write_flush(
             )
         )
     data, index = arrow.write_file(batches, metadata, block_bytes=block_bytes)
-    name = _ReplayPart(rank, begin * gbs, finish * gbs)
-    storage.write(name.data, data)
-    return {"writer": rank, "path": name.data, "index": index}
+    storage.write(part_path(rank, begin, finish), data)
+    return {"writer": rank, "path": storage_module.part_name(rank), "index": index}
 
 
 def write_cache(
@@ -199,12 +193,9 @@ def write_cache(
             dp, mbs, gbs, contract={**mode, **(contract or {})}, provenance=provenance
         )
     metadata = json.loads(json.dumps(metadata))
-    metadata["contract"].pop("writers", None)
-    metadata["contract"].pop("writer_mbs", None)
     for begin in range(start, iterations, bundle):
         finish = min(begin + bundle, iterations)
-        name = storage_module.GroupName(begin * gbs, finish * gbs)
-        if storage.exists(name.index):
+        if storage.exists(flush_path(begin, finish)):
             continue
         parts = []
         for rank in range(dp):
@@ -225,12 +216,12 @@ def write_cache(
                 )
             )
         storage.write(
-            name.index,
+            flush_path(begin, finish),
             json.dumps(
                 {
                     "group_version": 1,
-                    "start": name.start,
-                    "end": name.end,
+                    "start_iteration": begin,
+                    "end_iteration": finish,
                     "writers": dp,
                     "writer_mbs": mbs,
                     "parts": parts,
@@ -250,6 +241,22 @@ def reader(storage, metadata, **kwargs):
 
 def ids_of(samples):
     return [s["sample_id"] for s in samples]
+
+
+def replay_order(start, end, gbs=8, writers=2, mbs=2):
+    """Teacher sample ids of samples ``[start, end)`` in replay order.
+
+    Within each teacher iteration, replay serves writer 0's rows, then writer 1's, ...
+    """
+    order = []
+    for base in range(start, end, gbs):
+        for writer in range(writers):
+            order += [
+                base + (mb * writers + writer) * mbs + j
+                for mb in range(gbs // (writers * mbs))
+                for j in range(mbs)
+            ]
+    return order
 
 
 def test_capture_owns_a_compact_snapshot():
@@ -321,8 +328,8 @@ def batch_targets(batch):
 
 def test_files_are_plain_arrow_ipc_with_settings_in_the_schema(tmp_path):
     storage, metadata = write_cache(tmp_path, iterations=2, logprobs=True)
-    name = _ReplayPart(1, 0, 16)
-    table = pa.ipc.open_file(storage.path(name.data)).read_all()
+    name = part_path(1, 0, 2)
+    table = pa.ipc.open_file(storage.path(name)).read_all()
     assert table.schema.names == [
         "tokens",
         "labels",
@@ -336,17 +343,17 @@ def test_files_are_plain_arrow_ipc_with_settings_in_the_schema(tmp_path):
     ]
     assert json.loads(table.schema.metadata[arrow.META_KEY]) == metadata
     assert table.num_rows == 8 and table.column("tokens")[0].as_py() == list(range(200, 208))
-    index = _read_part_index(storage, name)
-    assert index["size"] == storage.size(name.data) and len(index["blocks"]) > 1
+    index = _read_part_index(storage, 1, 0, 2)
+    assert index["size"] == storage.size(name) and len(index["blocks"]) > 1
     assert sum(block["rows"] for block in index["blocks"]) == 8
-    assert _read_meta(storage, name) == metadata
+    assert _read_meta(storage, (0, 2)) == metadata
 
 
 def test_input_only_reads_fetch_one_prefix_range(tmp_path):
     storage, _ = write_cache(tmp_path, iterations=2, logprobs=True)
-    name = _ReplayPart(0, 0, 16)
-    index = _read_part_index(storage, name)
-    data = (tmp_path / name.data).read_bytes()
+    name = part_path(0, 0, 2)
+    index = _read_part_index(storage, 0, 0, 2)
+    data = (tmp_path / name).read_bytes()
     for block, entry in enumerate(index["blocks"]):
         assert entry["input_length"] < entry["length"]
         offset, size = arrow.block_range(index, block, inputs_only=True)
@@ -361,11 +368,11 @@ def test_input_only_reads_fetch_one_prefix_range(tmp_path):
 
 def test_index_is_bound_to_its_data_file(tmp_path):
     storage, metadata = write_cache(tmp_path, iterations=2)
-    name = _ReplayPart(0, 0, 16)
-    index = _read_part_index(storage, name)
-    arrow.check_index(index, storage.size(name.data))
+    name = part_path(0, 0, 2)
+    index = _read_part_index(storage, 0, 0, 2)
+    arrow.check_index(index, storage.size(name))
     with pytest.raises(ValueError, match="another version of the file"):
-        arrow.check_index(index, storage.size(name.data) + 1)
+        arrow.check_index(index, storage.size(name) + 1)
     with pytest.raises(ValueError, match="index version"):
         arrow.check_index({**index, "index_version": 99})
 
@@ -559,7 +566,8 @@ def test_target_encoder_rejects_invalid_ids(index, value):
         {"attention_mode": "unknown"},
         {"prefix_stable": "yes"},
         {"tokenizer": {}},
-        {"first_sample": -1},
+        {"first_iteration": -1},
+        {"global_batch_size": 0},
     ],
 )
 def test_unsupported_required_metadata_rejected(contract):
@@ -721,23 +729,38 @@ def test_malformed_blocks_rejected(case):
 
 def test_files_are_self_describing_and_published_as_groups(tmp_path):
     storage, metadata = write_cache(tmp_path)
-    assert storage.list("*") == sorted(
-        [
-            storage_module.replay_data_name(rank, a, b)
-            for rank in range(2)
-            for a, b in ((0, 16), (16, 32))
-        ]
-        + [storage_module.GroupName(a, b).index for a, b in ((0, 16), (16, 32))]
+    objects = storage_module.flush_objects(storage, storage_module.REPLAY)
+    assert objects == sorted(
+        [part_path(rank, a, b) for rank in range(2) for a, b in ((0, 2), (2, 4))]
+        + [flush_path(a, b) for a, b in ((0, 2), (2, 4))]
     )
-    name = _ReplayPart(1, 16, 32)
-    meta = _read_meta(storage, name)
+    assert storage_module.published_spans(objects, storage_module.REPLAY) == [(0, 2), (2, 4)]
+    meta = _read_meta(storage, (2, 4))
     assert codec.mismatched_settings(meta, metadata) == ([], [])
-    # A data file without an index (an interrupted attempt) is invisible and replaceable.
-    orphan = _ReplayPart(0, 32, 48)
-    storage.write(orphan.data, b"partial")
-    assert storage_module.GroupName(32, 48) not in storage_module.list_published(storage)
-    storage.write(orphan.data, b"data")
-    assert storage.read(orphan.data) == b"data"
+    # A part without an index (an interrupted attempt) is invisible and replaceable.
+    orphan = part_path(0, 4, 6)
+    storage.write(orphan, b"partial")
+    objects = storage_module.flush_objects(storage, storage_module.REPLAY)
+    assert storage_module.object_spans(objects, storage_module.REPLAY) == [(0, 2), (2, 4), (4, 6)]
+    assert storage_module.published_spans(objects, storage_module.REPLAY) == [(0, 2), (2, 4)]
+    assert replay.discover_groups(storage, metadata) == ([(0, 16), (16, 32)], None)
+    storage.write(orphan, b"data")
+    assert storage.read(orphan) == b"data"
+
+
+def test_flushes_are_named_by_teacher_iteration_and_parts_by_writer(tmp_path):
+    assert storage_module.flush_dir(storage_module.REPLAY, 0, 2) == (
+        "replay-000000000000-000000000002"
+    )
+    assert storage_module.flush_dir(storage_module.CHUNK, 12, 345) == (
+        "chunk-000000000012-000000000345"
+    )
+    assert storage_module.part_name(3) == "part-000003.arrow"
+    write_cache(tmp_path, iterations=2)
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["replay-000000000000-000000000002"]
+    assert sorted(
+        path.name for path in (tmp_path / "replay-000000000000-000000000002").iterdir()
+    ) == ["index.json", "part-000000.arrow", "part-000001.arrow"]
 
 
 @pytest.mark.parametrize(
@@ -817,7 +840,8 @@ def test_rampup_changes_iteration_size_without_skips(tmp_path):
     iterator = make(0, lambda: count[0])
     assert next(iterator)["_kd_sample_ids"] == [0, 1]
     count[0] = 3
-    assert [next(iterator)["_kd_sample_ids"] for _ in range(3)] == [[2, 3], [4, 5], [6, 7]]
+    # Replay order within an iteration is writer-major: [0, 1, 4, 5] then [2, 3, 6, 7].
+    assert [next(iterator)["_kd_sample_ids"] for _ in range(3)] == [[4, 5], [2, 3], [6, 7]]
     assert iterator.consumed == 8
     iterator.close()
     resumed = make(8, lambda: 3)
@@ -833,8 +857,8 @@ def test_shuffle_is_deterministic_and_group_granular(tmp_path):
     assert first.groups != groups(storage, metadata)
     ids = ids_of(first.samples(list(range(64)), 64))
     assert sorted(ids) == list(range(64))
-    for start in range(0, 64, 16):
-        assert ids[start : start + 16] == list(range(ids[start], ids[start] + 16))
+    expected = [sid for span in first.groups for sid in replay_order(*span)]
+    assert ids == expected  # Whole flushes move; each keeps its own replay order.
     first.close()
     second.close()
 
@@ -855,19 +879,18 @@ def test_prefetch_stays_within_iteration_and_preserves_rampup(tmp_path):
     try:
         assert next(iterator)["_kd_sample_ids"] == [0, 1]
         assert iterator._prefetched is not None
-        assert next(iterator)["_kd_sample_ids"] == [2, 3]
+        assert next(iterator)["_kd_sample_ids"] == [4, 5]
         assert iterator._prefetched is None
         count[0] = 1
-        assert next(iterator)["_kd_sample_ids"] == [4, 5]
+        assert next(iterator)["_kd_sample_ids"] == [2, 3]
         assert iterator._prefetched is None
     finally:
         iterator.close()
 
 
-@pytest.mark.parametrize("missing", ["replay-0-16.index.json"])
-def test_range_is_published_only_when_every_writer_published(tmp_path, missing):
+def test_range_is_published_only_when_every_writer_published(tmp_path):
     storage, metadata = write_cache(tmp_path)
-    (tmp_path / missing).unlink()
+    (tmp_path / flush_path(0, 2)).unlink()
     found, hole = replay.discover_groups(storage, metadata)
     assert found == []
     assert hole == (0, 16, 1)
@@ -906,7 +929,7 @@ def test_overlapping_ranges_are_rejected(tmp_path):
     write_cache(tmp_path / "other", iterations=3, bundle=3)
     for path in list((tmp_path / "other").iterdir()):
         path.rename(tmp_path / path.name)
-    with pytest.raises(ValueError, match="Overlapping"):
+    with pytest.raises(ValueError, match="overlapping offline KD flush"):
         replay.discover_groups(storage, metadata)
 
 
@@ -947,22 +970,124 @@ class _CountingStorage(Storage):
 def test_each_block_is_one_ranged_read(tmp_path, targets):
     write_cache(tmp_path, logprobs=True)
     storage = _CountingStorage(tmp_path)
-    metadata = _read_meta(storage, _ReplayPart(0, 0, 16))
+    metadata = _read_meta(storage, (0, 2))
     live = reader(storage, metadata, targets=targets)
     samples = live.samples(list(range(32)), 32)
     live.close()
-    assert ids_of(samples) == list(range(32))
+    assert ids_of(samples) == replay_order(0, 32)
     assert ("teacher_values" in samples[0]) == targets
     expected = []
-    for start, end in ((0, 16), (16, 32)):
+    for start, end in ((0, 2), (2, 4)):
         for rank in range(2):
-            name = _ReplayPart(rank, start, end)
-            index = _read_part_index(storage, name)
+            index = _read_part_index(storage, rank, start, end)
             expected += [
-                (name.data, *arrow.block_range(index, block, inputs_only=not targets))
+                (
+                    part_path(rank, start, end),
+                    *arrow.block_range(index, block, inputs_only=not targets),
+                )
                 for block in range(len(index["blocks"]))
             ]
     assert sorted(storage.reads) == sorted(expected)
+
+
+def student_batches(live, rank, *, dp, mbs, gbs, iterations):
+    """One student rank's sample ids per global batch, checking each sample's tokens."""
+    iterator = replay.ReplayIterator(
+        live,
+        consumed=0,
+        dp_rank=rank,
+        dp_size=dp,
+        micro_batch_size=mbs,
+        seq_length=8,
+        num_microbatches=lambda: gbs // (dp * mbs),
+    )
+    per_batch = []
+    try:
+        for _ in range(iterations):
+            ids = []
+            for _ in range(gbs // (dp * mbs)):
+                batch = next(iterator)
+                origins = (batch["tokens"][:, 0] // 100).tolist()
+                assert origins == batch["_kd_sample_ids"]  # Each id names its own sample.
+                ids += batch["_kd_sample_ids"]
+            per_batch.append(ids)
+    finally:
+        iterator.close()
+    return per_batch
+
+
+def test_student_ranks_read_only_their_own_teacher_writers(tmp_path):
+    # Teacher DP 4 and student DP 2 with the same global batch: rank r reads writers 2r, 2r+1.
+    gbs, iterations = 16, 4
+    write_cache(tmp_path, dp=4, mbs=2, gbs=gbs, iterations=iterations)
+    batches = []
+    for rank in range(2):
+        storage = _CountingStorage(tmp_path)
+        live = reader(storage, settings(gbs=gbs))
+        batches.append(student_batches(live, rank, dp=2, mbs=2, gbs=gbs, iterations=iterations))
+        writers = {2 * rank, 2 * rank + 1}
+        assert set(live.lanes) == writers
+        read = {name.rsplit("/", 1)[1] for name, _, _ in storage.reads}
+        assert read == {storage_module.part_name(writer) for writer in writers}
+        for iteration, ids in enumerate(batches[rank]):
+            order = replay_order(iteration * gbs, (iteration + 1) * gbs, gbs, 4, 2)
+            assert ids == order[rank * 8 : (rank + 1) * 8]
+    # Each global batch holds exactly the teacher's samples of that iteration.
+    for iteration, (first, second) in enumerate(zip(*batches)):
+        assert sorted(first + second) == list(range(iteration * gbs, (iteration + 1) * gbs))
+
+
+def test_writer_lanes_prefetch_across_flush_boundaries(tmp_path):
+    write_cache(tmp_path, iterations=4)  # Flushes of iterations 0-2 and 2-4.
+    storage = _CountingStorage(tmp_path)
+    live = reader(storage, settings())
+    try:
+        assert ids_of(live.samples(list(range(16)), 16)) == replay_order(0, 16)
+        lanes = dict(live.lanes)
+        assert set(lanes) == {0, 1}
+        # Without any request for the second flush, each lane streams into it.
+        later = storage_module.flush_dir(storage_module.REPLAY, 2, 4)
+        expected = {f"{later}/{storage_module.part_name(writer)}" for writer in lanes}
+        deadline = time.monotonic() + 10
+        while {name for name, _, _ in storage.reads} < expected | {
+            part_path(writer, 0, 2) for writer in lanes
+        }:
+            assert time.monotonic() < deadline, "lanes did not prefetch the next flush"
+            time.sleep(0.01)
+        assert ids_of(live.samples(list(range(16, 32)), 32)) == replay_order(16, 32)
+        # The same lane objects served both flushes.
+        assert live.lanes.keys() == lanes.keys()
+        assert all(live.lanes[writer] is lanes[writer] for writer in lanes)
+    finally:
+        live.close()
+
+
+def test_teacher_dp_may_change_between_flushes(tmp_path):
+    # Three dump jobs with teacher DP 2, then 4, then 2 again (same global batch size).
+    gbs = 8
+    _, metadata = write_cache(tmp_path, dp=2, mbs=2, iterations=2)
+    write_cache(tmp_path, dp=4, mbs=1, start=2, iterations=4, metadata=metadata)
+    write_cache(tmp_path, dp=2, mbs=2, start=4, iterations=6, metadata=metadata)
+    storage = Storage(str(tmp_path))
+    assert [
+        storage_module.read_group(storage, span)["writers"] for span in ((0, 2), (2, 4), (4, 6))
+    ] == [2, 4, 2]
+    live = reader(storage, metadata)
+    try:
+        assert ids_of(live.samples(list(range(48)), 48)) == (
+            replay_order(0, 16) + replay_order(16, 32, gbs, 4, 1) + replay_order(32, 48)
+        )
+    finally:
+        live.close()
+    batches = [
+        student_batches(reader(storage, metadata), rank, dp=2, mbs=2, gbs=gbs, iterations=6)
+        for rank in range(2)
+    ]
+    seen = []
+    for iteration, (first, second) in enumerate(zip(*batches)):
+        assert sorted(first + second) == list(range(iteration * gbs, (iteration + 1) * gbs))
+        seen += first + second
+    assert sorted(seen) == list(range(48))  # Every flush is replayed exactly once.
 
 
 def test_files_differing_in_recorded_settings_warn_and_in_required_ones_fail(tmp_path, capsys):
@@ -971,7 +1096,7 @@ def test_files_differing_in_recorded_settings_warn_and_in_required_ones_fail(tmp
     write_cache(tmp_path, iterations=6, contract={"prefix_stable": False})
     live = reader(storage, metadata)
     try:
-        assert ids_of(live.samples(list(range(32)), 32)) == list(range(32))
+        assert ids_of(live.samples(list(range(32)), 32)) == replay_order(0, 32)
         assert (
             "recorded settings (seq_length, teacher); it is still used" in capsys.readouterr().out
         )
@@ -981,16 +1106,38 @@ def test_files_differing_in_recorded_settings_warn_and_in_required_ones_fail(tmp
         live.close()
 
 
-def test_invalid_group_block_ranges_are_rejected(tmp_path):
+@pytest.mark.parametrize("field", ["size", "offset", "first_row", "input_length"])
+def test_invalid_group_block_ranges_are_rejected(tmp_path, field):
     storage, metadata = write_cache(tmp_path, iterations=2)
-    path = tmp_path / storage_module.GroupName(0, 16).index
+    path = tmp_path / flush_path(0, 2)
     group = json.loads(path.read_text())
-    group["parts"][0]["index"]["size"] = 1
+    index = group["parts"][0]["index"]
+    block = index["blocks"][0]
+    if field == "size":
+        index["size"] = 1
+    elif field == "offset":
+        block["offset"] = index["size"] + 1
+    elif field == "first_row":
+        block["first_row"] = 1
+    else:
+        block["input_length"] = block["length"] + 1
     path.write_text(json.dumps(group))
     live = reader(storage, metadata)
-    with pytest.raises(ValueError, match="Invalid replay byte ranges"):
-        live.samples([0], 1)
-    live.close()
+    try:
+        with pytest.raises(ValueError, match="Invalid block rows or byte ranges for writer 0"):
+            live.samples([0], 1)
+    finally:
+        live.close()
+
+
+def test_replay_writers_must_split_every_teacher_iteration_evenly(tmp_path):
+    storage, metadata = write_cache(tmp_path, dp=2, mbs=2, gbs=8, iterations=2)
+    path = tmp_path / flush_path(0, 2)
+    group = json.loads(path.read_text())
+    group["writer_mbs"] = 3  # 2 writers x 3 do not divide an 8-sample iteration.
+    path.write_text(json.dumps(group))
+    with pytest.raises(ValueError, match="wrong number of samples"):
+        storage_module.read_group(storage, (0, 2))
 
 
 def test_packed_samples_must_fit_the_student_length(tmp_path):
@@ -1154,20 +1301,31 @@ def test_token_maps_match_megatron_cpu_partitioning(packed, layout, monkeypatch)
 
 def test_discard_range_only_touches_its_own_range(tmp_path):
     storage, metadata = write_cache(tmp_path, iterations=6)
-    (tmp_path / "replay-16-32.index.json").unlink()
-    (tmp_path / "replay-16-32.part-000000.arrow.0123456789abcdef0123456789abcdef.tmp").write_bytes(
-        b"x"
+    (tmp_path / flush_path(2, 4)).unlink()  # An interrupted flush: parts but no index.
+    staged = part_path(0, 2, 4) + ".0123456789abcdef0123456789abcdef.tmp"
+    (tmp_path / staged).write_bytes(b"x")
+    kind = storage_module.REPLAY
+    objects = storage_module.flush_objects(storage, kind)
+    assert storage_module.object_spans(objects, kind) == [(0, 2), (2, 4), (4, 6)]
+    assert storage_module.published_spans(objects, kind) == [(0, 2), (4, 6)]
+    removed = []
+    remove = storage.remove
+    storage.remove = lambda name: removed.append(name) or remove(name)
+    assert storage_module.discard_range(storage, kind, objects, 2, 4) == [(2, 4)]
+    assert sorted(removed) == sorted([part_path(0, 2, 4), staged, part_path(1, 2, 4)])
+    assert not (tmp_path / storage_module.flush_dir(kind, 2, 4)).exists()
+    # Another job's range (iterations 4-6) and an earlier one are untouched.
+    assert storage_module.flush_objects(storage, kind) == sorted(
+        [path for path in objects if not path.startswith(storage_module.flush_dir(kind, 2, 4))]
     )
-    assert storage_module.object_ranges(storage) == [(0, 16), (16, 32), (32, 48)]
-    removed = storage_module.discard_range(storage, 16, 32)
-    # Indexes go first, so an interrupted cleanup leaves only unpublished data files.
-    assert removed == [
-        "replay-16-32.part-000000.arrow",
-        "replay-16-32.part-000000.arrow.0123456789abcdef0123456789abcdef.tmp",
-        "replay-16-32.part-000001.arrow",
-    ]
-    # Another job's range (32-48) is untouched.
-    assert len(storage.list("replay-32-48.*")) == 3
+    # Indexes go first, so an interrupted cleanup leaves only unpublished parts.
+    removed.clear()
+    objects = storage_module.flush_objects(storage, kind)
+    assert storage_module.discard_range(storage, kind, objects, 0, 6) == [(0, 2), (4, 6)]
+    assert [path.endswith("/" + storage_module.INDEX) for path in removed] == [True] * 2 + [
+        False
+    ] * 4
+    assert not list(tmp_path.iterdir())
 
 
 @pytest.fixture
@@ -1430,11 +1588,11 @@ def test_corpus_sources_must_share_a_tokenizer(tmp_path, runtime_environment, ca
 
 def test_storage_lists_nested_names_relative_to_its_root(tmp_path):
     write_cache(tmp_path / "web" / "train", iterations=2)
-    assert Storage(str(tmp_path)).list("*/*/replay-*.index.json") == [
-        "web/train/replay-0-16.index.json"
+    assert Storage(str(tmp_path)).list("*/*/replay-*/index.json") == [
+        "web/train/" + flush_path(0, 2)
     ]
-    assert Storage(str(tmp_path / "web" / "train")).list("replay-*.index.json") == [
-        "replay-0-16.index.json"
+    assert Storage(str(tmp_path / "web" / "train")).list("replay-*/index.json") == [
+        flush_path(0, 2)
     ]
 
 
@@ -1524,8 +1682,8 @@ def test_corpus_writers_publish_chunks_that_jobs_rewrite_from_their_start(
     assert Storage(args.save).read("latest_checkpointed_iteration.txt") == b"3"
     source = Storage(args.logits_save_dir)
     assert source.list("chunk-*/index.json") == [
-        "chunk-000000000000/index.json",
-        "chunk-000000000002/index.json",
+        "chunk-000000000000-000000000002/index.json",
+        "chunk-000000000002-000000000003/index.json",
     ]
     manifest = blend.plan(
         {"corpus": str(tmp_path), "sources": {"web": 1}, "seed": 1, "lanes": 1}, budget=20
@@ -1539,9 +1697,11 @@ def test_corpus_writers_publish_chunks_that_jobs_rewrite_from_their_start(
     # Restarting at iteration 2 (override or tracker) unpublishes and rewrites from there.
     capsys.readouterr()
     args.consumed_train_samples = 16
+    assert source.list("chunk-000000000002-000000000003/*")
     runtime.initialize_dump_metadata(job)
-    assert "replacing 1 published flushes (iterations 2-3)" in capsys.readouterr().out
-    assert source.list("chunk-*/index.json") == ["chunk-000000000000/index.json"]
+    assert not source.list("chunk-000000000002-000000000003/*")  # Parts too, not just the index.
+    assert "replacing 1 existing flushes (iterations 2-3)" in capsys.readouterr().out
+    assert source.list("chunk-*/index.json") == ["chunk-000000000000-000000000002/index.json"]
     args.consumed_train_samples = 8  # Inside the published chunk of iterations 0-2.
     with pytest.raises(RuntimeError, match="only partly rewritten"):
         runtime.initialize_dump_metadata(job)
@@ -1565,10 +1725,10 @@ def corpus_source(root, name, *, samples, iterations, base=0, contract=None, met
     metadata["contract"]["num_samples"] = samples  # Required for corpus sources.
     storage = Storage(str(root / name))
     for begin in range(0, iterations, 2):
-        directory = chunks.chunk_path(begin)
+        end = min(begin + 2, iterations)
+        directory = storage_module.flush_dir(storage_module.CHUNK, begin, end)
         if storage.exists(f"{directory}/index.json"):
             continue
-        end = min(begin + 2, iterations)
         parts = []
         for rank in range(2):
             ids = [i for i in range(begin * 8, min(end * 8, samples)) if (i // 2) % 2 == rank]
@@ -1584,7 +1744,7 @@ def corpus_source(root, name, *, samples, iterations, base=0, contract=None, met
                 *make_record(captured, metadata["contract"]), vocab_size=len(TEST_VOCAB)
             )
             data, index = arrow.write_file([batch], metadata, block_bytes=TEST_BLOCK_BYTES)
-            path = chunks.part_path(rank)
+            path = storage_module.part_name(rank)
             storage.write(f"{directory}/{path}", data)
             parts.append({"path": path, "index": index})
         chunks.publish_chunk(
@@ -1625,16 +1785,12 @@ def test_blend_plan_is_deterministic_and_follows_the_weights(tmp_path):
     assert (manifest["lanes"], manifest["lane_samples"]) == (4, 10)  # Whole lanes >= budget.
     assert {s["name"]: s["samples"] for s in manifest["sources"]} == {"web": 30, "math": 10}
     assert all(s["passes"] == 1 for s in manifest["sources"])
-    catalog = importlib.import_module(f"{_namespace}.format.disk_plan").Catalog(manifest)
-    try:
-        lengths = (
-            catalog.connection()
-            .execute("SELECT sum(b-a) FROM segments GROUP BY lane ORDER BY lane")
-            .fetchall()
-        )
-        assert lengths == [(10,), (10,), (10,), (10,)]
-    finally:
-        catalog.close_current()
+    pieces, starts = manifest["segments"], manifest["lane_starts"]
+    lengths = np.add.reduceat(pieces["end"] - pieces["first"], starts[:-1])
+    assert lengths.tolist() == [10, 10, 10, 10]
+    # Compact tables: no per-file footers, one shared schema for identical columns.
+    assert manifest["blocks"].dtype.itemsize == 32 and len(manifest["schemas"]) == 1
+    assert len(manifest["files"]["path"]) == len(manifest["files"]["size"]) == 6
     assert blend.plan(blend_config(tmp_path), budget=38)["hash"] == manifest["hash"]
     assert blend.plan(blend_config(tmp_path, seed=2), budget=38)["hash"] != manifest["hash"]
     assert "web: weight 3, 30 samples (75.0%" in blend.describe(manifest)
@@ -1656,6 +1812,16 @@ def test_blend_excludes_filler_and_refuses_incomplete_sources(tmp_path):
     manifest = blend.plan(blend_config(tmp_path), budget=8)
     available = {s["name"]: s["available"] for s in manifest["sources"]}
     assert available == {"web": 13, "math": 32}
+
+
+def test_blend_rejects_overlapping_chunks_of_one_source(tmp_path):
+    two_sources(tmp_path)
+    source = Storage(str(tmp_path / "web"))
+    first = json.loads(source.read("chunk-000000000000-000000000002/index.json"))
+    first["producer"]["end_iteration"] = 3  # Overlaps the chunk starting at iteration 2.
+    source.write("chunk-000000000000-000000000002/index.json", json.dumps(first).encode())
+    with pytest.raises(ValueError, match="overlapping chunks"):
+        blend.plan(blend_config(tmp_path), budget=40)
 
 
 def test_blend_sources_must_agree_on_required_settings(tmp_path):
@@ -1702,12 +1868,130 @@ def test_corpus_reader_only_opens_the_lanes_of_its_rank(tmp_path):
         live.close()
 
 
-def test_corpus_reader_rejects_a_changed_catalog_identity(tmp_path):
+def test_plan_hash_identifies_the_schedule_not_the_budget(tmp_path):
     two_sources(tmp_path)
     manifest = blend.plan(blend_config(tmp_path), budget=40)
-    manifest["hash"] = "changed"
-    with pytest.raises(ValueError, match="catalog differs from the checkpoint"):
-        replay.CorpusReader(str(tmp_path), manifest)
+    assert blend.manifest_hash(manifest) == manifest["hash"]
+    rounded = blend.plan(blend_config(tmp_path), budget=37)  # Also 4 lanes x 10 samples.
+    assert rounded["budget"] != manifest["budget"] and rounded["hash"] == manifest["hash"]
+    files = manifest["files"]
+    for change in ({"size": files["size"] + 1}, {"path": [p + "x" for p in files["path"]]}):
+        assert blend.manifest_hash({**manifest, "files": {**files, **change}}) != manifest["hash"]
+    with pytest.raises(ValueError, match="cannot recompute"):
+        blend.manifest_hash(blend.rank_plan(manifest, dp_rank=0, dp_size=2, micro_batch_size=2))
+
+
+@pytest.mark.parametrize(
+    "lanes,lane_samples,dp_size,mbs,start",
+    [
+        (4, 10, 2, 2, 0),
+        (4, 10, 3, 1, 0),
+        (8, 3, 2, 3, 0),
+        (8, 1, 4, 4, 0),
+        # A resume that changes DP or MBS keeps the old run's cursor (e.g. DP 2 x MBS 4
+        # for 3 iterations), which need not be a multiple of the new D * MBS.
+        (64, 8, 4, 4, 24),
+        (8, 4, 3, 2, 10),
+    ],
+)
+def test_rank_lanes_match_megatrons_positions(lanes, lane_samples, dp_size, mbs, start):
+    total = lanes * lane_samples
+    for rank in range(dp_size):
+        positions = [
+            start + (m * dp_size + rank) * mbs + j
+            for m in range(total)
+            for j in range(mbs)
+            if start + (m * dp_size + rank) * mbs + j < total
+        ]
+        found = blend.rank_lanes(
+            lanes, total, dp_rank=rank, dp_size=dp_size, micro_batch_size=mbs, start=start
+        )
+        assert found.tolist() == sorted({p % lanes for p in positions})
+
+
+def test_rank_plan_holds_only_its_lanes_and_their_blocks(tmp_path):
+    two_sources(tmp_path)
+    manifest = blend.plan(blend_config(tmp_path), budget=40)
+    local = blend.rank_plan(manifest, dp_rank=1, dp_size=2, micro_batch_size=2)
+    assert local["lane_ids"].tolist() == [2, 3] and local["hash"] == manifest["hash"]
+
+    def pieces(plan, lane):
+        """A lane's pieces, independent of the plan's table numbering."""
+        index = int(np.searchsorted(plan["lane_ids"], lane))
+        rows = plan["segments"][plan["lane_starts"][index] : plan["lane_starts"][index + 1]]
+        found = []
+        for block, first, end in rows.tolist():
+            entry = plan["blocks"][block]
+            file = int(entry["file"])
+            source = plan["sources"][plan["files"]["source"][file]]["name"]
+            path = f"{source}/{plan['files']['path'][file]}"
+            found.append((path, int(entry["offset"]), first, end))
+        return found
+
+    for lane in (2, 3):
+        assert pieces(local, lane) == pieces(manifest, lane)
+    assert sorted(set(local["segments"]["block"].tolist())) == list(range(len(local["blocks"])))
+    assert sorted(set(local["blocks"]["file"].tolist())) == list(range(len(local["files"]["path"])))
+    assert len(local["blocks"]) < len(manifest["blocks"])
+    # Every rank's lanes together are the whole plan.
+    other = blend.rank_plan(manifest, dp_rank=0, dp_size=2, micro_batch_size=2)
+    assert other["lane_ids"].tolist() == [0, 1]
+    every = blend.rank_plan(manifest, dp_rank=0, dp_size=3, micro_batch_size=1)
+    assert every["lane_ids"].tolist() == [0, 1, 2, 3]  # 4 lanes are not a multiple of 3.
+
+
+def test_rank_local_reader_serves_the_whole_plans_samples(tmp_path):
+    two_sources(tmp_path)
+    manifest = blend.plan(blend_config(tmp_path), budget=40)
+    positions = [p for p in range(40) if (p % 4) // 2 == 1]
+    for targets in (True, False):
+        readers = [
+            replay.CorpusReader(str(tmp_path), plan, targets=targets)
+            for plan in (
+                manifest,
+                blend.rank_plan(manifest, dp_rank=1, dp_size=2, micro_batch_size=2),
+            )
+        ]
+        try:
+            whole, local = (reader.samples(positions, 40) for reader in readers)
+            with pytest.raises(RuntimeError, match="lane 0 is not in this rank's plan"):
+                readers[1].samples([0], 40)
+        finally:
+            for reader in readers:
+                reader.close()
+        assert len(whole) == len(local) == 20
+        for expected, sample in zip(whole, local):
+            assert expected.keys() == sample.keys() and ("teacher_values" in sample) == targets
+            for key, value in expected.items():
+                same = torch.equal if torch.is_tensor(value) else (lambda a, b: a == b)
+                assert same(value, sample[key]), key
+
+
+def test_shared_schema_decodes_blocks_without_their_footer():
+    files = []
+    for ids, teacher in (([0, 1, 2], "/teacher@1"), ([3, 4], "/teacher@2")):
+        metadata = settings(recorded={"teacher": teacher})
+        batch = arrow.samples_batch(
+            *make_record(codec.capture_batch(inputs(ids)), metadata["contract"], logprobs=True),
+            vocab_size=len(TEST_VOCAB),
+        )
+        files.append(arrow.write_file([batch], metadata, block_bytes=TEST_BLOCK_BYTES))
+    schemas = {arrow.block_schema(index) for _, index in files}
+    assert len(schemas) == 1  # Files with different settings share their columns.
+    schema = pa.ipc.read_schema(pa.py_buffer(schemas.pop()))
+    for data, index in files:
+        assert len(index["blocks"]) > 1
+        for block, entry in enumerate(index["blocks"]):
+            for inputs_only in (False, True):
+                offset, size = arrow.block_range(index, block, inputs_only=inputs_only)
+                raw = data[offset : offset + size]
+                shared = arrow.read_block_bytes(
+                    schema, raw, entry["length"], inputs_only=inputs_only
+                )
+                assert shared.equals(arrow.read_block(index, block, raw, inputs_only=inputs_only))
+                assert shared.schema.names == (
+                    list(arrow.INPUT_COLUMNS) if inputs_only else schema.names
+                )
 
 
 def test_student_trains_on_a_corpus_blend_and_resumes_only_on_the_same_plan(
@@ -2181,7 +2465,7 @@ def test_frontier_rejects_changed_published_prefix(tmp_path, runtime_environment
     args.logits_load_shuffle_shards = None
     replay_cache(tmp_path, args, runtime, iterations=2)
     runtime.initialize_replay(args)
-    (tmp_path / "replay-0-16.index.json").unlink()
+    (tmp_path / flush_path(0, 2)).unlink()
     args.consumed_train_samples = 16
     with pytest.raises(RuntimeError, match="Previously published"):
         runtime.ensure_replay_frontier(args)
@@ -2281,7 +2565,7 @@ def teacher_saver(runtime, tmp_path, dp_size=2):
 def teacher_cache(tmp_path, runtime, args, **kwargs):
     saver = teacher_saver(runtime, tmp_path)
     shared = runtime._dump_settings(saver)
-    shared["contract"]["first_sample"] = kwargs.pop("first_sample", 0)
+    shared["contract"]["first_iteration"] = kwargs.pop("first_iteration", 0)
     return write_cache(tmp_path, metadata=shared, **kwargs)
 
 
@@ -2293,7 +2577,7 @@ def test_teacher_and_student_use_effective_attention_mode(
     args.reset_attention_mask = True
     args.create_attention_mask_in_dataloader = create_attention_mask
     metadata = runtime._dump_settings(teacher_saver(runtime, tmp_path))
-    metadata["contract"]["first_sample"] = 0
+    metadata["contract"]["first_iteration"] = 0
     expected = "causal_eod_reset" if create_attention_mask else "causal"
     contract = metadata["contract"]
     assert contract["attention_mode"] == expected
@@ -2495,21 +2779,29 @@ def test_teacher_rewrites_its_range_like_a_checkpoint_resume(tmp_path, runtime_e
     args.exit_interval = 4
     saver = teacher_saver(runtime, tmp_path)
     metadata = runtime.initialize_dump_metadata(saver)  # Empty cache.
-    assert metadata["contract"]["first_sample"] == 0
-    teacher_cache(tmp_path, runtime, args, iterations=8)  # Flushes of samples 0-16, ..., 48-64.
-    (tmp_path / "replay-48-64.index.json").unlink()  # An interrupted flush.
+    assert metadata["contract"]["first_iteration"] == 0
+    assert metadata["contract"]["global_batch_size"] == 8
+    teacher_cache(tmp_path, runtime, args, iterations=8)  # Flushes of iterations 0-2, ..., 6-8.
+    (tmp_path / flush_path(6, 8)).unlink()  # An interrupted flush.
     storage = storage_module.Storage(str(tmp_path))
-    # Restart at iteration 4 (samples 32-64): everything published there is rewritten,
+
+    def spans():
+        return storage_module.object_spans(
+            storage_module.flush_objects(storage, storage_module.REPLAY), storage_module.REPLAY
+        )
+
+    # Restart at iteration 4 (to iteration 8): everything written there is rewritten,
     # including complete flushes, while earlier ranges are kept.
     args.consumed_train_samples = 4 * 8
     runtime.initialize_dump_metadata(saver)
-    assert "replacing 2 published flushes (samples 32-64)" in capsys.readouterr().out
-    assert not storage.list("replay-32-48.*") and not storage.list("replay-48-64.*")
-    assert storage_module.object_ranges(storage) == [(0, 16), (16, 32)]
+    assert "replacing 2 existing flushes (iterations 4-8)" in capsys.readouterr().out
+    assert not (tmp_path / storage_module.flush_dir(storage_module.REPLAY, 4, 6)).exists()
+    assert not (tmp_path / storage_module.flush_dir(storage_module.REPLAY, 6, 8)).exists()
+    assert spans() == [(0, 2), (2, 4)]
     # Another job's range (from iteration 8 on) is never touched.
     teacher_cache(tmp_path, runtime, args, start=8, iterations=10)
     runtime.initialize_dump_metadata(saver)
-    assert storage_module.object_ranges(storage) == [(0, 16), (16, 32), (64, 80)]
+    assert spans() == [(0, 2), (2, 4), (8, 10)]
     # A start inside a published flush would leave half of it stale.
     args.consumed_train_samples = 3 * 8
     with pytest.raises(RuntimeError, match="only partly rewritten"):
@@ -2520,22 +2812,22 @@ def test_teacher_rewrites_its_range_like_a_checkpoint_resume(tmp_path, runtime_e
     runtime.initialize_dump_metadata(saver)
     args.consumed_train_samples, args.exit_interval = 0, None
     runtime.initialize_dump_metadata(saver)
-    assert storage_module.object_ranges(storage) == []
+    assert spans() == []
 
 
-def test_unfrozen_teacher_recovers_first_sample(tmp_path, runtime_environment):
+def test_unfrozen_teacher_recovers_first_iteration(tmp_path, runtime_environment):
     args, runtime, _ = runtime_environment
     dump_args(args)
     args.logits_save_dir = str(tmp_path)
     args.freeze_all_layers = False
     args.consumed_train_samples = 16
     saver = teacher_saver(runtime, tmp_path)
-    assert runtime.initialize_dump_metadata(saver)["contract"]["first_sample"] == 16
-    teacher_cache(tmp_path, runtime, args, first_sample=16, start=2, iterations=4)
+    assert runtime.initialize_dump_metadata(saver)["contract"]["first_iteration"] == 2
+    teacher_cache(tmp_path, runtime, args, first_iteration=2, start=2, iterations=4)
     args.load = "resumed-training-checkpoint"
     args.consumed_train_samples = 32
     metadata = runtime.initialize_dump_metadata(saver)
-    assert metadata["contract"]["first_sample"] == 16
+    assert metadata["contract"]["first_iteration"] == 2
     assert metadata["recorded"]["teacher"] == "resumed-training-checkpoint"
 
 
@@ -2608,24 +2900,38 @@ def test_saver_writes_files_readable_by_replay(tmp_path, runtime_environment, mo
             "key": rank,
             "start": 0,
             "end": 2,
-            "path": storage_module.replay_data_name(rank, 0, 16),
+            "directory": storage_module.flush_dir(storage_module.REPLAY, 0, 2),
             "writer": rank,
             "writers": 2,
             "writer_mbs": 2,
-            "first_sample": 0,
-            "end_sample": 16,
         }
         module.PairedLogitsSaver._write_batched_tar(
             str(tmp_path), writes[rank], json.dumps(metadata), task, results, None
         )
     assert [(report["start"], report["end"]) for report in results.values()] == [(0, 2), (0, 2)]
+    assert [report["part"]["path"] for report in results.values()] == [
+        storage_module.part_name(rank) for rank in (0, 1)
+    ]
     saver = finalizing_saver(module.PairedLogitsSaver, dp_size=2)
     saver.save_dir = str(tmp_path)
     saver._publish_flush(0, 2, list(results.values()))
     storage = Storage(str(tmp_path))
-    assert _read_meta(storage, _ReplayPart(0, 0, 16)) == metadata
+    assert storage_module.flush_objects(storage, storage_module.REPLAY) == [
+        flush_path(0, 2),
+        part_path(0, 0, 2),
+        part_path(1, 0, 2),
+    ]
+    index = json.loads(storage.read(flush_path(0, 2)))
+    assert {key: index[key] for key in index if key != "parts"} == {
+        "group_version": 1,
+        "start_iteration": 0,
+        "end_iteration": 2,
+        "writers": 2,
+        "writer_mbs": 2,
+    }
+    assert _read_meta(storage, (0, 2)) == metadata
     live = reader(storage, metadata)
-    assert ids_of(live.samples(list(range(16)), 16)) == list(range(16))
+    assert ids_of(live.samples(list(range(16)), 16)) == replay_order(0, 16)
     live.close()
 
 
@@ -3020,26 +3326,26 @@ def test_msc_opt_in_and_worker_enable_are_preserved(runtime_environment, monkeyp
     with pytest.raises(RuntimeError, match="enable-msc"):
         Storage("msc://test/dump")
     calls = []
-    backend.glob = lambda pattern: calls.append(pattern) or [
-        "msc://test/dump/replay-0-8.index.json"
-    ]
+    backend.glob = lambda pattern: calls.append(pattern) or ["msc://test/dump/" + flush_path(0, 1)]
     module = importlib.import_module(f"{_namespace}.v3_saver")
     monkeypatch.setattr(module, "write_file", lambda *a: (b"", {}))
     monkeypatch.setattr(
         module, "Storage", lambda root: types.SimpleNamespace(write=lambda *a: None)
     )
+    task = {"key": "k", "start": 0, "end": 1, "directory": "d", "writer": 0}
     module.PairedLogitsSaver._write_batched_tar(
         "msc://test/dump",
-        {0: {"start": 0, "end": 8, "batch": None}},
+        {0: {"start": 0, "end": 8, "batch": types.SimpleNamespace(num_rows=8)}},
         "{}",
-        {"key": "k", "start": 0, "end": 1, "path": "replay-0-8.part-000000.arrow", "writer": 0},
+        task,
         {},
         None,
     )
     assert state["enabled"]
     storage = Storage("msc://test/dump")
-    assert storage_module.list_published(storage) == [storage_module.GroupName(0, 8)]
-    storage_module.list_published(storage)
+    for _ in range(2):
+        objects = storage_module.flush_objects(storage, storage_module.REPLAY)
+        assert storage_module.published_spans(objects, storage_module.REPLAY) == [(0, 1)]
     assert len(calls) == 2  # Refreshes never reuse a stale application-level listing.
 
 
@@ -3249,9 +3555,9 @@ def test_v3_async_write_failure_sets_shared_event(runtime_environment, monkeypat
     with pytest.raises(OSError, match="failed publication"):
         module.PairedLogitsSaver._write_batched_tar(
             str(tmp_path),
-            {0: {"start": 0, "end": 8, "batch": None}},
+            {0: {"start": 0, "end": 8, "batch": types.SimpleNamespace(num_rows=8)}},
             "{}",
-            {"key": "k", "start": 0, "end": 1, "path": "replay-0-8.part-000000.arrow", "writer": 0},
+            {"key": "k", "start": 0, "end": 1, "directory": "d", "writer": 0},
             {},
             event,
         )
@@ -3271,7 +3577,11 @@ def test_dp_resharding_with_rampup_shuffle_and_resume(
         tmp_path, dp=teacher_dp, mbs=teacher_mbs, gbs=teacher_gbs, iterations=12, packed=packed
     )
     prototype = reader(storage, metadata, shuffle=shuffle, seed=7)
-    expected_order = [sid for start, end in prototype.groups for sid in range(start, end)]
+    expected_order = [
+        sid
+        for span in prototype.groups
+        for sid in replay_order(*span, teacher_gbs, teacher_dp, teacher_mbs)
+    ]
     prototype.close()
     # A valid old student checkpoint need not align to teacher iterations,
     # saved microbatches, or the new student's batch size.
@@ -3295,10 +3605,11 @@ def test_dp_resharding_with_rampup_shuffle_and_resume(
         for num_mb in (1, 2, 3):
             count[0] = num_mb
             seen = []
-            for mb in range(num_mb):
-                for rank, stream in enumerate(iterators):
+            # Each student rank reads one contiguous slice of the global batch.
+            for rank, stream in enumerate(iterators):
+                for mb in range(num_mb):
                     batch = next(stream)
-                    start = consumed + (mb * student_dp + rank) * student_mbs
+                    start = consumed + (rank * num_mb + mb) * student_mbs
                     expected = expected_order[start : start + student_mbs]
                     assert batch["_kd_sample_ids"] == expected
                     # Packed batches map to the flattened THD layout, others to [S, B].
@@ -3362,7 +3673,10 @@ def test_golden_fixtures_decode(tmp_path, name):
         build_fixture(golden, name)
     expected_storage, expected_meta = build_fixture(tmp_path, name)
     storage = Storage(str(golden))
-    meta = _read_meta(storage, storage_module.list_published(storage)[0])
+    first = storage_module.published_spans(
+        storage_module.flush_objects(storage, storage_module.REPLAY), storage_module.REPLAY
+    )[0]
+    meta = _read_meta(storage, first)
     codec.validate_metadata(meta)
     assert codec.mismatched_settings(meta, expected_meta) == ([], [])
     count = groups(storage, meta)[-1][1]
@@ -3382,8 +3696,9 @@ def test_golden_fixtures_decode(tmp_path, name):
             "teacher_tail",
         ):
             assert torch.equal(a[key], b[key]), (name, key)
-    first = storage_module.list_published(storage)[0]
-    path = storage_module.read_group(storage, first)["parts"][0]["path"]
+    path = f"{storage_module.flush_dir(storage_module.REPLAY, *first)}/" + (
+        storage_module.read_group(storage, first)["parts"][0]["path"]
+    )
     schema = pa.ipc.open_file(storage.path(path)).schema
     assert ("tail" in schema.names) == (name == "u16_logprobs_with_tail")
     if name == "u16_logprobs_with_tail":

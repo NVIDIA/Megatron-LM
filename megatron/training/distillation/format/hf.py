@@ -3,9 +3,10 @@
 """Reference consumer of a planned corpus blend for Hugging Face-style training (torch only).
 
 - :func:`check_student` rejects a student tokenizer that differs from the teacher's.
-- :class:`CorpusStream` yields one data-parallel rank's samples of a manifest (see
+- :class:`CorpusStream` yields one data-parallel rank's samples of a plan (see
   :mod:`.blend`) in Megatron's order, so each lane is read by one rank when the lane
-  count is a multiple of world size × micro batch size.
+  count is a multiple of world size × micro batch size. It keeps only that rank's part
+  of the plan (:func:`.blend.rank_plan`).
 - :func:`collate` pads samples into ``input_ids``, ``attention_mask``, ``position_ids``,
   ``labels`` and the teacher's top-K targets.
 - :func:`topk_kl` is the single-device sparse KL that Megatron's offline KD loss
@@ -24,6 +25,7 @@ from typing import Any, Iterator
 import torch
 
 from ..v3_replay import CorpusReader
+from .blend import rank_plan
 from .contract import LOGPROB_SENTINEL, hf_tokenizer_identity
 
 
@@ -60,6 +62,8 @@ class CorpusStream(torch.utils.data.IterableDataset):
     too when given. Every stored target index must be a token of the tokenizer.
     This stream already assigns DP ranks. Do not apply another distributed dataset
     sharder (for example Trainer/Accelerate's automatic sharding) on top of it.
+    ``manifest`` is a whole :func:`.blend.plan` (or this rank's :func:`.blend.rank_plan`);
+    the stream keeps only this rank's lanes.
     """
 
     def __init__(
@@ -77,6 +81,16 @@ class CorpusStream(torch.utils.data.IterableDataset):
     ):
         check_student(manifest, tokenizer, vocab_size=model_vocab_size)
         reader_options["vocab_size"] = len(tokenizer)
+        layout = {
+            "dp_rank": rank,
+            "dp_size": world_size,
+            "micro_batch_size": micro_batch_size,
+            "start": start,
+        }
+        if manifest.get("rank") is None:
+            manifest = rank_plan(manifest, **layout)
+        elif manifest["rank"] != layout:
+            raise ValueError(f"This corpus plan is for {manifest['rank']}, not {layout}")
         self.root, self.manifest = root, manifest
         self.rank, self.world_size, self.micro_batch_size = rank, world_size, micro_batch_size
         self.start = start

@@ -26,9 +26,9 @@ import torch.distributed as dist
 
 from .format.arrow import file_meta
 from .format.contract import blend_contract, mismatched_corpus_order, mismatched_settings
-from .format.corpus import CorpusInventory, check_chunk, chunk_path
+from .format.corpus import CorpusInventory, check_chunk
 from .v3_options import runtime_options
-from .v3_storage import Storage
+from .v3_storage import CHUNK, Storage, discard_range, flush_dir, object_spans
 
 # Placeholder budget until the epoch length is known (set once the dataset is built).
 _UNTIL_EPOCH_END = 1 << 40
@@ -45,8 +45,6 @@ def corpus_inventory() -> CorpusInventory:
 def reset_corpus_runtime() -> None:
     """Discard cached producer state on an in-process restart."""
     global _INVENTORY
-    if _INVENTORY is not None and hasattr(_INVENTORY.chunks, "close"):
-        _INVENTORY.chunks.close()
     _INVENTORY = None
 
 
@@ -86,7 +84,7 @@ def initialize_corpus_metadata(saver: Any, expected: dict) -> dict:
             for directory in sorted(inventory.chunks):
                 chunk = inventory.chunks[directory]
                 a, b = chunk["producer"]["start_iteration"], chunk["producer"]["end_iteration"]
-                if directory != chunk_path(a) or not 0 <= a < b:
+                if directory != flush_dir(CHUNK, a, b) or not 0 <= a < b:
                     raise ValueError("Invalid Megatron corpus chunk interval")
                 spans.append((a, b))
                 if not start <= a < end:
@@ -96,7 +94,7 @@ def initialize_corpus_metadata(saver: Any, expected: dict) -> dict:
                 if a < previous:
                     raise ValueError("Overlapping Megatron corpus chunks")
                 previous = b
-            check_rewrite_bounds(spans, start, end, "iterations")
+            check_rewrite_bounds(object_spans(inventory.objects, CHUNK), start, end, "iterations")
             # Chunks this job keeps must agree with it; the ones it rewrites need not.
             settings = producer_settings(args)
             total = expected["contract"]["num_samples"]
@@ -141,8 +139,11 @@ def initialize_corpus_metadata(saver: Any, expected: dict) -> dict:
                     raise ValueError(f"Corpus source {source} uses a different tokenizer")
                 if meta.get("recorded", {}).get("teacher") != expected["recorded"]["teacher"]:
                     recorded_differences.add("teacher")
-            report_replaced([span for span in spans if start <= span[0] < end], "iterations")
-            inventory.invalidate(set(inventory.chunks) - set(kept))
+            # Unpublish and delete everything this job rewrites, unpublished parts included.
+            replaced = discard_range(inventory.storage, CHUNK, inventory.objects, start, end)
+            report_replaced(replaced, "iterations")
+            for directory in set(inventory.chunks) - set(kept):
+                del inventory.chunks[directory]
             _INVENTORY = inventory  # Only this rank publishes chunk indexes.
             return {"metadata": expected, "differing": sorted(recorded_differences)}
         except Exception as error:

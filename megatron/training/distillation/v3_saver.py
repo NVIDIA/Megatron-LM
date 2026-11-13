@@ -19,13 +19,16 @@ from .logits_saver import LogitsSaverHooks
 from .v3_format import MAX_VOCAB_SIZE, capture_batch, finalize_record, join_inputs, tail_logprob
 from .v3_options import get_args
 from .v3_replay import layout_options, token_map
-from .v3_storage import GroupName, Storage, replay_data_name
+from .v3_storage import INDEX, REPLAY, Storage, flush_dir, part_name
 
 TRACKER = "latest_checkpointed_iteration.txt"
 
 
 class PairedLogitsSaver(LogitsSaverHooks):
     """Reuse teacher top-K extraction while persisting full CPU input records."""
+
+    # Flush directories are ``<flush_kind>-<start>-<end>`` (see v3_storage).
+    flush_kind = REPLAY
 
     _max_vocab_size = MAX_VOCAB_SIZE
 
@@ -212,25 +215,19 @@ class PairedLogitsSaver(LogitsSaverHooks):
         writes, self._pending_writes = self._pending_writes, OrderedDict()
         task = None
         if writes:
-            start, end = min(a for a, _ in writes), max(b for _, b in writes)
             gbs = get_args().global_batch_size
-            task = self._flush_task(start // gbs, end // gbs, start, end)
+            start, end = min(a for a, _ in writes) // gbs, max(b for _, b in writes) // gbs
+            task = {
+                "key": uuid.uuid4().hex,
+                "start": start,
+                "end": end,
+                "directory": flush_dir(self.flush_kind, start, end),
+                "writer": self.dp_rank,
+                "writers": self.dp_size,
+                "writer_mbs": get_args().micro_batch_size,
+            }
         self._last_flush = task
         return self.save_dir, writes, self._meta_bytes, task, self._results, self._failure_event
-
-    def _flush_task(self, start: int, end: int, first_sample: int, end_sample: int) -> dict:
-        """Describe one flush of iterations ``[start, end)`` for the async writer."""
-        return {
-            "key": uuid.uuid4().hex,
-            "start": start,
-            "end": end,
-            "path": replay_data_name(self.dp_rank, first_sample, end_sample),
-            "writer": self.dp_rank,
-            "writers": self.dp_size,
-            "writer_mbs": get_args().micro_batch_size,
-            "first_sample": first_sample,
-            "end_sample": end_sample,
-        }
 
     @staticmethod
     def _write_batched_tar(
@@ -241,7 +238,11 @@ class PairedLogitsSaver(LogitsSaverHooks):
         results: Any,
         failure_event: Any,
     ) -> None:
-        """Publish one writer's flush and report it, without reading the object back."""
+        """Upload this writer's part of a flush and report its index, without reading it back.
+
+        A writer with no rows (a corpus writer holding only final-batch fillers) reports
+        no part.
+        """
         if task is None:
             return
         try:
@@ -250,43 +251,42 @@ class PairedLogitsSaver(LogitsSaverHooks):
                 from megatron.core.msc_utils import MultiStorageClientFeature
 
                 MultiStorageClientFeature.enable()
-            data, index = write_file(
-                [record["batch"] for record in writes.values()], json.loads(metadata)
-            )
-            Storage(root).write(task["path"], data)
-            results[task["key"]] = {
-                **task,
-                "part": {"writer": task["writer"], "path": task["path"], "index": index},
-            }
+            batches = [record["batch"] for record in writes.values() if record["batch"].num_rows]
+            part = None
+            if batches:
+                data, index = write_file(batches, json.loads(metadata))
+                path = part_name(task["writer"])
+                Storage(root).write(f"{task['directory']}/{path}", data)
+                part = {"writer": task["writer"], "path": path, "index": index}
+            results[task["key"]] = {**task, "part": part}
         except Exception:
             if failure_event is not None:
                 failure_event.set()
             raise
 
     def _publish_flush(self, start: int, end: int, reports: list[dict]) -> None:
-        """Publish one replay group after every independent writer upload succeeds."""
+        """Publish a replay flush's index once every writer has uploaded its part."""
         first = reports[0]
-        fields = ("first_sample", "end_sample", "writers", "writer_mbs")
-        if any(any(report[key] != first[key] for key in fields) for report in reports):
-            raise RuntimeError("Replay writers disagree on sample span or writer layout")
-        parts = sorted([report["part"] for report in reports], key=lambda part: part["writer"])
-        if [part["writer"] for part in parts] != list(range(first["writers"])):
+        writers, mbs = first["writers"], first["writer_mbs"]
+        if any((r["writers"], r["writer_mbs"]) != (writers, mbs) for r in reports):
+            raise RuntimeError("Replay writers disagree on the writer layout")
+        parts = sorted((r["part"] for r in reports if r["part"]), key=lambda part: part["writer"])
+        if [part["writer"] for part in parts] != list(range(writers)):
             raise RuntimeError("Replay flush is missing writer parts")
-        span = GroupName(first["first_sample"], first["end_sample"])
-        if (span.end - span.start) % (first["writers"] * first["writer_mbs"]):
-            raise RuntimeError("Replay flush does not cover whole writer microbatches")
-        rows = (span.end - span.start) // first["writers"]
+        rows = (end - start) * get_args().global_batch_size // writers
         if any(sum(block["rows"] for block in part["index"]["blocks"]) != rows for part in parts):
             raise RuntimeError("Replay flush contains an unexpected writer row count")
-        group = {
+        index = {
             "group_version": 1,
-            "start": span.start,
-            "end": span.end,
-            "writers": first["writers"],
-            "writer_mbs": first["writer_mbs"],
+            "start_iteration": start,
+            "end_iteration": end,
+            "writers": writers,
+            "writer_mbs": mbs,
             "parts": parts,
         }
-        Storage(self.save_dir).write(span.index, json.dumps(group, separators=(",", ":")).encode())
+        Storage(self.save_dir).write(
+            f"{first['directory']}/{INDEX}", json.dumps(index, separators=(",", ":")).encode()
+        )
 
     def flush_finalize_fn(self, iteration: int) -> Callable[[], None]:
         """Confirm every writer's upload before the progress tracker advances.

@@ -295,6 +295,40 @@ def read_block(
     return _open(index, {offset: raw}, **options).get_batch(block)
 
 
+def block_schema(index: dict[str, Any]) -> bytes:
+    """Serialize a data file's columns, without its settings, from the index's footer.
+
+    Files with the same columns share this schema, which :func:`read_block_bytes` needs
+    in place of each file's footer.
+    """
+    reader = _open(index, {})
+    if reader.num_record_batches != len(index["blocks"]):
+        raise ValueError("Offline KD index and footer disagree on the number of blocks")
+    return reader.schema.remove_metadata().serialize().to_pybytes()
+
+
+def read_block_bytes(
+    schema: pa.Schema, raw: bytes, length: int, *, inputs_only: bool = False
+) -> pa.RecordBatch:
+    """Decode a block from its ranged bytes using a shared :func:`block_schema`.
+
+    ``raw`` is the block's ``length``-byte record batch message or, for the input
+    columns only, its ``input_length`` prefix.
+    """
+    if not inputs_only:
+        if len(raw) != length:
+            raise ValueError(f"Offline KD block has {len(raw)} of its {length} bytes")
+        return pa.ipc.read_record_batch(pa.ipc.read_message(pa.py_buffer(raw)), schema)
+    # A one-message stream whose unread target bytes are zero (untouched) pages: the
+    # reader only decompresses the included input columns, which prefix the body.
+    header = schema.serialize()
+    stream = np.zeros(header.size + length, dtype=np.uint8)
+    stream[: header.size] = np.frombuffer(header, dtype=np.uint8)
+    stream[header.size : header.size + len(raw)] = np.frombuffer(raw, dtype=np.uint8)
+    options = pa.ipc.IpcReadOptions(included_fields=list(range(len(INPUT_COLUMNS))))
+    return pa.ipc.open_stream(pa.py_buffer(stream), options=options).read_next_batch()
+
+
 def _tensor(array: np.ndarray) -> torch.Tensor:
     """Wrap a NumPy array as a tensor, copying Arrow's read-only buffers."""
     return torch.from_numpy(np.require(array, requirements=["C", "W"]))
@@ -371,10 +405,12 @@ __all__ = [
     "LOGPROB_SENTINEL",
     "META_KEY",
     "block_range",
+    "block_schema",
     "check_index",
     "decode_block",
     "file_meta",
     "read_block",
+    "read_block_bytes",
     "samples_batch",
     "write_file",
 ]

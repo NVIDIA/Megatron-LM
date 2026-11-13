@@ -25,8 +25,9 @@ ATTENTION_MODES = ("causal", "causal_eod_reset", "isolated_segments")
 # Required by every reader: what token IDs mean (which also bounds target indices),
 # which attention the inputs assume, and whether a prefix of a sample keeps its targets.
 REQUIRED_KEYS = ("tokenizer", "attention_mode", "prefix_stable")
-# Replay files share an origin; each group index separately records its writer layout.
-REPLAY_KEYS = ("first_sample",)
+# A replay cache starts at a teacher iteration and maps iterations to samples by the
+# teacher's global batch size; each flush index separately records its writer layout.
+REPLAY_KEYS = ("first_iteration", "global_batch_size")
 # A corpus source also needs its epoch size, which defines when it is complete.
 CORPUS_KEYS = ("num_samples",)
 # These recorded fields become invariants within a single corpus source, but may
@@ -57,7 +58,7 @@ def validate_metadata(meta: dict[str, Any], *, replay: bool = True, corpus: bool
 
     ``meta`` holds ``format_version``, the required settings under ``contract``, and
     optional ``recorded`` and ``provenance`` dictionaries. Corpus files and blend
-    manifests use ``replay=False``: neither requires a replay sample origin.
+    manifests use ``replay=False``: neither requires a replay origin or batch size.
     """
     if meta.get("format_version") != FORMAT_VERSION:
         raise ValueError(f"Expected offline KD format version {FORMAT_VERSION} metadata")
@@ -77,8 +78,10 @@ def validate_metadata(meta: dict[str, Any], *, replay: bool = True, corpus: bool
     if type(contract["prefix_stable"]) is not bool:
         raise ValueError("Offline KD metadata prefix_stable must be a boolean")
     if replay:
-        if type(contract["first_sample"]) is not int or contract["first_sample"] < 0:
-            raise ValueError("Offline KD metadata first_sample must be a nonnegative integer")
+        if type(contract["first_iteration"]) is not int or contract["first_iteration"] < 0:
+            raise ValueError("Offline KD metadata first_iteration must be a nonnegative integer")
+        if type(contract["global_batch_size"]) is not int or contract["global_batch_size"] < 1:
+            raise ValueError("Offline KD metadata global_batch_size must be a positive integer")
     if corpus and (type(contract["num_samples"]) is not int or contract["num_samples"] < 1):
         raise ValueError("Offline KD corpus metadata num_samples must be a positive integer")
 

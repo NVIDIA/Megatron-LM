@@ -12,14 +12,14 @@ import threading
 from typing import Any, Callable
 
 import numpy as np
+import pyarrow as pa
 import torch
 
-from .format.arrow import block_range, check_index, decode_block, file_meta, read_block
+from .format.arrow import block_range, decode_block, file_meta, read_block, read_block_bytes
 from .format.blend import MANIFEST_VERSION
-from .format.contract import blend_contract
 from .format.index_cache import BoundedIndexCache
 from .v3_format import LOGPROB_SENTINEL, TOKEN_FIELDS, mismatched_settings, validate_metadata
-from .v3_storage import GroupName, Storage, list_published, read_group, validate_published_ranges
+from .v3_storage import INDEX, REPLAY, Storage, flush_dir, published_spans, read_group
 
 
 def merged_boundaries(rows: list[torch.Tensor], sample_lengths: list[int]) -> torch.Tensor:
@@ -135,27 +135,29 @@ def layout_options(args: Any, *, hybrid: bool = False) -> dict[str, Any]:
 
 
 def discover_groups(
-    storage: Storage, metadata: dict, *, published: list[GroupName] | None = None
+    storage: Storage, metadata: dict, *, indexes: list[str] | None = None
 ) -> tuple[list[tuple[int, int]], tuple[int, int, int] | None]:
-    """List published indexes once and return the contiguous published prefix.
+    """List published flush indexes once and return the contiguous published prefix.
 
-    A flush range is published when its consolidated index is visible. Returns
-    ``(groups, hole)`` where ``groups`` are the published
-    ``(start, end)`` sample ranges from ``first_sample`` without a gap, and
-    ``hole`` is ``(gap_start, next_published_start, later_groups)`` when published
-    ranges exist beyond a gap (e.g. parallel dump jobs that are still writing).
+    A flush is published once its index exists. Returns ``(groups, hole)`` where
+    ``groups`` are the published ``(start, end)`` sample ranges from the cache's first
+    iteration without a gap, and ``hole`` is ``(gap_start, next_published_start,
+    later_groups)`` in samples when published flushes exist beyond a gap (e.g. parallel
+    dump jobs that are still writing).
     """
     validate_metadata(metadata)
     contract = metadata["contract"]
-    ranges = validate_published_ranges(list_published(storage) if published is None else published)
-    by_start = dict(ranges)
+    gbs = contract["global_batch_size"]
+    if indexes is None:
+        indexes = storage.list(f"{REPLAY}-*/{INDEX}")
+    by_start = dict(published_spans(indexes, REPLAY))
     groups = []
-    cursor = contract["first_sample"]
+    cursor = contract["first_iteration"]
     while cursor in by_start:
-        groups.append((cursor, by_start[cursor]))
+        groups.append((cursor * gbs, by_start[cursor] * gbs))
         cursor = by_start[cursor]
-    later = [span for span in ranges if span[0] > cursor]
-    hole = (cursor, later[0][0], len(later)) if later else None
+    later = sorted(start for start in by_start if start > cursor)
+    hole = (cursor * gbs, later[0] * gbs, len(later)) if later else None
     return groups, hole
 
 
@@ -206,6 +208,7 @@ class _Lane:
                 future = reader.pool.submit(reader.decode_rows, index, block, raw, label)
                 if not self._put((key, future)):
                     return
+            self._put((None, RuntimeError("Offline KD v3 stream ended before a requested block")))
         except BaseException as error:  # Surface any failure to the consumer.
             self._put((None, error))
 
@@ -234,6 +237,9 @@ class _Lane:
 class _BlockReader:
     """Decoding, vocabulary masking and sample slicing shared by replay and corpus readers."""
 
+    # Whether each DP rank reads one contiguous slice of a global batch (see ReplayIterator).
+    rank_slices = False
+
     def __init__(
         self,
         contract: dict,
@@ -255,11 +261,15 @@ class _BlockReader:
         )
         self.lanes: dict[Any, _Lane] = {}
 
+    def read_batch(self, index: dict, block: int, raw: bytes) -> Any:
+        """Decode a block's record batch from the bytes :func:`block_range` names."""
+        return read_block(index, block, raw, inputs_only=not self.targets)
+
     def decode_rows(
         self, index: dict, block: int, raw: bytes, label: str
     ) -> tuple[dict, tuple | None]:
         """Decode and validate one block."""
-        batch = read_block(index, block, raw, inputs_only=not self.targets)
+        batch = self.read_batch(index, block, raw)
         inputs, targets = decode_block(batch, vocab_size=self.vocab_size)
         if inputs["sample_offsets"].numel() - 1 != index["blocks"][block]["rows"]:
             raise ValueError(f"Offline KD v3 block {block} of {label} has wrong rows")
@@ -295,7 +305,15 @@ class _BlockReader:
 
 
 class ReplayReader(_BlockReader):
-    """Read samples by logical replay position, streaming each writer's files."""
+    """Read samples by logical replay position, streaming each writer's parts.
+
+    Within a flush, each teacher iteration's samples are ordered writer by writer
+    (all of DP rank 0's rows, then rank 1's, ...). A global batch holds the same samples
+    as the teacher's, and a student rank reading a contiguous slice of it streams rows
+    from as few parts as possible; ``sample_id`` keeps the teacher's sample index.
+    """
+
+    rank_slices = True
 
     def __init__(
         self,
@@ -321,6 +339,8 @@ class ReplayReader(_BlockReader):
         )
         self.storage = storage
         self.metadata = metadata
+        self.gbs = self.contract["global_batch_size"]
+        self.pinned = None
         # Recorded settings that differ between files are reported once each, never fatal.
         self.reported_differences: set[str] = set()
         # Each pass replays every group once; shuffled passes draw successive orders from one
@@ -378,57 +398,69 @@ class ReplayReader(_BlockReader):
                 f"Offline KD cache exhausted at {self.total_samples} samples; requested {end}"
             )
 
-    def index(self, dp_rank: int, span: tuple[int, int]) -> dict:
-        """Return a writer's index from one cached group GET, without a data HEAD."""
-        return self._group(span)["parts"][dp_rank]["index"]
-
     def _group(self, span: tuple[int, int]) -> dict:
+        """Return a flush's validated index (one cached GET), given its sample range."""
+
         def load() -> dict:
-            group = read_group(self.storage, GroupName(*span))
+            group = read_group(self.storage, (span[0] // self.gbs, span[1] // self.gbs))
+            directory = flush_dir(REPLAY, group["start_iteration"], group["end_iteration"])
             for part in group["parts"]:
+                part["path"] = f"{directory}/{part['path']}"
                 index = part["index"]
-                self.check_meta(file_meta(index), part["writer"], span)
+                self.check_meta(file_meta(index), part["path"])
                 index["first_rows"] = [block["first_row"] for block in index["blocks"]]
             return group
 
         return self.group_cache.get_or_load(span, load)
 
-    def check_meta(self, meta: dict, dp_rank: int, span: tuple[int, int]) -> None:
-        """Validate a file's settings against the cache."""
+    def check_meta(self, meta: dict, path: str) -> None:
+        """Validate a part's settings against the cache."""
         validate_metadata(meta)
         required, recorded = mismatched_settings(meta, self.metadata)
         if required:
             raise ValueError(
-                f"Offline KD v3 file dp{dp_rank} {span[0]}-{span[1]} disagrees with the cache on "
-                f"{', '.join(required)}; it was written by an incompatible dump job"
+                f"Offline KD v3 part {path} disagrees with the cache on {', '.join(required)}; "
+                "it was written by an incompatible dump job"
             )
         new = [key for key in recorded if key not in self.reported_differences]
         if new:
             self.reported_differences.update(new)
             print(
-                f"WARNING: offline KD v3 file dp{dp_rank} {span[0]}-{span[1]} differs from the "
-                f"cache in recorded settings ({', '.join(new)}); it is still used",
+                f"WARNING: offline KD v3 part {path} differs from the cache in recorded "
+                f"settings ({', '.join(new)}); it is still used",
                 flush=True,
             )
 
-    def _lane(self, dp_rank: int, group_index: int, first_block: int) -> _Lane:
-        # A lane belongs to one writer part of one logical group. Closing lanes at
-        # a group boundary bounds metadata held outside the LRU and permits a new
-        # group to change its teacher DP without idle old writers scanning ahead.
-        key = (group_index, dp_rank)
-        lane = self.lanes.get(key)
+    def _lane(self, writer: int, group_index: int, first_block: int) -> _Lane:
+        """Stream one teacher writer's parts in replay order, across flush boundaries.
+
+        A stream stops at a flush without this writer (the teacher's DP shrank). One this
+        rank skipped for a whole flush is restarted rather than drained through it.
+        """
+        lane = self.lanes.get(writer)
+        if lane is not None and (lane.current is None or lane.current[0][0] < group_index - 1):
+            self.lanes.pop(writer).close()
+            lane = None
         if lane is None:
-            span = self.groups[group_index]
-            part = self._group(span)["parts"][dp_rank]
-            path, index = part["path"], part["index"]
 
             def items(stopped: threading.Event) -> Any:
-                for block in range(first_block, len(index["blocks"])):
-                    if stopped.is_set():
+                group, start_block = group_index, first_block
+                while not stopped.is_set():
+                    span = self.wait_for_group(group, stopped)
+                    if span is None:
                         return
-                    yield (group_index, block), (self.storage, path, index, block, path)
+                    info = self._group(span)
+                    if writer >= info["writers"]:
+                        return  # The teacher's DP shrank; a later need restarts the stream.
+                    part = info["parts"][writer]
+                    index, label = part["index"], f"{part['path']} (teacher DP rank {writer})"
+                    for block in range(start_block, len(index["blocks"])):
+                        if stopped.is_set():
+                            return
+                        yield (group, block), (self.storage, part["path"], index, block, label)
+                    group, start_block = group + 1, 0
 
-            lane = self.lanes[key] = _Lane(self, f"group{group_index}-writer{dp_rank}", items)
+            lane = self.lanes[writer] = _Lane(self, f"writer{writer}", items)
         return lane
 
     def samples(self, positions: list[int], available_end: int) -> list[dict[str, Any]]:
@@ -437,22 +469,23 @@ class ReplayReader(_BlockReader):
         samples = []
         for position in positions:
             group_index = bisect.bisect_right(self.ends, position)
-            start, _ = self.groups[group_index]
-            end = self.groups[group_index][1]
-            span = (start, end)
-            for key in list(self.lanes):
-                if key[0] != group_index:
-                    self.lanes.pop(key).close()
-            self.group_cache.set_pinned([span])
+            span = self.groups[group_index]
+            if span != self.pinned:
+                # Keep the consumer's flush resident while lanes prefetch later ones.
+                self.group_cache.set_pinned([span])
+                self.pinned = span
             info = self._group(span)
             writers, mbs = info["writers"], info["writer_mbs"]
-            sid = start + position - self.group_starts[group_index]
-            offset = sid - start
-            dp_rank = (offset // mbs) % writers
-            row = (offset // (mbs * writers)) * mbs + offset % mbs
-            first_rows = self.index(dp_rank, (start, end))["first_rows"]
+            rows = self.gbs // writers
+            iteration, within = divmod(position - self.group_starts[group_index], self.gbs)
+            writer, local = divmod(within, rows)
+            row = iteration * rows + local
+            # The teacher's own sample index: Megatron interleaves writers by microbatch.
+            sid = span[0] + iteration * self.gbs + ((local // mbs) * writers + writer) * mbs
+            sid += local % mbs
+            first_rows = info["parts"][writer]["index"]["first_rows"]
             block = bisect.bisect_right(first_rows, row) - 1
-            inputs, targets = self._lane(dp_rank, group_index, block).block((group_index, block))
+            inputs, targets = self._lane(writer, group_index, block).block((group_index, block))
             samples.append(self.slice_sample(inputs, targets, row - first_rows[block], sid))
         return samples
 
@@ -466,7 +499,12 @@ class ReplayReader(_BlockReader):
 
 
 class CorpusReader(_BlockReader):
-    """Read only active lane pieces and part indexes from a shared disk catalog."""
+    """Read a planned corpus blend (see :mod:`.format.blend`) by global sample position.
+
+    Global sample ``p`` is row ``p // L`` of lane ``p % L``. The plan may be a rank-local
+    :func:`~.format.blend.rank_plan` holding only the lanes this rank reads. Each lane
+    streams its pieces' blocks in order, decoded with the plan's shared Arrow schemas.
+    """
 
     def __init__(
         self,
@@ -478,10 +516,6 @@ class CorpusReader(_BlockReader):
         prefetch_depth: int = 2,
         vocab_size: int | None = None,
     ):
-        from collections import OrderedDict
-
-        from .format.disk_plan import Catalog
-
         if manifest.get("manifest_version") != MANIFEST_VERSION:
             raise ValueError("Unsupported offline KD corpus manifest version")
         super().__init__(
@@ -492,73 +526,92 @@ class CorpusReader(_BlockReader):
             vocab_size=vocab_size,
         )
         self.root, self.manifest = root, manifest
-        self.catalog = Catalog(manifest)
         self.lanes_count = manifest["lanes"]
         self.total_samples = self.lanes_count * manifest["lane_samples"]
+        self.lane_ids, self.lane_starts = manifest["lane_ids"], manifest["lane_starts"]
+        self.segments, self.blocks, self.files = (
+            manifest["segments"],
+            manifest["blocks"],
+            manifest["files"],
+        )
+        lengths = (self.segments["end"] - self.segments["first"]).astype(np.int64)
+        ends = np.concatenate(([0], np.cumsum(lengths)))
+        lane_lengths = ends[self.lane_starts[1:]] - ends[self.lane_starts[:-1]]
+        if (lane_lengths != manifest["lane_samples"]).any():
+            raise ValueError("Offline KD corpus plan has a lane of the wrong length")
+        # Each piece's first sample within its lane.
+        self.offsets = ends[:-1] - np.repeat(ends[self.lane_starts[:-1]], np.diff(self.lane_starts))
+        self.schemas = [pa.ipc.read_schema(pa.py_buffer(schema)) for schema in manifest["schemas"]]
         self.storages: dict[str, Storage] = {}
-        self.files = OrderedDict()
-        self.index_lock = threading.Lock()
-        self.file_cache_size = max(8, self.prefetch_depth * 2)
 
-    def _file(self, file_id: int) -> tuple[Storage, str, dict]:
-        with self.index_lock:
-            entry = self.files.get(file_id)
-            if entry is None:
-                entry = self.catalog.file(file_id)
-                self.files[file_id] = entry
-                while len(self.files) > self.file_cache_size:
-                    self.files.popitem(last=False)
-            else:
-                self.files.move_to_end(file_id)
-            storage = self.storages.get(entry["folder"])
-            if storage is None:
-                storage = self.storages[entry["folder"]] = Storage(
-                    os.path.join(self.root, entry["folder"])
-                )
-        return storage, entry["path"], entry
+    def _storage(self, folder: str) -> Storage:
+        storage = self.storages.get(folder)
+        if storage is None:
+            storage = self.storages.setdefault(folder, Storage(os.path.join(self.root, folder)))
+        return storage
 
-    def index(self, file_id: int) -> dict:
-        """Load a bounded active-file footer; block entries stay in the disk catalog."""
-        return self._file(file_id)[2]["index"]
+    def _local(self, lane: int) -> int:
+        local = int(np.searchsorted(self.lane_ids, lane))
+        if local == len(self.lane_ids) or self.lane_ids[local] != lane:
+            raise RuntimeError(
+                f"Offline KD corpus lane {lane} is not in this rank's plan "
+                f"({self.manifest.get('rank')}); the reader's DP layout differs from the plan's"
+            )
+        return local
 
-    def _lane(self, lane: int, first_piece: int) -> _Lane:
+    def _lane(self, lane: int, local: int, first_piece: int) -> _Lane:
         stream = self.lanes.get(lane)
         if stream is None:
+            end = int(self.lane_starts[local + 1])
 
             def items(stopped: threading.Event) -> Any:
-                for piece, file_id, block, a, b in self.catalog.lane(lane, first_piece):
+                for piece in range(first_piece, end):
                     if stopped.is_set():
                         return
-                    storage, path, entry = self._file(file_id)
-                    yield (piece,), (
-                        storage,
-                        path,
-                        entry["index"],
-                        block,
-                        f"{entry['folder']}/{path}",
-                    )
+                    block = int(self.segments["block"][piece])
+                    entry = self.blocks[block]
+                    file_id = int(entry["file"])
+                    folder = self.manifest["sources"][int(self.files["source"][file_id])]["name"]
+                    path = self.files["path"][file_id]
+                    # The one block entry that block_range and read_batch need.
+                    index = {
+                        "blocks": {
+                            block: {
+                                **{key: int(entry[key]) for key in ("rows", "offset", "length")},
+                                "input_length": int(entry["input_length"]),
+                                "schema": int(self.files["schema"][file_id]),
+                            }
+                        }
+                    }
+                    yield (piece,), (self._storage(folder), path, index, block, f"{folder}/{path}")
 
             stream = self.lanes[lane] = _Lane(self, f"lane{lane}", items)
         return stream
 
+    def read_batch(self, index: dict, block: int, raw: bytes) -> Any:
+        """Decode with the plan's shared schema; the plan keeps no per-file footers."""
+        entry = index["blocks"][block]
+        return read_block_bytes(
+            self.schemas[entry["schema"]], raw, entry["length"], inputs_only=not self.targets
+        )
+
     def samples(self, positions: list[int], available_end: int) -> list[dict[str, Any]]:
-        """Seek directly to each lane cursor without a materialized segments array."""
+        """Fetch samples at global positions (non-decreasing per lane across calls)."""
         if available_end > self.total_samples:
             raise RuntimeError(
-                f"Offline KD corpus blend holds {self.total_samples} samples; requested {available_end}"
+                f"Offline KD corpus blend holds {self.total_samples} samples; requested "
+                f"{available_end}"
             )
         samples = []
         for position in positions:
             lane, offset = position % self.lanes_count, position // self.lanes_count
-            piece, start, file_id, block, a, b = self.catalog.piece(lane, offset)
-            inputs, targets = self._lane(lane, piece).block((piece,))
-            samples.append(self.slice_sample(inputs, targets, a + offset - start, position))
+            local = self._local(lane)
+            first, end = int(self.lane_starts[local]), int(self.lane_starts[local + 1])
+            piece = first + int(np.searchsorted(self.offsets[first:end], offset, "right")) - 1
+            inputs, targets = self._lane(lane, local, piece).block((piece,))
+            row = int(self.segments["first"][piece]) + offset - int(self.offsets[piece])
+            samples.append(self.slice_sample(inputs, targets, row, position))
         return samples
-
-    def close(self) -> None:
-        """Stop prefetch/decode work and release this thread's catalog descriptor."""
-        super().close()
-        self.catalog.close_current()
 
 
 def _layout_sample(
@@ -786,11 +839,21 @@ class ReplayIterator:
                     flush=True,
                 )
 
+    def _start(self, microbatch: int) -> int:
+        """The first global position of this rank's ``microbatch`` in the current batch.
+
+        Replay gives each rank one contiguous slice of the global batch, so it streams
+        whole teacher parts where possible; corpus lanes rely on Megatron's interleaving.
+        """
+        if self.reader.rank_slices:
+            return self.consumed + (self.dp_rank * self._count + microbatch) * self.mbs
+        return self.consumed + (microbatch * self.dp_size + self.dp_rank) * self.mbs
+
     def __next__(self) -> dict[str, Any]:
         if self._microbatch == 0:
             self._count = self.num_microbatches()
         end = self.consumed + self._count * self.mbs * self.dp_size
-        start = self.consumed + (self._microbatch * self.dp_size + self.dp_rank) * self.mbs
+        start = self._start(self._microbatch)
         if self._prefetched is None:
             batch = self._load(start, end)
         else:
@@ -804,8 +867,7 @@ class ReplayIterator:
             # Stay within this iteration: the next iteration's ramp-up count is
             # determined only when Megatron updates its batch calculator. The
             # per-rank streams already decode ahead across iterations.
-            next_start = self.consumed + (self._microbatch * self.dp_size + self.dp_rank) * self.mbs
-            self._prefetched = self._executor.submit(self._load, next_start, end)
+            self._prefetched = self._executor.submit(self._load, self._start(self._microbatch), end)
         return batch
 
     def close(self) -> None:

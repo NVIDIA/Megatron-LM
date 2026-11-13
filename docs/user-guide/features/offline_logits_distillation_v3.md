@@ -27,7 +27,7 @@ Add these flags to a normal `pretrain_gpt.py` or `pretrain_hybrid.py` teacher la
 The teacher still uses its original dataset flags. `--freeze-all-layers` is optional;
 omit it only when intentionally collecting targets while training the teacher.
 `--save` and `--save-interval` are required: the save interval is the flush interval,
-and each flush writes one data part per teacher DP rank followed by one group index.
+and each flush writes one data part per teacher DP rank followed by one flush index.
 Teacher batch-size ramp-up, `--iterations-to-skip` (including iterations added from
 `--result-rejected-tracker-filename`), and `--allow-ambiguous-pad-tokens` are rejected.
 A frozen teacher must score deterministically: it still runs in train mode, so set
@@ -206,13 +206,13 @@ in its copy of the blend configuration.
 
 The sources must share tokenizer identity, attention mode and prefix stability. Their
 top-K widths may differ: collation pads K to the batch maximum with masked entries. Teacher identity is recorded per source. The checkpoint pins the plan's hash: a resume re-plans and refuses a different
-file table or sample schedule. Changing DP or microbatch size on resume is fine.
+file table or sample schedule, but accepts a changed budget that rounds to the same lanes. Changing DP or microbatch size on resume is fine.
 Shuffling flags do not apply. Validation works as with replay, from `--data-path` with
 LM loss only; to hold data out of a blend, dump it as its own source and leave it out.
 
 Outside Megatron, `format/blend.py` plans the same schedule and `format/hf.py` is a
-torch-only reference consumer: `CorpusStream` yields one rank's samples in Megatron's
-order, `collate` pads them into `input_ids`, `attention_mask`, `position_ids`, `labels`
+torch-only reference consumer: `CorpusStream` takes the plan, keeps only its rank's part
+(`rank_plan`), and yields that rank's samples in Megatron's order, `collate` pads them into `input_ids`, `attention_mask`, `position_ids`, `labels`
 and the teacher's top-K targets, and `topk_kl` computes the same sparse KL with the tail
 bucket as Megatron. `CorpusStream` requires the student's Hugging Face tokenizer and
 rejects one whose fingerprint differs from the blend's (`check_student`); pass
@@ -240,9 +240,9 @@ Enable deterministic shard-group reordering with:
 
 Omitting this option keeps sequential loading; `--logits-load-shuffle-shards 0` enables
 shuffling with seed zero. The shuffle seed is independent of the teacher dataset seed.
-One reorder unit is one flush range (all teacher DP files for it). Samples inside a group
-retain their global saved order. A smaller student budget consumes a prefix of the
-selected order, and may stop within a group at a student iteration boundary. It does not
+One reorder unit is one flush (all teacher DP parts for it). Samples inside a flush keep
+their replay order (see [Batch and parallelism changes](#batch-and-parallelism-changes)). A smaller student budget consumes a prefix of the
+selected order, and may stop within a flush at a student iteration boundary. It does not
 require the teacher's global batch size.
 
 Shuffling uses the groups published when the student first starts; that extent is saved
@@ -261,8 +261,8 @@ When the next student iteration would cross the known published prefix, world ra
 lists the cache once and shares any newly published groups with every rank. If there are
 still too few samples, all ranks raise the same exhaustion error; replay does not sleep
 or poll. Start the student after the teacher has published enough data to stay ahead of
-consumption. A flush range is published once its index exists for every
-teacher DP rank. Replay never crosses a hole in the published prefix; when later ranges
+consumption. A flush is published once its `index.json` exists, which happens only
+after every teacher DP rank's part has been uploaded. Replay never crosses a hole in the published prefix; when later ranges
 are already published (for example, parallel dump jobs that are still writing), it logs
 a warning naming the gap, and only fails if the student actually needs those samples.
 
@@ -270,8 +270,21 @@ a warning naming the gap, and only fails if the student actually needs those sam
 
 Students may change DP, microbatch size, global batch size, and use batch-size ramp-up.
 Replay derives the next iteration's consumption from Megatron's current microbatch
-calculator. Each student rank streams the teacher DP files it needs, decoding a bounded
-window of blocks ahead.
+calculator.
+
+Each student DP rank reads one contiguous slice of every global batch, and within a
+teacher iteration replay orders samples writer by writer (all of teacher DP rank 0's
+rows, then rank 1's, ...). With the teacher's global batch size, a student global batch
+holds exactly the teacher's samples (only their order differs, which does not change
+the gradient), and each student rank reads its own parts:
+
+- student DP dividing teacher DP: each rank streams whole parts no other rank reads
+  (student rank `r` of `D` reads teacher ranks `r*W/D` to `(r+1)*W/D - 1`);
+- student DP a multiple of teacher DP: each rank reads its own contiguous rows of one
+  part; ranks share only blocks that straddle their row boundaries.
+
+Each rank keeps one stream per teacher part it reads, decoding a bounded window of blocks
+ahead, and the stream continues across flush boundaries without a cold start.
 
 When the student DP size does not divide the teacher's, or the student microbatch is
 smaller than the teacher's, several student ranks read the same teacher block, so the
@@ -305,21 +318,26 @@ Local paths and configured `msc://` storage are supported; remote paths require
 
 ### Directory layouts
 
-Replay publishes one complete group index after all parts finish:
+Both dump modes write one directory per flush, named by its teacher iteration range
+`<kind>-<start>-<end>` (12-digit iterations, exclusive end): `replay-...` for replay
+caches and `chunk-...` for corpus sources. Each holds one `part-<rank>.arrow` per
+teacher DP rank, and an `index.json` written only after every part has been uploaded.
+The prefix tells the two modes apart, and a missing or corrupt part names the DP rank
+(and so the node) that wrote it. There are no per-part index sidecars.
 
 ```text
-/data/teacher-v3/
-├── replay-0-51200.part-000000.arrow
-├── replay-0-51200.part-000001.arrow
-├── replay-0-51200.index.json
-├── replay-51200-102400.part-000000.arrow
-└── replay-51200-102400.index.json
+/data/teacher-v3/                     # replay cache: teacher --logits-save-dir
+├── replay-000000000000-000000000100/
+│   ├── part-000000.arrow             # teacher DP rank 0
+│   ├── part-000001.arrow
+│   └── index.json                    # published last
+└── replay-000000000100-000000000200/
+    ├── part-000000.arrow
+    └── index.json                    # this flush ran with teacher DP 1
 ```
 
-Ranges are global sample counts, with exclusive ends. Part paths are explicit in the
-index; the second group above may use a different teacher DP size. Each group records
-its own `writers` and `writer_mbs` to reconstruct microbatch interleaving. Neither field
-is required in the file-wide contract. There are no per-part index sidecars.
+Each replay index records its own `writers` and `writer_mbs`, so teacher DP and
+microbatch size may change between dump jobs; the global batch size may not.
 
 A corpus root contains independent chunks per source. The source directory name comes
 from `--kd-corpus-dump`, and the student blend configuration refers to that name:
@@ -327,16 +345,16 @@ from `--kd-corpus-dump`, and the student blend configuration refers to that name
 ```text
 /data/corpus/                         # teacher --logits-save-dir; blend "corpus"
 ├── web_crawl/                        # --kd-corpus-dump web_crawl
-│   ├── chunk-000000000000/
+│   ├── chunk-000000000000-000000000128/
 │   │   ├── part-000000.arrow
 │   │   ├── part-000001.arrow
 │   │   └── index.json
-│   ├── chunk-000000000128/
+│   ├── chunk-000000000128-000000000256/
 │   │   ├── part-000000.arrow
 │   │   └── index.json
 │   └── ...
 └── math_sft/                         # --kd-corpus-dump math_sft
-    ├── chunk-000000000000/
+    ├── chunk-000000000000-000000000128/
     │   ├── part-000000.arrow
     │   └── index.json
     └── ...
@@ -346,19 +364,18 @@ from `--kd-corpus-dump`, and the student blend configuration refers to that name
 /data/student-progress/               # normal student checkpoints from --save
 ```
 
-For Megatron the chunk number is its starting teacher iteration, zero-padded to 12
-digits; the second chunk above starts at 128. Numbers need not be consecutive. Parts
-are numbered by the current writer, but consumers use their explicit paths and never
-interpret that ordinal as a DP rank. A final writer with no real rows creates no part.
-Other producers can choose their own `chunk-*` identifiers and relative part paths.
+As for replay, Megatron names a chunk by its teacher iterations and a part by the
+writer's DP rank. A final writer with no real rows creates no part. Consumers follow the
+explicit part paths in the chunk index, so other producers may name their chunks and
+parts differently.
 
 Each source has its own epoch size. Teacher progress is separate from the Arrow dump:
 each parallel dump job needs its own progress directory, containing the tracker rather
 than copies of the frozen weights.
 The student blend JSON is an input configuration, not an automatically generated dump
 file. V3 creates no separate input/target files, `metadata.json`, completion marker, or
-student planning artifact inside the dump. The student writes its catalog to a separate
-plan-cache directory. Required settings are embedded in every Arrow file and
+student planning artifact inside the dump; the student plans in memory at startup and
+writes no plan files anywhere. Required settings are embedded in every Arrow file and
 also available through the footer copy in its index.
 
 Corpus parts have no individual `.index.json` sidecars and there is no `commit.json`.
@@ -373,27 +390,29 @@ target columns, grouped into record batches ("blocks") of at most 32 MiB uncompr
 interpret its sample columns and the settings in schema metadata under `offline_kd`.
 
 Every writer returns its uploaded part's index in a flush-finalizer report. Once all
-writers succeed, one rank publishes the group/chunk index, then advances the tracker.
+writers succeed, one rank publishes the flush's `index.json`, then advances the tracker.
 Unindexed parts remain invisible. Final partial flushes use the same ordering
 synchronously; redo removes affected indexes before overwriting data.
 
-Replay group fields are `group_version` (currently 1), `start`, `end`, `writers`,
-`writer_mbs`, and `parts`. Each part has its `writer` ordinal, unique relative `path`, and
-Arrow `index` below. Every writer must appear exactly once with its expected row count.
-Discovery lists only group indexes and detects gaps/overlaps. A cache miss fetches one
-group index without per-part GETs or HEADs. The bounded cache pins the active group
-while prefetching; later passes can reload evicted groups.
+Replay index fields are `group_version` (currently 1), `start_iteration`,
+`end_iteration`, `writers`, `writer_mbs`, and `parts`. Each part has its `writer` (the
+teacher DP rank), its `path` (`part-<writer>.arrow`, relative to the flush directory),
+and the Arrow `index` below. Every writer must appear exactly once with its expected row
+count. Discovery lists only flush indexes and detects gaps and overlaps. A cache miss
+fetches one flush index without per-part GETs or HEADs. A small bounded cache keeps the
+flush being consumed while streams prefetch later ones.
 
-Corpus planning lists once per source and reads each chunk index once. Numeric block
-rows and compressed footers go into the disk-backed catalog described below. Readers
-query it without additional S3 index GETs, HEADs, or globs. Producers also spool startup
-indexes to scratch storage rather than retaining all chunk dictionaries. Discovery
-still holds chunk filenames in memory, and the producer performs one sibling-source
-listing for tokenizer compatibility. Corpus students never poll a growing source.
+Corpus planning lists once per source and reads each chunk index once, retaining one
+chunk's JSON at a time. It keeps compact numeric block rows and one Arrow schema per
+distinct column layout, not per-file footers (see
+[Student corpus manifest](#student-corpus-manifest)). Readers use the plan without
+additional S3 index GETs, HEADs, or globs. A producer keeps its own source's chunk
+indexes in memory for resume checks, and performs one sibling-source listing for
+tokenizer compatibility. Corpus students never poll a growing source.
 
 ### JSON index
 
-Each part's `index`, embedded in its replay group or corpus chunk, is a range-read
+Each part's `index`, embedded in its replay or corpus flush index, is a range-read
 directory. Its footer and block
 locations duplicate information obtainable from Arrow so that a reader can start with
 one small index read and then fetch only the blocks it needs.
@@ -490,7 +509,7 @@ Every file stores its inputs next to its targets, so a file is self-consistent o
 own. Settings needed to interpret a file are required (`contract`). Files in one replay
 cache or corpus source must agree on them. Across sources in a corpus blend, token
 identity, attention mode and prefix stability must agree. Replay writer layout lives
-in each group index; neither mode needs it in the file contract. The blend manifest
+in each flush index; neither mode needs it in the file contract. The blend manifest
 records its shared contract separately:
 
 | Key | Meaning and reason for storing it |
@@ -499,21 +518,25 @@ records its shared contract separately:
 | `tokenizer.sha256` | Fingerprint of the complete token-to-ID mapping, true vocabulary size and special-token assignments. Prevents accepting different tokenizers merely because their vocabulary sizes happen to match. |
 | `attention_mode` | `causal`, `causal_eod_reset` or `isolated_segments` (see [Context](#context)). Prevents changing the context available to each teacher/student position. |
 | `prefix_stable` | Whether a retained prefix preserves the teacher's distributions. False for length-dependent position scaling such as dynamic NTK RoPE or LongRoPE's short/long switch. Megatron currently writes true. Shortening a longer sample requires true. |
-| `writers` | Per replay group index, not the file contract: teacher writer count for that flush. Student DP may differ. |
-| `writer_mbs` | Per replay group index, not the file contract: microbatch interleaving within that flush. |
-| `first_sample` | Replay only: global sample ID where the intended dump begins. Separates a deliberate nonzero start from a missing initial range. Frozen replay teachers use zero. |
+| `first_iteration` | Replay only: teacher iteration where the intended dump begins. Separates a deliberate nonzero start from a missing initial range. Frozen replay teachers use zero. |
+| `global_batch_size` | Replay only: the teacher's global batch size, fixed for a cache. Converts flush iterations to sample positions. |
 | `num_samples` | Corpus only: real samples in the source epoch. The sum of published part rows must match it exactly. Fillers are removed before writing. Counts prepared GPT windows or SFT rows, not necessarily raw documents or conversations. |
 
-For a replay flush starting at global sample `s`, sample `x` lives in writer
-`((x-s)//writer_mbs) % writers`, at row
-`((x-s)//(writer_mbs*writers))*writer_mbs + (x-s)%writer_mbs` within that writer's file.
-Corpus consumers do not use this formula; their manifest points directly to selected
-file/block rows, independently of the producing framework or its DP layout.
+Each replay index's `writers` and `writer_mbs` describe how that flush's samples are
+spread over its parts. The teacher's global sample `x` (counting from the flush start,
+`G = global_batch_size`) lies in teacher iteration `x // G`; with `y = x % G`, it is in
+writer `(y // writer_mbs) % writers`, at row
+`(x // G) * (G // writers) + (y // (writer_mbs * writers)) * writer_mbs + y % writer_mbs`
+of that writer's part. Replay reads each iteration writer by writer (see
+[Batch and parallelism changes](#batch-and-parallelism-changes)) and reports the
+teacher's sample index as `sample_id`. Corpus consumers do not use this formula; their
+plan points directly to selected file and block rows.
 
-For example, if the only available ranges are `[100, 200)` and `[200, 300)`,
-`first_sample=0` means the initial `[0, 100)` range is missing. `first_sample=100`
-means those same files form a valid start. File names alone cannot distinguish the two
-intentions. Student replay positions start at zero even for a nonzero teacher start.
+For example, if the only published flushes cover iterations `[100, 200)` and
+`[200, 300)`, `first_iteration=0` means the initial `[0, 100)` is missing, while
+`first_iteration=100` means those flushes form a valid start. File names alone cannot
+distinguish the two intentions. Student replay positions start at zero even for a
+nonzero teacher start.
 
 `format_version` 3 implies T=1 log probabilities and stripped padding (see
 [Stored records](#stored-records)).
@@ -761,66 +784,95 @@ on a 1K-token answer stores 1K target rows.
 ### Object storage
 
 Each block is one ranged read (`StorageClient.read` with a byte range), independent of
-the MSC cache configuration. Replay fetches one consolidated index per uncached group;
-corpus readers use the shared local catalog built during planning. Reading starts at the
+the MSC cache configuration. Replay fetches one consolidated index per uncached flush;
+corpus readers take block byte ranges from their rank-local plan. Reading starts at the
 block a resume needs, without fetching earlier ones. `--logits-load-msc-prefetch-depth`
 sets how many blocks each active stream reads and decodes ahead, and
-`--logits-load-decode-threads` how many decode concurrently. Replay streams prefetch
-within their current group and close at group boundaries. Only world rank 0 refreshes
+`--logits-load-decode-threads` how many decode concurrently. Replay streams continue
+from one flush into the next, so prefetch never restarts cold. Only world rank 0 refreshes
 the replay listing when the student reaches the known frontier. Corpus discovery
 happens once during planning.
 
 ## Student corpus manifest
 
-A corpus plan is a small descriptor plus an immutable SQLite catalog on shared POSIX
-storage. Rank 0 lists each source once and streams each published chunk index into the
-catalog, retaining one chunk JSON at a time. No corpus-wide Python block dictionary or
-schedule array is materialized or broadcast.
+The manifest ("plan") is the student's materialized consumption schedule. World rank 0
+lists each source once, validates every chunk index (one chunk JSON at a time), and
+selects/repeats rows for the student budget, orders blocks and assigns them to lanes.
+It does not change the source dump, add weights to its files, or need shared POSIX
+storage: the plan lives only in memory and is rebuilt on resume. It writes no
+`manifest.json` or other plan files.
 
-Use `--kd-corpus-plan-cache-dir /lustre/path/plans` for distributed jobs. Defaults are a
-shared `--data-cache-path`, or `<--save>/offline-kd-plans` when the save path is POSIX.
-Object-store URIs are invalid here. All ranks must see the same directory; startup checks
-readability collectively. Standalone/HF `plan(config, budget=..., cache_dir=...)` uses a
-persistent temporary directory if `cache_dir` is omitted. Keep the catalog for the
-reader's lifetime.
+The plan is a few compact NumPy tables rather than JSON indexes. Each block costs
+32 bytes, each schedule piece 12 bytes, and each file its path plus 16 bytes, so a
+25 TB corpus of 32 MiB blocks (about 1.6M blocks) plans in tens of MB on rank 0. Files
+keep no footers: a block is decoded from its ranged bytes with the shared Arrow schema
+of its column layout (a source may have a few, such as boolean or float loss masks, or
+`u16` or `u16+u8` indices). Input-only reads still fetch only the input prefix.
 
-Only the descriptor is broadcast. Reader ranks query their current lane pieces and
-required block rows, with bounded SQLite page caches and an active-file footer cache.
-Other ranks do not open those tables. The catalog holds numeric SQL block rows and
-compressed footers referencing one dictionary per exact schema variant, accommodating
-mixed K and dtypes. The Arrow decoder and input-only range reads are unchanged.
+World rank 0 plans and broadcasts the compact plan once. Each rank then keeps only its
+rank-local plan (`blend.rank_plan`): the lanes its DP rank reads from the resumed sample
+cursor `c` on (positions `c + (m * DP + r) * MBS + j` modulo `lanes`, which stay valid
+when a resume changes DP or MBS) and only the blocks, files and schemas those lanes use.
+When `lanes` is a multiple of DP × MBS each rank keeps about `1 / DP` of the plan;
+otherwise a rank may need many or all lanes. Planning errors are broadcast so that all
+ranks fail together. Within a source, chunks whose producer iteration ranges overlap are
+rejected, since matching row totals could otherwise hide one range dumped twice.
+
+The student checkpoint stores only the plan's hash in `args.kd_corpus_manifest_hash`,
+alongside the normal consumed-sample cursor. Comparing this digest avoids checkpointing
+the potentially large old schedule solely to compare it field by field. A mismatch
+reports a changed plan without identifying each changed field.
 
 ### Manifest fields
 
-| Key | Purpose |
+| Key | Meaning and purpose |
 | --- | --- |
-| `manifest_version` | Currently `3`: disk-backed representation. |
-| `catalog` | Absolute shared POSIX path to the complete, atomically published SQLite artifact. |
-| `config` | Resolved `corpus` root, positive sample weights in `sources`, `seed` (default 1234), and `lanes` (default 64). |
-| `budget` | Requested samples before rounding to equal lanes. |
-| `lanes`, `lane_samples` | Position `p` maps to lane `p % lanes`, offset `p // lanes`, independently of student DP. |
-| `contract` | Shared tokenizer, attention mode and prefix stability. |
-| `sources` | Small summaries: name, samples, available, passes, supervised, teacher, share and supervised_share. |
-| `hash` | Streamed digest of indexed file identities/metadata, block rows and schedule. Checkpointed; not a payload checksum. |
+| `manifest_version` | Currently `4`: compact in-memory tables with shared schemas. |
+| `config` | Copy of the resolved blend configuration; field meanings are below. Megatron uses its corpus root to locate files. |
+| `budget` | Requested student sample count before rounding up to whole lanes. Descriptive only; not part of the hash. |
+| `lanes` | Number of streams, `L`. Global sample position `p` maps to lane `p % L` and offset `p // L`, independently of student DP. |
+| `lane_samples` | Equal number of samples assigned to each lane. Total planned capacity is `lanes * lane_samples`, at least the requested budget. |
+| `contract` | Shared tokenizer, attention mode and prefix stability. Writer layout is excluded. |
+| `sources` | Per-source reporting and provenance summaries; `files.source` indexes this list. |
+| `schemas` | Serialized Arrow schemas (without settings metadata), one per distinct column layout. |
+| `files` | Columns `source` (int32), `path` (explicit source-relative Arrow path such as `chunk-000000000128-000000000256/part-000001.arrow`; the plan never interprets its parts), `size` (int64) and `schema` (int32). |
+| `blocks` | One 32-byte record per block: `file`, `first_row`, `rows`, `supervised`, `offset` (int64), `length` and `input_length` (from the chunk index). |
+| `lane_ids`, `lane_starts` | Lanes held (all of them in a whole plan); lane `lane_ids[i]` has pieces `segments[lane_starts[i]:lane_starts[i + 1]]`. |
+| `segments` | Schedule pieces `(block, first, end)`: rows `[first, end)` of a block, in lane order. Unrelated to the attention `segments` column stored inside Arrow. |
+| `rank` | `null` for a whole plan; `{dp_rank, dp_size, micro_batch_size, start}` for a rank-local plan. |
+| `hash` | SHA-256 of the whole plan, carried by every rank-local plan (see below). |
 
-There are no `files` or `segments` arrays in the descriptor. Catalog tables hold file
-paths/sizes/footer references, numeric blocks, and lane pieces `(lane, ordinal, start,
-end, file, block, a, b)`. Source weights remain a student consumption policy.
+The hash covers the shared contract, the file table (source name, path and size), the
+block table, lane count, lane length and the lane pieces, but not the requested budget
+or data-file contents: a budget that rounds to the same lanes resumes, and it is not a
+corruption checksum. The absolute corpus root and reporting fields are excluded,
+allowing the same file layout and schedule to be read from a replacement root. Resume
+still requires equivalent data in that replacement.
 
-### Planning and resume
+### Blend configuration in `config`
 
-Planning uses bounded batches and external sorting. Seeded random-key ordering selects
-whole source passes or subsets, then the existing global source-spreading sort and lane
-cut assign pieces. This preserves deterministic weights, repetition and DP independence.
-The exact shuffle differs from the previous in-memory permutation; old plan hashes
-cannot silently resume with the new schedule.
+| Key | Meaning and purpose |
+| --- | --- |
+| `corpus` | Root path/URI containing the source directories. |
+| `sources` | Mapping of source directory names to positive relative weights in samples, e.g. `{"web_crawl": 3, "math_sft": 1}`. Used to allocate student consumption, without changing source files. |
+| `seed` | Student seed for selecting/repeating and ordering source blocks. Independent of the teacher's recorded dataset seed. Defaults to `1234`. |
+| `lanes` | Requested stream count, default `64`; duplicated at manifest top level after planning. Ideally a multiple of student DP times microbatch size for exclusive lane ownership. |
 
-Planning time and disk size still scale with blocks and passes. RAM is bounded by SQL
-caches, one chunk index and small batches. Allow disk space for the catalog, external
-sorts and compaction; set `SQLITE_TMPDIR` before launching to place SQLite sort files on
-suitable scratch storage. Very large plans can take significant time to build. The
-runtime reader does not load the complete schedule. Object discovery still retains an
-O(chunks) filename list; it is not a paged object-store catalog.
+### Reporting summaries in `sources[]`
+
+| Key | Meaning and purpose |
+| --- | --- |
+| `name` | Source name, also the corresponding directory/configuration key. |
+| `samples` | Realized number of student samples allocated to this source. |
+| `available` | Number of real source samples available before any repetition, excluding fillers. |
+| `passes` | Number of source passes needed for the allocation, including a final partial pass. |
+| `supervised` | Estimated supervised-token count of the selected allocation, using block statistics. |
+| `teacher` | Copy of `recorded.teacher`, or null, retained for source provenance. |
+| `share` | Realized sample fraction of the entire plan. |
+| `supervised_share` | Estimated supervised-token fraction of the entire plan. |
+
+Requested weights are read from `config.sources` for logging; no additional `weight`
+copy is stored in each source summary.
 
 ## Checkpoint resume
 

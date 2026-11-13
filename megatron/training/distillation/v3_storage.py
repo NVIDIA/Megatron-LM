@@ -1,11 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Storage and atomic replay-group publication for offline KD V3.
+"""Storage and flush publication for offline KD V3.
 
-A replay flush has independent ``replay-START-END.part-N.arrow`` files and one
-``replay-START-END.index.json`` published after every upload succeeds. Its explicit
-part paths and per-group writer layout reconstruct the teacher order without fixing
-the whole cache to one teacher DP size. Unindexed parts are ignored on discovery.
+Both dump modes publish one directory per flush, named by its teacher iteration range:
+``<kind>-<start>-<end>/`` (12-digit iterations; ``replay`` or ``chunk``) holds one
+``part-<rank>.arrow`` per teacher DP writer and an ``index.json`` written only after
+every part has been uploaded. A missing or corrupt part names the DP rank that wrote it.
 """
 
 import glob
@@ -14,72 +14,30 @@ import json
 import os
 import re
 import uuid
-from typing import Any, NamedTuple
+from typing import Any
 
-_FILE_NAME = re.compile(r"^dp(\d+)__(\d+)-(\d+)\.(arrow|index\.json)$")
-_STAGED_NAME = re.compile(r"^(.+)\.[0-9a-f]{32}\.tmp$")
-_REPLAY_GROUP = re.compile(r"^replay-(\d+)-(\d+)\.index\.json$")
-_REPLAY_OBJECT = re.compile(
-    r"^replay-(\d+)-(\d+)\.(?:index\.json|part-\d+\.arrow)(?:\.[0-9a-f]{32}\.tmp)?$"
-)
+REPLAY = "replay"
+CHUNK = "chunk"
+INDEX = "index.json"
+_FLUSH_DIR = re.compile(r"^(replay|chunk)-(\d{12})-(\d{12})$")
 
 
-class GroupName(NamedTuple):
-    """An atomically published replay flush, addressed in global sample positions."""
-
-    start: int
-    end: int
-
-    @property
-    def index(self) -> str:
-        """The consolidated index published after all writer uploads."""
-        return f"replay-{self.start}-{self.end}.index.json"
+def flush_dir(kind: str, start: int, end: int) -> str:
+    """Name a flush directory by its teacher iteration range ``[start, end)``."""
+    return f"{kind}-{start:012d}-{end:012d}"
 
 
-def replay_data_name(writer: int, start: int, end: int) -> str:
-    """Name one independent replay part; consumers use its explicit index path."""
-    return f"replay-{start}-{end}.part-{writer:06d}.arrow"
+def part_name(rank: int) -> str:
+    """Name a teacher DP writer's part within its flush directory."""
+    return f"part-{rank:06d}.arrow"
 
 
-class FileName(NamedTuple):
-    """A parsed v3 file name."""
-
-    dp_rank: int
-    start: int
-    end: int
-
-    @property
-    def data(self) -> str:
-        """The data file's name."""
-        return replay_data_name(self.dp_rank, self.start, self.end)
-
-    @property
-    def index(self) -> str:
-        """The index's name."""
-        return GroupName(self.start, self.end).index
-
-
-def data_name(dp_rank: int, start: int, end: int) -> str:
-    """Name the data file holding one writer's flush range."""
-    return replay_data_name(dp_rank, start, end)
-
-
-def index_name(dp_rank: int, start: int, end: int) -> str:
-    """Name the index published after that data file."""
-    return GroupName(start, end).index
-
-
-def parse_name(name: str) -> FileName | None:
-    """Parse a v3 data file or index name, or return None for other objects."""
-    match = re.fullmatch(r"replay-(\d+)-(\d+)\.part-(\d+)\.arrow", name)
-    if match is not None:
-        start, end, writer = match.groups()
-        return FileName(int(writer), int(start), int(end))
-    match = _FILE_NAME.match(name)
-    if match is None:
+def parse_flush_dir(name: str, kind: str) -> tuple[int, int] | None:
+    """Return the iteration range of a ``kind`` flush directory name, or None."""
+    match = _FLUSH_DIR.fullmatch(name)
+    if match is None or match[1] != kind:
         return None
-    dp_rank, start, end, _ = match.groups()
-    return FileName(int(dp_rank), int(start), int(end))
+    return int(match[2]), int(match[3])
 
 
 class Storage:
@@ -178,149 +136,120 @@ class Storage:
         os.replace(self.path(staged), self.path(name))
 
 
-def read_index(storage: Storage, name: FileName | GroupName) -> dict[str, Any]:
-    """Read a group, or select one writer's Arrow index from the group."""
-    group = read_group(storage, GroupName(name.start, name.end))
-    return group["parts"][name.dp_rank]["index"] if isinstance(name, FileName) else group
+def flush_objects(storage: Storage, kind: str) -> list[str]:
+    """List every object in ``kind`` flush directories, published or not (one listing)."""
+    return storage.list(f"{kind}-*/*")
 
 
-def read_group(storage: Storage, name: GroupName) -> dict[str, Any]:
-    """Read and validate one complete replay group with one GET, without HEADs."""
+def object_spans(objects: list[str], kind: str) -> list[tuple[int, int]]:
+    """Iteration ranges of the flush directories that hold any of ``objects``."""
+    spans = {parse_flush_dir(path.split("/", 1)[0], kind) for path in objects if "/" in path}
+    return sorted(span for span in spans if span is not None)
+
+
+def published_spans(objects: list[str], kind: str) -> list[tuple[int, int]]:
+    """Iteration ranges of published flushes (those with an index), checked for overlap."""
+    spans = sorted(
+        span
+        for path in objects
+        if path.count("/") == 1
+        and path.endswith("/" + INDEX)
+        and (span := parse_flush_dir(path.split("/", 1)[0], kind)) is not None
+    )
+    previous = 0
+    for start, end in spans:
+        if end <= start or start < previous:
+            raise ValueError(
+                f"Invalid or overlapping offline KD flush {flush_dir(kind, start, end)}"
+            )
+        previous = end
+    return spans
+
+
+def discard_range(
+    storage: Storage, kind: str, objects: list[str], start: int, end: int
+) -> list[tuple[int, int]]:
+    """Unpublish and delete the flushes starting in ``[start, end)`` before rewriting them.
+
+    Indexes go first, so an interrupted cleanup leaves only unpublished parts. Only this
+    job's range is touched, so parallel dump jobs never interfere.
+    """
+    spans = [span for span in object_spans(objects, kind) if start <= span[0] < end]
+    doomed = {flush_dir(kind, *span) for span in spans}
+    victims = [path for path in objects if path.split("/", 1)[0] in doomed]
+    for path in sorted(victims, key=lambda path: not path.endswith("/" + INDEX)):
+        storage.remove(path)
+    if not storage.remote:
+        for directory in doomed:
+            try:
+                os.rmdir(storage.path(directory))
+            except OSError:
+                pass
+    return spans
+
+
+def read_group(storage: Storage, span: tuple[int, int]) -> dict[str, Any]:
+    """Read and validate one published replay flush index with one GET."""
     from .format.arrow import check_index, file_meta
     from .format.contract import mismatched_settings, validate_metadata
 
-    group = json.loads(storage.read(name.index))
-    if group.get("group_version") != 1 or (group.get("start"), group.get("end")) != tuple(name):
-        raise ValueError(f"Invalid replay group header {name.index}")
+    name = f"{flush_dir(REPLAY, *span)}/{INDEX}"
+    group = json.loads(storage.read(name))
+    if group.get("group_version") != 1 or (
+        group.get("start_iteration"),
+        group.get("end_iteration"),
+    ) != tuple(span):
+        raise ValueError(f"Invalid replay flush index {name}")
     writers, mbs = group.get("writers"), group.get("writer_mbs")
     if type(writers) is not int or writers < 1 or type(mbs) is not int or mbs < 1:
-        raise ValueError(f"Invalid replay writer layout in {name.index}")
-    if name.start < 0 or name.end <= name.start or (name.end - name.start) % (writers * mbs):
-        raise ValueError(f"Replay group {name.index} is not whole writer microbatches")
+        raise ValueError(f"Invalid replay writer layout in {name}")
     if len(group.get("parts", [])) != writers:
-        raise ValueError(f"Replay group {name.index} is missing writer parts")
-    parts, seen, reference = [None] * writers, set(), None
+        raise ValueError(f"Replay flush {name} does not list one part per writer")
+    parts, reference = [None] * writers, None
     for part in group["parts"]:
-        writer, path, index = part.get("writer"), part.get("path"), part.get("index")
+        writer, index = part.get("writer"), part.get("index")
         if type(writer) is not int or not 0 <= writer < writers or parts[writer] is not None:
-            raise ValueError(f"Invalid or duplicate replay writer in {name.index}")
-        if (
-            not isinstance(path, str)
-            or not path
-            or path.startswith("/")
-            or ":" in path
-            or "\\" in path
-            or any(p in ("", ".", "..") for p in path.split("/"))
-            or path in seen
-        ):
-            raise ValueError(f"Invalid or duplicate replay part path in {name.index}")
-        seen.add(path)
+            raise ValueError(f"Invalid or duplicate replay writer in {name}")
+        if part.get("path") != part_name(writer):
+            raise ValueError(
+                f"Replay flush {name} lists an unexpected part path for writer {writer}"
+            )
         check_index(index)
         cursor, byte_end = 0, 0
         for block in index["blocks"]:
-            if block["first_row"] != cursor or block["rows"] <= 0:
-                raise ValueError(f"Invalid replay block rows in {path}")
             if (
-                block["offset"] < byte_end
+                block["first_row"] != cursor
+                or block["rows"] <= 0
+                or block["offset"] < byte_end
                 or block["length"] <= 0
                 or block["offset"] + block["length"] > index["size"]
                 or not 0 < block["input_length"] <= block["length"]
             ):
-                raise ValueError(f"Invalid replay byte ranges in {path}")
+                raise ValueError(f"Invalid block rows or byte ranges for writer {writer} in {name}")
             cursor += block["rows"]
             byte_end = block["offset"] + block["length"]
-        if cursor != (name.end - name.start) // writers:
-            raise ValueError(f"Wrong row count in replay part {path}")
         metadata = file_meta(index)
         validate_metadata(metadata)
         if reference is not None and mismatched_settings(metadata, reference)[0]:
-            raise ValueError(f"Replay group {name.index} mixes incompatible file contracts")
+            raise ValueError(f"Replay flush {name} mixes incompatible file contracts")
         reference = metadata
+        gbs = metadata["contract"]["global_batch_size"]
+        rows = (span[1] - span[0]) * gbs
+        # Each teacher iteration splits evenly into the writers' microbatches.
+        if gbs % (writers * mbs) or sum(b["rows"] for b in index["blocks"]) != rows // writers:
+            raise ValueError(f"Replay part {name} writer {writer} has the wrong number of samples")
         parts[writer] = part
     group["parts"] = parts
     return group
 
 
-def read_meta(storage: Storage, name: GroupName | FileName) -> dict[str, Any]:
-    """Read a replay group's shared metadata from its first part footer."""
-    from .format.arrow import check_index, file_meta
+def read_meta(storage: Storage, span: tuple[int, int]) -> dict[str, Any]:
+    """Read a replay flush's file settings from its first part's footer copy."""
+    from .format.arrow import file_meta
 
-    if isinstance(name, GroupName):
-        return file_meta(read_group(storage, name)["parts"][0]["index"])
-    index = read_index(storage, name)
-    check_index(index)
-    return file_meta(index)
+    return file_meta(read_group(storage, span)["parts"][0]["index"])
 
 
 def has_legacy_tars(storage: Storage) -> bool:
     """Whether the directory holds V1/V2 tar dumps, which V3 never mixes with."""
     return bool(storage.list("*.tar"))
-
-
-def list_published(storage: Storage, *, objects: list[str] | None = None) -> list[GroupName]:
-    """List atomically published groups; incomplete writer uploads have no index."""
-    groups = []
-    for path in storage.list("replay-*.index.json") if objects is None else objects:
-        match = _REPLAY_GROUP.fullmatch(path)
-        if match is not None:
-            groups.append(GroupName(*(int(value) for value in match.groups())))
-    return sorted(groups)
-
-
-def complete_ranges(
-    published: list[GroupName], writers: int | None = None
-) -> list[tuple[int, int]]:
-    """A group index already establishes that all of its writers completed."""
-    return [(name.start, name.end) for name in published]
-
-
-def validate_published_ranges(
-    published: list[GroupName], writers: int | None = None, writer_mbs: int | None = None
-) -> list[tuple[int, int]]:
-    """Reject overlapping groups; each group's own index validates its writer layout."""
-    previous = None
-    for name in sorted(published):
-        if (
-            name.start < 0
-            or name.end <= name.start
-            or previous is not None
-            and name.start < previous
-        ):
-            raise ValueError(f"Invalid or overlapping replay group {name.index}")
-        previous = name.end
-    return complete_ranges(published)
-
-
-def contiguous_end(ranges: list[tuple[int, int]], start: int, end: int | None = None) -> int:
-    """Return the end of the contiguous run beginning at start."""
-    by_start = dict(ranges)
-    cursor = start
-    while cursor in by_start and (end is None or cursor < end):
-        cursor = by_start[cursor]
-    return cursor
-
-
-def object_ranges(storage: Storage, *, objects: list[str] | None = None) -> list[tuple[int, int]]:
-    """Ranges of replay group indexes, parts and incomplete staged writes."""
-    spans = set()
-    for name in storage.list("replay-*") if objects is None else objects:
-        match = _REPLAY_OBJECT.fullmatch(name)
-        if match is not None:
-            spans.add(tuple(int(value) for value in match.groups()))
-    return sorted(spans)
-
-
-def discard_range(
-    storage: Storage, start: int, end: int, *, objects: list[str] | None = None
-) -> list[str]:
-    """Unpublish selected groups first, then remove their parts before replacement."""
-    removed = []
-    for name in sorted(
-        storage.list("replay-*") if objects is None else objects,
-        key=lambda name: not name.endswith(".index.json"),
-    ):
-        match = _REPLAY_OBJECT.fullmatch(name)
-        if match is not None and start <= int(match[1]) < end:
-            storage.remove(name)
-            removed.append(name)
-    return removed
