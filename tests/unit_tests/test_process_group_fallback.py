@@ -480,6 +480,11 @@ class TestGlobalProcessGroupFallbacks:
         _fallback_warning(record, "TEDotProductAttention")
         assert attention.tp_group is None
         assert attention.core_attention._tp_group is None
+        # The linears are handed no collection either. With the fallback's all-None collection
+        # a per-module FP8/FP4 recipe would raise for its missing amax group at forward time,
+        # instead of using the global group once model parallelism is initialized.
+        assert attention.linear_qkv._pg_collection is None
+        assert attention.linear_proj._pg_collection is None
 
         # An explicit collection without a TP group is still rejected.
         with pytest.raises(ValueError, match="non-None tp process group"):
