@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
 Fault Tolerance (FT) package integration for Megatron-LM, using the FT section-based API.
@@ -33,7 +33,6 @@ ft_launcher \
 ```
 """
 
-import argparse
 import json
 import os
 import random
@@ -45,8 +44,8 @@ from typing import Any, Optional
 
 import torch
 
-from . import arguments
 from . import global_vars
+from .config.resilience_config import FaultToleranceConfig
 from .utils import is_rank0, print_rank_0
 
 _GLOBAL_RANK_MONITOR_CLIENT = None
@@ -84,10 +83,15 @@ def get_rank_monitor_client() -> Optional[Any]:
     return _GLOBAL_RANK_MONITOR_CLIENT
 
 
-def setup() -> None:
-    """Initialize fault tolerance before initialize_megatron"""
-    args = arguments.parse_args(ignore_unknown_args=True)
-    if not args.enable_ft_package:
+def setup(config: FaultToleranceConfig, *, checkpoint_dir: str | None, async_save: bool) -> None:
+    """Initialize fault tolerance before initialize_megatron.
+
+    Args:
+        config: Fault-tolerance monitoring settings.
+        checkpoint_dir: Finalized checkpoint save directory, required when FT is enabled.
+        async_save: Whether the finalized checkpoint policy enables asynchronous saves.
+    """
+    if not config.enable_ft_package:
         return
 
     # Initialize fault tolerance
@@ -96,9 +100,6 @@ def setup() -> None:
     if os.environ.get("RANK") == "0":
         print("FT: initializing...", flush=True)
 
-    checkpoint_dir = args.save
-    if not checkpoint_dir:
-        raise ValueError("checkpointing save dir must be set to enable fault tolerance")
     if not os.path.exists(checkpoint_dir):
         os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -111,13 +112,13 @@ def setup() -> None:
     _ft_state_path = os.path.join(checkpoint_dir, "ft_state.json")
 
     global _is_async_chkpt_enabled
-    _is_async_chkpt_enabled = args.async_save
+    _is_async_chkpt_enabled = async_save
 
     global _is_calculating_timeouts
-    _is_calculating_timeouts = args.calc_ft_timeouts
+    _is_calculating_timeouts = config.calc_ft_timeouts
 
     global _NUM_WARMUP_ITERS
-    _NUM_WARMUP_ITERS = args.ft_num_warmup_iters
+    _NUM_WARMUP_ITERS = config.ft_num_warmup_iters
 
     cli.init_workload_monitoring(num_warmup_iters=_NUM_WARMUP_ITERS)
     _load_state_if_exists()
