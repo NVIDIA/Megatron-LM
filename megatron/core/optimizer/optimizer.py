@@ -56,6 +56,15 @@ from .optimizer_config import OptimizerConfig
 logger = getLogger(__name__)
 
 
+def _sqrt(value: Union[float, torch.Tensor]) -> Union[float, torch.Tensor]:
+    """Return the square root of a Python number, or of a tensor without synchronizing the host.
+
+    A child optimizer may return its gradient norm as a tensor, as FullyShardedOptimizer does, so
+    that the step can be captured in a CUDA graph.
+    """
+    return value.sqrt() if isinstance(value, torch.Tensor) else math.sqrt(value)
+
+
 def _zero_grad_group_helper(
     group: List[torch.nn.Parameter], set_to_none: bool, use_decoupled_grad: bool = False
 ):
@@ -2185,8 +2194,9 @@ class ChainedOptimizer(MegatronOptimizer):
             grad_norms = []
             for optimizer in self.chained_optimizers:
                 _grad_norm = optimizer.get_grad_norm()
-                grad_norms += [_grad_norm if _grad_norm else 0.0]
-            grad_norm = math.sqrt(sum([x**2 for x in grad_norms]))
+                # A tensor norm is not tested for truth: that would synchronize the host.
+                grad_norms += [0.0 if _grad_norm is None else _grad_norm]
+            grad_norm = _sqrt(sum([x**2 for x in grad_norms]))
         return grad_norm
 
     @override
@@ -2216,8 +2226,8 @@ class ChainedOptimizer(MegatronOptimizer):
                 child_indexer_norm, child_non_indexer_norm = optimizer.get_dsa_split_grad_norms()
                 indexer_norm_sq += child_indexer_norm**2
                 non_indexer_norm_sq += child_non_indexer_norm**2
-            indexer_grad_norm = math.sqrt(indexer_norm_sq)
-            non_indexer_grad_norm = math.sqrt(non_indexer_norm_sq)
+            indexer_grad_norm = _sqrt(indexer_norm_sq)
+            non_indexer_grad_norm = _sqrt(non_indexer_norm_sq)
         return indexer_grad_norm, non_indexer_grad_norm
 
     @torch.no_grad()
@@ -2314,7 +2324,7 @@ class ChainedOptimizer(MegatronOptimizer):
         if self.config.dsa_indexer_clip_grad is not None:
             indexer_grad_norm, non_indexer_grad_norm = self.get_dsa_split_grad_norms()
             self._last_dsa_split_grad_norms = (indexer_grad_norm, non_indexer_grad_norm)
-            grad_norm = math.sqrt(indexer_grad_norm**2 + non_indexer_grad_norm**2)
+            grad_norm = _sqrt(indexer_grad_norm**2 + non_indexer_grad_norm**2)
         else:
             if any(param_group.get('is_dsa_indexer', False) for param_group in self.param_groups):
                 self._last_dsa_split_grad_norms = self.get_dsa_split_grad_norms()

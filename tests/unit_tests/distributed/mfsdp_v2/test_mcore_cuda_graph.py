@@ -189,3 +189,102 @@ def test_full_iteration_and_optimizer_cuda_graph_match_eager(
     # operates on. Remove the wrapper to break this cycle so the optimizer's
     # GPU memory can be released when the test returns.
     del graph_optimizer.step
+
+
+@pytest.mark.parametrize(
+    "outer_dp_size,inner_strategy,outer_strategy",
+    [(1, "optim_grads_params", "no_shard"), (2, "optim_grads_params", "optim")],
+    ids=["zero3", "hfsdp"],
+)
+def test_muon_optimizer_cuda_graph_matches_eager(
+    process_group_collection, outer_dp_size, inner_strategy, outer_strategy
+):
+    """Replay a captured Muon + Adam optimizer step and compare it with eager steps.
+
+    The learning rate changes every step, so a replay must read it from device memory, and
+    weight decay and clipping are on so the captured step uses them too.
+    """
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+    )
+
+    def build_model_and_optimizer(enable_cuda_graph: bool):
+        model = TransformerBlock(config=config, spec=get_gpt_layer_local_spec()).to(
+            device="cuda", dtype=config.params_dtype
+        )
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy=inner_strategy,
+                num_distributed_optimizer_instances=outer_dp_size,
+                outer_dp_sharding_strategy=outer_strategy,
+                megatron_fsdp_main_grads_dtype=torch.float32,
+                megatron_fsdp_cuda_graph_mode=enable_cuda_graph,
+            ),
+            module=model,
+            pg_collection=process_group_collection,
+        )
+        optimizer = get_megatron_optimizer(
+            OptimizerConfig(
+                optimizer="muon",
+                lr=1.0e-2,
+                weight_decay=0.1,
+                bf16=True,
+                params_dtype=torch.bfloat16,
+                use_distributed_optimizer=False,
+                muon_split_qkv=False,
+                clip_grad=0.5,
+                optimizer_cuda_graph=enable_cuda_graph,
+            ),
+            [model],
+            pg_collection=process_group_collection,
+        )
+        optimizer.reload_model_params()
+        if enable_cuda_graph:
+            optimizer.step = OptimizerCudaGraphWrapper(optimizer.step, cuda_graph_warmup_steps=1)
+        return model, optimizer
+
+    steps = [
+        torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16) for _ in range(6)
+    ]
+
+    def run(model, optimizer) -> torch.Tensor:
+        losses = []
+        for step, hidden in enumerate(steps):
+            # What the learning-rate scheduler does: fill a tensor in place, else assign.
+            lr = 1.0e-2 * (1 - step / len(steps))
+            for group in optimizer.param_groups:
+                if isinstance(group["lr"], torch.Tensor):
+                    group["lr"].fill_(lr)
+                else:
+                    group["lr"] = lr
+            optimizer.zero_grad(set_to_none=True)
+
+            def forward():
+                output = model(hidden_states=hidden, attention_mask=None)
+                return output.float().pow(2).mean()
+
+            losses += run_forward_backward_on_microbatches(model, forward)
+            success, grad_norm, _ = optimizer.step()
+            assert success and grad_norm is not None
+        return torch.stack(losses)
+
+    eager_model, eager_optimizer = build_model_and_optimizer(enable_cuda_graph=False)
+    graph_model, graph_optimizer = build_model_and_optimizer(enable_cuda_graph=True)
+    graph_model.load_state_dict(eager_model.state_dict())
+    eager_losses = run(eager_model, eager_optimizer)
+    with torch.profiler.profile() as prof:
+        graph_losses = run(graph_model, graph_optimizer)
+
+    assert sum(event.name == "cudaGraphLaunch" for event in prof.events()) == len(steps) - 1
+    torch.testing.assert_close(graph_losses, eager_losses, rtol=1e-3, atol=0)
+    del graph_optimizer.step
