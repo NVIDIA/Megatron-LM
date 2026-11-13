@@ -1130,9 +1130,11 @@ def _mock_backend(monkeypatch, *, single_grouped=False, gated=True, mxfp8=False,
             },
             True,
         ),
+        # Whole-layer capture graphs MOK as well.
+        ({"cuda_graph_impl": "transformer_engine", "cuda_graph_modules": []}, True),
     ],
 )
-def test_weight_view_refresh_leaves_the_graph_only_for_the_te_moe_scope(
+def test_weight_view_refresh_leaves_the_graph_only_for_te_graphs_containing_mok(
     monkeypatch, config_extra, refreshed_outside_graph
 ):
     module, _, _ = _mock_backend(monkeypatch, mxfp8=True, **config_extra)
@@ -1141,14 +1143,23 @@ def test_weight_view_refresh_leaves_the_graph_only_for_the_te_moe_scope(
     assert not module._weight_views_captured
 
 
-def test_deleting_te_cuda_graphs_releases_the_captured_mok_weight_views(monkeypatch):
+@pytest.mark.parametrize(
+    "cuda_graph_modules",
+    [[CudaGraphModule.attn, CudaGraphModule.moe], []],
+    ids=["moe_scope", "whole_layer"],
+)
+def test_deleting_te_cuda_graphs_releases_the_captured_mok_weight_views(
+    monkeypatch, cuda_graph_modules
+):
     """Captured weight views block parameter reloads and moves only while a graph references them:
     TECudaGraphHelper.delete_cuda_graphs releases them through the layer."""
     from megatron.core.transformer import cuda_graphs
 
-    moe_scope = [CudaGraphModule.attn, CudaGraphModule.moe]
     module, _, _ = _mock_backend(
-        monkeypatch, mxfp8=True, cuda_graph_impl="transformer_engine", cuda_graph_modules=moe_scope
+        monkeypatch,
+        mxfp8=True,
+        cuda_graph_impl="transformer_engine",
+        cuda_graph_modules=cuda_graph_modules,
     )
     capturing = [False]
     monkeypatch.setattr(
@@ -1171,7 +1182,7 @@ def test_deleting_te_cuda_graphs_releases_the_captured_mok_weight_views(monkeypa
 
     graph = _Graph()
     layer = _graph_layer(
-        True, module, moe_scope, cuda_graphs=[graph], cuda_graph_manual_hooks=[object()]
+        True, module, cuda_graph_modules, cuda_graphs=[graph], cuda_graph_manual_hooks=[object()]
     )
     helper = cuda_graphs.TECudaGraphHelper.__new__(cuda_graphs.TECudaGraphHelper)
     helper.callables_per_chunk = [[layer]]

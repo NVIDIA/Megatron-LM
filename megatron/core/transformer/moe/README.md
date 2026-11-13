@@ -633,7 +633,7 @@ target is unsupported.
 | Parallelism | TP=1, expert TP=1, EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast |
 | Shapes | Hidden and expert intermediate sizes divisible by 256; at least 512 local tokens per rank, divisible by 256; identical token, hidden, and top-k shapes across EP ranks |
 | Recomputation | Whole-MoE activation recompute |
-| CUDA Graph | Full-iteration capture; per-layer Transformer Engine capture with the `moe_router` scope, or with the `moe` scope, which also captures the megakernel (Transformer Engine 2.19 or later and `pipeline_model_parallel_size=1`; not with `moe` in `recompute_modules`). Unless `moe_router_force_load_balancing` is set, the `moe` scope needs a `padding_mask` model input during the eager `cuda_graph_warmup_steps`: without one, the capture warm-up routes every token to the same experts and can exceed MOK's schedule capacity (a device-side trap) |
+| CUDA Graph | Full-iteration capture; per-layer Transformer Engine capture with the `moe_router` scope, or with the `moe` scope or whole-layer capture (empty `cuda_graph_modules`), which also capture the megakernel (Transformer Engine 2.19 or later and `pipeline_model_parallel_size=1`; not with `moe` in `recompute_modules`). Unless `moe_router_force_load_balancing` is set, a graph that captures the megakernel needs a `padding_mask` model input during the eager `cuda_graph_warmup_steps`: without one, the capture warm-up routes every token to the same experts and can exceed MOK's schedule capacity (a device-side trap) |
 | Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
 
 Wgrad GEMMs accumulate in FP32. The destination `main_grad` dtype selects the reduction-store
@@ -651,11 +651,16 @@ and refreshes its converted scale buffers once per optimizer iteration. The adap
 both native weight layouts; TE's `post_all_gather_processing` is not an MXFP8 capability check.
 
 Per-layer whole-layer capture (empty `cuda_graph_modules`) is distinct from
-`cuda_graph_impl=full_iteration` and is not supported. Per-layer MOK replay goes through the `moe`
-scope, which refreshes MOK's weight views eagerly before each replay. That scope was validated only
-without pipeline parallelism, where each microbatch's backward runs before the next microbatch
-replays the layer's graph, so it requires `pipeline_model_parallel_size=1`. Pipeline schedules keep
-several microbatches in flight, and per-layer MOK replay has not been validated there.
+`cuda_graph_impl=full_iteration`. Per-layer MOK replay goes through a Transformer Engine graph that
+contains the megakernel: the `moe` scope, or whole-layer capture, whose graph also contains the
+rest of the layer. The layer refreshes MOK's weight views eagerly before each replay. The `moe`
+scope was validated only without pipeline parallelism, where each microbatch's backward runs before
+the next microbatch replays the layer's graph, so both require `pipeline_model_parallel_size=1`.
+Pipeline schedules keep several microbatches in flight, and per-layer MOK replay has not been
+validated there. With the `moe_router` scope, the graph ends after the router and MOK runs eagerly
+after each replay, not in the capture warm-up. That scope is therefore also accepted with pipeline
+parallelism and with Transformer Engine older than 2.19, and its warm-up cannot exceed MOK's
+schedule capacity, with or without a `padding_mask` input.
 
 The current backend requires grouped experts and fused gradient accumulation. It does not support
 linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed

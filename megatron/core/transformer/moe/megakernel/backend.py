@@ -32,9 +32,10 @@ class MegakernelBackend(nn.Module, ABC):
         """Update weight-derived state before a CUDA graph that contains this backend replays.
 
         A TE CUDA graph whose scope covers the whole MoE (``cuda_graph_modules`` containing
-        ``moe``) replays the backend without running Python. The layer calls this eagerly before
-        every replay, after the parameter all-gather hooks and on the replay stream, so a backend
-        that converts its weights once per optimizer step does that here. No-op by default.
+        ``moe``, or empty for whole-layer capture) replays the backend without running Python. The
+        layer calls this eagerly before every replay, after the parameter all-gather hooks and on
+        the replay stream, so a backend that converts its weights once per optimizer step does
+        that here. No-op by default.
         """
 
     def cuda_graphs_deleted(self) -> None:

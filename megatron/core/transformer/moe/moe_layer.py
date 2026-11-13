@@ -824,7 +824,16 @@ class MoELayer(BaseMoELayer):
                     output = megakernel_forward(hidden_states, padding_mask)
                 except MoECudaGraphPartialCaptureSignal as e:
                     # Capturing cuda_graph_modules=[..., "moe_router"]: the layer's CUDA graph
-                    # ends after the router and returns its outputs. The shared expert runs inside
+                    # ends after the router and returns its outputs, and the megakernel runs
+                    # eagerly after each replay, not in TE's capture warm-up. MOK has static
+                    # shapes and no host synchronization after warm-up, so the moe scope and
+                    # whole-layer capture put it in the graph as well. TransformerConfig rejects
+                    # those two for MOK with pipeline parallelism and with Transformer Engine
+                    # older than 2.19. Unless moe_router_force_load_balancing is set, they also
+                    # need a padding_mask input during the eager cuda_graph_warmup_steps, or the
+                    # capture warm-up can exceed MOK's schedule capacity (see
+                    # TransformerLayer.get_layer_static_inputs). This router-only graph keeps the
+                    # router captured without these requirements. The shared expert runs inside
                     # the megakernel, so it adds no graph output.
                     return e.get_early_return_outputs(hidden_states, None)
             return output, None

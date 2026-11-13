@@ -125,6 +125,14 @@ def _moe_transformer_layer(monkeypatch, backend=None, num_experts=4, **config_ov
     return TransformerLayer(config, submodules).cuda()
 
 
+# Per-layer TE CUDA graphs that contain the megakernel: the moe scope, and whole-layer capture.
+_MEGAKERNEL_GRAPH_MODULES = pytest.mark.parametrize(
+    "cuda_graph_modules",
+    [[CudaGraphModule.attn, CudaGraphModule.moe], []],
+    ids=["moe_scope", "whole_layer"],
+)
+
+
 class TestMoELayerInit:
 
     @pytest.mark.skipif(
@@ -287,7 +295,10 @@ class TestMoELayerInit:
         not is_te_min_version("2.19.0"),
         reason="The megakernel moe CUDA graph scope requires TE 2.19 and later.",
     )
-    def test_megakernel_moe_graph_capture_covers_router_and_megakernel(self, monkeypatch):
+    @_MEGAKERNEL_GRAPH_MODULES
+    def test_megakernel_moe_graph_capture_covers_router_and_megakernel(
+        self, monkeypatch, cuda_graph_modules
+    ):
         Utils.initialize_model_parallel(1, 1)
         try:
             backend = _RecordingMegakernel()
@@ -295,7 +306,7 @@ class TestMoELayerInit:
                 monkeypatch,
                 backend,
                 cuda_graph_impl="transformer_engine",
-                cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe],
+                cuda_graph_modules=cuda_graph_modules,
             )
             hidden = torch.randn((3, 2, 128), dtype=torch.bfloat16)
             padding_mask = torch.tensor([[False, False, True], [False, True, True]])
@@ -326,7 +337,10 @@ class TestMoELayerInit:
         not is_te_min_version("2.19.0"),
         reason="The megakernel moe CUDA graph scope requires TE 2.19 and later.",
     )
-    def test_megakernel_moe_graph_warmup_on_static_inputs_routes_no_tokens(self, monkeypatch):
+    @_MEGAKERNEL_GRAPH_MODULES
+    def test_megakernel_moe_graph_warmup_on_static_inputs_routes_no_tokens(
+        self, monkeypatch, cuda_graph_modules
+    ):
         """TE warms the graphed layer up eagerly on get_layer_static_inputs before capturing it.
         Their all-ones hidden states give every token the same router logits, so real routing sends
         all of them to one expert, beyond a megakernel's static capacity (MOK traps). The static
@@ -345,7 +359,7 @@ class TestMoELayerInit:
                 backend,
                 num_experts,
                 cuda_graph_impl="transformer_engine",
-                cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe],
+                cuda_graph_modules=cuda_graph_modules,
             )
             padding_mask = torch.zeros((micro_batch_size, seq_length), dtype=torch.bool).cuda()
             padding_mask[0, -3:] = True
@@ -386,6 +400,8 @@ class TestMoELayerInit:
         [
             (True, [CudaGraphModule.attn, CudaGraphModule.moe], {}, True),
             (True, [CudaGraphModule.moe], {}, True),
+            # Whole-layer capture graphs the megakernel as well.
+            (True, [], {}, True),
             # A router-only graph ends before the megakernel, which runs eagerly on the real mask.
             (True, [CudaGraphModule.attn, CudaGraphModule.moe_router], {}, False),
             # Native MoE layers keep the all-False static mask.

@@ -179,13 +179,14 @@ class MoKMegakernel(MegakernelBackend):
         self._routed_dummy_gradient_buffers = None
         self._main_grad_arguments_cache = None
         self._shared_fc1_gate_up_cache = None
-        # Per-layer TE CUDA graphs with the moe scope replay MOK without Python. The layer then
-        # refreshes the cached weight views eagerly before each replay (refresh_weight_views, after
-        # the parameter all-gather hooks), so a capture must neither record nor consume the refresh.
+        # Per-layer TE CUDA graphs with the moe scope, or with empty modules (whole-layer capture),
+        # replay MOK without Python. The layer then refreshes the cached weight views eagerly before
+        # each replay (refresh_weight_views, after the parameter all-gather hooks), so a capture
+        # must neither record nor consume the refresh.
         cuda_graph_modules = getattr(config, "cuda_graph_modules", None) or []
+        graphs_cover_moe = not cuda_graph_modules or CudaGraphModule.moe in cuda_graph_modules
         self._weight_views_refreshed_outside_graph = (
-            getattr(config, "cuda_graph_impl", "none") == "transformer_engine"
-            and CudaGraphModule.moe in cuda_graph_modules
+            getattr(config, "cuda_graph_impl", "none") == "transformer_engine" and graphs_cover_moe
         )
         # Set once a CUDA graph captured the cached views: their addresses must stay valid.
         self._weight_views_captured = False
