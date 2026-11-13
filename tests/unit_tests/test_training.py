@@ -21,7 +21,9 @@ from megatron.training.config import (
 from megatron.training.global_vars import (
     _set_train_state,
     destroy_global_vars,
+    get_args,
     get_train_state,
+    is_args_initialized,
     set_args,
 )
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
@@ -560,60 +562,86 @@ class TestPackedSampleAccounting:
         assert train.train_iters == expected_iters
         assert calculator.get_current_global_batch_size() == (8 if schedule else 16)
 
-    def test_sample_schedule_horizon_without_global_calculator(self, monkeypatch):
-        """finalize() runs before the global calculator exists."""
-        from megatron.core import num_microbatches_calculator as calculator
+    def test_sample_schedule_counts_iterations_before_calculator_init(self):
+        """65 samples on 0:8 32:16 is 7 iterations, and startup can still init afterwards."""
+        from megatron.core.num_microbatches_calculator import (
+            destroy_num_microbatches_calculator,
+            init_num_microbatches_calculator,
+            unset_num_microbatches_calculator,
+        )
         from megatron.training.config import container
 
-        monkeypatch.setattr(calculator, "_GLOBAL_NUM_MICROBATCHES_CALCULATOR", None)
+        previous = get_args() if is_args_initialized() else None
+        unset_num_microbatches_calculator()
+        set_args(SimpleNamespace(seq_length=None))
         train = TrainingConfig(
             micro_batch_size=2,
             global_batch_size=16,
             train_samples=65,
             step_batch_size_schedule="0:8 32:16",
         )
-        container.update_train_iters(train)
-        # 4 * 8 + 3 * 16 = 80. The short remainder is still counted.
-        assert train.train_iters == 7
-        assert calculator._GLOBAL_NUM_MICROBATCHES_CALCULATOR is None
+        try:
+            container.update_train_iters(train)
+            # 4 * 8 + 3 * 16 = 80. The short remainder is still counted.
+            assert train.train_iters == 7
+            init_num_microbatches_calculator(
+                rank=0,
+                global_batch_size=16,
+                micro_batch_size=2,
+                data_parallel_size=1,
+            )
+        finally:
+            destroy_num_microbatches_calculator()
+            set_args(previous)
 
-    def test_sample_schedule_horizon_uses_sequence_length_without_global_calculator(
-        self, monkeypatch
-    ):
-        from megatron.core import num_microbatches_calculator as calculator
-        from megatron.training import global_vars
+    def test_sample_schedule_counts_token_thresholds_from_seq_length(self):
+        """Token thresholds use args.seq_length: 32 tokens at length 4 is 8 samples."""
+        from megatron.core.num_microbatches_calculator import (
+            destroy_num_microbatches_calculator,
+            unset_num_microbatches_calculator,
+        )
         from megatron.training.config import container
 
-        monkeypatch.setattr(calculator, "_GLOBAL_NUM_MICROBATCHES_CALCULATOR", None)
-        monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(seq_length=4))
+        previous = get_args() if is_args_initialized() else None
+        unset_num_microbatches_calculator()
+        set_args(SimpleNamespace(seq_length=4))
         train = TrainingConfig(
             micro_batch_size=2,
             global_batch_size=16,
             train_samples=32,
             step_batch_size_schedule="0:8 32:16",
         )
-        container.update_train_iters(train)
-        # 32 tokens / seq_length 4 = 8 samples, then batches of 16. 8 + 16 + 16 = 40.
-        assert train.train_iters == 3
-        assert calculator._GLOBAL_NUM_MICROBATCHES_CALCULATOR is None
+        try:
+            container.update_train_iters(train)
+            # Threshold 32 tokens is 8 samples, then batches of 16: 8 + 16 + 16.
+            assert train.train_iters == 3
+        finally:
+            destroy_num_microbatches_calculator()
+            set_args(previous)
 
-    def test_resolve_scheduler_steps_with_sample_schedule_and_no_calculator(
-        self, monkeypatch, run_config
-    ):
-        from megatron.core import num_microbatches_calculator as calculator
+    def test_scheduler_steps_follow_sample_schedule_before_calculator_init(self, run_config):
+        from megatron.core.num_microbatches_calculator import (
+            destroy_num_microbatches_calculator,
+            unset_num_microbatches_calculator,
+        )
 
-        monkeypatch.setattr(calculator, "_GLOBAL_NUM_MICROBATCHES_CALCULATOR", None)
+        previous = get_args() if is_args_initialized() else None
+        unset_num_microbatches_calculator()
+        set_args(SimpleNamespace(seq_length=None))
         run_config.train = TrainingConfig(
             micro_batch_size=2,
             global_batch_size=16,
             train_samples=65,
             step_batch_size_schedule="0:8 32:16",
         )
-        run_config._resolve_scheduler_step_fields()
-        assert run_config.train.train_iters == 7
-        assert run_config.scheduler.lr_decay_steps == 65
-        assert run_config.scheduler.wd_incr_steps == 65
-        assert calculator._GLOBAL_NUM_MICROBATCHES_CALCULATOR is None
+        try:
+            run_config._resolve_scheduler_step_fields()
+            assert run_config.train.train_iters == 7
+            assert run_config.scheduler.lr_decay_steps == 65
+            assert run_config.scheduler.wd_incr_steps == 65
+        finally:
+            destroy_num_microbatches_calculator()
+            set_args(previous)
 
     @pytest.mark.parametrize(
         "total_cp,num_sequence_shards,weight_shards,samples",

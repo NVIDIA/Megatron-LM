@@ -20,6 +20,12 @@ from megatron.core.distributed.torch_fully_sharded_data_parallel_config import (
     TorchFullyShardedDataParallelConfig,
 )
 from megatron.core.msc_utils import maybe_msc
+from megatron.core.num_microbatches_calculator import (
+    destroy_num_microbatches_calculator,
+    get_current_global_batch_size,
+    init_num_microbatches_calculator,
+    update_num_microbatches,
+)
 from megatron.core.optimizer import OptimizerConfig
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
@@ -48,6 +54,7 @@ from megatron.training.config.utils import (
     serialize_value,
 )
 from megatron.training.config.yaml_utils import safe_yaml_representers
+from megatron.training.global_vars import get_args, is_args_initialized
 from megatron.training.models import (
     BertModelConfig,
     LLaVAModelConfig,
@@ -849,36 +856,11 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.ddp.finalize()
 
 
-def _sample_schedule_calculator(train: TrainingConfig):
-    """Return the step-batch calculator used to count sample-based iterations.
-
-    finalize() calls this before the global calculator exists. The scheduled
-    global batch size does not depend on data-parallel size.
-    """
-    from megatron.core.num_microbatches_calculator import (
-        _GLOBAL_NUM_MICROBATCHES_CALCULATOR,
-        StepBatchsizeNumMicroBatchesCalculator,
-    )
-
-    if isinstance(_GLOBAL_NUM_MICROBATCHES_CALCULATOR, StepBatchsizeNumMicroBatchesCalculator):
-        return _GLOBAL_NUM_MICROBATCHES_CALCULATOR
-
-    # Same seq_length the runtime calculator receives. Absent args mean sample thresholds.
-    try:
-        from megatron.training.global_vars import get_args
-
-        seq_length = getattr(get_args(), "seq_length", None)
-    except AssertionError:
-        seq_length = None
-    return StepBatchsizeNumMicroBatchesCalculator(
-        micro_batch_size=train.micro_batch_size,
-        data_parallel_size=1,
-        decrease_batch_size_if_needed=train.decrease_batch_size_if_needed,
-        # Rank 0 logs the schedule. The global calculator does that at startup.
-        rank=-1,
-        schedule=train.step_batch_size_schedule,
-        seq_length=seq_length,
-    )
+def _step_schedule_seq_length() -> int | None:
+    """args.seq_length once set_args() has run; otherwise thresholds stay in samples."""
+    if not is_args_initialized():
+        return None
+    return getattr(get_args(), "seq_length", None)
 
 
 def update_train_iters(train: TrainingConfig) -> None:
@@ -892,16 +874,37 @@ def update_train_iters(train: TrainingConfig) -> None:
 
     if train.step_batch_size_schedule is not None:
         # Sample based training with step batch size schedule.
-        calculator = _sample_schedule_calculator(train)
-        iterations = 0
-        consumed_samples = 0
-        while consumed_samples < train.train_samples:
-            calculator.update(consumed_samples, consistency_check=False)
-            consumed_samples += calculator.get_current_global_batch_size()
-            iterations += 1
-        # Reset the global calculator when this walk used it.
-        calculator.update(0, consistency_check=False)
-        train.train_iters = iterations
+        # finalize() runs before the global calculator exists. Count on a temporary
+        # one, then remove it so startup can initialize the real calculator.
+        temporary = False
+        try:
+            get_current_global_batch_size()
+        except AttributeError:
+            # Scheduled global batch size does not depend on data-parallel size.
+            # rank -1 skips the log; the real calculator logs at startup.
+            init_num_microbatches_calculator(
+                rank=-1,
+                micro_batch_size=train.micro_batch_size,
+                data_parallel_size=1,
+                decrease_batch_size_if_needed=train.decrease_batch_size_if_needed,
+                global_batch_size=train.global_batch_size,
+                step_batch_size_schedule=train.step_batch_size_schedule,
+                seq_length=_step_schedule_seq_length(),
+            )
+            temporary = True
+        try:
+            iterations = 0
+            consumed_samples = 0
+            while consumed_samples < train.train_samples:
+                update_num_microbatches(consumed_samples, consistency_check=False)
+                consumed_samples += get_current_global_batch_size()
+                iterations += 1
+            if not temporary:
+                update_num_microbatches(0, consistency_check=False)
+            train.train_iters = iterations
+        finally:
+            if temporary:
+                destroy_num_microbatches_calculator()
     else:
         # Constant batch size with sample-based training.
         train.train_iters = train.train_samples // train.global_batch_size

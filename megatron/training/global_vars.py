@@ -42,6 +42,11 @@ def get_args():
     return _GLOBAL_ARGS
 
 
+def is_args_initialized() -> bool:
+    """Whether set_args() has registered the parsed arguments."""
+    return _GLOBAL_ARGS is not None
+
+
 def get_run_config():
     """Return the full pretrain config container."""
     _ensure_var_is_initialized(_GLOBAL_RUN_CONFIG, 'run config')
