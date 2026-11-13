@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import parallel_state
@@ -51,7 +52,6 @@ from tests.unit_tests.determinism.kernels.harness import (
     bytes_equal,
     seeded,
 )
-from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and HAVE_TE), reason="needs a GPU and Transformer Engine"
@@ -73,6 +73,52 @@ if HAVE_TE:
 
 HIDDEN, FFN, TOKENS = 2048, 8192, 8192
 _IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+
+
+@pytest.mark.skipif(not te_ext.HAVE_TE_GDN, reason="Transformer Engine GDN is unavailable")
+def test_te_gdn_context_parallel_state_geometry_replays():
+    """Replay expanded-head local kernels with incoming states and outgoing gradients."""
+    torch.manual_seed(1939)
+    tokens, heads, dim = 4096, 4, 128
+    # The CP backend operates on the supplied full-head shard, independently of
+    # the headwise adapter's fixed head count.
+    adapter = te_ext.TEGatedDeltaNetAttention(1, dim, dim, 1)
+    backend = adapter.get_context_parallel_backend()
+    q = torch.nn.functional.normalize(
+        torch.randn(tokens, heads, dim, device="cuda"), dim=-1
+    ).bfloat16()
+    k = torch.nn.functional.normalize(torch.randn_like(q.float()), dim=-1).bfloat16()
+    v = torch.randn_like(q)
+    g = -0.05 * torch.rand(tokens, heads, device="cuda")
+    beta = torch.rand_like(g)
+    cu = torch.tensor([0, 1536, tokens], device="cuda", dtype=torch.int32)
+    state = 0.01 * torch.randn(2, heads, dim, dim, device="cuda")
+    output_grad = torch.randn_like(v)
+    final_grad = 0.01 * torch.randn_like(state)
+
+    def run(q, k, v, g, beta, state, output_grad, final_grad):
+        output = backend.forward(q, k, v, g, beta, cu, scale=dim**-0.5, initial_state=state)
+        gradients = backend.backward(
+            output_grad,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            cu,
+            scale=dim**-0.5,
+            initial_state=state,
+            final_state_grad=final_grad,
+        )
+        return (output, *gradients)
+
+    assert_replays_bit_exact(
+        run,
+        (q, k, v, g, beta, state, output_grad, final_grad),
+        replays=3,
+        backward=False,
+        contention=True,
+    )
 
 
 @pytest.fixture
