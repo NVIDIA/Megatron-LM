@@ -4,10 +4,17 @@
 
 from __future__ import annotations
 
-import torch
-from liger_kernel.megatron import LigerMegatronCrossEntropy  # type: ignore[import-untyped]
+from functools import cache
 
-_cross_entropy = LigerMegatronCrossEntropy(ignore_index=-100, reduction="none", label_smoothing=0.0)
+import torch
+
+
+@cache
+def _cross_entropy():
+    # Imported on first use, so this module imports without liger-kernel installed.
+    from liger_kernel.megatron import LigerMegatronCrossEntropy  # type: ignore[import-untyped]
+
+    return LigerMegatronCrossEntropy(ignore_index=-100, reduction="none", label_smoothing=0.0)
 
 
 def liger_cross_entropy(
@@ -19,4 +26,4 @@ def liger_cross_entropy(
 
     The supplied group owns all vocabulary reductions; ``None`` means local vocabulary.
     """
-    return _cross_entropy(logits, labels, tp_group=tp_group)
+    return _cross_entropy()(logits, labels, tp_group=tp_group)
