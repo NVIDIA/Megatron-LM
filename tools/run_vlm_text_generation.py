@@ -23,7 +23,7 @@ from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.global_vars import set_run_config
 from megatron.training.initialize import initialize_megatron
-from pretrain_vlm import model_provider
+from pretrain_vlm import model_provider, set_vlm_sequence_lengths
 from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
@@ -207,6 +207,7 @@ def main():
     from megatron.training.models import LLaVAModelConfig
 
     model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    set_vlm_sequence_lengths(args, model_cfg)
     set_run_config(inference_cfg_container_from_args(args, model_cfg))
     initialize_megatron()
 
