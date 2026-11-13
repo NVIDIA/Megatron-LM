@@ -15,6 +15,7 @@
 """Select MCore modules for MFSDP v2 sharding."""
 
 from collections.abc import Sequence
+from enum import IntEnum
 
 from torch import nn
 
@@ -29,6 +30,14 @@ from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
+
+
+class RecomputeType(IntEnum):
+    """Recompute requirements, ordered so internal replay takes precedence when combined."""
+
+    NONE = 0
+    FULL = 1  # Whole layers replay through their forward hooks.
+    PARTIAL = 2  # Internal replay needs weights without re-entering the owning unit.
 
 
 class FsdpUnitCollector:
@@ -60,45 +69,49 @@ class FsdpUnitCollector:
         """Whether this unit needs MXFP8 rowwise planes during backward recomputation."""
         return unit in self._partially_recomputed_units
 
-    def _visit(self, module: nn.Module, *, is_root: bool = False) -> bool:
-        """Collect this unit, or propagate its recomputation requirement to its parent."""
+    def _visit(self, module: nn.Module, *, is_root: bool = False) -> RecomputeType:
+        """Collect this unit, or propagate its recompute type to its parent."""
         if isinstance(module, HyperConnectionHybridLayer):
-            partially_recomputed = self._visit_mhc(module)
+            recompute_type = self._visit_mhc(module)
         elif isinstance(module, ShortcutMoEBlock):
-            partially_recomputed = self._visit_shortcut(module)
+            recompute_type = self._visit_shortcut(module)
         elif isinstance(module, TransformerLayer):
-            partially_recomputed = self._visit_transformer(module)
+            recompute_type = self._visit_transformer(module)
         elif isinstance(module, MambaLayer):
-            partially_recomputed = self._has_partial_recompute(module.mixer)
+            recompute_type = self._visit_mamba(module)
         elif isinstance(module, (TransformerBlock, HybridStack)):
-            partially_recomputed = self._visit_children(module)
+            recompute_type = self._visit_children(module)
             config = module.config
-            partially_recomputed |= (
-                config.recompute_granularity == "full"
-                and (config.recompute_method != "block" or bool(config.recompute_num_layers))
-                and any(layer not in self._units for layer in module.layers)
-            )
+            if config.recompute_granularity == "full" and (
+                config.recompute_method != "block" or config.recompute_num_layers
+            ):
+                block_recompute_type = (
+                    RecomputeType.PARTIAL
+                    if any(layer not in self._units for layer in module.layers)
+                    else RecomputeType.FULL
+                )
+                recompute_type = max(recompute_type, block_recompute_type)
         elif isinstance(module, MultiTokenPredictionLayer):
-            partially_recomputed = self._visit_children(module)
+            recompute_type = self._visit_children(module)
             # GPT MTP checkpoints its projection; Hybrid MTP delegates to its inner stack.
-            partially_recomputed |= (
-                module.config.recompute_granularity == "full" and not module.is_hybrid_mtp
-            )
+            if module.config.recompute_granularity == "full" and not module.is_hybrid_mtp:
+                recompute_type = RecomputeType.PARTIAL
         else:
-            partially_recomputed = self._visit_children(module)
-            partially_recomputed |= self._has_partial_recompute(module)
+            recompute_type = max(
+                self._visit_children(module), self._component_recompute_type(module)
+            )
 
         if is_root or isinstance(module, self._fsdp_unit_module_types):
             self._units.append(module)
-            if partially_recomputed:
+            if recompute_type is RecomputeType.PARTIAL:
                 self._partially_recomputed_units.add(module)
-            return False
-        return partially_recomputed
+            return RecomputeType.NONE
+        return recompute_type
 
-    def _has_partial_recompute(self, module: nn.Module) -> bool:
+    def _component_recompute_type(self, module: nn.Module) -> RecomputeType:
         """Check the current component's checkpoint flags without visiting its children."""
         if isinstance(module, MoELayer):
-            return module.config.recompute_granularity != "full" and (
+            partially_recomputed = module.config.recompute_granularity != "full" and (
                 (module.moe_layer_recompute and self._mlp_has_owned_parameters(module))
                 or (
                     module.shared_experts_recompute
@@ -107,33 +120,54 @@ class FsdpUnitCollector:
                     and next(module.shared_experts.parameters(), None) is not None
                 )
             )
-        if isinstance(module, Attention):
+        elif isinstance(module, Attention):
             # MLA variants share Attention but no narrower base. They expose this checkpoint
             # flag; other attention implementations may omit it.
-            return getattr(module, "recompute_up_proj", False)
-        if isinstance(module, _GDNBase):
-            return module.config.recompute_granularity != "full" and module.recompute_gdn
-        if isinstance(module, GatedDeltaProductMixer):
-            return module.config.recompute_granularity != "full" and module.recompute_in_proj
-        return False
+            partially_recomputed = getattr(module, "recompute_up_proj", False)
+        elif isinstance(module, _GDNBase):
+            partially_recomputed = (
+                module.config.recompute_granularity != "full" and module.recompute_gdn
+            )
+        elif isinstance(module, GatedDeltaProductMixer):
+            partially_recomputed = (
+                module.config.recompute_granularity != "full" and module.recompute_in_proj
+            )
+        else:
+            return RecomputeType.NONE
+        return RecomputeType.PARTIAL if partially_recomputed else RecomputeType.NONE
 
-    def _visit_children(self, module: nn.Module) -> bool:
-        partially_recomputed = False
+    def _visit_children(self, module: nn.Module) -> RecomputeType:
+        recompute_type = RecomputeType.NONE
         for child in module.children():
-            partially_recomputed |= self._visit(child)
-        return partially_recomputed
+            recompute_type = max(recompute_type, self._visit(child))
+        return recompute_type
 
-    def _visit_transformer(self, layer: TransformerLayer) -> bool:
+    def _visit_transformer(self, layer: TransformerLayer) -> RecomputeType:
         self._collect_routed_experts(layer)
-        partially_recomputed = False
+        recompute_type = (
+            RecomputeType.FULL
+            if layer.config.recompute_granularity == "full"
+            else RecomputeType.NONE
+        )
         # These components belong to the layer; check their flags without collecting them.
         for child in layer.children():
-            partially_recomputed |= self._has_partial_recompute(child)
-        if layer.config.recompute_granularity != "full":
-            partially_recomputed |= (
-                isinstance(layer, MoETransformerLayer) and layer.moe_layer_recompute
-            ) or (layer.recompute_mlp and self._mlp_has_owned_parameters(layer.mlp))
-        return partially_recomputed
+            recompute_type = max(recompute_type, self._component_recompute_type(child))
+        if layer.config.recompute_granularity != "full" and (
+            (isinstance(layer, MoETransformerLayer) and layer.moe_layer_recompute)
+            or (layer.recompute_mlp and self._mlp_has_owned_parameters(layer.mlp))
+        ):
+            recompute_type = RecomputeType.PARTIAL
+        return recompute_type
+
+    def _visit_mamba(self, layer: MambaLayer) -> RecomputeType:
+        return max(
+            (
+                RecomputeType.FULL
+                if layer.config.recompute_granularity == "full"
+                else RecomputeType.NONE
+            ),
+            self._component_recompute_type(layer.mixer),
+        )
 
     def _mlp_has_owned_parameters(self, mlp: nn.Module) -> bool:
         if isinstance(mlp, MoELayer):
@@ -145,13 +179,13 @@ class FsdpUnitCollector:
             )
         return next(mlp.parameters(), None) is not None
 
-    def _visit_shortcut(self, block: ShortcutMoEBlock) -> bool:
+    def _visit_shortcut(self, block: ShortcutMoEBlock) -> RecomputeType:
         # Helpers bypass both inner layers' __call__; their experts are still collected.
-        return self._visit_inner_layer(block.compute_layer) | self._visit_inner_layer(
-            block.moe_layer
+        return max(
+            self._visit_inner_layer(block.compute_layer), self._visit_inner_layer(block.moe_layer)
         )
 
-    def _visit_mhc(self, mhc_layer: HyperConnectionHybridLayer) -> bool:
+    def _visit_mhc(self, mhc_layer: HyperConnectionHybridLayer) -> RecomputeType:
         inner_layer = mhc_layer.inner_layer
         if isinstance(inner_layer, TransformerLayer):
             config = mhc_layer.config
@@ -165,13 +199,13 @@ class FsdpUnitCollector:
                         self._units.append(norm)
         return self._visit_inner_layer(inner_layer)
 
-    def _visit_inner_layer(self, layer: nn.Module) -> bool:
+    def _visit_inner_layer(self, layer: nn.Module) -> RecomputeType:
         """Visit a wrapper-owned layer without collecting it as an independent unit."""
         if isinstance(layer, TransformerLayer):
             return self._visit_transformer(layer)
         if isinstance(layer, MambaLayer):
-            return self._has_partial_recompute(layer.mixer)
-        return self._has_partial_recompute(layer)
+            return self._visit_mamba(layer)
+        return self._component_recompute_type(layer)
 
     def _collect_routed_experts(self, layer: TransformerLayer) -> None:
         if layer.is_moe_layer:
