@@ -14,41 +14,35 @@ historical shapes and order regardless of arguments. Only the RNG-free
 bias_swiglu/bias_gelu/bias_geglu kernel calls may be skipped.
 """
 
-from types import SimpleNamespace
 from unittest import mock
 
 import pytest
 import torch
 
+from megatron.core.fusions.fused_bias_geglu import quick_gelu
+from megatron.core.transformer import TransformerConfig
 from megatron.training.initialize import _warmup_jit_function
 
 
-@pytest.fixture(autouse=True)
-def warmup_config(run_config):
-    run_config.train.micro_batch_size = 2
-
-
-def _args(**overrides):
+def _config(**overrides):
     base = dict(
         bf16=False,
         fp16=False,
         use_te_activation_func=False,
         gated_linear_unit=False,
-        quick_geglu=False,
-        swiglu=False,
-        bias_swiglu_fusion=True,
-        bias_gelu_fusion=True,
+        activation_func=torch.nn.functional.gelu,
+        bias_activation_fusion=True,
         bias_dropout_fusion=True,
         sequence_parallel=False,
         ffn_hidden_size=64,
         tensor_model_parallel_size=1,
-        seq_length=8,
         context_parallel_size=1,
-        micro_batch_size=1,
+        num_layers=2,
+        num_attention_heads=4,
         hidden_size=32,
     )
     base.update(overrides)
-    return SimpleNamespace(**base)
+    return TransformerConfig(**base)
 
 
 def _fake_rand(*size, **kwargs):
@@ -70,8 +64,13 @@ def _fake_rand(*size, **kwargs):
 class TestJitWarmupSkippedWhenFusionDisabled:
     @mock.patch("megatron.training.initialize.bias_swiglu")
     def test_skips_bias_swiglu(self, mock_swiglu, mock_get_args, mock_rand, mock_dropout, _cache):
-        mock_get_args.return_value = _args(swiglu=True, bias_swiglu_fusion=False)
-        _warmup_jit_function()
+        config = _config(
+            activation_func=torch.nn.functional.silu,
+            gated_linear_unit=True,
+            bias_activation_fusion=False,
+        )
+        _warmup_jit_function(config, sequence_length=8, micro_batch_size=1)
+        mock_get_args.assert_not_called()
         mock_swiglu.assert_not_called()
         # RNG-consuming draws and dropout warmup stay unconditional for
         # golden-value parity; mock dropout call count: zip(...) × range(5).
@@ -80,20 +79,16 @@ class TestJitWarmupSkippedWhenFusionDisabled:
 
     @mock.patch("megatron.training.initialize.bias_gelu")
     def test_skips_bias_gelu(self, mock_gelu, mock_get_args, mock_rand, mock_dropout, _cache):
-        mock_get_args.return_value = _args(
-            swiglu=False, bias_gelu_fusion=False, gated_linear_unit=False
-        )
-        _warmup_jit_function()
+        config = _config(bias_activation_fusion=False, gated_linear_unit=False)
+        _warmup_jit_function(config, sequence_length=8, micro_batch_size=1)
         mock_gelu.assert_not_called()
         assert mock_dropout.call_count == 10
         assert mock_rand.call_count == 5
 
     @mock.patch("megatron.training.initialize.bias_geglu")
     def test_skips_bias_geglu(self, mock_geglu, mock_get_args, mock_rand, mock_dropout, _cache):
-        mock_get_args.return_value = _args(
-            swiglu=False, bias_gelu_fusion=False, gated_linear_unit=True
-        )
-        _warmup_jit_function()
+        config = _config(bias_activation_fusion=False, gated_linear_unit=True)
+        _warmup_jit_function(config, sequence_length=8, micro_batch_size=1)
         mock_geglu.assert_not_called()
         assert mock_dropout.call_count == 10
         assert mock_rand.call_count == 5
@@ -104,10 +99,10 @@ class TestJitWarmupSkippedWhenFusionDisabled:
         self, mock_gelu, mock_geglu, mock_get_args, mock_rand, mock_dropout, _cache
     ):
         # Even with bias_gelu_fusion True, quick_geglu skips gelu and geglu warmups.
-        mock_get_args.return_value = _args(
-            swiglu=False, quick_geglu=True, bias_gelu_fusion=True, gated_linear_unit=True
+        config = _config(
+            activation_func=quick_gelu, bias_activation_fusion=True, gated_linear_unit=True
         )
-        _warmup_jit_function()
+        _warmup_jit_function(config, sequence_length=8, micro_batch_size=1)
         mock_gelu.assert_not_called()
         mock_geglu.assert_not_called()
         # Draws and dropout warmup are still unconditional.
@@ -122,14 +117,13 @@ class TestJitWarmupSkippedWhenFusionDisabled:
     ):
         # TE activation skips only the RNG-free activation kernels; the
         # RNG-consuming dropout warmup still runs for golden-value parity.
-        mock_get_args.return_value = _args(
+        config = _config(
             use_te_activation_func=True,
-            swiglu=True,
-            bias_swiglu_fusion=True,
+            activation_func=torch.nn.functional.silu,
+            bias_activation_fusion=False,
             gated_linear_unit=True,
-            bias_gelu_fusion=True,
         )
-        _warmup_jit_function()
+        _warmup_jit_function(config, sequence_length=8, micro_batch_size=1)
         mock_swiglu.assert_not_called()
         mock_gelu.assert_not_called()
         mock_geglu.assert_not_called()
@@ -147,9 +141,9 @@ class TestJitWarmupSkippedWhenFusionDisabled:
 def test_calls_bias_swiglu_when_fusion_enabled(
     mock_get_args, mock_swiglu, mock_torch_rand, _empty_cache, mock_gelu, mock_geglu, mock_dropout
 ):
-    mock_get_args.return_value = _args(swiglu=True, bias_swiglu_fusion=True)
+    config = _config(activation_func=torch.nn.functional.silu, gated_linear_unit=True)
     mock_swiglu.return_value = torch.tensor(0.0)
-    _warmup_jit_function()
+    _warmup_jit_function(config, sequence_length=8, micro_batch_size=1)
     assert mock_swiglu.call_count == 10  # zip([True,True],[False,True]) × range(5)
     mock_gelu.assert_not_called()
     mock_geglu.assert_not_called()
@@ -166,15 +160,13 @@ def test_dropout_warmup_and_geglu_cat(mock_get_args, mock_dropout, mock_rand, _c
     """Gated GEGLU warmup uses torch.cat (RNG-free) to get 2x-ffn tensors, and
     the fused dropout warmup runs even when bias_dropout_fusion is False so
     RNG consumption stays identical to the historical behavior."""
-    mock_get_args.return_value = _args(
-        swiglu=False, gated_linear_unit=True, bias_gelu_fusion=True, bias_dropout_fusion=False
-    )
-    _warmup_jit_function()
+    config = _config(gated_linear_unit=True, bias_activation_fusion=True, bias_dropout_fusion=False)
+    _warmup_jit_function(config, sequence_length=8, micro_batch_size=2)
     assert mock_geglu.call_count == 10
     # bias_geglu receives 2x-ffn tensors built via torch.cat
     bias_arg, input_arg = mock_geglu.call_args[0]
     assert bias_arg.shape[-1] == 128  # 2 * (ffn_hidden_size // tp) = 2 * 64
     assert input_arg.shape[-1] == 128
-    assert input_arg.shape[1] == 2  # Batch size comes from cfg.train, not the legacy args.
+    assert input_arg.shape[1] == 2  # The caller supplies cfg.train's resolved batch size.
     assert mock_dropout.call_count == 10  # unconditional for RNG parity
     assert mock_rand.call_count == 5

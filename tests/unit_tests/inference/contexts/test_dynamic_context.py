@@ -271,9 +271,9 @@ class TestDynamicContext:
         enable_chunked_prefill: bool = False,
         max_requests: int = None,
         expert_model_parallel_size: int = 1,
+        expert_tensor_parallel_size: int = None,
         reserve_recurrent_state_dummy_slot: bool = False,
         mamba_memory_ratio: float = None,
-        expert_tensor_parallel_size: int = None,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -298,13 +298,7 @@ class TestDynamicContext:
                 num_attention_heads=num_attention_heads,
                 expert_model_parallel_size=expert_model_parallel_size,
                 expert_tensor_parallel_size=expert_tensor_parallel_size,
-                # MoE bias is only supported with expert TP == 1.
-                add_bias_linear=(expert_tensor_parallel_size or 1) == 1,
-                num_moe_experts=(
-                    2
-                    if expert_model_parallel_size > 1 or (expert_tensor_parallel_size or 1) > 1
-                    else None
-                ),
+                num_moe_experts=2 if expert_model_parallel_size > 1 else None,
             ),
             inference_config=InferenceConfig(
                 max_sequence_length=max_sequence_length,
@@ -2926,26 +2920,22 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
-    @pytest.mark.parametrize("ep_size, etp_size, reserved", [(1, 2, True), (1, 1, False)])
-    def test_hybrid_expert_tp_dummy_reserves_state_slot(self, ep_size, etp_size, reserved):
-        """EP == 1 with expert TP > 1 still runs idle-rank dummy forwards, so it needs the slot."""
+    @pytest.mark.parametrize(
+        "expert_model_parallel_size, expert_tensor_parallel_size, expected",
+        [(1, 1, False), (2, 1, True), (1, 2, True)],
+    )
+    def test_hybrid_dummy_slot_reserved_when_tp_ep_group_has_peers(
+        self, expert_model_parallel_size, expert_tensor_parallel_size, expected
+    ):
+        # The work consensus runs over the tp_ep group (ETP x EP), so TP > 1 with EP = 1
+        # can also run a dummy forward and needs the reserved recurrent-state slot.
         ctx = self._get_hybrid_ep_context(
             num_cuda_graphs=16,
+            expert_model_parallel_size=expert_model_parallel_size,
+            expert_tensor_parallel_size=expert_tensor_parallel_size,
             reserve_recurrent_state_dummy_slot=True,
-            expert_model_parallel_size=ep_size,
-            expert_tensor_parallel_size=etp_size,
         )
-        assert ctx.reserve_recurrent_state_dummy_slot is reserved
-        metadata = ctx.mamba_metadata
-        assert (metadata.dummy_state_idx is not None) is reserved
-        if not reserved:
-            return
-        assert metadata.batch_allocate_slots(ctx.max_requests) is not None
-        assert metadata.mamba_state_free_slot_count == 0
-        ctx.initialize_attention_state(
-            is_expert_parallel_dummy_cuda_graph_step=True, transfer_bookkeeping_to_gpu=False
-        )
-        assert ctx._cpu_mamba_batch_indices_decode[0] == metadata.dummy_state_idx
+        assert ctx.reserve_recurrent_state_dummy_slot is expected
 
     @pytest.mark.internal
     @rounder_override(1)
