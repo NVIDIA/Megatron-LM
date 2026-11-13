@@ -118,9 +118,9 @@ class TestTrainingPgCollection:
         Utils.initialize_model_parallel(expert_model_parallel_size=2)
         # The expert all-gather group follows the model config's expert-parallel size.
         run_config.model.transformer.expert_model_parallel_size = 2
-        args = SimpleNamespace(create_all_gather_group=create_all_gather_group)
+        ddp_config = DistributedDataParallelConfig(create_all_gather_group=create_all_gather_group)
 
-        pg_collection = training._build_pg_collection_from_parallel_state(args)
+        pg_collection = training._build_pg_collection_from_parallel_state(ddp_config)
 
         if not create_all_gather_group:
             assert pg_collection.dp_cp_ag is None and pg_collection.expt_dp_ag is None
@@ -149,28 +149,28 @@ class TestTrainingPgCollection:
         monkeypatch.setattr(
             training, "create_all_gather_groups", lambda **kwargs: all_gather_groups
         )
-        args = SimpleNamespace(create_all_gather_group=True)
+        ddp_config = DistributedDataParallelConfig(create_all_gather_group=True)
 
         with pytest.raises(ValueError, match="all-gather groups whose ranks differ"):
-            training._build_pg_collection_from_parallel_state(args)
+            training._build_pg_collection_from_parallel_state(ddp_config)
 
     @pytest.mark.usefixtures("run_config")
     def test_all_gather_groups_reject_several_optimizer_instances(self):
         # Megatron-FSDP then shards over the intra-instance group, which has half of the
         # data-parallel ranks that the all-gather group spans.
         Utils.initialize_model_parallel(num_distributed_optimizer_instances=2)
-        args = SimpleNamespace(create_all_gather_group=True)
+        ddp_config = DistributedDataParallelConfig(create_all_gather_group=True)
 
         with pytest.raises(ValueError, match="--num-distributed-optimizer-instances > 1"):
-            training._build_pg_collection_from_parallel_state(args)
+            training._build_pg_collection_from_parallel_state(ddp_config)
 
     @pytest.mark.usefixtures("run_config")
     @pytest.mark.parametrize("use_gloo_process_groups", [True, False])
     def test_collection_carries_the_grid_gloo_groups(self, use_gloo_process_groups):
         Utils.initialize_model_parallel(create_gloo_process_groups=use_gloo_process_groups)
-        args = SimpleNamespace(create_all_gather_group=False)
+        ddp_config = DistributedDataParallelConfig(create_all_gather_group=False)
 
-        pg_collection = training._build_pg_collection_from_parallel_state(args)
+        pg_collection = training._build_pg_collection_from_parallel_state(ddp_config)
 
         if not use_gloo_process_groups:
             assert pg_collection.intra_dp_cp_gloo is None
@@ -193,9 +193,7 @@ class TestTrainingPgCollection:
         Utils.initialize_model_parallel(create_gloo_process_groups=use_gloo_process_groups)
         run_config.dist.use_gloo_process_groups = use_gloo_process_groups
         # The collection pretrain() builds and hands to setup_model_and_optimizer().
-        pg_collection = training._build_pg_collection_from_parallel_state(
-            SimpleNamespace(create_all_gather_group=False)
-        )
+        pg_collection = training._build_pg_collection_from_parallel_state(run_config.ddp)
         if use_gloo_process_groups:
             # Distinct Gloo communicators over the data-parallel ranks (every rank on this grid),
             # so the optimizer holds them only if it takes its Gloo groups from the collection.
