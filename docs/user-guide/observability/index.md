@@ -9,7 +9,7 @@
 
 # Observability Overview
 
-Megatron-LM is instrumented with [OpenTelemetry](https://opentelemetry.io/) via the [`nemo-lens`](https://github.com/NVIDIA-NeMo/Lens) library, emitting **traces** at training-framework boundaries and **metrics** for loss, throughput, and gradient norm.
+Megatron-LM is instrumented with [OpenTelemetry](https://opentelemetry.io/) via the [`nemo-lens`](https://github.com/NVIDIA-NeMo/Lens) library, emitting **traces** at training-framework boundaries and span events for training reports.
 
 Telemetry exports to any OTLP-compatible backend (Jaeger, Grafana Tempo, W&B Weave, Honeycomb, Datadog, ...).
 
@@ -20,6 +20,7 @@ Telemetry exports to any OTLP-compatible backend (Jaeger, Grafana Tempo, W&B Wea
 - [Metrics](metrics.md)
 - [Pipeline-Parallel Trace Correlation](pipeline-parallel.md)
 - [Extending Instrumentation](extending.md)
+- [Trace Lifecycle](trace-lifecycle.md)
 
 ## Scope
 
@@ -37,21 +38,17 @@ export MEGATRON_OTEL_SPAN_GROUPS=default   # coarse-grained; safe for production
 torchrun --nproc_per_node=8 pretrain_gpt.py ...
 ```
 
-With `default` span groups, Megatron emits a handful of coarse spans per iteration and a steady stream of training metrics. Switch to `per_step` for profiling individual steps, or `all` for fine-grained debugging.
+With `default` span groups, training reports attach to recording coarse spans.
+Switch to `per_step` for profiling individual steps, or `all` for fine-grained
+debugging. See [Training Signals](metrics.md) for report cadence and field semantics.
 
 ## What gets instrumented
 
-| Subsystem | File | Spans |
-|---|---|---|
-| Training loop | `megatron/training/training.py` | `megatron.pretrain`, `megatron.train`, `megatron.train_step`, `megatron.forward_backward`, `megatron.optimizer_step` |
-| Pipeline schedules | `megatron/core/pipeline_parallel/schedules.py` | `megatron.microbatch.forward`, `megatron.microbatch.backward`, `megatron.pp.recv_forward.linked` |
-| P2P communication | `megatron/core/pipeline_parallel/p2p_communication.py` | `megatron.p2p.{send,recv}_{forward,backward}` |
-| Gradient sync (DDP) | `megatron/core/distributed/distributed_data_parallel.py` | `megatron.grad_sync.{start,finish}` |
-| Checkpointing | `megatron/training/checkpointing.py` | `megatron.save_checkpoint.*`, `megatron.load_checkpoint.*` |
-| Model init | `megatron/training/training.py` | `megatron.model_init` |
-| Evaluation | `megatron/training/training.py` | `megatron.evaluate`, `megatron.evaluate.step` |
-
-Each span is tagged with a **span group** that controls whether it's emitted at runtime. See [Span Groups](span-groups.md).
+Training, checkpointing, evaluation, pipeline communication, and model layers
+route instrumentation through `megatron/core/telemetry/telemetry.py`.
+Namespaced [span groups](span-groups.md) control which operation boundaries
+emit spans. The facade owns optional-dependency behavior and delegates the
+instrumentation primitives to Lens.
 
 ## What gets exported
 
@@ -59,7 +56,8 @@ Each span is tagged with a **span group** that controls whether it's emitted at 
 - **Metrics**: Prometheus via the OTel Collector, or direct OTLP to Grafana Mimir / Datadog / etc.
 - **Logs** (optional): via the OTel log bridge when `MEGATRON_OTEL_LOGS_ENABLED=1` — correlates `logging` records with the active span's trace ID.
 
-By default, only **one rank** exports (the last rank). For multi-rank telemetry, see [Configuration — Rank strategy](configuration.md#rank-strategy).
+Each enabled trainer rank exports its own telemetry. Resource attributes
+identify the rank and inherited run; see [Configuration](configuration.md).
 
 ## Related
 
