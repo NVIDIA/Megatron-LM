@@ -545,7 +545,7 @@ def test_stock_initialization_seeds_from_its_grid_without_global_reads(
             assert torch.equal(actual_states[name], state), name
         assert actual_python_state == expected_python_state
 
-        pretrain_collection = training._build_pg_collection_from_parallel_state(args)
+        pretrain_collection = training._build_pg_collection_from_parallel_state(run_config.ddp)
         for field in fields(ProcessGroupCollection):
             assert _same_groups(
                 getattr(pretrain_collection, field.name), getattr(built[0], field.name)
