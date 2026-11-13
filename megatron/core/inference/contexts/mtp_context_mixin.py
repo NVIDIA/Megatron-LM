@@ -218,7 +218,9 @@ class MTPContextMixin:
                         if next_token_idx < len(req.prompt_tokens)
                         else -1
                     )
-                    producer_next = int(self.kv_block_allocator.block_mtp_next_token[block_id])
+                    producer_next = int(
+                        self.kv_block_allocator.pc_state.block_mtp_next_token[block_id]
+                    )
                     # -1 on either side means the slot holds no draft KV (the producer's
                     # successor had not arrived) or that we have no successor to match it
                     # against, so equality there is not agreement -- neither is inheritable.
@@ -255,12 +257,15 @@ class MTPContextMixin:
             block_id is None
             or match.backed_off_blocks != 1
             or self.prefix_caching_eviction_policy != PrefixCachingEvictionPolicy.LRU
-            or int(alloc.block_ref_counts[block_id]) != 0
-            or int(alloc.block_child_count[block_id]) != 0
-            or int(alloc.block_hashes[block_id]) == -1
+            or int(alloc.pc_state.block_ref_counts[block_id]) != 0
+            or int(alloc.pc_state.block_child_count[block_id]) != 0
+            or int(alloc.pc_state.block_hashes[block_id]) == -1
         ):
             return False
-        alloc._deregister_blocks(torch.tensor([block_id], dtype=torch.int32))
+        victims = torch.tensor([block_id], dtype=torch.int32)
+        hashes = alloc.pc_state.deregister_blocks(victims)
+        alloc._push_to_pool(victims)
+        alloc._notify_deregistered(victims, hashes)
         self.mtp_prefix_replaced_blocks += 1
         return True
 

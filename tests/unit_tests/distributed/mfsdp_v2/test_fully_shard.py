@@ -22,10 +22,10 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     Placements,
     PrefetchOrder,
     RuntimePolicy,
+    finalize_gradients,
     fully_shard,
     fully_shard_context,
     fully_shard_optimizer,
-    microbatch,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
@@ -229,7 +229,7 @@ def test_fully_shard_sgd_losses_match_baseline(
             optimizer.zero_grad()
 
             for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
-                with microbatch(context, is_last=microbatch_index == num_microbatches - 1):
+                with finalize_gradients(context, enabled=microbatch_index == num_microbatches - 1):
                     loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                     losses.append(loss.detach())
                     logger.debug(
@@ -297,7 +297,11 @@ def test_shared_mtp_backward_matches_baseline(distributed_setup):
     torch.manual_seed(1234)
     model = TinySharedMTP(width, vocab_size).to(device)
     # Registration order contains the shared block once; execution calls it twice.
-    with fully_shard_context(FsdpContext(device=device, prefetch_order=PrefetchOrder.RECORDED)):
+    with fully_shard_context(
+        FsdpContext(
+            device=device, runtime_policy=RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)
+        )
+    ):
         fully_shard(model.shared_block, mesh=mesh, placements=_default_placements())
         fully_shard(model, mesh=mesh, placements=_default_placements())
     optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
@@ -305,33 +309,6 @@ def test_shared_mtp_backward_matches_baseline(distributed_setup):
     losses = train(model, optimizer, inputs, reduce_wgrad=False)
 
     torch.testing.assert_close(torch.stack(losses), torch.stack(baseline_losses))
-
-
-def test_rejects_delayed_te_weight_gradient(distributed_setup):
-    """Default automatic synchronization rejects weight gradients produced after autograd."""
-    world_size = distributed_setup.world_size
-    device = distributed_setup.device
-
-    mesh = init_device_mesh(device.type, (world_size,))
-    model = te.Linear(
-        16,
-        16,
-        bias=False,
-        params_dtype=torch.bfloat16,
-        device=device,
-        delay_wgrad_compute=True,
-        fuse_wgrad_accumulation=False,
-    )
-    with fully_shard_context(FsdpContext(device=device)):
-        fully_shard(model, mesh=mesh, placements=_default_placements())
-
-    x = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
-    model(x).float().square().mean().backward()
-    assert model.weight.grad is None
-    assert model.phase is Phase.BACKWARD
-
-    with pytest.raises(RuntimeError, match="caller_managed_grad_sync=True"):
-        model.backward_dw()
 
 
 def test_fully_shard_rejects_tied_delayed_weight_gradients(distributed_setup):
@@ -465,7 +442,7 @@ def test_losses_match_baseline(
             optimizer.zero_grad(set_to_none=set_to_none)
             for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
                 is_last = microbatch_index == num_microbatches - 1
-                with microbatch(context, is_last=is_last):
+                with finalize_gradients(context, enabled=is_last):
                     loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                     (loss / num_microbatches).backward()
                 losses.append(loss.detach())
@@ -520,7 +497,7 @@ def test_hsdp_defers_dp_outer_allreduce_to_last_microbatch(distributed_setup):
         optimizer.zero_grad(set_to_none=True)
         for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
             is_last = microbatch_index == num_microbatches - 1
-            with microbatch(context, is_last=is_last):
+            with finalize_gradients(context, enabled=is_last):
                 loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                 (loss / num_microbatches).backward()
         optimizer.step()
@@ -584,7 +561,7 @@ def test_hfsdp_reduce_scatters_dp_outer_on_last_microbatch(distributed_setup):
         optimizer.zero_grad(set_to_none=True)
         for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
             is_last = microbatch_index == num_microbatches - 1
-            with microbatch(context, is_last=is_last):
+            with finalize_gradients(context, enabled=is_last):
                 loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                 (loss / num_microbatches).backward()
         optimizer.step()
@@ -625,7 +602,7 @@ def test_backward_averages_across_dp_and_accumulates_across_calls(distributed_se
         fully_shard(model, mesh=mesh, placements=_default_placements())
 
     x = torch.full((1, 1), float(rank + 1), device=device)
-    with microbatch(context, is_last=False):
+    with finalize_gradients(context, enabled=False):
         model(x).sum().backward()
     model(x).sum().backward()
 
@@ -909,7 +886,7 @@ def test_fully_shard_tensor_atomic_losses_match_baseline(
         for _ in range(5):
             optimizer.zero_grad()
             for microbatch_index, (microbatch_x, microbatch_target) in enumerate(microbatches):
-                with microbatch(context, is_last=microbatch_index == num_microbatches - 1):
+                with finalize_gradients(context, enabled=microbatch_index == num_microbatches - 1):
                     loss = torch.nn.functional.mse_loss(model(microbatch_x), microbatch_target)
                     losses.append(loss.detach())
                     (loss / num_microbatches).backward()

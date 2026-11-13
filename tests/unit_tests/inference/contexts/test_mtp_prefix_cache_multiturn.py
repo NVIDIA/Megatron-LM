@@ -95,7 +95,7 @@ class TestMtpMultiTurnPrefixReuse(PrefixCachingTestBase):
         hashes = req.precomputed_block_hashes
         alloc = ctx.kv_block_allocator
         stats.registered_blocks = next(
-            (k for k, h in enumerate(hashes) if h not in alloc.kv_hash_to_block_id), len(hashes)
+            (k for k, h in enumerate(hashes) if h not in alloc.registry.kv_hash_to_block_id), len(hashes)
         )
         return stats
 
@@ -188,25 +188,25 @@ class TestMtpDeclinedBlockReplacementInvariants(PrefixCachingTestBase):
     def _check_forest(ctx, requests):
         """Assert the allocator's prefix forest and the in-flight block tables are consistent."""
         alloc = ctx.kv_block_allocator
-        hashes = alloc.block_hashes
+        hashes = alloc.pc_state.block_hashes
         registered = (hashes != -1).nonzero().flatten().tolist()
 
         for block_id in registered:
             # The hash map and the per-block hash agree.
-            assert alloc.kv_hash_to_block_id[int(hashes[block_id])] == block_id
-            parent = int(alloc.block_parent_id[block_id])
+            assert alloc.registry.kv_hash_to_block_id[int(hashes[block_id])] == block_id
+            parent = int(alloc.pc_state.block_parent_id[block_id])
             if parent >= 0:
                 assert int(hashes[parent]) != -1, f"block {block_id} has a deregistered parent"
-            children = sum(int(alloc.block_parent_id[b]) == block_id for b in registered)
-            assert int(alloc.block_child_count[block_id]) == children, (
-                f"block {block_id}: child count {int(alloc.block_child_count[block_id])}, "
+            children = sum(int(alloc.pc_state.block_parent_id[b]) == block_id for b in registered)
+            assert int(alloc.pc_state.block_child_count[block_id]) == children, (
+                f"block {block_id}: child count {int(alloc.pc_state.block_child_count[block_id])}, "
                 f"{children} registered children"
             )
 
         # Prefix-closed: a request can only match block k if blocks 0..k-1 are cached, so a
         # cached block must never sit behind an uncached ancestor in any request's hash chain.
         for req in requests:
-            cached = [h in alloc.kv_hash_to_block_id for h in req.precomputed_block_hashes]
+            cached = [h in alloc.registry.kv_hash_to_block_id for h in req.precomputed_block_hashes]
             first_gap = next((k for k, c in enumerate(cached) if not c), len(cached))
             assert not any(
                 cached[first_gap:]
@@ -226,8 +226,8 @@ class TestMtpDeclinedBlockReplacementInvariants(PrefixCachingTestBase):
                 holders[b] = holders.get(b, 0) + 1
         for b, n in holders.items():
             assert (
-                int(alloc.block_ref_counts[b]) == n
-            ), f"block {b}: ref count {int(alloc.block_ref_counts[b])}, held by {n} rows"
+                int(alloc.pc_state.block_ref_counts[b]) == n
+            ), f"block {b}: ref count {int(alloc.pc_state.block_ref_counts[b])}, held by {n} rows"
 
     @pytest.mark.internal
     # A 0-block tail leaves the first request's copy as a childless in-use leaf, the case only
@@ -246,8 +246,8 @@ class TestMtpDeclinedBlockReplacementInvariants(PrefixCachingTestBase):
         base = self._tokens(5 * self.BS, 0)
         self._admit(ctx, base.clone(), request_id=1)
         declined_hash = self._req(ctx, base.clone(), request_id=99).precomputed_block_hashes[-1]
-        declined_block = alloc.kv_hash_to_block_id[declined_hash]
-        assert int(alloc.block_ref_counts[declined_block]) == 0
+        declined_block = alloc.registry.kv_hash_to_block_id[declined_hash]
+        assert int(alloc.pc_state.block_ref_counts[declined_block]) == 0
 
         tail_len = tail_blocks * self.BS + 11
         tail_a = self._tokens(tail_len, 50_000)
@@ -271,9 +271,9 @@ class TestMtpDeclinedBlockReplacementInvariants(PrefixCachingTestBase):
         # Only the first admission may replace the declined block; the second must never evict
         # the copy the first request now holds.
         assert ctx.mtp_prefix_replaced_blocks == 1
-        first_copy = alloc.kv_hash_to_block_id.get(declined_hash)
+        first_copy = alloc.registry.kv_hash_to_block_id.get(declined_hash)
         assert first_copy is not None, "the first request's copy of the block was not registered"
-        assert int(alloc.block_ref_counts[first_copy]) >= 1
+        assert int(alloc.pc_state.block_ref_counts[first_copy]) >= 1
 
         # Release both and peel the whole cached forest: `evict_lru_blocks` asserts the parent
         # graph is a forest, so a dangling or cyclic chain would fail here.
@@ -285,4 +285,4 @@ class TestMtpDeclinedBlockReplacementInvariants(PrefixCachingTestBase):
         evictable = int(alloc.get_evictable_block_count())
         assert evictable > 0
         assert alloc.evict_lru_blocks(evictable)
-        assert all(int(h) == -1 for h in alloc.block_hashes.tolist())
+        assert all(int(h) == -1 for h in alloc.pc_state.block_hashes.tolist())
