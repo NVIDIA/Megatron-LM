@@ -15,10 +15,15 @@ They are excluded from Megatron-LM's generated CLI until that loop supports them
 | Training | Fractional `num_epochs`, derived epoch state, optimizer-step checking, gradient-norm synchronization policy; legacy nested evaluation fields |
 | Scheduler | `max_steps` full schedule horizon for shortened runs |
 | Checkpoint | CPU optimizer-state staging, per-rank writer count, write-result multiprocessing mode, per-DP RNG state, custom checkpoint manager, additional Hugging Face export settings |
-| Distributed initialization | Torch FSDP2 driver selection, external device mapping, GTP options, experimental gate, explicit process-group routing, evaluation context-parallel degree |
+| Distributed initialization | External device mapping |
 | Logging | Training-metrics gate, legacy Comet credential, MLflow artifact-upload policy; `timing_log_level=-1` for Bridge's disabled timer logging |
 | Rerun | `spiky_loss_factor` used by Bridge's loss checks |
-| Straggler detection | `enable_straggler_on_startup` retained only to reload old saved Bridge configs; the runtime uses `disable_straggler_on_startup` |
+
+Torch FSDP2 is selected by `TorchFullyShardedDataParallelConfig`, and GTP FP32
+reduce-scatter accumulation belongs to DDP configuration. Bridge retains its
+experimental feature switch, process-group routing, evaluation CP rebinding,
+and legacy GTP NCCL-buffer switch locally. The unused positive straggler-startup
+field is removed; `disable_straggler_on_startup` remains the runtime control.
 
 The native CLI retains its existing timing levels, validation flags, defaults,
 and runtime behavior. The separate MLflow/Comet integration supplies the shared

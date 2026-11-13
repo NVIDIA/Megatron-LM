@@ -2491,9 +2491,7 @@ def _add_wide_residual_args(parser):
 def _add_straggler_detector_args(parser):
     from megatron.training.config import StragglerDetectionConfig
 
-    straggler_factory = ArgumentGroupFactory(
-        StragglerDetectionConfig, exclude=['enable_straggler_on_startup']
-    )
+    straggler_factory = ArgumentGroupFactory(StragglerDetectionConfig)
     group = straggler_factory.build_group(parser, "straggler")
 
     return parser
@@ -2960,16 +2958,7 @@ def _add_distributed_args(parser):
     from megatron.training.config import DistributedInitConfig
 
     dist_init_factory = ArgumentGroupFactory(
-        DistributedInitConfig,
-        exclude=[
-            'use_torch_fsdp2',
-            'external_gpu_device_mapping',
-            'gtp_remat_reduce_scatter_with_fp32_accumulation',
-            'gtp_remat_nccl_ub',
-            'enable_megatron_core_experimental',
-            'use_decentralized_pg',
-            'eval_context_parallel_size',
-        ],
+        DistributedInitConfig, exclude=['external_gpu_device_mapping']
     )
     group = dist_init_factory.build_group(parser, "distributed init")
 

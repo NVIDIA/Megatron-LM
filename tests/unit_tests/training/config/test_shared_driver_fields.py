@@ -27,7 +27,7 @@ def test_driver_settings_survive_nested_serialization():
             hf_distributed_save=True,
             stage_precision_aware_optimizer_state_on_cpu=True,
         ),
-        dist=DistributedInitConfig(external_gpu_device_mapping=True, eval_context_parallel_size=2),
+        dist=DistributedInitConfig(external_gpu_device_mapping=True),
     )
     saved = config.to_dict()
     target_allowlist.add_exact(saved["_target_"])
@@ -39,7 +39,7 @@ def test_driver_settings_survive_nested_serialization():
     assert loaded.checkpoint.hf_source_path == "org/source"
     assert loaded.checkpoint.hf_distributed_save
     assert loaded.checkpoint.stage_precision_aware_optimizer_state_on_cpu
-    assert loaded.dist.eval_context_parallel_size == 2
+    assert loaded.dist.external_gpu_device_mapping is True
     loaded.dist.lazy_init = True
     assert loaded.dist.lazy_mpu_init is True
 

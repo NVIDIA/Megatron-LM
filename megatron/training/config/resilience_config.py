@@ -89,9 +89,6 @@ class RerunStateMachineConfig:
 class StragglerDetectionConfig:
     """Configuration settings for detecting and logging GPU stragglers."""
 
-    enable_straggler_on_startup: bool = True
-    """Legacy positive spelling retained for saved driver configurations."""
-
     log_straggler: bool = False
     """If set, tracks and logs straggler per GPU."""
 
