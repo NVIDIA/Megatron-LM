@@ -48,16 +48,22 @@ def _fp64_oracle(mixed, freqs, qw, kw, nq, hn, eps, zc):
     return nr(q, qw), nr(k, kw), v
 
 
+# nq=3 pads the query heads to 4; at eps=0 a padded head's rsigma is inf.
 @pytest.mark.parametrize(
-    "sq,b,ng,nq,hn", [(256, 2, 4, 8, 128), (128, 3, 2, 4, 64), (64, 1, 1, 1, 128)]
+    "sq,b,ng,nq,hn,eps",
+    [
+        (256, 2, 4, 8, 128, 1e-6),
+        (128, 3, 2, 4, 64, 1e-6),
+        (64, 1, 1, 1, 128, 1e-6),
+        (64, 2, 2, 3, 128, 0.0),
+    ],
 )
 @pytest.mark.parametrize("zc", [False, True])
 # None: automatic (1 token per program at these sizes); 7: the last program gets a partial block.
 @pytest.mark.parametrize("bwd_tokens", [None, 7])
-def test_matches_unfused_te_path(sq, b, ng, nq, hn, zc, bwd_tokens, monkeypatch):
+def test_matches_unfused_te_path(sq, b, ng, nq, hn, eps, zc, bwd_tokens, monkeypatch):
     monkeypatch.setattr(fused_module, "BWD_TOKENS", bwd_tokens)
     torch.manual_seed(0)
-    eps = 1e-6
     row = (nq + 2) * hn
     mixed = torch.randn(sq, b, ng * row, device="cuda", dtype=torch.bfloat16).view(sq, b, ng, row)
     freqs = _freqs(sq, hn)

@@ -219,6 +219,8 @@ def _qkv_qknorm_rope_bwd_kernel(
             x1 = tl.load(base + qoff, mask=hmask, other=0.0).to(tl.float32)
             x2 = tl.load(base + qoff + HALF, mask=hmask, other=0.0).to(tl.float32)
             rs = _rsqrt((tl.sum(x1 * x1, axis=1) + tl.sum(x2 * x2, axis=1)) / HN + eps)
+            # Padded heads read zeros: rsqrt(eps) is inf at eps=0, and 0 * inf is NaN in dgamma.
+            rs = tl.where(h < NQ, rs, 0.0)
             xh1 = x1 * rs[:, None]
             xh2 = x2 * rs[:, None]
             z1 = g1 * w1[None, :]
