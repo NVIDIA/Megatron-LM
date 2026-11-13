@@ -1,0 +1,31 @@
+# yaml-language-server: $schema=https://schema.buildwithfern.dev/docs-yml.json
+
+instances:
+  - url: https://nvidia-megatron.docs.buildwithfern.com/megatron
+    custom-domain: docs.nvidia.com/megatron
+
+title: Megatron Core
+
+global-theme: nvidia
+
+navbar-links:
+  - type: github
+    value: https://github.com/NVIDIA/Megatron-LM
+
+logo:
+  href: /megatron/latest
+  right-text: Megatron Core
+
+experimental:
+  basepath-aware: true
+
+versions:
+  - display-name: "0.20.0 (latest)"
+    path: versions/latest.yml
+    slug: latest
+  - display-name: "nightly"
+    path: versions/nightly.yml
+    slug: nightly
+  - display-name: "Archives"
+    path: versions/archives.yml
+    slug: archives
