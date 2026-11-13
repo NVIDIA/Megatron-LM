@@ -166,7 +166,6 @@ from megatron.training.initialize import (
     write_args_to_tensorboard,
 )
 from megatron.training.kernel_warmup import warmup_training_kernels
-from megatron.training.logging.dsa_flops import dsa_indexer_flops
 
 # Retain the training.py import path used by existing multimodal callers.
 from megatron.training.logging.packed_sequence_stats import (
@@ -920,23 +919,63 @@ def num_floating_point_operations(
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
         )
 
-    def indexer_flops(num_layers, **execution):
+    def indexer_flops(
+        num_layers, *, hybrid_layer_pattern=None, mtp_num_layers=0, mtp_use_repeated_layer=False
+    ):
+        from megatron.core.transformer.experimental_attention_variant.dsa import (
+            DSAIndexer,
+            is_dsa_skip_topk_layer,
+        )
+
+        if num_layers == 0:
+            return 0.0
+
+        def count_indexers(layer_numbers):
+            return sum(
+                not is_dsa_skip_topk_layer(
+                    layer_number,
+                    transformer_cfg.dsa_indexer_skip_topk_offset or 0,
+                    transformer_cfg.dsa_indexer_topk_freq or 1,
+                )
+                for layer_number in layer_numbers
+            )
+
+        if hybrid_layer_pattern is None:
+            mtp_num_layers = mtp_num_layers or 0
+            num_indexers = count_indexers(range(1, num_layers - mtp_num_layers + 1))
+            # MTP starts numbering at 1; repeated MTP executes layer 1 at every depth.
+            num_indexers += (
+                mtp_num_layers
+                if mtp_use_repeated_layer
+                else count_indexers(range(1, mtp_num_layers + 1))
+            )
+        else:
+            from megatron.core.models.hybrid.hybrid_layer_allocation import (
+                Symbols,
+                parse_hybrid_pattern,
+            )
+
+            parsed = parse_hybrid_pattern(hybrid_layer_pattern)
+
+            def count_pattern(pattern):
+                # All positions advance numbering; pipeline separators do not.
+                return count_indexers(
+                    i
+                    for i, symbol in enumerate(pattern.replace(Symbols.PIPE, ""), start=1)
+                    if symbol == Symbols.DS_ATTENTION
+                )
+
+            num_indexers = count_pattern(parsed.main_pattern or "")
+            if parsed.mtp_pattern:
+                # Each hybrid MTP depth restarts its template's numbering at 1.
+                num_indexers += parsed.mtp_num_depths * count_pattern(parsed.mtp_pattern)
+
         # The detached indexer has loss-dependent backward costs, unlike the layer's x3.
-        return dsa_indexer_flops(
-            total_tokens=total_real_tokens_in_batch,
-            seqlen_squared_sum=seqlen_squared_sum_in_batch,
-            hidden_size=transformer_cfg.hidden_size,
-            q_lora_rank=transformer_cfg.q_lora_rank,
-            dsa_indexer_n_heads=transformer_cfg.dsa_indexer_n_heads,
-            dsa_indexer_head_dim=transformer_cfg.dsa_indexer_head_dim,
-            dsa_indexer_topk=transformer_cfg.dsa_indexer_topk,
-            num_dsa_layers=num_layers,
-            dsa_indexer_loss_coeff=transformer_cfg.dsa_indexer_loss_coeff,
-            dsa_indexer_use_sparse_loss=transformer_cfg.dsa_indexer_use_sparse_loss,
-            dsa_indexer_skip_topk_offset=transformer_cfg.dsa_indexer_skip_topk_offset,
-            dsa_indexer_topk_freq=transformer_cfg.dsa_indexer_topk_freq,
-            dsa_indexer_kpool=transformer_cfg.dsa_indexer_kpool,
-            **execution,
+        return num_indexers * DSAIndexer.estimate_flops(
+            transformer_cfg,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+            include_backward=True,
         )
 
     def hybrid_flops():
