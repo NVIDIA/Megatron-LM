@@ -83,6 +83,7 @@ def test_shortcut_checkpoint_keys_preserve_physical_layer_offsets(pp_layer_offse
     block.layer_config_list = [object() for _ in range(5)]
     block._execution_layer_indices = [0, 2, 4]
     block._execution_layer_config_list = [block.layer_config_list[index] for index in (0, 2, 4)]
+    block._has_custom_layers = False
 
     sharded_state_dict = block.sharded_state_dict(prefix='decoder.')
     assert set(sharded_state_dict) == {f'decoder.layers.{index}.weight' for index in range(3)}

@@ -196,11 +196,13 @@ class HybridStack(MegatronModule):
                     [layer_utils.get_layer_symbol_from_config(config) for config in layer_config]
                 )
         for layer_config in flatten_layer_type_list(layer_config_list):
-            layer_utils.validate_tp_comm_overlap(
-                layer_config,
-                layer_utils.get_layer_symbol_from_config(layer_config),
-                has_mtp=is_mtp_layer,
-            )
+            if layer_utils.get_custom_layer_type(layer_config) is None:
+                segment = layer_utils.get_layer_symbol_from_config(layer_config)
+            else:
+                # Custom layers have no built-in symbol. An empty segment skips symbol-specific
+                # checks while preserving MTP validation.
+                segment = ""
+            layer_utils.validate_tp_comm_overlap(layer_config, segment, has_mtp=is_mtp_layer)
 
         super().__init__(config=config)
         self.pre_process = pre_process
@@ -241,6 +243,10 @@ class HybridStack(MegatronModule):
                 "Bracketed HybridStack layer groups are not supported with enable_mhc_connections, "
                 "wide residuals, or MoE shortcuts."
             )
+        self._has_custom_layers = any(
+            layer_utils.get_custom_layer_type(layer_config) is not None
+            for layer_config in self.layer_config_list
+        )
         self._has_linear_layer_with_chunkwise_cp = any(
             type(layer_config) is layer_utils.MambaLayerConfig
             and layer_config.linear_cp_mode == "chunkwise"
@@ -285,6 +291,7 @@ class HybridStack(MegatronModule):
             else:
                 quant_init_context = nullcontext()
             with quant_init_context:
+                custom_layer_type = layer_utils.get_custom_layer_type(layer_config)
                 if is_layer_group(layer_config):
                     # A bracketed group (e.g. ``[M*E]``) is one logical layer built as a
                     # nested HybridStack over its physical layers. It restores the outer
@@ -308,6 +315,25 @@ class HybridStack(MegatronModule):
                         name=(name + f".layers.{i}") if name is not None else None,
                         boundary_layout=boundary_layout,
                     )
+                elif custom_layer_type is not None:
+                    layer = custom_layer_type(
+                        config=layer_config,
+                        pg_collection=pg_collection,
+                        layer_number=layer_number,
+                        pp_layer_offset=pp_layer_offset,
+                        is_mtp_layer=is_mtp_layer,
+                        mtp_layer_number=mtp_layer_number,
+                        name=(name + f".layers.{i}") if name is not None else None,
+                    )
+                    if (
+                        layer.config is not layer_config
+                        or getattr(layer, "layer_number", None) != layer_number
+                    ):
+                        raise ValueError(
+                            "Custom layers must preserve the supplied config and layer number."
+                        )
+                    if getattr(layer, "tp_group", None) is not pg_collection.tp:
+                        raise ValueError("Custom layers must retain the supplied tp_group.")
                 elif type(layer_config) is layer_utils.MambaLayerConfig:
                     self._assert_submodule_configured(submodules, "mamba_layer")
                     layer = build_module(
@@ -491,7 +517,7 @@ class HybridStack(MegatronModule):
         self._execution_layer_indices = list(range(len(self.layers)))
         if self.config.moe_shortcut_connection:
             self.layers = group_layers_into_shortcut_blocks(
-                self.layers, self.layer_type_list, self.config, pp_layer_offset=pp_layer_offset
+                self.layers, self.layer_config_list, self.config, pp_layer_offset=pp_layer_offset
             )
             self._execution_layer_indices = [
                 (
@@ -713,7 +739,8 @@ class HybridStack(MegatronModule):
             rotary_pos_emb (Tensor, optional): the rotary positional embeddings.
                 Defaults to None.
             input_ids (Tensor, optional): Token IDs forwarded to hash-routed
-                TransformerLayer instances. Defaults to None.
+                TransformerLayer instances and custom layers. Defaults to None.
+                Custom layers must accept None; HybridModel does not forward IDs to MTP stacks.
             sequence_len_offset (Tensor, optional): precomputed per-sample sequence offsets
                 for static-batching inference. Computed here when None.
         Returns:
@@ -721,6 +748,8 @@ class HybridStack(MegatronModule):
         """
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        if self._has_custom_layers and (inference_context is not None or InferenceMode.is_active()):
+            raise ValueError("Custom hybrid layers do not support inference contexts yet.")
 
         runtime_cp_group, cp_layout_manager = self._resolve_runtime_cp_layout(packed_seq_params)
 
@@ -922,6 +951,14 @@ class HybridStack(MegatronModule):
                             if is_layer_group(layer_config)
                             else get_inner_quant_context(layer_config, layer.layer_number - 1)
                         )
+                        is_custom_layer = (
+                            layer_utils.get_custom_layer_type(layer_config) is not None
+                        )
+                        layer_input_ids = input_ids
+                        if is_custom_layer and cp_layout_state is not None:
+                            layer_input_ids = cp_layout_state.get_layer_input_ids(
+                                physical_layer_idx, input_ids
+                            )
                         with inner_quant_context:
                             if isinstance(layer, HybridStack):
                                 hidden_states = layer(
@@ -936,6 +973,18 @@ class HybridStack(MegatronModule):
                                     packed_seq_params_by_layout=packed_seq_params_by_layout,
                                     cp_layout_plan=cp_layout_plan,
                                     input_ids=input_ids,
+                                )
+                            elif is_custom_layer and not isinstance(
+                                layer, HyperConnectionHybridLayer
+                            ):
+                                hidden_states = layer_utils.invoke_custom_layer(
+                                    layer,
+                                    hidden_states,
+                                    attention_mask=attention_mask,
+                                    rotary_pos_emb=rotary_pos_emb,
+                                    packed_seq_params=layer_packed_seq_params,
+                                    padding_mask=layer_padding_mask,
+                                    input_ids=layer_input_ids,
                                 )
                             elif isinstance(layer, (TransformerLayer, HyperConnectionHybridLayer)):
                                 layer_kwargs = dict(
@@ -966,8 +1015,10 @@ class HybridStack(MegatronModule):
                                     layer, HyperConnectionHybridLayer
                                 ):
                                     layer_kwargs["mhc_recompute_manager"] = mhc_manager
-                                if input_ids is not None and self._uses_hash_routing(layer):
-                                    layer_kwargs["input_ids"] = input_ids
+                                if input_ids is not None and (
+                                    is_custom_layer or self._uses_hash_routing(layer)
+                                ):
+                                    layer_kwargs["input_ids"] = layer_input_ids
                                 hidden_states, _ = layer(hidden_states, **layer_kwargs)
                             elif isinstance(layer, MambaLayer):
                                 layer_kwargs = dict(
@@ -1104,6 +1155,13 @@ class HybridStack(MegatronModule):
         layer_prefix = f'{prefix}layers.'
         if sharded_layer_prefix is None:
             sharded_layer_prefix = layer_prefix
+
+        if self._has_custom_layers:
+            metadata = dict(metadata or {})
+            if metadata.get("dp_cp_group") is None:
+                metadata["dp_cp_group"] = getattr(self.pg_collection, "dp_cp", None)
+            if metadata["dp_cp_group"] is None:
+                raise ValueError("Custom layer checkpoints require pg_collection.dp_cp.")
 
         for local_layer_idx, (layer_config, layer) in enumerate(
             zip(self._execution_layer_config_list, self.layers, strict=True)
