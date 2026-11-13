@@ -1260,6 +1260,24 @@ def test_getitem_sbhd_pads_to_seq_length_and_masks_tail():
     assert out["padding_mask"].dtype == torch.bool
 
 
+@pytest.mark.parametrize("sbhd", [False, True])
+def test_getitem_exact_max_plus_one_replaces_last_token_with_eod(sbhd):
+    """A max_len+1 sample without EOD must replace its tail, not append past the limit."""
+    tok = _FakeTokenizer(eod=0, pad=7)
+    ds = _make_varlen(["abcdefghi"], _make_config(tok, seq_length=8, sbhd=sbhd))
+
+    out = ds[0]
+
+    assert out["tokens"].numel() == 8
+    assert out["labels"].numel() == 8
+    assert out["labels"][-1].item() == tok.eod
+    if sbhd:
+        assert not out["padding_mask"].any()
+    else:
+        assert out["original_seq_len"].item() == 8
+        assert out["padded_seq_len"].item() == 8
+
+
 def test_sbhd_padding_mask_is_partitioned_with_tokens(monkeypatch):
     """CP zigzag slicing must select identical token and padding-mask positions."""
     from megatron.core.utils import get_batch_on_this_cp_rank
