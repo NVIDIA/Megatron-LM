@@ -14,7 +14,7 @@
 
 """Select MCore modules for MFSDP v2 sharding."""
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import NamedTuple
 
 from torch import nn
@@ -69,24 +69,25 @@ class FsdpUnitCollector:
             )
         self._fsdp_unit_module_types = tuple(fsdp_unit_module_types)
         self._units: list[nn.Module] = []
-        # Maps each collected unit to itself and its descendants outside nested units.
-        self._owned_modules_by_unit: dict[nn.Module, dict[nn.Module, None]] = {}
+        self._partially_recomputed_units: set[nn.Module] = set()
 
     def collect(self, module: nn.Module) -> list[nn.Module]:
         """Return selected modules children before parents, including the root last."""
         self._units = []
+        self._partially_recomputed_units = set()
+
+        # 1. Collect FSDP units.
         self._visit(module)
         if not isinstance(module, self._fsdp_unit_module_types):
             self._units.append(module)
-        self._owned_modules_by_unit = {unit: {} for unit in self._units}
-        for unit, owned in self._owned_modules_by_unit.items():
-            owned[unit] = None
-            pending = list(unit.children())
-            while pending:
-                submodule = pending.pop()
-                if submodule not in self._owned_modules_by_unit:
-                    owned[submodule] = None
-                    pending.extend(submodule.children())
+
+        # 2. Collect modules whose parameters replay uses without their unit's hooks.
+        recomputed_modules = self._collect_recomputed_modules(module)
+
+        # 3. Mark the units that own those parameters.
+        for unit in self._units:
+            if any(owned in recomputed_modules for owned in self._owned_modules(unit)):
+                self._partially_recomputed_units.add(unit)
         return self._units
 
     def is_partially_recomputed(self, unit: nn.Module) -> bool:
@@ -97,17 +98,30 @@ class FsdpUnitCollector:
         SchedulePolicy.unshard_all_planes_in_backward. Modules inside a nested unit don't
         count: their own hooks run during recomputation.
         """
-        owned = self._owned_modules_by_unit[unit]
-        for module in owned:
+        return unit in self._partially_recomputed_units
+
+    def _collect_recomputed_modules(self, root: nn.Module) -> set[nn.Module]:
+        """Collect parameter-bearing replay regions, excluding re-entered child units."""
+        recomputed = set()
+        for module in root.modules():
             for rerun in _rerun_submodules(module):
-                for submodule in rerun.modules():
-                    # Skip modules of nested units, which own their weights.
-                    if submodule not in owned:
-                        continue
-                    # Skip parameterless modules, e.g. an IdentityOp MLP.
-                    if next(submodule.parameters(recurse=False), None) is not None:
-                        return True
-        return False
+                # A checkpoint outside this unit re-enters its forward hooks. A checkpoint
+                # inside the unit (rerun is module) still needs its owned weights.
+                if rerun in self._units and rerun is not module:
+                    continue
+                recomputed.update(
+                    submodule
+                    for submodule in self._owned_modules(rerun)
+                    if next(submodule.parameters(recurse=False), None) is not None
+                )
+        return recomputed
+
+    def _owned_modules(self, module: nn.Module) -> Iterator[nn.Module]:
+        """Yield this module and its descendants outside independent child units."""
+        yield module
+        for child in module.children():
+            if child not in self._units:
+                yield from self._owned_modules(child)
 
     def _visit(self, module: nn.Module) -> None:
         if isinstance(module, HyperConnectionHybridLayer):
