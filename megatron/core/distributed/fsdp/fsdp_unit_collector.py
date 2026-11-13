@@ -24,14 +24,8 @@ from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.ssm.gated_delta_net.common import _GDNBase
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.ssm.mamba_layer import MambaLayer
-from megatron.core.transformer.experimental_attention_variant.absorbed_mla import (
-    AbsorbedMLASelfAttention,
-)
-from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
-    DSv4HybridAttention,
-)
+from megatron.core.transformer.attention import Attention
 from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.transformer.multi_latent_attention import MultiLatentAttention
 from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
@@ -113,10 +107,10 @@ class FsdpUnitCollector:
                     and next(module.shared_experts.parameters(), None) is not None
                 )
             )
-        if isinstance(
-            module, (MultiLatentAttention, AbsorbedMLASelfAttention, DSv4HybridAttention)
-        ):
-            return module.config.recompute_granularity != "full" and module.recompute_up_proj
+        if isinstance(module, Attention):
+            # MLA variants share Attention but no narrower base. They expose this checkpoint
+            # flag; other attention implementations may omit it.
+            return getattr(module, "recompute_up_proj", False)
         if isinstance(module, _GDNBase):
             return module.config.recompute_granularity != "full" and module.recompute_gdn
         if isinstance(module, GatedDeltaProductMixer):
