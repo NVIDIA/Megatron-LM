@@ -7,14 +7,20 @@ Called without metadata, ``sharded_state_dict`` filled in the global
 replicas by another grid's DP ranks, so several ranks or none wrote each shard.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch.nn.functional as F
 
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
 )
-from megatron.core.models.hybrid.hybrid_block import HybridStack
-from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
+from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
+from megatron.core.models.hybrid.hybrid_layer_allocation import (
+    Symbols,
+    clone_hybrid_layer_config_list,
+    validate_segment_layers,
+)
 from megatron.core.models.hybrid.hybrid_layer_specs import gdp_stack_spec, hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm import gated_delta_product
@@ -23,6 +29,7 @@ from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from tests.unit_tests.models.hybrid.external_layer import ExternalGainConfig, ExternalGainLayer
 from tests.unit_tests.ssm.gdp_test_utils import HAVE_GDP_DEPS, _make_config
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_sharded_state_dict_dp_cp_group import (
@@ -138,3 +145,76 @@ class TestSSMShardedStateDictDpCpGroup:
 
         assert mixer.norm.dp_cp_group is self.pg_collection.dp_cp_gtp_remat
         self._assert_own_group_without_global_read(mixer.norm)
+
+
+class TestCustomLayerStackDpCpGroup:
+    """A stack with custom layers takes the caller's group or its own, never the global one."""
+
+    @staticmethod
+    def _stack(dp_cp=None, dp_cp_gtp_remat=None):
+        config = TransformerConfig(
+            num_layers=2, hidden_size=32, num_attention_heads=4, use_cpu_initialization=True
+        )
+        layer_config = ExternalGainConfig.from_config(config)
+        # The CPU, unsharded construction path only consults the size of these groups.
+        group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)
+        return HybridStack(
+            config=config,
+            submodules=HybridStackSubmodules(),
+            layer_config_list=clone_hybrid_layer_config_list([layer_config, layer_config]),
+            pg_collection=SimpleNamespace(
+                tp=group,
+                pp=group,
+                cp=group,
+                tp_cp=group,
+                dp_cp=dp_cp,
+                dp_cp_gtp_remat=dp_cp_gtp_remat,
+            ),
+            pre_process=True,
+            post_process=False,
+            post_layer_norm=False,
+        )
+
+    @staticmethod
+    def _record_layer_groups(monkeypatch):
+        """Record the DP x CP group every custom layer is asked to shard with."""
+        seen = []
+
+        def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
+            seen.append(metadata['dp_cp_group'])
+            return {}
+
+        monkeypatch.setattr(ExternalGainLayer, 'sharded_state_dict', sharded_state_dict)
+        return seen
+
+    @pytest.mark.parametrize("metadata", [None, {}, {'dp_cp_group': None}])
+    def test_without_any_group_raises_instead_of_reading_the_global_one(self, metadata):
+        stack = self._stack()
+        with forbid_global_dp_cp_group():
+            with pytest.raises(ValueError, match="Custom layer checkpoints require"):
+                stack.sharded_state_dict(metadata=metadata)
+
+    @pytest.mark.parametrize("with_gtp_remat", [True, False])
+    def test_default_is_the_stacks_own_group(self, monkeypatch, with_gtp_remat):
+        dp_cp, dp_cp_gtp_remat = object(), object()
+        stack = self._stack(
+            dp_cp=dp_cp, dp_cp_gtp_remat=dp_cp_gtp_remat if with_gtp_remat else None
+        )
+        seen = self._record_layer_groups(monkeypatch)
+
+        with forbid_global_dp_cp_group():
+            stack.sharded_state_dict()
+
+        # The GTP-inclusive group when the collection has one, as for the built-in layers.
+        expected = dp_cp_gtp_remat if with_gtp_remat else dp_cp
+        assert seen == [expected, expected]
+
+    def test_group_in_the_metadata_wins(self, monkeypatch):
+        given = object()
+        stack = self._stack(dp_cp=object(), dp_cp_gtp_remat=object())
+        seen = self._record_layer_groups(monkeypatch)
+
+        with forbid_global_dp_cp_group():
+            stack.sharded_state_dict(metadata={'dp_cp_group': given})
+
+        assert seen == [given, given]
