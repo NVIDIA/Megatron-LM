@@ -7,9 +7,9 @@ names differ) from the entry points at that commit, before the providers started
 runtime config from ``PretrainConfigContainer.dataset``. ``test_dataset_providers.py`` compares
 what every entry point builds now against ``pretrain_gpt.py``'s, and lists where the other three
 differed from it. The dataset-class selection of the legacy providers is reproduced at the end of
-this module. One deviation from verbatim: #7047 (``main`` ``ea99fdfce``) renamed
-``hybrid_context_parallel`` to ``dynamic_context_parallel`` on ``GPTDatasetConfig`` and in these
-factories, and the copies follow that rename so the oracle compares the field ``main`` now sets.
+this module. One deviation from verbatim: the copies follow the dynamic context parallelism
+field naming introduced in #7047 (``main`` ``ea99fdfce``), so the oracle compares the field
+``main`` now sets.
 """
 
 import json
