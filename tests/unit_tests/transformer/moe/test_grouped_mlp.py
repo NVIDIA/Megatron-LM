@@ -565,6 +565,7 @@ def _make_precision_fused_forward_module(monkeypatch, *, fc2_bias=False):
     module.config = SimpleNamespace(
         fp8="e4m3",
         fp4=False,
+        deterministic_mode=False,
         moe_router_padding_for_quantization=True,
         moe_use_grouped_tensor=True,
         moe_paged_stash=False,
@@ -701,7 +702,8 @@ def _fused_forward_shell(config, fused_ops, use_bias):
     module.config = config
     module._use_grouped_tensor = True
     module._fused_ops = (fused_ops,)
-    module.linear_fc2 = SimpleNamespace(use_bias=use_bias)
+    module.linear_fc1 = SimpleNamespace(te_quant_params=None, training=True)
+    module.linear_fc2 = SimpleNamespace(use_bias=use_bias, te_quant_params=None, training=True)
     return module
 
 
