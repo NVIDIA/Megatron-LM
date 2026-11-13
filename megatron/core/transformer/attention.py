@@ -2353,7 +2353,8 @@ class CrossAttention(Attention):
             skip_bias_add=False,
             is_expert=False,
             tp_group=self.pg_collection.tp,
-            pg_collection=self.pg_collection,
+            # None for the fallback built before initialize_model_parallel(), as for linear_proj.
+            pg_collection=self.pg_collection if self.tp_group is not None else None,
             name=(name + ".linear_q") if name is not None else None,
         )
 
@@ -2367,7 +2368,8 @@ class CrossAttention(Attention):
             skip_bias_add=False,
             is_expert=False,
             tp_group=self.pg_collection.tp,
-            pg_collection=self.pg_collection,
+            # None for the fallback built before initialize_model_parallel(), as for linear_proj.
+            pg_collection=self.pg_collection if self.tp_group is not None else None,
             name=(name + ".linear_kv") if name is not None else None,
         )
 
