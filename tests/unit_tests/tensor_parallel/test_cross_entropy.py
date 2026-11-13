@@ -135,6 +135,27 @@ def test_language_module_loss_on_gathered_logits_uses_full_vocab_cross_entropy()
     assert logits.grad is not None and torch.isfinite(logits.grad).all()
 
 
+def test_language_module_loss_on_gathered_logits_upcasts_low_precision_logits():
+    """bf16/fp16 gathered logits must be upcast, as the vocab-parallel path does.
+
+    That kernel starts with ``vocab_parallel_logits.float()``; computing (and
+    returning) the loss at the input dtype instead would change the loss of every
+    bf16/fp16 run whose output layer gathers the vocabulary."""
+    module = SimpleNamespace(tp_group=_FakeTPGroup(), vocab_parallel_cross_entropy=None)
+    labels = torch.tensor([[0, 1, 2], [2, 1, 0]])
+    logits = (torch.randn(3, 2, 5) * 8).to(torch.bfloat16)
+
+    loss = language_module_module.LanguageModule.compute_language_model_loss(
+        module, labels=labels, logits=logits, logits_are_gathered=True
+    )
+
+    expected_loss = torch.nn.functional.cross_entropy(
+        logits.float().reshape(-1, 5), labels.transpose(0, 1).reshape(-1), reduction="none"
+    ).view(3, 2)
+    assert loss.dtype == torch.float32
+    torch.testing.assert_close(loss, expected_loss.transpose(0, 1).contiguous())
+
+
 def test_language_module_loss_on_gathered_logits_returns_full_vocab_argmax():
     """With return_argmax on gathered logits, the argmax covers the full vocabulary."""
     tp_group = _FakeTPGroup()

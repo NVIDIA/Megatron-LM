@@ -142,13 +142,15 @@ class LanguageModule(MegatronModule):
         if logits_are_gathered:
             # The vocab-parallel kernel reads the last dimension as one vocabulary
             # shard: with the full vocabulary replicated on every TP rank it counts
-            # the softmax denominator TP times, so the loss is off by log(TP) (more
-            # when the target is not the max logit) and the gradients are wrong.
-            # Plain CE over each rank's own full copy is exact, and the backward of
-            # the output gather splits the gradient, so each vocab shard still
-            # receives softmax - one_hot on its own slice.
+            # the softmax denominator TP times, so the loss is off by exactly
+            # log(TP) and the gradients are wrong. Plain CE over each rank's own
+            # full copy is exact, and the backward of the output gather splits the
+            # gradient, so each vocab shard still receives softmax - one_hot on its
+            # own slice. Upcast like the vocab-parallel path does (it starts with
+            # `vocab_parallel_logits.float()`): with bf16/fp16 logits the loss would
+            # otherwise be computed, and returned, at the low-precision dtype.
             loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)), labels.reshape(-1), reduction="none"
+                logits.float().reshape(-1, logits.size(-1)), labels.reshape(-1), reduction="none"
             ).view_as(labels)
             if return_argmax:
                 argmax = logits.argmax(dim=-1)
