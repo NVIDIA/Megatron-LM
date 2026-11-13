@@ -1940,7 +1940,9 @@ class TransformerConfig(ModelParallelConfig):
             if self.enable_mhc_connections:
                 raise ValueError("wide_residual and enable_mhc_connections are mutually exclusive.")
             if (
-                self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph
+                self.cuda_graph_impl not in ("none", "full_iteration")
+                or self.enable_cuda_graph
+                or self.external_cuda_graph
             ) and not (
                 self.cuda_graph_impl == "local"
                 and not self.enable_cuda_graph
@@ -1951,8 +1953,9 @@ class TransformerConfig(ModelParallelConfig):
                 == InferenceCudaGraphScope.block
             ):
                 raise NotImplementedError(
-                    "wide_residual supports CUDA graphs only with cuda_graph_impl='local' "
-                    "and inference_cuda_graph_scope='block'."
+                    "wide_residual supports CUDA graphs only with "
+                    "cuda_graph_impl='full_iteration', or cuda_graph_impl='local' with "
+                    "inference_cuda_graph_scope='block'."
                 )
             if self.pipeline_model_parallel_size > 1:
                 raise NotImplementedError(
