@@ -1908,8 +1908,7 @@ class TestMoEModules:
                 },
                 id="flex-hybridep-custom-allgather-ep2",
                 marks=pytest.mark.skipif(
-                    not HAVE_HYBRIDEP_CUSTOM_AG,
-                    reason="HybridEP custom allgather not available",
+                    not HAVE_HYBRIDEP_CUSTOM_AG, reason="HybridEP custom allgather not available"
                 ),
             ),
         ],

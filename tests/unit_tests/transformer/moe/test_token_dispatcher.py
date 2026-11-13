@@ -1279,15 +1279,15 @@ def test_hybridep_dispatch_passes_dense_routing_metadata(monkeypatch):
     assert "dense_routing" not in fake_buffer.kwargs
 
 
-class _FakeFixedHybridEPBuffer:
-    """DeepEP with #682: the custom allgather traps on timeout and defaults to off."""
+class _FakeDefaultOffHybridEPBuffer:
+    """DeepEP with #682: the custom allgather defaults to off."""
 
     def __init__(self, enable_custom_allgather: bool = False, **kwargs):
         self.kwargs = dict(kwargs, enable_custom_allgather=enable_custom_allgather)
 
 
-class _FakeUnfixedHybridEPBuffer:
-    """DeepEP before #682: the custom allgather reuses stale routing on timeout and defaults on."""
+class _FakeDefaultOnHybridEPBuffer:
+    """DeepEP before #682: the custom allgather defaults to on."""
 
     def __init__(self, enable_custom_allgather: bool = True, **kwargs):
         self.kwargs = dict(kwargs, enable_custom_allgather=enable_custom_allgather)
@@ -1303,10 +1303,10 @@ class _FakeNoCustomAllgatherHybridEPBuffer:
 @pytest.mark.parametrize(
     "buffer_cls,requested,expected,warns",
     [
-        (_FakeFixedHybridEPBuffer, True, True, False),
-        (_FakeFixedHybridEPBuffer, False, False, False),
-        (_FakeUnfixedHybridEPBuffer, True, False, True),
-        (_FakeUnfixedHybridEPBuffer, False, False, False),
+        (_FakeDefaultOffHybridEPBuffer, True, True, False),
+        (_FakeDefaultOffHybridEPBuffer, False, False, False),
+        (_FakeDefaultOnHybridEPBuffer, True, True, False),
+        (_FakeDefaultOnHybridEPBuffer, False, False, False),
         (_FakeNoCustomAllgatherHybridEPBuffer, True, None, True),
         (_FakeNoCustomAllgatherHybridEPBuffer, False, None, False),
     ],
@@ -1314,7 +1314,7 @@ class _FakeNoCustomAllgatherHybridEPBuffer:
 def test_init_hybrid_ep_buffer_custom_allgather(
     monkeypatch, buffer_cls, requested, expected, warns
 ):
-    """The custom allgather is opt-in and only enabled on DeepEP builds that trap on timeout."""
+    """The custom allgather is opt-in: the option is always passed, overriding DeepEP's default."""
     monkeypatch.setattr(fused_a2a, "HybridEPBuffer", buffer_cls, raising=False)
     monkeypatch.setattr(fused_a2a, "_hybrid_ep_buffer", None)
 
@@ -1328,7 +1328,7 @@ def test_init_hybrid_ep_buffer_custom_allgather(
         )
 
     if warns:
-        with pytest.warns(UserWarning, match="Falling back to the NCCL allgather"):
+        with pytest.warns(UserWarning, match="Using the NCCL allgather"):
             init()
     else:
         with warnings.catch_warnings():
@@ -1466,8 +1466,8 @@ class TestFlexDispatcher:
         """The custom NVLink allgather runs its own kernel and dispatches exactly like NCCL."""
         if not is_hybrid_ep_available():
             pytest.skip("Hybrid EP is not available")
-        if not fused_a2a._hybridep_custom_allgather_traps_on_timeout():
-            pytest.skip("Installed DeepEP's custom allgather does not trap on timeout")
+        if not fused_a2a._hybridep_supports_custom_allgather():
+            pytest.skip("Installed DeepEP has no custom allgather")
 
         buffer_kwargs = []
         base_cls = fused_a2a.HybridEPBuffer

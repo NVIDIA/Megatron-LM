@@ -530,11 +530,9 @@ _hybrid_ep_buffer = None
 HYBRIDEP_TOKEN_ALIGNMENT = 64
 
 
-def _hybridep_custom_allgather_traps_on_timeout() -> bool:
-    """Whether the installed DeepEP's custom allgather aborts on timeout instead of continuing."""
-    # DeepEP #682 made the timeout trap and flipped this default to False in the same change.
-    param = inspect.signature(HybridEPBuffer.__init__).parameters.get('enable_custom_allgather')
-    return param is not None and param.default is False
+def _hybridep_supports_custom_allgather() -> bool:
+    """Whether the installed DeepEP's HybridEPBuffer has the custom allgather option."""
+    return 'enable_custom_allgather' in inspect.signature(HybridEPBuffer.__init__).parameters
 
 
 def init_hybrid_ep_buffer(
@@ -580,8 +578,8 @@ def init_hybrid_ep_buffer(
         num_sms_preprocessing_api (Optional[int]):
             Number of SMs used by the preprocessing (metadata scan) kernel.
         enable_custom_allgather (bool):
-            Gather routing maps with HybridEP's NVLink kernel instead of NCCL. Falls back to
-            NCCL if the installed DeepEP does not abort on an allgather timeout.
+            Gather routing maps with HybridEP's NVLink kernel instead of NCCL. Requires DeepEP
+            hybrid-ep at or after 94a9f8f (#682); older builds reuse stale routing on a timeout.
     '''
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
@@ -596,20 +594,19 @@ def init_hybrid_ep_buffer(
         kwargs['num_blocks_unpermute'] = num_blocks_unpermute
     if num_sms_preprocessing_api is not None:
         kwargs['num_sms_preprocessing_api'] = num_sms_preprocessing_api
-    # Before DeepEP #682 the custom allgather gave up after ~20 s if a rank was late and reused
-    # that rank's stale routing rows, silently corrupting dispatch. Only enable it once fixed.
-    if enable_custom_allgather and not _hybridep_custom_allgather_traps_on_timeout():
+    # Before DeepEP #682 the custom allgather defaulted on and reused a late rank's stale routing
+    # rows after a timeout, so always pass the option explicitly.
+    if _hybridep_supports_custom_allgather():
+        kwargs['enable_custom_allgather'] = enable_custom_allgather
+    elif enable_custom_allgather:
         import warnings
 
         warnings.warn(
-            "moe_hybridep_enable_custom_allgather requires a DeepEP build whose custom allgather "
-            "aborts on timeout (DeepEP #682). Falling back to the NCCL allgather.",
+            "moe_hybridep_enable_custom_allgather is set but the installed DeepEP has no custom "
+            "allgather. Using the NCCL allgather.",
             UserWarning,
             stacklevel=2,
         )
-        enable_custom_allgather = False
-    if 'enable_custom_allgather' in inspect.signature(HybridEPBuffer.__init__).parameters:
-        kwargs['enable_custom_allgather'] = enable_custom_allgather
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
