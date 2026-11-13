@@ -508,6 +508,12 @@ class TransformerConfig(ModelParallelConfig):
     there is no automatic fallback. ``torch`` selects the PyTorch-native reference
     implementation and is required when deterministic mode is enabled."""
 
+    gdn_cp_mode: Literal["headwise", "chunkwise"] = "headwise"
+    """GDN context-parallel algorithm. Chunkwise is opt-in and currently supports
+    TE/cuDNN, TP1, no sequence parallelism, batch-one THD or dense training, and
+    fused pre-GDN preparation. It converts zigzag ownership internally and restores
+    it before the output projection; other attention layers retain their layout."""
+
     linear_conv_kernel_dim: Optional[int] = 4
     """Conv kernel dimension for the gated delta net."""
 
@@ -1859,6 +1865,20 @@ class TransformerConfig(ModelParallelConfig):
 
     def _validate_cp_layouts(self) -> None:
         """Validate context-parallel layout settings."""
+        if self.gdn_cp_mode not in {"headwise", "chunkwise"}:
+            raise ValueError("gdn_cp_mode must be 'headwise' or 'chunkwise'.")
+        if self.gdn_cp_mode == "chunkwise" and self.context_parallel_size > 1:
+            if (
+                self.gdn_kernel_backend != "transformer_engine"
+                or not self.gdn_pre_gated_delta_rule_fusion
+                or self.tensor_model_parallel_size != 1
+                or self.sequence_parallel
+                or self.deterministic_mode
+            ):
+                raise ValueError(
+                    "GDN chunkwise CP requires TE/cuDNN, fused pre-GDN preparation, "
+                    "TP1, no sequence parallelism and deterministic_mode=False."
+                )
         if self.linear_cp_mode == "chunkwise" and self.linear_cp_layout != "contiguous":
             raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
         if (

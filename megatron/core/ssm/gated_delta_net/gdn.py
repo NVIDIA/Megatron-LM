@@ -232,6 +232,11 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
         cp_size = get_pg_size(cp_group)
 
+        if self.config.gdn_cp_mode == "chunkwise" and cp_size > 1:
+            from megatron.core.ssm.gated_delta_net.chunkwise import forward_chunkwise
+
+            return forward_chunkwise(self, hidden_states, packed_seq_params, cp_group)
+
         seq_len, batch, _ = hidden_states.shape
         seq_len = seq_len * self.sp_size * cp_size
 
