@@ -429,21 +429,9 @@ class FsdpModule:
         context = self.context
         if context.is_recording_execution_order:
             context.execution_order.append(ExecutionEvent(cast(nn.Module, self), Phase.BACKWARD))
-        current_stream = context.current_stream()
         if self.is_root():
             context.register_post_backward_hook()
-            # Fork the reduce-scatter stream from the current stream once, at the
-            # start of backward, so every module's post-backward reduce-scatter is
-            # part of any active CUDA-graph capture. A stream only joins the
-            # capture via this wait_stream edge; without it the first allocation on
-            # the reduce-scatter stream falls back to a raw cudaMalloc, which is
-            # illegal during capture. Later modules are covered by the post-copy
-            # fork each preceding module issues before its collective.
-            context.inner_reduction_stream.wait_stream(current_stream)
-            # The DP-outer reduction stream needs no fork here: it never allocates (the
-            # finalize reuses the persistent main_grad and its view), and it joins any
-            # capture via its wait on the reduce-scatter stream before each finalize in
-            # _reduce_gradient_groups.
+            context.pre_backward()
 
         self.unshard(Phase.BACKWARD, prefetch=not context.is_recording_execution_order)
 

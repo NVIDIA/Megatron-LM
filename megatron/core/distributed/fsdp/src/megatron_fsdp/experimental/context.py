@@ -278,6 +278,15 @@ class FsdpContext:
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
 
+    def pre_backward(self) -> None:
+        """Fork the reduce-scatter stream into any active CUDA-graph capture.
+
+        A stream joins a capture only via a wait_stream edge; without it, the first
+        allocation on the reduce-scatter stream is illegal during capture. The DP-outer
+        reduction stream needs no fork: it joins via its wait on the reduce-scatter stream.
+        """
+        self.inner_reduction_stream.wait_stream(self.current_stream())
+
     def post_backward(self) -> None:
         """Finish backward cleanup and synchronize gradients when finalization is enabled."""
         self._run_delayed_post_backward_callbacks()

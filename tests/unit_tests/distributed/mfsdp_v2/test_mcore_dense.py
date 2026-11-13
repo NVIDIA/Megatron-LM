@@ -6,6 +6,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+import torch.distributed as dist
 import transformer_engine.pytorch as te
 from torch.distributed.tensor import DTensor
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
@@ -481,8 +482,9 @@ def test_delayed_wgrad_matches_immediate(
     torch.testing.assert_close(delayed_losses, immediate_losses, rtol=0, atol=0)
 
 
-def test_build_train_and_step(process_group_collection):
-    """Match eager training against an MFSDP v2 train-and-step sequence."""
+@pytest.mark.parametrize("nccl_ub", [False, True], ids=["ordinary", "symmetric"])
+def test_build_train_and_step(process_group_collection, nccl_ub):
+    """Match eager training with MFSDP v2, including a cold symmetric-memory communicator."""
     config = TransformerConfig(
         num_layers=2,
         hidden_size=16,
@@ -504,6 +506,9 @@ def test_build_train_and_step(process_group_collection):
     # requires DDP/FSDP buffer metadata, but the optimizer factory still expects
     # every model chunk to expose ddp_config.
     reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+    if nccl_ub:
+        # Leave the fresh DP communicator's initialization to the adapter.
+        process_group_collection.dp_cp = dist.new_group(backend="nccl")
     model = FullyShardedDataParallel(
         config=config,
         ddp_config=DistributedDataParallelConfig(
@@ -511,6 +516,7 @@ def test_build_train_and_step(process_group_collection):
             megatron_fsdp_version=2,
             use_distributed_optimizer=False,
             data_parallel_sharding_strategy="optim_grads_params",
+            nccl_ub=nccl_ub,
         ),
         module=model,
         pg_collection=process_group_collection,

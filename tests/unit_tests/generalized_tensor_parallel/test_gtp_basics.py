@@ -117,6 +117,23 @@ class TestGTPWeightCacheSchedulingDomain:
         other_ticket = cache.reserve(other, torch.bfloat16, fwd=True)
         assert cache.get(other_ticket) is not first_buffer
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA event test")
+    def test_released_rs_output_is_not_reused_by_its_previous_owner(self):
+        """Releasing an eager RS output gives up the ticket's ownership: once another ticket
+        has acquired the buffer, the first ticket's next get() returns a different buffer.
+        """
+        cache = GTPWeightCache()
+        group = _FakeGroup(size=2)
+        a = self._make_param(group, GTPChain.UNGRAPHED.value)
+        b = self._make_param(group, GTPChain.UNGRAPHED.value)
+        a_ticket = cache.reserve(a, torch.float32, fwd=False, reduce_scatter=True)
+        b_ticket = cache.reserve(b, torch.float32, fwd=False, reduce_scatter=True)
+        a_buffer = cache.get(a_ticket)
+        cache.release(a_ticket)
+        assert cache.get(b_ticket) is a_buffer, "B should acquire the buffer A released"
+        assert cache.get(a_ticket) is not a_buffer, "A reused the buffer B now owns"
+        assert cache.get(b_ticket) is a_buffer, "B lost the buffer it owns"
+
 
 def _worker_sharding_aligned(rank, world_size, port):
     K, M = world_size * 32, 16  # K divisible by 16*world_size → no padding
