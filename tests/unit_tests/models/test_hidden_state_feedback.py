@@ -61,6 +61,29 @@ def _with_params(spec, **params):
     return replace(spec, params={**spec.params, **params})
 
 
+def _assert_matches_reference(actual, expected, name):
+    """Compare a TE result with the FP32 reference at the reference tensor's scale.
+
+    TE requests TF32 for FP32 GEMMs regardless of PyTorch's TF32 flags. That rounding
+    error scales with the GEMM operands, not with each result element, so near-zero
+    elements of a cancelling sum, such as a weight gradient over a few tokens, need an
+    absolute tolerance tied to the tensor's magnitude. The relative L2 bound also
+    limits aggregate error, which a large reference element could otherwise hide.
+    """
+    torch.testing.assert_close(
+        actual,
+        expected,
+        rtol=3e-3,
+        atol=3e-3 * expected.abs().max().item(),
+        msg=lambda message: f"{name}: {message}",
+    )
+    error_norm = (actual.detach() - expected.detach()).norm().item()
+    allowed_norm = 3e-3 * expected.detach().norm().item()
+    assert (
+        error_norm <= allowed_norm
+    ), f"{name}: L2 error {error_norm:.6g} exceeds allowed {allowed_norm:.6g}"
+
+
 @pytest.mark.parametrize(
     "spec",
     [additive_hidden_state_fusion_spec, gated_hidden_state_fusion_spec],
@@ -111,6 +134,24 @@ def test_additive_zero_init_learns_feedback_after_optimizer_step(bias, fusion_pg
     for gradient in (hidden.grad, fusion.hidden_state_norm.weight.grad):
         assert gradient is not None and torch.isfinite(gradient).all()
         assert gradient.abs().sum() > 0
+
+
+def test_additive_uses_configured_rmsnorm_epsilon(fusion_pg):
+    fusion = _fusion(
+        additive_hidden_state_fusion_spec,
+        fusion_pg,
+        layernorm_epsilon=1 / 64,
+        layernorm_zero_centered_gamma=False,
+    ).cuda()
+    with torch.no_grad():
+        fusion.hidden_state_norm.weight.fill_(1.0)
+        fusion.hidden_state_projection.weight.copy_(torch.eye(64, device="cuda"))
+    embedding = torch.zeros(3, 2, 64, device="cuda")
+    hidden = torch.full_like(embedding, 1 / 8)
+    # mean(hidden**2) and epsilon are both 1/64, so the normalized value is 1/sqrt(2).
+    # Ignoring the configured epsilon instead gives approximately 1.
+    expected = torch.full_like(hidden, 2**-0.5)
+    _assert_matches_reference(fusion(embedding, hidden), expected, "epsilon-sensitive output")
 
 
 @pytest.mark.parametrize(
@@ -191,17 +232,13 @@ def test_fusion_matches_functional_reference(
     actual_gradients = torch.autograd.grad(
         (actual * probe).sum(), (embedding, hidden, *parameters.values())
     )
-    # TE FP32 GEMMs may use TF32 independently of the PyTorch reference flags.
-    # Allow that rounding difference; these tolerances still need GPU qualification.
-    torch.testing.assert_close(actual, expected, rtol=3e-3, atol=3e-3)
+    _assert_matches_reference(actual, expected, "output")
     for name, actual_gradient, expected_gradient in zip(
         ("embedding", "hidden", *parameters), actual_gradients, expected_gradients
     ):
         assert torch.isfinite(actual_gradient).all(), name
         assert actual_gradient.abs().sum() > 0, name
-        torch.testing.assert_close(
-            actual_gradient, expected_gradient, rtol=3e-3, atol=3e-3, msg=name
-        )
+        _assert_matches_reference(actual_gradient, expected_gradient, name)
 
 
 @pytest.mark.parametrize(
