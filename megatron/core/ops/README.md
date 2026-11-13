@@ -242,6 +242,11 @@ Say DSA gains a third fused backend, `flashinfer`, next to `tilelang` and `cudnn
    `reference.py` for the new hooks, and run the existing DSA suites with the new
    backend name.
 
+## Liger vocab-parallel cross entropy
+
+Install `pip install liger-kernel==0.8.5` (or a newer compatible release) and select
+`--cross-entropy-loss-fusion --cross-entropy-fusion-impl liger`.
+
 ## Adding a cross-entropy or normalization backend
 
 These two families are chosen through `BackendSpecProvider` (see Selection

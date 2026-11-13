@@ -403,9 +403,13 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
-    cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
-    """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
-       from Transformer Engine library is used. Defaults to 'native'.
+    cross_entropy_fusion_impl: Literal['native', 'te', 'liger'] = 'native'
+    """If 'native', MCore based CE loss fusion is used; if 'te', parallel CE from
+       Transformer Engine is used; if 'liger', Liger's vocab-parallel CE is used.
+       Liger requires the optional ``liger_kernel.megatron.LigerMegatronCrossEntropy``
+       export and always allocates an FP32 logits-sized buffer, so with FP32 logits it
+       needs one more such buffer than 'native'. Ignored when cross entropy loss fusion
+       is disabled. Defaults to 'native'.
     """
 
     tp_comm_overlap_disable_qkv: bool = False
