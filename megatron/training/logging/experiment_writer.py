@@ -17,7 +17,7 @@ import time
 from threading import Lock
 from typing import Any
 
-from megatron.training.logging.config import serialize_config_for_logging
+from megatron.training.config.container import serialize_config_for_logging
 
 logger = logging.getLogger(__name__)
 

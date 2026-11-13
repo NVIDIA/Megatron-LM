@@ -50,12 +50,12 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.config import PretrainConfigContainer
+from megatron.training.config.container import serialize_config_for_logging
 from megatron.training.global_vars import (
     get_run_config,
     get_train_state,
     initialize_runtime_services,
 )
-from megatron.training.logging.config import serialize_config_for_logging
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
