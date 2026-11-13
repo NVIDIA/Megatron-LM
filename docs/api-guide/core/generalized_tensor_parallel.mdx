@@ -13,7 +13,7 @@ GTP splits the weight-parallel domain into two orthogonal sub-axes — **`GTP = 
 - **It shards along a model-parallel axis, not the data-parallel one.** `GTP_remat` is a sub-axis of the weight-parallel grid that sits *on top of* TP — the `TP` slice stays sharded through the GEMM, and only the `GTP_remat` slice is rebuilt. It therefore composes with TP instead of competing with it for the same weight dimension.
 - **It materializes one weight at a time, not a bucket.** Each `GTPShardedParam` gathers, computes and frees on its own schedule, which is what makes the per-weight prefetch chain (§3.4) and the low-precision gather (§1.3) possible — see the FSDP contrast in §1.1.
 
-| slice | stored | at GEMM time |
+| Slice | Stored | At GEMM Time |
 |---|---|---|
 | **`TP`** | `1/TP` of the weight, permanently | **stays sharded** — ordinary tensor parallelism; the output is TP-sharded |
 | **`GTP_remat`** | `1/GTP_remat` of the TP slice, permanently | **rematerialized**: all-gathered across the `GTP_remat` group just before the GEMM, so the GEMM sees the full TP slice; freed afterwards, and the wgrad is reduce-scattered back on the way out |
