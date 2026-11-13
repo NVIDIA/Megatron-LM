@@ -1638,13 +1638,18 @@ class _CudaGraphRunner(torch.nn.Module):
             gc.freeze()
 
         capture_comm_context = track_gtp_capture_comms() if self.gtp_remat else nullcontext(None)
+        # Eager warmup ran on this stream, and the autograd nodes it keeps alive (e.g. parameter
+        # AccumulateGrad) carry it. autograd.grad ends by making the capturing stream wait on the
+        # streams of its captured inputs, so fork this stream into the capture and join it back.
+        outer_stream = torch.cuda.current_stream()
         with (
             capture_comm_context as capture_comms,
             _preserve_parameter_grads_during_backward_capture(self),
             capture_constants(self.bwd_graph),
             torch.cuda.graph(self.bwd_graph, pool=self.mempool),
         ):
-
+            capture_stream = torch.cuda.current_stream()
+            outer_stream.wait_stream(capture_stream)
             grad_inputs = torch.autograd.grad(
                 outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
                 inputs=tuple(i for i in self.fwd_graph_input_surface if i.requires_grad),
@@ -1653,6 +1658,7 @@ class _CudaGraphRunner(torch.nn.Module):
                 only_inputs=True,
                 allow_unused=True,
             )
+            capture_stream.wait_stream(outer_stream)
             # Accumulate wgrads directly into main_grad inside the graph
             n_act_grads = sum(
                 1 for i in self.fwd_graph_input_surface[: self.num_dgrads] if i.requires_grad
