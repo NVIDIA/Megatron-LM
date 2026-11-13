@@ -1270,7 +1270,8 @@ class TestMultiTokenPredictionLayer:
         assert torch.count_nonzero(embedding.weight.grad[6]) > 0
 
     @pytest.mark.parametrize("detach_heads", [False, True])
-    def test_process_mtp_loss_detaches_output_weight(self, detach_heads):
+    @pytest.mark.parametrize("supply_weight", [False, True])
+    def test_process_mtp_loss_detaches_output_weight(self, detach_heads, supply_weight):
         """process_mtp_loss must detach the output-head weight when mtp_detach_heads=True
         so the MTP loss does not update the (shared) output projection weight."""
         torch.manual_seed(_SEED)
@@ -1299,9 +1300,16 @@ class TestMultiTokenPredictionLayer:
         loss_mask = torch.ones(batch_size, seq_len)
         output_weight = torch.nn.Parameter(torch.randn(vocab_size, config.hidden_size))
 
-        def output_layer(hidden, weight=None, runtime_gather_output=None):
-            # hidden: [s, b, h] -> logits: [s, b, vocab]
-            return torch.matmul(hidden, weight.t()), None
+        class OutputHead(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = output_weight
+
+            def forward(self, hidden, weight=None, runtime_gather_output=None, detach_weight=False):
+                weight = self.weight if weight is None else weight
+                if detach_weight:
+                    weight = weight.detach()
+                return torch.matmul(hidden, weight.t()), None
 
         def compute_language_model_loss(labels, logits):
             # per-token loss of shape [b, s] that depends on logits (hence output_weight).
@@ -1311,8 +1319,8 @@ class TestMultiTokenPredictionLayer:
             hidden_states=hidden_states,
             labels=labels,
             loss_mask=loss_mask,
-            output_layer=output_layer,
-            output_weight=output_weight,
+            output_layer=OutputHead(),
+            output_weight=output_weight if supply_weight else None,
             is_training=False,
             compute_language_model_loss=compute_language_model_loss,
             config=config,

@@ -333,6 +333,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
 
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
+            self._tie_local_output_weight()
 
         if has_config_logger_enabled(self.config):
             log_config_to_disk(
@@ -765,9 +766,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         )
 
         # logits and loss
+        # The output head resolves its registered weight after its forward pre-hooks.
         output_weight = None
-        if self.share_embeddings_and_output_weights:
-            output_weight = self.shared_embedding_or_output_weight()
         if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
             hidden_states = self.mtp(
                 input_ids=input_ids,

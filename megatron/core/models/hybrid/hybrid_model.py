@@ -603,6 +603,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         if self.pre_process or self.post_process or self.mtp_process:
             self.setup_embeddings_and_output_layer()
+            self._tie_local_output_weight()
 
         for name, module in self.named_modules():
             if hasattr(module, 'finish_init'):
@@ -912,8 +913,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             mhc_multistream = None
 
         output_weight = None
-        if self.share_embeddings_and_output_weights:
-            output_weight = self.shared_embedding_or_output_weight()
 
         # Check if speculative decoding is active. When it is, MTP must be
         # computed *after* verification so that it is conditioned on verified
