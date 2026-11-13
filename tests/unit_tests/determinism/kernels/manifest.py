@@ -68,6 +68,8 @@ KERNEL_CONTENT_PATTERNS: Tuple[str, ...] = (
     r"\bcausal_conv1d_(fn|update|update_cuda|varlen_fn|varlen_states|varlen_carry_states|cp)\s*\(",
     r"\b(mamba_chunk_scan_combined\w*|mamba_split_conv1d_scan_combined\w*|selective_state_update|selective_scan_fn)\s*\(",
     r"\b((chunk|fused_recurrent)_gated_delta_(rule|product)\w*|chunk_gdn2|l2_norm|l2norm_(fwd|bwd))\s*\(",
+    # cuDNN KDA recurrence, boundary summaries and FROST state-chain dispatch.
+    r"\b(_KDA_(FWD|BWD)|kimi_delta_attention_summary(_bwd)?|build_state_chain|run_state_chain)\s*\(",
     # DeepEP buffers and cuTile kernels.
     r"\bfused_(dispatch|combine)\s*\(|\b\w*buffer\.(low_latency_)?(dispatch|combine)\s*\(",
     r"@ct\.kernel\b|\bct\.launch\s*\(",
@@ -712,6 +714,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             K + "test_ssm_kernels.py",
+            K + "test_dev_sync_kernels.py",
             K + "test_gated_norm.py",
             C + "test_hybrid_model.py",
             R + 'test_ssm_replay.py',
@@ -726,7 +729,17 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "activation; test_ssm_kernels.py replays a whole GatedDeltaNet built with a GELU "
         "activation_func under deterministic_mode (torch conv1d / L2 norm / chunk rule). The "
         "opt-in fused output norm (gdn_gated_output_norm_fusion; SiLU for GDN, sigmoid for KDA) "
-        "is replayed through both _apply_gated_norm dispatchers in test_gated_norm.py.",
+        "is replayed through both _apply_gated_norm dispatchers in test_gated_norm.py. "
+        "KDA backend selection is replayed by test_dev_sync_kernels.py.",
+    ),
+    KernelEntry(
+        name="cudnn_kda_backend",
+        sources=("megatron/core/ops/ssm/kda/cudnn_backend.py",),
+        tests=(K + "test_kda_cudnn.py",),
+        kind="external-lib",
+        notes="Replays cuDNN KDA forward/backward and gate-parameter gradients at CP1. CP4 "
+        "also replays boundary summaries, the packed all-gather and forward/reverse FROST "
+        "state-chain composition. Requires nvidia-cudnn-frontend >= 1.32.0 and SM100+.",
     ),
     KernelEntry(
         name="gdn_pre_gated_delta_rule_fusion",
