@@ -749,6 +749,10 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     if cu_seqlens is None or cu_seqlens.numel() < 2:
         return
+    if _seqlen_stats_are_global:
+        # The packing scheduler already seeded this iteration's global totals
+        # (set_seqlen_stats_in_iteration); adding the micro-batch again would count it twice.
+        return
     # Pin the accumulator to the current CUDA device when available so the
     # eventual all-reduce can use NCCL even if a caller passed a CPU tensor
     # (e.g. unit tests). Production always supplies a CUDA tensor.
