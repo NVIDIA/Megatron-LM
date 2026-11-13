@@ -150,6 +150,11 @@ from megatron.training.callbacks import (
     CallbackManager,
     normalize_callbacks,
 )
+from megatron.training.checkpoint_manager import (
+    CheckpointLoadContext,
+    CheckpointSaveContext,
+    get_checkpoint_manager,
+)
 from megatron.training.checkpointing import (
     checkpoint_exists,
     get_loaded_iteration,
@@ -186,7 +191,6 @@ from .activation_logging import (
     save_activations,
     save_tokens_per_expert,
 )
-from .async_utils import maybe_finalize_async_save
 from .dgrad_logging import disable_dgrad_logging, enable_dgrad_logging, save_dgrads
 from .global_vars import (
     destroy_global_vars,
@@ -2390,7 +2394,7 @@ def pretrain(
         wandb_writer.finish()
 
     ft_integration.on_checkpointing_start()
-    maybe_finalize_async_save(blocking=True, terminate=True)
+    get_checkpoint_manager().finalize_async_saves(blocking=True, terminate=True)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
 
     one_logger and one_logger.log_metrics(
@@ -3144,24 +3148,29 @@ def setup_model_and_optimizer(
         with _otel_managed_span('load_checkpoint', 'megatron.checkpoint.load', is_goodput_span=True):
 
             ckpt_pgc = getattr(unwrapped_model[0], "pg_collection", None)
-            train_state.iteration, train_state.num_floating_point_operations_so_far = load_checkpoint(
-                model,
-                optimizer,
-                opt_param_scheduler,
-                checkpointing_context=checkpointing_context,
-                restore_training_state=True,
-                record_finetune=True,
-                skip_load_to_model_and_opt=HAVE_FSDP2
-                and isinstance(cfg.ddp, TorchFullyShardedDataParallelConfig)
-                and cfg.checkpoint.ckpt_format == "torch_dist",
-                tp_group=ckpt_pgc.tp if ckpt_pgc is not None else None,
-                pp_group=ckpt_pgc.pp if ckpt_pgc is not None else None,
-                # Replica_id must match the save path (see save_checkpoint_and_time): use the
-                # gtp_remat-inclusive group, not replicate dp_cp, or gtp_remat peers collide.
-                dp_cp_group=getattr(ckpt_pgc, "dp_cp_gtp_remat", None),
-                dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
-                expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
-                rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
+            train_state.iteration, train_state.num_floating_point_operations_so_far = (
+                get_checkpoint_manager().load(
+                    CheckpointLoadContext(
+                        model=model,
+                        optimizer=optimizer,
+                        opt_param_scheduler=opt_param_scheduler,
+                        checkpointing_context=checkpointing_context,
+                        restore_training_state=True,
+                        record_finetune=True,
+                        skip_load_to_model_and_opt=HAVE_FSDP2
+                        and isinstance(cfg.ddp, TorchFullyShardedDataParallelConfig)
+                        and cfg.checkpoint.ckpt_format == "torch_dist",
+                        tp_group=ckpt_pgc.tp if ckpt_pgc is not None else None,
+                        pp_group=ckpt_pgc.pp if ckpt_pgc is not None else None,
+                        # Replica_id must match the save path (see save_checkpoint_and_time): use
+                        # the gtp_remat-inclusive group, not replicate dp_cp, or gtp_remat peers
+                        # collide.
+                        dp_cp_group=getattr(ckpt_pgc, "dp_cp_gtp_remat", None),
+                        dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
+                        expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
+                        rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
+                    )
+                )
             )
             train_state.resume_iteration = train_state.iteration
             train_state.resume_num_floating_point_operations = (
@@ -4516,25 +4525,27 @@ def save_checkpoint_and_time(
 
         # Save checkpoint.
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save', is_goodput_span=True, **{'megatron.iteration': iteration}):
-            save_checkpoint(
-                iteration,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                num_floating_point_operations_so_far,
-                checkpointing_context,
-                non_persistent_ckpt=non_persistent_ckpt,
-                train_data_iterator=train_data_iterator,
-                preprocess_common_state_dict_fn=preprocess_common_state_dict,
-                tp_group=tp_group,
-                pp_group=pp_group,
-                dp_cp_group=dp_cp_group,
-                dp_group=dp_group,
-                dp_gtp_remat_group=dp_gtp_remat_group,
-                expt_dp_group=expt_dp_group,
-                rng_state_key_prefix=rng_state_key_prefix,
-                cp_group=cp_group,
-                on_saved=on_saved,
+            get_checkpoint_manager().save(
+                CheckpointSaveContext(
+                    iteration=iteration,
+                    model=model,
+                    optimizer=optimizer,
+                    opt_param_scheduler=opt_param_scheduler,
+                    num_floating_point_operations_so_far=num_floating_point_operations_so_far,
+                    checkpointing_context=checkpointing_context,
+                    non_persistent_ckpt=non_persistent_ckpt,
+                    train_data_iterator=train_data_iterator,
+                    preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                    tp_group=tp_group,
+                    pp_group=pp_group,
+                    dp_cp_group=dp_cp_group,
+                    dp_group=dp_group,
+                    dp_gtp_remat_group=dp_gtp_remat_group,
+                    expt_dp_group=expt_dp_group,
+                    rng_state_key_prefix=rng_state_key_prefix,
+                    cp_group=cp_group,
+                    on_saved=on_saved,
+                )
             )
 
             # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
@@ -5227,7 +5238,7 @@ def train(
         # on the worker), and shows up as a per-iteration gap near checkpoint
         # boundaries. Cheap most iterations, blocks when finalizing.
         with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.finalize', is_goodput_span=True):
-            maybe_finalize_async_save(blocking=False)
+            get_checkpoint_manager().finalize_async_saves(blocking=False)
         ft_integration.on_checkpointing_end(is_async_finalization=True)
         # Update the timeout for all process groups after initialization
         # We update the timeout after the first successful iteration,
@@ -5707,7 +5718,7 @@ def train(
     # async worker (if enabled) if the code is meant to exit and not return from this
     # function.
     with _otel_managed_span('checkpoint', 'megatron.checkpoint.exit_finalize', is_goodput_span=True):
-        maybe_finalize_async_save(blocking=True, terminate=should_exit)
+        get_checkpoint_manager().finalize_async_saves(blocking=True, terminate=should_exit)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
 
     if cfg.logger.log_energy:
