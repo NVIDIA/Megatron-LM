@@ -320,6 +320,14 @@ class MaskedWordPieceDataset(MegatronDataset):
             if len(masked_positions_and_labels) >= n_maskings:
                 break
 
+            # Every N-gram covers at least one token. With permutation, the
+            # remaining draws still feed the same RandomState.
+            if (
+                not self.config.masking_do_permutation
+                and len(masked_positions_and_labels) + 1 > n_maskings
+            ):
+                break
+
             # Do nothing for candidates with no ngrams
             if not candidate_ngrams[candidate_idx]:
                 continue
@@ -369,9 +377,9 @@ class MaskedWordPieceDataset(MegatronDataset):
 
         assert len(masked_positions_and_labels) <= n_maskings
 
-        numpy_random_state.shuffle(candidate_ngrams)
-
         if self.config.masking_do_permutation:
+            numpy_random_state.shuffle(candidate_ngrams)
+
             n_swappings = n_maskings
 
             permuted_indices = set()
