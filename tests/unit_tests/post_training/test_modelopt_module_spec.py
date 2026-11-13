@@ -2,6 +2,8 @@
 import inspect
 import tempfile
 from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -20,7 +22,11 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
+from megatron.core.post_training.modelopt.gpt.model_specs import (
+    get_gpt_modelopt_layer_spec,
+    get_gpt_modelopt_mtp_layer_spec,
+    get_gpt_modelopt_spec,
+)
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
 )
@@ -484,3 +490,68 @@ def test_modelopt_linear_accepts_duplicated_parallel_mode():
 
     with pytest.raises(ValueError, match="only supports parallel_mode"):
         Linear(4, 4, config=config, init_method=config.init_method, parallel_mode="column")
+
+
+_GPT_MODELOPT_SPECS = "megatron.core.post_training.modelopt.gpt.model_specs"
+
+
+def _modelopt_layer_spec_config(**overrides):
+    values = dict(
+        heterogeneous_block_specs=False,
+        transformer_impl="transformer_engine",
+        num_moe_experts=8,
+        qk_layernorm=True,
+        multi_latent_attention=False,
+        experimental_attention_variant=None,
+        qk_l2_norm=False,
+        context_parallel_size=1,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_get_gpt_modelopt_layer_spec_heterogeneous_takes_precedence():
+    config = _modelopt_layer_spec_config(heterogeneous_block_specs=True)
+    with patch(f"{_GPT_MODELOPT_SPECS}.get_gpt_heterogeneous_layer_spec") as get_spec:
+        result = get_gpt_modelopt_layer_spec(config, use_default_te_spec=True)
+    get_spec.assert_called_once_with(config=config, use_te=True)
+    assert result is get_spec.return_value
+
+
+def test_get_gpt_modelopt_layer_spec_default_te_spec():
+    config = _modelopt_layer_spec_config()
+    with patch(f"{_GPT_MODELOPT_SPECS}.get_gpt_layer_with_transformer_engine_spec") as get_spec:
+        result = get_gpt_modelopt_layer_spec(
+            config, use_default_te_spec=True, moe_grouped_gemm=False
+        )
+    get_spec.assert_called_once_with(8, False, True, False, None, qk_l2_norm=False)
+    assert result is get_spec.return_value
+
+
+@pytest.mark.parametrize("cp_size,expected_local", [(1, True), (2, False)])
+def test_get_gpt_modelopt_layer_spec_local_spec(cp_size, expected_local):
+    config = _modelopt_layer_spec_config(context_parallel_size=cp_size)
+    with patch(f"{_GPT_MODELOPT_SPECS}.get_gpt_modelopt_spec") as get_spec:
+        result = get_gpt_modelopt_layer_spec(
+            config,
+            local_core_attention=True,
+            remap_te_layernorm=True,
+            real_quant_cfg="fp8_real_quant",
+        )
+    get_spec.assert_called_once_with(
+        config=config,
+        local_core_attention=expected_local,
+        remap_te_layernorm=True,
+        real_quant_cfg="fp8_real_quant",
+    )
+    assert result is get_spec.return_value
+
+
+def test_get_gpt_modelopt_mtp_layer_spec_uses_standard_decoder_spec():
+    config = _modelopt_layer_spec_config(transformer_impl="local")
+    layer_specs = [object(), object()]
+    with patch(
+        f"{_GPT_MODELOPT_SPECS}.get_gpt_decoder_layer_specs", return_value=layer_specs
+    ) as get_specs:
+        assert get_gpt_modelopt_mtp_layer_spec(config) is layer_specs[-1]
+    get_specs.assert_called_once_with(config, use_transformer_engine=False)

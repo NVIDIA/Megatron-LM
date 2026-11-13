@@ -480,15 +480,13 @@ if __name__ == "__main__":
         extra_args_provider=add_modelopt_args if has_nvidia_modelopt else None,
         args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
     )
-    use_modelopt_config = has_nvidia_modelopt and should_use_modelopt_config(args)
     model_cfg = hybrid_config_from_args(args, vocab_size_from_tokenizer=True)
-    if use_modelopt_config:
-        apply_modelopt_model_config(model_cfg, args)
     full_config = pretrain_cfg_container_from_args(
         args, model_cfg, data_cfg=gpt_data_config_from_args(args)
     )
-    if use_modelopt_config:
-        full_config.distillation = distillation_config_from_args(args, model_cfg)
+    if has_nvidia_modelopt and should_use_modelopt_config(args):
+        apply_modelopt_model_config(full_config.model, args)
+        full_config.distillation = distillation_config_from_args(args, full_config.model)
     set_run_config(full_config)
     pretrain(
         full_config,

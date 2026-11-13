@@ -83,13 +83,13 @@ def _make_dispatch_config(**transformer_kwargs):
 class TestDefaultLayerSpecDispatch:
     """Tests for ``default_layer_spec`` — branch dispatch on config flags."""
 
-    @patch("megatron.training.models.gpt.get_gpt_modelopt_spec")
+    @patch("megatron.training.models.gpt.get_gpt_modelopt_layer_spec")
     def test_transform_config_selects_modelopt_spec(self, mock_get_spec):
         spec = Mock(spec=ModuleSpec)
         mock_get_spec.return_value = spec
         config = _make_dispatch_config()
         config.transformations = ModelTransformConfig(
-            force_local_attention=True, real_quant_cfg="fp8_real_quant"
+            force_local_attention=True, real_quant_cfg="fp8_real_quant", moe_grouped_gemm=False
         )
 
         result = default_layer_spec(config, vp_stage=None)
@@ -99,7 +99,8 @@ class TestDefaultLayerSpecDispatch:
             local_core_attention=True,
             remap_te_layernorm=True,
             real_quant_cfg="fp8_real_quant",
-            use_arbitrary_attention_mask=False,
+            use_default_te_spec=False,
+            moe_grouped_gemm=False,
         )
         assert result is spec
 
@@ -893,7 +894,7 @@ class TestMtpBlockSpec:
         assert mock_get_mtp.call_args.args[1] is layer_specs[-1]
         assert result is mock_get_mtp.return_value
 
-    @patch("megatron.training.models.gpt._modelopt_mtp_layer_spec")
+    @patch("megatron.training.models.gpt.get_gpt_modelopt_mtp_layer_spec")
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
     def test_transform_config_selects_standard_mtp_spec(self, mock_get_mtp, mock_modelopt_mtp):
         config = self._make_config(mtp_num_layers=1)
@@ -904,7 +905,7 @@ class TestMtpBlockSpec:
 
         mtp_block_spec(config, decoder_spec)
 
-        mock_modelopt_mtp.assert_called_once_with(config)
+        mock_modelopt_mtp.assert_called_once_with(config.transformer)
         assert mock_get_mtp.call_args.args[1] is standard_mtp_spec
 
     @patch("megatron.training.models.gpt._te_or_local_layer_spec")

@@ -45,11 +45,12 @@ def distillation_config_from_args(
 
     distillation = DistillationConfig(
         teacher_load=args.export_kd_teacher_load,
-        teacher_model_config=args.export_kd_teacher_model_config,
         teacher_ckpt_format=args.export_kd_teacher_ckpt_format,
         loss=load_distillation_loss_yaml(args.export_kd_cfg) if args.export_kd_cfg else {},
     )
-    teacher_args = _load_teacher_model_config(distillation, args)
+    teacher_args = _load_teacher_model_config(
+        args, args.export_kd_teacher_load, args.export_kd_teacher_model_config
+    )
     teacher_transformations = student_model_config.transformations
     if teacher_transformations is not None:
         teacher_transformations = dataclasses.replace(
@@ -71,23 +72,26 @@ def distillation_config_from_args(
     return distillation
 
 
-def _load_teacher_model_config(distillation: DistillationConfig, args: Namespace) -> Namespace:
+def _load_teacher_model_config(
+    args: Namespace, teacher_load: str, teacher_model_config: str | None = None
+) -> Namespace:
     """Reads teacher config from a file.
 
-    The config provided, either in the teacher checkpoint dir or via ``distillation.teacher_model_config``,
-    should specify any model architecture settings which differ from the main student model's.
+    The config provided, either via ``teacher_model_config`` (``--export-kd-teacher-model-config``)
+    or as ``model_config.yaml`` in the ``teacher_load`` checkpoint dir, should specify any model
+    architecture settings which differ from the main student model's.
     The field names should match those returned by get_args() and not TransformerConfig.
     """
-    if distillation.teacher_model_config is not None:
-        config_path = distillation.teacher_model_config
+    if teacher_model_config is not None:
+        config_path = teacher_model_config
         if not os.path.exists(config_path):
             raise FileNotFoundError(f"Teacher model-config file ({config_path}) not found.")
     else:
-        config_path = os.path.join(distillation.teacher_load, "model_config.yaml")
+        config_path = os.path.join(teacher_load, "model_config.yaml")
         if not os.path.exists(config_path):
             logger.warning(
                 "No teacher config provided via --export-kd-teacher-model-config nor found at"
-                f" {distillation.teacher_load}/model_config.yaml. Assuming teacher model architecture same as student's."
+                f" {teacher_load}/model_config.yaml. Assuming teacher model architecture same as student's."
             )  # Useful for cases like QAD
             config_path = None
 

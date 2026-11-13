@@ -63,7 +63,6 @@ class TestDistillationConfigFromArgs:
         distillation = mc.distillation_config_from_args(args, student)
 
         assert distillation.teacher_load == str(tmp_path)
-        assert distillation.teacher_model_config == str(teacher_yaml)
         assert distillation.teacher_ckpt_format == "torch_dist"
         assert distillation.loss == {
             "logit_kl_temperature": 2.0,
@@ -192,7 +191,8 @@ class TestModelOptModelConfigFromArgs:
         assert config.mtp_layer_spec is None
         spec = object()
         with patch(
-            "megatron.training.models.gpt.get_gpt_modelopt_spec", return_value=spec
+            "megatron.core.post_training.modelopt.gpt.model_specs.get_gpt_modelopt_spec",
+            return_value=spec,
         ) as get_spec:
             assert default_layer_spec(config, vp_stage=None) is spec
         get_spec.assert_called_once_with(
@@ -200,7 +200,6 @@ class TestModelOptModelConfigFromArgs:
             local_core_attention=True,
             remap_te_layernorm=True,
             real_quant_cfg="None",
-            use_arbitrary_attention_mask=False,
         )
 
     def test_gpt_default_te_spec_honors_disable_moe_grouped_gemm(self):
@@ -209,7 +208,8 @@ class TestModelOptModelConfigFromArgs:
         config = mc.modelopt_model_config_from_args(args, disable_moe_grouped_gemm=True)
 
         with patch(
-            "megatron.training.models.gpt.get_gpt_layer_with_transformer_engine_spec"
+            "megatron.core.post_training.modelopt.gpt.model_specs."
+            "get_gpt_layer_with_transformer_engine_spec"
         ) as get_spec:
             default_layer_spec(config, vp_stage=None)
         assert get_spec.call_args.args[1] is False  # moe_grouped_gemm
@@ -474,11 +474,9 @@ class TestLoadTeacherModelConfig:
     def test_overlays_yaml_and_drops_kv_channels(self, tmp_path):
         teacher_yaml = tmp_path / "teacher.yaml"
         teacher_yaml.write_text(yaml.safe_dump({"num_layers": 2, "hybrid_override_pattern": "M*"}))
-        distillation = DistillationConfig(
-            teacher_load=str(tmp_path), teacher_model_config=str(teacher_yaml)
+        raw = mc._load_teacher_model_config(
+            self._args(flextron=True), str(tmp_path), str(teacher_yaml)
         )
-
-        raw = mc._load_teacher_model_config(distillation, self._args(flextron=True))
 
         assert raw.num_layers == 2
         assert not hasattr(raw, "kv_channels")
@@ -486,19 +484,16 @@ class TestLoadTeacherModelConfig:
         assert raw.hybrid_layer_pattern == "M*"
 
     def test_defaults_to_student_arch_without_yaml(self, tmp_path):
-        distillation = DistillationConfig(teacher_load=str(tmp_path))
-
-        raw = mc._load_teacher_model_config(distillation, self._args())
+        raw = mc._load_teacher_model_config(self._args(), str(tmp_path))
 
         assert raw.num_layers == 4
         assert raw.kv_channels == 16
 
     def test_missing_explicit_config_raises(self, tmp_path):
-        distillation = DistillationConfig(
-            teacher_load=str(tmp_path), teacher_model_config=str(tmp_path / "missing.yaml")
-        )
         with pytest.raises(FileNotFoundError):
-            mc._load_teacher_model_config(distillation, self._args())
+            mc._load_teacher_model_config(
+                self._args(), str(tmp_path), str(tmp_path / "missing.yaml")
+            )
 
 
 class TestBuildTeacher:
@@ -634,14 +629,17 @@ class TestModelOptMtpSpec:
                 make_modelopt_test_args(mtp_num_layers=1, export_real_quant_cfg=quant_cfg)
             )
             decoder_spec = default_layer_spec(config, vp_stage=None)
-            from megatron.training.models.gpt import _modelopt_mtp_layer_spec
+            from megatron.core.post_training.modelopt.gpt.model_specs import (
+                get_gpt_modelopt_mtp_layer_spec,
+            )
 
-            expected = _modelopt_mtp_layer_spec(config)
+            expected = get_gpt_modelopt_mtp_layer_spec(config.transformer)
             with patch(
-                "megatron.training.models.gpt._modelopt_mtp_layer_spec", return_value=expected
+                "megatron.training.models.gpt.get_gpt_modelopt_mtp_layer_spec",
+                return_value=expected,
             ) as select_mtp_spec:
                 mtp_spec = mtp_block_spec(config, decoder_spec, pp_rank=0)
-            select_mtp_spec.assert_called_once_with(config)
+            select_mtp_spec.assert_called_once_with(config.transformer)
             layer = mtp_spec.layer_specs[0].submodules.mtp_model_layer
             assert layer is expected
             assert layer.module is TransformerLayer

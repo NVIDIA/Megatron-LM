@@ -150,6 +150,7 @@ def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
             else hybrid_inference_stack_spec
         )
     if model_config.restore_modelopt_state:
+        # Megatron-Bridge compatibility only; Megatron-LM uses model_config.transformations above.
         _check_modelopt_spec_supported(use_wide_residual)
         return get_hybrid_stack_modelopt_spec(local_core_attention=False, remap_te_layernorm=True)
     return wide_residual_hybrid_stack_spec if use_wide_residual else default_hybrid_stack_spec

@@ -21,7 +21,11 @@ from megatron.core.pipeline_parallel.utils import (
     is_vp_first_stage,
     is_vp_last_stage,
 )
-from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
+from megatron.core.post_training.modelopt.gpt.model_specs import (
+    get_gpt_modelopt_layer_spec,
+    get_gpt_modelopt_mtp_layer_spec,
+    get_gpt_modelopt_spec,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.dot_product_attention import (
     DotProductAttention as MCoreDotProductAttention,
@@ -45,55 +49,10 @@ from dataclasses import dataclass
 
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
-    get_gpt_decoder_layer_specs,
     get_gpt_layer_local_spec,
     get_gpt_layer_with_inference_spec,
     get_gpt_layer_with_transformer_engine_spec,
 )
-
-
-def _modelopt_layer_spec(config: "GPTModelConfig") -> ModuleSpec:
-    """Build the decoder spec declared by ``ModelTransformConfig``."""
-    options = config.transformations
-    assert options is not None
-    transformer_cfg = config.transformer
-    if transformer_cfg.heterogeneous_block_specs:
-        return get_gpt_heterogeneous_layer_spec(
-            config=transformer_cfg,
-            use_te=transformer_cfg.transformer_impl == "transformer_engine",
-        )
-    if options.default_te_spec:
-        return get_gpt_layer_with_transformer_engine_spec(
-            transformer_cfg.num_moe_experts,
-            options.moe_grouped_gemm,
-            transformer_cfg.qk_layernorm,
-            transformer_cfg.multi_latent_attention,
-            transformer_cfg.experimental_attention_variant,
-            qk_l2_norm=transformer_cfg.qk_l2_norm,
-        )
-    if transformer_cfg.context_parallel_size > 1:
-        from megatron.training import print_rank_0
-
-        print_rank_0("context_parallel_size > 1! Force using TEDotProductAttention!")
-        local_core_attention = False
-    else:
-        local_core_attention = options.force_local_attention
-    return get_gpt_modelopt_spec(
-        config=transformer_cfg,
-        local_core_attention=local_core_attention,
-        remap_te_layernorm=True,
-        real_quant_cfg=options.real_quant_cfg,
-        use_arbitrary_attention_mask=False,
-    )
-
-
-def _modelopt_mtp_layer_spec(config: "GPTModelConfig") -> ModuleSpec:
-    """Keep MTP on the standard decoder spec independently of ModelOpt quantization."""
-    transformer_cfg = config.transformer
-    return get_gpt_decoder_layer_specs(
-        transformer_cfg,
-        use_transformer_engine=transformer_cfg.transformer_impl == "transformer_engine",
-    )[-1]
 
 
 def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
@@ -101,7 +60,15 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
     transformer_cfg = config.transformer
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
     if config.transformations is not None:
-        return _modelopt_layer_spec(config)
+        options = config.transformations
+        return get_gpt_modelopt_layer_spec(
+            config=transformer_cfg,
+            local_core_attention=options.force_local_attention,
+            remap_te_layernorm=True,
+            real_quant_cfg=options.real_quant_cfg,
+            use_default_te_spec=options.default_te_spec,
+            moe_grouped_gemm=options.moe_grouped_gemm,
+        )
     elif (
         transformer_cfg.transformer_impl == "inference_optimized"
         and transformer_cfg.num_moe_experts is None
@@ -115,6 +82,7 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
         )
     elif config.restore_modelopt_state:
         ## Layer specification for quantization with ModelOpt. ##
+        # Megatron-Bridge compatibility only; Megatron-LM uses config.transformations above.
 
         # arbitrary attention mask is used for speculative decoding training
         # When context parallel > 1, only causal mask type is supported
@@ -243,6 +211,7 @@ class GPTModelConfig(ModelConfig):
 
     ### settings for default layer spec options ###
     use_arbitrary_attention_mask: bool | None = None
+    """Megatron-Bridge compatibility only: read by the ``restore_modelopt_state`` layer spec."""
 
     @override
     def __getattr__(self, name: str, /) -> Any:
@@ -500,7 +469,7 @@ def mtp_block_spec(
             if not isinstance(spec, ModuleSpec) and callable(spec):
                 spec = spec(config)
         elif config.transformations is not None:
-            spec = _modelopt_mtp_layer_spec(config)
+            spec = get_gpt_modelopt_mtp_layer_spec(config.transformer)
         elif isinstance(transformer_layer_spec, TransformerBlockSubmodules):
             if transformer_layer_spec.layer_specs:
                 # Reuse the resolved spec: the generic decoder builder rejects experimental attention.

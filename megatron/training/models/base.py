@@ -63,7 +63,9 @@ class ModelConfig:
 
     # === ModelOpt ===
     restore_modelopt_state: bool = False
-    """Restore ModelOpt quantization/sparsity state."""
+    """Megatron-Bridge compatibility only: select the ModelOpt layer spec so Bridge can restore
+    ModelOpt quantization/sparsity state itself. Megatron-LM never sets this; it uses
+    ``transformations``. Remove together with its spec branches once Bridge no longer needs it."""
 
     transformations: ModelTransformConfig | None = None
     """Declarative ModelOpt layer-spec and hook setup used by GPT/Hybrid builders."""

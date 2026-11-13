@@ -31,21 +31,12 @@ class DistillationConfig:
     """
 
     teacher_load: str
-    """Path to the teacher checkpoint. Also used to find ``model_config.yaml`` when
-    ``teacher_model_config`` is not given."""
+    """Path to the teacher checkpoint."""
 
     teacher_model: ModelConfig | None = None
     """Resolved teacher architecture. CLI translation resolves the teacher YAML once;
     serialized configs can then rebuild the teacher without the original CLI namespace.
     """
-
-    teacher_model_config: str | None = None
-    """YAML overriding the student's architecture settings for the teacher. Field names
-    follow the argparse names (e.g. ``num_layers``), not ``TransformerConfig``.
-
-    Only for ``--export-kd-teacher-model-config``: it is resolved into ``teacher_model`` at
-    CLI translation time. YAML run configs should give the teacher as ``teacher_model``, a
-    ``ModelConfig`` of its own, rather than as argparse-name overrides."""
 
     teacher_ckpt_format: str | None = None
     """Checkpoint format of the teacher, if different from the student's."""
