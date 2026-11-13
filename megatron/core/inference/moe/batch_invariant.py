@@ -14,9 +14,16 @@ from megatron.core.inference.communication.torch_symm_triton.utils import (
     is_device_nvls_capable,
     sync_threads,
 )
+from megatron.core.inference.quantization.mxfp8_quantize import (
+    MXFP8_BLOCK_SIZE,
+    MXFP8_SCALE_COL_BLOCK,
+    MXFP8_SCALE_ROW_BLOCK,
+)
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, ensure_mxfp8_scale_dtype
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
+from megatron.core.transformer.moe.ep_invariant_combine import tree_combine_forward
 from megatron.core.utils import null_decorator
 
 try:
@@ -292,6 +299,148 @@ def squared_relu_with_probs(
 
 
 @triton.jit
+def _peer_rows_tree(
+    buffer_ptrs, input_byte_offset, row_offsets, mask, START: tl.constexpr, N: tl.constexpr
+):
+    """Pairwise fp32 tree over the rows of peers [START, START + N), unrolled at compile time."""
+    if N == 1:
+        peer_base = tl.load(buffer_ptrs + START).to(tl.pointer_type(tl.uint8))
+        peer_ptr = (peer_base + input_byte_offset).to(tl.pointer_type(tl.float32))
+        acc = tl.load(peer_ptr + row_offsets, mask=mask, other=0.0)
+    else:
+        acc = _peer_rows_tree(buffer_ptrs, input_byte_offset, row_offsets, mask, START, N // 2)
+        acc = acc + _peer_rows_tree(
+            buffer_ptrs, input_byte_offset, row_offsets, mask, START + N // 2, N // 2
+        )
+    return acc
+
+
+@triton.jit
+def _squared_relu_with_probs_quantize_kernel(
+    input_ptr,
+    out_fp8_ptr,
+    out_scale_ptr,
+    permutation_map_ptr,
+    n_used_ptr,
+    probs_ptr,
+    K,
+    n_col_blocks,
+    max_rows,
+    clamp_scale,
+    CLAMP: tl.constexpr,
+    REAL_GROUPS: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_GROUPS: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+):
+    """``_squared_relu_with_probs_kernel`` followed by MXFP8 quantization, in one pass.
+
+    Each live row runs the activation's statements (FP32 square and probability multiply,
+    one BF16 round) and then ``_mxfp8_quant_swizzle_row``'s statements on the BF16 values,
+    so data and scales are bitwise those of the two-kernel sequence. Alignment-padding rows
+    (permutation map -1) quantize a zero row, as the unfused path quantizes the zeros the
+    activation writes there. Rows at or beyond n_used are not touched.
+    """
+    pid = tl.program_id(0)
+    n_used = tl.load(n_used_ptr)
+    if pid >= n_used:
+        return
+
+    offs = tl.arange(0, BLOCK_K)
+    mask = offs < K
+    col_offs = tl.arange(0, BLOCK_GROUPS)
+    col_mask = col_offs < REAL_GROUPS
+    for row in tl.range(pid, tl.minimum(n_used, max_rows), NUM_BLOCKS):
+        if row < n_used:
+            row_i64 = row.to(tl.int64)
+            if tl.load(permutation_map_ptr + row_i64) >= 0:
+                prob = tl.load(probs_ptr + row_i64)
+                value = tl.load(input_ptr + row_i64 * K + offs, mask=mask, other=0.0).to(tl.float32)
+                value = tl.maximum(value, 0.0)
+                if CLAMP:
+                    value = clamp_scale * libdevice.tanh(value / clamp_scale)
+                value = value * value
+                # The unfused path stores this BF16 value and the quantizer reloads it.
+                x = (value * prob).to(tl.bfloat16).to(tl.float32)
+            else:
+                x = tl.zeros([BLOCK_K], dtype=tl.float32)
+
+            # _mxfp8_quant_swizzle_row on x.
+            x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])
+            max_vals = tl.max(tl.abs(x_grouped), axis=1)
+            dequant_scale = max_vals / 448.0
+            dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
+            dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
+            quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
+            quantized = tl.reshape(x_grouped * quant_scale[:, None], [BLOCK_K])
+            tl.store(out_fp8_ptr + row_i64 * K + offs, quantized.to(tl.float8e4nv), mask=mask)
+
+            scale_exp = (dequant_exp >> 23).to(tl.uint8)
+            local_row = row_i64 % 128
+            tile_idx = (row_i64 // 128) * n_col_blocks + col_offs // 4
+            swizzled_offs = tile_idx * 512 + (local_row % 32) * 16 + (local_row // 32) * 4
+            swizzled_offs += col_offs % 4
+            tl.store(out_scale_ptr + swizzled_offs, scale_exp, mask=col_mask)
+
+
+def squared_relu_with_probs_quantize_mxfp8(
+    x: torch.Tensor,
+    permutation_map: torch.Tensor,
+    n_used: torch.Tensor,
+    probs: torch.Tensor,
+    clamp_scale: Optional[float] = None,
+):
+    """``squared_relu_with_probs(..., zero_padding=True)`` then MXFP8 quantization of the
+    first ``n_used`` rows, fused into one kernel with bitwise identical data and scales.
+
+    Args:
+        x: [M, K] BF16 FC1 output in expert-grouped order.
+        permutation_map: [M] int32, source token of each row or -1 for alignment padding.
+        n_used: 1-element CUDA tensor, rows [0, n_used) feed the FC2 grouped GEMM.
+        probs: [M] FP32 routing probability of each row.
+        clamp_scale: config.activation_func_tanh_clamp_scale, if set.
+
+    Returns:
+        MXFP8Tensor; data rows at or beyond n_used are uninitialized and their scales zero.
+    """
+    num_rows, hidden_size = x.shape
+    assert hidden_size % MXFP8_BLOCK_SIZE == 0
+    assert x.is_contiguous()
+    scale_cols = hidden_size // MXFP8_BLOCK_SIZE
+    n_col_blocks = triton.cdiv(scale_cols, MXFP8_SCALE_COL_BLOCK)
+    total_scale_bytes = (
+        triton.cdiv(num_rows, MXFP8_SCALE_ROW_BLOCK)
+        * n_col_blocks
+        * MXFP8_SCALE_ROW_BLOCK
+        * MXFP8_SCALE_COL_BLOCK
+    )
+    out_data = torch.empty(num_rows, hidden_size, dtype=torch.float8_e4m3fn, device=x.device)
+    out_scale = torch.zeros(total_scale_bytes, dtype=torch.uint8, device=x.device)
+    block_k = triton.next_power_of_2(hidden_size)
+    num_blocks = max(1, min(num_rows, 512))
+    _squared_relu_with_probs_quantize_kernel[(num_blocks,)](
+        x,
+        out_data,
+        out_scale,
+        permutation_map,
+        n_used,
+        probs,
+        hidden_size,
+        n_col_blocks,
+        num_rows,
+        clamp_scale if clamp_scale is not None else 0.0,
+        CLAMP=clamp_scale is not None,
+        REAL_GROUPS=scale_cols,
+        BLOCK_K=block_k,
+        BLOCK_GROUPS=block_k // MXFP8_BLOCK_SIZE,
+        NUM_BLOCKS=num_blocks,
+    )
+    return MXFP8Tensor(
+        data=out_data, scale=ensure_mxfp8_scale_dtype(out_scale), backend="triton", dtype=x.dtype
+    )
+
+
+@triton.jit
 def _ordered_reduce_scatter_v_kernel(
     local_ptr,
     buffer_ptrs_dev,
@@ -304,8 +453,10 @@ def _ordered_reduce_scatter_v_kernel(
     BLOCK_SIZE: tl.constexpr,
     RANK: tl.constexpr,
     WORLD_SIZE: tl.constexpr,
+    PAIRWISE_TREE: tl.constexpr,
 ):
-    """Reduce peer rows with an explicit rank-order FP32 sum."""
+    """Reduce peer rows with an explicit rank-order FP32 sum (PAIRWISE_TREE: a pairwise
+    tree in rank order, (r0 + r1) + (r2 + r3), the top of the EP-invariant combine tree)."""
     pid = tl.program_id(axis=0)
 
     ep_max_tokens = tl.load(ep_max_tokens_ptr)
@@ -332,15 +483,24 @@ def _ordered_reduce_scatter_v_kernel(
         for channel_offset in range(0, HIDDEN_SIZE, BLOCK_SIZE):
             offsets = channel_offset + tid
             mask = offsets < HIDDEN_SIZE
-            acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
-
-            for src_rank in tl.range(0, WORLD_SIZE):
-                peer_base = tl.load(buffer_ptrs + src_rank).to(tl.pointer_type(tl.uint8))
-                peer_ptr = (peer_base + input_byte_offset).to(tl.pointer_type(tl.float32))
-                values = tl.load(
-                    peer_ptr + global_token * HIDDEN_SIZE + offsets, mask=mask, other=0.0
+            if PAIRWISE_TREE:
+                acc = _peer_rows_tree(
+                    buffer_ptrs,
+                    input_byte_offset,
+                    global_token * HIDDEN_SIZE + offsets,
+                    mask,
+                    0,
+                    WORLD_SIZE,
                 )
-                acc += values
+            else:
+                acc = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
+                for src_rank in tl.range(0, WORLD_SIZE):
+                    peer_base = tl.load(buffer_ptrs + src_rank).to(tl.pointer_type(tl.uint8))
+                    peer_ptr = (peer_base + input_byte_offset).to(tl.pointer_type(tl.float32))
+                    values = tl.load(
+                        peer_ptr + global_token * HIDDEN_SIZE + offsets, mask=mask, other=0.0
+                    )
+                    acc += values
 
             tl.store(local_ptr + token_offset * HIDDEN_SIZE + offsets, acc, mask=mask)
 
@@ -353,9 +513,14 @@ def ordered_reduce_scatter_v(
     ep_max_tokens: torch.Tensor,
     per_rank_max_tokens: int,
     input_byte_offset: int = 0,
+    pairwise_tree: bool = False,
     **kwargs,
 ) -> torch.Tensor:
-    """Reduce-scatter variable token rows with a fixed FP32 rank order."""
+    """Reduce-scatter variable token rows with a fixed FP32 rank order.
+
+    ``pairwise_tree`` adds the rank rows as a pairwise tree in rank order instead of a
+    chain (``moe_ep_invariant_combine``; needs a power-of-two world size).
+    """
     assert HAVE_TRITON, "Triton is required for ordered_reduce_scatter_v."
     assert (
         output_tensor.ndim == 2 and input_tensor.ndim == 2
@@ -376,6 +541,10 @@ def ordered_reduce_scatter_v(
     assert (
         input_tensor.shape[1] == hidden_size
     ), f"input and output hidden_size mismatch: {input_tensor.shape[1]} vs {hidden_size}"
+    world_size = symm_mem_hdl.world_size
+    assert (
+        not pairwise_tree or world_size & (world_size - 1) == 0
+    ), "pairwise_tree requires a power-of-two world size"
 
     # Do not autotune the number of blocks with Triton: every rank must launch the same grid
     # of at most max_num_blocks blocks, or the barrier overflows the signal pad or hangs.
@@ -398,6 +567,7 @@ def ordered_reduce_scatter_v(
         BLOCK_SIZE=block_size,
         RANK=symm_mem_hdl.rank,
         WORLD_SIZE=symm_mem_hdl.world_size,
+        PAIRWISE_TREE=pairwise_tree,
         num_warps=num_warps,
     )
     return output_tensor
@@ -449,8 +619,19 @@ def unpermute_tokens_in_expert_order(
     inverse_map: torch.Tensor,
     valid_tokens: torch.Tensor,
     out: Optional[torch.Tensor],
+    ep_invariant_leaves: Optional[int] = None,
 ) -> torch.Tensor:
-    """Reduce local expert contributions token-by-token in fixed expert order."""
+    """Reduce local expert contributions token-by-token in fixed expert order.
+
+    ``ep_invariant_leaves`` (``moe_ep_invariant_combine``): sum each token over this
+    rank's subtree of the EP-invariant combine tree, which has that many leaves over
+    the local experts (``ep_invariant_combine``), to an fp32 rank partial. At EP 1 that
+    is the final row; at larger EP the reduce-scatter finishes the tree.
+    """
+    if ep_invariant_leaves is not None:
+        return tree_combine_forward(
+            expert_output, inverse_map, ep_invariant_leaves, valid_tokens=valid_tokens, out=out
+        )
     _, hidden_dim = expert_output.shape
     num_tokens, num_local_experts = inverse_map.shape
     if out is None:
