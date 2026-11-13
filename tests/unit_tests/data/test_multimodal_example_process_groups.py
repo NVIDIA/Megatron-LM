@@ -18,9 +18,11 @@ import pytest
 import torch
 
 from megatron.core import process_groups_config, tensor_parallel
+from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.models import LLaVAModelConfig
 from tests.unit_tests.test_utilities import Utils, forbid_global_process_groups
 
 _MULTIMODAL_DIR = Path(__file__).resolve().parents[3] / "examples" / "multimodal"
@@ -66,11 +68,16 @@ def train(monkeypatch):
     spec.loader.exec_module(module)
     monkeypatch.setattr(module, "get_timers", lambda: MagicMock())
     monkeypatch.setattr(module, "get_tokenizer", lambda: SimpleNamespace(pad=0))
-    monkeypatch.setattr(
-        module,
-        "get_run_config",
-        lambda: SimpleNamespace(dist=SimpleNamespace(use_torch_fsdp2=False)),
+    # get_batch takes the image size from an LLaVA model config and asks the wrapper config
+    # whether the model runs under Torch FSDP2.
+    run_config = SimpleNamespace(
+        model=LLaVAModelConfig(
+            transformer=TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=2),
+            seq_length=16,
+        ),
+        ddp=DistributedDataParallelConfig(),
     )
+    monkeypatch.setattr(module, "get_run_config", lambda: run_config)
     return module
 
 

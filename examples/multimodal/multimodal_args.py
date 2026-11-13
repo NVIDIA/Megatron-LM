@@ -440,9 +440,6 @@ def add_multimodal_extra_args(parser):
         "--use-new-dataloader-path", action="store_true", default=False, help="Use the new dataloader path."
     )
     group.add_argument(
-        "--decoder-tp-comm-overlap", action="store_true", default=False, help="Enable tensor parallel communication overlap in the decoder."
-    )
-    group.add_argument(
         "--freeze-vision-projection", action="store_true", default=False, help="Freeze the vision projection module."
     )
     group.add_argument(
