@@ -6,6 +6,7 @@ Tests for softmax_scale config propagation.
 Verifies that TransformerConfig.softmax_scale is properly considered in every code path that
 consumes a softmax scale:
 - MLASelfAttention.__init__ (mscale^2 * config.softmax_scale),
+- Attention.__init__ for YaRN with RoPE fusion (concentration factor^2 * the base scale),
 - Attention.get_softmax_scale resolution order,
 - Attention.flash_decode (FA2 kvcache),
 - Attention.flash_decode_and_prefill for all kernel backends (prefill: FA2/FA3/FA4 varlen, decode:
@@ -23,7 +24,7 @@ import pytest
 import torch
 
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
-from megatron.core.models.common.embeddings import _yarn_get_mscale
+from megatron.core.models.common.embeddings import _yarn_get_mscale, rope_utils
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
@@ -452,3 +453,79 @@ class TestMLASoftmaxScale(_GpuTestFixtureBase):
             )
         else:
             assert attention.core_attention.softmax_scale == attention.softmax_scale
+
+
+def _make_yarn_self_attention(apply_rope_fusion, softmax_scale=None, softmax_type="vanilla"):
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        use_cpu_initialization=True,
+        softmax_scale=softmax_scale,
+        softmax_type=softmax_type,
+        apply_rope_fusion=apply_rope_fusion,
+        attention_dropout=0.0,
+    )
+    # gpt-oss YaRN settings: concentration factor 0.1 * ln(32) + 1.
+    config.yarn_rotary_scaling_factor = 32.0
+    config.yarn_mscale = None
+    config.yarn_mscale_all_dim = None
+    submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
+    attn = SelfAttention(config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal)
+    return attn.cuda()
+
+
+class TestYarnRopeFusionSoftmaxScale(_GpuTestFixtureBase):
+    """YaRN scales q and k by its concentration factor. TE's fused RoPE takes no scale, so with
+    RoPE fusion Attention applies the factor squared through the softmax scale instead."""
+
+    FACTOR = 0.1 * math.log(32.0) + 1.0
+
+    @pytest.mark.parametrize("softmax_scale", [None, 0.042])
+    def test_factor_moves_into_softmax_scale(self, softmax_scale):
+        unfused = _make_yarn_self_attention(False, softmax_scale)
+        assert unfused._rope_mscale == pytest.approx(self.FACTOR)
+        assert not hasattr(unfused, 'softmax_scale')
+
+        fused = _make_yarn_self_attention(True, softmax_scale)
+        base = softmax_scale if softmax_scale is not None else fused.config.kv_channels**-0.5
+        assert fused._rope_mscale == 1.0
+        assert fused.softmax_scale == pytest.approx(base * self.FACTOR**2)
+        core = fused.core_attention
+        if isinstance(core, TEDotProductAttention):
+            assert core.flash_attention.softmax_scale == fused.softmax_scale
+            assert core.fused_attention.softmax_scale == fused.softmax_scale
+            assert core.unfused_attention.softmax_scale == fused.softmax_scale
+        else:
+            assert core.softmax_scale == fused.softmax_scale
+
+    @pytest.mark.parametrize("softmax_type", ["vanilla", "learnable"])
+    def test_fused_rope_matches_unfused(self, softmax_type):
+        """Same outputs and grads (fp32) as scaling q and k in the unfused RoPE, with the fused
+        RoPE kernel used for both q and k. The learnable sink logit is not scaled either way."""
+        unfused = _make_yarn_self_attention(False, softmax_type=softmax_type)
+        fused = _make_yarn_self_attention(True, softmax_type=softmax_type)
+        fused.load_state_dict(unfused.state_dict())
+        seq_len, batch, head_dim = 32, 2, unfused.config.kv_channels
+        x = torch.randn(seq_len, batch, unfused.config.hidden_size, device='cuda')
+        freqs = torch.rand(seq_len, 1, 1, head_dim, device='cuda') * 8
+
+        def run(attn):
+            inp = x.clone().requires_grad_(True)
+            out, _ = attn(inp, None, rotary_pos_emb=freqs)
+            out.backward(torch.ones_like(out))
+            # linear_proj's bias is returned separately and gets no grad here.
+            grads = {n: p.grad for n, p in attn.named_parameters() if p.grad is not None}
+            return out, inp.grad, grads
+
+        ref_out, ref_dx, ref_dw = run(unfused)
+        with patch.object(
+            rope_utils, 'fused_apply_rotary_pos_emb', wraps=rope_utils.fused_apply_rotary_pos_emb
+        ) as fused_rope:
+            out, dx, dw = run(fused)
+        assert fused_rope.call_count == 2
+        assert dw.keys() == ref_dw.keys()
+        # Bound relative to each tensor's largest value. The paths round differently (TF32 GEMMs)
+        # by well under it; dropping the factor squared from the softmax scale exceeds it >10x.
+        for got, ref in [(out, ref_out), (dx, ref_dx)] + [(dw[n], ref_dw[n]) for n in dw]:
+            torch.testing.assert_close(got, ref, rtol=0, atol=1e-3 * ref.abs().max().item())
