@@ -113,7 +113,7 @@ def main() -> None:
         # Set up the global grid at bootstrap; pass the collection it returns to the model.
         pg_collection = parallel_state.initialize_model_parallel()
         torch.manual_seed(1234)
-        model_parallel_cuda_manual_seed(1234)
+        model_parallel_cuda_manual_seed(1234, pg_collection=pg_collection)
 
         model = build_model(pg_collection).cuda()
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
