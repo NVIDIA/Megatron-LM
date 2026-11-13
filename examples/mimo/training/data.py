@@ -391,7 +391,8 @@ def _build_energon_data_loaders(args, topology):
     checkpoint_paths = None
     allow_missing = False
     if args.load is not None:
-        iteration = get_train_state().iteration
+        train_state = get_train_state()
+        iteration = train_state.iteration
         checkpoint_paths = {
             lane: Path(
                 get_checkpoint_name(
@@ -407,7 +408,9 @@ def _build_energon_data_loaders(args, topology):
             )
             for lane in lane_ids
         }
-        allow_missing = is_initial_checkpoint_load_without_dataloader_state(args, iteration)
+        allow_missing = is_initial_checkpoint_load_without_dataloader_state(
+            train_state, get_run_config().checkpoint
+        )
     return (
         build_energon_iterator(
             args,

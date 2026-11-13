@@ -359,7 +359,7 @@ def test_positive_workers_randomness_and_fresh_process_resume(tmp_path, workers)
                 _equal(left, right)
 
 
-def _entrypoint_iterator(args, lane, iteration, *, encoder=False):
+def _entrypoint_iterator(args, lane, iteration, *, encoder=False, effective_finetune=False):
     """Resolve native state through the same data provider used by pretrain_mimo."""
     from examples.mimo.training.data import build_train_valid_test_data_loaders
     from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
@@ -375,8 +375,14 @@ def _entrypoint_iterator(args, lane, iteration, *, encoder=False):
             "sound_encoder": SimpleNamespace(dp=group),
         },
     )
-    with patch(
-        "megatron.training.get_train_state", return_value=SimpleNamespace(iteration=iteration)
+    train_state = SimpleNamespace(iteration=iteration, effective_finetune=effective_finetune)
+    checkpoint = SimpleNamespace(pretrained_checkpoint=getattr(args, "pretrained_checkpoint", None))
+    with (
+        patch("megatron.training.get_train_state", return_value=train_state),
+        patch(
+            "examples.mimo.training.data.get_run_config",
+            return_value=SimpleNamespace(checkpoint=checkpoint),
+        ),
     ):
         train, valid, test = build_train_valid_test_data_loaders(args, topology)
     assert valid is None and test is None
@@ -519,8 +525,18 @@ def test_checkpoint_hook_and_data_entrypoint_compose_native_lane_state(tmp_path)
                 _equal(left, right)
 
 
-@pytest.mark.parametrize("flags", [{}, {"finetune": True}, {"pretrained_checkpoint": "weights"}])
-def test_data_entrypoint_distinguishes_resume_from_initial_weights(tmp_path, flags):
+@pytest.mark.parametrize(
+    "flags,effective_finetune",
+    [
+        pytest.param({}, False, id="resume"),
+        pytest.param({"finetune": True}, True, id="finetune"),
+        pytest.param({"pretrained_checkpoint": "weights"}, False, id="pretrained"),
+        pytest.param({}, True, id="resolved-finetune"),
+    ],
+)
+def test_data_entrypoint_distinguishes_resume_from_initial_weights(
+    tmp_path, flags, effective_finetune
+):
     args = _args(
         _jsonl(tmp_path / "data.jsonl"),
         mimo_llm_dp=1,
@@ -531,9 +547,9 @@ def test_data_entrypoint_distinguishes_resume_from_initial_weights(tmp_path, fla
     )
     # Even initial-weight flags cannot forgive missing state at a resumed iteration.
     with pytest.raises(FileNotFoundError, match="iter_0000007.*dprank000"):
-        _entrypoint_iterator(args, 0, 7)
-    if flags:
-        fresh = _entrypoint_iterator(args, 0, 0)
+        _entrypoint_iterator(args, 0, 7, effective_finetune=effective_finetune)
+    if effective_finetune or flags.get("pretrained_checkpoint") is not None:
+        fresh = _entrypoint_iterator(args, 0, 0, effective_finetune=effective_finetune)
         baseline_args = argparse.Namespace(**{**vars(args), "load": None})
         baseline = _entrypoint_iterator(baseline_args, 0, 0)
         try:
@@ -550,7 +566,7 @@ def test_data_entrypoint_distinguishes_resume_from_initial_weights(tmp_path, fla
     state_path.parent.mkdir(parents=True)
     torch.save({"dataloader_state_dict": {"contract": {"seed": -1}, "energon": None}}, state_path)
     with pytest.raises(ValueError, match="incompatible"):
-        _entrypoint_iterator(args, 0, 7)
+        _entrypoint_iterator(args, 0, 7, effective_finetune=effective_finetune)
 
 
 def test_native_state_rejects_changed_application_and_seed(tmp_path):
