@@ -3,7 +3,6 @@
 """Megatron arguments."""
 
 import argparse
-import dataclasses
 import json
 import os
 import re
@@ -13,6 +12,7 @@ from pathlib import Path
 import torch
 
 from megatron.core.config import set_experimental_flag
+from megatron.core.model_parallel_config import normalize_gtp_nccl_ub
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
@@ -1045,12 +1045,10 @@ def validate_args(args, defaults={}):
         assert os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1", \
             'FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.'
 
-        if args.nccl_ub:
-            # In Megatron-LM, required implementation for manual registration is already provided.
-            # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
+        if args.nccl_ub and args.megatron_fsdp_version == 1:
+            # V1 supplies manual registration; v2 uses symmetric-memory registration instead.
             args.fsdp_manual_registration = True
-            args.fsdp_double_buffer = True
-            warn_rank_0('FSDP double buffer and manual registration is enabled by default when --nccl-ub is enabled!')
+            warn_rank_0('FSDP manual registration is enabled by default when --nccl-ub is enabled!')
 
         if args.megatron_fsdp_max_pool_double_buffer:
             # MaxPoolAllocator is a type of FSDP double buffer.
@@ -1398,14 +1396,21 @@ def validate_args(args, defaults={}):
                 "buffer via replace_raw_data is unsupported)."
             )
 
+        for attr in ("gtp_remat_nccl_ub", "gtp_expert_remat_nccl_ub"):
+            setattr(args, attr, normalize_gtp_nccl_ub(getattr(args, attr, None)))
+
+        gtp_ub_collectives = (args.gtp_remat_nccl_ub or []) + (args.gtp_expert_remat_nccl_ub or [])
+
         # GTP symmetric memory registers pools with symmetric=True (NVLS needs symmetric
         # windows), which contradicts --disable-symmetric-registration.
-        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+        if gtp_ub_collectives:
             assert not getattr(args, 'disable_symmetric_registration', False), (
                 "--gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require symmetric window registration and "
                 "cannot be combined with --disable-symmetric-registration."
             )
-            if getattr(args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False):
+            if "rs" in gtp_ub_collectives and getattr(
+                args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
+            ):
                 print_rank_0(
                     "WARNING: --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub take precedence over "
                     "--gtp-remat-reduce-scatter-with-fp32-accumulation on their groups: NVLS "
@@ -2687,7 +2692,8 @@ def _add_training_args(parser):
                        help='Enable nsys profiling. When using this option, nsys '
                        'options should be specified in commandline.')
 
-    train_factory = ArgumentGroupFactory(TrainingConfig)
+    # Keep the legacy vision CLI master switch/defaults at their existing boundary.
+    train_factory = ArgumentGroupFactory(TrainingConfig, exclude=["vision_pretraining_type"])
     group = train_factory.build_group(parser, "training")
 
     # Keep this CLI-only until dataset options have their own config dataclass.
@@ -2904,6 +2910,9 @@ def _add_distributed_args(parser):
 
     dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
     group = dist_init_factory.build_group(parser, "distributed init")
+
+    group.add_argument('--use-torch-fsdp2', action='store_true', default=False,
+                       help="Use PyTorch FSDP2. Cannot be used together with use_megatron_fsdp.")
 
     group.add_argument('--use-megatron-fsdp', action='store_true', default=False,
                        help="Use Megatron's Fully Sharded Data Parallel. Cannot be used together with use_torch_fsdp2.")

@@ -104,7 +104,9 @@ def fully_shard(
 
     Args:
         module: Module whose currently unowned parameters are managed by FSDP.
-        mesh: Parent device mesh containing the data-parallel axes.
+        mesh: Parent device mesh containing the data-parallel axes. With symmetric memory,
+            the mesh provider must initialize each data-parallel NCCL communicator before
+            construction, for example with a barrier on each mesh-axis group.
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
