@@ -608,8 +608,11 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
     runner's replay stream (its tail = captured Phase 2 main_grad.add_). Under whole-step capture
     there are no per-layer runners, so that second wait is skipped. No-op when GTP is inactive.
     """
+    # Whole-step capture runs the accumulation fence too: it is part of the captured step, and
+    # skipping it would drop a wgrad that the accumulation window left for the fence to flush.
+    run_accum_fence = _FULL_ITERATION or not torch.cuda.is_current_stream_capturing()
     # Before the drain: wait_async_comms() waits without adding, losing the result.
-    if not torch.cuda.is_current_stream_capturing():
+    if run_accum_fence:
         _collect_inflight_wgrad_reduce_scatters()
     wait_async_comms()
     cur = torch.cuda.current_stream()
@@ -620,7 +623,7 @@ def wait_for_gtp_grad_reduction_on_current_stream() -> None:
         cur.wait_stream(s)
     # AFTER the joins: this fires grad-ready, which can dispatch a DP collective that would
     # race peers' main_grad.add_ still queued on rs_stream.
-    if not torch.cuda.is_current_stream_capturing():
+    if run_accum_fence:
         _finalize_wgrad_accumulation()
     # The per-layer CG runner replay streams exist only in the eager / per-layer-CG path; under
     # whole-step capture there are no runners, so stop here while capturing.
@@ -2786,14 +2789,18 @@ class GTPShardedParam(torch.nn.Parameter):
         return self.wgrad_reduce_scatter(wgrads, nvtx_label=nvtx_label)
 
     def _can_accumulate_wgrad(self) -> bool:
-        """Eligibility, not state: opted in, and not on a graphed or ring-slot path.
+        """Eligibility, not state: opted in, and not on a partially graphed or ring-slot path.
 
         Whether it IS accumulating right now is ``_wgrad_accum_buf is not None``.
         """
         if not self._wgrad_accum_enabled:
             return False
-        # A graph bakes in the schedule and the ring slot owns its own lifecycle.
-        if _chain_is_graphed(self.chain_id) or torch.cuda.is_current_stream_capturing():
+        # A partial graph bakes in one backward's schedule, and the ring slot owns its own
+        # lifecycle. A full-iteration graph holds every forward and backward of the step and
+        # its fence, so the whole accumulation window is inside the capture and replays as is.
+        if not _FULL_ITERATION and (
+            _chain_is_graphed(self.chain_id) or torch.cuda.is_current_stream_capturing()
+        ):
             return False
         return getattr(self, "_gtp_graph_wgrad_ring_slot", None) is None
 
