@@ -88,9 +88,7 @@ def get_gpt_modelopt_layer_spec(
         )
     if config.context_parallel_size > 1:
         log_single_rank(
-            logger,
-            logging.WARNING,
-            "context_parallel_size > 1! Force using TEDotProductAttention!",
+            logger, logging.WARNING, "context_parallel_size > 1! Force using TEDotProductAttention!"
         )
         local_core_attention = False
     return get_gpt_modelopt_spec(
