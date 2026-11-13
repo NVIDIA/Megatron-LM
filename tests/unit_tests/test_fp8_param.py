@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
 import gc
@@ -39,7 +39,7 @@ from megatron.training.training import (
 )
 from megatron.training.utils import get_device_arch_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 _SEED = 1234
 fp8_available, reason_for_no_fp8 = check_fp8_support()
@@ -312,7 +312,6 @@ class TestFP8Param:
         else:
             gpt_model, optimizer, _ = setup_model_and_optimizer(
                 ModelType.encoder_or_decoder,
-                self.model_provider,
                 cfg_container=cfg_container,
                 pg_collection=pg_collection,
             )
@@ -867,6 +866,7 @@ class TestFP8Param:
             # and gathered before the state dict is taken.
             force_param_sync(model, optimizer=optimizer)
             saved_state = self.quantized_param_state(model[0])
+            sync_checkpoint_config(get_args())
             save_checkpoint(3, model, optimizer, opt_param_scheduler, 0)
             torch.distributed.barrier()
 
@@ -875,6 +875,7 @@ class TestFP8Param:
             args, model, optimizer, opt_param_scheduler = self.setup_checkpoint_case(
                 tp_size, recipe, str(ckpt_dir), **kwargs
             )
+            sync_checkpoint_config(get_args())
             iteration, _ = load_checkpoint(
                 model, optimizer, opt_param_scheduler, strict=True, restore_training_state=True
             )
@@ -935,6 +936,7 @@ class TestFP8Param:
             self.run_train_steps(args, model, optimizer, num_steps=2)
             force_param_sync(model, optimizer=optimizer)
             saved_state = self.quantized_param_state(model[0])
+            sync_checkpoint_config(get_args())
             save_checkpoint(2, model, optimizer, opt_param_scheduler, 0)
             torch.distributed.barrier()
 
@@ -953,6 +955,7 @@ class TestFP8Param:
                 )
                 args.load = str(ckpt_dir)
                 try:
+                    sync_checkpoint_config(get_args())
                     iteration, _ = load_checkpoint(model, None, None, strict=True)
                 except Exception:
                     # A failure on one rank only leaves the other rank waiting in a collective
