@@ -1914,7 +1914,6 @@ class TransformerConfig(ModelParallelConfig):
             "moe_ncclep_zero_copy",
             "moe_pad_expert_input_to_capacity",
             "moe_router_padding_for_quantization",
-            "moe_paged_stash",
             "moe_virtual_expert_load_balance",
             "moe_shortcut_connection",
             "cpu_offloading",
@@ -3616,7 +3615,7 @@ class TransformerConfig(ModelParallelConfig):
                     f"(paged stash covers those activations). "
                     f"Remove: {moe_offload_conflict}"
                 )
-            if not self.use_transformer_engine_op_fuser:
+            if not self.use_transformer_engine_op_fuser and self.moe_megakernel_backend != "te":
                 if not self.moe_use_grouped_tensor:
                     raise ValueError(
                         "moe_paged_stash without use_transformer_engine_op_fuser requires "
