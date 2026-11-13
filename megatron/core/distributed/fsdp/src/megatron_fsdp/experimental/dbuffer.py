@@ -16,6 +16,7 @@
 
 import dataclasses
 from collections.abc import Iterable, Sequence
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -28,6 +29,9 @@ from . import layout_builder
 from .layout import GlobalLayout, Shape, non_leading_numel
 from .placement import BlockAtomic, ShardLayout, TensorAtomic
 from .range import Range, intersect_ranges
+
+if TYPE_CHECKING:
+    from .quantized_dbuffer import QuantizedDBuffer
 
 
 @dataclasses.dataclass(frozen=True)
@@ -325,9 +329,12 @@ class DBuffer:
             self.layout,
         )
 
-    def is_alias_of(self, other: "DBuffer") -> bool:
-        """Whether the local buffers share backing storage, including distinct views."""
-        return self.local_buffer.untyped_storage() is other.local_buffer.untyped_storage()
+    def is_alias_of(self, other: "DBuffer | QuantizedDBuffer") -> bool:
+        """Whether local buffers share storage; different representations never alias."""
+        return (
+            isinstance(other, DBuffer)
+            and self.local_buffer.untyped_storage() is other.local_buffer.untyped_storage()
+        )
 
     @classmethod
     def distribute_tensors(
