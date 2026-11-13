@@ -56,7 +56,6 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_triton_autotune_args(parser)
     parser = _add_regularization_args(parser)
     parser = _add_training_args(parser)
-    parser = _add_rl_args(parser)
     parser = _add_initialization_args(parser)
     parser = _add_learning_rate_args(parser)
     parser = _add_checkpointing_args(parser)
@@ -478,9 +477,8 @@ def validate_args(args, defaults={}):
         * args.context_parallel_size
     )
 
-    from megatron.training.config import InferenceSetupConfig, RLConfig
+    from megatron.training.config import InferenceSetupConfig
 
-    rl_cfg = _default_config_from_args(RLConfig, args)
     _default_config_from_args(InferenceSetupConfig, args).validate()
 
     print_rank_0('using world size: {}, data-parallel size: {}, '
@@ -1719,20 +1717,6 @@ def validate_args(args, defaults={}):
     if args.skip_train and not args.no_load_optim:
         args.no_load_optim = True
         warn_rank_0('enabling --no-load-optim when skipping training.')
-    rl_cfg.validate_run(
-        cuda_graph_impl=args.cuda_graph_impl,
-        micro_batch_size=args.micro_batch_size,
-        global_batch_size=args.global_batch_size,
-        train_iters=args.train_iters,
-        train_samples=args.train_samples,
-        skip_train=args.skip_train,
-        load_optim=not args.no_load_optim,
-        save_interval=args.save_interval,
-        exit_interval=args.exit_interval,
-        separate_inference_model=rl_cfg.uses_separate_inference_model(
-            context_parallel_size=args.context_parallel_size, inference_shards=args.inference_shards
-        ),
-    )
 
     # Local checkpointing and replication prerequisites, the async-save worker requirement and a
     # replication jump without replication are checked by CheckpointConfig.validate().
@@ -2673,13 +2657,6 @@ def _add_regularization_args(parser):
                        '(used in momentum EMA update). Default: 0.98.')
     return parser
 
-
-def _add_rl_args(parser):
-    from megatron.training.config import RLConfig
-
-    rl_factory = ArgumentGroupFactory(RLConfig)
-    rl_factory.build_group(parser, "rl")
-    return parser
 
 def _add_training_args(parser):
     from megatron.training.config import ProfilingConfig, TrainingConfig

@@ -48,6 +48,7 @@ from megatron.training.config import (
     InferenceConfigContainer,
     InferenceSetupConfig,
     ProfilingConfig,
+    RootConfigContainer,
 )
 from megatron.training.global_vars import get_args, get_run_config, set_args
 from megatron.training.models import (
@@ -1064,7 +1065,9 @@ def test_save_checkpoint(
         with open(ckpt_dir / "run_config.yaml") as f:
             saved_config = yaml.safe_load(f)
         for field in fields(profiling):
-            assert saved_config["profiling"][field.name] == getattr(profiling, field.name)
+            assert saved_config["training"]["profiling"][field.name] == getattr(
+                profiling, field.name
+            )
         assert args.profile is False and args.profile_ranks == [99]
         assert args.memory_snapshot_path == "stale.pickle"
 
@@ -1158,10 +1161,10 @@ def test_load_checkpoint(
         with open(ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml") as f:
             saved_config = yaml.safe_load(f)
         for field in fields(rng_config):
-            assert saved_config["rng"][field.name] == getattr(rng_config, field.name)
-        restored_config = type(run_config).from_yaml(
+            assert saved_config["training"]["rng"][field.name] == getattr(rng_config, field.name)
+        restored_config = RootConfigContainer.from_yaml(
             ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml"
-        )
+        ).training
         assert type(restored_config.model) is model_cls
         # The shared YAML comes from rank 0; distributed rank fields differ on other ranks.
         assert restored_config.to_dict()["model"] == run_config.to_dict()["model"]
@@ -1540,9 +1543,11 @@ def test_checkpoint_load_without_microbatch_calculator(
 
             # Converters restore consumed-sample metadata without a training config.
             monkeypatch.setattr(
-                "megatron.training.global_vars._GLOBAL_RUN_CONFIG",
-                inference_cfg_container_from_args(
-                    args, model_cfg=run_config.model, build_model_config=False
+                "megatron.training.global_vars._GLOBAL_ROOT_CONFIG_CONTAINER",
+                RootConfigContainer.wrap(
+                    inference_cfg_container_from_args(
+                        args, model_cfg=run_config.model, build_model_config=False
+                    )
                 ),
             )
         if is_inference:
@@ -1764,7 +1769,7 @@ def test_the_saved_section_decides_what_a_resume_requests(
             elif section_says_rng is False:
                 with open(config_filename) as handle:
                     saved = yaml.safe_load(handle)
-                saved["checkpoint"]["save_rng"] = False
+                saved["training"]["checkpoint"]["save_rng"] = False
                 with open(config_filename, "w") as handle:
                     yaml.safe_dump(saved, handle)
         torch.distributed.barrier()

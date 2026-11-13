@@ -3,14 +3,20 @@
 """Disaggregated prefill/decode rollouts for RL."""
 
 import copy
+from argparse import Namespace
+from contextlib import AbstractContextManager
 
+import torch
 import torch.distributed as dist
 
+from megatron.core.enums import ModelType
 from megatron.core.inference.shards import build_inference_pg_collections_for_shards
 from megatron.core.inference.shards_spec import (
     resolve_inference_shard,
     spec_declares_disaggregation,
 )
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.config import InferenceConfigContainer, RLConfig
 
 
 def disagg_refit_pools(
@@ -26,34 +32,30 @@ def disagg_refit_pools(
 
 
 def build_disagg_inference_model(
-    args, model_type, transformer_config, *, cfg_container, model_alloc_ctx
-):
+    args: Namespace,
+    model_type: ModelType,
+    transformer_config: TransformerConfig,
+    *,
+    rl_config: RLConfig,
+    inference_container: InferenceConfigContainer,
+    model_alloc_ctx: AbstractContextManager,
+) -> list[torch.nn.Module]:
     """Build this rank's disaggregated RL inference shard."""
-    for field in (
-        "rl_inference_tensor_model_parallel_size",
-        "rl_inference_pipeline_model_parallel_size",
-        "rl_inference_expert_model_parallel_size",
-        "rl_inference_expert_tensor_model_parallel_size",
-    ):
-        if getattr(cfg_container.rl, field) is not None:
-            raise ValueError(
-                f"--{field.replace('_', '-')} cannot be combined with disaggregated "
-                "--inference-shards; configure parallelism in each shard specification"
-            )
-    if cfg_container.rl.rl_verify_model_weights_swap:
+    if rl_config.rl_verify_model_weights_swap:
         raise ValueError(
             "--rl-verify-model-weights-swap does not support disaggregated inference shards"
         )
-    if cfg_container.rl.refit_method == "nixl":
+    if rl_config.refit_method == "nixl":
         raise ValueError(
             "--refit-method=nixl does not support multiple disaggregated destination pools; "
             "use a supported refit backend such as nccl"
         )
-    if not args.inference_dynamic_batching_enable_prefix_caching:
+    setup = inference_container.inference
+    if not setup.inference_dynamic_batching_enable_prefix_caching:
         raise ValueError("disaggregated RL rollouts require prefix caching")
     shards = build_inference_pg_collections_for_shards(
         total_world_size=args.world_size,
-        shards=args.inference_shards,
+        shards=setup.inference_shards,
         use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
     )
     local_shards = [shard for shard in shards if shard.pg_collection is not None]
@@ -75,9 +77,9 @@ def build_disagg_inference_model(
         cfg.expert_tensor_parallel_size = my_spec.expt_tp
 
     with model_alloc_ctx:
-        model_config = copy.deepcopy(cfg_container.model)
-        model_config.transformer = cfg
-        model = model_config.get_builder_cls()(model_config).build_distributed_models(
+        shard_model_config = copy.deepcopy(inference_container.model)
+        shard_model_config.transformer = cfg
+        model = shard_model_config.get_builder_cls()(shard_model_config).build_distributed_models(
             pg_collection=my_pg, wrap_with_ddp=False, model_type=model_type
         )
     model[0].eval()

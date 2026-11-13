@@ -32,7 +32,7 @@ class _WorkerDataset(torch.utils.data.Dataset):
         if multiprocessing.get_start_method() != 'fork':
             # The parent only patches the getters; fresh interpreters have no run config.
             assert global_vars._GLOBAL_ARGS is None
-            assert global_vars._GLOBAL_RUN_CONFIG is None
+            assert global_vars._GLOBAL_ROOT_CONFIG_CONTAINER is None
         if self.exit_signal_handler:
             assert callable(signal.getsignal(signal.SIGUSR1))
             os.kill(os.getpid(), signal.SIGUSR1)

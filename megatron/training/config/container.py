@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import copy
+import importlib
 import logging
 import os
 from dataclasses import dataclass, field
@@ -105,6 +106,13 @@ class ConfigContainerBase:
         if callable(finalize_model):
             finalize_model()
 
+    def resolve_tokenizer_vocab_size(self) -> None:
+        """Bind tokenizer-derived vocabulary on every member container."""
+        for config_field in dataclass_fields(self):
+            member = getattr(self, config_field.name)
+            if isinstance(member, ConfigContainerBase):
+                member.resolve_tokenizer_vocab_size()
+
     @classmethod
     def from_dict(
         cls: Type[T],
@@ -145,7 +153,12 @@ class ConfigContainerBase:
 
         # Use instantiate to create the object
         instance = instantiate(config_dict, mode=mode)
-
+        if not isinstance(instance, cls):
+            name = type(instance).__qualname__
+            raise TypeError(
+                f"Expected {cls.__qualname__}, got {name}; load this document with "
+                f"{name}.from_dict or {name}.from_yaml."
+            )
         return instance
 
     @classmethod
@@ -295,11 +308,20 @@ class PretrainConfigContainer(ConfigContainerBase):
     checkpoint: CheckpointConfig
     profiling: ProfilingConfig = field(default_factory=ProfilingConfig)
     tokenizer: TokenizerConfig = field(default_factory=TokenizerConfig)
-    rl: RLConfig = field(default_factory=RLConfig)
 
     rerun_state_machine: RerunStateMachineConfig = field(default_factory=RerunStateMachineConfig)
     straggler: StragglerDetectionConfig | None = None
     fault_tolerance: FaultToleranceConfig = field(default_factory=FaultToleranceConfig)
+
+    @classmethod
+    def from_dict(
+        cls: Type[T],
+        config_dict: dict[str, Any],
+        mode: InstantiationMode = InstantiationMode.STRICT,
+    ) -> T:
+        """Create a container from a dictionary."""
+        config_dict = {key: value for key, value in config_dict.items() if key != "rl"}
+        return super().from_dict(config_dict, mode=mode)
 
     def get_model_world_size(self) -> int:
         """Return ranks in the model grid, which may be a subset of the launch."""
@@ -444,7 +466,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                 self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
 
     def validate(self) -> None:
-        """Validate each section and the cross-config GTP, batch-size, and RL policies."""
+        """Validate each section and the cross-config GTP and batch-size policies."""
         if self.model is None:
             raise ValueError("Training requires a model config")
         if getattr(self.model, "transformer", None) is None:
@@ -482,9 +504,8 @@ class PretrainConfigContainer(ConfigContainerBase):
         self._validate_checkpoint()
         if self.fault_tolerance.enable_ft_package and not self.checkpoint.save:
             raise ValueError("checkpointing save dir must be set to enable fault tolerance")
-        global_batch_size, _, _ = self._resolve_batch_sizes()
+        self._resolve_batch_sizes()
         self._validate_ddp_config()
-        self._validate_rl_config(global_batch_size)
         optimizer.validate_run(
             ddp_config=self.ddp,
             use_torch_fsdp2=isinstance(self.ddp, TorchFullyShardedDataParallelConfig),
@@ -542,7 +563,7 @@ class PretrainConfigContainer(ConfigContainerBase):
         """Check wrapper requirements without deriving or mutating other configs."""
         # DDP's copy is derived during finalization; recipes only set optimizer policy.
         if self.optimizer.reuse_grad_buf_for_mxfp8_param_ag and not self.ddp.use_megatron_fsdp:
-            if self.ddp.grad_buffer_offload or self.rl.requires_grad_buffer_offload:
+            if self.ddp.grad_buffer_offload:
                 raise ValueError(
                     "Gradient-buffer offload is incompatible with "
                     "--reuse-grad-buf-for-mxfp8-param-ag: "
@@ -612,24 +633,6 @@ class PretrainConfigContainer(ConfigContainerBase):
                 "Manual FSDP registration requires Megatron FSDP v1 with NCCL user buffers."
             )
 
-    def _validate_rl_config(self, global_batch_size: int | None) -> None:
-        """Check RL policy against the supplied or resolved training batch size."""
-        transformer = getattr(self.model, "transformer", None)
-        cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
-        self.rl.validate_run(
-            cuda_graph_impl=cuda_graph_impl,
-            micro_batch_size=self.train.micro_batch_size,
-            global_batch_size=global_batch_size,
-            train_iters=self.train.train_iters,
-            train_samples=self.train.train_samples,
-            skip_train=self.validation.skip_train,
-            load_optim=self.checkpoint.load_optim,
-            save_interval=self.checkpoint.save_interval,
-            exit_interval=self.train.exit_interval,
-            # The rollout deployment (inference shards, model CP) is not a pretrain section;
-            # validate_args checks that rule from the launch arguments.
-            separate_inference_model=None,
-        )
 
     def _validate_data_section(self) -> None:
         """Cross-section checks for ``data.dataset``, one per field.
@@ -701,9 +704,8 @@ class PretrainConfigContainer(ConfigContainerBase):
             )
 
     def _finalize(self) -> None:
-        # Checkpoint derivations first: the RL check below reads the derived load_optim. The
-        # conditions are validate_args', and the warning fires only when a value changes, so a CLI
-        # run, whose arguments validate_args already normalized, stays silent.
+        # The conditions are validate_args', and the warning fires only when a value changes, so a
+        # CLI run, whose arguments validate_args already normalized, stays silent.
         if self.checkpoint.ckpt_convert_format is not None:
             # A conversion run exits instead of training from random weights.
             self.checkpoint.exit_on_missing_checkpoint = True
@@ -727,7 +729,6 @@ class PretrainConfigContainer(ConfigContainerBase):
                     "at finalize(), leave it unset."
                 )
         batch_sizes = self._resolve_batch_sizes(self.get_batch_parallel_size())
-        self._validate_rl_config(batch_sizes[0])
         # Resolve RNG and model settings before deriving optimizer precision.
         super()._finalize()
         optimizer = self._optimizer_with_model_precision()
@@ -848,9 +849,14 @@ class PretrainConfigContainer(ConfigContainerBase):
                 getattr(transformer, "dynamic_context_parallel", False)
             )
         self.data.finalize()
-        if self.rl.requires_grad_buffer_offload:
-            self.ddp.grad_buffer_offload = True
         self.ddp.finalize()
+
+    def resolve_tokenizer_vocab_size(self) -> None:
+        """Bind the model's vocabulary from this container's tokenizer section."""
+        # Imported lazily: megatron.training.argument_utils imports megatron.training.config.
+        from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+
+        resolve_tokenizer_vocab_size(self)
 
 
 def update_train_iters(train: TrainingConfig) -> None:
@@ -882,7 +888,7 @@ def update_train_iters(train: TrainingConfig) -> None:
 
 @dataclass(kw_only=True)
 class InferenceConfigContainer(ConfigContainerBase):
-    """Top-level container for inference entry points.
+    """Container for inference entry points.
 
     This is the inference counterpart to :class:`PretrainConfigContainer`. It holds only the
     configs that inference actually needs and is intentionally shaped differently from the
@@ -898,7 +904,8 @@ class InferenceConfigContainer(ConfigContainerBase):
     """Model to load, or None for args-only entrypoints without model inputs."""
 
     checkpoint: CheckpointConfig
-    """Checkpoint configuration used to load model weights."""
+    """Checkpoint configuration used to load model weights; ``load=None`` for a deployment whose
+    weights come from an in-process training model (the RL rollout engine)."""
 
     inference: InferenceSetupConfig
     """Declarative inference settings (the serializable, args-shaped layer). Use
@@ -917,3 +924,119 @@ class InferenceConfigContainer(ConfigContainerBase):
             # A conversion run (the checkpoint converters bootstrap through this container) exits
             # instead of loading random weights, as validate_args derives it.
             self.checkpoint.exit_on_missing_checkpoint = True
+
+    def resolve_tokenizer_vocab_size(self) -> None:
+        """Bind the model's vocabulary from this container's tokenizer section."""
+        # Imported lazily: megatron.training.argument_utils imports megatron.training.config.
+        from megatron.training.argument_utils import resolve_tokenizer_vocab_size
+
+        resolve_tokenizer_vocab_size(self)
+
+
+@dataclass(kw_only=True)
+class AlgorithmConfigContainer(ConfigContainerBase):
+    """Container for the algorithm sections a run adds on top of `training`.
+
+    Each section names the module holding its rules against the run's other containers
+    (`run_rules`); the root container applies them when it validates and finalizes.
+    """
+
+    rl: RLConfig | None = None
+    """The RL loop's section; `None` for a run without RL."""
+
+    def _run_rules(self) -> list:
+        """The rules modules of the sections this run has."""
+        sections = (getattr(self, f.name) for f in dataclass_fields(self) if f.init)
+        return [importlib.import_module(s.run_rules) for s in sections if s is not None]
+
+    def validate_run(self, root: "RootConfigContainer") -> None:
+        """Check each section's rules against the run's other containers."""
+        for rules in self._run_rules():
+            rules.validate_run(root)
+
+    def finalize_run(self, root: "RootConfigContainer") -> None:
+        """Apply each section's derivations to the run's other containers."""
+        for rules in self._run_rules():
+            rules.finalize_run(root)
+
+
+@dataclass(kw_only=True)
+class RootConfigContainer(ConfigContainerBase):
+    """Container of config containers: a run's whole configuration, saved as `run_config.yaml`.
+
+    Each member is itself a container (the other containers hold config sections).
+    A training run sets `training`, an inference run sets `inference`,
+    an RL run sets `training`, `inference`, and `algorithm`.
+
+    A run config saved before this type, one container serialized flat, still loads through
+    `megatron.training.utils.checkpoint_utils.run_config_sections` (backwards compatibility).
+    """
+
+    training: PretrainConfigContainer | None = None
+    """The training sections; for a training or RL run, the run config the loop reads."""
+
+    inference: InferenceConfigContainer | None = None
+    """An inference or converter process's sections, or an RL run's rollout engine deployment."""
+
+    algorithm: AlgorithmConfigContainer | None = None
+    """The algorithm sections a run adds on top of `training` (the RL section)."""
+
+    def validate(self) -> None:
+        """Check the algorithm sections' rules against the run, then validate every member."""
+        if self.algorithm is not None:
+            self.algorithm.validate_run(self)
+        super().validate()
+
+    def _finalize(self) -> None:
+        """Apply the algorithm sections' rules, then finalize the members."""
+        if self.algorithm is not None:
+            self.algorithm.finalize_run(self)
+        # The run config last: an RL run finalizes its rollout deployment before training.
+        run_config = self.run_config
+        for config_field in dataclass_fields(self):
+            member = getattr(self, config_field.name)
+            if isinstance(member, ConfigContainerBase) and member is not run_config:
+                member.finalize()
+        if run_config is not None:
+            run_config.finalize()
+
+    @classmethod
+    def wrap(cls, run_config: ConfigContainerBase) -> "RootConfigContainer":
+        """Return a run's root container: a root as is, a lone run config as the matching member."""
+        if isinstance(run_config, cls):
+            return run_config
+        if isinstance(run_config, PretrainConfigContainer):
+            return cls(training=run_config)
+        if isinstance(run_config, InferenceConfigContainer):
+            return cls(inference=run_config)
+        raise TypeError(
+            "A run config is a PretrainConfigContainer or an InferenceConfigContainer, "
+            f"got {type(run_config).__qualname__}"
+        )
+
+    @classmethod
+    def run_config_member(cls, members: Mapping[str, Any]) -> str | None:
+        """The name of the member a process runs on (`training`, else `inference`), given a root
+        container's members or its saved document."""
+        return next(
+            (name for name in ("training", "inference") if members.get(name) is not None), None
+        )
+
+    @property
+    def run_config(self) -> PretrainConfigContainer | InferenceConfigContainer | None:
+        """The container the process runs on."""
+        member = self.run_config_member(vars(self))
+        return None if member is None else getattr(self, member)
+
+    def to_dict(self, **section_overrides: Mapping[str, Any]) -> dict[str, Any]:
+        """The document holds only the members the run has. Section overrides (a checkpoint save's
+        own directory and format) reach the member that is the run config."""
+        document = {key: value for key, value in super().to_dict().items() if value is not None}
+        if section_overrides:
+            owner = self.run_config_member(vars(self))
+            if owner is None:
+                raise ValueError(
+                    "RootConfigContainer has no run config member to apply overrides to"
+                )
+            document[owner] = getattr(self, owner).to_dict(**section_overrides)
+        return document

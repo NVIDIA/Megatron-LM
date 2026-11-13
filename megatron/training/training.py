@@ -193,6 +193,7 @@ from .global_vars import (
     get_args,
     get_energy_monitor,
     get_one_logger,
+    get_root_config_container,
     get_run_config,
     get_signal_handler,
     get_telemetry,
@@ -1829,7 +1830,9 @@ def pretrain(
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
 
-    cfg_container.validate()
+    # The run's root container: `cfg_container` is its training member.
+    root = get_root_config_container()
+    root.validate()
 
     callback_manager = normalize_callbacks(callbacks)
 
@@ -1842,7 +1845,7 @@ def pretrain(
     # Finalize the registered configuration before anything reads it: fault tolerance captures
     # the checkpoint policy (save directory, async mode) and must see the derived values.
     # initialize_megatron() re-enters the idempotent finalize later.
-    cfg_container.finalize()
+    root.finalize()
 
     # Early fault tolerance setup - must be done before initialize_megatron
     # to enable monitoring of the initialization process

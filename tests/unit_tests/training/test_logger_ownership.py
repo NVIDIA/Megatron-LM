@@ -219,7 +219,7 @@ def test_tensorboard_metadata_preserves_legacy_args(monkeypatch):
     monkeypatch.setattr(initialize, 'get_args', lambda: args)
     monkeypatch.setattr(initialize, 'get_train_state', lambda: train_state)
     monkeypatch.setattr(initialize, 'get_tensorboard_writer', lambda: writer)
-    monkeypatch.setattr(global_vars, '_GLOBAL_RUN_CONFIG', None)
+    monkeypatch.setattr(global_vars, '_GLOBAL_ROOT_CONFIG_CONTAINER', None)
     write_args_to_tensorboard()
     assert writer.add_text.call_count == len(vars(args))
     for name, value in vars(args).items():

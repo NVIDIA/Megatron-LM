@@ -47,7 +47,12 @@ from megatron.training.vocab_utils import (
 @pytest.fixture
 def isolated_globals(monkeypatch):
     """Avoid changing services owned by the distributed test harness."""
-    for name in ("_GLOBAL_ARGS", "_GLOBAL_RUN_CONFIG", "_GLOBAL_TOKENIZER", "_GLOBAL_TRAIN_STATE"):
+    for name in (
+        "_GLOBAL_ARGS",
+        "_GLOBAL_ROOT_CONFIG_CONTAINER",
+        "_GLOBAL_TOKENIZER",
+        "_GLOBAL_TRAIN_STATE",
+    ):
         monkeypatch.setattr(global_vars, name, None)
 
 
@@ -346,7 +351,7 @@ def test_inference_can_defer_model_even_with_dimensions(monkeypatch):
 def test_explicit_training_bootstrap_preserves_config(monkeypatch, isolated_globals, run_config):
     args = _runtime_args()
     cfg = run_config
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
     cfg.train.train_iters = 7
     cfg.train.micro_batch_size = 2
     cfg.logger.log_interval = 3
@@ -464,7 +469,7 @@ def test_runtime_service_order_and_microbatch_inputs(
     # Runtime services must use the container even when legacy args disagree.
     args.global_batch_size = 99
     args.micro_batch_size = 99
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
     cfg.model = GPTModelConfig(
         transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
         seq_length=32,
@@ -929,7 +934,8 @@ def test_callbacks_construct_from_registered_model_config(
         if inference
         else pretrain_cfg_container_from_args(args, model)
     )
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
+    global_vars.set_run_config(cfg)
     monkeypatch.setattr(provider, "get_args", lambda: args)
     build = Mock()
     monkeypatch.setattr(provider, "BertModel" if family == "bert" else "T5Model", build)
@@ -1227,13 +1233,11 @@ def test_mock_vlm_resolves_padding_before_startup(
 
 @pytest.mark.parametrize("eval_batch_sizes", [None, (16, 4)])
 @pytest.mark.parametrize("schedule", [None, "0:8 32:16"])
-@pytest.mark.parametrize("rl", [False, True])
 def test_native_batch_defaults_preserve_explicit_eval_sizes(
-    monkeypatch, run_config, eval_batch_sizes, schedule, rl
+    monkeypatch, run_config, eval_batch_sizes, schedule
 ):
     run_config.train.micro_batch_size = 2
     run_config.train.step_batch_size_schedule = schedule
-    run_config.rl.perform_rl_step = rl
     if eval_batch_sizes is not None:
         (
             run_config.validation.eval_global_batch_size,
@@ -1277,16 +1281,12 @@ def test_training_batch_divisibility_preserves_calculator_modes(monkeypatch, run
         assert run_config.validation.eval_micro_batch_size == 2
 
 
-@pytest.mark.parametrize("invalid_policy", ["eval", "rl"])
-def test_derived_batch_validation_precedes_config_mutation(monkeypatch, run_config, invalid_policy):
+def test_derived_batch_validation_precedes_config_mutation(monkeypatch, run_config):
+    # The RL rules are tested in tests/unit_tests/training/config/test_rl_config.py.
     monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
     run_config.train.micro_batch_size = 3
-    if invalid_policy == "eval":
-        run_config.validation.eval_micro_batch_size = 4
-        error, message = AssertionError, "Evaluation global batch size must be divisible"
-    else:
-        run_config.rl.perform_rl_step = True
-        error, message = ValueError, "divisible by global_batch_size"
+    run_config.validation.eval_micro_batch_size = 4
+    error, message = AssertionError, "Evaluation global batch size must be divisible"
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", None)
     before = deepcopy(run_config.to_dict())
     run_config.validate()
@@ -1411,8 +1411,15 @@ def test_config_first_matches_legacy_tokenizer_and_model_inputs(
 @pytest.mark.parametrize("pad_vocab", [False, True])
 @pytest.mark.parametrize("padded_vocab", [None, 768])
 def test_training_tokenizer_padding_uses_model_inputs(
-    monkeypatch, isolated_globals, adapter, pad_vocab, padded_vocab
+    monkeypatch, isolated_globals, run_config, adapter, pad_vocab, padded_vocab
 ):
+    from megatron.training.config import (
+        CheckpointConfig,
+        InferenceConfigContainer,
+        InferenceSetupConfig,
+        RootConfigContainer,
+    )
+
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
@@ -1436,13 +1443,23 @@ def test_training_tokenizer_padding_uses_model_inputs(
     else:
         model = adapter(args, config=transformer)
     model.make_vocab_size_divisible_by = 256
-    cfg = SimpleNamespace(
-        model=model,
-        tokenizer=_default_config_from_args(TokenizerConfig, args),
-        dist=DistributedInitConfig(),
+    cfg = run_config
+    cfg.model = model
+    cfg.tokenizer = _default_config_from_args(TokenizerConfig, args)
+    # A deployment with its own copy of the model config, taken before the tokenizer exists; it
+    # shares the run's tokenizer section (an RL rollout layout).
+    deployment = InferenceConfigContainer(
+        model=deepcopy(model),
+        checkpoint=CheckpointConfig(),
+        inference=InferenceSetupConfig(),
+        tokenizer=cfg.tokenizer,
     )
     global_vars.set_args(args)
-    global_vars.set_run_config(cfg)
+    monkeypatch.setattr(
+        global_vars,
+        "_GLOBAL_ROOT_CONFIG_CONTAINER",
+        RootConfigContainer(training=cfg, inference=deployment),
+    )
     for service in ("_set_wandb_writer", "_set_telemetry", "initialize_training_runtime_services"):
         monkeypatch.setattr(global_vars, service, Mock())
 
@@ -1453,6 +1470,8 @@ def test_training_tokenizer_padding_uses_model_inputs(
     assert cfg.tokenizer.padded_vocab_size == expected
     assert args.padded_vocab_size == padded_vocab
     assert cfg.model.vocab_size == (129 if expected is None else expected)
+    # The services bound every container of the run, the deployment's copy included.
+    assert deployment.model.vocab_size == cfg.model.vocab_size
     assert global_vars.get_tokenizer().vocab_size == 129
     assert args.tensor_model_parallel_size == 1
     assert args.make_vocab_size_divisible_by == 128
@@ -1477,7 +1496,9 @@ def test_gpt_embedding_groups_use_registered_model(monkeypatch, isolated_globals
             share_embeddings_and_output_weights=share_embeddings,
         )
     )
-    global_vars.set_run_config(cfg)
+    monkeypatch.setattr(
+        global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", SimpleNamespace(run_config=cfg)
+    )
     global_vars.set_args(Namespace(untie_embeddings_and_output_weights=share_embeddings))
 
     assert pretrain_gpt.get_embedding_ranks([0, 2, 4]) == (
@@ -1859,37 +1880,48 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
     monkeypatch, isolated_globals, run_config, rollout_only
 ):
     import megatron.training as training_package
+    from megatron.rl import config as rl_config_module
     from megatron.rl import rl_utils
     from megatron.rl.callbacks import RLCheckpointCallback, RLLoggingCallback
     from megatron.rl.training_setup import RLSetupCallback
     from megatron.training import argument_utils, utils
-
-    args = Namespace(
-        reset_attention_mask=False,
-        batch_invariant_mode=False,
-        perform_rl_step=True,
-        no_load_optim=False,
+    from megatron.training.config import (
+        CheckpointConfig,
+        InferenceConfigContainer,
+        InferenceSetupConfig,
+        RLConfig,
+        RootConfigContainer,
     )
+
+    args = Namespace(reset_attention_mask=False, batch_invariant_mode=False)
     model = Mock()
-    # The real RL callback derives its rollout interval from these batch values.
+    # The real RL callback derives its rollout interval from these batch values, and
+    # the RL rules check the run against them (rollout-only needs a training horizon).
     cfg = run_config
     cfg.train.micro_batch_size = 1
     cfg.train.global_batch_size = 8
-    # The entrypoint branches on the container; the namespace carries the matching attrs
-    # anyway so the test stays green under a raw-args read as well.
-    cfg.rl.perform_rl_step = True
-    cfg.rl.rl_rollout_only = rollout_only
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    cfg.train.train_iters = 10
+    # The entrypoint composes the run's root container from the parsed args: the run config, the
+    # rollout engine's deployment and the RL section; the two builders are stubbed, like the args.
+    deployment = InferenceConfigContainer(
+        model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
+    )
+    rl_section = RLConfig(perform_rl_step=True, rl_rollout_only=rollout_only)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
     monkeypatch.setattr(logging, "basicConfig", Mock())
     monkeypatch.setattr(arguments, "parse_and_validate_args", Mock(return_value=args))
     monkeypatch.setattr(utils, "is_hybrid_model", lambda args: False)
     monkeypatch.setattr(argument_utils, "gpt_config_from_args", Mock(return_value=model))
     monkeypatch.setattr(argument_utils, "pretrain_cfg_container_from_args", Mock(return_value=cfg))
+    monkeypatch.setattr(
+        rl_config_module, "rollout_inference_container_from_args", Mock(return_value=deployment)
+    )
+    monkeypatch.setattr(argument_utils, "_default_config_from_args", Mock(return_value=rl_section))
     services = Mock(side_effect=AssertionError("entrypoint initialized services before pretrain"))
     monkeypatch.setattr(global_vars, "initialize_runtime_services", services)
     pretrain = Mock()
     monkeypatch.setattr(training_package, "pretrain", pretrain)
-    # The entrypoint's finally owns the shutdown; the real one would os._exit the test process.
+    # The entrypoint owns the shutdown; the real one would os._exit the test process.
     shutdown = Mock()
     monkeypatch.setattr(rl_utils, "rl_inference_interface_shutdown", shutdown)
 
@@ -1909,5 +1941,19 @@ def test_rl_entrypoint_leaves_runtime_setup_to_pretrain(
     assert kwargs["suppress_microbatch_rampup_handling"] is False
     assert callable(kwargs["next_train_iterator"]) and callable(kwargs["run_eval"])
     assert global_vars.get_run_config() is cfg
+    root = global_vars.get_root_config_container()
+    assert isinstance(root, RootConfigContainer)
+    assert root.training is cfg and root.inference is deployment
+    assert root.algorithm.rl is rl_section
+    assert deployment._finalized  # the entrypoint finalized the root container
     assert global_vars._GLOBAL_TOKENIZER is None
     services.assert_not_called()
+    # A run the RL rules reject fails before the try whose finally exits with code 0: 128
+    # samples per collection are 16 global batches of 8, which an exit interval of 3 splits.
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
+    cfg.train.exit_interval = 3
+    train_rl = str(Path(__file__).resolve().parents[3] / "train_rl.py")
+    with pytest.raises(ValueError, match="exit_interval should be divisible"):
+        runpy.run_path(train_rl, run_name="__main__")
+    pretrain.assert_called_once()
+    shutdown.assert_called_once()

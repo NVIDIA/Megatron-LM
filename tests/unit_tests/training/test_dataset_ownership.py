@@ -683,6 +683,14 @@ def test_pre_data_run_config_loads_with_the_default_section(run_config):
         PretrainConfigContainer.from_dict(old_schema)
 
 
+def test_run_config_with_the_retired_rl_section_loads(run_config):
+    """A run_config.yaml saved while the pretrain container carried `rl` still loads."""
+    legacy = run_config.to_dict()
+    legacy["rl"] = {"_target_": "megatron.training.config.rl_config.RLConfig"}
+    restored = PretrainConfigContainer.from_dict(legacy)
+    assert "rl" not in restored.to_dict()
+
+
 def test_inference_container_is_unaffected():
     cfg = InferenceConfigContainer(
         model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
@@ -730,7 +738,12 @@ def test_set_global_variables_finalizes_a_dataset_section(
 ):
     """The compatibility bootstrap finalizes the container before the runtime services bind the
     tokenizer (every PretrainConfigContainer, loader-only ones included, since upstream #8149)."""
-    globals_ = ("_GLOBAL_ARGS", "_GLOBAL_RUN_CONFIG", "_GLOBAL_TOKENIZER", "_GLOBAL_TRAIN_STATE")
+    globals_ = (
+        "_GLOBAL_ARGS",
+        "_GLOBAL_ROOT_CONFIG_CONTAINER",
+        "_GLOBAL_TOKENIZER",
+        "_GLOBAL_TRAIN_STATE",
+    )
     for name in globals_:
         monkeypatch.setattr(global_vars, name, None)
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)

@@ -139,7 +139,7 @@ def test_shared_config_factories_use_run_rng_after_bootstrap(
         args.model_parallel = Namespace()
     run_config.rng = RNGConfig(te_rng_tracker=enabled, inference_rng_tracker=enabled)
     if not registered:
-        monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+        monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
     factory = core_transformer_config_from_yaml if yaml else core_transformer_config_from_args
     config = factory(args)
     assert config.use_te_rng_tracker is enabled
@@ -161,7 +161,8 @@ def test_initialization_uses_owner_and_preserves_deferred_seeding(
 ):
     args = _args_without_rng()
     cfg = inference_cfg_container_from_args(args, build_model_config=False)
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
+    global_vars.set_run_config(cfg)
     cfg.dist.lazy_mpu_init = lazy
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     for name in (

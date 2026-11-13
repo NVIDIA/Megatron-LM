@@ -138,7 +138,7 @@ def run_config(monkeypatch):
     )
     from megatron.training.models import GPTModelConfig
 
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
     container = PretrainConfigContainer(
         train=TrainingConfig(),
         model=GPTModelConfig(
