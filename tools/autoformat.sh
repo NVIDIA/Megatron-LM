@@ -40,6 +40,12 @@ if [[ -n "$CHANGED_FILES" ]]; then
     isort $ADDITIONAL_ARGS $CHANGED_FILES
     pylint $ADDITIONAL_PYLINT_ARGS $CHANGED_FILES
     ruff check $ADDITIONAL_RUFF_ARGS $CHANGED_FILES
+    # Enforce type checking for experimental FSDP and its v2 unit tests.
+    TYPECHECK_FILES=$(echo "$CHANGED_FILES" | grep -E '^(megatron/core/distributed/fsdp/src/megatron_fsdp/experimental/|tests/unit_tests/distributed/mfsdp_v2/)' || true)
+    if [[ -n "$TYPECHECK_FILES" ]]; then
+        # The linting environment does not install runtime dependencies or their stubs.
+        mypy --explicit-package-bases --follow-imports=skip --ignore-missing-imports $TYPECHECK_FILES
+    fi
     mypy --explicit-package-bases --follow-imports=skip $CHANGED_FILES || true
 else
     echo Changeset is empty, all good.
