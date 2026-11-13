@@ -447,7 +447,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             is_expert=False,
             tp_comm_buffer_name='proj',
             tp_group=self.pg_collection.tp,
-            pg_collection=self.pg_collection,
+            # As for core attention: the fallback built before initialize_model_parallel() holds
+            # no group, and the linear then resolves its amax group at forward time.
+            pg_collection=self.pg_collection if self.tp_group is not None else None,
             name=(name + ".linear_proj") if name is not None else None,
         )
 
@@ -1919,7 +1921,8 @@ class SelfAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='qkv',
             tp_group=self.pg_collection.tp,
-            pg_collection=self.pg_collection,
+            # None for the fallback built before initialize_model_parallel(), as for linear_proj.
+            pg_collection=self.pg_collection if self.tp_group is not None else None,
             name=(name + ".linear_qkv") if name is not None else None,
         )
 
@@ -2356,7 +2359,8 @@ class CrossAttention(Attention):
             skip_bias_add=False,
             is_expert=False,
             tp_group=self.pg_collection.tp,
-            pg_collection=self.pg_collection,
+            # None for the fallback built before initialize_model_parallel(), as for linear_proj.
+            pg_collection=self.pg_collection if self.tp_group is not None else None,
             name=(name + ".linear_q") if name is not None else None,
         )
 
@@ -2370,7 +2374,8 @@ class CrossAttention(Attention):
             skip_bias_add=False,
             is_expert=False,
             tp_group=self.pg_collection.tp,
-            pg_collection=self.pg_collection,
+            # None for the fallback built before initialize_model_parallel(), as for linear_proj.
+            pg_collection=self.pg_collection if self.tp_group is not None else None,
             name=(name + ".linear_kv") if name is not None else None,
         )
 
