@@ -873,9 +873,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         emit_fp32 = in_inference_mode and self.lm_head_can_emit_fp32
         output_dtype = torch.float32 if emit_fp32 else None
         logits_buffer = getattr(inference_context, "logits_output_buffer", None)
-        if logits_buffer is not None and inference_context.logits_output_in_place:
-            # TP 1 with a head that takes a preallocated output and emits fp32: the GEMM writes
-            # directly into the (fp32) buffer.
+        if emit_fp32 and logits_buffer is not None and inference_context.logits_output_in_place:
+            # The GEMM writes directly into the buffer for TP1.
             buffer_rows = logits_buffer[0, : hidden_states.shape[0]]
             logits, _ = self.output_layer(
                 hidden_states,

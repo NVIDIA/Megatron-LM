@@ -4368,7 +4368,8 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
                 assert context.logits_output_buffer is controller._all_logits_cuda
                 assert controller._all_logits_cuda.shape[-1] == self.vocab_size
                 assert context.logits_output_in_place == (
-                    tp_size == 1 and controller._language_model.lm_head_can_emit_fp32
+                    tp_size == 1
+                    and getattr(controller._language_model, "lm_head_can_emit_fp32", False)
                 )
             else:
                 assert context.logits_output_buffer is None
