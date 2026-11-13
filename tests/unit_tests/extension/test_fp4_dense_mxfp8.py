@@ -70,10 +70,7 @@ def _recipe_dict(fp8_param=True, overrides=()):
 class TestExampleRecipe:
     def test_loads_and_matches(self):
         recipe = RecipeConfig.from_yaml_file(str(_RECIPE_YAML))
-        assert (
-            recipe.as_dict()["configs"]
-            == RecipeConfig.from_config_dict(_recipe_dict()).as_dict()["configs"]
-        )
+        assert recipe.configs == RecipeConfig.from_config_dict(_recipe_dict()).configs
         cases = {
             "decoder.layers.1.mlp.experts.linear_fc1": "global_recipe",
             "mtp.layers.0.mtp_model_layer.mlp.experts.linear_fc2": "global_recipe",
