@@ -998,20 +998,20 @@ class HybridStack(MegatronModule):
         """
 
         sharded_offsets = sharded_offsets or ()
-        # Guard for cases metadata is not provided: replica ids span the stack's GTP-inclusive
-        # DP x CP group, the group the global default stands for.
-        metadata = ensure_metadata_has_dp_cp_group(
-            metadata, self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
-        )
-        sharded_state_dict = {}
-        layer_prefix = f'{prefix}layers.'
-
+        # Replica ids span the stack's GTP-inclusive DP x CP group, the group the global default
+        # stands for.
+        dp_cp_group = self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
         if self._has_custom_layers:
+            # Custom layers take the caller's group or the stack's, never the global one.
             metadata = dict(metadata or {})
             if metadata.get("dp_cp_group") is None:
-                metadata["dp_cp_group"] = getattr(self.pg_collection, "dp_cp", None)
+                metadata["dp_cp_group"] = dp_cp_group
             if metadata["dp_cp_group"] is None:
                 raise ValueError("Custom layer checkpoints require pg_collection.dp_cp.")
+        # Guard for cases metadata is not provided.
+        metadata = ensure_metadata_has_dp_cp_group(metadata, dp_cp_group)
+        sharded_state_dict = {}
+        layer_prefix = f'{prefix}layers.'
 
         for local_layer_idx, layer in enumerate(self.layers):
 
