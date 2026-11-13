@@ -310,7 +310,7 @@ def test_table_search_uses_only_explicit_paths(monkeypatch, tmp_path):
 
 def test_packaged_tables_are_loadable():
     """The shipped tables must parse and be non-empty for the architectures we ship."""
-    for arch in ("sm100", "sm103"):
+    for arch in ("sm90", "sm100", "sm103"):
         table = table_mod.load(arch)
         assert table, f"packaged table for {arch} is empty"
         assert table.provenance["arch"] == arch
@@ -323,7 +323,7 @@ def test_packaged_entries_name_live_candidates():
     back to the cheapest candidate.
     """
     autotuner = pytest.importorskip("triton.runtime.autotuner")
-    for arch in ("sm100", "sm103"):
+    for arch in ("sm90", "sm100", "sm103"):
         table = table_mod.load(arch)
         for kernel, entries in table.kernels.items():
             if not kernel.startswith("megatron.core."):

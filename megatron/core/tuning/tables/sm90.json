@@ -490,9 +490,7 @@
    }
   }
  },
- "packages": {
-  "mamba-ssm": "2.3.2.post1"
- },
- "source": "Experimental candidate; model qualification incomplete. NVIDIA GH200 480GB (aarch64), NVIDIA driver 595.58.03, CUDA runtime 13.0, PyTorch 2.14.1+cu130, Triton 3.8.0, mamba_ssm 2.3.2.post1. Swept 63 MLA RoPE/mHC/SSD cases at 2048/8192/32768 tokens against core 13a9d46d958ca72582682ae93fa742e94d550d25; 25 kernels and 42 entries. Fixed candidate selection validated on all 63 cases in two independent processes with ordered reductions enabled. H100 was swept separately with a different runtime; its choices are not merged into this table.",
- "triton": "3.8.0"
+ "packages": {},
+ "source": "megatron.core MLA RoPE and mHC kernels and mamba_ssm SSD kernels: one GH200 sweep timing every candidate at 2k, 8k and 32k tokens, smallest worst-case slowdown",
+ "triton": ""
 }
