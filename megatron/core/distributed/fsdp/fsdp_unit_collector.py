@@ -111,15 +111,13 @@ class FsdpUnitCollector:
     def _component_recompute_type(self, module: nn.Module) -> RecomputeType:
         """Check the current component's checkpoint flags without visiting its children."""
         if isinstance(module, MoELayer):
-            partially_recomputed = module.config.recompute_granularity != "full" and (
-                (module.moe_layer_recompute and self._mlp_has_owned_parameters(module))
-                or (
-                    module.shared_experts_recompute
-                    and module.shared_experts is not None
-                    and module.shared_experts not in self._units
-                    and next(module.shared_experts.parameters(), None) is not None
-                )
-            )
+            # The flags already encode selective recompute. Whole-MoE replay uses the
+            # router's weights even though routed experts have their own FSDP hooks.
+            if module.moe_layer_recompute:
+                return RecomputeType.PARTIAL
+            if module.shared_experts_recompute and module.shared_experts is not None:
+                return RecomputeType.PARTIAL
+            return RecomputeType.NONE
         elif isinstance(module, Attention):
             # MLA variants share Attention but no narrower base. They expose this checkpoint
             # flag; other attention implementations may omit it.
@@ -154,7 +152,7 @@ class FsdpUnitCollector:
             recompute_type = max(recompute_type, self._component_recompute_type(child))
         if layer.config.recompute_granularity != "full" and (
             (isinstance(layer, MoETransformerLayer) and layer.moe_layer_recompute)
-            or (layer.recompute_mlp and self._mlp_has_owned_parameters(layer.mlp))
+            or (layer.recompute_mlp and next(layer.mlp.parameters(), None) is not None)
         ):
             recompute_type = RecomputeType.PARTIAL
         return recompute_type
@@ -168,16 +166,6 @@ class FsdpUnitCollector:
             ),
             self._component_recompute_type(layer.mixer),
         )
-
-    def _mlp_has_owned_parameters(self, mlp: nn.Module) -> bool:
-        if isinstance(mlp, MoELayer):
-            # Routed experts have their own hooks; the other children stay with the layer.
-            return any(
-                next(child.parameters(), None) is not None
-                for child in mlp.children()
-                if child not in self._units
-            )
-        return next(mlp.parameters(), None) is not None
 
     def _visit_shortcut(self, block: ShortcutMoEBlock) -> RecomputeType:
         # Helpers bypass both inner layers' __call__; their experts are still collected.
