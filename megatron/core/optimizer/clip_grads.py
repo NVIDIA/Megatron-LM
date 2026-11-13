@@ -305,6 +305,12 @@ def count_zeros_fp32(
         total_num_zeros, op=torch.distributed.ReduceOp.SUM, group=grad_stats_parallel_group
     )
 
+    if torch.cuda.is_current_stream_capturing():
+        # Inside a CUDA graph (--optimizer-cuda-graph) the count cannot be read on the host.
+        # Return the device tensor; the graph refreshes it on every replay and the training
+        # loop reads it after the optimizer step, outside the graph.
+        return total_num_zeros
+
     total_num_zeros = total_num_zeros.item()
 
     return total_num_zeros
