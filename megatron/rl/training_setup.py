@@ -1,11 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
-from typing import Any, Optional
+from argparse import Namespace
+from typing import Any, Callable, Optional
+
+import torch
 
 from megatron.core import mpu
 from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.distributed import TorchFullyShardedDataParallelConfig
+from megatron.core.enums import ModelType
 from megatron.core.inference.shards import build_inference_pg_collection
 from megatron.core.inference.shards_spec import spec_declares_disaggregation
 from megatron.core.num_microbatches_calculator import (
@@ -14,8 +18,9 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     update_num_microbatches,
 )
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_model_config
-from megatron.rl.config import get_rl_config, rollout_model_is_separate
+from megatron.rl.config import ROLLOUT_MODEL_LAYOUT_FIELDS, get_rl_config, rollout_model_is_separate
 from megatron.rl.inference.disagg import build_disagg_inference_model
 from megatron.rl.rl_utils import inference_model_alloc_context
 from megatron.training.callbacks import Callback, CallbackContext
@@ -35,11 +40,11 @@ except ImportError:
 
 def build_rollout_inference_model(
     inference_container: InferenceConfigContainer,
-    args: Any,
-    config: Any,
-    model_provider: Any,
-    model_type: Any,
-) -> Optional[list]:
+    args: Namespace,
+    config: TransformerConfig,
+    model_provider: Callable[..., torch.nn.Module],
+    model_type: ModelType,
+) -> Optional[list[torch.nn.Module]]:
     """Build the rollout engine's separately parallelized model, if the deployment needs one."""
     if spec_declares_disaggregation(args.inference_shards):
         # Disaggregated rollouts build this rank's prefill/decode model on
@@ -55,11 +60,6 @@ def build_rollout_inference_model(
     if not rollout_model_is_separate(inference_container, get_run_config().model):
         return None
 
-    from megatron.training.argument_utils import resolve_tokenizer_vocab_size
-
-    # The copy was taken before the tokenizer bound the run's vocabulary;
-    # bind it from the tokenizer section the deployment shares with the run.
-    resolve_tokenizer_vocab_size(inference_container)
     deployment = inference_container.model.transformer
     print_rank_0(
         "Building separate RL inference model with custom parallelism: "
@@ -81,15 +81,7 @@ def build_rollout_inference_model(
 
     # Build an isolated inference config so the training config remains unchanged.
     inference_config = copy.deepcopy(config)
-    for name in (
-        "tensor_model_parallel_size",
-        "pipeline_model_parallel_size",
-        "context_parallel_size",
-        "expert_model_parallel_size",
-        "expert_tensor_parallel_size",
-        "tensor_parallel_num_weight_shards",
-        "expert_tensor_parallel_num_weight_shards",
-    ):
+    for name in ROLLOUT_MODEL_LAYOUT_FIELDS:
         setattr(inference_config, name, getattr(deployment, name))
 
     with inference_model_alloc_context():
@@ -173,7 +165,11 @@ class RLSetupCallback(Callback):
     """Builds the RL loop's state at `on_data_init_start` and keeps it for the rollout hooks."""
 
     def __init__(
-        self, inference_container: InferenceConfigContainer, *, model_provider: Any, model_type: Any
+        self,
+        inference_container: InferenceConfigContainer,
+        *,
+        model_provider: Callable[..., torch.nn.Module],
+        model_type: ModelType,
     ) -> None:
         self._inference_container = inference_container
         self._model_provider = model_provider

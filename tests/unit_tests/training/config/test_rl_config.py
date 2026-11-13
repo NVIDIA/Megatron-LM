@@ -35,7 +35,7 @@ from megatron.training.config import (
     InferenceConfigContainer,
     InferenceSetupConfig,
     RLConfig,
-    RunConfigRecord,
+    RootConfigContainer,
     rl_config,
 )
 from megatron.training.config.utils import sanitize_dataclass_config, serialize_value
@@ -279,7 +279,7 @@ def _pretrain_container(micro_batch_size=4, model=None):
 
 
 def _inference_container():
-    """A rollout deployment sharing the training model, as the record of a colocated run holds."""
+    """A rollout deployment sharing the training model, as in a colocated run's root container."""
     return InferenceConfigContainer(
         model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
     )
@@ -294,7 +294,7 @@ def _model_with_layout(**layout):
 
 
 def _rl_run(pretrain, inference=None, **rl_kwargs):
-    return RunConfigRecord(
+    return RootConfigContainer(
         training=pretrain,
         inference=_inference_container() if inference is None else inference,
         algorithm=AlgorithmConfigContainer(
@@ -303,10 +303,10 @@ def _rl_run(pretrain, inference=None, **rl_kwargs):
     )
 
 
-def _record_from_args(args):
+def _root_from_args(args):
     """What the RL entry point composes from its parsed arguments."""
     pretrain = pretrain_cfg_container_from_args(args, gpt_config_from_args(args))
-    return RunConfigRecord(
+    return RootConfigContainer(
         training=pretrain,
         inference=rollout_inference_container_from_args(args, pretrain),
         algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
@@ -342,7 +342,7 @@ def test_validate_run_from_the_container_and_the_entry_point():
     cfg.validate_run(**{**RUN, "skip_train": True, "train_iters": 0})
     RLConfig(rl_rollout_only=True).validate_run(**RUN)  # accepted while the RL loop is off
 
-    # Through validate_rl_run, against the training member of the record; the training
+    # Through validate_rl_run, against the training member of the root container; the training
     # container itself carries no RL section. Training containers require a transformer
     # section for the CUDA-graph rule.
     from megatron.training.models.base import ModelConfig
@@ -385,7 +385,7 @@ def test_validate_run_from_the_container_and_the_entry_point():
     assert not pretrain.ddp.grad_buffer_offload
     pretrain = _pretrain_container()
     pretrain.ddp.grad_buffer_offload = True
-    explicit_layout_run = RunConfigRecord(
+    explicit_layout_run = RootConfigContainer(
         training=pretrain,
         inference=_inference_container(),
         algorithm=AlgorithmConfigContainer(rl=RLConfig()),
@@ -407,7 +407,7 @@ def test_validate_run_from_the_container_and_the_entry_point():
         )
     with pytest.raises(ValueError, match="Training requires model.transformer"):
         validate_rl_run(
-            RunConfigRecord(
+            RootConfigContainer(
                 training=_pretrain_container(model=TopologyOnlyModelConfig()),
                 inference=_inference_container(),
                 algorithm=AlgorithmConfigContainer(rl=RLConfig()),
@@ -445,7 +445,7 @@ def test_validate_run_from_the_container_and_the_entry_point():
     with patch("sys.argv", argv):
         args = validate_args(parse_args(extra_args_provider=add_rl_args))
     with pytest.raises(ValueError, match="must be 1"):
-        validate_rl_run(_record_from_args(args))
+        validate_rl_run(_root_from_args(args))
     # The retired inference-only spelling points at the new flag, which does not combine with
     # --skip-train; the variant without an optimizer is --rl-rollout-only --no-load-optim.
     argv = (
@@ -459,10 +459,10 @@ def test_validate_run_from_the_container_and_the_entry_point():
             args = validate_args(parse_args(extra_args_provider=add_rl_args))
         assert args.no_load_optim  # --skip-train still coerces --no-load-optim with the RL group
         with pytest.raises(ValueError, match="--rl-rollout-only collects"):
-            validate_rl_run(_record_from_args(args))
+            validate_rl_run(_root_from_args(args))
     with patch("sys.argv", argv + ["--rl-rollout-only", "--no-load-optim"]):
         args = validate_args(parse_args(extra_args_provider=add_rl_args))
-    validate_rl_run(_record_from_args(args))
+    validate_rl_run(_root_from_args(args))
     assert args.rl_rollout_only and args.no_load_optim
 
 
@@ -479,7 +479,7 @@ def test_entry_point_parse_leaves_the_section_to_the_container():
     )
     with patch("sys.argv", argv):
         args = validate_args(parse_args(extra_args_provider=add_rl_args))
-    cfg = _record_from_args(args).algorithm.rl
+    cfg = _root_from_args(args).algorithm.rl
     # validate_args neither derives nor mirrors RL values; the RL section does.
     assert not hasattr(args, "grpo_samples_per_iteration")
     assert args.rl_generation_lag is None
@@ -488,7 +488,7 @@ def test_entry_point_parse_leaves_the_section_to_the_container():
 
 def _layout_run(run_config, **rl):
     """An RL run over the `run_config` fixture, with the section's default GRPO sizes."""
-    return RunConfigRecord(
+    return RootConfigContainer(
         training=run_config,
         inference=_inference_container(),
         algorithm=AlgorithmConfigContainer(rl=RLConfig(**rl)),
@@ -600,13 +600,13 @@ def test_model_setup_uses_owned_ddp_config(
     parser = argparse.ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
-    # The record's algorithm section, not legacy args, owns the RL policy.
+    # The root container's algorithm section, not legacy args, owns the RL policy.
     args.perform_rl_step = not perform_rl_step
     args.batch_parallel_size = 1
     args.world_size = 1
     monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", args)
     monkeypatch.setattr(global_vars, "_GLOBAL_TRAIN_STATE", TrainState())
-    rl_run = RunConfigRecord(
+    rl_run = RootConfigContainer(
         training=run_config,
         inference=_inference_container(),
         algorithm=AlgorithmConfigContainer(
@@ -703,78 +703,78 @@ def test_weight_offload_needs_a_separate_rollout_model(offload):
 def test_rl_run_config_is_a_singleton(monkeypatch):
     from megatron.training import global_vars
 
-    # The registered record is process-wide; monkeypatch puts the previous one back afterwards.
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG_RECORD", None)
+    # The root container is registered process-wide; monkeypatch restores the previous one.
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
     with pytest.raises(AssertionError, match="not initialized"):
         get_rl_run_config()
-    record = RunConfigRecord(
+    root = RootConfigContainer(
         training=_pretrain_container(),
         inference=_inference_container(),
         algorithm=AlgorithmConfigContainer(rl=RLConfig()),
     )
-    set_rl_run_config(record)
-    assert get_rl_run_config() is record
+    set_rl_run_config(root)
+    assert get_rl_run_config() is root
     with pytest.raises(AssertionError, match="already initialized"):
-        set_rl_run_config(record)
+        set_rl_run_config(root)
     with pytest.raises(AssertionError, match="inference and algorithm members"):
-        set_rl_run_config(RunConfigRecord(training=_pretrain_container()))
+        set_rl_run_config(RootConfigContainer(training=_pretrain_container()))
 
 
-def test_the_record_is_one_type_for_every_run(monkeypatch, tmp_path):
-    """Every process writes a RunConfigRecord whose members are its containers: a training run
-    records `training`, an inference run `inference`, an RL run adds `inference` and `algorithm`;
-    absent members stay out of the document; any record plus the missing members is the larger
-    run's record; and a legacy flat record still yields its sections."""
+def test_the_root_container_is_one_type_for_every_run(monkeypatch, tmp_path):
+    """Every process writes a RootConfigContainer whose members are its containers: a training run
+    sets `training`, an inference run `inference`, an RL run adds `inference` and `algorithm`;
+    absent members stay out of the document; any root container plus the missing members is the
+    larger run's; and a legacy flat run config still yields its sections."""
     import yaml
 
     from megatron.training import checkpointing, global_vars
     from megatron.training.utils.checkpoint_utils import run_config_sections
 
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
-    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG_RECORD", None)
+    monkeypatch.setattr(global_vars, "_GLOBAL_ROOT_CONFIG_CONTAINER", None)
     pretrain = _pretrain_container()
     global_vars.set_run_config(pretrain)
-    assert global_vars.get_run_config_record() is None
-    # A plain training run records its run config under `training`, an inference run under
+    assert global_vars.get_root_config_container() is None
+    # A plain training run saves its run config under `training`, an inference run under
     # `inference`; the writer wraps what the process registered.
-    plain = checkpointing._run_config_record()
-    assert isinstance(plain, RunConfigRecord) and plain.training is pretrain
+    plain = checkpointing._root_config_container()
+    assert isinstance(plain, RootConfigContainer) and plain.training is pretrain
     assert set(plain.to_dict()) == {"_target_", "training"}
-    inference_record = RunConfigRecord.wrap(_inference_container()).to_dict()
-    assert set(inference_record) == {"_target_", "inference"}
+    inference_document = RootConfigContainer.wrap(_inference_container()).to_dict()
+    assert set(inference_document) == {"_target_", "inference"}
 
-    record = RunConfigRecord(
+    root = RootConfigContainer(
         training=pretrain,
         inference=_inference_container(),
         algorithm=AlgorithmConfigContainer(rl=RLConfig(**GRPO_4x3)),
     )
-    set_rl_run_config(record)
+    set_rl_run_config(root)
     assert global_vars.get_run_config() is pretrain  # the loop keeps the pretrain container
-    assert checkpointing._run_config_record() is record
+    assert checkpointing._root_config_container() is root
 
     path = str(tmp_path / "run_config.yaml")
-    record.to_yaml(path)
-    rebuilt = RunConfigRecord.from_yaml(path)
+    root.to_yaml(path)
+    rebuilt = RootConfigContainer.from_yaml(path)
     # The training member's own YAML round trip turns one tuple field into a list (its own
     # serialization); the document and the RL-side members round-trip exactly.
-    assert rebuilt.to_dict() == record.to_dict()
-    assert (rebuilt.algorithm, rebuilt.inference) == (record.algorithm, record.inference)
+    assert rebuilt.to_dict() == root.to_dict()
+    assert (rebuilt.algorithm, rebuilt.inference) == (root.algorithm, root.inference)
     with open(path) as f:
         document = yaml.safe_load(f)
-    assert document["_target_"] == "megatron.training.config.container.RunConfigRecord"
+    assert document["_target_"] == "megatron.training.config.container.RootConfigContainer"
     assert set(document) == {"_target_", "training", "inference", "algorithm"}
     assert document["training"]["_target_"].endswith(".PretrainConfigContainer")
     assert document["algorithm"]["_target_"].endswith(".AlgorithmConfigContainer")
     assert document["algorithm"]["rl"]["_target_"] == "megatron.training.config.rl_config.RLConfig"
-    # Symmetry: an inference run's record plus the training and RL members is the RL record.
-    as_dict = record.to_dict()
-    grown = RunConfigRecord.from_dict(
-        {**inference_record, "training": as_dict["training"], "algorithm": as_dict["algorithm"]}
+    # Symmetry: an inference run's document plus the training and RL members is the RL run's.
+    as_dict = root.to_dict()
+    grown = RootConfigContainer.from_dict(
+        {**inference_document, "training": as_dict["training"], "algorithm": as_dict["algorithm"]}
     )
     assert grown.to_dict() == as_dict
-    # Readers that look sections up by name get the training member of a record, nothing from a
-    # record without one, and a legacy flat record as it is.
+    # Readers that look sections up by name get the training member of a root container, nothing
+    # from one without it, and a legacy flat run config as it is.
     assert run_config_sections(document) is document["training"]
-    assert run_config_sections(inference_record) is None
+    assert run_config_sections(inference_document) is None
     assert run_config_sections(document["training"]) is document["training"]
     assert run_config_sections(None) is None

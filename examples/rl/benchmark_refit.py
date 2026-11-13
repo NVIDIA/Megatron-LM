@@ -37,7 +37,7 @@ from megatron.training.argument_utils import (
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
-from megatron.training.config import AlgorithmConfigContainer, RLConfig, RunConfigRecord
+from megatron.training.config import AlgorithmConfigContainer, RLConfig, RootConfigContainer
 from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.initialize import initialize_megatron
 from megatron.training.utils import is_hybrid_model
@@ -447,15 +447,15 @@ def main():
     model_cfg = (
         hybrid_config_from_args(args) if is_hybrid_model(args) else gpt_config_from_args(args)
     )
-    record = RunConfigRecord(
+    root = RootConfigContainer(
         training=pretrain_container,
         inference=rollout_inference_container_from_args(
             args, pretrain_container, model_cfg=model_cfg
         ),
         algorithm=AlgorithmConfigContainer(rl=_default_config_from_args(RLConfig, args)),
     )
-    finalize_rl_run(record)
-    set_rl_run_config(record)
+    finalize_rl_run(root)
+    set_rl_run_config(root)
     # This synthetic benchmark does not construct datasets, so it does not
     # require the native dataset index helper.
     initialize_megatron(training=True, skip_dependency_compilation=True)

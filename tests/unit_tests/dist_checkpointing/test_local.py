@@ -14,7 +14,7 @@ import pytest
 import torch
 
 from megatron.training.arguments import parse_args
-from megatron.training.config import RunConfigRecord
+from megatron.training.config import RootConfigContainer
 from tests.unit_tests.test_utilities import sync_checkpoint_config
 
 nvidia_resiliency_ext = pytest.importorskip(
@@ -109,9 +109,9 @@ class TestLocalCheckpointing:
                     checkpointing_context=context,
                     non_persistent_ckpt=True,
                 )
-            saved_record = save.call_args.args[0].common_state_dict["run_config"]
-            assert saved_record == RunConfigRecord(training=run_config).to_dict()
-            saved_config = saved_record["training"]
+            saved_root = save.call_args.args[0].common_state_dict["run_config"]
+            assert saved_root == RootConfigContainer(training=run_config).to_dict()
+            saved_config = saved_root["training"]
             run_config.logger.log_interval += 1
             torch.manual_seed(999)
             sync_checkpoint_config(args)

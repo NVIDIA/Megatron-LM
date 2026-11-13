@@ -71,7 +71,7 @@ def _model_and_states(ckpt_format):
 def _assert_saved_config(ckpt_dir, run_config, checkpoint):
     run_config_filename = get_checkpoint_run_config_filename(str(ckpt_dir))
     assert os.path.exists(run_config_filename)
-    # The record names the run's containers as members: a training run's sections sit under training.
+    # A training run's sections sit under the root container's training member.
     loaded_config = read_run_config(run_config_filename)["training"]
     assert loaded_config["train"]["global_batch_size"] == 8
     # The saved checkpoint section describes the policy of this save.
@@ -132,8 +132,8 @@ def test_save_checkpoint_without_optimizer(
         assert "opt_param_scheduler" not in saved
         assert (save_dir / "latest_checkpointed_iteration.txt").read_text().strip() == "123"
         saved_config = read_run_config(get_checkpoint_run_config_filename(str(ckpt_dir)))
-        # The record names the run's containers as members: an inference run records only its own.
-        assert saved_config["_target_"].endswith(".RunConfigRecord")
+        # An inference run's root container holds only its inference member.
+        assert saved_config["_target_"].endswith(".RootConfigContainer")
         assert set(saved_config) == {"_target_", "inference"}
         assert saved_config["inference"]["_target_"].endswith(".InferenceConfigContainer")
         assert "optimizer" not in saved_config["inference"]

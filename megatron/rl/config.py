@@ -5,14 +5,15 @@ from argparse import ArgumentParser, Namespace
 
 from megatron.core.inference.shards_spec import spec_declares_disaggregation
 from megatron.training.argument_utils import ArgumentGroupFactory, _default_config_from_args
-from megatron.training.config import CheckpointConfig, RLConfig, RunConfigRecord
+from megatron.training.config import CheckpointConfig, RLConfig, RootConfigContainer
 from megatron.training.config.container import InferenceConfigContainer, PretrainConfigContainer
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.global_vars import (
-    get_run_config_record,
-    set_run_config_record,
-    unset_run_config_record,
+    get_root_config_container,
+    set_root_config_container,
+    unset_root_config_container,
 )
+from megatron.training.models.base import ModelConfig
 
 _DEPLOYMENT_ARGS = {
     "tensor_model_parallel_size": "rl_inference_tensor_model_parallel_size",
@@ -20,9 +21,21 @@ _DEPLOYMENT_ARGS = {
     "expert_model_parallel_size": "rl_inference_expert_model_parallel_size",
     "expert_tensor_parallel_size": "rl_inference_expert_tensor_model_parallel_size",
 }
+# Transformer fields in which a rollout deployment's layout can differ from training's:
+# the overridable parallelism, plus the CP that context-parallel training forces to 1.
+ROLLOUT_LAYOUT_FIELDS = (*_DEPLOYMENT_ARGS, "context_parallel_size")
+# What a separately built rollout model takes from its deployment:
+# the layout, plus the weight-shard counts derived with it.
+ROLLOUT_MODEL_LAYOUT_FIELDS = (
+    *ROLLOUT_LAYOUT_FIELDS,
+    "tensor_parallel_num_weight_shards",
+    "expert_tensor_parallel_num_weight_shards",
+)
 
 
-def rollout_model_is_separate(inference_container, training_model_cfg) -> bool:
+def rollout_model_is_separate(
+    inference_container: InferenceConfigContainer, training_model_cfg: ModelConfig | None
+) -> bool:
     """Whether rollouts need their own model instead of the training model.
 
     True for disaggregated shards, or for a deployment layout that differs from the training
@@ -35,15 +48,13 @@ def rollout_model_is_separate(inference_container, training_model_cfg) -> bool:
     layouts = (getattr(deployment, "transformer", None), getattr(training, "transformer", None))
     if None in layouts:
         return deployment is not training
-    # The overridable parallelism, plus the CP that context-parallel training forces to 1.
     return any(
-        getattr(layouts[0], name) != getattr(layouts[1], name)
-        for name in (*_DEPLOYMENT_ARGS, "context_parallel_size")
+        getattr(layouts[0], name) != getattr(layouts[1], name) for name in ROLLOUT_LAYOUT_FIELDS
     )
 
 
 def rollout_inference_container_from_args(
-    args: Namespace, pretrain: PretrainConfigContainer, *, model_cfg=None
+    args: Namespace, pretrain: PretrainConfigContainer, *, model_cfg: ModelConfig | None = None
 ) -> InferenceConfigContainer:
     """Compose the rollout engine's deployment from the pretrain container and the RL arguments."""
     if model_cfg is None:
@@ -114,9 +125,9 @@ def rollout_inference_container_from_args(
     )
 
 
-def validate_rl_run(record: RunConfigRecord, *, global_batch_size: int | None = None) -> None:
-    """Validate an RL run's record."""
-    training, inference, rl = record.training, record.inference, record.algorithm.rl
+def validate_rl_run(root: RootConfigContainer, *, global_batch_size: int | None = None) -> None:
+    """Validate an RL run's root container."""
+    training, inference, rl = root.training, root.inference, root.algorithm.rl
     if global_batch_size is None:
         global_batch_size = training.train.global_batch_size
     # The offload `finalize_rl_run` will request, checked like the offload the DDP section
@@ -131,7 +142,7 @@ def validate_rl_run(record: RunConfigRecord, *, global_batch_size: int | None = 
             "--reuse-grad-buf-for-mxfp8-param-ag: "
             "parameters share the gradient-buffer storage that offload releases."
         )
-    record.validate()
+    root.validate()
     transformer = getattr(training.model, "transformer", None)
     cuda_graph_impl = None if transformer is None else transformer.cuda_graph_impl
     rl.validate_run(
@@ -155,20 +166,20 @@ def validate_rl_run(record: RunConfigRecord, *, global_batch_size: int | None = 
         )
 
 
-def finalize_rl_run(record: RunConfigRecord) -> None:
-    """Validate the record, then finalize the deployment."""
-    global_batch_size = record.training.train.global_batch_size
+def finalize_rl_run(root: RootConfigContainer) -> None:
+    """Validate the root container, then finalize the deployment."""
+    global_batch_size = root.training.train.global_batch_size
     if global_batch_size is None:
         # The training container derives an unset global batch size when it finalizes,
         # after this call; check the RL rules against the size it will derive.
-        global_batch_size, _, _ = record.training._resolve_batch_sizes(
-            record.training.get_batch_parallel_size()
+        global_batch_size, _, _ = root.training._resolve_batch_sizes(
+            root.training.get_batch_parallel_size()
         )
-    validate_rl_run(record, global_batch_size=global_batch_size)
-    record.inference.finalize()
-    if record.algorithm.rl.requires_grad_buffer_offload:
+    validate_rl_run(root, global_batch_size=global_batch_size)
+    root.inference.finalize()
+    if root.algorithm.rl.requires_grad_buffer_offload:
         # Applied before the training container finalizes its DDP section.
-        record.training.ddp.grad_buffer_offload = True
+        root.training.ddp.grad_buffer_offload = True
 
 
 def add_rl_args(parser: ArgumentParser) -> ArgumentParser:
@@ -207,22 +218,22 @@ def add_rollout_inference_args(parser: ArgumentParser) -> ArgumentParser:
     return parser
 
 
-def set_rl_run_config(record: RunConfigRecord) -> None:
-    """Register an RL run's record."""
+def set_rl_run_config(root: RootConfigContainer) -> None:
+    """Register an RL run's root container."""
     assert (
-        record.inference is not None and record.algorithm is not None
-    ), "an RL run's record carries its inference and algorithm members"
-    assert record.algorithm.rl is not None, "an RL run's algorithm container carries its rl section"
-    set_run_config_record(record)
+        root.inference is not None and root.algorithm is not None
+    ), "an RL run's root container carries its inference and algorithm members"
+    assert root.algorithm.rl is not None, "an RL run's algorithm container carries its rl section"
+    set_root_config_container(root)
 
 
-def get_rl_run_config() -> RunConfigRecord:
-    """Return the registered RL run's record."""
-    record = get_run_config_record()
+def get_rl_run_config() -> RootConfigContainer:
+    """Return the registered RL run's root container."""
+    root = get_root_config_container()
     assert (
-        record is not None and record.algorithm is not None and record.algorithm.rl is not None
+        root is not None and root.algorithm is not None and root.algorithm.rl is not None
     ), "RL run config is not initialized."
-    return record
+    return root
 
 
 def get_rl_config() -> RLConfig:
@@ -231,5 +242,5 @@ def get_rl_config() -> RLConfig:
 
 
 def unset_rl_run_config() -> None:
-    """Forget the registered record (tests and multi-run processes)."""
-    unset_run_config_record()
+    """Forget the registered root container (tests and multi-run processes)."""
+    unset_root_config_container()
