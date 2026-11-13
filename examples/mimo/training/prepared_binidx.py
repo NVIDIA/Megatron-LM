@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""Prepared BinIdx causal batches and worker-prepared RADIO inputs for MIMO."""
+"""Prepared BinIdx causal batches and worker-prepared vision inputs for MIMO."""
 
 import hashlib
 import json
@@ -12,13 +12,13 @@ import torch
 from PIL import Image
 
 from examples.mimo.training.energon_provider import EnergonDataConfig
+from examples.mimo.vision import resolve_encoder_spec
 from examples.multimodal.data_loading.binidx_token_mask import IndexedTokenMaskReference
 from examples.multimodal.data_loading.image_processing import (
     DynamicResolutionImageTilingStrategy,
     pixel_statistics,
 )
 from examples.multimodal.data_loading.prepared_streaming import PreparedStreamingTaskEncoder
-from megatron.core.models.vision.encoder_registry import get_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.energon import Lazy, NoCachePool, register_aux_filestore_protocol, stateless
 from megatron.training.global_vars import get_run_config
@@ -80,7 +80,7 @@ def _realize_image_row(row, *, image_strategy, geometry):
         if isinstance(pixels, Lazy):
             pixels = copy(pixels).get()
         if not isinstance(pixels, Image.Image):
-            raise TypeError("prepared RADIO images must decode to PIL images")
+            raise TypeError("prepared vision images must decode to PIL images")
         if pixels.size != (plan.media.width, plan.media.height):
             raise ValueError("decoded image size disagrees with original width/height metadata")
         realized = replace(plan, media=replace(plan.media, value=pixels))
@@ -90,7 +90,7 @@ def _realize_image_row(row, *, image_strategy, geometry):
             for tile in tiles
         )
         if len(tiles) != plan.num_tiles or actual != plan.num_embeddings or actual != stop - start:
-            raise ValueError("realized RADIO geometry disagrees with prepared visual spans")
+            raise ValueError("realized encoder geometry disagrees with prepared visual spans")
         images.extend(tiles)
     return images
 
@@ -145,19 +145,21 @@ def _make_encoder(*, split, strategy, options, geometry, prepare_images=False):
 
 
 def make_config(args):
-    """Build the opt-in prepared RADIO application using explicit prepared-token IDs.
+    """Build the opt-in prepared vision application using explicit prepared-token IDs.
 
     Select with ``--energon-data-config examples.mimo.training.prepared_binidx:make_config``.
-    This application supports the existing dynamic RADIO encoder with dropped
-    class tokens and optional 2x2 pixel shuffle. Image budgets count emitted
+    This application supports dynamic RADIO with optional pixel shuffle and
+    native Pixtral with its preset spatial merger. Both drop class tokens. Image budgets count emitted
     visual embeddings, never source end/break tokens. Recipe artifacts must stay
     immutable for checkpoint replay.
     """
     if not args.dynamic_resolution or not args.disable_vision_class_token:
-        raise ValueError("prepared RADIO data requires dynamic resolution and dropped class tokens")
-    # The existing MIMO model provider constructs RADIO; it has no tower selector.
-    spec = get_spec("radio")
-    geometry = replace(spec, patch_dim=args.patch_dim, pixel_shuffle=args.pixel_shuffle)
+        raise ValueError(
+            "prepared vision data requires dynamic resolution and dropped class tokens"
+        )
+    geometry = resolve_encoder_spec(args)
+    native = geometry.name != "radio"
+    vision_model_type = geometry.name if native else "radio"
     # These CLI values also configure the actual encoder. Registry defaults must
     # not silently replace explicitly selected patch size or pixel shuffle.
     if type(args.patch_dim) is not int or args.patch_dim <= 0:
@@ -169,13 +171,15 @@ def make_config(args):
         if type(getattr(args, name)) is not int:
             raise ValueError(f"--{name.replace('_', '-')} must be explicitly configured")
     strategy = DynamicResolutionImageTilingStrategy(
-        vision_model_type="radio",
-        min_num_patches=4 if args.pixel_shuffle else 1,
+        vision_model_type=vision_model_type,
+        min_num_patches=geometry.spatial_reduction**2,
         max_num_patches=budget * geometry.spatial_reduction**2,
         patch_size=args.patch_dim,
         get_num_embeddings=partial(_count_spatial_embeddings, geometry=geometry),
         pixel_shuffle=args.pixel_shuffle,
         use_thumbnail=False,
+        spatial_merge_size=geometry.spatial_merge_size,
+        max_image_size=(geometry.default_img_h, geometry.default_img_w) if native else None,
     )
     tokenizer_config = get_run_config().tokenizer
     options = dict(
@@ -209,6 +213,18 @@ def make_config(args):
         "image_normalization": pixel_statistics["radio"][0],
         "image_std": pixel_statistics["radio"][1],
     }
+    if native:
+        identity.update(
+            task="prepared-causal-stream-native-pixtral",
+            vision_model_type=vision_model_type,
+            spatial_merge_size=geometry.spatial_merge_size,
+            image_min_raw_patches=geometry.spatial_reduction**2,
+            image_max_height=geometry.default_img_h,
+            image_max_width=geometry.default_img_w,
+            image_resize_policy="aligned-native-axis-bounds-v1",
+            image_normalization=pixel_statistics[vision_model_type][0],
+            image_std=pixel_statistics[vision_model_type][1],
+        )
     return EnergonDataConfig(
         create_task_encoder=partial(
             _make_encoder, strategy=strategy, options=options, geometry=geometry

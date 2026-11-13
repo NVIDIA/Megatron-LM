@@ -33,6 +33,7 @@ from examples.mimo.training.encoder_prefetch import (
 )
 from examples.mimo.training.step import mimo_forward_step
 from examples.mimo.training.topology import create_topology
+from examples.mimo.vision import configure_vision_args
 from megatron.core.enums import ModelType
 from megatron.core.utils import unwrap_model
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
@@ -48,6 +49,8 @@ def extra_args_provider(parser: argparse.ArgumentParser) -> argparse.ArgumentPar
     parser = add_hetero_grid_args(parser)
     parser = add_mimo_data_args(parser)
     parser = add_encoder_prefetch_args(parser)
+    # Resolve only this entrypoint's omitted geometry from its selected encoder.
+    parser.set_defaults(patch_dim=None, img_h=None, img_w=None)
     return parser
 
 
@@ -63,6 +66,7 @@ def _set_stock_parallel_args(args: argparse.Namespace) -> None:
 def _parse_and_validate() -> argparse.Namespace:
     """Parse stock plus MIMO arguments and validate the disjoint module grids."""
     args = parse_args(extra_args_provider)
+    configure_vision_args(args)
     _, llm_size = validate_hetero_grid_args(args, args.world_size)
     _set_stock_parallel_args(args)
     if args.dataset_provider == "energon":

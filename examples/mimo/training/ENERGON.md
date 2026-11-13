@@ -271,5 +271,67 @@ supplies the actual RADIO wrapper's `x`, host `imgs_sizes` and packed-attention
 metadata. Realization checks patch geometry against the visual spans. Native
 checkpoint cursors remain authoritative; the application identity fingerprints
 all selected token/objective/sequence/image policies hidden inside callbacks.
-The initial application supports dynamic RADIO with dropped class tokens; it
-does not add other towers, video, token-budget dataset subsets or custom storage.
+The application supports dynamic RADIO and native Pixtral with dropped class
+tokens. It does not add video, token-budget dataset subsets or custom storage.
+
+
+## Native Pixtral and prepared BinIdx inputs
+
+The prepared-data application supports the MIMO native Pixtral tower as an
+opt-in alternative to RADIO. Select `--vision-model-type pixtral-vit-1p6b`
+for the 30-layer, 2048-wide tower with FFN6144, 16 heads, patch14 and native
+2x2 spatial merging. This is a separate preset from `pixtral-vit-large`, whose
+architecture is 48 layers/1664 hidden units. The new preset is qualified through
+the MIMO prepared-data route. Conventional VLM entrypoints are not qualified
+by this addition.
+
+Use these encoder/data options with the normal MIMO language-model and topology
+arguments. Encoder TP must be 1 for the optional pretrained initialization:
+
+```bash
+--dataset-provider energon \
+--energon-data-config examples.mimo.training.prepared_binidx:make_config \
+--vision-model-type pixtral-vit-1p6b \
+--dynamic-resolution --disable-vision-class-token \
+--patch-dim 14 --img-h 1540 --img-w 1540 \
+--vision-projection-type mlp2 --freeze-vit \
+--load-vision-from /path/to/vision_architecture_export \
+--exit-on-missing-checkpoint \
+--energon-image-token-budget 3025 --seq-length 8192
+```
+
+Do not enable RADIO pixel shuffle for native Pixtral. Its own merger reduces
+patch count by four while retaining the 2048-wide output, so the projector reads
+2048 features. Processed images retain their aspect ratio within patch-grid
+rounding, align both axes to 28 pixels and stay within the configured height and
+width. The budget counts emitted visual embeddings. A 1540x1540 image has 12100
+premerge patches and 3025 emitted embeddings. Packed attention boundaries use
+premerge counts, and `imgs_sizes` remains on CPU during model transfer. CLIP
+normalization uses the existing public image-processing constants.
+
+The full MIMO entrypoint derives omitted image/patch values from the selected
+preset before stock validation. Explicit incompatible native patch sizes and
+pixel shuffle are rejected. Existing RADIO selection, mock defaults and prepared
+replay identities remain unchanged. Native Pixtral mock mode is not enabled by
+this addition. Use the prepared Energon application or provide an application
+that follows the same packed native-image geometry.
+
+`--load-vision-from DIRECTORY` is an optional initial architecture-export load,
+performed on encoder ranks before DDP and optimizer construction. It expects a
+PyTorch distributed checkpoint with exactly every named encoder parameter under
+`model.vision_model.`, matching shapes and BF16 source tensors. Runtime-only
+Transformer Engine state is retained. Missing/extra weights, a different
+architecture, nonfinite values, meta parameters and unsupported TP are errors.
+The loader copies into existing parameter objects and verifies the result.
+
+A full training `--load` takes precedence over the encoder export. Combining
+both flags requires `--exit-on-missing-checkpoint`, because stock missing-tracker
+fallback must not create a frozen random tower. A full `--pretrained-checkpoint`
+also bypasses the separate encoder export and retains its stock strict loading
+behavior. For a fresh run, omit both full-model checkpoint options. Keep native
+checkpoint identities with their immutable data and image policies when resuming.
+
+Freezing the encoder leaves the selected projector trainable unless separately
+frozen. Matching this encoder does not by itself match a reference language
+model, data blend, resize policy, optimizer, precision or learning-rate schedule.
+Those choices must also be aligned for a parity comparison.

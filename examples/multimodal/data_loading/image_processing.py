@@ -30,6 +30,9 @@ RADIO_G_PIXEL_STD = [0.2230, 0.2240, 0.2250]
 
 pixel_statistics = {
     "clip": (CLIP_PIXEL_MEAN, CLIP_PIXEL_STD),
+    "pixtral-vit": (CLIP_PIXEL_MEAN, CLIP_PIXEL_STD),
+    "pixtral-vit-large": (CLIP_PIXEL_MEAN, CLIP_PIXEL_STD),
+    "pixtral-vit-1p6b": (CLIP_PIXEL_MEAN, CLIP_PIXEL_STD),
     "siglip": (SIGLIP_PIXEL_MEAN, SIGLIP_PIXEL_STD),
     "internvit": (IMAGENET_PIXEL_MEAN, IMAGENET_PIXEL_STD),
     "radio": (CLIP_PIXEL_MEAN, CLIP_PIXEL_STD),
@@ -676,6 +679,8 @@ class DynamicResolutionImageTilingStrategy(ImageTilingStrategy):
         video_target_num_patches: int | None = None,
         video_maintain_aspect_ratio: bool = False,
         video_temporal_patch_size: int = 1,
+        spatial_merge_size: int = 1,
+        max_image_size: tuple[int, int] | None = None,
     ):
         """
         Args:
@@ -700,8 +705,28 @@ class DynamicResolutionImageTilingStrategy(ImageTilingStrategy):
             video_maintain_aspect_ratio: If True, match video native aspect ratio while respecting target
                 patch budget. Default False.
             video_temporal_patch_size: Temporal patch size for video frame compression. Default 1, no temporal compression.
+            spatial_merge_size: Native per-axis patch reduction, default 1. Pixtral's
+                2x2 merger uses 2. Cannot be combined with RADIO pixel shuffle.
+            max_image_size: Optional (height, width) limits in pixels, aligned to the
+                patch size times spatial reduction. Defaults to no additional axis limits.
         """
-        assert "radio" in vision_model_type, "Dynamic resolution is only supported for radio models"
+        native = vision_model_type in ("pixtral-vit", "pixtral-vit-large", "pixtral-vit-1p6b")
+        if "radio" not in vision_model_type and not native:
+            raise ValueError("dynamic resolution requires a RADIO or native Pixtral encoder")
+        if type(spatial_merge_size) is not int or spatial_merge_size < 1:
+            raise ValueError("spatial_merge_size must be a positive integer")
+        if spatial_merge_size != 1 and (pixel_shuffle or not native):
+            raise ValueError("native spatial merging cannot be combined with RADIO pixel shuffle")
+        self.spatial_reduction = 2 if pixel_shuffle else spatial_merge_size
+        self._native_geometry = native
+        self._max_patch_grid = None
+        if max_image_size is not None:
+            stride = patch_size * self.spatial_reduction
+            if len(max_image_size) != 2 or any(
+                type(value) is not int or value <= 0 or value % stride for value in max_image_size
+            ):
+                raise ValueError("max_image_size must contain positive aligned height and width")
+            self._max_patch_grid = tuple(value // patch_size for value in max_image_size)
 
         if apply_data_augment:
             warnings.warn(
@@ -804,8 +829,19 @@ class DynamicResolutionImageTilingStrategy(ImageTilingStrategy):
         #      then take the min of this and factor_max to never scale too high (default: factor_max = 1)
         # If factor_max == 1, we can only reduce the H/W to stay within budget, never increase it
         factor = min(math.sqrt(current_num_tokens_available / patches), self._factor_max)
+        if self._native_geometry and self._max_patch_grid is not None:
+            factor = min(
+                factor,
+                self._max_patch_grid[0] / closest_patch_height,
+                self._max_patch_grid[1] / closest_patch_width,
+            )
         target_patch_height = math.floor(factor * closest_patch_height)
         target_patch_width = math.floor(factor * closest_patch_width)
+        if self._native_geometry:
+            # A very thin source may round its short side to zero. Native merger
+            # groups need at least one complete block along each image axis.
+            target_patch_height = max(self.spatial_reduction, target_patch_height)
+            target_patch_width = max(self.spatial_reduction, target_patch_width)
 
         # Scale up (possibly > factor_max) if we're less than min_num_patches and this is > num tokens avail
         if (
@@ -864,7 +900,7 @@ class DynamicResolutionImageTilingStrategy(ImageTilingStrategy):
                 target_patch_width, target_patch_height = long, short
 
         # Pixel shuffle groups 2x2 patches, so both grid dimensions must be even.
-        required_divisor = 2 if self._pixel_shuffle else 1
+        required_divisor = self.spatial_reduction
 
         # Augment before handling required divisors
         if data_augment and random.random() < tiling_augment_prob:
@@ -963,6 +999,34 @@ class DynamicResolutionImageTilingStrategy(ImageTilingStrategy):
                     target_patch_height = target_patch_height_down
                     target_patch_width = target_patch_width_down
 
+        if self._native_geometry:
+            # Finalize after every rounding/augmentation stage. Attention uses
+            # this raw patch grid; emitted embeddings use its native reduction.
+            if self._max_patch_grid is not None:
+                axis_factor = min(
+                    1.0,
+                    self._max_patch_grid[0] / target_patch_height,
+                    self._max_patch_grid[1] / target_patch_width,
+                )
+                target_patch_height = math.floor(target_patch_height * axis_factor)
+                target_patch_width = math.floor(target_patch_width * axis_factor)
+            target_patch_height = max(
+                required_divisor, target_patch_height // required_divisor * required_divisor
+            )
+            target_patch_width = max(
+                required_divisor, target_patch_width // required_divisor * required_divisor
+            )
+            if current_num_tokens_available < required_divisor**2:
+                raise ValueError("native image budget cannot hold one merger block")
+            while target_patch_height * target_patch_width > current_num_tokens_available:
+                if (
+                    target_patch_height >= target_patch_width
+                    and target_patch_height > required_divisor
+                ):
+                    target_patch_height -= required_divisor
+                else:
+                    target_patch_width -= required_divisor
+
         # Calculate spatial embeddings for this frame/tile (E)
         # Note: Temporal compression is handled externally in task_encoder.py
         # via _group_video_frame_params_into_tubelets, which groups T frames
@@ -1059,7 +1123,7 @@ class DynamicResolutionImageTilingStrategy(ImageTilingStrategy):
             List of ImageTilingParams for each media item
         """
         # Expand token budget by reduction factors (tokens available before reduction)
-        num_tokens_available = num_tokens_available * (4 if self._pixel_shuffle else 1)
+        num_tokens_available = num_tokens_available * self.spatial_reduction**2
         num_images = sum(1 for m in media_list if isinstance(m, ImageMedia))
         num_video_frames = sum(1 for m in media_list if isinstance(m, VideoFrameMedia))
         assert num_images + num_video_frames == len(

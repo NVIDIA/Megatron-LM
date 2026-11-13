@@ -224,6 +224,32 @@ def _radio_h_spec(
 
 
 REGISTRY: Dict[str, EncoderSpec] = {
+    "pixtral-vit-1p6b": EncoderSpec(
+        name="pixtral-vit-1p6b",
+        model_type="pixtral-vit-large",
+        patch_dim=14,
+        default_img_h=1540,
+        default_img_w=1540,
+        has_native_spatial_merge=True,
+        spatial_merge_size=2,
+        dynamic_resolution=True,
+        conv_merging=True,
+        dynamic_resolution_max_patches=12100,
+        dynamic_resolution_max_side=1540,
+        num_layers=30,
+        hidden_size=2048,
+        num_attention_heads=16,
+        ffn_hidden_size=6144,
+        kv_channels=128,
+        gated_linear_unit=True,
+        activation_func="silu",
+        add_bias_linear=False,
+        add_qkv_bias=False,
+        normalization="RMSNorm",
+        layernorm_epsilon=1e-5,
+        qk_layernorm=False,
+        rotary_interleaved=True,
+    ),
     "clip": EncoderSpec(
         name="clip",
         patch_dim=16,

@@ -27,7 +27,12 @@ from examples.mimo.model_providers.radio_encoder import (
     radio_vision_config,
     radio_vision_encoder_spec,
 )
+from examples.mimo.model_providers.vision_encoder import (
+    native_vision_config,
+    native_vision_encoder_spec,
+)
 from examples.mimo.utils.hetero import get_grid_dim_size
+from examples.mimo.vision import add_vision_args
 from megatron.core.activations import squared_relu, unfused_fast_gelu
 from megatron.core.hyper_comm_grid import HyperCommGrid
 from megatron.core.model_parallel_config import resolve_tensor_parallel_weight_shards
@@ -90,6 +95,7 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     ``radio_encoder`` owns the RADIO-encoder knobs.
     """
     add_radio_encoder_args(parser)
+    add_vision_args(parser)
     provider = parser.add_argument_group("mimo model provider")
     provider.add_argument(
         "--model-provider",
@@ -270,7 +276,7 @@ def _nemotron_projection_spec(
     pg_collection: ProcessGroupCollection | None,
     base_config: TransformerConfig | None = None,
 ) -> ModuleSpec:
-    """Build the RADIO-to-language projection for its owning grid."""
+    """Build the selected vision-to-language projection for its owning grid."""
     projector_type = _resolve_vision_projection_type(args.vision_projection_type)
     return ModuleSpec(
         module=MultimodalProjector,
@@ -350,6 +356,15 @@ def language_model_spec(
     )
 
 
+def _vision_encoder_config(args, tp_size, pp_size):
+    factory = (
+        radio_vision_config
+        if getattr(args, "vision_model_type", "radio") == "radio"
+        else native_vision_config
+    )
+    return factory(args, tp_size, pp_size)
+
+
 def vision_submodules_spec(
     args: argparse.Namespace,
     pg_collection: Optional[ProcessGroupCollection],
@@ -370,12 +385,17 @@ def vision_submodules_spec(
         tp_size = get_pg_size(tp_pg)
         pp_size = get_pg_size(pp_pg)
 
-    vision_config = radio_vision_config(args, tp_size, pp_size)
+    vision_config = _vision_encoder_config(args, tp_size, pp_size)
     if args.mimo_vision_encoder_attention_backend is not None:
         vision_config.attention_backend = args.mimo_vision_encoder_attention_backend
     if args.mimo_vision_encoder_flash_attention_version is not None:
         vision_config.flash_attention_version = args.mimo_vision_encoder_flash_attention_version
-    vision_encoder_spec = radio_vision_encoder_spec(args, vision_config, pg_collection)
+    encoder_factory = (
+        radio_vision_encoder_spec
+        if getattr(args, "vision_model_type", "radio") == "radio"
+        else native_vision_encoder_spec
+    )
+    encoder_spec = encoder_factory(args, vision_config, pg_collection)
     projection_input_size = _vision_projection_input_size(args, vision_config)
     input_projections = []
     if not args.mimo_run_input_projections_on_llm_ranks:
@@ -386,7 +406,7 @@ def vision_submodules_spec(
         module=VisionModalitySubmodules,
         params={"pg_collection": pg_collection},
         submodules={
-            "encoders": {RADIO_ENCODER_MODULE_NAME: vision_encoder_spec},
+            "encoders": {RADIO_ENCODER_MODULE_NAME: encoder_spec},
             "input_projections": input_projections,
         },
     )
@@ -398,12 +418,12 @@ def language_input_projection_spec(
     language_grid: HyperCommGrid,
     language_spec: ModuleSpec,
 ) -> ModuleSpec | None:
-    """Build the RADIO input projection on the first language stage when requested."""
+    """Build the vision input projection on the first language stage when requested."""
     if not args.mimo_run_input_projections_on_llm_ranks:
         return None
 
     del language_grid
-    vision_config = radio_vision_config(args, args.mimo_encoder_tp, 1)
+    vision_config = _vision_encoder_config(args, args.mimo_encoder_tp, 1)
     language_config = language_spec.params["config"]
     return _nemotron_projection_spec(
         args,
@@ -434,7 +454,7 @@ def _nemotron_bridge_recv_shape(
 def build_nemotron_communicator(
     args: argparse.Namespace, topology: "HeteroTopology"
 ) -> MultiModulePipelineCommunicator:
-    """Wire the RADIO-encoder -> language cross-grid pipeline communicator."""
+    """Wire the vision-encoder to language cross-grid pipeline communicator."""
     language_grid = topology.grids[MIMO_LANGUAGE_MODULE_KEY]
     language_config = language_model_spec(args, None, language_grid).params["config"]
     if RADIO_ENCODER_MODULE_NAME not in topology.grids:
@@ -449,7 +469,7 @@ def build_nemotron_communicator(
     if getattr(args, "mimo_bridge_skip_shape_exchange", False):
         bridge_hidden_size = int(args.hidden_size)
         if getattr(args, "mimo_run_input_projections_on_llm_ranks", False):
-            vision_config = radio_vision_config(args, args.mimo_encoder_tp, 1)
+            vision_config = _vision_encoder_config(args, args.mimo_encoder_tp, 1)
             bridge_hidden_size = _vision_projection_input_size(args, vision_config)
         bridge_recv_shape_fns = {
             RADIO_ENCODER_MODULE_NAME: partial(
@@ -470,7 +490,7 @@ def build_nemotron_communicator(
 
 
 def nemotron_provider() -> MimoProvider:
-    """Provider descriptor for the Nemotron MoE + RADIO VLM."""
+    """Provider descriptor for Nemotron MoE with the selected vision encoder."""
     return MimoProvider(
         encoder_module_names=(RADIO_ENCODER_MODULE_NAME,),
         language_spec=language_model_spec,
