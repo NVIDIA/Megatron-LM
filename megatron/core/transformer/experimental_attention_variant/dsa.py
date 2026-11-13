@@ -2218,24 +2218,6 @@ class DSAIndexer(MegatronModule):
         cost fwd + wgrad and scoring costs dense fwd plus dense or sparse dq/dk.
         Do not apply the ordinary x3 multiplier when include_backward is true.
         """
-        token_linear, core = cls._flops_coefficients(
-            config,
-            total_real_tokens_in_batch=total_real_tokens_in_batch,
-            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-            include_backward=include_backward,
-        )
-        return total_real_tokens_in_batch * token_linear + seqlen_squared_sum_in_batch * core
-
-    @staticmethod
-    def _flops_coefficients(
-        config: TransformerConfig,
-        *,
-        total_real_tokens_in_batch: float,
-        seqlen_squared_sum_in_batch: float,
-        include_backward: bool,
-        num_indexer_layers: int = 1,
-    ) -> tuple[float, float]:
-        """Return token-linear and causal-pair coefficients, retaining legacy count handling."""
         total_tokens = total_real_tokens_in_batch
         seqlen_squared_sum = seqlen_squared_sum_in_batch
         dsa_indexer_loss_enabled = (config.dsa_indexer_loss_coeff or 0) > 0
@@ -2257,19 +2239,17 @@ class DSAIndexer(MegatronModule):
                 or dsa_indexer_topk % dsa_indexer_kpool
             ):
                 raise ValueError("KPool FLOPs require a positive top-k divisible by the pool size.")
-        if num_indexer_layers <= 0:
-            return 0, 0
         if q_lora_rank is None:
             # Mirrors DSAIndexer's own fallback when the model has no q lora rank.
             q_lora_rank = hidden_size
         index_dim = n_heads * head_dim
-        token_linear = num_indexer_layers * (
+        token_linear = (
             q_lora_rank * index_dim  # wq_b
             + hidden_size * head_dim  # wk
             + hidden_size * n_heads  # weights_proj
         )
         # Scoring each query against every past token under a causal mask (/2).
-        core = num_indexer_layers * index_dim / 2
+        core = index_dim / 2
         fma_expansion_factor = 2
         core_expansion: float
         if not (include_backward and dsa_indexer_loss_enabled):
@@ -2301,9 +2281,9 @@ class DSAIndexer(MegatronModule):
                     pool_size * (pools + fraction * (next_pools - pools)) / mean_seqlen
                 )
             # Gate on every token; one FMA per key component in complete pools.
-            token_linear += 2 * num_indexer_layers * head_dim * (hidden_size + compression_scale)
+            token_linear += 2 * head_dim * (hidden_size + compression_scale)
             core *= indexer_scale
-        return token_linear, core
+        return total_tokens * token_linear + seqlen_squared_sum * core
 
     def _projection_quantization_context(self, *, is_init: bool = False):
         """Use the enclosing quantization context only when explicitly enabled."""
