@@ -974,7 +974,7 @@ def test_word_embedding_marker_reaches_tied_copies_only(share_embeddings_and_out
 class _FakeProcessGroup:
     """Process group stand-in exposing only the rank and size that a sequence split reads."""
 
-    def __init__(self, rank, size):
+    def __init__(self, rank, size) -> None:
         self._rank = rank
         self._size = size
 
