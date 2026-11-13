@@ -11,7 +11,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import (
     HAVE_TE,
@@ -141,20 +141,22 @@ class TestParamStorageFollowsModelInit:
 class TestReuseGradBufForFp4ParamGather:
     """The MXFP8 params of an FP4 model may reuse the grad buffer for their all-gather."""
 
+    @staticmethod
+    def _validate(**overrides):
+        ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=True, reuse_grad_buf_for_mxfp8_param_ag=True, **overrides
+        )
+        model_config = TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
+        DistributedDataParallel._validate_config(model_config, ddp_config)
+        return ddp_config
+
     @pytest.mark.parametrize("param_gather", ["fp8_param_gather", "fp4_param_gather"])
     def test_accepts_quantized_param_gather(self, param_gather):
-        config = DistributedDataParallelConfig(
-            use_distributed_optimizer=True,
-            reuse_grad_buf_for_mxfp8_param_ag=True,
-            **{param_gather: True},
-        )
-        assert config.reuse_grad_buf_for_mxfp8_param_ag
+        assert self._validate(**{param_gather: True}).reuse_grad_buf_for_mxfp8_param_ag
 
     def test_rejects_high_precision_params(self):
         with pytest.raises(AssertionError, match="Reuse grad buffer only"):
-            DistributedDataParallelConfig(
-                use_distributed_optimizer=True, reuse_grad_buf_for_mxfp8_param_ag=True
-            )
+            self._validate()
 
 
 class TestReuseGradBufWithPrecisionAwareOptimizer:
