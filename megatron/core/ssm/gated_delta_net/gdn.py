@@ -52,6 +52,11 @@ from megatron.core.utils import (
     nvtx_range_push,
 )
 
+try:
+    from megatron.core.fusions.fused_pre_gated_delta_rule import fused_streamed_pre_gated_delta_rule
+except ImportError:
+    fused_streamed_pre_gated_delta_rule = None
+
 
 def get_parameter_local_cp_headwise(
     param: torch.Tensor,
@@ -92,6 +97,11 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             raise ValueError(
                 "Pre-GDR fusion is non-deterministic, but deterministic_mode=True. "
                 "Disable gdn_pre_gated_delta_rule_fusion or deterministic_mode."
+            )
+        if self.gdn_pre_gated_delta_rule_fusion and fused_streamed_pre_gated_delta_rule is None:
+            raise ImportError(
+                "gdn_pre_gated_delta_rule_fusion requires the streamed pre-GDR fusion "
+                "dependencies, including causal-conv1d."
             )
 
         # alpha, beta
@@ -577,6 +587,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         *,
         pg_collection: Optional[ProcessGroupCollection] = None,
         inference_params: Optional[BaseInferenceContext] = None,
+        strict_runtime_validation: bool = True,
         **kwargs,
     ):
         """
@@ -663,6 +674,20 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             # TODO: support inference
             raise NotImplementedError("GDN does not support inference for now.")
 
+        if strict_runtime_validation:
+            if cp_size_chunkwise > 1:
+                if batch > 1:
+                    raise ValueError(
+                        "GDN chunkwise CP with SBHD inputs currently requires "
+                        "micro_batch_size == 1 when cp_context is used. Use packed THD input "
+                        "or micro_batch_size=1."
+                    )
+                if self.config.gdn_conv_pad_alignment is not None:
+                    raise ValueError(
+                        "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. "
+                        "Padding chunk-local causal-conv inputs can change later chunk numerics."
+                    )
+
         if cp_size_headwise > 1 and (
             (
                 packed_seq_params is not None
@@ -692,6 +717,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 seq_len_global,
                 "cu_seqlens_q",
                 cp_size=cp_size_runtime,
+                strict_runtime_validation=strict_runtime_validation,
             )
             cu_seqlens_kv = self._resolve_cu_seqlens(
                 packed_seq_params.cu_seqlens_kv_padded,
@@ -699,16 +725,18 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 seq_len_global,
                 "cu_seqlens_kv",
                 cp_size=cp_size_runtime,
+                strict_runtime_validation=strict_runtime_validation,
             )
-            assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
-                "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
-            )
-            num_packed_seqs = cu_seqlens_q.shape[0] - 1
-            assert num_packed_seqs > 0, (
-                "Number of packed sequences must be greater than 0, "
-                f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
-            )
+            if strict_runtime_validation:
+                assert torch.equal(cu_seqlens_q, cu_seqlens_kv), (
+                    "Currently only support cu_seqlens_q equals to cu_seqlens_kv, "
+                    f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
+                )
+                num_packed_seqs = cu_seqlens_q.shape[0] - 1
+                assert num_packed_seqs > 0, (
+                    "Number of packed sequences must be greater than 0, "
+                    f"but got {cu_seqlens_q=} and {cu_seqlens_kv=}"
+                )
         else:
             cu_seqlens_q = None
             cu_seqlens_kv = None
@@ -760,6 +788,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                     cu_seqlens_q,
                     packed_seq_params,
                     chunkwise_cp_context,
+                    strict_runtime_validation,
                 )
 
             # Quantized recompute must restore TE's FP8/FP4 state, matching the
@@ -791,6 +820,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 cu_seqlens_q,
                 packed_seq_params,
                 chunkwise_cp_context,
+                strict_runtime_validation,
             )
 
         if back_to_input_converter is not None:
@@ -812,6 +842,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         cu_seqlens_q,
         packed_seq_params,
         chunkwise_cp_context,
+        strict_runtime_validation,
     ):
         """Core GDN computation (in_proj -> conv1d -> gated_delta_rule -> norm -> out_proj)."""
         # Input projection
@@ -830,16 +861,6 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         )
 
         if self.gdn_pre_gated_delta_rule_fusion:
-            if cp_size_chunkwise > 1 and batch > 1:
-                raise ValueError(
-                    "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
-                    "when cp_context is used. Use packed THD input or micro_batch_size=1."
-                )
-            if cp_size_chunkwise > 1 and self.config.gdn_conv_pad_alignment is not None:
-                raise ValueError(
-                    "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. Padding "
-                    "chunk-local causal-conv inputs can change later chunk numerics."
-                )
             nvtx_range_push(suffix="fused_streamed_pre_gated_delta_rule")
             seq_idx = (
                 packed_seq_params.seq_idx
@@ -859,24 +880,12 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                 seq_idx=seq_idx,
                 cp_group=cp_group_chunkwise if cp_size_chunkwise > 1 else None,
                 cp_group_headwise=cp_group_headwise,
+                strict_runtime_validation=strict_runtime_validation,
             )
             kernel_inputs = {"q": query, "k": key, "v": value, "g": g, "beta": beta}
             nvtx_range_pop(suffix="fused_streamed_pre_gated_delta_rule")
         else:
             nvtx_range_push(suffix="pre_gated_delta_rule")
-            if cp_size_chunkwise > 1 and packed_seq_params is None and batch > 1:
-                # TODO: If additional gated delta rule backends are added, handle this
-                # SBHD + chunkwise CP + batch>1 case per backend instead of
-                # unconditionally rejecting it.
-                raise ValueError(
-                    "GDN chunkwise CP with SBHD inputs currently requires micro_batch_size == 1 "
-                    "when cp_context is used. Use packed THD input or micro_batch_size=1."
-                )
-            if cp_size_chunkwise > 1 and self.config.gdn_conv_pad_alignment is not None:
-                raise ValueError(
-                    "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. Padding "
-                    "chunk-local causal-conv inputs can change later chunk numerics."
-                )
             query, key, value, gate, beta, g = self.pre_gated_delta_rule(
                 qkvzba,
                 batch,
@@ -1034,11 +1043,6 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
                         "gdn_conv_pad_alignment is only supported with packed sequence "
                         "parameters in THD format. SBHD inputs do not need causal-conv padding."
                     )
-                if chunkwise_cp_context is not None:
-                    raise ValueError(
-                        "gdn_conv_pad_alignment is incompatible with GDN chunkwise CP. Padding "
-                        "chunk-local causal-conv inputs can change later chunk numerics."
-                    )
                 pad_n = -orig_seq % self.config.gdn_conv_pad_alignment
             if pad_n > 0:
                 conv_input = torch.nn.functional.pad(conv_input, (0, 0, 0, pad_n))
@@ -1087,19 +1091,15 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         )
 
     def _fused_streamed_pre_gated_delta_rule(
-        self, qkvzba, cu_seqlens_q=None, seq_idx=None, cp_group=None, cp_group_headwise=None
+        self,
+        qkvzba,
+        cu_seqlens_q=None,
+        seq_idx=None,
+        cp_group=None,
+        cp_group_headwise=None,
+        strict_runtime_validation=True,
     ):
         """Call the streamed fused pre-GDR wrapper."""
-
-        try:
-            from megatron.core.fusions.fused_pre_gated_delta_rule import (
-                fused_streamed_pre_gated_delta_rule,
-            )
-        except ImportError as exc:
-            raise ImportError(
-                "gdn_pre_gated_delta_rule_fusion requires the streamed pre-GDR fusion "
-                "dependencies, including causal-conv1d."
-            ) from exc
 
         qkv_channels_split_sections = [
             self.qk_dim_local_tp,
@@ -1143,6 +1143,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
             cu_seqlens=cu_seqlens_q,
             seq_idx=seq_idx,
             cp_group=cp_group,
+            strict_runtime_validation=strict_runtime_validation,
         )
 
 

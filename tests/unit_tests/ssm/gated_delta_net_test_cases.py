@@ -527,12 +527,12 @@ class GatedDeltaNetModuleTestCases(GatedDeltaNetTestBase):
             return tuple(torch.empty(0, device=qkvzba_arg.device) for _ in range(6))
 
         with mock.patch(
-            "megatron.core.fusions.fused_pre_gated_delta_rule."
-            "fused_streamed_pre_gated_delta_rule",
+            "megatron.core.ssm.gated_delta_net.gdn.fused_streamed_pre_gated_delta_rule",
             side_effect=fake_fused_streamed_pre_gated_delta_rule,
-        ):
+        ) as fused_pre_gdr:
             gdn._fused_streamed_pre_gated_delta_rule(qkvzba, cp_group_headwise=gdn.pg_collection.cp)
 
+        fused_pre_gdr.assert_called_once()
         assert captured["qkvzba"] is qkvzba
         assert captured["conv1d_weight"].shape == (
             2 * qk_channels + v_channels,

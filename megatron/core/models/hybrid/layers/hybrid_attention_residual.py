@@ -136,6 +136,7 @@ class AttnResHybridLayer(MegatronModule):
         input_ids: Optional[Tensor] = None,
         *,
         attn_res_sources: Optional[Tuple[Tensor, ...]] = None,
+        strict_runtime_validation: Optional[bool] = None,
         packed_sequence_cp_metadata=None,
     ) -> Tensor:
         """Aggregate depth sources, run the inner entry, and update the partial sum."""
@@ -175,6 +176,7 @@ class AttnResHybridLayer(MegatronModule):
                 _called_from_hybrid_attn_res_wrapper=True,
                 _return_layer_delta=True,
                 _input_is_normalized=fused_norm is not None,
+                strict_runtime_validation=strict_runtime_validation,
             )
             if packed_sequence_cp_metadata is not None:
                 raise TypeError(
@@ -192,6 +194,10 @@ class AttnResHybridLayer(MegatronModule):
             )
             if packed_sequence_cp_metadata is not None:
                 inner_kwargs["packed_sequence_cp_metadata"] = packed_sequence_cp_metadata
+            if strict_runtime_validation is not None and getattr(
+                self.inner_layer, "supports_strict_runtime_validation", False
+            ):
+                inner_kwargs["strict_runtime_validation"] = strict_runtime_validation
             output = self.inner_layer(aggregated, **inner_kwargs)
         if isinstance(output, tuple):
             output = output[0]

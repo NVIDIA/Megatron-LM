@@ -333,6 +333,16 @@ class ModelParallelConfig:
     """If true, code that has deterministic execution will be chosen. This usually
        means slower execution, but is good for debugging and testing. Defaults to False."""
 
+    strict_runtime_validation_frequency: Literal["never", "once_per_microbatch", "always"] = (
+        "always"
+    )
+    """Controls how often supported modules run strict runtime validation.
+
+    ``always`` preserves the default behavior. ``once_per_microbatch`` validates the first
+    instance of each supported layer type in every microbatch. ``never`` skips these checks and
+    may allow invalid runtime inputs to produce incorrect results.
+    """
+
     enable_autocast: bool = False
     """If true runs the forward step function inside torch.autocast context."""
 
@@ -660,6 +670,24 @@ class ModelParallelConfig:
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
+        if self.strict_runtime_validation_frequency not in (
+            "never",
+            "once_per_microbatch",
+            "always",
+        ):
+            raise ValueError(
+                "strict_runtime_validation_frequency must be 'never', "
+                "'once_per_microbatch', or 'always', got "
+                f"{self.strict_runtime_validation_frequency!r}."
+            )
+        if self.strict_runtime_validation_frequency == "never":
+            warnings.warn(
+                "Strict runtime validation is disabled. Invalid runtime inputs may produce "
+                "incorrect results; use this mode at your own risk.",
+                UserWarning,
+                stacklevel=2,
+            )
+
         if self.hybrid_context_parallel:
             warnings.warn(
                 "hybrid_context_parallel is deprecated and will be removed in a future release. "

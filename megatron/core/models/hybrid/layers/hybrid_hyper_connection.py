@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
 from typing import List, Optional, Tuple
@@ -573,7 +573,10 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             return self._replay_mhc_attention_cuda_graph(args, kwargs)
 
         group_tail = self._get_te_cuda_graph_group_tail()
-        cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **kwargs))
+        # Validation is Python control flow used by eager forward/capture, not a
+        # tensor input to the captured graph.
+        graph_kwargs = {k: v for k, v in kwargs.items() if k != "strict_runtime_validation"}
+        cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **graph_kwargs))
 
         if group_tail is not None:
             return group_tail._resume_partial_moe_cuda_graph(cuda_graph_output)
@@ -656,6 +659,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
         packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata] = None,
+        strict_runtime_validation: Optional[bool] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         # When this wrapper is itself being CUDA-graph captured, the inner layer
         # must run as a plain forward: routing through its ``__call__`` would
@@ -678,6 +682,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                 padding_mask=padding_mask,
                 input_ids=input_ids,
                 _called_from_hybrid_mhc_wrapper=True,
+                strict_runtime_validation=strict_runtime_validation,
             )
         else:
             # Non-transformer layers (e.g. MambaLayer; GatedDeltaNet which does
@@ -689,6 +694,10 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             extra_kwargs = {}
             if packed_sequence_cp_metadata is not None:
                 extra_kwargs["packed_sequence_cp_metadata"] = packed_sequence_cp_metadata
+            if strict_runtime_validation is not None and getattr(
+                self.inner_layer, "supports_strict_runtime_validation", False
+            ):
+                extra_kwargs["strict_runtime_validation"] = strict_runtime_validation
             output = inner(
                 hidden_states,
                 attention_mask=attention_mask,
@@ -713,6 +722,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         padding_mask: Optional[Tensor],
         input_ids: Optional[Tensor] = None,
         mhc_recompute_manager: Optional[MHCCheckpointManager] = None,
+        strict_runtime_validation: Optional[bool] = None,
     ) -> Optional[Tuple[Tuple[Tensor, Optional[Tensor]], Optional[Tensor], float, bool]]:
         """Return a raw TransformerLayer branch output when the wrapped layer is split.
 
@@ -745,6 +755,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                     packed_seq_params=packed_seq_params,
                     sequence_len_offset=sequence_len_offset,
                     mhc_recompute_manager=mhc_recompute_manager,
+                    strict_runtime_validation=strict_runtime_validation,
                 )
             )
             output_with_bias = layer._group_offload_output_with_bias(
@@ -785,6 +796,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
         input_ids: Optional[Tensor] = None,
         mhc_recompute_manager=None,
         packed_sequence_cp_metadata: Optional[PackedSequenceCPMetadata] = None,
+        strict_runtime_validation: Optional[bool] = None,
     ) -> Tuple[Tensor, Optional[Tensor]]:
         """Run the wrapped hybrid layer through one layer-boundary mHC update.
 
@@ -810,6 +822,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
             padding_mask,
             input_ids,
             mhc_recompute_manager=mhc_recompute_manager,
+            strict_runtime_validation=strict_runtime_validation,
         )
 
         if fast_path_result is None:
@@ -823,6 +836,7 @@ class HyperConnectionHybridLayer(GraphableMegatronModule):
                 padding_mask,
                 input_ids,
                 packed_sequence_cp_metadata=packed_sequence_cp_metadata,
+                strict_runtime_validation=strict_runtime_validation,
             )
             # The inner hybrid layer already applied its own local residual/dropout, so
             # it returns `aggregated + f(aggregated)`. We feed only the function

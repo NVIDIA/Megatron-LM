@@ -701,6 +701,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         inference_context: Optional[BaseInferenceContext] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
         sequence_len_offset: Optional[Tensor] = None,
+        strict_runtime_validation: Optional[bool] = None,
         mhc_recompute_manager: Optional['CheckpointWithoutOutputManager'] = None,
         input_is_normalized: bool = False,
         *,
@@ -732,6 +733,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         if using_fused_tp_inference_kernel:
             self._set_proj_residual(residual)
 
+        runtime_validation_kwargs = {}
+        if strict_runtime_validation is not None and getattr(
+            self.self_attention, "supports_strict_runtime_validation", False
+        ):
+            runtime_validation_kwargs["strict_runtime_validation"] = strict_runtime_validation
+
         nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
@@ -744,6 +751,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             attention_bias=attention_bias,
             packed_seq_params=packed_seq_params,
             sequence_len_offset=sequence_len_offset,
+            **runtime_validation_kwargs,
         )
         nvtx_range_pop(suffix="self_attention")
 
@@ -816,6 +824,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        strict_runtime_validation: Optional[bool] = None,
         *,
         inference_params: Optional[Any] = None,
     ):
@@ -869,6 +878,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         if using_fused_tp_inference_kernel:
             self._set_proj_residual(residual)
 
+        runtime_validation_kwargs = {}
+        if strict_runtime_validation is not None and getattr(
+            self.self_attention, "supports_strict_runtime_validation", False
+        ):
+            runtime_validation_kwargs["strict_runtime_validation"] = strict_runtime_validation
+
         nvtx_range_push(suffix="self_attention")
         with _otel_managed_span('layer', 'megatron.layer.self_attention'):
             attention_output_with_bias = self.self_attention(
@@ -882,6 +897,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                 attention_bias=attention_bias,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                **runtime_validation_kwargs,
             )
         nvtx_range_pop(suffix="self_attention")
 
@@ -1296,6 +1312,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     rotary_pos_emb=kwargs.get("rotary_pos_emb"),
                     sequence_len_offset=kwargs.get("sequence_len_offset"),
                     packed_seq_params=kwargs.get("packed_seq_params"),
+                    strict_runtime_validation=kwargs.get("strict_runtime_validation"),
                     input_is_normalized=input_is_normalized,
                 )
             )
@@ -2451,8 +2468,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
         # The graph only takes padding_mask when it was captured with that input; the eager MoE
         # steps after the graph keep using the caller's mask from `kwargs`.
+        # Keep the validation control flag available to eager attention, but do
+        # not pass Python control flow into the captured graph's tensor inputs.
         graph_kwargs = {
-            k: v for k, v in kwargs.items() if k not in ("padding_mask", "packed_seq_params")
+            k: v
+            for k, v in kwargs.items()
+            if k not in ("padding_mask", "packed_seq_params", "strict_runtime_validation")
         }
         hidden_states = args[0]
         graph_padding_mask = self._te_cuda_graph_padding_mask(
@@ -2979,6 +3000,7 @@ class AttnResTransformerLayer(TransformerLayer):
         padding_mask: Optional[Tensor] = None,
         input_ids: Optional[Tensor] = None,
         residual_stream_recompute_context: ResidualStreamRecomputeContext | None = None,
+        strict_runtime_validation: Optional[bool] = None,
         *,
         attn_res_sources: Tuple[Tensor, ...] = (),
         inference_params: Optional[Any] = None,
@@ -3017,6 +3039,7 @@ class AttnResTransformerLayer(TransformerLayer):
                 inference_context=None,
                 packed_seq_params=packed_seq_params,
                 sequence_len_offset=sequence_len_offset,
+                strict_runtime_validation=strict_runtime_validation,
                 input_is_normalized=self._fuse_input_norm,
             )
         )
