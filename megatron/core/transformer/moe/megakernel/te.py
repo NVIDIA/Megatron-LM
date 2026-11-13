@@ -1,4 +1,4 @@
-"""NCCL EP dispatch, grouped experts, and combine in one TE operation sequence."""
+"""NCCL EP dispatch, grouped experts, and combine in one TE MegaMoE operation."""
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ class TEMegakernel(MegakernelBackend):
         self.ep_group = ep_group
         self.num_local_experts = num_local_experts
         self._native_experts = (routed_experts, shared_experts)
-        self._sequence = None
+        self._mega_op = None
         self._ep_config = None
 
     def sharded_state_dict(self, prefix="", sharded_offsets=(), metadata=None):
@@ -150,9 +150,9 @@ class TEMegakernel(MegakernelBackend):
         fc1.set_extra_input_channel(0, "tokens_per_expert")
         activation.set_extra_input_channel(0, "routing_weights")
         fc2.set_extra_input_channel(0, "tokens_per_expert")
-        sequence = ops.Sequential(dispatch, fc1, activation, fc2, combine)
-        sequence.register_forward_pre_hook(experts._make_fused_impl_pre_forward_hook())
-        return sequence
+        mega_op = ops.Sequential(dispatch, fc1, activation, fc2, combine)
+        mega_op.register_forward_pre_hook(experts._make_fused_impl_pre_forward_hook())
+        return mega_op
 
     def forward(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
@@ -182,12 +182,9 @@ class TEMegakernel(MegakernelBackend):
             dispatch_fwd_quant_recipe=config.dispatch_fwd_quant_recipe,
             combine_bwd_quant_recipe=config.combine_bwd_quant_recipe,
         )
-        if self._sequence is None:
-            self._sequence = (self._make_megamoe_op(buffer),)
-        (sequence,) = self._sequence
-        sequence[0].buffer = buffer
-        sequence[-1].buffer = buffer
-        sequence.train(self.training)
+        self._mega_op = (self._make_megamoe_op(buffer),)
+        (mega_op,) = self._mega_op
+        mega_op.train(self.training)
         weights, indices = routing_map_to_indices(
             probs.reshape(-1, self.config.num_moe_experts).contiguous(),
             routing_map.reshape(-1, self.config.num_moe_experts).contiguous(),
@@ -206,7 +203,7 @@ class TEMegakernel(MegakernelBackend):
             nullcontext() if fc1_recipe is None else _get_fp8_autocast_for_quant_recipe(fc1_recipe)
         )
         with context:
-            output = sequence(tokens, indices, weights, indices).view(shape)
+            output = mega_op(tokens, indices, weights, indices).view(shape)
         if shared_experts is not None:
             output = output + shared_experts(hidden_states)
         return output
