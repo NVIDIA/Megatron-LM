@@ -24,7 +24,7 @@ def _warmup_cross_entropy(
     vocab: int,
     logit_dtype: torch.dtype | None,
 ) -> None:
-    from megatron.core.fusions.fused_cross_entropy import fused_vocab_parallel_cross_entropy
+    from megatron.core.ops.loss.fused_cross_entropy import fused_vocab_parallel_cross_entropy
 
     if vocab <= 0:
         raise ValueError("CE vocabulary must be positive")

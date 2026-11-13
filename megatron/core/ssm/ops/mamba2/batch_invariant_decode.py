@@ -30,8 +30,9 @@ def _masked_update_rows_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     """Copy contiguous rows, skipping entries whose destination index is -1."""
-    src_row = tl.program_id(0)
-    dst_row = tl.load(indices_ptr + src_row)
+    # int64: row * row stride can exceed 2^31 elements on large state pools.
+    src_row = tl.program_id(0).to(tl.int64)
+    dst_row = tl.load(indices_ptr + src_row).to(tl.int64)
     if dst_row < 0:
         return
 
@@ -474,11 +475,15 @@ class MambaBatchInvariantDecode:
         B = B.view(batch, 1, mixer.ngroups_local_tp, -1)
         C = C.view(batch, 1, mixer.ngroups_local_tp, -1)
 
-        A = -torch.exp(mixer.cp.get_A_log().float())
+        cached = mixer._get_batch_invariant_decode_params()
+        if cached is not None:
+            A, dt_bias = cached.A_neg_exp, cached.dt_bias
+        else:
+            A = -torch.exp(mixer.cp.get_A_log().float())
+            dt_bias = mixer.cp.get_dt_bias().float()
         D = mixer.cp.get_D()
         if mixer.D_has_hdim:
             D = D.float().view(-1, mixer.headdim)
-        dt_bias = mixer.cp.get_dt_bias().float()
 
         buffers = self._get_buffers(ssm_state.shape[0], x, B)
 
