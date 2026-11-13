@@ -348,9 +348,12 @@ def test_get_batch_reads_on_a_tensor_parallel_grid_unlike_the_global_one(module,
         Utils.destroy_model_parallel()
 
 
-def test_vlm_get_batch_broadcasts_over_the_supplied_tensor_parallel_group(monkeypatch):
+def test_vlm_get_batch_broadcasts_over_the_supplied_tensor_parallel_group(monkeypatch, run_config):
     import pretrain_vlm
+    from megatron.training.models import LLaVAModelConfig
 
+    # get_batch reads the context-parallel size from the registered LLaVA model config.
+    run_config.model = LLaVAModelConfig(transformer=run_config.model.transformer, seq_length=16)
     _forbid_global_process_groups(monkeypatch)
     tp_group = _FakeGroup(1, [3, 7])
     monkeypatch.setattr(
