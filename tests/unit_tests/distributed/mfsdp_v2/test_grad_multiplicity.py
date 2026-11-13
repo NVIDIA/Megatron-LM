@@ -21,7 +21,7 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     fully_shard_context,
     fully_shard_optimizer,
 )
-from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import finish_fsdp_backward
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import post_fsdp_backward
 
 
 def _sharded_unit(setup, model):
@@ -94,7 +94,7 @@ def test_gradients_and_updates_match_baseline(distributed_setup, nodes):
                     torch.testing.assert_close(
                         _graph_task(model, inputs, node), baseline_loss.detach()
                     )
-                finish_fsdp_backward(model)
+                post_fsdp_backward(model)
         model.context.finish_grad_sync()
         for reference, parameter in zip(baseline.parameters(), model.parameters()):
             dist.all_reduce(reference.grad, op=dist.ReduceOp.AVG)
