@@ -104,11 +104,10 @@ ModelOpt callbacks reject bounds inconsistent with the rows they actually emit.
 `validate()` checks these constraints without mutation. Framework startup calls
 `finalize()` to derive unset/owned fields before any runtime consumer reads them.
 
-### Migration from the data-config PR
+### Python API compatibility
 
-The temporary `cfg.sample_length` and `cfg.model_input_length` properties and
-`LLaVAModelConfig.decoder_seq_length` are removed. Python callers and saved
-configurations using those APIs require updating; strict deserialization rejects
+`LLaVAModelConfig.decoder_seq_length` is removed. Python callers and saved
+configurations using this field require updating; strict deserialization rejects
 the removed LLaVA field. For LLaVA, move the resolved text + image + padding width
 to `model.transformer.max_seq_length_per_sample` before startup. Do not substitute
 the allocation bound for a fixed GPT dataset's actual row width.
