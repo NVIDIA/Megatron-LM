@@ -392,7 +392,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_mok_kernels.py",),
         kind="triton",
         notes="Dense routing-map compaction and router-gradient scatter use one CTA per token "
-        "and unique expert indices; replayed with missing routes and side-stream contention.",
+        "and unique expert indices; replayed with missing routes, a strided padding mask and "
+        "side-stream contention. test_moe_kernels.py also replays it with MoELayer's padding mask, "
+        "through a megakernel stand-in, in eager and CUDA-graph replay.",
     ),
     KernelEntry(
         name="mok_runtime",
@@ -431,7 +433,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
         "virtual-expert routing metadata and probability gradients replay under stream contention; "
         "the FlashInfer per-token NVFP4 value pass (moe_training_matches_inference) with recompute "
-        "backward, and its MXFP8 training-stack quantization.",
+        "backward, and its MXFP8 training-stack quantization. The megakernel branch passes the "
+        "padding mask to a stand-in backend that runs MOK route compaction: replayed under stream "
+        "contention against the reference semantics, and in a CUDA graph whose static mask "
+        "changes between replays.",
     ),
     KernelEntry(
         name="moe_experts",

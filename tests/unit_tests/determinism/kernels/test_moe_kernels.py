@@ -5,13 +5,14 @@
 Operator level: token permute / unpermute (torch and TE-fused, both branches of the
 ``torch.are_deterministic_algorithms_enabled()`` switch), chunk sorting, top-k routing (torch
 and TE-fused), group-limited routing, the load-balancing aux loss (torch and TE-fused), and
-the router gating GEMM, the padding-route masking that megakernel backends must reproduce
-(``drop_padding_routes``), and virtual-expert planning against a CPU oracle, both in eager and
-CUDA graphs. Module level: ``TopKRouter``, ``TEGroupedMLP`` / ``SequentialMLP`` on
-deliberately uneven expert loads (including an empty expert), and a full ``MoELayer`` through
+the router gating GEMM, and virtual-expert planning against a CPU oracle in eager and CUDA
+graphs. Module level: ``TopKRouter``, ``TEGroupedMLP`` / ``SequentialMLP`` on
+deliberately uneven expert loads (including an empty expert), a full ``MoELayer`` through
 the all-gather and all-to-all dispatchers (plus the flex/DeepEP dispatcher from
-``fused_a2a.py`` when the dependency and the GPUs are available), and the inference
-``MoELayer`` through FlashInfer per-token NVFP4 experts on Blackwell.
+``fused_a2a.py`` when the dependency and the GPUs are available), the megakernel branch of
+``MoELayer`` with a stand-in backend that applies the layer's padding mask in MOK's route
+compaction (eager and CUDA graphs, no MOK needed), and the inference ``MoELayer`` through
+FlashInfer per-token NVFP4 experts on Blackwell.
 """
 
 import pytest
@@ -36,12 +37,13 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.moe import batch_invariant, moe_utils
+from megatron.core.transformer.moe import batch_invariant, moe_layer, moe_utils
 from megatron.core.transformer.moe.experts import (
     SequentialMLP,
     TEGroupedMLP,
     _te_supports_scaled_tanh_srelu,
 )
+from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.moe.ops.virtual_expert_triton import VirtualExpertPlannerWorkspace
 from megatron.core.transformer.moe.router import InferenceTopKRouter, TopKRouter
@@ -63,9 +65,11 @@ from tests.unit_tests.determinism.kernels.harness import (
     bytes_equal,
     count_differing_replays,
     deterministic_algorithms,
+    run_once,
     seeded,
 )
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.moe.megakernel_test_utils import drop_padding_routes
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -905,122 +909,6 @@ def test_router_gating_linear_replays(router_dtype, with_bias):
     )
 
 
-# --- megakernel padding routes --------------------------------------------------------------
-
-
-def _padding_mask(pattern, batch_size, seq_length):
-    """Batch-first ``[batch_size, seq_length]`` padding mask, True for padding tokens."""
-    if pattern == "none":
-        return torch.zeros(batch_size, seq_length, dtype=torch.bool, device="cuda")
-    if pattern == "all":
-        return torch.ones(batch_size, seq_length, dtype=torch.bool, device="cuda")
-    if pattern == "right":
-        # Right padding of a partial, a full, a one-token and an empty sequence.
-        lengths = torch.tensor([3 * seq_length // 4 + 1, seq_length, 1, 0], device="cuda")
-        return torch.arange(seq_length, device="cuda") >= lengths[:batch_size, None]
-    assert pattern == "random", pattern
-    return torch.rand(batch_size, seq_length, device="cuda") < 0.6
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-@pytest.mark.parametrize(
-    "batch_size,pattern,layout",
-    [
-        (2, "none", "bool"),
-        (2, "all", "bool"),
-        (1, "right", "bool"),
-        (4, "right", "bool"),
-        (4, "random", "int"),
-        (4, "random", "strided"),
-    ],
-)
-def test_drop_padding_routes_replays(dtype, batch_size, pattern, layout):
-    """Padding tokens lose every route; real tokens keep theirs bit for bit, gradient included.
-
-    ``drop_padding_routes`` is the reference for the ``padding_mask`` that ``MoELayer`` passes to
-    a megakernel backend: padding tokens get no routes, so their routed output and their probs
-    gradient are zero.
-    """
-    seeded()
-    seq_length = NUM_TOKENS // batch_size
-    routing_map, probs = _routing()
-    probs = probs.to(dtype)
-    # Padded rows must come out as +0.0 whatever they hold; real rows keep every bit.
-    probs[[0, -1], 0] = float("nan")
-    probs[[0, -1], 1] = -0.0
-    probs.requires_grad_()
-    mask = _padding_mask(pattern, batch_size, seq_length)
-    padding_mask = {"bool": mask, "int": mask.int(), "strided": mask.t().contiguous().t()}[layout]
-    upstream = torch.randn_like(probs)
-    originals = (probs.detach().clone(), routing_map.clone(), padding_mask.clone())
-
-    outputs, grads = assert_replays_bit_exact(
-        moe_utils.drop_padding_routes,
-        (probs, routing_map, padding_mask),
-        grad_outputs={"out[0]": upstream},
-        replays=3,
-        contention=True,
-        what=f"drop_padding_routes[{dtype}, batch={batch_size}, {pattern}, {layout}]",
-    )
-
-    # Hidden states are sequence-first, so token t is mask[t % batch_size, t // batch_size].
-    tokens = torch.arange(NUM_TOKENS, device="cuda")
-    padded = mask[tokens % batch_size, tokens // batch_size]
-    masked_probs, masked_map = outputs["out[0]"], outputs["out[1]"]
-    assert bytes_equal(masked_probs[padded], torch.zeros_like(originals[0][padded]))
-    assert not masked_map[padded].any()
-    assert bytes_equal(masked_probs[~padded], originals[0][~padded])
-    assert torch.equal(masked_map[~padded], routing_map[~padded])
-    assert bytes_equal(grads["in[0]"], upstream.masked_fill(padded[:, None], 0))
-    # The caller's routing result and mask are left untouched.
-    moe_utils.drop_padding_routes(probs, routing_map, padding_mask)
-    for tensor, original in zip((probs, routing_map, padding_mask), originals):
-        assert bytes_equal(tensor, original)
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
-def test_drop_padding_routes_graph_replay(dtype):
-    """A captured ``drop_padding_routes`` applies whatever mask its static buffer holds.
-
-    In the TE graph of a megakernel MoE layer (``cuda_graph_modules`` containing ``moe``), the
-    padding mask is a static buffer: all padding during the warm-up, then each microbatch's
-    mask, copied in before its replay. Outputs and the probs gradient must match eager bit for
-    bit on every replay.
-    """
-    seeded()
-    batch_size, seq_length = 4, NUM_TOKENS // 4
-    routing_map, probs = _routing()
-    probs = probs.to(dtype).requires_grad_()
-    upstream = torch.randn_like(probs)
-    static_mask = _padding_mask("all", batch_size, seq_length)
-
-    def run():
-        masked_probs, masked_map = moe_utils.drop_padding_routes(probs, routing_map, static_mask)
-        (probs_grad,) = torch.autograd.grad(masked_probs, probs, upstream)
-        return masked_probs.detach(), masked_map, probs_grad
-
-    side_stream = torch.cuda.Stream()
-    side_stream.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(side_stream):
-        run()
-    torch.cuda.current_stream().wait_stream(side_stream)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        captured = run()
-
-    names = ("probs", "routing map", "probs gradient")
-    for pattern in ("all", "right", "none", "random", "right"):
-        static_mask.copy_(_padding_mask(pattern, batch_size, seq_length))
-        expected = run()
-        for replay in range(2):
-            graph.replay()
-            torch.cuda.synchronize()
-            for name, actual, reference in zip(names, captured, expected):
-                assert bytes_equal(
-                    actual, reference
-                ), f"{name} of graph replay {replay} with {pattern} padding differs from eager"
-
-
 # --- modules --------------------------------------------------------------------------------
 
 
@@ -1061,6 +949,70 @@ class _InQuantizationContext(torch.nn.Module):
     def forward(self, *args):
         with get_fp8_context(self.config):
             return self.module(*args)
+
+
+def _padding_mask(pattern, batch_size, seq_length):
+    """Batch-first ``[batch_size, seq_length]`` padding mask, True for padding tokens."""
+    if pattern == "none":
+        return torch.zeros(batch_size, seq_length, dtype=torch.bool, device="cuda")
+    if pattern == "all":
+        return torch.ones(batch_size, seq_length, dtype=torch.bool, device="cuda")
+    if pattern == "right":
+        # Right padding of a partial, a full, a one-token and an empty sequence.
+        lengths = torch.tensor([3 * seq_length // 4 + 1, seq_length, 1, 0], device="cuda")
+        return torch.arange(seq_length, device="cuda") >= lengths[:batch_size, None]
+    assert pattern == "random", pattern
+    return torch.rand(batch_size, seq_length, device="cuda") < 0.6
+
+
+class _CompactingMegakernel(torch.nn.Module):
+    """Megakernel backend stand-in that runs MOK's route compaction without MOK or Blackwell.
+
+    It compacts the routes it receives with ``routing_map_to_mok_inputs``, whose Triton kernel
+    drops the routes of the padding tokens, and scales each token by its routed probabilities,
+    weighted by ``e + 1`` for expert ``e``. With ``reference`` set, it drops the padding routes
+    with the reference semantics (``drop_padding_routes``) and compacts without a mask instead.
+    """
+
+    def __init__(self, topk: int) -> None:
+        super().__init__()
+        self.topk = topk
+        self.reference = False
+        self.routes = None
+
+    def forward(self, hidden_states, probs, routing_map, padding_mask=None):
+        if self.reference:
+            probs, routing_map = drop_padding_routes(probs, routing_map, padding_mask)
+            padding_mask = None
+        weights, indices = routing_map_to_mok_inputs(probs, routing_map, self.topk, padding_mask)
+        self.routes = (weights.detach(), indices)
+        # Unused route slots hold index -1 and weight 0, so they add nothing.
+        token_scale = (weights * (indices + 1)).sum(dim=-1)
+        tokens = hidden_states.reshape(-1, hidden_states.shape[-1])
+        return (tokens * token_scale.to(tokens.dtype).unsqueeze(-1)).view_as(hidden_states)
+
+
+def _megakernel_moe_layer(monkeypatch):
+    """A top-``TOPK`` MoE layer over ``NUM_EXPERTS`` experts whose megakernel backend is a
+    ``_CompactingMegakernel``, injected through ``build_megakernel_backend`` as in
+    ``test_moe_layer.py``."""
+    config = _moe_config(
+        hidden_size=256,
+        ffn_hidden_size=256,
+        num_moe_experts=NUM_EXPERTS,
+        moe_router_topk=TOPK,
+        moe_shared_expert_intermediate_size=256,
+        gradient_accumulation_fusion=True,
+        moe_megakernel_backend="mok",
+    )
+    backend = _CompactingMegakernel(TOPK)
+    monkeypatch.setattr(moe_layer, "build_megakernel_backend", lambda **kwargs: backend)
+    mlp_spec = get_gpt_layer_with_transformer_engine_spec(
+        num_experts=NUM_EXPERTS, moe_grouped_gemm=True
+    ).submodules.mlp
+    layer = MoELayer(config, get_submodules(mlp_spec)).cuda()
+    assert layer.megakernel_experts is backend
+    return layer, backend
 
 
 class TestMoEModules:
@@ -2128,6 +2080,123 @@ class TestMoEModules:
         with deterministic_algorithms(True):
             layer(hidden)
         assert layer.token_dispatcher.probs is None
+
+    @pytest.mark.skipif(not HAVE_TE, reason="MOK layers build TE grouped experts")
+    def test_megakernel_padding_routes_replay(self, monkeypatch):
+        """The megakernel branch of ``MoELayer`` passes the layer's padding mask to the backend,
+        whose MOK route compaction gives padding tokens no routes.
+
+        The compacted routes, the layer output and the gradients of the hidden states and of the
+        router probs, through the compaction, replay bit-exactly under side-stream contention, and
+        they equal the reference semantics (``drop_padding_routes`` before an unmasked compaction)
+        bit for bit.
+        """
+        self._init()
+        seeded()
+        batch_size, seq_length = 4, 1024
+        layer, backend = _megakernel_moe_layer(monkeypatch)
+        routing_map, probs = _routing(num_tokens=batch_size * seq_length)
+        router_outputs = []
+        monkeypatch.setattr(layer.router, "forward", lambda *args, **kwargs: router_outputs[-1])
+
+        def megakernel_moe(hidden_states, probs, routing_map, padding_mask):
+            router_outputs.append((probs, routing_map))
+            output, bias = layer(hidden_states, padding_mask=padding_mask)
+            assert bias is None
+            return (output, *backend.routes)
+
+        hidden = torch.randn(
+            seq_length,
+            batch_size,
+            layer.config.hidden_size,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        padding_mask = _padding_mask("right", batch_size, seq_length)
+        inputs = {
+            "hidden_states": hidden,
+            "probs": probs.requires_grad_(),
+            "routing_map": routing_map,
+            "padding_mask": padding_mask,
+        }
+        upstream = {"out[0]": torch.randn_like(hidden)}
+        outputs, grads = assert_replays_bit_exact(
+            megakernel_moe,
+            inputs,
+            grad_outputs=upstream,
+            replays=3,
+            contention=True,
+            what="MoELayer[megakernel stand-in, padding mask]",
+        )
+
+        # Tokens flatten sequence-first: token s * batch_size + b is padding_mask[b, s]. Padding
+        # tokens keep no routes, the other tokens keep all of theirs.
+        padded = padding_mask.t().reshape(-1)
+        indices = outputs["out[2]"]
+        assert (indices[padded] == -1).all() and (indices[~padded] >= 0).all()
+        backend.reference = True
+        expected_outputs, expected_grads = run_once(megakernel_moe, inputs, upstream)
+        assert outputs.keys() == expected_outputs.keys()
+        assert grads.keys() == expected_grads.keys() == {"in.hidden_states", "in.probs"}
+        for name, expected in (*expected_outputs.items(), *expected_grads.items()):
+            actual = outputs[name] if name in outputs else grads[name]
+            assert bytes_equal(actual, expected), f"{name} differs from drop_padding_routes"
+
+    @pytest.mark.skipif(not HAVE_TE, reason="MOK layers build TE grouped experts")
+    def test_megakernel_padding_routes_graph_replay(self, monkeypatch):
+        """A CUDA graph of the megakernel branch applies whatever mask its static buffer holds.
+
+        In the TE graph of a megakernel MoE layer (``cuda_graph_modules`` containing ``moe``),
+        the padding mask is a static buffer: all padding during the warm-up, then each
+        microbatch's mask, copied in before its replay. The compacted routes, the layer output
+        and the gradients of the hidden states and of the router probs must match eager bit for
+        bit on every replay.
+        """
+        self._init()
+        seeded()
+        batch_size, seq_length = 4, 1024
+        layer, backend = _megakernel_moe_layer(monkeypatch)
+        routing_map, probs = _routing(num_tokens=batch_size * seq_length)
+        probs.requires_grad_()
+        monkeypatch.setattr(layer.router, "forward", lambda *args, **kwargs: (probs, routing_map))
+        hidden = torch.randn(
+            seq_length,
+            batch_size,
+            layer.config.hidden_size,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        upstream = torch.randn_like(hidden)
+        static_mask = _padding_mask("all", batch_size, seq_length)
+
+        def run():
+            output, _ = layer(hidden, padding_mask=static_mask)
+            hidden_grad, probs_grad = torch.autograd.grad(output, (hidden, probs), upstream)
+            return (output.detach(), *backend.routes, hidden_grad, probs_grad)
+
+        # As TE does, run the warm-up eagerly on the static inputs before the capture.
+        side_stream = torch.cuda.Stream()
+        side_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side_stream):
+            run()
+        torch.cuda.current_stream().wait_stream(side_stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            captured = run()
+
+        names = ("output", "route weights", "route indices", "hidden gradient", "probs gradient")
+        for pattern in ("all", "right", "none", "random", "right"):
+            static_mask.copy_(_padding_mask(pattern, batch_size, seq_length))
+            expected = run()
+            for replay in range(2):
+                graph.replay()
+                torch.cuda.synchronize()
+                for name, actual, reference in zip(names, captured, expected):
+                    assert bytes_equal(
+                        actual, reference
+                    ), f"{name} of graph replay {replay} with {pattern} padding differs from eager"
 
 
 @pytest.mark.parametrize("collective", ["ordered", "multimem"])

@@ -116,8 +116,9 @@ class RoutingMapToIndices(torch.autograd.Function):
     order. Rows with fewer than topk routes are padded with -1 indices
     and zero probabilities. The backward pass scatters router-weight gradients
     into the corresponding positions of the dense probability tensor.
-    An optional padding mask removes every route of the padding tokens, as
-    drop_padding_routes does, without materializing the masked inputs.
+    An optional padding mask removes every route of the padding tokens, as if
+    their rows of probs and routing_map were zero, without materializing
+    masked inputs.
     """
 
     @staticmethod
@@ -222,9 +223,9 @@ def routing_map_to_mok_inputs(
         routing_map: Dense boolean/integer route map with the same shape as probs.
         topk: Maximum number of valid routes emitted per token.
         padding_mask: Optional batch-first [bsz, seq_length] mask of the sequence-first
-            tokens, True for padding. Padding tokens get no routes; the result equals
-            routing_map_to_mok_inputs(*drop_padding_routes(probs, routing_map, padding_mask), topk),
-            in values and in the gradient of probs.
+            tokens, True for padding. Padding tokens get no routes: in values and in the
+            gradient of probs, the result equals compacting probs and routing_map with the
+            rows of the padding tokens zeroed.
     Returns:
         A pair (probs_indices, indices) with shapes [num_tokens, topk].
         probs_indices is float32 and indices is int32 with -1 padding.

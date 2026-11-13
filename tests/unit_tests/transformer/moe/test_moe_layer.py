@@ -15,7 +15,6 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import _set_capture_end, _set_capture_start
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
-from megatron.core.transformer.moe.moe_utils import drop_padding_routes
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -23,6 +22,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer, Transf
 from megatron.core.utils import is_te_min_version
 from megatron.training.initialize import _set_random_seed
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.moe.megakernel_test_utils import drop_padding_routes
 
 
 class _RecordingMegakernel(torch.nn.Module):

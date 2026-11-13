@@ -9,7 +9,7 @@ import torch
 from megatron.core import config
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
-from megatron.core.transformer.moe.moe_utils import drop_padding_routes
+from tests.unit_tests.transformer.moe.megakernel_test_utils import drop_padding_routes
 
 
 class PytorchIndicesToMultihot:
