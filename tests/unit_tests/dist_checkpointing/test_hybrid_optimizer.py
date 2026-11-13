@@ -12,6 +12,7 @@ from megatron.core import parallel_state
 from megatron.core.dist_checkpointing import ShardedTensor
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.tensor_parallel import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.training.arguments import parse_args
@@ -27,7 +28,8 @@ from tests.unit_tests.dist_checkpointing import (
     init_basic_mock_args,
     init_checkpointing_mock_args,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.dist_checkpointing.utils import _sync_run_config_optimizer_flags
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 
 class HybridOptimizerModel(torch.nn.Module):
@@ -50,11 +52,18 @@ class HybridOptimizerModel(torch.nn.Module):
         )
 
     def forward(self, step: int) -> torch.Tensor:
-        """Produce known nonzero gradients through autograd and DDP."""
+        """Produce known nonzero, weight-dependent gradients through autograd and DDP.
+
+        The quadratic term makes every gradient depend on the weights used in the
+        forward pass, so a stale weight in the first resumed step changes the update.
+        """
         gradient = (
             torch.arange(256, device='cuda', dtype=torch.float32).remainder(13) - 6
         ).reshape(16, 16) * (0.0078125 * step)
-        return sum((parameter.float() * gradient).sum() for parameter in self.weights)
+        return sum(
+            (parameter.float() * gradient).sum() + 0.25 * parameter.float().square().sum()
+            for parameter in self.weights
+        )
 
     def state_dict_for_save_checkpoint(self, **kwargs) -> dict:
         """Expose the native checkpoint interface used by production model modules."""
@@ -77,23 +86,40 @@ class HybridOptimizerModel(torch.nn.Module):
         }
 
 
-@pytest.mark.parametrize('offload_fraction', [0.5, 1.0], ids=['partial_offload', 'full_offload'])
-@pytest.mark.parametrize('precision_aware,mixed', [(False, False), (True, False), (True, True)])
+# Offload fills the CPU in optimizer-parameter order, and precision-aware groups
+# list native FP32 shards before BF16 shards. With the mixed model, a quarter
+# offload therefore leaves native FP32 parameters on both owners, a half offload
+# moves every native FP32 parameter to the CPU, and full offload moves everything.
+# Zero offload keeps every parameter on the GPU inside the hybrid optimizer.
 @pytest.mark.parametrize(
-    'checkpoint_format', ['dp_reshardable', 'fully_reshardable', 'dp_zero_gather_scatter', 'torch']
+    'offload_fraction',
+    [0.0, 0.25, 0.5, 1.0],
+    ids=['no_offload', 'quarter_offload', 'half_offload', 'full_offload'],
+)
+@pytest.mark.parametrize('mixed', [False, True], ids=['bf16', 'bf16_and_fp32'])
+@pytest.mark.parametrize(
+    'checkpoint_format,loader',
+    [
+        ('dp_reshardable', 'load_parameter_state_from_dp_reshardable'),
+        ('fully_reshardable', 'load_parameter_state_from_fully_reshardable'),
+        ('dp_zero_gather_scatter', 'load_parameter_state_from_dp_zero'),
+        ('torch', 'load_parameter_state_from_dp_zero'),
+    ],
 )
 def test_hybrid_checkpoint_continuation(
     tmp_path_dist_ckpt,
     monkeypatch,
-    precision_aware: bool,
     mixed: bool,
     checkpoint_format: str,
+    loader: str,
     offload_fraction: float,
 ) -> None:
     """Restore step two and compare all owner states after steps three through five.
 
-    Full offload places the native FP32 parameters of the mixed model on the CPU
-    optimizer, so a stale CPU copy would overwrite the restored model weights.
+    CPU offload requires the precision-aware optimizer. Every checkpoint format
+    must restore the Adam counters, refresh each CPU and GPU owner from the
+    restored master weights, and leave the model weights untouched before the
+    first resumed forward pass.
     """
     if Utils.world_size < 2 or Utils.world_size % 2:
         pytest.skip('Requires an even world size for DP=2')
@@ -116,7 +142,7 @@ def test_hybrid_checkpoint_continuation(
                 bf16=True,
                 params_dtype=torch.bfloat16,
                 use_distributed_optimizer=True,
-                use_precision_aware_optimizer=precision_aware,
+                use_precision_aware_optimizer=True,
                 optimizer_cpu_offload=True,
                 optimizer_offload_fraction=offload_fraction,
                 overlap_cpu_optimizer_d2h_h2d=True,
@@ -125,12 +151,17 @@ def test_hybrid_checkpoint_continuation(
             [model],
         )
         inner = optimizer.chained_optimizers[0].optimizer
-        assert inner.cpu_optimizers
+        assert bool(inner.cpu_optimizers) == (offload_fraction > 0.0)
         assert (inner.gpu_optimizer is None) == (offload_fraction == 1.0)
-        if mixed and offload_fraction == 1.0:
-            assert any(
-                parameter.dtype == torch.float32 for parameter in inner.gpu_params_map_cpu_copy
-            ), 'Expected a CPU-owned native FP32 parameter'
+        if mixed:
+            fp32_owners = {
+                parameter in inner.gpu_params_map_cpu_copy
+                for group in inner.param_groups
+                for parameter in group['params']
+                if parameter.dtype == torch.float32
+            }
+            expected = {0.0: {False}, 0.25: {True, False}}.get(offload_fraction, {True})
+            assert fp32_owners == expected, f'Native FP32 CPU ownership: {fp32_owners}'
         return model, optimizer
 
     def train_step(model, optimizer, step):
@@ -182,7 +213,10 @@ def test_hybrid_checkpoint_continuation(
             args.optimizer_cpu_offload = True
             args.optimizer_offload_fraction = offload_fraction
             args.overlap_cpu_optimizer_d2h_h2d = True
-            args.use_precision_aware_optimizer = precision_aware
+            args.use_precision_aware_optimizer = True
+            # Checkpointing reads the registered run config rather than args.
+            sync_checkpoint_config(args)
+            _sync_run_config_optimizer_flags(True, False)
 
             def metadata(*metadata_args, **kwargs):
                 result = _build_sharded_state_dict_metadata(*metadata_args, **kwargs)
@@ -207,6 +241,7 @@ def test_hybrid_checkpoint_continuation(
                     0,
                     preprocess_common_state_dict_fn=preprocess_common_state_dict,
                 )
+                saved_model = deepcopy(model.module.state_dict())
                 expected = {}
                 for step in (3, 4, 5):
                     train_step(model, optimizer, step)
@@ -215,10 +250,20 @@ def test_hybrid_checkpoint_continuation(
                 restored_model, restored_optimizer = construct()
                 with (
                     patch('megatron.training.checkpointing.check_checkpoint_args'),
-                    patch('megatron.training.checkpointing.update_num_microbatches'),
+                    patch.object(
+                        DistributedOptimizer,
+                        loader,
+                        autospec=True,
+                        side_effect=getattr(DistributedOptimizer, loader),
+                    ) as loader_spy,
                 ):
-                    iteration, _ = load_checkpoint([restored_model], restored_optimizer, None)
+                    iteration, _ = load_checkpoint(
+                        [restored_model], restored_optimizer, None, restore_training_state=True
+                    )
                 assert iteration == 2
+                assert loader_spy.called, f'{checkpoint_format} did not reach {loader}'
+                # The first resumed forward must already see the saved weights.
+                assert_equal(saved_model, restored_model.module.state_dict())
                 for step in (3, 4, 5):
                     train_step(restored_model, restored_optimizer, step)
                     assert_equal(expected[step], snapshot(restored_model, restored_optimizer))

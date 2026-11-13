@@ -324,14 +324,24 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.state = new_state
 
         # FusedAdam keeps its counter in GPU parameter groups, whereas Torch
-        # AdamW keeps per-parameter counters in state. Preserve the GPU counters
-        # for checkpoints and the next outer-to-child group synchronization.
+        # AdamW keeps per-parameter counters in state. Mirror the counters into
+        # every outer group, including groups owned only by the CPU, so that
+        # checkpoints and ChainedOptimizer step alignment see one current value.
+        param_to_group = {p: group for group in self.param_groups for p in group["params"]}
+        updated_groups = set()
         if self.gpu_optimizer is not None:
-            param_to_group = {p: group for group in self.param_groups for p in group["params"]}
             for group in self.gpu_optimizer.param_groups:
                 if "step" in group:
                     orig_param = self.inner_param_to_orig_param[group["params"][0]]
-                    param_to_group[orig_param]["step"] = group["step"]
+                    outer_group = param_to_group[orig_param]
+                    outer_group["step"] = group["step"]
+                    updated_groups.add(id(outer_group))
+        for optimizer in self.cpu_optimizers:
+            for param, state in optimizer.state.items():
+                outer_group = param_to_group[self.inner_param_to_orig_param[param]]
+                if "step" in state and id(outer_group) not in updated_groups:
+                    outer_group["step"] = int(state["step"])
+                    updated_groups.add(id(outer_group))
 
     def _sync_hdo_state_to_sub_optimizers(self):
         for optimizer in self.sub_optimizers:
@@ -383,11 +393,14 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         if not self.param_update_in_fp32:
             return
         for param, v in self.state.items():
-            # CPU-owned native FP32 parameters also have a separate inner copy.
-            # GPU-owned native FP32 parameters are restored with the model.
+            # Refresh every owner from the restored master, including CPU copies
+            # of native FP32 parameters and GPU-owned native FP32 parameters,
+            # whose inner copy is the parameter itself. The result must not
+            # depend on whether the model weights were loaded first.
             inner_param = self.param_to_inner_param[param]
-            if inner_param is not param:
-                inner_param.data.copy_(v["master_param"])
+            master_param = v.get("master_param")
+            if master_param is not None and master_param is not inner_param:
+                inner_param.data.copy_(master_param)
 
     @torch.no_grad()
     def update_fp32_param_by_new_param(self):
@@ -477,12 +490,27 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         The dummy step can be used to initialize the potential optimizer.state,
         which can solve the problem of checkpoint loading for an inplace operation
         such as loading a torch distributed checkpoint, for example.
+
+        A legacy Torch-format resume calls it after the model weights have been
+        loaded, so it must leave the parameters unchanged: the optimizer copies
+        are first refreshed from the current parameters, because the step copies
+        them back, and the step runs at a zero learning rate.
         """
-        for group in self.param_groups:
+        self.update_fp32_param_by_new_param()
+        # Groups without an "lr" key keep the sub-optimizer default, as before.
+        learning_rates = {}
+        for index, group in enumerate(self.param_groups):
+            if "lr" in group:
+                learning_rates[index] = group["lr"]
+                group["lr"] = 0.0
             for param in group["params"]:
                 param.grad = torch.randn_like(param)
-        self.step()
-        self.zero_grad()
+        try:
+            self.step()
+        finally:
+            for index, learning_rate in learning_rates.items():
+                self.param_groups[index]["lr"] = learning_rate
+            self.zero_grad()
 
     @property
     def sub_optimizers(self):

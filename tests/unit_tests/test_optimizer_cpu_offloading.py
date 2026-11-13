@@ -130,19 +130,29 @@ def test_hybrid_decoupled_gradient_and_missing_grad(
                 ), "A supplied gradient did not update its owner"
 
 
+@pytest.mark.parametrize('restore_model_first', [True, False])
 @pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize('overlap', [False, True])
 @pytest.mark.skipif(GPUAdam is Adam, reason='Requires TransformerEngine FusedAdam')
-def test_hybrid_state_dict_preserves_gpu_steps(dtype: torch.dtype, overlap: bool) -> None:
-    """A native checkpoint must preserve more than the first resumed update."""
+def test_hybrid_state_dict_preserves_gpu_steps(
+    dtype: torch.dtype, overlap: bool, restore_model_first: bool
+) -> None:
+    """A native checkpoint must preserve more than the first resumed update.
+
+    Without restoring the model first, every owner (CPU copies of native FP32
+    parameters and GPU-owned native FP32 parameters included) must be refreshed
+    from the restored master weights, or the first update writes the initial
+    weights back.
+    """
     initial = [
         torch.linspace(-0.5, 0.5, size, device='cuda').to(dtype) for size in (65, 93, 33, 101)
     ]
 
     def construct():
         parameters = [nn.Parameter(value.clone()) for value in initial]
+        # The first group is owned only by the CPU, the second only by the GPU.
         optimizer = HybridDeviceOptimizer(
-            [{'params': parameters[:3]}, {'params': parameters[3:]}],
+            [{'params': parameters[:2]}, {'params': parameters[2:]}],
             offload_fraction=0.5,
             cpu_optimizer_cls=AdamW,
             gpu_optimizer_cls=GPUAdam,
@@ -152,6 +162,8 @@ def test_hybrid_state_dict_preserves_gpu_steps(dtype: torch.dtype, overlap: bool
             fused=True,
         )
         assert optimizer.cpu_optimizers and optimizer.gpu_optimizer is not None
+        assert all(p in optimizer.gpu_params_map_cpu_copy for p in parameters[:2])
+        assert not any(p in optimizer.gpu_params_map_cpu_copy for p in parameters[2:])
         return parameters, optimizer
 
     def step(parameters, optimizer, index):
@@ -169,8 +181,9 @@ def test_hybrid_state_dict_preserves_gpu_steps(dtype: torch.dtype, overlap: bool
     torch.cuda.synchronize()
     checkpoint = deepcopy(optimizer.state_dict())
     restored_parameters, restored_optimizer = construct()
-    for old, new in zip(parameters, restored_parameters):
-        new.data.copy_(old.data)
+    if restore_model_first:
+        for old, new in zip(parameters, restored_parameters):
+            new.data.copy_(old.data)
     restored_optimizer.load_state_dict(checkpoint)
 
     for index in (4, 5):
@@ -179,6 +192,10 @@ def test_hybrid_state_dict_preserves_gpu_steps(dtype: torch.dtype, overlap: bool
         torch.cuda.synchronize()
         for child in (optimizer.gpu_optimizer, restored_optimizer.gpu_optimizer):
             assert all(group['step'] == index for group in child.param_groups)
+        # Outer groups, including any owned only by the CPU, carry the current
+        # counter; ChainedOptimizer asserts that all of them agree on save.
+        for outer in (optimizer, restored_optimizer):
+            assert all(group['step'] == index for group in outer.param_groups)
         for left, right in zip(parameters, restored_parameters):
             assert torch.equal(left, right), "Native resume changed parameter bytes"
             left_state, right_state = optimizer.state[left], restored_optimizer.state[right]
@@ -186,6 +203,39 @@ def test_hybrid_state_dict_preserves_gpu_steps(dtype: torch.dtype, overlap: bool
             for key in left_state:
                 a, b = left_state[key], right_state[key]
                 assert bytes_equal(a, b), f"Native resume changed {key} bytes"
+
+
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
+@pytest.mark.skipif(GPUAdam is Adam, reason='Requires TransformerEngine FusedAdam')
+def test_hybrid_dummy_step_preserves_parameters(dtype: torch.dtype) -> None:
+    """State initialization must not move weights loaded after construction."""
+    parameters = [
+        nn.Parameter(torch.linspace(-0.5, 0.5, size, device='cuda').to(dtype))
+        for size in (65, 93, 33, 101)
+    ]
+    optimizer = HybridDeviceOptimizer(
+        [{'params': parameters[:2]}, {'params': parameters[2:]}],
+        offload_fraction=0.5,
+        cpu_optimizer_cls=AdamW,
+        gpu_optimizer_cls=GPUAdam,
+        param_update_in_fp32=True,
+        lr=0.1,
+        weight_decay=0.1,
+    )
+    assert optimizer.cpu_optimizers and optimizer.gpu_optimizer is not None
+    # A legacy Torch-format resume loads the model before the optimizer state,
+    # so the optimizer copies still hold the construction-time weights.
+    with torch.no_grad():
+        for parameter in parameters:
+            parameter.mul_(-2.0).add_(0.25)
+    before = [parameter.detach().clone() for parameter in parameters]
+    optimizer.dummy_step()
+    torch.cuda.synchronize()
+    assert len(optimizer.state) == len(parameters)
+    assert all(group['lr'] == 0.1 for group in optimizer.param_groups)
+    for old, parameter in zip(before, parameters):
+        assert torch.equal(old, parameter), "dummy_step changed a parameter"
+        assert parameter.grad is None
 
 
 class ConditionalParameterModel(nn.Module):
