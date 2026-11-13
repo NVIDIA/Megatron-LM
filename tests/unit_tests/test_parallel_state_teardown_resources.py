@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 import torch
@@ -157,8 +157,11 @@ def test_gtp_pools_release_before_groups(recorded_teardown, monkeypatch):
     torch.distributed.distributed_c10d._world.pg_map[external_group] = None
     pools = {"owned": object(), "external": object()}
     monkeypatch.setattr(gtp_symmetric_memory, "_pools", pools.copy())
+    collectives = frozenset({"rs"})
     monkeypatch.setattr(
-        gtp_symmetric_memory, "_registered", {"owned": group, "external": external_group}
+        gtp_symmetric_memory,
+        "_registered",
+        {"owned": (group, collectives), "external": (external_group, collectives)},
     )
     pool_cache = gtp_symmetric_memory.RegisteredLIFOPool()
     pool_cache._free["buffer"] = [object()]
@@ -196,8 +199,18 @@ def test_gtp_pool_teardown_skips_destroyed_groups(monkeypatch):
     )
     pools = {"live": object(), "dead": object()}
     monkeypatch.setattr(gtp_symmetric_memory, "_pools", pools.copy())
+    collectives = frozenset({"rs"})
     monkeypatch.setattr(
-        gtp_symmetric_memory, "_registered", {"live": live_group, "dead": dead_group}
+        gtp_symmetric_memory,
+        "_registered",
+        {"live": (live_group, collectives), "dead": (dead_group, collectives)},
+    )
+    # A pool owned elsewhere follows the same rule.
+    live_external_pool, dead_external_pool = object(), object()
+    monkeypatch.setattr(
+        gtp_symmetric_memory,
+        "_registered_ext_pools",
+        {(live_external_pool, "live"): live_group, (dead_external_pool, "dead"): dead_group},
     )
     pool_cache = gtp_symmetric_memory.RegisteredLIFOPool()
     pool_cache._free["buffer"] = [object()]
@@ -208,8 +221,12 @@ def test_gtp_pool_teardown_skips_destroyed_groups(monkeypatch):
 
     gtp_symmetric_memory.deregister_and_clear_gtp_symm_pools()
 
-    deregister.assert_called_once_with(pools["live"], live_group)
+    assert deregister.call_args_list == [
+        call(pools["live"], live_group),
+        call(live_external_pool, live_group),
+    ]
     assert not gtp_symmetric_memory._registered
+    assert not gtp_symmetric_memory._registered_ext_pools
     assert not gtp_symmetric_memory._pools
     assert not pool_cache._free
 
