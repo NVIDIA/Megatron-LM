@@ -457,7 +457,11 @@ class T5Model(LanguageModule):
                 return lm_logits.transpose(0, 1).contiguous()
             else:
                 # [b s] => [s b]
-                lm_loss = self.compute_language_model_loss(lm_labels, lm_logits)
+                lm_loss = self.compute_language_model_loss(
+                    lm_labels,
+                    lm_logits,
+                    logits_are_gathered=self.lm_head.output_layer.gather_output,
+                )
                 return lm_loss
         else:
             return decoder_hidden_states
