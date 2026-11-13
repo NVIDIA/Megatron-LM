@@ -21,10 +21,7 @@ from typing import Callable, Iterable, Optional, Self
 
 import torch
 
-from megatron.core.tensor_parallel.gtp_symmetric_memory import (
-    gtp_symm_pool_ctx,
-    is_gtp_symm_pool_registered,
-)
+from megatron.core.tensor_parallel.gtp_symmetric_memory import gtp_symm_pool_ctx, uses_gtp_symm_pool
 from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
@@ -82,7 +79,7 @@ class GraphWgradRingSlot:
     @classmethod
     def allocate(cls, param, *, key: tuple, index: int = 0) -> Self:
         """Allocate padded persistent storage; the caller records its initial ready event."""
-        symm = is_gtp_symm_pool_registered(param.group)
+        symm = uses_gtp_symm_pool(param.group, collective="rs")
         with gtp_symm_pool_ctx(param.group) if symm else nullcontext():
             tensor = torch.empty(
                 param._unsharded_shape_padded,
@@ -137,6 +134,13 @@ class GTPCaptureCommState:
 
     def get_comms_for_chain(self, chain_id: str) -> tuple[list, list, list]:
         """Return owned parameters, AG streams, and RS streams for one GTP chain."""
+        return self.get_comms_for_chains((chain_id,))
+
+    def get_comms_for_chains(
+        self, chain_ids: Iterable[str] | Callable[[str], bool]
+    ) -> tuple[list, list, list]:
+        """Select owned communication by IDs or a predicate, deduplicating shared streams."""
+        matches_chain = chain_ids if callable(chain_ids) else set(chain_ids).__contains__
         params = []
         ag_streams = []
         rs_streams = []
@@ -145,7 +149,8 @@ class GTPCaptureCommState:
         rs_stream_ids = set()
 
         for param, stream, reduce_scatter in self._comm_records:
-            if getattr(param, "chain_id", None) != chain_id:
+            chain_id = getattr(param, "chain_id", None)
+            if chain_id is None or not matches_chain(chain_id):
                 continue
             if id(param) not in param_ids:
                 param_ids.add(id(param))
@@ -268,7 +273,7 @@ def allocate_graph_wgrad_rings(
     full_iteration: bool,
     async_reduction: bool,
     ring_size: int,
-    graphed_chain_id: str,
+    chain_is_graphed: Callable[[str], bool],
     stream_key: Callable[[str, object], tuple],
 ) -> None:
     """Allocate bounded persistent inputs for cross-graph asynchronous reduce-scatter.
@@ -286,7 +291,7 @@ def allocate_graph_wgrad_rings(
     for chain_param in params:
         if not getattr(chain_param, "is_gtp_weight_remat", False):
             continue
-        if chain_param.chain_id != graphed_chain_id or chain_param.prev_w is None:
+        if not chain_is_graphed(chain_param.chain_id) or chain_param.prev_w is None:
             continue
         for param in chain_param._weights:
             if id(param) in seen_params:

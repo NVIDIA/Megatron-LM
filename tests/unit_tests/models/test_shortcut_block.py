@@ -17,8 +17,8 @@ from megatron.core.transformer.module import TwoStageAttentionLayer
 from megatron.core.transformer.residual_recompute import build_residual_stream_recompute_plan
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualConnection
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.core.transformer.wide_residual_layer import StreamwiseSigmoidWideResidualConnection
 
 # The shortcut-owned norms are Transformer Engine norms, which need a full TransformerConfig to
 # build and a GPU to run.
@@ -109,7 +109,7 @@ class _FakeMoE(torch.nn.Module):
         """Stand-in for the layer protocol: norm output, residual, and an empty payload."""
         return hidden_states, hidden_states, ()
 
-    def _get_mlp_residual_connection(self, operation):
+    def _get_residual_connection_for_mlp(self, operation):
         if self.config.wide_residual is None:
             return None
         match operation:
@@ -141,7 +141,10 @@ def test_group_layers_into_shortcut_blocks(compute_symbol, parallel):
 
     grouped = group_layers_into_shortcut_blocks(
         torch.nn.ModuleList([leading_moe, compute, paired_moe, trailing_layer]),
-        [LayerSymbols.MOE, compute_symbol, LayerSymbols.MOE, LayerSymbols.MLP],
+        [
+            LayerSymbols.LAYER_CONFIG_MAP[symbol].from_config(config)
+            for symbol in (LayerSymbols.MOE, compute_symbol, LayerSymbols.MOE, LayerSymbols.MLP)
+        ],
         config,
     )
 
@@ -240,6 +243,9 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
     expected_layer_kwargs = (
         {"residual_stream_recompute_context": attn_context} if residual_replay else {}
     )
+    input_padding_mask = torch.tensor([[False, True]])
+    moe_padding_mask = torch.tensor([[True, False]])
+    masks_by_layout = {"zigzag": moe_padding_mask}
 
     class RecordingCPLayoutState:
         def prepare_layer(self, layer_idx, hidden_states):
@@ -249,6 +255,12 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
         def finalize_layer(self, layer_idx, hidden_states):
             calls.append(("finalize", layer_idx))
             return hidden_states + layer_idx
+
+        def get_layer_padding_mask(self, layer_idx, padding_mask, padding_mask_by_layout):
+            assert layer_idx == 5
+            assert padding_mask is input_padding_mask
+            assert padding_mask_by_layout is masks_by_layout
+            return moe_padding_mask
 
     def attn_forward(hidden_states, packed_seq_params=None, **kwargs):
         observed["attn_packed"] = packed_seq_params
@@ -267,11 +279,13 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
     def route(shortcut_hidden, padding_mask=None, packed_seq_params=None, recompute_context=None):
         assert recompute_context is attn_context
         observed["route_packed"] = packed_seq_params
+        assert padding_mask is moe_padding_mask
         return shortcut_hidden, shortcut_hidden
 
     def shared(hidden_states, padding_mask=None, packed_seq_params=None, recompute_context=None):
         assert recompute_context is moe_context
         observed["shared_packed"] = packed_seq_params
+        assert padding_mask is moe_padding_mask
         return torch.zeros_like(hidden_states), None, hidden_states, ()
 
     def postprocess(
@@ -311,12 +325,13 @@ def test_shortcut_owns_cp_layout_transitions(monkeypatch, residual_replay):
         rotary_pos_emb=None,
         sequence_len_offset=None,
         packed_seq_params="packed-input",
-        padding_mask=None,
+        padding_mask=input_padding_mask,
         quant_context_factory=quant_context_factory,
         cp_layout_state=RecordingCPLayoutState(),
         packed_sequence_cp_metadata=cp_metadata,
         attn_recompute_context=attn_context,
         moe_recompute_context=moe_context,
+        padding_mask_by_layout=masks_by_layout,
     )
 
     assert calls == [("prepare", 4), ("prepare", 5), ("prepare", 5), ("finalize", 5)]
@@ -340,7 +355,9 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
     compute_layer = _FakeCompute(config)
     moe_layer = _FakeMoE(config)
     block = ShortcutMoEBlock(compute_layer, moe_layer, overlap_a2a=False)
-    inference_context = object()
+    inference_context = SimpleNamespace(
+        config=SimpleNamespace(inference_shortcut_moe_overlap=False)
+    )
     observed = {}
 
     def compute_forward(hidden_states, **kwargs):
@@ -446,7 +463,10 @@ def test_group_layers_rejects_invalid_shortcut_pair(compute_symbol, compute, err
     with pytest.raises(ValueError, match=error):
         group_layers_into_shortcut_blocks(
             torch.nn.ModuleList([compute(config), _FakeMoE(config)]),
-            [compute_symbol, LayerSymbols.MOE],
+            [
+                LayerSymbols.LAYER_CONFIG_MAP[symbol].from_config(config)
+                for symbol in (compute_symbol, LayerSymbols.MOE)
+            ],
             config,
         )
 
@@ -457,7 +477,10 @@ def test_group_layers_rejects_pair_split_across_pipeline_stages():
     with pytest.raises(ValueError, match="cannot cross pipeline-stage boundaries"):
         group_layers_into_shortcut_blocks(
             torch.nn.ModuleList([_FakeMoE(config, layer_number=5), _FakeCompute(config)]),
-            [LayerSymbols.MOE, LayerSymbols.MAMBA],
+            [
+                LayerSymbols.LAYER_CONFIG_MAP[symbol].from_config(config)
+                for symbol in (LayerSymbols.MOE, LayerSymbols.MAMBA)
+            ],
             config,
             pp_layer_offset=4,
         )
@@ -694,9 +717,11 @@ def test_shortcut_norm_recompute_and_offload(monkeypatch):
         torch.ones_like(hidden_states),
         torch.ones_like(hidden_states, dtype=torch.bool),
     )
-    mlp.preprocess = lambda hidden_states, probs, routing_map, padding_mask=None: (
-        hidden_states,
-        probs,
+    mlp.preprocess = (
+        lambda hidden_states, probs, routing_map, padding_mask=None, packed_seq_params=None: (
+            hidden_states,
+            probs,
+        )
     )
     mlp.dispatch = lambda hidden_states, probs: (hidden_states, probs)
     mlp.routed_experts_compute = lambda hidden_states, probs: (hidden_states + probs, None)

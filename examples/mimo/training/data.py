@@ -17,6 +17,7 @@ from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.training.global_vars import get_run_config
+from megatron.training.models import MimoBuildConfig
 
 _ENCODER_SEED_OFFSET = 10_000
 _LANGUAGE_SEED_OFFSET = 20_000
@@ -288,6 +289,12 @@ def build_train_valid_test_data_loaders(
     args: argparse.Namespace, topology: HeteroTopology
 ) -> tuple[Optional[DataLoader], Optional[DataLoader], Optional[DataLoader]]:
     """Build independent mock DataLoaders for the data-consuming rank role."""
+    cfg = get_run_config()
+    if not isinstance(cfg.model, MimoBuildConfig):
+        raise TypeError(
+            "Expected cfg.model to be MimoBuildConfig, "
+            f"got {type(cfg.model).__name__}"
+        )
     if getattr(args, "dataset_provider", "mock") != "mock":
         raise ValueError(f"unsupported dataset provider: {args.dataset_provider}")
 
@@ -312,7 +319,7 @@ def build_train_valid_test_data_loaders(
     if encoder_name is not None:
         encoder_pgc = topology.module_pgs[encoder_name]
         rank_in_encoder = topology.grids[encoder_name].is_current_rank_in_grid()
-        if rank_in_encoder and not getattr(args, "disable_vision_class_token", False):
+        if rank_in_encoder and not cfg.model.drop_vision_class_token:
             raise ValueError("RADIO mock data requires --disable-vision-class-token")
         encoder_needs_data = rank_in_encoder and is_pp_first_stage(encoder_pgc.pp)
 
@@ -349,7 +356,7 @@ def _build_split_loaders(
     """Build split-local datasets with deterministic module/DP/split seeds."""
     cfg = get_run_config()
     base_seed = cfg.rng.seed + module_seed_offset + get_data_lane_rank(pg_collection)
-    common = _mock_loader_kwargs(args, encoder_name)
+    common = _mock_loader_kwargs(cfg, args, encoder_name)
     return tuple(
         _build_mock_vlm_dataloader(
             batch_size=batch_size,
@@ -361,17 +368,16 @@ def _build_split_loaders(
     )
 
 
-def _mock_loader_kwargs(args: argparse.Namespace, encoder_name: Optional[str]) -> dict:
+def _mock_loader_kwargs(cfg, args: argparse.Namespace, encoder_name: Optional[str]) -> dict:
     """Translate parsed training arguments to the reusable mock loader."""
     seq_len = args.seq_length
     dtype = getattr(args, "params_dtype", None)
     if dtype is None:
         dtype = torch.bfloat16 if getattr(args, "bf16", False) else torch.float32
 
-    image_size = getattr(args, "image_size", 224)
-    img_h = getattr(args, "img_h", image_size)
-    img_w = getattr(args, "img_w", image_size)
-    patch_dim = getattr(args, "patch_dim", 16)
+    img_h = cfg.model.img_h
+    img_w = cfg.model.img_w
+    patch_dim = cfg.model.patch_dim
     num_image_tiles = getattr(args, "num_image_tiles", 1)
     pixel_shuffle = bool(getattr(args, "pixel_shuffle", False))
     dynamic_resolution = bool(getattr(args, "dynamic_resolution", False))
@@ -386,7 +392,7 @@ def _mock_loader_kwargs(args: argparse.Namespace, encoder_name: Optional[str]) -
     return {
         "seq_len": seq_len,
         "image_seq_length": image_seq_length,
-        "vocab_size": args.vocab_size,
+        "vocab_size": cfg.tokenizer.vocab_size,
         "pad_token_id": getattr(args, "pad_token_id", 0),
         "image_token_id": args.image_token_id,
         "encoder_name": encoder_name,

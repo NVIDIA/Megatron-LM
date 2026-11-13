@@ -164,6 +164,16 @@ workload rather than generalizing from any single comparison.
 > must be validated numerically rather than inferred from alignment.
 > Keep `use_transformer_engine_op_fuser=False`. Forward batch invariance does
 > not promise bitwise-identical gradients across different minibatches.
+>
+> Batch-invariant MoE matches training and inference only at the same expert-parallel
+> size: the expert combine adds per-EP-rank partials. To train and generate at different
+> EP sizes (for example EP8 training, EP4 generation), also set
+> `moe_ep_invariant_combine=True` on both configs. Every EP size then sums a token's
+> expert outputs over one fixed fp32 tree over the expert ids, so MoE outputs are
+> bitwise identical at every power-of-two EP that divides `num_moe_experts`. It covers
+> the training AllToAll dispatcher and the inference `nvls` dispatcher with the `torch`
+> or `vllm` grouped-GEMM backend, at any expert-tensor-parallel size: inference sums each
+> expert's rows over expert TP before the combine, as training does.
 
 > **Selective MXFP8 parameter storage.** Use the same Transformer Engine per-module
 > precision recipe for training and inference through `TransformerConfig.quant_recipe`
@@ -454,6 +464,12 @@ prompt top-N log-probs, are always raw in both modes, because prompt tokens were
 not sampled from the processed distribution.
 `'processed_logprobs'` is not yet supported with speculative decoding.
 
+With prefix caching, prompt log-probs are cached on the KV blocks of the
+tokens that produced them, so a request that returns prompt log-probs can
+still skip a cached prefix. It skips only the blocks whose cached rows cover
+its `top_n_logprobs`, and computes the rest. Requests with `top_n_logprobs`
+above 100 share cached KV but compute every prompt token.
+
 ### Engine Configuration
 
 `InferenceConfig` configures the engine, KV-cache, and CUDA-graph behavior and is
@@ -483,7 +499,7 @@ used fields:
 | `offset_sampling_seed_by_dp_rank` | Give each DP rank a distinct sampling seed (default `True`), so the same prompt routed to different replicas produces different samples |
 | `image_preprocessing_config` | Image preprocessing for vision-language models |
 | `use_flashinfer_fused_rope` | Use FlashInfer's fused RoPE kernel |
-| `disable_ep_consensus`, `ep_consensus_interval`, `use_synchronous_zmq_collectives` | MoE and expert-parallel coordination tuning |
+| `ep_consensus_interval`, `use_synchronous_zmq_collectives` | MoE and expert-parallel coordination tuning |
 | `track_paused_request_events`, `track_generated_token_events`, `metrics_writer`, `logging_step_interval` | Observability |
 
 ```python
@@ -502,8 +518,20 @@ than `InferenceConfig`, because they must be set when you build the model:
 `batch_invariant_mode` (and `batch_invariant_backend` /
 `batch_invariant_collective`), `inference_moe_token_dispatcher_type` (`nvls` by
 default, or `nccl`), `inference_grouped_gemm_backend` (`vllm` by default, or
-`torch` / `flashinfer`), `quant_recipe`, `moe_enable_routing_replay`, and
-`window_size` for sliding-window attention.
+`torch` / `flashinfer`), `inference_moe_router_backend` (`triton` by default, or
+`torch`), `quant_recipe`, `moe_enable_routing_replay`, and `window_size` for
+sliding-window attention.
+
+#### Tanh-clamped squared ReLU with FlashInfer
+
+On SM10x GPUs, BF16 and MXFP8 experts support the activation `(L * tanh(relu(x) / L)) ** 2` with
+`inference_grouped_gemm_backend="flashinfer"`, `activation_func=squared_relu`,
+`activation_func_tanh_clamp_scale=L`, `gated_linear_unit=False`,
+and `add_bias_linear=False`. 
+
+Requires FlashInfer >= 0.7.2, with `ActivationType.ClampedRelu2` and
+`clamped_relu2_limit` support. This path does not support
+`inference_flashinfer_mxfp8_token_capacity` or `batch_invariant_mode`.
 
 ### Reading Results
 

@@ -145,7 +145,7 @@ class TestDPBalancing:
         assert selected.owner_rank in [0, 4]
 
     def test_dp_balancing_single_dp_group(self):
-        """Test fast path when only one DP group exists."""
+        """Test round-robin when only one DP group exists."""
         # Setup: TP=2, DP=1, World=2 (single DP group)
 
         src_meta_list = [
@@ -155,11 +155,36 @@ class TestDPBalancing:
 
         dst_meta = self._create_metadata(rank=0, tp_group=[0], dp_group=[0])
 
-        # Should hit fast path and return first metadata
+        # With one DP group, destination rank 0 selects the first entry
         selected = select_src_metadata_balanced(src_meta_list, dst_meta, dst_rank=0)
-
-        # Fast path returns first entry (after any TP/EP filtering)
         assert selected == src_meta_list[0]
+
+        # and destination rank 1 rotates to the next one.
+        selected = select_src_metadata_balanced(src_meta_list, dst_meta, dst_rank=1)
+        assert selected == src_meta_list[1]
+
+    def test_single_dp_group_spreads_across_replicas(self):
+        """With TP=1 every replica shares one DP group; destinations must still spread."""
+        # Setup: training TP=1, DP=4 on ranks 0-3; inference on disjoint ranks 4-7.
+        dp_group = [0, 1, 2, 3]
+        src_meta_list = [
+            self._create_metadata(rank=rank, tp_group=[rank], dp_group=dp_group)
+            for rank in dp_group
+        ]
+        dst_meta = self._create_metadata(rank=4, tp_group=[4], dp_group=[4, 5, 6, 7])
+
+        selected = [
+            select_src_metadata_balanced(src_meta_list, dst_meta, dst_rank).owner_rank
+            for dst_rank in range(4, 8)
+        ]
+
+        # Each destination reads from a different replica instead of all from rank 0.
+        assert sorted(selected) == dp_group
+        # Selection is a pure function of the gathered metadata and the destination rank.
+        assert selected == [
+            select_src_metadata_balanced(src_meta_list, dst_meta, dst_rank).owner_rank
+            for dst_rank in range(4, 8)
+        ]
 
     def test_tp_size_mismatch_no_filter(self):
         """Test DP balancing when TP sizes differ (resharding mode)."""
