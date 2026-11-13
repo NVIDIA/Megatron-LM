@@ -1203,7 +1203,7 @@ def resolve_gtp_pad_for_alignment(*, fp4=False, fp8_recipe=None, fp8=False):
 
 
 def grant_shape_mismatch_for_gtp_padding(
-    sharded_state_dict, checkpoint_dir, pad_for_alignment, sharded_strategy=None
+    sharded_state_dict, checkpoint_dir, pad_for_alignment, sharded_strategy=None, *, filesystem=None
 ):
     """Decide, per tensor, whether a checkpoint-vs-expected shape mismatch is GTP padding.
 
@@ -1224,6 +1224,7 @@ def grant_shape_mismatch_for_gtp_padding(
 
     ``sharded_strategy`` reads the checkpoint metadata; pass the strategy of the load that follows
     so that both share its metadata cache. Defaults to the default load strategy.
+    ``filesystem`` selects the same checkpoint storage as the subsequent load.
     """
     from megatron.core.dist_checkpointing.dict_utils import nested_values
 
@@ -1234,7 +1235,9 @@ def grant_shape_mismatch_for_gtp_padding(
     try:
         from megatron.core.dist_checkpointing.serialization import load_tensors_metadata
 
-        checkpoint_metadata = load_tensors_metadata(str(checkpoint_dir), sharded_strategy)
+        checkpoint_metadata = load_tensors_metadata(
+            checkpoint_dir, sharded_strategy, filesystem=filesystem
+        )
     except Exception as e:  # noqa: BLE001
         logger.warning(
             f"grant_shape_mismatch_for_gtp_padding: could not read metadata, "

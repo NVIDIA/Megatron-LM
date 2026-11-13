@@ -3,7 +3,6 @@
 import hashlib
 import json
 import logging
-import os
 from collections import Counter, defaultdict
 from enum import Enum
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
@@ -24,7 +23,8 @@ from megatron.core.dist_checkpointing.mapping import (
     ShardedStateDict,
     is_main_replica,
 )
-from megatron.core.msc_utils import maybe_msc
+
+from .filesystem import create_write_stream, resolve_filesystem
 
 if TYPE_CHECKING:
     from megatron.core.dist_checkpointing.serialization import CkptShardedMetadata
@@ -200,16 +200,17 @@ def validate_integrity_and_strict_load(
     return sharded_state_dict, missing_keys, unexpected_keys
 
 
-def verify_checkpoint(checkpoint_dir: str):
+def verify_checkpoint(checkpoint_dir: str, *, filesystem=None):
     """Verifies if checkpoint exists.
 
     Args:
         checkpoint_dir (str): checkpoint directory
     """
-    if not maybe_msc.path_isdir(str(checkpoint_dir), strict=False):
+    filesystem = resolve_filesystem(filesystem)
+    if filesystem.stat(checkpoint_dir) != "directory":
         raise CheckpointingException(f'Checkpoint directory {checkpoint_dir} does not exist')
 
-    if not check_is_distributed_checkpoint(checkpoint_dir):
+    if not check_is_distributed_checkpoint(checkpoint_dir, filesystem=filesystem):
         raise CheckpointingException(f'{checkpoint_dir} is not a distributed checkpoint')
 
 
@@ -404,7 +405,7 @@ def validate_sharding_integrity(
 
 
 def _validate_sharding_for_key(
-    rank_sharding: List[Tuple[int, ShardedTensor]]
+    rank_sharding: List[Tuple[int, ShardedTensor]],
 ) -> List[CheckpointingException]:
     some_rank_shard = rank_sharding[0][1]
     global_shape = some_rank_shard.global_shape
@@ -495,7 +496,7 @@ def determine_global_metadata(
     return local_metadata, global_metadata  # type: ignore[return-value]
 
 
-def _compute_file_hash(file_path: str) -> str:
+def _compute_file_hash(file_path: str, *, filesystem) -> str:
     """Return the SHA-256 hex digest of `file_path`, read in streaming chunks.
     Args:
         file_path: absolute path to the file to hash.
@@ -503,13 +504,13 @@ def _compute_file_hash(file_path: str) -> str:
         Lowercase hex-encoded SHA-256 digest string.
     """
     h = hashlib.sha256()
-    with maybe_msc.open(file_path, 'rb') as f:
+    with filesystem.create_stream(file_path, "rb") as f:
         for chunk in iter(lambda: f.read(_READ_CHUNK_SIZE), b''):
             h.update(chunk)
     return h.hexdigest()
 
 
-def save_integrity_manifest(checkpoint_dir: str) -> None:
+def save_integrity_manifest(checkpoint_dir: str, *, filesystem=None) -> None:
     """Hash every file in `heckpoint_dir` and write an integrity manifest.
     The manifest lists each filename (relative to `checkpoint_dir`)
     together with its SHA-256 digest. The manifest file itself is excluded
@@ -517,23 +518,23 @@ def save_integrity_manifest(checkpoint_dir: str) -> None:
     Args:
         checkpoint_dir: directory that contains the checkpoint files.
     """
+    filesystem = resolve_filesystem(filesystem)
     manifest: Dict[str, str] = {}
+    for name in sorted(filesystem.listdir(checkpoint_dir)):
+        entry = filesystem.concat_path(checkpoint_dir, name)
+        if name != INTEGRITY_FNAME and filesystem.stat(entry) == "file":
+            manifest[name] = _compute_file_hash(entry, filesystem=filesystem)
 
-    ckpt_path = maybe_msc.Path(checkpoint_dir)
-    for entry in sorted(ckpt_path.iterdir(), key=lambda p: str(p)):
-        if entry.is_file() and entry.name != INTEGRITY_FNAME:
-            manifest[entry.name] = _compute_file_hash(str(entry))
-
-    integrity_path = os.path.join(checkpoint_dir, INTEGRITY_FNAME)
+    integrity_path = filesystem.concat_path(checkpoint_dir, INTEGRITY_FNAME)
     payload = {'algorithm': _HASH_ALGORITHM, 'files': manifest}
 
-    with maybe_msc.open(integrity_path, 'w') as f:
-        json.dump(payload, f, indent=2)
+    with create_write_stream(filesystem, integrity_path) as f:
+        f.write(json.dumps(payload, indent=2).encode("utf-8"))
 
     logger.info("Saved integrity manifest with %d file(s) to %s", len(manifest), integrity_path)
 
 
-def _verify_integrity_manifest_impl(checkpoint_dir: str) -> None:
+def _verify_integrity_manifest_impl(checkpoint_dir: str, *, filesystem) -> None:
     """Single-process implementation of integrity verification.
     Reads ``integrity.json``, recomputes each file's hash, and raises
     `megatron.core.dist_checkpointing.core.CheckpointingException`
@@ -544,16 +545,16 @@ def _verify_integrity_manifest_impl(checkpoint_dir: str) -> None:
         CheckpointingException: if the manifest is absent, uses an unsupported
             algorithm, or any file's hash does not match.
     """
-    integrity_path = os.path.join(checkpoint_dir, INTEGRITY_FNAME)
+    integrity_path = filesystem.concat_path(checkpoint_dir, INTEGRITY_FNAME)
 
-    if not maybe_msc.os.path.exists(integrity_path):
+    if not filesystem.exists(integrity_path):
         raise CheckpointingException(
             f'Integrity manifest not found at {integrity_path}. '
             'The checkpoint must be saved with integrity verification enabled '
             '(save_integrity=True) before it can be verified on load.'
         )
-    with maybe_msc.open(integrity_path) as f:
-        manifest_data = json.load(f)
+    with filesystem.create_stream(integrity_path, "rb") as f:
+        manifest_data = json.loads(f.read().decode("utf-8"))
 
     algorithm = manifest_data.get('algorithm', _HASH_ALGORITHM)
     if algorithm != _HASH_ALGORITHM:
@@ -566,9 +567,9 @@ def _verify_integrity_manifest_impl(checkpoint_dir: str) -> None:
     mismatches = []
 
     for filename, expected_hash in manifest.items():
-        full_path = os.path.join(checkpoint_dir, filename)
+        full_path = filesystem.concat_path(checkpoint_dir, filename)
         try:
-            actual_hash = _compute_file_hash(full_path)
+            actual_hash = _compute_file_hash(full_path, filesystem=filesystem)
         except (FileNotFoundError, OSError) as exc:
             mismatches.append(f'  {filename}: file missing or unreadable ({exc})')
             continue
@@ -587,7 +588,7 @@ def _verify_integrity_manifest_impl(checkpoint_dir: str) -> None:
     logger.info("Checkpoint integrity verified: %d file(s) OK in %s", len(manifest), checkpoint_dir)
 
 
-def verify_integrity_manifest(checkpoint_dir: str) -> None:
+def verify_integrity_manifest(checkpoint_dir: str, *, filesystem=None) -> None:
     """Verify checkpoint files against their recorded SHA-256 hashes.
     Args:
         checkpoint_dir: checkpoint directory to verify.
@@ -595,17 +596,16 @@ def verify_integrity_manifest(checkpoint_dir: str) -> None:
         CheckpointingException: if ``integrity.json`` is absent or any file's
             hash no longer matches the stored value.
     """
-    import torch
-
+    filesystem = resolve_filesystem(filesystem)
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:
         error_payload = [None]
         if torch.distributed.get_rank() == 0:
             try:
-                _verify_integrity_manifest_impl(checkpoint_dir)
-            except CheckpointingException as exc:
+                _verify_integrity_manifest_impl(checkpoint_dir, filesystem=filesystem)
+            except Exception as exc:
                 error_payload = [str(exc)]
         torch.distributed.broadcast_object_list(error_payload, src=0)
         if error_payload[0] is not None:
             raise CheckpointingException(error_payload[0])
     else:
-        _verify_integrity_manifest_impl(checkpoint_dir)
+        _verify_integrity_manifest_impl(checkpoint_dir, filesystem=filesystem)
