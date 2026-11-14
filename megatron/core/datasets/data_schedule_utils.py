@@ -750,6 +750,7 @@ def next_dynamic_cp_group_packing_aware(
     gpu_group_id: List[Optional[int]] = [None] * total_gpus
     group_members: Dict[int, List[int]] = {}
     group_size: Dict[int, int] = {}
+    groups_by_size: Dict[int, List[int]] = {}
     next_gid = 0
 
     sample_id, seq_len = sample_seqlens[0]
@@ -763,6 +764,7 @@ def next_dynamic_cp_group_packing_aware(
     members = list(range(cp_size))
     group_members[group_id] = members
     group_size[group_id] = cp_size
+    groups_by_size[cp_size] = [group_id]
     packing_sequence_len[group_id] = per_rank_length(seq_len, cp_size)
     per_gpu_cost = workload(seq_len, cp_size)
     for rank in members:
@@ -775,41 +777,32 @@ def next_dynamic_cp_group_packing_aware(
     for sample_id, seq_len in sample_seqlens[1:]:
         min_needed = cp_min_fn(seq_len)
         best = None
+        # The ranks of a group (and all free ranks) share one exec time and costs are
+        # non-negative, so a placement's critical path is max(member time + cost, current max).
+        max_exec_time = max(exec_times)
+        free_ranks = [
+            rank for rank, assigned_group_id in enumerate(gpu_group_id) if assigned_group_id is None
+        ]
+        free_ranks.sort(key=lambda rank: exec_times[rank])
 
         for cp_size in enabled_cp_sizes:
-            if cp_size < min_needed or per_rank_length(seq_len, cp_size) > max_seq_len_per_rank:
+            seq_len_per_rank = per_rank_length(seq_len, cp_size)
+            if cp_size < min_needed or seq_len_per_rank > max_seq_len_per_rank:
                 continue
             per_gpu_cost = workload(seq_len, cp_size)
 
-            for group_id, size in list(group_size.items()):
-                if size != cp_size:
+            for group_id in groups_by_size.get(cp_size, ()):
+                if packing_sequence_len.get(group_id, 0) + seq_len_per_rank > max_seq_len_per_rank:
                     continue
-                if (
-                    packing_sequence_len.get(group_id, 0) + per_rank_length(seq_len, cp_size)
-                    > max_seq_len_per_rank
-                ):
-                    continue
-                members = group_members[group_id]
-                member_set = set(members)
-                projected_max = max(
-                    time + per_gpu_cost if rank in member_set else time
-                    for rank, time in enumerate(exec_times)
-                )
+                member_time = exec_times[group_members[group_id][0]]
+                projected_max = max(member_time + per_gpu_cost, max_exec_time)
                 if projected_max <= cap and (best is None or projected_max < best[0]):
                     best = (projected_max, cp_size, "add", group_id, None)
 
-            free_ranks = [
-                rank
-                for rank, assigned_group_id in enumerate(gpu_group_id)
-                if assigned_group_id is None
-            ]
             if len(free_ranks) >= cp_size:
-                chosen_members = sorted(free_ranks, key=lambda rank: exec_times[rank])[:cp_size]
-                chosen_set = set(chosen_members)
-                projected_max = max(
-                    time + per_gpu_cost if rank in chosen_set else time
-                    for rank, time in enumerate(exec_times)
-                )
+                chosen_members = free_ranks[:cp_size]
+                member_time = exec_times[chosen_members[0]]
+                projected_max = max(member_time + per_gpu_cost, max_exec_time)
                 if projected_max <= cap and (best is None or projected_max < best[0]):
                     best = (projected_max, cp_size, "new", None, chosen_members)
 
@@ -831,6 +824,7 @@ def next_dynamic_cp_group_packing_aware(
             next_gid += 1
             group_members[group_id] = chosen_members
             group_size[group_id] = selected_cp_size
+            groups_by_size.setdefault(selected_cp_size, []).append(group_id)
             packing_sequence_len[group_id] = per_rank_length(seq_len, selected_cp_size)
             for rank in chosen_members:
                 gpu_group_id[rank] = group_id
