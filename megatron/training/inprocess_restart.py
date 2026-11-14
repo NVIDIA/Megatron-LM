@@ -66,8 +66,32 @@ def inprocess_restart(train, args):
             )
         )
 
+    # ThreadedFinalize runs destroy_state on its own thread and ignores an exception
+    # raised there, so the wrapper would restart on partially destroyed state, e.g.
+    # with model-parallel globals that still name destroyed groups. Record the error
+    # and re-raise it from the wrapper's thread, which makes the wrapper terminate
+    # this rank instead of restarting it.
+    finalize_errors = []
+
+    def destroy_state_or_record_error():
+        try:
+            destroy_state()
+        except Exception as error:
+            finalize_errors.append(error)
+
+    class RaiseFinalizeError(inprocess.finalize.Finalize):
+        def __call__(self, state: inprocess.state.FrozenState) -> inprocess.state.FrozenState:
+            if finalize_errors:
+                raise finalize_errors.pop()
+            return state
+
+    # inprocess.Compose calls its callables from last to first, so RaiseFinalizeError,
+    # listed first, runs after every other finalize step.
     finalize = [
-        inprocess.finalize.ThreadedFinalize(timeout=timedelta(seconds=10), fn=destroy_state)
+        RaiseFinalizeError(),
+        inprocess.finalize.ThreadedFinalize(
+            timeout=timedelta(seconds=10), fn=destroy_state_or_record_error
+        ),
     ]
 
     if args.inprocess_empty_cuda_cache:
