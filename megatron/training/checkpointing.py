@@ -96,7 +96,9 @@ try:
         handle_fp8_extra_state_case,
         handle_mla_down_proj_in_state_dict,
         handle_mtp_in_state_dict,
+        handle_pp_layers_in_state_dict,
         handle_swiglu_in_state_dict,
+        localize_pp_layers_in_optimizer_state_dict,
         print_diff_in_state_dicts,
         validate_fsdp_dtensor_model_load,
     )
@@ -2004,6 +2006,9 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
         if 'optimizer' in state_dict:
             state_dict['optimizer'] = optimizer_state_dict
 
+    # The handlers below resolve keys against live module paths, which number each pipeline
+    # stage's layers from 0. Optimizer FQNs use global layer indices, so localize them first.
+    apply(localize_pp_layers_in_optimizer_state_dict)
     if (
         config.gated_linear_unit
         and config.activation_func is torch.nn.functional.silu
@@ -2016,9 +2021,12 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
         state_dict['model'] = handle_experts_in_state_dict(
             state_dict['model'], config.num_moe_experts
         )
-    # Rename the MTP inner layer to the name used on disk. Runs last because the handlers
-    # above resolve keys against live module paths, which still use the new name.
+    # Rename the MTP inner layer to the name used on disk. Runs after the handlers above
+    # because they resolve keys against live module paths, which still use the new name.
     apply(handle_mtp_in_state_dict)
+    # Rename stage-local layer indices to the global ones used on disk, so pipeline stages
+    # do not overwrite each other's layers. Runs last for the same reason as the MTP rename.
+    apply(handle_pp_layers_in_state_dict)
     preprocess_state_dict_for_uneven_dtensor(state_dict)
 
     return state_dict
