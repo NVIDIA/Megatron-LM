@@ -639,7 +639,7 @@ class TestSerialization:
                 assert loaded_state_dict.keys() == {'common'}
             else:
                 assert loaded_state_dict.keys() == {'common', 'a'}
-                loaded_state_dict['a'].cpu().numpy().tolist() == [
+                assert loaded_state_dict['a'].cpu().numpy().tolist() == [
                     3,
                     3,
                 ]  # rank 3 held the main replica so did the saving
