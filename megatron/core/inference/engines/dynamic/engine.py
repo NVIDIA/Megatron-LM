@@ -178,6 +178,9 @@ class DynamicInferenceEngine(
     gc_mode: str = "default"
     _in_custom_gc_mode: bool = False
     _gc_freeze_pending: bool = False
+    # Immutable so instances never share one set; reset() installs a mutable one. Read by
+    # suspend(), which tests also run on engines built via __new__.
+    stop_word_finished_request_ids: Set[int] = frozenset()
 
     @deprecate_args(
         *DEPRECATED_ARGS,
@@ -926,10 +929,21 @@ class DynamicInferenceEngine(
                 if request_id not in waiting_request_id_set
             ]
 
-            # Reset any partially prefilled requests so they recompute from the start
+            # Reset any partially prefilled requests so they recompute from the start.
+            # A request waiting to finish on a stop word whose prefill is complete keeps its
+            # prompt scores, even when the stop removed every generated token; one that is
+            # prefilling again after an earlier checkpoint is reset like any other.
             for req_id in [*waiting_request_ids, *recompute_resident_ids]:
                 req = self.get_request(req_id)
-                if req.finished_chunk_token_count > 0 and not req.generated_tokens:
+                stopped_after_prefill = req_id in self.stop_word_finished_request_ids and (
+                    req.remaining_prompt_tokens is not None
+                    and len(req.remaining_prompt_tokens) == 0
+                )
+                if (
+                    req.finished_chunk_token_count > 0
+                    and not req.generated_tokens
+                    and not stopped_after_prefill
+                ):
                     req.remaining_prompt_tokens = req.prompt_tokens
                     req.finished_chunk_token_count = 0
                     # The restarted prefill recomputes these positions, so its
