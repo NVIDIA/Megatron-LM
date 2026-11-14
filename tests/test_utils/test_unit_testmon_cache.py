@@ -574,7 +574,7 @@ def test_action_baseline_guard_rejects_untrusted_producers(tmp_path, override, a
             "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
             "SOURCE_REPOSITORY": "NVIDIA/Megatron-LM",
             "SOURCE_REF": "refs/heads/main",
-            "SOURCE_EVENT": "schedule",
+            "SOURCE_EVENT": "workflow_dispatch",
             "SOURCE_SHA": "b" * 40,
             "REQUESTED_SHA": "b" * 40,
             "TARGET_BRANCH": "main",
@@ -586,3 +586,106 @@ def test_action_baseline_guard_rejects_untrusted_producers(tmp_path, override, a
         check=False,
     )
     assert (result.returncode == 0) is allowed
+
+
+@pytest.fixture
+def publication(generation, source_tree, tmp_path, monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        "publish_unit_testmon", ROOT / ".github/scripts/publish_unit_testmon.py"
+    )
+    assert spec is not None and spec.loader is not None
+    publisher = importlib.util.module_from_spec(spec)
+    monkeypatch.syspath_prepend(HELPER.parent)
+    monkeypatch.setitem(sys.modules, "testmon_cache", cache)
+    spec.loader.exec_module(publisher)
+    monkeypatch.chdir(source_tree)
+    directory, identity = generation
+    (directory / "manifest.json").unlink()
+    for platform in cache.PLATFORMS.values():
+        Path(platform["recipe"]).write_text(yaml.safe_dump({"products": [{"test_case": [BUCKET]}]}))
+    (directory / "producer.json").write_text(
+        json.dumps({"identity": identity, "source_sha": "b" * 40, "generation": "123-2"})
+    )
+    responses = {
+        "git/commits/" + "a" * 40: {"tree": {"sha": "same-tree"}},
+        "git/commits/" + "b" * 40: {"tree": {"sha": "same-tree"}},
+        "git/ref/heads/main": {"object": {"sha": "a" * 40}},
+        "actions/workflows/cicd-main.yml/runs?event=merge_group&per_page=100": {
+            "workflow_runs": [
+                {
+                    "id": 123,
+                    "run_attempt": 2,
+                    "event": "merge_group",
+                    "repository": {"full_name": publisher.REPOSITORY},
+                    "head_repository": {"full_name": publisher.REPOSITORY},
+                    "head_branch": "gh-readonly-queue/main/pr-1",
+                    "head_sha": "b" * 40,
+                    "status": "completed",
+                    "conclusion": "success",
+                }
+            ]
+        },
+        "actions/runs/123/artifacts?per_page=100&page=1": {
+            "artifacts": [{"id": 42, "name": identity["cache_prefix"] + "123-2", "expired": False}]
+        },
+    }
+    monkeypatch.setattr(publisher, "api", responses.__getitem__)
+    for key, value in {
+        "GITHUB_SHA": "a" * 40,
+        "GITHUB_RUN_ID": "456",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_STEP_SUMMARY": str(tmp_path / "summary"),
+        "RUNNER_TEMP": str(tmp_path),
+    }.items():
+        monkeypatch.setenv(key, value)
+    saved_keys = []
+
+    def actions(operation, *args):
+        if operation == "download":
+            assert args[:2] == ("42", "123")
+            shutil.copytree(directory, args[2])
+        else:
+            assert operation == "save"
+            shutil.copytree(args[0], tmp_path / "published")
+            saved_keys.append(args[1])
+
+    monkeypatch.setattr(publisher, "actions", actions)
+    return publisher, directory, identity, saved_keys
+
+
+def test_publishes_matching_tree_as_restorable_main_cache(publication, tmp_path):
+    publisher, directory, identity, saved_keys = publication
+
+    publisher.main()
+
+    assert saved_keys == [identity["cache_prefix"] + "456-1"]
+    published = tmp_path / "published"
+    manifest = cache.validate_cache(published, identity, saved_keys[0])
+    assert manifest["source_sha"] == "a" * 40
+    assert manifest["generation"] == "456-1"
+    assert manifest["image_id"] == IMAGE_ID
+    for phase in ("prod", "experimental"):
+        assert (published / phase / ".testmondata").read_bytes() == (
+            directory / phase / ".testmondata"
+        ).read_bytes()
+
+
+def test_rejects_wrong_attempt_without_replacing_existing_cache(publication, tmp_path):
+    publisher, directory, _, saved_keys = publication
+    producer_file = directory / "producer.json"
+    producer = json.loads(producer_file.read_text())
+    producer["generation"] = "123-1"
+    producer_file.write_text(json.dumps(producer))
+    destination = Path("assets_dir/testmon")
+    destination.mkdir(parents=True)
+    previous = destination / "existing-cache"
+    previous.write_bytes(b"previous baseline")
+    before = _snapshot(destination)
+
+    with pytest.raises(ValueError, match="Baseline does not match the successful merge group"):
+        publisher.main()
+
+    assert saved_keys == []
+    assert _snapshot(destination) == before
+    assert not (tmp_path / "published").exists()
+    assert not (tmp_path / "summary").exists()

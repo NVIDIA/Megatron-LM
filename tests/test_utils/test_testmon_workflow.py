@@ -1002,7 +1002,8 @@ def test_cpu_selection_controls_gpu_execution_and_coverage(tmp_path, shell_envir
         "${{ fromJSON(needs.select.outputs.matrix || inputs.buckets) }}"
     )
     assert workflow["jobs"]["run"]["steps"][-1]["with"]["unit_testmon_mode"] == (
-        "${{ inputs.unit_testmon_mode == 'enforce' && "
+        "${{ inputs.unit_testmon_mode == 'baseline' && 'baseline' || "
+        "inputs.unit_testmon_mode == 'enforce' && "
         "inputs.unit_testmon_target_branch == 'main' && 'enforce' || 'full' }}"
     )
     assert "unit_testmon_plan_artifact" not in workflow["jobs"]["run"]["steps"][-1]["with"]

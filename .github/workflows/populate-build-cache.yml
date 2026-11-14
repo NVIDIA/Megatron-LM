@@ -32,8 +32,6 @@ on:
       - "tests/unit_tests/testmon*.py"
       - "tests/unit_tests/run_ci_test.sh"
       - "tests/test_utils/recipes/*/unit-tests.yaml"
-  schedule:
-    - cron: "17 */6 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -81,7 +79,7 @@ jobs:
   parse-unit-tests:
     name: Select Testmon cache buckets
     needs: populate-build-cache
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
