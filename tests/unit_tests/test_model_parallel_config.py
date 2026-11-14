@@ -26,7 +26,9 @@ def test_gtp_nccl_ub_is_normalized(value, expected):
 
 
 def test_dynamic_cp_selects_default_scheduler_and_variable_lengths():
-    config = ModelParallelConfig(dynamic_context_parallel=True, max_seqlen_per_dp_cp_rank=4096)
+    config = ModelParallelConfig(
+        dynamic_context_parallel=True, deterministic_mode=False, max_seqlen_per_dp_cp_rank=4096
+    )
 
     assert config.sequence_packing_scheduler == "default_dynamic_cp"
     assert config.variable_seq_lengths is True
@@ -96,6 +98,8 @@ def _te_cross_entropy_training_args(monkeypatch):
     args.vocab_size = 1024
     args.cross_entropy_loss_fusion = True
     args.cross_entropy_fusion_impl = 'te'
+    # Cross entropy loss fusion is rejected by deterministic mode.
+    args.deterministic_mode = False
     return args
 
 

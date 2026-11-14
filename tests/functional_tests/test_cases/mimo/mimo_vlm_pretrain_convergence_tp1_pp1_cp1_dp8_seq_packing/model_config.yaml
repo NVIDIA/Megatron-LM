@@ -48,7 +48,6 @@ MODEL_ARGS:
   --adam-beta2: 0.95
   --dataset-provider: llava_vlm
   --model-provider: llava_vlm
-  --deterministic-mode: true
   --log-memory-to-tensorboard: true
   --dataloader-type: external
   --data-path: ${DATA_PATH}/mixed/mcore_mimo_vlm/llava_pretrain_energon

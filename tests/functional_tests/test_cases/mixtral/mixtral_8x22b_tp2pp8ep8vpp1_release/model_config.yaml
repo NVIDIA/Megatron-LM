@@ -100,6 +100,7 @@ MODEL_ARGS:
   --bf16: true
   --dist-ckpt-strictness: log_all # backward compatibility for TE changes
   --exit-interval: 150
+  --disable-deterministic-mode: true
 METRICS:
   - "iteration-time"
   - "lm loss"

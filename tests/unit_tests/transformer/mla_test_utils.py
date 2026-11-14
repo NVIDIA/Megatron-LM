@@ -128,6 +128,9 @@ def check_mla_parallel_correctness(
         apply_rope_fusion=apply_rope_fusion,
         hidden_dropout=0.0,
         attention_dropout=0.0,
+        # This helper runs with NVTE_ALLOW_NONDETERMINISTIC_ALGO=1 (see above), which TE
+        # rejects when deterministic_mode is on.
+        deterministic_mode=False,
     )
 
     with TempNamedDir(tmp_path_dist_ckpt / 'test_parallel_mla', sync=True) as ckpt_dir:

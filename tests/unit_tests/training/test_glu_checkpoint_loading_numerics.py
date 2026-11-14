@@ -88,6 +88,7 @@ def _setup_model(
     load,
     gated=True,
     restore_optimizer=False,
+    deterministic_mode=True,
 ):
     args = case.create_test_args(
         precision=precision,
@@ -104,6 +105,7 @@ def _setup_model(
             bias_dropout_fusion=False,
             moe_single_grouped_bias=single_bias,
             moe_mlp_glu_interleave_size=interleave,
+            deterministic_mode=deterministic_mode,
         ),
     )
     args.save = directory
@@ -570,9 +572,11 @@ def test_bf16_full_optimizer_resume_matches_uninterrupted_training(
     """
     numerics._skip_if_unsupported("bf16")
     # Determinism tests can set this globally during collection. Keep exercising
-    # GroupedTensor + bias, whose TE dbias kernel requires atomic adds.
+    # GroupedTensor + bias, whose TE dbias kernel requires atomic adds. That is incompatible
+    # with deterministic mode (on by default), so it is disabled for this test's setup.
     monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "1")
     setup_kwargs = dict(
+        deterministic_mode=False,
         single_weight=False,
         single_bias=False,
         interleave=interleave,

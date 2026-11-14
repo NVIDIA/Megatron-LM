@@ -49,7 +49,6 @@ MODEL_ARGS:
   --moe-ffn-hidden-size: 1024
   --moe-grouped-gemm: true
   --ckpt-fully-parallel-load: true
-  --deterministic-mode: true
   --no-gradient-accumulation-fusion: true
   --attention-softmax-in-fp32: true
   --use-checkpoint-opt_param-scheduler: true

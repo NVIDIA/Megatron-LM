@@ -13,6 +13,7 @@ import megatron.core.transformer.moe.token_dispatcher as token_dispatcher
 from megatron.core import config, parallel_state
 from megatron.core.extensions.transformer_engine import (
     fused_topk_with_score_function_supports_topk_indices,
+    te_supports_deterministic_moe_aux_loss,
 )
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -1295,6 +1296,8 @@ class TestFlexDispatcher:
         uniform full-width probs would otherwise select unrouted experts)."""
         if not is_hybrid_ep_available():
             pytest.skip("Hybrid EP is not available")
+        if moe_router_fusion and not te_supports_deterministic_moe_aux_loss():
+            pytest.skip("TE fused auxiliary loss lacks deterministic support (deterministic_mode)")
         if routing_map_mode == "indices" and not HAVE_HYBRIDEP_DENSE_ROUTING:
             pytest.skip("Dense HybridEP routing API is not available")
         if (
@@ -1330,6 +1333,8 @@ class TestFlexDispatcher:
             pytest.skip("NCCL EP is not available")
         if not fused_topk_with_score_function_supports_topk_indices:
             pytest.skip("Dense TE routing output is not available")
+        if not te_supports_deterministic_moe_aux_loss():
+            pytest.skip("TE fused auxiliary loss lacks deterministic support (deterministic_mode)")
 
         container = MoEModelTestContainer(
             tp_size=1,

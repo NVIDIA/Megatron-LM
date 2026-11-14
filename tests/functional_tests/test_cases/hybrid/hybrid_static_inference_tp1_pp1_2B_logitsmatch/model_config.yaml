@@ -54,7 +54,6 @@ MODEL_ARGS:
   --use-checkpoint-args: true
   --no-use-tokenizer-model-from-checkpoint-args: true
   --no-load-optim: true
-  --deterministic-mode: true
   --save-interval: 2000
   --temperature: 1.0
   --top_k: 1

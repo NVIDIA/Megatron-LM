@@ -15,7 +15,7 @@ installed once, during initialization, before any Triton kernel runs.
 `initialize_megatron` builds the policy from the `--triton-autotune-*`
 arguments and installs it right after enabling batch-invariant mode, before
 distributed initialization, so the kernel warm-up before model construction
-already runs under it. `--deterministic-mode` selects
+already runs under it. Deterministic mode, which is on by default, selects
 `pinned` for a policy that leaves `mode` unset. `--yaml-cfg` users put the policy
 in a top-level `triton_autotune` section:
 
@@ -120,7 +120,7 @@ later recover its discarded candidates.
 | `record` | Triton chooses normally and the adapter records winners. |
 
 An explicit mode wins. Otherwise, `record_path` selects `record`; otherwise,
-the `deterministic` argument of `install` (`--deterministic-mode` in training)
+the `deterministic` argument of `install` (deterministic mode in training)
 or PyTorch's deterministic flag selects `pinned`; ordinary execution uses
 `auto`. Recording intentionally permits benchmarking and requires a file prefix.
 `MAMBA_DETERMINISTIC` does not select `pinned`: it only controls the external
