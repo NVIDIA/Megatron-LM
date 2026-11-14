@@ -895,6 +895,32 @@ class TestGroupedRollouts:
             assert len(pipeline.output_queue_dwell) == len(groups)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("rollouts_per_group", [1, 2])
+    async def test_drain_banks_a_batch_whose_episodes_finished(self, rollouts_per_group):
+        """The drain banks a batch whose episodes already finished, so the trainer can
+        skip the inference switch: assembling a group takes event-loop turns that change
+        no counter, and the drain must not take them for a stall."""
+        release = asyncio.Event()
+
+        class LateInference(MockInferenceInterface):
+            async def base_generate(self, request):
+                if int(request.prompt[0].content.removeprefix("t")) >= 2:
+                    await release.wait()
+                return await super().base_generate(request)
+
+        request = GroupedRolloutRequest(
+            num_groups=2,
+            rollouts_per_group=rollouts_per_group,
+            inference_interface=LateInference(),
+        )
+        # One batch of generation lag: batch 2 is in flight when batch 1 is consumed.
+        pipeline = RolloutPipeline(MockGenerator(), request, parallel_generation_tasks=2)
+        async with aclosing(pipeline.run()) as groups:
+            [await anext(groups) for _ in range(2)]
+            release.set()  # batch 2's episodes finish; banking it needs no inference
+            assert await pipeline._drain() == 1
+
+    @pytest.mark.asyncio
     async def test_batch_order_starts_at_initial_batch_id(self):
         request = GroupedRolloutRequest(
             num_groups=2,
