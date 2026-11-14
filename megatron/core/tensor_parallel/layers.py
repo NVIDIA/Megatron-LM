@@ -1357,6 +1357,7 @@ class ColumnParallelLinear(torch.nn.Module):
         runtime_gather_output: Optional[bool] = None,
         inference_tp_ag_barrier: bool = False,
         output_dtype: Optional[torch.dtype] = None,
+        detach_weight: bool = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of ColumnParallelLinear
 
@@ -1375,6 +1376,7 @@ class ColumnParallelLinear(torch.nn.Module):
                 (``megatron.core.inference.communication.torch_symm_triton.collectives``).
             output_dtype (torch.dtype, optional): GEMM output dtype for this call.
                 Default None means the `output_dtype` arg in the constructor will be used.
+            detach_weight (bool, optional): Detach the resolved weight for MTP head losses.
 
         Returns:
             - output
@@ -1400,6 +1402,9 @@ class ColumnParallelLinear(torch.nn.Module):
                     f"supplied weight's shape is {tuple(weight.shape)}, "
                     f"not {expected_shape} as expected"
                 )
+
+        if detach_weight:
+            weight = weight.detach()
 
         bias = self.bias if not self.skip_bias_add else None
 
