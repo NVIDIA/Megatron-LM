@@ -50,12 +50,13 @@ def _ceil_div(a, b):
     return (a + b - 1) // b
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["max_pairs"])
 def _count_local_tokens_kernel(
     routing_map_ptr,  # [max_tokens, topk] flattened expert assignments
     tokens_per_expert_ptr,  # [num_local_experts] output counters (zeroed by caller)
     valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens this iteration
     topk,  # number of expert choices per token
+    max_pairs,  # max_tokens * topk (fixed for CG)
     local_expert_start,  # first global expert index owned by this rank
     num_local_experts: tl.constexpr,  # number of experts on this rank
     BLOCK_SIZE: tl.constexpr,  # number of pairs processed per program
@@ -71,8 +72,10 @@ def _count_local_tokens_kernel(
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
-    valid_pairs = valid_tokens * topk
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    # int64: valid_tokens * topk can pass 2^31 before the clamp, and the map can hold more
+    # than 2^31 pairs.
+    valid_pairs = tl.minimum(valid_tokens.to(tl.int64) * topk, max_pairs)
+    offsets = pid.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < valid_pairs
     expert_ids = tl.load(routing_map_ptr + offsets, mask=mask, other=-1)
     local_ids = expert_ids - local_expert_start
@@ -80,12 +83,13 @@ def _count_local_tokens_kernel(
     tl.atomic_add(tokens_per_expert_ptr + local_ids, 1, mask=is_local)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["max_pairs"])
 def _count_local_tokens_kernel_persistent(
     routing_map_ptr,  # [max_tokens, topk] flattened expert assignments
     tokens_per_expert_ptr,  # [num_local_experts] output counters (zeroed by caller)
     valid_tokens_ptr,  # scalar int32 CUDA tensor: number of valid tokens this iteration
     topk,  # number of expert choices per token
+    max_pairs,  # max_tokens * topk (fixed for CG)
     local_expert_start,  # first global expert index owned by this rank
     num_local_experts: tl.constexpr,  # number of experts on this rank
     num_sms,  # number of SMs (grid size for persistent kernel)
@@ -98,7 +102,9 @@ def _count_local_tokens_kernel_persistent(
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
-    valid_pairs = valid_tokens * topk
+    # int64, as are the block counts, block ids and offsets derived from it: the pair count,
+    # cdiv's valid_pairs + BLOCK_SIZE - 1 and the offsets can each pass 2^31.
+    valid_pairs = tl.minimum(valid_tokens.to(tl.int64) * topk, max_pairs)
 
     total_blocks = tl.cdiv(valid_pairs, BLOCK_SIZE)
     blocks_per_cta = tl.cdiv(total_blocks, num_sms)
@@ -128,7 +134,7 @@ def compute_local_tokens_per_expert(
 
     Args:
         routing_map: [max_tokens, topk] expert assignments. Only the first
-            valid_tokens rows are processed; the rest are ignored.
+            min(valid_tokens, max_tokens) rows are processed; the rest are ignored.
         local_expert_start: first global expert index on this rank.
         num_local_experts: number of experts on this rank.
         valid_tokens: scalar int32 CUDA tensor with the number of valid tokens
@@ -159,6 +165,7 @@ def compute_local_tokens_per_expert(
             tokens_per_expert,
             valid_tokens,
             topk,
+            max_pairs,
             local_expert_start,
             num_local_experts,
             num_sms,
@@ -170,6 +177,7 @@ def compute_local_tokens_per_expert(
             tokens_per_expert,
             valid_tokens,
             topk,
+            max_pairs,
             local_expert_start,
             num_local_experts,
             BLOCK_SIZE=BLOCK,
@@ -217,7 +225,8 @@ def _init_permutation_map_kernel(
     """
     pid = tl.program_id(0)
     n_used = tl.load(n_used_ptr)
-    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    # int64: the buffer may hold more than 2^31 entries.
+    offsets = pid.to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_used
     tl.store(perm_map_ptr + offsets, tl.full([BLOCK_SIZE], -1, tl.int32), mask=mask)
 
@@ -280,7 +289,9 @@ def _permute_tokens_kernel(
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
-    valid_pairs = valid_tokens * topk
+    # int64, as are the pair index and tok derived from it: valid_tokens * topk, the pair
+    # index and the inverse-map offset tok * num_local_experts + lid can each pass 2^31.
+    valid_pairs = valid_tokens.to(tl.int64) * topk
     if pid >= valid_pairs:
         return
     for pair in tl.range(pid, tl.minimum(valid_pairs, max_pairs), NUM_BLOCKS):
@@ -402,6 +413,8 @@ def permute_tokens(
         max_tokens * min(topk, num_local_experts) + alignment * num_local_experts
     )
     output_size = _ceil_div(unaligned_output_size, row_alignment) * row_alignment
+    # The expert offsets and the claimed row positions are int32.
+    assert output_size < 2**31, f"{output_size} permuted rows: offsets and positions are int32"
 
     permuted_hidden = torch.empty(
         output_size, hidden_dim, dtype=hidden_states.dtype, device=hidden_states.device
@@ -644,7 +657,9 @@ def _permute_quantize_mxfp8_kernel(
     """
     pid = tl.program_id(0)
     valid_tokens = tl.load(valid_tokens_ptr)
-    valid_pairs = valid_tokens * topk
+    # int64, as are the pair index and tok derived from it: valid_tokens * topk, the pair
+    # index and the inverse-map offset tok * num_local_experts + lid can each pass 2^31.
+    valid_pairs = valid_tokens.to(tl.int64) * topk
     if pid >= valid_pairs:
         return
 
@@ -771,6 +786,8 @@ def permute_and_quantize_mxfp8(
     )
     # Keep data rows consistent with the swizzled scale layout's fixed row block.
     output_size = _ceil_div(unaligned_output_size, MXFP8_SCALE_ROW_BLOCK) * MXFP8_SCALE_ROW_BLOCK
+    # The expert offsets and the claimed row positions are int32.
+    assert output_size < 2**31, f"{output_size} permuted rows: offsets and positions are int32"
 
     scale_cols = K // MXFP8_BLOCK_SIZE
     n_row_blocks = _ceil_div(output_size, MXFP8_SCALE_ROW_BLOCK)
