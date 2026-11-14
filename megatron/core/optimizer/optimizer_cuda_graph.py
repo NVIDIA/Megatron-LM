@@ -45,7 +45,17 @@ class OptimizerCudaGraphWrapper:
             torch.distributed.barrier()
             logger.info(f'Optimizer CUDA graph capture done!!!')
         if OptimizerCudaGraphWrapper.cuda_graph is None:
-            OptimizerCudaGraphWrapper.result = self.optimizer_step_func()
+            # Run the eager warmup steps on the stream the graphs are captured on, as the
+            # full-iteration forward/backward warmup does. The allocator caches freed memory
+            # per stream: with forward/backward on the capture stream and the optimizer on the
+            # caller's, neither can reuse the other's cache and warmup peaks well above both
+            # eager and the captured steady state.
+            caller_stream = torch.cuda.current_stream()
+            warmup_stream = get_shared_capture_stream()
+            warmup_stream.wait_stream(caller_stream)
+            with torch.cuda.stream(warmup_stream):
+                OptimizerCudaGraphWrapper.result = self.optimizer_step_func()
+            caller_stream.wait_stream(warmup_stream)
         else:
             OptimizerCudaGraphWrapper.cuda_graph.replay()
         OptimizerCudaGraphWrapper.curr_iteration += 1
