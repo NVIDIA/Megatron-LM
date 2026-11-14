@@ -361,13 +361,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if not hasattr(pg_collection, 'dp_cp'):
             raise ValueError("MFSDP v2 requires an explicit dp_cp process group.")
 
-        if "residual_stream" in (config.recompute_modules or []):
-            # Stack-managed replay can run before the owning layer gathers its weights.
-            raise ValueError(
-                "MFSDP v2 does not support residual_stream recomputation (#7777). "
-                "Remove it from recompute_modules and clear residual_stream_recompute_num_layers."
-            )
-
         if config.mtp_detach_heads:
             # Detached MTP heads are tagged into a separate gradient-norm group, which
             # the shared helpers reduce with get_grad_norm_fp32. That path derives a
