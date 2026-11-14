@@ -1,5 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import inspect
 from typing import Any, Optional
 
 import torch
@@ -43,6 +44,14 @@ class FlashInferSampling(Sampling):
         del config, enable_cuda_graph
         self._vocab_size = vocab_size
         self._rng = rng
+        # FlashInfer's radix top-p renorm (0.6.7+) has float atomic histograms by default, which
+        # pick the kept set in a run-dependent order; request its integer accumulation where the
+        # switch exists. Without it, top-p renorm is a one-block-per-row kernel, deterministic.
+        has_switch = flashinfer is not None and (
+            "is_deterministic"
+            in inspect.signature(flashinfer.sampling.top_p_renorm_probs).parameters
+        )
+        self._top_p_renorm_kwargs = {"is_deterministic": True} if has_switch else {}
 
     def sample_kernel(
         self,
@@ -182,10 +191,15 @@ class FlashInferSampling(Sampling):
         top_k_safe = top_k.masked_fill(no_top_k, self._vocab_size)
         top_p_safe = top_p.masked_fill(no_top_p, 1.0)
 
-        probs = torch.softmax(scaled, dim=-1)
-        # Renormalize to the kept set (top-k first, then top-p) to match
-        renormed = flashinfer.sampling.top_k_renorm_probs(probs, top_k_safe)
-        renormed = flashinfer.sampling.top_p_renorm_probs(renormed, top_p_safe)
+        # Renormalize to the kept set, top-k first and then top-p, as the joint sampling kernel
+        # does. Top-k masks the logits rather than renormalizing probs: the mask's pivot comes
+        # from integer counts, whereas `top_k_renorm_probs` sums a row split over several CTAs
+        # (large vocabularies) with float atomics, so its result varies from run to run.
+        masked = flashinfer.sampling.top_k_mask_logits(scaled, top_k_safe)
+        probs = torch.softmax(masked, dim=-1)
+        renormed = flashinfer.sampling.top_p_renorm_probs(
+            probs, top_p_safe, **self._top_p_renorm_kwargs
+        )
         # Unfiltered rows of a mixed batch bypass the renorm rounding entirely.
         return torch.where(
             (no_top_k & no_top_p).unsqueeze(1),
