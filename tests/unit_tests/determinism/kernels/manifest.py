@@ -382,8 +382,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="torch-op",
         notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
-        "router gating GEMM, TE fused permutation/router kernels, global-batch quantile "
-        "histogram accumulation and bias updates. Fused aux loss uses TE's "
+        "router gating GEMM, TE fused permutation/router kernels (sparse and dense top-k "
+        "output), global-batch quantile histogram accumulation and bias updates. Fused aux loss uses TE's "
         "fixed-order reduction when explicitly requested, with torch deterministic algorithms on or off; "
         "the default atomic branch is a negative control.",
     ),
@@ -416,7 +416,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/transformer/moe/test_aux_loss.py",
         ),
         kind="torch.compile",
-        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing. "
+        notes="MoonEP compact IDs, scores and gradients replay for fused, unfused, hash and QB routing; "
+        "InferenceTopKRouter's sinkhorn routing replays under InferenceMode. "
         "Fused aux_loss, seq_aux_loss and global_aux_loss replay their logged scalar, "
         "input and router-weight gradients with fused TopK routing, and compare to the unfused reference.",
     ),

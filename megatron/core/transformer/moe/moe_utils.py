@@ -904,7 +904,9 @@ def topk_routing_with_score_function(
                                         or "sqrtsoftplus". Defaults to "softmax".
         expert_bias (torch.Tensor, optional): The bias added to logits for expert routing.
                                               Defaults to None.
-        fused (bool, optional): Whether to use the fused version. Defaults to False.
+        fused (bool, optional): Whether to use the fused version. Routing with router_replay, or
+                                dense routing with a TE that cannot write dense indices, uses
+                                the unfused version instead. Defaults to False.
         router_replay (Optional['RouterReplay']): For debugging and development, allows for
                                              deterministic routing by replaying a previously
                                              recorded routing sequence.
@@ -921,7 +923,9 @@ def topk_routing_with_score_function(
         qb_bin_bounds (torch.Tensor, optional): FP32 CUDA tensor containing the lower and upper
                                                 K3 Quantile Balancing histogram bounds.
         topk_indices (torch.Tensor, optional): Optional dense top-k index output buffer with shape
-                                               [num_tokens, topk]. Only used by the fused TE path.
+                                               [num_tokens, topk] that receives the selected
+                                               expert IDs in its own dtype. The fused path
+                                               forwards it to TE when TE supports it.
         allow_batch_invariant_sigmoid_topk (bool): Allow the batch-invariant Triton sigmoid top-k
             optimization. Set False when routing must keep the reference implementation across
             passes. Defaults to True.
@@ -940,7 +944,7 @@ def topk_routing_with_score_function(
                 - probs (torch.Tensor): Shape [num_tokens, topk]. The normalized routing
                   probabilities for each token's top-k selected experts.
                 - top_indices (torch.Tensor): Shape [num_tokens, topk]. The expert indices
-                  selected for each token.
+                  selected for each token (the topk_indices buffer when provided).
     """
     assert logits.dim() == 2, f"Expected 2D logits [num_tokens, num_experts], got {logits.dim()}."
     num_tokens, num_experts = logits.shape
@@ -974,11 +978,19 @@ def topk_routing_with_score_function(
     assert not (
         fused and precomputed_indices is not None
     ), "precomputed_indices is not supported with the fused top-k score function."
+    if fused and (not HAVE_TE or fused_topk_with_score_function is None):
+        raise ValueError(
+            "fused_topk_with_score_function is not available. Please install TE >= 2.6.0."
+        )
+    # The routing features and TE's capability choose the implementation, never the output
+    # format. Router replay records or overrides the top-k selection, which the fused kernel
+    # makes internally, and dense output needs TE's dense index output; otherwise route unfused.
+    fused = (
+        fused
+        and router_replay is None
+        and (not dense_output or fused_topk_with_score_function_supports_topk_indices)
+    )
     if fused:
-        if not HAVE_TE or fused_topk_with_score_function is None:
-            raise ValueError(
-                "fused_topk_with_score_function is not available. Please install TE >= 2.6.0."
-            )
         if score_function == "sqrtsoftplus" and not is_te_min_version("2.13.0"):
             raise ValueError(
                 "Fused sqrtsoftplus score function requires TE >= 2.13.0. "
@@ -1006,9 +1018,15 @@ def topk_routing_with_score_function(
                 qb_bin_bounds=qb_bin_bounds,
                 qb_histogram_mode="fused_atomic",
             )
+        if dense_output and topk_indices is None:
+            topk_indices = torch.empty((num_tokens, topk), dtype=torch.int64, device=logits.device)
         if fused_topk_with_score_function_supports_topk_indices and topk_indices is not None:
             kwargs["topk_indices"] = topk_indices
-        return fused_topk_with_score_function(**kwargs)
+        probs, routing_map = fused_topk_with_score_function(**kwargs)
+        if dense_output:
+            # TE wrote the selected expert IDs to topk_indices; its probs are full width.
+            return probs.gather(1, topk_indices.long()), topk_indices
+        return probs, routing_map
 
     if (
         allow_batch_invariant_sigmoid_topk
@@ -1028,7 +1046,7 @@ def topk_routing_with_score_function(
             probs, top_indices = sigmoid_topk_routing(
                 logits.contiguous(), bias, topk, scaling_factor, batch_invariant=True
             )
-        return _topk_routing_output(logits, probs, top_indices, dense_output)
+        return _topk_routing_output(logits, probs, top_indices, dense_output, topk_indices)
 
     def _compute_topk(
         scores: torch.Tensor,
@@ -1138,15 +1156,22 @@ def topk_routing_with_score_function(
         probs = probs * scaling_factor
 
     probs = probs.type_as(logits)
-    return _topk_routing_output(logits, probs, top_indices, dense_output)
+    return _topk_routing_output(logits, probs, top_indices, dense_output, topk_indices)
 
 
 def _topk_routing_output(
-    logits: torch.Tensor, probs: torch.Tensor, top_indices: torch.Tensor, dense_output: bool
+    logits: torch.Tensor,
+    probs: torch.Tensor,
+    top_indices: torch.Tensor,
+    dense_output: bool,
+    topk_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Return top-k routing as dense [num_tokens, topk] or [num_tokens, num_experts] maps."""
+    if topk_indices is not None:
+        # Same output as the fused path: the selected expert IDs in the caller's buffer.
+        topk_indices.copy_(top_indices)
     if dense_output:
-        return probs, top_indices
+        return probs, top_indices if topk_indices is None else topk_indices
 
     num_tokens = logits.shape[0]
     if torch.are_deterministic_algorithms_enabled():
@@ -1165,7 +1190,7 @@ def _topk_routing_output(
         routing_probs = torch.zeros_like(logits).scatter(1, top_indices, probs)
         routing_map = torch.zeros_like(logits).int().scatter(1, top_indices, 1).bool()
 
-    return routing_probs, routing_map
+    return routing_probs, routing_map if topk_indices is None else topk_indices
 
 
 def compute_normalized_router_scores(logits: torch.Tensor, score_function: str) -> torch.Tensor:
