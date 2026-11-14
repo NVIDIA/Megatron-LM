@@ -810,6 +810,15 @@ class InferenceConfig:
     Defaults to 0, which means no logging.
     """
 
+    dsa_backend: Literal['triton', 'flashinfer'] = 'triton'
+    """Kernels for DSA-over-GQA (simplified indexer) attention in dynamic batching. Both run
+    indexer selection and sparse attention for decode, prefill and mixed steps from a per-step
+    plan, so every step type can run as a CUDA graph. "triton" uses Megatron's Triton/Gluon
+    kernels with FlashInfer's ``top_k_varlen`` (KV blocks a multiple of 128 tokens). "flashinfer"
+    uses FlashInfer's DSA kernels (``flashinfer.sdsa`` and ``flashinfer.token_sparse``,
+    trtllm-gen token-sparse decode) and FA4 (KV blocks a multiple of 64 tokens), and raises if
+    they are missing."""
+
     sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
     """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
     "flashinfer" is requested but the package is not installed."""

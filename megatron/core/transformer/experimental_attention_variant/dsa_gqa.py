@@ -732,8 +732,11 @@ class DSGQACoreAttention(MegatronModule):
         use_indexer_rope: bool = False,
         indexer_input_norm: Optional[_DSAIndexerInputNormSpec] = None,
     ) -> torch.Tensor:
-        """Run paged Triton prefill and Gluon/Triton decode."""
-        from .dsa_gqa_inference import dynamic_sparse_attention
+        """Run sparse attention over the paged caches through the kernels of
+        ``inference_context.dsa_backend``: Megatron's Triton/Gluon kernels
+        (``dsa_gqa_inference``, "triton") or FlashInfer's DSA kernels (``dsa_gqa_flashinfer``,
+        "flashinfer")."""
+        from . import dsa_gqa_flashinfer, dsa_gqa_inference
 
         assert not self.training, "Dynamic DSA-GQA inference only supports eval mode."
         if self.config.dsa_fwd_use_dense_attn:
@@ -759,6 +762,13 @@ class DSGQACoreAttention(MegatronModule):
         inference_context.append_dsa_key_cache(provider_layer_number, current_index_key)
         index_key_cache, _ = inference_context.dsa_key_cache(provider_layer_number)
 
+        backend = inference_context.dsa_backend
+        if backend == "triton":
+            dynamic_sparse_attention = dsa_gqa_inference.dynamic_sparse_attention
+        elif backend == "flashinfer":
+            dynamic_sparse_attention = dsa_gqa_flashinfer.dynamic_sparse_attention
+        else:
+            raise ValueError(f"Unknown DSA inference backend {backend!r}.")
         return dynamic_sparse_attention(
             query=query,
             key_cache=key_cache,
