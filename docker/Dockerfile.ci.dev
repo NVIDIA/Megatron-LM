@@ -243,6 +243,7 @@ ENV RDMA_CORE_HOME=/opt/rdma-core/build
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64/:$LD_LIBRARY_PATH
 COPY docker/patches/deepep.patch /workspace/deepep.patch
 COPY docker/patches/deepep-nvshmem.patch /workspace/deepep-nvshmem.patch
+COPY docker/patches/deepep-cooperative-scan.patch /workspace/deepep-cooperative-scan.patch
 # DeepEP compiles its CUDA extensions without nvcc --threads. Unset keeps that; CI passes
 # --build-arg DEEPEP_NVCC_THREADS=<n>, which helps up to the 3 targets of TORCH_CUDA_ARCH_LIST.
 ARG DEEPEP_NVCC_THREADS
@@ -276,6 +277,10 @@ RUN bash -ex <<"EOF"
         patch -p1 < /workspace/deepep.patch
         # Backport deepseek-ai/DeepEP#564 for NVSHMEM 3.5 and newer.
         patch -p1 < /workspace/deepep-nvshmem.patch
+        # Backport deepseek-ai/DeepEP#792: prevent metadata scan blocks from
+        # waiting indefinitely for blocks that have not been scheduled.
+        git apply --check /workspace/deepep-cooperative-scan.patch
+        git apply /workspace/deepep-cooperative-scan.patch
         apt-get update
         apt-get install -y --no-install-recommends libnvidia-ml-dev
         if [ -n "${DEEPEP_NVCC_THREADS:-}" ]; then
