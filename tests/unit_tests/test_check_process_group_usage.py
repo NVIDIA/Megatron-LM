@@ -24,6 +24,11 @@ SPEC.loader.exec_module(checker)
 
 IMPORT = "from megatron.core import parallel_state\n"
 CALL = "parallel_state.get_tensor_model_parallel_group()"
+SHIM_IMPORT = "from megatron.core.process_groups_config import ProcessGroupCollection\n"
+SHIM_CALL = "ProcessGroupCollection.use_mpu_process_groups()"
+GUARDED_IMPORT = "from megatron.core.process_groups_config import resolve_process_groups\n"
+GUARDED_ARGS = "(None, owner='Model', required=('tp',))"
+GUARDED_CALL = "resolve_process_groups" + GUARDED_ARGS
 
 
 class TestDetection(unittest.TestCase):
@@ -82,6 +87,49 @@ class TestDetection(unittest.TestCase):
                 "PGC.use_mpu_process_groups()\n"
             ),
             ["<module>:shim:use_mpu_process_groups"],
+        )
+
+    def test_flags_resolve_process_groups_as_guarded(self):
+        cases = [
+            (GUARDED_IMPORT, GUARDED_CALL),
+            (
+                "from megatron.core import process_groups_config as pgc\n",
+                "pgc.resolve_process_groups" + GUARDED_ARGS,
+            ),
+            (
+                "import megatron.core.process_groups_config\n",
+                "megatron.core.process_groups_config.resolve_process_groups" + GUARDED_ARGS,
+            ),
+            (
+                "from ..process_groups_config import resolve_process_groups as resolve\n",
+                "resolve" + GUARDED_ARGS,
+            ),
+        ]
+        for prefix, call in cases:
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    self.hits(prefix + call), ["<module>:guarded:resolve_process_groups"]
+                )
+
+    def test_guarded_calls_are_keyed_by_enclosing_scope(self):
+        self.assertEqual(
+            self.hits(
+                GUARDED_IMPORT
+                + "class Model:\n    def __init__(self, pg_collection=None):\n        "
+                + GUARDED_CALL
+            ),
+            ["Model.__init__:guarded:resolve_process_groups"],
+        )
+
+    def test_ignores_helpers_that_do_not_read_global_state(self):
+        self.assertEqual(
+            self.hits(
+                "from megatron.core import process_groups_config as pgc\n"
+                "pgc.require_process_groups(pg_collection, ('tp',), owner='Model')\n"
+                "pgc.warn_global_process_group_fallback('Model')\n"
+                "from unrelated import resolve_process_groups\n" + GUARDED_CALL
+            ),
+            [],
         )
 
     def test_flags_rank_and_world_size_accessors(self):
@@ -280,6 +328,11 @@ class TestRatchet(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return checker.main(list(argv))
 
+    def write_baseline(self, source):
+        """Make ``source`` the scanned file and record its reads as the allowlist."""
+        self.source.write_text(source, encoding="utf-8")
+        self.allowlist.write_text(json.dumps({"allowed": checker.scan()}), encoding="utf-8")
+
     def test_matching_baseline_passes(self):
         self.assertEqual(self.run_check(), 0)
 
@@ -321,7 +374,7 @@ class TestRatchet(unittest.TestCase):
         for rel in (*checker.EXEMPT, "megatron/training/example.py", "tests/example.py"):
             path = self.root / rel
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(IMPORT + CALL, encoding="utf-8")
+            path.write_text(IMPORT + CALL + "\n" + GUARDED_IMPORT + GUARDED_CALL, encoding="utf-8")
         self.assertEqual(self.run_check(), 0)
 
     def test_update_keeps_a_call_before_a_reassignment(self):
@@ -342,6 +395,75 @@ class TestRatchet(unittest.TestCase):
         self.source.write_text(IMPORT + CALL + "; " + CALL, encoding="utf-8")
         self.assertEqual(self.run_check("--stats"), 0)
         self.assertEqual(self.run_check(), 1)
+
+    def test_stats_reports_guarded_reads_separately(self):
+        self.source.write_text(
+            IMPORT + CALL + "\n" + GUARDED_IMPORT + GUARDED_CALL, encoding="utf-8"
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(checker.main(["--stats"]), 0)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(
+            lines[0], "2 global process-group read(s) across 1 file(s) in megatron/core"
+        )
+        self.assertEqual(
+            [line.split() for line in lines[1:]],
+            [["accessor", "1"], ["shim", "0"], ["guarded", "1"]],
+        )
+
+    def test_conversion_to_resolve_process_groups_swaps_the_entry(self):
+        # One guarded call may replace the shim, or several accessor reads, of its scope.
+        for read_import, reads in ((SHIM_IMPORT, SHIM_CALL), (IMPORT, CALL + "; " + CALL)):
+            with self.subTest(reads=reads):
+                self.write_baseline(read_import + "def build():\n    " + reads)
+                self.source.write_text(
+                    GUARDED_IMPORT + "def build():\n    " + GUARDED_CALL, encoding="utf-8"
+                )
+                # The replaced read is stale until --update records the guarded entry instead.
+                self.assertEqual(self.run_check(), 1)
+                self.assertEqual(self.run_check("--update"), 0)
+                allowlist = json.loads(self.allowlist.read_text())
+                self.assertEqual(
+                    allowlist["allowed"],
+                    {"megatron/core/sample.py": ["build:guarded:resolve_process_groups"]},
+                )
+                self.assertEqual(allowlist["total"], 1)
+                self.assertEqual(self.run_check(), 0)
+
+    def test_guarded_call_without_a_replaced_read_is_new(self):
+        other = self.core / "other.py"
+        read_in_build = IMPORT + "def build():\n    " + CALL
+        guarded_in_build = GUARDED_IMPORT + "def build():\n    " + GUARDED_CALL
+        cases = {
+            "added next to a kept read": (
+                read_in_build,
+                {self.source: GUARDED_IMPORT + read_in_build + "; " + GUARDED_CALL},
+            ),
+            "replaces a read in another scope": (
+                IMPORT + "def old():\n    " + CALL,
+                {self.source: guarded_in_build},
+            ),
+            "replaces a read in another file": (
+                read_in_build,
+                {self.source: "", other: guarded_in_build},
+            ),
+            "two guarded calls replace one read": (
+                read_in_build,
+                {self.source: guarded_in_build + "; " + GUARDED_CALL},
+            ),
+            "a read replaces a guarded call": (guarded_in_build, {self.source: read_in_build}),
+        }
+        for case, (before, after) in cases.items():
+            with self.subTest(case=case):
+                other.unlink(missing_ok=True)
+                self.write_baseline(before)
+                original = self.allowlist.read_bytes()
+                for path, source in after.items():
+                    path.write_text(source, encoding="utf-8")
+                self.assertEqual(self.run_check(), 1)
+                self.assertEqual(self.run_check("--update"), 1)
+                self.assertEqual(self.allowlist.read_bytes(), original)
 
 
 if __name__ == "__main__":

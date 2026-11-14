@@ -13,6 +13,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import TransformerConfig
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.arguments import _add_rl_args, parse_args, validate_args
@@ -570,5 +571,8 @@ def test_model_setup_uses_owned_ddp_config(
     run_config.finalize()
     with pytest.raises(ReachedConstruction):
         training.setup_model_and_optimizer(
-            Mock(), model_provider_func=None if native_builder else Mock(), cfg_container=run_config
+            Mock(),
+            model_provider_func=None if native_builder else Mock(),
+            cfg_container=run_config,
+            pg_collection=ProcessGroupCollection(),
         )
