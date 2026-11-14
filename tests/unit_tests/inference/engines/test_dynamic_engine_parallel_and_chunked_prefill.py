@@ -1253,27 +1253,40 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
     #
     # At TP > 1 with local CUDA graphs on NVLS, the controller keeps its logits buffer in
     # symmetric memory and each rank's model multicast-stores its vocab shard straight into
-    # it. Serving only ever runs that store from a replayed graph, so that is where it is
-    # checked, against the same graphs gathering and copying into a plain buffer.
+    # it. A head that emits its compute dtype has its shards gathered in that dtype into
+    # staging rows and upcast into the buffer on arrival. Serving only ever runs that store
+    # from a replayed graph, so that is where it is checked, against the same graphs gathering
+    # and copying into a plain buffer.
 
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
     @pytest.mark.parametrize("model_provider", ["gpt", "hybrid"])
+    @pytest.mark.parametrize("head_emits_fp32", [True, False], ids=["fp32-head", "bf16-head"])
     @torch.inference_mode()
-    def test_multicast_logits_buffer_under_cuda_graph_replay(self, model_provider, monkeypatch):
+    def test_multicast_logits_buffer_under_cuda_graph_replay(
+        self, model_provider, head_emits_fp32, monkeypatch
+    ):
         """TP=2 under replayed CUDA graphs: the multicast store leaves the rows that sampling
         reads bitwise equal, every step, to the gather and copy into a plain buffer.
 
-        The vocab is 128 so an fp32 shard row (64 values) is 16-byte divisible, as the store
-        requires. Skips only where symmetric memory cannot initialize.
+        A head that emits fp32 stores its shard straight into the buffer; a head that emits
+        bf16 has its shards gathered in bf16 into staging rows and upcast on arrival. The
+        vocab is 128 so a shard row (64 values) is 16-byte divisible in either dtype, as the
+        store requires. Skips only where symmetric memory cannot initialize.
         """
         from megatron.core.inference.communication.torch_symm_triton import is_device_nvls_capable
         from megatron.core.inference.symmetric_memory import HAVE_TORCH_SYMM_MEM, HAVE_TRITON
         from tests.unit_tests.inference.engines.test_dynamic_engine import DynamicEngineTestConfig
 
         skip_if_mamba_sequence_packing_not_available(model_provider)
+        if not head_emits_fp32:
+            # As without TE general_gemm: the head emits its compute dtype.
+            monkeypatch.setattr(
+                "megatron.core.models.common.language_module.language_module.lm_head_can_emit",
+                lambda output_layer, dtype: dtype == output_layer.config.params_dtype,
+            )
         Utils.initialize_distributed()
         if torch.distributed.get_world_size() < 2:
             pytest.skip("Test requires at least 2 GPUs")
@@ -1348,6 +1361,14 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
             assert reason is not None, "symmetric memory initialized but no multicast buffer"
             pytest.skip(f"symmetric memory unavailable: {reason}")
 
+        # Staging rows are held exactly when the head emits its compute dtype.
+        staging = env.engine.context.logits_staging_buffer
+        if env.engine.controller._language_model.lm_head_can_emit_fp32:
+            assert head_emits_fp32 and staging is None
+        else:
+            assert staging is not None and staging.dtype == torch.bfloat16
+            assert env.engine.context.logits_staging_multicast_handle is not None
+
         # Guard against a vacuous comparison: the model's graphs must exist and replay.
         model = env.engine.controller.inference_wrapped_model.model
         assert model.cudagraph_manager.cudagraph_runners
@@ -1364,6 +1385,7 @@ class TestDynamicInferenceEngineParallel(DynamicInferenceEngineTestBase):
         )
         plain_env, plain_tokens, plain_logits, plain_step_log = run()
         assert plain_env.engine.context.logits_buffer_multicast_handle is None
+        assert plain_env.engine.context.logits_staging_buffer is None
         assert plain_step_log == step_log
         assert len(plain_logits) == len(logits)
         for step, (multicast, plain) in enumerate(zip(logits, plain_logits)):

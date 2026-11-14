@@ -4419,15 +4419,26 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
-    def test_logits_buffer_multicast_gather_matches_gathered_generation_tp2(self):
+    @pytest.mark.parametrize("head_emits_fp32", [True, False], ids=["fp32-head", "bf16-head"])
+    def test_logits_buffer_multicast_gather_matches_gathered_generation_tp2(
+        self, head_emits_fp32, monkeypatch
+    ):
         """With the logits buffer in symmetric memory each rank multicast-stores its shard
         straight into its column block, zero copies at TP 2, and generation matches the
-        no-buffer run token for token (both run the same eager kernels here). The vocab is
-        128 so an fp32 shard row (64 values) is 16-byte divisible as the store requires.
-        Skips only where NVLS symmetric memory is unavailable.
+        no-buffer run token for token (both run the same eager kernels here). A head that
+        emits bf16 has its shards gathered in bf16 into staging rows and upcast on arrival.
+        The vocab is 128 so a shard row (64 values) is 16-byte divisible in either dtype, as
+        the store requires. Skips only where NVLS symmetric memory is unavailable.
         """
         from megatron.core.inference.communication.torch_symm_triton import is_device_nvls_capable
         from megatron.core.inference.symmetric_memory import HAVE_TORCH_SYMM_MEM, HAVE_TRITON
+
+        if not head_emits_fp32:
+            # As without TE general_gemm: the head emits its compute dtype.
+            monkeypatch.setattr(
+                "megatron.core.models.common.language_module.language_module.lm_head_can_emit",
+                lambda output_layer, dtype: dtype == output_layer.config.params_dtype,
+            )
 
         generated = {}
         for cuda_graph_impl in ("none", "local"):
@@ -4442,7 +4453,8 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
                 cuda_graph_impl=cuda_graph_impl,
                 vocab_size=128,
             )
-            context = self.text_generation_controller.inference_wrapped_model.inference_context
+            controller = self.text_generation_controller
+            context = controller.inference_wrapped_model.inference_context
             if cuda_graph_impl == "local" and context.logits_buffer_multicast_handle is None:
                 nvls_available = (
                     HAVE_TORCH_SYMM_MEM
@@ -4451,6 +4463,14 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
                 )
                 assert not nvls_available, "NVLS is available but no symmetric buffer"
                 pytest.skip("NVLS symmetric memory unavailable on this platform")
+            if cuda_graph_impl == "local":
+                # Staging rows are held exactly when the head emits its compute dtype.
+                staging = context.logits_staging_buffer
+                if controller._language_model.lm_head_can_emit_fp32:
+                    assert head_emits_fp32 and staging is None
+                else:
+                    assert staging is not None and staging.dtype == torch.bfloat16
+                    assert context.logits_staging_multicast_handle is not None
             generated[cuda_graph_impl] = self._generate_dynamic()
         assert generated["none"] == generated["local"]
 

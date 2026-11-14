@@ -529,6 +529,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # The controller owns it, so it is exempt from asserts and deallocation.
         self.logits_output_buffer = None
         self.logits_buffer_multicast_handle = None
+        # Symmetric-memory landing rows for shards the LM head emits in its compute dtype:
+        # they are gathered in that dtype and upcast into the buffer on arrival.
+        self.logits_staging_buffer = None
+        self.logits_staging_multicast_handle = None
 
         # Mamba states.
         mamba_inference_state_config = inference_config.mamba_inference_state_config
