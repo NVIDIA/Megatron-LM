@@ -1,4 +1,5 @@
 # Copyright (c) 2025-2026, NVIDIA CORPORATION. All rights reserved.
+# License for these changes: BSD-3-Clause.
 from __future__ import annotations
 
 import inspect
@@ -1100,6 +1101,14 @@ def _accepts_return_argmax(compute_language_model_loss: Callable) -> bool:
         return False
 
 
+def _accepts_private_logits(compute_language_model_loss: Callable) -> bool:
+    """Whether a callback explicitly accepts ownership of its logits buffer."""
+    try:
+        return "inplace_backward" in inspect.signature(compute_language_model_loss).parameters
+    except (TypeError, ValueError):
+        return False
+
+
 def process_mtp_loss(
     hidden_states: Tensor,
     labels: Tensor,
@@ -1205,6 +1214,11 @@ def process_mtp_loss(
     # LanguageModule's loss can return the argmax of the logits from its cross entropy, which
     # spares the acceptance metric a pass over them.
     loss_returns_argmax = is_training and _accepts_return_argmax(compute_language_model_loss)
+    # Custom loss callbacks remain compatible: transfer ownership only when
+    # they explicitly implement the private-logits contract.
+    loss_accepts_private_logits = getattr(
+        config, "cross_entropy_inplace_backward", False
+    ) and _accepts_private_logits(compute_language_model_loss)
     if mtp_input_mask is not None:
         assert mtp_input_mask.shape == loss_mask.shape, (
             f"mtp_input_mask shape {mtp_input_mask.shape} must match "
@@ -1235,12 +1249,16 @@ def process_mtp_loss(
                 batch_dim=1,
             )
         mtp_preds = None
+        loss_kwargs = {}
         if loss_returns_argmax:
-            head_loss, mtp_preds = compute_language_model_loss(
-                head_labels, mtp_logits, return_argmax=True
-            )
+            loss_kwargs["return_argmax"] = True
+        if loss_accepts_private_logits and not is_observing_tensor("mtp_logits"):
+            loss_kwargs["inplace_backward"] = True
+        loss_result = compute_language_model_loss(head_labels, mtp_logits, **loss_kwargs)
+        if loss_returns_argmax:
+            head_loss, mtp_preds = loss_result
         else:
-            head_loss = compute_language_model_loss(head_labels, mtp_logits)
+            head_loss = loss_result
         correct = total = None
         if is_training:
             correct, total = _compute_mtp_acceptance_counts(
