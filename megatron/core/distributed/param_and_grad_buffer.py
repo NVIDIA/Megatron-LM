@@ -1148,6 +1148,8 @@ class _ParamAndGradBuffer:
         # Data structures to store underlying buckets and relevant indexing data.
         self.buckets = []
         self.param_to_bucket = {}  # Param -> bucket mapping.
+        # Param -> {process-group ranks: (lo, hi) or None}; caches get_grad_shard_range_union.
+        self.grad_shard_range_unions = {}
 
         # Use the provided layout if given, otherwise compute the default (no-padding) layout.
         if param_layout is None:
@@ -1652,6 +1654,68 @@ class _ParamAndGradBuffer:
         self.grad_data *= buffer_scale
         for grad in self.extra_main_grads:
             grad *= scaling_factor
+
+    def get_grad_shard_range(self, param: torch.nn.Parameter) -> Optional[Tuple[int, int]]:
+        """Element range of ``param``'s flattened grad inside this rank's distributed-optimizer
+        shard of its bucket ((0, 0) if no element is), or None if the buffer is not sharded by a
+        distributed optimizer or does not hold ``param``."""
+        if not self.ddp_config.use_distributed_optimizer or param not in self.param_to_bucket:
+            return None
+        bucket = self.param_to_bucket[param]
+        start, end = bucket.param_to_index[param]
+        if bucket.grad_data.numel() % self.data_parallel_world_size != 0:
+            return None
+        shard_size = bucket.grad_data.numel() // self.data_parallel_world_size
+        dp_rank = self.data_parallel_group.rank()
+        lo = max(start, dp_rank * shard_size)
+        hi = min(end, (dp_rank + 1) * shard_size)
+        if hi <= lo:
+            return (0, 0)
+        return (lo - start, hi - start)
+
+    def get_grad_shard_range_union(
+        self, param: torch.nn.Parameter, grad: torch.Tensor, group: torch.distributed.ProcessGroup
+    ) -> Optional[Tuple[int, int]]:
+        """Union of the ranks' ``get_grad_shard_range(param)`` over ``group``.
+
+        ``group`` holds ranks with a copy of ``param`` in their own buffers, e.g. the embedding
+        group (same DP rank, different PP stages), and all of them call this together. Returns the
+        smallest element range of the flattened ``grad`` covering every rank's distributed-optimizer
+        shard ((0, 0) if no rank's shard overlaps ``param``), or None if any rank cannot tell (then
+        the whole grad has to be used).
+
+        The ranges depend only on the buffer layout. They are exchanged once with an all-gather
+        over ``group`` and cached; a first call inside a CUDA graph capture returns None and does
+        not cache.
+        """
+        group_ranks = tuple(torch.distributed.get_process_group_ranks(group))
+        cached = self.grad_shard_range_unions.setdefault(param, {})
+        if group_ranks in cached:
+            return cached[group_ranks]
+        if torch.cuda.is_current_stream_capturing():
+            return None
+
+        local = self.get_grad_shard_range(param) if grad.is_contiguous() else None
+        if local is not None and local[1] > local[0]:
+            assert grad.numel() >= local[1]
+        local_tensor = torch.tensor(
+            [local[0], local[1], 1] if local is not None else [0, 0, 0],
+            dtype=torch.int64,
+            device=grad.device,
+        )
+        gathered = [torch.empty_like(local_tensor) for _ in range(group.size())]
+        torch.distributed.all_gather(gathered, local_tensor, group=group)
+        ranges = [tuple(t.tolist()) for t in gathered]
+
+        result = None
+        if all(valid == 1 for _, _, valid in ranges):
+            nonempty = [(lo, hi) for lo, hi, _ in ranges if hi > lo]
+            if nonempty:
+                result = (min(lo for lo, _ in nonempty), max(hi for _, hi in nonempty))
+            else:
+                result = (0, 0)
+        cached[group_ranks] = result
+        return result
 
     def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:
         """

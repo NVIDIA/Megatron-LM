@@ -2980,6 +2980,11 @@ def _add_distributed_args(parser):
                        dest='align_param_gather')
     group.add_argument('--use-distributed-optimizer', action='store_true',
                        help='Use distributed optimizer.')
+    group.add_argument('--shard-embedding-grad-allreduce', action='store_true',
+                       default=False,
+                       help='With the distributed optimizer, all-reduce the tied embedding gradient '
+                       'across pipeline stages only over the distributed-optimizer shards that '
+                       'are read afterwards, instead of the whole gradient.')
     group.add_argument('--megatron-fsdp-version', type=int, default=1, choices=[1, 2],
                        help='Megatron-FSDP implementation version. Defaults to 1.')
     group.add_argument('--overlap-outer-communication', action='store_true',

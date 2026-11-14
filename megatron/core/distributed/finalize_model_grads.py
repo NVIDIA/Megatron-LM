@@ -37,6 +37,7 @@ from ..utils import (
     get_pg_size,
     get_tensor_model_parallel_group_if_none,
 )
+from .param_and_grad_buffer import _ParamAndGradBuffer
 
 
 def _get_main_grad_attr(param: torch.nn.Parameter):
@@ -174,6 +175,7 @@ def _allreduce_word_embedding_grads(
     config: TransformerConfig,
     embd_group: Optional[torch.distributed.ProcessGroup] = None,
     pp_group: Optional[torch.distributed.ProcessGroup] = None,
+    force_all_reduce: bool = False,
 ):
     """All-reduce word-embedding gradients across the first and last PP stages.
 
@@ -193,6 +195,9 @@ def _allreduce_word_embedding_grads(
         pp_group: The pipeline
             parallel process group used to identify first/last stages. If
             ``None``, it will be looked up.
+        force_all_reduce: Whether the DP grad sync used an all-reduce instead of a
+            reduce-scatter; then the full gradient is reduced (see
+            ``DistributedDataParallelConfig.shard_embedding_grad_allreduce``).
     """
     if embd_group is None:
         embd_group = parallel_state.get_embedding_group(check_initialized=False)
@@ -206,6 +211,7 @@ def _allreduce_word_embedding_grads(
         pp_group,
         partial(_get_shared_word_embedding_weight, config=config),
         config=config,
+        force_all_reduce=force_all_reduce,
     )
 
 
@@ -245,6 +251,7 @@ def _allreduce_embedding_grad(
     weight_getter: Callable[[torch.nn.Module], Optional[torch.nn.Parameter]],
     skip_if_none: bool = True,
     config: TransformerConfig = None,
+    force_all_reduce: bool = False,
 ):
     """Unified helper to all-reduce embedding parameters across pipeline stages.
 
@@ -258,6 +265,8 @@ def _allreduce_embedding_grad(
             (or ``None`` if not applicable).
         skip_if_none (bool, optional): If True, quietly returns when the parameter or its
             gradient is ``None``. Defaults to True.
+        force_all_reduce (bool, optional): Whether the DP grad sync used an all-reduce
+            instead of a reduce-scatter. Defaults to False.
     """
 
     if (
@@ -277,6 +286,7 @@ def _allreduce_embedding_grad(
         else:  # We do not support an interleaved schedule for models with encoders yet.
             model_module = model[0]
 
+        ddp_module = model_module
         ddp_config = model_module.ddp_config
         model_module = get_attr_wrapped_model(model_module, 'pre_process', return_model_obj=True)
 
@@ -295,11 +305,41 @@ def _allreduce_embedding_grad(
         # When the embedding is frozen, the grad is None.
         if grad is None and skip_if_none:
             return
-        torch.distributed.all_reduce(grad, group=embd_group)
+        shard_range = None
+        # Reducing only the distributed-optimizer shards is valid when (1) the DP grad sync was a
+        # reduce-scatter, so nothing reads the rest of the grad (force_all_reduce asks for the
+        # whole grad on every rank), and (2) the grad is the main grad in a DDP grad buffer, whose
+        # layout defines the shards. Megatron-FSDP and torch FSDP2 grads have no such buffer; there
+        # ``grad`` is a gathered copy of a differently sharded DTensor and is reduced whole.
+        if ddp_config.shard_embedding_grad_allreduce and not force_all_reduce:
+            grad_buffer = _grad_buffer_of_param(ddp_module, weight)
+            if grad_buffer is not None:
+                shard_range = grad_buffer.get_grad_shard_range_union(weight, grad, embd_group)
+        if shard_range is None:
+            torch.distributed.all_reduce(grad, group=embd_group)
+        elif shard_range[1] > shard_range[0]:
+            # Only the distributed-optimizer shards of the grad are read after this point, so
+            # reducing the union of the group's shard ranges is enough.
+            torch.distributed.all_reduce(
+                grad.view(-1)[shard_range[0] : shard_range[1]], group=embd_group
+            )
         if ddp_config.use_megatron_fsdp:
             _copy_embedding_grad_back(orig_grad, grad)
         else:
             setattr(weight, grad_attr, _reshard_if_dtensor(grad, orig_grad))
+
+
+def _grad_buffer_of_param(
+    ddp_module: torch.nn.Module, param: torch.nn.Parameter
+) -> Optional[_ParamAndGradBuffer]:
+    """The DistributedDataParallel grad buffer that holds ``param``'s main grad, or None (e.g. for
+    Megatron-FSDP or torch FSDP2 model chunks, which have no such buffers)."""
+    if param not in getattr(ddp_module, 'param_to_bucket_group', {}):
+        return None
+    for buffer in ddp_module.buffers + ddp_module.expert_parallel_buffers:
+        if param in buffer.param_to_bucket:
+            return buffer
+    return None
 
 
 def _allreduce_position_embedding_grads(
@@ -307,6 +347,7 @@ def _allreduce_position_embedding_grads(
     config: TransformerConfig,
     pos_emb_group: torch.distributed.ProcessGroup,
     pp_group: torch.distributed.ProcessGroup,
+    force_all_reduce: bool = False,
 ):
     """
     All-reduce position_embeddings grad across encoder and decoder stages to ensure that position
@@ -314,7 +355,12 @@ def _allreduce_position_embedding_grads(
     """
 
     _allreduce_embedding_grad(
-        model, pos_emb_group, pp_group, _get_position_embedding_weight, skip_if_none=False
+        model,
+        pos_emb_group,
+        pp_group,
+        _get_position_embedding_weight,
+        skip_if_none=False,
+        force_all_reduce=force_all_reduce,
     )
 
 
@@ -772,8 +818,12 @@ def finalize_model_grads(
         config.timers('embedding-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
         )
-    _allreduce_word_embedding_grads(model, config, embd_group, pp_group)
-    _allreduce_position_embedding_grads(model, config, pos_emb_group, pp_group)
+    _allreduce_word_embedding_grads(
+        model, config, embd_group, pp_group, force_all_reduce=force_all_reduce
+    )
+    _allreduce_position_embedding_grads(
+        model, config, pos_emb_group, pp_group, force_all_reduce=force_all_reduce
+    )
 
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
