@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass
-from typing import Dict, List, Union
+from typing import Dict, List, Optional, Union
 
 import numpy as np
 
@@ -220,8 +220,14 @@ class SFTTokenizer:
 
         return tokens, target
 
-    def text_to_ids(self, text: Union[str, List[Dict]], add_special_tokens: bool = True):
-        """Tokenize conversation or string input."""
+    def text_to_ids(self, text: Union[str, List[Dict]], add_special_tokens: bool = False):
+        """Tokenize conversation or string input.
+
+        Plain strings are encoded without the tokenizer's special-token template (for
+        example a BOS post-processor) unless ``add_special_tokens`` is set. The chat
+        template already emits BOS where the prompt format wants it, so this keeps plain
+        text consistent with ``tokenize_conversation`` and makes encode/decode round-trip.
+        """
         if isinstance(text, list):
             # This code path is used by the inference code currently.
             return self.tokenize_conversation(
@@ -234,9 +240,9 @@ class SFTTokenizer:
         """Convert tokens to IDs."""
         return self._tokenizer.convert_tokens_to_ids(tokens)
 
-    def ids_to_text(self, tokens: List[int]):
-        """Detokenize tokens."""
-        return self._tokenizer.decode(tokens)
+    def ids_to_text(self, tokens: List[int], remove_special_tokens: Optional[bool] = None):
+        """Detokenize tokens, dropping special tokens when ``remove_special_tokens`` is set."""
+        return self._tokenizer.decode(tokens, skip_special_tokens=bool(remove_special_tokens))
 
     def ids_to_tokens(self):
         """Converts ids to tokens."""
