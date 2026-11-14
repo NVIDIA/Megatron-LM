@@ -16,7 +16,12 @@ import zmq
 
 from megatron.core import parallel_state
 from megatron.core.inference.config import KVCacheManagementMode, PrefixCachingEvictionPolicy
-from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.contexts.dynamic_context import (
+    BlockOverflowError,
+    DynamicInferenceContext,
+    MaxSequenceLengthOverflowError,
+    TokenOverflowError,
+)
 from megatron.core.inference.contexts.kv_block_allocator import KVBlockAllocator
 from megatron.core.inference.contexts.prefix_cache_block_state import PrefixCacheBlockState
 from megatron.core.inference.contexts.prefix_cache_registry import PrefixCacheRegistry
@@ -93,6 +98,7 @@ class _KvAllocator:
     def __init__(self, registry):
         self.next_block = 10
         self.capacity_available = True
+        self.pool_size = 256  # Including the dummy block, as in the real allocator.
         self.releases = []
         self.registered_parent_hashes = []
         # Production reads ref counts through `pc_state` and cached hashes through the
@@ -176,6 +182,7 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
             max_requests=8,
             active_token_count=0,
             max_tokens=8,
+            max_sequence_length=64,
             is_hybrid_model=hybrid,
             kv_block_allocator=_KvAllocator(registry),
             prefix_cache_registry=registry,
@@ -197,6 +204,8 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
         self.precomputed_hashes = {}
         self.partial_admissions = set()
         self.track_generated_token_events = False
+        # The fake admits a whole prompt at once; limit tests turn this off explicitly.
+        self.enable_chunked_prefill = True
         self.use_coordinator = False
         self.is_mp_coordinator = False
         self._generation_epoch = None
@@ -734,6 +743,66 @@ def test_capacity_miss_defers_before_any_transfer(handoff_loop):
     assert len(engine._ssm_transfer_agents["recurrent"].calls) == 1
     assert engine._pending_kv_imports[0].ssm.live_slot == 20
     assert engine.context.mamba_metadata.mamba_state_free_slot_count == 0
+
+
+@pytest.mark.parametrize(
+    "prompt_length, params, chunked, error, message",
+    [
+        # Four prompt blocks plus the first decode step's block exceed a four-block pool.
+        # A collocated engine would serve this one-token request; the import cannot,
+        # because it reserves the first decode step's block on arrival.
+        (16, dict(num_tokens_to_generate=1), True, BlockOverflowError, "needs 5 KV blocks"),
+        # The import fits, but the whole generation does not, as add_request() checks.
+        (8, dict(num_tokens_to_generate=10), True, BlockOverflowError, None),
+        (12, dict(num_tokens_to_generate=1), False, TokenOverflowError, None),
+        (65, dict(num_tokens_to_generate=1), True, MaxSequenceLengthOverflowError, None),
+        (
+            8,
+            dict(num_tokens_to_generate=None, num_tokens_total=7),
+            True,
+            MaxSequenceLengthOverflowError,
+            None,
+        ),
+    ],
+)
+def test_impossible_handoff_fails_on_arrival_without_blocking_later_ones(
+    handoff_loop, prompt_length, params, chunked, error, message
+):
+    engine = _HandoffHarness(handoff_loop)
+    engine.context.kv_block_allocator.pool_size = 5  # Four usable blocks and the dummy.
+    engine.enable_chunked_prefill = chunked
+    tokens = [1] * prompt_length
+    source_blocks = list(range(100, 100 + (prompt_length + 3) // 4))
+
+    with pytest.raises(error, match=message) as raised:
+        engine.add_request_with_kv_handoff(
+            7, tokens, SamplingParams(**params), {"resume_tokens": [99]}, source_blocks
+        )
+    assert raised.value.request_id == 7
+    assert engine.pending_kv_import_count == 0
+    assert not engine._pending_handoff_hash_owners
+    assert not engine._kv_transfer_agent.calls
+    assert engine.context.kv_block_allocator.next_block == 10
+
+    # A later handoff that fits starts at once instead of waiting behind it.
+    future = engine.add_request_with_kv_handoff(
+        8, [1, 2, 3, 4], SamplingParams(num_tokens_to_generate=2), {"resume_tokens": [99]}, [200]
+    )
+    assert not future.done() and not engine._deferred_kv_handoffs
+    assert [pending.request_id for pending in engine._pending_kv_imports] == [8]
+    assert len(engine._kv_transfer_agent.calls) == 1
+
+
+def test_handoff_that_fills_the_pool_exactly_is_accepted(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    engine.context.kv_block_allocator.pool_size = 5
+    # Three prompt blocks and one block for the first decode step use the whole pool.
+    engine.add_request_with_kv_handoff(
+        7, [1] * 12, SamplingParams(num_tokens_to_generate=1), {"resume_tokens": [99]}, [1, 2, 3]
+    )
+    assert [pending.request_id for pending in engine._pending_kv_imports] == [7]
+    assert engine._pending_kv_imports[0].local_blocks == [10, 11, 12]
+    assert engine._pending_kv_imports[0].continuation_blocks == [13]
 
 
 @pytest.mark.parametrize("queued", [False, True])
