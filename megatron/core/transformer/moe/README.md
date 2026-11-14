@@ -757,6 +757,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-router-enable-expert-bias | Dynamic per-expert bias | False |
 | --moe-router-bias-update-rate | Bias update rate | 1e-3 |
 | --moe-router-fusion | Enable router fusion | False |
+| --moe-router-defer-global-aux-loss | Overlap the global_aux_loss token-count all-reduce with dispatch, experts and combine | False |
 | --moe-router-dtype | Router precision: fp32, fp64 | None |
 | --moe-router-padding-for-fp8 | Pad for FP8 alignment | False |
 

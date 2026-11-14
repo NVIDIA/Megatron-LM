@@ -16,7 +16,7 @@ from megatron.core.transformer.moe.moe_utils import (
     get_default_pg_collection,
     get_moe_layer_wise_logging_tracker,
 )
-from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.router import TopKRouter, _GlobalAuxLossInBackward
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.training.initialize import _set_random_seed
@@ -989,3 +989,205 @@ class TestPaddingMaskAuxLoss:
         finally:
             # Always cleanup model parallel
             Utils.destroy_model_parallel()
+
+
+class TestDeferredGlobalAuxLoss:
+    """moe_router_defer_global_aux_loss gives the same loss and gradients as the synchronous
+    global aux loss."""
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("mtp_repeated", [False, True])
+    @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+    @pytest.mark.parametrize("with_padding", [False, True])
+    @pytest.mark.parametrize(
+        "tp_size,ep_size,cp_size", [(1, 1, 1), (1, 8, 1), (8, 1, 1), (2, 2, 2), (1, 2, 4)]
+    )
+    def test_matches_synchronous(
+        self, tp_size, ep_size, cp_size, with_padding, calculate_per_token_loss, mtp_repeated
+    ):
+        if with_padding and tp_size > 1:
+            pytest.skip("the padding mask is per local token only without sequence parallelism")
+        container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            cp_size=cp_size,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="global_aux_loss",
+            moe_token_dispatcher_type="alltoall",
+            moe_aux_loss_coeff=0.1,
+            calculate_per_token_loss=calculate_per_token_loss,
+        )
+        moe_layer = container.moe_layer
+        router = moe_layer.router
+        # A repeated MTP layer keeps waiting after combine; mtp_num_layers stays None so the loss
+        # is not rescaled.
+        router.is_mtp_layer = mtp_repeated
+        moe_layer.config.mtp_use_repeated_layer = mtp_repeated
+        assert moe_layer.config is router.config
+
+        seq_len, batch_size = 16, 4
+        torch.manual_seed(1000 + torch.distributed.get_rank())
+        # Two micro-batches with different routing: the second loss reads the counts
+        # accumulated over both.
+        micro_batches = [
+            torch.randn((seq_len, batch_size, moe_layer.config.hidden_size), device="cuda")
+            for _ in range(2)
+        ]
+        padding_mask = None
+        if with_padding:
+            padding_mask = torch.zeros((batch_size, seq_len), dtype=torch.bool, device="cuda")
+            padding_mask[:, seq_len - 5 :] = True
+
+        # Record whether a deferred loss was pending when MoELayer.forward finished it.
+        finish = router.finish_deferred_global_aux_loss
+        pending_at_finish = []
+
+        def spy_finish(activation):
+            pending_at_finish.append(router._pending_global_aux_loss is not None)
+            return finish(activation)
+
+        router.finish_deferred_global_aux_loss = spy_finish
+
+        def run(defer):
+            moe_layer.config.moe_router_defer_global_aux_loss = defer
+            clear_aux_losses_tracker()
+            router.reset_global_aux_loss_tracker()
+            moe_layer.zero_grad(set_to_none=True)
+            pending_at_finish.clear()
+            results = {"outputs": [], "losses": [], "input_grads": []}
+            for step, hidden_states in enumerate(micro_batches):
+                x = hidden_states.detach().clone().requires_grad_(True)
+                output, _ = moe_layer(x, padding_mask=padding_mask)
+                assert router._pending_global_aux_loss is None
+                # Deferred, the loss and its count accumulation run in backward, except for a
+                # repeated MTP layer, which waits after combine.
+                assert int(router.ga_steps) == (step if defer and not mtp_repeated else step + 1)
+                output.float().pow(2).mean().backward()
+                assert int(router.ga_steps) == step + 1
+                results["outputs"].append(output.detach().clone())
+                results["input_grads"].append(x.grad.clone())
+                results["losses"].append(
+                    get_moe_layer_wise_logging_tracker()["global_load_balancing_loss"]["values"][0]
+                    .detach()
+                    .clone()
+                )
+            # MoELayer.forward calls finish_deferred_global_aux_loss only when the flag is set.
+            assert pending_at_finish == ([True, True] if defer else [])
+            results["router_grad"] = router.weight.grad.clone()
+            results["tokens_per_expert"] = router.global_tokens_per_expert.clone()
+            return results
+
+        try:
+            reference = run(defer=False)
+            deferred = run(defer=True)
+            assert torch.count_nonzero(reference["router_grad"]) > 0
+            assert torch.equal(reference["tokens_per_expert"], deferred["tokens_per_expert"])
+            for name in ("outputs", "losses", "input_grads"):
+                for ref, out in zip(reference[name], deferred[name]):
+                    torch.testing.assert_close(ref, out, rtol=1e-5, atol=1e-7)
+            torch.testing.assert_close(
+                reference["router_grad"], deferred["router_grad"], rtol=1e-5, atol=1e-7
+            )
+
+            # No-grad and eval forwards keep the synchronous path.
+            pending_at_finish.clear()
+            with torch.no_grad():
+                moe_layer(micro_batches[0], padding_mask=padding_mask)
+            moe_layer.eval()
+            moe_layer(micro_batches[0], padding_mask=padding_mask)
+            moe_layer.train()
+            assert pending_at_finish == [False, False]
+
+            # An exception between route and combine drops the pending loss.
+            with pytest.raises(RuntimeError, match="after route"):
+                with router.defer_global_aux_loss():
+                    router(micro_batches[0].detach().requires_grad_(True))
+                    assert router._pending_global_aux_loss is not None
+                    raise RuntimeError("after route")
+            assert router._pending_global_aux_loss is None
+        finally:
+            clear_aux_losses_tracker()
+            del container
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.parametrize("calculate_per_token_loss", [False, True])
+    @pytest.mark.parametrize("tp_size,ep_size,cp_size", [(1, 1, 1), (1, 8, 1), (2, 2, 2)])
+    def test_backward_wait_with_forwards_ahead(
+        self, tp_size, ep_size, cp_size, calculate_per_token_loss
+    ):
+        """1F1B order: every micro-batch's forward runs before the first backward. Waiting in
+        backward must still give micro-batch k the counts of micro-batches 1..k."""
+        container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            cp_size=cp_size,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="global_aux_loss",
+            moe_token_dispatcher_type="alltoall",
+            moe_aux_loss_coeff=1.0,
+            calculate_per_token_loss=calculate_per_token_loss,
+        )
+        moe_layer = container.moe_layer
+        router = moe_layer.router
+        seq_len, batch_size = 16, 4
+        torch.manual_seed(2000 + torch.distributed.get_rank())
+        micro_batches = [
+            torch.randn((seq_len, batch_size, moe_layer.config.hidden_size), device="cuda")
+            for _ in range(3)
+        ]
+
+        def run(defer):
+            moe_layer.config.moe_router_defer_global_aux_loss = defer
+            clear_aux_losses_tracker()
+            router.reset_global_aux_loss_tracker()
+            moe_layer.zero_grad(set_to_none=True)
+            inputs, outputs = [], []
+            for hidden_states in micro_batches:
+                x = hidden_states.detach().clone().requires_grad_(True)
+                output, _ = moe_layer(x)
+                inputs.append(x)
+                outputs.append(output)
+            assert int(router.ga_steps) == (0 if defer else len(micro_batches))
+            for output in outputs:
+                output.float().pow(2).mean().backward()
+            assert int(router.ga_steps) == len(micro_batches)
+            return {
+                "input_grads": [x.grad.clone() for x in inputs],
+                "router_grad": router.weight.grad.clone(),
+                "tokens_per_expert": router.global_tokens_per_expert.clone(),
+                "loss": get_moe_layer_wise_logging_tracker()["global_load_balancing_loss"][
+                    "values"
+                ][0].clone(),
+            }
+
+        backward = _GlobalAuxLossInBackward.backward
+        try:
+            reference = run(defer=False)
+            deferred = run(defer=True)
+            assert torch.equal(reference["tokens_per_expert"], deferred["tokens_per_expert"])
+            assert torch.equal(reference["loss"], deferred["loss"])
+            assert torch.equal(reference["router_grad"], deferred["router_grad"])
+            for ref, out in zip(reference["input_grads"], deferred["input_grads"]):
+                assert torch.equal(ref, out)
+
+            # Negative control: dropping the aux loss gradient must change the router gradient.
+            def without_aux_grad(ctx, grad_output):
+                grads = backward(ctx, grad_output)
+                return (grads[0], torch.zeros_like(grads[1])) + tuple(grads[2:])
+
+            _GlobalAuxLossInBackward.backward = staticmethod(without_aux_grad)
+            cut = run(defer=True)
+            assert not torch.allclose(reference["router_grad"], cut["router_grad"])
+        finally:
+            _GlobalAuxLossInBackward.backward = backward
+            clear_aux_losses_tracker()
+            del container

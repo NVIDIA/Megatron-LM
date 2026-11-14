@@ -261,6 +261,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "moe_permute_fusion_into_hybridep": False,
     "moe_router_aux_loss_fusion": False,
     "moe_router_bias_update_rate": 0.001,
+    "moe_router_defer_global_aux_loss": False,
     "moe_router_dtype": "fp64",
     "moe_router_enable_expert_bias": True,
     "moe_router_force_load_balancing": False,
