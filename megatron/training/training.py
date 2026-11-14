@@ -2670,7 +2670,7 @@ def _freeze_base_model_for_mtp(model_list):
     return model_list
 
 
-def _freeze_backbone_for_ssa_indexer(model_list):
+def freeze_backbone_for_ssa_indexer(model_list):
     """Freeze everything but simplified sparse attention indexers, including router bias updates.
 
     Phase 1 of simplified sparse attention trains only the indexers against a frozen dense
@@ -2706,7 +2706,7 @@ def _add_model_freeze_pre_wrap_hook(
     elif freeze_base_model_for_mtp:
         freeze_hook = _freeze_base_model_for_mtp
     elif ssa_train_indexer_only:
-        freeze_hook = _freeze_backbone_for_ssa_indexer
+        freeze_hook = freeze_backbone_for_ssa_indexer
 
     if freeze_hook is not None and freeze_hook not in model_config.pre_wrap_hooks:
         model_config.pre_wrap_hooks.append(freeze_hook)
@@ -2808,7 +2808,7 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
     elif config.freeze_base_model_for_mtp:
         _freeze_base_model_for_mtp(model)
     elif config.ssa_train_indexer_only:
-        _freeze_backbone_for_ssa_indexer(model)
+        freeze_backbone_for_ssa_indexer(model)
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
