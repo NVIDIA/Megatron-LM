@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from packaging.version import Version
 
 import megatron.core.transformer.utils as transformer_utils
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
@@ -69,6 +70,50 @@ def test_set_attention_backend_rejects_process_wide_conflicts(isolated_nvte_atte
     )
     for config in conflicts:
         with pytest.raises(AssertionError, match="process-wide"):
+            set_attention_backend(config)
+
+
+@pytest.mark.parametrize(
+    "te_version, fa4_version, attention_backend, flash_attention_version, rejected",
+    [
+        # TE before 2.21 with FA4 4.0.0b30 or later, where TE can pick FA4.
+        ("2.20.2+44f31bbe", "4.0.0b37", AttnBackend.flash, None, True),
+        ("2.20.2+44f31bbe", "4.0.0b30", AttnBackend.auto, None, True),
+        ("2.20.2+44f31bbe", "4.0.0b37", AttnBackend.flash, 4, True),
+        # The FA4 releases the lock allows, a fixed TE, and backends that keep TE off FA4.
+        ("2.20.2+44f31bbe", "4.0.0b29", AttnBackend.flash, 4, False),
+        ("2.21.0", "4.0.0b37", AttnBackend.flash, 4, False),
+        ("2.20.2+44f31bbe", "4.0.0b37", AttnBackend.fused, None, False),
+        ("2.20.2+44f31bbe", "4.0.0b37", AttnBackend.flash, 2, False),
+        ("2.20.2+44f31bbe", None, AttnBackend.flash, None, False),
+    ],
+)
+def test_set_attention_backend_refuses_te_flash_attention_4_window_pairing(
+    isolated_nvte_attention_env,
+    te_version,
+    fa4_version,
+    attention_backend,
+    flash_attention_version,
+    rejected,
+):
+    """set_attention_backend refuses a TE that would run causal attention on an FA4 that reads
+    its unbounded-window value as an empty window, when TE can select FA4 for the model."""
+    import megatron.core.transformer.attention as attention_module
+
+    config = _attention_config(
+        attention_backend=attention_backend, flash_attention_version=flash_attention_version
+    )
+    with (
+        patch("torch.cuda.is_available", return_value=True),
+        patch("torch.cuda.get_device_capability", return_value=(10, 0)),
+        patch("megatron.core.extensions.transformer_engine.HAVE_TE", True),
+        patch.object(transformer_utils, "get_te_version", return_value=Version(te_version)),
+        patch.object(attention_module, "_FA4_VERSION", fa4_version),
+    ):
+        if rejected:
+            with pytest.raises(RuntimeError, match="would return zeros"):
+                set_attention_backend(config)
+        else:
             set_attention_backend(config)
 
 

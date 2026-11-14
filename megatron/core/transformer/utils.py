@@ -10,6 +10,7 @@ from operator import itemgetter
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterable, Optional, Tuple, Union
 
 import torch
+from packaging.version import Version as PkgVersion
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, StateDict
@@ -17,6 +18,7 @@ from megatron.core.jit import jit_fuser
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import (
     get_pg_rank,
+    get_te_version,
     get_tensor_model_parallel_group_if_none,
     make_sharded_tensor_for_checkpoint,
     make_tp_sharded_tensor_for_checkpoint,
@@ -26,6 +28,47 @@ if TYPE_CHECKING:
     from megatron.core.transformer import TransformerConfig
 
 logger = logging.getLogger(__name__)
+
+# Transformer Engine before 2.21 hands FlashAttention-4 the window (-1, 0) for every causal mask,
+# with -1 meaning unbounded. flash-attn-4 4.0.0b30 and later read -1 as a literal offset, so that
+# window is empty and causal attention on TE's FlashAttention-4 backend returns zeros. TE 2.21
+# passes FlashAttention-4 None instead (TransformerEngine PRs #3532 and #3540).
+_TE_FA4_WINDOW_FIXED_VERSION = "2.21.0"
+_FA4_LITERAL_WINDOW_VERSION = "4.0.0b30"
+
+
+def _check_te_flash_attention_4_window(config: 'TransformerConfig') -> None:
+    """Refuse a Transformer Engine that would run causal attention on an FA4 it cannot drive.
+
+    Runs once TE's attention-backend environment is set for the model. TE can select its
+    FlashAttention-4 backend when FlashAttention and its version 4 are enabled, on SM90 or newer.
+    """
+    if config.transformer_impl == "local":
+        return
+    if not int(os.getenv("NVTE_FLASH_ATTN", "1")) or not int(os.getenv("NVTE_FLASH_ATTN_V4", "1")):
+        return
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
+        return
+    from megatron.core.extensions.transformer_engine import HAVE_TE
+
+    if not HAVE_TE or get_te_version() >= PkgVersion(_TE_FA4_WINDOW_FIXED_VERSION):
+        return
+    from megatron.core.transformer import attention
+
+    fa4_version = attention._FA4_VERSION  # The flash-attn-4 that `flash_attn.cute` imports.
+    if fa4_version is None or PkgVersion(fa4_version) < PkgVersion(_FA4_LITERAL_WINDOW_VERSION):
+        return
+    raise RuntimeError(
+        f"Transformer Engine {get_te_version()} cannot run causal attention on flash-attn-4 "
+        f"{fa4_version}: Transformer Engine before {_TE_FA4_WINDOW_FIXED_VERSION} passes "
+        "FlashAttention-4 -1 for an unbounded window, which flash-attn-4 "
+        f"{_FA4_LITERAL_WINDOW_VERSION} and later read as a literal offset, so causal attention "
+        "on its FlashAttention-4 backend would return zeros. Install flash-attn-4 "
+        f">={attention._MIN_FA4_VERSION},<{_FA4_LITERAL_WINDOW_VERSION} (as Megatron's lock does) "
+        f"or Transformer Engine >= {_TE_FA4_WINDOW_FIXED_VERSION}, or choose an attention backend "
+        "that keeps Transformer Engine off FlashAttention-4 (attention_backend fused or unfused, "
+        "or another flash_attention_version)."
+    )
 
 
 def set_attention_backend(config: 'TransformerConfig') -> None:
@@ -80,6 +123,8 @@ def set_attention_backend(config: 'TransformerConfig') -> None:
                 int(version == config.flash_attention_version),
                 attention_backend,
             )
+
+    _check_te_flash_attention_4_window(config)
 
 
 def get_linear_layer(rows, columns, init_method, perform_initialization=True):
