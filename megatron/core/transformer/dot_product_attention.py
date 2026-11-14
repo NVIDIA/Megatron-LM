@@ -144,6 +144,12 @@ class DotProductAttention(MegatronModule):
             )
             if config.perform_initialization:
                 self.softmax_offset = config.init_method(self.softmax_offset)
+            # One entry per local attention head, so the offset is sharded across TP along
+            # dim 0 (as in sharded_state_dict). Without the TP attributes, the grad-norm and
+            # zero-count filters treat it as a TP duplicate and keep it only on TP rank 0.
+            tensor_parallel.set_tensor_model_parallel_attributes(
+                self.softmax_offset, is_parallel=True, dim=0, stride=1
+            )
         else:
             raise ValueError("Softmax type not supported")
 
