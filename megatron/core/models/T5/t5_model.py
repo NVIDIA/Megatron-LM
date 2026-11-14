@@ -181,6 +181,12 @@ class T5Model(LanguageModule):
                     "T5Model tied pipeline embedding/output stages require a usable embd group"
                 )
         super(T5Model, self).__init__(config=config, pg_collection=pg_collection)
+        if self.config.cross_entropy_mxfp8_grad:
+            # Only GPTModel builds the MXFP8 LM head that takes an MXFP8 logits gradient.
+            raise ValueError(
+                "cross_entropy_mxfp8_grad requires GPTModel's MXFP8 LM head; "
+                "T5Model builds a BF16 LM head."
+            )
 
         self.config: TransformerConfig = config
         self.encoder_config: TransformerConfig = encoder_config
