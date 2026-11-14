@@ -25,6 +25,7 @@ from megatron.core.rerun_state_machine import RerunMode, RerunState, RerunStateM
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule, WideResidualConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import is_torch_min_version
 from megatron.training import checkpointing
 from megatron.training.checkpointing import (
@@ -134,6 +135,65 @@ def test_checkpoint_backend_uses_config(
     monkeypatch.setattr(checkpointing, "_load_base_checkpoint", load_base)
     with pytest.raises(BackendReached):
         load_checkpoint([], None, None)
+
+
+def test_fsdp_dtensor_layer_fqn_map():
+    layer_number = 5
+    layer = mock.Mock(spec=TransformerLayer, layer_number=layer_number)
+    model = mock.Mock()
+    model.named_modules.return_value = [
+        ("module.decoder.layers.0", layer),
+        ("module.mtp.layers.0", layer),
+        ("module.decoder.final_layernorm", object()),
+    ]
+    assert checkpointing._get_fsdp_dtensor_layer_fqn_map(model) == {
+        "decoder.layers.0": f"decoder.layers.{layer_number - 1}"
+    }
+    layer.layer_number = 1
+    assert checkpointing._get_fsdp_dtensor_layer_fqn_map(model) == {}
+
+
+def test_translate_fsdp_dtensor_fqn():
+    layer_names = {"decoder.layers.0": "decoder.layers.4"}
+    for name, expected in [
+        ("decoder.layers.0", "decoder.layers.4"),
+        ("decoder.layers.0.weight_w", "decoder.layers.4.weight_w"),
+        ("module.model.decoder.layers.0.weight", "module.model.decoder.layers.4.weight"),
+        ("decoder.layers.10.weight", "decoder.layers.10.weight"),
+        ("output_layer.weight", "output_layer.weight"),
+    ]:
+        assert checkpointing._translate_fsdp_dtensor_fqn(name, layer_names) == expected
+
+
+def test_fsdp_dtensor_global_fqn_lookup():
+    chunks = []
+    for layer_number in (1, 5):
+        layer = TransformerLayer.__new__(TransformerLayer)
+        torch.nn.Module.__init__(layer)
+        layer.layer_number = layer_number
+        layer.weight = torch.nn.Parameter(torch.ones(1))
+        layer.tied_weight = layer.weight
+        chunk = torch.nn.Module()
+        chunk.module = torch.nn.Module()
+        chunk.module.decoder = torch.nn.Module()
+        chunk.module.decoder.layers = torch.nn.ModuleList([layer])
+        chunks.append(chunk)
+
+    config = SimpleNamespace(num_moe_experts=None)
+    lookup = checkpointing._build_fsdp_dtensor_global_fqn_lookup(config, chunks)
+    assert lookup.config is config
+    modules = dict(lookup.named_modules())
+    for chunk, layer_index in zip(chunks, (0, 4)):
+        layer = chunk.module.decoder.layers[0]
+        fqn = f"decoder.layers.{layer_index}"
+        assert lookup.get_parameter(f"{fqn}.weight") is layer.weight
+        assert lookup.get_parameter(f"module.{fqn}.weight") is layer.weight
+        assert lookup.get_parameter(f"{fqn}.tied_weight") is layer.weight
+        assert modules[fqn] is layer
+
+    chunks[1].module.decoder.layers[0].layer_number = 1
+    with pytest.raises(ValueError, match="Non-unique"):
+        checkpointing._build_fsdp_dtensor_global_fqn_lookup(config, chunks)
 
 
 class MockModel(MegatronModule):
