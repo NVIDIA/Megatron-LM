@@ -4,11 +4,16 @@
 import pytest
 import torch
 
+from megatron.core.extensions.transformer_engine import TEDotProductAttention
+from megatron.core.optimizer import OptimizerConfig
+from megatron.core.optimizer.optimizer import FP32Optimizer
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import CrossAttention
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
 
 """ 
@@ -132,3 +137,52 @@ class TestDotProductAttentionSoftcap:
         assert (without - wrong).abs().max() > 1e-3, "inputs do not separate the two caps"
 
         torch.testing.assert_close(with_scaling, without, rtol=1e-2, atol=1e-2)
+
+
+class TestLearnableSoftmaxOffsetGradNorm:
+    """Every TP head shard must contribute to the norm used for clipping."""
+
+    def setup_method(self, method):
+        if Utils.world_size < 2 or Utils.world_size % 2:
+            pytest.skip("requires an even world size of at least two")
+        Utils.initialize_model_parallel(2, 1)
+        self.pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=["tp", "cp"]
+        )
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("implementation", ["local", "transformer_engine"])
+    def test_softmax_offset_grad_norm_and_clipping(self, implementation):
+        if implementation == "transformer_engine" and not is_te_min_version("2.8.0"):
+            pytest.skip("learnable softmax requires Transformer Engine >= 2.8")
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=2,
+            kv_channels=64,
+            tensor_model_parallel_size=2,
+            sequence_parallel=True,
+            softmax_type="learnable",
+            perform_initialization=False,
+            params_dtype=torch.float32,
+        )
+        attention_cls = DotProductAttention if implementation == "local" else TEDotProductAttention
+        attention = attention_cls(
+            config, 1, AttnMaskType.causal, "self", pg_collection=self.pg_collection
+        )
+        param = attention.softmax_offset
+        # Rank-specific gradients expose dropping rank 1's distinct head shard.
+        gradient = 3.0 if self.pg_collection.tp.rank() == 0 else 4.0
+        param.grad = torch.full_like(param, gradient)
+        optimizer = FP32Optimizer(
+            torch.optim.SGD([param], lr=0.1), OptimizerConfig(), init_state_fn=None
+        )
+        optimizer.tp_group = self.pg_collection.tp
+        optimizer.grad_stats_parallel_group = self.pg_collection.tp
+
+        norm = optimizer.clip_grad_norm(1.0)
+
+        assert float(norm) == pytest.approx(5.0)
+        torch.testing.assert_close(param.grad, torch.full_like(param, gradient / 5.0))
