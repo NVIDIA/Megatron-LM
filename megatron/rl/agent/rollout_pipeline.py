@@ -227,11 +227,23 @@ class RolloutPipeline:
             request, [allocation.num_groups for allocation in self.allocations]
         )
         # Lag may be fractional or negative (>= -1): clamp and round the slot math at granularity.
+        # G and B slots return only when the trainer consumes a banked batch, so fewer than
+        # one batch of them could never bank one; R slots return when inference completes.
+        units_per_batch = self.gran_policy.units_per_batch()
+        min_capacity = 1 if self.gran_policy.submission == "R" else units_per_batch
+        capacity = round(parallel_generation_tasks * units_per_batch)
+        if capacity < min_capacity and self.gran_policy.submission == "G":
+            logger.warning(
+                "Generation lag %s leaves %d of the %d groups of a batch in flight; group "
+                "submission needs a whole batch, so the gate holds %d groups. Use rollout "
+                "submission granularity to cap in-flight requests below one batch.",
+                parallel_generation_tasks - 1,
+                capacity,
+                units_per_batch,
+                min_capacity,
+            )
         self.gate = _SubmissionGate(
-            capacity=max(
-                1, round(parallel_generation_tasks * self.gran_policy.units_per_batch())
-            ),
-            submission=self.gran_policy.submission,
+            capacity=max(min_capacity, capacity), submission=self.gran_policy.submission
         )
         rollouts_per_batch = self.gran_policy.num_groups_per_batch * request.rollouts_per_group
         self.num_infer_workers = self.gate.capacity * (
