@@ -2816,6 +2816,57 @@ def test_snapshot_live_requests(replay):
         other_loop.close()
 
 
+def test_snapshot_routing_after_a_stop_removes_every_generated_token():
+    """An unkept stop can remove every token a finished prefill generated, a step before the
+    request completes. Its prompt still ran forward, so a snapshot carries that routing, as the
+    completion would; a segment whose last prefill chunk is unscheduled or in flight has none."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._loop = asyncio.new_event_loop()
+    active = Status.ACTIVE_AND_GENERATING_TOKENS
+    finished, in_flight, unscheduled = (
+        _make_request_entry(engine._loop, request_id, active, resolve=False)
+        for request_id in (1, 2, 3)
+    )
+    engine.requests = {1: finished, 2: in_flight, 3: unscheduled}
+    for entry in engine.requests.values():
+        request = entry.record[-1]
+        # The detected stop removed the only token; its reason marks the coming completion.
+        request.finish_reason, request.generated_tokens = "stop", []
+        request.remaining_prompt_tokens = request.prompt_tokens.new_empty(0)
+    unscheduled.record[-1].remaining_prompt_tokens = torch.tensor([2])
+    routing = {10: np.full((1, 1, 2), 1), 20: np.full((1, 1, 2), 2), 30: np.full((1, 1, 2), 3)}
+    reads = []
+
+    def reconstruct(block_ids, total_routing_tokens):
+        reads.append((block_ids, total_routing_tokens))
+        return routing[block_ids[0]]
+
+    engine.context = types.SimpleNamespace(
+        request_ids=object(),
+        kv_block_allocator=types.SimpleNamespace(
+            routing_replay=types.SimpleNamespace(
+                has_data=mock.Mock(return_value=True), reconstruct_routing_from_blocks=reconstruct
+            )
+        ),
+        get_index_of_request={1: 0, 2: 1, 3: 2}.__getitem__,
+        get_committed_kv_block_ids=[[10], [20], [30]].__getitem__,
+        # Request 2's last prefill chunk is still in flight.
+        request_in_prefill_status_tensor=torch.tensor([0, 1, 0]),
+    )
+    try:
+        snapshots = engine._loop.run_until_complete(engine.snapshot_live_requests())
+    finally:
+        engine._loop.close()
+
+    routed = {s.request_id: s.payload.routing_indices for s in snapshots}
+    # The two-token prompt routes one token: every token but the last ran forward.
+    assert routed[1].tolist() == routing[10].tolist()
+    assert routed[2] is None and routed[3] is None
+    assert reads == [([10], 1)]
+    resumed = ResumedGeneration.from_snapshot(next(s for s in snapshots if s.request_id == 1))
+    assert resumed.finish_reason == "stop" and resumed.routing_indices.tolist() == [[[1, 1]]]
+
+
 def test_vision_state_invalidation_marks_request_local_embeddings_stale():
     request = DynamicVLMInferenceRequest(
         request_id=31,
