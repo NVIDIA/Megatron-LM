@@ -23,6 +23,17 @@ class TestSamplingParams:
             for name, value in expected.items():
                 assert getattr(params, name) == value
 
+    @pytest.mark.parametrize(
+        'given',
+        [{'temperature': 0.0}, {'temperature': 0.0, 'top_k': 20, 'top_p': 0.95}],
+        ids=['no-filters', 'model-card-filters'],
+    )
+    def test_zero_temperature_is_greedy(self, given):
+        # Greedy is top_k=1 (the lowest-index argmax) for every caller, not only the HTTP
+        # front ends; a top-p after top-1 keeps the same token.
+        for params in (SamplingParams(**given), SamplingParams.deserialize(given)):
+            assert (params.top_k, params.top_p) == (1, 0.0)
+
     def test_sampling_params(self):
         sampling_params = SamplingParams()
         sampling_params.add_attributes({"min_tokens": 45})

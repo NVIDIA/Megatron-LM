@@ -204,9 +204,6 @@ def parse_sampling_params(req, app_config, tokenizer, *, completions_mode, retur
     _log_sampling_defaults_once(
         tokenizer, {"temperature": temperature, "top_p": top_p, "top_k": top_k}
     )
-    if temperature == 0.0:
-        top_k = 1
-        top_p = 0.0
 
     if completions_mode:
         echo = bool(req.get("echo", False))

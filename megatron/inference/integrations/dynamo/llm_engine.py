@@ -102,10 +102,7 @@ def build_sampling_params(request: GenerateRequest) -> SamplingParams:
     params.return_log_probs = token_logprobs == 0
     params.skip_prompt_log_probs = True
     params.detokenize_generations = False
-    params.add_attributes({})
-    if params.temperature == 0.0:
-        params.top_k = 1
-        params.top_p = 0.0
+    params.add_attributes({})  # Normalizes the filters, e.g. temperature 0 to greedy.
     return params
 
 

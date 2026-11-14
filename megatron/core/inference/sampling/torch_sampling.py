@@ -32,8 +32,15 @@ class TorchSampling(Sampling):
 
     @staticmethod
     def _modify_logits_for_top_k_filtering(logits: Tensor, top_k: int) -> None:
-        """In-place: set logits outside the top-k set to -inf."""
-        filter_ = logits < torch.topk(logits, top_k)[0][..., -1, None]
+        """In-place: set logits outside the top-k set to -inf.
+
+        Top-1 is greedy and keeps only the lowest-index maximum, the token `torch.argmax` picks.
+        """
+        if top_k == 1:
+            filter_ = torch.ones_like(logits, dtype=torch.bool)
+            filter_.scatter_(-1, logits.argmax(dim=-1, keepdim=True), False)
+        else:
+            filter_ = logits < torch.topk(logits, top_k)[0][..., -1, None]
         logits.masked_fill_(filter_, float("-Inf"))
 
     @staticmethod
@@ -62,13 +69,15 @@ class TorchSampling(Sampling):
     ) -> Tensor:
         """Temperature-scale then top-k/top-p filter logits; filtered entries become -inf.
 
-        Returns a new tensor (input unmodified). Shared by `sample_from_logits` and
+        Scaling runs in fp32 whatever the logits' dtype. With both filters active, top-p
+        applies to the renormalized top-k set (FlashInfer's `top_k_first` order).
+
+        Returns a new fp32 tensor (input unmodified). Shared by `sample_from_logits` and
         `log_probs_kernel` so sampling and processed log-probs apply the same filter.
         """
-        top_p_active = not is_no_op_top_p(top_p)
-        assert not (top_k > 0 and top_p_active), "Cannot have top-p and top-k both active"
-        # Clone needed: .div_() and the filters below modify in-place.
-        last_token_logits = last_token_logits.clone()
+        # An fp32 copy: .div_() and the filters below modify in-place, and dividing bf16 logits
+        # in bf16 would round the scaled logits, and so the distribution, to bf16 precision.
+        last_token_logits = last_token_logits.to(torch.float32, copy=True)
         if temperature != 1.0:
             last_token_logits.div_(max(temperature, MIN_SAMPLING_TEMPERATURE))
         if not is_no_op_top_k(top_k):
@@ -76,7 +85,7 @@ class TorchSampling(Sampling):
             if vocab_size:
                 assert top_k < vocab_size, "top-k is larger than vocab size."
             TorchSampling._modify_logits_for_top_k_filtering(last_token_logits, top_k)
-        elif top_p_active:
+        if not is_no_op_top_p(top_p):
             TorchSampling._modify_logits_for_top_p_filtering(last_token_logits, top_p)
         return last_token_logits
 
@@ -99,8 +108,9 @@ class TorchSampling(Sampling):
         Args:
             last_token_logits: Logits of shape `[batch_size, vocab_size]`.
             temperature: Temperature scaling factor.
-            top_k: Top-k filtering value (0 = disabled).
-            top_p: Top-p (nucleus) filtering value (0.0 or >= 1.0 = disabled).
+            top_k: Top-k filtering value (0 = disabled, 1 = greedy argmax).
+            top_p: Top-p (nucleus) filtering value (0.0 or >= 1.0 = disabled), applied to
+                the renormalized top-k set when top-k is also active.
             generator: Shared RNG for requests without an explicit seed.
             row_seeds: Optional per-row request seeds. None entries use the shared RNG.
                 Explicit seeds do not advance that RNG.
@@ -113,9 +123,6 @@ class TorchSampling(Sampling):
         """
         assert isinstance(top_p, float)
         assert isinstance(top_k, int)
-        assert not (
-            top_k > 0 and not is_no_op_top_p(top_p)
-        ), "Cannot have top-p and top-k both active"
         if row_seeds is not None and any(seed is not None for seed in row_seeds):
             assert last_token_logits.is_cuda, "Request-local seeded sampling requires CUDA logits"
         if top_k == 1:
@@ -232,7 +239,7 @@ class TorchSampling(Sampling):
             n: Number of rows to sample.
             context: The active DynamicInferenceContext.
             no_top_k, no_top_p: Batch-level dispatch flags (part of the shared kernel
-                contract). Used only to gate the all-greedy argmax shortcut; the exact
+                contract). `no_top_k` only gates the all-greedy argmax shortcut; the exact
                 per-bucket sort otherwise handles any top-k / top-p combination.
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: When set, the loop dispatches per-token rather than
@@ -253,15 +260,13 @@ class TorchSampling(Sampling):
         md = context.active_request_metadata
 
         # With top-k=1 for every request, every row uses argmax regardless of
-        # temperature or its request mapping. Avoid building GPU bucket indices,
+        # temperature, top-p or its request mapping. Avoid building GPU bucket indices,
         # torch.isin masks, and the scatter that otherwise serialize this eager
         # sampling path once for the base logits and once per MTP depth.
         if (
             active_request_count > 0
             and not no_top_k
-            and no_top_p
             and bool((md["top_k"][:active_request_count] == 1).all())
-            and bool((md["top_p"][:active_request_count] == 0.0).all())
         ):
             selected_logits = (
                 logits[gather_indices[:n], :] if gather_indices is not None else logits[:n, :]

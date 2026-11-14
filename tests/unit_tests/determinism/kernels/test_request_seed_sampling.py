@@ -57,7 +57,10 @@ def test_request_noise_replays_and_preserves_logical_coordinates():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_uniform_greedy_rows_ignore_request_seeds():
-    """An all-greedy batch takes per-row argmax, seeded or not, and never draws from the RNG."""
+    """An all-greedy batch takes per-row argmax, seeded or not, and never draws from the RNG.
+
+    Top-1 then top-p keeps the argmax, so a greedy row's top-p does not matter either.
+    """
     count = 4
     context = SimpleNamespace(
         total_request_count=count,
@@ -67,7 +70,7 @@ def test_uniform_greedy_rows_ignore_request_seeds():
             "seed": torch.tensor([7, -1, (1 << 63) - 1, 0], dtype=torch.int64),
             "temperature": torch.tensor([0.5, 1.0, 2.0, 1.0]),
             "top_k": torch.ones(count, dtype=torch.int32),
-            "top_p": torch.zeros(count),
+            "top_p": torch.tensor([0.0, 0.9, 0.0, 0.5]),
         },
         get_active_sequence_lengths=lambda: torch.tensor([3, 5, 8, 13]),
     )
@@ -80,7 +83,7 @@ def test_uniform_greedy_rows_ignore_request_seeds():
 
     def sample(logits, gather):
         return sampling.sample_kernel(
-            logits, count, context, no_top_k=False, no_top_p=True, gather_indices=gather
+            logits, count, context, no_top_k=False, no_top_p=False, gather_indices=gather
         )
 
     reference, _ = assert_replays_bit_exact(
@@ -88,3 +91,43 @@ def test_uniform_greedy_rows_ignore_request_seeds():
     )
     assert torch.equal(reference["out"], logits[gather].argmax(dim=-1))
     assert torch.equal(rng_before, sampling._rng.get_state())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_seeded_top_k_top_p_rows_replay_and_ignore_batch_layout():
+    """Seeded rows with both top-k and top-p, on bf16 logits scaled in fp32, replay bit-exact
+    and draw the same token alone as in their batch."""
+    vocab_size = 4099
+    seeds = torch.tensor([11, 12, (1 << 63) - 1, 0], dtype=torch.int64)
+
+    def context(rows):
+        return SimpleNamespace(
+            total_request_count=len(rows),
+            paused_request_count=0,
+            config=SimpleNamespace(num_speculative_tokens=0),
+            active_request_metadata={
+                "seed": seeds[rows],
+                "temperature": torch.full((len(rows),), 0.7),
+                "top_k": torch.full((len(rows),), 50, dtype=torch.int32),
+                "top_p": torch.full((len(rows),), 0.9),
+            },
+            get_active_sequence_lengths=lambda: torch.full((len(rows),), 19),
+        )
+
+    sampling = TorchSampling(torch.Generator(device="cuda").manual_seed(3), vocab_size)
+    generator = torch.Generator(device="cuda").manual_seed(1)
+    logits = (4 * torch.randn(4, vocab_size, device="cuda", generator=generator)).bfloat16()
+
+    def sample(logits):
+        return sampling.sample_kernel(
+            logits, 4, context([0, 1, 2, 3]), no_top_k=False, no_top_p=False
+        )
+
+    reference, _ = assert_replays_bit_exact(
+        sample, (logits,), backward=False, contention=True, what="seeded_top_k_top_p_sampling"
+    )
+    for row in range(4):
+        alone = sampling.sample_kernel(
+            logits[row : row + 1], 1, context([row]), no_top_k=False, no_top_p=False
+        )
+        assert torch.equal(alone, reference["out"][row : row + 1])

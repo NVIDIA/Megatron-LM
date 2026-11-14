@@ -97,8 +97,6 @@ class MegatronGenerate(Resource):
             top_p = request.get_json()["top_p"]
             if not (isinstance(top_p, float)):
                 return "top_p must be a positive float less than or equal to 1.0"
-            if top_p > 0.0 and top_k > 0.0:
-                return "cannot set both top-k and top-p samplings."
             if not (0 <= top_p <= 1.0):
                 return "top_p must be less than or equal to 1.0"
 
