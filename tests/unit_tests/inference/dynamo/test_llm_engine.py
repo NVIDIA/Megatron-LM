@@ -451,6 +451,33 @@ async def test_streaming_generation_forwards_selected_log_probs():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop_conditions", "generated", "engine_reason"),
+    [
+        # A stop token generated as the last budgeted token.
+        ({"max_tokens": 2, "stop_token_ids": [8]}, [7, 8], "stop"),
+        # A budget the engine clamped to the context length.
+        ({"max_tokens": 200}, [7, 8], "length"),
+        # No budget: the engine generates to the context length.
+        ({}, [7, 8], "length"),
+    ],
+)
+async def test_streaming_generation_reports_engine_finish_reason(
+    stop_conditions, generated, engine_reason
+):
+    stream = _stream({"final": {"generated_tokens": generated, "finish_reason": engine_reason}})
+    engine = MegatronLLMEngine(_config())
+    engine.client = SimpleNamespace(add_request_streaming=MagicMock(return_value=stream))
+    request = {"token_ids": [1], "sampling_options": {}, "stop_conditions": stop_conditions}
+
+    chunks = [chunk async for chunk in engine.generate(request, _Context())]
+
+    assert len(chunks) == 1
+    assert chunks[0]["finish_reason"] == engine_reason
+    assert chunks[0]["completion_usage"]["completion_tokens"] == len(generated)
+
+
+@pytest.mark.asyncio
 async def test_streaming_generation_rejects_misaligned_log_probs():
     stream = _stream({"partial": {"new_tokens": [7], "new_log_probs": []}})
     engine = MegatronLLMEngine(_config())
