@@ -47,6 +47,8 @@ def test_native_optimizer_step_replays():
         reference = None
         for replay in range(3):
             model = copy.deepcopy(initial)
+            # Parameter deepcopy drops custom attributes, including expert ownership.
+            model.block.experts.weight.allreduce = False
             wrapper = TorchMimoFSDP(
                 config,
                 DistributedDataParallelConfig(grad_reduce_in_fp32=True),
