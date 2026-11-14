@@ -329,6 +329,21 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         assert self.config.kv_channels is not None
         assert self.config.num_query_groups is not None
 
+        # YaRN scales q and k by the concentration factor, so the attention logits by its square.
+        # TE's fused RoPE takes no scale: with RoPE fusion, the square goes into the softmax scale.
+        # That is exact only if RoPE covers the whole head; forward() checks it.
+        self._rope_mscale = self._yarn_concentration_factor
+        if (
+            config.apply_rope_fusion
+            and self._yarn_concentration_factor != 1.0
+            and not config.multi_latent_attention
+        ):
+            base_scale = config.softmax_scale
+            if base_scale is None:
+                base_scale = config.kv_channels**-0.5
+            self.softmax_scale = base_scale * self._yarn_concentration_factor**2
+            self._rope_mscale = 1.0
+
         # For normal attention without groups, num_query_groups == num_attention_heads,
         # so these two will be the same
         self.query_projection_size = self.config.kv_channels * self.config.num_attention_heads
@@ -386,7 +401,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             attn_mask_type=self.attn_mask_type,
             attention_type=self.attention_type,
             cp_comm_type=cp_comm_type,
-            softmax_scale=self.config.softmax_scale,
+            softmax_scale=getattr(self, "softmax_scale", self.config.softmax_scale),
             pg_collection=self.pg_collection,
         )
 
@@ -730,7 +745,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             elif rotary_pos_emb is not None:
                 q_pos_emb, k_pos_emb = rotary_pos_emb
                 key = inference_context.apply_rotary_emb_key(
-                    key, k_pos_emb, self.config, cp_group, mscale=self._yarn_concentration_factor
+                    key, k_pos_emb, self.config, cp_group, mscale=self._rope_mscale
                 )
 
                 rotary_pos_emb = (q_pos_emb, None)  # key rotary emb has been applied
@@ -780,7 +795,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         """Return the softmax scaling value to use.
 
         Tries, in order:
-        - `self.softmax_scale` (should only be assigned for MLA),
+        - `self.softmax_scale` (assigned for MLA, and for YaRN with RoPE fusion),
         - `self.config.softmax_scale`, and if that is `None`, uses
         - 1 / sqrt(Q head dim), as per `query_tensor` and `head_dim_index`.
         """
@@ -1474,6 +1489,17 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
             rotary_pos_emb = (rotary_pos_emb,) * 2
 
+        # Partial RoPE scales only the rotated dims, which a softmax-scale factor can't express.
+        if rotary_pos_emb is not None and self._rope_mscale != self._yarn_concentration_factor:
+            if any(
+                emb is not None and emb.shape[-1] != self.hidden_size_per_attention_head
+                for emb in rotary_pos_emb
+            ):
+                raise ValueError(
+                    "YaRN with apply_rope_fusion needs RoPE on the whole head dim. "
+                    "Set apply_rope_fusion=False for partial rotary (rotary_percent < 1)."
+                )
+
         # =====================
         # Query, Key, and Value
         # =====================
@@ -1631,7 +1657,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                             q_pos_emb,
                             config=self.config,
                             cu_seqlens=cu_seqlens_q,
-                            mscale=self._yarn_concentration_factor,
+                            mscale=self._rope_mscale,
                             cp_group=runtime_cp_group,
                             max_seqlen=rope_freqs_max_seqlen,
                         )
@@ -1642,7 +1668,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                             self.config,
                             cu_seqlens_q,
                             runtime_cp_group,
-                            mscale=self._yarn_concentration_factor,
+                            mscale=self._rope_mscale,
                         )
                 if k_pos_emb is not None:
                     key = apply_rotary_pos_emb(
@@ -1650,7 +1676,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
                         k_pos_emb,
                         config=self.config,
                         cu_seqlens=cu_seqlens_kv,
-                        mscale=self._yarn_concentration_factor,
+                        mscale=self._rope_mscale,
                         cp_group=runtime_cp_group,
                         max_seqlen=rope_freqs_max_seqlen,
                     )
