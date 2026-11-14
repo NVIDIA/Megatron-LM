@@ -672,7 +672,8 @@ class TransformerConfig(ModelParallelConfig):
     activation_func_tanh_clamp_scale is set."""
 
     fused_single_qkv_rope: bool = False
-    """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
+    """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads.
+    With qk_layernorm (TE RMSNorm), the Q/K norm is fused into the same Triton kernel."""
 
     fused_residual_rmsnorm: bool = False
     """If True, fuses residual connection and RMSNorm backward pass when TE is used."""

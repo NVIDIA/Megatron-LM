@@ -176,9 +176,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="attention_kernels_and_dispatch",
         sources=("megatron/core/transformer/attention.py",),
-        tests=(K + "test_fused_activations.py", K + "test_runtime_cp_attention.py"),
+        tests=(
+            K + "test_fused_activations.py",
+            K + "test_runtime_cp_attention.py",
+            K + "test_fused_triton_kernels.py",
+        ),
         kind="dispatch",
         notes="Attention._apply_output_gate is replayed in test_fused_activations.py. "
+        "fused_single_qkv_rope with qk_layernorm dispatches to fused_qkv_qknorm_rope, replayed "
+        "in test_fused_triton_kernels.py. "
         "Packed SelfAttention dispatch through RoPE and TE attention is replayed with runtime "
         "CP1/CP2/CP4, including input/parameter gradients and CP-state restoration, in "
         "test_runtime_cp_attention.py. The dynamic-inference flash_decode_and_prefill "
@@ -252,6 +258,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_fused_triton_kernels.py",),
         kind="triton",
         notes="Elementwise with unique stores; bit-identical to the two unfused adds it replaces.",
+    ),
+    KernelEntry(
+        name="fused_qkv_qknorm_rope",
+        sources=("megatron/core/fusions/fused_qkv_qknorm_rope.py",),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="triton",
+        notes="Per-head tl.sum reductions; Q/K norm-weight grads summed from per-program "
+        "partials in a fixed order. Fwd+bwd replay at both backward warp settings.",
     ),
     KernelEntry(
         name="fused_mla_yarn_rope",
