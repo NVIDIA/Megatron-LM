@@ -360,9 +360,11 @@ class TestRegisterExternalPool:
         return calls
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="warmup tensor needs CUDA")
-    def test_registers_once_per_pool_and_group(self, calls):
+    def test_registers_once_per_pool_and_group(self, calls, monkeypatch):
         pool_a, pool_b = object(), object()
         g = _StubGroup(name="g")
+        # Teardown deregisters a pool only while its group still exists.
+        monkeypatch.setitem(dist.distributed_c10d._world.pg_map, g, None)
         try:
             gtp_symm.register_external_pool(pool_a, g)
             gtp_symm.register_external_pool(pool_a, g)
@@ -378,8 +380,10 @@ class TestRegisterExternalPool:
         assert not gtp_symm._registered_ext_pools
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="warmup tensor needs CUDA")
-    def test_failed_registration_is_rolled_back(self, calls):
+    def test_failed_registration_is_rolled_back(self, calls, monkeypatch):
         pool, group_a, group_fail = object(), _StubGroup(name="a"), _StubGroup(name="fail")
+        # Teardown deregisters a pool only while its group still exists.
+        monkeypatch.setitem(dist.distributed_c10d._world.pg_map, group_a, None)
         try:
             gtp_symm.register_external_pool(pool, group_a)
             with pytest.raises(RuntimeError, match="window registration failed"):
