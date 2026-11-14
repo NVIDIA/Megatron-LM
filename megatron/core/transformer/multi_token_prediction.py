@@ -1199,6 +1199,7 @@ def process_mtp_loss(
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
+    cp_size = cp_group.size() if cp_group is not None else 1
 
     cumulative_mtp_input_mask = None
     rolled_num_tokens = original_num_tokens
@@ -1323,13 +1324,27 @@ def process_mtp_loss(
             mtp_layer_number, head_input, mtp_labels, layer_loss_mask
         )
 
+        # CP ranks own disjoint parts of the same examples. Use their combined
+        # counts so moving a target across a CP boundary cannot change its weight,
+        # including when a rank has no LM targets but receives a rolled MTP target.
+        if cp_size > 1:
+            token_counts = torch.stack((original_num_tokens, num_tokens))
+            torch.distributed.all_reduce(
+                token_counts, op=torch.distributed.ReduceOp.SUM, group=cp_group
+            )
+            normalization_original_tokens, normalization_tokens = token_counts.unbind()
+        else:
+            normalization_original_tokens = original_num_tokens
+            normalization_tokens = num_tokens
+        safe_normalization_tokens = normalization_tokens.clamp(min=1)
+
         if is_training:
             # Logging only: detach so nothing here keeps this head's graph alive.
             mtp_loss_for_log = torch.sum(mtp_loss.detach())
             if not config.calculate_per_token_loss:
                 mtp_loss_for_log = (
-                    mtp_loss_for_log * (num_tokens > 0).to(mtp_loss.dtype)
-                ) / num_tokens.clamp(min=1)
+                    mtp_loss_for_log * (normalization_tokens > 0).to(mtp_loss.dtype) * cp_size
+                ) / safe_normalization_tokens
 
             if metric_avg_group is None:
                 # Compatibility fallback for callers that have not migrated to explicit groups.
@@ -1355,25 +1370,19 @@ def process_mtp_loss(
             mtp_loss_normalized = mtp_loss_scale * mtp_loss
         elif config.calculate_per_token_loss:
             # finalize_model_grads divides by the global main-loss token count.
-            # Use one main/MTP token ratio for this logical microbatch, independent
-            # of its CP partition. Rolling and masking can leave different ratios
-            # (or no valid tokens) on individual ranks. Keep the local counts above
-            # unchanged for logging, which reduces them separately over DP+CP.
-            normalization_tokens = torch.stack((original_num_tokens, num_tokens))
-            if cp_group is not None and cp_group.size() > 1:
-                torch.distributed.all_reduce(
-                    normalization_tokens, op=torch.distributed.ReduceOp.SUM, group=cp_group
-                )
-            main_num_tokens, mtp_num_tokens = normalization_tokens.unbind()
-            # Clamp only after the collective; empty ranks must participate too.
+            # Use the CP-wide main/MTP ratio for this logical microbatch. Keep
+            # local counts unchanged for logging, which sums them over DP+CP.
             # This preserves CP partition invariance, not a global MTP-token mean
             # across different DP microbatches with different main/MTP ratios.
             mtp_loss_normalized = (
-                mtp_loss_scale * mtp_loss * (main_num_tokens / mtp_num_tokens.clamp(min=1))
+                mtp_loss_scale
+                * mtp_loss
+                * (normalization_original_tokens / safe_normalization_tokens)
             )
         else:
-            safe_num_tokens = num_tokens.clamp(min=1)
-            mtp_loss_normalized = mtp_loss_scale * mtp_loss / safe_num_tokens
+            # The legacy path averages parameter gradients over DP and CP.
+            # Compensate the CP average when using a CP-wide denominator.
+            mtp_loss_normalized = mtp_loss_scale * cp_size * mtp_loss / safe_normalization_tokens
 
         if early_backward:
             # Same upstream gradient MTPLossAutoScaler.backward would supply, applied now. This
