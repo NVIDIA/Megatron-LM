@@ -972,6 +972,13 @@ class StepPostProcessingMixin:
             if tpot_is_token_aligned[id(segment)]:
                 segment.tpot = segment.tpot[:-trim]
 
+            # A resumed segment carries the routing of every token but its last.
+            # Keep it aligned with the tokens, or the merged result cannot cover
+            # the visible sequence and drops its routing.
+            routing_indices = getattr(segment, "routing_indices", None)
+            if routing_indices is not None:
+                segment.routing_indices = routing_indices[:-trim]
+
             generated_event_indexes = [
                 idx
                 for idx, event in enumerate(segment.events)
