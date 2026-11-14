@@ -32,6 +32,8 @@ try:
     import triton
     import triton.language as tl
 
+    from megatron.core.inference.triton_pdl import gdc_wait, pdl_enabled, pdl_launch_kwargs
+
     HAVE_STREAMWISE_TRITON = True
 except ImportError:
     HAVE_STREAMWISE_TRITON = False
@@ -231,8 +233,11 @@ if HAVE_STREAMWISE_TRITON:
         NUM_STREAMS: tl.constexpr,
         BLOCK_BATCH: tl.constexpr,
         BLOCK_WIDTH: tl.constexpr,
+        USE_PDL: tl.constexpr = False,
     ) -> None:
         """Read full-width streams while forming sigmoid factors in registers."""
+        if USE_PDL:
+            gdc_wait()
 
         pid_batch = tl.program_id(0)
         pid_width = tl.program_id(1)
@@ -313,8 +318,11 @@ if HAVE_STREAMWISE_TRITON:
         BLOCK_BATCH: tl.constexpr,
         BLOCK_WIDTH: tl.constexpr,
         HAS_RETENTION: tl.constexpr,
+        USE_PDL: tl.constexpr = False,
     ) -> None:
         """Write one update to every stream with optional learned retained carry."""
+        if USE_PDL:
+            gdc_wait()
 
         pid_batch = tl.program_id(0)
         pid_width = tl.program_id(1)
@@ -610,6 +618,8 @@ def _streamwise_sigmoid_read_triton(
         block_batch,
         block_width,
         num_warps=num_warps,
+        USE_PDL=pdl_enabled(),
+        **pdl_launch_kwargs(),
     )
     return _unflatten_leading(output, leading)
 
@@ -679,6 +689,8 @@ def _streamwise_sigmoid_write_triton(
         block_width,
         retention_logits is not None,
         num_warps=num_warps,
+        USE_PDL=pdl_enabled(),
+        **pdl_launch_kwargs(),
     )
     return _unflatten_leading(output, leading)
 

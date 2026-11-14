@@ -17,6 +17,8 @@ try:
     import triton
     import triton.language as tl
 
+    from megatron.core.inference.triton_pdl import gdc_wait, pdl_enabled, pdl_launch_kwargs
+
     HAVE_TRITON = True
 except ImportError:
     from unittest.mock import MagicMock
@@ -40,8 +42,11 @@ def _zero_padding_rows_kernel(  # pragma: no cover
     first_token_idx,  # token index of row 0
     BLOCK_M: tl.constexpr,  # rows per program
     BLOCK_N: tl.constexpr,  # elements per row per program
+    USE_PDL: tl.constexpr = False,
 ):
     """Store zeros to rows whose token index is at or past the real token count."""
+    if USE_PDL:
+        gdc_wait()
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
 
@@ -81,6 +86,8 @@ def zero_padding_rows(tensor: Tensor, real_token_count: Tensor, first_token_idx:
             first_token_idx,
             BLOCK_M=block_m,
             BLOCK_N=block_n,
+            USE_PDL=pdl_enabled(),
+            **pdl_launch_kwargs(),
         )
         return
 

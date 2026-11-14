@@ -19,6 +19,8 @@ try:
     import triton
     import triton.language as tl
 
+    from megatron.core.inference.triton_pdl import gdc_wait, pdl_enabled, pdl_launch_kwargs
+
     HAVE_TRITON = True
 except ImportError:
     from unittest.mock import MagicMock
@@ -41,8 +43,11 @@ def _mask_routing_padding_kernel(
     TOPK: tl.constexpr,  # actual topk
     BLOCK_M: tl.constexpr,  # rows per program
     BLOCK_TOPK: tl.constexpr,  # next_power_of_2(TOPK), column block
+    USE_PDL: tl.constexpr = False,
 ):
     """Fill `routing_map[real_token_count:, :]` with -1, BLOCK_M rows per program."""
+    if USE_PDL:
+        gdc_wait()
     pid = tl.program_id(0)
     rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
 
@@ -98,4 +103,6 @@ def mask_routing_padding(
         TOPK=topk,
         BLOCK_M=BLOCK_M,
         BLOCK_TOPK=BLOCK_TOPK,
+        USE_PDL=pdl_enabled(),
+        **pdl_launch_kwargs(),
     )

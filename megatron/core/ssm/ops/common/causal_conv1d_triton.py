@@ -10,6 +10,8 @@ try:
     import triton
     import triton.language as tl
 
+    from megatron.core.inference.triton_pdl import gdc_wait, pdl_enabled, pdl_launch_kwargs
+
     HAVE_TRITON = True
 except ImportError:
     from unittest.mock import MagicMock
@@ -57,8 +59,11 @@ def causal_conv1d_update_kernel(
     HAS_STATE_INDICES: tl.constexpr,
     HAS_INT_STATE: tl.constexpr,
     SILU_ACTIVATION: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     """Triton implementation of causal_conv1d_update (kernel)."""
+    if USE_PDL:
+        gdc_wait()
     batch_id = tl.program_id(0)
     channel_block_id = tl.program_id(1)
 
@@ -318,6 +323,8 @@ def causal_conv1d_update(
         HAS_STATE_INDICES=has_state_indices,
         HAS_INT_STATE=has_int_state,
         SILU_ACTIVATION=silu_activation == "silu",
+        USE_PDL=pdl_enabled(),
+        **pdl_launch_kwargs(),
     )
 
     if is_2d:
