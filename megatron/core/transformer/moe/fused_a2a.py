@@ -3,7 +3,9 @@
 # Copyright (c) 2025 DeepSeek
 # Licensed under the MIT License - https://github.com/deepseek-ai/DeepEP/blob/main/LICENSE
 
+import functools
 import inspect
+import warnings
 from typing import Callable, Optional
 
 from megatron.core.utils import internal_api
@@ -24,12 +26,51 @@ try:
 except ImportError:
     HAVE_DEEP_EP = False
 
-try:
-    from deep_ep import ElasticBuffer
 
-    HAVE_DEEP_EP_V2 = True
-except ImportError:
-    HAVE_DEEP_EP_V2 = False
+def _import_deep_ep_v2_buffer():
+    """Return the DeepEP v2 buffer class, or None if the installed deep_ep has none.
+
+    DeepEP 2.5 renamed ElasticBuffer (DeepEP 2.1) to EPBuffer (deepseek-ai/DeepEP#763).
+    """
+    try:
+        from deep_ep import EPBuffer
+
+        return EPBuffer
+    except ImportError:
+        pass
+    try:
+        from deep_ep import ElasticBuffer
+
+        return ElasticBuffer
+    except ImportError:
+        return None
+
+
+DeepEPV2Buffer = _import_deep_ep_v2_buffer()
+HAVE_DEEP_EP_V2 = DeepEPV2Buffer is not None
+
+
+def _warn_if_no_deep_ep_buffer(have_deep_ep: bool, have_deep_ep_v2: bool) -> None:
+    """Warn when deep_ep imports but provides no buffer class the deepep or deepepv2 backend uses.
+
+    Without this, a DeepEP release that renames its buffer classes disables both backends silently.
+    """
+    if have_deep_ep or have_deep_ep_v2:
+        return
+    try:
+        import deep_ep
+    except ImportError:
+        return
+    warnings.warn(
+        f"deep_ep {getattr(deep_ep, '__version__', '(unknown version)')} is installed but provides "
+        "none of Buffer, ElasticBuffer or EPBuffer, so the 'deepep' and 'deepepv2' flex dispatcher "
+        "backends are unavailable.",
+        UserWarning,
+        stacklevel=2,
+    )
+
+
+_warn_if_no_deep_ep_buffer(HAVE_DEEP_EP, HAVE_DEEP_EP_V2)
 
 import torch
 
@@ -88,7 +129,7 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
 def get_elastic_buffer(
     group: torch.distributed.ProcessGroup, num_max_tokens_per_rank: int, hidden: int, num_topk: int
 ):
-    """Get or create a DeepEP v2 elastic buffer for all-to-all communication."""
+    """Get or create a DeepEP v2 buffer for all-to-all communication."""
     global _elastic_buffer
 
     if _elastic_buffer is None or _elastic_buffer.group != group:
@@ -96,7 +137,7 @@ def get_elastic_buffer(
         # get_buffer_size_hint(); a fresh group's pointer may still be null.
         torch.distributed.all_reduce(torch.zeros(1, device="cuda"), group=group)
 
-    num_bytes = ElasticBuffer.get_buffer_size_hint(
+    num_bytes = DeepEPV2Buffer.get_buffer_size_hint(
         group, num_max_tokens_per_rank=num_max_tokens_per_rank, hidden=hidden, num_topk=num_topk
     )
 
@@ -106,7 +147,7 @@ def get_elastic_buffer(
         or _elastic_buffer.num_bytes < num_bytes
         or _elastic_buffer.num_max_tokens_per_rank < num_max_tokens_per_rank
     ):
-        _elastic_buffer = ElasticBuffer(
+        _elastic_buffer = DeepEPV2Buffer(
             group,
             num_bytes=num_bytes,
             num_max_tokens_per_rank=num_max_tokens_per_rank,
@@ -316,8 +357,23 @@ else:
     set_deepep_num_sms = None
 
 
+@functools.lru_cache(maxsize=None)
+def _dispatch_copies_topk_idx(buffer_cls: type) -> bool:
+    """Return whether ``buffer_cls.dispatch`` stores its own copy of ``topk_idx`` in the handle.
+
+    DeepEP 2.1 ``ElasticBuffer.dispatch`` clones it by default (``do_handle_copy=True``).
+    DeepEP 2.5 ``EPBuffer.dispatch`` keeps the caller's tensor, rejects ``do_handle_copy=True``,
+    and asserts that the tensor is not modified while the handle is in use.
+    """
+    try:
+        parameter = inspect.signature(buffer_cls.dispatch).parameters.get("do_handle_copy")
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.default is True
+
+
 class DeepepV2Dispatch(torch.autograd.Function):
-    """Dispatch operation using the DeepEP v2 ElasticBuffer backend."""
+    """Dispatch operation using the DeepEP v2 backend."""
 
     @staticmethod
     def forward(
@@ -333,7 +389,12 @@ class DeepepV2Dispatch(torch.autograd.Function):
         async_finish=False,
         allocate_on_comm_stream=False,
     ):
-        """Forward pass of dispatch using the DeepEP v2 ElasticBuffer backend."""
+        """Forward pass of dispatch using the DeepEP v2 backend."""
+        if not _dispatch_copies_topk_idx(type(buffer)):
+            # DeepEP 2.5 keeps topk_idx by reference in the handle, which lives until backward.
+            # Give the handle its own copy, as DeepEP 2.1 does, so later in-place changes to
+            # token_indices cannot reach it. The copy is queued before the captured event.
+            token_indices = token_indices.clone()
         # Capture the current stream for the communication stream to wait on when
         # DeepEP v2 allocates output tensors on the communication stream.
         previous_event = buffer.capture() if async_finish and allocate_on_comm_stream else None
@@ -367,7 +428,7 @@ class DeepepV2Dispatch(torch.autograd.Function):
     def backward(
         ctx, grad_output, grad_token_indices, grad_token_probs, grad_tokens_per_expert, grad_handle
     ):
-        """Backward pass of dispatch using the DeepEP v2 ElasticBuffer backend."""
+        """Backward pass of dispatch using the DeepEP v2 backend."""
         # Queue input conversions before recording the event that DeepEP waits on.
         grad_output = grad_output.contiguous()
         grad_token_probs = grad_token_probs.float()
@@ -390,11 +451,11 @@ class DeepepV2Dispatch(torch.autograd.Function):
 
 
 class DeepepV2Combine(torch.autograd.Function):
-    """DeepEP v2 elastic combine with autograd support."""
+    """DeepEP v2 combine with autograd support."""
 
     @staticmethod
     def forward(ctx, buffer, x, handle, num_sms, async_finish=False, allocate_on_comm_stream=False):
-        """Forward pass of DeepEP v2 elastic combine."""
+        """Forward pass of DeepEP v2 combine."""
         previous_event = buffer.capture() if async_finish and allocate_on_comm_stream else None
         combined_x, combined_token_probs, event = buffer.combine(
             x,
@@ -416,7 +477,7 @@ class DeepepV2Combine(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output, grad_combined_token_probs):
-        """Backward pass of DeepEP v2 elastic combine."""
+        """Backward pass of DeepEP v2 combine."""
         # The communication stream must wait for the contiguous copy as well.
         grad_output = grad_output.contiguous()
         previous_event = (
@@ -449,10 +510,10 @@ if HAVE_DEEP_EP_V2:
         async_finish=False,
         allocate_on_comm_stream=False,
     ):
-        """Perform dispatch using the DeepEP v2 ElasticBuffer backend.
+        """Perform dispatch using the DeepEP v2 backend.
 
         Args:
-            buffer (ElasticBuffer):
+            buffer (EPBuffer or ElasticBuffer):
                 DeepEP v2 buffer used for all-to-all communication.
             x (torch.Tensor):
                 Input hidden states to dispatch.
@@ -467,7 +528,8 @@ if HAVE_DEEP_EP_V2:
             expert_alignment (int):
                 Alignment applied to per-expert token counts.
             num_sms (int):
-                Number of SMs used by the dispatch API.
+                Number of SMs used by the dispatch API; 0 lets DeepEP choose. DeepEP 2.5
+                rounds odd values up to even.
             async_finish (bool):
                 Whether to use asynchronous communication completion.
             allocate_on_comm_stream (bool):
@@ -489,7 +551,7 @@ if HAVE_DEEP_EP_V2:
     def deepepv2_combine(
         buffer, x, handle, num_sms=0, async_finish=False, allocate_on_comm_stream=False
     ):
-        """Perform DeepEP v2 elastic combine."""
+        """Perform DeepEP v2 combine."""
         return DeepepV2Combine.apply(
             buffer, x.contiguous(), handle, num_sms, async_finish, allocate_on_comm_stream
         )
