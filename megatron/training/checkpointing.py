@@ -2664,7 +2664,19 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     _set_arg('mtp_num_layers', force=True)
     _set_arg('mtp_use_repeated_layer', force=True)
 
-    _set_arg('spec', force=True)
+    # Simplified sparse attention checkpoints carry the attention variant and indexer top-k.
+    # Indexer-only (phase 1) training from a dense checkpoint keeps the requested SSA spec, since
+    # the dense checkpoint's spec would build a model without indexers.
+    if getattr(checkpoint_args, 'experimental_attention_variant', None) == 'ssa':
+        _set_arg('experimental_attention_variant', force=True)
+        _set_arg('dsa_indexer_topk', force=True)
+    converting_dense_to_ssa = (
+        getattr(args, 'experimental_attention_variant', None) == 'ssa'
+        and getattr(args, 'ssa_train_indexer_only', False)
+        and getattr(checkpoint_args, 'experimental_attention_variant', None) is None
+    )
+    if not converting_dense_to_ssa:
+        _set_arg('spec', force=True)
 
     _set_arg('num_experts', force=True)
     _set_arg('mtp_num_layers', force=True)
