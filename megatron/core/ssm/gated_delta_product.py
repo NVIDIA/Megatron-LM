@@ -1833,6 +1833,9 @@ def _gtp_split_tensor_factory(
     match ``_split_tensor_factory`` in a non-GTP run, so the checkpoint is the same either way;
     shard boundaries are uneven, which DCP stores as-is. Pad rows are not saved.
     """
+    from megatron.core.tensor_parallel.gtp_ckpt_util import physical_gtp_shard
+
+    orig_sh_ten = physical_gtp_shard(orig_sh_ten)
     assert isinstance(orig_sh_ten, ShardedTensor), type(orig_sh_ten)
     orig_sh_ten_no_data = orig_sh_ten.without_data()  # remove `data` reference
     prepend_axis_num = orig_sh_ten_no_data.prepend_axis_num
