@@ -386,7 +386,11 @@ async def test_completions_response_format(
     )
     # Hit its token limit; without prompt_length the prompt count falls back to the token ids.
     second = completed_reply(
-        "req-1", [10, 11, 12], [14, 15], sampling_params={"num_tokens_to_generate": 2}
+        "req-1",
+        [10, 11, 12],
+        [14, 15],
+        sampling_params={"num_tokens_to_generate": 2},
+        num_cached_tokens=1,
     )
     del second["prompt_length"]
     if skip_prompt_log_probs:
@@ -412,10 +416,10 @@ async def test_completions_response_format(
     assert payload["model"] == "EMPTY"
     assert isinstance(payload["created"], int)
     assert payload["usage"] == {
-        "prompt_tokens": 3,
+        "prompt_tokens": 5,
         "completion_tokens": 4,
-        "total_tokens": 7,
-        "prompt_tokens_details": {"cached_tokens": 2},
+        "total_tokens": 9,
+        "prompt_tokens_details": {"cached_tokens": 3},
     }
     choice_0, choice_1 = payload["choices"]
     assert (choice_0["index"], choice_1["index"]) == (0, 1)
