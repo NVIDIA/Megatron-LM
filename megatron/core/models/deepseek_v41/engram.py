@@ -9,14 +9,26 @@ import torch
 from torch import nn
 
 from megatron.core.enums import Fp8Recipe
+from megatron.core.env_flags import env_flag
 from megatron.core.fp8_utils import get_fp8_context, is_first_last_bf16_layer
 from megatron.core.models.deepseek_v41.engram_hash import EngramLayout, compute_hash_multipliers
+from megatron.core.models.deepseek_v41.engram_hash_kernels import fused_engram_hash
 from megatron.core.models.engram.distributed_embedding import EPShardedMultiTableEmbedding
 from megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils import (
     exchange_cp_boundary_hidden,
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size
+
+# MCORE_ENGRAM_FUSED_HASH (read once at import; on by default) computes EngramHasher's addresses
+# after the CP halo exchange with one Triton kernel (engram_hash_kernels.py) instead of 64 small
+# PyTorch kernels per microbatch (4-grams with a token mask and THD sequence ids). The kernel
+# performs the same int64 operations, so the addresses are bit-identical for every token id the
+# token map covers; the reference rejects other ids, the kernel hashes them as compressed id 0
+# unless MCORE_ENGRAM_HASH_CHECKS=1 asserts on them. MCORE_ENGRAM_FUSED_HASH=0 keeps the PyTorch
+# arithmetic, which CPU tensors, a kernel specialization first seen inside CUDA-graph capture and
+# one that fails to compile use in any case (the latter two with a warning).
+_FUSED_HASH = env_flag("MCORE_ENGRAM_FUSED_HASH", True)
 
 
 class EngramHasher(nn.Module):
@@ -66,6 +78,25 @@ class EngramHasher(nn.Module):
             rows = torch.cat((prefix, rows)).transpose(0, 1)
             token_ids, token_mask, sequence_ids = rows.unbind(-1)
             token_mask = token_mask.bool()
+        hashes = None
+        if _FUSED_HASH:
+            hashes = fused_engram_hash(
+                token_ids,
+                token_mask,
+                sequence_ids,
+                self.token_map,
+                self.multipliers,
+                self.primes,
+                self.offsets,
+                self.pad_id,
+                local_length,
+            )
+        if hashes is None:
+            hashes = self._reference_hash(token_ids, token_mask, sequence_ids, local_length)
+        return hashes
+
+    def _reference_hash(self, token_ids, token_mask, sequence_ids, local_length):
+        """The PyTorch arithmetic: addresses of the last ``local_length`` positions."""
         compressed = self.token_map[token_ids]
         if token_mask is not None:
             compressed = compressed.masked_fill(~token_mask, -1)

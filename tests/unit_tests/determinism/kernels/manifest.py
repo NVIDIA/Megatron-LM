@@ -1079,6 +1079,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             "tests/unit_tests/models/test_v41_engram.py",
+            "tests/unit_tests/models/test_v41_engram_hash.py",
             "tests/unit_tests/models/test_v41_engram_static.py",
             "tests/unit_tests/ops/test_engram.py",
             K + "test_te_wrappers.py",
@@ -1092,7 +1093,28 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "bytes/scales, interleaved nonblocking chunks, hotspots, empty ranks, independent "
         "buffers and multiple live lookup plans through backward. CuTe/NCCL device "
         "transport replays striped LSA/GIN exchanges with bounded slot reuse under "
-        "side-stream contention.",
+        "side-stream contention. EngramHasher's dispatch between the fused hash "
+        "(v41_engram_hash) and its PyTorch reference is compared bit for bit in "
+        "test_v41_engram_hash.py.",
+    ),
+    KernelEntry(
+        name="v41_engram_hash",
+        sources=("megatron/core/models/deepseek_v41/engram_hash_kernels.py",),
+        tests=(
+            K + "test_engram_hash_kernels.py",
+            "tests/unit_tests/models/test_v41_engram_hash.py",
+        ),
+        kind="triton",
+        notes="Fused EngramHasher addresses (MCORE_ENGRAM_FUSED_HASH, on by default): int64 "
+        "token-map lookup, n-gram history blocking, wrapping products, XOR and floored modulo "
+        "with one writer per output element and no reduction or atomics. The replay runs the "
+        "proxy shape (2 layers x 24 columns, 4096 tokens + 3-token halo, THD documents, mask) "
+        "under side-stream contention and equals the PyTorch reference; the model test "
+        "compares masks, documents, int32/negative/strided ids, overflowing multipliers, "
+        "CP 1/2/4 halos (neighbor exchange and tiny-shard all-gather) and CUDA-graph replay "
+        "bit for bit, and checks that one Triton variant serves every length, stride and "
+        "alignment. MCORE_ENGRAM_HASH_CHECKS adds a device-side token-id bounds assert "
+        "(torch._assert_async, no host sync) that changes no output.",
     ),
     KernelEntry(
         name="v41_engram_static_exchange",
