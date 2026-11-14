@@ -5,7 +5,13 @@ import sys
 import types
 
 import torch
-from utils import initialize_checkpoint_converter_fake_process_groups, print_memory_usage
+from utils import (
+    build_checkpoint_converter_process_groups,
+    initialize_checkpoint_converter_distributed,
+    print_memory_usage,
+    register_checkpoint_converter_process_groups,
+    set_checkpoint_converter_model_ranks,
+)
 
 
 class MegatronCheckpointLoaderBase:
@@ -27,6 +33,7 @@ class MegatronCheckpointLoaderBase:
         self.md = None               # Metadata sent to the saver
         self.consumed_train_samples = None
         self.consumed_valid_samples = None
+        self.pg_collection = None    # Fake process groups the models are built on
 
     def _maybe_parse_additional_megatron_args(self, margs, checkpoint_args):
         """
@@ -150,17 +157,14 @@ class MegatronCheckpointLoaderBase:
 
         self.cfg = inference_cfg_container_from_args(self.margs, self.build_model_config())
         set_global_variables(self.margs, self.cfg, build_tokenizer=self.build_tokenizer)
-        mpu.set_tensor_model_parallel_world_size(self.margs.tensor_model_parallel_size)
-        mpu.set_pipeline_model_parallel_world_size(self.margs.pipeline_model_parallel_size)
-        mpu.set_virtual_pipeline_model_parallel_world_size(self.margs.virtual_pipeline_model_parallel_size)
-        mpu.set_expert_model_parallel_world_size(self.margs.expert_model_parallel_size)
-        
-        initialize_checkpoint_converter_fake_process_groups(
-            mpu,
+        initialize_checkpoint_converter_distributed()
+        self.pg_collection = build_checkpoint_converter_process_groups(
             self.margs.tensor_model_parallel_size,
             self.margs.pipeline_model_parallel_size,
             self.margs.expert_model_parallel_size,
         )
+        # Code that reads the global groups instead of a collection sees the same groups.
+        register_checkpoint_converter_process_groups(mpu, self.pg_collection)
 
     def compute_true_vocab_size(self):
         """Determine the 'true' (non-padded) vocab size."""
@@ -190,7 +194,7 @@ class MegatronCheckpointLoaderBase:
           - A nested list of loaded models by [pipeline_rank][virtual_pipeline_rank].
           - consumed_train_samples, consumed_valid_samples
         """
-        from megatron.core import mpu
+        from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
         from megatron.training import get_train_state
         from megatron.training.checkpointing import load_checkpoint
 
@@ -199,24 +203,32 @@ class MegatronCheckpointLoaderBase:
         consumed_valid_samples = None
         tp_size = self.margs.tensor_model_parallel_size
         pp_size = self.margs.pipeline_model_parallel_size
-        vp_size = self.margs.virtual_pipeline_model_parallel_size or 1
+        vp_size = self.margs.virtual_pipeline_model_parallel_size
+        # A pipeline stage holds one model chunk per virtual pipeline stage. Without a virtual
+        # pipeline it holds a single chunk, which is built without a virtual stage.
+        vp_stages = list(range(vp_size)) if vp_size is not None else [None]
+
+        pg_collection = self.pg_collection
 
         all_models = []  # all_models[pp_rank][vp_rank] = [list of models across TP ranks]
 
-        def get_models_for_pipeline_stage(count, dtype):
-            local_models_for_stage = [[] for _ in range(vp_size)]
+        def get_models_for_pipeline_stage(pp_rank, count, dtype):
+            local_models_for_stage = [[] for _ in vp_stages]
             for tp_rank in range(count):
-                fake_tp_group = mpu.get_tensor_model_parallel_group()
-                fake_tp_group.set_rank(tp_rank)
-                mpu.set_tensor_model_parallel_rank(tp_rank)
+                set_checkpoint_converter_model_ranks(
+                    pg_collection, pipeline_rank=pp_rank, tensor_rank=tp_rank
+                )
                 model_list = []
 
-                for i in range(vp_size):
-                    mpu.set_virtual_pipeline_model_parallel_rank(i)
-                    pre_process = mpu.is_pipeline_first_stage()
-                    post_process = mpu.is_pipeline_last_stage()
-                    this_model = model_provider(pre_process=pre_process,
-                                                post_process=post_process).to(dtype)
+                for vp_stage in vp_stages:
+                    this_model = model_provider(
+                        pre_process=pp_rank == 0 and is_vp_first_stage(vp_stage, vp_size),
+                        post_process=(
+                            pp_rank == pp_size - 1 and is_vp_last_stage(vp_stage, vp_size)
+                        ),
+                        vp_stage=vp_stage,
+                        pg_collection=pg_collection,
+                    ).to(dtype)
                     model_list.append(this_model)
 
                 # Each time we load, we set counters to 0, pass None for optimizer/ LR
@@ -227,7 +239,9 @@ class MegatronCheckpointLoaderBase:
                 from megatron.training.global_vars import get_run_config
 
                 get_run_config().checkpoint.exit_on_missing_checkpoint = True
-                load_checkpoint(model_list, None, None, restore_training_state=True)
+                load_checkpoint(
+                    model_list, None, None, restore_training_state=True, pg_collection=pg_collection
+                )
 
                 # Validate that train/valid samples match across ranks
                 nonlocal consumed_train_samples, consumed_valid_samples
@@ -241,8 +255,8 @@ class MegatronCheckpointLoaderBase:
                 else:
                     consumed_valid_samples = train_state.consumed_valid_samples
 
-                for vp_rank in range(vp_size):
-                    local_models_for_stage[vp_rank].append(model_list[vp_rank])
+                for vp_rank, this_model in enumerate(model_list):
+                    local_models_for_stage[vp_rank].append(this_model)
 
                 # Print memory usage
                 print_memory_usage("loader", tp_rank, count)
@@ -250,10 +264,8 @@ class MegatronCheckpointLoaderBase:
             return local_models_for_stage
 
         # Load shards for each pipeline rank
-        mpu.set_virtual_pipeline_model_parallel_rank(0)
         for pp_rank in range(pp_size):
-            mpu.set_pipeline_model_parallel_rank(pp_rank)
-            all_models.append(get_models_for_pipeline_stage(tp_size, dtype))
+            all_models.append(get_models_for_pipeline_stage(pp_rank, tp_size, dtype))
 
         return all_models, consumed_train_samples, consumed_valid_samples
     

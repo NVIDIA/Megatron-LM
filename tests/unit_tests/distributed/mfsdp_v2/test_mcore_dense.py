@@ -447,6 +447,7 @@ def test_delayed_wgrad_matches_immediate(
                 clip_grad=0.0,
             ),
             [model],
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         optimizer.reload_model_params()
         losses = []
@@ -533,7 +534,11 @@ def test_build_train_and_step(process_group_collection, nccl_ub):
         # clipping is fixed.
         clip_grad=0.0,
     )
-    reference_optimizer = get_megatron_optimizer(reference_optimizer_config, [reference_model])
+    reference_optimizer = get_megatron_optimizer(
+        reference_optimizer_config,
+        [reference_model],
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+    )
     optimizer = get_megatron_optimizer(
         replace(
             reference_optimizer_config,
@@ -543,6 +548,7 @@ def test_build_train_and_step(process_group_collection, nccl_ub):
             exp_avg_sq_dtype=torch.bfloat16,
         ),
         [model],
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
     assert isinstance(optimizer, FullyShardedOptimizer)
     optimizer.reload_model_params()
@@ -620,7 +626,9 @@ def test_fused_sgd_casts_mismatched_grads(process_group_collection):
         use_distributed_optimizer=False,
         clip_grad=0.0,
     )
-    optimizer = get_megatron_optimizer(optimizer_config, [model])
+    optimizer = get_megatron_optimizer(
+        optimizer_config, [model], pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+    )
 
     hidden = torch.randn(8, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
 
@@ -685,6 +693,7 @@ def test_gradient_clipping_reaches_global_norm(
             use_precision_aware_optimizer=use_precision_aware_optimizer,
         ),
         [model],
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
     )
 
     def global_norm(local_tensors) -> float:

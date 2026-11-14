@@ -247,8 +247,12 @@ def benchmark_collocated():
         world_size,
         tp_size=dst_tp,
         pp_size=dst_pp,
+        cp_size=args.context_parallel_size,
         ep_size=dst_ep,
-        expt_tp_size=cfg.rl.rl_inference_expert_tensor_model_parallel_size,
+        expt_tp_size=(
+            cfg.rl.rl_inference_expert_tensor_model_parallel_size
+            or args.expert_tensor_parallel_size
+        ),
         use_tp_pp_dp_mapping=cfg.dist.use_tp_pp_dp_mapping,
     )
 
@@ -340,8 +344,12 @@ def benchmark_non_collocated():
         world_size=dst_world,
         tp_size=dst_tp,
         pp_size=dst_pp,
+        cp_size=args.context_parallel_size,
         ep_size=dst_ep,
-        expt_tp_size=cfg.rl.rl_inference_expert_tensor_model_parallel_size,
+        expt_tp_size=(
+            cfg.rl.rl_inference_expert_tensor_model_parallel_size
+            or args.expert_tensor_parallel_size
+        ),
         use_tp_pp_dp_mapping=cfg.dist.use_tp_pp_dp_mapping,
         rank_offset=src_world,
     )
