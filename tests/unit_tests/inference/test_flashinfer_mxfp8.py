@@ -178,7 +178,7 @@ def _make_bounded_mxfp8_config(**overrides):
         num_layers=1,
         hidden_size=128,
         num_attention_heads=4,
-        num_moe_experts=2,
+        num_moe_experts=8,
         moe_ffn_hidden_size=128,
         moe_grouped_gemm=True,
         moe_router_dtype="fp32",
@@ -409,6 +409,39 @@ def test_bounded_flashinfer_mxfp8_config_rejects_invalid_configuration(overrides
         _make_bounded_mxfp8_config(**overrides)
 
 
+_CLAMPED = dict(
+    activation_func_tanh_clamp_scale=16.0, inference_flashinfer_mxfp8_token_capacity=None
+)
+_BF16 = dict(fp8=None, fp8_param=False, inference_flashinfer_mxfp8_token_capacity=None)
+
+
+@pytest.mark.parametrize(
+    ("num_experts", "topk", "overrides", "accepted"),
+    [
+        (8, 7, {}, True),
+        (4, 3, {}, True),
+        (8, 8, {}, False),
+        (6, 2, {}, False),
+        # CUTLASS ClampedRelu2 and BF16 experts do not run the TRT-LLM routed MoE.
+        (8, 8, _CLAMPED, True),
+        (6, 6, _BF16, True),
+    ],
+)
+def test_routed_mxfp8_config_rejects_routing_flashinfer_cannot_launch(
+    num_experts, topk, overrides, accepted
+):
+    def make_config():
+        return _make_bounded_mxfp8_config(
+            num_moe_experts=num_experts, moe_router_topk=topk, **overrides
+        )
+
+    if accepted:
+        assert make_config().moe_router_topk == topk
+    else:
+        with pytest.raises(ValueError, match="FlashInfer routed MXFP8 experts need"):
+            make_config()
+
+
 def test_missing_routed_mxfp8_capability_has_precise_error(monkeypatch):
     from megatron.core.inference.moe import flashinfer_mxfp8
 
@@ -615,3 +648,71 @@ def test_flashinfer_nvls_clears_routing_before_metadata_fence(monkeypatch):
 
     assert calls == [("clear", -1), ("metadata", 7)]
     assert base_cls._host_valid_tokens_estimate == 28
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    not HAVE_FLASHINFER_ROUTED_MXFP8 or not _blackwell_or_newer(),
+    reason="FlashInfer routed MXFP8 requires Blackwell and FlashInfer >= 0.6.4",
+)
+@pytest.mark.parametrize(("num_experts", "topk"), [(8, 7), (8, 8), (6, 2)])
+def test_routed_mxfp8_config_accepts_the_routing_flashinfer_launches(num_experts, topk):
+    """TransformerConfig accepts an expert count and top-k for routed MXFP8 exactly when
+    FlashInfer's routed MoE launches them; FlashInfer checks them only at the first forward."""
+    from megatron.core.inference.moe.flashinfer_mxfp8 import (
+        flashinfer_routed_mxfp8_moe,
+        prepare_routed_mxfp8_weights,
+    )
+
+    try:
+        _make_bounded_mxfp8_config(num_moe_experts=num_experts, moe_router_topk=topk)
+        accepted = True
+    except ValueError as error:
+        assert "FlashInfer routed MXFP8 experts need" in str(error)
+        accepted = False
+
+    torch.manual_seed(1234)
+    hidden_size = intermediate_size = 256
+    num_tokens = 16
+
+    def _prepare_weight(rows, cols):
+        weight = torch.randn(num_experts, rows, cols, device="cuda", dtype=torch.bfloat16)
+        quantized = [MXFP8Tensor.from_bf16(expert, backend="triton") for expert in weight]
+        return prepare_routed_mxfp8_weights(
+            MXFP8Tensor(
+                data=torch.stack([expert.data for expert in quantized]).contiguous(),
+                scale=torch.stack([expert.scale for expert in quantized]).contiguous(),
+                backend="triton",
+                dtype=torch.bfloat16,
+            )
+        )
+
+    fc1_weight = _prepare_weight(intermediate_size, hidden_size)
+    fc2_weight = _prepare_weight(hidden_size, intermediate_size)
+    hidden_states = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+    routing_map = torch.stack(
+        [torch.randperm(num_experts, device="cuda")[:topk] for _ in range(num_tokens)]
+    )
+    probs = torch.softmax(torch.randn(num_tokens, topk, device="cuda"), dim=-1)
+    try:
+        with torch.no_grad():
+            flashinfer_routed_mxfp8_moe(
+                hidden_states,
+                routing_map,
+                probs,
+                fc1_weight,
+                fc2_weight,
+                num_experts=num_experts,
+                local_expert_offset=0,
+                activation_type=6,
+            )
+        torch.cuda.synchronize()
+        launched, error = True, None
+    except Exception as exc:  # FlashInfer raises its own (TVM FFI) error types.
+        launched, error = False, exc
+        assert "num_experts" in str(exc), str(exc)
+
+    assert accepted == launched, (
+        f"TransformerConfig {'accepts' if accepted else 'rejects'} {num_experts} experts with "
+        f"top-k {topk}, but FlashInfer's routed MoE {'fails: ' + str(error) if error else 'runs'}"
+    )
