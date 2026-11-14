@@ -525,10 +525,7 @@ class DSv4HybridAttention(Attention):
         core_attn_out = core_attn_out.view(
             core_attn_out.size(0), core_attn_out.size(1), self.output_projection_local_groups, -1
         )
-        wo_a_weight = self.linear_o_group_proj.view(
-            self.output_projection_local_groups, self.config.output_projection_lora_rank, -1
-        )
-        core_attn_out = torch.einsum("...gd,grd->...gr", core_attn_out, wo_a_weight)
+        core_attn_out = self._apply_grouped_output_projection(core_attn_out)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
         # =================
@@ -540,6 +537,22 @@ class DSv4HybridAttention(Attention):
         output = attn_proj_manager.group_offload(output, forced_released_tensors=[core_attn_out])
 
         return output, bias
+
+
+    def _apply_grouped_output_projection(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Apply a supplied packed projection, or the native dense grouped weight.
+
+        The optional module owns its packed weight/scale layout and input VJP.
+        This preserves the ordinary dense path while allowing checkpoint formats
+        that cannot be represented by ``linear_o_group_proj`` alone.
+        """
+        group_output_projection = getattr(self, "group_output_projection", None)
+        if group_output_projection is not None:
+            return group_output_projection(hidden_states)
+        weight = self.linear_o_group_proj.view(
+            self.output_projection_local_groups, self.config.output_projection_lora_rank, -1
+        )
+        return torch.einsum("...gd,grd->...gr", hidden_states, weight)
 
 
 class DSv4HybridSelfAttention(DSv4HybridAttention):
