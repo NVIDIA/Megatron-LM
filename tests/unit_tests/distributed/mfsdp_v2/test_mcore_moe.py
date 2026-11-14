@@ -8,10 +8,14 @@ from dataclasses import replace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import fully_shard_optimizer
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_stack_spec,
@@ -20,13 +24,16 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
+from megatron.core.pipeline_parallel.utils import set_streams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.experts import SequentialMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig, WideResidualConfig
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
+    run_combined_1f1b_on_microbatches,
     run_forward_backward_on_microbatches,
 )
 from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import destroy_model_parallel
@@ -277,6 +284,120 @@ def test_shortcut_moe_training_and_clipping(process_group_collections, distribut
     assert torch.isfinite(reference_losses).all()
     assert losses[-1] < losses[0]
     torch.testing.assert_close(losses, reference_losses)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] < 10
+    or not is_te_min_version("2.14.0"),
+    reason="The fused TEGroupedMLP (TE op fuser + MXFP8) requires Blackwell and TE >= 2.14.",
+)
+def test_fused_grouped_mlp_ep_overlap_training(process_group_collections):
+    """Train a fused TEGroupedMLP under the EP-overlap 1F1B schedule like the standard loop.
+
+    The fused TEGroupedMLP bypasses linear_fc1/linear_fc2, through whose hooks MFSDP v2
+    unshards under the overlap schedule. With two MoE layers and two microbatches, the
+    schedule reshards a layer between a microbatch's forward and its backward, so the
+    backward must unshard the released MXFP8 weights again.
+    """
+    process_group_collection, _ = process_group_collections
+    set_streams()
+    config_kwargs = dict(
+        num_layers=2,
+        hidden_size=256,
+        num_attention_heads=4,
+        attention_backend=AttnBackend.unfused,
+        num_moe_experts=4,
+        expert_model_parallel_size=2,
+        moe_router_topk=2,
+        moe_ffn_hidden_size=256,
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="alltoall",
+        use_transformer_engine_op_fuser=True,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        add_bias_linear=False,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        fp8="e4m3",
+        fp8_recipe="mxfp8",
+        fp8_param=True,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        gradient_accumulation_fusion=False,
+    )
+    ddp_config = DistributedDataParallelConfig(
+        use_megatron_fsdp=True,
+        megatron_fsdp_version=2,
+        use_distributed_optimizer=False,
+        data_parallel_sharding_strategy="optim_grads_params",
+        fsdp_all_gather_in_start_param_sync=False,
+        fp8_param_gather=True,
+    )
+
+    torch.manual_seed(4321 + torch.distributed.get_rank())
+    steps = [
+        [
+            {
+                "input_ids": torch.randint(0, 128, (1, 32), device="cuda"),
+                "labels": torch.randint(0, 128, (1, 32), device="cuda"),
+                "position_ids": torch.arange(32, device="cuda").unsqueeze(0),
+                "attention_mask": torch.ones((1, 1, 32, 32), dtype=torch.bool, device="cuda"),
+            }
+            for _ in range(2)
+        ]
+        for _ in range(3)
+    ]
+
+    def train(overlap):
+        config = TransformerConfig(**config_kwargs, overlap_moe_expert_parallel_comm=overlap)
+        # Seed identically so both models start from the same MXFP8 parameters and the
+        # same high-precision initial values, from which MFSDP v2 initializes main weights.
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(123)
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_decoder_block_spec(config, use_transformer_engine=True),
+            vocab_size=128,
+            max_sequence_length=32,
+            pg_collection=process_group_collection,
+        ).cuda()
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=ddp_config,
+            module=model,
+            pg_collection=process_group_collection,
+        )
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+        fully_shard_optimizer(optimizer)
+
+        losses = []
+        for microbatches in steps:
+            optimizer.zero_grad()
+            if overlap:
+                microbatch_losses = run_combined_1f1b_on_microbatches(model, config, microbatches)
+            else:
+                batches = iter(microbatches)
+                microbatch_losses = run_forward_backward_on_microbatches(
+                    model,
+                    lambda: model(**next(batches)).float().sum(),
+                    num_microbatches=len(microbatches),
+                    loss_scale=1 / len(microbatches),
+                )
+            optimizer.step()
+            losses.append(torch.stack(microbatch_losses))
+        return model, torch.stack(losses)
+
+    reference_model, reference_losses = train(overlap=False)
+    model, losses = train(overlap=True)
+
+    torch.testing.assert_close(losses, reference_losses)
+    for (name, reference_parameter), (_, parameter) in zip(
+        reference_model.named_parameters(), model.named_parameters()
+    ):
+        torch.testing.assert_close(
+            parameter.to_local(), reference_parameter.to_local(), msg=lambda m: f"{name}: {m}"
+        )
 
 
 def _sync_model_parameters(reference_model, model):
