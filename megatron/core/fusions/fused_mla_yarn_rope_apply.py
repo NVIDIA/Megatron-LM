@@ -664,6 +664,7 @@ def _mla_rope_bwd_kv_split_kernel(
     cp_rank,
     cp_size,
     REMOVE_INTERLEAVING: tl.constexpr,
+    STORE_D_KV: tl.constexpr,
     BLOCK_H: tl.constexpr,
 ):
     """
@@ -681,6 +682,9 @@ def _mla_rope_bwd_kv_split_kernel(
         dKV: [seq_len, batch_size, head_num, k_dim + v_dim]
             or [total_seq_len, head_num, k_dim + v_dim]
         dEMB: [seq_len, batch_size, emb_dim] or [total_seq_len, emb_dim]
+
+    With STORE_D_KV=False only dEMB is computed (by the programs with pid_head == 0); dV and dKV
+    are not accessed.
     """
     pid_m = tl.program_id(axis=0)
     pid_head = tl.program_id(axis=1)
@@ -690,20 +694,21 @@ def _mla_rope_bwd_kv_split_kernel(
     else:
         token_idx = _get_thd_token_idx(cu_seqlens_kv, pid_m, seq_num, cp_rank, cp_size)
 
-    dKV_ptr = dKV + pid_m * stride_dkv_seq + pid_head * BLOCK_H * stride_dkv_nheads
-    dkv_off = tl.arange(0, BLOCK_H)[:, None] * stride_dkv_nheads
-    mask = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
-    dk_out_off = dkv_off + tl.arange(0, k_dim)[None, :]
-    dv_out_off = dkv_off + k_dim + tl.arange(0, v_dim)[None, :]
+    if STORE_D_KV:
+        dKV_ptr = dKV + pid_m * stride_dkv_seq + pid_head * BLOCK_H * stride_dkv_nheads
+        dkv_off = tl.arange(0, BLOCK_H)[:, None] * stride_dkv_nheads
+        mask = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
+        dk_out_off = dkv_off + tl.arange(0, k_dim)[None, :]
+        dv_out_off = dkv_off + k_dim + tl.arange(0, v_dim)[None, :]
 
-    dK_ptr = dK + pid_m * stride_dk_seq + pid_head * BLOCK_H * stride_dk_nheads
-    dV_ptr = dV + pid_m * stride_dv_seq + pid_head * BLOCK_H * stride_dv_nheads
-    dk_in_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + tl.arange(0, k_dim)[None, :]
-    dv_in_off = tl.arange(0, BLOCK_H)[:, None] * stride_dv_nheads + tl.arange(0, v_dim)[None, :]
-    dk = tl.load(dK_ptr + dk_in_off, mask=mask)
-    dv = tl.load(dV_ptr + dv_in_off, mask=mask)
-    tl.store(dKV_ptr + dk_out_off, dk, mask=mask)
-    tl.store(dKV_ptr + dv_out_off, dv, mask=mask)
+        dK_ptr = dK + pid_m * stride_dk_seq + pid_head * BLOCK_H * stride_dk_nheads
+        dV_ptr = dV + pid_m * stride_dv_seq + pid_head * BLOCK_H * stride_dv_nheads
+        dk_in_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + tl.arange(0, k_dim)[None, :]
+        dv_in_off = tl.arange(0, BLOCK_H)[:, None] * stride_dv_nheads + tl.arange(0, v_dim)[None, :]
+        dk = tl.load(dK_ptr + dk_in_off, mask=mask)
+        dv = tl.load(dV_ptr + dv_in_off, mask=mask)
+        tl.store(dKV_ptr + dk_out_off, dk, mask=mask)
+        tl.store(dKV_ptr + dv_out_off, dv, mask=mask)
 
     if pid_head == 0:
         x_left_accum = tl.zeros((BLOCK_H, emb_dim // 2), dtype=tl.float32)
@@ -897,11 +902,67 @@ class _FusedMLARoPEKVSplit(torch.autograd.Function):
             ctx.cp_rank,
             ctx.cp_size,
             REMOVE_INTERLEAVING=ctx.remove_interleaving,
+            STORE_D_KV=True,
         )
         if ctx.cu_seqlens_kv is None:
             d_kv = d_kv.view(max_seqlen, batch_size, nheads, ctx.k_dim + ctx.v_dim)
             d_emb = d_emb.view(max_seqlen, batch_size, 1, ctx.emb_dim)
         return d_kv, d_emb, None, None, None, None, None, None, None, None, None, None
+
+
+def fused_mla_rope_kv_split_emb_grad(
+    dk: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, emb_dim: int, k_dim: int, v_dim: int
+) -> torch.Tensor:
+    """Gradient of k_pos_emb in the backward of :func:`fused_mla_rope_kv_split` (sbhd, without
+    interleaving removal), without the key/value gradient.
+
+    Launches the backward kernel of :func:`fused_mla_rope_kv_split` with the same autotuning key,
+    so that it shares its tuned BLOCK_H (and with it the order of the sum over heads): within a
+    process, the result is bitwise identical to the d_emb of that backward. For callers that
+    produce the key/value gradient by other means.
+
+    Args:
+        dk: [seq_len, batch_size, head_num, k_dim + emb_dim]
+        cos/sin: [max_seq_len, 1, 1, emb_dim]
+        emb_dim, k_dim, v_dim: as for :func:`fused_mla_rope_kv_split`
+
+    Returns:
+        d_emb: [seq_len, batch_size, 1, emb_dim]
+    """
+    max_seqlen, batch_size, nheads, _ = dk.shape
+    dk = dk.contiguous().view(-1, nheads, emb_dim + k_dim)
+    assert cos.is_contiguous() and sin.is_contiguous()
+    total_seqlen = dk.shape[0]
+    d_emb = dk.new_empty(total_seqlen, 1, emb_dim)
+    # dV and dKV are not accessed; dk stands in for them, so that the autotuning key (which
+    # includes the tensors' dtypes) is that of the full backward.
+    _mla_rope_bwd_kv_split_kernel[(total_seqlen, 1)](
+        dk,
+        dk,
+        dk,
+        d_emb,
+        cos,
+        sin,
+        emb_dim,
+        k_dim,
+        v_dim,
+        nheads,
+        batch_size,
+        None,
+        None,
+        dk.stride(0),
+        dk.stride(1),
+        dk.stride(0),
+        dk.stride(1),
+        dk.stride(0),
+        dk.stride(1),
+        d_emb.stride(0),
+        0,
+        1,
+        REMOVE_INTERLEAVING=False,
+        STORE_D_KV=False,
+    )
+    return d_emb.view(max_seqlen, batch_size, 1, emb_dim)
 
 
 def fused_mla_rope_kv_split(

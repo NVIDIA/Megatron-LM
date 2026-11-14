@@ -2196,6 +2196,18 @@ def _fused_kv_rope_quant_config(**overrides):
     return MLATransformerConfig(**kwargs)
 
 
+def test_fused_up_proj_grad_quant_config_requires_qkv_rope_quant():
+    with pytest.raises(ValueError, match="use_fused_mla_up_proj_grad_quant"):
+        _fused_kv_rope_quant_config(use_fused_mla_up_proj_grad_quant=True)
+
+
+def test_fused_qkv_rope_quant_config_requires_kv_rope_quant():
+    with pytest.raises(ValueError, match="use_fused_mla_qkv_rope_quant"):
+        _fused_kv_rope_quant_config(
+            use_fused_mla_kv_rope_quant=False, use_fused_mla_qkv_rope_quant=True
+        )
+
+
 @pytest.mark.parametrize("dpa_option", ["fp8_dot_product_attention", "attention_dropout"])
 def test_fused_kv_rope_quant_config_requires_mxfp8_attention(dpa_option):
     overrides = (
@@ -2488,3 +2500,343 @@ class TestFusedMLAKVRoPEQuant:
         ):
             attention(hidden_states, None)
         assert kernel.call_count == 0
+
+
+def _run_mla_fwd_bwd(attention, config, hidden_states, grad_output, spies=()):
+    """Forward and backward of an MLA module; returns (output, dx, parameter grads, spy calls)."""
+    x = hidden_states.clone().requires_grad_(True)
+    with contextlib.ExitStack() as stack:
+        mocks = [
+            stack.enter_context(
+                mock.patch.object(mla_module, name, wraps=getattr(mla_module, name))
+            )
+            for name in spies
+        ]
+        stack.enter_context(get_fp8_context(config))
+        output, _ = attention(x, None)
+        output.backward(grad_output)
+        calls = [m.call_count for m in mocks]
+    grads = {name: p.grad for name, p in attention.named_parameters() if p.grad is not None}
+    return output.detach(), x.grad, grads, calls
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="The fused MLA RoPE + MXFP8 kernels require SM100+",
+)
+class TestFusedMLAQKVRoPEQuant:
+    """use_fused_mla_qkv_rope_quant feeds attention the same MXFP8 q/k/v, and gives the same
+    gradients, as use_fused_mla_kv_rope_quant and as the unfused path."""
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("variant", ["mla", "fused_mla"])
+    @pytest.mark.parametrize("batch_size", [1, 2])
+    def test_matches_kv_rope_quant_and_unfused_paths(self, variant, batch_size):
+        if mla_module.fused_mla_q_rope_mxfp8 is None:
+            pytest.skip("Transformer Engine lacks fused_mla_q_rope_mxfp8")
+        env = {
+            "NVTE_FUSED_ATTN": "1",
+            "NVTE_FLASH_ATTN": "0",
+            "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+        }
+        spies = ("fused_mla_q_rope_mxfp8", "fused_mla_kv_rope_mxfp8", "mxfp8_transpose_swizzle")
+        with mock.patch.dict(os.environ, env, clear=False):
+            attention_cls, submodules = (
+                (FusedMLASelfAttention, get_fused_mla_submodules())
+                if variant == "fused_mla"
+                else (MLASelfAttention, get_mla_self_attn_submodules())
+            )
+            options = [(False, False), (True, False), (True, True)]  # (kv_rope, qkv_rope)
+            modules, configs = [], []
+            for kv_rope, qkv_rope in options:
+                config = _fused_kv_rope_quant_config(
+                    use_fused_mla_kv_rope_quant=kv_rope, use_fused_mla_qkv_rope_quant=qkv_rope
+                )
+                configs.append(config)
+                modules.append(
+                    attention_cls(
+                        config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+                    )
+                    .cuda()
+                    .bfloat16()
+                )
+            for module in modules[1:]:
+                module.load_state_dict(modules[0].state_dict())
+            assert [m._use_fused_qkv_rope_quant for m in modules] == [False, False, True]
+
+            torch.manual_seed(0)
+            hidden_states = torch.randn(256, batch_size, 512, dtype=torch.bfloat16, device="cuda")
+            grad_output = torch.randn_like(hidden_states)
+            results = [
+                _run_mla_fwd_bwd(m, c, hidden_states, grad_output, spies)
+                for m, c in zip(modules, configs)
+            ]
+
+        # (q kernel, kv kernel, scale permute + swizzle) calls per path.
+        assert [r[3] for r in results] == [[0, 0, 0], [0, 1, 1], [1, 1, 0]]
+        out, dx, grads, _ = results[2]
+        for ref_out, ref_dx, ref_grads, _ in results[:2]:
+            assert torch.equal(out, ref_out)
+            assert torch.equal(dx, ref_dx)
+            assert grads.keys() == ref_grads.keys()
+            assert "linear_q_up_proj.weight" in grads and "linear_kv_up_proj.weight" in grads
+            for name, grad in grads.items():
+                assert torch.equal(grad, ref_grads[name]), name
+
+    def test_fp32_rope_tables_use_kv_rope_quant_path(self):
+        """The kernels take BF16 cos / sin; other tables keep the use_fused_mla_kv_rope_quant
+        path."""
+        if mla_module.fused_mla_q_rope_mxfp8 is None:
+            pytest.skip("Transformer Engine lacks fused_mla_q_rope_mxfp8")
+        config = _fused_kv_rope_quant_config(use_fused_mla_qkv_rope_quant=True)
+        attention = (
+            MLASelfAttention(
+                config,
+                get_mla_self_attn_submodules(),
+                layer_number=1,
+                attn_mask_type=AttnMaskType.causal,
+            )
+            .cuda()
+            .bfloat16()
+        )
+        rotary = attention.rotary_pos_emb
+        original = rotary.get_cached_cos_sin
+
+        def fp32_tables(*args, **kwargs):
+            return tuple(t.float() for t in original(*args, **kwargs))
+
+        hidden_states = torch.randn(256, 2, 512, dtype=torch.bfloat16, device="cuda")
+        with (
+            mock.patch.dict(
+                os.environ, {"NVTE_FUSED_ATTN": "1", "NVTE_FLASH_ATTN": "0"}, clear=False
+            ),
+            mock.patch.object(rotary, "get_cached_cos_sin", side_effect=fp32_tables),
+        ):
+            _, _, _, calls = _run_mla_fwd_bwd(
+                attention,
+                config,
+                hidden_states,
+                torch.randn_like(hidden_states),
+                ("fused_mla_q_rope_mxfp8", "fused_mla_kv_rope_mxfp8"),
+            )
+        assert calls == [0, 1]
+
+    def test_cuda_graph_replay(self):
+        """The query and key/value autograd functions, forward and backward, captured in a CUDA
+        graph and replayed on new inputs give the eager results."""
+        if mla_module.fused_mla_q_rope_mxfp8 is None:
+            pytest.skip("Transformer Engine lacks fused_mla_q_rope_mxfp8")
+        s, b, h = 256, 2, 8
+        static = dict(
+            q=torch.empty(s, b, h, 192, device="cuda", dtype=torch.bfloat16),
+            kv=torch.empty(s, b, h, 256, device="cuda", dtype=torch.bfloat16),
+            kv_down=torch.empty(s, b, 576, device="cuda", dtype=torch.bfloat16),
+            dq=torch.empty(s, b, h, 192, device="cuda", dtype=torch.bfloat16),
+            dk=torch.empty(s, b, h, 192, device="cuda", dtype=torch.bfloat16),
+            dv=torch.empty(s, b, h, 128, device="cuda", dtype=torch.bfloat16),
+            cos=torch.empty(s, 1, 1, 64, device="cuda", dtype=torch.bfloat16),
+            sin=torch.empty(s, 1, 1, 64, device="cuda", dtype=torch.bfloat16),
+        )
+
+        def fill(seed):
+            torch.manual_seed(seed)
+            for t in static.values():
+                t.copy_(torch.randn_like(t))
+
+        def step():
+            q = static["q"].detach().requires_grad_(True)
+            kv = static["kv"].detach().requires_grad_(True)
+            kv_down = static["kv_down"].detach().requires_grad_(True)
+            k_pos_emb = kv_down[..., 512:].unsqueeze(-2)
+            cos, sin = static["cos"], static["sin"]
+            query = mla_module._FusedQRoPEQuantForFusedAttn.apply(q, cos, sin)
+            key, value = mla_module._FusedKVRoPEQuantForFusedAttn.apply(
+                kv, k_pos_emb, cos, sin, 64, 128, 128, True
+            )
+            dq, dkv, dkv_down = torch.autograd.grad(
+                [query, key, value],
+                [q, kv, kv_down],
+                [static["dq"].clone(), static["dk"], static["dv"]],
+            )
+            buffers = [
+                getattr(t, name)
+                for t in (query, key, value)
+                for name in (
+                    "_rowwise_data",
+                    "_rowwise_scale_inv",
+                    "_columnwise_data",
+                    "_columnwise_scale_inv",
+                )
+            ]
+            return buffers + [dq, dkv, dkv_down]
+
+        fill(0)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                step()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graphed = step()
+        for seed in (1, 2):
+            fill(seed)
+            graph.replay()
+            eager = step()
+            for i, (a, e) in enumerate(zip(graphed, eager)):
+                assert torch.equal(a.view(torch.uint8), e.view(torch.uint8)), i
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 10,
+    reason="The fused MLA RoPE + MXFP8 kernels require SM100+",
+)
+class TestFusedMLAUpProjGradQuant:
+    """use_fused_mla_up_proj_grad_quant gives the up-projections the MXFP8 grad_output they would
+    have quantized: same outputs and gradients as use_fused_mla_qkv_rope_quant and the unfused
+    path."""
+
+    @pytest.fixture(scope='function', autouse=True)
+    def setup_and_teardown(self):
+        Utils.initialize_model_parallel(1, 1)
+        model_parallel_cuda_manual_seed(123)
+        yield
+        Utils.destroy_model_parallel()
+
+    SPIES = (
+        "fused_mla_q_rope_backward_mxfp8",
+        "fused_mla_kv_split_backward_mxfp8",
+        "fused_mla_q_rope_mxfp8",
+    )
+
+    def _compare(self, variant, batch_size, fp8="e4m3"):
+        if mla_module.fused_mla_q_rope_backward_mxfp8 is None:
+            pytest.skip("Transformer Engine lacks fused_mla_q_rope_backward_mxfp8")
+        env = {
+            "NVTE_FUSED_ATTN": "1",
+            "NVTE_FLASH_ATTN": "0",
+            "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            attention_cls, submodules = (
+                (FusedMLASelfAttention, get_fused_mla_submodules())
+                if variant == "fused_mla"
+                else (MLASelfAttention, get_mla_self_attn_submodules())
+            )
+            # (kv_rope, qkv_rope, up_proj_grad)
+            options = [(False, False, False), (True, True, False), (True, True, True)]
+            modules, configs = [], []
+            for kv_rope, qkv_rope, grad_quant in options:
+                config = _fused_kv_rope_quant_config(
+                    fp8=fp8,
+                    use_fused_mla_kv_rope_quant=kv_rope,
+                    use_fused_mla_qkv_rope_quant=qkv_rope,
+                    use_fused_mla_up_proj_grad_quant=grad_quant,
+                )
+                configs.append(config)
+                modules.append(
+                    attention_cls(
+                        config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+                    )
+                    .cuda()
+                    .bfloat16()
+                )
+            for module in modules[1:]:
+                module.load_state_dict(modules[0].state_dict())
+            assert [m._use_fused_up_proj_grad_quant for m in modules] == [False, False, True]
+
+            torch.manual_seed(0)
+            hidden_states = torch.randn(256, batch_size, 512, dtype=torch.bfloat16, device="cuda")
+            grad_output = torch.randn_like(hidden_states)
+            results = [
+                _run_mla_fwd_bwd(m, c, hidden_states, grad_output, self.SPIES)
+                for m, c in zip(modules, configs)
+            ]
+        out, dx, grads, _ = results[2]
+        for ref_out, ref_dx, ref_grads, _ in results[:2]:
+            assert torch.equal(out, ref_out)
+            assert torch.equal(dx, ref_dx)
+            assert grads.keys() == ref_grads.keys()
+            for name in ("linear_q_up_proj.weight", "linear_kv_up_proj.weight"):
+                assert name in grads
+            for name, grad in grads.items():
+                assert torch.equal(grad, ref_grads[name]), name
+        return [r[3] for r in results]
+
+    @pytest.mark.parametrize("variant", ["mla", "fused_mla"])
+    @pytest.mark.parametrize("batch_size", [1, 2])
+    def test_matches_qkv_rope_quant_and_unfused_paths(self, variant, batch_size):
+        calls = self._compare(variant, batch_size)
+        # (q backward + MXFP8, kv split backward + MXFP8, q RoPE + MXFP8) calls per path.
+        assert calls == [[0, 0, 0], [0, 0, 1], [1, 1, 1]]
+
+    def test_hybrid_recipe_uses_qkv_rope_quant_path(self):
+        """With E5M2 gradients (fp8='hybrid') the projections do not quantize grad_output to
+        E4M3, so the fused backward kernels do not run; results still match."""
+        calls = self._compare("mla", 2, fp8="hybrid")
+        assert calls == [[0, 0, 0], [0, 0, 1], [0, 0, 1]]
+
+    def test_cuda_graph_replay(self):
+        """The two autograd functions, forward and backward, captured in a CUDA graph and
+        replayed on new inputs give the eager results (MXFP8 gradients included)."""
+        if mla_module.fused_mla_q_rope_backward_mxfp8 is None:
+            pytest.skip("Transformer Engine lacks fused_mla_q_rope_backward_mxfp8")
+        s, b, h = 256, 2, 8
+        static = dict(
+            q=torch.empty(s, b, h * 192, device="cuda", dtype=torch.bfloat16),
+            kv=torch.empty(s, b, h * 256, device="cuda", dtype=torch.bfloat16),
+            kv_down=torch.empty(s, b, 576, device="cuda", dtype=torch.bfloat16),
+            dq=torch.empty(s, b, h, 192, device="cuda", dtype=torch.bfloat16),
+            dk=torch.empty(s, b, h, 192, device="cuda", dtype=torch.bfloat16),
+            dv=torch.empty(s, b, h, 128, device="cuda", dtype=torch.bfloat16),
+            cos=torch.empty(s, 1, 1, 64, device="cuda", dtype=torch.bfloat16),
+            sin=torch.empty(s, 1, 1, 64, device="cuda", dtype=torch.bfloat16),
+        )
+        names = ("_rowwise_data", "_rowwise_scale_inv", "_columnwise_data", "_columnwise_scale_inv")
+
+        def fill(seed):
+            torch.manual_seed(seed)
+            for t in static.values():
+                t.copy_(torch.randn_like(t))
+
+        def step():
+            q = static["q"].detach().requires_grad_(True)
+            kv = static["kv"].detach().requires_grad_(True)
+            kv_down = static["kv_down"].detach().requires_grad_(True)
+            k_pos_emb = kv_down[..., 512:].unsqueeze(-2)
+            cos, sin = static["cos"], static["sin"]
+            query = mla_module._FusedQUpProjRoPEQuantForFusedAttn.apply(q, cos, sin, h)
+            key, value = mla_module._FusedKVUpProjRoPEQuantForFusedAttn.apply(
+                kv, k_pos_emb, cos, sin, h, 64, 128, 128
+            )
+            dq, dkv, dkv_down = torch.autograd.grad(
+                [query, key, value], [q, kv, kv_down], [static["dq"], static["dk"], static["dv"]]
+            )
+            mxfp8 = (query, key, value, dq, dkv)
+            return [getattr(t, n) for t in mxfp8 for n in names] + [dkv_down]
+
+        fill(0)
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side):
+            for _ in range(2):
+                step()
+        torch.cuda.current_stream().wait_stream(side)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graphed = step()
+        for seed in (1, 2):
+            fill(seed)
+            graph.replay()
+            eager = step()
+            for i, (a, e) in enumerate(zip(graphed, eager)):
+                assert torch.equal(a.view(torch.uint8), e.view(torch.uint8)), i
