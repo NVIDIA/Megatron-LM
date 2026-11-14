@@ -21,6 +21,7 @@ from megatron.core.inference.quantization.utils import mm_mxfp8
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.process_groups_config import ProcessGroupCollection, resolve_gtp_remat_group
+from megatron.core.tensor_parallel.batch_invariant_reduction import batch_invariant_reduce_scatter
 from megatron.core.tensor_parallel.mappings import (
     gather_from_tensor_model_parallel_region,
     reduce_scatter_to_sequence_parallel_region,
@@ -28,6 +29,7 @@ from megatron.core.tensor_parallel.mappings import (
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     get_batch_invariant_backend,
     is_batch_invariant_mode_enabled,
+    mm_out_batch_invariant,
     rmsnorm_batch_invariant,
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -74,6 +76,16 @@ def _apply_linear(
     kwargs = {"out": out} if out is not None else {}
     if isinstance(weight, MXFP8Tensor):
         return mm_mxfp8(x, weight, **kwargs)
+    if (
+        out is not None
+        and is_batch_invariant_mode_enabled()
+        and get_batch_invariant_backend() != "te_native"
+    ):
+        # The backend replaces aten::mm, not the out= overload torch.matmul would use here.
+        mm_out_batch_invariant(
+            x.reshape(-1, x.size(-1)), weight.t(), out=out.view(-1, out.size(-1))
+        )
+        return out
     return torch.matmul(x, weight.t(), **kwargs)
 
 
@@ -477,14 +489,15 @@ class InferenceRowParallelLinear(TERowParallelLinear):
         # RS requires bf16 (hardware multimem reduce is bf16-only).
         # Check the matmul output shape: if it is NVLS-eligible, the RS output
         # (world_size times smaller on dim 0) is too.
-        # TP sequence-parallel RS: use NCCL in batch-invariant mode to match
-        # the training reduction path. This does not affect MoE EP NVLS.
+        # TP sequence-parallel RS: batch-invariant mode reduces in rank order, as
+        # training does (batch_invariant_reduce_scatter). This does not affect MoE EP NVLS.
+        batch_invariant = is_batch_invariant_mode_enabled()
         can_use_nvls = (
             self.triton_nvls_kernels_allowed
             and x.dtype == torch.bfloat16
             and are_tensors_nvls_eligible(x)
             and symm_mem_buffer["handle"] is not None
-            and not is_batch_invariant_mode_enabled()
+            and not batch_invariant
         )
 
         if can_use_nvls:
@@ -519,10 +532,24 @@ class InferenceRowParallelLinear(TERowParallelLinear):
                 # 2. The output of the full reduce-scatter + add + rms-norm + all-gather is
                 #    written into symm_mem_buffer["tensor"] and will be accessible there.
                 return residual
+        elif (
+            batch_invariant
+            and self.triton_nvls_kernels_allowed
+            and symm_mem_buffer["handle"] is not None
+        ):
+            # Write the matmul output to symmetric memory; one kernel then sums every
+            # rank's rows of this rank's chunk in rank order.
+            x = _apply_linear(x, self.weight, self.config, out=symm_mem_buffer["tensor"])
+            x, _ = batch_invariant_reduce_scatter(
+                x, self.tp_group, symm_mem_hdl=symm_mem_buffer["handle"]
+            )
         else:
-            # revert to torch dist (NCCL) reduce-scatter
             x = _apply_linear(x, self.weight, self.config)
-            x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)
+            if batch_invariant:
+                x, _ = batch_invariant_reduce_scatter(x, self.tp_group)
+            else:
+                # revert to torch dist (NCCL) reduce-scatter
+                x, _ = reduce_scatter_along_first_dim(x, tp_group=self.tp_group)
         return x
 
     def _set_next_layer_norm_weights(self, weights: torch.Tensor):
@@ -620,6 +647,7 @@ def inference_reduce_scatter_to_sequence_parallel_region(
 
     Replaces `reduce_scatter_to_sequence_parallel_region` in inference paths
     where autograd is not needed and NVLS symmetric-memory is available.
+    Batch-invariant mode uses `batch_invariant_reduce_scatter` instead.
     """
     # TODO(ksanthanam): Refactor InferenceRowParallelLinear._matmul_reduce_scatter
     # to use this function for its non-fused NVLS reduce-scatter path.
@@ -631,17 +659,20 @@ def inference_reduce_scatter_to_sequence_parallel_region(
         config, 'inference_disable_triton_nvls_kernels', False
     )
 
-    # TP sequence-parallel RS: use NCCL in batch-invariant mode to match
-    # training. This does not affect MoE EP NVLS.
-    if (
-        triton_nvls_kernels_allowed
-        and SymmetricMemoryManager.is_initialized("tp")
-        and not is_batch_invariant_mode_enabled()
-    ):
+    if triton_nvls_kernels_allowed and SymmetricMemoryManager.is_initialized("tp"):
         buf = SymmetricMemoryManager.get_buffer("tp", process_group=tp_group)
         symm_mem_buffer = buf.maybe_get_tensor(list(x.size()), dtype=x.dtype)
 
-        if (
+        # TP sequence-parallel RS: batch-invariant mode reduces in rank order, as
+        # training does. This does not affect MoE EP NVLS.
+        if is_batch_invariant_mode_enabled():
+            if symm_mem_buffer["handle"] is not None:
+                symm_mem_buffer["tensor"].copy_(x)
+                x, _ = batch_invariant_reduce_scatter(
+                    symm_mem_buffer["tensor"], tp_group, symm_mem_hdl=symm_mem_buffer["handle"]
+                )
+                return x
+        elif (
             x.dtype == torch.bfloat16
             and are_tensors_nvls_eligible(x)
             and symm_mem_buffer["handle"] is not None
@@ -653,4 +684,5 @@ def inference_reduce_scatter_to_sequence_parallel_region(
             multimem_reduce_scatter(output, symm_mem_buffer["tensor"], symm_mem_buffer["handle"])
             return output
 
+    # In batch-invariant mode this reduces in rank order too (see mappings).
     return reduce_scatter_to_sequence_parallel_region(x, group=tp_group)
