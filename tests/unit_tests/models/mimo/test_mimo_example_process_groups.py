@@ -166,15 +166,35 @@ def _mock_data_args():
     )
 
 
-@pytest.mark.parametrize("tp_rank", [0, 1])
-def test_mock_datasets_are_built_on_the_first_rank_of_the_collection_tp_group(monkeypatch, tp_rank):
-    from examples.mimo.data import mock
+@pytest.fixture
+def mock_data(monkeypatch):
+    """examples/mimo/data/mock.py, imported without running its package's __init__.
 
+    The package imports the Energon task encoders, which need soundfile. soundfile is not a
+    dependency of this repository, and the mock datasets do not use it. The provider imports
+    MockVLMDataset from examples.mimo.data.mock, so the module is registered under that name.
+    """
+    package = types.ModuleType("examples.mimo.data")
+    package.__path__ = [str(_MIMO_DIR / "data")]
+    monkeypatch.setitem(sys.modules, "examples.mimo.data", package)
+    spec = importlib.util.spec_from_file_location(
+        "examples.mimo.data.mock", _MIMO_DIR / "data" / "mock.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "examples.mimo.data.mock", module)
+    spec.loader.exec_module(module)
+    return module
+
+
+@pytest.mark.parametrize("tp_rank", [0, 1])
+def test_mock_datasets_are_built_on_the_first_rank_of_the_collection_tp_group(
+    mock_data, monkeypatch, tp_rank
+):
     monkeypatch.setattr(megatron.training, "get_args", _mock_data_args)
     pg_collection = ProcessGroupCollection(tp=_Group(tp_rank, 2))
 
     with forbid_global_process_groups():
-        train_ds, valid_ds, test_ds = mock.train_valid_test_datasets_provider(
+        train_ds, valid_ds, test_ds = mock_data.train_valid_test_datasets_provider(
             [4, 2, 0], pg_collection=pg_collection
         )
 
@@ -186,9 +206,7 @@ def test_mock_datasets_are_built_on_the_first_rank_of_the_collection_tp_group(mo
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA to build the global grid")
-def test_mock_datasets_without_collection_warn_and_use_the_global_grid(monkeypatch):
-    from examples.mimo.data import mock
-
+def test_mock_datasets_without_collection_warn_and_use_the_global_grid(mock_data, monkeypatch):
     monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
     monkeypatch.setattr(megatron.training, "get_args", _mock_data_args)
     Utils.initialize_model_parallel()
@@ -196,7 +214,7 @@ def test_mock_datasets_without_collection_warn_and_use_the_global_grid(monkeypat
         # Only the resolver in process_groups_config.py may read the global grid.
         with forbid_global_process_groups(forbid_shim=False):
             with pytest.warns(ProcessGroupFallbackWarning, match="deprecated since Megatron Core"):
-                train_ds, _, _ = mock.train_valid_test_datasets_provider([4, 2, 0])
+                train_ds, _, _ = mock_data.train_valid_test_datasets_provider([4, 2, 0])
     finally:
         Utils.destroy_model_parallel()
 
