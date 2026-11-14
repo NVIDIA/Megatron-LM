@@ -378,6 +378,9 @@ def _ddp_wrap(
         construction_context = (
             fully_shard_context(
                 FsdpContext(
+                    prefetch_order=FullyShardedDataParallelV2.prefetch_order_for(
+                        get_model_config(model[0])
+                    ),
                     runtime_policy=RuntimePolicy(
                         use_symmetric_memory=ddp_config.nccl_ub,
                         caller_managed_grad_sync=True,
