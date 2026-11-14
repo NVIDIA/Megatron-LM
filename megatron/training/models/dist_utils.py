@@ -118,6 +118,9 @@ def unimodal_build_distributed_models(
         else:
             logger.warning("Final pre wrap hook returned None, skipping pre wrap hooks.")
 
+    # Model construction can replace the caller's config, e.g. when HybridModel
+    # clones a root reused as a layer entry before inferring its MTP depth.
+    transformer_config = get_model_config(model_list[0])
     return prepare_existing_model_chunks_for_distributed_training(
         model_list,
         transformer_config,

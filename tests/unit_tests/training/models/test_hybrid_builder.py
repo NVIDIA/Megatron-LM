@@ -1,14 +1,18 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+from argparse import Namespace
 from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
 
+from megatron.core.models.hybrid import MTPSplit, PipelineSplit
 from megatron.core.transformer import ModuleSpec
+from megatron.core.transformer.attention_layer_config import AttentionLayerConfig
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
+from megatron.training.utils.checkpoint_utils import read_run_config
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -78,6 +82,48 @@ class TestHybridModelConfigInitialization:
     def test_hybrid_stack_spec_default_is_none(self):
         config = _make_hybrid_config()
         assert config.hybrid_stack_spec is None
+
+    @pytest.mark.parametrize("container_type", [list, tuple])
+    def test_config_list_is_saved_in_parent_run_config_metadata(
+        self, run_config, tmp_path, container_type
+    ):
+        transformer = _make_transformer()
+        transformer.is_hybrid_model = True
+        layer_config = AttentionLayerConfig.from_config(transformer)
+        other_layer_config = AttentionLayerConfig.from_config(transformer)
+        other_layer_config.attention_dropout = 0.25
+        source_config_list = container_type(
+            [layer_config, PipelineSplit, other_layer_config, MTPSplit, layer_config]
+        )
+        config = _make_hybrid_config(
+            transformer=transformer, hybrid_layer_config_list=source_config_list
+        )
+        run_config.model = config
+
+        serialized = run_config.to_dict()
+        assert serialized["model"]["transformer"]["is_hybrid_model"] is True
+
+        yaml_path = tmp_path / "run_config.yaml"
+        run_config.to_yaml(yaml_path)
+        saved = read_run_config(str(yaml_path))
+        for metadata in (serialized, saved):
+            layers = metadata["model"]["hybrid_layer_config_list"]
+            assert len(layers) == 5
+            for index in (0, 2, 4):
+                assert layers[index]["_target_"].endswith(".AttentionLayerConfig")
+                assert layers[index]["hidden_size"] == 128
+            assert layers[0]["attention_dropout"] == layer_config.attention_dropout
+            assert layers[2]["attention_dropout"] == 0.25
+            assert layers[4] == layers[0]
+            for index, marker in ((1, PipelineSplit), (3, MTPSplit)):
+                assert layers[index] == {
+                    "_target_": f"{marker.__module__}.{marker.__qualname__}",
+                    "_call_": False,
+                }
+        assert config.hybrid_layer_config_list is source_config_list
+        assert source_config_list[0] is layer_config
+        assert source_config_list[4] is layer_config
+        assert layer_config.mtp_num_layers is None
 
 
 class TestHybridModelConfigGetAttr:
@@ -381,6 +427,161 @@ class TestHybridModelBuilderBuildModel:
         assert kw["seq_len_interpolation_factor"] is None
         assert kw["pg_collection"] is pg
         assert kw["vp_stage"] is None
+
+    @pytest.mark.parametrize("with_mtp", [False, True])
+    @patch("megatron.training.models.hybrid.get_args")
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_config_list_is_forwarded_without_conversion(self, mock_model, mock_args, with_mtp):
+        args = Namespace(mtp_num_layers=None)
+        mock_args.return_value = args
+        transformer = _make_transformer()
+        layer_config = AttentionLayerConfig.from_config(transformer)
+        source_config_list = [layer_config, layer_config]
+        if with_mtp:
+            source_config_list.extend([MTPSplit, layer_config])
+        config = _make_hybrid_config(
+            transformer=transformer, hybrid_layer_config_list=source_config_list
+        )
+        expected_depth = 1 if with_mtp else None
+        mock_model.return_value.config = _make_transformer(mtp_num_layers=expected_depth)
+        mock_model.return_value.mtp_num_depths = expected_depth or 0
+
+        HybridModelBuilder(config).build_model(self.pg, pre_process=True, post_process=True)
+
+        forwarded = mock_model.call_args.kwargs["hybrid_layer_config_list"]
+        assert forwarded is source_config_list
+        assert forwarded[0] is layer_config
+        assert forwarded[1] is layer_config
+        assert mock_model.call_args.kwargs["config"] is transformer
+        assert transformer.mtp_num_layers is None
+        assert config.transformer is mock_model.return_value.config
+        assert args.mtp_num_layers == expected_depth
+        assert args.is_hybrid_model is True
+        assert layer_config.mtp_num_layers is None
+
+    @pytest.mark.parametrize(
+        "pp_rank,vp_stage,expected_pre,expected_post",
+        [(0, 0, True, False), (1, 0, False, False), (0, 1, False, False), (1, 1, False, True)],
+    )
+    @pytest.mark.parametrize("explicit_flags", [False, True])
+    @patch("megatron.training.models.hybrid.get_args", return_value=Namespace(mtp_num_layers=None))
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_config_list_virtual_stage_ownership(
+        self, mock_model, mock_args, pp_rank, vp_stage, expected_pre, expected_post, explicit_flags
+    ):
+        transformer = _make_transformer(
+            num_layers=4,
+            pipeline_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=2,
+            pipeline_dtype=torch.float32,
+        )
+        layer = AttentionLayerConfig.from_config(transformer)
+        config = _make_hybrid_config(
+            transformer=transformer,
+            hybrid_layer_config_list=[
+                layer,
+                PipelineSplit,
+                layer,
+                PipelineSplit,
+                layer,
+                PipelineSplit,
+                layer,
+            ],
+        )
+        mock_model.return_value.config = transformer
+        mock_model.return_value.mtp_num_depths = 0
+        overrides = {"pre_process": True, "post_process": True} if explicit_flags else {}
+        with (
+            patch("megatron.training.models.hybrid.is_pp_first_stage", return_value=pp_rank == 0),
+            patch("megatron.training.models.hybrid.is_pp_last_stage", return_value=pp_rank == 1),
+        ):
+            HybridModelBuilder(config).build_model(self.pg, vp_stage=vp_stage, **overrides)
+
+        assert mock_model.call_args.kwargs["pre_process"] is (
+            True if explicit_flags else expected_pre
+        )
+        assert mock_model.call_args.kwargs["post_process"] is (
+            True if explicit_flags else expected_post
+        )
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"hybrid_layer_pattern": "**"},
+            {"hybrid_override_pattern": "**"},
+            {"hybrid_attention_ratio": 0.5},
+            {"hybrid_mlp_ratio": 0.5},
+        ],
+    )
+    @patch("megatron.training.models.hybrid.get_args", return_value=Namespace(mtp_num_layers=None))
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_config_list_rejects_pattern_alternatives_before_construction(
+        self, mock_model, mock_args, overrides
+    ):
+        layer = AttentionLayerConfig.from_config(_make_transformer())
+        config = _make_hybrid_config(hybrid_layer_config_list=[layer, layer], **overrides)
+
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            HybridModelBuilder(config).build_model(self.pg)
+
+        mock_model.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "runtime_args,message",
+        [
+            (Namespace(mtp_num_layers=2), "defines 1 MTP depths"),
+            (
+                Namespace(mtp_num_layers=None, num_layers_per_virtual_pipeline_stage=1),
+                "must configure VPP explicitly",
+            ),
+        ],
+    )
+    @patch("megatron.training.models.hybrid.get_args")
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_config_list_rejects_conflicting_runtime_args_before_construction(
+        self, mock_model, mock_args, runtime_args, message
+    ):
+        mock_args.return_value = runtime_args
+        root = AttentionLayerConfig.from_config(_make_transformer())
+        config = _make_hybrid_config(
+            transformer=root, hybrid_layer_config_list=[root, root, MTPSplit, root]
+        )
+
+        with pytest.raises(ValueError, match=message):
+            HybridModelBuilder(config).build_model(self.pg)
+
+        mock_model.assert_not_called()
+        assert config.transformer is root
+        assert root.mtp_num_layers is None
+
+    @patch(
+        "megatron.training.models.dist_utils.prepare_existing_model_chunks_for_distributed_training"
+    )
+    @patch("megatron.training.models.dist_utils.build_virtual_pipeline_stages")
+    @patch("megatron.training.models.hybrid.get_args", return_value=Namespace(mtp_num_layers=None))
+    @patch("megatron.training.models.hybrid.HybridModel")
+    def test_aliased_root_uses_model_resolved_config_for_distributed_preparation(
+        self, mock_model, mock_args, mock_stages, mock_prepare
+    ):
+        root = AttentionLayerConfig.from_config(_make_transformer(num_layers=1, bf16=True))
+        resolved = AttentionLayerConfig.from_config(root)
+        resolved.mtp_num_layers = 1
+        model = Mock(config=resolved, mtp_num_depths=1)
+        mock_model.return_value = model
+        mock_stages.side_effect = lambda build, pg, *_: [
+            build(pg, pre_process=True, post_process=True)
+        ]
+        config = _make_hybrid_config(
+            transformer=root, hybrid_layer_config_list=[root, MTPSplit, root]
+        )
+
+        HybridModelBuilder(config).build_distributed_models(self.pg, wrap_with_ddp=False)
+
+        assert mock_model.call_args.kwargs["config"] is root
+        assert mock_prepare.call_args.args[0] == [model]
+        assert mock_prepare.call_args.args[1] is resolved
+        assert config.transformer is resolved
+        assert root.mtp_num_layers is None
 
 
 class TestHybridModelBuilderBuildDistributedModels:

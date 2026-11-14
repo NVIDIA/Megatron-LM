@@ -4,6 +4,7 @@ import abc
 import importlib
 from dataclasses import dataclass, field
 from dataclasses import fields as dataclass_fields
+from dataclasses import is_dataclass
 from typing import Any, Callable, ClassVar, Generic, Protocol, TypeVar, runtime_checkable
 
 from megatron.core.distributed import DistributedDataParallelConfig
@@ -94,7 +95,8 @@ class ModelConfig:
         Includes:
         - _target_: Full class path for deserialization
         - _builder_: Full builder class path (serialized from ClassVar)
-        - All dataclass fields, including nested dataclasses
+        - All dataclass fields, including nested dataclasses and config sequences
+        - _config_id_ on shared dataclasses, preserving their identity within this model
         """
 
         from megatron.training.config.utils import serialize_dataclass
@@ -104,6 +106,35 @@ class ModelConfig:
             skip_fields=frozenset({"pre_wrap_hooks", "post_wrap_hooks"}),
             encode_callables=True,
         )
+        shared_configs = {}
+
+        def _record_shared_configs(value, encoded):
+            # Nested ModelConfig serializers own their IDs; from_dict scopes them likewise.
+            if isinstance(value, ModelConfig) and value is not self:
+                return
+            if is_dataclass(value) and not isinstance(value, type) and isinstance(encoded, dict):
+                config_id = id(value)
+                if config_id in shared_configs:
+                    reference, first = shared_configs[config_id]
+                    first["_config_id_"] = encoded["_config_id_"] = reference
+                else:
+                    shared_configs[config_id] = (len(shared_configs), encoded)
+                for config_field in dataclass_fields(value):
+                    if config_field.name in encoded:
+                        _record_shared_configs(
+                            getattr(value, config_field.name), encoded[config_field.name]
+                        )
+            elif isinstance(value, dict) and isinstance(encoded, dict):
+                for key, item in value.items():
+                    if key in encoded:
+                        _record_shared_configs(item, encoded[key])
+            elif isinstance(value, (list, tuple)) and isinstance(encoded, (list, tuple)):
+                for item, encoded_item in zip(value, encoded, strict=True):
+                    _record_shared_configs(item, encoded_item)
+
+        # Full dictionaries remain readable metadata. Explicit IDs survive YAML/JSON
+        # and sanitation that rebuilds dictionaries and loses Python object aliases.
+        _record_shared_configs(self, result)
         result["_builder_"] = self.builder  # Serialize the builder path
         return result
 
@@ -112,7 +143,8 @@ class ModelConfig:
         """Deserialize config from dictionary.
 
         Uses _target_ to determine the correct class to instantiate.
-        The builder is restored from the required _builder_ entry.
+        The builder is restored from the required _builder_ entry. Shared dataclasses
+        carrying the same _config_id_ are reconstructed once per model config.
 
         Args:
             data: Dictionary with _target_ and config fields
@@ -121,10 +153,17 @@ class ModelConfig:
             Instance of the appropriate ModelConfig subclass
         """
 
-        def _from_dict(subdata):
+        def _from_dict(subdata, shared_configs):
             target = subdata.get("_target_")
             if target is None:
                 raise ValueError("Cannot deserialize: missing '_target_' field")
+
+            config_id = subdata.get("_config_id_")
+            if config_id is not None and config_id in shared_configs:
+                previous_data, previous_config = shared_configs[config_id]
+                if subdata != previous_data:
+                    raise ValueError(f"Conflicting definitions for shared config {config_id!r}")
+                return previous_config
 
             # Import the class from the target path
             module_path, class_name = target.rsplit(".", 1)
@@ -135,9 +174,16 @@ class ModelConfig:
             valid_fields = {f.name for f in dataclass_fields(config_cls)}
             filtered_data = {k: v for k, v in subdata.items() if k in valid_fields and not k.startswith("_")}
 
-            return config_cls(**{key: _from_value(value) for key, value in filtered_data.items()})
+            config = config_cls(
+                **{key: _from_value(value, shared_configs) for key, value in filtered_data.items()}
+            )
+            if config_id is not None:
+                shared_configs[config_id] = (subdata, config)
+            if "_builder_" in subdata:
+                config.builder = subdata["_builder_"]
+            return config
 
-        def _from_value(value):
+        def _from_value(value, shared_configs):
             if isinstance(value, dict):
                 if "_target_" in value:
                     if (
@@ -148,13 +194,13 @@ class ModelConfig:
                         from megatron.training.config.instantiate_utils import instantiate
 
                         return instantiate(value)
-                    return _from_dict(value)
-                return {key: _from_value(item) for key, item in value.items()}
+                    return _from_dict(value, {} if "_builder_" in value else shared_configs)
+                return {key: _from_value(item, shared_configs) for key, item in value.items()}
             if isinstance(value, (list, tuple)):
-                return type(value)(_from_value(item) for item in value)
+                return type(value)(_from_value(item, shared_configs) for item in value)
             return value
 
-        result = _from_dict(data)
+        result = _from_dict(data, {})
         result.builder = data["_builder_"]
 
         return result

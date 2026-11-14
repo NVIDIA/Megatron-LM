@@ -1833,6 +1833,9 @@ def generate_state_dict(
     padded_vocab_size = get_run_config().tokenizer.padded_vocab_size
     if getattr(args, 'padded_vocab_size', None) != padded_vocab_size:
         state_dict['args'].padded_vocab_size = padded_vocab_size
+    # Record the actual model family without mutating the live namespace. Config-list
+    # architectures do not carry a legacy pattern that can identify their family.
+    state_dict["args"].is_hybrid_model = any(_contains_hybrid_model(m) for m in model)
     state_dict['checkpoint_version'] = 3.1
     if iteration is not None:
         state_dict['iteration'] = iteration
@@ -2716,6 +2719,106 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     return args, checkpoint_args
 
 
+def _contains_hybrid_model(module):
+    """Return whether ``module`` contains a HybridModel through known wrappers."""
+    return _hybrid_model_architecture(module) is not None
+
+
+def _hybrid_model_architecture(module):
+    """Return ``"config_list"`` or ``"pattern"`` for a contained HybridModel."""
+    from megatron.core.models.hybrid.hybrid_model import HybridModel
+    from megatron.core.models.mimo.model.base import MimoModel
+
+    # Megatron-FSDP and Float16Module both retain the wrapped module under
+    # ``module`` but are intentionally not handled by the regular
+    # ``unwrap_model`` helper. Multimodal wrappers (e.g. LLaVAModel) attach the
+    # language model under ``language_model`` instead.
+    while module is not None:
+        if isinstance(module, HybridModel):
+            return (
+                "config_list"
+                if getattr(module, "hybrid_layer_config_list", None) is not None
+                else "pattern"
+            )
+        if isinstance(module, MimoModel):
+            language_spec = module.mimo_config.language_model_spec
+            language_module = language_spec.module
+            if isinstance(language_module, type) and issubclass(language_module, HybridModel):
+                return (
+                    "config_list"
+                    if language_spec.params.get("hybrid_layer_config_list") is not None
+                    else "pattern"
+                )
+        inner = getattr(module, "language_model", None)
+        inner_architecture = (
+            _hybrid_model_architecture(inner) if inner is not None else None
+        )
+        if inner_architecture is not None:
+            return inner_architecture
+        module = getattr(module, "module", None)
+    return None
+
+
+def _contains_config_list_hybrid_model(module):
+    """Return whether ``module`` contains a config-list-defined HybridModel."""
+    return _hybrid_model_architecture(module) == "config_list"
+
+
+def _validate_checkpoint_model_family(args, ckpt_args, model, *, checkpoint_model=None):
+    """Validate HybridModel/GPT families using saved config, with saved args as a fallback.
+
+    A pattern-defined HybridModel loading a GPT checkpoint is left for the
+    distributed-checkpoint translation path. Config-list-defined HybridModels
+    cannot use that pattern-based translation.
+    """
+    runtime_is_hybrid = any(_contains_hybrid_model(m) for m in model)
+    runtime_uses_config_list = any(_contains_config_list_hybrid_model(m) for m in model)
+    ckpt_pattern = _checkpoint_model_arg(checkpoint_model, "hybrid_layer_pattern")
+    if ckpt_pattern is _MISSING_CONFIG_VALUE or ckpt_pattern is None:
+        ckpt_pattern = _checkpoint_model_arg(checkpoint_model, "hybrid_override_pattern")
+    if ckpt_pattern is _MISSING_CONFIG_VALUE:
+        ckpt_pattern = getattr(ckpt_args, "hybrid_layer_pattern", None) or getattr(
+            ckpt_args, "hybrid_override_pattern", None
+        )
+    ckpt_marker = _checkpoint_model_arg(checkpoint_model, "is_hybrid_model")
+    if ckpt_marker is _MISSING_CONFIG_VALUE:
+        ckpt_marker = getattr(ckpt_args, "is_hybrid_model", False)
+    ckpt_config_list = _checkpoint_model_arg(checkpoint_model, "hybrid_layer_config_list")
+    ckpt_is_hybrid = bool(
+        ckpt_marker
+        or ckpt_pattern
+        or (ckpt_config_list is not _MISSING_CONFIG_VALUE and ckpt_config_list is not None)
+    )
+    if runtime_is_hybrid == ckpt_is_hybrid:
+        return runtime_is_hybrid, ckpt_is_hybrid, ckpt_pattern
+
+    if not runtime_is_hybrid:
+        checkpoint_description = (
+            f"a hybrid model run (hybrid layer pattern {ckpt_pattern!r})"
+            if ckpt_pattern
+            else "a config-list-defined hybrid model run"
+        )
+        raise RuntimeError(
+            f"The checkpoint was saved by {checkpoint_description} but the current run "
+            f"builds a non-hybrid model. Load it with the hybrid training entrypoint instead."
+        )
+
+    if runtime_uses_config_list:
+        raise RuntimeError(
+            "Loading a GPT checkpoint into a config-list-defined hybrid model is not "
+            "supported. Use --hybrid-layer-pattern so checkpoint layers can be paired "
+            "with hybrid layer positions."
+        )
+    if not getattr(get_run_config().model, "hybrid_layer_pattern", None):
+        raise RuntimeError(
+            "Loading a GPT checkpoint into a hybrid model requires "
+            "--hybrid-layer-pattern so checkpoint layers can be paired with "
+            "hybrid layer positions."
+        )
+
+    return runtime_is_hybrid, ckpt_is_hybrid, ckpt_pattern
+
+
 def _maybe_setup_gpt_to_hybrid_load(
     args, ckpt_args, model, *, load_optim: bool, saved_save_optim: bool, checkpoint_model=None
 ):
@@ -2732,57 +2835,20 @@ def _maybe_setup_gpt_to_hybrid_load(
     RuntimeError for combinations that cannot be loaded.
     """
     from megatron.core.dist_checkpointing.gpt_checkpoint_interop import gpt_compatible_layer_maps
-    from megatron.core.models.hybrid.hybrid_model import HybridModel
-    from megatron.core.models.mimo.model.base import MimoModel
 
-    def _contains_hybrid_model(module):
-        # Megatron-FSDP and Float16Module both retain the wrapped module under
-        # ``module`` but are intentionally not handled by the regular
-        # ``unwrap_model`` helper. Multimodal wrappers (e.g. LLaVAModel) attach
-        # the language model under ``language_model`` instead.
-        while module is not None:
-            if isinstance(module, HybridModel):
-                return True
-            if isinstance(module, MimoModel):
-                language_module = module.mimo_config.language_model_spec.module
-                if isinstance(language_module, type) and issubclass(language_module, HybridModel):
-                    return True
-            inner = getattr(module, 'language_model', None)
-            if inner is not None and isinstance(inner, HybridModel):
-                return True
-            module = getattr(module, 'module', None)
-        return False
-
-    runtime_is_hybrid = any(_contains_hybrid_model(m) for m in model)
     if (ckpt_args is None or not vars(ckpt_args)) and not checkpoint_model:
         # Checkpoints imported by Megatron Bridge may omit training args entirely.
         # Without explicit source-model metadata, keep the regular loading path.
         return None, False
-    ckpt_pattern = _checkpoint_model_arg(checkpoint_model, 'hybrid_layer_pattern')
-    if ckpt_pattern is _MISSING_CONFIG_VALUE or ckpt_pattern is None:
-        ckpt_pattern = _checkpoint_model_arg(checkpoint_model, 'hybrid_override_pattern')
-    if ckpt_pattern is _MISSING_CONFIG_VALUE:
-        ckpt_pattern = getattr(ckpt_args, 'hybrid_layer_pattern', None) or getattr(
-            ckpt_args, 'hybrid_override_pattern', None
-        )
-    if runtime_is_hybrid == bool(ckpt_pattern):
+    runtime_is_hybrid, ckpt_is_hybrid, _ = _validate_checkpoint_model_family(
+        args, ckpt_args, model, checkpoint_model=checkpoint_model
+    )
+    if runtime_is_hybrid == ckpt_is_hybrid:
         return None, False
-    if not runtime_is_hybrid:
-        raise RuntimeError(
-            f'The checkpoint was saved by a hybrid model run (hybrid layer pattern '
-            f'{ckpt_pattern!r}) but the current run builds a non-hybrid model. Load it '
-            f'with the hybrid training entrypoint instead.'
-        )
 
     # GPT checkpoint feeding a HybridModel run: translate the sharded state
     # dict at load time instead of converting the checkpoint on disk.
     cfg = get_run_config()
-    if not cfg.model.hybrid_layer_pattern:
-        raise RuntimeError(
-            'Loading a GPT checkpoint into a hybrid model requires '
-            '--hybrid-layer-pattern so checkpoint layers can be paired with '
-            'hybrid layer positions.'
-        )
     try:
         layer_maps = gpt_compatible_layer_maps(cfg.model.hybrid_layer_pattern)
     except ValueError as exc:
@@ -2950,7 +3016,9 @@ def load_checkpoint(
     ckpt_format = load_format
     state_dict = None
     release = False
-    if checkpoint.auto_detect_ckpt_format or ckpt_format in ('torch_dist', 'fsdp_dtensor'):
+    if checkpoint.auto_detect_ckpt_format or ckpt_format in (
+        "torch_dist", "torch_dcp", "fsdp_dtensor"
+    ):
         with _otel_managed_span('load_checkpoint', 'megatron.checkpoint.load.io_read', is_goodput_span=True):
             state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
                 load_dir,
@@ -2997,7 +3065,7 @@ def load_checkpoint(
     ignore_rerun_state = True
     ckpt_args = types.SimpleNamespace()
     if (
-        ckpt_format in ('torch_dist', 'fsdp_dtensor')
+        ckpt_format in ("torch_dist", "torch_dcp", "fsdp_dtensor")
         and state_dict is not None
         and 'args' in state_dict
     ):
@@ -3020,6 +3088,13 @@ def load_checkpoint(
             fp4=saved_transformer.get('fp4') is not None,
             fp8_recipe=saved_transformer.get('fp8_recipe'),
             fp8=saved_transformer.get('fp8') is not None,
+        )
+
+    # torch_dcp loads tensors in place. Check family metadata before constructing or
+    # applying its runtime state dict, just as the translation path below does.
+    if ckpt_format == "torch_dcp" and state_dict is not None and (vars(ckpt_args) or checkpoint_model):
+        _validate_checkpoint_model_family(
+            args, ckpt_args, model, checkpoint_model=checkpoint_model
         )
 
     # Both model-space torch_dist and fsdp_dtensor checkpoints carry model-keyed
@@ -3422,6 +3497,17 @@ def load_checkpoint(
         checkpoint_config = _read_checkpoint_run_config(state_dict, checkpoint_name, ckpt_type)
     validate_glu_layout(state_dict, release)
     state_dict = prepare_glu_checkpoint_for_load(state_dict, args)
+
+    # Distributed formats validate before the in-place load. Legacy formats can
+    # validate once their common metadata has been read, before loading model tensors.
+    checkpoint_args = state_dict.get("args")
+    checkpoint_model = (checkpoint_config or {}).get("model")
+    if ckpt_format not in ("torch_dist", "torch_dcp", "fsdp_dtensor") and (
+        (checkpoint_args is not None and vars(checkpoint_args)) or checkpoint_model
+    ):
+        _validate_checkpoint_model_family(
+            args, checkpoint_args, model, checkpoint_model=checkpoint_model
+        )
 
     # Set checkpoint version.
     set_checkpoint_version(state_dict.get('checkpoint_version', 0))
