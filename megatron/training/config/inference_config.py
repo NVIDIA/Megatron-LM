@@ -308,6 +308,10 @@ class InferenceSetupConfig:
     inference_dynamic_batching_allow_stale_multimodal_embeddings: bool = False
     """Allow request-local and cached multimodal embeddings across weight-change boundaries."""
 
+    require_gpu_local_cpu_affinity: bool | None = None
+    """Check that inference ranks are bound to GPU-local CPUs. None enables it on Grace
+    (aarch64) hosts only. Disable with --no-require-gpu-local-cpu-affinity."""
+
     inference_shortcut_moe_overlap: bool = False
     """Overlap Shortcut MoE routing, experts and communication during dynamic inference."""
 
@@ -481,6 +485,7 @@ class InferenceSetupConfig:
             allow_stale_multimodal_embeddings=(
                 self.inference_dynamic_batching_allow_stale_multimodal_embeddings
             ),
+            require_gpu_local_cpu_affinity=self.require_gpu_local_cpu_affinity,
             prefix_caching_mamba_gb=self.inference_dynamic_batching_prefix_caching_mamba_gb,
             disaggregation_shards=(
                 self.inference_shards

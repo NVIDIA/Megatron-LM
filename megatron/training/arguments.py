@@ -2152,6 +2152,10 @@ def _add_inference_args(parser):
                        default=True,
                        help='Use the same inference sampling seed on every data-parallel rank. '
                             '--deterministic-mode also uses the same seed on every DP rank.')
+    group.add_argument('--require-gpu-local-cpu-affinity',
+                       action=argparse.BooleanOptionalAction, default=None,
+                       help='Check that each inference rank is bound to CPUs local to its GPU. '
+                            'Defaults to on for Grace (aarch64) hosts and off elsewhere.')
     group.add_argument('--inference-dynamic-batching-async-sched-mode',
                        type=str, default='async',
                        choices=['async', 'legacy'],
