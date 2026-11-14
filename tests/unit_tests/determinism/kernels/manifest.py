@@ -105,6 +105,13 @@ R = "tests/unit_tests/context_parallel/runtime/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
+        name="lite_fsdp2_adamw_cohorts",
+        sources=("experimental/lite/megatron/lite/primitive/optimizers/fsdp2/adamw.py",),
+        tests=(K + "test_lite_adamw_cohorts.py",),
+        kind="dispatch",
+        notes="Public megatron.lite import; compares PyTorch foreach local-view state updates against scalar DTensor updates and replays model weights, masters, moments and steps.",
+    ),
+    KernelEntry(
         name="mtp_packed_cp1_roll",
         sources=("megatron/core/transformer/multi_token_prediction.py",),
         tests=(K + "test_dev_sync_kernels.py",),
