@@ -22,11 +22,9 @@ try:
     )
     from fla.ops.common.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local
     from fla.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
-    from fla.ops.cp.chunk_delta_h import (
-        merge_fwd_bwd_kernel,
-        pre_process_bwd_kernel_merged,
-        pre_process_fwd_kernel_merged,
-    )
+    from fla.ops.cp.chunk_bwd import chunk_cp_bwd_kernel_dh
+    from fla.ops.cp.chunk_fwd import chunk_cp_fwd_kernel_h
+    from fla.ops.cp.chunk_merge import chunk_cp_fwd_bwd_kernel_merge
     from fla.ops.gated_delta_product.chunk_deltaproduct_h import chunk_gated_delta_product_fwd_h
     from fla.ops.gated_delta_product.chunk_deltaproduct_o import chunk_gated_delta_product_fwd_o
     from fla.ops.gated_delta_rule.wy_fast import prepare_wy_repr_bwd, recompute_w_u_fwd
@@ -367,7 +365,7 @@ def _compute_fragment_summary(
         grid = (grid_columns, value_heads)
         multiple_sequences = False
 
-    pre_process_fwd_kernel_merged[grid](
+    chunk_cp_fwd_kernel_h[grid](
         k=k,
         v=u,
         w=w,
@@ -383,8 +381,8 @@ def _compute_fragment_summary(
         K=key_dim,
         V=value_dim,
         BT=64,
-        BK1=triton.next_power_of_2(key_dim),
-        BLOCK_SIZE=block_size,
+        BV=block_size,
+        BK=triton.next_power_of_2(key_dim),
         MULTI_SEQS=multiple_sequences,
     )
     return summary
@@ -425,7 +423,7 @@ def _compute_backward_fragment_summary(
         summary: torch.Tensor,
         boundary_cu_seqlens: torch.Tensor | None,
     ) -> None:
-        pre_process_bwd_kernel_merged[grid](
+        chunk_cp_bwd_kernel_dh[grid](
             q=q_fragment,
             k=k_fragment,
             w=w_fragment,
@@ -442,8 +440,8 @@ def _compute_backward_fragment_summary(
             K=key_dim,
             V=value_dim,
             BT=64,
-            BK1=triton.next_power_of_2(key_dim),
-            BLOCK_SIZE=block_size,
+            BV=block_size,
+            BK=triton.next_power_of_2(key_dim),
             USE_BG=False,
         )
 
@@ -498,22 +496,23 @@ def _merge_affine_summaries(
     # that slice. Forward visits [0, n); backward visits [n - 1, ..., 0].
     merge_rank = summary_count if forward else -1
 
-    merge_fwd_bwd_kernel[grid](
+    chunk_cp_fwd_bwd_kernel_merge[grid](
         h=output_state,
         ag_hm=packed_summaries,
-        pre_or_post_num_ranks=summary_count,
+        num_ranks=summary_count,
         rank=merge_rank,
         seq_offsets=None,
         init_offsets=None,
         h0_seq_ids=None,
         h0=None,
+        h_seq_idx=None,
         HV=merge_heads,
         K=key_dim,
         V=value_dim,
         BK=triton.next_power_of_2(key_dim),
         FORWARD=forward,
-        INTRACARD_MODE=False,
-        NUM_SEQ_ENTRIES=0,
+        IS_INTRACARD=False,
+        N=0,
         STATE_V_FIRST=False,
     )
     return output
