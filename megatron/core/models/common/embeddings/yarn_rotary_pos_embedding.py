@@ -162,6 +162,13 @@ class YarnRotaryEmbedding(RotaryEmbedding):
         emb = emb[:, None, None, :]
         return emb, _mscale
 
+    def get_cos_sin(self, max_seq_len: int, offset: int = 0) -> tuple[Tensor, Tensor]:
+        """Cosines and sines of YaRN's frequencies for all positions up to the maximum sequence
+        length, scaled by its concentration factor as attention scales the rotation."""
+        emb, mscale = self.get_emb(max_seq_len, offset)
+        freqs = emb[:, 0, 0, : emb.shape[-1] // 2]
+        return torch.cos(freqs) * mscale, torch.sin(freqs) * mscale
+
     def _get_emb_and_scale(self, max_seq_len: int, offset: int) -> tuple[Tensor, float]:
         return self.get_emb(max_seq_len, offset)
 
