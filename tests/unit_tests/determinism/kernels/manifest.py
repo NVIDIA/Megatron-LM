@@ -445,7 +445,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_moe_kernels.py",
         ),
         kind="te-wrapper",
-        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert.",
+        notes="TEGroupedMLP / SequentialMLP on uneven expert loads including an empty expert. "
+        "Inference BF16 experts on FlashInfer cutlass_fused_moe pass use_fused_finalize=False "
+        "under deterministic algorithms or batch-invariant mode (global or in the config), since "
+        "fused-finalize GEMM2 "
+        "tactics sum the top-k routes with BF16 atomics; every GEMM2 tactic the autotuner can "
+        "select is replayed and checked for batch invariance. Needs FlashInfer >= 0.6.15 on "
+        "SM90/100/103 with its CUTLASS fused-MoE module already built (flashinfer-jit-cache or "
+        "a warm JIT cache); it skips otherwise, since a cold build takes tens of minutes.",
     ),
     KernelEntry(
         name="moe_fused_a2a",
@@ -918,14 +925,19 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/quantization/utils.py",
             "megatron/core/inference/moe/flashinfer_mxfp8.py",
         ),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(K + "test_inference_kernels.py", K + "test_moe_kernels.py"),
         kind="dispatch",
         training_path=False,
         notes="MXFP8Tensor dispatches the Megatron quantize kernel (replayed: "
         "test_mxfp8_quantize_replays) or FlashInfer mxfp8_quantize / mm_mxfp8 / fused MoE, which need "
         "flashinfer on Blackwell. The clamped CUTLASS BF16/MXFP8 adapters are replayed "
         "by test_flashinfer_clamped_relu2_replays with top-k=1, including CUDA graphs; "
-        "the default atomic top-k finalize and routed backend are not covered by that test.",
+        "the routed backend is not covered by that test. Under deterministic algorithms the "
+        "CUTLASS MXFP8 call passes use_fused_finalize=False, ruling out the atomic top-k "
+        "finalize; test_inference_flashinfer_cutlass_mxfp8_experts_replay_for_every_gemm2_tactic "
+        "(launch_on_gb200) replays top-k=4 under every GEMM2 tactic the autotuner can select. "
+        "It does not skip on Blackwell: without flashinfer-jit-cache, FlashInfer builds its "
+        "CUTLASS fused-MoE module on first use (about 8 minutes on GB200).",
     ),
     KernelEntry(
         name="inference_flashinfer_nvfp4_moe",
