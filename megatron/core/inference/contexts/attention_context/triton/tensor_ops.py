@@ -32,7 +32,8 @@ def _tensor_get_slice_after_kernel(
 ):
     """Kernel to copy rows from INPUT_TENSOR[pos_on_device:] into OUTPUT_TENSOR."""
 
-    pid = tl.program_id(0)
+    # Row offsets (row * ROW_SIZE) are formed in int64: they pass 2**31 elements for large inputs.
+    pid = tl.program_id(0).to(tl.int64)
     pos_on_device = tl.load(POS_ON_DEVICE)
     copy_size = INPUT_BATCH_SIZE - pos_on_device
 
@@ -69,8 +70,10 @@ def _tensor_merge_kernel(
     - output[pos_on_device:pos_on_device + tensor_b_batch] = tensor_b[:tensor_b_batch]
     """
 
-    pid = tl.program_id(0)
-    pos_on_device = tl.load(POS_ON_DEVICE)
+    # Row offsets (row * ROW_SIZE) and the end of tensor_b's rows (pos_on_device +
+    # TENSOR_B_BATCH_SIZE) are formed in int64: they pass 2**31 for large outputs and inputs.
+    pid = tl.program_id(0).to(tl.int64)
+    pos_on_device = tl.load(POS_ON_DEVICE).to(tl.int64)
 
     if pid < pos_on_device:
         if not IS_INPLACE:

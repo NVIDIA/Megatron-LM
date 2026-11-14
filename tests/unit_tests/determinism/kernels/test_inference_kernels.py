@@ -200,8 +200,10 @@ def test_fused_kv_append_replays():
 
     seeded()
     n_tokens, heads, dim, block, blocks, layers = 8192, 8, 128, 64, 2048, 2
-    key = torch.randn(n_tokens, 1, heads, dim, device="cuda", dtype=torch.bfloat16)
-    value = torch.randn(n_tokens, 1, heads, dim, device="cuda", dtype=torch.bfloat16)
+    # Key and value are views of a fused QKV projection (4 query heads per KV head), as
+    # attention passes them: their token stride is the whole QKV row.
+    qkv = torch.randn(n_tokens, 1, heads, 6 * dim, device="cuda", dtype=torch.bfloat16)
+    key, value = qkv[..., 4 * dim : 5 * dim], qkv[..., 5 * dim :]
     slots = torch.randperm(blocks * block, device="cuda")[:n_tokens]
     token_to_block = (slots // block).to(torch.int32)
     token_to_pos = (slots % block).to(torch.int32)
