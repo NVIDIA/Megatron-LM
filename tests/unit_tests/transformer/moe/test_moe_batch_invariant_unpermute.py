@@ -26,7 +26,8 @@ def _adversarial(shape, dtype, seed):
     return values
 
 
-def _routed(num_tokens, hidden, num_experts, topk, dtype, seed):
+def _inverse_map(num_tokens, hidden, num_experts, topk, dtype, seed):
+    """Random top-k routing, permuted as the dispatcher does; [2, tokens, topk] rows and experts."""
     gen = torch.Generator(device="cuda").manual_seed(seed)
     scores = torch.rand(num_tokens, num_experts, device="cuda", generator=gen)
     routing_map = torch.zeros(num_tokens, num_experts, dtype=torch.bool, device="cuda")
@@ -38,6 +39,11 @@ def _routed(num_tokens, hidden, num_experts, topk, dtype, seed):
         num_out_tokens=num_tokens * topk,
         return_batch_invariant_inverse_map=True,
     )
+    return inverse_map
+
+
+def _routed(num_tokens, hidden, num_experts, topk, dtype, seed):
+    inverse_map = _inverse_map(num_tokens, hidden, num_experts, topk, dtype, seed)
     rows = _adversarial((num_tokens * topk, hidden), dtype, seed + 1)
     return rows, inverse_map
 
@@ -166,3 +172,85 @@ def test_fused_unpermute_backward_is_cuda_graph_capturable(ep_world_size, dtype)
     assert torch.equal(_bits(out), _bits(loop))
     assert torch.equal(_bits(rows.grad), _bits(loop_rows.grad))
     assert torch.equal(_bits(rows.grad[[3, 5]]), _bits(torch.zeros_like(rows.grad[[3, 5]])))
+
+
+def _kernel_rank_partials_reference(
+    rows, route_rows, route_experts, probs, num_experts, ep_size, rank_partial_dtype, collective
+):
+    """``unpermute_with_kernel_rank_partials`` in fp64 with every rounding written out.
+
+    A fused multiply-add is exact in fp64 and then rounded once to fp32, as the hardware
+    instruction rounds, while the operands stay within a few binades of each other.
+    """
+    experts_per_rank = num_experts // ep_size
+    acc = torch.zeros(route_rows.shape[0], rows.shape[1], dtype=torch.float64, device=rows.device)
+    for ep_rank in range(ep_size):
+        partial = torch.zeros_like(acc)
+        for k in range(route_rows.shape[1]):
+            expert = route_experts[:, k]
+            on_rank = (route_rows[:, k] >= 0) & (expert // experts_per_rank == ep_rank)
+            value = rows[route_rows[:, k].clamp(min=0)].double()
+            fused = (partial + probs[:, k].double()[:, None] * value).float().double()
+            partial = torch.where(on_rank[:, None], fused, partial)
+        if rank_partial_dtype is torch.bfloat16:
+            partial = partial.float().bfloat16().double()
+        if collective == "multimem":
+            acc = acc + partial  # the exact fp32 sum of the partials, rounded once at the end
+        else:
+            acc = (acc + partial).float().double()  # ascending rank-order fp32 chain
+    return acc.float().to(rows.dtype)
+
+
+@pytest.mark.parametrize("collective", ["ordered", "multimem"])
+@pytest.mark.parametrize("rank_partial_dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize(
+    "num_tokens,hidden,num_experts,topk,ep_size",
+    [(1, 8, 4, 1, 1), (37, 100, 8, 2, 2), (300, 520, 16, 4, 4), (257, 1030, 64, 8, 8)],
+)
+def test_kernel_rank_partials_match_the_reference_bitwise(
+    monkeypatch, collective, rank_partial_dtype, num_tokens, hidden, num_experts, topk, ep_size
+):
+    """Both rank-partial dtypes: fp32 fused multiply-adds in slot order, the partial stored as
+    bf16 or fp32, then the ranks added as the configured collective adds them."""
+    monkeypatch.setattr(batch_invariant, "get_batch_invariant_collective", lambda: collective)
+    route_rows, route_experts = _inverse_map(
+        num_tokens, hidden, num_experts, topk, torch.bfloat16, seed=num_tokens
+    )
+    # Magnitudes within eight binades of each other keep the fp64 reference exact.
+    gen = torch.Generator(device="cuda").manual_seed(num_tokens + 1)
+    signs = torch.randint(0, 2, (num_tokens * topk, hidden), device="cuda", generator=gen) * 2 - 1
+    rows = (
+        torch.empty(num_tokens * topk, hidden, device="cuda").uniform_(1 / 16, 16, generator=gen)
+        * signs
+    ).to(torch.bfloat16)
+    probs = torch.rand(num_tokens, topk, device="cuda", generator=gen) * 0.75 + 0.25
+    probs = probs.to(torch.bfloat16).float()
+
+    out = batch_invariant.unpermute_with_kernel_rank_partials(
+        rows, route_rows, route_experts, probs, num_experts, ep_size, rank_partial_dtype
+    )
+    ref = _kernel_rank_partials_reference(
+        rows, route_rows, route_experts, probs, num_experts, ep_size, rank_partial_dtype, collective
+    )
+
+    assert out.dtype == rows.dtype and out.shape == ref.shape
+    assert torch.equal(_bits(out), _bits(ref))
+
+
+@pytest.mark.parametrize("collective", ["ordered", "multimem"])
+def test_kernel_rank_partials_round_to_bf16_only_when_asked(monkeypatch, collective):
+    """One token, routes on both of two ranks: rank 0 adds 1 and 2^-10, rank 1 adds 2^-10. A
+    bf16 rank partial drops rank 0's 2^-10; an fp32 one keeps it."""
+    monkeypatch.setattr(batch_invariant, "get_batch_invariant_collective", lambda: collective)
+    rows = torch.tensor([[1.0], [2**-10], [2**-10]], device="cuda").expand(3, 8).contiguous()
+    route_rows = torch.tensor([[0, 1, 2]], device="cuda")
+    route_experts = torch.tensor([[0, 1, 2]], device="cuda")  # experts per rank: 2
+    probs = torch.ones(1, 3, device="cuda")
+
+    def run(dtype):
+        return batch_invariant.unpermute_with_kernel_rank_partials(
+            rows, route_rows, route_experts, probs, 4, 2, dtype
+        )
+
+    assert torch.equal(run(torch.float32), torch.full((1, 8), 1 + 2**-9, device="cuda"))
+    assert torch.equal(run(torch.bfloat16), torch.full((1, 8), 1 + 2**-10, device="cuda"))

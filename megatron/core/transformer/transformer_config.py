@@ -1624,6 +1624,9 @@ class TransformerConfig(ModelParallelConfig):
     host-known EP-wide token ceiling fits. Prefill, mixed, static-inference,
     and oversized decode graphs retain the full dispatcher buffer. Requires
     the NVLS inference dispatcher and EP > 1.
+
+    FlashInfer routed MXFP8 MoE ignores it, with a warning: that path bounds its work by
+    the dispatcher's device-side token count instead.
     """
 
     inference_moe_nvfp4_recipe: Optional[Literal['per_token']] = None
