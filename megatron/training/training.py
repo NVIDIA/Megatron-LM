@@ -3582,11 +3582,16 @@ def training_log(
     if cfg.model.transformer.num_moe_experts is not None:
         moe_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         track_names = []
-        if "aux_loss" in cfg.model.transformer.moe_router_load_balancing_type:
+        # A single load-balancing type is stored as a plain string; a substring test would
+        # then match "aux_loss" inside "seq_aux_loss" and "global_aux_loss".
+        load_balancing_types = cfg.model.transformer.moe_router_load_balancing_type
+        if isinstance(load_balancing_types, str):
+            load_balancing_types = [load_balancing_types]
+        if "aux_loss" in load_balancing_types:
             track_names.append("load_balancing_loss")
-        if "seq_aux_loss" in cfg.model.transformer.moe_router_load_balancing_type:
+        if "seq_aux_loss" in load_balancing_types:
             track_names.append("seq_load_balancing_loss")
-        if "global_aux_loss" in cfg.model.transformer.moe_router_load_balancing_type:
+        if "global_aux_loss" in load_balancing_types:
             track_names.append("global_load_balancing_loss")
         if cfg.model.transformer.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
