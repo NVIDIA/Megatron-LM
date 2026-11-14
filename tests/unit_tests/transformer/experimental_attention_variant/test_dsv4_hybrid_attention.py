@@ -251,6 +251,54 @@ def test_grouped_output_projection_respects_cpu_initialization(monkeypatch):
     assert attention.linear_o_group_proj.device.type == "cpu"
 
 
+def test_projections_take_the_attention_collection(monkeypatch):
+    """Each linear projection of the attention is built with the attention's collection."""
+    from megatron.core.transformer import identity_op
+    from megatron.core.transformer.experimental_attention_variant import (
+        deepseek_v4_hybrid_attention as dsv4_attention,
+    )
+    from megatron.core.transformer.spec_utils import ModuleSpec
+
+    class SizeOneGroup:
+        def size(self) -> int:
+            return 1
+
+    class RecordingLinear(identity_op.IdentityOp):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.given_pg_collection = kwargs.get("pg_collection")
+
+    monkeypatch.setattr(dsv4_attention, "RotaryEmbedding", identity_op.IdentityOp)
+    # The attention accepts only the Transformer Engine linear as its Q down-projection.
+    monkeypatch.setattr(dsv4_attention, "TELinear", RecordingLinear)
+
+    config = _make_config(perform_initialization=False, csa_compress_ratios=[0, 0, 0, 0])
+    pg_collection = ProcessGroupCollection()
+    pg_collection.tp = SizeOneGroup()
+    pg_collection.cp = SizeOneGroup()
+    submodules = dsv4_attention.DSv4HybridSelfAttentionSubmodules(
+        q_layernorm=identity_op.IdentityOp,
+        kv_layernorm=identity_op.IdentityOp,
+        linear_q_down_proj=RecordingLinear,
+        linear_q_up_proj=RecordingLinear,
+        linear_kv_proj=RecordingLinear,
+        core_attention=ModuleSpec(module=identity_op.IdentityOp),
+        linear_proj=RecordingLinear,
+    )
+
+    attention = dsv4_attention.DSv4HybridSelfAttention(
+        config=config,
+        submodules=submodules,
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+        pg_collection=pg_collection,
+        compress_ratio=0,
+    )
+
+    for name in ("linear_q_down_proj", "linear_q_up_proj", "linear_kv_proj", "linear_proj"):
+        assert getattr(attention, name).given_pg_collection is pg_collection, name
+
+
 def test_config_includes_mtp_ratio_and_derives_dimensions():
     """DSv4 config should account for MTP and derive its shared Q/KV content width."""
     config = _make_config(num_layers=2, mtp_num_layers=1, csa_compress_ratios=[0, 4, 128])

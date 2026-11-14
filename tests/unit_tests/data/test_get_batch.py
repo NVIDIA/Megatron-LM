@@ -1092,6 +1092,9 @@ def test_intermediate_pipeline_batch_uses_config_layout(monkeypatch):
         mtp_num_layers=None,
         dynamic_context_parallel=False,
         linear_cp_layout="contiguous",
+        virtual_pipeline_model_parallel_size=None,
+        sequence_parallel=False,
+        tensor_model_parallel_size=1,
     )
     monkeypatch.setattr(pretrain_hybrid, "get_args", lambda: args)
     monkeypatch.setattr(
@@ -1099,11 +1102,17 @@ def test_intermediate_pipeline_batch_uses_config_layout(monkeypatch):
         "get_run_config",
         lambda: SimpleNamespace(model=SimpleNamespace(transformer=config)),
     )
-    monkeypatch.setattr(pretrain_hybrid.mpu, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(pretrain_hybrid, "is_first_or_last_pipeline_stage", lambda stage: False)
+    # get_batch reads its ranks and stages from the collection; these stand-in groups need no
+    # parallel state.
+    monkeypatch.setattr(pretrain_hybrid, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(
+        pretrain_hybrid, "is_first_or_last_pipeline_stage", lambda stage, **kwargs: False
+    )
     monkeypatch.setattr(pretrain_hybrid, "mtp_on_this_rank_func", lambda **kwargs: False)
 
-    batch = get_batch(None)
+    batch = get_batch(
+        None, pg_collection=ProcessGroupCollection(tp=object(), pp=object(), cp=object())
+    )
 
     assert set(batch.batches_by_layout) == {"contiguous"}
     assert all(value is None for value in batch.get_batch().values())
@@ -1147,7 +1156,9 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
             "get_run_config",
             return_value=SimpleNamespace(model=SimpleNamespace(transformer=config)),
         ),
-        patch.object(pretrain_hybrid, "mtp_on_this_rank_func", return_value=True),
+        patch.object(
+            pretrain_hybrid, "mtp_on_this_rank_func", return_value=True
+        ) as mtp_on_this_rank,
         patch.object(
             pretrain_hybrid,
             "get_batch_on_this_rank_for_sequence_packing",
@@ -1160,6 +1171,9 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
     assert cp_batch is scheduler_batch
     assert fetch_batch.call_args.kwargs["return_context_parallel_batch"]
     assert fetch_batch.call_args.kwargs["pg_collection"] is pg_collection
+    # get_batch passes the collection's pipeline group, so mtp_on_this_rank does not fall back
+    # to the global grid.
+    assert mtp_on_this_rank.call_args.kwargs["pp_group"] is pg_collection.pp
     assert set(cp_batch.batches_by_layout) == {"zigzag"}
     assert cp_batch.get_packed_seq_params() is packed_seq_params
     batch = cp_batch.get_batch()
@@ -1207,6 +1221,59 @@ def test_get_batch_reuses_run_config_without_rebuilding(script, monkeypatch):
     for _ in range(2):
         assert script.get_batch(None, pg_collection=pg_collection) is result
         assert fetch_batch.call_args.kwargs["config"] is configs[1]
+
+
+@pytest.mark.parametrize("script", [pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])
+@pytest.mark.parametrize("explicit_pg_collection", [True, False])
+def test_unpacked_get_batch_places_mtp_by_the_callers_pipeline_group(
+    script, explicit_pg_collection, monkeypatch
+):
+    """Without sequence packing, MTP placement uses the caller's pipeline group, else the global."""
+    args = SimpleNamespace(
+        sft=False,
+        dataloader_inter_document_masking=False,
+        create_attention_mask_in_dataloader=False,
+    )
+    config = SimpleNamespace(
+        sequence_packing_scheduler=None,
+        context_parallel_size=1,
+        dynamic_context_parallel=False,
+        virtual_pipeline_model_parallel_size=None,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=1,
+        linear_cp_layout="zigzag",
+        sequence_parallel=False,
+        tensor_model_parallel_size=1,
+    )
+    global_pp_group = object()
+    # Without a collection, get_batch builds one from the global grid.
+    global_grid = ProcessGroupCollection(tp=object(), pp=global_pp_group, cp=object())
+    mtp_on_this_rank = MagicMock(return_value=False)
+    monkeypatch.setattr(script, "get_args", lambda: args)
+    monkeypatch.setattr(
+        script, "get_run_config", lambda: SimpleNamespace(model=SimpleNamespace(transformer=config))
+    )
+    monkeypatch.setattr(
+        ProcessGroupCollection, "use_mpu_process_groups", MagicMock(return_value=global_grid)
+    )
+    monkeypatch.setattr(script, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(script, "mtp_on_this_rank_func", mtp_on_this_rank)
+    # An intermediate stage without MTP or cu_seqlens returns before reading any data.
+    monkeypatch.setattr(script, "is_first_or_last_pipeline_stage", lambda vp_stage, **kwargs: False)
+
+    caller_pp_group = object()
+    pg_collection = (
+        ProcessGroupCollection(tp=object(), pp=caller_pp_group, cp=object())
+        if explicit_pg_collection
+        else None
+    )
+    batch = script.get_batch(None, pg_collection=pg_collection)
+    # pretrain_hybrid wraps the empty batch in a ContextParallelBatch.
+    values = list(batch.get_batch().values()) if script is pretrain_hybrid else batch
+    assert values == [None] * len(script.BATCH_KEYS)
+
+    expected = caller_pp_group if explicit_pg_collection else global_pp_group
+    assert mtp_on_this_rank.call_args.kwargs["pp_group"] is expected
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
