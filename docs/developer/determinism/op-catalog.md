@@ -33,6 +33,7 @@ Selected by `torch.are_deterministic_algorithms_enabled()` or
 
 | Operation | Where | Deterministic Path | Default Path |
 | --- | --- | --- | --- |
+| Native fused cross-entropy (`--cross-entropy-fusion-impl native`) | `megatron/core/fusions/fused_cross_entropy.py` | `torch.compile` reduction configurations constrained by strict deterministic algorithms; covered by TP1/TP2 bf16/fp32 contention replays | compiler autotuning can select different reduction configurations between processes |
 | MoE token unpermute (combine) | `megatron/core/transformer/moe/moe_utils.py` | `index_add_` — deterministic under torch deterministic algorithms and CUDA-graph safe | `scatter_add_` (atomic accumulation) |
 | MoE routing map and probabilities | `megatron/core/transformer/moe/moe_utils.py` | `index_put_(accumulate=False)` row-wise writes | out-of-place `scatter` |
 | Vocab-parallel embedding | `megatron/core/tensor_parallel/layers.py` | direct indexing `weight[idx]` (deterministic backward) | `F.embedding` (non-deterministic atomic backward) |
@@ -65,7 +66,7 @@ are known open gaps.
 
 | Operation or Feature | Where Enforced or Observed | Status |
 | --- | --- | --- |
-| Fused cross-entropy loss (`--cross-entropy-loss-fusion`) | rejected by `--deterministic-mode` (`megatron/training/determinism.py`) | The fused kernel is non-deterministic. Whether a deterministic variant is feasible remains an open question. Until then, the framework uses the native vocab-parallel path. |
+| Transformer Engine fused cross-entropy (`--cross-entropy-loss-fusion --cross-entropy-fusion-impl te`) | rejected by `--deterministic-mode` (`megatron/training/determinism.py`) | The native CE replay matrix does not qualify the separate TE backend. |
 | TP communication overlap (`--tp-comm-overlap`) | rejected by `--deterministic-mode` | Overlapped collective ordering is not reproducible. |
 | Packed sequence (`thd`) in gated-delta-net | assertion in `megatron/core/ssm/gated_delta_net.py` | No deterministic packed-sequence SSM path exists yet. |
 | Pre-GDR fusion (`--gdn-pre-gated-delta-rule-fusion`) | rejected by `GatedDeltaNet._setup_variant_attrs` | Uses atomic parameter-gradient reductions and timing-based Triton autotuning. |
