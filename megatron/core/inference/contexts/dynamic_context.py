@@ -305,7 +305,9 @@ class DynamoHelper:
 
     def __init__(self) -> None:
         self._kv_event_listeners: list[KVEventListener] = []
-        self._pending_kv_stored_events: list[dict[str, Any]] = []
+        # Events awaiting the end of the current forward pass, in the order the prefix
+        # cache changed. A removal that follows an unpublished store waits behind it.
+        self._pending_kv_events: list[tuple[str, dict[str, Any]]] = []
 
     @property
     def has_kv_event_listeners(self) -> bool:
@@ -326,31 +328,51 @@ class DynamoHelper:
         Args:
             payload: Stored-event payload.
         """
-        self._pending_kv_stored_events.append(payload)
+        self._pending_kv_events.append(("stored", payload))
 
     def publish_pending_kv_stored_events(self) -> None:
-        """Publish blocks whose KV contents were produced by a successful forward pass."""
-        pending, self._pending_kv_stored_events = self._pending_kv_stored_events, []
-        for payload in pending:
-            self._emit_kv_event("stored", payload)
+        """Publish blocks whose KV contents were produced by a successful forward pass.
+
+        Removals queued behind those stores are published after them, in order.
+        """
+        pending, self._pending_kv_events = self._pending_kv_events, []
+        for kind, payload in pending:
+            self._emit_kv_event(kind, payload)
 
     def discard_pending_kv_stored_events(self) -> None:
-        """Discard registrations left by an interrupted or failed forward pass."""
-        self._pending_kv_stored_events.clear()
+        """Discard registrations left by an interrupted or failed forward pass.
+
+        Queued removals are still published: a removed block may have been advertised by
+        an earlier forward pass.
+        """
+        pending, self._pending_kv_events = self._pending_kv_events, []
+        for kind, payload in pending:
+            if kind == "removed":
+                self._emit_kv_event(kind, payload)
 
     def on_kv_blocks_deregistered(self, _block_ids: list[int], hashes: set[int]) -> None:
         """Publish removal events for deregistered KV blocks.
+
+        A block registered in the current step is stored only after the forward pass, so
+        while stores are pending the removal waits behind them. Publishing it first would
+        leave listeners advertising a block the cache no longer holds.
 
         Args:
             _block_ids: Deregistered block IDs, unused by Dynamo.
             hashes: Hashes of the deregistered blocks.
         """
-        if hashes:
-            self._emit_kv_event("removed", {"block_hashes": list(hashes)})
+        if not hashes:
+            return
+        payload = {"block_hashes": list(hashes)}
+        if self._pending_kv_events:
+            self._pending_kv_events.append(("removed", payload))
+        else:
+            self._emit_kv_event("removed", payload)
 
     def notify_kv_cache_cleared(self) -> None:
         """Notify listeners that no previously advertised block is routable."""
-        self.discard_pending_kv_stored_events()
+        # The clear supersedes every pending store and removal.
+        self._pending_kv_events.clear()
         if self._kv_event_listeners:
             self._emit_kv_event("cleared", {})
 

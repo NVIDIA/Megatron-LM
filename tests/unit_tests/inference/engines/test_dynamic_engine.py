@@ -6232,6 +6232,68 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert list(env.engine.waiting_request_ids) == [2]
 
     @pytest.mark.internal
+    @pytest.mark.parametrize(
+        "async_sched_mode", [AsyncScheduleMode.LEGACY, AsyncScheduleMode.ASYNC]
+    )
+    @torch.inference_mode()
+    def test_kv_events_store_blocks_before_removing_them(self, async_sched_mode):
+        """A request finishing in the step that caches its prompt leaves nothing advertised.
+
+        Under REF_ZERO the finished request's blocks leave the cache at once. Their
+        removal must reach KV-event listeners after their storage, so a listener's view
+        (stored minus removed) stays equal to the prefix cache.
+        """
+        block_size = 16
+        test_config = DynamicEngineTestConfig(
+            model_provider="gpt",
+            num_requests=0,
+            num_tokens_to_generate=1,
+            context_max_tokens=256,
+            context_max_requests=2,
+            context_block_size_tokens=block_size,
+            max_sequence_length=128,
+            enable_prefix_caching=True,
+            prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
+            async_sched_mode=async_sched_mode,
+            use_cuda_graphs_for_non_decode_steps=False,
+        )
+        env = self._build_test_env(test_config)
+        engine, ctx = env.engine, env.engine.context
+        model_instance = engine.controller.inference_wrapped_model.model
+        model_instance.forward = partial(mock_forward, vocab_size=test_config.vocab_size)
+        events = []
+        ctx.dynamo_helper.add_kv_event_listener(
+            lambda kind, payload: events.append((kind, list(payload.get("block_hashes", []))))
+        )
+
+        request = DynamicInferenceRequest(
+            request_id=1,
+            prompt_tokens=torch.randint(
+                0, test_config.vocab_size, (2 * block_size,), device='cuda'
+            ),
+            sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+            block_size_tokens=block_size,
+            enable_prefix_caching=True,
+        )
+        engine._add_request(request)
+        for _ in range(8):
+            if not engine.has_unfinished_requests():
+                break
+            engine.step_modern()
+        assert not engine.has_unfinished_requests()
+
+        advertised = set()
+        for kind, hashes in events:
+            if kind == "stored":
+                advertised.update(hashes)
+            elif kind == "removed":
+                advertised.difference_update(hashes)
+            else:
+                advertised.clear()
+        assert [kind for kind, _ in events] == ["stored", "removed"]
+        assert advertised == set(ctx.kv_block_allocator.registry.kv_hash_to_block_id) == set()
+
+    @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
