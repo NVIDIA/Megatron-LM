@@ -399,6 +399,8 @@ class BertModel(LanguageModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous(), binary_logits
 
-        loss = self.compute_language_model_loss(lm_labels, logits)
+        loss = self.compute_language_model_loss(
+            lm_labels, logits, logits_are_gathered=self.output_layer.gather_output
+        )
 
         return loss, binary_logits
