@@ -13,6 +13,7 @@ from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import wide_residual_hybrid_stack_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -124,6 +125,9 @@ def _build_stack(
     assert model._residual_stream_atomic_layer_pairs == ((0, 1),)
     if cp_size > 1:
         assert model._cp_layout_manager is not None
+    # Replay keeps Mamba sequence-first; pin every arm to it so parity compares one reduction order.
+    for mixer in (module for module in model.modules() if isinstance(module, MambaMixer)):
+        mixer._use_batch_first_ssm = lambda inference_mode: False
     return model
 
 

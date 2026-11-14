@@ -169,16 +169,22 @@ class TestMambaMixerDeterminism:
         Utils.destroy_model_parallel()
 
     @requires_deterministic_conv1d
+    @pytest.mark.parametrize("batch_first", [True, False], ids=["batch_first", "sequence_first"])
     @pytest.mark.parametrize("packed_layout", ["none", "unpadded", "padded"])
-    def test_mixer_replays_bit_exactly(self, monkeypatch, packed_layout):
+    def test_mixer_replays_bit_exactly(self, monkeypatch, packed_layout, batch_first):
         """Two runs of one mixer agree bitwise under the deterministic conv reduction.
 
         ``MAMBA_DETERMINISTIC`` pins the SSD scan, whose nondeterminism would otherwise reach
-        the conv weight gradient, so a failure points at the convolution.
+        the conv weight gradient, so a failure points at the convolution. Both training
+        layouts are replayed; sequence-first still runs under sequence or context parallelism.
         """
         monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
         mixer = _build_mixer()
+        # This config passes the batch-first gate, so only sequence-first needs pinning.
+        assert mixer._use_batch_first_ssm(inference_mode=False)
+        if not batch_first:
+            monkeypatch.setattr(mixer, "_use_batch_first_ssm", lambda inference_mode: False)
         hidden_size = mixer.config.hidden_size
         micro_batch = _MICRO_BATCH if packed_layout == "none" else 1
         packed_seq_params = None
