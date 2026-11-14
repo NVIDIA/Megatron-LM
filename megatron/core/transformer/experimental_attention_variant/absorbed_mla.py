@@ -141,6 +141,12 @@ class AbsorbedMLASelfAttention(Attention):
     computation which can be more efficient for certain attention variants.
     """
 
+    def estimate_training_flops(self, **batch_stats: float) -> float:
+        """Use the constructed sparse core's indexer and backward costs when present."""
+        if getattr(self.core_attention, "requires_dsa_inputs", False):
+            return self.core_attention.estimate_training_flops(absorbed_mla=True, **batch_stats)
+        return super().estimate_training_flops(**batch_stats)
+
     @classmethod
     def estimate_flops(
         cls,

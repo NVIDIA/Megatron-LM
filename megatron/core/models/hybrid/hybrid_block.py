@@ -545,6 +545,10 @@ class HybridStack(MegatronModule):
         forward_step_func"""
         self.input_tensor = input_tensor
 
+    def estimate_training_flops(self, **kwargs) -> float:
+        """Sum the layers executed on this pipeline chunk, including shortcut pairs."""
+        return sum(layer.estimate_training_flops(**kwargs) for layer in self.physical_layers())
+
     def physical_layers(self) -> tuple[nn.Module, ...]:
         """Return one layer per layer_type_list entry, in execution order.
 

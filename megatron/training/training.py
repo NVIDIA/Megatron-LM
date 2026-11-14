@@ -842,6 +842,34 @@ def _dsv4_attention_flops(transformer_cfg, layer_counts, total_tokens, seqlen_sq
     return 3 * forward
 
 
+def _hybrid_model_flops(hybrid_models, **kwargs):
+    """Combine local chunk estimates across PP, without counting TP/DP replicas."""
+    error = None
+    try:
+        flops = float(sum(model.estimate_training_flops(**kwargs) for model in hybrid_models))
+        if not math.isfinite(flops) or flops < 0:
+            raise ValueError("The local model returned an invalid FLOP estimate.")
+    except Exception as exc:
+        # Every PP rank must enter the collective even if a local layer cannot estimate.
+        error = exc
+        flops = float("nan")
+    pp_group = hybrid_models[0].pg_collection.pp
+    if pp_group is not None and torch.distributed.get_world_size(pp_group) > 1:
+        device = (
+            torch.cuda.current_device()
+            if torch.distributed.get_backend(pp_group) == "nccl"
+            else "cpu"
+        )
+        total = torch.tensor(flops, dtype=torch.float64, device=device)
+        torch.distributed.all_reduce(total, group=pp_group)
+        flops = total.item()
+    if error is not None:
+        raise error
+    if not math.isfinite(flops) or flops < 0:
+        raise ValueError("A pipeline stage returned an invalid FLOP estimate or could not estimate.")
+    return flops
+
+
 def num_floating_point_operations(
     model_config,
     batch_size,
@@ -849,7 +877,7 @@ def num_floating_point_operations(
     sequence_length,
     seqlen_squared_sum_in_batch=None,
     total_real_tokens_in_batch=None,
-    hybrid_model=None,
+    hybrid_models=None,
 ):
     """Compute the number of floating-point operations for one global batch.
 
@@ -875,42 +903,44 @@ def num_floating_point_operations(
             than ``batch_size * llm_seq_length`` whenever the dataloader added
             CP-alignment padding or end-of-sequence padding, so neither kind of
             padding shows up in the reported FLOPs.
-        hybrid_model: Actual HybridModel, when available. Its config list, resolved
-            root config, vocabulary, and built-in specs define the architecture to count.
+        hybrid_models: All local, unwrapped HybridModel chunks for a config-defined
+            architecture. Their estimates are summed across pipeline stages.
             Pattern-defined models retain the existing calculation.
     """
+    # Defaults: BSHD layout assumption (full causal mask, every sample length =
+    # llm_seq_length, no padding). For BSHD ``total_real_tokens = batch * s`` and
+    # ``seqlen_squared_sum = batch * s^2`` recover the original closed-form.
+    if seqlen_squared_sum_in_batch is None:
+        seqlen_squared_sum_in_batch = batch_size * sequence_length * sequence_length
+    if total_real_tokens_in_batch is None:
+        total_real_tokens_in_batch = batch_size * sequence_length
+
+    if hybrid_models is not None:
+        return _hybrid_model_flops(
+            hybrid_models,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+        )
+
     from megatron.core.transformer.attention import SelfAttention
     from megatron.core.transformer.mlp import MLP
     from megatron.core.transformer.moe.moe_layer import MoELayer
     from megatron.core.transformer.multi_latent_attention import MLASelfAttention
     from megatron.training.vocab_utils import model_vocab_size
 
-    layer_configs = getattr(hybrid_model, "hybrid_layer_config_list", None)
-    transformer_cfg = hybrid_model.config if layer_configs is not None else model_config.transformer
+    transformer_cfg = model_config.transformer
     llm_seq_length = sequence_length
     group_query_attention = transformer_cfg.num_query_groups != transformer_cfg.num_attention_heads
     swiglu = (
         transformer_cfg.gated_linear_unit
         and transformer_cfg.activation_func is torch.nn.functional.silu
     )
-    vocab_size = (
-        hybrid_model.vocab_size
-        if layer_configs is not None
-        else model_vocab_size(
-            model_config.vocab_size,
-            should_pad_vocab=model_config.should_pad_vocab,
-            make_vocab_size_divisible_by=model_config.make_vocab_size_divisible_by,
-            tensor_model_parallel_size=transformer_cfg.tensor_model_parallel_size,
-        )
+    vocab_size = model_vocab_size(
+        model_config.vocab_size,
+        should_pad_vocab=model_config.should_pad_vocab,
+        make_vocab_size_divisible_by=model_config.make_vocab_size_divisible_by,
+        tensor_model_parallel_size=transformer_cfg.tensor_model_parallel_size,
     )
-
-    # Defaults: BSHD layout assumption (full causal mask, every sample length =
-    # llm_seq_length, no padding). For BSHD ``total_real_tokens = batch * s`` and
-    # ``seqlen_squared_sum = batch * s^2`` recover the original closed-form.
-    if seqlen_squared_sum_in_batch is None:
-        seqlen_squared_sum_in_batch = batch_size * llm_seq_length * llm_seq_length
-    if total_real_tokens_in_batch is None:
-        total_real_tokens_in_batch = batch_size * llm_seq_length
 
     def estimate(layer_type, config=None):
         return layer_type.estimate_flops(
@@ -1169,98 +1199,6 @@ def num_floating_point_operations(
         )
         return 3 * forward + expanded
 
-    def config_list_flops():
-        """Count every pipeline/MTP execution through the same layer-owned hook."""
-        from numbers import Real
-
-        from megatron.core.models.hybrid import MTPSplit, PipelineSplit
-        from megatron.core.models.hybrid.layers import utils as layers
-        from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2
-        from megatron.core.transformer.experimental_attention_variant.deepseek_v4_hybrid_attention import (
-            DSv4HybridSelfAttention,
-        )
-        from megatron.core.transformer.experimental_attention_variant.dsa import (
-            DSAIndexer,
-            is_dsa_skip_topk_layer,
-        )
-
-        builtins = {
-            layers.AttentionLayerConfig: SelfAttention,
-            layers.MLALayerConfig: MLASelfAttention,
-            layers.CSALayerConfig: DSv4HybridSelfAttention,
-            layers.MLPLayerConfig: MLP,
-            layers.MoELayerConfig: MoELayer,
-        }
-        forward, expanded, mtp_depths, layer_number = 0, 0, 0, 0
-        for layer in layer_configs:
-            if layer is PipelineSplit:
-                continue
-            if layer is MTPSplit:
-                mtp_depths += 1
-                layer_number = 0
-                continue
-            layer_number += 1
-            implementation = layers.get_custom_layer_type(layer)
-            is_builtin = implementation is None
-            if is_builtin:
-                if type(layer) is layers.MambaLayerConfig:
-                    implementation = (
-                        hybrid_model.hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.module
-                    )
-                elif type(layer) is layers.DSALayerConfig:
-                    implementation = (
-                        hybrid_model.hybrid_stack_spec.submodules.dsa_layer.submodules.self_attention.module
-                    )
-                elif type(layer) is layers.GDNLayerConfig:
-                    implementation = (
-                        GatedDeltaNet2
-                        if layer.experimental_attention_variant == "gdn2"
-                        else GatedDeltaNet
-                    )
-                else:
-                    implementation = builtins.get(type(layer))
-            if implementation is None:
-                raise ValueError(
-                    f"No FLOP estimate is available for hybrid layer config {type(layer).__name__}."
-                )
-            layer_flops = estimate(implementation, layer)
-            if (
-                not isinstance(layer_flops, Real)
-                or isinstance(layer_flops, bool)
-                or not math.isfinite(layer_flops)
-                or layer_flops < 0
-            ):
-                raise ValueError(
-                    f"{implementation.__name__}.estimate_flops must return a finite, "
-                    f"nonnegative real number, got {layer_flops!r}."
-                )
-            forward += layer_flops
-            if (
-                is_builtin
-                and type(layer) is layers.DSALayerConfig
-                and not is_dsa_skip_topk_layer(
-                    layer_number, layer.dsa_indexer_skip_topk_offset, layer.dsa_indexer_topk_freq
-                )
-            ):
-                expanded += DSAIndexer.estimate_flops(
-                    layer,
-                    total_real_tokens_in_batch=total_real_tokens_in_batch,
-                    seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-                    include_backward=True,
-                )
-        hidden_size = transformer_cfg.hidden_size
-        forward += (
-            2
-            * total_real_tokens_in_batch
-            * (
-                mtp_depths * (3 * hidden_size + 2 * hidden_size**2)
-                + hidden_size * vocab_size * (1 + mtp_depths)
-            )
-        )
-        return 3 * forward + expanded
-
-    if layer_configs is not None:
-        return config_list_flops()
     # Keep legacy non-SiLU GLU accounting unchanged; list configs use their actual widths.
     legacy_config = copy.copy(transformer_cfg)
     legacy_config.gated_linear_unit = swiglu
@@ -4656,7 +4594,10 @@ def train(
     cfg = get_run_config()
     timers = get_timers()
     train_state = get_train_state()
-    hybrid_model = _find_hybrid_model_for_runtime_metrics(model[0])
+    hybrid_models = [_find_hybrid_model_for_runtime_metrics(chunk) for chunk in model]
+    hybrid_model = hybrid_models[0]
+    if hybrid_model is None or hybrid_model.hybrid_layer_config_list is None:
+        hybrid_models = None
     moe_logging_metadata = None
     has_moe_layers = cfg.model.transformer.num_moe_experts is not None
     if hybrid_model is not None and hybrid_model.hybrid_layer_config_list is not None:
@@ -4664,7 +4605,7 @@ def train(
         num_floating_point_operations(
             cfg.model, 1, sequence_length=1,
             total_real_tokens_in_batch=1, seqlen_squared_sum_in_batch=1,
-            hybrid_model=hybrid_model,
+            hybrid_models=hybrid_models,
         )
         moe_logging_metadata = _hybrid_config_list_moe_logging_metadata(
             hybrid_model.hybrid_layer_config_list,
@@ -5313,7 +5254,7 @@ def train(
             sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
-            hybrid_model=hybrid_model,
+            hybrid_models=hybrid_models,
         )
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
         train_state.num_floating_point_operations_so_far += num_floating_point_operations_in_batch

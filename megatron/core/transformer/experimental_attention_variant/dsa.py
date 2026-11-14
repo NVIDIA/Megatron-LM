@@ -2203,6 +2203,17 @@ class DSAIndexer(MegatronModule):
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L431-L480
     """
 
+    def estimate_training_flops(
+        self, *, total_real_tokens_in_batch: float, seqlen_squared_sum_in_batch: float
+    ) -> float:
+        """Use the indexer's loss-dependent backward cost instead of a fixed multiplier."""
+        return self.estimate_flops(
+            self.config,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+            include_backward=True,
+        )
+
     @classmethod
     def estimate_flops(
         cls,
@@ -2876,6 +2887,13 @@ class DSAttention(MegatronModule):
     Reference:
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L491-L597
     """
+
+    def estimate_training_flops(self, *, absorbed_mla: bool = True, **batch_stats: float) -> float:
+        """Compose attention and the indexer actually executed by this layer."""
+        flops = 3 * self.estimate_flops(self.config, absorbed_mla=absorbed_mla, **batch_stats)
+        if self.indexer is not None:
+            flops += self.indexer.estimate_training_flops(**batch_stats)
+        return flops
 
     @classmethod
     def estimate_flops(

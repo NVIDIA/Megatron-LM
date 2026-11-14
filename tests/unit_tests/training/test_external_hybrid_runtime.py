@@ -1,21 +1,29 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Runtime integration for config-defined layers implemented outside Megatron Core."""
+"""Runtime integration for layers implemented outside Megatron Core."""
 
 from argparse import Namespace
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
 from megatron.core.models.hybrid import MTPSplit, PipelineSplit
-from megatron.core.models.hybrid.hybrid_layer_specs import gdp_stack_spec, hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.models.hybrid.layers.utils import create_layer_config
-from megatron.core.ssm.mlp_layer_config import MLPLayerConfig
+from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
+from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
+from megatron.core.transformer.identity_op import IdentityOp
+from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
-from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+from megatron.core.transformer.multi_token_prediction import (
+    MultiTokenPredictionBlock,
+    MultiTokenPredictionLayer,
+)
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.training import checkpointing
 from megatron.training.models.hybrid import HybridModelConfig
 from megatron.training.training import (
@@ -30,38 +38,89 @@ def _config(config_type=ExternalGainConfig, **kwargs):
     return config_type(num_layers=3, hidden_size=16, num_attention_heads=2, **kwargs)
 
 
-def _model(config, layers, spec=None):
-    return SimpleNamespace(
-        config=config, hybrid_layer_config_list=tuple(layers), vocab_size=32, hybrid_stack_spec=spec
+def _bare(module_type, config, **attributes):
+    """Build only the module hierarchy; constructors would allocate CUDA model state."""
+    module = module_type.__new__(module_type)
+    MegatronModule.__init__(module, config)
+    for name, value in attributes.items():
+        setattr(module, name, value)
+    return module
+
+
+def _stack(config, layers):
+    return _bare(HybridStack, config, layers=torch.nn.ModuleList(layers))
+
+
+def _model(config, layers, *, mtp=None, post_process=True, pp_group=None):
+    return _bare(
+        HybridModel,
+        config,
+        decoder=_stack(config, layers),
+        mtp=mtp,
+        mtp_process=mtp is not None,
+        post_process=post_process,
+        vocab_size=32,
+        pg_collection=SimpleNamespace(pp=pp_group),
     )
 
 
-def _flops(model):
+def _flops(*models, model_config=None):
     return num_floating_point_operations(
-        HybridModelConfig(transformer=model.config, vocab_size=32),
+        model_config or HybridModelConfig(transformer=models[0].config, vocab_size=32),
         batch_size=2,
         sequence_length=128,
         total_real_tokens_in_batch=7,
         seqlen_squared_sum_in_batch=25,
-        hybrid_model=model,
+        hybrid_models=list(models),
     )
 
 
 @pytest.mark.parametrize("shared_weights", [False, True])
-def test_external_flops_count_all_pipeline_and_mtp_layers(shared_weights):
-    config = _config(mtp_num_layers=2, mtp_use_repeated_layer=shared_weights)
-    mlp = MLPLayerConfig.from_config(config)
-    configs = [config, PipelineSplit, mlp, config, MTPSplit, config, MTPSplit, config]
-    tokens = 7
-    vocab_size = 32
-    result = _flops(_model(config, configs))
+def test_model_composition_counts_repeated_mtp_and_output_heads(shared_weights):
+    config = _config(ffn_hidden_size=64, mtp_num_layers=2, mtp_use_repeated_layer=shared_weights)
+    decoder = [
+        _bare(ExternalGainLayer, config),
+        _bare(MLP, config),
+        _bare(ExternalGainLayer, config),
+    ]
+    mtp_layers = [
+        _bare(
+            MultiTokenPredictionLayer,
+            config,
+            mtp_model_layer=_stack(config, [_bare(ExternalGainLayer, config)]),
+        )
+        for _ in range(1 if shared_weights else 2)
+    ]
+    mtp = _bare(
+        MultiTokenPredictionBlock,
+        config,
+        layers=torch.nn.ModuleList(mtp_layers),
+        mtp_use_repeated_layer=shared_weights,
+    )
+    # T=7: four gain executions=448, FFN=28672, MTP=15680, three heads=21504;
+    # each forward term receives the usual x3 training expansion.
+    assert _flops(_model(config, decoder, mtp=mtp)) == 198_912
 
-    # Four gain executions, one dense MLP, two MTP projections, and three logits heads.
-    gain_flops = 4 * tokens * config.hidden_size
-    mlp_flops = 4 * tokens * config.hidden_size * mlp.ffn_hidden_size
-    mtp_flops = 2 * tokens * 2 * (3 * config.hidden_size + 2 * config.hidden_size**2)
-    logits_flops = 2 * tokens * config.hidden_size * vocab_size * 3
-    assert result == 3 * (gain_flops + mlp_flops + mtp_flops + logits_flops)
+
+def test_nested_custom_children_and_shortcut_wrappers_are_counted_once():
+    config = _config(ffn_hidden_size=64)
+    transformer = _bare(
+        TransformerLayer,
+        config,
+        self_attention=_bare(ExternalGainLayer, config),
+        cross_attention=IdentityOp(),
+        mlp=_bare(MLP, config),
+    )
+    shortcut = _bare(
+        ShortcutMoEBlock,
+        config,
+        compute_layer=transformer,
+        moe_layer=_bare(ExternalGainLayer, config),
+    )
+    wrapped = _bare(HyperConnectionHybridLayer, config, inner_layer=shortcut.compute_layer)
+    shortcut.compute_layer = wrapped
+    # Two gain executions plus one FFN, with no output head on this stage.
+    assert _flops(_model(config, [shortcut], post_process=False)) == 86_688
 
 
 @pytest.mark.parametrize("layer_flops", [0, 123, 123.5])
@@ -69,23 +128,18 @@ def test_training_forwards_packed_sequence_counts_to_external_estimator(monkeypa
     config = _config()
     estimate_layer = Mock(return_value=layer_flops)
     monkeypatch.setattr(ExternalGainLayer, "estimate_flops", classmethod(estimate_layer))
-    model = _model(config, [config])
-    stale_config = _config()
-    stale_config.hidden_size = 32
-
-    result = num_floating_point_operations(
-        HybridModelConfig(transformer=stale_config, vocab_size=64),
-        batch_size=2,
-        sequence_length=128,
-        total_real_tokens_in_batch=7,
-        seqlen_squared_sum_in_batch=25,
-        hybrid_model=model,
+    model = _model(config, [_bare(ExternalGainLayer, config)])
+    stale_config = HybridModelConfig(
+        transformer=TransformerConfig(num_layers=3, hidden_size=32, num_attention_heads=2),
+        vocab_size=None,
     )
+
+    result = _flops(model, model_config=stale_config)
 
     estimate_layer.assert_called_once_with(
         ExternalGainLayer, config, total_real_tokens_in_batch=7, seqlen_squared_sum_in_batch=25
     )
-    assert result == 3 * (layer_flops + 2 * 7 * config.hidden_size * 32)
+    assert result == 3 * (layer_flops + 7168)
 
 
 @pytest.mark.parametrize("invalid_flops", [None, float("nan"), float("inf"), -1, True, "123"])
@@ -95,7 +149,7 @@ def test_invalid_external_flops_are_rejected_before_updating_counters(monkeypatc
         ExternalGainLayer, "estimate_flops", classmethod(Mock(return_value=invalid_flops))
     )
     with pytest.raises(ValueError, match="finite, nonnegative real number"):
-        _flops(_model(config, [config]))
+        _flops(_model(config, [_bare(ExternalGainLayer, config)]))
 
 
 def test_missing_external_flops_does_not_select_the_legacy_estimator(monkeypatch):
@@ -104,73 +158,81 @@ def test_missing_external_flops_does_not_select_the_legacy_estimator(monkeypatch
         ExternalGainLayer, "estimate_flops", classmethod(MegatronModule.estimate_flops.__func__)
     )
     with pytest.raises(NotImplementedError):
-        _flops(_model(config, [config]))
+        _flops(_model(config, [_bare(ExternalGainLayer, config)]))
 
 
-@pytest.mark.parametrize(
-    "symbol,spec",
-    [(symbol, hybrid_stack_spec) for symbol in ("*", "-", "M", "G", "E", "D", "C")]
-    + [("M", gdp_stack_spec)],
-)
-def test_config_lists_preserve_existing_pattern_flops(symbol, spec):
-    config = MLATransformerConfig(
-        num_layers=2,
-        hidden_size=16,
-        num_attention_heads=2,
-        ffn_hidden_size=32,
-        multi_latent_attention=False,
-        q_lora_rank=4,
-        kv_lora_rank=6,
-        qk_head_dim=4,
-        qk_pos_emb_head_dim=2,
-        v_head_dim=4,
-        num_moe_experts=4 if symbol == "E" else None,
-        moe_ffn_hidden_size=24 if symbol == "E" else None,
-        moe_router_topk=2,
-        mamba_state_dim=4,
-        mamba_head_dim=8,
-        mamba_num_groups=1,
-        mamba_num_heads=6,
-        gdp_num_householder=2,
-        linear_key_head_dim=4,
-        linear_value_head_dim=6,
-        linear_num_key_heads=2,
-        linear_num_value_heads=4,
-        dsa_indexer_n_heads=2,
-        dsa_indexer_head_dim=4,
-        dsa_indexer_topk=2,
-        dsa_indexer_loss_coeff=0.1,
-        dsa_indexer_use_sparse_loss=True,
-        csa_window_size=2,
-        output_projection_groups=2,
-        output_projection_lora_rank=4,
-    )
-    pattern_config = HybridModelConfig(
-        transformer=config, vocab_size=32, hybrid_layer_pattern=symbol * 2, hybrid_stack_spec=spec
-    )
-    expected = num_floating_point_operations(
-        pattern_config,
-        batch_size=2,
-        sequence_length=128,
-        total_real_tokens_in_batch=7,
-        seqlen_squared_sum_in_batch=25,
-    )
-    layers = [create_layer_config(config, symbol) for _ in range(2)]
-    # Preserve the existing formulas and their final integer rounding, including
-    # packed attention and the separate DSA/CSA backward factors.
-    assert _flops(_model(config, layers, spec)) == pytest.approx(expected, rel=0, abs=1)
-
-
-def test_mixed_ffn_widths_use_layer_configs_instead_of_stack_defaults():
+def test_mixed_ffn_widths_use_actual_child_configs():
     config = _config()
-    narrow = MLPLayerConfig.from_config(config)
-    wide = MLPLayerConfig.from_config(config)
-    narrow.ffn_hidden_size, wide.ffn_hidden_size = 24, 48
-    layers = [narrow, PipelineSplit, wide, config]
-    expected_forward = 4 * 7 * config.hidden_size * (24 + 48)
-    expected_forward += 7 * config.hidden_size  # external gain
-    expected_forward += 2 * 7 * config.hidden_size * 32  # logits
-    assert _flops(_model(config, layers)) == 3 * expected_forward
+    narrow = _bare(MLP, _config(ffn_hidden_size=24))
+    wide = _bare(MLP, _config(ffn_hidden_size=48))
+    # Two FFNs, one gain, and one output head at T=7/h=16/V=32.
+    assert _flops(_model(config, [narrow, wide, _bare(ExternalGainLayer, config)])) == 118_608
+
+
+@pytest.mark.parametrize("post_process,expected", [(False, 0), (True, 21_504)])
+def test_empty_stages_count_only_locally_executed_heads(post_process, expected):
+    config = _config(mtp_num_layers=2)
+    # Global MTP depth does not create local work on chunks that have no MTP block.
+    assert _flops(_model(config, [], post_process=post_process)) == expected
+
+
+def _mock_pipeline(monkeypatch):
+    pp_group = object()
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(torch.distributed, "get_backend", lambda group: "gloo")
+    return pp_group
+
+
+@pytest.mark.parametrize("with_layers,expected_local", [(False, 0), (True, 672)])
+def test_virtual_chunks_are_summed_before_reducing_only_the_pipeline_group(
+    monkeypatch, with_layers, expected_local
+):
+    pp_group = _mock_pipeline(monkeypatch)
+    reductions = []
+
+    def reduce_peer(value, *, group):
+        assert group is pp_group
+        reductions.append(value.item())
+        value.add_(1000)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce_peer)
+    config = _config()
+    chunks = [
+        _model(
+            config,
+            [_bare(ExternalGainLayer, config)] if with_layers else [],
+            post_process=False,
+            pp_group=pp_group,
+        )
+        for _ in range(2)
+    ]
+    assert _flops(*chunks) == expected_local + 1000
+    assert reductions == [expected_local]
+
+
+@pytest.mark.parametrize("local_estimate", [None, float("nan"), -1, 1j])
+def test_estimation_failures_propagate_across_pipeline_ranks(monkeypatch, local_estimate):
+    pp_group = _mock_pipeline(monkeypatch)
+    reductions = []
+
+    def reduce_failure(value, *, group):
+        assert group is pp_group
+        if local_estimate is not None:
+            assert torch.isnan(value).item()
+        reductions.append(value.item())
+        value.fill_(float("nan"))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce_failure)
+    config = _config()
+    model = _model(
+        config, [_bare(ExternalGainLayer, config)], post_process=False, pp_group=pp_group
+    )
+    if local_estimate is not None:
+        # Composite overrides must also be validated before entering the collective.
+        monkeypatch.setattr(model, "estimate_training_flops", Mock(return_value=local_estimate))
+    with pytest.raises((ValueError, TypeError)):
+        _flops(model)
+    assert len(reductions) == 1  # A local error must still reach the shared collective.
 
 
 @pytest.mark.parametrize("repeated_mtp", [False, True])

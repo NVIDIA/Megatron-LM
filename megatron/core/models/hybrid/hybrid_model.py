@@ -609,6 +609,28 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
 
+    def estimate_training_flops(
+        self, *, total_real_tokens_in_batch: float, seqlen_squared_sum_in_batch: float
+    ) -> float:
+        """Estimate this pipeline chunk's work for a global batch, without collectives."""
+        kwargs = dict(
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+        )
+        flops = self.decoder.estimate_training_flops(**kwargs)
+        if self.mtp_process:
+            flops += self.mtp.estimate_training_flops(**kwargs)
+        if self.post_process:
+            output_heads = 1 + (self.config.mtp_num_layers if self.mtp_process else 0)
+            flops += (
+                6
+                * total_real_tokens_in_batch
+                * self.config.hidden_size
+                * self.vocab_size
+                * output_heads
+            )
+        return flops
+
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.
 

@@ -2,7 +2,9 @@
 
 """Megatron Module."""
 
+import math
 from functools import partial
+from numbers import Real
 from typing import Any, Optional, Tuple
 
 import torch
@@ -90,14 +92,41 @@ class MegatronModule(torch.nn.Module):
 
         Built-in and custom layers share this optional hook. It must be pure:
         do not mutate the config, construct modules, or run collectives.
-        Return a finite nonnegative real number. Training accounts for repeated
-        layer executions and applies the forward/backward multiplier separately.
+        Return a finite nonnegative real number. Composites account for repeated
+        layer executions and apply the forward/backward multiplier separately.
 
         Include multiply/add operations, but exclude model-level work such as logits.
         """
         raise NotImplementedError(
             f"{cls.__name__} must implement estimate_flops for layer FLOP accounting."
         )
+
+    def estimate_training_flops(
+        self, *, total_real_tokens_in_batch: float, seqlen_squared_sum_in_batch: float
+    ) -> float:
+        """Estimate one execution for a global batch, including forward and backward.
+
+        Leaves reuse their pure forward estimate with the usual backward multiplier.
+        Composites override this method to sum their executed children, and layers with
+        different backward costs override it to account for that work. Like estimate_flops,
+        overrides must be pure and return a finite nonnegative real number.
+        """
+        forward = self.estimate_flops(
+            self.config,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+        )
+        if (
+            not isinstance(forward, Real)
+            or isinstance(forward, bool)
+            or not math.isfinite(forward)
+            or forward < 0
+        ):
+            raise ValueError(
+                f"{type(self).__name__}.estimate_flops must return a finite, "
+                f"nonnegative real number, got {forward!r}."
+            )
+        return 3 * forward
 
     def refresh_cache(self) -> None:
         """Refresh state derived from parameters after an in-place weight refit.

@@ -70,6 +70,15 @@ class MambaLayer(GraphableMegatronModule, TwoStageAttentionLayer):
     #: Whether this layer class owns a wide-residual connection around its mixer.
     supports_wide_residual_connections: bool = False
 
+    def estimate_training_flops(
+        self, *, total_real_tokens_in_batch: float, seqlen_squared_sum_in_batch: float
+    ) -> float:
+        """Use the mixer actually selected for this layer."""
+        return self.mixer.estimate_training_flops(
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+        )
+
     def __init__(
         self,
         config: TransformerConfig,
