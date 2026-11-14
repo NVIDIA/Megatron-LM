@@ -52,9 +52,6 @@ jobs:
           fetch-tags: true
           persist-credentials: false
 
-      - name: Checkout frozen version content
-        run: python3 fern/scripts/fern_versions.py extract-content
-
       - name: Set up Fern CLI
         uses: ./.github/actions/setup-fern
 

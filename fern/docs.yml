@@ -22,7 +22,7 @@ versions:
   - display-name: "nightly"
     ref: main
     slug: nightly
-  - display-name: "0.20.0"
+  - display-name: "0.20.0 (latest)"
     path: ../docs/index.yml
     slug: latest
   - display-name: "Archives"
