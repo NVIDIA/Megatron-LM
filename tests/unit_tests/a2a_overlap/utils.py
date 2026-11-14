@@ -3,6 +3,7 @@ import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+import pytest
 import torch
 
 from megatron.core import config
@@ -430,7 +431,14 @@ def get_valid_fp8_flags():
         for recipe in recipes:
             if fp8_type == "hybrid" and recipe == Fp8Recipe.mxfp8:
                 continue
-            valid_flags.append((fp8_type, recipe))
+            if recipe == Fp8Recipe.mxfp8:
+                # GB200 CI runs only tests marked launch_on_gb200, and only from files that name
+                # the marker (tests/unit_tests/find_test_cases.py), so callers' files name it too.
+                valid_flags.append(
+                    pytest.param((fp8_type, recipe), marks=pytest.mark.launch_on_gb200)
+                )
+            else:
+                valid_flags.append((fp8_type, recipe))
     valid_flags.append(None)
 
     return valid_flags

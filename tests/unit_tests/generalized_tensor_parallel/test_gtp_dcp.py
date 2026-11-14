@@ -2242,10 +2242,12 @@ class TestGtpDcpHelper:
         _require_world_size(4)
         _worker_helper_offsets_tp_eq_gtp_axis(dist.get_rank(), 4, None)
 
+    @pytest.mark.launch_on_gb200
     def test_native_fp8_dcp_save(self):
         _require_world_size(4)
         _worker_native_fp8_dcp_save(dist.get_rank(), 4, None)
 
+    @pytest.mark.launch_on_gb200
     def test_native_fp8_dcp_load_copy(self):
         _require_world_size(4)
         _worker_native_fp8_dcp_load_copy(dist.get_rank(), 4, None)

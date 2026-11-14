@@ -338,6 +338,7 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
 
 
 class TestMambaGTPCorrectness:
+    @pytest.mark.launch_on_gb200
     def test_mamba_gtp_loss_trajectory_matches_baseline(self):
         """GTP Mamba per-step losses must match the no-GTP baseline for BOTH bf16 (Phase 2) and
         native-MXFP8 (Phase 3) weight-remat, within bf16 reduction / mxfp8 quantization noise."""

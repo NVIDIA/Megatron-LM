@@ -33,12 +33,18 @@ _QUANT_RECIPES = [
     pytest.param(
         {"fp8": "hybrid", "fp8_recipe": "mxfp8"},
         id="fp8-mxfp8",
-        marks=pytest.mark.skipif(not _IS_BLACKWELL, reason="mxfp8 requires Blackwell"),
+        marks=[
+            pytest.mark.skipif(not _IS_BLACKWELL, reason="mxfp8 requires Blackwell"),
+            pytest.mark.launch_on_gb200,
+        ],
     ),
     pytest.param(
         {"fp4": "e2m1", "fp4_recipe": "nvfp4"},
         id="fp4-nvfp4",
-        marks=pytest.mark.skipif(not _IS_BLACKWELL, reason="nvfp4 requires Blackwell"),
+        marks=[
+            pytest.mark.skipif(not _IS_BLACKWELL, reason="nvfp4 requires Blackwell"),
+            pytest.mark.launch_on_gb200,
+        ],
     ),
 ]
 

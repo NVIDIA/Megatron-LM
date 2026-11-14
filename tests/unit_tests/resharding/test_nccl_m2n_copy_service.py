@@ -556,6 +556,7 @@ def test_nccl_m2n_refits_selective_mxfp8_from_te(
     not _has_nccl_m2n_python_package(),
     reason="install NVIDIA/nccl-extensions and NCCL4Py to run the M2N integration test",
 )
+@pytest.mark.launch_on_gb200
 def test_nccl_m2n_quantizes_packed_parameters_to_mxfp8_one_at_a_time():
     """Receive packed BF16 shards and immediately quantize each full local parameter."""
     from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor

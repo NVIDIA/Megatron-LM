@@ -137,6 +137,7 @@ class TestGPTModelOutputLayerSelection:
         assert model.output_layer.output_dtype == torch.float32
 
     @pytest.mark.internal
+    @pytest.mark.launch_on_gb200
     @pytest.mark.skipif(
         not _IS_BLACKWELL, reason="MXFP8 output projection requires Blackwell (SM >= 10)"
     )
