@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -316,6 +317,44 @@ class TestLayerWiseOptimizer:
         reference_model = type(model.module)().bfloat16().cuda()
         reference_model.load_state_dict(model.module.state_dict())
         return reference_model
+
+    def test_allgather_params_when_rank_0_owns_no_param(self):
+        """The all-gather helper must not index rank 0's owned list.
+
+        ``allgather_params()`` gathers each dp_cp group's owned params in one flatten /
+        all-gather-v / unflatten pass and read ``params_list[0][0]`` for the device and dtype;
+        rank 0's list is empty when the ping-pong assignment gives it no param of the group, and
+        every rank then died with IndexError. Each rank holds every param (as under DDP), the
+        owner writes a distinct value, and after ``allgather_params()`` every rank must hold the
+        owner's value for every param.
+        """
+        rank, world = torch.distributed.get_rank(), torch.distributed.get_world_size()
+        device = torch.device('cuda', torch.cuda.current_device())
+
+        def param(shape):
+            return torch.nn.Parameter(torch.zeros(shape, dtype=torch.bfloat16, device=device))
+
+        # Ownership: rank 0 -> nothing; rank 1 -> two params; every other rank -> one param.
+        owned = [(param((256, 128)), 1), (param((4, 8)), 1)]
+        owned += [(param((96, 64)), owner) for owner in range(2, world)]
+        params_list = [[] for _ in range(world)]
+        for p, owner in owned:
+            params_list[owner].append(p)
+        for index, (p, owner) in enumerate(owned):
+            if owner == rank:
+                p.data.fill_(float(owner + 1) + 0.5 * index)
+
+        optimizer = object.__new__(LayerWiseDistributedOptimizer)
+        optimizer.pg_collection = SimpleNamespace(dp_cp=torch.distributed.group.WORLD, expt_dp=None)
+        optimizer.dp_cp = torch.distributed.group.WORLD
+        optimizer.expt_dp = None
+        optimizer.dp_cp_params_list = params_list
+        optimizer.expt_dp_params_list = None
+        optimizer.allgather_params()
+
+        for index, (p, owner) in enumerate(owned):
+            expected = torch.full_like(p, float(owner + 1) + 0.5 * index)
+            torch.testing.assert_close(p.data, expected, rtol=0, atol=0)
 
     @pytest.mark.parametrize('use_param_layout', [False, True])
     def test_basic(self, use_param_layout):
