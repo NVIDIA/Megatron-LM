@@ -8,7 +8,8 @@
   goes straight into ``main_grad`` (``fused_embedding_wgrad``).
 * ``vocab_parallel_cross_entropy``: the unfused path deterministic mode relies on.
 * ``ColumnParallelLinear`` / ``RowParallelLinear``: cuBLAS GEMMs under the pinned workspace,
-  with and without apex ``fused_weight_gradient_mlp_cuda`` gradient-accumulation fusion.
+  with and without apex ``fused_weight_gradient_mlp_cuda`` gradient-accumulation fusion, and
+  the Megatron-FSDP fusion path for a weight used twice in one backward.
 * ``ColumnParallelLinear`` with BF16 inputs and FP32 output: Transformer Engine
   ``general_gemm`` forward plus the corresponding input- and weight-gradient paths.
 * apex ``FusedLayerNorm`` (persistent and non-persistent) and ``FusedScaleMaskSoftmax``
@@ -242,6 +243,53 @@ class TestTensorParallelLayers:
             contention=True,
             what=f"{layer} linear[fusion={grad_accum_fusion}]",
         )
+
+    @pytest.mark.skipif(
+        not HAVE_WGRAD_ACCUM_EXT, reason="apex fused_weight_gradient_mlp_cuda missing"
+    )
+    @pytest.mark.skipif(
+        te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
+    )
+    def test_fsdp_reused_weight_wgrad_fusion_replays(self):
+        """Megatron-FSDP gradient-accumulation fusion into ``get_main_grad()`` for a weight used
+        twice in one backward: the first wgrad overwrites stale contents, the second adds."""
+        seeded()
+        config = _config(hidden_size=1024, num_attention_heads=8, gradient_accumulation_fusion=True)
+        linear = ColumnParallelLinear(
+            1024, 2048, config=config, init_method=init_method_normal(0.02), bias=False
+        ).cuda()
+        weight = linear.weight
+        buffer = torch.empty_like(weight, dtype=torch.float32)
+        weight.__fsdp_param__ = True
+        weight.get_main_grad = lambda: buffer
+        weight.main_grad = buffer
+        weight.overwrite_main_grad = True
+
+        class ReusedLinear(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = linear
+
+            def forward(self, x1, x2):
+                # As Megatron-FSDP hands main_grad back: stale bytes and a cleared flag.
+                buffer.fill_(1e3)
+                weight._fsdp_wgrad_written = False
+                weight.grad_added_to_main_grad = False
+                return self.linear(x1)[0] + 2.0 * self.linear(x2)[0]
+
+        x1 = torch.randn(1024, 2, 1024, device="cuda", dtype=torch.bfloat16)
+        x2 = torch.randn(1024, 2, 1024, device="cuda", dtype=torch.bfloat16)
+        _, grads = assert_module_replays_bit_exact(
+            ReusedLinear(),
+            (x1, x2),
+            replays=3,
+            contention=True,
+            what="FSDP column linear[fusion, weight used twice]",
+        )
+        # Upstream gradient is ones, so each row of the wgrad is the column sum of x1 + 2 * x2.
+        expected = (x1.float() + 2.0 * x2.float()).sum(dim=(0, 1)).expand(2048, -1)
+        torch.testing.assert_close(grads["chunk0.linear.weight"], expected, rtol=1e-2, atol=1e-1)
+        assert weight._fsdp_wgrad_written
 
     @pytest.mark.skipif(
         te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
