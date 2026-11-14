@@ -522,6 +522,8 @@ def handle_control_signal(coordinator, sender_identity, metadata, bodies):
     # Broadcast the control signal. Forward the full metadata so that
     # data-bearing signals (e.g. SET_GENERATION_EPOCH) retain their args.
     coordinator._broadcast_to_engines(metadata)
+    if header == Headers.SET_GENERATION_EPOCH:
+        coordinator.generation_epoch = metadata[1]
 
     # STOP affects engines; reset coordinator to RUNNING to allow future engines.
     if header == Headers.STOP:
