@@ -8,7 +8,7 @@ import importlib
 import importlib.util
 import logging
 from collections import namedtuple
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
@@ -396,14 +396,17 @@ def mean_kernel(
     input_stride2,
     output_stride0,
     output_stride1,
-    M,  # size before reduction dim
-    N,  # size of reduction dim
-    K,  # size after reduction dim
+    M,  # size before reduction dims
+    N,  # size of reduction dims
+    K,  # size after reduction dims
     BLOCK_SIZE: tl.constexpr,
+    ACC_DTYPE: tl.constexpr,
+    INT64_OFFSETS: tl.constexpr,
 ):
     """
-    Kernel for computing mean along a single dimension.
-    Input is viewed as (M, N, K) where N is the dimension being reduced.
+    Kernel for computing mean along one or more adjacent dimensions.
+    Input is viewed as (M, N, K) where N is the dimensions being reduced. Each program sums
+    its N elements in ACC_DTYPE in the same order whatever M and K are.
     """
     # Program ID gives us which output element we're computing
     pid = tl.program_id(0)
@@ -416,18 +419,26 @@ def mean_kernel(
     if m_idx >= M or k_idx >= K:
         return
 
+    # Input element offsets, or the loop counter, reach 2**31 or more
+    n_begin = 0
+    if INT64_OFFSETS:
+        m_idx = m_idx.to(tl.int64)
+        k_idx = k_idx.to(tl.int64)
+        # An int64 start makes the loop counter, and so n_offsets, int64
+        n_begin = tl.zeros((), dtype=tl.int64)
+
     # Accumulate sum across reduction dimension
-    acc = 0.0
-    for n_start in range(0, N, BLOCK_SIZE):
+    acc = tl.zeros((), dtype=ACC_DTYPE)
+    for n_start in range(n_begin, N, BLOCK_SIZE):
         n_offsets = n_start + tl.arange(0, BLOCK_SIZE)
         mask = n_offsets < N
 
         # Calculate input indices
         input_idx = m_idx * input_stride0 + n_offsets * input_stride1 + k_idx * input_stride2
 
-        # Load and accumulate
+        # Load and accumulate. tl.sum keeps bf16/fp16 in their own dtype, so widen first.
         vals = tl.load(input_ptr + input_idx, mask=mask, other=0.0)
-        acc += tl.sum(vals)
+        acc += tl.sum(vals.to(ACC_DTYPE))
 
     # Compute mean and store
     mean_val = acc / N
@@ -436,29 +447,49 @@ def mean_kernel(
 
 
 def mean_dim(
-    input: torch.Tensor, dim: int, keepdim: bool = False, dtype: torch.dtype | None = None
+    input: torch.Tensor,
+    dim: int | Sequence[int] | None,
+    keepdim: bool = False,
+    dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """
-    Triton implementation of torch.mean with single dimension reduction.
+    Triton implementation of torch.mean over one or more dimensions.
+
+    Each mean is summed in one order that depends only on the sizes of the reduced
+    dimensions, so its bits do not depend on the sizes or values of the other dimensions.
 
     Args:
         input: Input tensor
-        dim: Single dimension along which to compute mean
-        keepdim: Whether to keep the reduced dimension
-        dtype: Output dtype. If None, uses input dtype (or float32 for integer inputs)
+        dim: Dimension or dimensions along which to compute mean; None or an empty
+            sequence reduces every dimension
+        keepdim: Whether to keep the reduced dimensions
+        dtype: Output dtype. If None, uses input dtype (or float32 for integer inputs).
+            As in torch.mean, the input is cast to it first and bf16/fp16 are summed in fp32.
 
     Returns:
-        Tensor with mean values along specified dimension
+        Tensor with mean values along specified dimensions
     """
     # Validate inputs
     assert input.is_cuda, "Input must be a CUDA tensor"
-    assert (
-        -input.ndim <= dim < input.ndim
-    ), f"Invalid dimension {dim} for tensor with {input.ndim} dimensions"
-
-    # Handle negative dim
-    if dim < 0:
-        dim = dim + input.ndim
+    # As in torch, a 0-dim tensor reduces like a 1-dim tensor of one element.
+    shape = list(input.shape) or [1]
+    ndim = len(shape)
+    if dim is None:
+        dim = []
+    elif isinstance(dim, int):
+        dim = [dim]
+    dims = []
+    for d in dim:
+        if not -ndim <= d < ndim:
+            raise IndexError(
+                f"Dimension out of range (expected to be in range of [{-ndim}, {ndim - 1}],"
+                f" but got {d})"
+            )
+        if d % ndim in dims:
+            raise RuntimeError(f"dim {d % ndim} appears multiple times in the list of dims")
+        dims.append(d % ndim)
+    # No dimension means every dimension.
+    dims = sorted(dims) or list(range(ndim))
 
     # Handle dtype
     if dtype is None:
@@ -471,38 +502,34 @@ def mean_dim(
     if input.dtype != dtype:
         input = input.to(dtype)
 
-    # Get input shape and strides
-    shape = list(input.shape)
+    # View the input as (M, N, K) with N the reduced dimensions: they move next to each
+    # other, after the kept dimensions before the first of them (no move for a single
+    # dimension or adjacent ones). Their elements are summed in row-major order.
+    before = list(range(dims[0]))
+    after = [d for d in range(dims[0], ndim) if d not in dims]
+    M = torch.Size([shape[d] for d in before]).numel()
+    N = torch.Size([shape[d] for d in dims]).numel()
+    K = torch.Size([shape[d] for d in after]).numel()
+    input_3d = input.reshape(shape).permute(before + dims + after).reshape(M, N, K)
+    # 64-bit offsets only for an input whose last element lies 2**31 or more elements from its
+    # first. Judged from the strides: a strided view can hold fewer elements and span more.
+    max_offset = sum(
+        max(size - 1, 0) * stride for size, stride in zip((M, N, K), input_3d.stride())
+    )
 
-    # Calculate dimensions for kernel
-    M = 1
-    for i in range(dim):
-        M *= shape[i]
-
-    N = shape[dim]
-
-    K = 1
-    for i in range(dim + 1, len(shape)):
-        K *= shape[i]
-
-    # Reshape input to 3D view (M, N, K)
-    input_3d = input.reshape(M, N, K)
-
-    # Create output shape
-    if keepdim:
-        output_shape = shape.copy()
-        output_shape[dim] = 1
+    # Create output shape: the kept dimensions keep their order
+    if input.ndim == 0:
+        output_shape = []
+    elif keepdim:
+        output_shape = [1 if d in dims else size for d, size in enumerate(shape)]
     else:
-        output_shape = shape[:dim] + shape[dim + 1 :]
+        output_shape = [size for d, size in enumerate(shape) if d not in dims]
 
     # Create output tensor
     output = torch.empty(output_shape, dtype=dtype, device=input.device)
 
     # Reshape output for kernel
-    if keepdim:
-        output_2d = output.reshape(M, 1, K).squeeze(1)
-    else:
-        output_2d = output.reshape(M, K)
+    output_2d = output.view(M, K)
 
     # Launch kernel
     grid = (M * K,)
@@ -515,11 +542,14 @@ def mean_dim(
         input_3d.stride(1),
         input_3d.stride(2),
         output_2d.stride(0),
-        output_2d.stride(1) if output_2d.ndim > 1 else 0,
+        output_2d.stride(1),
         M,
         N,
         K,
         BLOCK_SIZE,
+        ACC_DTYPE=tl.float64 if dtype == torch.float64 else tl.float32,
+        # The loop over N also steps its counter up to a block past the last element.
+        INT64_OFFSETS=max(max_offset, N + BLOCK_SIZE - 1) >= 2**31,
     )
 
     return output
@@ -594,23 +624,25 @@ def _log_softmax_batch_invariant(input, dim, _half_to_float):
 
 
 def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = None):
-    """Batch-invariant replacement for `aten::mean.dim` over one or more dimensions."""
-    assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
-    # A full reduction (`x.mean()`, `torch.mean(x)`) arrives with an empty dim list.
-    if dim is None or len(dim) == 0:
-        dim = list(range(input.ndim))
-    if len(dim) == 1:
-        return mean_dim(input, dim[0], keepdim=keepdim)
-    else:
-        assert input.dtype in {
-            torch.float16,
-            torch.bfloat16,
-            torch.float32,
-        }, "only float types supported for now"
-        n_elems = 1
-        for d in dim:
-            n_elems *= input.shape[d]
-        return torch.sum(input, dim=dim, keepdim=keepdim, dtype=torch.float32) / n_elems
+    """Batch-invariant replacement for `aten::mean.dim` over one or more dimensions.
+
+    As aten, the output dtype is `dtype` if given, else the input's, and must be floating
+    point or complex. A full reduction (`x.mean()`, `torch.mean(x)`) arrives with an empty
+    dim list.
+    """
+    out_dtype = input.dtype if dtype is None else dtype
+    if out_dtype.is_complex:
+        # The mean of complex numbers is the mean of their real and imaginary parts.
+        input = input.to(out_dtype)
+        return torch.complex(
+            mean_dim(input.real, dim, keepdim=keepdim), mean_dim(input.imag, dim, keepdim=keepdim)
+        )
+    if not out_dtype.is_floating_point:
+        raise RuntimeError(
+            f"mean(): could not infer output dtype. {'Input' if dtype is None else 'Optional'}"
+            f" dtype must be either a floating point or complex dtype. Got: {out_dtype}"
+        )
+    return mean_dim(input, dim, keepdim=keepdim, dtype=out_dtype)
 
 
 AttentionBlockSize = namedtuple("AttentionBlockSize", ["block_m", "block_n"])

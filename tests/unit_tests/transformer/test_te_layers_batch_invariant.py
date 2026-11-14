@@ -67,13 +67,178 @@ def test_batch_invariant_rejects_incompatible_te(monkeypatch):
         assert_te_supports_batch_invariant_attention()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 @pytest.mark.parametrize("dim", ([], (), None))
 @pytest.mark.parametrize("keepdim", (False, True))
 def test_mean_batch_invariant_full_reduction(dim, keepdim):
     """An empty (or None) dim list reduces over every dimension, as aten::mean does."""
-    x = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    x = torch.arange(24, dtype=torch.float32, device="cuda").reshape(2, 3, 4)
     out = mean_batch_invariant(x, dim, keepdim=keepdim)
     torch.testing.assert_close(out, x.mean(dim=(0, 1, 2), keepdim=keepdim))
+
+
+def _exact_values(shape, dtype, seed=0):
+    """Multiples of 1/8 below 32 in magnitude: exact in bf16 and fp16, and any sum of up to
+    2**16 of them is exact in fp32."""
+    g = torch.Generator(device="cuda").manual_seed(seed)
+    return (torch.randint(-255, 256, shape, device="cuda", generator=g) / 8).to(dtype)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("dtype", (torch.bfloat16, torch.float16), ids=("bf16", "fp16"))
+@pytest.mark.parametrize(
+    "shape,dim",
+    (((5, 8192), [-1]), ((2, 2048, 3), [1]), ((3, 32, 64), [1, 2]), ((16, 512), None)),
+    ids=("last", "middle", "two-dims", "all-dims"),
+)
+def test_mean_batch_invariant_sums_half_inputs_in_fp32(dtype, shape, dim):
+    """bf16/fp16 means are summed in fp32 and rounded once to the input dtype, as aten's are.
+
+    The sums are exact in fp32 and the counts are powers of two, so each mean must be the
+    exact mean rounded once. Partial sums kept in bf16/fp16 would drop bits.
+    """
+    x = _exact_values(shape, dtype)
+    with set_batch_invariant_mode(True):
+        out = torch.mean(x, dim=dim)
+    assert out.dtype == dtype
+    assert torch.equal(out, x.double().mean(dim=dim).to(dtype))
+
+
+# name: (input dtype, dim, dtype argument)
+_MEAN_DTYPE_CASES = {
+    "bf16-dtype-fp32": (torch.bfloat16, [-1], torch.float32),
+    "fp32-dtype-bf16": (torch.float32, [1, 2], torch.bfloat16),
+    "int64-dtype-fp32": (torch.int64, [1], torch.float32),
+    "bf16-two-dims": (torch.bfloat16, [1, 2], None),
+    "fp16-all-dims": (torch.float16, None, None),
+    "fp64-last": (torch.float64, [-1], None),
+    "fp64-split-dims": (torch.float64, [0, 2], None),
+    "complex64-two-dims": (torch.complex64, [1, 2], None),
+}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("name", tuple(_MEAN_DTYPE_CASES))
+def test_mean_batch_invariant_output_dtype_matches_aten(name):
+    """The output dtype is aten's (``dtype`` if given, else the input's) for the input dtypes
+    and ``dtype`` arguments torch.mean accepts. The inputs are small integers, so every sum is
+    exact and the values must equal aten's as well."""
+    in_dtype, dim, dtype = _MEAN_DTYPE_CASES[name]
+    g = torch.Generator(device="cuda").manual_seed(0)
+    x = torch.randint(-8, 9, (4, 16, 32), device="cuda", generator=g)
+    if in_dtype.is_complex:
+        x = torch.complex(x.float(), x.flip(-1).float())
+    x = x.to(in_dtype)
+    kwargs = {} if dtype is None else {"dtype": dtype}
+    expected = torch.mean(x, dim=dim, **kwargs)
+    with set_batch_invariant_mode(True):
+        out = torch.mean(x, dim=dim, **kwargs)
+    assert out.dtype == expected.dtype
+    assert torch.equal(out, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_mean_batch_invariant_rejects_integer_outputs():
+    """aten has no integer mean: without a floating ``dtype`` it raises, and so does the
+    batch-invariant mean."""
+    x = torch.arange(6, device="cuda").view(2, 3)
+    with pytest.raises(RuntimeError, match="could not infer output dtype"):
+        x.mean(1)
+    with set_batch_invariant_mode(True):
+        with pytest.raises(RuntimeError, match="could not infer output dtype"):
+            x.mean(1)
+
+
+# name: (shape, None marking the batch dim; batch dim; reduced dims; keepdim)
+_MEAN_BATCH_FORMS = {
+    "last": ((None, 4096), 0, [-1], False),
+    "two-dims": ((None, 33, 160), 0, [1, 2], False),
+    "two-dims-keepdim": ((None, 33, 160), 0, [1, 2], True),
+    "split-dims": ((33, None, 160), 1, [0, 2], False),
+    "leading-dims": ((33, 160, None), 2, [0, 1], False),
+}
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("name", tuple(_MEAN_BATCH_FORMS))
+def test_mean_batch_invariant_does_not_depend_on_the_batch(name):
+    """Five probe slices keep the bits of their means among 6, 129 and 1029 slices: for one
+    dim, several adjacent dims, dims on both sides of the batch dim and leading dims."""
+    shape, batch_dim, dim, keepdim = _MEAN_BATCH_FORMS[name]
+    g = torch.Generator(device="cuda").manual_seed(0)
+    probe = torch.randn([5 if s is None else s for s in shape], device="cuda", generator=g)
+    filler = torch.randn([1029 if s is None else s for s in shape], device="cuda", generator=g)
+    out_dim = batch_dim if keepdim else 0
+    with set_batch_invariant_mode(True):
+        base = torch.mean(probe, dim=dim, keepdim=keepdim)
+        for rows in (6, 129, 1029):
+            x = filler.narrow(batch_dim, 0, rows).clone()
+            x.narrow(batch_dim, rows - 5, 5).copy_(probe)
+            out = torch.mean(x, dim=dim, keepdim=keepdim)
+            assert torch.equal(out.narrow(out_dim, rows - 5, 5), base), f"{name}: rows={rows}"
+
+
+def _require_free_memory(nbytes):
+    """Skip, with the numbers, when the device has less than ``nbytes`` free."""
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    if free < nbytes:
+        pytest.skip(f"needs {nbytes / 2**30:.1f} GiB of device memory, {free / 2**30:.1f} free")
+
+
+@pytest.mark.large
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("form", ("rows", "column-slice", "first-dim"))
+def test_mean_batch_invariant_offsets_past_int32(form):
+    """Element offsets of 2**31 and more: means of the rows of a 4 GiB bf16 input that start
+    past 2**31 elements, of a 16-column slice of it (fewer elements, the same span) and over
+    its first dim read their own elements.
+
+    Opt in with ``-m large``; run one case per process, since a wrapped offset can leave a
+    sticky illegal-address error.
+    """
+    rows, cols = 2**20, 2064  # rows 1040448 and on start past element 2**31
+    _require_free_memory(rows * cols * 2 + 2**30)
+    x = torch.zeros(rows, cols, dtype=torch.bfloat16, device="cuda")
+    x[:8] = -0.25
+    x[-8:] = 1.5
+    with set_batch_invariant_mode(True):
+        if form == "first-dim":
+            out = torch.mean(x, dim=0)
+        else:
+            out = torch.mean(x if form == "rows" else x[:, :16], dim=-1)
+    if form == "first-dim":
+        # 8 * 1.5 - 8 * 0.25 = 10 in every column, over 2**20 rows: exact in bf16.
+        assert torch.equal(out, torch.full_like(out, 10 / rows))
+    else:
+        assert torch.equal(out[:8], torch.full_like(out[:8], -0.25))
+        assert torch.equal(out[-8:], torch.full_like(out[-8:], 1.5))
+        assert not out[8:-8].any()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize(
+    "n",
+    (
+        3 * 1024 + 1,
+        pytest.param(2**31 - 1024, marks=pytest.mark.large),
+        pytest.param(2**31 - 1023, marks=pytest.mark.large),
+        pytest.param(2**31 - 1, marks=pytest.mark.large),
+    ),
+    ids=("small", "counter-fits", "counter-wraps-first", "counter-wraps-last"),
+)
+def test_mean_batch_invariant_loop_counter_past_int32(n):
+    """The mean of n bf16 ones is 1. Its loop steps the counter a block past the last element,
+    which passes 2**31 for n from 2**31 - 1023 to 2**31 - 1 although every offset fits in int32.
+
+    The three cases near 2**31 need 4 GiB each: opt in with ``-m large`` and run one case per
+    process, since a wrapped counter reads before the input.
+    """
+    _require_free_memory(n * 2 + 2**30)
+    x = torch.ones(n, dtype=torch.bfloat16, device="cuda")
+    with set_batch_invariant_mode(True):
+        out = torch.mean(x, dim=0)
+    assert torch.equal(out, torch.ones_like(out))
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
