@@ -49,6 +49,9 @@ class Encoder(object):
         self.args = args
 
     def initializer(self):
+        # Worker processes provide parallelism; avoid an additional tokenizer
+        # thread pool in each worker unless the user explicitly enables it.
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         # Use Encoder class as a container for global data
         Encoder.tokenizer = build_tokenizer(self.args)
         if self.args.split_sentences:
@@ -155,6 +158,8 @@ class Partition(object):
 
         startup_start = time.time()
         encoder = Encoder(self.args)
+        # Partition processes also build a tokenizer before starting their pool.
+        os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         tokenizer = build_tokenizer(self.args)
         pool = multiprocessing.Pool(self.workers, initializer=encoder.initializer)
         encoded_docs = pool.imap(encoder.encode, fin, 32)
