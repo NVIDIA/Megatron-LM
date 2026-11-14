@@ -54,6 +54,7 @@ def test_fused_absorbed_mla_dsa_matches_native(
 def test_unfused_absorbed_mla_dsa_matches_native(
     seqlen: int, calculate_per_token_loss: bool, use_sparse_loss: bool
 ) -> None:
+    _skip_without_free_memory(_UNFUSED_PARITY_MEMORY_GIB[seqlen])
     run_absorbed_mla_dsa_parity(
         kernel_backend="none",
         seqlen=seqlen,
@@ -62,6 +63,23 @@ def test_unfused_absorbed_mla_dsa_matches_native(
         use_sparse_loss=use_sparse_loss,
         num_iterations=10,
     )
+
+
+# GPU memory the unfused parity test needs per sequence length: the smallest per-process limit
+# (torch.cuda.set_per_process_memory_fraction) under which each case passed on B300. The unfused
+# path materializes the full attention scores, so the need grows with seqlen**2; at 4096 tokens it
+# is more than an 80 GB GPU holds.
+_UNFUSED_PARITY_MEMORY_GIB = {1024: 9, 2048: 26, 4096: 94}
+
+
+def _skip_without_free_memory(gib: int) -> None:
+    if not torch.cuda.is_available():
+        return
+    # Release cached blocks first: what an earlier case left cached is free for this one.
+    torch.cuda.empty_cache()
+    free, _ = torch.cuda.mem_get_info()
+    if free < gib * 2**30:
+        pytest.skip(f"needs about {gib} GiB of free GPU memory, {free / 2**30:.0f} GiB is free")
 
 
 def _skip_if_fused_dsa_unavailable() -> None:
