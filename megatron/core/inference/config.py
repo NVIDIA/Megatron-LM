@@ -554,7 +554,8 @@ class InferenceConfig:
     max_tokens: Optional[int] = None
     """
     Max number of tokens to use for forward passes. This is primarily limited by prefill activation
-    memory usage. (Defaults to 16384).
+    memory usage. Must be divisible by the tensor parallel size. Batch-invariant inference also
+    requires alignment to the dynamic context's token rounding size. (Defaults to 16384).
     """
 
     unified_memory_level: int = 0

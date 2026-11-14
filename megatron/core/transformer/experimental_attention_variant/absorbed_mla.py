@@ -141,6 +141,32 @@ class AbsorbedMLASelfAttention(Attention):
     computation which can be more efficient for certain attention variants.
     """
 
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: MLATransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+    ) -> float:
+        """Estimate forward absorbed DSA attention, excluding its separately counted indexer."""
+        from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+        from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import (
+            DSALayerConfig,
+        )
+        from megatron.core.transformer.multi_latent_attention import MLASelfAttention
+
+        estimator = (
+            DSAttention
+            if isinstance(config, DSALayerConfig) or config.experimental_attention_variant == "dsa"
+            else MLASelfAttention
+        )
+        return estimator.estimate_flops(
+            config,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+        )
+
     def _mla_projection_context(self, *, is_init: bool = False):
         """Use high precision for MLA projections only when explicitly requested."""
         if not self.config.mla_proj_use_quantization:
