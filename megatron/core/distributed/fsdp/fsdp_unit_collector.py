@@ -81,12 +81,13 @@ class FsdpUnitCollector:
         if not isinstance(module, self._fsdp_unit_module_types):
             self._units.append(module)
 
-        # 2. Collect modules whose parameters replay uses without their unit's hooks.
+        # 2. Collect parameter-bearing replay modules for each checkpoint source.
         recomputed_modules = self._collect_recomputed_modules(module)
 
-        # 3. Mark the units that own those parameters.
+        # 3. Mark units whose own checkpoints replay their own parameters.
         for unit in self._units:
-            if any(owned in recomputed_modules for owned in self._owned_modules(unit)):
+            owned = set(self._owned_modules(unit))
+            if any(owned.intersection(recomputed_modules.get(source, ())) for source in owned):
                 self._partially_recomputed_units.add(unit)
         return self._units
 
@@ -100,20 +101,19 @@ class FsdpUnitCollector:
         """
         return unit in self._partially_recomputed_units
 
-    def _collect_recomputed_modules(self, root: nn.Module) -> set[nn.Module]:
-        """Collect parameter-bearing replay regions, excluding re-entered child units."""
-        recomputed = set()
+    @staticmethod
+    def _collect_recomputed_modules(root: nn.Module) -> dict[nn.Module, set[nn.Module]]:
+        """Map checkpoint sources to parameter-bearing replay modules, independent of FSDP."""
+        recomputed = {}
         for module in root.modules():
-            for rerun in _rerun_submodules(module):
-                # A checkpoint outside this unit re-enters its forward hooks. A checkpoint
-                # inside the unit (rerun is module) still needs its owned weights.
-                if rerun in self._units and rerun is not module:
-                    continue
-                recomputed.update(
-                    submodule
-                    for submodule in self._owned_modules(rerun)
-                    if next(submodule.parameters(recurse=False), None) is not None
-                )
+            replayed = {
+                submodule
+                for rerun in _rerun_submodules(module)
+                for submodule in rerun.modules()
+                if next(submodule.parameters(recurse=False), None) is not None
+            }
+            if replayed:
+                recomputed[module] = replayed
         return recomputed
 
     def _owned_modules(self, module: nn.Module) -> Iterator[nn.Module]:
