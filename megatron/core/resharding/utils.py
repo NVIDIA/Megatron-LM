@@ -145,6 +145,11 @@ class TensorReshardSpec:
     dst_slice: tuple[slice, ...] | None = None
     part_index: int = 0
     part_count: int = 1
+    # Expert-stacked specs: one logical [num_experts, *expert_shape] tensor
+    # sharded on dim 0 over the EP mesh. The local tensor is this rank's
+    # experts stacked in local-index order; these are their parameter names.
+    src_stack_names: tuple[str, ...] | None = None
+    dst_stack_names: tuple[str, ...] | None = None
 
 
 @dataclass
