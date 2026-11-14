@@ -630,6 +630,8 @@ def _get_megatron_optimizer_based_on_param_groups(
                 pin_cpu_grads=config.pin_cpu_grads,
                 pin_cpu_params=config.pin_cpu_params,
                 param_update_in_fp32=True,
+                main_params_rounding=config.main_params_rounding,
+                main_params_rounding_seed=config.main_params_rounding_seed,
                 **optimizer_defaults,
             )
             init_state_fn = None

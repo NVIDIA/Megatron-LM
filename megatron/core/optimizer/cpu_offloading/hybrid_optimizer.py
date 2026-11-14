@@ -4,6 +4,8 @@ from typing import Dict
 
 import torch
 
+from ..main_params_rounding import MainParamsRounding, copy_main_to_model_param_
+
 
 def _param_generator(cpu_optimizer):
     for group in cpu_optimizer.param_groups:
@@ -52,6 +54,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         pin_cpu_grads: bool = True,
         pin_cpu_params: bool = True,
         overlap_cpu_optimizer_d2h_h2d: bool = True,
+        main_params_rounding: MainParamsRounding = "nearest",
+        main_params_rounding_seed: int = 0,
         **kwargs,
     ):
         super(HybridDeviceOptimizer, self).__init__(
@@ -64,6 +68,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 "pin_cpu_grads": pin_cpu_grads,
                 "pin_cpu_params": pin_cpu_params,
                 "overlap_cpu_optimizer_d2h_h2d": overlap_cpu_optimizer_d2h_h2d,
+                "main_params_rounding": main_params_rounding,
+                "main_params_rounding_seed": main_params_rounding_seed,
                 **kwargs,
             },
         )
@@ -75,6 +81,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.pin_cpu_params = pin_cpu_params
         self.overlap_cpu_optimizer_d2h_h2d = overlap_cpu_optimizer_d2h_h2d
         self.param_update_in_fp32 = param_update_in_fp32
+        self.main_params_rounding = main_params_rounding
+        self.main_params_rounding_seed = main_params_rounding_seed
         self.sub_optimizer_kwargs = kwargs
 
         self._init_sub_optimizers()
@@ -123,7 +131,12 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                 with torch.cuda.stream(self._h2d_stream):
                     for param in _param_generator(optimizer):
                         gpu_param = self.cpu_copys_map_gpu_param[param]
-                        gpu_param.data.copy_(param.data, non_blocking=True)
+                        copy_main_to_model_param_(
+                            gpu_param.data,
+                            param.data,
+                            self.main_params_rounding,
+                            self.main_params_rounding_seed,
+                        )
                 self._h2d_stream.record_event().wait(torch.cuda.current_stream())
 
             return param_copy_back_gpu_hook
@@ -139,7 +152,12 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
 
                         if param in self.param_to_fp32_param:
                             fp32_param = self.param_to_fp32_param[param]
-                            param.data.copy_(fp32_param.data)
+                            copy_main_to_model_param_(
+                                param.data,
+                                fp32_param.data,
+                                self.main_params_rounding,
+                                self.main_params_rounding_seed,
+                            )
 
             return fp32_param_copy_back_gpu_hook
 

@@ -66,6 +66,7 @@ from ..full_cuda_graph import FullIterationGradCopy
 from ..transformer.fsdp_dtensor_checkpoint import handle_experts_in_state_dict
 from ..transformer.module import MegatronModule
 from .grad_scaler import MegatronGradScaler
+from .main_params_rounding import copy_main_to_model_param_
 from .optimizer import (
     MixedPrecisionOptimizer,
     _missing_param_group_message,
@@ -3261,7 +3262,12 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                         # function.
                         continue
                     else:
-                        shard_model_param.data.copy_(shard_main_param)
+                        copy_main_to_model_param_(
+                            shard_model_param.data,
+                            shard_main_param,
+                            self.config.main_params_rounding,
+                            self.config.main_params_rounding_seed,
+                        )
 
         # Copy shard groups to model groups.
         copy_group_params(self.shard_fp32_from_float16_groups, self.model_float16_groups)
