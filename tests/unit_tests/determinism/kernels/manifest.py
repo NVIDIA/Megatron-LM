@@ -309,7 +309,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="torch-op",
         notes="VocabParallelEmbedding (weight[idx] deterministic branch vs F.embedding, and the main_grad "
         "accumulation of gradient_accumulation_fusion) and local Column/RowParallelLinear "
-        "incl. apex fused_weight_gradient_mlp_cuda gradient-accumulation fusion.",
+        "incl. apex fused_weight_gradient_mlp_cuda gradient-accumulation fusion, and the "
+        "fp32-output TE general_gemm path on dense and strided (packed) inputs.",
     ),
     KernelEntry(
         name="vocab_parallel_cross_entropy",

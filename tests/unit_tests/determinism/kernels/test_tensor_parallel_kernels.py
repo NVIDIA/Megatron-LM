@@ -10,7 +10,8 @@
 * ``ColumnParallelLinear`` / ``RowParallelLinear``: cuBLAS GEMMs under the pinned workspace,
   with and without apex ``fused_weight_gradient_mlp_cuda`` gradient-accumulation fusion.
 * ``ColumnParallelLinear`` with BF16 inputs and FP32 output: Transformer Engine
-  ``general_gemm`` forward plus the corresponding input- and weight-gradient paths.
+  ``general_gemm`` forward plus the corresponding input- and weight-gradient paths, on a dense
+  and on a strided (column-sliced) input.
 * apex ``FusedLayerNorm`` (persistent and non-persistent) and ``FusedScaleMaskSoftmax``
   (causal and padding CUDA kernels).
 """
@@ -246,11 +247,13 @@ class TestTensorParallelLayers:
     @pytest.mark.skipif(
         te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
     )
-    def test_column_parallel_linear_fp32_output_replays(self):
-        """Replay the mixed-output GEMM used by FP32 language-model logits."""
+    @pytest.mark.parametrize("strided_input", [False, True], ids=["dense", "column_slice"])
+    def test_column_parallel_linear_fp32_output_replays(self, strided_input):
+        """Replay the mixed-output GEMM used by FP32 language-model logits, also on a strided
+        input view, which the layer packs before Transformer Engine's GEMM."""
         seeded()
         config = _config(hidden_size=512, num_attention_heads=8)
-        module = ColumnParallelLinear(
+        linear = ColumnParallelLinear(
             512,
             1024,
             config=config,
@@ -258,10 +261,21 @@ class TestTensorParallelLayers:
             bias=False,
             output_dtype=torch.float32,
         ).cuda()
-        x = torch.randn(2048, 2, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        width = 1024 if strided_input else 512
+
+        class _Head(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.linear = linear
+
+            def forward(self, x):
+                # Slicing inside the module keeps the view strided: the harness clones inputs.
+                return self.linear(x[..., :512])
+
+        x = torch.randn(2048, 2, width, device="cuda", dtype=torch.bfloat16, requires_grad=True)
 
         outputs, _ = assert_module_replays_bit_exact(
-            module, (x,), replays=3, contention=True, what="column linear[bf16 input, fp32 output]"
+            _Head(), (x,), replays=3, contention=True, what="column linear[bf16 input, fp32 output]"
         )
         assert outputs["out[0]"].dtype is torch.float32
 
