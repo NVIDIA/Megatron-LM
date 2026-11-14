@@ -171,7 +171,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(K + "test_fused_activations.py",),
         kind="torch.compile",
         notes="squared_relu/quick_gelu/fast_gelu/tanh_soft_clamp/situ/situ_glu, openai/erf GELU, "
-        "L2Norm._norm (row reduction).",
+        "L2Norm._norm (row reduction), and eager unfused_fast_gelu for variable-length projections.",
     ),
     KernelEntry(
         name="attention_kernels_and_dispatch",
@@ -1031,6 +1031,22 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "test_muon_matches_reference checks weights, momentum, and forward outputs bitwise "
         "against unsharded Muon across multiple steps, including an optimizer-state reload. "
         "Tests exercise the default GEMM path with FP32 and BF16 model weights.",
+    ),
+    KernelEntry(
+        name="csa_deterministic_attention_and_indexer",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py",
+        ),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa_deterministic_indexer.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_csa_fused_sparse_attention.py",
+        ),
+        kind="dispatch",
+        notes="Stable TopK and fixed-order sparse indexer dK/dW, with batch-local reference/replay; "
+        "real non-CP attention replay exercises deterministic cuDNN backward independently. "
+        "Deterministic learned-indexer SBHD forwards preserve key order and output bits across "
+        "no-grad and training dispatch, including zero and positive sparse indexer loss.",
     ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(

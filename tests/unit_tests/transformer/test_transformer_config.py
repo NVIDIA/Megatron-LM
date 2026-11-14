@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from contextlib import nullcontext
+from dataclasses import dataclass, field
 
 import pytest
 import torch
@@ -311,6 +312,49 @@ def test_from_config_creates_independent_target_config_without_reinitializing():
     assert config.dynamic_value == {"items": []}
 
 
+def test_from_config_initializes_subclass_defaults_and_preserves_existing_values():
+    @dataclass
+    class LayerConfig(TransformerConfig):
+        scale: float = 1.5
+        annotations: list = field(default_factory=list)
+        values: list = field(default_factory=list)
+
+        def __post_init__(self):
+            raise AssertionError("from_config must not reinitialize the target config")
+
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    config.values = [3]
+    config.values_alias = config.values
+
+    first = LayerConfig.from_config(config)
+    second = LayerConfig.from_config(config)
+
+    assert first.scale == 1.5
+    assert first.annotations == []
+    assert first.annotations is not second.annotations
+    assert first.values == [3]
+    assert first.values is first.values_alias
+    assert first.values is not config.values
+    assert first.ffn_hidden_size == config.ffn_hidden_size
+
+    first.values = [4]
+    copied = LayerConfig.from_config(first)
+    assert copied.values == [4]
+    assert copied.values is not first.values
+    assert copied.values_alias == [3]
+
+
+def test_from_config_rejects_missing_required_subclass_fields():
+    @dataclass(kw_only=True)
+    class LayerConfig(TransformerConfig):
+        required_value: int
+
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+
+    with pytest.raises(TypeError, match="requires a value for 'required_value'"):
+        LayerConfig.from_config(config)
+
+
 def _make_softcap_config(attn_logit_softcapping) -> TransformerConfig:
     return TransformerConfig(
         num_layers=1,
@@ -583,6 +627,73 @@ def test_mxfp8_wire_dtypes_reject_non_ncclep_dispatcher(overrides):
 def test_mxfp8_wire_dtypes_require_op_fuser_grouped_gemm(overrides):
     with pytest.raises(ValueError, match="require BOTH"):
         _make_mxfp8_wire_config(**overrides)
+
+
+@pytest.mark.parametrize(
+    "wire_dtypes",
+    [
+        dict(moe_dispatch_fwd_dtype='nvfp4', moe_combine_bwd_dtype='nvfp4'),
+        dict(moe_dispatch_fwd_dtype='nvfp4', moe_combine_bwd_dtype='bf16'),
+        dict(moe_dispatch_fwd_dtype='bf16', moe_combine_bwd_dtype='nvfp4'),
+    ],
+)
+def test_nvfp4_wire_dtypes_accept_fp4_config(wire_dtypes):
+    config = _make_mxfp8_wire_config(fp4="e2m1", **wire_dtypes)
+
+    assert config.moe_dispatch_fwd_dtype == wire_dtypes['moe_dispatch_fwd_dtype']
+    assert config.moe_combine_bwd_dtype == wire_dtypes['moe_combine_bwd_dtype']
+
+
+@pytest.mark.parametrize("compute", [dict(), dict(fp8="e4m3", fp8_recipe="mxfp8")])
+def test_nvfp4_wire_dtypes_require_fp4(compute):
+    with pytest.raises(ValueError, match="'nvfp4' require fp4"):
+        _make_mxfp8_wire_config(
+            moe_dispatch_fwd_dtype='nvfp4', moe_combine_bwd_dtype='bf16', **compute
+        )
+
+
+def test_nvfp4_wire_dtypes_require_op_fuser():
+    with pytest.raises(ValueError, match="require BOTH"):
+        _make_mxfp8_wire_config(
+            fp4="e2m1",
+            moe_dispatch_fwd_dtype='nvfp4',
+            moe_combine_bwd_dtype='nvfp4',
+            use_transformer_engine_op_fuser=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "wire_dtypes",
+    [
+        dict(moe_dispatch_fwd_dtype='nvfp4', moe_combine_bwd_dtype='bf16'),
+        dict(moe_dispatch_fwd_dtype='bf16', moe_combine_bwd_dtype='nvfp4'),
+    ],
+)
+def test_nvfp4_wire_dtypes_reject_first_last_layers_bf16(wire_dtypes):
+    # Layers kept in BF16 run their experts outside the FP4 context, but the dispatcher uses
+    # one global wire recipe, so they would still get NVFP4 payloads; reject the combination.
+    with pytest.raises(ValueError, match="cannot be combined with first_last_layers_bf16"):
+        _make_mxfp8_wire_config(fp4="e2m1", first_last_layers_bf16=True, **wire_dtypes)
+
+    config = _make_mxfp8_wire_config(fp4="e2m1", first_last_layers_bf16=False, **wire_dtypes)
+    assert not config.first_last_layers_bf16
+
+
+@pytest.mark.parametrize(
+    "a2a_dtype, recipe_name",
+    [('bf16', None), ('mxfp8', 'MXFP8BlockScaling'), ('nvfp4', 'NVFP4BlockScaling')],
+)
+def test_get_fp8_recipe_for_a2a(a2a_dtype, recipe_name):
+    te_recipe = pytest.importorskip("transformer_engine.common.recipe")
+    from megatron.core.fp8_utils import get_fp8_recipe_for_a2a
+
+    recipe = get_fp8_recipe_for_a2a(a2a_dtype)
+    if recipe_name is None:
+        assert recipe is None
+    else:
+        assert isinstance(recipe, getattr(te_recipe, recipe_name))
+    with pytest.raises(ValueError, match="Unsupported a2a wire dtype"):
+        get_fp8_recipe_for_a2a('fp16')
 
 
 requires_te_2_9 = pytest.mark.skipif(
