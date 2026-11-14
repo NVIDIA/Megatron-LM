@@ -79,7 +79,7 @@ def get_parameter_local_cp_headwise(
 class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
     # pylint: disable=missing-class-docstring
     @classmethod
-    def estimate_flops(
+    def _estimate_flops_from_config(
         cls,
         config: TransformerConfig,
         *,

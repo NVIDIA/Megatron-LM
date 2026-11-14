@@ -43,16 +43,16 @@ class GainLayer(MegatronModule):
             torch.full((config.hidden_size,), config.gain_init, dtype=config.params_dtype)
         )
 
-    @classmethod
     def estimate_flops(
-        cls,
-        config: "GainConfig",
+        self,
         *,
         total_real_tokens_in_batch: float,
         seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
     ) -> float:
-        """Count one forward multiplication per token and hidden channel."""
-        return total_real_tokens_in_batch * config.hidden_size
+        """Count channel scaling, optionally including input and parameter gradients."""
+        forward = total_real_tokens_in_batch * self.config.hidden_size
+        return (3 if include_backward else 1) * forward
 
     def forward(
         self,

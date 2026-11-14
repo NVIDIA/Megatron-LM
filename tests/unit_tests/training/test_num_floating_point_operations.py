@@ -196,7 +196,7 @@ def test_mla_forward_flops_with_optional_query_projection(q_lora_rank, expected)
     # Projection MACs per token are 204 without Q LoRA, or 191 with it.
     # Causal attention contributes 14 FLOPs per squared sequence length.
     assert (
-        MLASelfAttention.estimate_flops(
+        MLASelfAttention._estimate_flops_from_config(
             config, total_real_tokens_in_batch=5, seqlen_squared_sum_in_batch=13
         )
         == expected
@@ -215,7 +215,7 @@ def test_mla_forward_flops_with_optional_query_projection(q_lora_rank, expected)
 def test_layer_forward_flops_include_variant_projections(layer_type, overrides, expected):
     config = _make_config(**overrides).transformer
     assert (
-        layer_type.estimate_flops(
+        layer_type._estimate_flops_from_config(
             config, total_real_tokens_in_batch=5, seqlen_squared_sum_in_batch=13
         )
         == expected

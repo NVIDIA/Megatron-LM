@@ -141,14 +141,16 @@ class AbsorbedMLASelfAttention(Attention):
     computation which can be more efficient for certain attention variants.
     """
 
-    def estimate_training_flops(self, **batch_stats: float) -> float:
-        """Use the constructed sparse core's indexer and backward costs when present."""
+    def estimate_flops(self, *, include_backward: bool = False, **batch_stats: float) -> float:
+        """Include the constructed sparse core's indexer and optional backward work."""
         if getattr(self.core_attention, "requires_dsa_inputs", False):
-            return self.core_attention.estimate_training_flops(absorbed_mla=True, **batch_stats)
-        return super().estimate_training_flops(**batch_stats)
+            return getattr(self.core_attention, "estimate_flops")(
+                absorbed_mla=True, include_backward=include_backward, **batch_stats
+            )
+        return super().estimate_flops(include_backward=include_backward, **batch_stats)
 
     @classmethod
-    def estimate_flops(
+    def _estimate_flops_from_config(
         cls,
         config: MLATransformerConfig,
         *,
@@ -167,7 +169,7 @@ class AbsorbedMLASelfAttention(Attention):
             if isinstance(config, DSALayerConfig) or config.experimental_attention_variant == "dsa"
             else MLASelfAttention
         )
-        return estimator.estimate_flops(
+        return estimator._estimate_flops_from_config(
             config,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,

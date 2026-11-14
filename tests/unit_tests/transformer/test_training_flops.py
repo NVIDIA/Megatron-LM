@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Training FLOP composition uses the sparse core and indexer actually constructed."""
+"""Forward and backward FLOPs use the sparse core and indexer actually constructed."""
 
 from types import SimpleNamespace
 
@@ -45,32 +45,44 @@ def _bare_module(module_type, config, **children):
     return module
 
 
-@pytest.mark.parametrize("loss_coeff,expected", [(0.0, 416), (0.01, 896)])
-def test_indexer_training_cost_obeys_its_backward_rule(loss_coeff, expected):
+@pytest.mark.parametrize(
+    "loss_coeff,include_backward,expected",
+    [(0.0, False, 416), (0.01, False, 416), (0.0, True, 416), (0.01, True, 896)],
+)
+def test_indexer_obeys_its_backward_rule(loss_coeff, include_backward, expected):
     indexer = _bare_module(DSAIndexer, _config(loss_coeff))
     # Forward costs 352 projection + 64 scoring FLOPs. Loss doubles projections
     # and triples scoring, rather than applying x3 to the whole indexer.
-    assert indexer.estimate_training_flops(**BATCH_STATS) == expected
+    assert indexer.estimate_flops(**BATCH_STATS, include_backward=include_backward) == expected
 
 
-@pytest.mark.parametrize("computes_index,expected", [(False, 5544), (True, 6440)])
-def test_sparse_attention_counts_only_its_own_indexer(computes_index, expected):
+@pytest.mark.parametrize(
+    "computes_index,include_backward,expected",
+    [(False, False, 1848), (True, False, 2264), (False, True, 5544), (True, True, 6440)],
+)
+def test_sparse_attention_counts_only_its_own_indexer(computes_index, include_backward, expected):
     config = _config()
     indexer = _bare_module(DSAIndexer, config) if computes_index else None
     attention = _bare_module(DSAttention, config, indexer=indexer)
     # Attention forward: 1,528 projections + 320 absorbed-core FLOPs. A sharing
     # layer still executes attention, while only its source layer pays the 896 indexer FLOPs.
-    assert attention.estimate_training_flops(**BATCH_STATS) == expected
+    assert attention.estimate_flops(**BATCH_STATS, include_backward=include_backward) == expected
 
 
 @pytest.mark.parametrize(
-    "module_type,expected", [(MLASelfAttention, 6152), (AbsorbedMLASelfAttention, 6440)]
+    "module_type,include_backward,expected",
+    [
+        (MLASelfAttention, False, 2168),
+        (AbsorbedMLASelfAttention, False, 2264),
+        (MLASelfAttention, True, 6152),
+        (AbsorbedMLASelfAttention, True, 6440),
+    ],
 )
-def test_mla_composes_its_sparse_core_once(module_type, expected):
+def test_mla_composes_its_sparse_core_once(module_type, include_backward, expected):
     config = _config()
     indexer = _bare_module(DSAIndexer, config)
     core = _bare_module(DSAttention, config, indexer=indexer)
     attention = _bare_module(module_type, config, core_attention=core)
     # Expanded MLA core costs 224 FLOPs; absorbed core costs 320. Both include
     # projections exactly once and the same exceptional indexer training cost.
-    assert attention.estimate_training_flops(**BATCH_STATS) == expected
+    assert attention.estimate_flops(**BATCH_STATS, include_backward=include_backward) == expected

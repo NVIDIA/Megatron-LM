@@ -2203,19 +2203,23 @@ class DSAIndexer(MegatronModule):
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L431-L480
     """
 
-    def estimate_training_flops(
-        self, *, total_real_tokens_in_batch: float, seqlen_squared_sum_in_batch: float
+    def estimate_flops(
+        self,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
     ) -> float:
-        """Use the indexer's loss-dependent backward cost instead of a fixed multiplier."""
-        return self.estimate_flops(
+        """Estimate the indexer, including its loss-dependent backward work when requested."""
+        return self._estimate_flops_from_config(
             self.config,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-            include_backward=True,
+            include_backward=include_backward,
         )
 
     @classmethod
-    def estimate_flops(
+    def _estimate_flops_from_config(
         cls,
         config: TransformerConfig,
         *,
@@ -2888,15 +2892,19 @@ class DSAttention(MegatronModule):
         https://github.com/deepseek-ai/DeepSeek-V3.2-Exp/blob/main/inference/model.py#L491-L597
     """
 
-    def estimate_training_flops(self, *, absorbed_mla: bool = True, **batch_stats: float) -> float:
+    def estimate_flops(
+        self, *, include_backward: bool = False, absorbed_mla: bool = True, **batch_stats: float
+    ) -> float:
         """Compose attention and the indexer actually executed by this layer."""
-        flops = 3 * self.estimate_flops(self.config, absorbed_mla=absorbed_mla, **batch_stats)
+        flops = (3 if include_backward else 1) * self._estimate_flops_from_config(
+            self.config, absorbed_mla=absorbed_mla, **batch_stats
+        )
         if self.indexer is not None:
-            flops += self.indexer.estimate_training_flops(**batch_stats)
+            flops += self.indexer.estimate_flops(include_backward=include_backward, **batch_stats)
         return flops
 
     @classmethod
-    def estimate_flops(
+    def _estimate_flops_from_config(
         cls,
         config: TransformerConfig,
         *,

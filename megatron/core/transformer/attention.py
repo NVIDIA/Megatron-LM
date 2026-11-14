@@ -1840,7 +1840,7 @@ class SelfAttention(Attention):
     """
 
     @classmethod
-    def estimate_flops(
+    def _estimate_flops_from_config(
         cls,
         config: TransformerConfig,
         *,

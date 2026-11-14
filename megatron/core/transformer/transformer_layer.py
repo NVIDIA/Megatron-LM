@@ -233,8 +233,12 @@ def get_transformer_layer_offset(
 class MlpInterface(Protocol):
     """Interface for MLP implementations in the transformer layer."""
 
-    def estimate_training_flops(
-        self, *, total_real_tokens_in_batch: float, seqlen_squared_sum_in_batch: float
+    def estimate_flops(
+        self,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
     ) -> float:
         """Estimate forward and backward work for a global batch."""
         ...
@@ -352,14 +356,19 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
     output of the same size.
     """
 
-    def estimate_training_flops(
-        self, *, total_real_tokens_in_batch: float, seqlen_squared_sum_in_batch: float
+    def estimate_flops(
+        self,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
     ) -> float:
         """Compose the computational sublayers without counting their children twice."""
         return sum(
-            layer.estimate_training_flops(
+            layer.estimate_flops(
                 total_real_tokens_in_batch=total_real_tokens_in_batch,
                 seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+                include_backward=include_backward,
             )
             for layer in (self.self_attention, self.cross_attention, self.mlp)
         )

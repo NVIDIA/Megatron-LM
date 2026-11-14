@@ -42,9 +42,9 @@ class HyperConnectionHybridLayer(MegatronModule):
         if hasattr(layer, 'tp_group'):
             self.tp_group = layer.tp_group
 
-    def estimate_training_flops(self, **kwargs) -> float:
+    def estimate_flops(self, **kwargs) -> float:
         """Delegate to the wrapped layer; residual mixing remains outside the estimate."""
-        return self.inner_layer.estimate_training_flops(**kwargs)
+        return self.inner_layer.estimate_flops(**kwargs)
 
     def mamba_state_shapes_per_request(self) -> Optional[Tuple[Tuple[int], Tuple[int]]]:
         """Delegate Mamba inference state shape requests to the wrapped layer."""

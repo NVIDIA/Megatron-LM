@@ -14,8 +14,12 @@ class IdentityOp(torch.nn.Module):
     def __init__(self, *args: object, **kwargs: object):
         super().__init__()
 
-    def estimate_training_flops(
-        self, *, total_real_tokens_in_batch: float, seqlen_squared_sum_in_batch: float
+    def estimate_flops(
+        self,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
     ) -> float:
         """Identity placeholders do no floating-point computation."""
         return 0
