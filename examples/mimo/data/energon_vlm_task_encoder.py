@@ -500,7 +500,18 @@ class VLMTaskEncoder(
         else:
             raise ValueError(f"Model type {self.model_type} not supported")
 
-def llava_vlm_dataloader_provider(train_val_test_num_samples, max_seq_length: Optional[int] = None, is_video_input: bool = False):
+def llava_vlm_dataloader_provider(
+    train_val_test_num_samples,
+    max_seq_length: Optional[int] = None,
+    is_video_input: bool = False,
+    pg_collection=None,
+):
+    """Build the LLaVA VLM dataloaders.
+
+    pg_collection holds the process groups of the run, which select the dataloader ranks and
+    shard the samples. None falls back to the global parallel state with a
+    ProcessGroupFallbackWarning; that fallback is deprecated.
+    """
     args = get_args()
     cfg = get_run_config()
     tokenizer_model_id = cfg.tokenizer.tokenizer_model
@@ -516,7 +527,8 @@ def llava_vlm_dataloader_provider(train_val_test_num_samples, max_seq_length: Op
             processor=processor,
             conversation_template_config=LlavaConversationTemplateConfig(),
             max_seq_length=max_seq_length,
-        )
+        ),
+        pg_collection=pg_collection,
     )
 
 

@@ -138,7 +138,7 @@ class TestDSAIndexShareHelpers:
             attn_mask_type=AttnMaskType.causal,
             attention_type="self",
             softmax_scale=1.0,
-            pg_collection=SimpleNamespace(),
+            pg_collection=SimpleNamespace(tp=None, cp=None),
         )
 
         assert attention.skip_topk
@@ -159,7 +159,7 @@ class TestDSAIndexShareHelpers:
             attn_mask_type=AttnMaskType.causal,
             attention_type="self",
             softmax_scale=1.0,
-            pg_collection=SimpleNamespace(),
+            pg_collection=SimpleNamespace(tp=None, cp=None),
         )
         attention_mask = torch.empty(1)
 
@@ -185,7 +185,7 @@ class TestDSAIndexShareHelpers:
             attn_mask_type=AttnMaskType.causal,
             attention_type="self",
             softmax_scale=1.0,
-            pg_collection=SimpleNamespace(),
+            pg_collection=SimpleNamespace(tp=None, cp=None),
         )
         packed_seq_params = PackedSeqParams(qkv_format="thd")
         attention_mask = torch.empty(1)
@@ -217,7 +217,7 @@ class TestDSAIndexShareHelpers:
             attn_mask_type=AttnMaskType.causal,
             attention_type="self",
             softmax_scale=1.0,
-            pg_collection=SimpleNamespace(),
+            pg_collection=SimpleNamespace(tp=None, cp=None),
         )
         recomputed_supports = []
 
@@ -255,7 +255,7 @@ class TestDSAIndexShareHelpers:
         )
         checkpoint_calls = []
 
-        def fake_checkpoint(function, _distribute_saved_activations, *args):
+        def fake_checkpoint(function, _distribute_saved_activations, *args, tp_group=None):
             checkpoint_calls.append((function, args))
             with torch.no_grad():
                 return function(*args)

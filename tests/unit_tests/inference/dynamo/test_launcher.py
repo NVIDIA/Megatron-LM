@@ -11,6 +11,7 @@ import pytest
 
 pytest.importorskip("dynamo")
 
+from megatron.core import parallel_state
 from megatron.core.inference.disaggregation.engine import StateHandoffDynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
 from megatron.inference.integrations.dynamo import engine_service
@@ -159,9 +160,12 @@ def test_engine_service_initializes_config_before_megatron(monkeypatch):
 )
 async def test_engine_service_validates_handoff_before_construction(monkeypatch, role, backend):
     args = SimpleNamespace(role=role, disagg_kv_transport_backend=backend)
+    registered = object()
+    monkeypatch.setattr(parallel_state, "_REGISTERED_PROCESS_GROUPS", registered)
 
-    def build_engine(*, engine_class):
+    def build_engine(*, engine_class, pg_collection):
         assert engine_class is not None
+        assert pg_collection is registered
         raise RuntimeError("configuration observed")
 
     monkeypatch.setattr(engine_service, "get_args", lambda: args)

@@ -53,5 +53,6 @@ MODEL_ARGS:
   --ckpt-format: torch
   --attention-backend: unfused
   --log-memory-to-tensorboard: true
+  --strict-process-group-fallbacks: true
 TEST_TYPE: regular
 LAUNCHER: ft_launcher

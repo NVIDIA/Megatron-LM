@@ -120,6 +120,7 @@ class KimiDeltaAttention(_GDNBase):
             is_expert=False,
             tp_comm_buffer_name="beta_proj",
             tp_group=self.pg_collection.tp,
+            pg_collection=self.pg_collection,
             name=(name + ".beta_proj") if name is not None else None,
         )
 
@@ -149,6 +150,8 @@ class KimiDeltaAttention(_GDNBase):
                         skip_bias_add=False,
                         skip_weight_param_allocation=False,
                         parallel_mode="duplicated",
+                        tp_group=self.pg_collection.tp,
+                        pg_collection=self.pg_collection,
                         name=f"{name}.{a_name}" if name is not None else None,
                     ),
                 )
@@ -168,6 +171,7 @@ class KimiDeltaAttention(_GDNBase):
                         is_expert=False,
                         tp_comm_buffer_name=b_name,
                         tp_group=self.pg_collection.tp,
+                        pg_collection=self.pg_collection,
                         name=f"{name}.{b_name}" if name is not None else None,
                     ),
                 )
@@ -419,7 +423,10 @@ class KimiDeltaAttention(_GDNBase):
                 )
             else:
                 out, out_bias = tensor_parallel.checkpoint(
-                    _checkpointed_compute, self.config.distribute_saved_activations, hidden_states
+                    _checkpointed_compute,
+                    self.config.distribute_saved_activations,
+                    hidden_states,
+                    tp_group=self.pg_collection.tp,
                 )
         else:
             out, out_bias = self._forward_compute(

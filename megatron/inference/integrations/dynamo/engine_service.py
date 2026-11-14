@@ -11,6 +11,7 @@ import torch.distributed as dist
 
 from megatron.core.inference.engine_endpoint import InferenceEngineEndpoint
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+from megatron.core.parallel_state import get_registered_process_groups
 from megatron.core.utils import get_pg_size
 from megatron.inference.integrations.dynamo.args import add_engine_service_args
 from megatron.inference.integrations.dynamo.dynamic_engine import DynamoDynamicInferenceEngine
@@ -39,7 +40,10 @@ async def _serve() -> None:
             "NCCL handoff across independent worker process groups is not supported"
         )
     engine_class = DynamoDynamicInferenceEngine if disaggregated else DynamicInferenceEngine
-    engine = get_dynamic_inference_engine(engine_class=engine_class)
+    # The model is built on the groups of the grid that initialize_megatron() registered.
+    engine = get_dynamic_inference_engine(
+        engine_class=engine_class, pg_collection=get_registered_process_groups()
+    )
 
     replica_group = (
         engine.pg_collection.expt_dp
