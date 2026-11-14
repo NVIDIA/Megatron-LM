@@ -1,3 +1,6 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+import pytest
 import torch
 from pytest_mock import mocker
 
@@ -12,6 +15,7 @@ from megatron.core.export.trtllm.trtllm_weights_converter.distributed_trtllm_mod
 )
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -46,6 +50,7 @@ class TestTRTLLMDistributedGPUConverter:
             transformer_layer_spec=get_gpt_layer_local_spec(),
             vocab_size=_VOCAB_SIZE,
             max_sequence_length=_SEQUENCE_LENGTH,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -113,3 +118,17 @@ class TestTRTLLMDistributedGPUConverter:
             assert (
                 expected_result[key] == value.shape
             ), f"Shape mismatch for {key}. Expected {expected_result[key]} but got {value.shape}"
+
+    def test_requires_model_parallel_groups(self, mocker):
+        """
+        Without model parallel groups the converter raises instead of exporting TP1/PP1.
+        """
+        mocker.patch(
+            "megatron.core.export.trtllm.trtllm_weights_converter.distributed_trtllm_model_weights_converter.str_dtype_to_torch",
+            return_value=torch.float32,
+        )
+        transformer_config = self.gpt_model.config
+        Utils.destroy_model_parallel()
+
+        with pytest.raises(RuntimeError, match="initialize_model_parallel"):
+            DistributedTRTLLMModelWeightsConverter(transformer_config, DataType.bfloat16)
