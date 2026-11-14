@@ -5,6 +5,7 @@ import inspect
 import logging
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -62,6 +63,7 @@ from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
 from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
+from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -2300,6 +2302,8 @@ class TestHybridLayerPairCudaGraph:
     The GPU tests train one model twice in the same process, capturing TE graphs after an eager
     iteration: first with per-layer graphs, then, after deleting them and restoring the initial
     weights, with paired graphs. Deterministic kernels make the two runs comparable bit for bit.
+    Per-layer graphs leave Hybrid MTP blocks eager, and pairing graphs their layers, so models with
+    MTP also compare graphed with eager MTP layers.
     """
 
     seq_length = 128
@@ -2308,6 +2312,7 @@ class TestHybridLayerPairCudaGraph:
 
     def setup_method(self, method):
         self.helpers = []
+        MTPLossLoggingHelper.reset_metrics_tracker()
 
     def teardown_method(self, method):
         for helper in self.helpers:
@@ -2316,6 +2321,7 @@ class TestHybridLayerPairCudaGraph:
         self.helpers = []
         reset_hybrid_ep_buffer()
         destroy_moe_metrics_tracker()
+        MTPLossLoggingHelper.reset_metrics_tracker()
         destroy_num_microbatches_calculator()
         Utils.destroy_model_parallel()
         gc.collect()
@@ -2399,7 +2405,8 @@ class TestHybridLayerPairCudaGraph:
 
     def _config(self, pattern, cuda_graph_modules, **overrides):
         config_kwargs = dict(
-            num_layers=len(pattern.replace("|", "")),
+            # Decoder layers only: HybridModel takes the MTP depths from the "/" sections.
+            num_layers=len(pattern.split("/")[0].replace("|", "")),
             hidden_size=128,
             num_attention_heads=4,
             num_query_groups=2,
@@ -2524,7 +2531,7 @@ class TestHybridLayerPairCudaGraph:
         """Run an eager iteration, capture TE graphs, then run two graphed iterations.
 
         Each iteration ends with an SGD step. Returns the helper and, per iteration, the losses,
-        the main_grad of every parameter and the number of graph replays.
+        the MTP losses, the main_grad of every parameter and the number of graph replays.
         """
         config.cuda_graph_pair_hybrid_layers = pair
         helper = TECudaGraphHelper(
@@ -2534,7 +2541,7 @@ class TestHybridLayerPairCudaGraph:
             micro_batch_size=self.micro_batch_size,
         )
         self.helpers.append(helper)
-        record = {"loss": [], "grads": [], "replays": []}
+        record = {"loss": [], "mtp_loss": [], "grads": [], "replays": []}
         for iteration in range(3):
             if iteration == config.cuda_graph_warmup_steps:
                 helper.create_cudagraphs()
@@ -2557,6 +2564,10 @@ class TestHybridLayerPairCudaGraph:
             replays[0] = 0
             record["loss"].append(self._forward_backward(models, batches))
             record["replays"].append(replays[0])
+            # The MTP loss of each depth, summed over the microbatches (on the stage with MTP).
+            mtp_loss = MTPLossLoggingHelper.tracker.get("loss_values")
+            record["mtp_loss"].append(None if mtp_loss is None else mtp_loss.clone())
+            MTPLossLoggingHelper.clean_metrics_in_tracker()
             record["grads"].append(
                 {name: param.main_grad.clone() for name, param in self._named_parameters(models)}
             )
@@ -2579,6 +2590,12 @@ class TestHybridLayerPairCudaGraph:
                 assert torch.equal(
                     paired_loss, unpaired_loss
                 ), f"iteration {iteration}: loss {paired_loss.item()!r} != {unpaired_loss.item()!r}"
+            paired_mtp = paired["mtp_loss"][iteration]
+            unpaired_mtp = unpaired["mtp_loss"][iteration]
+            assert (paired_mtp is None) == (unpaired_mtp is None)
+            assert paired_mtp is None or torch.equal(
+                paired_mtp, unpaired_mtp
+            ), f"iteration {iteration}: MTP loss {paired_mtp.tolist()} != {unpaired_mtp.tolist()}"
             paired_grads, unpaired_grads = paired["grads"][iteration], unpaired["grads"][iteration]
             assert paired_grads.keys() == unpaired_grads.keys()
             mismatched = [
@@ -2632,6 +2649,9 @@ class TestHybridLayerPairCudaGraph:
                 "*E*E", _PARTIAL_MOE_GRAPH_MODULES, {}, True, None, id="moe-router-padding"
             ),
             pytest.param(
+                "GE*E/*E", _PARTIAL_MOE_GRAPH_MODULES, {}, True, None, id="moe-router-mtp-padding"
+            ),
+            pytest.param(
                 "GE*E",
                 _PARTIAL_MOE_GRAPH_MODULES,
                 {"moe_token_dispatcher_type": "flex", "moe_flex_dispatcher_backend": "hybridep"},
@@ -2651,17 +2671,17 @@ class TestHybridLayerPairCudaGraph:
                 "G-*-", [CudaGraphModule.attn, CudaGraphModule.mlp], {}, False, None, id="dense-mlp"
             ),
             pytest.param(
-                "GE*E",
+                "GE*E/*E",
                 _PARTIAL_MOE_GRAPH_MODULES,
                 # MXFP8 needs GDN projection widths that are multiples of 32.
                 {"fp8": "e4m3", "fp8_recipe": "mxfp8", "linear_num_value_heads": 16},
                 False,
                 None,
-                id="moe-router-mxfp8",
+                id="moe-router-mtp-mxfp8",
                 marks=pytest.mark.launch_on_gb200,
             ),
             pytest.param(
-                "GE*EGE*E",
+                "GE*EGE*E/*E",
                 _PARTIAL_MOE_GRAPH_MODULES,
                 {
                     "fp8": "e4m3",
@@ -2671,9 +2691,10 @@ class TestHybridLayerPairCudaGraph:
                 },
                 False,
                 # The BF16 first and last layers keep their own graphs, and so do their FP8
-                # neighbors, so one capture holds both pairs and single layers.
-                [False, False, True, True, False, False],
-                id="moe-router-mxfp8-bf16-first-last-layers",
+                # neighbors, so one capture holds both pairs and single layers. The MTP layers,
+                # which run under the MTP block's FP8 setting, still pair.
+                [False, False, True, True, False, False, True],
+                id="moe-router-mtp-mxfp8-bf16-first-last-layers",
                 marks=pytest.mark.launch_on_gb200,
             ),
         ],
@@ -2712,18 +2733,24 @@ class TestHybridLayerPairCudaGraph:
             paired_helper, paired = self._train(models, config, batches, replays, pair=True)
 
             # Unless expected_pairs says otherwise, every mixer is paired with the layer after it:
-            # half the callables and replays.
+            # half the callables and replays. The layers of the MTP block, eager with per-layer
+            # graphs, form one more pair.
+            num_decoder_layers = len(pattern.split("/")[0])
+            num_layers = len(pattern.replace("/", ""))
             if expected_pairs is None:
-                expected_pairs = [True] * (len(pattern) // 2)
+                expected_pairs = [True] * (num_layers // 2)
             paired_callables = paired_helper.flattened_callables
             assert not any(
                 isinstance(c, _TECudaGraphLayerPair) for c in unpaired_helper.flattened_callables
             )
-            assert len(unpaired_helper.flattened_callables) == len(pattern)
+            assert len(unpaired_helper.flattened_callables) == num_decoder_layers
             is_pair = [isinstance(c, _TECudaGraphLayerPair) for c in paired_callables]
             assert is_pair == expected_pairs
+            assert sum(paired_helper.flattened_callables_is_mtp) == (
+                (num_layers - num_decoder_layers) // 2
+            )
             # One forward and one backward replay per graphed callable.
-            assert unpaired["replays"] == [0, 2 * len(pattern), 2 * len(pattern)]
+            assert unpaired["replays"] == [0, 2 * num_decoder_layers, 2 * num_decoder_layers]
             assert paired["replays"] == [0, 2 * len(expected_pairs), 2 * len(expected_pairs)]
             self._assert_bitwise_equal(paired, unpaired)
             # The pairs are not part of the model.
@@ -2747,7 +2774,15 @@ class TestHybridLayerPairCudaGraph:
                 )
             )
             decoder = get_attr_wrapped_model(models[0], "decoder")
-            assert all(layer._te_cuda_graph_pair_link is None for layer in decoder.layers)
+            mtp = getattr(models[0].module, "mtp", None)
+            mtp_layers = [
+                layer
+                for depth in getattr(mtp, "layers", ())
+                for layer in depth.mtp_model_layer.layers
+            ]
+            assert all(
+                layer._te_cuda_graph_pair_link is None for layer in [*decoder.layers, *mtp_layers]
+            )
         torch.cuda.current_stream().wait_stream(stream)
 
     @pytest.mark.skipif(
@@ -2763,6 +2798,10 @@ class TestHybridLayerPairCudaGraph:
             # Stage 0 holds chunks "GE" and "EGE", stage 1 holds "*E*" and "*E".
             pytest.param(
                 2, "GE|*E*|EGE|*E", {0: ([2, 3], [1, 2]), 1: ([3, 2], [2, 1])}, id="pp2-vpp2"
+            ),
+            # The last chunk also holds the MTP block "*E", which pairing graphs as one more pair.
+            pytest.param(
+                2, "GE|*E*|EGE|*E/*E", {0: ([2, 3], [1, 2]), 1: ([3, 2], [2, 2])}, id="pp2-vpp2-mtp"
             ),
         ],
     )
@@ -2805,6 +2844,101 @@ class TestHybridLayerPairCudaGraph:
             self._assert_bitwise_equal(paired, unpaired)
             paired_helper.delete_cuda_graphs()
         torch.cuda.current_stream().wait_stream(stream)
+
+    @pytest.mark.parametrize(
+        "pattern,overrides,expected_pairs,blocking_feature",
+        [
+            # The BF16 first and last layers split both decoder pairs, but every MTP layer runs
+            # under the MTP block's FP8 setting, so the MTP layers still pair.
+            pytest.param(
+                "GE*E/*E",
+                {
+                    "fp8": "e4m3",
+                    "fp8_recipe": "tensorwise",
+                    "first_last_layers_bf16": True,
+                    "num_layers_at_start_in_bf16": 1,
+                    "num_layers_at_end_in_bf16": 1,
+                    # FP8 needs GDN projection widths that are multiples of 16.
+                    "linear_num_value_heads": 16,
+                },
+                [False, False, False, False, True],
+                None,
+                id="fp8-bf16-first-last-layers",
+            ),
+            # TE graphs would capture the MTP layers in FP8.
+            pytest.param(
+                "GE*E/*E",
+                {
+                    "fp8": "e4m3",
+                    "fp8_recipe": "tensorwise",
+                    "keep_mtp_in_bf16": True,
+                    "linear_num_value_heads": 16,
+                },
+                [True, True],
+                "keep_mtp_in_bf16",
+                id="keep-mtp-in-bf16",
+            ),
+            # The MTP block runs once per depth, a graph holds the activations of one call.
+            pytest.param(
+                "GE*E/*E/*E",
+                {"mtp_use_repeated_layer": True},
+                [True, True],
+                "mtp_use_repeated_layer",
+                id="repeated-mtp-layer",
+            ),
+        ],
+    )
+    def test_which_hybrid_mtp_layers_are_graphed(
+        self, monkeypatch, pattern, overrides, expected_pairs, blocking_feature
+    ):
+        if "fp8" in overrides and not fp8_available:
+            pytest.skip("FP8 is not supported on this GPU")
+        self._setup_parallel_state(monkeypatch, num_microbatches=1)
+        config = self._config(
+            pattern, _PARTIAL_MOE_GRAPH_MODULES, cuda_graph_pair_hybrid_layers=True, **overrides
+        )
+        models = self._build_models(config, pattern)
+        logged = self._record_warnings(monkeypatch)
+        helper = TECudaGraphHelper(
+            model=models,
+            config=config,
+            seq_length=self.seq_length,
+            micro_batch_size=self.micro_batch_size,
+        )
+        self.helpers.append(helper)
+        callables = helper.flattened_callables
+        assert [isinstance(c, _TECudaGraphLayerPair) for c in callables] == expected_pairs
+        # The MTP block is graphed as one pair, or stays eager with a warning.
+        num_mtp_callables = 1 if blocking_feature is None else 0
+        assert helper.flattened_callables_is_mtp == (
+            [False] * (len(callables) - num_mtp_callables) + [True] * num_mtp_callables
+        )
+        if blocking_feature is None:
+            assert not logged
+        else:
+            assert len(logged) == 1 and blocking_feature in logged[0][1]
+
+    def test_set_current_microbatch_reaches_hybrid_mtp_layers_of_a_vlm(self):
+        """Graph replay selects the graph of each layer by its te_cuda_graph_current_microbatch.
+
+        A VLM keeps its decoder and MTP block in its language model, and a Hybrid MTP block graphs
+        its layers one by one.
+        """
+
+        def module(**attributes):
+            return SimpleNamespace(
+                config=SimpleNamespace(cuda_graph_impl="transformer_engine"), **attributes
+            )
+
+        mtp_block = module(layers=[module(), module()])
+        language_model = SimpleNamespace(
+            decoder=SimpleNamespace(layers=[module()]),
+            mtp=SimpleNamespace(layers=[SimpleNamespace(mtp_model_layer=mtp_block)]),
+        )
+        vlm = SimpleNamespace(decoder=language_model.decoder, language_model=language_model)
+        set_te_cuda_graph_current_microbatch(vlm, 3)
+        layers = [*language_model.decoder.layers, mtp_block, *mtp_block.layers]
+        assert [layer.te_cuda_graph_current_microbatch for layer in layers] == [3] * len(layers)
 
 
 class _SimpleModule(MegatronModule):

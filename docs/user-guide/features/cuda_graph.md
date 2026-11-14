@@ -145,6 +145,9 @@ follows it as one graph, which halves the graph launches per block:
 - A layer keeps its own graph when it cannot be paired: Mamba layers, layers whose neighbor is not
   graphed, pairs split by a pipeline stage boundary, hash-routed MoE layers, and pairs whose two
   layers differ in their FP8/FP4 first/last-layer BF16 setting.
+- The layers of Hybrid MTP blocks, which per-layer graphs leave eager, are graphed too, paired the
+  same way. They stay eager with `--mtp-use-repeated-layer` and several MTP depths, and with
+  `--keep-mtp-in-bf16` in FP8 or FP4 training.
 - Pairing is skipped, with a warning, with `--overlap-moe-expert-parallel-comm`,
   `--delay-wgrad-compute`, `--fine-grained-activation-offloading`, `--sequence-packing-scheduler`,
   `--enable-mhc-connections`, `--wide-residual` or `--context-parallel-size` greater than 1.

@@ -2497,7 +2497,7 @@ def _te_cuda_graph_pair_supported(mixer, partner, config) -> bool:
         and _te_cuda_graph_layer_is_graphable(partner, config)
     ):
         return False
-    if mixer.is_mtp_layer or partner.is_mtp_layer:
+    if mixer.is_mtp_layer != partner.is_mtp_layer:
         return False
     mixer_is_attention_only = (
         not isinstance(mixer.self_attention, IdentityOp)
@@ -2517,10 +2517,11 @@ def _te_cuda_graph_pair_supported(mixer, partner, config) -> bool:
     # Hash routing reads input_ids, which HybridStack passes to the hash-routed layer only.
     if partner.is_moe_layer and getattr(partner.mlp.router, "is_hash_layer", False):
         return False
-    if config.fp8 or config.fp4:
+    # One graph runs both layers under one FP8/FP4 setting. All layers of an MTP block run under
+    # the block's setting, to which the first/last-layer BF16 rule does not apply.
+    if (config.fp8 or config.fp4) and not mixer.is_mtp_layer:
         from megatron.core.fp8_utils import is_first_last_bf16_layer
 
-        # One graph runs both layers under one FP8/FP4 setting.
         if is_first_last_bf16_layer(config, mixer.layer_number - 1) != is_first_last_bf16_layer(
             config, partner.layer_number - 1
         ):
@@ -2561,6 +2562,67 @@ def _pair_hybrid_layers_enabled(config: TransformerConfig) -> bool:
         )
         return False
     return True
+
+
+def _hybrid_mtp_graphs_supported(config: TransformerConfig) -> bool:
+    """Whether cuda_graph_pair_hybrid_layers can also graph the layers of Hybrid MTP blocks.
+
+    A graph keeps the activations of one call per microbatch, so a block that runs once per MTP
+    depth (mtp_use_repeated_layer) stays eager. TE graphs capture MTP layers with the model's
+    FP8/FP4 setting, so a block kept out of it (keep_mtp_in_bf16) stays eager too.
+    """
+    blocking_features = [
+        name
+        for name, enabled in (
+            (
+                "mtp_use_repeated_layer",
+                config.mtp_use_repeated_layer and (config.mtp_num_layers or 0) > 1,
+            ),
+            ("keep_mtp_in_bf16", config.keep_mtp_in_bf16 and bool(config.fp8 or config.fp4)),
+        )
+        if enabled
+    ]
+    if blocking_features:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f'Hybrid MTP layers are not CUDA-graphed with {", ".join(blocking_features)}; '
+            'they run eagerly.',
+        )
+        return False
+    return True
+
+
+def _te_graph_callables(layers, config: TransformerConfig, pair_hybrid_layers: bool) -> tuple:
+    """Return the TE graphed callables of consecutive layers and how many of them are pairs.
+
+    With pair_hybrid_layers, each mixer is captured with the layer after it where
+    _te_cuda_graph_pair_supported allows it. Every other graphable layer keeps its own callable.
+    """
+    callables, num_pairs, index = [], 0, 0
+    while index < len(layers):
+        layer = layers[index]
+        partner = layers[index + 1] if pair_hybrid_layers and index + 1 < len(layers) else None
+        if partner is not None and _te_cuda_graph_pair_supported(layer, partner, config):
+            callables.append(_TECudaGraphLayerPair(layer, partner))
+            num_pairs += 1
+            index += 2
+            continue
+        if _te_cuda_graph_layer_is_graphable(layer, config):
+            callables.append(layer)
+        index += 1
+    return callables, num_pairs
+
+
+def _is_mtp_te_graph_layer(layer, chunk_with_decoder) -> bool:
+    """Whether a layer is the model layer of an MTP block, or a layer of a Hybrid MTP block."""
+    for mtp_layer in getattr(getattr(chunk_with_decoder, "mtp", None), "layers", ()):
+        mtp_model_layer = mtp_layer.mtp_model_layer
+        if layer is mtp_model_layer or any(
+            layer is inner_layer for inner_layer in getattr(mtp_model_layer, "layers", ())
+        ):
+            return True
+    return False
 
 
 class TECudaGraphHelper:
@@ -2630,7 +2692,14 @@ class TECudaGraphHelper:
         self.flattened_callables = []
         self.flattened_callables_is_mtp = []
         pair_hybrid_layers = _pair_hybrid_layers_enabled(self.config)
-        num_pairs = 0
+        # Per-layer graphs leave Hybrid MTP blocks eager: such a block is a HybridStack, which is
+        # not graphable as a whole. With pairing, its layers are graphed like decoder layers.
+        graph_hybrid_mtp = (
+            pair_hybrid_layers
+            and bool(self.config.mtp_num_layers)
+            and _hybrid_mtp_graphs_supported(self.config)
+        )
+        num_pairs, num_hybrid_mtp_callables = 0, 0
         for chunk_number, model_chunk in enumerate(self.model):
             try:
                 chunk_with_decoder = get_attr_wrapped_model(
@@ -2650,47 +2719,42 @@ class TECudaGraphHelper:
                     f'No valid layer in model chunk {chunk_number}.',
                 )
             else:
-                num_decoder_layers = len(chunk_with_decoder.decoder.layers)
-                if hasattr(chunk_with_decoder, 'mtp'):
-                    num_mtp_layers = len(chunk_with_decoder.mtp.layers)
-                else:
-                    num_mtp_layers = 0
                 num_graphable_layers = 0
-                callables, callables_is_mtp = [], []
                 decoder_layers = chunk_with_decoder.decoder.layers
-                for layer in decoder_layers:
-                    # Drop pair links left by an earlier helper, so that layers graphed again
-                    # with a different setting never replay a stale pair.
-                    if getattr(layer, "_te_cuda_graph_pair_link", None) is not None:
-                        layer._te_cuda_graph_pair_link = None
-                layer_number = 0
-                while layer_number < num_decoder_layers:
-                    layer = decoder_layers[layer_number]
-                    partner = (
-                        decoder_layers[layer_number + 1]
-                        if pair_hybrid_layers and layer_number + 1 < num_decoder_layers
-                        else None
-                    )
-                    if partner is not None and _te_cuda_graph_pair_supported(
-                        layer, partner, self.config
-                    ):
-                        num_graphable_layers += 1
-                        num_pairs += 1
-                        callables.append(_TECudaGraphLayerPair(layer, partner))
-                        callables_is_mtp.append(False)
-                        layer_number += 2
+                mtp_layers = (
+                    chunk_with_decoder.mtp.layers if hasattr(chunk_with_decoder, 'mtp') else []
+                )
+                num_decoder_layers, num_mtp_layers = len(decoder_layers), len(mtp_layers)
+                hybrid_mtp_blocks = [
+                    mtp_layer.mtp_model_layer
+                    for mtp_layer in mtp_layers
+                    if getattr(mtp_layer, "is_hybrid_mtp", False)
+                ]
+                for layers in (decoder_layers, *(block.layers for block in hybrid_mtp_blocks)):
+                    for layer in layers:
+                        # Drop pair links left by an earlier helper, so that layers graphed
+                        # again with a different setting never replay a stale pair.
+                        if getattr(layer, "_te_cuda_graph_pair_link", None) is not None:
+                            layer._te_cuda_graph_pair_link = None
+                callables, chunk_pairs = _te_graph_callables(
+                    decoder_layers, self.config, pair_hybrid_layers
+                )
+                callables_is_mtp = [False] * len(callables)
+                for mtp_layer in mtp_layers:
+                    if _te_cuda_graph_layer_is_graphable(mtp_layer.mtp_model_layer, self.config):
+                        mtp_callables = [mtp_layer.mtp_model_layer]
+                    elif graph_hybrid_mtp and getattr(mtp_layer, "is_hybrid_mtp", False):
+                        mtp_callables, mtp_pairs = _te_graph_callables(
+                            mtp_layer.mtp_model_layer.layers, self.config, pair_hybrid_layers
+                        )
+                        chunk_pairs += mtp_pairs
+                        num_hybrid_mtp_callables += len(mtp_callables)
+                    else:
                         continue
-                    if _te_cuda_graph_layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(False)
-                    layer_number += 1
-                for layer_number in range(num_mtp_layers):
-                    layer = chunk_with_decoder.mtp.layers[layer_number].mtp_model_layer
-                    if _te_cuda_graph_layer_is_graphable(layer, self.config):
-                        num_graphable_layers += 1
-                        callables.append(layer)
-                        callables_is_mtp.append(True)
+                    callables += mtp_callables
+                    callables_is_mtp += [True] * len(mtp_callables)
+                num_pairs += chunk_pairs
+                num_graphable_layers = len(callables)
                 log_on_each_pipeline_stage(
                     logger=logger,
                     tp_group=self.tp_group,
@@ -2729,7 +2793,8 @@ class TECudaGraphHelper:
                 dp_cp_group=self.dp_cp_group,
                 level=logging.INFO,
                 msg=f'Rank {torch.distributed.get_rank()}: {num_pairs} Hybrid mixer and '
-                'feed-forward layer pairs are graphed as one callable each.',
+                'feed-forward layer pairs are graphed as one callable each, and '
+                f'{num_hybrid_mtp_callables} graphed callables belong to Hybrid MTP blocks.',
             )
 
     def capture_finished(self):
@@ -2825,8 +2890,8 @@ class TECudaGraphHelper:
                 # A pair's inputs are its mixer's plus the partner's extras, so check the chunk
                 # and add the rotary input for the mixer.
                 layer = layer.mixer
-            assert layer in chunk_of_the_layer.decoder.layers or any(
-                layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
+            assert layer in chunk_of_the_layer.decoder.layers or _is_mtp_te_graph_layer(
+                layer, chunk_of_the_layer
             ), "Layer is not in the chunk"
 
             def get_rotary_pos_emb(transformer_module, transformer_input):
