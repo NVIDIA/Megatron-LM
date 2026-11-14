@@ -1,6 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import json
-from typing import Union
+from typing import Optional, Union
 
 import torch
 
@@ -24,6 +24,7 @@ from megatron.core.export.trtllm.trtllm_weights_converter.single_device_trtllm_m
     SingleDeviceTRTLLMModelWeightsConverter,
 )
 from megatron.core.export.trtllm.trtllm_weights_converter.utils import is_gated_activation
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 try:
@@ -272,6 +273,7 @@ class TRTLLMHelper:
         state_dict_split_by_layer_numbers: bool = True,
         fp8_quantized: bool = False,
         fp8_kvcache: bool = False,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """Get TRTLLM Config and Converted Model Weights
 
@@ -289,6 +291,7 @@ class TRTLLMHelper:
             vocab_size (int, optional): The vocabulary size. Defaults to None.
             gpus_per_node (int, optional): The number of gpus per node. Used for on device conversion.
             state_dict_split_by_layer_numbers (bool, optional): Are the model layers split by layer numbers in state dict. For example : mlp.fc1.weight can be represented like mlp.fc1.weight of shape [num_layers, hidden_dim, ffn_hidden_dim]} or it can be like mlp.fc1.layers.0.weight of shape [hidden_dim, ffn_hidden_dim], then mlp.fc1.layers.1.weight ... for all layers. If you use represenation 2 set this to True. Defaults to True
+            pg_collection (ProcessGroupCollection, optional): Process groups of the model being exported. Used only for on device conversion, which reads its tp and pp groups. If None, the global process groups from parallel_state are used, which is deprecated.
 
         Returns:
             Two lists . First list of trtllm converted model weights(Either on device, or a list of weights for each gpu) and the trtllm_model_configs.
@@ -326,6 +329,7 @@ class TRTLLMHelper:
                     scales,
                     fp8_quantized,
                     fp8_kvcache,
+                    pg_collection,
                 )
             )
             return [trtllm_model_weights_on_device], [trtllm_model_config]
@@ -383,6 +387,7 @@ class TRTLLMHelper:
         scales: dict,
         fp8_quantized: bool,
         fp8_kvcache: bool,
+        pg_collection: Optional[ProcessGroupCollection],
     ):
         """Get the TRTLLM Pretrained config and model weights list in a distributed setting
 
@@ -398,6 +403,7 @@ class TRTLLMHelper:
             scales (dict): Dictionary with fp8 scaling factors
             fp8_quantized (bool): True for fp8 checkpoint export
             fp8_kvcache (bool): True for fp8 KV-cache quantization
+            pg_collection (Optional[ProcessGroupCollection]): Process groups of the model, or None for the deprecated global process groups
         Returns:
             Two lists . List of trtllm converted model weights and trtllm model configs (One for each gpu).
         """
@@ -408,6 +414,7 @@ class TRTLLMHelper:
             multi_query_mode=self.multi_query_mode,
             activation=self.activation,
             scales=scales,
+            pg_collection=pg_collection,
         )
         self.weights_converter.convert(
             model_state_dict=model_state_dict,

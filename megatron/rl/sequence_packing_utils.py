@@ -10,7 +10,6 @@ from megatron.core.utils import log_single_rank, round_up_to_nearest_multiple
 from megatron.training.global_vars import get_tokenizer
 from megatron.training.utils import get_nvtx_range
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core import mpu
 import logging
 import typing
 from megatron.core.num_microbatches_calculator import (
@@ -52,6 +51,8 @@ class PackingContext:
         packed_trajs: Packed trajectories tensor [num_bins, bin_size]
         packed_position_ids: Position IDs for packed sequences [num_bins, bin_size]
         packed_loss_mask: Loss mask for packed sequences [num_bins, bin_size]
+        dp_group: Data-parallel group of the model being trained; the bins are distributed
+            over its ranks
         original_inference_logprobs: Inference logprobs for all sequences before packing (optional)
         bin_advantages: List of advantage tensors for each bin
         cached_packed_seq_params: Pre-computed PackedSeqParams for each bin
@@ -64,6 +65,7 @@ class PackingContext:
     packed_trajs: torch.Tensor
     packed_position_ids: torch.Tensor
     packed_loss_mask: torch.Tensor
+    dp_group: torch.distributed.ProcessGroup
     original_inference_logprobs: Optional[torch.Tensor] = None
     bin_advantages: List[torch.Tensor] = field(default_factory=list)
     cached_packed_seq_params: List[Optional[PackedSeqParams]] = field(default_factory=list)
@@ -151,7 +153,8 @@ def log_packing_efficiency(packing_context: PackingContext):
     total_capacity = packed_trajs.shape[0] * packed_trajs.shape[1]
     packing_efficiency = my_tokens / total_capacity if total_capacity > 0 else 0
     avg_seq_length = total_tokens / len(packing_info.seq_lengths)
-    rank = mpu.get_data_parallel_rank()
+    dp_group = packing_context.dp_group
+    rank = dp_group.rank()
 
     log_single_rank(logger, logging.INFO, "[Sequence Packing] Statistics:")
     log_single_rank(
@@ -210,11 +213,9 @@ def log_packing_efficiency(packing_context: PackingContext):
         )
 
         # Gather from all ranks
-        world_size = mpu.get_data_parallel_world_size()
+        world_size = dp_group.size()
         all_rank_stats = [torch.zeros_like(rank_stats) for _ in range(world_size)]
-        torch.distributed.all_gather(
-            all_rank_stats, rank_stats, group=mpu.get_data_parallel_group()
-        )
+        torch.distributed.all_gather(all_rank_stats, rank_stats, group=dp_group)
 
         # Print detailed statistics for each rank
         if rank == 0:
@@ -852,10 +853,11 @@ def distribute_packed_bins(
     packed_position_ids: torch.Tensor,
     packed_loss_mask: torch.Tensor,
     packing_info: PackingInfo,
+    dp_group: torch.distributed.ProcessGroup,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, PackingInfo]:
-    """Distribute packed bins across the data parallel ranks."""
-    rank = mpu.get_data_parallel_rank()
-    world_size = mpu.get_data_parallel_world_size()
+    """Distribute packed bins across the ranks of the data-parallel group ``dp_group``."""
+    rank = dp_group.rank()
+    world_size = dp_group.size()
     tokenizer = get_tokenizer()
 
     # Distribute packed bins across data parallel ranks
@@ -1006,17 +1008,42 @@ def distribute_packed_bins(
     return packed_trajs, packed_position_ids, packed_loss_mask, new_packing_info
 
 
-def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_advantages, bin_size, max_sequences_per_bin, packing_algo):
+def pack_all_trajectories(
+    trajs,
+    generation_masks,
+    inference_logprobs,
+    global_advantages,
+    bin_size,
+    max_sequences_per_bin,
+    packing_algo,
+    dp_group: torch.distributed.ProcessGroup,
+    cp_group: torch.distributed.ProcessGroup,
+):
+    """Gather this rank's trajectories, pack them into bins and distribute the bins.
+
+    Args:
+        trajs: This rank's trajectories [num_rows, bin_size].
+        generation_masks: Generation masks of the trajectories.
+        inference_logprobs: Inference logprobs of the trajectories, or None.
+        global_advantages: Advantages of the trajectories of every rank of ``dp_group``, in
+            rank order.
+        bin_size: Size of each bin (in tokens).
+        max_sequences_per_bin: Maximum number of sequences in a bin.
+        packing_algo: Algorithm used for distributing bins ('fifo' or 'round-robin').
+        dp_group: Data-parallel group of the model being trained. The trajectories are gathered
+            from its ranks and the packed bins are distributed over them.
+        cp_group: Context-parallel group of the model being trained. Each sequence is placed so
+            that its ranks can split it evenly.
+    """
     tokenizer = get_tokenizer()
-    data_parallel_world_size = mpu.get_data_parallel_world_size()
-    data_parallel_group = mpu.get_data_parallel_group()
+    data_parallel_world_size = dp_group.size()
     nvtx_range = get_nvtx_range()
 
     with nvtx_range("rl/regather-trajectories", time=True):
         def _gather(data):
             data = data.cuda()
             data_list = [torch.empty_like(data) for _ in range(data_parallel_world_size)]
-            torch.distributed.all_gather(data_list, data, group=data_parallel_group)
+            torch.distributed.all_gather(data_list, data, group=dp_group)
             return torch.cat(data_list, dim=0)
 
         trajs = _gather(trajs)
@@ -1029,7 +1056,7 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
         # Context parallelism requires every sequence's padded slot in the bin to be
         # divisible by 2*cp_size so TE's THD ring attention can split each sequence
         # evenly across CP ranks (see _scatter_for_context_parallel in rl_utils).
-        cp_size = mpu.get_context_parallel_world_size()
+        cp_size = cp_group.size()
         packer = SequencePacker(
             bin_size=bin_size,
             pad_token=tokenizer.pad,
@@ -1057,6 +1084,7 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
             packed_position_ids,
             packed_loss_mask,
             packing_info,
+            dp_group,
         )
 
     # Create bin_advantages list
@@ -1093,6 +1121,7 @@ def pack_all_trajectories(trajs, generation_masks, inference_logprobs, global_ad
         packed_trajs=packed_trajs,
         packed_position_ids=packed_position_ids,
         packed_loss_mask=packed_loss_mask,
+        dp_group=dp_group,
         original_inference_logprobs=inference_logprobs,
         bin_advantages=bin_advantages,
         cached_packed_seq_params=cached_packed_seq_params,
@@ -1109,6 +1138,7 @@ def update_microbatch_calculator(
     global_batch_size: int,
     micro_batch_size: int,
     decrease_batch_size_if_needed: bool,
+    dp_group: torch.distributed.ProcessGroup,
 ):
     """Return a data loader with seqpacked indices with microbatches in bins frame of reference.
     Args:
@@ -1118,13 +1148,15 @@ def update_microbatch_calculator(
         global_batch_size: Current global batch size.
         micro_batch_size: Micro batch size at init.
         decrease_batch_size_if_needed: Scale down batch size. See num_microbatches_calculator.py for more.
+        dp_group: Data-parallel group of the model being trained, over which the bins are
+            distributed.
 
     As a side effect, we calculate the global batch size in the bins frame of reference.
     In sequence packing, our batch dimension shrinks as we move some trajs onto free
     space in sequence dimension. The resulting batch size is what we return here.
     """
 
-    dp_world_size = mpu.get_data_parallel_world_size()
+    dp_world_size = dp_group.size()
 
     # Ceiling division means we will reuse some bins
     # If we did floor we would leave some behind
@@ -1198,16 +1230,24 @@ def get_sequence_packing_log_info(consumed_train_bins):
     return ''
 
 
-def bin_batch_size(micro_batch_size):
-    """Bins consumed per iteration across the data-parallel ranks."""
-    return mpu.get_data_parallel_world_size() * micro_batch_size * get_num_microbatches()
+def bin_batch_size(micro_batch_size, dp_group: torch.distributed.ProcessGroup):
+    """Bins consumed per iteration across the ranks of the data-parallel group ``dp_group``."""
+    return dp_group.size() * micro_batch_size * get_num_microbatches()
 
 
-def get_sequence_packing_tensorboard_metrics(consumed_train_bins, micro_batch_size):
-    """Get tensorboard metrics for sequence packing mode."""
+def get_sequence_packing_tensorboard_metrics(
+    consumed_train_bins, micro_batch_size, dp_group: torch.distributed.ProcessGroup
+):
+    """Get tensorboard metrics for sequence packing mode.
+
+    Args:
+        consumed_train_bins: Bins consumed so far.
+        micro_batch_size: Bins per microbatch.
+        dp_group: Data-parallel group of the model being trained.
+    """
     metrics = {}
     if consumed_train_bins > 0:
-        metrics['bin-batch-size'] = bin_batch_size(micro_batch_size)
+        metrics['bin-batch-size'] = bin_batch_size(micro_batch_size, dp_group)
         metrics['consumed-bins'] = consumed_train_bins
     return metrics
 
@@ -1250,7 +1290,7 @@ def get_packing_efficiency(packing_context: PackingContext) -> float:
         Packing efficiency as a float between 0 and 1.
     """
     total_actual_tokens = sum(packing_context.packing_info.seq_lengths)
-    num_ranks = mpu.get_data_parallel_world_size()
+    num_ranks = packing_context.dp_group.size()
     bins_per_rank = packing_context.packed_trajs.shape[0]
     bin_size = packing_context.packed_trajs.shape[1]
     total_capacity = bins_per_rank * bin_size * num_ranks

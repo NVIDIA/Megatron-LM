@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-import warnings
 from typing import List, Literal, Optional, Tuple
 
 import torch
@@ -22,7 +21,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import deprecate_inference_params, get_tensor_model_parallel_group_if_none
+from megatron.core.utils import deprecate_inference_params
 
 
 class T5LMHead(MegatronModule):
@@ -51,7 +50,9 @@ class T5LMHead(MegatronModule):
         super(T5LMHead, self).__init__(config=config)
 
         if has_config_logger_enabled(config):
-            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+            log_config_to_disk(
+                config, locals(), prefix=type(self).__name__, pg_collection=pg_collection
+            )
 
         self.parallel_output = parallel_output
 
@@ -135,6 +136,16 @@ class T5Model(LanguageModule):
         add_decoder (bool): Include an output layer (used with pipeline parallelism).
             As with `add_encoder`, when using this model and pipelining,
             the decoder will only be created on a subset of the pipeline ranks.
+
+        pg_collection (ProcessGroupCollection, optional): Process groups for the model and
+            its submodules, checked by LanguageModule. Omitting it is deprecated: LanguageModule
+            warns and resolves the global parallel_state groups without checking them, and the
+            embedding, blocks and LM head are built on that same collection. In a supplied
+            collection, an `embd` of NON_GROUP_MEMBER raises ValueError on every stage, and an
+            omitted `embd` field is treated as None with a FutureWarning. After the parent
+            constructor, a supplied collection whose `embd` group is None raises ValueError
+            when embeddings are tied, pipeline_model_parallel_size > 1, and this stage has
+            pre_process or post_process set.
     """
 
     def __init__(
@@ -162,25 +173,19 @@ class T5Model(LanguageModule):
         pg_collection: ProcessGroupCollection = None,
     ):
 
-        if pg_collection is not None:
-            if 'embd' not in vars(pg_collection):
-                warnings.warn(
-                    "T5Model was given a pg_collection without an embd field and treats it as "
-                    "embd=None. Set embd explicitly, to None when it is unused; a missing embd "
-                    "becomes an error in Megatron Core 0.23.",
-                    FutureWarning,
-                    stacklevel=2,
-                )
-            if (
-                share_embeddings_and_output_weights
-                and config.pipeline_model_parallel_size > 1
-                and (pre_process or post_process)
-                and pg_collection.embd in (None, torch.distributed.GroupMember.NON_GROUP_MEMBER)
-            ):
-                raise ValueError(
-                    "T5Model tied pipeline embedding/output stages require a usable embd group"
-                )
         super(T5Model, self).__init__(config=config, pg_collection=pg_collection)
+        if (
+            pg_collection is not None
+            and share_embeddings_and_output_weights
+            and config.pipeline_model_parallel_size > 1
+            and (pre_process or post_process)
+            and self.embd_group is None
+        ):
+            raise ValueError(
+                "T5Model tied pipeline embedding/output stages require a usable embd group"
+            )
+        # LanguageModule resolves an omitted collection; build the submodules on the same groups.
+        pg_collection = self.pg_collection
 
         self.config: TransformerConfig = config
         self.encoder_config: TransformerConfig = encoder_config
@@ -197,11 +202,6 @@ class T5Model(LanguageModule):
         self.share_embeddings_and_output_weights = share_embeddings_and_output_weights
         self.position_embedding_type = position_embedding_type
         self.encoder_hidden_state = None
-        if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['tp', 'cp', 'pp']
-            )
-        self.tp_group = get_tensor_model_parallel_group_if_none(pg_collection.tp)
 
         self.model_type = ModelType.encoder_or_decoder
 

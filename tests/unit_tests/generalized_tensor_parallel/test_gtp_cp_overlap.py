@@ -6,6 +6,8 @@ Run with torchrun on both four and eight GPUs to cover all TP/CP/GTP layouts.
 The reference uses ordinary CP and replicated weights, with identical tokens.
 """
 
+import warnings
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -16,11 +18,12 @@ if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
 
 from megatron.core import parallel_state as ps
+from megatron.core import process_groups_config
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
     GTP_CONFIG,
     GTPShardedParam,
@@ -175,10 +178,12 @@ def _step(model, optimizer, pg, step):
     )
 
 
-def test_replica_all_gather_group_uses_weight_layout():
+@pytest.mark.parametrize("with_collection", [False, True])
+def test_replica_all_gather_group_uses_weight_layout(monkeypatch, with_collection):
     """Optimizer AG must use the same replicas as its gradient reduction."""
     if dist.get_world_size() not in (4, 8):
         pytest.skip("Requires four or eight ranks")
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
     ps.destroy_model_parallel()
     try:
         ps.initialize_model_parallel(
@@ -187,7 +192,16 @@ def test_replica_all_gather_group_uses_weight_layout():
             gtp_remat_num_sequence_shards=2,
         )
         pg = ProcessGroupCollection.use_mpu_process_groups()
-        all_gather, _ = ps.create_all_gather_groups()
+        if with_collection:
+            # The form that training uses: the group mirrors the collection's, with no fallback.
+            with warnings.catch_warnings():
+                warnings.simplefilter("error", ProcessGroupFallbackWarning)
+                all_gather, _ = ps.create_all_gather_groups(pg_collection=pg)
+        else:
+            # Without a collection, the deprecated form reads the global grid.
+            with pytest.warns(ProcessGroupFallbackWarning, match="create_all_gather_groups"):
+                all_gather, _ = ps.create_all_gather_groups()
+        assert all_gather is not pg.dp_cp
         assert dist.get_process_group_ranks(all_gather) == dist.get_process_group_ranks(pg.dp_cp)
         assert pg.dp_gtp_remat.size() == 1
         assert pg.dp_cp.size() == dist.get_world_size() // 2
