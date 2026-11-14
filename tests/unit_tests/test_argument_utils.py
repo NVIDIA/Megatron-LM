@@ -25,7 +25,12 @@ from megatron.training.argument_utils import (
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
-from megatron.training.arguments import add_megatron_arguments, parse_args, validate_args
+from megatron.training.arguments import (
+    _resolve_ssa_indexer_clip_grad,
+    add_megatron_arguments,
+    parse_args,
+    validate_args,
+)
 from megatron.training.config import PretrainConfigContainer
 from megatron.training.models import BertModelConfig
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
@@ -1679,3 +1684,72 @@ class TestTrainingConfigMapping:
         assert result.train.train_iters is None
         assert result.train.micro_batch_size is None
         assert result.train.global_batch_size is None
+
+
+def _ssa_clip_args(**overrides):
+    args = SimpleNamespace(
+        experimental_attention_variant="ssa",
+        clip_grad=0.5,
+        ssa_separate_indexer_grad_clip=False,
+        ssa_indexer_clip_grad=None,
+    )
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
+
+
+def test_ssa_indexer_gradients_clip_jointly_by_default():
+    args = _ssa_clip_args()
+    _resolve_ssa_indexer_clip_grad(args)
+    assert _default_config_from_args(OptimizerConfig, args).dsa_indexer_clip_grad is None
+
+
+@pytest.mark.parametrize("indexer_clip_grad, expected", [(None, 0.5), (2.0, 2.0), (0.0, 0.0)])
+def test_ssa_separate_indexer_clipping_sets_the_optimizer_threshold(indexer_clip_grad, expected):
+    """The indexer threshold defaults to --clip-grad; the backbone keeps --clip-grad."""
+    args = _ssa_clip_args(
+        ssa_separate_indexer_grad_clip=True, ssa_indexer_clip_grad=indexer_clip_grad
+    )
+    _resolve_ssa_indexer_clip_grad(args)
+    config = _default_config_from_args(OptimizerConfig, args)
+    assert config.dsa_indexer_clip_grad == expected
+    assert config.clip_grad == 0.5
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"ssa_indexer_clip_grad": 1.0}, "requires --ssa-separate-indexer-grad-clip"),
+        (
+            {"ssa_separate_indexer_grad_clip": True, "experimental_attention_variant": "dsa"},
+            "requires --experimental-attention-variant ssa",
+        ),
+        (
+            {"ssa_separate_indexer_grad_clip": True, "ssa_indexer_clip_grad": -1.0},
+            "finite and non-negative",
+        ),
+        (
+            {"ssa_separate_indexer_grad_clip": True, "ssa_indexer_clip_grad": float("nan")},
+            "finite and non-negative",
+        ),
+    ],
+)
+def test_ssa_indexer_clipping_rejects_invalid_flags(overrides, message):
+    with pytest.raises(AssertionError, match=message):
+        _resolve_ssa_indexer_clip_grad(_ssa_clip_args(**overrides))
+
+
+def test_ssa_indexer_clipping_flags_parse(monkeypatch):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "test_argument_utils.py",
+            "--ssa-separate-indexer-grad-clip",
+            "--ssa-indexer-clip-grad",
+            "2",
+        ],
+    )
+    args = parse_args()
+    assert args.ssa_separate_indexer_grad_clip
+    assert args.ssa_indexer_clip_grad == 2.0

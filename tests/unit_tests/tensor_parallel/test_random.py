@@ -237,6 +237,25 @@ def test_checkpoint():
     Utils.destroy_model_parallel()
 
 
+def test_checkpoint_input_without_grad_keeps_parameter_gradients():
+    """Reentrant checkpoint() with frozen inputs still trains parameters used inside."""
+    Utils.initialize_model_parallel()
+    model_parallel_cuda_manual_seed(123)
+    try:
+        linear = torch.nn.Linear(8, 8).cuda()
+        reference = torch.nn.Linear(8, 8).cuda()
+        reference.load_state_dict(linear.state_dict())
+        x = torch.randn(4, 8, device="cuda")
+
+        checkpoint(linear, False, x).square().sum().backward()
+        reference(x).square().sum().backward()
+
+        assert torch.equal(linear.weight.grad, reference.weight.grad)
+        assert torch.equal(linear.bias.grad, reference.bias.grad)
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_checkpoint_without_output():
     def normal_forward(input):
         x = torch.nn.functional.gelu(input)

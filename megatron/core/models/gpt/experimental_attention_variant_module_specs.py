@@ -150,6 +150,14 @@ def get_experimental_attention_variant_module_spec(
         return dsv4_hybrid_specs.get_dsv4_hybrid_module_spec_for_backend(
             config=config, backend=backend
         )
+    elif config.experimental_attention_variant == "ssa":
+        from megatron.core.transformer.experimental_attention_variant import (
+            simplified_sparse_attention,
+        )
+
+        attention = _get_self_attention_module_spec(config=config, backend=backend)
+        attention.module = simplified_sparse_attention.SimplifiedSparseAttention
+        return attention
     else:
         raise ValueError(
             f"Invalid experimental attention variant: {config.experimental_attention_variant}"

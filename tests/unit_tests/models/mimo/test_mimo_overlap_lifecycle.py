@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
 from megatron.core.models.mimo.model.base import MimoModel
@@ -159,9 +160,19 @@ def test_mimo_optimizer_scopes_param_group_alignment_to_module(mocker):
     optimizer_factory = mocker.patch(
         "megatron.core.optimizer.get_megatron_optimizer", return_value=MagicMock()
     )
+    has_trainable_params = torch.tensor(True, dtype=torch.int64)
+    mocker.patch(
+        "megatron.core.models.mimo.optimizer.torch.tensor", return_value=has_trainable_params
+    )
+    trainability_reduce = mocker.patch(
+        "megatron.core.models.mimo.optimizer.torch.distributed.all_reduce"
+    )
 
     get_mimo_optimizer(mimo_model, OptimizerConfig())
 
+    trainability_reduce.assert_called_once_with(
+        has_trainable_params, op=torch.distributed.ReduceOp.MAX, group=intra_dist_opt
+    )
     assert optimizer_factory.call_args.kwargs['param_group_process_group'] is intra_dist_opt
     assert optimizer_factory.call_args.kwargs['pg_collection'] is pg_collection
 

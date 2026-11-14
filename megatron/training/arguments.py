@@ -4,6 +4,7 @@
 
 import argparse
 import json
+import math
 import os
 import re
 import types
@@ -411,6 +412,27 @@ def tuple_type(x):
     return tuple(int(i) for i in x.strip('()').split(','))
 
 
+def _resolve_ssa_indexer_clip_grad(args):
+    """Map the SSA indexer clipping flags onto ``OptimizerConfig.dsa_indexer_clip_grad``.
+
+    Separate clipping gives the indexer gradients their own L2 norm and threshold, which defaults
+    to ``--clip-grad``; zero leaves them unclipped. The backbone keeps ``--clip-grad``.
+    """
+    if not args.ssa_separate_indexer_grad_clip:
+        assert (
+            args.ssa_indexer_clip_grad is None
+        ), "--ssa-indexer-clip-grad requires --ssa-separate-indexer-grad-clip."
+        return
+    assert (
+        args.experimental_attention_variant == 'ssa'
+    ), "--ssa-separate-indexer-grad-clip requires --experimental-attention-variant ssa."
+    threshold = args.clip_grad if args.ssa_indexer_clip_grad is None else args.ssa_indexer_clip_grad
+    assert (
+        math.isfinite(threshold) and threshold >= 0.0
+    ), f"The SSA indexer clipping threshold must be finite and non-negative, got {threshold}."
+    args.dsa_indexer_clip_grad = threshold
+
+
 def validate_args(args, defaults={}):
 
     # Prep for checkpoint conversion. CheckpointConfig.validate() checks the prerequisites below;
@@ -788,6 +810,12 @@ def validate_args(args, defaults={}):
         assert not args.freeze_all_layers, (
             "--freeze-base-model-for-mtp cannot be combined with --freeze-all-layers."
         )
+
+    if args.ssa_train_indexer_only:
+        assert (
+            not args.freeze_all_layers
+        ), "--ssa-train-indexer-only cannot be combined with --freeze-all-layers."
+    _resolve_ssa_indexer_clip_grad(args)
 
     # All MLA-based hybrid attention symbols use MLA projections.
     if args.hybrid_layer_pattern and any(
@@ -2594,6 +2622,12 @@ def _add_regularization_args(parser):
                        help='Apply weight decay to qk layernorm as a special case.')
     group.add_argument('--clip-grad', type=float, default=1.0,
                        help='Gradient clipping based on global L2 norm.')
+    group.add_argument('--ssa-separate-indexer-grad-clip', action='store_true',
+                       help='Clip simplified sparse attention indexer gradients with an L2 norm '
+                       'separate from the other gradients, which keep --clip-grad.')
+    group.add_argument('--ssa-indexer-clip-grad', type=float, default=None,
+                       help='Indexer threshold for --ssa-separate-indexer-grad-clip. Defaults to '
+                       '--clip-grad; zero leaves indexer gradients unclipped.')
     group.add_argument('--adam-beta1', type=float, default=0.9,
                        help='First coefficient for computing running averages '
                        'of gradient and its square')

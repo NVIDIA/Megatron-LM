@@ -350,9 +350,11 @@ class TransformerConfig(ModelParallelConfig):
     # attention variant
     ####################
     experimental_attention_variant: Optional[
-        Literal['gdn', 'gdn2', 'dsa', 'dsv4_hybrid', 'gated_delta_net']
+        Literal['gdn', 'gdn2', 'dsa', 'dsv4_hybrid', 'ssa', 'gated_delta_net']
     ] = None
-    """Type of attention variant to use. Supports gdn, gdn2, dsa, and dsv4_hybrid.
+    """Type of attention variant to use. Supports gdn, gdn2, dsa, dsv4_hybrid, and ssa.
+    ssa selects simplified sparse attention: a learned one-head indexer chooses
+    ``dsa_indexer_topk`` keys per query for MQA attention, using cuDNN frontend kernels.
     gdn2 selects the GDN2 (Gated DeltaNet-2) variant of the gated delta net layer, with
     channel-wise decay, erase and write gates; it requires flash-linear-attention >= 0.5.1.
     Both gdn and gdn2 also select the layer built for the hybrid layer pattern symbol 'G'.
@@ -361,6 +363,11 @@ class TransformerConfig(ModelParallelConfig):
 
     experimental_attention_variant_loss_scale_func: Optional[Callable[[torch.Tensor], None]] = None
     """Optional hook for experimental attention variants to receive the main loss scale."""
+
+    ssa_train_indexer_only: bool = False
+    """Simplified sparse attention phase 1: train only the indexer against a frozen dense
+    attention teacher, over every causal key. Freezes all other parameters and router bias updates.
+    Requires experimental_attention_variant='ssa' and a positive dsa_indexer_loss_coeff."""
 
     ####################
     # DSA
@@ -2207,6 +2214,32 @@ class TransformerConfig(ModelParallelConfig):
                         "this path. Use sparse indexer loss or set dsa_kernel_backend='none'."
                     )
             self.hetereogenous_dist_checkpoint = True
+        elif self.experimental_attention_variant == "ssa":
+            if self.deterministic_mode:
+                raise ValueError(
+                    "Simplified sparse attention backward uses atomics and is not deterministic."
+                )
+            if self.multi_latent_attention:
+                raise ValueError("Simplified sparse attention requires ordinary Q/K/V projections.")
+            if self.dsa_indexer_topk not in (512, 1024, 2048):
+                raise ValueError("Simplified sparse attention supports top-k 512, 1024 or 2048.")
+            coefficient = self.dsa_indexer_loss_coeff
+            if coefficient is None or not math.isfinite(coefficient) or coefficient < 0:
+                raise ValueError("dsa_indexer_loss_coeff must be finite and nonnegative.")
+            if self.ssa_train_indexer_only:
+                if coefficient == 0:
+                    raise ValueError(
+                        "Indexer-only training requires a positive dsa_indexer_loss_coeff."
+                    )
+                if self.freeze_base_model_for_mtp:
+                    raise ValueError(
+                        "ssa_train_indexer_only and freeze_base_model_for_mtp select different "
+                        "trainable parameters."
+                    )
+        if self.ssa_train_indexer_only and self.experimental_attention_variant != "ssa":
+            raise ValueError(
+                "ssa_train_indexer_only requires experimental_attention_variant='ssa'."
+            )
 
         if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant != "gdn":
             raise ValueError(

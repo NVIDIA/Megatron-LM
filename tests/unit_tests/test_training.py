@@ -282,6 +282,53 @@ def test_indexer_logging_counts_hybrid_mtp_depths_and_dense_mode():
     assert _get_indexer_logging_layer_counts(model_config) == (5, 0)
 
 
+def test_ssa_indexer_only_freezes_everything_but_indexers():
+    model = torch.nn.Module()
+    model.linear_qkv = torch.nn.Linear(2, 2)
+    model.core_attention = torch.nn.Module()
+    model.core_attention.indexer = torch.nn.Linear(2, 2)
+    model.router = torch.nn.Linear(2, 2)
+    model.router.frozen_expert_bias = False
+
+    assert training.freeze_backbone_for_ssa_indexer([model]) == [model]
+    trainable = {name for name, param in model.named_parameters() if param.requires_grad}
+    assert trainable == {"core_attention.indexer.weight", "core_attention.indexer.bias"}
+    assert model.router.frozen_expert_bias
+
+    model_config = SimpleNamespace(pre_wrap_hooks=[])
+    training._add_model_freeze_pre_wrap_hook(
+        model_config,
+        freeze_all_layers=False,
+        freeze_base_model_for_mtp=False,
+        ssa_train_indexer_only=True,
+    )
+    assert model_config.pre_wrap_hooks == [training.freeze_backbone_for_ssa_indexer]
+
+
+def test_ssa_indexer_only_rejects_a_model_without_indexers():
+    with pytest.raises(RuntimeError, match="no simplified sparse attention indexer"):
+        training.freeze_backbone_for_ssa_indexer([torch.nn.Linear(2, 2)])
+
+
+def test_indexer_logging_counts_ssa_hybrid_attention_layers():
+    """Only '*' layers own SSA indexers; MTP attention repeats once per unshared depth."""
+    args = SimpleNamespace(
+        experimental_attention_variant="ssa",
+        num_layers=3,
+        mtp_num_layers=2,
+        mtp_use_repeated_layer=False,
+        hybrid_layer_pattern="*M*/*M/*M",
+        csa_compress_ratios=None,
+        csa_dense_mode=False,
+    )
+
+    model_config = SimpleNamespace(transformer=args, hybrid_layer_pattern=args.hybrid_layer_pattern)
+    assert _get_indexer_logging_layer_counts(model_config) == (5, 4)
+
+    args.mtp_use_repeated_layer = True
+    assert _get_indexer_logging_layer_counts(model_config) == (5, 3)
+
+
 def test_indexer_logging_uses_normalized_hybrid_layer_positions():
     """C layers in the main and repeated MTP patterns keep their positional denominator."""
     args = SimpleNamespace(

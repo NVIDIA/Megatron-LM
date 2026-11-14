@@ -1100,6 +1100,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_gqa_inference.py, "
         "including empty/ragged requests, causal masks, and graph page-table refresh.",
     ),
+    KernelEntry(
+        name="ssa_cudnn_dispatch",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/"
+            "simplified_sparse_attention_cudnn.py",
+        ),
+        kind="dispatch",
+        exempt_reason="cuDNN frontend simplified sparse attention reduces dK/dV with FP32 "
+        "atomics and has no deterministic mode; TransformerConfig rejects deterministic_mode "
+        "with experimental_attention_variant='ssa'. The kernels need SM100/SM103.",
+        notes="Output, indexer loss and gradients are checked against a PyTorch reference in "
+        "tests/unit_tests/transformer/experimental_attention_variant/"
+        "test_simplified_sparse_attention.py.",
+    ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
         name="dsa_tilelang_absorbed_shape_dispatch",

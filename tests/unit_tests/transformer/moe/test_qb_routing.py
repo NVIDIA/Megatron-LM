@@ -108,23 +108,28 @@ class TestQuantileBalancingRouter:
 
     @pytest.mark.internal
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-    def test_qb_beta_accumulates_in_training(self):
+    @pytest.mark.parametrize("frozen", [False, True])
+    def test_qb_beta_accumulates_only_when_unfrozen(self, frozen):
         self.router = self.router.cuda()
         self.router.train()
+        self.router.frozen_expert_bias = frozen
         hidden_states = torch.randn((32, 2, self.router.config.hidden_size)).cuda().bfloat16()
 
         assert self.router.qb_beta_count.item() == 0
         self.router(hidden_states)
-        assert self.router.qb_beta_count.item() == 1
-        assert self.router.qb_beta_accum.abs().sum().item() > 0
+        assert self.router.qb_beta_count.item() == (0 if frozen else 1)
+        if frozen:
+            assert torch.count_nonzero(self.router.qb_beta_accum) == 0
+        else:
+            assert self.router.qb_beta_accum.abs().sum().item() > 0
         self.router(hidden_states)
-        assert self.router.qb_beta_count.item() == 2
+        assert self.router.qb_beta_count.item() == (0 if frozen else 2)
 
         # No accumulation outside the training path (eval / recompute).
         accum_before = self.router.qb_beta_accum.clone()
         with torch.no_grad():
             self.router(hidden_states)
-        assert self.router.qb_beta_count.item() == 2
+        assert self.router.qb_beta_count.item() == (0 if frozen else 2)
         torch.testing.assert_close(self.router.qb_beta_accum, accum_before)
 
     @pytest.mark.internal

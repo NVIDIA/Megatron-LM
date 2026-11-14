@@ -936,6 +936,42 @@ def num_floating_point_operations(
     if total_real_tokens_in_batch is None:
         total_real_tokens_in_batch = batch_size * llm_seq_length
 
+    using_ssa = transformer_cfg.experimental_attention_variant == "ssa"
+    # Indexer-only training (SSA phase 1) runs the frozen backbone forward only.
+    ssa_indexer_only = using_ssa and transformer_cfg.ssa_train_indexer_only
+    backbone_passes = 1 if ssa_indexer_only else 3
+
+    def ssa_core_and_indexer_flops(total_tokens, seqlen_squared_sum, seq_length):
+        """Training FLOPs of one simplified sparse attention core and its indexer.
+
+        Counts useful GEMM work with two FLOPs per multiply-add. Joint training counts top-k
+        sparse QK/PV forward and backward, full causal indexer scoring for selection, and
+        selected-support indexer gradients. Indexer-only training counts the frozen dense
+        teacher's QK/PV forward and the indexer's QK, dQ and dK over every causal key. Both
+        count the indexer's two hidden-to-128 projections, whose inputs are detached: forward
+        and weight gradients, no input gradients. Selection, elementwise work and communication
+        are excluded. Main QKV/output projections are counted by the attention layer formula.
+        """
+        indexer_dim = 128
+        query_dim = transformer_cfg.num_attention_heads * transformer_cfg.kv_channels
+        causal_pairs = (seqlen_squared_sum + total_tokens) / 2
+        train_indexer = transformer_cfg.dsa_indexer_loss_coeff > 0
+        indexer_projections = (
+            4 * total_tokens * transformer_cfg.hidden_size * indexer_dim * (1 + train_indexer)
+        )
+        if ssa_indexer_only:
+            return (
+                4 * causal_pairs * query_dim + indexer_projections + 6 * causal_pairs * indexer_dim
+            )
+        topk = min(transformer_cfg.dsa_indexer_topk, seq_length)
+        selected_pairs = total_tokens * topk - (total_tokens / seq_length) * topk * (topk - 1) / 2
+        return (
+            12 * selected_pairs * query_dim  # Sparse QK/PV forward and backward.
+            + indexer_projections
+            + 2 * causal_pairs * indexer_dim  # Full causal scoring for selection.
+            + 4 * selected_pairs * indexer_dim * train_indexer  # Selected-support dQ/dK.
+        )
+
     def mlp_layer_flops(total_tokens, hidden_size, expansion=4.0, swiglu=False):
         """Calculate FLOPs for an MLP layer."""
         scale_factor = 3.0 / 2.0 if swiglu else 1.0
@@ -1107,7 +1143,8 @@ def num_floating_point_operations(
         )
         flops_fwd = (
                 num_dsa_layers * dsa_attention_flops +
-                num_attn_layers * attn_layer_flops(total_tokens, seqlen_squared_sum,
+                num_attn_layers * attn_layer_flops(total_tokens,
+                                                   0 if using_ssa else seqlen_squared_sum,
                                                    hidden_size, num_attn_heads, gqa,
                                                    gqa_groups, kv_channels) +
                 num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size,
@@ -1141,7 +1178,13 @@ def num_floating_point_operations(
                 dsa_indexer_kpool=getattr(transformer_cfg, "dsa_indexer_kpool", 1),
             ) if num_dsa_layers else 0
         )
-        return flops_fwd * 3 + indexer_flops
+        ssa_flops = (
+            num_attn_layers
+            * ssa_core_and_indexer_flops(total_tokens, seqlen_squared_sum, llm_seq_length)
+            if using_ssa
+            else 0
+        )
+        return flops_fwd * backbone_passes + indexer_flops + ssa_flops
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
@@ -1196,7 +1239,8 @@ def num_floating_point_operations(
 
         # - 3x: Each GEMM in the model needs to be performed 3 times (forward pass,
         #       backward wgrad [weight gradient], backward dgrad [data gradient]).
-        forward_backward_expansion_factor = 3
+        #       1x for SSA indexer-only training, whose backbone is frozen.
+        forward_backward_expansion_factor = backbone_passes
         # - 2x: A GEMM of a m*n tensor with a n*k tensor requires 2mnk floating-point operations.
         fma_expansion_factor = 2
         # - 3x (SwiGLU enabled): h->2*ffn_h GEMM and ffn_h->h GEMM are stacked.
@@ -1389,8 +1433,11 @@ def num_floating_point_operations(
             linear_self_attn_term * num_linear_attention_layers
             + standard_self_attn_term * num_standard_attention_layers
         )
-        # Core attention (L^2) FLOPs per standard-attention layer.
-        self_attn_core_term = standard_self_attn_core_term * num_standard_attention_layers
+        # Core attention (L^2) FLOPs per standard-attention layer. SSA's sparse core
+        # attention is counted separately below.
+        self_attn_core_term = (
+            0 if using_ssa else standard_self_attn_core_term * num_standard_attention_layers
+        )
 
         # Token-linear FLOPs scale with the real (unpadded) token count.
         # For BSHD this falls back to ``batch_size * seq_length`` (no padding).
@@ -1488,6 +1535,12 @@ def num_floating_point_operations(
                 mtp_num_layers=mtp_num_layers,
                 mtp_use_repeated_layer=getattr(transformer_cfg, "mtp_use_repeated_layer", False),
                 dsa_indexer_kpool=getattr(transformer_cfg, "dsa_indexer_kpool", 1),
+            )
+        if using_ssa:
+            total_floating_point_operations += num_standard_attention_layers * (
+                ssa_core_and_indexer_flops(
+                    total_real_tokens_in_batch, seqlen_squared_sum_in_batch, llm_seq_length
+                )
             )
         return total_floating_point_operations
 
@@ -2617,13 +2670,43 @@ def _freeze_base_model_for_mtp(model_list):
     return model_list
 
 
-def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_base_model_for_mtp):
+def freeze_backbone_for_ssa_indexer(model_list):
+    """Freeze everything but simplified sparse attention indexers, including router bias updates.
+
+    Phase 1 of simplified sparse attention trains only the indexers against a frozen dense
+    teacher. A pipeline stage may hold no indexer; only a model without any is rejected.
+    """
+    local_indexer_params = 0
+    for model_module in model_list:
+        for name, param in model_module.named_parameters():
+            is_indexer = name.startswith("indexer.") or ".indexer." in name
+            param.requires_grad_(is_indexer)
+            local_indexer_params += int(is_indexer)
+        for module in model_module.modules():
+            if hasattr(module, "frozen_expert_bias"):
+                module.frozen_expert_bias = True
+
+    indexer_params = local_indexer_params
+    if torch.distributed.is_initialized():
+        count = torch.tensor(indexer_params, dtype=torch.int64, device=torch.cuda.current_device())
+        torch.distributed.all_reduce(count)
+        indexer_params = count.item()
+    if indexer_params == 0:
+        raise RuntimeError("ssa_train_indexer_only found no simplified sparse attention indexer.")
+    return model_list
+
+
+def _add_model_freeze_pre_wrap_hook(
+    model_config, *, freeze_all_layers, freeze_base_model_for_mtp, ssa_train_indexer_only=False
+):
     """Install the requested freeze hook before a config-built model is wrapped."""
     freeze_hook = None
     if freeze_all_layers:
         freeze_hook = _freeze_all_model_chunks
     elif freeze_base_model_for_mtp:
         freeze_hook = _freeze_base_model_for_mtp
+    elif ssa_train_indexer_only:
+        freeze_hook = freeze_backbone_for_ssa_indexer
 
     if freeze_hook is not None and freeze_hook not in model_config.pre_wrap_hooks:
         model_config.pre_wrap_hooks.append(freeze_hook)
@@ -2724,6 +2807,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         _freeze_all_model_chunks(model)
     elif config.freeze_base_model_for_mtp:
         _freeze_base_model_for_mtp(model)
+    elif config.ssa_train_indexer_only:
+        freeze_backbone_for_ssa_indexer(model)
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -2944,6 +3029,7 @@ def setup_model_and_optimizer(
                 model_config,
                 freeze_all_layers=args.freeze_all_layers,
                 freeze_base_model_for_mtp=cfg.model.transformer.freeze_base_model_for_mtp,
+                ssa_train_indexer_only=cfg.model.transformer.ssa_train_indexer_only,
             )
 
             return builder.build_distributed_models(
@@ -3779,9 +3865,27 @@ def train_step(
 
 
 def _get_indexer_logging_layer_counts(model_config) -> tuple[int, int | None]:
-    """Return tracker slots and active CSA indexer modules for loss logging."""
+    """Return tracker slots and active CSA or SSA indexer modules for loss logging."""
     transformer_cfg = model_config.transformer
     tracker_layers = transformer_cfg.num_layers + (transformer_cfg.mtp_num_layers or 0)
+    using_ssa = getattr(transformer_cfg, "experimental_attention_variant", None) == "ssa"
+    if using_ssa and is_hybrid_model(model_config):
+        # Only the attention layers of a hybrid stack own a simplified sparse indexer.
+        from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            Symbols,
+            parse_hybrid_pattern,
+        )
+
+        parsed_pattern = parse_hybrid_pattern(model_config.hybrid_layer_pattern)
+        mtp_pattern = parsed_pattern.mtp_pattern or ""
+        tracker_layers = transformer_cfg.num_layers + len(mtp_pattern)
+        mtp_indexer_repeats = (
+            1 if transformer_cfg.mtp_use_repeated_layer else parsed_pattern.mtp_num_depths
+        )
+        indexer_layers = (parsed_pattern.main_pattern or "").count(Symbols.ATTENTION) + (
+            mtp_pattern.count(Symbols.ATTENTION) * mtp_indexer_repeats
+        )
+        return tracker_layers, indexer_layers
     if transformer_cfg.csa_compress_ratios is None:
         return tracker_layers, None
 

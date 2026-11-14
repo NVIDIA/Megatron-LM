@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import math
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
@@ -50,6 +51,7 @@ class MimoOptimizer(MegatronOptimizer):
         ]
         self.is_stub_optimizer = len(self._active_optimizers) == 0
         self.optimizer = None  # Base class compat
+        self._last_dsa_split_grad_norms = None
 
     @torch.no_grad()
     def prepare_grads(self) -> bool:
@@ -78,6 +80,54 @@ class MimoOptimizer(MegatronOptimizer):
         return torch.sqrt(norm_sq.sum()).item()
 
     @torch.no_grad()
+    def get_dsa_split_grad_norms(self) -> Tuple[float, float]:
+        """Compute global indexer and non-indexer gradient norms across all modules.
+
+        Like :meth:`get_grad_norm`, every rank joins the all_reduce, including ranks whose
+        module is frozen.
+        """
+        norm_sq = torch.zeros((len(self.module_infos), 2), device="cuda", dtype=torch.float32)
+        for i, (_, info) in enumerate(sorted(self.module_infos.items())):
+            if info.is_active and info.optimizer is not None:
+                for j, norm in enumerate(info.optimizer.get_dsa_split_grad_norms()):
+                    norm_sq[i, j] = float(norm) ** 2
+        torch.distributed.all_reduce(norm_sq, op=torch.distributed.ReduceOp.MAX)
+        indexer_grad_norm, non_indexer_grad_norm = norm_sq.sum(dim=0).sqrt().tolist()
+        return indexer_grad_norm, non_indexer_grad_norm
+
+    def _clip_grads(self, grad_norm: float) -> None:
+        """Clip every active module's gradients with the global norm."""
+        for opt in self._active_optimizers:
+            if getattr(opt, "is_stub_optimizer", False):
+                continue
+            params = opt.get_parameters()
+            if params and opt.config.clip_grad > 0.0:
+                clip_grad_by_total_norm_fp32(
+                    params,
+                    max_norm=opt.config.clip_grad,
+                    total_norm=grad_norm,
+                    use_decoupled_grad=opt.config.use_precision_aware_optimizer,
+                )
+
+    def _clip_dsa_split_grads(self, indexer_grad_norm: float, non_indexer_grad_norm: float) -> None:
+        """Clip indexer and other gradients separately, each with its global norm."""
+        for opt in self._active_optimizers:
+            if getattr(opt, "is_stub_optimizer", False):
+                continue
+            indexer_params, non_indexer_params = opt.get_dsa_split_parameters()
+            for params, max_norm, total_norm in (
+                (non_indexer_params, opt.config.clip_grad, non_indexer_grad_norm),
+                (indexer_params, opt.config.dsa_indexer_clip_grad, indexer_grad_norm),
+            ):
+                if params and max_norm > 0.0:
+                    clip_grad_by_total_norm_fp32(
+                        params,
+                        max_norm=max_norm,
+                        total_norm=total_norm,
+                        use_decoupled_grad=opt.config.use_precision_aware_optimizer,
+                    )
+
+    @torch.no_grad()
     def step(self) -> Tuple[bool, Optional[float], Optional[int]]:
         """Run one optimizer step across all active module optimizers."""
         found_inf = self.prepare_grads()
@@ -90,20 +140,17 @@ class MimoOptimizer(MegatronOptimizer):
         if found_inf:
             return False, None, None
 
-        grad_norm = self.get_grad_norm()
-
-        # Clip with global norm
-        for opt in self._active_optimizers:
-            if getattr(opt, "is_stub_optimizer", False):
-                continue
-            params = opt.get_parameters()
-            if params and opt.config.clip_grad > 0.0:
-                clip_grad_by_total_norm_fp32(
-                    params,
-                    max_norm=opt.config.clip_grad,
-                    total_norm=grad_norm,
-                    use_decoupled_grad=opt.config.use_precision_aware_optimizer,
-                )
+        self._last_dsa_split_grad_norms = None
+        if self.config.dsa_indexer_clip_grad is not None:
+            # Indexer gradients get their own global norm and threshold; the reported norm
+            # still covers every gradient.
+            indexer_grad_norm, non_indexer_grad_norm = self.get_dsa_split_grad_norms()
+            self._last_dsa_split_grad_norms = (indexer_grad_norm, non_indexer_grad_norm)
+            grad_norm = math.sqrt(indexer_grad_norm**2 + non_indexer_grad_norm**2)
+            self._clip_dsa_split_grads(indexer_grad_norm, non_indexer_grad_norm)
+        else:
+            grad_norm = self.get_grad_norm()
+            self._clip_grads(grad_norm)
 
         num_zeros = self.count_zeros() if self.config.log_num_zeros_in_grad else None
         success = self.step_with_ready_grads()
@@ -412,14 +459,28 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
             else:
                 module = mimo_model.modality_submodules[module_name]
 
-            if module is not None and any(
-                parameter.requires_grad for parameter in module.parameters()
-            ):
-                is_active = True
+            if module is not None:
                 pg_collection = getattr(unwrap_model(module), 'pg_collection', None)
                 assert (
                     pg_collection is not None
                 ), f"Module '{module_name}' must own a ProcessGroupCollection for optimizer setup"
+                # Parameter-group alignment and gradient statistics span every pipeline stage,
+                # so a stage without trainable parameters (for example, one without SSA
+                # indexers during indexer-only training) stays active unless the whole module
+                # is frozen.
+                has_trainable_params = torch.tensor(
+                    any(parameter.requires_grad for parameter in module.parameters()),
+                    dtype=torch.int64,
+                    device="cuda",
+                )
+                torch.distributed.all_reduce(
+                    has_trainable_params,
+                    op=torch.distributed.ReduceOp.MAX,
+                    group=pg_collection.intra_dist_opt,
+                )
+                is_active = bool(has_trainable_params.item())
+
+            if is_active:
                 module_config = _optimizer_config_for_module(config, module)
                 assert module.ddp_config.num_distributed_optimizer_instances == 1, (
                     "MIMO optimizer does not yet support "

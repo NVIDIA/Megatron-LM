@@ -100,16 +100,31 @@ def wrap_active_modules_with_ddp(
     use_layer_wise_distributed_optimizer: bool = False,
     use_layer_wise_param_layout: bool = True,
 ) -> None:
-    """Freeze (per --freeze-* flags), Float16Module-wrap, and DDP-wrap each active module."""
+    """Freeze (SSA indexer-only training or --freeze-* flags), Float16Module-wrap, and DDP-wrap
+    each active module."""
+    indexer_only = (
+        mimo_model.config.experimental_attention_variant == "ssa"
+        and mimo_model.config.ssa_train_indexer_only
+    )
+    if indexer_only:
+        if getattr(args, "freeze_lm", False):
+            raise ValueError("--freeze-lm cannot be combined with SSA indexer-only training.")
+        from megatron.training.training import freeze_backbone_for_ssa_indexer
+
+        # Every rank holds the language config, encoder-only ranks included. Freezing the whole
+        # model on every rank lets all roles join the world-wide indexer check, and freezes
+        # every non-indexer parameter and router bias before DDP captures its parameters.
+        freeze_backbone_for_ssa_indexer([mimo_model])
+
     if mimo_model.language_model is not None:
         freeze_projection = bool(getattr(args, "freeze_projection", False))
         input_projections = mimo_model.language_model_input_projections
         assert input_projections is not None
-        if getattr(args, "freeze_lm", False):
+        if not indexer_only and getattr(args, "freeze_lm", False):
             mimo_model.language_model.requires_grad_(False)
             if not freeze_projection:
                 input_projections.requires_grad_(True)
-        elif freeze_projection:
+        elif not indexer_only and freeze_projection:
             input_projections.requires_grad_(False)
         lm_config = _module_config(mimo_model.language_model)
         print_rank_0("wrapping language model in DDP")
@@ -127,7 +142,8 @@ def wrap_active_modules_with_ddp(
     for name, submodule in mimo_model.modality_submodules.items():
         if submodule is None or name not in topology.module_pgs:
             continue
-        _freeze_modality_submodule(submodule, args)
+        if not indexer_only:
+            _freeze_modality_submodule(submodule, args)
         enc_config = _module_config(submodule)
         print_rank_0(f"wrapping modality submodule {name!r} in DDP")
         mimo_model.modality_submodules[name] = (

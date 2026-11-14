@@ -149,7 +149,11 @@ def test_ddp_config_for_role_preserves_fields_and_masks_overlap(
 def test_supplied_ddp_config_wins_over_global_args(mocker):
     encoder = mocker.MagicMock()
     wrapped_encoder = mocker.MagicMock()
-    mimo_model = SimpleNamespace(language_model=None, modality_submodules={ENCODER: encoder})
+    mimo_model = SimpleNamespace(
+        config=SimpleNamespace(experimental_attention_variant=None, ssa_train_indexer_only=False),
+        language_model=None,
+        modality_submodules={ENCODER: encoder},
+    )
     topology = SimpleNamespace(module_pgs={ENCODER: mocker.MagicMock()})
     prepare = mocker.patch(
         "examples.mimo.training.runtime.prepare_existing_model_chunks_for_distributed_training",
@@ -181,6 +185,7 @@ def test_freezing_language_model_keeps_language_projection_trainable(mocker):
     projection = torch.nn.Linear(8, 4)
     projections = torch.nn.ModuleDict({ENCODER: projection})
     mimo_model = SimpleNamespace(
+        config=SimpleNamespace(experimental_attention_variant=None, ssa_train_indexer_only=False),
         language_model=language_model,
         language_model_input_projections=projections,
         modality_submodules={},

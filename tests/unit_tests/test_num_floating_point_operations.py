@@ -1581,3 +1581,83 @@ class TestDSAKPool:
             )
             == 0
         )
+
+
+class TestSimplifiedSparseAttentionFlops:
+    """SSA replaces dense core attention with top-k sparse attention plus its indexer."""
+
+    @staticmethod
+    def _configs(hybrid, *, topk=512, loss_coeff=0.1, seq_length=1024):
+        make = _make_hybrid_config if hybrid else _make_gpt_config
+        dense = make(num_layers=4, hidden_size=256, num_attention_heads=16, seq_length=seq_length)
+        dense.transformer.num_query_groups = 1
+        dense.transformer.kv_channels = 256
+        ssa = deepcopy(dense)
+        ssa.transformer.experimental_attention_variant = "ssa"
+        ssa.transformer.dsa_indexer_topk = topk
+        ssa.transformer.dsa_indexer_loss_coeff = loss_coeff
+        return dense, ssa
+
+    @staticmethod
+    def _attention_work(batch_size, seq_length, topk, loss_coeff):
+        """Per-layer SSA core and indexer FLOPs, counted pair by pair."""
+        hidden, query_dim, indexer_dim = 256, 16 * 256, 128
+        positions = range(seq_length)
+        causal_pairs = batch_size * sum(i + 1 for i in positions)
+        selected_pairs = batch_size * sum(min(i + 1, topk) for i in positions)
+        tokens = batch_size * seq_length
+        train_indexer = loss_coeff > 0
+        return (
+            12 * selected_pairs * query_dim
+            + 4 * tokens * hidden * indexer_dim * (1 + train_indexer)
+            + 2 * causal_pairs * indexer_dim
+            + 4 * selected_pairs * indexer_dim * train_indexer
+        )
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    @pytest.mark.parametrize("topk,seq_length", [(512, 1024), (2048, 1024)])
+    def test_sparse_core_replaces_dense_core(self, hybrid, topk, seq_length):
+        dense, ssa = self._configs(hybrid, topk=topk, seq_length=seq_length)
+        batch_size = 2
+        # Removing the dense L^2 term leaves the shared projections, MLP and logits.
+        dense_without_core = num_floating_point_operations(
+            dense, batch_size, sequence_length=seq_length, seqlen_squared_sum_in_batch=0
+        )
+        ssa_flops = num_floating_point_operations(ssa, batch_size, sequence_length=seq_length)
+        attention_layers = 2 if hybrid else 4
+        expected = attention_layers * self._attention_work(batch_size, seq_length, topk, 0.1)
+        assert ssa_flops - dense_without_core == pytest.approx(expected, rel=1e-12)
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    def test_indexer_only_counts_frozen_forward_dense_teacher_and_full_support_kl(self, hybrid):
+        dense, ssa = self._configs(hybrid)
+        ssa.transformer.ssa_train_indexer_only = True
+        batch_size, seq_length = 2, 1024
+        dense_without_core = num_floating_point_operations(
+            dense, batch_size, sequence_length=seq_length, seqlen_squared_sum_in_batch=0
+        )
+        causal_pairs = batch_size * sum(i + 1 for i in range(seq_length))
+        tokens = batch_size * seq_length
+        attention_layers = 2 if hybrid else 4
+        # Frozen backbone forward only; dense teacher QK/PV forward; indexer projections
+        # forward and weight gradients; indexer QK, dQ and dK over every causal key.
+        expected = dense_without_core / 3 + attention_layers * (
+            4 * causal_pairs * 16 * 256 + 8 * tokens * 256 * 128 + 6 * causal_pairs * 128
+        )
+        actual = num_floating_point_operations(ssa, batch_size, sequence_length=seq_length)
+        assert actual == pytest.approx(expected, rel=1e-9)
+
+    @pytest.mark.parametrize("hybrid", [False, True])
+    def test_zero_coefficient_removes_indexer_training(self, hybrid):
+        _, trained = self._configs(hybrid, loss_coeff=0.1)
+        _, frozen = self._configs(hybrid, loss_coeff=0.0)
+        batch_size = 2
+        difference = num_floating_point_operations(
+            trained, batch_size, sequence_length=1024
+        ) - num_floating_point_operations(frozen, batch_size, sequence_length=1024)
+        attention_layers = 2 if hybrid else 4
+        expected = attention_layers * (
+            self._attention_work(batch_size, 1024, 512, 0.1)
+            - self._attention_work(batch_size, 1024, 512, 0.0)
+        )
+        assert difference == pytest.approx(expected, rel=1e-12)
