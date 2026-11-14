@@ -6,7 +6,10 @@ import torch
 from torch import Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import reshard_fsdp_module
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import (
+    post_fsdp_backward,
+    register_fsdp_schedule_hooks,
+)
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -328,11 +331,14 @@ class TransformerLayerSchedulePlan:
         explicit release hooks to individual schedule nodes so that all-gathered
         parameters are freed at the right time.
 
+        The post-backward callback belongs to ``pre_dispatch_computation``, the
+        first forward node and last backward node. ``TransformerLayerNode`` fires
+        it after ``backward()``, or after ``backward_dw()`` when wgrad is delayed.
+
         Args:
-            post_forward_hook: Callable(module) that releases forward-pass params
-                (bwd=False). Typically ``fsdp_wrapper.post_forward_release_module``.
-            post_backward_hook: Callable(module) that releases backward-pass params
-                (bwd=True). Typically ``fsdp_wrapper.post_backward_release_module``.
+            post_forward_hook: Callable(module) invoked after the last forward node.
+            post_backward_hook: Callable(module) invoked after the last backward
+                operation, including delayed weight-gradient computation.
         """
         from megatron.core.models.hybrid.hybrid_block import HybridStack
         from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
@@ -656,23 +662,7 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 model, self._model_chunk_state, self._event, get_comp_stream
             )
 
-        # setup FSDP hooks
-        has_fsdp_module = any(isinstance(submodule, FsdpModule) for submodule in model.modules())
-        if has_fsdp_module:
-            for layer_plan in self._transformer_layers:
-                # Forward resharding follows the schedule. Backward resharding and
-                # reduction are triggered by each FsdpModule's gradient countdown.
-                #
-                # One hook per layer plan pins the reshard boundary to "one transformer
-                # layer == one FSDP unit": the plan registers it on its own layer module
-                # (TransformerLayer / HybridStack / MTP layer) and fires it on that layer's
-                # last forward node, so the layer's all-gathered parameters are released at
-                # the layer boundary. That only holds while the FSDP unit is the layer
-                # itself -- the granularity `set_fsdp_reshard_hooks` asserts and the MFSDP
-                # v2 adapter forms for EP overlap (``fsdp_unit_modules``). A sub-layer unit
-                # would need a hook per unit; a coarser one would need this hoisted to the
-                # enclosing plan.
-                layer_plan.set_fsdp_reshard_hooks(reshard_fsdp_module, lambda _: None)
+        self._fsdp_remaining_modules: tuple[FsdpModule, ...] = ()
 
         # Split into segments; pre_process and post_process keep their graphs.
         self._build_recompute_segments(model.config)
@@ -767,6 +757,10 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         """Waits for the event to complete on the current CUDA stream."""
         stream = torch.cuda.current_stream()
         self.event.wait(stream)
+
+    def register_fsdp_hooks(self, model: torch.nn.Module) -> None:
+        """Configure FSDP completion using this chunk's outer model and wrappers."""
+        self._fsdp_remaining_modules = register_fsdp_schedule_hooks(model, self._transformer_layers)
 
     def get_layer(self, i):
         """Gets the transformer layer at the specified index."""
@@ -932,6 +926,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
             f_schedule_plan.wait_current_stream()
         if b_schedule_plan:
             b_schedule_plan.wait_current_stream()
+            for unit in b_schedule_plan._fsdp_remaining_modules:
+                post_fsdp_backward(unit)
             model = b_schedule_plan._model_chunk_state.model
             if isinstance(model, FsdpModule):
                 # This schedule bypasses the root's autograd completion callback.
