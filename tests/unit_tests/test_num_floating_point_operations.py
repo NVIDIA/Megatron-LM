@@ -27,6 +27,9 @@ from megatron.training.models import GPTModelConfig, HybridModelConfig
 from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
     num_floating_point_operations,
+    reactivate_seqlen_stats_for_graph_replay,
+    record_seqlen_stats_capture,
+    set_seqlen_stats_in_iteration,
     update_seqlen_stats_from_cu_seqlens,
 )
 
@@ -35,6 +38,11 @@ def _reset_seqlen_accumulator():
     """Tear down the per-iteration accumulator between tests."""
     training_module._seqlen_stats_in_iteration = None
     training_module._seqlen_stats_active = False
+    training_module._seqlen_stats_are_global = False
+    training_module._seqlen_stats_produced_in_capture = {
+        'training': False,
+        'validation': False,
+    }
 
 
 def _make_gpt_config(
@@ -534,6 +542,56 @@ class TestAccumulator:
         assert training_module._seqlen_stats_active is False
         assert training_module._seqlen_stats_in_iteration is not None
         assert training_module._seqlen_stats_in_iteration.tolist() == [0.0, 0.0]
+
+
+class TestAccumulatorGraphReplay:
+    """Full-iteration CUDA graph replay must keep draining the statistics.
+
+    Under ``--cuda-graph-impl full_iteration`` the producers run inside the
+    captured region: their device-side ``+=`` is replayed, but the Python
+    ``_seqlen_stats_active`` flag is not. Without re-arming it per replay,
+    ``consume_*`` reports the BSHD ``(None, None)`` defaults from the second
+    iteration on and the accumulator is never drained.
+    """
+
+    def setup_method(self):
+        _reset_seqlen_accumulator()
+
+    def teardown_method(self):
+        _reset_seqlen_accumulator()
+
+    def test_replay_keeps_reporting_real_tokens(self):
+        # Two samples of length 5 and 3 -> real-token statistics are (8, 34).
+        cu = torch.tensor([0, 5, 8], dtype=torch.int32)
+        update_seqlen_stats_from_cu_seqlens(cu)  # capture iteration
+        record_seqlen_stats_capture('training')
+        assert consume_seqlen_stats_in_iteration() == (8, 34)
+
+        replayed = torch.tensor([8.0, 34.0], dtype=torch.float64)
+        for _ in range(3):
+            # The captured ``+=`` is what a replay re-executes on the device.
+            training_module._seqlen_stats_in_iteration += replayed
+            # Python state is not replayed, so the consumer gate stays closed.
+            assert consume_seqlen_stats_in_iteration() == (None, None)
+            assert reactivate_seqlen_stats_for_graph_replay('training') is True
+            assert consume_seqlen_stats_in_iteration() == (8, 34)
+            # Drained exactly once per replayed iteration.
+            assert training_module._seqlen_stats_in_iteration.tolist() == [0.0, 0.0]
+
+    def test_replay_without_a_producer_stays_bshd(self):
+        """A graph captured without a producer keeps the zero-collective path."""
+        record_seqlen_stats_capture('validation')
+        assert reactivate_seqlen_stats_for_graph_replay('validation') is False
+        assert consume_seqlen_stats_in_iteration() == (None, None)
+        assert training_module._seqlen_stats_active is False
+
+    def test_reactivation_preserves_globally_seeded_stats(self):
+        """The scheduler-seeded path stays global; reactivation must not force a reduce."""
+        set_seqlen_stats_in_iteration(128, 2048)
+        record_seqlen_stats_capture('training')
+        assert reactivate_seqlen_stats_for_graph_replay('training') is True
+        assert training_module._seqlen_stats_are_global is True
+        assert consume_seqlen_stats_in_iteration() == (128, 2048)
 
 
 class TestAccumulatorDistributed:
