@@ -563,8 +563,8 @@ def test_precision_aware_checkpoint_uses_te_checkpoint_for_fp8_and_fp4(precision
 def test_precision_aware_checkpoint_binds_kwargs_for_tensor_parallel_checkpoint(monkeypatch):
     calls = []
 
-    def fake_checkpoint(function, distribute_saved_activations, *args):
-        calls.append((distribute_saved_activations, args))
+    def fake_checkpoint(function, distribute_saved_activations, *args, tp_group):
+        calls.append((distribute_saved_activations, args, tp_group))
         return function(*args)
 
     monkeypatch.setattr(transformer_utils.tensor_parallel, "checkpoint", fake_checkpoint)
@@ -572,8 +572,13 @@ def test_precision_aware_checkpoint_binds_kwargs_for_tensor_parallel_checkpoint(
         "megatron.core.extensions.transformer_engine.te_checkpoint", _unexpected_checkpoint
     )
     config = SimpleNamespace(fp8=None, fp4=None)
+    tp_group = object()
 
-    output = transformer_utils.precision_aware_checkpoint(_scale, config, object(), 3, factor=2)
+    output = transformer_utils.precision_aware_checkpoint(
+        _scale, config, tp_group, 3, distribute_saved_activations=True, factor=2
+    )
 
     assert output == 6
-    assert calls == [(False, (3,))]
+    # The caller's TP group must reach tensor_parallel.checkpoint, which splits the saved
+    # input over it; dropping it would fall back to the global tensor-parallel group.
+    assert calls == [(True, (3,), tp_group)]
