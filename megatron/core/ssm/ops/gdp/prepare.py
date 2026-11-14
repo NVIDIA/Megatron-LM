@@ -44,39 +44,8 @@ test.
 
 import torch
 
-from .common import HAVE_TRITON, tl, triton
-
-if HAVE_TRITON:
-    # Everything numeric here goes through libdevice rather than `tl`: on fp32
-    # `tl.exp` lowers to `ex2.approx.f32` and `/` to `div.full.f32`, both of which
-    # cost bitwise agreement with the eager path. `log1p` is libdevice-only
-    # regardless; `triton.language.math` does not carry it.
-    # The `triton.language.extra.libdevice` path dates to Triton 3.0 -- 2.x
-    # exposed it as `extra.cuda.libdevice`, which this package does not support.
-    try:
-        from triton.language.extra import libdevice
-
-        HAVE_TRITON_LIBDEVICE = True
-    except ImportError:
-        libdevice = None
-        HAVE_TRITON_LIBDEVICE = False
-else:
-    libdevice = None
-    HAVE_TRITON_LIBDEVICE = False
-
-
-@triton.jit
-def softplus(x):
-    """`log1p(exp(x))` in fp32, saturating to the identity above 20 like torch's.
-
-    `log1p` rather than `log(1 + ...)` so the far-negative tail, where `exp(x)`
-    falls below fp32's epsilon and `1 + exp(x)` rounds to exactly 1, keeps its
-    significant digits instead of flushing to zero.
-
-    Mirrors `F.softplus`'s `(x * beta) > threshold ? x : log1p(exp(x * beta)) / beta`
-    at the default `beta == 1.0`, where the multiply and divide are exact.
-    """
-    return tl.where(x > 20.0, x, libdevice.log1p(libdevice.exp(x)))
+# Everything numeric here goes through libdevice rather than `tl` (see `common`).
+from .common import HAVE_TRITON, HAVE_TRITON_LIBDEVICE, libdevice, softplus, tl, triton
 
 
 @triton.jit

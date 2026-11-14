@@ -299,6 +299,37 @@ def test_selective_state_update_replays():
     )
 
 
+def test_selective_state_update_dense_dt_A_replays():
+    """The kernel's general branch: dt, A and dt_bias vary over the head dim, so the softplus and
+    the decay are computed per channel instead of once per head (TIE_HDIM)."""
+    from megatron.core.ssm.ops.mamba2.mamba_ssm import selective_state_update
+
+    seeded()
+    batch, nheads, headdim, dstate, ngroups = 256, 32, 64, 128, 1
+    state = torch.randn(batch, nheads, headdim, dstate, device="cuda")
+    x = torch.randn(batch, nheads, headdim, device="cuda", dtype=torch.bfloat16)
+    dt = torch.rand(batch, nheads, headdim, device="cuda")
+    A = -torch.rand(nheads, headdim, dstate, device="cuda") - 1.0
+    Bm = torch.randn(batch, ngroups, dstate, device="cuda", dtype=torch.bfloat16)
+    Cm = torch.randn(batch, ngroups, dstate, device="cuda", dtype=torch.bfloat16)
+    D = torch.randn(nheads, headdim, device="cuda")
+    dt_bias = torch.rand(nheads, headdim, device="cuda") - 4.0
+
+    def fn(state, x, dt, A, Bm, Cm, D, dt_bias):
+        out = selective_state_update(
+            state, x, dt, A, Bm, Cm, D=D, dt_bias=dt_bias, dt_softplus=True
+        )
+        return out, state
+
+    assert_replays_bit_exact(
+        fn,
+        (state, x, dt, A, Bm, Cm, D, dt_bias),
+        replays=4,
+        backward=False,
+        what="selective_state_update (dense dt, A)",
+    )
+
+
 @pytest.mark.parametrize("act_dtype", [torch.bfloat16, torch.float32], ids=["bf16", "fp32"])
 def test_replayssm_spec_step_replays(act_dtype):
     """One ReplaySSM speculative step: the fused scatter + B.C precompute, the verify and flush
@@ -682,6 +713,9 @@ def test_fused_recurrent_gated_delta_rule_update_replays(gate_in_kernel):
         if gate_in_kernel
         else {}
     )
+    if gate_in_kernel:
+        # Raw gates on both sides of the in-kernel softplus's threshold (20).
+        g = torch.randn(B, 1, H, device="cuda") * 12
 
     def fn(q, k, v, g, beta, initial_state):
         return fused_recurrent_gated_delta_rule_update(
