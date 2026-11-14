@@ -997,6 +997,12 @@ class DynamicInferenceEngine(
                 self.create_cuda_graphs()
             capture_time = time.time() - capture_time
 
+            # Suspend already invalidated the media it saw, but requests submitted
+            # while suspended were encoded at admission, and filled the vision
+            # cache, with the weights from before any refit. Invalidate again so
+            # the refresh below re-encodes them under the resumed weights.
+            self._invalidate_vision_state()
+
             # Request records outlive the context buffers. Refresh every stale
             # VLM record, including PERSIST/OFFLOAD requests that need not be
             # re-added below, so no later checkpoint can carry old projections.
