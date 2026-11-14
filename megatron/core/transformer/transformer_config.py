@@ -1608,6 +1608,16 @@ class TransformerConfig(ModelParallelConfig):
     fp8_recipe='mxfp8' with inference_grouped_gemm_backend='torch' or 'vllm'. Set to
     True to disable fusion and use separate kernel launches (useful for debugging)."""
 
+    inference_moe_vllm_parallel_align: bool = False
+    """Opt in to a multi-CTA kernel that builds the expert indirection tables before the
+    expert GEMMs of inference_grouped_gemm_backend='vllm' (BF16), at decode and small
+    prefill sizes. Outputs are unchanged. Batch-invariant mode keeps the default kernel."""
+
+    inference_moe_vllm_tiled_sum: bool = False
+    """Opt in to a tiled kernel for the top-k sum after the expert GEMMs of
+    inference_grouped_gemm_backend='vllm' (BF16). Outputs are unchanged. Batch-invariant
+    mode keeps the default kernel."""
+
     inference_moe_router_backend: Literal['torch', 'triton'] = 'triton'
     """Backend for InferenceTopKRouter top-k routing in inference mode.
     - 'torch': torch.compile'd PyTorch routing.

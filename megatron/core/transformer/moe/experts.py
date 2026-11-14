@@ -1896,6 +1896,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
             num_tokens_hint=InferenceAllGatherDispatcherBase._get_host_valid_tokens_estimate(),
             activation_clamp_scale=self._activation_clamp_scale,
             batch_invariant_kwargs=self._batch_invariant_kwargs(),
+            parallel_align=self.config.inference_moe_vllm_parallel_align,
+            tiled_sum=self.config.inference_moe_vllm_tiled_sum,
         )
         return output, None
 
