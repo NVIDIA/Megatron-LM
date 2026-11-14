@@ -96,6 +96,7 @@ class MegatronLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: if called on a non-primary rank in coordinator mode.
         """
+        self._assert_not_shutdown()
         self._assert_primary()
         if sampling_params is None:
             sampling_params = SamplingParams()
@@ -126,6 +127,7 @@ class MegatronLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: in direct mode (``use_coordinator=False``).
         """
+        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         self._loop_manager.run_sync(self._pause_impl())
@@ -136,6 +138,7 @@ class MegatronLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: in direct mode (``use_coordinator=False``).
         """
+        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         self._loop_manager.run_sync(self._unpause_impl())
@@ -148,6 +151,7 @@ class MegatronLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: in direct mode (``use_coordinator=False``).
         """
+        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         self._loop_manager.run_sync(self._suspend_impl())
@@ -158,22 +162,15 @@ class MegatronLLM(_MegatronLLMBase):
         Raises:
             RuntimeError: in direct mode (``use_coordinator=False``).
         """
+        self._assert_not_shutdown()
         self._assert_coordinator()
         assert self._loop_manager is not None
         self._loop_manager.run_sync(self._resume_impl())
 
     def shutdown(self) -> None:
         """Tear down the engine and runtime. Idempotent. Direct mode is a no-op."""
-        if self._shutdown_called:
-            return
-        self._shutdown_called = True
-        self._stop_frontend_if_started()
-        if not self._use_coordinator:
-            return  # direct mode: nothing to tear down
-        assert self._loop_manager is not None
-        self._loop_manager.run_sync(self._shutdown_impl())
-        # Sync caller already on its own thread; no need for to_thread.
-        self._loop_manager.stop()
+        self._assert_not_on_runtime_loop("shutdown")
+        self._begin_shutdown().result()
 
     def serve(self, serve_config: ServeConfig, *, blocking: bool = True) -> None:
         """Start the OpenAI-compatible HTTP frontend.
@@ -194,6 +191,7 @@ class MegatronLLM(_MegatronLLMBase):
                 the coordinator path).
             RuntimeError: if a frontend replica exits before it is listening.
         """
+        self._assert_not_shutdown()
         if not self._use_coordinator:
             raise ValueError("MegatronLLM.serve() requires use_coordinator=True")
 
@@ -242,6 +240,11 @@ class MegatronLLM(_MegatronLLMBase):
     def wait_for_shutdown(self) -> None:
         """Block until the engine loop terminates. Direct mode no-op."""
         if not self._use_coordinator:
+            return
+        self._assert_not_on_runtime_loop("wait_for_shutdown")
+        shutdown_complete_future = self._started_shutdown_future()
+        if shutdown_complete_future is not None:
+            shutdown_complete_future.result()
             return
         assert self._loop_manager is not None
         self._loop_manager.run_sync(self._wait_for_shutdown_impl())

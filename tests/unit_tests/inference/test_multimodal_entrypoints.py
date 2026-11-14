@@ -301,6 +301,7 @@ def _build_toy_async_llm(service):
     llm._use_coordinator = True
     llm._loop_manager = _InlineLoopManager()
     llm._coord_runtime = SimpleNamespace(client=service)
+    llm._shutdown_called = False
     return llm
 
 
