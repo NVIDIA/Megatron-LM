@@ -460,11 +460,23 @@ class MultimodalPromptConfig:
     """``preserve`` keeps each message's content order; ``media_first`` moves media ahead of
     text, e.g. [text, video] renders the video first."""
 
+    content_rendering: Literal["join", "nemotron_vl"] = "join"
+    """How a message's content parts become one string. ``join`` joins them with the media
+    spec's ``content_part_separator``. ``nemotron_vl`` follows the Nemotron VL chat template:
+    parts keep their order, a newline goes before a media item only when it follows text that
+    does not already end with one, and with several images each is labeled ``<image N>``, e.g.
+    [image, image, text] renders ``<image 1><img>..</img><image 2><img>..</img>text``."""
+
     def __post_init__(self):
         if self.content_part_order not in ("preserve", "media_first"):
             raise ValueError(
                 "MultimodalPromptConfig.content_part_order must be 'preserve' or "
                 f"'media_first', got {self.content_part_order!r}."
+            )
+        if self.content_rendering not in ("join", "nemotron_vl"):
+            raise ValueError(
+                "MultimodalPromptConfig.content_rendering must be 'join' or "
+                f"'nemotron_vl', got {self.content_rendering!r}."
             )
 
     def get_spec(self, modality: str) -> MediaPromptSpec:
@@ -485,6 +497,7 @@ class MultimodalPromptConfig:
             image_spec=replace(defaults.image_spec, **dict(value.get("image_spec", {}))),
             video_spec=replace(defaults.video_spec, **dict(value.get("video_spec", {}))),
             content_part_order=value.get("content_part_order", defaults.content_part_order),
+            content_rendering=value.get("content_rendering", defaults.content_rendering),
         )
 
 
