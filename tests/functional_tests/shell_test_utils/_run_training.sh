@@ -96,9 +96,6 @@ if [[ "$BEFORE_SCRIPT" != null ]]; then
     eval "$BEFORE_SCRIPT"
 fi
 
-# Keep functional validation on FA2 while using the unpatched NGC 26.09 stack.
-export NVTE_FLASH_ATTN_V4=0
-
 # Exit earlier to leave time for properly saving checkpoint
 if [[ "$IS_NEMO_TEST" == "true" ]]; then
     PARAMS=()
@@ -196,8 +193,13 @@ fi
 
 # Extract training params
 PARAMS=("${PARAMS[@]}" "${TRAINING_PARAMS_ARRAY[@]}")
-if [[ "$IS_NEMO_TEST" != "true" ]]; then
-    PARAMS+=("--flash-attention-version" "2")
+# Keep functional validation on FA2 while using the unpatched NGC 26.09 stack, unless the
+# test case selects its own FlashAttention version.
+if [[ " ${TRAINING_PARAMS_ARRAY[*]} " != *" --flash-attention-version "* ]]; then
+    export NVTE_FLASH_ATTN_V4=0
+    if [[ "$IS_NEMO_TEST" != "true" ]]; then
+        PARAMS+=("--flash-attention-version" "2")
+    fi
 fi
 
 # Set PYTHONPATH

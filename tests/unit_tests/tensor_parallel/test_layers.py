@@ -327,24 +327,31 @@ def test_LinearWithFrozenWeight_3d_input_matches_torch_linear():
 @pytest.mark.skipif(
     te_general_gemm is None, reason="Transformer Engine general_gemm is not available"
 )
-def test_linear_with_grad_accumulation_supports_fp32_output_and_bf16_backward():
+@pytest.mark.parametrize("use_bias", [False, True])
+def test_linear_with_grad_accumulation_supports_fp32_output_and_bf16_backward(use_bias):
     Utils.initialize_model_parallel(1, 1)
 
     input_data = torch.randn(4, 3, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     weight = torch.randn(32, 16, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    bias = None
+    if use_bias:
+        bias = torch.randn(32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     reference_input = input_data.detach().clone().requires_grad_(True)
     reference_weight = weight.detach().clone().requires_grad_(True)
+    reference_bias = bias.detach().clone().requires_grad_(True) if use_bias else None
 
     output = linear_with_grad_accumulation_and_async_allreduce(
-        input_data, weight, None, False, False, False, tp_group=None, output_dtype=torch.float32
+        input_data, weight, bias, False, False, False, tp_group=None, output_dtype=torch.float32
     )
     assert output._base is None
     output.sum().backward()
 
-    reference_output = torch.nn.functional.linear(reference_input, reference_weight)
+    reference_output = torch.nn.functional.linear(reference_input, reference_weight, reference_bias)
     reference_output.sum().backward()
     fp32_reference_output = torch.nn.functional.linear(
-        input_data.detach().float(), weight.detach().float()
+        input_data.detach().float(),
+        weight.detach().float(),
+        bias.detach().float() if use_bias else None,
     )
 
     assert output.dtype == torch.float32
@@ -353,6 +360,9 @@ def test_linear_with_grad_accumulation_supports_fp32_output_and_bf16_backward():
     assert torch.allclose(output, fp32_reference_output, atol=1e-4, rtol=1e-4)
     assert torch.allclose(input_data.grad, reference_input.grad)
     assert torch.allclose(weight.grad, reference_weight.grad)
+    if use_bias:
+        assert bias.grad.dtype == torch.bfloat16
+        assert torch.allclose(bias.grad, reference_bias.grad)
 
     Utils.destroy_model_parallel()
 

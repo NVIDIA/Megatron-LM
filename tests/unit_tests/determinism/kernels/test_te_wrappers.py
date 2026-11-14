@@ -22,6 +22,7 @@ import pytest
 import torch
 
 import megatron.core.extensions.transformer_engine as te_ext
+import megatron.core.transformer.custom_layers.batch_invariant_kernels as bik
 from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP, mark_grouped_tensor
@@ -620,6 +621,83 @@ class TestTEWrappers:
             contention=True,
             what=f"TELayerNormColumnParallelLinear[{normalization}]",
         )
+
+    @pytest.mark.parametrize(
+        "backend",
+        [
+            "triton",
+            pytest.param(
+                "deepgemm",
+                marks=pytest.mark.skipif(
+                    not bik.HAVE_DEEPGEMM_BF16, reason="DeepGEMM bf16 bindings are unavailable"
+                ),
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("fused_norm", [False, True], ids=["linear", "layernorm-linear"])
+    def test_batch_invariant_linear_3d_input_replays(self, monkeypatch, fused_norm, backend):
+        """The GEMM and RMSNorm replacements replay a 3-D input and match its flattened rows."""
+        seeded()
+        layer_cls = TELayerNormColumnParallelLinear if fused_norm else TEColumnParallelLinear
+        module = layer_cls(
+            HIDDEN,
+            3 * HIDDEN,
+            config=_config(normalization="RMSNorm"),
+            init_method=init_method_normal(0.02),
+            gather_output=False,
+            bias=True,
+            skip_bias_add=False,
+            is_expert=False,
+        ).cuda()
+        # 2000 rows leave a partial row tile in the persistent GEMM.
+        x = torch.randn(1000, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        grad_output = torch.randn(1000, 2, 3 * HIDDEN, device="cuda", dtype=torch.bfloat16)
+
+        # Count TE's calls into the replacements, so a replay of native TE cannot pass for one.
+        calls = {"_te_general_gemm_patched": 0, "_te_apply_normalization_patched": 0}
+
+        def counted(name):
+            replacement = getattr(bik, name)
+
+            def wrapper(*args, **kwargs):
+                calls[name] += 1
+                return replacement(*args, **kwargs)
+
+            return wrapper
+
+        for name in calls:
+            monkeypatch.setattr(bik, name, counted(name))
+
+        replays = 3
+        with set_batch_invariant_mode(True, backend=backend):
+            outputs, grads = assert_module_replays_bit_exact(
+                module,
+                (x,),
+                grad_output=grad_output,
+                replays=replays,
+                contention=True,
+                what=f"batch-invariant {layer_cls.__name__}[3-D, {backend}]",
+            )
+            # The same rows as a 2-D input: the operands' rank must not change a bit.
+            module.zero_grad(set_to_none=True)
+            x_flat = x.detach().reshape(-1, HIDDEN).requires_grad_(True)
+            out_flat, _ = module(x_flat)
+            out_flat.backward(grad_output.reshape(-1, 3 * HIDDEN))
+
+        passes = replays + 1
+        assert calls["_te_general_gemm_patched"] >= 3 * passes  # forward, dgrad and wgrad
+        if fused_norm:
+            assert calls["_te_apply_normalization_patched"] >= passes
+        else:
+            assert calls["_te_apply_normalization_patched"] == 0
+
+        names = ("weight", "bias", "layer_norm_weight") if fused_norm else ("weight", "bias")
+        assert set(grads) == {"in[0]"} | {f"chunk0.{name}" for name in names}
+        assert outputs["out[0]"].shape == (1000, 2, 3 * HIDDEN)
+        assert bytes_equal(out_flat.detach(), outputs["out[0]"].reshape(out_flat.shape))
+        assert bytes_equal(x_flat.grad, grads["in[0]"].reshape(x_flat.shape))
+        for name in names:
+            assert bytes_equal(getattr(module, name).grad, grads[f"chunk0.{name}"]), name
 
     @pytest.mark.parametrize("normalization", ["LayerNorm", "RMSNorm"])
     def test_te_norm_replays(self, normalization):
