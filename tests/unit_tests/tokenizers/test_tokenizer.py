@@ -19,6 +19,9 @@ from megatron.core.tokenizers.text.libraries.sft_tokenizer import IGNORE_INDEX
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 
 try:
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+
     from megatron.core.tokenizers.text.libraries.huggingface_tokenizer import (
         HAVE_TRANSFORMERS,
         HuggingFaceTokenizer,
@@ -523,6 +526,28 @@ def test_hf_ids_to_text_eos_with_include_and_remove_special_tokens(
             f"Expected EOS stripped for include_special_tokens={include_special_tokens}, "
             f"remove_special_tokens={remove_special_tokens}. Got: {text!r}"
         )
+
+
+@pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
+def test_hf_ids_to_text_removes_only_special_tokens(tmp_path):
+    """Removal drops the special-tokens map, not every added token flagged special."""
+    vocab = {"[UNK]": 0, "hello": 1, "world": 2, "<eos>": 3}
+    backend = Tokenizer(models.WordLevel(vocab=vocab, unk_token="[UNK]"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="[UNK]", eos_token="<eos>"
+    ).save_pretrained(tmp_path)
+    tokenizer = HuggingFaceTokenizer(str(tmp_path), additional_special_tokens=["<extra>"])
+    tokenizer.tokenizer.add_tokens(["<think>"], special_tokens=True)
+
+    extra, think = tokenizer.tokens_to_ids(["<extra>", "<think>"])
+    # The last id is outside the vocabulary, so it has no token.
+    ids = [1, 3, extra, 2, think, 0, len(tokenizer.tokenizer) + 5]
+    assert tokenizer.ids_to_text(ids, remove_special_tokens=True) == "hello world <think>"
+    assert (
+        tokenizer.ids_to_text(ids, remove_special_tokens=False)
+        == "hello <eos> <extra> world <think> [UNK]"
+    )
 
 
 @pytest.mark.skipif(not HAVE_TRANSFORMERS, reason="transformers not installed")
