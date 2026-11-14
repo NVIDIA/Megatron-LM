@@ -1,0 +1,4 @@
+interface:
+  display_name: "Select PR Unit Tests"
+  short_description: "Select PR unit tests and write a JSON test plan"
+  default_prompt: "Use $select-unit-tests to inspect this PR and write a unit-tests-to-run.json plan without Testmon."
