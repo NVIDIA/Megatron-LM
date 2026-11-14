@@ -86,14 +86,14 @@ class FsdpUnitCollector:
 
         # 3. Mark units whose owned parameters are replayed without their hooks.
         for unit in self._units:
-            owned = set(_owned_modules(unit, self._units))
+            owned = set(self._owned_modules(unit))
             for rerun in owned.intersection(recomputed_modules):
                 # An external checkpoint re-enters the whole unit's forward hooks.
                 if rerun is unit and unit not in _rerun_submodules(unit):
                     continue
                 if any(
                     next(submodule.parameters(recurse=False), None) is not None
-                    for submodule in _owned_modules(rerun, self._units)
+                    for submodule in self._owned_modules(rerun)
                 ):
                     self._partially_recomputed_units.add(unit)
                     break
@@ -117,6 +117,13 @@ class FsdpUnitCollector:
             for rerun in _rerun_submodules(module):
                 recomputed.add(rerun)
         return recomputed
+
+    def _owned_modules(self, module: nn.Module) -> Iterator[nn.Module]:
+        """Yield this module and its descendants outside independent child units."""
+        yield module
+        for child in module.children():
+            if child not in self._units:
+                yield from self._owned_modules(child)
 
     def _visit(self, module: nn.Module) -> None:
         if isinstance(module, HyperConnectionHybridLayer):
@@ -169,14 +176,6 @@ class FsdpUnitCollector:
     def _collect_routed_experts(self, layer: TransformerLayer) -> None:
         if layer.is_moe_layer:
             self._units.append(layer.mlp.experts)
-
-
-def _owned_modules(module: nn.Module, fsdp_units: Sequence[nn.Module]) -> Iterator[nn.Module]:
-    """Yield this module and its descendants outside independent child units."""
-    yield module
-    for child in module.children():
-        if child not in fsdp_units:
-            yield from _owned_modules(child, fsdp_units)
 
 
 def _rerun_submodules(module: nn.Module) -> list[nn.Module]:
