@@ -10,6 +10,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.training import arguments, global_vars
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.async_utils import build_otel_worker_bootstrap
@@ -361,7 +362,9 @@ def test_native_builder_keeps_core_metric_settings(monkeypatch, model_kind, enab
 
     monkeypatch.setattr(config_cls, 'get_builder_cls', lambda self: construct)
     with pytest.raises(ObservedModel):
-        training.setup_model_and_optimizer(Mock(), cfg_container=run_config)
+        training.setup_model_and_optimizer(
+            Mock(), cfg_container=run_config, pg_collection=ProcessGroupCollection()
+        )
 
 
 @pytest.mark.parametrize('enabled', [False, True])
@@ -398,7 +401,21 @@ def test_attention_metric_logging_reads_model_config(
     for getter in ('get_wandb_writer', 'get_one_logger', 'get_energy_monitor', 'get_telemetry'):
         monkeypatch.setattr(training, getter, lambda: None)
     model = [SimpleNamespace(config=transformer)] if supplied_model else None
-    training.training_log({}, {}, 0.01, 1, 1.0, False, 0, None, None, None, 7.0, model=model)
+    training.training_log(
+        {},
+        {},
+        0.01,
+        1,
+        1.0,
+        False,
+        0,
+        None,
+        None,
+        None,
+        7.0,
+        pg_collection=ProcessGroupCollection(),
+        model=model,
+    )
     logged = [
         call for call in writer.add_scalar.call_args_list if call.args[0] == 'max_attention_logit'
     ]

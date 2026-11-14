@@ -355,7 +355,13 @@ class AVLMTaskEncoder(
             raise ValueError(f"Model type {self.model_type} not supported")
 
 
-def llava_avlm_dataloader_provider(train_val_test_num_samples):
+def llava_avlm_dataloader_provider(train_val_test_num_samples, pg_collection=None):
+    """Build the LLaVA AVLM dataloaders.
+
+    pg_collection holds the process groups of the run, which select the dataloader ranks and
+    shard the samples. None falls back to the global parallel state with a
+    ProcessGroupFallbackWarning; that fallback is deprecated.
+    """
     args = get_args()
     cfg = get_run_config()
 
@@ -386,6 +392,7 @@ def llava_avlm_dataloader_provider(train_val_test_num_samples):
             audio_processor=audio_processor,
             conversation_template_config=LlavaConversationTemplateConfig(),
         ),
+        pg_collection=pg_collection,
     )
 
 

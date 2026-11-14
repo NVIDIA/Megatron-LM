@@ -2,8 +2,8 @@
 
 import torch
 
-from megatron.core.parallel_state import get_global_memory_buffer
 from megatron.core.utils import (
+    get_global_memory_buffer,
     get_pg_size,
     get_tensor_model_parallel_group_if_none,
     is_torch_min_version,

@@ -50,10 +50,18 @@ from megatron.core.post_training.modelopt.checkpointing import (
     save_modelopt_state,
     save_sharded_modelopt_state,
 )
+from megatron.core.process_groups_config import (
+    MultiModuleProcessGroupCollection,
+    ProcessGroupCollection,
+    global_process_group_fallback,
+    require_process_groups,
+    warn_global_process_group_fallback,
+)
 from megatron.core.rerun_state_machine import RerunState, get_rerun_state_machine
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.transformer.wide_residual import has_combined_residual_keys
 from megatron.core.utils import (
+    get_attr_wrapped_model,
     get_model_config,
     get_pg_rank,
     get_pg_size,
@@ -92,6 +100,7 @@ try:
         preprocess_state_dict_for_uneven_dtensor,
     )
     from megatron.core.transformer.fsdp_dtensor_checkpoint import (
+        get_model_ep_rank_and_size,
         handle_experts_in_state_dict,
         handle_fp8_extra_state_case,
         handle_mla_down_proj_in_state_dict,
@@ -373,6 +382,125 @@ def ensure_directory_exists(filename, check_parent=True):
     maybe_msc.os.makedirs(dirname, exist_ok=True)
 
 
+# The collection fields that saving and loading a checkpoint read.
+_CHECKPOINT_PROCESS_GROUPS = [
+    'tp',
+    'pp',
+    'cp',
+    'ep',
+    'dp',
+    'dp_gtp_remat',
+    'dp_cp',
+    'dp_cp_gtp_remat',
+    'expt_dp',
+    'gtp_remat',
+]
+
+
+def _model_pg_collection(model):
+    """Return the collection that a list of model chunks was built on.
+
+    Returns None for an empty list and for a model class that carries no collection.
+    """
+    if len(model) == 0:
+        return None
+    try:
+        return get_attr_wrapped_model(model[0], 'pg_collection')
+    except RuntimeError:
+        return None
+
+
+def _warn_global_grid_fallback(owner, argument):
+    """Warn that ``owner`` was called without ``argument`` and reads the global parallel grid.
+
+    Checkpointing keeps these fallbacks for callers that do not pass their process groups yet.
+    They warn from Megatron Core 0.21 on and are removed in 0.23.
+    """
+    warn_global_process_group_fallback(owner, argument, deprecated_in='0.21', removed_in='0.23')
+
+
+def _global_grid_fallback(owner, argument):
+    """Warn as ``_warn_global_grid_fallback`` does, and return a block that reads the grid.
+
+    The accessors of ``mpu`` called in the block belong to this fallback, so they do not warn
+    again.
+    """
+    return global_process_group_fallback(owner, argument, deprecated_in='0.21', removed_in='0.23')
+
+
+def _dp_cp_group_or_global(dp_cp_group, owner):
+    """Return ``dp_cp_group``, or warn and return the global data- and context-parallel group.
+
+    The global group spans the GTP-remat axis, like the ``dp_cp_gtp_remat`` group of a
+    collection.
+    """
+    if dp_cp_group is not None:
+        return dp_cp_group
+    with _global_grid_fallback(owner, 'dp_cp_group'):
+        return mpu.get_data_parallel_group(with_context_parallel=True)
+
+
+def _checkpoint_pg_collection(model, pg_collection, owner):
+    """Return the process groups that saving or loading ``model`` runs on.
+
+    An explicit ``pg_collection`` wins; otherwise the collection the model was built on is used.
+    A model built without a collection runs on the global parallel grid, so its groups are read
+    from there, with a deprecation warning naming ``owner``.
+    """
+    if pg_collection is None:
+        pg_collection = _model_pg_collection(model)
+    if pg_collection is None:
+        # Compatibility fallback for model classes that carry no collection.
+        _warn_global_grid_fallback(owner, 'pg_collection')
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=_CHECKPOINT_PROCESS_GROUPS
+        )
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        raise ValueError(
+            'Checkpointing needs the process groups of the module that this rank saves or '
+            'loads: pass that module\'s ProcessGroupCollection, not a '
+            'MultiModuleProcessGroupCollection.'
+        )
+    return pg_collection
+
+
+def _first_group(*groups):
+    """Return the first of ``groups`` that is not None, or None if all of them are."""
+    return next((group for group in groups if group is not None), None)
+
+
+def _data_parallel_group(group, pg_collection, *fields):
+    """Return ``group``, or the first of ``fields`` that ``pg_collection`` holds a group for.
+
+    A collection that sets none of ``fields`` says nothing about that group: a language model
+    needs only its tp, cp, pp and embd groups. The group is then read from the global parallel
+    grid, as it was before checkpointing took a collection. A field that is set to None means
+    that the axis is not used, and without torch.distributed there is no group to read.
+    """
+    if group is not None:
+        return group
+    if torch.distributed.is_initialized() and not any(
+        field in vars(pg_collection) for field in fields
+    ):
+        # Compatibility fallback for collections that leave these groups out.
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=[fields[0]])
+    return _first_group(*(getattr(pg_collection, field) for field in fields))
+
+
+def _group_rank(group):
+    """Return this rank's index in ``group``, or 0 when the collection has no such group.
+
+    Reads the group itself rather than ``get_pg_rank``: offline checkpoint tools name shards by
+    the ranks of stand-in groups without initializing torch.distributed.
+    """
+    return group.rank() if group is not None else 0
+
+
+def _group_size(group):
+    """Return the size of ``group``, or 1 when the collection has no such group."""
+    return group.size() if group is not None else 1
+
+
 def get_checkpoint_name(
     checkpoints_path,
     iteration,
@@ -384,8 +512,14 @@ def get_checkpoint_name(
     expert_rank=None,
     return_base_dir=False,
     basename='model_optim_rng.pt',
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ):
-    """Determine the directory name for this rank's checkpoint."""
+    """Determine the directory name for this rank's checkpoint.
+
+    The ranks and parallel flags that are not given come from the tensor, pipeline and expert
+    groups of ``pg_collection``. Without a collection they come from the global parallel grid,
+    which is deprecated and warns.
+    """
     if release:
         directory = 'release'
     else:
@@ -394,17 +528,35 @@ def get_checkpoint_name(
         common_path = os.path.join(checkpoints_path, directory)
         return common_path
 
-    # Use both the tensor and pipeline MP rank.
-    if pipeline_parallel is None:
-        pipeline_parallel = mpu.get_pipeline_model_parallel_world_size() > 1
-    if tensor_rank is None:
-        tensor_rank = mpu.get_tensor_model_parallel_rank()
-    if pipeline_rank is None:
-        pipeline_rank = mpu.get_pipeline_model_parallel_rank()
-    if expert_parallel is None:
-        expert_parallel = mpu.get_expert_model_parallel_world_size() > 1
-    if expert_rank is None:
-        expert_rank = mpu.get_expert_model_parallel_rank()
+    if pg_collection is not None:
+        if pipeline_parallel is None:
+            pipeline_parallel = _group_size(pg_collection.pp) > 1
+        if tensor_rank is None:
+            tensor_rank = _group_rank(pg_collection.tp)
+        if pipeline_rank is None:
+            pipeline_rank = _group_rank(pg_collection.pp)
+        if expert_parallel is None:
+            expert_parallel = _group_size(pg_collection.ep) > 1
+        if expert_rank is None:
+            expert_rank = _group_rank(pg_collection.ep)
+
+    # Use both the tensor and pipeline MP rank. Without a collection, the ranks that are not
+    # given come from the global parallel grid.
+    if any(
+        value is None
+        for value in (pipeline_parallel, tensor_rank, pipeline_rank, expert_parallel, expert_rank)
+    ):
+        with _global_grid_fallback('get_checkpoint_name', 'pg_collection'):
+            if pipeline_parallel is None:
+                pipeline_parallel = mpu.get_pipeline_model_parallel_world_size() > 1
+            if tensor_rank is None:
+                tensor_rank = mpu.get_tensor_model_parallel_rank()
+            if pipeline_rank is None:
+                pipeline_rank = mpu.get_pipeline_model_parallel_rank()
+            if expert_parallel is None:
+                expert_parallel = mpu.get_expert_model_parallel_world_size() > 1
+            if expert_rank is None:
+                expert_rank = mpu.get_expert_model_parallel_rank()
 
     # Use both the tensor and pipeline MP rank. If using the distributed
     # optimizer, then the optimizer's path must additionally include the
@@ -590,6 +742,9 @@ def get_rng_state(
     dp_group threads the data-parallel group used for RNG gather/indexing.
     dp_cp_group threads the data-parallel (with context-parallel) group used for the rng shard key.
     key_prefix namespaces the rng ShardedObject key so disjoint grids avoid a key collision (default '').
+
+    Omitting dp_group or dp_cp_group reads that group from the global parallel grid, which is
+    deprecated and warns.
     """
     cfg = get_run_config()
     rng_state = {
@@ -600,25 +755,22 @@ def get_rng_state(
         'rng_tracker_states': tensor_parallel.get_cuda_rng_tracker().get_states(),
     }
 
-    dp_world_size = (
-        get_pg_size(dp_group) if dp_group is not None else mpu.get_data_parallel_world_size()
-    )
+    if dp_group is None:
+        with _global_grid_fallback('get_rng_state', 'dp_group'):
+            dp_world_size = mpu.get_data_parallel_world_size()
+    else:
+        dp_world_size = get_pg_size(dp_group)
     rng_state_list = None
     if cfg.rng.data_parallel_random_init and torch.distributed.is_initialized() and dp_world_size > 1:
+        if dp_group is None:
+            with _global_grid_fallback('get_rng_state', 'dp_group'):
+                dp_group = mpu.get_data_parallel_group()
         rng_state_list = [None for i in range(dp_world_size)]
-        torch.distributed.all_gather_object(
-            rng_state_list,
-            rng_state,
-            group=dp_group if dp_group is not None else mpu.get_data_parallel_group(),
-        )
+        torch.distributed.all_gather_object(rng_state_list, rng_state, group=dp_group)
     else:
         rng_state_list = [rng_state]
 
-    dp_cp_group = (
-        dp_cp_group
-        if dp_cp_group is not None
-        else mpu.get_data_parallel_group(with_context_parallel=True)
-    )
+    dp_cp_group = _dp_cp_group_or_global(dp_cp_group, 'get_rng_state')
     dp_cp_rank = get_pg_rank(dp_cp_group)
     if ckpt_format == 'torch_dist':
         pp_rank = get_pg_rank(pp_group)
@@ -669,7 +821,8 @@ def _build_sharded_state_dict_metadata(
     impossible to enforce a linearly increasing versioning for this whole space.
 
     Args:
-        dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
+        dp_cp_group: Data parallel + context parallel group. Omitting it reads the group from the
+            global parallel grid, which is deprecated and warns.
         ckpt_format: The format of the operation (default: the run's checkpoint section's)
     """
     cfg = get_run_config()
@@ -703,29 +856,75 @@ def _build_sharded_state_dict_metadata(
 
     metadata['singleton_local_shards'] = False
     metadata['chained_optim_avoid_prefix'] = True
-    # Add dp_cp_group to metadata. If not provided, fallback to global parallel state.
-    if dp_cp_group is None:
-        dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
-    metadata['dp_cp_group'] = dp_cp_group
+    metadata['dp_cp_group'] = _dp_cp_group_or_global(
+        dp_cp_group, '_build_sharded_state_dict_metadata'
+    )
     return metadata
 
 
-def save_grads(save_dir, state_dict, iteration, grad_label):
+def save_grads(
+    save_dir,
+    state_dict,
+    iteration,
+    grad_label,
+    *,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+):
     """Persist state_dict of grads onto disk. In case of wgrads, this collection should
     be performed before the grads are cleared but after they are reduced.
 
+    The first rank of each expert data-parallel group writes the file of its tensor, pipeline
+    and expert parallel ranks.
+
     NOTE: wgrads for non-expert layers will be duplicated if using expert parallelism, but
-    this can be handled in postprocessing."""
+    this can be handled in postprocessing.
+
+    Args:
+        pg_collection: Process groups of the model whose state is saved. It must set ``tp``,
+            ``pp``, ``ep`` and ``expt_dp``. The writers are the first ranks of
+            ``expt_dp_gtp_remat``, or of ``expt_dp`` for a collection without it. A model
+            without expert parallelism may set ``expt_dp`` to None: its writers are then the
+            first ranks of its data-parallel group (``dp_cp_gtp_remat``, ``dp_cp``,
+            ``dp_gtp_remat`` or ``dp``, whichever is set first). With expert parallelism and
+            ``expt_dp`` set to None, every rank writes the file of its expert-parallel rank.
+            Omitting the collection reads the global parallel grid, which is deprecated and
+            warns.
+    """
 
     print_rank_0(
         f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] saving {grad_label} from iteration {iteration:7d}'
     )
 
-    if mpu.get_expert_data_parallel_rank() == 0:
+    if pg_collection is None:
+        with _global_grid_fallback('save_grads', 'pg_collection'):
+            expt_dp_rank = mpu.get_expert_data_parallel_rank()
+            tp_rank = mpu.get_tensor_model_parallel_rank()
+            pp_rank = mpu.get_pipeline_model_parallel_rank()
+            ep_rank = mpu.get_expert_model_parallel_rank()
+            pipeline_parallel = mpu.get_pipeline_model_parallel_world_size() > 1
+            expert_parallel = mpu.get_expert_model_parallel_world_size() > 1
+    else:
+        tp_group, pp_group, ep_group, expt_dp_group = require_process_groups(
+            pg_collection, ('tp', 'pp', 'ep', 'expt_dp'), owner='save_grads'
+        )
+        writer_group = _first_group(pg_collection.expt_dp_gtp_remat, expt_dp_group)
+        if writer_group is None and get_pg_size(ep_group) == 1:
+            # Without expert parallelism, the replicas of a file are the data-parallel ranks.
+            writer_group = _first_group(
+                pg_collection.dp_cp_gtp_remat,
+                pg_collection.dp_cp,
+                pg_collection.dp_gtp_remat,
+                pg_collection.dp,
+            )
+        expt_dp_rank = get_pg_rank(writer_group)
+        tp_rank = get_pg_rank(tp_group)
+        pp_rank = get_pg_rank(pp_group)
+        ep_rank = get_pg_rank(ep_group)
+        pipeline_parallel = get_pg_size(pp_group) > 1
+        expert_parallel = get_pg_size(ep_group) > 1
+
+    if expt_dp_rank == 0:
         # Create saving directory.
-        ep_rank = mpu.get_expert_model_parallel_rank()
-        pp_rank = mpu.get_pipeline_model_parallel_rank()
-        tp_rank = mpu.get_tensor_model_parallel_rank()
         assert save_dir is not None
         assert iteration is not None
         save_dir = os.path.join(save_dir, grad_label, f'iter_{iteration:07d}')
@@ -733,9 +932,9 @@ def save_grads(save_dir, state_dict, iteration, grad_label):
 
         # Save state_dict.
         checkpoint_name = f'mp_rank_{tp_rank:02d}'
-        if mpu.get_pipeline_model_parallel_world_size() > 1:
+        if pipeline_parallel:
             checkpoint_name += f'_{pp_rank:03d}'
-        if mpu.get_expert_model_parallel_world_size() > 1:
+        if expert_parallel:
             checkpoint_name += f'_{ep_rank:03d}'
         full_save_path = os.path.join(save_dir, f'{checkpoint_name}.pth')
         # Convert back to dict (e.g., from collections.defaultdict) for easy loading later.
@@ -775,6 +974,7 @@ def save_checkpoint(
     save: Optional[str] = None,
     ckpt_format: Optional[str] = None,
     verify_integrity: Optional[bool] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
@@ -790,15 +990,20 @@ def save_checkpoint(
     Dataloader checkpoint is only saved if the dataloader supports it. Currently this applies only
     to the Megatron Energon dataloader (multimodal) and not the built-in Megatron dataloader (text-only).
 
+    The process groups come from ``pg_collection``; each group argument below overrides the
+    matching group of the collection.
+
     Args:
-        dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
+        tp_group: Tensor parallel group (default: ``pg_collection.tp``)
+        pp_group: Pipeline parallel group (default: ``pg_collection.pp``)
+        dp_cp_group: Data parallel + context parallel group, including the GTP-remat axis, for
+            the replica ids of the sharded state (default: ``pg_collection.dp_cp_gtp_remat``)
         dp_group: Data parallel replicate group, for RNG state and checkpoint replicas
-            (default: None, falls back to mpu API)
+            (default: ``pg_collection.dp``)
         dp_gtp_remat_group: Full data-distribution group (dp x gtp_remat), for indexing the
-            per-rank dataloader state (default: None, falls back to mpu API)
-        expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
-        cp_group: Context-parallel group for dataloader saving. Falls back to the MPU group
-            when available. Callers using CP without global MPU initialization must pass it.
+            per-rank dataloader state (default: ``pg_collection.dp_gtp_remat``)
+        expt_dp_group: Expert data parallel replicate group (default: ``pg_collection.expt_dp``)
+        cp_group: Context-parallel group for dataloader saving (default: ``pg_collection.cp``)
         on_saved: Called once the checkpoint is durable: after the barrier of a synchronous
             save, as a finalize function of an asynchronous one.
         save, ckpt_format, verify_integrity: The directory, format and integrity check of this
@@ -806,6 +1011,10 @@ def save_checkpoint(
             in another format and directory). Everything else (the async worker and its knobs,
             the local checkpoint manager and its directories, replication) is run-wide and
             follows the section, which is not written.
+        pg_collection: Process groups of the model being saved. Defaults to the collection the
+            model was built on, and to the global parallel grid for a model built without one.
+            The data-parallel groups that a collection leaves out are also read from the
+            global parallel grid.
     """
     start_ckpt = time()
     args = get_args()
@@ -868,10 +1077,20 @@ def save_checkpoint(
         f'at iteration {iteration:7d} to {save_dir} in {ckpt_format} format'
     )
 
+    pg_collection = _checkpoint_pg_collection(model, pg_collection, 'save_checkpoint')
+    # A collection without the GTP-remat-inclusive groups has no GTP-remat axis, so the plain
+    # data-parallel groups stand in for them.
+    tp_group = _first_group(tp_group, pg_collection.tp)
+    pp_group = _first_group(pp_group, pg_collection.pp)
+    cp_group = _first_group(cp_group, pg_collection.cp)
+    dp_group = _data_parallel_group(dp_group, pg_collection, 'dp')
+    dp_gtp_remat_group = _data_parallel_group(
+        dp_gtp_remat_group, pg_collection, 'dp_gtp_remat', 'dp'
+    )
+    dp_cp_group = _data_parallel_group(dp_cp_group, pg_collection, 'dp_cp_gtp_remat', 'dp_cp')
+    expt_dp_group = _data_parallel_group(expt_dp_group, pg_collection, 'expt_dp')
+
     # Collect rng state across data parallel ranks.
-    if tp_group is None and pp_group is None:
-        tp_group = mpu.get_tensor_model_parallel_group()
-        pp_group = mpu.get_pipeline_model_parallel_group()
     rng_state = get_rng_state(
         save_format,
         tp_group,
@@ -899,6 +1118,7 @@ def save_checkpoint(
         expert_parallel=expert_parallel,
         expert_rank=expert_rank,
         return_base_dir=return_base_dir,
+        pg_collection=pg_collection,
     )
 
     # Save distributed optimizer's custom parameter state.
@@ -916,7 +1136,7 @@ def save_checkpoint(
 
     # LayerWiseDistributedOptimizer save optimizer state to file on different ranks
     if can_save_optim and getattr(cfg.optimizer, 'use_layer_wise_distributed_optimizer', False) and save_format == 'torch':
-        dp_rank = mpu.get_data_parallel_rank()
+        dp_rank = get_pg_rank(dp_gtp_remat_group)
         optim_checkpoint_name = os.path.join(
             os.path.dirname(checkpoint_name), f'layer_wise_optimizer_{dp_rank}.pt'
         )
@@ -943,12 +1163,8 @@ def save_checkpoint(
     dp_rank = 0
     expt_dp_rank = 0
     if torch.distributed.is_initialized():
-        dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
-        expt_dp_rank = (
-            get_pg_rank(expt_dp_group)
-            if expt_dp_group is not None
-            else mpu.get_expert_data_parallel_rank()
-        )
+        dp_rank = get_pg_rank(dp_group)
+        expt_dp_rank = get_pg_rank(expt_dp_group)
 
     train_state = get_train_state()
     train_state_dict = None
@@ -993,6 +1209,7 @@ def save_checkpoint(
                 optim_sd_kwargs=dict(metadata=sharded_sd_metadata),
                 model_sd_kwargs=dict(metadata=sharded_sd_metadata),
                 rerun_state=rerun_state,
+                dp_cp_group=dp_cp_group,
                 ckpt_format=save_format,
                 save=save_root,
                 verify_integrity=verify_integrity,
@@ -1042,17 +1259,9 @@ def save_checkpoint(
 
                 if checkpoint.fully_parallel_save:
                     if checkpoint.ckpt_fully_parallel_save_process_group == 'dp':
-                        process_group = (
-                            dp_cp_group
-                            if dp_cp_group is not None
-                            else mpu.get_data_parallel_group(with_context_parallel=True)
-                        )
+                        process_group = dp_cp_group
                     elif checkpoint.ckpt_fully_parallel_save_process_group == 'ep_dp':
-                        process_group = (
-                            expt_dp_group
-                            if expt_dp_group is not None
-                            else mpu.get_expert_data_parallel_group()
-                        )
+                        process_group = expt_dp_group
                     save_strategy = FullyParallelSaveStrategyWrapper(
                         save_strategy,
                         process_group,
@@ -1188,11 +1397,7 @@ def save_checkpoint(
                     state_dict,
                     algo=algo,
                     cached_metadata=cached_metadata,
-                    parallelization_group=(
-                        dp_cp_group
-                        if dp_cp_group is not None
-                        else mpu.get_data_parallel_group(with_context_parallel=True)
-                    ),
+                    parallelization_group=dp_cp_group,
                 )
                 async_save_request = checkpointing_context['local_checkpoint_manager'].save(
                     state_dict_for_save, iteration, is_async=bool(checkpoint.async_save)
@@ -1252,29 +1457,17 @@ def save_checkpoint(
 
         else:
 
-            def _rank_and_size(explicit_rank, group, mpu_rank_fn, mpu_size_fn):
-                rank = (
-                    explicit_rank
-                    if explicit_rank is not None
-                    else get_pg_rank(group) if group is not None else mpu_rank_fn()
-                )
-                size = get_pg_size(group) if group is not None else mpu_size_fn()
-                return rank + 1, size
+            def _rank_and_size(explicit_rank, group):
+                rank = explicit_rank if explicit_rank is not None else get_pg_rank(group)
+                return rank + 1, get_pg_size(group)
 
-            tensor_mp_rank, tp_size_to_print = _rank_and_size(
-                tensor_rank,
-                tp_group,
-                mpu.get_tensor_model_parallel_rank,
-                mpu.get_tensor_model_parallel_world_size,
+            tensor_mp_rank, tp_size_to_print = _rank_and_size(tensor_rank, tp_group)
+            pipeline_mp_rank, pp_size_to_print = _rank_and_size(pipeline_rank, pp_group)
+            gtp_remat_group = pg_collection.gtp_remat
+            gtp_remat_rank = get_pg_rank(gtp_remat_group) + 1
+            gtp_remat_size_to_print = (
+                get_pg_size(gtp_remat_group) if gtp_remat_group is not None else 0
             )
-            pipeline_mp_rank, pp_size_to_print = _rank_and_size(
-                pipeline_rank,
-                pp_group,
-                mpu.get_pipeline_model_parallel_rank,
-                mpu.get_pipeline_model_parallel_world_size,
-            )
-            gtp_remat_rank = mpu.get_gtp_weight_remat_rank() + 1
-            gtp_remat_size_to_print = mpu.get_gtp_weight_remat_world_size()
 
             def iter_finalize_fn():
                 cfg = get_run_config()
@@ -1708,13 +1901,16 @@ def maybe_save_dataloader_state(
         train_iterator (iterable): Train dataloader.
         iteration (int): Current iteration.
         dataloader_save_path (str): Path where the dataloader state is saved.
-        tp_group (ProcessGroup): Tensor-parallel group, or MPU fallback when unset.
-        pp_group (ProcessGroup): Pipeline-parallel group, or MPU fallback when unset.
+        tp_group (ProcessGroup): Tensor-parallel group.
+        pp_group (ProcessGroup): Pipeline-parallel group.
         dp_group (ProcessGroup): Full data-distribution group (dp x gtp_remat), matching the
-            axis the dataloader shards on, or MPU fallback when unset. Passing the replicate
-            data-parallel group instead makes gtp_remat peers write the same file.
-        cp_group (ProcessGroup): Context-parallel group, or the MPU group when available.
-            No group preserves the TP0/PP0 writer behavior without requiring MPU initialization.
+            axis the dataloader shards on. Passing the replicate data-parallel group instead
+            makes gtp_remat peers write the same file.
+        cp_group (ProcessGroup): Context-parallel group. When it is omitted, the global group
+            is used if one is initialized; without one, every rank is a first CP rank.
+
+    A group that is omitted is read from the global parallel grid, which is deprecated and
+    warns.
     """
     # If no dataloader or saving path is provided, exit early, otherwise, raise an error.
     if train_iterator is None or dataloader_save_path is None or dataloader_save_path == '':
@@ -1726,26 +1922,39 @@ def maybe_save_dataloader_state(
             f'Could not find a save_state for the train_iterator of type {type(train_iterator)}'
         )
 
-    # Compatibility fallback for callers that still use the global MPU groups.
-    # Explicit-group callers need not initialize MPU, including when CP is unused.
+    # Compatibility fallbacks for callers that omit a group: what the group decides comes from
+    # the global parallel grid. Every rank reads it, and so warns, before any rank-dependent
+    # branch.
+    owner = 'maybe_save_dataloader_state'
+    if tp_group is None:
+        with _global_grid_fallback(owner, 'tp_group'):
+            is_first_tp_rank = mpu.get_tensor_model_parallel_rank() == 0
+    else:
+        is_first_tp_rank = get_pg_rank(tp_group) == 0
+    if pp_group is None:
+        with _global_grid_fallback(owner, 'pp_group'):
+            is_first_pp_rank = mpu.is_pipeline_first_stage(ignore_virtual=True)
+            pipeline_parallel = mpu.get_pipeline_model_parallel_world_size() > 1
+    else:
+        is_first_pp_rank = get_pg_rank(pp_group) == 0
+        pipeline_parallel = get_pg_size(pp_group) > 1
+    if dp_group is None:
+        with _global_grid_fallback(owner, 'dp_group'):
+            dp_rank = mpu.get_data_parallel_rank()
+            dp_group = mpu.get_data_parallel_group()
+    else:
+        dp_rank = get_pg_rank(dp_group)
     if cp_group is None:
-        cp_group = mpu.get_context_parallel_group(check_initialized=False)
+        # An omitted CP group does not require an initialized global grid: without one, the
+        # TP0/PP0 ranks write.
+        with _global_grid_fallback(owner, 'cp_group'):
+            cp_group = mpu.get_context_parallel_group(check_initialized=False)
     is_first_cp_rank = cp_group is None or get_pg_rank(cp_group) == 0
 
     # Save dataloader state for each data parallel rank only once.
-    first_rank = (
-        get_pg_rank(pp_group) == 0
-        if pp_group is not None
-        else mpu.is_pipeline_first_stage(ignore_virtual=True)
-    ) and (
-        get_pg_rank(tp_group) == 0
-        if tp_group is not None
-        else mpu.get_tensor_model_parallel_rank() == 0
-    ) and is_first_cp_rank
-    if not first_rank:
+    if not (is_first_pp_rank and is_first_tp_rank and is_first_cp_rank):
         return
 
-    dp_rank = get_pg_rank(dp_group) if dp_group is not None else mpu.get_data_parallel_rank()
     # A loader that advances a global cursor and slices it by rank returns the same state on
     # every data-parallel rank. It can say so to collapse the per-rank files into a single
     # dprank000 file that every rank restores from.
@@ -1763,11 +1972,7 @@ def maybe_save_dataloader_state(
     data_state_save_path = get_checkpoint_name(
         dataloader_save_path,
         iteration,
-        pipeline_parallel=(
-            get_pg_size(pp_group) > 1
-            if pp_group is not None
-            else mpu.get_pipeline_model_parallel_world_size() > 1
-        ),
+        pipeline_parallel=pipeline_parallel,
         # Dataloader state is sharded only by DP rank. Keep it in the canonical TP0/PP0 directory.
         tensor_rank=0,
         pipeline_rank=0,
@@ -1776,13 +1981,12 @@ def maybe_save_dataloader_state(
         basename=f'train_dataloader_dprank{state_file_rank:03d}.pt',
     )
 
-    data_parallel_group = dp_group if dp_group is not None else mpu.get_data_parallel_group()
-    torch.distributed.barrier(group=data_parallel_group)
+    torch.distributed.barrier(group=dp_group)
 
     if dp_rank == 0:
         ensure_directory_exists(data_state_save_path)
 
-    torch.distributed.barrier(group=data_parallel_group)
+    torch.distributed.barrier(group=dp_group)
 
     if train_dataloader_state_dict is None:
         return
@@ -1802,12 +2006,18 @@ def generate_state_dict(
     optim_sd_kwargs=None,
     model_sd_kwargs=None,
     rerun_state=None,
+    dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
     *,
     ckpt_format: Optional[str] = None,
     save: Optional[str] = None,
     verify_integrity: Optional[bool] = None,
 ):
     """Generate a state dict from given model, optimizer, scheduler, rng state and others.
+
+    dp_cp_group: Data parallel + context parallel group of the sharded state metadata: the
+        default model and optimizer metadata of a torch_dist state dict, and the fsdp_dtensor
+        optimizer metadata. Omitting it reads the group from the global parallel grid, which is
+        deprecated and warns.
 
     ``ckpt_format``, ``save`` and ``verify_integrity`` are the values of the operation this state
     dict serves (a save, or the load template of a load) where they differ from the run's
@@ -1848,7 +2058,9 @@ def generate_state_dict(
                     model_sd_kwargs
                     or {
                         'metadata': {
-                            'dp_cp_group': mpu.get_data_parallel_group(with_context_parallel=True)
+                            'dp_cp_group': _dp_cp_group_or_global(
+                                dp_cp_group, 'generate_state_dict'
+                            )
                         }
                     }
                 )
@@ -1868,8 +2080,8 @@ def generate_state_dict(
                         optim_sd_kwargs
                         or {
                             'metadata': {
-                                'dp_cp_group': mpu.get_data_parallel_group(
-                                    with_context_parallel=True
+                                'dp_cp_group': _dp_cp_group_or_global(
+                                    dp_cp_group, 'generate_state_dict'
                                 )
                             }
                         }
@@ -1881,7 +2093,10 @@ def generate_state_dict(
                 if 'metadata' not in optim_sd_kwargs:
                     optim_sd_kwargs['metadata'] = {}
                 optim_sd_kwargs['metadata'].update(
-                    _build_sharded_state_dict_metadata(ckpt_format=ckpt_format)
+                    _build_sharded_state_dict_metadata(
+                        dp_cp_group=_dp_cp_group_or_global(dp_cp_group, 'generate_state_dict'),
+                        ckpt_format=ckpt_format,
+                    )
                 )
                 optimizer_sd = optimizer.sharded_state_dict(state_dict, **optim_sd_kwargs)
             else:
@@ -2013,8 +2228,10 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
     # layout used on disk. No-op for unfused models.
     apply(handle_mla_down_proj_in_state_dict)
     if config.num_moe_experts:
+        # Name the experts by the model's own expert-parallel layout.
+        ep_rank, ep_size = get_model_ep_rank_and_size(model)
         state_dict['model'] = handle_experts_in_state_dict(
-            state_dict['model'], config.num_moe_experts
+            state_dict['model'], config.num_moe_experts, ep_rank=ep_rank, ep_size=ep_size
         )
     # Rename the MTP inner layer to the name used on disk. Runs last because the handlers
     # above resolve keys against live module paths, which still use the new name.
@@ -2140,6 +2357,10 @@ def _load_non_persistent_base_checkpoint(
 ):
     """Load the base state_dict from a non-persistent distributed checkpoint.
     Depending on the non_persistent_ckpt_type, different logic may be required.
+
+    A group that is needed but omitted (dp_cp_group, and expt_dp_group for a fully parallel
+    load over expert data parallelism) is read from the global parallel grid, which is
+    deprecated and warns.
     """
     assert checkpoint.non_persistent_ckpt_type is not None
     if checkpoint.non_persistent_ckpt_type == 'global':
@@ -2165,14 +2386,15 @@ def _load_non_persistent_base_checkpoint(
         intermediate_state_dict, checkpoint_name = checkpointing_context[
             'local_checkpoint_manager'
         ].load()
+        # Without a sharded state dict only the common state is restored, which needs no group.
+        if sharded_state_dict:
+            dp_cp_group = _dp_cp_group_or_global(
+                dp_cp_group, '_load_non_persistent_base_checkpoint'
+            )
         state_dict = intermediate_state_dict.to_state_dict(
             sharded_state_dict,
             algo=checkpoint.non_persistent_local_ckpt_algo,
-            parallelization_group=(
-                dp_cp_group
-                if dp_cp_group is not None
-                else mpu.get_data_parallel_group(with_context_parallel=True)
-            ),
+            parallelization_group=dp_cp_group,
         )
         return state_dict, checkpoint_name, False, CheckpointType.LOCAL
     else:
@@ -2208,6 +2430,9 @@ def _load_global_dist_base_checkpoint(
     """Load the base state_dict from the given directory containing the global distributed checkpoint.
 
     ``checkpoint`` is the load policy; ``args`` is still read for the precision recipe (GTP padding).
+
+    The fully parallel load runs over dp_cp_group or expt_dp_group. Omitting the one it needs
+    reads it from the global parallel grid, which is deprecated and warns.
     """
     if rank0:
         checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
@@ -2233,15 +2458,12 @@ def _load_global_dist_base_checkpoint(
     # NOTE: `checkpoint.fully_parallel_load` applies to both persistent and non-persistent checkpoints.
     if checkpoint.fully_parallel_load:
         if checkpoint.ckpt_fully_parallel_load_process_group == 'dp':
-            process_group = (
-                dp_cp_group
-                if dp_cp_group is not None
-                else mpu.get_data_parallel_group(with_context_parallel=True)
-            )
+            process_group = _dp_cp_group_or_global(dp_cp_group, '_load_global_dist_base_checkpoint')
         elif checkpoint.ckpt_fully_parallel_load_process_group == 'ep_dp':
-            process_group = (
-                expt_dp_group if expt_dp_group is not None else mpu.get_expert_data_parallel_group()
-            )
+            if expt_dp_group is None:
+                with _global_grid_fallback('_load_global_dist_base_checkpoint', 'expt_dp_group'):
+                    expt_dp_group = mpu.get_expert_data_parallel_group()
+            process_group = expt_dp_group
         else:
             raise ValueError(
                 f'Invalid load process group: {checkpoint.ckpt_fully_parallel_load_process_group}'
@@ -2310,13 +2532,15 @@ def _load_base_checkpoint(
     gpt_compat_layer_maps=None,
     gtp_pad_for_alignment=None,
     use_megatron_fsdp=False,
+    pg_collection=None,
     *,
     checkpoint: Optional[CheckpointConfig] = None,
     finetune: Optional[bool] = None,
 ):
     """Load the base state_dict from the given directory
 
-    If rank0 is true, just loads rank 0 checkpoint, ignoring arguments.
+    If rank0 is true, just loads rank 0 checkpoint, ignoring arguments. Otherwise the ranks of
+    ``pg_collection`` (default: the global parallel grid) select this rank's legacy checkpoint.
     ``checkpoint`` is the run's checkpoint section (default: the registered run config's; the
     parse-time load of ``--use-checkpoint-args`` passes a section built from the arguments) and
     ``finetune`` whether this load is weights-only (default: the section's).
@@ -2425,7 +2649,7 @@ def _load_base_checkpoint(
             checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
         else:
             checkpoint_name = get_checkpoint_name(
-                load_dir, iteration, release, return_base_dir=False
+                load_dir, iteration, release, return_base_dir=False, pg_collection=pg_collection
             )
         try:
             state_dict = torch.load(checkpoint_name, map_location='cpu')
@@ -2844,6 +3068,7 @@ def load_checkpoint(
     load_optim: Optional[bool] = None,
     load_rng: Optional[bool] = None,
     ckpt_format: Optional[str] = None,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
@@ -2862,9 +3087,12 @@ def load_checkpoint(
     skip_load_to_model_and_opt (bool): whether to call `load_state_dict`
         for :attr:`model` and :attr:`optimizer`. In case of running FSDP2 with mcore distributed
         checkpointing, the tensors are already loaded in-place by `_load_base_checkpoint`.
-    dp_cp_group: Data parallel + context parallel group (default: None, falls back to mpu API)
-    dp_group: Data parallel group (default: None, falls back to mpu API)
-    expt_dp_group: Expert data parallel group (default: None, falls back to mpu API)
+    tp_group: Tensor parallel group (default: ``pg_collection.tp``)
+    pp_group: Pipeline parallel group (default: ``pg_collection.pp``)
+    dp_cp_group: Data parallel + context parallel group, including the GTP-remat axis
+        (default: ``pg_collection.dp_cp_gtp_remat``)
+    dp_group: Data parallel replicate group, for RNG state (default: ``pg_collection.dp``)
+    expt_dp_group: Expert data parallel replicate group (default: ``pg_collection.expt_dp``)
     checkpoint_group: Ranks that collectively form one complete checkpoint
         view (default: None, uses the global process group)
     load_dir: The directory this load reads. Omitted: the run's ``load``. ``None`` clears it, so
@@ -2874,6 +3102,10 @@ def load_checkpoint(
         the run's checkpoint section (a weights-only load of the teacher or of RL's reference
         weights; the pretrained load of the finetune tasks without its RNG state). Everything
         else follows the section, which is not written.
+    pg_collection: Process groups of the model being loaded; each group argument above
+        overrides the matching group. Defaults to the collection the model was built on, and to
+        the global parallel grid for a model built without one. The data-parallel groups that a
+        collection leaves out are also read from the global parallel grid.
     """
     cfg = get_run_config()
     args = get_args()
@@ -3058,6 +3290,15 @@ def load_checkpoint(
         # Check common metadata before DCP can write into model/optimizer storage.
         validate_glu_layout(state_dict, release)
 
+    pg_collection = _checkpoint_pg_collection(model, pg_collection, 'load_checkpoint')
+    # A collection without the GTP-remat-inclusive groups has no GTP-remat axis, so the plain
+    # data-parallel groups stand in for them.
+    tp_group = _first_group(tp_group, pg_collection.tp)
+    pp_group = _first_group(pp_group, pg_collection.pp)
+    dp_group = _data_parallel_group(dp_group, pg_collection, 'dp')
+    dp_cp_group = _data_parallel_group(dp_cp_group, pg_collection, 'dp_cp_gtp_remat', 'dp_cp')
+    expt_dp_group = _data_parallel_group(expt_dp_group, pg_collection, 'expt_dp')
+
     if ckpt_format == 'torch_dist':
         if not hasattr(ckpt_args, 'tensor_model_parallel_size'):
             print_rank_0('WARNING: TP size not found in checkpoint args, using 1 as default.')
@@ -3098,9 +3339,6 @@ def load_checkpoint(
             and load_rng
             and saved.save_rng
         ):
-            if tp_group is None and pp_group is None:
-                tp_group = mpu.get_tensor_model_parallel_group()
-                pp_group = mpu.get_pipeline_model_parallel_group()
             gen_sd_rng_state = get_rng_state(
                 load_format,
                 tp_group,
@@ -3196,9 +3434,6 @@ def load_checkpoint(
             gen_sd_optim = None
             gen_sd_opt_param_scheduler = None
 
-        if dp_cp_group is None:
-            dp_cp_group = mpu.get_data_parallel_group(with_context_parallel=True)
-
         # dist_checkpointing.load_content_metadata(...) may return None.
         # Ensure we have a dict before updating to avoid NoneType AttributeError.
         if sharded_sd_metadata is None:
@@ -3274,6 +3509,7 @@ def load_checkpoint(
                 optim_sd_kwargs=optim_sd_kwargs,
                 model_sd_kwargs=model_sd_kwargs,
                 rerun_state=gen_sd_rerun_state,
+                dp_cp_group=dp_cp_group,
                 ckpt_format=load_format,
             )
 
@@ -3299,9 +3535,6 @@ def load_checkpoint(
                     model_sharded_state_dict_modifier(load_kwargs['sharded_state_dict'][model_key])
     elif load_format == 'torch_dcp':
         model_sd = model[0].state_dict()
-        if tp_group is None and pp_group is None:
-            tp_group = mpu.get_tensor_model_parallel_group()
-            pp_group = mpu.get_pipeline_model_parallel_group()
         sharded_state_dict = {
             'model': model_sd,
             'args': None,
@@ -3388,6 +3621,7 @@ def load_checkpoint(
                 optim_sd_kwargs=optim_sd_kwargs,
                 rerun_state=gen_sd_rerun_state,
                 iteration=1,
+                dp_cp_group=dp_cp_group,
                 ckpt_format=load_format,
             )
         finally:
@@ -3406,6 +3640,7 @@ def load_checkpoint(
         checkpoint_group=checkpoint_group,
         gpt_compat_layer_maps=gpt_compat_layer_maps,
         gtp_pad_for_alignment=gtp_pad_for_alignment,
+        pg_collection=pg_collection,
         finetune=finetune,
         use_megatron_fsdp=use_megatron_fsdp,
         **load_kwargs,
@@ -3596,7 +3831,9 @@ def load_checkpoint(
                 and load_format == 'torch'
             ):
                 # LayerWiseDistributedOptimizer load optimizer state from file on different ranks
-                dp_rank = mpu.get_data_parallel_rank()
+                dp_rank = get_pg_rank(
+                    _data_parallel_group(None, pg_collection, 'dp_gtp_remat', 'dp')
+                )
                 optim_checkpoint_name = os.path.join(
                     os.path.dirname(checkpoint_name), f'layer_wise_optimizer_{dp_rank}.pt'
                 )
@@ -3621,7 +3858,9 @@ def load_checkpoint(
                 # This code should not be reached when reading from a non_persistent checkpoint
                 assert not is_torch_dist
                 iteration, release, _ = _resolve_load_iteration(load_dir)
-                model_checkpoint_name = get_checkpoint_name(load_dir, iteration, release)
+                model_checkpoint_name = get_checkpoint_name(
+                    load_dir, iteration, release, pg_collection=pg_collection
+                )
                 optim_checkpoint_name = get_distributed_optimizer_checkpoint_name(
                     model_checkpoint_name
                 )
@@ -3731,16 +3970,8 @@ def load_checkpoint(
             if 'rng_state' in state_dict:
                 if load_format == 'fsdp_dtensor':
                     # FSDP DTensor checkpoints store rng_state in a different format.
-                    tp_rank = (
-                        get_pg_rank(tp_group)
-                        if tp_group is not None
-                        else mpu.get_tensor_model_parallel_rank()
-                    )
-                    pp_rank = (
-                        get_pg_rank(pp_group)
-                        if pp_group is not None
-                        else mpu.get_pipeline_model_parallel_rank()
-                    )
+                    tp_rank = get_pg_rank(tp_group)
+                    pp_rank = get_pg_rank(pp_group)
                     if f'({pp_rank}, {tp_rank})' in state_dict['rng_state']:
                         rng_state = state_dict['rng_state'][f'({pp_rank}, {tp_rank})']
                     else:
@@ -3751,12 +3982,7 @@ def load_checkpoint(
 
                 # access rng_state for data parallel rank
                 if cfg.rng.data_parallel_random_init:
-                    dp_rank = (
-                        get_pg_rank(dp_group)
-                        if dp_group is not None
-                        else mpu.get_data_parallel_rank()
-                    )
-                    rng_state = rng_state[dp_rank]
+                    rng_state = rng_state[get_pg_rank(dp_group)]
                 else:
                     rng_state = rng_state[0]
                 random.setstate(rng_state['random_rng_state'])
@@ -3796,22 +4022,13 @@ def load_checkpoint(
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
-    _tp_r = get_pg_rank(tp_group) if tp_group is not None else mpu.get_tensor_model_parallel_rank()
-    _tp_w = (
-        get_pg_size(tp_group)
-        if tp_group is not None
-        else mpu.get_tensor_model_parallel_world_size()
-    )
-    _pp_r = (
-        get_pg_rank(pp_group) if pp_group is not None else mpu.get_pipeline_model_parallel_rank()
-    )
-    _pp_w = (
-        get_pg_size(pp_group)
-        if pp_group is not None
-        else mpu.get_pipeline_model_parallel_world_size()
-    )
-    _gtp_remat_r = mpu.get_gtp_weight_remat_rank()
-    _gtp_remat_w = mpu.get_gtp_weight_remat_world_size()
+    _tp_r = get_pg_rank(tp_group)
+    _tp_w = get_pg_size(tp_group)
+    _pp_r = get_pg_rank(pp_group)
+    _pp_w = get_pg_size(pp_group)
+    gtp_remat_group = pg_collection.gtp_remat
+    _gtp_remat_r = get_pg_rank(gtp_remat_group)
+    _gtp_remat_w = get_pg_size(gtp_remat_group) if gtp_remat_group is not None else 0
     print_rank_0(
         f'  successfully loaded checkpoint from {load_dir} '
         f'[ t {_tp_r + 1}/{_tp_w}, '

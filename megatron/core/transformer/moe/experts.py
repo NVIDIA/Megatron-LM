@@ -312,6 +312,7 @@ class TEGroupedMLP(MegatronModule):
             self.config.add_bias_linear and config.bias_dropout_fusion
         ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
 
+        self.pg_collection = pg_collection
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
 
@@ -928,7 +929,11 @@ class TEGroupedMLP(MegatronModule):
                 "and linear_fc2. Apply the override to both linears."
             )
         quant_context = (
-            nullcontext() if fc1_recipe is None else _get_fp8_autocast_for_quant_recipe(fc1_recipe)
+            nullcontext()
+            if fc1_recipe is None
+            else _get_fp8_autocast_for_quant_recipe(
+                fc1_recipe, owner=type(self).__name__, pg_collection=self.pg_collection
+            )
         )
 
         # Construct fused impl if needed
@@ -1340,8 +1345,12 @@ class TEGroupedMLP(MegatronModule):
         Maps local expert to global experts.
         The sharded state dict is interchangable with SequentialMLP's.
         """
-        # Guard for cases metadata is not provided
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        # Guard for cases metadata is not provided: fill in the GTP-inclusive dense DP x CP group,
+        # the group the global default stands for and the one a model passes down. TE grouped
+        # linears set the DP entry of each replica id from the expert data-parallel groups.
+        metadata = ensure_metadata_has_dp_cp_group(
+            metadata, self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
+        )
         singleton_local_shards = (metadata or {}).get('singleton_local_shards', False)
         sharded_state_dict = {}
         for name, module in self._modules.items():
@@ -2013,6 +2022,7 @@ class SequentialMLP(MegatronModule):
 
         self.num_local_experts = num_local_experts
         self.local_experts = torch.nn.ModuleList()
+        self.pg_collection = pg_collection
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
         # use pg_collection.expt_dp_group as data parallel group in this module.
@@ -2020,12 +2030,15 @@ class SequentialMLP(MegatronModule):
         self.dp_group = pg_collection.expt_dp
 
         for expert_idx in range(self.num_local_experts):
+            # The expert linears take their GTP-remat group (expt_gtp_remat) and the checkpoint
+            # replica group of their GTP shards (expt_dp) from the collection.
             expert = MLP(
                 self.config,
                 submodules,
                 ffn_hidden_size=self.config.moe_ffn_hidden_size,
                 is_expert=True,
                 tp_group=pg_collection.expt_tp,
+                pg_collection=pg_collection,
                 name=(name + f".local_experts.{expert_idx}") if name is not None else None,
             )
             self.local_experts.append(expert)
@@ -2105,8 +2118,12 @@ class SequentialMLP(MegatronModule):
 
     def sharded_state_dict(self, prefix='', sharded_offsets=(), metadata=None):
         """Maps local expert to global experts."""
-        # Guard for cases metadata is not provided
-        metadata = ensure_metadata_has_dp_cp_group(metadata)
+        # Guard for cases metadata is not provided: fill in the GTP-inclusive dense DP x CP group,
+        # the group the global default stands for and the one a model passes down. The DP entry
+        # of each expert replica id is set below from the expert data-parallel group.
+        metadata = ensure_metadata_has_dp_cp_group(
+            metadata, self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
+        )
 
         sharded_state_dict = {}
         num_global_experts = self.ep_group.size() * self.num_local_experts

@@ -36,10 +36,6 @@ except ImportError:
     _HAS_SHARED_CALIB = False
 from utils import get_hf_tokenizer
 
-from megatron.core.parallel_state import (
-    get_pipeline_model_parallel_group,
-    get_tensor_model_parallel_group,
-)
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -158,14 +154,11 @@ def check_arguments(args):
 
 
 def get_params(model):
+    """Return the number of parameters of the model summed over its pipeline and TP ranks."""
     params = sum(p.numel() for p in model.parameters())
     reduced_params = torch.Tensor([params]).to(device=next(model.parameters()).device)
-    torch.distributed.all_reduce(
-        reduced_params, group=get_pipeline_model_parallel_group()
-    )
-    torch.distributed.all_reduce(
-        reduced_params, group=get_tensor_model_parallel_group()
-    )
+    torch.distributed.all_reduce(reduced_params, group=model.pg_collection.pp)
+    torch.distributed.all_reduce(reduced_params, group=model.pg_collection.tp)
     return reduced_params.item()
 
 
