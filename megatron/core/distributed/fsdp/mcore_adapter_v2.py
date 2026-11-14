@@ -169,7 +169,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 wrapping), this wrapper joins it and uses that context's device. The
                 context's symmetric-memory setting must match ``ddp_config.nccl_ub``.
             pg_collection: Explicit process groups. The ``dp_cp`` group defines the
-                data-parallel mesh.
+                data-parallel mesh. With ``num_distributed_optimizer_instances`` > 1 the
+                mesh is built from ``inter_dist_opt`` and ``intra_dp_cp`` instead, and
+                ``dp_cp`` is not required.
 
         Raises:
             ImportError: If the Megatron FSDP implementation is unavailable.
@@ -187,7 +189,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
 
         if has_config_logger_enabled(config):
-            log_config_to_disk(config, locals(), prefix=type(self).__name__)
+            log_config_to_disk(
+                config, locals(), prefix=type(self).__name__, pg_collection=pg_collection
+            )
 
         use_symmetric_memory = ddp_config.nccl_ub
         if use_symmetric_memory:
@@ -358,7 +362,13 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             )
         if disable_bucketing:
             raise ValueError("MFSDP v2 does not support disabling bucketing.")
-        if not hasattr(pg_collection, 'dp_cp'):
+        # vars(), not hasattr: an unset field reads as None, so hasattr is always True. With
+        # several optimizer instances the meshes come from inter_dist_opt and the intra groups,
+        # which _build_hybrid_dp_mesh checks, and dp_cp is not read.
+        if (
+            ddp_config.num_distributed_optimizer_instances <= 1
+            and vars(pg_collection).get("dp_cp") is None
+        ):
             raise ValueError("MFSDP v2 requires an explicit dp_cp process group.")
 
         if "residual_stream" in (config.recompute_modules or []):

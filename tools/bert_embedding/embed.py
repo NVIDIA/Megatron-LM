@@ -12,12 +12,18 @@ from torch.utils.data import BatchSampler, DataLoader, SequentialSampler, Subset
 from torch.utils.data._utils.collate import default_collate
 
 from megatron.training import get_args, get_tokenizer, print_rank_0
+from megatron.training.global_vars import get_run_config
 from megatron import core
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.core import parallel_state
 from megatron.core.enums import ModelType
 from megatron.core.pipeline_parallel import get_forward_backward_func
-from megatron.training.training import setup_model_and_optimizer
+from megatron.core.process_groups_config import global_process_group_fallback
+from megatron.core.utils import get_attr_wrapped_model
+from megatron.training.training import (
+    _build_pg_collection_from_parallel_state,
+    setup_model_and_optimizer,
+)
 from pretrain_bert import model_provider, get_batch, loss_func, forward_step
 
 from .dataset import BertEmbeddingDataset
@@ -260,8 +266,9 @@ def get_blocks_by_rank(
         validate (Callable): Method for validating each block file during load.
         sample (Optional[float]): If provided, sample a random subset of the blocks.
             Used for validating preprocessing correctness.
-        process_group (Optional[ProcessGroup]): Process group for distributed operations.
-            If None, uses data parallel group.
+        process_group (Optional[ProcessGroup]): The data-parallel group whose ranks split the
+            blocks. If None, falls back to the global data-parallel group with a
+            ``ProcessGroupFallbackWarning``; the fallback is deprecated.
 
     Returns:
         A namespace consisting of 2 lists: existing blocks, and missing blocks.
@@ -273,7 +280,8 @@ def get_blocks_by_rank(
     """
 
     if process_group is None:
-        process_group = parallel_state.get_data_parallel_group()
+        with global_process_group_fallback("get_blocks_by_rank", "process_group"):
+            process_group = parallel_state.get_data_parallel_group()
 
     # Get world blocks.
     blocks = get_blocks(dirname, n_samples, block_size, validate)
@@ -372,9 +380,16 @@ class BertEmbedder:
 
         assert args.output_bert_embeddings
 
-        self.models, optimizer, opt_param_scheduler = \
-            setup_model_and_optimizer(ModelType.encoder_or_decoder,
-                                      model_provider)
+        # Build the model on the grid that initialize_megatron() registered, in the collection
+        # that pretrain() builds from it. The embedder takes no collection, so a grid set up
+        # without registering one warns, as before, that setup_model_and_optimizer() falls back
+        # to the global grid.
+        pg_collection = _build_pg_collection_from_parallel_state(
+            get_run_config().ddp, owner="setup_model_and_optimizer"
+        )
+        self.models, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            ModelType.encoder_or_decoder, model_provider, pg_collection=pg_collection
+        )
         self.batch_size = batch_size
         self.max_bert_seq_length = max_bert_seq_length
 
@@ -485,11 +500,17 @@ class DiskDataParallelBertEmbedder:
         # Missing embedding blocks (stored on disk).
         def validate(f):
             assert f["data"].shape[1] == 1024
+
+        # Split the blocks over the model's data-parallel ranks. GTP weight-rematerialization
+        # peers process distinct data, so the group includes them.
+        pg_collection = get_attr_wrapped_model(self.embedder.models[0], "pg_collection")
         blocks = get_blocks_by_rank(
             dirname,
             len(text_dataset),
             self.block_size,
-            validate=validate)
+            validate=validate,
+            process_group=pg_collection.dp_gtp_remat,
+        )
 
         # Prevent missing file race condition.
         torch.distributed.barrier()

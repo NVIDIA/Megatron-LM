@@ -15,6 +15,7 @@ from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
@@ -30,6 +31,7 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.utils import get_device_arch_version
+from tests.unit_tests.amax_reduction_group_utils import global_amax_groups
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.mla_test_utils import check_mla_parallel_correctness
 from tests.unit_tests.transformer.packed_seq_test_utils import (
@@ -93,6 +95,7 @@ class TestParallelMLAAttention:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -208,6 +211,7 @@ class TestParallelMLAAttention:
                 get_mla_self_attn_submodules(),
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             config = checkpointed_parallel_attention.config
 
@@ -342,6 +346,7 @@ class TestParallelMLAAttention:
                 get_mla_self_attn_submodules(),
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
             sequence_length = 32
@@ -392,6 +397,7 @@ class TestParallelMLAAttention:
                 get_mla_self_attn_submodules(),
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             config = checkpointed_parallel_attention.config
 
@@ -431,6 +437,7 @@ class TestParallelMLAAttention:
                 get_mla_self_attn_submodules(),
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             config = checkpointed_parallel_attention.config
 
@@ -493,6 +500,7 @@ class TestSequenceParallelMLAAttention:
             get_mla_self_attn_submodules(linear_qkv_down_proj=linear_qkv_down_proj),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -550,6 +558,7 @@ class TestTensorParallelMLAAttention:
             get_mla_self_attn_submodules(linear_qkv_down_proj=linear_qkv_down_proj),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -621,6 +630,7 @@ class TestContextParallelMLAAttention:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).bfloat16()
 
     def teardown_method(self, method):
@@ -717,6 +727,7 @@ class TestParallelMLAAttentionPrecision:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -879,6 +890,7 @@ class TestContextParallelMLAAttentionPrecision:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).bfloat16()
 
     def teardown_method(self, method):
@@ -1029,6 +1041,7 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -1197,6 +1210,7 @@ class TestMLAClipQK:
                 get_mla_self_attn_submodules(),
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
             with pytest.raises(ValueError, match="qk_clip option needs to be enabled"):
@@ -1210,6 +1224,7 @@ class TestMLAClipQK:
                 get_mla_self_attn_submodules(),
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
             with pytest.raises(ValueError, match="current_max_attn_logits is None"):
@@ -1225,6 +1240,7 @@ class TestMLAClipQK:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         attention.cuda()
 
@@ -1262,6 +1278,7 @@ class TestMLAClipQK:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         attention.cuda()
 
@@ -1299,6 +1316,7 @@ class TestMLAClipQK:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         attention.cuda()
 
@@ -1353,6 +1371,7 @@ class TestMLAClipQK:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         attention.cuda()
 
@@ -1530,7 +1549,11 @@ class TestMLAUpProjectionInput:
         submodules.linear_q_up_proj = ColumnParallelLinear
         submodules.linear_kv_up_proj = ColumnParallelLinear
         attention = MLASelfAttention(
-            config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+            config,
+            submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         seq_len, batch = 32, 2
         hidden_states = torch.randn(seq_len, batch, config.hidden_size, device="cuda")
@@ -1574,6 +1597,7 @@ class TestFusedMLASelfAttention:
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -1643,8 +1667,9 @@ class TestFusedMLASelfAttention:
         gathered_q = torch.cat([q_shard, torch.zeros_like(q_shard)], dim=-1)
         captured = {}
 
-        def fake_gather_from_tensor_model_parallel_region(tensor):
+        def fake_gather_from_tensor_model_parallel_region(tensor, group):
             captured["q_shard"] = tensor
+            captured["group"] = group
             return gathered_q
 
         monkeypatch.setattr(mla_module, "get_pg_size", lambda group: tp_size)
@@ -1659,6 +1684,7 @@ class TestFusedMLASelfAttention:
         q_compressed, kv_combined = self.fused_attention._qkv_down_projection(hidden)
 
         torch.testing.assert_close(captured["q_shard"], q_shard)
+        assert captured["group"] is self.fused_attention.tp_group
         torch.testing.assert_close(q_compressed, gathered_q)
         torch.testing.assert_close(kv_combined, kv_shard)
 
@@ -1735,7 +1761,11 @@ class TestFusedMLAGradientFlow:
 
         config = self.transformer_config
         fused = FusedMLASelfAttention(
-            config, get_fused_mla_submodules(), layer_number=1, attn_mask_type=AttnMaskType.causal
+            config,
+            get_fused_mla_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         fused.cuda()
 
@@ -1789,12 +1819,14 @@ class TestFusedMLALoadFromStateDict:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         fused = FusedMLASelfAttention(
             self.transformer_config,
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         unfused_sd = unfused.state_dict()
@@ -1824,6 +1856,7 @@ class TestFusedMLALoadFromStateDict:
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         sharded_sd = fused.sharded_state_dict(prefix="")
@@ -1846,6 +1879,7 @@ class TestFusedMLALoadFromStateDict:
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         seen = []
 
@@ -1870,6 +1904,7 @@ class TestFusedMLALoadFromStateDict:
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         sharded_sd = fused.sharded_state_dict(prefix="")
@@ -1889,6 +1924,7 @@ class TestFusedMLALoadFromStateDict:
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         config = self.transformer_config
         q_weight = torch.randn(config.q_lora_rank, config.hidden_size)
@@ -1941,6 +1977,7 @@ class TestFusedMLARequiresQLora:
                 get_fused_mla_submodules(),
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
 
@@ -2140,6 +2177,7 @@ class TestFusedMLAQUpProjIntegration:
                     get_mla_self_attn_submodules(),
                     layer_number=1,
                     attn_mask_type=AttnMaskType.causal,
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
                 )
                 .cuda()
                 .bfloat16()
@@ -2154,7 +2192,7 @@ class TestFusedMLAQUpProjIntegration:
             hidden_states = torch.randn(
                 256, 1, config.hidden_size, dtype=torch.bfloat16, device="cuda", requires_grad=True
             )
-            with get_fp8_context(config):
+            with get_fp8_context(config, pg_collection=global_amax_groups()):
                 output, _ = attention(hidden_states, None)
             output.float().square().mean().backward()
 
@@ -2380,7 +2418,10 @@ class TestFusedMLAKVRoPEQuant:
                 x = hidden_states.clone().requires_grad_(True)
                 # NVFP4 stochastic rounding draws from the RNG: give both passes the same draws.
                 torch.manual_seed(1)
-                with spy as kernel, quantization_context(config):
+                with (
+                    spy as kernel,
+                    quantization_context(config, pg_collection=global_amax_groups()),
+                ):
                     output, _ = attention(x, None)
                 output.backward(grad_output)
                 calls = kernel.call_count
@@ -2446,7 +2487,7 @@ class TestFusedMLAKVRoPEQuant:
                         "fused_mla_kv_rope_mxfp8",
                         wraps=mla_module.fused_mla_kv_rope_mxfp8,
                     ) as kernel,
-                    get_fp8_context(config),
+                    get_fp8_context(config, pg_collection=global_amax_groups()),
                 ):
                     output, _ = attention(x, None)
                 output.backward(grad_output)
@@ -2484,7 +2525,7 @@ class TestFusedMLAKVRoPEQuant:
                 mla_module, "fused_mla_kv_rope_mxfp8", wraps=mla_module.fused_mla_kv_rope_mxfp8
             ) as kernel,
             torch.no_grad(),
-            get_fp8_context(config),
+            get_fp8_context(config, pg_collection=global_amax_groups()),
         ):
             attention(hidden_states, None)
         assert kernel.call_count == 0

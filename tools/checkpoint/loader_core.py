@@ -58,7 +58,7 @@ class MegatronCheckpointLoaderLLM(MegatronCheckpointLoaderBase):
             from model_provider import model_provider
             from gpt_builders import gpt_builder
             self.model_provider = partial(model_provider, gpt_builder)
-            return model_provider
+            return self.model_provider
         elif self.args.model_type == 'BERT':
             from pretrain_bert import model_provider
             return model_provider

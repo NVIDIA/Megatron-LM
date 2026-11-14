@@ -41,5 +41,6 @@ MODEL_ARGS:
   --bf16: true
   --ckpt-format: torch
   --attention-backend: unfused
+  --strict-process-group-fallbacks: true
 TEST_TYPE: regular
 LAUNCHER: ft_launcher

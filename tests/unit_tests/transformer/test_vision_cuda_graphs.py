@@ -18,6 +18,7 @@ from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     initialize_rng_tracker,
@@ -271,6 +272,7 @@ class TestVisionTECudaGraphHelper:
             post_process=True,
             add_encoder=True,
             add_decoder=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         self.llava_model.bfloat16()
 
@@ -297,6 +299,7 @@ class TestVisionTECudaGraphHelper:
             vision_seq_length=self.vision_seq_length,
             micro_batch_size=self.micro_batch_size,
             num_microbatches=num_microbatches,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     # -- Initialization tests --
@@ -317,6 +320,7 @@ class TestVisionTECudaGraphHelper:
             vision_config=self.vision_config,
             vision_seq_length=self.vision_seq_length,
             micro_batch_size=self.micro_batch_size,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         assert helper.vision_model is None
         assert len(helper.callables) == 0
@@ -361,6 +365,7 @@ class TestVisionTECudaGraphHelper:
             vision_config=self.vision_config,
             vision_seq_length=self.vision_seq_length,
             micro_batch_size=self.micro_batch_size,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         sample_args, sample_kwargs_list = helper._get_sample_arguments(order=[1, -1])
         assert sample_args == []
@@ -427,6 +432,7 @@ class TestVisionTECudaGraphHelper:
             vision_config=self.vision_config,
             vision_seq_length=self.vision_seq_length,
             micro_batch_size=self.micro_batch_size,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         helper.create_cudagraphs()
         assert helper.capture_finished()  # Capture process finished
@@ -538,6 +544,7 @@ class TestVisionTECudaGraphHelperPP2:
             post_process=is_last_stage,
             add_encoder=is_first_stage,
             add_decoder=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         self.llava_model.bfloat16()
 
@@ -556,6 +563,7 @@ class TestVisionTECudaGraphHelperPP2:
             vision_seq_length=self.vision_seq_length,
             micro_batch_size=self.micro_batch_size,
             num_microbatches=num_microbatches,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def test_pp2_first_stage_finds_vision_layers(self):
