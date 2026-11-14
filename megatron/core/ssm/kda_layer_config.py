@@ -24,7 +24,12 @@ class KDALayerConfig(TransformerConfig):
     """Optional lower bound for KDA's bounded gate values."""
 
     kda_two_stage_gates: bool = False
-    """Use low-rank f_b(f_a(x)) and g_b(g_a(x)) gates with a QKV-only input projection."""
+    """Use low-rank f_b(f_a(x)) and g_b(g_a(x)) gates with a QKV-only input projection.
+
+    The output norm is then Kimi Linear's gated RMSNorm, RMSNorm(x) * weight * sigmoid(gate)
+    with no bias, whatever ``normalization`` says, and is built as a weight-only RMSNorm;
+    ``normalization`` still sets every other norm. With direct gates the output norm follows
+    ``normalization``."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
