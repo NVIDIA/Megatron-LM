@@ -537,6 +537,7 @@ def test_runtime_service_order_and_microbatch_inputs(
     ]
     microbatches.assert_called_once_with(
         rank=0,
+        rampup_batch_size=None,
         global_batch_size=8,
         micro_batch_size=2,
         data_parallel_size=2,

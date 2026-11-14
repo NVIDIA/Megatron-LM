@@ -229,6 +229,7 @@ def initialize_training_runtime_services(args: Namespace) -> None:
 
     init_num_microbatches_calculator(
         rank=args.rank,
+        rampup_batch_size=cfg.train.rampup_batch_size,
         global_batch_size=cfg.train.global_batch_size,
         micro_batch_size=cfg.train.micro_batch_size,
         # Independent sequences, including when CP and weight sharding share ranks.
