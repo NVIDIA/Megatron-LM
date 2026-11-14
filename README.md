@@ -82,9 +82,19 @@ Megatron-LM/
 
 # Performance Benchmarking
 
-The [NVIDIA Megatron Bridge Performance Summary](https://docs.nvidia.com/nemo/megatron-bridge/latest/performance-summary.html) publishes training throughput, system configurations, parallelism settings, and links to [performance recipes and reproduction instructions](https://github.com/NVIDIA-NeMo/Megatron-Bridge/tree/main/scripts/performance). Use the container and matching code version specified by those instructions when reproducing a result.
+Keep [Megatron](https://github.com/NVIDIA/Megatron-LM/releases) up to date to benefit from continued improvements in training performance and optimized recipes.
 
-Selected results from the **26.08.01 NeMo container** (August 2026):
+## DeepSeek-V3 performance on Blackwell
+
+Successive Megatron versions have improved published DeepSeek-V3 model TFLOP/s/GPU **2.1× on GB200** and **1.5× on GB300**, measured across 256 GPUs at 4K sequence length.
+
+![DeepSeek-V3 performance across Megatron updates: 2.1× model TFLOP/s/GPU on GB200 and 1.5× on GB300](images/deepseek_v3_blackwell_performance.svg)
+
+See the [performance summary](https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary.html) for the full batch sizes and parallelism configurations, and get the [NGC container](https://catalog.ngc.nvidia.com/orgs/nvidia/-/containers/nemo/26.08.01/tags).
+
+## Selected training results
+
+Selected results from published Megatron training recipes:
 
 | Model | System | GPUs | Precision | Sequence length | Tokens/s/GPU | Model TFLOPs/s/GPU |
 | --- | --- | ---: | --- | ---: | ---: | ---: |
@@ -93,10 +103,11 @@ Selected results from the **26.08.01 NeMo container** (August 2026):
 | Qwen3-235B-A22B | DGX-GB300 | 256 | MXFP8 | 4,096 | 8,832 | 1,306 |
 | Nemotron 3 Ultra | DGX-GB300 | 256 | NVFP4 | 8,192 | 3,744 | 1,348 |
 
-See the summary for the full batch sizes and parallelism configurations. MoE benchmarks use force-balanced expert routing and do not drop tokens. These results measure performance under the published benchmark conditions; throughput depends on the model, precision, hardware, and configuration.
+These results measure performance under the published benchmark conditions; throughput depends on the model, precision, hardware, and configuration.
 
 # Roadmaps
 
+- **[2026 Q4 Megatron Core Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/9232)**
 - **[2026 Q3 Megatron Core Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/5676)**
 - **[2026 Q3 MoE Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/6757)** [`dev` branch first developments]
 - **[2026 Q3 Megatron FSDP v2 Roadmap](https://github.com/NVIDIA/Megatron-LM/issues/6812)** [experimental]

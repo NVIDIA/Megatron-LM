@@ -1,0 +1,830 @@
+<?xml version='1.0' encoding='utf-8'?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:cc="http://creativecommons.org/ns#" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:xlink="http://www.w3.org/1999/xlink" width="900pt" height="511.2pt" viewBox="0 0 900 511.2" version="1.1" role="img" aria-label="DeepSeek-V3 training performance across Megatron updates on Blackwell. Published benchmark releases 25.07 through 26.08.01. Model TFLOP/s/GPU increases from 606 to 1,277 on GB200 (2.1 times) and from 1,088 to 1,636 on GB300 (1.5 times). Runs use 256 GPUs at 4K sequence length. Published recipe configurations vary across versions. Performance summary: https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary.html.">
+ <title>DeepSeek-V3 training performance on Blackwell</title>
+ <metadata>
+  <rdf:RDF>
+   <cc:Work>
+    <dc:type rdf:resource="http://purl.org/dc/dcmitype/StillImage" />
+    <dc:title>DeepSeek-V3 training performance on Blackwell</dc:title>
+    <dc:description>DeepSeek-V3 training performance across Megatron updates on Blackwell. Published benchmark releases 25.07 through 26.08.01. Model TFLOP/s/GPU increases from 606 to 1,277 on GB200 (2.1 times) and from 1,088 to 1,636 on GB300 (1.5 times). Runs use 256 GPUs at 4K sequence length. Published recipe configurations vary across versions. Performance summary: https://docs.nvidia.com/nemo/megatron-bridge/0.7.0/performance-summary.html.</dc:description>
+    <dc:format>image/svg+xml</dc:format>
+    <dc:creator>
+     <cc:Agent>
+      <dc:title>Matplotlib v3.11.2, https://matplotlib.org/</dc:title>
+     </cc:Agent>
+    </dc:creator>
+   </cc:Work>
+  </rdf:RDF>
+ </metadata>
+ <defs>
+  <style type="text/css">*{stroke-linejoin: round; stroke-linecap: butt}</style>
+ </defs>
+ <g id="figure_1">
+  <g id="patch_1">
+   <path d="M 0 511.2  L 900 511.2  L 900 0  L 0 0  z " style="fill: #ffffff" />
+  </g>
+  <g id="axes_1">
+   <g id="patch_2">
+    <path d="M 81 388.512  L 882 388.512  L 882 117.576  L 81 117.576  z " style="fill: #ffffff" />
+   </g>
+   <g id="matplotlib.axis_1">
+    <g id="xtick_1">
+     <g id="line2d_1" />
+     <g id="text_1">
+
+      <g style="fill: #1e1e1e" transform="translate(97.890224 405.932) scale(0.106 -0.106)">
+       <defs>
+        <path id="NVIDIASans-Regular-22" d="M 454 0  L 454 538  Q 454 1491 1306 1933  L 2163 2381  Q 2810 2714 2810 3245  L 2810 3334  Q 2810 3648 2573 3840  Q 2336 4032 1952 4032  L 1901 4032  Q 1510 4032 1273 3885  Q 1037 3738 909 3418  L 467 3610  Q 800 4480 1901 4480  L 1971 4480  Q 2381 4480 2685 4339  Q 2989 4198 3158 3945  Q 3328 3693 3328 3347  L 3328 3238  Q 3328 2816 3113 2521  Q 2899 2227 2387 1965  L 1555 1536  Q 1261 1389 1126 1133  Q 992 877 992 493  L 992 461  L 3354 461  L 3354 0  L 454 0  z " transform="scale(0.015625)" />
+        <path id="NVIDIASans-Regular-25" d="M 1837 -77  Q 1293 -77 909 124  Q 525 326 378 698  L 806 902  Q 1030 371 1824 371  L 1882 371  Q 2355 371 2633 611  Q 2912 851 2912 1248  L 2912 1363  Q 2912 1779 2617 2025  Q 2323 2272 1811 2272  L 1760 2272  Q 1242 2272 832 2010  L 531 2157  L 634 4403  L 3187 4403  L 3187 3942  L 1069 3942  L 1018 2522  Q 1395 2714 1882 2714  L 1946 2714  Q 2394 2714 2726 2547  Q 3059 2381 3244 2080  Q 3430 1779 3430 1376  L 3430 1248  Q 3430 640 3020 281  Q 2611 -77 1914 -77  L 1837 -77  z " transform="scale(0.015625)" />
+        <path id="NVIDIASans-Regular-4" d="M 422 0  L 422 646  L 1024 646  L 1024 0  L 422 0  z " transform="scale(0.015625)" />
+        <path id="NVIDIASans-Regular-20" d="M 1882 -77  Q 1101 -77 672 448  Q 243 973 243 1920  L 243 2483  Q 243 3437 672 3958  Q 1101 4480 1882 4480  L 1958 4480  Q 2739 4480 3164 3958  Q 3590 3437 3590 2483  L 3590 1920  Q 3590 973 3164 448  Q 2739 -77 1958 -77  L 1882 -77  z M 1882 390  L 1958 390  Q 2496 390 2781 787  Q 3066 1184 3066 1933  L 3066 2477  Q 3066 3219 2781 3619  Q 2496 4019 1958 4019  L 1882 4019  Q 1344 4019 1059 3619  Q 774 3219 774 2477  L 774 1933  Q 774 1184 1059 787  Q 1344 390 1882 390  z " transform="scale(0.015625)" />
+        <path id="NVIDIASans-Regular-27" d="M 1306 0  L 1306 506  Q 1306 902 1421 1273  Q 1536 1645 1805 2131  L 2784 3942  L 467 3942  L 467 4403  L 3392 4403  L 3392 4000  L 2259 1920  Q 2029 1498 1929 1165  Q 1830 832 1830 474  L 1830 0  L 1306 0  z " transform="scale(0.015625)" />
+       </defs>
+       <use xlink:href="#NVIDIASans-Regular-22" />
+       <use xlink:href="#NVIDIASans-Regular-25" transform="translate(60 0)" />
+       <use xlink:href="#NVIDIASans-Regular-4" transform="translate(120 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(142.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-27" transform="translate(202.59375 0)" />
+      </g>
+     </g>
+    </g>
+    <g id="xtick_2">
+     <g id="line2d_2" />
+     <g id="text_2">
+
+      <g style="fill: #1e1e1e" transform="translate(166.351762 405.932) scale(0.106 -0.106)">
+       <defs>
+        <path id="NVIDIASans-Regular-21" d="M 1850 0  L 1850 3955  L 1139 3955  L 1203 4403  L 2374 4403  L 2374 0  L 1850 0  z " transform="scale(0.015625)" />
+       </defs>
+       <use xlink:href="#NVIDIASans-Regular-22" />
+       <use xlink:href="#NVIDIASans-Regular-25" transform="translate(60 0)" />
+       <use xlink:href="#NVIDIASans-Regular-4" transform="translate(120 0)" />
+       <use xlink:href="#NVIDIASans-Regular-21" transform="translate(142.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-21" transform="translate(202.59375 0)" />
+      </g>
+     </g>
+    </g>
+    <g id="xtick_3">
+     <g id="line2d_3" />
+     <g id="text_3">
+
+      <g style="fill: #1e1e1e" transform="translate(234.8133 405.932) scale(0.106 -0.106)">
+       <defs>
+        <path id="NVIDIASans-Regular-26" d="M 1939 -77  Q 1203 -77 784 384  Q 365 845 365 1658  L 365 2432  Q 365 3430 781 3955  Q 1197 4480 1984 4480  L 2054 4480  Q 3046 4480 3354 3718  L 2893 3546  Q 2784 3802 2579 3917  Q 2374 4032 2035 4032  L 1978 4032  Q 864 4032 864 2438  L 864 2285  Q 1030 2566 1334 2720  Q 1638 2874 2029 2874  L 2093 2874  Q 2515 2874 2838 2694  Q 3162 2515 3344 2198  Q 3526 1882 3526 1472  L 3526 1350  Q 3526 941 3331 617  Q 3136 294 2793 108  Q 2451 -77 2003 -77  L 1939 -77  z M 1914 365  L 1978 365  Q 2432 365 2720 637  Q 3008 909 3008 1344  L 3008 1453  Q 3008 1888 2720 2160  Q 2432 2432 1978 2432  L 1914 2432  Q 1453 2432 1168 2160  Q 883 1888 883 1453  L 883 1344  Q 883 915 1168 640  Q 1453 365 1914 365  z " transform="scale(0.015625)" />
+       </defs>
+       <use xlink:href="#NVIDIASans-Regular-22" />
+       <use xlink:href="#NVIDIASans-Regular-26" transform="translate(60 0)" />
+       <use xlink:href="#NVIDIASans-Regular-4" transform="translate(120 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(142.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-22" transform="translate(202.59375 0)" />
+      </g>
+     </g>
+    </g>
+    <g id="xtick_4">
+     <g id="line2d_4" />
+     <g id="text_4">
+
+      <g style="fill: #1e1e1e" transform="translate(295.71737 405.932) scale(0.106 -0.106)">
+       <use xlink:href="#NVIDIASans-Regular-22" />
+       <use xlink:href="#NVIDIASans-Regular-26" transform="translate(60 0)" />
+       <use xlink:href="#NVIDIASans-Regular-4" transform="translate(120 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(142.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-22" transform="translate(202.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-4" transform="translate(262.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(285.1875 0)" />
+       <use xlink:href="#NVIDIASans-Regular-21" transform="translate(345.1875 0)" />
+      </g>
+     </g>
+    </g>
+    <g id="xtick_5">
+     <g id="line2d_5" />
+     <g id="text_5">
+
+      <g style="fill: #1e1e1e" transform="translate(371.736377 405.932) scale(0.106 -0.106)">
+       <defs>
+        <path id="NVIDIASans-Regular-24" d="M 2528 0  L 2528 1005  L 256 1005  L 256 1382  L 2522 4403  L 3021 4403  L 3021 1440  L 3622 1440  L 3565 1005  L 3021 1005  L 3021 0  L 2528 0  z M 2528 1440  L 2528 3725  L 813 1440  L 2528 1440  z " transform="scale(0.015625)" />
+       </defs>
+       <use xlink:href="#NVIDIASans-Regular-22" />
+       <use xlink:href="#NVIDIASans-Regular-26" transform="translate(60 0)" />
+       <use xlink:href="#NVIDIASans-Regular-4" transform="translate(120 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(142.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-24" transform="translate(202.59375 0)" />
+      </g>
+     </g>
+    </g>
+    <g id="xtick_6">
+     <g id="line2d_6" />
+     <g id="text_6">
+
+      <g style="fill: #1e1e1e" transform="translate(432.640447 405.932) scale(0.106 -0.106)">
+       <use xlink:href="#NVIDIASans-Regular-22" />
+       <use xlink:href="#NVIDIASans-Regular-26" transform="translate(60 0)" />
+       <use xlink:href="#NVIDIASans-Regular-4" transform="translate(120 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(142.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-24" transform="translate(202.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-4" transform="translate(262.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(285.1875 0)" />
+       <use xlink:href="#NVIDIASans-Regular-21" transform="translate(345.1875 0)" />
+      </g>
+     </g>
+    </g>
+    <g id="xtick_7">
+     <g id="line2d_7" />
+     <g id="text_7">
+
+      <g style="fill: #1e1e1e" transform="translate(508.659454 405.932) scale(0.106 -0.106)">
+       <use xlink:href="#NVIDIASans-Regular-22" />
+       <use xlink:href="#NVIDIASans-Regular-26" transform="translate(60 0)" />
+       <use xlink:href="#NVIDIASans-Regular-4" transform="translate(120 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(142.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-26" transform="translate(202.59375 0)" />
+      </g>
+     </g>
+    </g>
+    <g id="xtick_8">
+     <g id="line2d_8" />
+     <g id="text_8">
+
+      <g style="fill: #1e1e1e" transform="translate(569.563524 405.932) scale(0.106 -0.106)">
+       <use xlink:href="#NVIDIASans-Regular-22" />
+       <use xlink:href="#NVIDIASans-Regular-26" transform="translate(60 0)" />
+       <use xlink:href="#NVIDIASans-Regular-4" transform="translate(120 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(142.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-26" transform="translate(202.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-4" transform="translate(262.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(285.1875 0)" />
+       <use xlink:href="#NVIDIASans-Regular-21" transform="translate(345.1875 0)" />
+      </g>
+     </g>
+    </g>
+    <g id="xtick_9">
+     <g id="line2d_9" />
+     <g id="text_9">
+
+      <g style="fill: #1e1e1e" transform="translate(645.582531 405.932) scale(0.106 -0.106)">
+       <defs>
+        <path id="NVIDIASans-Regular-28" d="M 1869 -77  Q 1126 -77 729 259  Q 333 595 333 1158  L 333 1280  Q 333 1619 518 1900  Q 704 2182 1018 2310  Q 749 2432 598 2685  Q 448 2938 448 3232  L 448 3334  Q 448 3853 832 4166  Q 1216 4480 1875 4480  L 1965 4480  Q 2624 4480 3008 4166  Q 3392 3853 3392 3334  L 3392 3232  Q 3392 2938 3241 2685  Q 3091 2432 2822 2310  Q 3136 2182 3321 1900  Q 3507 1619 3507 1280  L 3507 1158  Q 3507 595 3110 259  Q 2714 -77 1971 -77  L 1869 -77  z M 1882 371  L 1958 371  Q 2470 371 2726 601  Q 2982 832 2982 1171  L 2982 1280  Q 2982 1619 2729 1849  Q 2477 2080 1965 2080  L 1875 2080  Q 1370 2080 1114 1849  Q 858 1619 858 1280  L 858 1171  Q 858 832 1114 601  Q 1370 371 1882 371  z M 1894 2509  L 1946 2509  Q 2400 2509 2637 2707  Q 2874 2906 2874 3226  L 2874 3315  Q 2874 3635 2634 3833  Q 2394 4032 1946 4032  L 1894 4032  Q 1446 4032 1206 3833  Q 966 3635 966 3315  L 966 3226  Q 966 2906 1206 2707  Q 1446 2509 1894 2509  z " transform="scale(0.015625)" />
+       </defs>
+       <use xlink:href="#NVIDIASans-Regular-22" />
+       <use xlink:href="#NVIDIASans-Regular-26" transform="translate(60 0)" />
+       <use xlink:href="#NVIDIASans-Regular-4" transform="translate(120 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(142.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-28" transform="translate(202.59375 0)" />
+      </g>
+     </g>
+    </g>
+    <g id="xtick_10">
+     <g id="line2d_10" />
+     <g id="text_10">
+
+      <g style="fill: #1e1e1e" transform="translate(706.486601 405.932) scale(0.106 -0.106)">
+       <use xlink:href="#NVIDIASans-Regular-22" />
+       <use xlink:href="#NVIDIASans-Regular-26" transform="translate(60 0)" />
+       <use xlink:href="#NVIDIASans-Regular-4" transform="translate(120 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(142.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-28" transform="translate(202.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-4" transform="translate(262.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(285.1875 0)" />
+       <use xlink:href="#NVIDIASans-Regular-21" transform="translate(345.1875 0)" />
+      </g>
+     </g>
+    </g>
+    <g id="text_11">
+
+     <g style="fill: #1e1e1e" transform="translate(399.737813 433.812) scale(0.12 -0.12)">
+      <defs>
+       <path id="NVIDIASans-Regular-99" d="M 608 0  L 608 4480  L 2182 4480  Q 2944 4480 3363 4137  Q 3782 3795 3782 3168  L 3782 3014  Q 3782 2387 3356 2041  Q 2931 1696 2182 1696  L 1139 1696  L 1139 0  L 608 0  z M 1139 2150  L 2176 2150  Q 2688 2150 2969 2361  Q 3251 2573 3251 3002  L 3251 3174  Q 3251 3603 2969 3814  Q 2688 4026 2176 4026  L 1139 4026  L 1139 2150  z " transform="scale(0.015625)" />
+       <path id="NVIDIASans-Regular-b8" d="M 1658 -77  Q 1120 -77 793 262  Q 467 602 467 1254  L 467 3258  L 979 3258  L 979 1331  Q 979 858 1180 611  Q 1382 365 1760 365  L 1811 365  Q 2061 365 2269 489  Q 2477 614 2601 860  Q 2726 1107 2726 1478  L 2726 3258  L 3238 3258  L 3238 0  L 2771 0  L 2771 576  Q 2637 282 2374 102  Q 2112 -77 1715 -77  L 1658 -77  z " transform="scale(0.015625)" />
+       <path id="NVIDIASans-Regular-a5" d="M 2080 -77  Q 1683 -77 1404 96  Q 1126 269 979 563  L 979 0  L 512 0  L 512 4672  L 1024 4672  L 1024 2758  Q 1171 3021 1443 3177  Q 1715 3334 2080 3334  L 2125 3334  Q 2534 3334 2848 3152  Q 3162 2970 3344 2614  Q 3526 2259 3526 1747  L 3526 1510  Q 3526 998 3344 643  Q 3162 288 2848 105  Q 2534 -77 2125 -77  L 2080 -77  z M 1984 365  L 2042 365  Q 2458 365 2736 646  Q 3014 928 3014 1517  L 3014 1747  Q 3014 2336 2736 2614  Q 2458 2893 2042 2893  L 1984 2893  Q 1722 2893 1501 2771  Q 1280 2650 1152 2394  Q 1024 2138 1024 1728  L 1024 1530  Q 1024 922 1305 643  Q 1587 365 1984 365  z " transform="scale(0.015625)" />
+       <path id="NVIDIASans-Regular-af" d="M 512 0  L 512 4672  L 1024 4672  L 1024 0  L 512 0  z " transform="scale(0.015625)" />
+       <path id="NVIDIASans-Regular-ac" d="M 512 0  L 512 3258  L 1024 3258  L 1024 0  L 512 0  z M 499 3942  L 499 4525  L 1037 4525  L 1037 3942  L 499 3942  z " transform="scale(0.015625)" />
+       <path id="NVIDIASans-Regular-b6" d="M 1658 -77  Q 589 -77 262 672  L 672 877  Q 800 608 1040 480  Q 1280 352 1664 352  L 1734 352  Q 2502 352 2502 845  L 2502 877  Q 2502 1306 1997 1370  L 1267 1472  Q 838 1530 604 1747  Q 371 1965 371 2336  L 371 2406  Q 371 2822 704 3078  Q 1037 3334 1581 3334  L 1664 3334  Q 2112 3334 2445 3152  Q 2778 2970 2906 2643  L 2496 2458  Q 2291 2906 1664 2906  L 1587 2906  Q 1254 2906 1059 2771  Q 864 2637 864 2413  L 864 2374  Q 864 2176 982 2070  Q 1101 1965 1370 1926  L 2106 1824  Q 2528 1766 2761 1529  Q 2995 1293 2995 915  L 2995 845  Q 2995 390 2675 156  Q 2355 -77 1741 -77  L 1658 -77  z " transform="scale(0.015625)" />
+       <path id="NVIDIASans-Regular-ab" d="M 512 0  L 512 4672  L 1024 4672  L 1024 2752  Q 1165 3014 1430 3174  Q 1696 3334 2074 3334  L 2131 3334  Q 2688 3334 3024 2995  Q 3360 2656 3360 2003  L 3360 0  L 2848 0  L 2848 1920  Q 2848 2400 2637 2646  Q 2426 2893 2029 2893  L 1984 2893  Q 1728 2893 1510 2768  Q 1293 2643 1158 2396  Q 1024 2150 1024 1779  L 1024 0  L 512 0  z " transform="scale(0.015625)" />
+       <path id="NVIDIASans-Regular-a8" d="M 1786 -77  Q 1114 -77 723 339  Q 333 755 333 1510  L 333 1747  Q 333 2240 512 2595  Q 691 2950 1020 3142  Q 1350 3334 1786 3334  L 1837 3334  Q 2266 3334 2576 3155  Q 2886 2976 3059 2646  Q 3232 2317 3232 1875  L 3232 1485  L 838 1485  Q 845 915 1097 633  Q 1350 352 1786 352  L 1882 352  Q 2202 352 2403 467  Q 2605 582 2726 800  L 3117 563  Q 2950 269 2633 96  Q 2317 -77 1882 -77  L 1786 -77  z M 845 1875  L 2726 1875  L 2726 1946  Q 2726 2419 2486 2662  Q 2246 2906 1837 2906  L 1786 2906  Q 1389 2906 1129 2643  Q 870 2381 845 1875  z " transform="scale(0.015625)" />
+       <path id="NVIDIASans-Regular-a7" d="M 1734 -77  Q 1331 -77 1014 105  Q 698 288 515 646  Q 333 1005 333 1517  L 333 1747  Q 333 2259 515 2614  Q 698 2970 1014 3152  Q 1331 3334 1734 3334  L 1773 3334  Q 2144 3334 2413 3177  Q 2682 3021 2835 2758  L 2835 4672  L 3347 4672  L 3347 0  L 2880 0  L 2880 563  Q 2733 275 2454 99  Q 2176 -77 1773 -77  L 1734 -77  z M 1818 365  L 1875 365  Q 2144 365 2361 486  Q 2579 608 2707 864  Q 2835 1120 2835 1530  L 2835 1728  Q 2835 2138 2704 2394  Q 2573 2650 2355 2771  Q 2138 2893 1875 2893  L 1818 2893  Q 1402 2893 1123 2614  Q 845 2336 845 1747  L 845 1517  Q 845 928 1123 646  Q 1402 365 1818 365  z " transform="scale(0.015625)" />
+       <path id="NVIDIASans-Regular-3" transform="scale(0.015625)" />
+       <path id="NVIDIASans-Regular-b1" d="M 512 0  L 512 3258  L 979 3258  L 979 2675  Q 1114 2970 1389 3152  Q 1664 3334 2074 3334  L 2131 3334  Q 2688 3334 3024 2995  Q 3360 2656 3360 2003  L 3360 0  L 2848 0  L 2848 1920  Q 2848 2400 2637 2646  Q 2426 2893 2029 2893  L 1984 2893  Q 1728 2893 1510 2768  Q 1293 2643 1158 2396  Q 1024 2150 1024 1779  L 1024 0  L 512 0  z " transform="scale(0.015625)" />
+       <path id="NVIDIASans-Regular-a6" d="M 1830 -77  Q 1146 -77 739 339  Q 333 755 333 1510  L 333 1747  Q 333 2246 521 2601  Q 710 2957 1049 3145  Q 1389 3334 1830 3334  L 1901 3334  Q 2330 3334 2637 3132  Q 2944 2931 3085 2598  L 2675 2406  Q 2566 2630 2374 2761  Q 2182 2893 1901 2893  L 1837 2893  Q 1402 2893 1123 2605  Q 845 2317 845 1747  L 845 1510  Q 845 934 1117 649  Q 1389 365 1837 365  L 1901 365  Q 2195 365 2390 489  Q 2586 614 2688 826  L 3098 627  Q 2957 314 2646 118  Q 2336 -77 1901 -77  L 1830 -77  z " transform="scale(0.015625)" />
+       <path id="NVIDIASans-Regular-b0" d="M 512 0  L 512 3258  L 979 3258  L 979 2675  Q 1114 2976 1366 3155  Q 1619 3334 1971 3334  L 2029 3334  Q 2829 3334 3078 2643  Q 3219 2957 3491 3145  Q 3763 3334 4128 3334  L 4186 3334  Q 4723 3334 5030 2995  Q 5338 2656 5338 2003  L 5338 0  L 4826 0  L 4826 1920  Q 4826 2400 4646 2646  Q 4467 2893 4083 2893  L 4038 2893  Q 3821 2893 3622 2768  Q 3424 2643 3302 2396  Q 3181 2150 3181 1779  L 3181 0  L 2669 0  L 2669 1920  Q 2669 2400 2489 2646  Q 2310 2893 1926 2893  L 1882 2893  Q 1664 2893 1469 2768  Q 1274 2643 1149 2396  Q 1024 2150 1024 1779  L 1024 0  L 512 0  z " transform="scale(0.015625)" />
+       <path id="NVIDIASans-Regular-a4" d="M 1357 -77  Q 832 -77 550 172  Q 269 422 269 890  Q 269 1274 509 1520  Q 749 1766 1216 1830  L 2496 2003  L 2496 2029  Q 2496 2906 1715 2906  L 1645 2906  Q 1030 2906 806 2432  L 397 2630  Q 544 2963 867 3148  Q 1190 3334 1645 3334  L 1741 3334  Q 2362 3334 2685 3008  Q 3008 2682 3008 2061  L 3008 0  L 2541 0  L 2541 582  Q 2394 275 2093 99  Q 1792 -77 1414 -77  L 1357 -77  z M 2496 1613  L 1434 1459  Q 1062 1408 915 1286  Q 768 1165 768 915  Q 768 640 944 493  Q 1120 346 1453 346  L 1517 346  Q 1958 346 2227 627  Q 2496 909 2496 1376  L 2496 1613  z " transform="scale(0.015625)" />
+       <path id="NVIDIASans-Regular-b5" d="M 512 0  L 512 3258  L 979 3258  L 979 2573  Q 1094 2893 1328 3088  Q 1562 3283 2010 3283  L 2310 3283  L 2310 2816  L 1984 2816  Q 1568 2816 1296 2531  Q 1024 2246 1024 1658  L 1024 0  L 512 0  z " transform="scale(0.015625)" />
+       <path id="NVIDIASans-Regular-ae" d="M 512 0  L 512 4672  L 1024 4672  L 1024 1786  L 2637 3258  L 3309 3258  L 1946 2022  L 3411 0  L 2790 0  L 1568 1709  L 1024 1216  L 1024 0  L 512 0  z " transform="scale(0.015625)" />
+      </defs>
+      <use xlink:href="#NVIDIASans-Regular-99" />
+      <use xlink:href="#NVIDIASans-Regular-b8" transform="translate(59.59375 0)" />
+      <use xlink:href="#NVIDIASans-Regular-a5" transform="translate(118.1875 0)" />
+      <use xlink:href="#NVIDIASans-Regular-af" transform="translate(178.484375 0)" />
+      <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(202.484375 0)" />
+      <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(225.6875 0)" />
+      <use xlink:href="#NVIDIASans-Regular-ab" transform="translate(276.59375 0)" />
+      <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(336.390625 0)" />
+      <use xlink:href="#NVIDIASans-Regular-a7" transform="translate(391.59375 0)" />
+      <use xlink:href="#NVIDIASans-Regular-3" transform="translate(451.890625 0)" />
+      <use xlink:href="#NVIDIASans-Regular-a5" transform="translate(477.6875 0)" />
+      <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(537.984375 0)" />
+      <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(593.1875 0)" />
+      <use xlink:href="#NVIDIASans-Regular-a6" transform="translate(652.984375 0)" />
+      <use xlink:href="#NVIDIASans-Regular-ab" transform="translate(705.890625 0)" />
+      <use xlink:href="#NVIDIASans-Regular-b0" transform="translate(765.6875 0)" />
+      <use xlink:href="#NVIDIASans-Regular-a4" transform="translate(856.390625 0)" />
+      <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(910.6875 0)" />
+      <use xlink:href="#NVIDIASans-Regular-ae" transform="translate(950.390625 0)" />
+      <use xlink:href="#NVIDIASans-Regular-3" transform="translate(1005.1875 0)" />
+      <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(1030.984375 0)" />
+      <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1067.890625 0)" />
+      <use xlink:href="#NVIDIASans-Regular-af" transform="translate(1123.09375 0)" />
+      <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1147.09375 0)" />
+      <use xlink:href="#NVIDIASans-Regular-a4" transform="translate(1202.296875 0)" />
+      <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(1256.59375 0)" />
+      <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1307.5 0)" />
+     </g>
+    </g>
+   </g>
+   <g id="matplotlib.axis_2">
+    <g id="ytick_1">
+     <g id="line2d_11">
+      <path d="M 81 388.512  L 882 388.512  " clip-path="url(#pe237bbc172)" style="fill: none; stroke: #e5e5e5; stroke-width: 0.8; stroke-linecap: square" />
+     </g>
+     <g id="line2d_12" />
+     <g id="text_12">
+
+      <g style="fill: #1e1e1e" transform="translate(63.8 392.712) scale(0.12 -0.12)">
+       <use xlink:href="#NVIDIASans-Regular-20" />
+      </g>
+     </g>
+    </g>
+    <g id="ytick_2">
+     <g id="line2d_13">
+      <path d="M 81 331.472842  L 882 331.472842  " clip-path="url(#pe237bbc172)" style="fill: none; stroke: #e5e5e5; stroke-width: 0.8; stroke-linecap: square" />
+     </g>
+     <g id="line2d_14" />
+     <g id="text_13">
+
+      <g style="fill: #1e1e1e" transform="translate(49.4 335.672842) scale(0.12 -0.12)">
+       <use xlink:href="#NVIDIASans-Regular-24" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(60 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(120 0)" />
+      </g>
+     </g>
+    </g>
+    <g id="ytick_3">
+     <g id="line2d_15">
+      <path d="M 81 274.433684  L 882 274.433684  " clip-path="url(#pe237bbc172)" style="fill: none; stroke: #e5e5e5; stroke-width: 0.8; stroke-linecap: square" />
+     </g>
+     <g id="line2d_16" />
+     <g id="text_14">
+
+      <g style="fill: #1e1e1e" transform="translate(49.4 278.633684) scale(0.12 -0.12)">
+       <use xlink:href="#NVIDIASans-Regular-28" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(60 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(120 0)" />
+      </g>
+     </g>
+    </g>
+    <g id="ytick_4">
+     <g id="line2d_17">
+      <path d="M 81 217.394526  L 882 217.394526  " clip-path="url(#pe237bbc172)" style="fill: none; stroke: #e5e5e5; stroke-width: 0.8; stroke-linecap: square" />
+     </g>
+     <g id="line2d_18" />
+     <g id="text_15">
+
+      <g style="fill: #1e1e1e" transform="translate(39.48875 221.594526) scale(0.12 -0.12)">
+       <defs>
+        <path id="NVIDIASans-Regular-6" d="M 506 -902  L 314 -653  L 493 -512  Q 614 -422 659 -352  Q 704 -282 704 -115  L 704 0  L 422 0  L 422 646  L 1024 646  L 1024 -115  Q 1024 -294 989 -406  Q 954 -518 874 -601  Q 794 -685 653 -794  L 506 -902  z " transform="scale(0.015625)" />
+       </defs>
+       <use xlink:href="#NVIDIASans-Regular-21" />
+       <use xlink:href="#NVIDIASans-Regular-6" transform="translate(60 0)" />
+       <use xlink:href="#NVIDIASans-Regular-22" transform="translate(82.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(142.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(202.59375 0)" />
+      </g>
+     </g>
+    </g>
+    <g id="ytick_5">
+     <g id="line2d_19">
+      <path d="M 81 160.355368  L 882 160.355368  " clip-path="url(#pe237bbc172)" style="fill: none; stroke: #e5e5e5; stroke-width: 0.8; stroke-linecap: square" />
+     </g>
+     <g id="line2d_20" />
+     <g id="text_16">
+
+      <g style="fill: #1e1e1e" transform="translate(39.48875 164.555368) scale(0.12 -0.12)">
+       <use xlink:href="#NVIDIASans-Regular-21" />
+       <use xlink:href="#NVIDIASans-Regular-6" transform="translate(60 0)" />
+       <use xlink:href="#NVIDIASans-Regular-26" transform="translate(82.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(142.59375 0)" />
+       <use xlink:href="#NVIDIASans-Regular-20" transform="translate(202.59375 0)" />
+      </g>
+     </g>
+    </g>
+   </g>
+   <g id="line2d_21">
+    <path d="M 111.807692 302.097676  L 180.269231 245.486312  L 248.730769 241.921364  L 317.192308 239.354602  L 385.653846 233.080295  L 454.115385 230.798728  L 522.576923 204.27552  L 591.038462 205.986695  L 659.5 206.557086  L 727.961538 206.414488  " clip-path="url(#pe237bbc172)" style="fill: none; stroke: #1e1e1e; stroke-width: 2.7; stroke-linecap: square" />
+    <defs>
+     <path id="m8ef0102449" d="M 0 3.15  C 0.83539 3.15 1.636677 2.818096 2.227386 2.227386  C 2.818096 1.636677 3.15 0.83539 3.15 0  C 3.15 -0.83539 2.818096 -1.636677 2.227386 -2.227386  C 1.636677 -2.818096 0.83539 -3.15 0 -3.15  C -0.83539 -3.15 -1.636677 -2.818096 -2.227386 -2.227386  C -2.818096 -1.636677 -3.15 -0.83539 -3.15 0  C -3.15 0.83539 -2.818096 1.636677 -2.227386 2.227386  C -1.636677 2.818096 -0.83539 3.15 0 3.15  z " style="stroke: #1e1e1e" />
+    </defs>
+    <g clip-path="url(#pe237bbc172)">
+     <use xlink:href="#m8ef0102449" x="111.807692" y="302.097676" style="fill: #1e1e1e; stroke: #1e1e1e" />
+     <use xlink:href="#m8ef0102449" x="180.269231" y="245.486312" style="fill: #1e1e1e; stroke: #1e1e1e" />
+     <use xlink:href="#m8ef0102449" x="248.730769" y="241.921364" style="fill: #1e1e1e; stroke: #1e1e1e" />
+     <use xlink:href="#m8ef0102449" x="317.192308" y="239.354602" style="fill: #1e1e1e; stroke: #1e1e1e" />
+     <use xlink:href="#m8ef0102449" x="385.653846" y="233.080295" style="fill: #1e1e1e; stroke: #1e1e1e" />
+     <use xlink:href="#m8ef0102449" x="454.115385" y="230.798728" style="fill: #1e1e1e; stroke: #1e1e1e" />
+     <use xlink:href="#m8ef0102449" x="522.576923" y="204.27552" style="fill: #1e1e1e; stroke: #1e1e1e" />
+     <use xlink:href="#m8ef0102449" x="591.038462" y="205.986695" style="fill: #1e1e1e; stroke: #1e1e1e" />
+     <use xlink:href="#m8ef0102449" x="659.5" y="206.557086" style="fill: #1e1e1e; stroke: #1e1e1e" />
+     <use xlink:href="#m8ef0102449" x="727.961538" y="206.414488" style="fill: #1e1e1e; stroke: #1e1e1e" />
+    </g>
+   </g>
+   <g id="line2d_22">
+    <path d="M 180.269231 233.365491  L 248.730769 217.537124  L 317.192308 214.685166  L 385.653846 204.560716  L 454.115385 203.419933  L 522.576923 153.510669  L 591.038462 154.651453  L 659.5 155.364442  L 727.961538 155.221844  " clip-path="url(#pe237bbc172)" style="fill: none; stroke-dasharray: 9.99,4.32; stroke-dashoffset: 0; stroke: #76b900; stroke-width: 2.7" />
+    <defs>
+     <path id="mfea904c8bb" d="M -3.15 3.15  L 3.15 3.15  L 3.15 -3.15  L -3.15 -3.15  z " style="stroke: #76b900; stroke-linejoin: miter" />
+    </defs>
+    <g clip-path="url(#pe237bbc172)">
+     <use xlink:href="#mfea904c8bb" x="180.269231" y="233.365491" style="fill: #76b900; stroke: #76b900; stroke-linejoin: miter" />
+     <use xlink:href="#mfea904c8bb" x="248.730769" y="217.537124" style="fill: #76b900; stroke: #76b900; stroke-linejoin: miter" />
+     <use xlink:href="#mfea904c8bb" x="317.192308" y="214.685166" style="fill: #76b900; stroke: #76b900; stroke-linejoin: miter" />
+     <use xlink:href="#mfea904c8bb" x="385.653846" y="204.560716" style="fill: #76b900; stroke: #76b900; stroke-linejoin: miter" />
+     <use xlink:href="#mfea904c8bb" x="454.115385" y="203.419933" style="fill: #76b900; stroke: #76b900; stroke-linejoin: miter" />
+     <use xlink:href="#mfea904c8bb" x="522.576923" y="153.510669" style="fill: #76b900; stroke: #76b900; stroke-linejoin: miter" />
+     <use xlink:href="#mfea904c8bb" x="591.038462" y="154.651453" style="fill: #76b900; stroke: #76b900; stroke-linejoin: miter" />
+     <use xlink:href="#mfea904c8bb" x="659.5" y="155.364442" style="fill: #76b900; stroke: #76b900; stroke-linejoin: miter" />
+     <use xlink:href="#mfea904c8bb" x="727.961538" y="155.221844" style="fill: #76b900; stroke: #76b900; stroke-linejoin: miter" />
+    </g>
+   </g>
+   <g id="patch_3">
+    <path d="M 81 388.512  L 882 388.512  " style="fill: none; stroke: #cccccc; stroke-width: 0.8; stroke-linejoin: miter; stroke-linecap: square" />
+   </g>
+   <g id="text_17">
+
+    <g style="fill: #1e1e1e" transform="translate(94.007692 325.097676) scale(0.12 -0.12)">
+     <defs>
+      <path id="NVIDIASans-Bold-26" d="M 2003 -77  Q 282 -77 282 1933  L 282 2432  Q 282 3437 717 3958  Q 1152 4480 1990 4480  L 2042 4480  Q 3110 4480 3418 3686  L 2643 3379  Q 2509 3699 2022 3699  L 1984 3699  Q 1178 3699 1178 2515  L 1178 2451  Q 1344 2662 1606 2780  Q 1869 2899 2189 2899  L 2234 2899  Q 2630 2899 2940 2716  Q 3251 2534 3430 2217  Q 3610 1901 3610 1498  L 3610 1395  Q 3610 966 3411 633  Q 3213 301 2861 112  Q 2509 -77 2054 -77  L 2003 -77  z M 1926 691  L 1965 691  Q 2291 691 2499 880  Q 2707 1069 2707 1370  L 2707 1459  Q 2707 1760 2499 1949  Q 2291 2138 1965 2138  L 1926 2138  Q 1600 2138 1392 1949  Q 1184 1760 1184 1459  L 1184 1370  Q 1184 1069 1392 880  Q 1600 691 1926 691  z " transform="scale(0.015625)" />
+      <path id="NVIDIASans-Bold-20" d="M 1894 -77  Q 1030 -77 582 451  Q 134 979 134 1965  L 134 2438  Q 134 3430 582 3955  Q 1030 4480 1894 4480  L 1952 4480  Q 2816 4480 3264 3955  Q 3712 3430 3712 2438  L 3712 1965  Q 3712 979 3264 451  Q 2816 -77 1952 -77  L 1894 -77  z M 1894 723  L 1952 723  Q 2797 723 2797 1978  L 2797 2426  Q 2797 3680 1952 3680  L 1894 3680  Q 1050 3680 1050 2426  L 1050 1978  Q 1050 723 1894 723  z " transform="scale(0.015625)" />
+     </defs>
+     <use xlink:href="#NVIDIASans-Bold-26" />
+     <use xlink:href="#NVIDIASans-Bold-20" transform="translate(60 0)" />
+     <use xlink:href="#NVIDIASans-Bold-26" transform="translate(120 0)" />
+    </g>
+   </g>
+   <g id="text_18">
+
+    <g style="fill: #1e1e1e" transform="translate(760.823077 208.743627) scale(0.135 -0.135)">
+     <defs>
+      <path id="NVIDIASans-Bold-90" d="M 2464 -90  Q 333 -90 333 2099  L 333 2349  Q 333 3046 579 3542  Q 826 4038 1286 4304  Q 1747 4570 2394 4570  L 2451 4570  Q 3098 4570 3542 4291  Q 3987 4013 4186 3494  L 3328 3194  Q 3149 3750 2445 3750  L 2400 3750  Q 1850 3750 1558 3395  Q 1267 3040 1267 2362  L 1267 2074  Q 1267 1382 1555 1056  Q 1843 730 2458 730  L 2496 730  Q 2746 730 2970 768  Q 3194 806 3360 883  L 3360 1709  L 2400 1709  L 2509 2490  L 4256 2490  L 4256 429  Q 3930 173 3482 41  Q 3034 -90 2515 -90  L 2464 -90  z " transform="scale(0.015625)" />
+      <path id="NVIDIASans-Bold-8b" d="M 531 0  L 531 4480  L 2355 4480  Q 3091 4480 3516 4144  Q 3942 3808 3942 3238  L 3942 3130  Q 3942 2874 3811 2672  Q 3680 2470 3443 2336  Q 3776 2202 3955 1958  Q 4134 1715 4134 1376  L 4134 1267  Q 4134 672 3715 336  Q 3296 0 2547 0  L 531 0  z M 1466 794  L 2522 794  Q 3200 794 3200 1267  L 3200 1389  Q 3200 1619 3024 1747  Q 2848 1875 2522 1875  L 1466 1875  L 1466 794  z M 1466 2656  L 2330 2656  Q 3008 2656 3008 3117  L 3008 3226  Q 3008 3443 2832 3564  Q 2656 3686 2330 3686  L 1466 3686  L 1466 2656  z " transform="scale(0.015625)" />
+      <path id="NVIDIASans-Bold-22" d="M 384 0  L 384 678  Q 384 1139 608 1510  Q 832 1882 1242 2099  L 1990 2502  Q 2502 2771 2502 3162  L 2502 3226  Q 2502 3430 2336 3564  Q 2170 3699 1914 3699  L 1882 3699  Q 1581 3699 1405 3584  Q 1229 3469 1146 3219  L 378 3558  Q 691 4480 1888 4480  L 1958 4480  Q 2624 4480 3014 4147  Q 3405 3814 3405 3251  L 3405 3149  Q 3405 2714 3184 2410  Q 2963 2106 2432 1818  L 1773 1459  Q 1389 1248 1363 806  L 3418 806  L 3418 0  L 384 0  z " transform="scale(0.015625)" />
+      <path id="NVIDIASans-Bold-3" transform="scale(0.015625)" />
+      <path id="NVIDIASans-Bold-21" d="M 1645 0  L 1645 3616  L 877 3616  L 986 4403  L 2560 4403  L 2560 0  L 1645 0  z " transform="scale(0.015625)" />
+      <path id="NVIDIASans-Bold-6" d="M 512 -1165  L 230 -768  L 467 -602  Q 621 -493 697 -387  Q 774 -282 774 -32  L 774 0  L 346 0  L 346 973  L 1286 973  L 1286 -51  Q 1286 -320 1219 -489  Q 1152 -659 1024 -777  Q 896 -896 710 -1024  L 512 -1165  z " transform="scale(0.015625)" />
+      <path id="NVIDIASans-Bold-27" d="M 1114 0  L 1114 493  Q 1114 826 1162 1104  Q 1210 1382 1322 1660  Q 1434 1939 1619 2266  L 2381 3597  L 378 3597  L 378 4403  L 3494 4403  L 3494 3706  L 2464 1971  Q 2234 1587 2131 1232  Q 2029 877 2029 467  L 2029 0  L 1114 0  z " transform="scale(0.015625)" />
+     </defs>
+     <use xlink:href="#NVIDIASans-Bold-90" />
+     <use xlink:href="#NVIDIASans-Bold-8b" transform="translate(72.40625 0)" />
+     <use xlink:href="#NVIDIASans-Bold-22" transform="translate(140.109375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-20" transform="translate(200.109375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-20" transform="translate(260.109375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-3" transform="translate(320.109375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-3" transform="translate(345.109375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-21" transform="translate(370.109375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-6" transform="translate(430.109375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-22" transform="translate(455.609375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-27" transform="translate(515.609375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-27" transform="translate(575.609375 0)" />
+    </g>
+   </g>
+   <g id="text_19">
+
+    <g style="fill: #1e1e1e" transform="translate(760.823077 227.273705) scale(0.115 -0.115)">
+     <defs>
+      <path id="NVIDIASans-Regular-65" d="M 986 922  L 685 1229  L 1619 2163  L 685 3104  L 986 3405  L 1926 2470  L 2861 3405  L 3162 3104  L 2227 2163  L 3162 1229  L 2861 922  L 1926 1862  L 986 922  z " transform="scale(0.015625)" />
+     </defs>
+     <use xlink:href="#NVIDIASans-Regular-22" />
+     <use xlink:href="#NVIDIASans-Regular-4" transform="translate(60 0)" />
+     <use xlink:href="#NVIDIASans-Regular-21" transform="translate(82.59375 0)" />
+     <use xlink:href="#NVIDIASans-Regular-65" transform="translate(142.59375 0)" />
+     <use xlink:href="#NVIDIASans-Regular-3" transform="translate(202.59375 0)" />
+     <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(228.390625 0)" />
+     <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(279.296875 0)" />
+     <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(303.296875 0)" />
+     <use xlink:href="#NVIDIASans-Regular-a6" transform="translate(363.09375 0)" />
+     <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(416 0)" />
+     <use xlink:href="#NVIDIASans-Regular-3" transform="translate(471.203125 0)" />
+     <use xlink:href="#NVIDIASans-Regular-22" transform="translate(497 0)" />
+     <use xlink:href="#NVIDIASans-Regular-25" transform="translate(557 0)" />
+     <use xlink:href="#NVIDIASans-Regular-4" transform="translate(617 0)" />
+     <use xlink:href="#NVIDIASans-Regular-20" transform="translate(639.59375 0)" />
+     <use xlink:href="#NVIDIASans-Regular-27" transform="translate(699.59375 0)" />
+    </g>
+   </g>
+   <g id="text_20">
+
+    <g style="fill: #1e1e1e" transform="translate(157.339231 219.365491) scale(0.12 -0.12)">
+     <defs>
+      <path id="NVIDIASans-Bold-28" d="M 1875 -77  Q 1088 -77 656 262  Q 224 602 224 1216  L 224 1306  Q 224 1632 368 1891  Q 512 2150 794 2310  Q 339 2630 339 3187  L 339 3270  Q 339 3821 758 4150  Q 1178 4480 1882 4480  L 1952 4480  Q 2656 4480 3075 4150  Q 3494 3821 3494 3270  L 3494 3187  Q 3494 2630 3040 2310  Q 3322 2150 3466 1891  Q 3610 1632 3610 1306  L 3610 1216  Q 3610 595 3178 259  Q 2746 -77 1958 -77  L 1875 -77  z M 1894 704  L 1939 704  Q 2298 704 2499 851  Q 2701 998 2701 1267  L 2701 1338  Q 2701 1600 2499 1750  Q 2298 1901 1939 1901  L 1894 1901  Q 1542 1901 1337 1750  Q 1133 1600 1133 1338  L 1133 1267  Q 1133 998 1334 851  Q 1536 704 1894 704  z M 1901 2630  L 1933 2630  Q 2240 2630 2416 2764  Q 2592 2899 2592 3136  L 2592 3206  Q 2592 3443 2416 3577  Q 2240 3712 1933 3712  L 1901 3712  Q 1594 3712 1418 3577  Q 1242 3443 1242 3206  L 1242 3136  Q 1242 2899 1418 2764  Q 1594 2630 1901 2630  z " transform="scale(0.015625)" />
+     </defs>
+     <use xlink:href="#NVIDIASans-Bold-21" />
+     <use xlink:href="#NVIDIASans-Bold-6" transform="translate(60 0)" />
+     <use xlink:href="#NVIDIASans-Bold-20" transform="translate(85.5 0)" />
+     <use xlink:href="#NVIDIASans-Bold-28" transform="translate(145.5 0)" />
+     <use xlink:href="#NVIDIASans-Bold-28" transform="translate(205.5 0)" />
+    </g>
+   </g>
+   <g id="text_21">
+
+    <g style="fill: #1e1e1e" transform="translate(760.823077 157.550983) scale(0.135 -0.135)">
+     <defs>
+      <path id="NVIDIASans-Bold-23" d="M 1811 -77  Q 582 -77 250 730  L 998 1062  Q 1152 704 1773 704  L 1818 704  Q 2170 704 2368 857  Q 2566 1011 2566 1274  L 2566 1344  Q 2566 1606 2361 1753  Q 2157 1901 1792 1901  L 1197 1901  L 1197 2656  L 1837 2656  Q 2458 2656 2458 3155  L 2458 3219  Q 2458 3443 2285 3571  Q 2112 3699 1805 3699  L 1773 3699  Q 1197 3699 1050 3315  L 301 3661  Q 634 4480 1850 4480  L 1920 4480  Q 2349 4480 2672 4326  Q 2995 4173 3177 3897  Q 3360 3622 3360 3251  L 3360 3168  Q 3360 2912 3248 2691  Q 3136 2470 2918 2310  Q 3475 1971 3475 1357  L 3475 1267  Q 3475 634 3059 278  Q 2643 -77 1894 -77  L 1811 -77  z " transform="scale(0.015625)" />
+     </defs>
+     <use xlink:href="#NVIDIASans-Bold-90" />
+     <use xlink:href="#NVIDIASans-Bold-8b" transform="translate(72.40625 0)" />
+     <use xlink:href="#NVIDIASans-Bold-23" transform="translate(140.109375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-20" transform="translate(200.109375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-20" transform="translate(260.109375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-3" transform="translate(320.109375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-3" transform="translate(345.109375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-21" transform="translate(370.109375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-6" transform="translate(430.109375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-26" transform="translate(455.609375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-23" transform="translate(515.609375 0)" />
+     <use xlink:href="#NVIDIASans-Bold-26" transform="translate(575.609375 0)" />
+    </g>
+   </g>
+   <g id="text_22">
+
+    <g style="fill: #1e1e1e" transform="translate(760.823077 176.081061) scale(0.115 -0.115)">
+     <use xlink:href="#NVIDIASans-Regular-21" />
+     <use xlink:href="#NVIDIASans-Regular-4" transform="translate(60 0)" />
+     <use xlink:href="#NVIDIASans-Regular-25" transform="translate(82.59375 0)" />
+     <use xlink:href="#NVIDIASans-Regular-65" transform="translate(142.59375 0)" />
+     <use xlink:href="#NVIDIASans-Regular-3" transform="translate(202.59375 0)" />
+     <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(228.390625 0)" />
+     <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(279.296875 0)" />
+     <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(303.296875 0)" />
+     <use xlink:href="#NVIDIASans-Regular-a6" transform="translate(363.09375 0)" />
+     <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(416 0)" />
+     <use xlink:href="#NVIDIASans-Regular-3" transform="translate(471.203125 0)" />
+     <use xlink:href="#NVIDIASans-Regular-22" transform="translate(497 0)" />
+     <use xlink:href="#NVIDIASans-Regular-25" transform="translate(557 0)" />
+     <use xlink:href="#NVIDIASans-Regular-4" transform="translate(617 0)" />
+     <use xlink:href="#NVIDIASans-Regular-21" transform="translate(639.59375 0)" />
+     <use xlink:href="#NVIDIASans-Regular-21" transform="translate(699.59375 0)" />
+    </g>
+   </g>
+  </g>
+  <g id="text_23">
+
+   <g style="fill: #1e1e1e" transform="translate(81 40.896) scale(0.23 -0.23)">
+    <defs>
+     <path id="NVIDIASans-Bold-8d" d="M 531 0  L 531 4480  L 2317 4480  Q 2995 4480 3459 4217  Q 3923 3955 4163 3481  Q 4403 3008 4403 2368  L 4403 2118  Q 4403 1133 3865 566  Q 3328 0 2317 0  L 531 0  z M 1466 806  L 2291 806  Q 2861 806 3165 1123  Q 3469 1440 3469 2099  L 3469 2387  Q 3469 3021 3165 3347  Q 2861 3674 2291 3674  L 1466 3674  L 1466 806  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-a8" d="M 1830 -90  Q 1075 -90 659 339  Q 243 768 243 1549  L 243 1741  Q 243 2522 665 2957  Q 1088 3392 1830 3392  L 1882 3392  Q 2586 3392 2979 2966  Q 3373 2541 3373 1792  L 3373 1389  L 1126 1389  Q 1171 627 1830 627  L 1920 627  Q 2426 627 2630 966  L 3277 538  Q 3098 243 2742 76  Q 2387 -90 1926 -90  L 1830 -90  z M 1133 1990  L 2502 1990  L 2502 2010  Q 2502 2675 1882 2675  L 1830 2675  Q 1216 2675 1133 1990  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-b3" d="M 416 -1280  L 416 3302  L 1197 3302  L 1197 2893  Q 1536 3392 2240 3392  L 2285 3392  Q 2688 3392 2998 3203  Q 3309 3014 3485 2646  Q 3661 2278 3661 1741  L 3661 1549  Q 3661 1024 3485 656  Q 3309 288 2998 99  Q 2688 -90 2285 -90  L 2240 -90  Q 1645 -90 1312 307  L 1312 -1280  L 416 -1280  z M 1997 678  L 2048 678  Q 2355 678 2560 883  Q 2765 1088 2765 1542  L 2765 1754  Q 2765 2208 2560 2416  Q 2355 2624 2048 2624  L 1997 2624  Q 1830 2624 1667 2537  Q 1504 2451 1401 2262  Q 1299 2074 1299 1754  L 1299 1549  Q 1299 1235 1404 1043  Q 1510 851 1673 764  Q 1837 678 1997 678  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-9c" d="M 1965 -90  Q 563 -90 179 902  L 966 1306  Q 1190 710 1965 710  L 2048 710  Q 2861 710 2861 1235  L 2861 1299  Q 2861 1504 2720 1651  Q 2579 1798 2317 1830  L 1619 1914  Q 979 1990 646 2313  Q 314 2637 314 3194  L 314 3270  Q 314 3667 518 3958  Q 723 4250 1097 4410  Q 1472 4570 1978 4570  L 2074 4570  Q 2688 4570 3110 4323  Q 3533 4077 3718 3610  L 2899 3264  Q 2726 3770 2067 3770  L 1984 3770  Q 1638 3770 1443 3635  Q 1248 3501 1248 3277  L 1248 3213  Q 1248 2822 1786 2752  L 2483 2669  Q 3136 2592 3465 2240  Q 3795 1888 3795 1325  L 3795 1248  Q 3795 608 3347 259  Q 2899 -90 2061 -90  L 1965 -90  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-ae" d="M 416 0  L 416 4672  L 1312 4672  L 1312 2131  L 2502 3302  L 3603 3302  L 2298 2054  L 3699 0  L 2624 0  L 1658 1485  L 1312 1152  L 1312 0  L 416 0  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-72" d="M 442 1446  L 442 2285  L 2374 2285  L 2374 1446  L 442 1446  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-9f" d="M 1741 0  L 77 4480  L 1088 4480  L 2189 1178  L 3290 4480  L 4250 4480  L 2579 0  L 1741 0  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-b7" d="M 2003 -38  Q 1318 -38 1033 256  Q 749 550 749 1133  L 749 2554  L 58 2554  L 58 3302  L 749 3302  L 749 4243  L 1645 4243  L 1645 3302  L 2662 3302  L 2554 2554  L 1645 2554  L 1645 1165  Q 1645 928 1763 822  Q 1882 717 2086 717  L 2662 717  L 2662 -38  L 2003 -38  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-b5" d="M 416 0  L 416 3302  L 1197 3302  L 1197 2739  Q 1331 3027 1536 3184  Q 1741 3341 2093 3341  L 2445 3341  L 2445 2515  L 2125 2515  Q 1933 2515 1747 2438  Q 1562 2362 1437 2173  Q 1312 1984 1312 1651  L 1312 0  L 416 0  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-a4" d="M 1370 -90  Q 838 -90 547 172  Q 256 435 256 909  Q 256 1344 521 1606  Q 787 1869 1293 1933  L 2330 2067  L 2330 2093  Q 2330 2675 1798 2675  L 1734 2675  Q 1498 2675 1338 2588  Q 1178 2502 1069 2285  L 384 2643  Q 531 2982 880 3187  Q 1229 3392 1728 3392  L 1824 3392  Q 3226 3392 3226 2080  L 3226 0  L 2445 0  L 2445 416  Q 2291 179 2019 44  Q 1747 -90 1402 -90  L 1370 -90  z M 2330 1466  L 1645 1370  Q 1350 1325 1235 1245  Q 1120 1165 1120 986  Q 1120 813 1251 713  Q 1382 614 1600 614  L 1651 614  Q 1971 614 2150 800  Q 2330 986 2330 1306  L 2330 1466  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-ac" d="M 416 0  L 416 3302  L 1312 3302  L 1312 0  L 416 0  z M 403 3770  L 403 4666  L 1325 4666  L 1325 3770  L 403 3770  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-b1" d="M 416 0  L 416 3302  L 1197 3302  L 1197 2893  Q 1363 3130 1622 3261  Q 1882 3392 2202 3392  L 2266 3392  Q 2829 3392 3158 3043  Q 3488 2694 3488 2048  L 3488 0  L 2592 0  L 2592 1926  Q 2592 2259 2454 2441  Q 2317 2624 2022 2624  L 1971 2624  Q 1811 2624 1660 2541  Q 1510 2458 1411 2285  Q 1312 2112 1312 1830  L 1312 0  L 416 0  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-aa" d="M 1760 -1370  Q 1274 -1370 950 -1216  Q 627 -1062 442 -755  L 1069 -275  Q 1197 -467 1360 -547  Q 1523 -627 1798 -627  L 1875 -627  Q 2592 -627 2592 218  L 2592 422  Q 2259 26 1670 26  L 1619 26  Q 1210 26 899 227  Q 589 429 416 790  Q 243 1152 243 1632  L 243 1786  Q 243 2266 416 2627  Q 589 2989 899 3190  Q 1210 3392 1619 3392  L 1670 3392  Q 2374 3392 2707 2893  L 2707 3296  L 3488 3296  L 3488 250  Q 3488 -531 3078 -950  Q 2669 -1370 1907 -1370  L 1760 -1370  z M 1850 794  L 1907 794  Q 2214 794 2409 1024  Q 2605 1254 2605 1626  L 2605 1792  Q 2605 2163 2409 2393  Q 2214 2624 1907 2624  L 1850 2624  Q 1517 2624 1328 2403  Q 1139 2182 1139 1792  L 1139 1632  Q 1139 1242 1328 1018  Q 1517 794 1850 794  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-a9" d="M 787 0  L 787 2554  L 128 2554  L 128 3302  L 787 3302  L 787 3443  Q 787 4058 1094 4384  Q 1402 4710 2118 4710  L 2688 4710  L 2688 3955  L 2150 3955  Q 1901 3955 1792 3830  Q 1683 3706 1683 3475  L 1683 3302  L 2688 3302  L 2579 2554  L 1683 2554  L 1683 0  L 787 0  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-b2" d="M 1856 -90  Q 1395 -90 1030 102  Q 666 294 454 662  Q 243 1030 243 1555  L 243 1747  Q 243 2278 454 2643  Q 666 3008 1030 3200  Q 1395 3392 1856 3392  L 1901 3392  Q 2362 3392 2726 3200  Q 3091 3008 3302 2643  Q 3514 2278 3514 1747  L 3514 1555  Q 3514 1030 3302 662  Q 3091 294 2726 102  Q 2362 -90 1901 -90  L 1856 -90  z M 1856 678  L 1901 678  Q 2214 678 2416 883  Q 2618 1088 2618 1536  L 2618 1766  Q 2618 2214 2416 2419  Q 2214 2624 1901 2624  L 1856 2624  Q 1542 2624 1340 2419  Q 1139 2214 1139 1766  L 1139 1536  Q 1139 1088 1340 883  Q 1542 678 1856 678  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-b0" d="M 416 0  L 416 3302  L 1197 3302  L 1197 2899  Q 1357 3136 1600 3264  Q 1843 3392 2150 3392  L 2214 3392  Q 2906 3392 3206 2854  Q 3373 3110 3632 3251  Q 3891 3392 4224 3392  L 4288 3392  Q 4826 3392 5142 3043  Q 5459 2694 5459 2048  L 5459 0  L 4563 0  L 4563 1926  Q 4563 2259 4438 2441  Q 4314 2624 4045 2624  L 3994 2624  Q 3776 2624 3581 2435  Q 3386 2246 3386 1830  L 3386 0  L 2490 0  L 2490 1926  Q 2490 2259 2365 2441  Q 2240 2624 1971 2624  L 1920 2624  Q 1702 2624 1507 2435  Q 1312 2246 1312 1830  L 1312 0  L 416 0  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-a6" d="M 1862 -90  Q 1120 -90 681 332  Q 243 755 243 1555  L 243 1747  Q 243 2272 444 2640  Q 646 3008 1011 3200  Q 1376 3392 1862 3392  L 1914 3392  Q 2394 3392 2723 3161  Q 3053 2931 3194 2554  L 2470 2246  Q 2394 2413 2256 2518  Q 2118 2624 1914 2624  L 1869 2624  Q 1542 2624 1340 2416  Q 1139 2208 1139 1766  L 1139 1536  Q 1139 1082 1334 880  Q 1530 678 1869 678  L 1914 678  Q 2138 678 2285 774  Q 2432 870 2515 1037  L 3213 672  Q 3072 346 2733 128  Q 2394 -90 1914 -90  L 1862 -90  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-af" d="M 416 0  L 416 4672  L 1312 4672  L 1312 0  L 416 0  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-ba" d="M 205 3302  L 1152 3302  L 1702 1120  L 2304 3302  L 3098 3302  L 3686 1171  L 4237 3302  L 5126 3302  L 4115 0  L 3302 0  L 2669 2208  L 2029 0  L 1216 0  L 205 3302  z " transform="scale(0.015625)" />
+    </defs>
+    <use xlink:href="#NVIDIASans-Bold-8d" />
+    <use xlink:href="#NVIDIASans-Bold-a8" transform="translate(73 0)" />
+    <use xlink:href="#NVIDIASans-Bold-a8" transform="translate(129.09375 0)" />
+    <use xlink:href="#NVIDIASans-Bold-b3" transform="translate(185.1875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-9c" transform="translate(246.1875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-a8" transform="translate(308.390625 0)" />
+    <use xlink:href="#NVIDIASans-Bold-a8" transform="translate(364.484375 0)" />
+    <use xlink:href="#NVIDIASans-Bold-ae" transform="translate(420.578125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-72" transform="translate(479.078125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-9f" transform="translate(517.578125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-23" transform="translate(585.171875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-3" transform="translate(645.171875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-b7" transform="translate(670.171875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-b5" transform="translate(715.96875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-a4" transform="translate(754.96875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-ac" transform="translate(811.265625 0)" />
+    <use xlink:href="#NVIDIASans-Bold-b1" transform="translate(838.265625 0)" />
+    <use xlink:href="#NVIDIASans-Bold-ac" transform="translate(898.671875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-b1" transform="translate(925.671875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-aa" transform="translate(986.078125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-3" transform="translate(1047.078125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-b3" transform="translate(1072.078125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-a8" transform="translate(1133.078125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-b5" transform="translate(1189.171875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-a9" transform="translate(1230.171875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-b2" transform="translate(1271.765625 0)" />
+    <use xlink:href="#NVIDIASans-Bold-b5" transform="translate(1330.46875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-b0" transform="translate(1369.46875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-a4" transform="translate(1460.671875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-b1" transform="translate(1516.96875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-a6" transform="translate(1577.375 0)" />
+    <use xlink:href="#NVIDIASans-Bold-a8" transform="translate(1630.375 0)" />
+    <use xlink:href="#NVIDIASans-Bold-3" transform="translate(1686.46875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-b2" transform="translate(1711.46875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-b1" transform="translate(1770.171875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-3" transform="translate(1830.578125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-8b" transform="translate(1855.578125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-af" transform="translate(1923.28125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-a4" transform="translate(1950.28125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-a6" transform="translate(2006.578125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-ae" transform="translate(2059.578125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-ba" transform="translate(2117.078125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-a8" transform="translate(2196.875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-af" transform="translate(2252.96875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-af" transform="translate(2279.96875 0)" />
+   </g>
+  </g>
+  <g id="text_24">
+
+   <g style="fill: #666666" transform="translate(81 68.5008) scale(0.13 -0.13)">
+    <defs>
+     <path id="NVIDIASans-Regular-90" d="M 2426 -77  Q 1434 -77 918 480  Q 403 1037 403 2086  L 403 2374  Q 403 3053 636 3542  Q 870 4032 1302 4297  Q 1734 4563 2323 4563  L 2400 4563  Q 3008 4563 3430 4297  Q 3853 4032 4038 3526  L 3552 3360  Q 3296 4090 2400 4090  L 2323 4090  Q 1664 4090 1299 3642  Q 934 3194 934 2381  L 934 2067  Q 934 390 2426 390  L 2502 390  Q 3168 390 3597 646  L 3597 1882  L 2458 1882  L 2522 2330  L 4109 2330  L 4109 403  Q 3827 186 3420 54  Q 3014 -77 2509 -77  L 2426 -77  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Regular-9e" d="M 3968 4480  L 3968 1754  Q 3968 890 3526 406  Q 3085 -77 2259 -77  L 2176 -77  Q 1350 -77 908 406  Q 467 890 467 1754  L 467 4480  L 998 4480  L 998 1741  Q 998 1075 1299 732  Q 1600 390 2182 390  L 2253 390  Q 2835 390 3136 732  Q 3437 1075 3437 1741  L 3437 4480  L 3968 4480  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Regular-b3" d="M 512 -1280  L 512 3258  L 979 3258  L 979 2701  Q 1126 2989 1404 3161  Q 1683 3334 2080 3334  L 2125 3334  Q 2534 3334 2848 3152  Q 3162 2970 3344 2614  Q 3526 2259 3526 1747  L 3526 1510  Q 3526 998 3344 643  Q 3162 288 2848 105  Q 2534 -77 2125 -77  L 2080 -77  Q 1715 -77 1443 76  Q 1171 230 1024 493  L 1024 -1280  L 512 -1280  z M 1984 365  L 2042 365  Q 2458 365 2736 646  Q 3014 928 3014 1517  L 3014 1747  Q 3014 2336 2736 2614  Q 2458 2893 2042 2893  L 1984 2893  Q 1722 2893 1501 2771  Q 1280 2650 1152 2394  Q 1024 2138 1024 1728  L 1024 1530  Q 1024 922 1305 643  Q 1587 365 1984 365  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Regular-94" d="M 608 0  L 608 4480  L 1139 4480  L 1139 2176  L 3334 4480  L 4000 4480  L 2246 2669  L 4083 0  L 3469 0  L 1894 2323  L 1139 1530  L 1139 0  L 608 0  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Regular-b4" d="M 2835 -1280  L 2835 493  Q 2682 230 2413 76  Q 2144 -77 1773 -77  L 1734 -77  Q 1331 -77 1014 105  Q 698 288 515 643  Q 333 998 333 1510  L 333 1741  Q 333 2259 515 2614  Q 698 2970 1014 3152  Q 1331 3334 1734 3334  L 1773 3334  Q 2176 3334 2454 3158  Q 2733 2982 2880 2694  L 2880 3258  L 3347 3258  L 3347 -1280  L 2835 -1280  z M 1818 365  L 1875 365  Q 2138 365 2355 486  Q 2573 608 2704 864  Q 2835 1120 2835 1523  L 2835 1728  Q 2835 2138 2704 2394  Q 2573 2650 2355 2771  Q 2138 2893 1875 2893  L 1818 2893  Q 1402 2893 1123 2611  Q 845 2330 845 1741  L 845 1510  Q 845 928 1123 646  Q 1402 365 1818 365  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Regular-aa" d="M 1805 -1370  Q 858 -1370 525 -762  L 896 -493  Q 1037 -723 1248 -828  Q 1459 -934 1811 -934  L 1907 -934  Q 2822 -934 2822 77  L 2822 570  Q 2509 13 1773 13  L 1734 13  Q 1312 13 998 208  Q 685 403 509 755  Q 333 1107 333 1574  L 333 1779  Q 333 2246 509 2595  Q 685 2944 998 3139  Q 1312 3334 1734 3334  L 1773 3334  Q 2579 3334 2880 2694  L 2880 3251  L 3347 3251  L 3347 83  Q 3347 -614 2976 -992  Q 2605 -1370 1920 -1370  L 1805 -1370  z M 1818 454  L 1875 454  Q 2323 454 2579 761  Q 2835 1069 2835 1600  L 2835 1754  Q 2835 2285 2579 2589  Q 2323 2893 1875 2893  L 1818 2893  Q 1370 2893 1107 2589  Q 845 2285 845 1773  L 845 1574  Q 845 1062 1107 758  Q 1370 454 1818 454  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Regular-b7" d="M 1862 -26  Q 1299 -26 1062 236  Q 826 499 826 954  L 826 2835  L 128 2835  L 128 3258  L 826 3258  L 826 4243  L 1338 4243  L 1338 3258  L 2464 3258  L 2394 2835  L 1338 2835  L 1338 986  Q 1338 678 1478 540  Q 1619 403 1914 403  L 2464 403  L 2464 -26  L 1862 -26  z " transform="scale(0.015625)" />
+    </defs>
+    <use xlink:href="#NVIDIASans-Regular-22" />
+    <use xlink:href="#NVIDIASans-Regular-25" transform="translate(60 0)" />
+    <use xlink:href="#NVIDIASans-Regular-26" transform="translate(120 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(180 0)" />
+    <use xlink:href="#NVIDIASans-Regular-90" transform="translate(205.796875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-99" transform="translate(277 0)" />
+    <use xlink:href="#NVIDIASans-Regular-9e" transform="translate(341.59375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(410.59375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(461.5 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b3" transform="translate(487.296875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(547.59375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(602.796875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(642.5 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(668.296875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b8" transform="translate(708 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(766.59375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-6" transform="translate(826.390625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(848.984375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-24" transform="translate(874.78125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-94" transform="translate(934.78125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(999.984375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(1025.78125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1076.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b4" transform="translate(1131.890625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b8" transform="translate(1192.1875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1250.78125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(1305.984375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a6" transform="translate(1365.78125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1418.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(1473.890625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-af" transform="translate(1499.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1523.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(1578.890625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-aa" transform="translate(1638.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b7" transform="translate(1698.1875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ab" transform="translate(1741.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-6" transform="translate(1801.484375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(1824.078125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(1849.875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1900.78125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-af" transform="translate(1955.984375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1979.984375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a6" transform="translate(2035.1875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b7" transform="translate(2087.1875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(2129.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a7" transform="translate(2184.890625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(2245.1875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b3" transform="translate(2270.984375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b8" transform="translate(2331.28125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a5" transform="translate(2389.875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-af" transform="translate(2450.171875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(2474.171875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(2497.375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ab" transform="translate(2548.28125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(2608.078125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a7" transform="translate(2663.28125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(2723.578125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b7" transform="translate(2749.375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(2792.171875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a4" transform="translate(2829.078125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(2883.375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(2907.375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(2967.171875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(2991.171875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-aa" transform="translate(3050.96875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(3111.265625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(3137.0625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(3173.96875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a6" transform="translate(3229.171875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(3282.078125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b3" transform="translate(3306.078125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(3366.375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(3421.578125 0)" />
+   </g>
+  </g>
+  <g id="text_25">
+
+   <g style="fill: #1e1e1e" transform="translate(81 100.7064) scale(0.12 -0.12)">
+    <defs>
+     <path id="NVIDIASans-Bold-96" d="M 531 0  L 531 4480  L 1696 4480  L 2976 1235  L 4256 4480  L 5389 4480  L 5389 0  L 4499 0  L 4499 3021  L 3296 0  L 2624 0  L 1421 3021  L 1421 0  L 531 0  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-a7" d="M 1619 -90  Q 1222 -90 908 99  Q 595 288 419 659  Q 243 1030 243 1562  L 243 1754  Q 243 2285 419 2649  Q 595 3014 908 3203  Q 1222 3392 1619 3392  L 1664 3392  Q 2259 3392 2592 2995  L 2592 4672  L 3488 4672  L 3488 0  L 2707 0  L 2707 410  Q 2368 -90 1664 -90  L 1619 -90  z M 1856 678  L 1907 678  Q 2080 678 2240 764  Q 2400 851 2502 1043  Q 2605 1235 2605 1549  L 2605 1754  Q 2605 2067 2499 2259  Q 2394 2451 2234 2537  Q 2074 2624 1907 2624  L 1856 2624  Q 1549 2624 1344 2419  Q 1139 2214 1139 1760  L 1139 1549  Q 1139 1094 1344 886  Q 1549 678 1856 678  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-9d" d="M 1440 0  L 1440 3674  L 96 3674  L 96 4480  L 3718 4480  L 3718 3674  L 2374 3674  L 2374 0  L 1440 0  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-8f" d="M 531 0  L 531 4480  L 3507 4480  L 3507 3686  L 1466 3686  L 1466 2541  L 3110 2541  L 3002 1747  L 1466 1747  L 1466 0  L 531 0  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-95" d="M 531 0  L 531 4480  L 1466 4480  L 1466 806  L 3418 806  L 3418 0  L 531 0  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-98" d="M 2406 -90  Q 1754 -90 1290 179  Q 826 448 579 941  Q 333 1434 333 2112  L 333 2368  Q 333 3046 579 3539  Q 826 4032 1290 4301  Q 1754 4570 2406 4570  L 2470 4570  Q 3123 4570 3587 4301  Q 4051 4032 4297 3539  Q 4544 3046 4544 2368  L 4544 2112  Q 4544 1434 4297 941  Q 4051 448 3587 179  Q 3123 -90 2470 -90  L 2406 -90  z M 2413 730  L 2464 730  Q 2989 730 3299 1069  Q 3610 1408 3610 2093  L 3610 2387  Q 3610 3072 3299 3411  Q 2989 3750 2464 3750  L 2413 3750  Q 1888 3750 1577 3411  Q 1267 3072 1267 2387  L 1267 2093  Q 1267 1408 1577 1069  Q 1888 730 2413 730  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-99" d="M 531 0  L 531 4480  L 2227 4480  Q 2746 4480 3126 4304  Q 3507 4128 3715 3805  Q 3923 3482 3923 3027  L 3923 2906  Q 3923 2208 3462 1827  Q 3002 1446 2227 1446  L 1466 1446  L 1466 0  L 531 0  z M 1466 2253  L 2202 2253  Q 2534 2253 2761 2400  Q 2989 2547 2989 2886  L 2989 3046  Q 2989 3373 2761 3523  Q 2534 3674 2202 3674  L 1466 3674  L 1466 2253  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-7c" d="M 960 -832  L 32 -832  L 1645 4928  L 2573 4928  L 960 -832  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-b6" d="M 1645 -90  Q 493 -90 192 666  L 890 1018  Q 979 826 1158 733  Q 1338 640 1651 640  L 1734 640  Q 2285 640 2285 928  L 2285 954  Q 2285 1197 1965 1242  L 1299 1331  Q 813 1402 553 1648  Q 294 1894 294 2310  L 294 2374  Q 294 2848 656 3120  Q 1018 3392 1619 3392  L 1715 3392  Q 2214 3392 2560 3197  Q 2906 3002 3059 2643  L 2349 2330  Q 2195 2662 1709 2662  L 1626 2662  Q 1158 2662 1158 2387  L 1158 2362  Q 1158 2259 1228 2198  Q 1299 2138 1459 2112  L 2150 2016  Q 2630 1952 2889 1680  Q 3149 1408 3149 992  L 3149 928  Q 3149 422 2790 166  Q 2432 -90 1741 -90  L 1645 -90  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Bold-9e" d="M 4128 4480  L 4128 1760  Q 4128 883 3654 396  Q 3181 -90 2304 -90  L 2240 -90  Q 1370 -90 893 396  Q 416 883 416 1760  L 416 4480  L 1350 4480  L 1350 1741  Q 1350 1210 1587 970  Q 1824 730 2246 730  L 2298 730  Q 2720 730 2957 970  Q 3194 1210 3194 1741  L 3194 4480  L 4128 4480  z " transform="scale(0.015625)" />
+    </defs>
+    <use xlink:href="#NVIDIASans-Bold-96" />
+    <use xlink:href="#NVIDIASans-Bold-b2" transform="translate(92.5 0)" />
+    <use xlink:href="#NVIDIASans-Bold-a7" transform="translate(151.203125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-a8" transform="translate(212.203125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-af" transform="translate(268.296875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-3" transform="translate(295.296875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-9d" transform="translate(320.296875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-8f" transform="translate(379.890625 0)" />
+    <use xlink:href="#NVIDIASans-Bold-95" transform="translate(438.796875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-98" transform="translate(495.796875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-99" transform="translate(572 0)" />
+    <use xlink:href="#NVIDIASans-Bold-7c" transform="translate(631.5 0)" />
+    <use xlink:href="#NVIDIASans-Bold-b6" transform="translate(668.203125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-7c" transform="translate(720.109375 0)" />
+    <use xlink:href="#NVIDIASans-Bold-90" transform="translate(760.8125 0)" />
+    <use xlink:href="#NVIDIASans-Bold-99" transform="translate(833.21875 0)" />
+    <use xlink:href="#NVIDIASans-Bold-9e" transform="translate(898.71875 0)" />
+   </g>
+  </g>
+  <g id="text_26">
+
+   <g style="fill: #666666" transform="translate(81 460.08) scale(0.11 -0.11)">
+    <defs>
+     <path id="NVIDIASans-Regular-7" d="M 506 -902  L 314 -653  L 493 -512  Q 614 -422 659 -352  Q 704 -282 704 -115  L 704 0  L 422 0  L 422 646  L 1024 646  L 1024 -115  Q 1024 -294 989 -406  Q 954 -518 874 -601  Q 794 -685 653 -794  L 506 -902  z M 422 2611  L 422 3257  L 1024 3257  L 1024 2611  L 422 2611  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Regular-b2" d="M 1818 -77  Q 1395 -77 1059 112  Q 723 301 528 659  Q 333 1018 333 1517  L 333 1741  Q 333 2240 528 2598  Q 723 2957 1059 3145  Q 1395 3334 1818 3334  L 1882 3334  Q 2310 3334 2646 3145  Q 2982 2957 3177 2601  Q 3373 2246 3373 1747  L 3373 1510  Q 3373 1011 3177 656  Q 2982 301 2646 112  Q 2310 -77 1882 -77  L 1818 -77  z M 1824 365  L 1875 365  Q 2291 365 2576 653  Q 2861 941 2861 1510  L 2861 1747  Q 2861 2317 2576 2605  Q 2291 2893 1875 2893  L 1824 2893  Q 1414 2893 1129 2605  Q 845 2317 845 1747  L 845 1510  Q 845 941 1129 653  Q 1414 365 1824 365  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Regular-c5" d="M 902 0  L 902 2835  L 224 2835  L 224 3258  L 902 3258  L 902 3584  Q 902 4102 1167 4403  Q 1433 4704 2016 4704  L 2541 4704  L 2541 4269  L 2035 4269  Q 1709 4269 1561 4099  Q 1414 3930 1414 3603  L 1414 3258  L 2541 3258  L 2483 2835  L 1414 2835  L 1414 0  L 902 0  z M 3136 0  L 3136 3258  L 3648 3258  L 3648 0  L 3136 0  z M 3123 3942  L 3123 4525  L 3661 4525  L 3661 3942  L 3123 3942  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Regular-b9" d="M 1402 0  L 115 3258  L 646 3258  L 1632 640  L 2611 3258  L 3123 3258  L 1837 0  L 1402 0  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Regular-bc" d="M 397 -1280  L 397 -851  L 576 -851  Q 877 -851 1033 -716  Q 1190 -582 1331 -198  L 1402 -6  L 115 3258  L 659 3258  L 1670 538  L 2637 3258  L 3155 3258  L 1837 -218  Q 1683 -634 1523 -867  Q 1363 -1101 1152 -1190  Q 941 -1280 627 -1280  L 397 -1280  z " transform="scale(0.015625)" />
+    </defs>
+    <use xlink:href="#NVIDIASans-Regular-99" />
+    <use xlink:href="#NVIDIASans-Regular-b8" transform="translate(59.59375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a5" transform="translate(118.1875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-af" transform="translate(178.484375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(202.484375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(225.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ab" transform="translate(276.59375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(336.390625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a7" transform="translate(391.59375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(451.890625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b7" transform="translate(477.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(520.484375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a4" transform="translate(557.390625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(611.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(635.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(695.484375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(719.484375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-aa" transform="translate(779.28125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(839.578125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(865.375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(902.28125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a6" transform="translate(957.484375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(1010.390625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b3" transform="translate(1034.390625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1094.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(1149.890625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-7" transform="translate(1200 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(1222.59375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a6" transform="translate(1248.390625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b2" transform="translate(1301.296875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(1359.09375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-c5" transform="translate(1418.890625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-aa" transform="translate(1483.890625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b8" transform="translate(1544.1875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(1602.78125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a4" transform="translate(1639.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b7" transform="translate(1692.484375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(1734.984375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b2" transform="translate(1758.984375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(1816.78125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(1876.578125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(1927.484375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b9" transform="translate(1953.28125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a4" transform="translate(2002.375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(2056.671875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-bc" transform="translate(2098.171875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(2149.265625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a4" transform="translate(2175.0625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a6" transform="translate(2229.359375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(2281.96875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b2" transform="translate(2318.875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(2376.671875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(2426.578125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(2477.484375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b9" transform="translate(2503.28125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(2552.375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(2607.578125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(2646.28125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(2697.1875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b2" transform="translate(2721.1875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(2778.984375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(2838.78125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-4" transform="translate(2889.6875 0)" />
+   </g>
+  </g>
+  <g id="text_27">
+
+   <g style="fill: #666666" transform="translate(81 483.084) scale(0.105 -0.105)">
+    <defs>
+     <path id="NVIDIASans-Regular-9c" d="M 1997 -77  Q 691 -77 288 890  L 742 1126  Q 896 755 1200 569  Q 1504 384 1990 384  L 2061 384  Q 2592 384 2877 585  Q 3162 787 3162 1152  L 3162 1222  Q 3162 1536 2982 1728  Q 2803 1920 2400 1990  L 1581 2125  Q 422 2317 422 3290  L 422 3373  Q 422 3725 617 3993  Q 813 4262 1158 4412  Q 1504 4563 1958 4563  L 2048 4563  Q 2624 4563 3030 4326  Q 3437 4090 3616 3648  L 3149 3450  Q 2906 4096 2042 4096  L 1965 4096  Q 1491 4096 1219 3901  Q 947 3706 947 3373  L 947 3296  Q 947 3002 1126 2838  Q 1306 2675 1696 2605  L 2515 2470  Q 3104 2374 3398 2057  Q 3693 1741 3693 1229  L 3693 1152  Q 3693 582 3261 252  Q 2829 -77 2080 -77  L 1997 -77  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Regular-a9" d="M 896 0  L 896 2835  L 218 2835  L 218 3258  L 896 3258  L 896 3584  Q 896 4102 1165 4403  Q 1434 4704 2016 4704  L 2560 4704  L 2560 4269  L 2029 4269  Q 1709 4269 1558 4099  Q 1408 3930 1408 3603  L 1408 3258  L 2560 3258  L 2496 2835  L 1408 2835  L 1408 0  L 896 0  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Regular-9b" d="M 608 0  L 608 4480  L 2125 4480  Q 2906 4480 3328 4150  Q 3750 3821 3750 3219  L 3750 3072  Q 3750 2618 3507 2314  Q 3264 2010 2803 1888  L 3872 0  L 3283 0  L 2272 1805  Q 2202 1805 2125 1805  L 1139 1805  L 1139 0  L 608 0  z M 1139 2259  L 2118 2259  Q 2650 2259 2934 2454  Q 3219 2650 3219 3053  L 3219 3232  Q 3219 3629 2934 3827  Q 2650 4026 2118 4026  L 1139 4026  L 1139 2259  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Regular-8e" d="M 608 0  L 608 4480  L 3386 4480  L 3386 4026  L 1139 4026  L 1139 2496  L 2963 2496  L 2906 2048  L 1139 2048  L 1139 454  L 3411 454  L 3411 0  L 608 0  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Regular-8a" d="M 96 0  L 1894 4480  L 2355 4480  L 4160 0  L 3590 0  L 3162 1107  L 1069 1107  L 640 0  L 96 0  z M 1242 1555  L 2982 1555  L 2112 3802  L 1242 1555  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Regular-8d" d="M 608 0  L 608 4480  L 2240 4480  Q 3213 4480 3741 3923  Q 4269 3366 4269 2387  L 4269 2099  Q 4269 1114 3741 557  Q 3213 0 2240 0  L 608 0  z M 1139 461  L 2234 461  Q 2957 461 3347 877  Q 3738 1293 3738 2086  L 3738 2400  Q 3738 3194 3347 3606  Q 2957 4019 2234 4019  L 1139 4019  L 1139 461  z " transform="scale(0.015625)" />
+     <path id="NVIDIASans-Regular-96" d="M 608 0  L 608 4480  L 1210 4480  L 2938 723  L 4659 4480  L 5248 4480  L 5248 0  L 4736 0  L 4736 3514  L 3117 0  L 2739 0  L 1120 3514  L 1120 0  L 608 0  z " transform="scale(0.015625)" />
+    </defs>
+    <use xlink:href="#NVIDIASans-Regular-9c" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(62.203125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(117.40625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(172.609375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b7" transform="translate(198.40625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ab" transform="translate(241.90625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(301.703125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(356.90625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b3" transform="translate(382.703125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(443 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(498.203125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a9" transform="translate(537.90625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b2" transform="translate(577.90625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(635.703125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b0" transform="translate(674.90625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a4" transform="translate(765.609375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(819.90625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a6" transform="translate(879.703125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(932.609375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(987.8125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(1013.609375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b8" transform="translate(1063.515625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b0" transform="translate(1122.109375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b0" transform="translate(1212.8125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a4" transform="translate(1303.515625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(1357.8125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-bc" transform="translate(1399.3125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(1450.40625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-af" transform="translate(1476.203125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(1500.203125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(1524.203125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ae" transform="translate(1584 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a8" transform="translate(1637.5 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a7" transform="translate(1692.703125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(1753 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(1778.796875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(1802.796875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(1862.59375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-9b" transform="translate(1888.390625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-8e" transform="translate(1953.1875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-8a" transform="translate(2010.890625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-8d" transform="translate(2077.390625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-96" transform="translate(2150.390625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-8e" transform="translate(2241.890625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(2301.09375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a9" transform="translate(2326.890625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b2" transform="translate(2366.890625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(2424.6875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(2464.390625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a9" transform="translate(2490.1875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b8" transform="translate(2532.28125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-af" transform="translate(2590.875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-af" transform="translate(2614.875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-3" transform="translate(2638.875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a6" transform="translate(2664.671875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b2" transform="translate(2717.578125 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(2775.375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-c5" transform="translate(2835.171875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-aa" transform="translate(2900.171875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b8" transform="translate(2960.46875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b5" transform="translate(3019.0625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-a4" transform="translate(3055.96875 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b7" transform="translate(3108.765625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-ac" transform="translate(3151.265625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b2" transform="translate(3175.265625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b1" transform="translate(3233.0625 0)" />
+    <use xlink:href="#NVIDIASans-Regular-b6" transform="translate(3292.859375 0)" />
+    <use xlink:href="#NVIDIASans-Regular-4" transform="translate(3343.765625 0)" />
+   </g>
+  </g>
+ </g>
+ <defs>
+  <clipPath id="pe237bbc172">
+   <rect x="81" y="117.576" width="801" height="270.936" />
+  </clipPath>
+ </defs>
+</svg>
