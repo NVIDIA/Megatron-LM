@@ -4,13 +4,11 @@ import asyncio
 import logging
 import time
 from dataclasses import replace
-from typing import TYPE_CHECKING, Iterable, Optional
+from typing import Optional
 
+from megatron.core.inference.inference_client import abort_requests
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
-
-if TYPE_CHECKING:
-    from megatron.core.inference.inference_client import InferenceClient
 
 logger = logging.getLogger(__name__)
 
@@ -26,23 +24,6 @@ def generation_finish_reason(result: dict) -> str:
     requested = (result.get("sampling_params") or {}).get("num_tokens_to_generate")
     generated = len(result.get("generated_tokens") or [])
     return "length" if requested is not None and generated >= requested else "stop"
-
-
-def abort_requests(client: "InferenceClient", request_ids: Iterable[int], reason: str) -> None:
-    """Tell the coordinator to stop generating the given requests.
-
-    Args:
-        client: The InferenceClient the requests were submitted through.
-        request_ids: Ids from add_request_with_id.
-        reason: Logged so the abort can be told apart from a normal completion.
-    """
-    for request_id in request_ids:
-        try:
-            client.abort_request(request_id)
-        except Exception:  # pylint: disable=broad-except
-            logger.warning("Failed to abort request %s (%s)", request_id, reason, exc_info=True)
-        else:
-            logger.debug("Aborted request %s (%s)", request_id, reason)
 
 
 def validate_offload_params(offload_params) -> Optional[str]:
@@ -276,6 +257,29 @@ def submit_requests(client, submissions, *, multi_modal_data=None, offload_param
     return request_ids, tasks
 
 
+def submit_streaming_requests(client, submissions, *, multi_modal_data=None, offload_params=None):
+    """Submit each `(prompt_tokens, sampling_params)` pair as a stream; return the streams.
+
+    If a submission fails, the streams admitted before it are aborted before the error propagates;
+    otherwise they would generate unread, because their generator is never started.
+    """
+    streams = []
+    try:
+        for prompt_tokens, sampling_params in submissions:
+            streams.append(
+                client.add_request_streaming(
+                    prompt_tokens,
+                    sampling_params,
+                    multi_modal_data=multi_modal_data,
+                    offload_params=offload_params,
+                )
+            )
+    except Exception as e:
+        abort_requests(client, [s.request_id for s in streams], f"submission failed: {e}")
+        raise
+    return streams
+
+
 async def run_inference(client, request_ids, tasks, verbose, log_label=""):
     """Await inference tasks with optional timing. Re-raises exceptions."""
     start_time = time.perf_counter()
@@ -283,6 +287,12 @@ async def run_inference(client, request_ids, tasks, verbose, log_label=""):
         batch_results = await asyncio.gather(*tasks)
     except asyncio.CancelledError:
         abort_requests(client, request_ids, "client disconnected")
+        raise
+    except Exception as e:
+        # gather returns as soon as one request raises, but does not cancel the remaining engine
+        # work. Abort every admitted request: completed IDs are harmless no-ops at the client,
+        # while pending siblings would otherwise keep generating after this HTTP response ends.
+        abort_requests(client, request_ids, f"inference failed: {e}")
         raise
     if verbose:
         label = f" {log_label}" if log_label else ""

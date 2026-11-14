@@ -4,7 +4,7 @@ import asyncio
 import functools
 import logging
 import time
-from typing import List, Optional, Union
+from typing import Iterable, List, Optional, Union
 
 import torch
 
@@ -35,6 +35,8 @@ try:
 except:
     HAVE_MSGPACK = False
 
+logger = logging.getLogger(__name__)
+
 
 class InferenceRequestError(RuntimeError):
     """Terminal request failure reported by the inference coordinator."""
@@ -46,6 +48,23 @@ class InferenceRequestError(RuntimeError):
 
 class InferenceRequestAborted(InferenceRequestError):
     """The local consumer cancelled; remote source-safety still requires an ACK."""
+
+
+def abort_requests(client: "InferenceClient", request_ids: Iterable[int], reason: str) -> None:
+    """Tell the coordinator to stop generating the given requests.
+
+    Args:
+        client: The InferenceClient the requests were submitted through.
+        request_ids: Ids from add_request_with_id.
+        reason: Logged so the abort can be told apart from a normal completion.
+    """
+    for request_id in request_ids:
+        try:
+            client.abort_request(request_id)
+        except Exception:  # pylint: disable=broad-except
+            logger.warning("Failed to abort request %s (%s)", request_id, reason, exc_info=True)
+        else:
+            logger.debug("Aborted request %s (%s)", request_id, reason)
 
 
 class InferenceClient:
@@ -451,26 +470,22 @@ class InferenceClient:
 
     def _send_abort(self, request_id: int) -> None:
         request_id = int(request_id)
+        if (
+            request_id not in self._pending_source_requests
+            or request_id in self.aborted_request_ids
+        ):
+            return
         stream = self.streams.pop(request_id, None)
         future = self.completion_futures.pop(request_id, None)
-        abort_future = self.abort_futures.get(request_id)
-        if stream is None and future is None and abort_future is None:
-            # Already completed (or never submitted): _submit_request and
-            # _submit_stream register synchronously and _recv_task pops only
-            # immediately before delivering, so absence from both means the
-            # reply has been consumed. No further ENGINE_REPLY will arrive to
-            # prune aborted_request_ids, and the coordinator has already
-            # dropped its mapping, so recording the id would leak an entry
-            # nothing ever removes and the ABORT_REQUEST send would be wasted.
-            return
         if stream is not None:
             stream.finish(exception=InferenceRequestAborted("Inference request cancelled"))
         if future is not None and not future.done():
             future.cancel()
         self.request_submission_times.pop(request_id, None)
-        self.aborted_request_ids.add(request_id)
         payload = [Headers.ABORT_REQUEST.value, request_id]
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
+        # Mark only a sent abort, so a failed send can be retried.
+        self.aborted_request_ids.add(request_id)
 
     def _new_abort_future(self, request_id: int) -> asyncio.Future:
         """Create a future for the request's source-safety acknowledgement."""
@@ -540,7 +555,11 @@ class InferenceClient:
     def _submit_request(self, frames: list, request_id: int) -> asyncio.Future:
         """Send a prepared request and register its completion future."""
         self._pending_source_requests.add(request_id)
-        self.socket.send_multipart(frames)
+        try:
+            self.socket.send_multipart(frames)
+        except Exception:  # pylint: disable=broad-except
+            self._pending_source_requests.discard(request_id)
+            raise
         assert request_id not in self.completion_futures
         future = asyncio.get_running_loop().create_future()
         self.completion_futures[request_id] = future
@@ -550,7 +569,11 @@ class InferenceClient:
     def _submit_stream(self, frames: list, request_id: int) -> AsyncStream[dict]:
         """Send a prepared streaming request and register its response stream."""
         self._pending_source_requests.add(request_id)
-        self.socket.send_multipart(frames)
+        try:
+            self.socket.send_multipart(frames)
+        except Exception:  # pylint: disable=broad-except
+            self._pending_source_requests.discard(request_id)
+            raise
         stream = AsyncStream(
             request_id, functools.partial(self.abort_request, request_id), loop=self._loop
         )
@@ -626,10 +649,12 @@ class InferenceClient:
                     stream = self.streams.pop(request_id, None)
                     if stream is not None:
                         stream.finish(exception=error)
-                        continue
-                    future = self.completion_futures.pop(request_id, None)
-                    if future is not None and not future.done():
-                        future.set_exception(error)
+                    else:
+                        future = self.completion_futures.pop(request_id, None)
+                        if future is not None and not future.done():
+                            future.set_exception(error)
+                    if not source_safe:
+                        self._send_abort(request_id)
                 elif header == Headers.REQUEST_ABORTED:
                     request_id, source_safe = int(data[1]), bool(data[2])
                     if source_safe:
