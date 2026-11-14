@@ -1,10 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# CLI changes adapted from https://github.com/021ai/ZJ-Megatron-LM at
+# a06c53757f6bc636db3a88f5dfca99f5b3ee6030 (BSD-3-Clause, repository LICENSE).
 
 """cuDNN/FlashMLA wrappers for fused DeepSeek sparse attention."""
 
 from __future__ import annotations
 
 import functools
+import inspect
 from typing import TYPE_CHECKING, Optional, Protocol, Tuple
 
 import torch
@@ -107,6 +110,8 @@ class CudnnDsaInterface(Protocol):
         indices: Tensor,
         softmax_scale: float,
         topk_length: Tensor,
+        return_cli_target: bool = False,
+        cli_target_head_count: Optional[int] = None,
     ) -> dict:
         """Backprop FlashMLA sparse attention to query and compressed KV (``"dq"``/``"dkv"``)."""
 
@@ -1397,6 +1402,7 @@ def run_fused_qk_topk_with_loss(
     local_packed_cp_query_len: Optional[int] = None,
     packed_seq_params: Optional["PackedSeqParams"] = None,
     cp_size: int = 1,
+    cli_target_accumulator=None,
 ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
     """Run cuDNN fused indexer and sparse indexer loss for split DSA."""
     del block_size
@@ -1460,6 +1466,7 @@ def run_fused_qk_topk_with_loss(
         packed_max_seqlen_k,
         cp_size,
         tp_group,
+        cli_target_accumulator,
     )
 
 
@@ -1468,6 +1475,18 @@ def _all_reduce_tp_target(target: Tensor, tp_group) -> Tensor:
     if get_pg_size(tp_group) > 1:
         torch.distributed.all_reduce(target, group=tp_group)
     return target
+
+
+def supports_fused_cli_target_in_attention_backward() -> bool:
+    """Return whether the installed SM90 cuDNN DSA wrapper exposes CLI target output."""
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        return False
+    try:
+        _ensure_dsa_namespace()
+        parameters = inspect.signature(_cudnn_dsa.sparse_attention_backward_wrapper).parameters
+    except (AttributeError, ImportError, OSError, TypeError, ValueError):
+        return False
+    return "return_cli_target" in parameters and "cli_target_head_count" in parameters
 
 
 def _pad_indexer_heads_for_backward(q_bshd: Tensor, w_bsh: Tensor) -> Tuple[Tensor, Tensor, int]:
@@ -1773,6 +1792,7 @@ def _compute_sparse_indexer_loss_and_grads(
     query_valid_rows: Optional[Tensor],
     calculate_per_token_loss: bool,
     tp_group,
+    cli_target_accumulator=None,
 ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
     """Compute sparse indexer KL loss and precomputed indexer gradients."""
     sq, b, num_heads, _d = query.shape
@@ -1825,6 +1845,34 @@ def _compute_sparse_indexer_loss_and_grads(
         target, predict_log_probs, loss_coeff, query_valid_rows, calculate_per_token_loss
     )
 
+    grouped_target_mass = 1
+    if cli_target_accumulator is not None:
+        if get_pg_size(tp_group) > 1:
+            raise RuntimeError("CLI owner-backward fusion currently requires TP=1")
+        cli_target_sum = cli_target_accumulator.target_sum
+        if (
+            cli_target_sum.shape != target.shape
+            or cli_target_sum.dtype != torch.float32
+            or not cli_target_sum.is_contiguous()
+        ):
+            raise RuntimeError(
+                "CLI owner target accumulator must be contiguous FP32 and match owner Top-K"
+            )
+        if cli_target_accumulator.reuse_count <= 0:
+            raise RuntimeError("CLI owner target accumulator has no reuse-layer targets")
+        cli_target_sum = cli_target_sum.masked_fill(~valid_positions, 0.0)
+        cli_cross_entropy_sum = -(cli_target_sum * predict_log_probs).sum()
+        cli_kl_sum = cli_target_accumulator.teacher_entropy_sum + cli_cross_entropy_sum
+        cli_loss = dsa_indexer_loss.reduce_indexer_kl_sum(
+            cli_kl_sum,
+            num_rows=b * sq,
+            calculate_per_token_loss=calculate_per_token_loss,
+            valid_row_count=(query_valid_rows.sum() if query_valid_rows is not None else None),
+        )
+        indexer_loss = indexer_loss + cli_loss * loss_coeff
+        grouped_target_mass += int(cli_target_accumulator.reuse_count)
+        target = (target + cli_target_sum) / float(grouped_target_mass)
+
     topk_indices_for_bwd = topk_indices_cmp
     if b > 1:
         batch_offsets = (
@@ -1851,7 +1899,7 @@ def _compute_sparse_indexer_loss_and_grads(
         attn_score_for_bwd,
         index_score_for_bwd,
         topk_indices_for_bwd,
-        loss_coeff=indexer_loss_coeff,
+        loss_coeff=indexer_loss_coeff * grouped_target_mass,
         grad_loss=unit_grad_loss,
         block_i=block_i,
     )
@@ -2013,7 +2061,8 @@ def _run_sparse_attention_backward(
     skv: int,
     grad_output: Tensor,
     all_rows_nonempty: bool = False,
-) -> Tuple[Tensor, Tensor]:
+    return_cli_target: bool = False,
+) -> Tuple[Tensor, ...]:
     """Run sparse attention backward, skipping rows that have no valid top-k entries."""
     d_v = out_flat.shape[-1]
     dO_flat = grad_output.reshape(sq * b, num_heads, d_v)
@@ -2036,13 +2085,16 @@ def _run_sparse_attention_backward(
         bwd_dO_flat = dO_flat.new_zeros((dO_flat.size(0), padded_num_heads, dO_flat.size(2)))
         bwd_dO_flat[:, :num_heads, :] = dO_flat
 
-        bwd_lse = lse.new_zeros((lse.size(0), padded_num_heads))
+        bwd_lse = lse.new_full((lse.size(0), padded_num_heads), float("inf"))
         bwd_lse[:, :num_heads] = lse
 
         bwd_attn_sink = attn_sink.new_full((padded_num_heads,), float("-inf"))
         bwd_attn_sink[:num_heads] = attn_sink
 
     _ensure_dsa_namespace()
+    cli_target_kwargs = (
+        {"return_cli_target": True, "cli_target_head_count": num_heads} if return_cli_target else {}
+    )
     if all_rows_nonempty:
         attn_bwd = _cudnn_dsa.sparse_attention_backward_wrapper(
             bwd_q_flat,
@@ -2054,6 +2106,7 @@ def _run_sparse_attention_backward(
             global_idxs,
             softmax_scale=softmax_scale,
             topk_length=topk_length,
+            **cli_target_kwargs,
         )
         grad_query_flat = attn_bwd["dq"]
         if padded_num_heads != num_heads:
@@ -2061,6 +2114,8 @@ def _run_sparse_attention_backward(
         grad_kv_flat = attn_bwd["dkv"]
         grad_query = grad_query_flat.reshape(sq, b, num_heads, d)
         grad_kv_full = grad_kv_flat.reshape(skv, b, kv_flat.size(-1))
+        if return_cli_target:
+            return grad_query, grad_kv_full, attn_bwd["cli_target"]
         return grad_query, grad_kv_full
 
     valid_row_indices = torch.nonzero(topk_length > 0, as_tuple=False).flatten()
@@ -2087,6 +2142,7 @@ def _run_sparse_attention_backward(
         global_idxs.index_select(0, compact_row_indices).contiguous(),
         softmax_scale=softmax_scale,
         topk_length=topk_length.index_select(0, compact_row_indices).contiguous(),
+        **cli_target_kwargs,
     )
     grad_query_valid = attn_bwd["dq"][:-1]
     if padded_num_heads != num_heads:
@@ -2097,6 +2153,11 @@ def _run_sparse_attention_backward(
 
     grad_query = grad_query_flat.reshape(sq, b, num_heads, d)
     grad_kv_full = grad_kv_flat.reshape(skv, b, kv_flat.size(-1))
+    if return_cli_target:
+        compact_target = attn_bwd["cli_target"][:-1]
+        cli_target = compact_target.new_zeros((q_flat.size(0), compact_target.size(-1)))
+        cli_target.index_copy_(0, valid_row_indices, compact_target)
+        return grad_query, grad_kv_full, cli_target
     return grad_query, grad_kv_full
 
 
@@ -2406,6 +2467,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         packed_max_seqlen_k: Optional[int],
         packed_cp_size: int,
         tp_group,
+        cli_target_accumulator,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """Compute shared attention top-k metadata and sparse indexer loss."""
         _ensure_dsa_namespace()
@@ -2416,28 +2478,40 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         )
 
         q_idx_bshd, k_idx_bsd, w_bsh = _sbhd_to_bshd_indexer_inputs(q_indexer, k_indexer, weights)
-        topk_indices_cmp, topk_length_cmp, indexer_score_payload = _indexer_topk_bshd(
-            q_idx_bshd,
-            k_idx_bsd,
-            w_bsh,
-            indexer_topk,
-            varlen_starts=varlen_starts,
-            varlen_ends=varlen_ends,
-            key_positions=None,
-            return_scores=False,
-            return_topk_scores=True,
-            use_local_indexer_varlen=use_local_indexer_varlen,
-            single_packed_thd_sequence=single_packed_thd_sequence,
-            local_packed_cp_rank=local_packed_cp_rank,
-            local_packed_cp_query_start=local_packed_cp_query_start,
-            local_packed_cp_query_len=local_packed_cp_query_len,
-            packed_cu_seqlens_q=packed_cu_seqlens_q,
-            packed_cu_seqlens_k=packed_cu_seqlens_k,
-            packed_max_seqlen_q=packed_max_seqlen_q,
-            packed_max_seqlen_k=packed_max_seqlen_k,
-            packed_cp_size=packed_cp_size,
-        )
-
+        if cli_target_accumulator is not None:
+            topk_indices_cmp = cli_target_accumulator.topk_indices
+            topk_length_cmp = (topk_indices_cmp >= 0).sum(dim=-1, dtype=torch.int32)
+            selected_predict = _cudnn_dsa.sparse_indexer_score_recompute_wrapper(
+                q_idx_bshd,
+                k_idx_bsd,
+                w_bsh,
+                topk_indices_cmp,
+                qhead_per_kv_head=q_idx_bshd.size(2),
+                topk_length=topk_length_cmp,
+            )["predict"]
+            indexer_score_payload = selected_predict.clamp_min(_CLIP_PROB_MIN).log()
+        else:
+            topk_indices_cmp, topk_length_cmp, indexer_score_payload = _indexer_topk_bshd(
+                q_idx_bshd,
+                k_idx_bsd,
+                w_bsh,
+                indexer_topk,
+                varlen_starts=varlen_starts,
+                varlen_ends=varlen_ends,
+                key_positions=None,
+                return_scores=False,
+                return_topk_scores=True,
+                use_local_indexer_varlen=use_local_indexer_varlen,
+                single_packed_thd_sequence=single_packed_thd_sequence,
+                local_packed_cp_rank=local_packed_cp_rank,
+                local_packed_cp_query_start=local_packed_cp_query_start,
+                local_packed_cp_query_len=local_packed_cp_query_len,
+                packed_cu_seqlens_q=packed_cu_seqlens_q,
+                packed_cu_seqlens_k=packed_cu_seqlens_k,
+                packed_max_seqlen_q=packed_max_seqlen_q,
+                packed_max_seqlen_k=packed_max_seqlen_k,
+                packed_cp_size=packed_cp_size,
+            )
         if indexer_score_payload is None:
             raise RuntimeError("cuDNN sparse indexer loss requires selected top-k scores.")
         topk_indices_attn, topk_length_attn = _prepare_attention_topk_indices(
@@ -2466,6 +2540,7 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
             query_valid_rows=query_valid_rows,
             calculate_per_token_loss=calculate_per_token_loss,
             tp_group=tp_group,
+            cli_target_accumulator=cli_target_accumulator,
         )
 
         ctx.save_for_backward(
@@ -2496,33 +2571,9 @@ class FusedQKTopKWithSparseLossFunc(torch.autograd.Function):
         #   single_packed_thd_sequence, local_packed_cp_rank,
         #   local_packed_cp_query_start, local_packed_cp_query_len,
         #   packed_cu_seqlens_q, packed_cu_seqlens_k, packed_max_seqlen_q,
-        #   packed_max_seqlen_k, packed_cp_size, tp_group.
-        return (
-            grad_q_indexer,
-            grad_k_indexer,
-            grad_weights,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
+        #   packed_max_seqlen_k, packed_cp_size, tp_group,
+        #   cli_target_accumulator.
+        return (grad_q_indexer, grad_k_indexer, grad_weights) + (None,) * 22
 
 
 class FusedSparseAttentionFunc(torch.autograd.Function):
@@ -2537,6 +2588,7 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
         softmax_scale: float,
         d_v: int,
         topk_length: Optional[Tensor],
+        cli_backward_callback=None,
     ) -> Tensor:
         """Run fused sparse attention for precomputed top-k metadata."""
         sq, b, num_heads, d = query.shape
@@ -2555,8 +2607,10 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
         ctx.num_heads = num_heads
         ctx.d = d
         ctx.skv = skv
+        ctx.cli_backward_callback = cli_backward_callback
 
-        return out_flat.reshape(sq, b, num_heads, d_v)
+        output = out_flat.reshape(sq, b, num_heads, d_v)
+        return output
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -2565,7 +2619,7 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
 
         sq, b, num_heads, d = ctx.sq, ctx.b, ctx.num_heads, ctx.d
         skv = ctx.skv
-        grad_query, grad_kv_full = _run_sparse_attention_backward(
+        backward_outputs = _run_sparse_attention_backward(
             q_flat=q_flat,
             kv_flat=kv_flat,
             attn_sink=attn_sink,
@@ -2580,9 +2634,21 @@ class FusedSparseAttentionFunc(torch.autograd.Function):
             d=d,
             skv=skv,
             grad_output=grad_output,
+            return_cli_target=ctx.cli_backward_callback is not None,
         )
 
-        return grad_query, grad_kv_full, None, None, None, None
+        if ctx.cli_backward_callback is not None:
+            grad_query, grad_kv_full, cli_target_flat = backward_outputs
+            cli_target = (
+                cli_target_flat.reshape(sq, b, cli_target_flat.size(-1))
+                .permute(1, 0, 2)
+                .contiguous()
+            )
+            ctx.cli_backward_callback(cli_target)
+        else:
+            grad_query, grad_kv_full = backward_outputs
+
+        return (grad_query, grad_kv_full, None, None, None, None, None)
 
 
 def run_fused_absorbed_sparse_attention(
@@ -2592,6 +2658,7 @@ def run_fused_absorbed_sparse_attention(
     softmax_scale: float,
     v_channels: int,
     topk_length: Optional[Tensor] = None,
+    cli_backward_callback=None,
 ) -> Optional[Tensor]:
     """Run cuDNN/FlashMLA sparse attention using externally supplied top-k indices."""
     if query.ndim != 4 or key.ndim != 4 or topk_indices.ndim != 3:
@@ -2609,7 +2676,7 @@ def run_fused_absorbed_sparse_attention(
 
     kv_full = key.squeeze(2).contiguous()
     return FusedSparseAttentionFunc.apply(
-        query, kv_full, topk_indices, softmax_scale, v_channels, topk_length
+        query, kv_full, topk_indices, softmax_scale, v_channels, topk_length, cli_backward_callback
     )
 
 
@@ -2695,6 +2762,7 @@ def fused_indexer_sparse_attn(
 __all__ = [
     "fused_indexer_sparse_attn",
     "run_fused_absorbed_sparse_attention",
+    "supports_fused_cli_target_in_attention_backward",
     "run_fused_dsa_attention",
     "run_fused_qk_topk",
     "run_fused_qk_topk_with_loss",

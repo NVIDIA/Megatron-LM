@@ -1,4 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# CLI changes adapted from https://github.com/021ai/ZJ-Megatron-LM at
+# a06c53757f6bc636db3a88f5dfca99f5b3ee6030 (BSD-3-Clause, repository LICENSE).
 
 from types import SimpleNamespace
 
@@ -1560,6 +1562,59 @@ def test_cudnn_sparse_attn_target_pads_small_local_head_count(monkeypatch):
     assert seen["topk_indices_global"] is False
 
 
+def test_cudnn_split_attention_delivers_cli_target_from_backward(monkeypatch):
+    seen = {}
+
+    class FakeDSA:
+        @staticmethod
+        def sparse_attention_backward_wrapper(
+            q,
+            kv,
+            out,
+            dO,
+            lse,
+            attn_sink,
+            topk_indices,
+            softmax_scale,
+            topk_length,
+            return_cli_target=False,
+            cli_target_head_count=None,
+        ):
+            del out, dO, lse, attn_sink, topk_indices, softmax_scale, topk_length
+            assert return_cli_target is True
+            assert cli_target_head_count == q.size(1)
+            return {
+                "dq": torch.ones_like(q),
+                "dkv": torch.zeros_like(kv),
+                "cli_target": torch.tensor([[0.25, 0.75], [0.6, 0.4], [0.0, 0.0]]),
+            }
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+
+    def fake_flash_mla(q, kv, topk_idxs, softmax_scale, d_v, attn_sink, topk_length):
+        del kv, topk_idxs, softmax_scale, attn_sink, topk_length
+        return torch.zeros((q.size(0), q.size(1), d_v), dtype=q.dtype), torch.zeros(
+            (q.size(0), q.size(1)), dtype=torch.float32
+        )
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_dsa_fwd_flash_mla", fake_flash_mla)
+    query = torch.zeros((2, 1, 1, 512), dtype=torch.bfloat16, requires_grad=True)
+    key = torch.zeros((4, 1, 1, 512), dtype=torch.bfloat16, requires_grad=True)
+    output = dsa_cudnn_kernels.run_fused_absorbed_sparse_attention(
+        query=query,
+        key=key,
+        topk_indices=torch.tensor([[[0, 1], [2, 3]]], dtype=torch.int32),
+        softmax_scale=1.0,
+        v_channels=512,
+        cli_backward_callback=lambda target: seen.setdefault("target", target.clone()),
+    )
+    assert output is not None
+    output.float().sum().backward()
+
+    torch.testing.assert_close(seen["target"], torch.tensor([[[0.25, 0.75], [0.6, 0.4]]]))
+
+
 def test_cudnn_sparse_loss_uses_selected_topk_scores(monkeypatch):
     seen = {}
 
@@ -1757,6 +1812,12 @@ def test_cudnn_sparse_loss_reduces_attention_target_across_tp(monkeypatch):
             return 2
 
     tp_group = FakeTPGroup()
+
+    # This test mocks TP collectives and must not depend on whether another
+    # test initialized torch.distributed. torchrun alone does not initialize it.
+    monkeypatch.setattr(
+        dsa_cudnn_kernels, "get_pg_size", lambda group: group.size() if group is not None else 1
+    )
 
     class FakeDSA:
         @staticmethod

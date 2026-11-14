@@ -1,4 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# CLI changes adapted from https://github.com/021ai/ZJ-Megatron-LM at
+# a06c53757f6bc636db3a88f5dfca99f5b3ee6030 (BSD-3-Clause, repository LICENSE).
 
 """TileLang backend hooks for optional fused DeepSeek sparse attention kernels."""
 
@@ -80,9 +82,12 @@ def run_fused_qk_topk_with_loss(
     local_packed_cp_query_len: Optional[int] = None,
     packed_seq_params: Optional[PackedSeqParams] = None,
     cp_size: int = 1,
+    cli_target_accumulator=None,
 ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor]]:
     """Run fused TileLang indexer and sparse indexer loss."""
     del config
+    if cli_target_accumulator is not None:
+        return None
     result = tilelang_dsa.run_fused_qk_topk_with_loss(
         q=q,
         k=k,
@@ -120,8 +125,11 @@ def run_fused_absorbed_sparse_attention(
     softmax_scale: float,
     v_channels: int,
     topk_length: Optional[torch.Tensor] = None,
-) -> Optional[torch.Tensor]:
+    cli_backward_callback=None,
+):
     """Run fused TileLang SparseMLA for absorbed DSA sparse attention."""
+    if cli_backward_callback is not None:
+        return None
     if topk_length is not None:
         if topk_indices.ndim != 3 or topk_length.shape != topk_indices.shape[:-1]:
             return None
