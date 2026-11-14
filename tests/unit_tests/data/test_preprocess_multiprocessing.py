@@ -8,10 +8,31 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from megatron.core.datasets.indexed_dataset import IndexedDataset
+from tools import preprocess_data
+
+
+def test_worker_sweep_rejects_consecutive_invalid_counts(monkeypatch):
+    """Reject an invalid sweep before starting partition processing."""
+    args = SimpleNamespace(
+        find_optimal_num_workers=True,
+        workers_to_check=[1, 3],
+        partitions=4,
+        split_sentences=False,
+        input="unused.jsonl",
+    )
+    monkeypatch.setattr(preprocess_data, "get_args", lambda: args)
+
+    def unexpected_input_lookup(_):
+        pytest.fail("Invalid worker counts reached input discovery")
+
+    monkeypatch.setattr(preprocess_data.glob, "glob", unexpected_input_lookup)
+    with pytest.raises(AssertionError, match="valid number of workers"):
+        preprocess_data.main()
 
 
 @pytest.mark.parametrize('start_method', multiprocessing.get_all_start_methods())
