@@ -10,6 +10,7 @@ from packaging.version import Version as PkgVersion
 from pytest_mock import mocker
 
 import megatron.core.parallel_state as ps
+from megatron.core import process_groups_config
 from megatron.core.datasets.t5_dataset import T5MaskedWordPieceDataset
 from megatron.core.models.T5.t5_model import T5Model
 from megatron.core.models.T5.t5_spec import (
@@ -128,10 +129,20 @@ class TestT5Model:
         pass
 
 
-@pytest.mark.parametrize("explicit_pg_collection", [False, True])
-def test_constructor_process_groups(mocker, explicit_pg_collection):
-    """T5 and LanguageModule must agree on the caller's process-group collection."""
+@pytest.fixture
+def clean_nvte_env():
+    """Clear the NVTE attention variables that LanguageModule sets, before and after a test."""
     clear_nvte_env_vars()
+    yield
+    clear_nvte_env_vars()
+
+
+@pytest.mark.usefixtures("clean_nvte_env")
+@pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope"])
+@pytest.mark.parametrize("explicit_pg_collection", [False, True])
+def test_constructor_process_groups(mocker, explicit_pg_collection, position_embedding_type):
+    """T5 and LanguageModule must agree on the caller's process-group collection."""
+    mocker.patch.object(process_groups_config, "_warned_global_process_group_fallbacks", set())
     mocker.patch("torch.distributed.is_initialized", return_value=True)
     pg_collection = ProcessGroupCollection(
         tp=mocker.sentinel.tp,
@@ -145,9 +156,11 @@ def test_constructor_process_groups(mocker, explicit_pg_collection):
     if explicit_pg_collection:
         global_groups.side_effect = AssertionError("Explicit groups must not read the global grid")
 
-    config = TransformerConfig(num_layers=2, hidden_size=16, num_attention_heads=4)
+    config = TransformerConfig(
+        num_layers=2, hidden_size=16, num_attention_heads=4, use_cpu_initialization=True
+    )
     # An empty pipeline stage exercises both constructors without constructing GPU layers.
-    model = T5Model(
+    t5_kwargs = dict(
         config=config,
         encoder_config=config,
         transformer_encoder_layer_spec=None,
@@ -158,20 +171,32 @@ def test_constructor_process_groups(mocker, explicit_pg_collection):
         post_process=False,
         add_encoder=False,
         add_decoder=False,
+        position_embedding_type=position_embedding_type,
         pg_collection=pg_collection if explicit_pg_collection else None,
     )
+    if explicit_pg_collection:
+        model = T5Model(**t5_kwargs)
+    else:
+        with pytest.warns(FutureWarning, match="T5Model was called without `pg_collection`"):
+            model = T5Model(**t5_kwargs)
 
     assert model.pg_collection is pg_collection
     assert model.tp_group is pg_collection.tp
     assert model.cp_group is pg_collection.cp
     assert model.pp_group is pg_collection.pp
     assert model.embd_group is pg_collection.embd
+    if position_embedding_type == "rope":
+        # The rotary embedding is built on the collection LanguageModule resolved, not on the
+        # omitted argument.
+        assert model.rotary_pos_emb.cp_group is pg_collection.cp
     if explicit_pg_collection:
         global_groups.assert_not_called()
     else:
-        global_groups.assert_called()
+        # LanguageModule resolves the global grid once, and T5 builds on that same collection.
+        global_groups.assert_called_once_with()
 
 
+@pytest.mark.usefixtures("clean_nvte_env")
 @pytest.mark.parametrize(
     'pp_size, pre_process, post_process, tied, embedding_state, valid',
     [
@@ -185,14 +210,13 @@ def test_constructor_process_groups(mocker, explicit_pg_collection):
         (2, True, True, True, 'none', False),
         (2, False, True, True, 'none', False),
         (2, True, False, True, 'nonmember', False),
-        (2, False, False, True, 'nonmember', True),
+        (2, False, False, True, 'nonmember', False),
     ],
 )
 def test_constructor_embedding_group_contract(
     mocker, pp_size, pre_process, post_process, tied, embedding_state, valid
 ):
     """An explicit collection cannot silently disable tied pipeline embedding synchronization."""
-    clear_nvte_env_vars()
     mocker.patch('torch.distributed.is_initialized', return_value=True)
     mocker.patch('megatron.core.models.T5.t5_model.LanguageModelEmbedding')
     mocker.patch('megatron.core.models.T5.t5_model.T5LMHead')
@@ -246,9 +270,9 @@ def test_constructor_embedding_group_contract(
     global_groups.assert_not_called()
 
 
+@pytest.mark.usefixtures("clean_nvte_env")
 def test_pipeline_tied_embeddings_use_supplied_group(mocker):
     """Real PP endpoints synchronize nonzero embedding weights through the supplied group."""
-    clear_nvte_env_vars()
     if Utils.world_size < 2 or Utils.world_size % 2:
         pytest.skip('requires a world size divisible by two')
     Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
