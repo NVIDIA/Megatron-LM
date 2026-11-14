@@ -15,13 +15,42 @@
 """Select MCore modules for MFSDP v2 sharding."""
 
 from collections.abc import Sequence
+from typing import NamedTuple
 
 from torch import nn
 
+from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.layers.hybrid_hyper_connection import HyperConnectionHybridLayer
 from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionLayer
+from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_layer import TransformerLayer
+
+
+class _SelectiveRecompute(NamedTuple):
+    """A module's selective recompute, which reruns part of its forward in backward.
+
+    The rerun recomputes activations with the rerun part's weights but does not call the
+    forward hooks of the FSDP unit owning those weights.
+    """
+
+    # Name of the bool attribute a module sets to True at construction when it recomputes,
+    # e.g. "recompute_mlp" for TransformerLayer.
+    recompute_flag_name: str
+    # Name of the module's attribute holding the child that the recompute reruns, e.g. "mlp"
+    # for TransformerLayer, or None when the module reruns itself.
+    recomputed_submodule_name: str | None
+
+
+_SELECTIVE_RECOMPUTES = (
+    _SelectiveRecompute("recompute_mlp", "mlp"),  # TransformerLayer, "mlp"
+    _SelectiveRecompute("moe_layer_recompute", None),  # MoELayer or MoETransformerLayer, "moe"
+    _SelectiveRecompute("shared_experts_recompute", "shared_experts"),  # MoELayer
+    _SelectiveRecompute("recompute_up_proj", None),  # MLA variants, "mla_up_proj"
+    _SelectiveRecompute("recompute_gdn", None),  # Gated delta net variants, "gdn"
+    _SelectiveRecompute("recompute_in_proj", "in_proj"),  # GatedDeltaProductMixer, "gdp_in_proj"
+)
 
 
 class FsdpUnitCollector:
@@ -40,6 +69,8 @@ class FsdpUnitCollector:
             )
         self._fsdp_unit_module_types = tuple(fsdp_unit_module_types)
         self._units: list[nn.Module] = []
+        # Maps each collected unit to itself and its descendants outside nested units.
+        self._owned_modules_by_unit: dict[nn.Module, dict[nn.Module, None]] = {}
 
     def collect(self, module: nn.Module) -> list[nn.Module]:
         """Return selected modules children before parents, including the root last."""
@@ -47,7 +78,36 @@ class FsdpUnitCollector:
         self._visit(module)
         if not isinstance(module, self._fsdp_unit_module_types):
             self._units.append(module)
+        self._owned_modules_by_unit = {unit: {} for unit in self._units}
+        for unit, owned in self._owned_modules_by_unit.items():
+            owned[unit] = None
+            pending = list(unit.children())
+            while pending:
+                submodule = pending.pop()
+                if submodule not in self._owned_modules_by_unit:
+                    owned[submodule] = None
+                    pending.extend(submodule.children())
         return self._units
+
+    def is_partially_recomputed(self, unit: nn.Module) -> bool:
+        """Whether activation recomputation reruns part of this unit's forward without calling
+        the unit.
+
+        The rerun uses the unit's weights without its hooks, so the unit needs
+        SchedulePolicy.unshard_all_planes_in_backward. Modules inside a nested unit don't
+        count: their own hooks run during recomputation.
+        """
+        owned = self._owned_modules_by_unit[unit]
+        for module in owned:
+            for rerun in _rerun_submodules(module):
+                for submodule in rerun.modules():
+                    # Skip modules of nested units, which own their weights.
+                    if submodule not in owned:
+                        continue
+                    # Skip parameterless modules, e.g. an IdentityOp MLP.
+                    if next(submodule.parameters(recurse=False), None) is not None:
+                        return True
+        return False
 
     def _visit(self, module: nn.Module) -> None:
         if isinstance(module, HyperConnectionHybridLayer):
@@ -100,3 +160,35 @@ class FsdpUnitCollector:
     def _collect_routed_experts(self, layer: TransformerLayer) -> None:
         if layer.is_moe_layer:
             self._units.append(layer.mlp.experts)
+
+
+def _rerun_submodules(module: nn.Module) -> list[nn.Module]:
+    """Return the parts of this module's forward that its own checkpoints rerun in backward."""
+    # Read the module's own config: hybrid layers may each have one.
+    config = getattr(module, "config", None)
+    if config is not None and config.recompute_granularity == "full":
+        if isinstance(module, (TransformerBlock, HybridStack)):
+            # Block recompute may checkpoint a prefix of the layers; FP8 can shift it at
+            # runtime, so conservatively take all layers.
+            if config.recompute_method == "block" and not config.recompute_num_layers:
+                return []
+            return list(module.layers)
+        # GPT MTP layers checkpoint eh_proj together with their inner layer. Hybrid MTP
+        # layers delegate full recompute to their inner stack.
+        if isinstance(module, MultiTokenPredictionLayer) and not module.is_hybrid_mtp:
+            return [module]
+        return []
+
+    # Selective recompute flags are set from each module's own config.
+    rerun = []
+    for recompute in _SELECTIVE_RECOMPUTES:
+        if getattr(module, recompute.recompute_flag_name, False) is not True:
+            continue
+        if recompute.recomputed_submodule_name is None:
+            rerun.append(module)
+            continue
+        # The submodule may be absent, e.g. shared_experts is None without shared experts.
+        submodule = getattr(module, recompute.recomputed_submodule_name, None)
+        if submodule is not None:
+            rerun.append(submodule)
+    return rerun

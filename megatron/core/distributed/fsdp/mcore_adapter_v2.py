@@ -17,6 +17,7 @@
 import contextlib
 import logging
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import List, NamedTuple, Optional, Tuple, Type
 
 import torch
@@ -270,7 +271,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
         common_fully_shard_kwargs = dict(
             mixed_precision_policy=self.mp_policy,
-            schedule_policy=schedule_policy,
             shard_layout=(
                 ShardLayout.PADDED
                 if ddp_config.megatron_fsdp_padded_shards
@@ -310,6 +310,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     mesh=expert_dp_mesh if is_expert else dp_mesh,
                     placements=expert_placements if is_expert else dense_placements,
                     grad_scale=expert_grad_scale if is_expert else dense_grad_scale,
+                    schedule_policy=replace(
+                        schedule_policy,
+                        unshard_all_planes_in_backward=collector.is_partially_recomputed(submodule),
+                    ),
                     **common_fully_shard_kwargs,
                 )
 
