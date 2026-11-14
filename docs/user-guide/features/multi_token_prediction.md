@@ -59,3 +59,69 @@ Arbitrary `AttnMaskType` and learned absolute position embeddings are not suppor
 with MTP. Static and dynamic context parallelism are supported with packed data;
 dynamic CP requires per-token loss. See [dynamic context parallelism](context_parallel.md#dynamic-context-parallelism)
 for runtime group requirements and the per-token gradient and logging behavior.
+
+
+## Knowledge distillation from the main model
+
+MTP can learn from the main model's next-token distribution, aligned to each
+MTP depth. The main model supplies a detached teacher through the shared output
+projection; the student is the corresponding MTP head. The per-token objective is
+
+```text
+mtp_ce_loss_weight * CE(labels, student)
+  + mtp_kl_loss_weight * S * KL(softmax(teacher / T) || softmax(student / T))
+```
+
+Here `T` is `mtp_kd_logit_temperature`, and `S` is `mtp_kd_loss_scale`.
+Leaving `--mtp-kd-loss-scale` unset uses `S = T^2`, preserving the default
+loss and gradients. Set it to a finite nonnegative value to replace that
+multiplier; for example, `--mtp-kd-loss-scale 1` uses unscaled KL. This scale
+applies only to KD, before `mtp_kl_loss_weight`; CE is unaffected.
+The existing
+`mtp_loss_scaling_factor / mtp_num_layers`, loss masks, and token normalization
+apply to the combined objective. Weights must be finite and nonnegative; they
+need not sum to one. Temperature must be finite and positive.
+
+Defaults (`--mtp-ce-loss-weight 1 --mtp-kl-loss-weight 0`) preserve CE-only
+training and avoid computing teacher logits. For KD-only training use:
+
+```bash
+--mtp-num-layers 2 \
+--mtp-ce-loss-weight 0 \
+--mtp-kl-loss-weight 1 \
+--mtp-kd-logit-temperature 2
+```
+
+For a mixture, use e.g. `--mtp-ce-loss-weight 0.3 --mtp-kl-loss-weight 0.7`.
+KL is training-only, matching the source implementation: evaluation computes
+only the weighted CE component, and KD-only evaluation attaches no MTP loss.
+Setting both weights to zero disables the MTP auxiliary loss.
+
+Teacher projection is performed before sequence shifting, preserving sequence
+parallelism. Teacher logits and their cached full-vocabulary normalizers are
+shifted with packed document boundaries and the configured context-parallel
+layout. Vocabulary-parallel KL uses global normalizers and reductions without
+all-gathering vocabulary logits. The backward recomputes probabilities and never
+backpropagates through the teacher. Student output-head gradients follow the
+existing `mtp_detach_heads` setting. Early backward remains available; it still
+retains teacher logits in addition to the current student's logits.
+
+`mtp_N loss` reports the weighted CE + KL objective before overall MTP scaling,
+including in KD-only training. `mtp_N ce_loss` reports unweighted CE when enabled;
+`mtp_N kd_logit_loss` reports KL with `S` applied, before `mtp_kl_loss_weight`,
+when enabled.
+The combined loss and CE metric retain upstream microbatch/rank mean averaging
+by default; with per-token loss enabled they use globally reduced token sums and
+counts. KL retains its token-count-weighted aggregation. With uneven token counts these
+aggregations differ, so the logged combined loss need not equal a weighted sum
+of the two logged component metrics.
+Acceptance metrics remain available for KD-only training. KL logging divides
+accumulated loss sums by accumulated counts; an empty microbatch contributes a
+zero sum and a count of one, matching the source branch. The KL metric is not
+scaled by the logging microbatch factor a second time.
+
+The local sum-exp, KL, and gradient helpers use `torch.compile(dynamic=False)`
+by default. Set `MTP_KD_DISABLE_COMPILE=1` before
+starting Python to use eager PyTorch instead. Compilation adds first-use latency;
+steady-state performance depends on the shapes and runtime. Distributed
+collectives remain outside the compiled helpers.
