@@ -416,6 +416,7 @@ def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
         ({"LABELS_VALID": "false"}, "false"),
         ({"HAS_RUN_TESTS": "true"}, "false"),
         ({"HAS_RUN_FUNCTIONAL": "true"}, "false"),
+        ({"MERGE_QUEUE_JOBS": "true"}, "false"),
         ({"FORCE_RUN_ALL": "true"}, "false"),
         ({"HAS_LTS": "true"}, "false"),
     ],
@@ -423,7 +424,7 @@ def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
 def test_pr_label_gate(overrides, expected):
     workflow = _source(".github/workflows/cicd-main.yml")
     start = workflow.index("          UNIT_TESTMON_ELIGIBLE=false")
-    end = workflow.index('\n\n          echo "scope=', start)
+    end = workflow.index("\n\n", start)
     gate = textwrap.dedent(workflow[start:end])
     environment = {
         **os.environ,
@@ -431,6 +432,7 @@ def test_pr_label_gate(overrides, expected):
         "UNIT_TESTMON_REQUESTED": "true",
         "IS_CI_WORKLOAD": "false",
         "IS_MERGE_GROUP": "false",
+        "MERGE_QUEUE_JOBS": "false",
         "EVENT_NAME": "push",
         "REF": "refs/heads/pull-request/123",
         "HAS_RUN_TESTS": "false",
@@ -469,7 +471,9 @@ def cpu_baseline(project, tmp_path):
     for path in (project / "tests").glob("test_*.py"):
         path.rename(directory / path.name)
     (directory / "test_app.py").write_text(
-        (directory / "test_app.py").read_text() + "\nimport pytest\n\n@pytest.mark.experimental\n"
+        "# Unicode source: input → output\n"
+        + (directory / "test_app.py").read_text()
+        + "\nimport pytest\n\n@pytest.mark.experimental\n"
         "def test_experimental():\n    assert active(2) == 3\n"
     )
     (project / "pytest.ini").write_text("[pytest]\nmarkers = experimental: experimental test\n")
@@ -485,6 +489,8 @@ def cpu_baseline(project, tmp_path):
         "mappings:\n  - source_dirs: [unobserved]\n    test_buckets:\n"
         f"      {platform}: [tests/unit_tests/example/test_other.py]\n"
     )
+    subprocess.run(["git", "init", "-q", str(project)], check=True)
+    subprocess.run(["git", "-C", str(project), "add", "."], check=True)
     cache_dir = tmp_path / "cpu-cache"
     for phase in cache_module.PHASES:
         marker = "not experimental" if phase == "prod" else "experimental"
@@ -514,6 +520,7 @@ def cpu_baseline(project, tmp_path):
     [
         ("unchanged", "selected", []),
         ("dependency", "selected", ["test_app.py"]),
+        ("unused-dependency", "selected", []),
         ("new-test", "selected", ["test_app.py", "test_new.py"]),
         ("mandatory", "selected", ["test_other.py"]),
         ("missing-cache", "full", []),
@@ -536,6 +543,10 @@ def test_cpu_selection(cpu_baseline, change, mode, selected):
     elif change == "dependency":
         # Selection must not execute this now-failing test.
         (project / "app.py").write_text("def active(value):\n    return value + 2\n")
+    elif change == "unused-dependency":
+        dependency = project / "app.py"
+        dependency.write_text(dependency.read_text().replace("value - 1", "value - 2"))
+        subprocess.run(["git", "-C", str(project), "add", "app.py"], check=True)
     elif change == "new-test":
         (project / "tests/unit_tests/example/test_new.py").write_text(
             "def test_new():\n    assert False\n"
