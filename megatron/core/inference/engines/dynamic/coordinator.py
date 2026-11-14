@@ -927,6 +927,11 @@ class CoordinatorMixin:
                         )
                     if not self._is_disaggregated_role("prefill"):
                         self._notify_request_aborted(request_id, source_safe=True)
+                        if (
+                            request_id in self.waiting_request_ids
+                            and request_id != self.context.chunked_prefill_request_id
+                        ):
+                            self._finish_aborted_queued_request(request_id)
             elif header == Headers.SET_GENERATION_EPOCH:
                 new_generation_epoch = data[1]
             elif header == Headers.START_CUDA_PROFILER:
@@ -1013,6 +1018,24 @@ class CoordinatorMixin:
 
         self._collect_failed_requests()
         return len(all_messages)
+
+    def _finish_aborted_queued_request(self, request_id: int) -> None:
+        """End an aborted request that is still queued, without admitting it.
+
+        A queued request holds no KV cache and has run no step for its current segment, so
+        it is taken off the queue and completed with the tokens it already has, as it would
+        complete after admission. Admitting it would only prefill a prompt whose output
+        nobody reads, and hold its place at the head of the queue until it fits.
+        """
+        self.waiting_request_ids.remove(request_id)
+        self._partial_emit_lengths.pop(request_id, None)
+        self.stop_word_finished_request_ids.discard(request_id)
+        entry = self.requests.pop(request_id)
+        request = entry.record[-1]
+        request.generated_length = len(request.generated_tokens)
+        request.status = Status.COMPLETED
+        self._set_finish_reason(request)
+        self._complete_request(entry, reply_now=True)
 
     def _prepare_submit_request_message(self, message: List[bytes]) -> List[bytes]:
         """Resolve a prompt once on MP rank zero before broadcasting the request.
