@@ -331,6 +331,7 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
 
         # YaRN scales q and k by the concentration factor, so the attention logits by its square.
         # TE's fused RoPE takes no scale: with RoPE fusion, the square goes into the softmax scale.
+        # That is exact only if RoPE covers the whole head; forward() checks it.
         self._rope_mscale = self._yarn_concentration_factor
         if (
             config.apply_rope_fusion
@@ -1487,6 +1488,17 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         # For self attention we just duplicate the rotary_pos_emb if it isn't already
         if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
             rotary_pos_emb = (rotary_pos_emb,) * 2
+
+        # Partial RoPE scales only the rotated dims, which a softmax-scale factor can't express.
+        if rotary_pos_emb is not None and self._rope_mscale != self._yarn_concentration_factor:
+            if any(
+                emb is not None and emb.shape[-1] != self.hidden_size_per_attention_head
+                for emb in rotary_pos_emb
+            ):
+                raise ValueError(
+                    "YaRN with apply_rope_fusion needs RoPE on the whole head dim. "
+                    "Set apply_rope_fusion=False for partial rotary (rotary_percent < 1)."
+                )
 
         # =====================
         # Query, Key, and Value

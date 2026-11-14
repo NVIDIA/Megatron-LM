@@ -529,3 +529,16 @@ class TestYarnRopeFusionSoftmaxScale(_GpuTestFixtureBase):
         # by well under it; dropping the factor squared from the softmax scale exceeds it >10x.
         for got, ref in [(out, ref_out), (dx, ref_dx)] + [(dw[n], ref_dw[n]) for n in dw]:
             torch.testing.assert_close(got, ref, rtol=0, atol=1e-3 * ref.abs().max().item())
+
+    def test_partial_rotary_raises_with_fusion(self):
+        """Partial RoPE scales only the rotated dims, so the softmax-scale form is refused."""
+        seq_len, batch = 8, 2
+        for apply_rope_fusion in [False, True]:
+            attn = _make_yarn_self_attention(apply_rope_fusion)
+            x = torch.randn(seq_len, batch, attn.config.hidden_size, device='cuda')
+            freqs = torch.rand(seq_len, 1, 1, attn.config.kv_channels // 2, device='cuda')
+            if apply_rope_fusion:
+                with pytest.raises(ValueError, match="whole head dim"):
+                    attn(x, None, rotary_pos_emb=freqs)
+            else:
+                attn(x, None, rotary_pos_emb=freqs)
