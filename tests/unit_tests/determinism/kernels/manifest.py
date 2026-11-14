@@ -378,12 +378,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             "tests/unit_tests/transformer/moe/test_moe_ep_invariant_combine.py",
             K + "test_moe_kernels.py",
+            K + "test_te_wrappers.py",
             "tests/unit_tests/inference/test_batch_invariant_nvls.py",
         ),
         kind="torch-op",
         notes="permute/unpermute (index_add_ vs scatter_add_), routing (index_put_ vs scatter), sort_chunks, aux loss, "
         "router gating GEMM, TE fused permutation/router kernels, global-batch quantile "
-        "histogram accumulation and bias updates. Fused aux loss uses TE's "
+        "score/logit histogram accumulation, pooled logit ranges, and bias updates. "
+        "Real TE score/logit routing, compact outputs, and histograms replay in test_te_wrappers.py. "
+        "Fused aux loss uses TE's "
         "fixed-order reduction when explicitly requested, with torch deterministic algorithms on or off; "
         "the default atomic branch is a negative control.",
     ),
