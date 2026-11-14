@@ -12,8 +12,8 @@ from megatron.core.inference.communication_utils import (
     recv_from_prev_pipeline_rank_,
     send_to_next_pipeline_rank,
 )
-from megatron.core.inference.config import MultimodalPromptConfig
-from megatron.core.inference.contexts import BaseInferenceContext
+from megatron.core.inference.config import MultimodalPromptConfig, check_ssm_chunking
+from megatron.core.inference.contexts import BaseInferenceContext, DynamicInferenceContext
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import deprecate_args, get_attr_wrapped_model, get_model_config
@@ -60,6 +60,17 @@ class AbstractModelInferenceWrapper(abc.ABC):
         self.sequence_parallel = self.config.sequence_parallel
 
         self.inference_context = inference_context
+        if isinstance(inference_context, DynamicInferenceContext) and (
+            inference_context.is_hybrid_model
+        ):
+            # Model and context meet here, before any engine or controller: prefill chunk
+            # boundaries come from the context, the SSM kernels' chunk sizes from the model.
+            check_ssm_chunking(
+                model,
+                inference_context.mamba_chunk_size,
+                inference_context.ssm_chunk_alignment,
+                inference_context.gdp_num_householder,
+            )
         configured_prompt_contract = getattr(
             self.inference_context.config, "multimodal_prompt_config", None
         )

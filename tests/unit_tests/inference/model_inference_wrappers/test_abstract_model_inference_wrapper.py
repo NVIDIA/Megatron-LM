@@ -135,3 +135,38 @@ def test_wrapper_rejects_mhc_pipeline_inference(monkeypatch, enable_mhc, pp_size
     else:
         wrapper = GPTInferenceWrapper(model, context)
         assert wrapper.pp_group is pg_collection.pp
+
+
+@pytest.mark.parametrize("context_chunk_size", [128, 256, 64])
+def test_wrapper_checks_the_dynamic_context_chunking(monkeypatch, context_chunk_size):
+    """The wrapper is where model and context first meet, so it compares the context's own
+    prefill chunking with the model's SSM layers before any controller or engine exists."""
+    from megatron.core.inference.contexts import DynamicInferenceContext
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+
+    pg_collection = SimpleNamespace(tp=object(), pp=object())
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group: 1)
+    layers = [SimpleNamespace(mixer=SimpleNamespace(chunk_size=128, ssm_inference_chunk_size=128))]
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            pipeline_model_parallel_size=1,
+            fp32_residual_connection=False,
+            params_dtype=torch.float32,
+            sequence_parallel=False,
+            fp8=None,
+        ),
+        decoder=SimpleNamespace(
+            layer_type_list=[Symbols.MAMBA], physical_layers=lambda: tuple(layers)
+        ),
+    )
+    context = object.__new__(DynamicInferenceContext)
+    context.config = SimpleNamespace(pg_collection=pg_collection)
+    context.is_hybrid_model = True
+    context.mamba_chunk_size = context.ssm_chunk_alignment = context_chunk_size
+    context.gdp_num_householder = 0
+
+    if context_chunk_size == 128:
+        assert GPTInferenceWrapper(model, context).inference_context is context
+    else:
+        with pytest.raises(ValueError, match="mamba_chunk_size is .* but the Mamba mixers chunk"):
+            GPTInferenceWrapper(model, context)
