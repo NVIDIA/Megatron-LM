@@ -16,6 +16,7 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm import causal_conv1d as causal_conv1d_module
 from megatron.core.ssm.causal_conv1d import assert_causal_conv1d_deterministic
 from megatron.core.ssm.mamba_mixer import MambaMixer
+from megatron.core.ssm.ops.mamba2.cudnn_ssd import cudnn_mamba2_unsupported_reason
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.determinism.configs import hybrid_base
@@ -77,12 +78,16 @@ def _conv_backward(x, weight, bias, grad):
     return torch.autograd.grad(out, (x, weight, bias), grad_outputs=grad)
 
 
-def _build_mixer(deterministic_mode=True):
+def _build_mixer(deterministic_mode=True, **config_overrides):
     """A bare MambaMixer on the suite's shared hybrid config."""
     Utils.initialize_model_parallel()
     model_parallel_cuda_manual_seed(123)
     config = TransformerConfig(
-        **(hybrid_base() | {"num_layers": 1, "deterministic_mode": deterministic_mode})
+        **(
+            hybrid_base()
+            | {"num_layers": 1, "deterministic_mode": deterministic_mode}
+            | config_overrides
+        )
     )
     mixer = MambaMixer(
         config,
@@ -170,15 +175,22 @@ class TestMambaMixerDeterminism:
 
     @requires_deterministic_conv1d
     @pytest.mark.parametrize("packed_layout", ["none", "unpadded", "padded"])
-    def test_mixer_replays_bit_exactly(self, monkeypatch, packed_layout):
+    @pytest.mark.parametrize("backend", ["triton", "cudnn"])
+    def test_mixer_replays_bit_exactly(self, monkeypatch, backend, packed_layout):
         """Two runs of one mixer agree bitwise under the deterministic conv reduction.
 
-        ``MAMBA_DETERMINISTIC`` pins the SSD scan, whose nondeterminism would otherwise reach
-        the conv weight gradient, so a failure points at the convolution.
+        ``MAMBA_DETERMINISTIC`` pins the Triton SSD scan, whose nondeterminism would otherwise
+        reach the conv weight gradient, so a failure points at the convolution. The cuDNN
+        backend (``mamba_kernel_backend='cudnn'``) replaces that scan and has no such switch.
         """
+        if backend == "cudnn":
+            reason = cudnn_mamba2_unsupported_reason(64, 128)
+            if reason is not None:
+                pytest.skip(reason)
         monkeypatch.setenv("MAMBA_DETERMINISTIC", "1")
         monkeypatch.setenv("CAUSAL_CONV1D_DETERMINISTIC", "1")
-        mixer = _build_mixer()
+        mixer = _build_mixer(mamba_kernel_backend=backend)
+        assert mixer.use_cudnn_kernels == (backend == "cudnn")
         hidden_size = mixer.config.hidden_size
         micro_batch = _MICRO_BATCH if packed_layout == "none" else 1
         packed_seq_params = None
