@@ -805,6 +805,12 @@ def checkpoint(
     # run inside a captured graph.
     if is_graph_warmup() or is_graph_capturing():
         return function(*args)
+    # A reentrant autograd Function runs backward only through a differentiable input. When
+    # every input is frozen, run eagerly so trainable parameters used inside still get gradients.
+    if not torch.is_grad_enabled() or not any(
+        isinstance(arg, torch.Tensor) and arg.requires_grad for arg in args
+    ):
+        return function(*args)
     return CheckpointFunction.apply(function, distribute_saved_activations, *args)
 
 
