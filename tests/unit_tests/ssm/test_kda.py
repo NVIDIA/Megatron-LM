@@ -156,6 +156,12 @@ def test_kda_forward_backward(two_stage_gates):
         assert kda.dt_bias.dtype == torch.float32
         assert getattr(kda.A_log, "keep_in_fp32", False)
         assert getattr(kda.dt_bias, "keep_in_fp32", False)
+        # out_norm is shared by every value head while TP splits the heads, so its
+        # gradients must be tagged for a TP sum in finalize_model_grads.
+        norm_params = list(kda.out_norm.parameters())
+        assert norm_params, "out_norm should have at least one parameter"
+        for param in norm_params:
+            assert getattr(param, "sum_gradients_across_tp_domain", False)
 
         hidden_states = torch.randn(
             (32, 2, config.hidden_size),
