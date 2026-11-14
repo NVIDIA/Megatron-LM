@@ -2325,6 +2325,7 @@ class DSAIndexer(MegatronModule):
         mscale: float,
         cu_seqlens: Optional[torch.Tensor] = None,
         cp_group: Optional[torch.distributed.ProcessGroup] = None,
+        max_seqlen: Optional[int] = None,
     ):
         """Apply RoPE to the input tensor."""
         cp_group = self.pg_collection.cp if cp_group is None else cp_group
@@ -2352,6 +2353,7 @@ class DSAIndexer(MegatronModule):
             cu_seqlens=cu_seqlens,
             mscale=mscale,
             cp_group=cp_group,
+            max_seqlen=max_seqlen,
             # This flag is for the MLA-style interleaving in RoPE.
             mla_rotary_interleaved=self.config.dsa_indexer_rope_interleaved,
         )
@@ -2384,8 +2386,17 @@ class DSAIndexer(MegatronModule):
             # NoPE: no rotary embedding; _apply_rope is a no-op.
             rotary_pos_emb = None
             mscale = 1.0
+        rope_max_seqlen = None
         if packed_seq:
             cu_seqlens_q, cu_seqlens_kv = dsa_layout.get_packed_qk_cu_seqlens(packed_seq_params)
+            # Lets the packed RoPE size its frequency table without a host sync, as MLA does.
+            if (
+                packed_seq_params.max_seqlen_q is not None
+                and packed_seq_params.max_seqlen_kv is not None
+            ):
+                rope_max_seqlen = max(
+                    packed_seq_params.max_seqlen_q, packed_seq_params.max_seqlen_kv
+                )
         else:
             cu_seqlens_q = cu_seqlens_kv = None
 
@@ -2410,7 +2421,14 @@ class DSAIndexer(MegatronModule):
         # [seqlen, batch, index_n_heads * index_head_dim]
         #   -> [seqlen, batch, index_n_heads, index_head_dim]
         q = q.reshape(seqlen, bsz, self.index_n_heads, self.index_head_dim)
-        q = self._apply_rope(q, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_q, cp_group=cp_group)
+        q = self._apply_rope(
+            q,
+            rotary_pos_emb,
+            mscale,
+            cu_seqlens=cu_seqlens_q,
+            cp_group=cp_group,
+            max_seqlen=rope_max_seqlen,
+        )
         if self.config.dsa_indexer_rotate_activation and self.index_kpool <= 1:
             q = rotate_activation(q)
 
@@ -2441,7 +2459,12 @@ class DSAIndexer(MegatronModule):
             # [seqlen, batch, index_head_dim] -> [seqlen, batch, 1, index_head_dim]
             k = k.reshape(seqlen, bsz, 1, self.index_head_dim)
             k = self._apply_rope(
-                k, rotary_pos_emb, mscale, cu_seqlens=cu_seqlens_kv, cp_group=cp_group
+                k,
+                rotary_pos_emb,
+                mscale,
+                cu_seqlens=cu_seqlens_kv,
+                cp_group=cp_group,
+                max_seqlen=rope_max_seqlen,
             )
             # [seqlen, batch, 1, index_head_dim] -> [seqlen, batch, index_head_dim]
             k = k.reshape(seqlen, bsz, self.index_head_dim)

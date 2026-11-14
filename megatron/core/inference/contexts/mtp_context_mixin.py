@@ -56,12 +56,17 @@ class MTPContextMixin:
             # decoder layer spec, so it is attention by construction.
             return True
 
-        # The reserved slot holds one layer's KV, so a head with a second attention layer would
-        # have both depths read and write the same plane.
-        attention_symbols = (Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MLA)
-        num_attention = sum(t in attention_symbols for t in mtp_layer_type_list)
-        has_recurrent = any(t in (Symbols.MAMBA, Symbols.GDN) for t in mtp_layer_type_list)
-        return num_attention == 1 and not has_recurrent
+        # The reserved slot holds one layer's KV, so the head may have exactly one attention layer
+        # that uses it, and otherwise only MLP and MoE layers, which keep no state. A second
+        # attention layer would have both depths read and write the same plane, and any other
+        # mixer (Mamba, GDN, KDA, DSv4 attention, or one added later) drafts without the
+        # context, which holds no draft state for it.
+        plane_attention = (Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MLA)
+        stateless = (Symbols.MLP, Symbols.MOE)
+        num_attention = sum(t in plane_attention for t in mtp_layer_type_list)
+        return num_attention == 1 and all(
+            t in plane_attention + stateless for t in mtp_layer_type_list
+        )
 
     def _mtp_initialize_kv_cache(
         self, model_config, mtp_layer_type_list: Optional[List[str]]

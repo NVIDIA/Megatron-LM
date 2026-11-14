@@ -83,6 +83,13 @@ class MambaInferenceStateConfig:
 
         decoder = get_attr_wrapped_model(model, "decoder")
         layer_type_list = getattr(decoder, "layer_type_list", None)
+        if layer_type_list is not None and Symbols.KDA in layer_type_list:
+            # KimiDeltaAttention rejects every inference context. An MTP head may still hold
+            # KDA layers: it drafts without a context.
+            raise NotImplementedError(
+                "KDA does not support inference in the decoder; only an MTP head may hold KDA "
+                "layers."
+            )
         recurrent_symbols = (Symbols.MAMBA, Symbols.GDN)
         if layer_type_list is not None and any(
             symbol in layer_type_list for symbol in recurrent_symbols
