@@ -492,6 +492,11 @@ def core_transformer_config_from_args(args, config_class=None):
                     f"got {variant!r} for pattern {pattern!r}."
                 )
             kw_args['experimental_attention_variant'] = 'dsv4_hybrid'
+        elif variant == 'ssa' and Symbols.DS_ATTENTION in pattern:
+            raise ValueError(
+                "Simplified sparse attention replaces '*' attention layers and cannot "
+                "be combined with MLA DSA 'D' layers."
+            )
         elif variant is None and Symbols.DS_ATTENTION in pattern:
             kw_args['experimental_attention_variant'] = 'dsa'
 

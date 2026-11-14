@@ -911,6 +911,23 @@ def num_floating_point_operations(
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
         )
 
+    using_ssa = transformer_cfg.experimental_attention_variant == "ssa"
+    # Indexer-only training (SSA phase 1) runs the frozen backbone forward only.
+    backbone_passes = 1 if using_ssa and transformer_cfg.ssa_train_indexer_only else 3
+
+    def ssa_indexer_flops(num_layers):
+        from megatron.core.transformer.experimental_attention_variant import (
+            simplified_sparse_attention as ssa_layers,
+        )
+
+        # The detached indexer has loss-dependent backward costs, unlike the layer's x3.
+        return num_layers * ssa_layers.SimplifiedSparseIndexer.estimate_flops(
+            transformer_cfg,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+            include_backward=True,
+        )
+
     def indexer_flops(
         num_layers, *, hybrid_layer_pattern=None, mtp_num_layers=0, mtp_use_repeated_layer=False
     ):
@@ -982,8 +999,18 @@ def num_floating_point_operations(
         attention_config = copy.copy(legacy_config)
         attention_config.attention_output_gate = False
         forward = 0
+        expanded = 0
         if counts[Symbols.ATTENTION]:
-            forward += counts[Symbols.ATTENTION] * estimate(SelfAttention, attention_config)
+            if using_ssa:
+                from megatron.core.transformer.experimental_attention_variant import (
+                    simplified_sparse_attention as ssa_layers,
+                )
+
+                attention_type = ssa_layers.SimplifiedSparseAttention
+                expanded += ssa_indexer_flops(counts[Symbols.ATTENTION])
+            else:
+                attention_type = SelfAttention
+            forward += counts[Symbols.ATTENTION] * estimate(attention_type, attention_config)
         if counts[Symbols.MLP]:
             forward += counts[Symbols.MLP] * estimate(MLP)
         if counts[Symbols.MOE]:
@@ -1010,7 +1037,6 @@ def num_floating_point_operations(
                 else GatedDeltaNet
             )
             forward += counts[Symbols.GDN] * estimate(gdn_type)
-        expanded = 0
         if counts[Symbols.DS_ATTENTION]:
             from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 
@@ -1037,7 +1063,7 @@ def num_floating_point_operations(
             * vocab_size
             * (1 + mtp_depths)
         )
-        return 3 * forward + expanded
+        return backbone_passes * forward + expanded
 
     def transformer_flops():
         """Count layer executions and model-level work using Core's forward estimates."""
@@ -1138,6 +1164,13 @@ def num_floating_point_operations(
                 mtp_num_layers=mtp_num_layers,
                 mtp_use_repeated_layer=transformer_cfg.mtp_use_repeated_layer,
             )
+        elif using_ssa:
+            from megatron.core.transformer.experimental_attention_variant import (
+                simplified_sparse_attention as ssa_layers,
+            )
+
+            attention_type = ssa_layers.SimplifiedSparseAttention
+            expanded = ssa_indexer_flops(num_standard_attention_layers)
         else:
             attention_type = (
                 MLASelfAttention if transformer_cfg.multi_latent_attention else SelfAttention
@@ -1159,7 +1192,7 @@ def num_floating_point_operations(
                 + hidden_size * vocab_size * (1 + mtp_num_layers)
             )
         )
-        return 3 * forward + expanded
+        return backbone_passes * forward + expanded
 
     # Keep legacy non-SiLU GLU accounting unchanged.
     legacy_config = copy.copy(transformer_cfg)
@@ -2201,13 +2234,43 @@ def _freeze_base_model_for_mtp(model_list):
     return model_list
 
 
-def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_base_model_for_mtp):
+def _freeze_backbone_for_ssa_indexer(model_list):
+    """Freeze everything but simplified sparse attention indexers, including router bias updates.
+
+    Phase 1 of simplified sparse attention trains only the indexers against a frozen dense
+    teacher. A pipeline stage may hold no indexer; only a model without any is rejected.
+    """
+    local_indexer_params = 0
+    for model_module in model_list:
+        for name, param in model_module.named_parameters():
+            is_indexer = name.startswith("indexer.") or ".indexer." in name
+            param.requires_grad_(is_indexer)
+            local_indexer_params += int(is_indexer)
+        for module in model_module.modules():
+            if hasattr(module, "frozen_expert_bias"):
+                module.frozen_expert_bias = True
+
+    indexer_params = local_indexer_params
+    if torch.distributed.is_initialized():
+        count = torch.tensor(indexer_params, dtype=torch.int64, device=torch.cuda.current_device())
+        torch.distributed.all_reduce(count)
+        indexer_params = count.item()
+    if indexer_params == 0:
+        raise RuntimeError("ssa_train_indexer_only found no simplified sparse attention indexer.")
+    return model_list
+
+
+def _add_model_freeze_pre_wrap_hook(
+    model_config, *, freeze_all_layers, freeze_base_model_for_mtp, ssa_train_indexer_only=False
+):
     """Install the requested freeze hook before a config-built model is wrapped."""
     freeze_hook = None
     if freeze_all_layers:
         freeze_hook = _freeze_all_model_chunks
     elif freeze_base_model_for_mtp:
         freeze_hook = _freeze_base_model_for_mtp
+    elif ssa_train_indexer_only:
+        freeze_hook = _freeze_backbone_for_ssa_indexer
 
     if freeze_hook is not None and freeze_hook not in model_config.pre_wrap_hooks:
         model_config.pre_wrap_hooks.append(freeze_hook)
@@ -2308,6 +2371,8 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
         _freeze_all_model_chunks(model)
     elif config.freeze_base_model_for_mtp:
         _freeze_base_model_for_mtp(model)
+    elif config.ssa_train_indexer_only:
+        _freeze_backbone_for_ssa_indexer(model)
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -2528,6 +2593,7 @@ def setup_model_and_optimizer(
                 model_config,
                 freeze_all_layers=args.freeze_all_layers,
                 freeze_base_model_for_mtp=cfg.model.transformer.freeze_base_model_for_mtp,
+                ssa_train_indexer_only=cfg.model.transformer.ssa_train_indexer_only,
             )
 
             return builder.build_distributed_models(
@@ -3370,9 +3436,27 @@ def train_step(
 
 
 def _get_indexer_logging_layer_counts(model_config) -> tuple[int, int | None]:
-    """Return tracker slots and active CSA indexer modules for loss logging."""
+    """Return tracker slots and active CSA or SSA indexer modules for loss logging."""
     transformer_cfg = model_config.transformer
     tracker_layers = transformer_cfg.num_layers + (transformer_cfg.mtp_num_layers or 0)
+    using_ssa = getattr(transformer_cfg, "experimental_attention_variant", None) == "ssa"
+    if using_ssa and is_hybrid_model(model_config):
+        # Only the attention layers of a hybrid stack own a simplified sparse indexer.
+        from megatron.core.models.hybrid.hybrid_layer_allocation import (
+            Symbols,
+            parse_hybrid_pattern,
+        )
+
+        parsed_pattern = parse_hybrid_pattern(model_config.hybrid_layer_pattern)
+        mtp_pattern = parsed_pattern.mtp_pattern or ""
+        tracker_layers = transformer_cfg.num_layers + len(mtp_pattern)
+        mtp_indexer_repeats = (
+            1 if transformer_cfg.mtp_use_repeated_layer else parsed_pattern.mtp_num_depths
+        )
+        indexer_layers = (parsed_pattern.main_pattern or "").count(Symbols.ATTENTION) + (
+            mtp_pattern.count(Symbols.ATTENTION) * mtp_indexer_repeats
+        )
+        return tracker_layers, indexer_layers
     if transformer_cfg.csa_compress_ratios is None:
         return tracker_layers, None
 

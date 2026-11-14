@@ -970,6 +970,7 @@ class DSGroupedSelfAttention(SelfAttention):
         rotary_pos_cos_sin,
         attn_mask_type: AttnMaskType,
         packed_seq_params: Optional[PackedSeqParams],
+        qkv_layernorm_output: Optional[torch.Tensor] = None,
     ) -> dict:
         if self.config.experimental_attention_variant != "dsa":
             return {}

@@ -789,6 +789,11 @@ def validate_args(args, defaults={}):
             "--freeze-base-model-for-mtp cannot be combined with --freeze-all-layers."
         )
 
+    if args.ssa_train_indexer_only:
+        assert (
+            not args.freeze_all_layers
+        ), "--ssa-train-indexer-only cannot be combined with --freeze-all-layers."
+
     # All MLA-based hybrid attention symbols use MLA projections.
     if args.hybrid_layer_pattern and any(
         symbol in args.hybrid_layer_pattern for symbol in Symbols.MLA_ATTENTION

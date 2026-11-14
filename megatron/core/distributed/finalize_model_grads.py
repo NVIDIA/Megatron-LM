@@ -436,7 +436,11 @@ def _update_router_qb_beta(
     qb_beta_count_list = []
     for model_chunk in model:
         for module in get_attr_wrapped_model(model_chunk, 'modules')():
-            if getattr(module, 'qb_beta_accum', None) is not None and module.training:
+            if (
+                getattr(module, 'qb_beta_accum', None) is not None
+                and module.training
+                and not getattr(module, 'frozen_expert_bias', False)
+            ):
                 qb_beta_list.append(module.qb_beta)
                 qb_beta_accum_list.append(module.qb_beta_accum)
                 qb_beta_count_list.append(module.qb_beta_count)
