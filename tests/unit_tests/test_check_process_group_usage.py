@@ -6,6 +6,7 @@ Run directly with ``python tests/unit_tests/test_check_process_group_usage.py`` 
 GPU fixtures used when pytest collects the enclosing unit-test package.
 """
 
+import ast
 import contextlib
 import importlib.util
 import io
@@ -24,6 +25,11 @@ SPEC.loader.exec_module(checker)
 
 IMPORT = "from megatron.core import parallel_state\n"
 CALL = "parallel_state.get_tensor_model_parallel_group()"
+SHIM_IMPORT = "from megatron.core.process_groups_config import ProcessGroupCollection\n"
+SHIM_CALL = "ProcessGroupCollection.use_mpu_process_groups()"
+GUARDED_IMPORT = "from megatron.core.process_groups_config import resolve_process_groups\n"
+GUARDED_ARGS = "(None, owner='Model', required=('tp',))"
+GUARDED_CALL = "resolve_process_groups" + GUARDED_ARGS
 
 
 class TestDetection(unittest.TestCase):
@@ -82,6 +88,49 @@ class TestDetection(unittest.TestCase):
                 "PGC.use_mpu_process_groups()\n"
             ),
             ["<module>:shim:use_mpu_process_groups"],
+        )
+
+    def test_flags_resolve_process_groups_as_guarded(self):
+        cases = [
+            (GUARDED_IMPORT, GUARDED_CALL),
+            (
+                "from megatron.core import process_groups_config as pgc\n",
+                "pgc.resolve_process_groups" + GUARDED_ARGS,
+            ),
+            (
+                "import megatron.core.process_groups_config\n",
+                "megatron.core.process_groups_config.resolve_process_groups" + GUARDED_ARGS,
+            ),
+            (
+                "from ..process_groups_config import resolve_process_groups as resolve\n",
+                "resolve" + GUARDED_ARGS,
+            ),
+        ]
+        for prefix, call in cases:
+            with self.subTest(prefix=prefix):
+                self.assertEqual(
+                    self.hits(prefix + call), ["<module>:guarded:resolve_process_groups"]
+                )
+
+    def test_guarded_calls_are_keyed_by_enclosing_scope(self):
+        self.assertEqual(
+            self.hits(
+                GUARDED_IMPORT
+                + "class Model:\n    def __init__(self, pg_collection=None):\n        "
+                + GUARDED_CALL
+            ),
+            ["Model.__init__:guarded:resolve_process_groups"],
+        )
+
+    def test_ignores_helpers_that_do_not_read_global_state(self):
+        self.assertEqual(
+            self.hits(
+                "from megatron.core import process_groups_config as pgc\n"
+                "pgc.require_process_groups(pg_collection, ('tp',), owner='Model')\n"
+                "pgc.warn_global_process_group_fallback('Model')\n"
+                "from unrelated import resolve_process_groups\n" + GUARDED_CALL
+            ),
+            [],
         )
 
     def test_flags_rank_and_world_size_accessors(self):
@@ -207,15 +256,80 @@ class TestDetection(unittest.TestCase):
             "initialize_model_parallel",
             "destroy_model_parallel",
             "is_initialized",
-            "get_virtual_pipeline_model_parallel_rank",
-            "get_virtual_pipeline_model_parallel_world_size",
-            "get_global_memory_buffer",
+            "model_parallel_is_initialized",
+            "register_process_groups",
+            "build_process_group_collection",
             "get_nccl_options",
-            "get_all_ranks",
         ]
         self.assertEqual(
             self.hits(IMPORT + "\n".join(f"parallel_state.{name}()" for name in names)), []
         )
+
+    def test_flags_other_deprecated_functions(self):
+        names = [
+            "is_pipeline_first_stage",
+            "is_pipeline_last_stage",
+            "is_rank_in_embedding_group",
+            "is_rank_in_position_embedding_group",
+            "get_virtual_pipeline_model_parallel_rank",
+            "set_virtual_pipeline_model_parallel_rank",
+            "get_virtual_pipeline_model_parallel_world_size",
+            "set_virtual_pipeline_model_parallel_world_size",
+            "get_all_ranks",
+            "set_tensor_model_parallel_world_size",
+            "set_tensor_model_parallel_rank",
+            "set_pipeline_model_parallel_world_size",
+            "set_pipeline_model_parallel_rank",
+            "set_data_parallel_rank",
+            "set_expert_model_parallel_world_size",
+            "set_expert_model_parallel_rank",
+            "set_expert_tensor_parallel_world_size",
+            "set_expert_tensor_parallel_rank",
+            "get_dynamic_data_context_parallel_group_map",
+            "get_dynamic_tensor_data_context_parallel_group_map",
+            "get_global_memory_buffer",
+            "destroy_global_memory_buffer",
+            "_set_global_memory_buffer",
+        ]
+        for name in names:
+            cases = [
+                (IMPORT, f"parallel_state.{name}()"),
+                ("from megatron.core import mpu\n", f"mpu.{name}()"),
+                (f"from megatron.core.parallel_state import {name}\n", f"{name}()"),
+            ]
+            for prefix, call in cases:
+                with self.subTest(prefix=prefix, call=call):
+                    self.assertEqual(
+                        self.hits(prefix + call), [f"<module>:function:parallel_state.{name}"]
+                    )
+
+    def test_call_after_a_fallback_warning_is_not_guarded(self):
+        # Only resolve_process_groups() is guarded: a direct call keeps its kind even when
+        # warn_global_process_group_fallback() precedes it.
+        self.assertEqual(
+            self.hits(
+                "from megatron.core import parallel_state, process_groups_config as pgc\n"
+                "def schedule(vp_size=None):\n"
+                "    if vp_size is None:\n"
+                "        pgc.warn_global_process_group_fallback('schedule', 'vp_size')\n"
+                "        vp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()\n"
+            ),
+            ["schedule:function:parallel_state.get_virtual_pipeline_model_parallel_world_size"],
+        )
+
+    def test_counts_every_deprecated_parallel_state_function(self):
+        # Megatron Core's own calls do not emit ParallelStateDeprecationWarning, so the ratchet is
+        # what tracks them: it counts a call of every function that parallel_state deprecates.
+        source = (REPO_ROOT / "megatron" / "core" / "parallel_state.py").read_text(encoding="utf-8")
+        deprecated = sorted(
+            node.name
+            for node in ast.parse(source).body
+            if isinstance(node, ast.FunctionDef)
+            and any("_deprecated_accessor" in ast.unparse(d) for d in node.decorator_list)
+        )
+        self.assertTrue(deprecated)
+        hits = self.hits(IMPORT + "\n".join(f"parallel_state.{name}()" for name in deprecated))
+        self.assertEqual(sorted(hit.rpartition(".")[2] for hit in hits), deprecated)
 
     def test_ignores_unrelated_imports_and_getters(self):
         self.assertEqual(
@@ -280,6 +394,11 @@ class TestRatchet(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()):
             return checker.main(list(argv))
 
+    def write_baseline(self, source):
+        """Make ``source`` the scanned file and record its reads as the allowlist."""
+        self.source.write_text(source, encoding="utf-8")
+        self.allowlist.write_text(json.dumps({"allowed": checker.scan()}), encoding="utf-8")
+
     def test_matching_baseline_passes(self):
         self.assertEqual(self.run_check(), 0)
 
@@ -321,7 +440,7 @@ class TestRatchet(unittest.TestCase):
         for rel in (*checker.EXEMPT, "megatron/training/example.py", "tests/example.py"):
             path = self.root / rel
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(IMPORT + CALL, encoding="utf-8")
+            path.write_text(IMPORT + CALL + "\n" + GUARDED_IMPORT + GUARDED_CALL, encoding="utf-8")
         self.assertEqual(self.run_check(), 0)
 
     def test_update_keeps_a_call_before_a_reassignment(self):
@@ -338,10 +457,98 @@ class TestRatchet(unittest.TestCase):
         self.assertEqual(json.loads(self.allowlist.read_text())["total"], 1)
         self.assertEqual(self.run_check(), 0)
 
+    def test_new_function_use_points_to_its_own_replacement(self):
+        # A new stage predicate, virtual-pipeline or memory-buffer call has no group to accept
+        # instead, so its error names the other replacements; a new group read's error does not.
+        hint = "A 'function' use has a replacement of its own"
+        cases = {
+            "parallel_state.set_virtual_pipeline_model_parallel_rank(0)": True,
+            "parallel_state.get_global_memory_buffer()": True,
+            CALL: False,
+        }
+        for call, has_hint in cases.items():
+            with self.subTest(call=call):
+                self.write_baseline("")
+                self.source.write_text(IMPORT + call, encoding="utf-8")
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    self.assertEqual(checker.main([]), 1)
+                self.assertIn("1 new use(s) of global parallel_state", output.getvalue())
+                self.assertEqual(hint in output.getvalue(), has_hint)
+
     def test_stats_does_not_hide_new_calls_in_check_mode(self):
         self.source.write_text(IMPORT + CALL + "; " + CALL, encoding="utf-8")
         self.assertEqual(self.run_check("--stats"), 0)
         self.assertEqual(self.run_check(), 1)
+
+    def test_stats_reports_guarded_reads_separately(self):
+        self.source.write_text(
+            IMPORT + CALL + "\n" + GUARDED_IMPORT + GUARDED_CALL, encoding="utf-8"
+        )
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(checker.main(["--stats"]), 0)
+        lines = output.getvalue().splitlines()
+        self.assertEqual(
+            lines[0], "2 use(s) of global parallel_state across 1 file(s) in megatron/core"
+        )
+        self.assertEqual(
+            [line.split() for line in lines[1:]],
+            [["accessor", "1"], ["function", "0"], ["shim", "0"], ["guarded", "1"]],
+        )
+
+    def test_conversion_to_resolve_process_groups_swaps_the_entry(self):
+        # One guarded call may replace the shim, or several accessor reads, of its scope.
+        for read_import, reads in ((SHIM_IMPORT, SHIM_CALL), (IMPORT, CALL + "; " + CALL)):
+            with self.subTest(reads=reads):
+                self.write_baseline(read_import + "def build():\n    " + reads)
+                self.source.write_text(
+                    GUARDED_IMPORT + "def build():\n    " + GUARDED_CALL, encoding="utf-8"
+                )
+                # The replaced read is stale until --update records the guarded entry instead.
+                self.assertEqual(self.run_check(), 1)
+                self.assertEqual(self.run_check("--update"), 0)
+                allowlist = json.loads(self.allowlist.read_text())
+                self.assertEqual(
+                    allowlist["allowed"],
+                    {"megatron/core/sample.py": ["build:guarded:resolve_process_groups"]},
+                )
+                self.assertEqual(allowlist["total"], 1)
+                self.assertEqual(self.run_check(), 0)
+
+    def test_guarded_call_without_a_replaced_read_is_new(self):
+        other = self.core / "other.py"
+        read_in_build = IMPORT + "def build():\n    " + CALL
+        guarded_in_build = GUARDED_IMPORT + "def build():\n    " + GUARDED_CALL
+        cases = {
+            "added next to a kept read": (
+                read_in_build,
+                {self.source: GUARDED_IMPORT + read_in_build + "; " + GUARDED_CALL},
+            ),
+            "replaces a read in another scope": (
+                IMPORT + "def old():\n    " + CALL,
+                {self.source: guarded_in_build},
+            ),
+            "replaces a read in another file": (
+                read_in_build,
+                {self.source: "", other: guarded_in_build},
+            ),
+            "two guarded calls replace one read": (
+                read_in_build,
+                {self.source: guarded_in_build + "; " + GUARDED_CALL},
+            ),
+            "a read replaces a guarded call": (guarded_in_build, {self.source: read_in_build}),
+        }
+        for case, (before, after) in cases.items():
+            with self.subTest(case=case):
+                other.unlink(missing_ok=True)
+                self.write_baseline(before)
+                original = self.allowlist.read_bytes()
+                for path, source in after.items():
+                    path.write_text(source, encoding="utf-8")
+                self.assertEqual(self.run_check(), 1)
+                self.assertEqual(self.run_check("--update"), 1)
+                self.assertEqual(self.allowlist.read_bytes(), original)
 
 
 if __name__ == "__main__":

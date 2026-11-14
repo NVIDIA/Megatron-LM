@@ -4,12 +4,12 @@
 
 from copy import deepcopy
 from functools import partial
-from typing import Union
+from typing import Optional, Union
 
 import torch
 
 import megatron
-from megatron.core import mpu, tensor_parallel
+from megatron.core import tensor_parallel
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.t5_dataset import (
     T5MaskedWordPieceDataset,
@@ -24,9 +24,14 @@ from megatron.core.models.T5.t5_spec import (
     get_t5_encoder_with_local_block_spec,
     get_t5_encoder_with_transformer_engine_block_spec,
 )
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
+from megatron.core.utils import get_pg_rank
 from megatron.training import get_args, get_timers, pretrain, print_rank_0
-from megatron.training.arguments import parse_and_validate_args
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.vocab_utils import model_vocab_size
 from megatron.training.global_vars import (
     get_run_config,
@@ -90,6 +95,8 @@ def model_provider(
     Returns:
         T5Model: The returned T5 model
     """
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     cfg = get_run_config()
 
@@ -143,6 +150,7 @@ def model_provider(
         relative_attention_max_distance=cfg.model.relative_attention_max_distance,
         add_encoder=add_encoder,
         add_decoder=add_decoder,
+        pg_collection=pg_collection,
     )
 
     return model
@@ -205,13 +213,29 @@ def forward_step(data_iterator, model: T5Model):
     return output_tensor, partial(loss_func, loss_mask)
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples: int):
+def train_valid_test_datasets_provider(
+    train_val_test_num_samples: int, pg_collection: Optional[ProcessGroupCollection] = None
+):
     """Build the train test and validation datasets.
 
     Args:
         train_val_test_num_samples : A list containing the number of samples
             in train test and validation.
+        pg_collection: Process groups of the run. The first rank of its tensor-parallel group
+            builds the datasets. Omitting it is deprecated: the groups are then built from the
+            global parallel state, with a ProcessGroupFallbackWarning.
     """
+    if pg_collection is None:
+        warn_global_process_group_fallback(
+            "pretrain_t5.train_valid_test_datasets_provider",
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"])
+    if pg_collection.tp is None:
+        raise ValueError("train_valid_test_datasets_provider requires pg_collection.tp")
+    tp_group = pg_collection.tp
+
     cfg = get_run_config()
     args = get_args()
     tokenizer = get_tokenizer()
@@ -245,7 +269,7 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
     train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
         T5MaskedWordPieceDataset,
         train_val_test_num_samples,
-        lambda: mpu.get_tensor_model_parallel_rank() == 0,
+        lambda: get_pg_rank(tp_group) == 0,
         config,
     ).build()
 

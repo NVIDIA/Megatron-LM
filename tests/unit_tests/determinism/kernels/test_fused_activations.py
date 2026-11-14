@@ -158,7 +158,9 @@ def test_paged_stash_marked_activation_fusions_replay_bit_exactly(name, activati
     def with_bf16_override(x, weights):
         with te_ext.fp8_autocast(enabled=True, fp8_recipe=MXFP8BlockScaling()):
             assert te_ext.FP8GlobalStateManager.is_fp8_enabled()
-            with te_ext._get_fp8_autocast_for_quant_params(qparams, training=True):
+            with te_ext._get_fp8_autocast_for_quant_params(
+                qparams, training=True, owner="test_fused_activations"
+            ):
                 assert not te_ext.FP8GlobalStateManager.is_fp8_enabled()
                 output = fn(x, weights)
             assert te_ext.FP8GlobalStateManager.is_fp8_enabled()
