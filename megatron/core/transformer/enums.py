@@ -55,6 +55,7 @@ class AttnBackend(enum.Enum):
 
     flash = 1
     fused = 2
+    cudnn = 2  # alias of fused: TE's FusedAttention is cuDNN attention
     unfused = 3
     local = 4
     auto = 5
