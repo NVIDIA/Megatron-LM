@@ -416,18 +416,13 @@ availability for those submodule calls and releases gathered parameters through
 callbacks from the overlap schedule. This integration is automatic; users do not
 need to register parameter hooks.
 
-The v2 integration manages parameters at the owning `FsdpModule` unit: it
-unshards the unit before computation, reshards it at the layer's forward boundary,
-and reshards and processes gradients once that unit's backward gradients are
-ready. It does not use v1's fine-grained parameter-gather mechanism. Its separate
-restrictions still apply, including disabling gradient
-accumulation fusion, FP4, and non-MXFP8 FP8 recipes. Do not assume that v1 buffer
-options or its compatibility guarantees apply to v2. The repository includes
-PP=1 eager overlap functional-test configurations for both
-[v1](../../../tests/functional_tests/test_cases/moe/deepseek_proxy_mfsdp_v1_ep2_ep_overlap/model_config.yaml)
-and [v2](../../../tests/functional_tests/test_cases/moe/deepseek_proxy_mfsdp_v2_ep2_ep_overlap/model_config.yaml).
-These are CI configurations, not standalone training commands or performance
-benchmarks. See [Megatron-FSDP](megatron_fsdp.md) for the broader setup.
+For v2, the Combined 1F1B scheduler explicitly unshards and reshards
+`FsdpModule` units to match its execution order. This integration does not use
+v1's fine-grained parameter-gather mechanism.
+
+The v2 restrictions still apply: disable gradient accumulation fusion, FP4, and
+non-MXFP8 FP8 recipes. Its buffer settings and compatibility constraints are
+separate from v1's. See [Megatron-FSDP](megatron_fsdp.md) for the broader setup.
 
 ### Other feature interactions
 
