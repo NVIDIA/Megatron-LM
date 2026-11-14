@@ -54,3 +54,4 @@ class TestRequestLifecycleRecomputeContinuity(RequestLifecyclePairwiseBase):
         result = self._assert_pair(_CHUNKED_RECOMPUTE, coordinator=True)
         assert result.witness["finished_chunk_token_count"] > 0
         assert result.checkpoint_counts == {3: 1, 1: 1, 0: 0}
+        assert all(request.finish_reason == "length" for request in result.requests)
