@@ -76,7 +76,7 @@ class SFTDataset(MegatronDataset):
         indices: np.ndarray,
         num_samples: Optional[int],
         index_split: Split,
-        config: SFTDatasetConfig,
+        config: OnlineTokenizedDatasetConfig,
     ) -> None:
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
         # Pre-calculate padding divisor to avoid redundant computation in get_item
@@ -319,7 +319,7 @@ class MockSFTDataset(SFTDataset):
         indices: np.ndarray,
         num_samples: Optional[int],
         index_split: Split,
-        config: SFTDatasetConfig,
+        config: OnlineTokenizedDatasetConfig,
     ) -> None:
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
 

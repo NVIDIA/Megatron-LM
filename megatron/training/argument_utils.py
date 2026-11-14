@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDatasetConfig
 from megatron.core.distributed import (
@@ -1174,7 +1175,7 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
 
 def core_gpt_dataset_config_from_args(
     args: Namespace, *, tokenizer: Any = None, dataset_type: type | None = None
-) -> GPTDatasetConfig:
+) -> BlendedMegatronDatasetConfig:
     """A standalone dataset config from the legacy arguments, with its tokenizer bound.
 
     The call shape the GPT entry points had before ``cfg.data`` existed, kept for scripts that build
