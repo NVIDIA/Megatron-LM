@@ -148,6 +148,10 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)
+        if getattr(args, "logits_save_inputs", False) or getattr(args, "logits_load_inputs", False):
+            from megatron.training.distillation.v3_runtime import on_tp0_batch
+
+            batch = on_tp0_batch(batch, hybrid=True, vp_stage=vp_stage)
         for key in BATCH_KEYS:
             batch[key] = (
                 batch[key].cuda(non_blocking=True)
@@ -189,7 +193,7 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         and cfg.model.transformer.linear_cp_layout != cfg.model.transformer.attention_cp_layout
     ):
         additional_layouts.add(cfg.model.transformer.attention_cp_layout)
-    return get_batches_on_this_cp_rank(
+    cp_batch = get_batches_on_this_cp_rank(
         batch,
         boundary_layout=cfg.model.transformer.linear_cp_layout,
         dynamic_cp=False,
@@ -208,6 +212,11 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
         ),
         tokens_per_sample=args.seq_length,
     )
+    if getattr(args, "logits_load_inputs", False):
+        from megatron.training.distillation.v3_runtime import stage_targets
+
+        stage_targets(vp_stage=vp_stage)
+    return cp_batch
 
 
 # define spiky loss as a loss that's 10x the max loss observed
@@ -241,7 +250,8 @@ def _build_cached_logits_loss_func(
 
 
 def loss_func(
-    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[HybridModel] = None
+    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[HybridModel] = None,
+    kd_batch=None,
 ):
     """Loss function.
 
@@ -256,7 +266,11 @@ def loss_func(
             the data parallel ranks
     """
     args = get_args()
-    if args.logits_load_dir is not None:
+    if getattr(args, "logits_load_inputs", False):
+        from megatron.training.distillation.v3_loss import paired_loss
+
+        loss, num_tokens, report = paired_loss(loss_mask, output_tensor, model, kd_batch)
+    elif args.logits_load_dir is not None:
         # Offline knowledge distillation loss using cached teacher log-probabilities.
         loss_func_cached_logits = _build_cached_logits_loss_func(
             logprobs_dir=args.logits_load_dir,
@@ -370,8 +384,14 @@ def forward_step(data_iterator, model: HybridModel):
             cp_batch=cp_batch,
         )
 
+    kd_batch = None
+    if getattr(get_args(), "logits_load_inputs", False):
+        from megatron.training.distillation.v3_runtime import take_targets
+
+        kd_batch = take_targets()
+
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
-    return output_tensor, partial(loss_func, loss_mask, model=model)
+    return output_tensor, partial(loss_func, loss_mask, model=model, kd_batch=kd_batch)
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None):
@@ -381,6 +401,12 @@ def train_valid_test_datasets_provider(train_val_test_num_samples, vp_stage=None
     ``pretrain_gpt.py`` and ``pretrain_hybrid_flex.py``, called with the shared rank
     predicate.
     """
+    if getattr(get_args(), "logits_load_inputs", False):
+        from megatron.training.distillation.v3_datasets import build_validation_datasets
+
+        return build_validation_datasets(
+            train_val_test_num_samples, vp_stage, is_dataset_built_on_rank, hybrid=True
+        )
     return build_gpt_datasets(
         train_val_test_num_samples, vp_stage, built_on_rank=is_dataset_built_on_rank
     )

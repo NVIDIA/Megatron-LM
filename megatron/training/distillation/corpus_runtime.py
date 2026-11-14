@@ -1,0 +1,278 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+"""Corpus dumps: one whole source dataset, scored once by a frozen teacher.
+
+A corpus source is generic, like the files it is derived from: complete, unweighted and
+unsplit. Weights, train/validation choices and repetition belong to blends of sources.
+A corpus dump captures ordinary V3 records, with independent parts published by a
+consolidated chunk index:
+
+- one unweighted source (one ``--data-path`` prefix or SFT file), written under
+  ``<corpus>/<source>/``;
+- all of it, exactly once, as Megatron builds it (GPT windows, SFT rows), with no
+  ``--split`` partition or additional sample permutation.
+
+The epoch is padded to whole global batches for execution. The corpus saver removes
+filler samples before writing. Like a replay dump, a job rewrites the source from its
+start iteration (``--override-ckpt-iteration``, else its ``--save`` progress tracker).
+"""
+
+import json
+import os
+from typing import Any, Callable
+
+import torch
+import torch.distributed as dist
+
+from .format.arrow import file_meta
+from .format.contract import blend_contract, mismatched_corpus_order, mismatched_settings
+from .format.corpus import CorpusInventory, check_chunk
+from .v3_options import runtime_options
+from .v3_storage import CHUNK, Storage, discard_range, flush_dir, object_spans
+
+# Placeholder budget until the epoch length is known (set once the dataset is built).
+_UNTIL_EPOCH_END = 1 << 40
+_INVENTORY = None
+
+
+def corpus_inventory() -> CorpusInventory:
+    """Return the source inventory of the rank that publishes chunk indexes."""
+    if _INVENTORY is None:
+        raise RuntimeError("Corpus inventory was not initialized with the dump metadata")
+    return _INVENTORY
+
+
+def reset_corpus_runtime() -> None:
+    """Discard cached producer state on an in-process restart."""
+    global _INVENTORY
+    _INVENTORY = None
+
+
+def producer_settings(args: Any) -> dict:
+    """Megatron-only invariants for retrying an existing source's work assignment.
+
+    A chunk's rows depend only on its iterations and the global batch size; the rank
+    layout and flush interval may change between jobs of one source.
+    """
+    return {"name": "megatron", "global_batch_size": args.global_batch_size}
+
+
+def initialize_corpus_metadata(saver: Any, expected: dict) -> dict:
+    """Validate the source, then unpublish the chunks this job rewrites (collective)."""
+    from .utils import _broadcast_without_pp
+    from .v3_options import get_args
+    from .v3_runtime import (
+        _report_recorded_differences,
+        check_rewrite_bounds,
+        dump_range,
+        report_replaced,
+    )
+
+    args = get_args()
+
+    def initialize() -> dict:
+        global _INVENTORY
+        try:
+            inventory = CorpusInventory(Storage(args.logits_save_dir))
+            start, end = dump_range(args)
+            if start > args.train_iters:
+                raise ValueError(
+                    f"Corpus job starts at iteration {start}, beyond the source epoch "
+                    f"({args.train_iters} iterations)"
+                )
+            spans, kept = [], []
+            for directory in sorted(inventory.chunks):
+                chunk = inventory.chunks[directory]
+                a, b = chunk["producer"]["start_iteration"], chunk["producer"]["end_iteration"]
+                if directory != flush_dir(CHUNK, a, b) or not 0 <= a < b:
+                    raise ValueError("Invalid Megatron corpus chunk interval")
+                spans.append((a, b))
+                if not start <= a < end:
+                    kept.append(directory)
+            previous = 0
+            for a, b in spans:
+                if a < previous:
+                    raise ValueError("Overlapping Megatron corpus chunks")
+                previous = b
+            check_rewrite_bounds(object_spans(inventory.objects, CHUNK), start, end, "iterations")
+            # Chunks this job keeps must agree with it; the ones it rewrites need not.
+            settings = producer_settings(args)
+            total = expected["contract"]["num_samples"]
+            gbs = args.global_batch_size
+            recorded_differences = set()
+            for directory in kept:
+                chunk = inventory.chunks[directory]
+                producer = chunk["producer"]
+                if any(producer.get(key) != value for key, value in settings.items()):
+                    raise ValueError(
+                        "Corpus producer settings changed; rewrite the whole source or use a new "
+                        "source directory"
+                    )
+                a, b = producer["start_iteration"], producer["end_iteration"]
+                rows = sum(
+                    block["rows"] for part in chunk["parts"] for block in part["index"]["blocks"]
+                )
+                if rows != min(total, b * gbs) - min(total, a * gbs):
+                    raise ValueError("Corpus chunk has the wrong number of real source rows")
+                for part in chunk["parts"]:
+                    meta = file_meta(part["index"])
+                    differing, recorded = mismatched_settings(meta, expected)
+                    recorded_differences.update(recorded)
+                    differing += mismatched_corpus_order(meta, expected)
+                    if differing:
+                        raise ValueError(f"Corpus source settings changed: {', '.join(differing)}")
+            # Preserve the existing cross-source tokenizer check. This listing is
+            # performed once on initialization, never during flush or student reads.
+            root = Storage(args.kd_corpus_root)
+            seen = {args.kd_corpus_dump}
+            for path in root.list("*/chunk-*/index.json"):
+                source = path.split("/", 1)[0]
+                if source in seen:
+                    continue
+                seen.add(source)
+                chunk = json.loads(root.read(path))
+                meta = check_chunk(chunk)
+                if (
+                    blend_contract(meta["contract"])["tokenizer"]
+                    != expected["contract"]["tokenizer"]
+                ):
+                    raise ValueError(f"Corpus source {source} uses a different tokenizer")
+                if meta.get("recorded", {}).get("teacher") != expected["recorded"]["teacher"]:
+                    recorded_differences.add("teacher")
+            # Unpublish and delete everything this job rewrites, unpublished parts included.
+            replaced = discard_range(inventory.storage, CHUNK, inventory.objects, start, end)
+            report_replaced(replaced, "iterations")
+            for directory in set(inventory.chunks) - set(kept):
+                del inventory.chunks[directory]
+            _INVENTORY = inventory  # Only this rank publishes chunk indexes.
+            return {"metadata": expected, "differing": sorted(recorded_differences)}
+        except Exception as error:
+            return {"error": f"{type(error).__name__}: {error}"}
+
+    result = _broadcast_without_pp(initialize)
+    if "error" in result:
+        raise RuntimeError(result["error"])
+    _report_recorded_differences(result["differing"], "corpus sources and dump job")
+    return result["metadata"]
+
+
+def validate_corpus_dump(args: Any) -> None:
+    """Check and apply ``--kd-corpus-dump`` settings (idempotent)."""
+    name = getattr(args, "kd_corpus_dump", None)
+    if not name:
+        return
+    if not args.logits_save_dir:
+        raise ValueError("--kd-corpus-dump requires --logits-save-dir (the corpus directory)")
+    if os.sep in name or name in ("", ".", ".."):
+        raise ValueError(f"--kd-corpus-dump source name {name!r} must be a plain directory name")
+    if not getattr(args, "freeze_all_layers", False):
+        raise ValueError("Corpus dumps require a frozen teacher (--freeze-all-layers)")
+    if getattr(args, "rampup_batch_size", None):
+        raise ValueError("Corpus dumping requires a fixed global batch size")
+    if getattr(args, "dataloader_type", None) not in (None, "single"):
+        # Fillers are recognized by their position in Megatron's sequential order.
+        raise ValueError("Corpus dumping requires --dataloader-type single")
+    paths = getattr(args, "data_path", None) or []
+    if not getattr(args, "mock_data", False) and len(paths) != 1:
+        raise ValueError(
+            "Corpus dumps take exactly one unweighted --data-path prefix (or SFT file); "
+            "dump each source with its own job"
+        )
+    for flag in ("train_data_path", "valid_data_path", "test_data_path", "data_args_path"):
+        if getattr(args, flag, None):
+            raise ValueError(f"Corpus dumps do not support --{flag.replace('_', '-')}")
+    if getattr(args, "per_split_data_args_path", None):
+        raise ValueError("Corpus dumps do not support --per-split-data-args-path")
+    if getattr(args, "phase_transition_iterations", None):
+        raise ValueError("Corpus dumps do not support dataset phase transitions")
+    if getattr(args, "eval_iters", 0):
+        raise ValueError(
+            "Corpus dumps score the whole source and no validation; use --eval-iters 0"
+        )
+    if getattr(args, "kd_corpus_root", None) is None:
+        if getattr(args, "train_samples", None):
+            raise ValueError("Corpus dumps size themselves to one epoch; omit --train-samples")
+        args.kd_corpus_root = args.logits_save_dir
+        args.logits_save_dir = os.path.join(args.logits_save_dir, name)
+        args.train_iters = _UNTIL_EPOCH_END // args.global_batch_size
+    # The whole source is the training part: a corpus source is never split.
+    args.split = "100,0,0"
+    args.logits_save_inputs = True
+
+
+def validate_corpus_blend(args: Any) -> None:
+    """Check and apply ``--kd-corpus-blend``: corpus loading reuses the replay path."""
+    path = getattr(args, "kd_corpus_blend", None)
+    if not path:
+        return
+    from .format.blend import load_config
+
+    if getattr(args, "logits_save_inputs", False) or getattr(args, "kd_corpus_dump", None):
+        raise ValueError("A run cannot both dump and load offline KD v3 data")
+    if getattr(args, "logits_load_shuffle_shards", None) is not None:
+        raise ValueError("A corpus blend is ordered by its plan; omit --logits-load-shuffle-shards")
+    config = load_config(path)
+    args.logits_load_inputs = True
+    args.logits_load_dir = args.logits_load_dir or config["corpus"]
+
+
+def epoch_length(dataset: Any) -> int:
+    """Samples in one epoch of a Megatron dataset built with ``num_samples=None``.
+
+    ``GPTDataset`` then builds exactly one epoch of windows; ``SFTDataset`` reports its
+    requested count, so its length is set to the number of rows it indexes.
+    """
+    if getattr(dataset, "num_samples", 0) is None and hasattr(dataset, "indices"):
+        dataset.num_samples = len(dataset.indices)
+    return len(dataset)
+
+
+class CorpusEpoch(torch.utils.data.Dataset):
+    """Preserve a dataset's epoch order and pad it to whole global batches."""
+
+    def __init__(self, dataset: Any, *, global_batch_size: int):
+        self.dataset = dataset
+        self.num_samples = epoch_length(dataset)
+        if self.num_samples < 1:
+            raise ValueError("Corpus dump source has no samples")
+        self.padded = -(-self.num_samples // global_batch_size) * global_batch_size
+
+    def __len__(self) -> int:
+        return self.padded
+
+    def __getitem__(self, index: int) -> Any:
+        # Filler positions repeat the first samples; they are never part of the corpus.
+        return self.dataset[index % self.num_samples]
+
+
+def build_corpus_dump_datasets(args: Any, provider: Callable) -> tuple:
+    """Build the whole source for exactly one epoch and wrap it (data-building ranks)."""
+    args = runtime_options(args)
+    # A single unweighted prefix, all in the training part, with size None builds one
+    # full epoch of the whole source.
+    dataset = provider([None, None, None])[0]
+    if dataset is None:
+        raise ValueError("Corpus dump source has no samples")
+    epoch = CorpusEpoch(dataset, global_batch_size=args.global_batch_size)
+    args.kd_corpus_samples = epoch.num_samples
+    return epoch, None, None
+
+
+def agree_corpus_epoch(args: Any) -> None:
+    """Share the epoch length with every rank and size the run to it (collective)."""
+    args = runtime_options(args)
+    length = torch.tensor(
+        [getattr(args, "kd_corpus_samples", 0)],
+        dtype=torch.long,
+        device="cuda" if torch.cuda.is_available() else "cpu",
+    )
+    if dist.is_initialized():
+        dist.all_reduce(length, op=dist.ReduceOp.MAX)
+    args.kd_corpus_samples = int(length.item())
+    args.train_iters = -(-args.kd_corpus_samples // args.global_batch_size)
+    if not dist.is_initialized() or dist.get_rank() == 0:
+        print(
+            f"Offline KD corpus dump: {args.kd_corpus_samples} samples of "
+            f"{args.kd_corpus_dump} in {args.train_iters} iterations",
+            flush=True,
+        )

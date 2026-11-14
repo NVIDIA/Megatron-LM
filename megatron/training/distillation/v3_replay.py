@@ -1,0 +1,882 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+"""Sample replay, collation, and token mappings for paired offline KD data."""
+
+import bisect
+import concurrent.futures
+import itertools
+import os
+import queue
+import random
+import threading
+from typing import Any, Callable
+
+import numpy as np
+import pyarrow as pa
+import torch
+
+from .format.arrow import block_range, decode_block, file_meta, read_block, read_block_bytes
+from .format.blend import MANIFEST_VERSION
+from .format.index_cache import BoundedIndexCache
+from .v3_format import LOGPROB_SENTINEL, TOKEN_FIELDS, mismatched_settings, validate_metadata
+from .v3_storage import INDEX, REPLAY, Storage, flush_dir, published_spans, read_group
+
+
+def merged_boundaries(rows: list[torch.Tensor], sample_lengths: list[int]) -> torch.Tensor:
+    """Combine document boundaries without losing sample-relative offsets."""
+    pieces = [torch.zeros(1, dtype=torch.int32)]
+    offset = 0
+    for row, length in zip(rows, sample_lengths):
+        pieces.append(row[1:].to(torch.int32).cpu() + offset)
+        offset += length
+    return torch.cat(pieces)
+
+
+def token_map(
+    inputs: dict[str, Any],
+    cp_rank: int,
+    cp_size: int,
+    *,
+    layout: str = "zigzag",
+    per_sequence: bool = False,
+    hybrid_padded_zigzag: bool = False,
+    tp_alignment: int = 1,
+) -> torch.Tensor:
+    """Return [local_sequence, model_batch] canonical token indices.
+
+    The same map gathers teacher outputs and slices student targets. Prefix
+    shortening has already happened before this mapping is constructed.
+    """
+    offsets = inputs["sample_offsets"]
+    lengths = (offsets[1:] - offsets[:-1]).tolist()
+    if len(set(lengths)) != 1:
+        raise ValueError("Variable-length v3 replay is reserved for a future packing adapter")
+    packed = inputs.get("cu_seqlens") is not None
+    length = lengths[0]
+    indices = torch.arange(int(offsets[-1]), dtype=torch.int64)
+    full = (
+        indices.reshape(-1, 1) if packed else indices.reshape(len(lengths), length).T.contiguous()
+    )
+    if cp_size == 1:
+        return full
+    if layout == "contiguous":
+        if full.shape[0] % (2 * cp_size):
+            raise ValueError("Offline KD sequence length must be divisible by 2 * student CP")
+        return full.chunk(cp_size, dim=0)[cp_rank].contiguous()
+    if layout != "zigzag":
+        raise ValueError(f"Unsupported offline KD CP layout: {layout}")
+    boundaries = None
+    if packed:
+        boundaries = merged_boundaries(inputs["cu_seqlens"], lengths)
+        if hybrid_padded_zigzag:
+            from megatron.core.context_parallel.layout import _build_thd_zigzag_metadata
+
+            real = merged_boundaries(inputs["cu_seqlens"], lengths)
+            metadata = _build_thd_zigzag_metadata(real, boundaries, cp_size, tp_alignment)
+            index = metadata.rank_order_indices.reshape(cp_size, -1)[cp_rank].to(torch.int64)
+            return index.reshape(-1, 1)
+    if boundaries is None or per_sequence:
+        boundaries = torch.tensor([0, full.shape[0]])
+    pieces = []
+    for a, b in zip(boundaries[:-1].tolist(), boundaries[1:].tolist()):
+        if (b - a) % (2 * cp_size):
+            raise ValueError("Saved offline KD document padding is incompatible with student CP")
+        chunk = (b - a) // (2 * cp_size)
+        pieces.extend(
+            (
+                full[a + cp_rank * chunk : a + (cp_rank + 1) * chunk],
+                full[a + (2 * cp_size - cp_rank - 1) * chunk : a + (2 * cp_size - cp_rank) * chunk],
+            )
+        )
+    return torch.cat(pieces, dim=0).contiguous()
+
+
+def map_targets(
+    values: torch.Tensor, indices: torch.Tensor, tail: torch.Tensor, mapping: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply precisely the input token mapping to teacher top-K targets and tails."""
+    flat = mapping.reshape(-1)
+    valid = flat >= 0
+    selected = flat.clamp_min(0)
+    shape = (*mapping.shape, values.shape[-1])
+    local_values = values.index_select(0, selected).reshape(shape)
+    local_indices = indices.index_select(0, selected).reshape(shape)
+    local_tail = tail.index_select(0, selected).reshape(mapping.shape)
+    if not valid.all():
+        local_values = local_values.masked_fill(~valid.reshape(*mapping.shape, 1), -1e3)
+        local_indices = local_indices.masked_fill(~valid.reshape(*mapping.shape, 1), 0)
+        local_tail = local_tail.masked_fill(~valid.reshape(mapping.shape), 0.0)
+    return local_values, local_indices, local_tail
+
+
+def layout_options(args: Any, *, hybrid: bool = False) -> dict[str, Any]:
+    """Match the entrypoint's standard CP partitioning options."""
+    layout = "zigzag"
+    attention_layout = "zigzag"
+    if hybrid:
+        config = getattr(args, "transformer_config", None)
+        if config is None:
+            from megatron.training.arguments import core_transformer_config_from_args
+
+            config = core_transformer_config_from_args(args)
+        layout = config.linear_cp_layout
+        attention_layout = config.attention_cp_layout
+    return {
+        "layout": layout,
+        "per_sequence": bool(args.dataloader_inter_document_masking and not args.sft),
+        "hybrid_padded_zigzag": hybrid
+        and layout == "zigzag"
+        and (
+            attention_layout == "contiguous"
+            or (args.dataloader_inter_document_masking and not args.sft)
+        ),
+        "tp_alignment": args.tensor_model_parallel_size if args.sequence_parallel else 1,
+    }
+
+
+def discover_groups(
+    storage: Storage, metadata: dict, *, indexes: list[str] | None = None
+) -> tuple[list[tuple[int, int]], tuple[int, int, int] | None]:
+    """List published flush indexes once and return the contiguous published prefix.
+
+    A flush is published once its index exists. Returns ``(groups, hole)`` where
+    ``groups`` are the published ``(start, end)`` sample ranges from the cache's first
+    iteration without a gap, and ``hole`` is ``(gap_start, next_published_start,
+    later_groups)`` in samples when published flushes exist beyond a gap (e.g. parallel
+    dump jobs that are still writing).
+    """
+    validate_metadata(metadata)
+    contract = metadata["contract"]
+    gbs = contract["global_batch_size"]
+    if indexes is None:
+        indexes = storage.list(f"{REPLAY}-*/{INDEX}")
+    by_start = dict(published_spans(indexes, REPLAY))
+    groups = []
+    cursor = contract["first_iteration"]
+    while cursor in by_start:
+        groups.append((cursor * gbs, by_start[cursor] * gbs))
+        cursor = by_start[cursor]
+    later = sorted(start for start in by_start if start > cursor)
+    hole = (cursor * gbs, later[0] * gbs, len(later)) if later else None
+    return groups, hole
+
+
+def describe_hole(hole: tuple[int, int, int] | None) -> str:
+    """Explain a gap in the published prefix."""
+    if hole is None:
+        return ""
+    gap_start, next_start, later = hole
+    return (
+        f"samples {gap_start}-{next_start} are not yet published, but {later} later range(s) "
+        "are; a parallel dump job may still be writing"
+    )
+
+
+class _Lane:
+    """Read one ordered stream of blocks, decoding a bounded window ahead.
+
+    ``items(stopped)`` yields ``(key, (storage, data file, index, block, label))`` with
+    increasing keys; consumers request keys in non-decreasing order. Each block is one
+    ranged read (of its input columns only, when targets are not needed).
+    """
+
+    def __init__(self, reader: Any, name: str, items: Callable):
+        self.reader = reader
+        self.queue: queue.Queue = queue.Queue(maxsize=reader.prefetch_depth)
+        self.current = None
+        self.stopped = threading.Event()
+        self.thread = threading.Thread(
+            target=self._run, args=(items,), name=f"offline-kd-v3-{name}", daemon=True
+        )
+        self.thread.start()
+
+    def _put(self, item: tuple) -> bool:
+        while not self.stopped.is_set():
+            try:
+                self.queue.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _run(self, items: Callable) -> None:
+        reader = self.reader
+        try:
+            for key, (storage, data, index, block, label) in items(self.stopped):
+                offset, size = block_range(index, block, inputs_only=not reader.targets)
+                raw = storage.read_range(data, offset, size)
+                future = reader.pool.submit(reader.decode_rows, index, block, raw, label)
+                if not self._put((key, future)):
+                    return
+            self._put((None, RuntimeError("Offline KD v3 stream ended before a requested block")))
+        except BaseException as error:  # Surface any failure to the consumer.
+            self._put((None, error))
+
+    def block(self, key: tuple) -> tuple[dict, tuple | None]:
+        """Return the decoded block for ``key``, advancing the stream as needed."""
+        while self.current is None or self.current[0] < key:
+            item = self.queue.get()
+            if item[0] is None:
+                raise item[1]
+            self.current = item
+        if self.current[0] != key:
+            raise RuntimeError(f"Offline KD v3 replay requested {key} after {self.current[0]}")
+        return self.current[1].result()
+
+    def close(self) -> None:
+        """Stop streaming and release buffered blocks."""
+        self.stopped.set()
+        while True:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+        self.current = None
+
+
+class _BlockReader:
+    """Decoding, vocabulary masking and sample slicing shared by replay and corpus readers."""
+
+    # Whether each DP rank reads one contiguous slice of a global batch (see ReplayIterator).
+    rank_slices = False
+
+    def __init__(
+        self,
+        contract: dict,
+        *,
+        targets: bool,
+        decode_threads: int,
+        prefetch_depth: int,
+        vocab_size: int | None,
+    ):
+        self.contract = contract
+        self.prefix_stable = contract["prefix_stable"]
+        self.isolated = contract["attention_mode"] == "isolated_segments"
+        self.targets = targets
+        # The tokenizer's size: every valid target index must be below it.
+        self.vocab_size = vocab_size
+        self.prefetch_depth = max(1, prefetch_depth)
+        self.pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, decode_threads), thread_name_prefix="offline-kd-v3-decode"
+        )
+        self.lanes: dict[Any, _Lane] = {}
+
+    def read_batch(self, index: dict, block: int, raw: bytes) -> Any:
+        """Decode a block's record batch from the bytes :func:`block_range` names."""
+        return read_block(index, block, raw, inputs_only=not self.targets)
+
+    def decode_rows(
+        self, index: dict, block: int, raw: bytes, label: str
+    ) -> tuple[dict, tuple | None]:
+        """Decode and validate one block."""
+        batch = self.read_batch(index, block, raw)
+        inputs, targets = decode_block(batch, vocab_size=self.vocab_size)
+        if inputs["sample_offsets"].numel() - 1 != index["blocks"][block]["rows"]:
+            raise ValueError(f"Offline KD v3 block {block} of {label} has wrong rows")
+        inputs["segment_offsets"] = torch.cat(
+            (torch.zeros(1, dtype=torch.int64), torch.cumsum(inputs["segment_counts"].long(), 0))
+        )
+        # Target rows exist only at positions with nonzero loss weight, in token order.
+        scored = inputs["loss_mask"] != 0
+        inputs["target_offsets"] = torch.cat(
+            (torch.zeros(1, dtype=torch.int64), torch.cumsum(scored.long(), 0))
+        )
+        return inputs, targets
+
+    def slice_sample(self, inputs: dict, targets: tuple | None, row: int, sample_id: int) -> dict:
+        """Cut one sample (and its target rows) out of a decoded block."""
+        a, b = inputs["sample_offsets"][row : row + 2].tolist()
+        sample = {field: inputs[field][a:b] for field in TOKEN_FIELDS}
+        sample["sample_id"] = sample_id
+        s0, s1 = inputs["segment_offsets"][row : row + 2].tolist()
+        sample["segments"] = inputs["segment_lengths"][s0:s1]
+        if targets is not None:
+            ta, tb = inputs["target_offsets"][[a, b]].tolist()
+            sample["teacher_values"], sample["teacher_indices"], sample["teacher_tail"] = (
+                tensor[ta:tb] for tensor in targets
+            )
+        return sample
+
+    def close(self) -> None:
+        """Stop all lanes and the decode pool."""
+        for lane in self.lanes.values():
+            lane.close()
+        self.pool.shutdown(wait=False, cancel_futures=True)
+
+
+class ReplayReader(_BlockReader):
+    """Read samples by logical replay position, streaming each writer's parts.
+
+    Within a flush, each teacher iteration's samples are ordered writer by writer
+    (all of DP rank 0's rows, then rank 1's, ...). A global batch holds the same samples
+    as the teacher's, and a student rank reading a contiguous slice of it streams rows
+    from as few parts as possible; ``sample_id`` keeps the teacher's sample index.
+    """
+
+    rank_slices = True
+
+    def __init__(
+        self,
+        storage: Storage,
+        metadata: dict,
+        groups: list[tuple[int, int]],
+        *,
+        targets: bool = True,
+        shuffle: bool = False,
+        seed: int = 0,
+        passes: int = 1,
+        decode_threads: int = 4,
+        prefetch_depth: int = 2,
+        vocab_size: int | None = None,
+    ):
+        validate_metadata(metadata)
+        super().__init__(
+            metadata["contract"],
+            targets=targets,
+            decode_threads=decode_threads,
+            prefetch_depth=prefetch_depth,
+            vocab_size=vocab_size,
+        )
+        self.storage = storage
+        self.metadata = metadata
+        self.gbs = self.contract["global_batch_size"]
+        self.pinned = None
+        # Recorded settings that differ between files are reported once each, never fatal.
+        self.reported_differences: set[str] = set()
+        # Each pass replays every group once; shuffled passes draw successive orders from one
+        # seeded generator, so the first pass matches a single-pass shuffle.
+        rng = random.Random(seed)
+        self.groups = []
+        for _ in range(passes):
+            order = [tuple(group) for group in groups]
+            if shuffle:
+                rng.shuffle(order)
+            self.groups.extend(order)
+        # A shuffled or repeated replay covers a fixed extent; only a sequential one grows.
+        self.fixed = shuffle or passes > 1
+        self.group_cache = BoundedIndexCache(max(4, prefetch_depth + 2))
+        self.closed = False
+        self.condition = threading.Condition()
+        self._reindex()
+
+    def _reindex(self) -> None:
+        self.ends = []
+        self.group_starts = []
+        logical_start = 0
+        for start, end in self.groups:
+            self.group_starts.append(logical_start)
+            logical_start += end - start
+            self.ends.append(logical_start)
+
+    @property
+    def total_samples(self) -> int:
+        """Number of currently available samples in replay order."""
+        return self.ends[-1] if self.ends else 0
+
+    def extend(self, groups: list[tuple[int, int]]) -> None:
+        """Append newly published sequential groups (agreed collectively by all ranks)."""
+        if self.fixed and groups:
+            raise RuntimeError("Shuffled or repeated offline KD replay cannot extend its groups")
+        with self.condition:
+            self.groups.extend(tuple(group) for group in groups)
+            self._reindex()
+            self.condition.notify_all()
+
+    def wait_for_group(self, index: int, stopped: threading.Event) -> tuple[int, int] | None:
+        """Block a lane until group ``index`` is known, or return None at the end."""
+        with self.condition:
+            while index >= len(self.groups):
+                if self.closed or stopped.is_set() or self.fixed:
+                    return None
+                self.condition.wait(timeout=0.5)
+            return self.groups[index]
+
+    def ensure_available(self, end: int) -> None:
+        """Fail if the collectively agreed frontier does not cover ``end``; never lists."""
+        if end > self.total_samples:
+            raise RuntimeError(
+                f"Offline KD cache exhausted at {self.total_samples} samples; requested {end}"
+            )
+
+    def _group(self, span: tuple[int, int]) -> dict:
+        """Return a flush's validated index (one cached GET), given its sample range."""
+
+        def load() -> dict:
+            group = read_group(self.storage, (span[0] // self.gbs, span[1] // self.gbs))
+            directory = flush_dir(REPLAY, group["start_iteration"], group["end_iteration"])
+            for part in group["parts"]:
+                part["path"] = f"{directory}/{part['path']}"
+                index = part["index"]
+                self.check_meta(file_meta(index), part["path"])
+                index["first_rows"] = [block["first_row"] for block in index["blocks"]]
+            return group
+
+        return self.group_cache.get_or_load(span, load)
+
+    def check_meta(self, meta: dict, path: str) -> None:
+        """Validate a part's settings against the cache."""
+        validate_metadata(meta)
+        required, recorded = mismatched_settings(meta, self.metadata)
+        if required:
+            raise ValueError(
+                f"Offline KD v3 part {path} disagrees with the cache on {', '.join(required)}; "
+                "it was written by an incompatible dump job"
+            )
+        new = [key for key in recorded if key not in self.reported_differences]
+        if new:
+            self.reported_differences.update(new)
+            print(
+                f"WARNING: offline KD v3 part {path} differs from the cache in recorded "
+                f"settings ({', '.join(new)}); it is still used",
+                flush=True,
+            )
+
+    def _lane(self, writer: int, group_index: int, first_block: int) -> _Lane:
+        """Stream one teacher writer's parts in replay order, across flush boundaries.
+
+        A stream stops at a flush without this writer (the teacher's DP shrank). One this
+        rank skipped for a whole flush is restarted rather than drained through it.
+        """
+        lane = self.lanes.get(writer)
+        if lane is not None and (lane.current is None or lane.current[0][0] < group_index - 1):
+            self.lanes.pop(writer).close()
+            lane = None
+        if lane is None:
+
+            def items(stopped: threading.Event) -> Any:
+                group, start_block = group_index, first_block
+                while not stopped.is_set():
+                    span = self.wait_for_group(group, stopped)
+                    if span is None:
+                        return
+                    info = self._group(span)
+                    if writer >= info["writers"]:
+                        return  # The teacher's DP shrank; a later need restarts the stream.
+                    part = info["parts"][writer]
+                    index, label = part["index"], f"{part['path']} (teacher DP rank {writer})"
+                    for block in range(start_block, len(index["blocks"])):
+                        if stopped.is_set():
+                            return
+                        yield (group, block), (self.storage, part["path"], index, block, label)
+                    group, start_block = group + 1, 0
+
+            lane = self.lanes[writer] = _Lane(self, f"writer{writer}", items)
+        return lane
+
+    def samples(self, positions: list[int], available_end: int) -> list[dict[str, Any]]:
+        """Fetch samples at logical replay positions (non-decreasing across calls)."""
+        self.ensure_available(available_end)
+        samples = []
+        for position in positions:
+            group_index = bisect.bisect_right(self.ends, position)
+            span = self.groups[group_index]
+            if span != self.pinned:
+                # Keep the consumer's flush resident while lanes prefetch later ones.
+                self.group_cache.set_pinned([span])
+                self.pinned = span
+            info = self._group(span)
+            writers, mbs = info["writers"], info["writer_mbs"]
+            rows = self.gbs // writers
+            iteration, within = divmod(position - self.group_starts[group_index], self.gbs)
+            writer, local = divmod(within, rows)
+            row = iteration * rows + local
+            # The teacher's own sample index: Megatron interleaves writers by microbatch.
+            sid = span[0] + iteration * self.gbs + ((local // mbs) * writers + writer) * mbs
+            sid += local % mbs
+            first_rows = info["parts"][writer]["index"]["first_rows"]
+            block = bisect.bisect_right(first_rows, row) - 1
+            inputs, targets = self._lane(writer, group_index, block).block((group_index, block))
+            samples.append(self.slice_sample(inputs, targets, row - first_rows[block], sid))
+        return samples
+
+    def close(self) -> None:
+        """Stop all lanes and the decode pool."""
+        with self.condition:
+            self.closed = True
+            self.condition.notify_all()
+        super().close()
+        self.group_cache.clear()
+
+
+class CorpusReader(_BlockReader):
+    """Read a planned corpus blend (see :mod:`.format.blend`) by global sample position.
+
+    Global sample ``p`` is row ``p // L`` of lane ``p % L``. The plan may be a rank-local
+    :func:`~.format.blend.rank_plan` holding only the lanes this rank reads. Each lane
+    streams its pieces' blocks in order, decoded with the plan's shared Arrow schemas.
+    """
+
+    def __init__(
+        self,
+        root: str,
+        manifest: dict,
+        *,
+        targets: bool = True,
+        decode_threads: int = 4,
+        prefetch_depth: int = 2,
+        vocab_size: int | None = None,
+    ):
+        if manifest.get("manifest_version") != MANIFEST_VERSION:
+            raise ValueError("Unsupported offline KD corpus manifest version")
+        super().__init__(
+            manifest["contract"],
+            targets=targets,
+            decode_threads=decode_threads,
+            prefetch_depth=prefetch_depth,
+            vocab_size=vocab_size,
+        )
+        self.root, self.manifest = root, manifest
+        self.lanes_count = manifest["lanes"]
+        self.total_samples = self.lanes_count * manifest["lane_samples"]
+        self.lane_ids, self.lane_starts = manifest["lane_ids"], manifest["lane_starts"]
+        self.segments, self.blocks, self.files = (
+            manifest["segments"],
+            manifest["blocks"],
+            manifest["files"],
+        )
+        lengths = (self.segments["end"] - self.segments["first"]).astype(np.int64)
+        ends = np.concatenate(([0], np.cumsum(lengths)))
+        lane_lengths = ends[self.lane_starts[1:]] - ends[self.lane_starts[:-1]]
+        if (lane_lengths != manifest["lane_samples"]).any():
+            raise ValueError("Offline KD corpus plan has a lane of the wrong length")
+        # Each piece's first sample within its lane.
+        self.offsets = ends[:-1] - np.repeat(ends[self.lane_starts[:-1]], np.diff(self.lane_starts))
+        self.schemas = [pa.ipc.read_schema(pa.py_buffer(schema)) for schema in manifest["schemas"]]
+        self.storages: dict[str, Storage] = {}
+
+    def _storage(self, folder: str) -> Storage:
+        storage = self.storages.get(folder)
+        if storage is None:
+            storage = self.storages.setdefault(folder, Storage(os.path.join(self.root, folder)))
+        return storage
+
+    def _local(self, lane: int) -> int:
+        local = int(np.searchsorted(self.lane_ids, lane))
+        if local == len(self.lane_ids) or self.lane_ids[local] != lane:
+            raise RuntimeError(
+                f"Offline KD corpus lane {lane} is not in this rank's plan "
+                f"({self.manifest.get('rank')}); the reader's DP layout differs from the plan's"
+            )
+        return local
+
+    def _lane(self, lane: int, local: int, first_piece: int) -> _Lane:
+        stream = self.lanes.get(lane)
+        if stream is None:
+            end = int(self.lane_starts[local + 1])
+
+            def items(stopped: threading.Event) -> Any:
+                for piece in range(first_piece, end):
+                    if stopped.is_set():
+                        return
+                    block = int(self.segments["block"][piece])
+                    entry = self.blocks[block]
+                    file_id = int(entry["file"])
+                    folder = self.manifest["sources"][int(self.files["source"][file_id])]["name"]
+                    path = self.files["path"][file_id]
+                    # The one block entry that block_range and read_batch need.
+                    index = {
+                        "blocks": {
+                            block: {
+                                **{key: int(entry[key]) for key in ("rows", "offset", "length")},
+                                "input_length": int(entry["input_length"]),
+                                "schema": int(self.files["schema"][file_id]),
+                            }
+                        }
+                    }
+                    yield (piece,), (self._storage(folder), path, index, block, f"{folder}/{path}")
+
+            stream = self.lanes[lane] = _Lane(self, f"lane{lane}", items)
+        return stream
+
+    def read_batch(self, index: dict, block: int, raw: bytes) -> Any:
+        """Decode with the plan's shared schema; the plan keeps no per-file footers."""
+        entry = index["blocks"][block]
+        return read_block_bytes(
+            self.schemas[entry["schema"]], raw, entry["length"], inputs_only=not self.targets
+        )
+
+    def samples(self, positions: list[int], available_end: int) -> list[dict[str, Any]]:
+        """Fetch samples at global positions (non-decreasing per lane across calls)."""
+        if available_end > self.total_samples:
+            raise RuntimeError(
+                f"Offline KD corpus blend holds {self.total_samples} samples; requested "
+                f"{available_end}"
+            )
+        samples = []
+        for position in positions:
+            lane, offset = position % self.lanes_count, position // self.lanes_count
+            local = self._local(lane)
+            first, end = int(self.lane_starts[local]), int(self.lane_starts[local + 1])
+            piece = first + int(np.searchsorted(self.offsets[first:end], offset, "right")) - 1
+            inputs, targets = self._lane(lane, local, piece).block((piece,))
+            row = int(self.segments["first"][piece]) + offset - int(self.offsets[piece])
+            samples.append(self.slice_sample(inputs, targets, row, position))
+        return samples
+
+
+def _layout_sample(
+    sample: dict, seq_length: int, *, packed: bool, divisor: int, prefix_stable: bool = True
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Place a stored (padding-free) sample at the student's fixed length.
+
+    Returns ``(source, positions, boundaries)``: for each output position, the stored
+    token it comes from (``-1`` for padding) and its position id within its segment,
+    plus the padded segment boundaries for packed samples. Packed segments are padded
+    to ``divisor`` and the pack tail extends the last segment, as Megatron SFT does;
+    non-packed samples keep their prefix and pad the tail.
+
+    Lengths are checked per sample, whatever length the producer used: a sample that
+    fits is used as is; a longer non-packed or single-segment sample keeps its prefix
+    when the producer's targets are prefix-stable; anything else is an error.
+    """
+    length = sample["tokens"].numel()
+    single = not packed or len(sample["segments"]) == 1
+    if single and length > seq_length and not prefix_stable:
+        raise ValueError(
+            f"Offline KD sample {sample.get('sample_id')} has {length} tokens, more than the "
+            f"student sequence length ({seq_length}), and its targets are not prefix-stable "
+            "(e.g. dynamic RoPE scaling), so it cannot be shortened"
+        )
+    if not packed or (single and length > seq_length):
+        kept = min(length, seq_length)
+        source = torch.cat((torch.arange(kept), torch.full((seq_length - kept,), -1)))
+        # A shortened single-segment pack stays one segment spanning the student length.
+        boundaries = torch.tensor([0, seq_length], dtype=torch.int32) if packed else None
+        return source, torch.arange(seq_length), boundaries
+    lengths = sample["segments"].tolist()
+    padded = [-(-n // divisor) * divisor for n in lengths]
+    if sum(padded) > seq_length:
+        raise ValueError(
+            f"Offline KD packed sample {sample.get('sample_id')} needs {sum(padded)} tokens after "
+            f"padding segments to a multiple of {divisor}; the student sequence length is "
+            f"{seq_length}"
+        )
+    if padded:
+        padded[-1] += seq_length - sum(padded)
+    else:
+        padded = [seq_length]  # Fully stripped sample: one padding segment.
+    pieces, positions, cursor = [], [], 0
+    for real, total in zip(lengths + [0] * (len(padded) - len(lengths)), padded):
+        pieces.extend((torch.arange(cursor, cursor + real), torch.full((total - real,), -1)))
+        positions.append(torch.arange(total))
+        cursor += real
+    boundaries = torch.tensor([0, *itertools.accumulate(padded)], dtype=torch.int32)
+    return torch.cat(pieces), torch.cat(positions), boundaries
+
+
+def _segment_ids(
+    sample: dict, source: torch.Tensor, boundaries: torch.Tensor | None
+) -> torch.Tensor:
+    """Attention segment of each student position; padding forms its own segment."""
+    if boundaries is not None:
+        return torch.repeat_interleave(
+            torch.arange(boundaries.numel() - 1), (boundaries[1:] - boundaries[:-1]).long()
+        )
+    count = sample["segments"].numel()
+    stored = torch.repeat_interleave(torch.arange(count), sample["segments"].long())
+    ids = torch.full(source.shape, count, dtype=torch.int64)
+    real = source >= 0
+    ids[real] = stored[source[real]]
+    return ids
+
+
+def collate_samples(
+    samples: list[dict],
+    seq_length: int,
+    *,
+    packed: bool = False,
+    divisor: int = 1,
+    cp_size: int = 1,
+    layout: dict[str, Any] | None = None,
+    prefix_stable: bool = True,
+) -> dict[str, Any]:
+    """Build a student CPU microbatch from stored samples.
+
+    Stored samples carry no padding: segments are padded back for the student (see
+    :func:`_layout_sample`), padding positions get zero loss weight and sentinel
+    targets, and teacher targets are mapped into one ``[local_sequence, batch, K]``
+    shard per student CP rank with exactly the token mapping used for the inputs.
+    """
+    if not samples:
+        raise ValueError("Cannot collate an empty offline KD microbatch")
+    fields = {field: [] for field in TOKEN_FIELDS}
+    boundary_rows, segment_rows, values, indices, tails = [], [], [], [], []
+    with_targets = "teacher_values" in samples[0]
+    if any(("teacher_values" in sample) != with_targets for sample in samples):
+        raise ValueError("Cannot mix offline KD samples with and without targets")
+    k = max(sample["teacher_values"].shape[-1] for sample in samples) if with_targets else 0
+    for sample in samples:
+        source, positions, boundaries = _layout_sample(
+            sample, seq_length, packed=packed, divisor=divisor, prefix_stable=prefix_stable
+        )
+        real = source >= 0
+        take = source.clamp_min(0)
+        for field in TOKEN_FIELDS:
+            dtype = torch.float32 if field == "loss_mask" else torch.int64
+            column = sample[field].to(dtype)[take] if sample["tokens"].numel() else None
+            filled = (
+                positions.to(dtype)
+                if field == "position_ids"
+                else torch.zeros(seq_length, dtype=dtype)
+            )
+            if column is not None:
+                filled = torch.where(real, column, filled)
+            fields[field].append(filled)
+        if with_targets:
+            # Stored rows cover only scored tokens; other positions get no KD target.
+            scored = sample["loss_mask"] != 0
+            row_of = torch.cumsum(scored.long(), 0) - 1
+            has_row = real.clone()
+            has_row[real] = scored[source[real]]
+            rows = row_of[source[has_row]]
+            sample_k = sample["teacher_values"].shape[-1]
+            row_values = torch.full(
+                (seq_length, k), LOGPROB_SENTINEL, dtype=sample["teacher_values"].dtype
+            )
+            row_indices = torch.zeros((seq_length, k), dtype=torch.int64)
+            row_tail = torch.zeros(seq_length, dtype=torch.float32)
+            row_values[has_row, :sample_k] = sample["teacher_values"][rows]
+            row_indices[has_row, :sample_k] = sample["teacher_indices"][rows]
+            row_tail[has_row] = sample["teacher_tail"][rows]
+            values.append(row_values)
+            indices.append(row_indices)
+            tails.append(row_tail)
+        boundary_rows.append(boundaries)
+        segment_rows.append(_segment_ids(sample, source, boundaries))
+    result = {field: torch.stack(rows) for field, rows in fields.items()}
+    result["_kd_segment_ids"] = torch.stack(segment_rows)
+    result["cu_seqlens_padded"] = None
+    if packed:
+        width = max(row.numel() for row in boundary_rows)
+        result["cu_seqlens"] = torch.stack(
+            [torch.cat((row, row[-1:].expand(width - row.numel()))) for row in boundary_rows]
+        )
+        result["max_seqlen"] = torch.tensor(
+            [int((row[1:] - row[:-1]).max()) for row in boundary_rows], dtype=torch.int32
+        )
+    else:
+        result["cu_seqlens"] = result["max_seqlen"] = None
+    result["_kd_sample_ids"] = [sample["sample_id"] for sample in samples]
+    if with_targets:
+        mapping_inputs = {
+            "sample_offsets": torch.arange(len(samples) + 1, dtype=torch.int64) * seq_length,
+            "cu_seqlens": boundary_rows if packed else None,
+        }
+        flat = (torch.cat(values), torch.cat(indices), torch.cat(tails))
+        shards = [
+            map_targets(*flat, token_map(mapping_inputs, rank, cp_size, **(layout or {})))
+            for rank in range(cp_size)
+        ]
+        result["_kd_values"] = [shard[0] for shard in shards]
+        result["_kd_indices"] = [shard[1] for shard in shards]
+        result["_kd_tail"] = [shard[2] for shard in shards]
+    return result
+
+
+class ReplayIterator:
+    """Consume student batches using the current ramp-up microbatch count."""
+
+    def __init__(
+        self,
+        reader: ReplayReader,
+        *,
+        consumed: int,
+        dp_rank: int,
+        dp_size: int,
+        micro_batch_size: int,
+        seq_length: int,
+        num_microbatches: Callable[[], int],
+        prefetch: bool = False,
+        cp_size: int = 1,
+        layout: dict[str, Any] | None = None,
+        divisor: int = 1,
+    ):
+        self.reader = reader
+        self.consumed = consumed
+        self.dp_rank = dp_rank
+        self.dp_size = dp_size
+        self.mbs = micro_batch_size
+        self.seq_length = seq_length
+        self.num_microbatches = num_microbatches
+        self.cp_size = cp_size
+        self.layout = layout
+        self.divisor = divisor
+        self._microbatch = 0
+        self._count = 0
+        self.unsupervised_samples = 0
+        self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=1) if prefetch else None
+        self._prefetched = None
+
+    def __iter__(self) -> "ReplayIterator":
+        return self
+
+    def _load(self, start: int, end: int) -> dict[str, Any]:
+        samples = self.reader.samples(list(range(start, start + self.mbs)), end)
+        self._note_shortening(samples)
+        return collate_samples(
+            samples,
+            self.seq_length,
+            packed=self.reader.isolated,
+            divisor=self.divisor,
+            cp_size=self.cp_size,
+            layout=self.layout,
+            prefix_stable=self.reader.prefix_stable,
+        )
+
+    def _note_shortening(self, samples: list[dict]) -> None:
+        """Report samples whose supervised tokens all lie beyond the student length."""
+        for sample in samples:
+            weights = sample["loss_mask"]
+            if weights[: self.seq_length].any() or not weights[self.seq_length :].any():
+                continue
+            self.unsupervised_samples += 1
+            if self.unsupervised_samples == 1:
+                print(
+                    f"WARNING: offline KD v3 sample {sample['sample_id']} has no supervised "
+                    f"tokens within the student sequence length ({self.seq_length}); prefix "
+                    "shortening leaves such samples without loss. Further cases are counted "
+                    "in ReplayIterator.unsupervised_samples",
+                    flush=True,
+                )
+
+    def _start(self, microbatch: int) -> int:
+        """The first global position of this rank's ``microbatch`` in the current batch.
+
+        Replay gives each rank one contiguous slice of the global batch, so it streams
+        whole teacher parts where possible; corpus lanes rely on Megatron's interleaving.
+        """
+        if self.reader.rank_slices:
+            return self.consumed + (self.dp_rank * self._count + microbatch) * self.mbs
+        return self.consumed + (microbatch * self.dp_size + self.dp_rank) * self.mbs
+
+    def __next__(self) -> dict[str, Any]:
+        if self._microbatch == 0:
+            self._count = self.num_microbatches()
+        end = self.consumed + self._count * self.mbs * self.dp_size
+        start = self._start(self._microbatch)
+        if self._prefetched is None:
+            batch = self._load(start, end)
+        else:
+            batch = self._prefetched.result()
+            self._prefetched = None
+        self._microbatch += 1
+        if self._microbatch == self._count:
+            self.consumed = end
+            self._microbatch = 0
+        elif self._executor is not None:
+            # Stay within this iteration: the next iteration's ramp-up count is
+            # determined only when Megatron updates its batch calculator. The
+            # per-rank streams already decode ahead across iterations.
+            self._prefetched = self._executor.submit(self._load, self._start(self._microbatch), end)
+        return batch
+
+    def close(self) -> None:
+        """Drain the prefetch worker and stop the reader's streams."""
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+            self._executor = None
+        self.reader.close()
+
+    def __del__(self):
+        if getattr(self, "_executor", None) is not None:
+            self._executor.shutdown(wait=False, cancel_futures=True)

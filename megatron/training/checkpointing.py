@@ -360,6 +360,13 @@ def check_checkpoint_args(
         _compare('data_parallel_random_init', config_section='rng')
     if check_training_state and args.phase_transition_iterations:
         _compare('global_batch_size', config_section='train')
+    if getattr(args, 'logits_load_inputs', False):
+        for name, default in (
+            ('logits_load_inputs', False),
+            ('logits_load_shuffle_shards', None),
+        ):
+            _compare(name, default=default)
+        _compare('seq_length', config_section='model')
     if get_checkpoint_version() < 3.0:
         _compare('tensor_model_parallel_size', old_arg_name='model_parallel_size', config_section='model.transformer')
     if get_checkpoint_version() >= 3.0 and not use_dist_ckpt:
@@ -1433,17 +1440,26 @@ def save_checkpoint(
                           f"{iteration} to {tracker_filename}", flush=True)
 
                 logits_finalize_fns.append(progress_finalize_fn)
+            logits_async_args = logits_saver.take_pending_data()
+            if getattr(args, 'logits_save_inputs', False):
+                # Offline KD v3: confirm every writer's upload (described by the pending data
+                # just taken) before any progress callback.
+                logits_finalize_fns.insert(0, logits_saver.flush_finalize_fn(iteration))
             async_logits_request = AsyncRequest(
                 async_fn=logits_saver._write_batched_tar,
-                async_fn_args=logits_saver.take_pending_data(),
+                async_fn_args=logits_async_args,
                 finalize_fns=logits_finalize_fns,
             )
+        elif getattr(args, 'logits_save_inputs', False):
+            # Only the last PP stage owns a saver, but async queue completion is
+            # collective across WORLD. Match its request on every other stage.
+            async_logits_request = AsyncRequest(async_fn=None, async_fn_args=(), finalize_fns=[])
 
         if on_saved is not None and async_save_request is not None:
             async_save_request.add_finalize_fn(on_saved)
         if async_save_request is not None:
             schedule_async_save(async_save_request)
-        if logits_saver is not None:
+        if logits_saver is not None or getattr(args, 'logits_save_inputs', False):
             schedule_async_save(async_logits_request)
         print_rank_0(
             f'  [{datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")}] scheduled '
@@ -3506,6 +3522,10 @@ def load_checkpoint(
                 current_train_state.consumed_valid_samples = getattr(checkpoint_args, 'consumed_valid_samples', 0)
             else:
                 print_rank_0('could not find runtime training state in the checkpoint ...')
+
+    if getattr(args, "logits_load_inputs", False) and "args" in state_dict and not finetune:
+        args.logits_load_replay_end = getattr(checkpoint_args, "logits_load_replay_end", None)
+        args.kd_corpus_manifest_hash = getattr(checkpoint_args, "kd_corpus_manifest_hash", None)
 
     # --override-ckpt-iteration: rewind the data loader to this iteration, operating on `args`
     # (not state_dict) so it also works on checkpoints with no saved `args` (release / HF). The

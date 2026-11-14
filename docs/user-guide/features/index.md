@@ -27,5 +27,6 @@ tokenizers
 megatron_energon
 megatron_rl
 offline_logits_distillation
+offline_logits_distillation_v3
 ../../mcore-inference-user-guide
 ```
