@@ -89,9 +89,16 @@ class EngramHasher(nn.Module):
 
 
 class EngramEmbedding(EPShardedMultiTableEmbedding):
-    """V4.1's fused table, using variable-split EP lookups and exact logical row sharding."""
+    """V4.1's fused table, using exact EP lookups and exact logical row sharding.
 
-    def __init__(self, config, rows, width, pg_collection, *, fp8_storage=False) -> None:
+    The NCCL, HybridEP and symmetric backends plan variable-split exchanges per batch; the
+    static backend sizes its exchange from ``column_ranges``, the hash columns'
+    ``(offset, prime)`` bucket ranges in the fused table.
+    """
+
+    def __init__(
+        self, config, rows, width, pg_collection, *, fp8_storage=False, column_ranges=None
+    ) -> None:
         options = getattr(config, "engram_config", None)
         super().__init__(
             config,
@@ -112,6 +119,7 @@ class EngramEmbedding(EPShardedMultiTableEmbedding):
             fp8_storage=fp8_storage,
             communication_backend=getattr(options, "communication_backend", "nccl"),
             hybridep_chunk_size=getattr(options, "hybridep_chunk_size", 4096),
+            column_ranges=column_ranges,
         )
         if getattr(pg_collection, 'engram', None) is not None:
             for table in self.tables:
@@ -138,12 +146,17 @@ class Engram(MegatronModule):
         self.fp8_lookup = self.fp8_projection and getattr(config, 'fp8_param', False)
         if self.fp8_lookup and config.fp8_recipe != Fp8Recipe.mxfp8:
             raise ValueError('Engram FP8 primary tables currently require the MXFP8 recipe')
+        # Hash column c = (order, head) addresses [offset_c, offset_c + prime_c) of the fused
+        # table: the EngramHasher's order-major/head-minor columns and exclusive offsets.
+        primes = [prime for order in layout.primes[self.hash_index] for prime in order]
+        offsets = [sum(primes[:column]) for column in range(len(primes))]
         self.embed = EngramEmbedding(
             config,
             layout.num_embeddings[self.hash_index],
             layout.head_dim,
             pg_collection,
             fp8_storage=self.fp8_lookup,
+            column_ranges=tuple(zip(offsets, primes)),
         )
         self.embed.tables[0].weight.lr_mult = getattr(
             getattr(config, "engram_config", None), "embedding_lr_multiplier", 5.0

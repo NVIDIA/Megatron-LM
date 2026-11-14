@@ -1079,6 +1079,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         tests=(
             "tests/unit_tests/models/test_v41_engram.py",
+            "tests/unit_tests/models/test_v41_engram_static.py",
             "tests/unit_tests/ops/test_engram.py",
             K + "test_te_wrappers.py",
         ),
@@ -1092,6 +1093,23 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "buffers and multiple live lookup plans through backward. CuTe/NCCL device "
         "transport replays striped LSA/GIN exchanges with bounded slot reuse under "
         "side-stream contention.",
+    ),
+    KernelEntry(
+        name="v41_engram_static_exchange",
+        sources=("megatron/core/models/engram/static_exchange.py",),
+        tests=(
+            K + "test_engram_static_exchange.py",
+            "tests/unit_tests/models/test_v41_engram_static.py",
+        ),
+        kind="triton",
+        notes="Static-shape Engram lookup (communication_backend='static'): the pack kernel "
+        "writes one row ID or -1 per static slot and each request's slot, the owner gather "
+        "copies MXFP8 bytes/scales or BF16 rows, the gradient scatter has unique destinations, "
+        "and each sorted row segment has one writer that adds sequentially in FP32 (no "
+        "atomics; the only atomic is an integer count of out-of-range IDs). Replays cover hot "
+        "rows under contention and the complete EP lookup with its all-to-alls; the model "
+        "tests match the NCCL backend and _embedding_row_gradients bit for bit, also after "
+        "CUDA-graph replay.",
     ),
     KernelEntry(
         name="dsa_dispatch",

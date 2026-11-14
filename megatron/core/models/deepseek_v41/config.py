@@ -44,7 +44,11 @@ class EngramConfig:
     """Learning-rate multiplier for the lookup tables, excluding projections and norms."""
 
     communication_backend: str = "nccl"
-    """Embedding lookup transport, independently of the MoE dispatcher."""
+    """Embedding lookup transport, independently of the MoE dispatcher: "nccl", "hybridep",
+    "symmetric" or "static". "static" sizes every exchange from the table's hash-column layout
+    and the token count, without host planning, so cuda_graph_impl="full_iteration" can capture
+    it. It requires the same token count on every rank of the shard group and does not support
+    prefetch or defer_grad_transfer."""
 
     hybridep_chunk_size: int = 4096
     """Maximum queries sent per rank per HybridEP dispatch; bounds communication workspace."""
@@ -72,8 +76,15 @@ class EngramConfig:
             raise ValueError('Engram buffer_budget_mb must be a positive integer')
         if not math.isfinite(self.embedding_lr_multiplier) or self.embedding_lr_multiplier <= 0:
             raise ValueError("Engram embedding_lr_multiplier must be finite and positive")
-        if self.communication_backend not in ("nccl", "hybridep", "symmetric"):
-            raise ValueError("Engram communication_backend must be nccl, hybridep or symmetric")
+        if self.communication_backend not in ("nccl", "hybridep", "symmetric", "static"):
+            raise ValueError(
+                "Engram communication_backend must be nccl, hybridep, symmetric or static"
+            )
+        if self.communication_backend == "static" and (self.prefetch or self.defer_grad_transfer):
+            raise ValueError(
+                "Engram communication_backend='static' does not support prefetch or "
+                "defer_grad_transfer: the lookup runtime plans its exchanges on the host"
+            )
         if self.hybridep_chunk_size <= 0 or self.hybridep_chunk_size % 64:
             raise ValueError("Engram hybridep_chunk_size must be a positive multiple of 64")
 
@@ -116,12 +127,21 @@ class DeepSeekV41Config(MLATransformerConfig):
         super().__post_init__()
         # After the base class, which migrates the deprecated cuda_graph_modules spelling.
         if self.engram_config is not None and self.cuda_graph_impl == "full_iteration":
-            raise NotImplementedError(
-                "Engram plans its EP lookup on the host per batch (bincount/.cpu()/HybridEP "
-                "rounds; unique_consecutive in the FP8 backward), so it cannot be captured by "
-                "cuda_graph_impl='full_iteration'; use transformer_engine partial graphs or "
-                "drop --engram-config"
-            )
+            backend = self.engram_config.communication_backend
+            if backend != "static":
+                raise NotImplementedError(
+                    f"Engram communication_backend={backend!r} plans its EP lookup on the host "
+                    "per batch (bincount/.cpu()/HybridEP rounds; unique_consecutive in the FP8 "
+                    "backward), so it cannot be captured by cuda_graph_impl='full_iteration'; "
+                    "use communication_backend='static', transformer_engine partial graphs or "
+                    "drop --engram-config"
+                )
+            if self.cuda_graph_warmup_steps < 1:
+                raise ValueError(
+                    "Engram with cuda_graph_impl='full_iteration' requires "
+                    "cuda_graph_warmup_steps >= 1: the first lookups validate the token counts "
+                    "and compile kernels eagerly"
+                )
 
     @classmethod
     def from_hf(cls, hf: dict[str, Any], **overrides) -> "DeepSeekV41Config":

@@ -75,12 +75,44 @@ is not implemented.
 Omitting `parallel_size` preserves the existing EP/expert-DP partition and
 optimizer domain. `prefetch` and `defer_grad_transfer` default to false and can
 be enabled independently. The original lookup remains available when both are
-off with the NCCL or HybridEP backend. Prefetch stages token/THD metadata before
+off with the NCCL or HybridEP backend; the static backend below requires both
+off. Prefetch stages token/THD metadata before
 the PP schedule, shares it across VPP chunks, deduplicates each batch's requests,
 and carries a ticket to the matching consumer. Lookup runs outside full
 recomputation and partial CUDA graphs; projection and gating retain their normal
 recompute behavior. Deferred backward coalesces queued microbatches per table,
-delivers row gradients to their owners, then lets DDP reduce replicas.
+delivers row gradients to their owners, then lets DDP reduce replicas. Only the
+static backend below can be captured, by full-iteration CUDA graphs.
+
+`communication_backend: "static"` keeps the exact lookup but plans nothing on the
+host, so `--cuda-graph-impl full_iteration` can capture it. Each hash column of a
+layer addresses its own prime bucket range of the fused table, so its requests
+can only reach the shards whose rows overlap that range. Every (requester, shard)
+pair gets a fixed block of (columns that shard serves) x (tokens) slots, which
+holds any data; unused slots carry row ID -1. All exchange sizes follow from the
+table layout and the token count. Row IDs travel as int64, rows (MXFP8 bytes and
+scales, or BF16 values) return in the same static layout, and backward sends the
+BF16 row gradients back the same way. Each shard sums a row's gradients
+sequentially in FP32, in (source rank, request) order, rounds once to the
+parameter dtype and, with gradient accumulation fusion (the training default)
+and Megatron DDP, adds the result straight into `main_grad`, so no table-sized
+gradient is built. Results are bit-identical to the NCCL backend for MXFP8 tables
+and for BF16 tables with `--deterministic-mode`; other BF16 runs change from
+`F.embedding`'s backward order to one sequential FP32 sum per row. With a single
+shard the same gather and backward run without an exchange.
+
+The static backend requires the same number of tokens per call on every rank of
+the Engram shard group (fixed-length packing; per-rank variable token counts need
+the NCCL or HybridEP backend). Eager calls check this on the device with one small
+all-reduce and an asynchronous assert, so a mismatch aborts the CUDA context
+instead of hanging; captured graphs skip the check. A hash ID outside its
+column's bucket range trips a device assert as well. It supports one table per
+module and neither `prefetch` nor `defer_grad_transfer`; capture needs CUDA and
+Triton (CPU tensors use a reference path). With full-iteration graphs, Engram also
+requires `--cuda-graph-warmup-steps` of at least 1. The exchange carries about
+(shards + columns - 1) / columns times the requested rows: 1.29x for 8 shards and
+24 columns, 3.6x for 64 shards. Keep the shard group (EP, or `parallel_size`)
+within one NVLink domain.
 
 `buffer_budget_mb` bounds the runtime's reserved row-payload/gradient capacity,
 shared across local tables and VPP chunks. Pressure flushes pending gradients
@@ -391,8 +423,9 @@ bit-identical too: the V4.1 state codec reuses the packed layouts after attentio
 and restores the chunk-start state once per forward, packed THD batches are built with fewer
 host syncs, `pretrain_hybrid.get_batch` builds its transformer config once per argument
 namespace, and the Engram JSON is parsed once per path. Full-iteration CUDA graphs can also
-capture V4.1 training now (`--cuda-graph-impl full_iteration`), without Engram; with Engram that
-option is rejected, because Engram plans its EP lookups on the host.
+capture V4.1 training now (`--cuda-graph-impl full_iteration`). With Engram they require
+`"communication_backend": "static"` and at least one warmup step; the other backends plan their
+EP lookups on the host, so that combination is rejected.
 
 The numbers above also use these run settings, outside Megatron-LM's switches:
 

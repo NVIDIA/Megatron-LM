@@ -11,7 +11,7 @@ from __future__ import annotations
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from types import MethodType
-from typing import Callable, NamedTuple, Optional
+from typing import Callable, NamedTuple, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -27,6 +27,7 @@ from megatron.core.fp8_utils import (
     dequantize_fp8_tensor,
     is_mxfp8tensor,
 )
+from megatron.core.models.engram.static_exchange import StaticEngramLookup, StaticLookupLayout
 from megatron.core.ops._backends import require
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import (
@@ -366,10 +367,13 @@ class _EngramAllToAll:
     Packets contain an integer ordering key followed by opaque bytes. Dispatch copies
     UINT16 words without arithmetic; combine would sum BF16 values and corrupt integer
     IDs and MXFP8 data/scales, so the return and gradient paths also use dispatch.
+
+    The "static" backend has no variable-split transport: its lookups size every exchange
+    from the table layout (see ``static_exchange``), so this object only records the group.
     """
 
     def __init__(self, group, backend="nccl", chunk_size=4096, max_row_bytes=16):
-        if backend not in ("nccl", "hybridep", "symmetric"):
+        if backend not in ("nccl", "hybridep", "symmetric", "static"):
             raise ValueError(f"Unknown Engram communication backend: {backend}")
         if chunk_size <= 0 or chunk_size % 64:
             raise ValueError("Engram hybridep_chunk_size must be a positive multiple of 64")
@@ -388,8 +392,16 @@ class _EngramAllToAll:
             else None
         )
 
+    def _reject_static(self):
+        if self.backend == "static":
+            raise RuntimeError(
+                "Engram communication_backend='static' has no variable-split exchange; "
+                "use EPShardedMultiTableEmbedding's lookups"
+            )
+
     def exchange_counts(self, send_counts, *, global_counts=False):
         """Return peer splits, owner table counts, and forward/reverse exchange plans."""
+        self._reject_static()
         if self.backend == "nccl" and not global_counts:
             recv_counts = torch.empty_like(send_counts)
             torch.distributed.all_to_all_single(recv_counts, send_counts, group=self.group)
@@ -438,6 +450,7 @@ class _EngramAllToAll:
 
     def exchange(self, input_, output_splits, input_splits, plan=None):
         """Return rows ordered by source rank, then by their original position."""
+        self._reject_static()
         if self.backend == "nccl":
             output = input_.new_empty((sum(output_splits), *input_.shape[1:]))
             torch.distributed.all_to_all_single(
@@ -920,7 +933,13 @@ class EPShardedEmbeddingTable(MegatronModule):
 
 
 class EPShardedMultiTableEmbedding(MegatronModule):
-    """Batch variable-size requests for multiple independently EP-sharded tables."""
+    """Batch variable-size requests for multiple independently EP-sharded tables.
+
+    With ``communication_backend="static"`` (exactly one table) lookups use
+    ``StaticEngramLookup``: exchange sizes follow from the table layout and the token count,
+    so lookups can be captured in CUDA graphs. ``column_ranges`` gives each hash column's
+    ``(offset, size)`` bucket range; without them every owner receives every request.
+    """
 
     def __init__(
         self,
@@ -934,9 +953,14 @@ class EPShardedMultiTableEmbedding(MegatronModule):
         fp8_storage: bool = False,
         communication_backend: str = "nccl",
         hybridep_chunk_size: int = 4096,
+        column_ranges: Optional[Sequence[tuple[int, int]]] = None,
     ) -> None:
         super().__init__(config=config)
         self.table_sizes = tuple(table_sizes)
+        if communication_backend == "static" and len(self.table_sizes) != 1:
+            raise ValueError(
+                "Engram communication_backend='static' supports exactly one table per module"
+            )
         self.embedding_dim = embedding_dim
         self.ep_group = ep_group
         self.ep_size = get_pg_size(ep_group)
@@ -981,6 +1005,58 @@ class EPShardedMultiTableEmbedding(MegatronModule):
                 device=device,
             ),
             persistent=False,
+        )
+        self.column_ranges = None
+        self.static_layout = None
+        self.set_column_ranges(column_ranges)
+
+    def set_column_ranges(self, column_ranges: Optional[Sequence[tuple[int, int]]]) -> None:
+        """Declare the ``(offset, size)`` bucket range of each hash column of the single table.
+
+        Every request of column ``c`` must then address ``[offset_c, offset_c + size_c)``; the
+        static backend checks this on the device. The ranges and the static layout are plain
+        attributes and a non-persistent buffer, never part of the state dict.
+        """
+        if column_ranges is not None:
+            if len(self.tables) != 1:
+                raise ValueError("Engram column ranges describe the columns of a single table")
+            column_ranges = tuple((int(offset), int(size)) for offset, size in column_ranges)
+            rows = self.table_sizes[0]
+            if any(
+                size <= 0 or offset < 0 or offset + size > rows for offset, size in column_ranges
+            ):
+                raise ValueError(f"Engram column ranges must be non-empty and inside {rows} rows")
+        self.column_ranges = column_ranges
+        if self.communication.backend != "static":
+            return
+        table = self.tables[0]
+        rows = table.global_num_embeddings
+        self.static_layout = StaticLookupLayout(
+            rows,
+            [get_contiguous_row_range(rows, rank, self.ep_size) for rank in range(self.ep_size)],
+            table.ep_rank,
+            column_ranges,
+        )
+        self.register_buffer(
+            "static_lookup_metadata",
+            self.static_layout.metadata().to(table.weight.device),
+            persistent=False,
+        )
+
+    def _static_lookup(self, hash_ids, output_width, needs_wgrad=False):
+        weight = self.tables[0].weight
+        if output_width is None and self.tables[0].fp8_storage:
+            raise RuntimeError('Use lookup_quantized for primary MXFP8 Engram tables')
+        # The owner gather reads table storage directly, without the table's forward hooks.
+        ensure_params_ready((weight,))
+        grad_enabled = torch.is_grad_enabled()
+        return StaticEngramLookup.apply(
+            self,
+            hash_ids,
+            output_width,
+            grad_enabled and needs_wgrad,
+            grad_enabled and weight.requires_grad,
+            weight,
         )
 
     @property
@@ -1038,6 +1114,8 @@ class EPShardedMultiTableEmbedding(MegatronModule):
             raise ValueError(
                 f"Expected {len(self.tables)} Engram hash heads, got {hash_ids.shape[-1]}."
             )
+        if self.communication.backend == "static":
+            return self._static_lookup(hash_ids, None)
         original_shape = hash_ids.shape
 
         if self.ep_size == 1:
@@ -1075,6 +1153,8 @@ class EPShardedMultiTableEmbedding(MegatronModule):
             raise ValueError('output_width must be a positive multiple of embedding_dim')
         if hash_ids.numel() * self.embedding_dim % output_width:
             raise ValueError('Quantized Engram lookup must contain complete output rows')
+        if self.communication.backend == "static":
+            return self._static_lookup(hash_ids, output_width, needs_wgrad)
         weights = tuple(table.weight for table in self.tables)
         # This path reads raw FP8 storage without calling the tables' forward hooks.
         ensure_params_ready(weights)
@@ -1216,6 +1296,11 @@ class EngramRuntime:
     def attach(self, module):
         """Share transport workspace between tables with the same row format/group."""
         transport = module.communication
+        if transport.backend == "static":
+            raise ValueError(
+                "Engram communication_backend='static' does not use the prefetch/deferred "
+                "gradient runtime"
+            )
         # Duplicate gradients are summed before communication, in at least FP32.
         # The legacy lookup sends model-dtype gradients and sized its workspace
         # accordingly; enlarge it before HybridEP allocates its first buffer.

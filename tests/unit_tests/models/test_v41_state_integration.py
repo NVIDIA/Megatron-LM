@@ -235,8 +235,8 @@ def test_prepare_forward_keeps_the_model_restored_state(setup):
 
 
 def test_full_iteration_graphs_reject_engram():
-    """V4.1 accepts full-iteration graphs, which need no single-pass mHC state adapter, but not
-    with Engram, whose EP lookup plans its exchange on the host per batch."""
+    """V4.1 accepts full-iteration graphs, which need no single-pass mHC state adapter. With
+    Engram only the static backend qualifies: the others plan their EP lookup on the host."""
     from megatron.core.models.deepseek_v41.config import EngramConfig
 
     cfg = _config()
@@ -255,6 +255,10 @@ def test_full_iteration_graphs_reject_engram():
     )
     with pytest.raises(NotImplementedError, match='full_iteration'):
         DeepSeekV41Config(**values)
+    static = replace(values['engram_config'], communication_backend='static')
+    assert DeepSeekV41Config(**{**values, 'engram_config': static}).engram_config is static
+    with pytest.raises(ValueError, match='cuda_graph_warmup_steps'):
+        DeepSeekV41Config(**{**values, 'engram_config': static, 'cuda_graph_warmup_steps': 0})
     values['cuda_graph_impl'] = 'none'
     assert DeepSeekV41Config(**values).engram_config is values['engram_config']
 

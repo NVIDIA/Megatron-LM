@@ -1386,19 +1386,22 @@ def test_prefetch_eviction_and_main_grad_accumulation():
 
 
 @pytest.mark.parametrize(
-    'field,value',
+    'field,value,backend',
     [
-        ('parallel_size', 0),
-        ('parallel_size', True),
-        ('prefetch', 1),
-        ('defer_grad_transfer', 'true'),
-        ('buffer_budget_mb', 0),
+        ('parallel_size', 0, 'nccl'),
+        ('parallel_size', True, 'nccl'),
+        ('prefetch', 1, 'nccl'),
+        ('defer_grad_transfer', 'true', 'nccl'),
+        ('buffer_budget_mb', 0, 'nccl'),
+        # The lookup runtime plans on the host; the static backend never uses it.
+        ('prefetch', True, 'static'),
+        ('defer_grad_transfer', True, 'static'),
     ],
 )
-def test_engram_runtime_config_rejects_invalid_values(field, value):
+def test_engram_runtime_config_rejects_invalid_values(field, value, backend):
     from dataclasses import asdict
 
-    options = asdict(EngramConfig([0], [11], 2, 11, 1, 4, 0, 20))
+    options = asdict(EngramConfig([0], [11], 2, 11, 1, 4, 0, 20, communication_backend=backend))
     options[field] = value
     with pytest.raises(ValueError):
         EngramConfig(**options)
