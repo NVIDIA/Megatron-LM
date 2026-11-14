@@ -530,6 +530,11 @@ _hybrid_ep_buffer = None
 HYBRIDEP_TOKEN_ALIGNMENT = 64
 
 
+def _hybridep_supports_custom_allgather() -> bool:
+    """Whether the installed DeepEP's HybridEPBuffer has the custom allgather option."""
+    return 'enable_custom_allgather' in inspect.signature(HybridEPBuffer.__init__).parameters
+
+
 def init_hybrid_ep_buffer(
     group: torch.distributed.ProcessGroup,
     hidden_dim: int,
@@ -541,6 +546,7 @@ def init_hybrid_ep_buffer(
     num_blocks_unpermute: Optional[int] = None,
     fp8_dispatch: bool = False,
     num_sms_preprocessing_api: Optional[int] = None,
+    enable_custom_allgather: bool = False,
 ) -> None:
     '''
     Initialize the HybridEP buffer, including buffer allocation and metadata
@@ -571,6 +577,9 @@ def init_hybrid_ep_buffer(
             Whether to use FP8 communication during the dispatch phase.
         num_sms_preprocessing_api (Optional[int]):
             Number of SMs used by the preprocessing (metadata scan) kernel.
+        enable_custom_allgather (bool):
+            Gather routing maps with HybridEP's NVLink kernel instead of NCCL. Requires DeepEP
+            hybrid-ep at or after 94a9f8f (#682); older builds reuse stale routing on a timeout.
     '''
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
@@ -585,10 +594,19 @@ def init_hybrid_ep_buffer(
         kwargs['num_blocks_unpermute'] = num_blocks_unpermute
     if num_sms_preprocessing_api is not None:
         kwargs['num_sms_preprocessing_api'] = num_sms_preprocessing_api
-    # HybridEP's custom allgather gives up after ~20 s if a rank is late and continues with that
-    # rank's routing rows from the previous dispatch, silently corrupting it. Use NCCL instead.
-    if 'enable_custom_allgather' in inspect.signature(HybridEPBuffer.__init__).parameters:
-        kwargs['enable_custom_allgather'] = False
+    # Before DeepEP #682 the custom allgather defaulted on and reused a late rank's stale routing
+    # rows after a timeout, so always pass the option explicitly.
+    if _hybridep_supports_custom_allgather():
+        kwargs['enable_custom_allgather'] = enable_custom_allgather
+    elif enable_custom_allgather:
+        import warnings
+
+        warnings.warn(
+            "moe_hybridep_enable_custom_allgather is set but the installed DeepEP has no custom "
+            "allgather. Using the NCCL allgather.",
+            UserWarning,
+            stacklevel=2,
+        )
     _hybrid_ep_buffer = HybridEPBuffer(
         group=group,
         hidden_dim=hidden_dim,
@@ -630,6 +648,7 @@ class HybridEPDispatch(torch.autograd.Function):
         num_sms_preprocessing_api=108,
         topk_idx=None,
         num_of_experts=None,
+        enable_custom_allgather=False,
     ):
         '''
         Forward pass of fused dispatch of the HybridEP backend
@@ -663,6 +682,7 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_unpermute,
                 fp8_dispatch,
                 num_sms_preprocessing_api,
+                enable_custom_allgather,
             )
         # If we provide the num_permuted_tokens, we do not need to use sync to
         # wait for the data in pinned memory ready
@@ -723,6 +743,7 @@ class HybridEPDispatch(torch.autograd.Function):
             combined_hidden,
             None,
             combined_probs,
+            None,
             None,
             None,
             None,
@@ -797,6 +818,7 @@ if HAVE_HYBRIDEP:
         num_sms_preprocessing_api=108,
         topk_idx=None,
         num_of_experts=None,
+        enable_custom_allgather=False,
     ):
         '''
         Perform fused dispatch for "permute + dispatch a2a + permute" using the
@@ -834,6 +856,9 @@ if HAVE_HYBRIDEP:
                 Dense top-k expert indices with shape [num_tokens, topk].
             num_of_experts (int, optional):
                 Total number of experts. Required when topk_idx is provided.
+            enable_custom_allgather (bool):
+                Gather routing maps with HybridEP's NVLink kernel instead of NCCL. Only read
+                when the HybridEP buffer is first created.
         '''
         return HybridEPDispatch.apply(
             x,
@@ -851,6 +876,7 @@ if HAVE_HYBRIDEP:
             num_sms_preprocessing_api,
             topk_idx,
             num_of_experts,
+            enable_custom_allgather,
         )
 
     @internal_api

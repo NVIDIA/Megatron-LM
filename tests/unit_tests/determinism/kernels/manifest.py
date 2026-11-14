@@ -432,8 +432,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
             K + "test_moe_kernels.py",
         ),
         kind="torch-op",
-        notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP when available; "
-        "virtual-expert routing metadata and probability gradients replay under stream contention; "
+        notes="MoELayer replay through the allgather / alltoall dispatchers (EP=1, EP=2) and flex+DeepEP / flex+HybridEP "
+        "when available; virtual-expert routing metadata and probability gradients replay under stream contention; "
         "the FlashInfer per-token NVFP4 value pass (moe_training_matches_inference) with recompute "
         "backward, and its MXFP8 training-stack quantization.",
     ),
@@ -452,8 +452,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         sources=("megatron/core/transformer/moe/fused_a2a.py",),
         tests=(K + "test_moe_kernels.py",),
         kind="external-lib",
-        notes="DeepEP flex dispatcher cell (skipped without deep_ep / >=2 GPUs). HybridEP and NCCL-EP backends are not yet "
-        "replayed bit-exactly here.",
+        notes="DeepEP and HybridEP (NCCL and custom routing-map allgather) flex dispatcher cells (skipped without "
+        "deep_ep / >=2 GPUs). The NCCL-EP backend is not yet replayed bit-exactly here.",
     ),
     KernelEntry(
         name="moe_shared_experts",

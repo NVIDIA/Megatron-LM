@@ -1242,6 +1242,11 @@ class TransformerConfig(ModelParallelConfig):
     moe_hybridep_num_sms_preprocessing: int = 108
     """Number of SMs to use for HybridEP preprocessing (metadata scan kernel)."""
 
+    moe_hybridep_enable_custom_allgather: bool = False
+    """Gather HybridEP routing maps with DeepEP's NVLink allgather kernel instead of NCCL. Only
+    used when the EP group fits in one NVLink domain. Requires DeepEP hybrid-ep at or after
+    94a9f8f (#682): older builds silently reuse a late rank's stale routing after a timeout."""
+
     moe_hybridep_routing_map_mode: Literal['indices', 'bool'] = 'indices'
     """Routing-map format for HybridEP. ``indices`` requests int16 top-k indices and is the
     default, while ``bool`` forces the bool token-to-expert map. Index routing remains gated on
