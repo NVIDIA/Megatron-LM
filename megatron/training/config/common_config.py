@@ -110,15 +110,6 @@ class DistributedInitConfig:
     external_gpu_device_mapping: bool = False
     """Use device zero when an external launcher exposes exactly one GPU per process."""
 
-    @property
-    def lazy_init(self) -> bool:
-        """Compatibility spelling for lazy_mpu_init."""
-        return self.lazy_mpu_init
-
-    @lazy_init.setter
-    def lazy_init(self, value: bool) -> None:
-        self.lazy_mpu_init = value
-
     distributed_backend: Literal["nccl", "gloo"] = "nccl"
     """Which backend to use for distributed training."""
 

@@ -28,13 +28,35 @@ evaluation and checkpoint bookkeeping consume them. This does not suppress
 ordinary progress metrics or eliminate required timer synchronization overhead.
 Levels 0, 1, and 2 retain their existing behavior; the default remains 0.
 
-## Shared driver settings
+## Native schedule and initialization controls
 
-`SchedulerConfig.max_steps` carries Bridge's full schedule horizon for shortened
-runs. `DistributedInitConfig.external_gpu_device_mapping` and its `lazy_init`
-alias preserve driver construction. `RerunStateMachineConfig.spiky_loss_factor`
-sets Bridge's spiky-loss threshold. These fields do not introduce new native CLI
-options or implementations of their Bridge-specific behavior.
+`--max-steps` / `SchedulerConfig.max_steps` sets the full iteration horizon for
+learning-rate decay and weight-decay growth while `train_iters` still determines
+when the run stops. An explicit horizon overrides `lr_decay_iters`; fractional
+warmup follows that horizon. With WSD, an unspecified decay duration also uses
+the horizon. The value must be positive and at least `train_iters`; sample-based
+training is unsupported. The default `None` preserves all existing scheduler
+resolution, including an explicitly supplied LR decay length.
+
+`--external-gpu-device-mapping` / `DistributedInitConfig.external_gpu_device_mapping`
+selects CUDA device 0 when a launcher exposes one GPU per process, even if the
+process has a nonzero local rank. NCCL restart initialization and GPU telemetry
+use the same device index. The default `False` retains local-rank device selection.
+Bridge alone provides the compatibility property `lazy_init`, backed by the
+existing shared `lazy_mpu_init` field.
+
+`--spiky-loss-factor` / `RerunStateMachineConfig.spiky_loss_factor` controls the
+maximum-loss multiplier used by GPT, hybrid and elastification loss checks when
+`check_for_spiky_loss` is enabled. The default 10.0 matches their previous fixed
+threshold. Gradient checks and RL's separate percentage-based detector retain
+their existing behavior.
+
+## Default behavior
+
+Leaving the new fields unset preserves native behavior: scheduler horizon `None`,
+external GPU mapping `False`, spiky-loss factor `10.0`, optimizer-success checking
+`True`, norm-sync skipping `False`, and timing level `0`. Regression tests exercise
+both defaults and explicit overrides at the runtime consumers.
 
 ## Deferred migrations
 

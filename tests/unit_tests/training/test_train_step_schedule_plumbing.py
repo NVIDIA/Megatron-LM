@@ -187,11 +187,17 @@ def test_model_process_groups_are_found_through_model_wrappers():
     assert training_mod._get_model_pg_collection(wrapped_model) is pg_collection
 
 
-@pytest.mark.parametrize("check_success", [False, True])
-@pytest.mark.parametrize("skip_norm_sync", [False, True])
-def test_train_step_invokes_tensor_metric_observer_before_optimizer(run_config, check_success, skip_norm_sync):
-    run_config.train.check_optimizer_step_success = check_success
-    run_config.train.skip_sync_grad_norm_across_mp = skip_norm_sync
+@pytest.mark.parametrize("check_success", [None, False, True])
+@pytest.mark.parametrize("skip_norm_sync", [None, False, True])
+def test_train_step_invokes_tensor_metric_observer_before_optimizer(
+    run_config, check_success, skip_norm_sync
+):
+    if check_success is not None:
+        run_config.train.check_optimizer_step_success = check_success
+    if skip_norm_sync is not None:
+        run_config.train.skip_sync_grad_norm_across_mp = skip_norm_sync
+    check_success = True if check_success is None else check_success
+    skip_norm_sync = False if skip_norm_sync is None else skip_norm_sync
     run_config.optimizer.log_num_zeros_in_grad = True
     success_reduction = mock.Mock(return_value=False)
     stat_reduction = mock.Mock(side_effect=lambda value, group: value + 5.0)

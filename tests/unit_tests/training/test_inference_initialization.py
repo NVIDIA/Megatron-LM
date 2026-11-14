@@ -188,17 +188,25 @@ def test_runtime_services_initialize_training_only_when_requested(
     assert vars(args) == {"enable_experimental": enable_runtime_flags}
 
 
-def test_inference_telemetry_does_not_read_training_fields(monkeypatch, run_config):
+@pytest.mark.parametrize("external_mapping", [False, True])
+def test_inference_telemetry_does_not_read_training_fields(
+    monkeypatch, run_config, external_mapping
+):
     class InferenceArgs(Namespace):
         def __getattribute__(self, name):
             if name in {"micro_batch_size", "global_batch_size", "train_iters"}:
                 raise AssertionError(f"Inference read training field {name}")
             return super().__getattribute__(name)
 
-    monkeypatch.setattr(global_vars, "_detect_gpu_identity", Mock(return_value={}))
+    run_config.dist.local_rank = 3
+    run_config.dist.external_gpu_device_mapping = external_mapping
+    detect = Mock(return_value={})
+    monkeypatch.setattr(global_vars, "_detect_gpu_identity", detect)
     attrs = global_vars.build_telemetry_resource_attrs(
         InferenceArgs(local_rank=0), include_training=False
     )
+    detect.assert_called_once_with(0 if external_mapping else 3)
+    assert attrs["dl.local_rank"] == 3
     assert "dl.batch_size" not in attrs
     assert "megatron.micro_batch_size" not in attrs
     assert "megatron.train_iters" not in attrs

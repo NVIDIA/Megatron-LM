@@ -188,7 +188,9 @@ class SchedulerConfig:
     """Configuration settings for the learning rate scheduler and weight decay."""
 
     max_steps: int | None = None
-    """Full schedule horizon when a driver executes only a shortened training run."""
+    """Full iteration horizon for LR and weight decay when train_iters shortens a run.
+    Overrides lr_decay_iters without changing train_iters; unavailable with train_samples.
+    """
 
     # ---------------- Learning rate config. ----------------
     lr_decay_style: Literal["constant", "linear", "cosine", "inverse-square-root", "WSD"] = "linear"
@@ -284,6 +286,13 @@ class SchedulerConfig:
         weight_decay: float | None,
     ) -> None:
         """Check this section against the rest of the run it belongs to."""
+        if self.max_steps is not None:
+            if self.max_steps <= 0:
+                raise ValueError("scheduler.max_steps must be positive")
+            if train_samples is not None:
+                raise ValueError("scheduler.max_steps requires iteration-based training")
+            if train_iters is not None and self.max_steps < train_iters:
+                raise ValueError("scheduler.max_steps must be at least train_iters")
         if train_iters and not skip_train:
             # If we use iteration-based training, make sure the
             # sample-based options are off.

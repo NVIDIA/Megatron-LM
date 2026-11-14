@@ -2795,9 +2795,7 @@ def _add_training_args(parser):
 def _add_rerun_machine_args(parser):
     from megatron.training.config import RerunStateMachineConfig
 
-    rerun_factory = ArgumentGroupFactory(
-        RerunStateMachineConfig, exclude=['check_for_nan_in_loss', 'spiky_loss_factor']
-    )
+    rerun_factory = ArgumentGroupFactory(RerunStateMachineConfig, exclude=["check_for_nan_in_loss"])
     group = rerun_factory.build_group(parser, "rerun engine")
 
     return parser
@@ -2818,7 +2816,7 @@ def _add_initialization_args(parser):
 def _add_learning_rate_args(parser):
     from megatron.training.config import SchedulerConfig
 
-    sched_factory = ArgumentGroupFactory(SchedulerConfig, exclude=['max_steps'])
+    sched_factory = ArgumentGroupFactory(SchedulerConfig)
     group = sched_factory.build_group(parser, title="learning rate and weight decay")
 
     group.add_argument('--lr', type=float, default=None,
@@ -2910,9 +2908,7 @@ def _add_mixed_precision_args(parser):
 def _add_distributed_args(parser):
     from megatron.training.config import DistributedInitConfig
 
-    dist_init_factory = ArgumentGroupFactory(
-        DistributedInitConfig, exclude=['external_gpu_device_mapping']
-    )
+    dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
     group = dist_init_factory.build_group(parser, "distributed init")
 
     group.add_argument('--use-torch-fsdp2', action='store_true', default=False,

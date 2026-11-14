@@ -315,3 +315,50 @@ def test_scheduled_weight_decay_is_not_overwritten_at_finalize(finalizable, run_
     run_config.finalize()
     assert run_config.scheduler.start_weight_decay == 0.0
     assert run_config.scheduler.end_weight_decay == 0.1
+
+
+@pytest.mark.parametrize("horizon", [None, 100, 200])
+@pytest.mark.parametrize("explicit_decay", [None, 150])
+def test_full_schedule_horizon_changes_lr_and_wd_without_extending_run(
+    monkeypatch, run_config, horizon, explicit_decay
+):
+    # Use the real scheduler to check effective LR/WD, not just copied config fields.
+    run_config.train = TrainingConfig(train_iters=100, global_batch_size=4)
+    run_config.scheduler = SchedulerConfig(
+        max_steps=horizon,
+        lr_decay_iters=explicit_decay,
+        start_weight_decay=0.0,
+        end_weight_decay=0.1,
+        weight_decay_incr_style="linear",
+    )
+    run_config.optimizer.lr = 1e-3
+    run_config.optimizer.min_lr = 0.0
+    monkeypatch.setattr(training, "get_args", lambda: SimpleNamespace())
+    run_config.scheduler.validate_run(
+        train_iters=100, train_samples=None, skip_train=False, weight_decay=0.1
+    )
+    run_config._resolve_scheduler_step_fields()
+    optimizer = SimpleNamespace(param_groups=[{}])
+    scheduler = training.get_optimizer_param_scheduler(optimizer)
+    scheduler.step(200)  # 50 iterations at batch size 4.
+    decay = horizon if horizon is not None else (explicit_decay or 100)
+    assert optimizer.param_groups[0]["lr"] == pytest.approx(1e-3 * (1 - 50 / decay))
+    assert optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.1 * 50 / (horizon or 100))
+    assert run_config.train.train_iters == 100
+
+
+@pytest.mark.parametrize(
+    "max_steps,train_iters,train_samples",
+    [(0, 10, None), (-1, 10, None), (5, 10, None), (20, None, 100)],
+)
+def test_invalid_full_schedule_horizons_fail_validation(max_steps, train_iters, train_samples):
+    with pytest.raises(ValueError, match="scheduler.max_steps"):
+        SchedulerConfig(max_steps=max_steps).validate_run(
+            train_iters=train_iters, train_samples=train_samples, skip_train=False, weight_decay=0.0
+        )
+
+
+def test_explicit_full_horizon_supplies_wsd_decay_when_unspecified(build_scheduler):
+    config = SchedulerConfig(max_steps=200, lr_decay_style="WSD")
+    kwargs = build_scheduler(config, train_iters=100)
+    assert kwargs["lr_decay_steps"] == kwargs["wsd_decay_steps"] == 800

@@ -36,8 +36,6 @@ def test_driver_settings_survive_nested_serialization():
     assert loaded.train.skip_sync_grad_norm_across_mp
     assert loaded.scheduler.max_steps == 1000
     assert loaded.dist.external_gpu_device_mapping is True
-    loaded.dist.lazy_init = True
-    assert loaded.dist.lazy_mpu_init is True
 
 
 def test_native_cli_owns_training_flags_and_accepts_disabled_timer_reports():
@@ -45,9 +43,7 @@ def test_native_cli_owns_training_flags_and_accepts_disabled_timer_reports():
     arguments.add_megatron_arguments(parser)
     flags = parser._option_string_actions
     assert "--num-epochs" not in flags
-    assert "--max-steps" not in flags
     assert "--also-save-hf-checkpoint" not in flags
-    assert "--external-gpu-device-mapping" not in flags
     args = parser.parse_args(
         [
             "--eval-iters",
@@ -56,15 +52,26 @@ def test_native_cli_owns_training_flags_and_accepts_disabled_timer_reports():
             "-1",
             "--no-check-optimizer-step-success",
             "--skip-sync-grad-norm-across-mp",
+            "--max-steps",
+            "1000",
+            "--external-gpu-device-mapping",
+            "--spiky-loss-factor",
+            "3.0",
         ]
     )
     assert args.eval_iters == 7
     assert args.timing_log_level == -1
     assert not args.check_optimizer_step_success
     assert args.skip_sync_grad_norm_across_mp
+    assert args.max_steps == 1000
+    assert args.external_gpu_device_mapping
+    assert args.spiky_loss_factor == 3.0
     defaults = parser.parse_args([])
     assert defaults.check_optimizer_step_success
     assert not defaults.skip_sync_grad_norm_across_mp
     assert defaults.timing_log_level == 0
+    assert defaults.max_steps is None
+    assert not defaults.external_gpu_device_mapping
+    assert defaults.spiky_loss_factor == 10.0
     with pytest.raises(SystemExit):
         parser.parse_args(["--timing-log-level", "-2"])

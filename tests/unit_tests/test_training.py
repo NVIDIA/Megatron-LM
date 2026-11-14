@@ -108,8 +108,9 @@ def test_straggler_reporting_uses_config_and_logger_cadence(
     ["pretrain_gpt", "pretrain_hybrid", "megatron.elastification.pretrain_hybrid_flex", "train_rl"],
 )
 @pytest.mark.parametrize("nan_check,spiky_check", [(False, False), (True, False), (False, True)])
+@pytest.mark.parametrize("loss_factor", [None, 3.0])
 def test_entrypoint_loss_checks_read_rerun_config(
-    monkeypatch, run_config, module_name, nan_check, spiky_check
+    monkeypatch, run_config, module_name, nan_check, spiky_check, loss_factor
 ):
     with patch("logging.basicConfig"):
         entrypoint = importlib.import_module(module_name)
@@ -123,6 +124,8 @@ def test_entrypoint_loss_checks_read_rerun_config(
     monkeypatch.setattr(entrypoint, "get_rerun_state_machine", lambda: machine)
     run_config.rerun_state_machine.check_for_nan_in_loss = nan_check
     run_config.rerun_state_machine.check_for_spiky_loss = spiky_check
+    if loss_factor is not None:
+        run_config.rerun_state_machine.spiky_loss_factor = loss_factor
     values = torch.ones(2, device="cuda")
     if module_name == "train_rl":
         result = entrypoint.loss_func(values, values, values, values, values, values, 1, values)
@@ -136,6 +139,9 @@ def test_entrypoint_loss_checks_read_rerun_config(
     for call in machine.validate_result.call_args_list:
         assert call.kwargs["tolerance"] == 0
         assert call.kwargs["fatal"] == (call.kwargs["message"] != "Spiky loss")
+        if call.kwargs["message"] == "Spiky loss":
+            threshold = 0.2 if module_name == "train_rl" else (10.0 if loss_factor is None else loss_factor)
+            assert call.kwargs["rejection_func"].keywords["threshold"] == threshold
 
 
 class _LenDataloader:
