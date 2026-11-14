@@ -151,6 +151,79 @@ class TestGDPDecodeIntermediateStates:
         assert torch.equal(state, replay_state)
 
     @pytest.mark.parametrize("num_householder", _HOUSEHOLDER)
+    @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+    def test_snapshots_match_token_by_token_decode_in_state_dtype(
+        self, num_householder, state_dtype
+    ):
+        """The snapshot contract holds for the cache dtype, not just FP32.
+
+        A serial decode stores the state to the cache dtype after every token, and
+        the next launch consumes that rounded value. The multi-token kernel instead
+        carries one FP32 accumulator across the whole step, so unless it folds the
+        same rounding in at each token boundary, snapshot `i` -- and the state a
+        rollback to that prefix restores -- is not what a serial decode of the
+        prefix holds, and the gap compounds once per token in BF16. FP32 caches
+        round-trip unchanged, which is why the FP32-only check above cannot see it.
+        """
+        _requires_cuda()
+        batch, num_slots, seq_len = 3, 6, 4
+        q, k, v, g, beta = _make_inputs(batch, seq_len, num_householder, dtype=state_dtype)
+
+        state_indices = torch.tensor([4, 0, 3], dtype=torch.int32, device="cuda")
+        initial_state = torch.randn(num_slots, _HV, _K, _V, device="cuda", dtype=state_dtype)
+
+        state = initial_state.clone()
+        intermediate = torch.full(
+            (num_slots, seq_len, _HV, _K, _V), float("nan"), device="cuda", dtype=state_dtype
+        )
+        out, _ = fused_recurrent_gated_delta_rule_update(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            state=state,
+            state_indices=state_indices,
+            use_qk_l2norm_in_kernel=True,
+            intermediate_states=intermediate,
+            steps_per_token=num_householder,
+        )
+
+        # Replay the same step one token per launch, against the same cache dtype.
+        # `steps_per_token` must match the multi-token launch: a serial decode runs
+        # one `ssm_decode` per token with the same list of Householder copies, so
+        # the state is rounded to the cache dtype once per *token*, not per copy.
+        replay_state = initial_state.clone()
+        for token in range(seq_len):
+            replay_out, _ = fused_recurrent_gated_delta_rule_update(
+                _token_slice(q, token, num_householder),
+                _token_slice(k, token, num_householder),
+                _token_slice(v, token, num_householder),
+                g=_token_slice(g, token, num_householder),
+                beta=_token_slice(beta, token, num_householder),
+                state=replay_state,
+                state_indices=state_indices,
+                use_qk_l2norm_in_kernel=True,
+                steps_per_token=num_householder,
+            )
+            assert torch.equal(
+                intermediate[state_indices.long(), token], replay_state[state_indices.long()]
+            ), (
+                f"snapshot for token {token} does not match a serial decode that stopped "
+                f"there (state cache dtype {state_dtype})"
+            )
+            # The outputs must agree too: the multi-token scan computes each token's
+            # output from the same state serial decode would hold there.
+            assert torch.equal(_token_slice(out, token, num_householder), replay_out), (
+                f"output for token {token} differs from serial decode (state cache dtype "
+                f"{state_dtype})"
+            )
+
+        assert torch.equal(state, replay_state), (
+            f"post-step state differs from serial decode (state cache dtype {state_dtype})"
+        )
+
+    @pytest.mark.parametrize("num_householder", _HOUSEHOLDER)
     def test_last_snapshot_is_the_final_state(self, num_householder):
         """The final snapshot is the state the cache ends the step with, which is
         what a fully-accepted draft rolls back to (i.e. does not roll back)."""

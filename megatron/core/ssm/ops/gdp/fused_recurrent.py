@@ -211,8 +211,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             # Snapshot the state once per draft token, on the step that closes that
             # token's group of `STEPS_PER_TOKEN` Householder updates -- so the
             # snapshot is the state a rollback to "this token accepted" must restore.
-            if STORE_INTERMEDIATE:
-                if (i_t + 1) % STEPS_PER_TOKEN == 0:
+            if (i_t + 1) % STEPS_PER_TOKEN == 0:
+                if STORE_INTERMEDIATE:
                     p_int = (
                         intermediate_states
                         + int_offset
@@ -221,6 +221,13 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                         + o_v[None, :]
                     )
                     tl.store(p_int, b_h.to(p_int.dtype.element_ty), mask=mask_h)
+                # A serial decode runs one launch per token and the next launch
+                # reloads the state rounded to the cache dtype, so fold the same
+                # rounding into the accumulator at each token boundary: snapshots,
+                # the final state, and every later token's output then match
+                # one-token-at-a-time decode bit for bit.
+                if STORE_FINAL_STATE:
+                    b_h = b_h.to(ht.dtype.element_ty).to(tl.float32)
 
             p_q += H * K
             p_k += H * K
@@ -273,8 +280,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
             # Snapshot the state once per draft token, on the step that closes that
             # token's group of `STEPS_PER_TOKEN` Householder updates -- so the
             # snapshot is the state a rollback to "this token accepted" must restore.
-            if STORE_INTERMEDIATE:
-                if (i_t + 1) % STEPS_PER_TOKEN == 0:
+            if (i_t + 1) % STEPS_PER_TOKEN == 0:
+                if STORE_INTERMEDIATE:
                     p_int = (
                         intermediate_states
                         + int_offset
@@ -283,6 +290,13 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
                         + o_v[None, :]
                     )
                     tl.store(p_int, b_h.to(p_int.dtype.element_ty), mask=mask_h)
+                # A serial decode runs one launch per token and the next launch
+                # reloads the state rounded to the cache dtype, so fold the same
+                # rounding into the accumulator at each token boundary: snapshots,
+                # the final state, and every later token's output then match
+                # one-token-at-a-time decode bit for bit.
+                if STORE_FINAL_STATE:
+                    b_h = b_h.to(ht.dtype.element_ty).to(tl.float32)
 
             p_q += H * K
             p_k += H * K
