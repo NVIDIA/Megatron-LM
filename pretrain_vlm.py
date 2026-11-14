@@ -28,6 +28,7 @@ from megatron.core.models.vision.vit_layer_specs import (
     get_vit_layer_with_local_spec,
     get_vit_layer_with_transformer_engine_spec,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.spec_utils import get_submodules, import_module
 from megatron.training import (
@@ -119,6 +120,11 @@ def model_provider(
             f"Expected cfg.model to be LLaVAModelConfig, got {type(cfg.model).__name__}"
         )
     vision_model_type = "clip"
+
+    if pg_collection is None:
+        # Omitting the collection from LLaVAModel is deprecated; this script trains on the global
+        # parallel grid, so resolve it here rather than inside megatron/core.
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
     assert (
         cfg.checkpoint.ckpt_format == 'torch'
@@ -272,6 +278,7 @@ def model_provider(
         img_h=cfg.model.img_h,
         img_w=cfg.model.img_w,
         patch_dim=cfg.model.patch_dim,
+        pg_collection=pg_collection,
     )
 
     model.freeze(
