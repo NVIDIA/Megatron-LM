@@ -1163,6 +1163,21 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     assert len(steps) == 1, f"steps: {optimizer.state}"
                     step = steps[0]
                     break
+            if step is None:
+                # No CPU-owned state on this rank: use the FusedAdam counters that
+                # the hybrid optimizer mirrors into its groups, so that groups that
+                # are empty on this rank are still saved with the current step.
+                steps = list(
+                    set(
+                        [
+                            g["step"]
+                            for g in self.optimizer.param_groups
+                            if len(g["params"]) > 0 and "step" in g
+                        ]
+                    )
+                )
+                assert len(steps) <= 1, f"steps: {steps}"
+                step = steps[0] if len(steps) == 1 else None
         elif USING_TE_OPTIMIZER or USING_APEX_OPTIMIZER:
             # Extract 'step', for TE FusedAdam support.
             steps = list(

@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import random
 from copy import deepcopy
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -18,6 +19,7 @@ except:
     from torch.optim import Adam as GPUAdam
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
 from megatron.core.transformer.module import (
     convert_module_to_dtype_except_fp32_marked,
     mark_keep_in_fp32,
@@ -236,6 +238,30 @@ def test_hybrid_dummy_step_preserves_parameters(dtype: torch.dtype) -> None:
     for old, parameter in zip(before, parameters):
         assert torch.equal(old, parameter), "dummy_step changed a parameter"
         assert parameter.grad is None
+
+
+@pytest.mark.skipif(GPUAdam is Adam, reason='Requires TransformerEngine FusedAdam')
+def test_gpu_only_hybrid_state_dict_saves_step_for_empty_group() -> None:
+    """A group that is empty on the saving rank must still carry the current step.
+
+    Another data-parallel rank may own parameters of that group; without a saved
+    step, its FusedAdam group would restart bias correction at step one.
+    """
+    parameter = nn.Parameter(torch.ones(64, device='cuda', dtype=torch.bfloat16))
+    optimizer = HybridDeviceOptimizer(
+        [{'params': []}, {'params': [parameter]}],
+        offload_fraction=0.0,
+        cpu_optimizer_cls=AdamW,
+        gpu_optimizer_cls=GPUAdam,
+        param_update_in_fp32=True,
+        lr=0.1,
+    )
+    assert not optimizer.cpu_optimizers and optimizer.gpu_optimizer is not None
+    for _ in range(3):
+        parameter.decoupled_grad = torch.ones_like(parameter, dtype=torch.float32)
+        optimizer.step()
+    saved = DistributedOptimizer.state_dict(SimpleNamespace(optimizer=optimizer, grad_scaler=None))
+    assert [group.get('step') for group in saved['optimizer']['param_groups']] == [3, 3]
 
 
 class ConditionalParameterModel(nn.Module):

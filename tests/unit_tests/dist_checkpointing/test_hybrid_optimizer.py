@@ -21,6 +21,7 @@ from megatron.training.checkpointing import (
     load_checkpoint,
     save_checkpoint,
 )
+from megatron.training.global_vars import get_run_config
 from megatron.training.training import preprocess_common_state_dict
 from tests.unit_tests.determinism.kernels.harness import bytes_equal
 from tests.unit_tests.dist_checkpointing import (
@@ -33,19 +34,19 @@ from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 
 class HybridOptimizerModel(torch.nn.Module):
-    """Small replicated parameters with a native FP32 subset when requested."""
+    """Small replicated parameters: BF16, BF16 with a native FP32 subset, or FP32."""
 
-    def __init__(self, mixed: bool):
+    def __init__(self, mixed: bool, fp32: bool = False):
         super().__init__()
         self.config = TransformerConfig(
-            num_layers=1, hidden_size=16, num_attention_heads=1, bf16=True
+            num_layers=1, hidden_size=16, num_attention_heads=1, bf16=not fp32
         )
         self.weights = torch.nn.ParameterList(
             [
                 torch.nn.Parameter(
                     torch.linspace(-0.5, 0.5, 256, device='cuda')
                     .reshape(16, 16)
-                    .to(torch.float32 if mixed and index >= 4 else torch.bfloat16)
+                    .to(torch.float32 if fp32 or (mixed and index >= 4) else torch.bfloat16)
                 )
                 for index in range(8)
             ]
@@ -267,5 +268,115 @@ def test_hybrid_checkpoint_continuation(
                 for step in (3, 4, 5):
                     train_step(restored_model, restored_optimizer, step)
                     assert_equal(expected[step], snapshot(restored_model, restored_optimizer))
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize('offload_fraction', [0.5, 1.0], ids=['half_offload', 'full_offload'])
+@pytest.mark.parametrize(
+    'policy', [{'finetune': True}, {'load_optim': False}], ids=['finetune', 'no_load_optim']
+)
+def test_hybrid_fp32_weights_only_load_refreshes_cpu_copies(
+    tmp_path_dist_ckpt, policy: dict, offload_fraction: float
+) -> None:
+    """An FP32 model loaded without optimizer state must train from the loaded weights.
+
+    CPU offload keeps a CPU copy of every offloaded FP32 parameter. Unless the
+    load refreshes it, the first step writes the construction-time weights back.
+    """
+    if Utils.world_size < 2 or Utils.world_size % 2:
+        pytest.skip('Requires an even world size for DP=2')
+    tp = Utils.world_size // 2
+    Utils.initialize_model_parallel(tensor_model_parallel_size=tp)
+    model_parallel_cuda_manual_seed(123)
+    config = OptimizerConfig(
+        optimizer='adam',
+        lr=0.01,
+        weight_decay=0.01,
+        params_dtype=torch.float32,
+        use_distributed_optimizer=True,
+        use_precision_aware_optimizer=True,
+        optimizer_cpu_offload=True,
+        optimizer_offload_fraction=offload_fraction,
+        overlap_cpu_optimizer_d2h_h2d=True,
+        clip_grad=0.0,
+    )
+
+    def build_model():
+        model = HybridOptimizerModel(mixed=False, fp32=True)
+        return DistributedDataParallel(
+            model.config,
+            DistributedDataParallelConfig(use_distributed_optimizer=True, grad_reduce_in_fp32=True),
+            model,
+        )
+
+    def build_optimizer(model):
+        optimizer = get_megatron_optimizer(config, [model])
+        inner = optimizer.chained_optimizers[0].optimizer
+        assert any(parameter.dtype == torch.float32 for parameter in inner.gpu_params_map_cpu_copy)
+        return optimizer
+
+    def train_step(model, optimizer, step):
+        model.zero_grad_buffer()
+        optimizer.zero_grad()
+        model(step).backward()
+        model.finish_grad_sync()
+        success, _, _ = optimizer.step()
+        assert success
+        torch.cuda.synchronize()
+
+    try:
+        with TempNamedDir(tmp_path_dist_ckpt / 'hybrid_fp32_weights_only', sync=True) as directory:
+            args = parse_args(ignore_unknown_args=True)
+            init_basic_mock_args(args, tp, 1, bf16=False)
+            init_checkpointing_mock_args(args, directory)
+            args.save_tokenizer_assets = False
+            args.optimizer_cpu_offload = True
+            args.use_precision_aware_optimizer = True
+            # Checkpointing reads the registered run config rather than args.
+            sync_checkpoint_config(args)
+            _sync_run_config_optimizer_flags(True, False)
+            get_run_config().optimizer.optimizer_cpu_offload = True
+            assert not get_run_config().model.transformer.bf16
+
+            with patch('megatron.training.checkpointing.get_args', return_value=args):
+                model = build_model()
+                optimizer = build_optimizer(model)
+                for step in (1, 2):
+                    train_step(model, optimizer, step)
+                save_checkpoint(
+                    2,
+                    [model],
+                    optimizer,
+                    None,
+                    0,
+                    preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                )
+                trained = deepcopy(model.module.state_dict())
+
+                # Construct the optimizer before the load, as training setup does.
+                loaded_model = build_model()
+                loaded_optimizer = build_optimizer(loaded_model)
+                with patch('megatron.training.checkpointing.check_checkpoint_args'):
+                    load_checkpoint(
+                        [loaded_model],
+                        loaded_optimizer,
+                        None,
+                        restore_training_state=True,
+                        **policy,
+                    )
+                for name, value in trained.items():
+                    assert bytes_equal(value, loaded_model.module.state_dict()[name])
+
+                # Reference: a fresh optimizer built after the weights are in place.
+                reference_model = build_model()
+                reference_model.module.load_state_dict(trained)
+                reference_optimizer = build_optimizer(reference_model)
+
+                train_step(loaded_model, loaded_optimizer, 1)
+                train_step(reference_model, reference_optimizer, 1)
+                reference = reference_model.module.state_dict()
+                for name, value in loaded_model.module.state_dict().items():
+                    assert bytes_equal(value, reference[name]), f'{name} trained from stale copies'
     finally:
         Utils.destroy_model_parallel()

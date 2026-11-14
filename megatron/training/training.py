@@ -2714,7 +2714,12 @@ def setup_model_and_optimizer(
         )
         torch.distributed.barrier()
         del dense_model_for_upcycling
-        if (cfg.model.transformer.fp16 or cfg.model.transformer.bf16) and optimizer is not None:
+        # CPU offload keeps separate optimizer copies of FP32 parameters as well.
+        if optimizer is not None and (
+            cfg.model.transformer.fp16
+            or cfg.model.transformer.bf16
+            or cfg.optimizer.optimizer_cpu_offload
+        ):
             optimizer.reload_model_params()
         print_rank_0(f'Upcycled checkpoint saved to {cfg.checkpoint.save}')
 

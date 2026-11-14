@@ -3711,7 +3711,14 @@ def load_checkpoint(
                 'ones the saving job chose, so the weights are not guaranteed to be bit-wise '
                 'identical to those saved. Load the optimizer state to avoid this.'
             )
-        if (cfg.model.transformer.fp16 or cfg.model.transformer.bf16) and optimizer is not None:
+        # CPU offload keeps separate optimizer copies of FP32 parameters as well,
+        # so they must be refreshed from the loaded model even without fp16/bf16.
+        # Inference config containers have no optimizer section.
+        if optimizer is not None and (
+            cfg.model.transformer.fp16
+            or cfg.model.transformer.bf16
+            or getattr(getattr(cfg, 'optimizer', None), 'optimizer_cpu_offload', False)
+        ):
             if checkpoint.load_main_params_from_ckpt:
                 optimizer.reload_model_params(state_dict=state_dict)
             else:
