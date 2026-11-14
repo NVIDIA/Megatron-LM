@@ -186,17 +186,35 @@ class _FusedKVRoPEQuantForFusedAttn(torch.autograd.Function):
         return d_kv, d_emb, None, None, None, None, None
 
 
+# Transformer Engine's DotProductAttention reads these once, when it is imported; mirror that.
+_DPA_FP8_RECIPE = os.getenv("NVTE_DPA_FP8_RECIPE", "")
+_DPA_FP8_FORMAT = os.getenv("NVTE_DPA_FP8_FORMAT", "HYBRID")
+
+
 def _is_mxfp8_attention_active() -> bool:
     """Whether attention runs in MXFP8 here: in an FP8 autocast with an MXFP8 recipe and FP8 DPA
-    (layers kept in BF16 run outside it), with an FP8 backward. With NVTE_FP8_DPA_BWD=0, attention
-    keeps the BF16 q/k/v for its backward, which pre-quantized inputs would replace by their
-    dequantized values."""
+    (layers kept in BF16 run outside it), or in an NVFP4 autocast with FP8 DPA that Transformer
+    Engine runs in MXFP8 (NVTE_DPA_FP8_RECIPE=MXFP8BlockScaling), with an FP8 backward. With
+    NVTE_FP8_DPA_BWD=0, attention keeps the BF16 q/k/v for its backward, which pre-quantized
+    inputs would replace by their dequantized values."""
     if not FP8GlobalStateManager.is_fp8_enabled():
         return False
     if int(os.getenv("NVTE_FP8_DPA_BWD", "1")) == 0:
         return False
     recipe = FP8GlobalStateManager.get_fp8_recipe()
-    return recipe.mxfp8() and recipe.fp8_dpa
+    if recipe.custom():
+        # Custom recipes take their attention quantizers from their factory, not the env.
+        return False
+    if recipe.nvfp4() and recipe.fp8_dpa:
+        # TE builds the MXFP8 attention recipe in NVTE_DPA_FP8_FORMAT; the fused kernel writes
+        # E4M3, the forward format of HYBRID and E4M3.
+        return _DPA_FP8_RECIPE == "MXFP8BlockScaling" and _DPA_FP8_FORMAT in ("HYBRID", "E4M3")
+    # TE switches MXFP8 attention to BF16 or to a delayed/current-scaling recipe for these.
+    return (
+        recipe.mxfp8()
+        and recipe.fp8_dpa
+        and _DPA_FP8_RECIPE not in ("F16", "DelayedScaling", "Float8CurrentScaling")
+    )
 
 
 def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_seq_params):
@@ -666,6 +684,54 @@ class MLASelfAttention(MultiLatentAttention):
     Self-attention layer takes input with size [s, b, h]
     and returns output of the same size.
     """
+
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: MLATransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+    ) -> float:
+        """Estimate forward MLA projections and attention, excluding any DSA indexer."""
+        from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import (
+            DSALayerConfig,
+        )
+        from megatron.core.transformer.mla_layer_config import MLALayerConfig
+
+        if isinstance(config, DSALayerConfig) or (
+            not isinstance(config, MLALayerConfig)
+            and config.experimental_attention_variant == "dsa"
+        ):
+            from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+
+            return DSAttention.estimate_flops(
+                config,
+                total_real_tokens_in_batch=total_real_tokens_in_batch,
+                seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+                absorbed_mla=False,
+            )
+        q_dim = config.qk_head_dim + config.qk_pos_emb_head_dim
+        q_term = (
+            config.hidden_size * config.num_attention_heads * q_dim
+            if config.q_lora_rank is None
+            else config.q_lora_rank * (config.hidden_size + config.num_attention_heads * q_dim + 1)
+        )
+        projections = 2 * (
+            q_term
+            + config.kv_lora_rank
+            * (
+                config.hidden_size
+                + config.num_attention_heads * (config.qk_head_dim + config.v_head_dim)
+                + 1
+            )
+            + config.hidden_size * config.qk_pos_emb_head_dim
+            + config.num_attention_heads * config.v_head_dim * config.hidden_size
+        )
+        return (
+            total_real_tokens_in_batch * projections
+            + seqlen_squared_sum_in_batch * config.num_attention_heads * (q_dim + config.v_head_dim)
+        )
 
     def __init__(
         self,
