@@ -134,6 +134,8 @@ _TOPK_WRAPPER_SCRATCH_INT32_FACTOR = 2
 _TOPK_WRAPPER_ROW_ALIGNMENT = 512
 _INDEXER_SCORE_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
 _INDEXER_SCORE_CHUNK_ROW_ALIGNMENT = 512
+_INDEXER_SCORE_HEAD_TILE_MAX_BYTES = 256 * 1024 * 1024
+_INDEXER_SCORE_HEAD_TILE_MAX_HEADS = 8
 _DENSE_ATTN_LSE_CHUNK_MAX_BYTES = 1024 * 1024 * 1024
 _FLASH_MLA_REQUIRED_VALUE_DIM = 512
 _CUDA_GRID_Y_MAX = 65535
@@ -510,6 +512,24 @@ def _indexer_score_chunk_rows(b: int, sq: int, sk: int) -> int:
     )
 
 
+def _indexer_score_head_tile_size(b: int, sq: int, sk: int, idx_nh: int) -> int:
+    """Bound the temporary FP32 head scores, retaining at least one head.
+
+    The budget excludes the output, the tile reduction, and Q/K/weight casts.
+    If one head exceeds the budget, use the original single-head working set.
+    """
+    bytes_per_head = max(1, b * sq * sk) * torch.finfo(torch.float32).bits // 8
+    return max(
+        1,
+        min(
+            idx_nh,
+            _INDEXER_SCORE_HEAD_TILE_MAX_HEADS,
+            _INDEXER_SCORE_HEAD_TILE_MAX_BYTES // bytes_per_head,
+        ),
+    )
+
+
+
 def _compute_indexer_scores_chunk_with_global_rows(
     q_chunk_bshd: Tensor,
     k_bshd: Tensor,
@@ -533,18 +553,31 @@ def _compute_indexer_scores_chunk_with_global_rows(
     if k_bshd.size(2) != 1:
         raise RuntimeError(f"cuDNN DSA indexer expects one key head, got {k_bshd.size(2)}.")
 
-    b, sq, idx_nh, _idx_hd = q_chunk_bshd.shape
+    b, sq, idx_nh, idx_hd = q_chunk_bshd.shape
     sk = k_bshd.size(1)
     scores_chunk = torch.zeros((b, sq, sk), dtype=torch.float32, device=q_chunk_bshd.device)
     if k_bdk is None:
         k_bdk = k_bshd[:, :, 0, :].to(dtype=torch.float32).transpose(1, 2).contiguous()
 
-    # Accumulate one head at a time to avoid materializing a [b, sq, idx_nh, sk] tensor.
-    for head_idx in range(idx_nh):
-        head_scores = torch.bmm(q_chunk_bshd[:, :, head_idx, :].to(dtype=torch.float32), k_bdk)
+    # Flatten only a bounded head tile into the GEMM rows, sharing K across heads.
+    # Never allocate scores proportional to the full head count for large indexers.
+    head_tile_size = _indexer_score_head_tile_size(b, sq, sk, idx_nh)
+    for head_start in range(0, idx_nh, head_tile_size):
+        head_end = min(head_start + head_tile_size, idx_nh)
+        tile_heads = head_end - head_start
+        q_tile = q_chunk_bshd[:, :, head_start:head_end, :].to(dtype=torch.float32)
+        head_scores = torch.bmm(q_tile.reshape(b, sq * tile_heads, idx_hd), k_bdk)
+        head_scores = head_scores.view(b, sq, tile_heads, sk)
         head_scores.relu_()
-        head_scores.mul_(w_chunk_bsh[:, :, head_idx].to(dtype=torch.float32).unsqueeze(-1))
-        scores_chunk.add_(head_scores)
+        head_scores.mul_(
+            w_chunk_bsh[:, :, head_start:head_end].to(dtype=torch.float32).unsqueeze(-1)
+        )
+        if tile_heads == 1:
+            scores_chunk.add_(head_scores.squeeze(2))
+        else:
+            scores_chunk.add_(head_scores.sum(dim=2))
+        # Release this tile before allocating the next GEMM result.
+        del head_scores, q_tile
 
     if sm_scale != 1.0:
         scores_chunk.mul_(sm_scale)
