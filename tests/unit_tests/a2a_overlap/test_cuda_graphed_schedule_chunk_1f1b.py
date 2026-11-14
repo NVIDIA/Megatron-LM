@@ -183,7 +183,24 @@ class TestPartialCudaGraphedA2AOverlap:
         loss_mask = torch.ones(seq_length).repeat((micro_batch_size, 1)).cuda()
         return input_ids, labels, position_ids, attention_mask, loss_mask
 
-    def _run_1f1b_helper(self, gpt_model, optimizer, data, num_iters, cuda_graph_warmup_steps):
+    def _run_1f1b_helper(
+        self,
+        gpt_model,
+        optimizer,
+        data,
+        num_iters,
+        cuda_graph_warmup_steps,
+        advance_microbatch=False,
+        grad_norms=None,
+        expected_num_graph_sets=None,
+    ):
+        """Run the combined 1F1B chunk schedule after eager warmup steps.
+
+        advance_microbatch: give every 1F1B micro-batch its own index (0, 1, 2, ...) so replay
+            cycles through the captured graph sets; otherwise all of them use index 1.
+        grad_norms: if a list, append the per-parameter main_grad norms of every step.
+        expected_num_graph_sets: if set, check the number of graphs captured per layer.
+        """
         from megatron.core.models.common.model_chunk_schedule_plan import (
             TransformerModelChunkSchedulePlan,
         )
@@ -200,6 +217,9 @@ class TestPartialCudaGraphedA2AOverlap:
             # Capture CUDA graphs after warmup if helper is provided
             if self.cuda_graph_helper is not None and fwd_mb_idx == cuda_graph_warmup_steps:
                 self.cuda_graph_helper.create_cudagraphs()
+                if expected_num_graph_sets is not None:
+                    for layer in self.cuda_graph_helper.flattened_callables:
+                        assert len(layer.cuda_graphs) == expected_num_graph_sets
 
             if fwd_mb_idx < cuda_graph_warmup_steps:
                 gpt_model[0].zero_grad_buffer()
@@ -208,9 +228,13 @@ class TestPartialCudaGraphedA2AOverlap:
                 schedule_plans.append(None)
             else:
                 if fwd_mb_idx == cuda_graph_warmup_steps:
+                    if advance_microbatch:
+                        set_current_microbatch(gpt_model[0], 0)
                     extra_schedule_plan = unwrap_model(gpt_model[0]).build_schedule_plan(**data)
                     TransformerModelChunkSchedulePlan.run(extra_schedule_plan, None)
                     schedule_plans[-1] = extra_schedule_plan
+                if advance_microbatch:
+                    set_current_microbatch(gpt_model[0], fwd_mb_idx - cuda_graph_warmup_steps + 1)
                 f_schedule_plan = unwrap_model(gpt_model[0]).build_schedule_plan(**data)
                 b_schedule_plan = schedule_plans[-1]
                 schedule_plans.append(f_schedule_plan)
@@ -234,6 +258,10 @@ class TestPartialCudaGraphedA2AOverlap:
 
             for param in gpt_model[0].parameters():
                 assert param.main_grad is not None
+            if grad_norms is not None:
+                grad_norms.append(
+                    torch.stack([p.main_grad.float().norm() for p in gpt_model[0].parameters()])
+                )
 
             update_successful, _, _ = optimizer.step()
             assert update_successful
@@ -247,6 +275,8 @@ class TestPartialCudaGraphedA2AOverlap:
         cuda_graph_modules,
         cuda_graph_warmup_steps,
         ep_overlap=False,
+        num_overlap_iters=2,
+        overlap_helper_kwargs=None,
         **kwargs,
     ):
         """Test fp8_param with gpt_model."""
@@ -258,13 +288,15 @@ class TestPartialCudaGraphedA2AOverlap:
             overlap_moe_expert_parallel_comm=ep_overlap,
             **kwargs,
         )
-        if ep_overlap:
-            set_streams()
         set_args(args)
         torch.manual_seed(123)
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=2, expert_model_parallel_size=ep_size
         )
+        if ep_overlap:
+            # After initialize_model_parallel, which sets this rank's CUDA device: the comm stream
+            # is created on the current device and cached for the process.
+            set_streams()
 
         input_ids, labels, position_ids, attention_mask, loss_mask = self.get_batch(
             self.seq_length, self.micro_batch_size
@@ -288,7 +320,7 @@ class TestPartialCudaGraphedA2AOverlap:
                 optimizers=[optimizer],
             )
 
-        num_iters = cuda_graph_warmup_steps + 2
+        num_iters = cuda_graph_warmup_steps + (num_overlap_iters if ep_overlap else 2)
         data = {
             "input_ids": input_ids,
             "position_ids": position_ids,
@@ -323,7 +355,12 @@ class TestPartialCudaGraphedA2AOverlap:
                 loss_list.append(output)
         else:
             loss_list = self._run_1f1b_helper(
-                gpt_model, optimizer, data, num_iters, cuda_graph_warmup_steps
+                gpt_model,
+                optimizer,
+                data,
+                num_iters,
+                cuda_graph_warmup_steps,
+                **(overlap_helper_kwargs or {}),
             )
 
         self.delete_cuda_graphs()
@@ -364,3 +401,62 @@ class TestPartialCudaGraphedA2AOverlap:
                     loss_list[i].mean(), loss_list_ref[i].mean()
                 ), f"scope={cuda_graph_modules}, i={i},loss_list={loss_list[i]}, loss_list_ref={loss_list_ref[i]}"
             print(f"[DEBUG] Pass {cuda_graph_modules}")
+
+    @pytest.mark.flaky
+    @pytest.mark.flaky_in_dev
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph support requires TransformerEngine version >= 2.10.0",
+    )
+    @pytest.mark.parametrize("moe_dispatcher_type", get_valid_token_dispatcher_types())
+    def test_moe_partial_cudagraph_ep_overlap_replays_more_microbatches_than_sets(
+        self, moe_dispatcher_type
+    ):
+        """With 4 micro-batches per step, EP overlap at PP=1 captures 2 graph sets per layer;
+        replaying 7 micro-batches cycles through each set at least 3 times and must match eager EP
+        overlap in losses and gradients."""
+        extra_kwargs = {"moe_layer_freq": 1}
+        extra_kwargs["moe_token_dispatcher_type"] = moe_dispatcher_type
+        if moe_dispatcher_type == "flex":
+            extra_kwargs["moe_flex_dispatcher_backend"] = get_valid_flex_dispatcher_backend()
+        # 4 micro-batches per step (TP=2, PP=1, CP=1), more than the 2 captured sets.
+        data_parallel_size = Utils.world_size // 2
+        extra_kwargs["global_batch_size"] = self.micro_batch_size * data_parallel_size * 4
+        cuda_graph_warmup_steps = 3
+        # The 1F1B loop runs one extra micro-batch at the first overlapped step: indices 0-6.
+        num_overlap_iters = 5
+
+        def run(cuda_graph_impl, cuda_graph_modules, expected_num_graph_sets):
+            grad_norms = []
+            losses = self._run_test_helper(
+                4,
+                cuda_graph_impl,
+                cuda_graph_modules,
+                cuda_graph_warmup_steps,
+                ep_overlap=True,
+                num_overlap_iters=num_overlap_iters,
+                overlap_helper_kwargs={
+                    "advance_microbatch": True,
+                    "grad_norms": grad_norms,
+                    "expected_num_graph_sets": expected_num_graph_sets,
+                },
+                **extra_kwargs,
+            )
+            return losses, grad_norms
+
+        loss_list_ref, grad_norms_ref = run("none", None, None)
+        for cuda_graph_modules in [
+            [CudaGraphModule.attn],
+            [CudaGraphModule.attn, CudaGraphModule.moe_router],
+        ]:
+            loss_list, grad_norms = run("transformer_engine", cuda_graph_modules, 2)
+            assert len(loss_list) == len(loss_list_ref)
+            assert len(grad_norms) == len(grad_norms_ref)
+            for i in range(len(loss_list)):
+                assert torch.equal(
+                    loss_list[i].mean(), loss_list_ref[i].mean()
+                ), f"scope={cuda_graph_modules}, i={i}, loss mismatch"
+            for i in range(len(grad_norms)):
+                assert torch.equal(
+                    grad_norms[i], grad_norms_ref[i]
+                ), f"scope={cuda_graph_modules}, step={i}, main_grad norm mismatch"
