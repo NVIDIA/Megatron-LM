@@ -6837,6 +6837,32 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize("async_sched_mode", list(AsyncScheduleMode))
+    @torch.inference_mode()
+    def test_logged_step_without_a_forward(self, async_sched_mode):
+        """A step that runs no forward still logs, in either scheduling mode.
+
+        With nothing active, the legacy step reports neither a consumed nor a launched
+        forward; its console line must label it idle rather than raise.
+        """
+        env = self._build_test_env(
+            DynamicEngineTestConfig(num_requests=2, async_sched_mode=async_sched_mode)
+        )
+        engine = env.engine
+        engine.logging_step_interval = 1
+        engine.step_modern()
+        assert engine.context.step_count == 1
+        for request in env.requests:
+            engine._add_request(request)
+        while engine.has_unfinished_requests():
+            self._run_step(env)
+        assert all(request.status == Status.COMPLETED for request in env.requests)
+        engine.step_modern()
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("gc_mode", ["freeze", "freeze_overlap"])
     @torch.inference_mode()
     def test_gc_mode_releases_frozen_garbage_on_suspend(self, gc_mode):
