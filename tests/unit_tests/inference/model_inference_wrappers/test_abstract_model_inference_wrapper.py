@@ -5,10 +5,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
+from megatron.core.inference.config import (
+    _INFERENCE_PROCESS_GROUPS,
+    InferenceConfig,
+    MediaPromptSpec,
+    MultimodalPromptConfig,
+)
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 
 
 def _wrapper(prompt_config=None):
@@ -111,7 +117,7 @@ def test_base_preexpanded_media_token_id_requires_model_specific_implementation(
 @pytest.mark.parametrize("enable_mhc,pp_size", [(True, 2), (True, 1), (False, 2)])
 def test_wrapper_rejects_mhc_pipeline_inference(monkeypatch, enable_mhc, pp_size):
     """Use the inference PP group, which can differ from the training configuration."""
-    pg_collection = SimpleNamespace(tp=object(), pp=object())
+    pg_collection = ProcessGroupCollection(**{name: object() for name in _INFERENCE_PROCESS_GROUPS})
     model = SimpleNamespace(
         config=SimpleNamespace(
             enable_mhc_connections=enable_mhc,
@@ -122,7 +128,7 @@ def test_wrapper_rejects_mhc_pipeline_inference(monkeypatch, enable_mhc, pp_size
             fp8=None,
         )
     )
-    context = SimpleNamespace(config=SimpleNamespace(pg_collection=pg_collection))
+    context = SimpleNamespace(config=InferenceConfig(pg_collection=pg_collection))
     monkeypatch.setattr(
         torch.distributed,
         "get_world_size",

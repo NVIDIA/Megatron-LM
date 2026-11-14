@@ -88,6 +88,8 @@ def _build_pg_collection(
     tp_dp_cp_group = grid.create_pg(["tp", "cp", "dp"])
     embd_group_ranks = mpu.default_embedding_ranks(dist.get_process_group_ranks(pp_group))
     embd_group = dist.new_group(ranks=embd_group_ranks)
+    if embd_group == dist.GroupMember.NON_GROUP_MEMBER:
+        embd_group = None
     pos_embd_group_ranks = mpu.default_position_embedding_ranks(
         dist.get_process_group_ranks(pp_group)
     )
@@ -925,10 +927,22 @@ def test_router_expert_bias_refit_non_collocated(refit_backend: str):
     # Both pg collections are built collectively on every rank (dist.new_group
     # requires it) but each one's groups only contain the ranks for that side.
     src_pgs = build_inference_pg_collection(
-        world_size=src_world, tp_size=src_tp, ep_size=src_ep, rank_offset=0
+        world_size=src_world,
+        tp_size=src_tp,
+        pp_size=1,
+        cp_size=1,
+        ep_size=src_ep,
+        expt_tp_size=1,
+        rank_offset=0,
     )
     dst_pgs = build_inference_pg_collection(
-        world_size=dst_world, tp_size=dst_tp, ep_size=dst_ep, rank_offset=src_world
+        world_size=dst_world,
+        tp_size=dst_tp,
+        pp_size=1,
+        cp_size=1,
+        ep_size=dst_ep,
+        expt_tp_size=1,
+        rank_offset=src_world,
     )
 
     src_model = None
@@ -1090,10 +1104,22 @@ def test_swap_dsa_non_collocated(
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
     src_pgs = build_inference_pg_collection(
-        world_size=src_world, tp_size=src_tp, pp_size=src_pp, rank_offset=0
+        world_size=src_world,
+        tp_size=src_tp,
+        pp_size=src_pp,
+        cp_size=1,
+        ep_size=1,
+        expt_tp_size=1,
+        rank_offset=0,
     )
     dst_pgs = build_inference_pg_collection(
-        world_size=dst_world, tp_size=dst_tp, pp_size=dst_pp, rank_offset=src_world
+        world_size=dst_world,
+        tp_size=dst_tp,
+        pp_size=dst_pp,
+        cp_size=1,
+        ep_size=1,
+        expt_tp_size=1,
+        rank_offset=src_world,
     )
 
     base_pattern = "D-"

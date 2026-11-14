@@ -25,6 +25,7 @@ from megatron.core.inference.config import (
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
@@ -142,6 +143,25 @@ class TestInferenceConfig:
         assert (
             InferenceConfig().media_cache_coordinator_policy == MediaCacheCoordinatorPolicy.AFFINITY
         )
+
+    def test_resolve_pg_collection_stores_the_groups_it_resolves(self, monkeypatch):
+        """The context, wrapper, controller and engine of one config share the stored collection."""
+        names = ("tp", "pp", "dp", "mp", "ep", "cp", "expt_tp", "expt_dp", "tp_ep")
+        global_groups = ProcessGroupCollection(**{name: object() for name in names})
+        monkeypatch.setattr(
+            ProcessGroupCollection,
+            "use_mpu_process_groups",
+            classmethod(lambda cls, required_pgs=None: global_groups),
+        )
+
+        config = InferenceConfig()
+        assert config.resolve_pg_collection() is global_groups
+        assert config.pg_collection is global_groups
+
+        explicit_groups = ProcessGroupCollection(**{name: object() for name in names})
+        config = InferenceConfig(pg_collection=explicit_groups)
+        assert config.resolve_pg_collection() is explicit_groups
+        assert config.pg_collection is explicit_groups
 
     def test_multimodal_prompt_config_builds_independent_specs_from_dict(self):
         config = MultimodalPromptConfig.from_dict(
