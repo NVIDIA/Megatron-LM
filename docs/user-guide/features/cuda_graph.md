@@ -124,6 +124,32 @@ not enable mHC capture by themselves.
 The same training `--cuda-graph-modules` options apply as for `local`, and the default is likewise
 whole-layer training capture when the flag is omitted.
 
+### Hybrid models: one graph per mixer and feed-forward pair
+
+`HybridModel` runs each block as two layers: a mixer (attention, GDN, and similar) without a
+feed-forward branch, followed by an MoE or MLP layer without an attention branch. With per-layer
+graphs, every block therefore launches two forward and two backward graphs.
+`--cuda-graph-pair-hybrid-layers` captures each mixer together with the MoE or MLP layer that
+follows it as one graph, which halves the graph launches per block:
+
+```bash
+--cuda-graph-impl transformer_engine \
+--cuda-graph-modules attn moe_router moe_preprocess \
+--cuda-graph-pair-hybrid-layers
+```
+
+- The pair's graph runs the same operations as the two per-layer graphs. The mixer launches it,
+  and the MoE or MLP layer then runs only its work outside the graph, such as the MoE token
+  dispatch, experts and combine.
+- The pair is not part of the model, so parameter names and checkpoints do not change.
+- A layer keeps its own graph when it cannot be paired: Mamba layers, layers whose neighbor is not
+  graphed, pairs split by a pipeline stage boundary, hash-routed MoE layers, and pairs whose two
+  layers differ in their FP8/FP4 first/last-layer BF16 setting.
+- Pairing is skipped, with a warning, with `--overlap-moe-expert-parallel-comm`,
+  `--delay-wgrad-compute`, `--fine-grained-activation-offloading`, `--sequence-packing-scheduler`,
+  `--enable-mhc-connections`, `--wide-residual` or `--context-parallel-size` greater than 1.
+- The flag has no effect with other `--cuda-graph-impl` values.
+
 ---
 
 ## Full-Iteration Training CUDA Graph (`--cuda-graph-impl full_iteration`)
