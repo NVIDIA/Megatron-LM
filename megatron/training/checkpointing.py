@@ -775,6 +775,7 @@ def save_checkpoint(
     save: Optional[str] = None,
     ckpt_format: Optional[str] = None,
     verify_integrity: Optional[bool] = None,
+    adapter_key_filter: Optional[Callable[[str], bool]] = None,
 ):
     """Save a model, optimizer and optionally dataloader checkpoint.
 
@@ -997,6 +998,9 @@ def save_checkpoint(
                 save=save_root,
                 verify_integrity=verify_integrity,
             )
+            if adapter_key_filter is not None:
+                # Adapter-only checkpoint: keep only the adapter weights (plus router expert bias).
+                state_dict = apply_peft_adapter_filter_to_state_dict(state_dict, adapter_key_filter)
 
         validate_glu_checkpoint_backend(args, ckpt_format=ckpt_format)
         state_dict = prepare_glu_checkpoint_for_save(state_dict, args)
@@ -2844,6 +2848,7 @@ def load_checkpoint(
     load_optim: Optional[bool] = None,
     load_rng: Optional[bool] = None,
     ckpt_format: Optional[str] = None,
+    adapter_key_filter: Optional[Callable[[str], bool]] = None,
 ):
     """Load a model checkpoint and return the iteration.
     strict (bool): whether to strictly enforce that the keys in
@@ -2852,6 +2857,11 @@ def load_checkpoint(
     model_sharded_state_dict_modifier: optional callback applied in place to each model
         sharded state dict before loading (torch_dist only), e.g. to remap keys to a
         checkpoint's naming.
+    adapter_key_filter: optional predicate on model state-dict keys that selects adapter
+        parameters (e.g. PEFT/LoRA). When set and this load resumes an adapter-only checkpoint
+        (loading ``load`` rather than the pretrained checkpoint, and not finetuning), only the
+        selected keys (plus router expert bias) are requested and the model is loaded
+        non-strictly. Pass the same filter that was used on save.
     restore_training_state (bool): restore optimizer, scheduler, rerun and data
         progress. Defaults to False; training resume must explicitly opt in.
         RNG loading remains independently controlled.
@@ -3396,6 +3406,15 @@ def load_checkpoint(
         state_dict['_model'] = model
         load_kwargs['sharded_state_dict'] = state_dict
 
+    adapter_resume = _is_adapter_resume(adapter_key_filter, finetune, loading_pretrained_checkpoint)
+    if adapter_resume and load_kwargs.get('sharded_state_dict') is not None:
+        load_kwargs['sharded_state_dict'] = apply_peft_adapter_filter_to_state_dict(
+            load_kwargs['sharded_state_dict'], adapter_key_filter
+        )
+    if adapter_resume:
+        # The checkpoint holds only adapters, so base-model keys are legitimately absent.
+        strict = False
+
     state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
         load_dir,
         args,
@@ -3857,3 +3876,75 @@ def _to_dtensor(wrapped_model, model_state_dict):
             new_model_sd[k] = torch.distributed.tensor.distribute_tensor(v, device_mesh)
 
     return new_model_sd
+
+
+def _is_adapter_resume(
+    adapter_key_filter: Optional[Callable[[str], bool]],
+    finetune: bool,
+    loading_pretrained_checkpoint: bool,
+) -> bool:
+    """Whether this load resumes an adapter-only checkpoint.
+
+    True only when an adapter filter is set and the load reads the run's own ``load``
+    checkpoint (not the pretrained base checkpoint) with full resume semantics.
+    """
+    return adapter_key_filter is not None and not finetune and not loading_pretrained_checkpoint
+
+
+def apply_peft_adapter_filter_to_state_dict(
+    state_dict: dict[str, Any], key_filter: Callable[[str], bool]
+) -> dict[str, Any]:
+    """Keep adapter parameters and persistent training buffers in model sections.
+
+    Takes a complete state dict (from ``generate_state_dict``) and filters its model sections
+    to the keys selected by ``key_filter`` for adapter-only checkpoint saving and loading.
+    MoE router expert biases are always kept: MCore updates these buffers during gradient
+    finalization even when every router parameter is frozen. Transformer Engine
+    ``._extra_state`` entries are excluded even under adapter modules, because adapter
+    checkpoint loading already tolerates missing extra-state keys and the objects can collide
+    under expert-parallel shared-adapter layouts.
+
+    Args:
+        state_dict: Complete state dict from generate_state_dict().
+        key_filter: Predicate over a model state-dict key; True selects the key as an adapter
+            parameter.
+
+    Returns:
+        State dict whose model sections hold only adapter parameters and router expert biases;
+        all non-model sections (optimizer, iteration, checkpoint_version, ...) are unchanged.
+    """
+    return {
+        checkpoint_section_key: (
+            {
+                parameter_name: parameter_value
+                for parameter_name, parameter_value in checkpoint_section_value.items()
+                if (
+                    key_filter(parameter_name)
+                    or parameter_name == "router.expert_bias"
+                    or parameter_name.endswith(".router.expert_bias")
+                )
+                and "_extra_state" not in parameter_name
+            }
+            if _is_model_section(checkpoint_section_key)
+            else checkpoint_section_value
+        )
+        for checkpoint_section_key, checkpoint_section_value in state_dict.items()
+    }
+
+
+def _is_model_section(section_key: str) -> bool:
+    """Check if a checkpoint section contains model parameters.
+
+    Model sections are named:
+    - "model" (single model)
+    - "model0", "model1", etc. (pipeline parallel models)
+
+    Non-model sections include: "optimizer", "iteration", "checkpoint_version", etc.
+    """
+    is_single_model = section_key == "model"
+    is_pipeline_model = (
+        section_key.startswith("model")
+        and section_key != "model"
+        and section_key[5:].isdigit()  # to match virtual pipeline state dict handling
+    )
+    return is_single_model or is_pipeline_model
