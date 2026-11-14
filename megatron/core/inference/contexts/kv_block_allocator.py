@@ -23,7 +23,8 @@ class KVBlockAllocator:
 
     This allocator owns:
 
-    - The free-pool stack (`block_bag`, `pool_avail`).
+    - The free-pool stack (`block_bag`, `pool_avail`), and each block's generation
+      (`block_generation`), advanced whenever the block returns to the free pool.
     - Allocation, release, retain, and reset orchestration.
     - The MoE routing-replay per-block storage (`routing_replay`).
 
@@ -74,6 +75,11 @@ class KVBlockAllocator:
 
         # Initialize block pool as a "stack" data structure (CPU for bookkeeping).
         self.block_bag = torch.arange(self.pool_size, dtype=torch.int32, device='cpu')
+
+        # Times each block has returned to the free pool. Work deferred on behalf of a block's
+        # owner (e.g. the context's queued page zeroing) records the generation and is dropped
+        # once it changes, so it can never act on the block's next owner.
+        self.block_generation = torch.zeros((self.pool_size,), dtype=torch.int64, device='cpu')
 
         # MoE routing-replay storage.
         self.routing_replay = MoERoutingReplayCache(
@@ -245,6 +251,7 @@ class KVBlockAllocator:
         torch.arange(self.pool_size, out=self.block_bag)
 
         self.pool_avail = self.pool_size - 1
+        self.block_generation += 1
 
         if self.pc_state is not None:
             self.pc_state.reset()
@@ -254,12 +261,17 @@ class KVBlockAllocator:
         self.routing_replay.reset()
 
     def _push_to_pool(self, blocks: Tensor) -> None:
-        """Push blocks back onto the free-pool stack."""
+        """Push blocks back onto the free-pool stack and end their owners' generation.
+
+        Args:
+            blocks (Tensor): Distinct block IDs that no request references.
+        """
         num_blocks = blocks.numel()
         if num_blocks == 0:
             return
         self.block_bag[self.pool_avail : self.pool_avail + num_blocks] = blocks
         self.pool_avail += num_blocks
+        self.block_generation[blocks] += 1
 
     def _notify_deregistered(self, block_ids: Tensor, hashes: list[int]) -> None:
         """Drop deregistered hashes from the registry, then notify the observers."""
