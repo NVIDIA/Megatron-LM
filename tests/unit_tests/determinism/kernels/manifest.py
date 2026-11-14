@@ -239,6 +239,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Copy with unique stores; bit-identical to Tensor.contiguous.",
     ),
     KernelEntry(
+        name="fused_float_upcast",
+        sources=("megatron/core/fusions/fused_float_upcast.py",),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="triton",
+        notes="Elementwise BF16/FP16 to FP32 conversion with unique stores; bit-identical to "
+        "Tensor.float().",
+    ),
+    KernelEntry(
         name="fused_embedding_wgrad",
         sources=("megatron/core/fusions/fused_embedding_wgrad.py",),
         tests=(K + "test_tensor_parallel_kernels.py",),

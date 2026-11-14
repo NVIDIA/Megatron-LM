@@ -2757,6 +2757,10 @@ def _add_training_args(parser):
                        help='Offload optimizer state to CPU')
     group.add_argument('--optimizer-cuda-graph', action='store_true',
                        help='Enable CUDA graph for optimizer step')
+    group.add_argument('--fused-main-grad-copy', action='store_true',
+                       help='Distributed optimizer: convert the BF16/FP16 gradient shards to the '
+                       'FP32 main grads with one vectorized kernel per run of adjacent shards '
+                       'instead of one cast per parameter (same values).')
     group.add_argument('--optimizer-offload-fraction', type=float, default=1.0,
                           help='Ratio of optimizer state to offload to CPU')
     group.add_argument('--use-torch-optimizer-for-cpu-offload', action='store_true',
