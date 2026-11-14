@@ -563,7 +563,7 @@ def ordered_reduce_scatter_v(
     # Do not autotune the number of blocks with Triton: every rank must launch the same grid
     # of at most max_num_blocks blocks, or the barrier overflows the signal pad or hangs.
     # See torch_symm_triton/kernel_config.py.
-    max_num_blocks = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
+    max_num_blocks = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.grid_limit())
     block_size = min(triton.next_power_of_2(hidden_size), SYMM_MEM_KERNEL_CONFIG.max_block_size)
     num_warps = max(1, block_size // SYMM_MEM_KERNEL_CONFIG.warp_size)
     num_blocks = min(per_rank_max_tokens, max_num_blocks)
