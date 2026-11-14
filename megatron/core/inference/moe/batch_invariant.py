@@ -21,8 +21,6 @@ from megatron.core.inference.quantization.mxfp8_quantize import (
 )
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, ensure_mxfp8_scale_dtype
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    grouped_gemm_batch_invariant,
-    grouped_gemm_batch_invariant_alignment,
     is_batch_invariant_mode_enabled,
 )
 from megatron.core.transformer.moe.ep_invariant_combine import tree_combine_forward
@@ -51,18 +49,6 @@ except ImportError:
 def enabled() -> bool:
     """Return whether global batch-invariant mode is active."""
     return is_batch_invariant_mode_enabled()
-
-
-def grouped_mm(x_bf16: torch.Tensor, weight: torch.Tensor, offs: torch.Tensor) -> torch.Tensor:
-    """Batch-invariant BF16 grouped GEMM used by inference fused MoE."""
-    return grouped_gemm_batch_invariant(
-        x_bf16, weight, offs=offs.to(torch.int32), m_total=x_bf16.shape[0]
-    )
-
-
-def grouped_mm_alignment() -> int:
-    """Per-expert row alignment required by the batch-invariant grouped GEMM."""
-    return grouped_gemm_batch_invariant_alignment()
 
 
 @triton.jit
