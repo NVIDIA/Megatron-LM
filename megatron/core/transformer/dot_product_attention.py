@@ -49,10 +49,12 @@ class DotProductAttention(MegatronModule):
         softmax_scale: Optional[float] = None,
         cp_comm_type: Optional[str] = None,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        name: str | None = None,
     ):
         super().__init__(config=config)
 
         self.config: TransformerConfig = config
+        self.name = name
 
         assert (
             self.config.context_parallel_size == 1

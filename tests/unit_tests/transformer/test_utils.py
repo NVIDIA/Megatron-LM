@@ -527,7 +527,9 @@ def _unexpected_checkpoint(*args, **kwargs):
     raise AssertionError("used the checkpoint implementation for the other precision")
 
 
-@pytest.mark.parametrize("precision", [{"fp8": "e4m3"}, {"fp4": "nvfp4"}])
+@pytest.mark.parametrize(
+    "precision", [{"fp8": "e4m3"}, {"fp4": "nvfp4"}, {"custom_recipe": "package.factory"}]
+)
 def test_precision_aware_checkpoint_uses_te_checkpoint_for_fp8_and_fp4(precision, monkeypatch):
     calls = []
 

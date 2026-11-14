@@ -1,6 +1,5 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
-from contextlib import nullcontext
 from unittest.mock import Mock, patch
 
 import pytest
@@ -31,10 +30,26 @@ reason_for_no_mxfp8 = "MXFP8 requires Transformer Engine and device arch >= 10"
     [
         (
             False,
-            {"fp8": "hybrid", "fp4": None, "fp8_param": False, "fp4_param": False},
+            {
+                "custom_recipe": None,
+                "fp8": "hybrid",
+                "fp4": None,
+                "fp8_param": False,
+                "fp4_param": False,
+            },
             "fp8_autocast",
         ),
-        (True, {"fp8": None, "fp4": None, "fp8_param": True, "fp4_param": False}, "fp8_model_init"),
+        (
+            True,
+            {
+                "custom_recipe": None,
+                "fp8": None,
+                "fp4": None,
+                "fp8_param": True,
+                "fp4_param": False,
+            },
+            "fp8_model_init",
+        ),
     ],
 )
 def test_get_fp8_disabled_context_uses_disabled_te_context(is_init, config_values, te_helper):
@@ -55,37 +70,24 @@ def _dummy_quantizer_factory(*args, **kwargs):
 
 
 @pytest.mark.skipif(not fp8_utils.HAVE_TE, reason="Transformer Engine required")
-def test_fp8_model_init_uses_custom_recipe_attrs(monkeypatch):
+def test_custom_fp8_recipe_uses_recipe_attrs():
     if not hasattr(fp8_utils.transformer_engine.common.recipe, "CustomRecipe"):
         pytest.skip("CustomRecipe requires newer Transformer Engine")
-
-    captured = {}
-
-    def fake_fp8_model_init(enabled=False, recipe=None, **kwargs):
-        captured["enabled"] = enabled
-        captured["recipe"] = recipe
-        captured["kwargs"] = kwargs
-        return nullcontext()
-
-    monkeypatch.setattr(fp8_utils.transformer_engine.pytorch, "fp8_model_init", fake_fp8_model_init)
 
     config = TransformerConfig(
         num_layers=1,
         hidden_size=64,
         num_attention_heads=4,
         fp8="e4m3",
-        fp8_param=True,
         fp8_recipe="custom",
         fp8_quantizer_factory="tests.unit_tests.test_fp8_utils._dummy_quantizer_factory",
         fp8_recipe_attrs={"_test_recipe_flag": "set"},
     )
 
-    with fp8_utils.get_fp8_context(config, is_init=True):
-        pass
+    recipe = fp8_utils.get_fp8_recipe(config)
 
-    assert captured["enabled"] is True
-    assert isinstance(captured["recipe"], fp8_utils.transformer_engine.common.recipe.CustomRecipe)
-    assert captured["recipe"]._test_recipe_flag == "set"
+    assert isinstance(recipe, fp8_utils.transformer_engine.common.recipe.CustomRecipe)
+    assert recipe._test_recipe_flag == "set"
 
 
 class MockTELinear(nn.Module):

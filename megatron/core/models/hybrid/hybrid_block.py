@@ -18,8 +18,6 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TENorm
-from megatron.core.fp4_utils import get_fp4_context
-from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
@@ -34,6 +32,8 @@ from megatron.core.models.hybrid.shortcut_block import (
 )
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.te_recipe import get_quantization_context
+from megatron.core.quantization.utils import is_quantization_enabled
 from megatron.core.recompute import checkpointed_forward
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
 from megatron.core.ssm.mamba_layer import MambaLayer
@@ -230,16 +230,9 @@ class HybridStack(MegatronModule):
         self.layers = nn.ModuleList()
         for i, layer_config in enumerate(self.layer_config_list):
             layer_number = i + 1 + pp_layer_offset
-            if layer_config.fp8:
-                quant_init_context = get_fp8_context(
-                    layer_config, i + pp_layer_offset, is_init=True
-                )
-            elif layer_config.fp4:
-                quant_init_context = get_fp4_context(
-                    layer_config, i + pp_layer_offset, is_init=True
-                )
-            else:
-                quant_init_context = nullcontext()
+            quant_init_context = get_quantization_context(
+                layer_config, i + pp_layer_offset, is_init=True
+            )
             with quant_init_context:
                 custom_layer_type = layer_utils.get_custom_layer_type(layer_config)
                 if custom_layer_type is not None:
@@ -270,7 +263,9 @@ class HybridStack(MegatronModule):
                         pp_layer_offset=pp_layer_offset,
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
-                        name=(name + f".layers.{i}") if name is not None else None,
+                        name=(
+                            (name + f".layers.{i + pp_layer_offset}") if name is not None else None
+                        ),
                     )
                 elif type(layer_config) is layer_utils.AttentionLayerConfig:
                     self._assert_submodule_configured(submodules, "attention_layer")
@@ -282,7 +277,9 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
-                        name=(name + f".layers.{i}") if name is not None else None,
+                        name=(
+                            (name + f".layers.{i + pp_layer_offset}") if name is not None else None
+                        ),
                     )
                 elif type(layer_config) is layer_utils.DSALayerConfig:
                     self._assert_submodule_configured(submodules, "dsa_layer")
@@ -294,7 +291,9 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
-                        name=(name + f".layers.{i}") if name is not None else None,
+                        name=(
+                            (name + f".layers.{i + pp_layer_offset}") if name is not None else None
+                        ),
                     )
                 elif type(layer_config) is layer_utils.CSALayerConfig:
                     csa_layer_spec_name = (
@@ -310,7 +309,9 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
-                        name=(name + f".layers.{i}") if name is not None else None,
+                        name=(
+                            (name + f".layers.{i + pp_layer_offset}") if name is not None else None
+                        ),
                     )
                 elif type(layer_config) is layer_utils.MLALayerConfig:
                     mla_layer_spec_name = (
@@ -328,6 +329,9 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
+                        name=(
+                            (name + f".layers.{i + pp_layer_offset}") if name is not None else None
+                        ),
                     )
                 elif type(layer_config) is layer_utils.MLPLayerConfig:
                     self._assert_submodule_configured(submodules, "mlp_layer")
@@ -338,7 +342,9 @@ class HybridStack(MegatronModule):
                         pg_collection=pg_collection,
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
-                        name=(name + f".layers.{i}") if name is not None else None,
+                        name=(
+                            (name + f".layers.{i + pp_layer_offset}") if name is not None else None
+                        ),
                     )
                 elif type(layer_config) is layer_utils.MoELayerConfig:
                     self._assert_submodule_configured(submodules, "moe_layer")
@@ -350,7 +356,9 @@ class HybridStack(MegatronModule):
                         is_mtp_layer=is_mtp_layer,
                         add_layer_offset=False,
                         hash_moe_layer_threshold=hash_moe_layer_threshold,
-                        name=(name + f".layers.{i}") if name is not None else None,
+                        name=(
+                            (name + f".layers.{i + pp_layer_offset}") if name is not None else None
+                        ),
                     )
                 elif type(layer_config) is layer_utils.GDNLayerConfig:
                     gdn_layer_spec_name = (
@@ -382,7 +390,9 @@ class HybridStack(MegatronModule):
                         # Set to False as we do not want to change offset.
                         add_layer_offset=False,
                         pp_layer_offset=pp_layer_offset,
-                        name=(name + f".layers.{i}") if name is not None else None,
+                        name=(
+                            (name + f".layers.{i + pp_layer_offset}") if name is not None else None
+                        ),
                     )
                 else:
                     raise ValueError(
@@ -709,20 +719,22 @@ class HybridStack(MegatronModule):
         # if we are using other fp8 recipes, then the context manager enter&exit are free
         # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
         # control which layer will be fp8 or bf16
-        use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
-        use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
-        use_fp4_context = self.config.fp4 is not None
-        outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
+        use_outer_quantization_context = (
+            self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
+        )
+        use_inner_quantization_context = (
+            is_quantization_enabled(self.config) and not use_outer_quantization_context
+        )
+        outer_quantization_context = (
+            get_quantization_context(self.config)
+            if use_outer_quantization_context
+            else nullcontext()
+        )
 
-        if use_inner_fp8_context:
+        if use_inner_quantization_context:
 
             def get_inner_quant_context(config, layer_number):
-                return get_fp8_context(config, layer_number)
-
-        elif use_fp4_context:
-
-            def get_inner_quant_context(config, layer_number):
-                return get_fp4_context(config, layer_number)
+                return get_quantization_context(config, layer_number)
 
         else:
 
@@ -750,7 +762,7 @@ class HybridStack(MegatronModule):
             else [None] * self.num_layers_per_pipeline_rank
         )
 
-        with outer_fp8_context:
+        with outer_quantization_context:
             if self.config.recompute_granularity == 'full' and self.training:
                 hidden_states = checkpointed_forward(
                     self,
@@ -762,9 +774,9 @@ class HybridStack(MegatronModule):
                     attention_bias=None,
                     packed_seq_params=packed_seq_params,
                     padding_mask=padding_mask,
+                    use_inner_quantization_context=use_inner_quantization_context,
                     input_ids=input_ids,
                     padding_mask_by_layout=padding_mask_by_layout,
-                    use_inner_quantization_context=(use_inner_fp8_context or use_fp4_context),
                     cp_layout_state=cp_layout_state,
                     packed_sequence_cp_metadata=packed_sequence_cp_metadata,
                 )

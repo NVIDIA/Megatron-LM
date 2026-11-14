@@ -151,6 +151,7 @@ class CLIPViTModel(VisionModule):
             post_process=False,
             pg_collection=self.pg_collection,
             vp_stage=self.vp_stage,
+            name="decoder",
         )
 
     def set_input_tensor(self, input_tensor: torch.Tensor) -> None:

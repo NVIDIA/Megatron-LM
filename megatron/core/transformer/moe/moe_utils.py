@@ -13,11 +13,10 @@ from megatron.core.extensions.transformer_engine import (
     TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
     te_supports_deterministic_moe_aux_loss,
 )
-from megatron.core.fp4_utils import get_fp4_align_size
-from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.inference.moe.sigmoid_topk import HAVE_TRITON as HAVE_SIGMOID_TOPK_KERNEL
 from megatron.core.inference.moe.sigmoid_topk import is_sigmoid_topk_supported, sigmoid_topk_routing
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.te_recipe import get_quantization_alignment
 from megatron.core.tensor_parallel import (
     get_cuda_rng_tracker,
     get_data_parallel_rng_tracker_name,
@@ -1760,12 +1759,7 @@ def get_align_size_for_quantization(config: TransformerConfig) -> int:
     # TE's grouped-tensor and fused grouped-MLP kernels share an expert-token alignment.
     if config.use_transformer_engine_op_fuser or config.moe_use_grouped_tensor:
         return TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT
-    if config.fp8:
-        return get_fp8_align_size(config.fp8_recipe)
-    if config.fp4:
-        return get_fp4_align_size(config.fp4_recipe)
-    # Legacy high-precision grouped GEMM does not require padding. Defaults to 0.
-    return 0
+    return get_quantization_alignment(config)
 
 
 def _deepep_permute_pads_grouped_tensor_input(config: TransformerConfig) -> bool:
