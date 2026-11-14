@@ -1857,6 +1857,29 @@ class SelfAttention(Attention):
     and returns output of the same size.
     """
 
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: TransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+    ) -> float:
+        """Estimate forward QKV/output projections and causal attention, including FMA x2."""
+        hidden = config.hidden_size
+        heads = config.num_attention_heads
+        projection_size = config.kv_channels * heads
+        flops = (
+            4
+            * total_real_tokens_in_batch
+            * projection_size
+            * (hidden + hidden * config.num_query_groups / heads)
+            + 2 * seqlen_squared_sum_in_batch * projection_size
+        )
+        if config.attention_output_gate:
+            flops += 2 * total_real_tokens_in_batch * hidden * projection_size
+        return flops
+
     def __init__(
         self,
         config: TransformerConfig,
