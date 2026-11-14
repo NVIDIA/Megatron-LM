@@ -465,6 +465,8 @@ class OffloadTensorGroup:
         self._offload_event = torch.cuda.Event()
         self._reload_event = torch.cuda.Event()
         self.offload = True
+        # Set when this group's D2H is enqueued; cleared by whichever reload consumes it.
+        self.reload_pending = False
         # Margin groups stay resident to provide compute time for the first reloads.
         self.is_offload_margin = False
         self.total_offload_bytes = 0
@@ -1104,6 +1106,10 @@ class ChunkOffloadHandler:
         self._groups_to_reload = []
         self._tensor_count_current_group = 0
         self._reloading_group = []
+        # A group offloaded but never reloaded must not carry its latch into the next
+        # iteration, where the recorded event is stale.
+        for group in self.offload_groups:
+            group.reload_pending = False
         # Clear the pending-event FIFO at iter boundary so we never wait on
         # an event recorded in a previous (non-captured) iteration.
         self._offload_pending_by_name.clear()
@@ -1180,7 +1186,16 @@ class ChunkOffloadHandler:
             return tensor_tag
         debug_rank(f"--------tensor_pop {tensor_tag}")
         group_id, idx = tensor_tag
-        tensor = self.offload_groups[group_id - 1].pop_tensor(tensor_tag)
+        group = self.offload_groups[group_id - 1]
+        if group.reload_pending:
+            # Backward reached this group before any prefetch ran: order the inline H2D after
+            # this group's D2H, and drop it from the LIFO so the next prefetch advances.
+            group.reload_pending = False
+            if not is_graph_capturing():
+                group.wait_offload_event(torch.cuda.current_stream())
+            if group in self._groups_to_reload:
+                self._groups_to_reload.remove(group)
+        tensor = group.pop_tensor(tensor_tag)
         # If tensor is offloaded (stored as tuple), reload it
         if isinstance(tensor, tuple):
             tensor = self.reload(tensor)
@@ -1225,6 +1240,7 @@ class ChunkOffloadHandler:
                     tensor_on_device.record_stream(self.d2h_stream)
                     group_to_offload.push_tensor(tensor_tag, state)
             group_to_offload.record_offload_event(self.d2h_stream)
+            group_to_offload.reload_pending = True
         nvtx_range_pop(nvtx_msg)
         # Under full-iteration CG capture, the main stream may not wait on d2h
         # events; optional max-inflight enqueues each group's offload event and
@@ -1299,6 +1315,9 @@ class ChunkOffloadHandler:
         """
         debug_rank("----bulk_reload_group")
         group_to_reload = self._groups_to_reload[-1]
+        # Cleared before the resident-group check below: that path consumes the slot too,
+        # so the latch must not survive it and make a later tensor_pop wait on a stale event.
+        group_to_reload.reload_pending = False
         # GPU-resident or already-consumed groups still occupy a reload slot.
         # Consume only this slot: skipping ahead to the next CPU-backed group
         # would reload activations before backward reaches their neighboring
@@ -1348,6 +1367,8 @@ class ChunkOffloadHandler:
         """Determine if the current group should be offloaded."""
         assert group in self._groups_to_offload, f"Group {group} is not pending offload"
         debug_rank(f"should_bulk_offload {self.is_warmup} {group.offload}")
+        # Warmup deliberately offloads every group: offload_groups is still being built, so the
+        # policy below sees nothing. post_warmup_callback bootstraps the resident group instead.
         if self.is_warmup:
             # Count every occurrence separately for each module name, including
             # empty/ineligible groups. This keeps corresponding core_attn and
