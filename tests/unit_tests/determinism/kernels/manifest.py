@@ -1100,6 +1100,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "tests/unit_tests/transformer/experimental_attention_variant/test_dsa_gqa_inference.py, "
         "including empty/ragged requests, causal masks, and graph page-table refresh.",
     ),
+    KernelEntry(
+        name="dsa_cudnn_indexer_scoring",
+        sources=("megatron/core/transformer/experimental_attention_variant/dsa_cudnn_kernels.py",),
+        tests=(K + "test_fused_triton_kernels.py",),
+        kind="dispatch",
+        notes="cuDNN DSA indexer scoring choke point (_indexer_forward) dispatches BF16 or FP8 "
+        "(E4M3 operands, UE8M0 per-vector scales); replay covers both precisions.",
+    ),
     # ---------------------------------------------------------------- DeepSeek sparse attention (TileLang)
     KernelEntry(
         name="dsa_tilelang_absorbed_shape_dispatch",

@@ -128,6 +128,13 @@ def run_fused_qk_topk(
     fn = _resolve_fused_hook(config, "run_fused_qk_topk")
     if fn is None:
         return None
+    # Only forward a non-default scoring precision; "fp8" is validated to require the cuDNN
+    # backend, so other backends (e.g. tilelang) never receive this kwarg. Fall back to the
+    # "bf16" default when the config object does not expose the field.
+    scoring_precision = getattr(config, "dsa_indexer_scoring_precision", "bf16")
+    scoring_precision_kwargs = (
+        {"scoring_precision": scoring_precision} if scoring_precision != "bf16" else {}
+    )
     result = fn(
         q=q,
         k=k,
@@ -144,6 +151,7 @@ def run_fused_qk_topk(
         local_packed_cp_query_len=local_packed_cp_query_len,
         packed_seq_params=packed_seq_params,
         cp_size=cp_size,
+        **scoring_precision_kwargs,
     )
     if result is None:
         _log_declined_hook(config, "run_fused_qk_topk", "backend returned None")
