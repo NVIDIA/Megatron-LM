@@ -595,6 +595,26 @@ def test_causal_conv1d_varlen_replays(monkeypatch, cache_autotuning):
     _assert_pinned(tuner)
 
 
+def test_causal_conv1d_varlen_carry_states_replays():
+    """The chunked-prefill conv-state carry, reading its slices from a column slice of the
+    projection as MambaMixer passes them: zero-length, short and long slices."""
+    from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_carry_states
+
+    seeded()
+    dim, width = 2048, 4
+    bounds = [0, 0, 2, 1000, 1003, 4096]
+    projection = torch.randn(bounds[-1], 2 * dim + 64, device="cuda", dtype=torch.bfloat16)
+    previous_states = torch.randn(len(bounds) - 1, dim, width, device="cuda", dtype=torch.bfloat16)
+    cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device="cuda")
+    assert_replays_bit_exact(
+        lambda p, s: causal_conv1d_varlen_carry_states(p[:, dim : 2 * dim], cu_seqlens, s),
+        (projection, previous_states),
+        replays=4,
+        backward=False,
+        what="causal_conv1d_varlen_carry_states",
+    )
+
+
 # --- Gated Delta Product ----------------------------------------------------------------------
 
 
