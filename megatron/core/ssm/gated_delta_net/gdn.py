@@ -167,7 +167,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         """Compute the per-head log-decay g and the write strength beta."""
         # ``gate_feats`` arrives in ``in_proj_split_names`` order: beta, then alpha.
         beta, alpha = gate_feats
-        g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
+        g = -A_log_local_cp.float().exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
         beta = beta.float().sigmoid()
         return g, {"beta": beta.contiguous()}
 
