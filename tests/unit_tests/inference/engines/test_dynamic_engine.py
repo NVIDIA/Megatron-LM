@@ -2418,6 +2418,149 @@ def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
         assert request.precomputed_block_hashes == hashes(None)
 
 
+def test_resume_releases_media_of_a_request_that_fails_readmission():
+    """A media request that fails re-admission at resume leaves no media on the context.
+
+    Re-admission can fail a request: without chunked prefill, a RECOMPUTE checkpoint whose
+    prompt and generated tokens no longer fit one step fails with `TokenOverflowError`.
+    Completion releases the request's media, so resume must restore that media before the
+    re-admission, not after it.
+    """
+    loop = asyncio.new_event_loop()
+    request = DynamicVLMInferenceRequest(
+        request_id=7,
+        prompt_tokens=torch.tensor([99, 99, 5]),
+        sampling_params=SamplingParams(num_tokens_to_generate=2, termination_id=-1),
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(1, 2, 4),
+        num_tiles=None,
+        imgs_sizes=torch.tensor([[1, 2]]),
+        decoder_seq_length=0,
+        image_embeddings=torch.ones(2, 1, 4),
+        image_token_mask=torch.tensor([0, 1, -1]),
+    )
+    media = {}
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        chunked_prefill_request_id=-1,
+        kv_cache_management_mode=KVCacheManagementMode.PERSIST,
+        static_kv_memory_pointers=True,
+        max_sequence_length=64,
+        deallocate_inference_state_buffers=mock.Mock(),
+        reinitialize_inference_state_buffers=mock.Mock(),
+        add_vlm_request_data=lambda request_id, **data: media.__setitem__(request_id, data),
+        remove_vlm_request_data=lambda request_id: media.pop(request_id, None),
+    )
+    engine.controller = types.SimpleNamespace(inference_wrapped_model=None, tokenizer=object())
+    engine.requests = {
+        7: RequestEntry(
+            record=DynamicInferenceRequestRecord.from_request(request), future=loop.create_future()
+        )
+    }
+    engine.context.add_vlm_request_data(
+        7, image_embeddings=request.image_embeddings, image_token_mask=request.image_token_mask
+    )
+    engine.waiting_request_ids = deque([7])
+    engine.failed_request_ids = []
+    engine.state = EngineState.RUNNING
+    engine.rank = 1
+    engine.enable_chunked_prefill = False
+    engine.unified_memory_level = 0
+    engine.use_coordinator = False
+    engine.allow_stale_multimodal_embeddings = True
+    engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
+    engine._notify_cond_for_new_request = mock.Mock(return_value=None)
+
+    def fail_readmission(request, *, is_resume=False):
+        assert is_resume
+        engine._handle_failed_request(request.request_id)
+
+    engine._add_request = fail_readmission
+    try:
+        with (
+            mock.patch.object(
+                DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()
+            ),
+            mock.patch.object(InferenceMode, "unset_active"),
+            mock.patch.object(InferenceMode, "set_active"),
+            mock.patch.object(torch.cuda, "synchronize"),
+        ):
+            engine.suspend()
+            engine.resume()
+    finally:
+        loop.close()
+
+    assert engine.failed_request_ids == [7]
+    assert engine.requests[7].future.result().status == Status.FAILED
+    assert media == {}
+
+
+def test_resume_does_not_refresh_media_of_a_failed_request():
+    """A failed request awaiting collection gets no media back from a resume.
+
+    A request that fails at admission, for example with a prompt longer than one step
+    without chunked prefill, has released its media but stays in `requests` until the next
+    step collects it. Suspend marks its media stale like everyone's; resume must not
+    re-encode and re-register it.
+    """
+    request = DynamicVLMInferenceRequest(
+        request_id=8,
+        prompt_tokens=torch.tensor([99, 99, 5]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(1, 2, 4),
+        num_tiles=None,
+        imgs_sizes=torch.tensor([[1, 2]]),
+        decoder_seq_length=0,
+        image_embeddings=torch.ones(2, 1, 4),
+        image_token_mask=torch.tensor([0, 1, -1]),
+    )
+    request.status = Status.FAILED
+    media = {}
+    wrapper = types.SimpleNamespace(
+        _forward_vision_encoder=mock.Mock(return_value=torch.ones(2, 1, 4))
+    )
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        chunked_prefill_request_id=-1,
+        kv_cache_management_mode=KVCacheManagementMode.PERSIST,
+        static_kv_memory_pointers=True,
+        deallocate_inference_state_buffers=mock.Mock(),
+        reinitialize_inference_state_buffers=mock.Mock(),
+        add_vlm_request_data=lambda request_id, **data: media.__setitem__(request_id, data),
+    )
+    engine.controller = types.SimpleNamespace(inference_wrapped_model=wrapper, tokenizer=object())
+    engine.requests = {
+        8: types.SimpleNamespace(record=DynamicInferenceRequestRecord.from_request(request))
+    }
+    engine.waiting_request_ids = deque()
+    engine.failed_request_ids = [8]
+    engine.state = EngineState.RUNNING
+    engine.unified_memory_level = 0
+    engine.use_coordinator = False
+    engine.allow_stale_multimodal_embeddings = False
+    engine.vision_embedding_cache_max_bytes = 1 << 20
+    engine._vision_embedding_cache = OrderedDict()
+    engine._vision_embedding_cache_bytes = 0
+    engine._has_deferred_image_encodes = False
+    engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
+    engine._notify_cond_for_new_request = mock.Mock(return_value=None)
+    engine._add_request = mock.Mock()
+
+    with (
+        mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
+        mock.patch.object(InferenceMode, "unset_active"),
+        mock.patch.object(InferenceMode, "set_active"),
+        mock.patch.object(torch.cuda, "synchronize"),
+    ):
+        engine.suspend()
+        engine.resume()
+
+    wrapper._forward_vision_encoder.assert_not_called()
+    engine._add_request.assert_not_called()
+    assert media == {}
+
+
 def test_collect_gc_while_idle_freezes_only_after_a_drained_step():
     """The coordinator loop idles before the first request; that idle is not the first drain."""
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
