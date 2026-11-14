@@ -125,11 +125,17 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
     is_sft = args.sft
     has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
     create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
+    # Use the caller's pipeline group when it is given, so a model on its own grid places MTP by
+    # the same group the model uses (GPTModel/HybridModel read pg_collection.pp).
+    pp_group = pg_collection.pp if pg_collection is not None else None
+    if pp_group is None:
+        pp_group = mpu.get_pipeline_model_parallel_group()
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=cfg.model.transformer.pipeline_model_parallel_layout,
         mtp_num_layers=cfg.model.transformer.mtp_num_layers,
         ignore_virtual=False,
         vp_stage=vp_stage,
+        pp_group=pp_group,
     )
     # Dynamic CP always uses the sequence-packing path above.
     assert not cfg.model.transformer.dynamic_context_parallel
