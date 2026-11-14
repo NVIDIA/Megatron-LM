@@ -2337,6 +2337,24 @@ def _layer_is_graphable(layer, config):
     return False
 
 
+def _graphable_leaves(module):
+    """Yield graphable leaf layers, descending into grouped HybridStack modules.
+
+    A HybridStack is a MegatronModule rather than a GraphableMegatronModule, so iterating
+    decoder.layers directly yields the stack instead of the inner Mamba/attention/MoE layers.
+    """
+    try:
+        from megatron.core.models.hybrid.hybrid_block import HybridStack
+    except ImportError:
+        # Hybrid models are optional; with no HybridStack there is nothing to descend into.
+        HybridStack = ()
+    if isinstance(module, HybridStack):
+        for inner in module.layers:
+            yield from _graphable_leaves(inner)
+    else:
+        yield module
+
+
 class TECudaGraphHelper:
     """
     Helper class to capture CUDA Graphs using TE make_graphed_callables().
@@ -2422,15 +2440,21 @@ class TECudaGraphHelper:
                     f'No valid layer in model chunk {chunk_number}.',
                 )
             else:
-                num_decoder_layers = len(chunk_with_decoder.decoder.layers)
+                # A bracketed HybridStack group is one entry of decoder.layers; capture the
+                # physical layers inside it, in execution order.
+                decoder_layers = [
+                    leaf
+                    for layer in chunk_with_decoder.decoder.layers
+                    for leaf in _graphable_leaves(layer)
+                ]
+                num_decoder_layers = len(decoder_layers)
                 if hasattr(chunk_with_decoder, 'mtp'):
                     num_mtp_layers = len(chunk_with_decoder.mtp.layers)
                 else:
                     num_mtp_layers = 0
                 num_graphable_layers = 0
                 callables, callables_is_mtp = [], []
-                for layer_number in range(num_decoder_layers):
-                    layer = chunk_with_decoder.decoder.layers[layer_number]
+                for layer in decoder_layers:
                     if _layer_is_graphable(layer, self.config):
                         num_graphable_layers += 1
                         callables.append(layer)
@@ -2561,7 +2585,11 @@ class TECudaGraphHelper:
             """
             Get the static inputs for a layer.
             """
-            assert layer in chunk_of_the_layer.decoder.layers or any(
+            assert any(
+                layer is leaf
+                for decoder_layer in chunk_of_the_layer.decoder.layers
+                for leaf in _graphable_leaves(decoder_layer)
+            ) or any(
                 layer is mtp_layer.mtp_model_layer for mtp_layer in chunk_of_the_layer.mtp.layers
             ), "Layer is not in the chunk"
 
@@ -3239,7 +3267,9 @@ def set_current_microbatch(model, microbatch_id):
         decoder_exists = False
     if decoder_exists and model_with_decoder is not None:
         for layer in model_with_decoder.decoder.layers:
-            layer.current_microbatch = microbatch_id
+            # The layers inside a bracketed HybridStack group replay their own graphs.
+            for leaf in _graphable_leaves(layer):
+                leaf.current_microbatch = microbatch_id
         if hasattr(model_with_decoder, 'mtp'):
             for layer in model_with_decoder.mtp.layers:
                 assert hasattr(
