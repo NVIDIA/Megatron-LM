@@ -3,7 +3,6 @@
 """Megatron global variables."""
 
 import os
-import re
 import signal
 import sys
 from argparse import Namespace
@@ -28,7 +27,7 @@ _GLOBAL_RUN_CONFIG = None
 _GLOBAL_TRAIN_STATE = None
 _GLOBAL_TOKENIZER = None
 _GLOBAL_TENSORBOARD_WRITER = None
-_GLOBAL_WANDB_WRITER = None
+_GLOBAL_EXPERIMENT_WRITER = None
 _GLOBAL_ONE_LOGGER = None
 _GLOBAL_ADLR_AUTORESUME = None
 _GLOBAL_TIMERS = None
@@ -76,16 +75,22 @@ def get_tensorboard_writer():
     return _GLOBAL_TENSORBOARD_WRITER
 
 
-def get_wandb_writer():
-    """Return tensorboard writer. It can be None so no need
-    to check if it is initialized."""
-    return _GLOBAL_WANDB_WRITER
-
-
 def get_one_logger():
     """Return one logger. It can be None so no need
     to check if it is initialized."""
     return _GLOBAL_ONE_LOGGER
+
+
+def get_experiment_writer():
+    """Return the third-party experiment writer (W&B, Comet, MLflow), or None."""
+    return _GLOBAL_EXPERIMENT_WRITER
+
+
+def finish_experiment_logging(status="FINISHED"):
+    """Finish all experiment backends after pending checkpoints complete."""
+    if _GLOBAL_EXPERIMENT_WRITER is not None:
+        _GLOBAL_EXPERIMENT_WRITER.finish(status)
+
 
 def get_adlr_autoresume():
     """ADLR autoresume object. It can be None so no need
@@ -133,6 +138,7 @@ def _graceful_shutdown(signum, frame):
     """
     from megatron.training.utils import print_rank_0
     print_rank_0("\nTermination requested. Performing orderly shutdown.")
+    finish_experiment_logging("KILLED")
 
     try:
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -205,7 +211,7 @@ def initialize_runtime_services(
     if build_tokenizer or cfg.tokenizer.padded_vocab_size is not None:
         resolve_tokenizer_vocab_size(cfg)
     _bind_dataset_tokenizer(cfg)
-    _set_wandb_writer(args)
+    _set_experiment_writer(args)
     _set_telemetry(args, include_training=training)
 
     if args.enable_experimental:
@@ -258,13 +264,15 @@ def unset_global_variables():
     Useful for multiple runs. See `tests/unit_tests/ckpt_converter/test_ckpt_converter.py` for an example.
     """
 
+    finish_experiment_logging("KILLED")
+    global _GLOBAL_EXPERIMENT_WRITER
+    _GLOBAL_EXPERIMENT_WRITER = None
     global _GLOBAL_ARGS
     global _GLOBAL_RUN_CONFIG
     global _GLOBAL_TRAIN_STATE
     global _GLOBAL_NUM_MICROBATCHES_CALCULATOR
     global _GLOBAL_TOKENIZER
     global _GLOBAL_TENSORBOARD_WRITER
-    global _GLOBAL_WANDB_WRITER
     global _GLOBAL_ONE_LOGGER
     global _GLOBAL_ADLR_AUTORESUME
     global _GLOBAL_TIMERS
@@ -278,7 +286,6 @@ def unset_global_variables():
     _GLOBAL_NUM_MICROBATCHES_CALCULATOR = None
     _GLOBAL_TOKENIZER = None
     _GLOBAL_TENSORBOARD_WRITER = None
-    _GLOBAL_WANDB_WRITER = None
     _GLOBAL_ONE_LOGGER = None
     _GLOBAL_ADLR_AUTORESUME = None
     _GLOBAL_TIMERS = None
@@ -381,61 +388,17 @@ def _set_tensorboard_writer(args):
                   'no TensorBoard logs will be written.', flush=True)
 
 
-def _wandb_run_id(exp_name: str) -> str:
-    """A wandb run id derived from the experiment name.
-
-    The id is part of the run URL, so wandb rejects the characters that would be
-    ambiguous there. Experiment names are often paths, so substitute rather than fail;
-    the unmodified name is still what gets displayed.
-    """
-    return re.sub(r"[/\\#?%:]", "-", exp_name)
-
-
-def _set_wandb_writer(args):
+def _set_experiment_writer(args):
+    """Initialize all enabled third-party experiment backends on the reporting rank."""
+    global _GLOBAL_EXPERIMENT_WRITER
+    _ensure_var_is_not_initialized(_GLOBAL_EXPERIMENT_WRITER, 'experiment writer')
     cfg = get_run_config()
-    global _GLOBAL_WANDB_WRITER
-    _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER,
-                                   'wandb writer')
-    if cfg.logger.wandb_project and args.rank == (safe_get_world_size() - 1):
-        if cfg.logger.wandb_exp_name == '':
-            raise ValueError("Please specify the wandb experiment name!")
+    if (
+        cfg.logger.wandb_project or cfg.logger.mlflow_experiment or cfg.logger.comet_project
+    ) and args.rank == safe_get_world_size() - 1:
+        from megatron.training.logging.experiment_writer import ExperimentWriter
 
-        import wandb
-        if cfg.logger.wandb_save_dir:
-            save_dir = cfg.logger.wandb_save_dir
-        else:
-            # Defaults to the save dir.
-            save_dir = os.path.join(cfg.checkpoint.save, 'wandb')
-        # Private attributes are runtime state rather than configuration and can be large; keep
-        # them out of the wandb config. Copy so the kitchen contents added below stay off args.
-        wandb_config = {k: v for k, v in vars(args).items() if not k.startswith('_')}
-        if 'kitchen_config_file' in wandb_config and wandb_config['kitchen_config_file'] is not None:
-            # Log the contents of the config for discovery of what the quantization
-            # settings were.
-            with open(wandb_config['kitchen_config_file'], "r") as f:
-                wandb_config['kitchen_config_file_contents'] = f.read()
-        # wandb.init() creates a new run unless it is given an id to resume, and this
-        # runs on every process start. A long job restarts many times -- a requeue, a
-        # node failure, an in-job restarter -- and each restart would otherwise open a
-        # fresh run, scattering one training run across many and leaving every chart
-        # covering only the stretch between two failures. Deriving a stable id from the
-        # experiment name and resuming it keeps them a single timeline. An unnamed run has
-        # nothing stable to derive an id from, so wandb assigns one as before.
-        run_id = cfg.logger.wandb_run_id or (
-            _wandb_run_id(cfg.logger.wandb_exp_name) if cfg.logger.wandb_exp_name else None
-        )
-        wandb_kwargs = {
-            'dir': save_dir,
-            "id": run_id,
-            'name': cfg.logger.wandb_exp_name,
-            'project': cfg.logger.wandb_project,
-            'config': wandb_config,
-            "resume": "allow"}
-        if cfg.logger.wandb_entity:
-            wandb_kwargs['entity'] = cfg.logger.wandb_entity
-        os.makedirs(wandb_kwargs['dir'], exist_ok=True)
-        wandb.init(**wandb_kwargs)
-        _GLOBAL_WANDB_WRITER = wandb
+        _GLOBAL_EXPERIMENT_WRITER = ExperimentWriter(cfg)
 
 
 def _set_one_logger(args):
@@ -714,6 +677,10 @@ def _set_telemetry(args, *, include_training: bool = True):
 
 
 def destroy_global_vars():
+    finish_experiment_logging("KILLED")
+    global _GLOBAL_EXPERIMENT_WRITER
+    _GLOBAL_EXPERIMENT_WRITER = None
+
     global _GLOBAL_ARGS
     _GLOBAL_ARGS = None
 
@@ -728,9 +695,6 @@ def destroy_global_vars():
 
     global _GLOBAL_TENSORBOARD_WRITER
     _GLOBAL_TENSORBOARD_WRITER = None
-
-    global _GLOBAL_WANDB_WRITER
-    _GLOBAL_WANDB_WRITER = None
 
     global _GLOBAL_ONE_LOGGER
     _GLOBAL_ONE_LOGGER = None

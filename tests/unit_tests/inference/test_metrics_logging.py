@@ -1,14 +1,14 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for wandb logging functionality in inference."""
+"""Unit tests for shared experiment logging in inference."""
 
-from unittest.mock import MagicMock, Mock, create_autospec, patch
+from unittest.mock import Mock, create_autospec
 
 import pytest
 import torch
 
 from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER
-from megatron.core.inference.config import InferenceConfig
+from megatron.core.inference.config import InferenceConfig, InferenceMetricsWriter
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -33,8 +33,8 @@ def reset_rounder():
     DynamicInferenceContext.REQUEST_ROUNDER = 4  # the default in dynamic_context.py
 
 
-class TestInferenceWandbLogging:
-    """Test suite for wandb logging in inference."""
+class TestInferenceMetricsLogging:
+    """Test suite for shared experiment logging in inference."""
 
     @classmethod
     def setup_class(cls):
@@ -209,16 +209,11 @@ class TestInferenceWandbLogging:
             ), f"{field} should be float but is {type(stats[field])}"
 
     @pytest.mark.internal
-    @patch('megatron.core.inference.engines.dynamic.engine.HAVE_WANDB', True)
     def test_engine_logging_step_interval_zero(self):
         """Test that no logging occurs when logging_step_interval is 0."""
-        mock_wandb = Mock()
-        mock_wandb.__name__ = "wandb"
-        mock_wandb.log = Mock()
+        writer = Mock(spec=InferenceMetricsWriter)
 
-        dynamic_context = self._get_dynamic_context(
-            logging_step_interval=0, metrics_writer=mock_wandb
-        )
+        dynamic_context = self._get_dynamic_context(logging_step_interval=0, metrics_writer=writer)
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
@@ -234,7 +229,8 @@ class TestInferenceWandbLogging:
         engine = DynamicInferenceEngine(controller=mock_controller, context=dynamic_context)
 
         # Verify log was never called
-        mock_wandb.log.assert_not_called()
+        writer.start_inference_logging.assert_not_called()
+        writer.log_inference.assert_not_called()
 
     @pytest.mark.internal
     def test_paused_requests_in_stats(self):
@@ -273,9 +269,15 @@ class TestInferenceWandbLogging:
         set_rounder(64)  # back to the class's pin
 
     @pytest.mark.internal
-    def test_metrics_writer_none_handling(self):
-        """Test that engine handles None metrics_writer gracefully."""
-        dynamic_context = self._get_dynamic_context(logging_step_interval=10, metrics_writer=None)
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_metrics_writer_initialization(self, enabled):
+        """Initialize the shared writer when enabled and accept no writer otherwise."""
+        writer = (
+            Mock(spec=InferenceMetricsWriter, start_inference_logging=Mock(return_value=17))
+            if enabled
+            else None
+        )
+        dynamic_context = self._get_dynamic_context(logging_step_interval=10, metrics_writer=writer)
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
@@ -293,4 +295,7 @@ class TestInferenceWandbLogging:
 
         # Verify engine was created successfully
         assert engine.logging_step_interval == 10
-        assert engine.metrics_writer is None
+        assert engine.metrics_writer is writer
+        if enabled:
+            writer.start_inference_logging.assert_called_once_with()
+            assert engine.inference_step_offset == 17

@@ -16,7 +16,8 @@ counterpart to ``megatron.training.models.GPTModelConfig``.
 
 The *runtime engine* config consumed by the inference context/engine is
 ``megatron.core.inference.config.InferenceConfig`` -- it holds rich runtime objects
-(``ProcessGroupCollection``, ``MambaInferenceStateConfig``, ``torch.dtype``, a wandb module)
+(``ProcessGroupCollection``, ``MambaInferenceStateConfig``, ``torch.dtype``,
+and an inference metrics writer)
 and can only be built once the model and process groups exist.
 
 Use :meth:`InferenceSetupConfig.to_inference_config` to produce the runtime engine config
@@ -28,7 +29,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
-    from megatron.core.inference.config import InferenceConfig
+    from megatron.core.inference.config import InferenceConfig, InferenceMetricsWriter
     from megatron.core.transformer.module import MegatronModule
 
 
@@ -355,7 +356,7 @@ class InferenceSetupConfig:
         model: "MegatronModule",
         *,
         pg_collection: Any = None,
-        metrics_writer: Any = None,
+        metrics_writer: "InferenceMetricsWriter | None" = None,
         verbose: bool = True,
     ) -> "InferenceConfig":
         """Build the runtime ``megatron.core.inference.config.InferenceConfig`` from this config.
@@ -372,7 +373,7 @@ class InferenceSetupConfig:
                 scope, and the process group collection when ``pg_collection`` is not provided.
             pg_collection: Process groups for distributed execution. Defaults to the
                 model's ``pg_collection`` attribute when None.
-            metrics_writer: Optional wandb module for inference metric logging.
+            metrics_writer: Optional shared writer for inference scalar metrics.
             verbose: Whether the context logs detailed configuration at initialization.
 
         Returns:

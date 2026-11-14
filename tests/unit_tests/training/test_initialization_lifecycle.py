@@ -480,7 +480,7 @@ def test_runtime_service_order_and_microbatch_inputs(
     for name in (
         "_build_tokenizer",
         "_set_tensorboard_writer",
-        "_set_wandb_writer",
+        "_set_experiment_writer",
         "_set_one_logger",
         "_set_adlr_autoresume",
         "_set_timers",
@@ -525,7 +525,7 @@ def test_runtime_service_order_and_microbatch_inputs(
     assert isinstance(global_vars.get_train_state(), global_vars.TrainState)
     assert calls == [
         "_build_tokenizer",
-        "_set_wandb_writer",
+        "_set_experiment_writer",
         "_set_telemetry",
         "microbatches",
         "_set_tensorboard_writer",
@@ -646,7 +646,7 @@ def test_training_batch_topology_uses_model_config(
     microbatches = Mock()
     monkeypatch.setattr(global_vars, "init_num_microbatches_calculator", microbatches)
     for name in (
-        "_set_wandb_writer",
+        "_set_experiment_writer",
         "_set_telemetry",
         "_set_tensorboard_writer",
         "_set_one_logger",
@@ -1443,7 +1443,12 @@ def test_training_tokenizer_padding_uses_model_inputs(
     )
     global_vars.set_args(args)
     global_vars.set_run_config(cfg)
-    for service in ("_set_wandb_writer", "_set_telemetry", "initialize_training_runtime_services"):
+    for service in (
+        "_set_experiment_writer",
+        "_set_experiment_writer",
+        "_set_telemetry",
+        "initialize_training_runtime_services",
+    ):
         monkeypatch.setattr(global_vars, service, Mock())
 
     global_vars.initialize_runtime_services(args, training=True)
@@ -1802,7 +1807,7 @@ def test_initialize_megatron_finalizes_before_services_and_resolves_vocabulary(
         assert cfg.tokenizer.padded_vocab_size == expected_tokenizer_vocab[vocabulary]
         events.append("writer")
 
-    monkeypatch.setattr(global_vars, "_set_wandb_writer", writer)
+    monkeypatch.setattr(global_vars, "_set_experiment_writer", writer)
     monkeypatch.setattr(global_vars, "_set_telemetry", Mock())
     training_services = Mock(side_effect=lambda args: events.append("training"))
     monkeypatch.setattr(global_vars, "initialize_training_runtime_services", training_services)

@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron initialization."""
+import json
 import logging
 import os
 import random
@@ -49,6 +50,7 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.async_utils import init_persistent_async_worker
 from megatron.training.config import PretrainConfigContainer
+from megatron.training.config.container import serialize_config_for_logging
 from megatron.training.global_vars import (
     get_run_config,
     get_train_state,
@@ -589,13 +591,12 @@ def _set_random_seed(
         raise ValueError("Seed ({}) should be a positive integer.".format(seed_))
 
 
-def write_args_to_tensorboard():
-    """Write arguments to tensorboard."""
-    args = get_args()
+def write_config_to_tensorboard():
+    """Write the structured run configuration as TensorBoard text."""
     writer = get_tensorboard_writer()
     if writer:
-        for arg in vars(args):
-            writer.add_text(arg, str(getattr(args, arg)), global_step=get_train_state().iteration)
+        config = serialize_config_for_logging(get_run_config())
+        writer.add_text("config", json.dumps(config, indent=2), global_step=get_train_state().iteration)
 
 
 def set_jit_fusion_options(

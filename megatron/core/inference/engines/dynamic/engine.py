@@ -59,14 +59,6 @@ except:
     HAVE_TQDM = False
 
 try:
-    import wandb
-
-    HAVE_WANDB = True
-except ImportError:
-    HAVE_WANDB = False
-    wandb = None
-
-try:
     import psutil
 
     HAVE_PSUTIL = True
@@ -270,30 +262,13 @@ class DynamicInferenceEngine(
             self._get_and_clear_stop_word_finished_ids
         )
 
-        # Configure wandb to use separate step counter for inference metrics (only once)
+        # Configure a separate step counter for inference metrics (only once)
         if self.logging_step_interval > 0 and self.metrics_writer is not None:
             logger.info(
                 f"\033[1;93m[INFERENCE]\033[0m "
-                f"\033[1;95mLogging inference metrics to wandb (rank {self.rank})\033[0m"
+                f"\033[1;95mLogging inference metrics (rank {self.rank})\033[0m"
             )
-            if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
-                # Make all inference/* metrics use inference_step as their x-axis
-                # This allows inference and training to have independent step counters
-                context.metrics_writer.define_metric(
-                    "inference/*", step_metric="inference/inference_step"
-                )
-                # Initialize inference step offset by querying existing run history
-                self.inference_step_offset = 0
-                if wandb.run is not None:
-                    api_run = wandb.Api().run(
-                        f"{wandb.run.entity}/{wandb.run.project}/{wandb.run.id}"
-                    )
-                    max_step = 0
-                    for row in api_run.scan_history(keys=["inference/inference_step"]):
-                        val = row.get("inference/inference_step")
-                        if isinstance(val, (int, float)) and int(val) > max_step:
-                            max_step = int(val)
-                    self.inference_step_offset = int(max_step)
+            self.inference_step_offset = self.metrics_writer.start_inference_logging()
 
         # Mark the inference engine as active. Cleared in `suspend()` and re-set in `resume()`.
         InferenceMode.set_active()

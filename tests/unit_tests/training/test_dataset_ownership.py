@@ -740,7 +740,7 @@ def test_set_global_variables_finalizes_a_dataset_section(
         return tokenizer
 
     monkeypatch.setattr(global_vars, "_build_tokenizer", build)
-    monkeypatch.setattr(global_vars, "_set_wandb_writer", lambda args: None)
+    monkeypatch.setattr(global_vars, "_set_experiment_writer", lambda args: None)
     monkeypatch.setattr(global_vars, "_set_telemetry", lambda args, **kwargs: None)
     monkeypatch.setattr(global_vars, "initialize_training_runtime_services", lambda args: None)
     args, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)

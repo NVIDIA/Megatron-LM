@@ -28,7 +28,7 @@ def env(monkeypatch):
         rl_callbacks, "get_args", SimpleNamespace  # only handed on to log_rl_throughput_metrics
     )
     monkeypatch.setattr(rl_callbacks, "get_tensorboard_writer", lambda: env.writer)
-    monkeypatch.setattr(rl_callbacks, "get_wandb_writer", lambda: env.wandb_writer)
+    monkeypatch.setattr(rl_callbacks, "get_experiment_writer", lambda: env.wandb_writer)
     monkeypatch.setattr(rl_callbacks, "get_timers", lambda: env.timers)
     monkeypatch.setattr(rl_callbacks, "get_train_state", lambda: env.train_state)
     monkeypatch.setattr(rl_callbacks, "log_iteration_profile", lambda **kw: env.profiles.append(kw))

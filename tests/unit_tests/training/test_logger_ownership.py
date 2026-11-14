@@ -1,7 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Logging services use config; argument metadata retains its legacy format."""
+"""Logging services and metadata use the structured run configuration."""
 
+import json
 import sys
 from argparse import ArgumentParser, Namespace
 from dataclasses import asdict, fields
@@ -14,7 +15,7 @@ from megatron.training import arguments, global_vars
 from megatron.training.argument_utils import _default_config_from_args
 from megatron.training.async_utils import build_otel_worker_bootstrap
 from megatron.training.config import LoggerConfig
-from megatron.training.initialize import setup_logging, write_args_to_tensorboard
+from megatron.training.initialize import setup_logging, write_config_to_tensorboard
 from megatron.training.training import _should_compute_params_norm
 
 
@@ -121,11 +122,11 @@ def test_tensorboard_uses_owned_directory_and_queue(monkeypatch, rank, enabled, 
         factory.assert_not_called()
 
 
-def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, run_config):
+def test_wandb_uses_owned_config_for_settings_and_metadata(monkeypatch, tmp_path, run_config):
     monkeypatch.setattr(global_vars, 'safe_get_world_size', lambda: 1)
-    wandb = SimpleNamespace(init=Mock())
+    wandb = Mock()
     monkeypatch.setitem(sys.modules, 'wandb', wandb)
-    monkeypatch.setattr(global_vars, '_GLOBAL_WANDB_WRITER', None)
+    monkeypatch.setattr(global_vars, '_GLOBAL_EXPERIMENT_WRITER', None)
     config = LoggerConfig(
         wandb_project='project',
         wandb_exp_name='run',
@@ -143,11 +144,17 @@ def test_wandb_uses_owned_settings_and_legacy_metadata(monkeypatch, tmp_path, ru
     before = vars(args).copy()
     run_config.logger = config
     run_config.profiling.run_workload_inspector_server = True
-    global_vars._set_wandb_writer(args)
+    global_vars._set_experiment_writer(args)
+    writer = global_vars.get_experiment_writer()
+    assert writer.wandb is wandb
+    writer.finish()
     kwargs = wandb.init.call_args.kwargs
     assert kwargs['project'] == 'project' and kwargs['name'] == 'run'
     assert kwargs['entity'] == 'team' and kwargs['dir'] == str(tmp_path)
-    assert kwargs['config'] == {k: v for k, v in before.items() if not k.startswith('_')}
+    assert kwargs['config']['logger']['log_interval'] == 17
+    assert kwargs['config']['profiling']['run_workload_inspector_server'] is True
+    assert 'log_interval' not in kwargs['config']
+    assert '_runtime_state' not in kwargs['config']
     assert vars(args) == before
 
 
@@ -209,23 +216,30 @@ def test_finetune_reuses_registered_config(monkeypatch, run_config):
     assert global_vars.get_timers() is timers
 
 
-def test_tensorboard_metadata_preserves_legacy_args(monkeypatch):
+def test_tensorboard_metadata_uses_run_config(monkeypatch, run_config):
     from megatron.training import initialize
     from megatron.training.state import TrainState
 
     args = Namespace(log_interval=99, run_workload_inspector_server=False)
+    run_config.logger.log_interval = 17
+    run_config.profiling.run_workload_inspector_server = True
     train_state = TrainState(iteration=13)
     writer = Mock()
-    monkeypatch.setattr(initialize, 'get_args', lambda: args)
+    monkeypatch.setattr(
+        initialize, 'get_args', Mock(side_effect=AssertionError('legacy args read'))
+    )
     monkeypatch.setattr(initialize, 'get_train_state', lambda: train_state)
     monkeypatch.setattr(initialize, 'get_tensorboard_writer', lambda: writer)
-    monkeypatch.setattr(global_vars, '_GLOBAL_RUN_CONFIG', None)
-    write_args_to_tensorboard()
-    assert writer.add_text.call_count == len(vars(args))
-    for name, value in vars(args).items():
-        writer.add_text.assert_any_call(name, str(value), global_step=13)
+    write_config_to_tensorboard()
+    writer.add_text.assert_called_once()
+    call = writer.add_text.call_args
+    assert call.args[0] == 'config'
+    assert call.kwargs == {'global_step': 13}
+    metadata = json.loads(call.args[1])
+    assert metadata['logger']['log_interval'] == 17
+    assert metadata['profiling']['run_workload_inspector_server'] is True
+    assert 'log_interval' not in metadata
     assert args.log_interval == 99
-    assert args.run_workload_inspector_server is False
 
 
 def test_async_worker_telemetry_uses_config(monkeypatch, run_config):
@@ -395,7 +409,12 @@ def test_attention_metric_logging_reads_model_config(
     monkeypatch.setattr(training, 'get_num_microbatches', lambda: 1)
     monkeypatch.setattr(training, 'one_logger_utils', Mock())
     monkeypatch.setattr(training, 'reduce_max_stat_across_model_parallel_group', lambda x, **kw: x)
-    for getter in ('get_wandb_writer', 'get_one_logger', 'get_energy_monitor', 'get_telemetry'):
+    for getter in (
+        'get_experiment_writer',
+        'get_one_logger',
+        'get_energy_monitor',
+        'get_telemetry',
+    ):
         monkeypatch.setattr(training, getter, lambda: None)
     model = [SimpleNamespace(config=transformer)] if supplied_model else None
     training.training_log({}, {}, 0.01, 1, 1.0, False, 0, None, None, None, 7.0, model=model)

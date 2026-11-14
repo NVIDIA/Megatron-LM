@@ -34,14 +34,6 @@ try:
 except:
     HAVE_MSGPACK = False
 
-try:
-    import wandb  # pylint: disable=unused-import
-
-    HAVE_WANDB = True
-except ImportError:
-    HAVE_WANDB = False
-    wandb = None
-
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
@@ -370,8 +362,8 @@ class EngineLoopMixin:
             self.context.prefix_cache_prefill_computed_tokens = 0
             self.context.prefix_cache_prefill_skipped_tokens = 0
 
-        # Log KV cache utilization stats to W&B
-        nvtx_range_push("wandb_logging")
+        # Log KV cache utilization stats to the configured experiment writer
+        nvtx_range_push("experiment_logging")
         if context_state["kv_stats"] is not None:
             # Prepare metrics dictionary with all stats
             # Use 'inference/' prefix for all metrics to separate from training metrics
@@ -418,11 +410,8 @@ class EngineLoopMixin:
                     self._prefix_cache_blocks_matched
                 )
 
-            if HAVE_WANDB and self.metrics_writer.__name__ == "wandb":
-                self.metrics_writer.log(metrics, commit=True)
-            else:
-                raise ValueError(f"Unsupported metrics writer type: {type(self.metrics_writer)}")
-        nvtx_range_pop("wandb_logging")
+            self.metrics_writer.log_inference(metrics)
+        nvtx_range_pop("experiment_logging")
 
         # Print context state.
         nvtx_range_push("console_logging")

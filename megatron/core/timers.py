@@ -10,11 +10,6 @@ from typing import List
 import torch
 
 try:
-    import wandb
-except ImportError:
-    wandb = None
-
-try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
     SummaryWriter = None
@@ -458,12 +453,11 @@ class Timers:
         reset: bool = True,
         barrier: bool = False,
     ):
-        """Write timers to a tensorboard writer.
-        Note that we only report maximum time across ranks to tensorboard.
+        """Write maximum times across ranks to a scalar writer.
 
         Args:
             names (List[str]): Names of the timers to log.
-            writer (SummaryWriter): Tensorboard SummaryWriter object
+            writer: Tensorboard SummaryWriter or experiment writer with a ``log`` method.
             iteration (int): Current iteration.
             normalizer (float, optional): Normalizes the timer values by the factor.
                                           Defaults to 1.0.
@@ -479,7 +473,7 @@ class Timers:
         if writer is not None:
             for name in name_to_min_max_time:
                 _, max_time = name_to_min_max_time[name]
-                if isinstance(writer, SummaryWriter) and SummaryWriter is not None:
+                if SummaryWriter is not None and isinstance(writer, SummaryWriter):
                     writer.add_scalar(name + '-time', max_time, iteration)
-                elif writer == wandb and wandb is not None:
+                elif hasattr(writer, 'log'):
                     writer.log({name + '-time': max_time}, iteration)

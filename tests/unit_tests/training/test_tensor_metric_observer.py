@@ -478,7 +478,7 @@ def test_default_sink_writes_tensorboard_and_wandb():
 
     with (
         mock.patch.object(observer_mod, "get_tensorboard_writer", return_value=tensorboard_writer),
-        mock.patch.object(observer_mod, "get_wandb_writer", return_value=wandb_writer),
+        mock.patch.object(observer_mod, "get_experiment_writer", return_value=wandb_writer),
     ):
         model = _layer_model()
         observer(

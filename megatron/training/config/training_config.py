@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import json
 import signal
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional
@@ -315,7 +316,7 @@ class SchedulerConfig:
 
 @dataclass(kw_only=True)
 class LoggerConfig:
-    """Configuration settings for logging, including TensorBoard and WandB."""
+    """Configuration settings for TensorBoard, W&B, MLflow and Comet logging."""
 
     log_interval: int = 100
     """Report loss and timing interval."""
@@ -421,6 +422,38 @@ class LoggerConfig:
     when two runs would otherwise derive the same id, or to resume a run whose
     experiment name has since changed."""
 
+    mlflow_experiment: str | None = None
+    """MLflow experiment name. Unset disables MLflow logging."""
+
+    mlflow_run_name: str | None = None
+    """Display name for the MLflow run."""
+
+    mlflow_tracking_uri: str | None = None
+    """MLflow tracking URI. Unset uses the SDK's environment/configuration."""
+
+    mlflow_run_id: str | None = None
+    """Existing MLflow run ID to resume; otherwise start a new run."""
+
+    mlflow_tags: dict[str, str] | None = field(
+        default=None, metadata={"argparse_meta": {"type": json.loads}}
+    )
+    """MLflow run tags; pass a JSON object on the CLI."""
+
+    mlflow_description: str | None = None
+    """Description for a new MLflow run."""
+
+    comet_project: str | None = None
+    """Comet project name. Unset disables Comet logging; use COMET_API_KEY for credentials."""
+
+    comet_experiment_name: str | None = None
+    """Display name for the Comet experiment."""
+
+    comet_workspace: str | None = None
+    """Comet workspace. Unset uses the SDK's environment/configuration."""
+
+    comet_tags: list[str] | None = None
+    """Tags added to the Comet experiment."""
+
     logging_level: int | None = None
     """Set default logging level"""
 
@@ -506,6 +539,17 @@ class LoggerConfig:
         """Check logging requirements shared by CLI and native configurations."""
         if self.log_memory_interval is not None:
             assert self.log_memory_interval % self.log_interval == 0
+        if self.mlflow_experiment and not self.mlflow_run_name:
+            raise ValueError("Set logger.mlflow_run_name when enabling MLflow logging.")
+        if self.comet_project and not self.comet_experiment_name:
+            raise ValueError("Set logger.comet_experiment_name when enabling Comet logging.")
+        if self.mlflow_run_id and not self.mlflow_experiment:
+            raise ValueError("Set logger.mlflow_experiment when resuming an MLflow run.")
+        if self.mlflow_tags is not None and (
+            not isinstance(self.mlflow_tags, dict)
+            or any(not isinstance(k, str) or not isinstance(v, str) for k, v in self.mlflow_tags.items())
+        ):
+            raise ValueError("logger.mlflow_tags must be a mapping of strings to strings.")
 
 
 @dataclass(kw_only=True)
