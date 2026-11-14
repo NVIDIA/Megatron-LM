@@ -2,6 +2,7 @@
 
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -750,3 +751,37 @@ def test_evict_lru_preserves_invariant_under_random_chains():
         assert retained == set(block_ids) - expected_evicted
         assert len(retained) == n - k_evict
         _assert_prefix_invariant(a)
+
+
+@pytest.mark.parametrize(
+    "order",
+    [np.arange(8), np.array([0, 4, 1, 5, 2, 6, 3, 7])],
+    ids=["block-contiguous", "interleaved"],
+)
+def test_store_prompt_logprobs_preserves_rows(order):
+    """Store each row in its block and slot regardless of input grouping."""
+    allocator = _pc_allocator(_make_context(), POOL_SIZE, PAUSED_LIMIT)
+    block_ids = np.repeat([4, 2], BLOCK_SIZE_TOKENS)
+    slots = np.tile(np.arange(BLOCK_SIZE_TOKENS), 2)
+    log_probs = np.arange(8, dtype=np.float32)
+    top_n_log_probs = np.stack((log_probs - 0.25, log_probs - 0.5), axis=1)
+    top_n_token_ids = np.stack((np.arange(100, 108), np.arange(200, 208)), axis=1)
+    next_token_ids = np.arange(300, 308)
+
+    allocator.store_prompt_logprobs(
+        block_ids[order],
+        slots[order],
+        log_probs[order],
+        top_n_log_probs[order],
+        top_n_token_ids[order],
+        next_token_ids[order],
+    )
+
+    for block_id, start in ((4, 0), (2, BLOCK_SIZE_TOKENS)):
+        entry = allocator.pc_state.block_prompt_logprobs[block_id]
+        rows = slice(start, start + BLOCK_SIZE_TOKENS)
+        np.testing.assert_array_equal(entry.log_probs, log_probs[rows])
+        np.testing.assert_array_equal(entry.top_n_log_probs, top_n_log_probs[rows])
+        np.testing.assert_array_equal(entry.top_n_token_ids, top_n_token_ids[rows])
+        assert entry.valid.all()
+        assert entry.next_token_id == next_token_ids[start + BLOCK_SIZE_TOKENS - 1]
