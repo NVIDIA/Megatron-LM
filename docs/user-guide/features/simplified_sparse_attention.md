@@ -41,12 +41,18 @@ Phase 1 usually starts from a dense `torch_dist` checkpoint, loaded without its
 optimizer state (`--no-load-optim` or `--finetune`). Indexer weights missing from
 the checkpoint keep their initialization; every other weight loads strictly. Loading
 optimizer state across a phase change is rejected, because the trainable parameters
-differ.
+differ. With `--use-checkpoint-args`, an SSA checkpoint restores the attention variant
+and `dsa_indexer_topk`, and phase 1 from a dense checkpoint keeps the requested SSA
+spec.
 
 `dsa_indexer_loss_coeff` scales both the auxiliary loss and its gradients and must
 be nonnegative. Mean-loss mode divides by the number of query tokens; per-token-loss
-mode leaves normalization to the training loop. Indexer gradients can be clipped
-separately from the backbone with `dsa_indexer_clip_grad`.
+mode leaves normalization to the training loop.
+
+Indexer gradients can be clipped separately from the backbone with
+`--ssa-separate-indexer-grad-clip`. The indexer then has its own L2 norm and
+threshold, `--ssa-indexer-clip-grad`, which defaults to `--clip-grad`; zero leaves
+indexer gradients unclipped. The flags set `OptimizerConfig.dsa_indexer_clip_grad`.
 
 ### Model FLOP accounting
 
