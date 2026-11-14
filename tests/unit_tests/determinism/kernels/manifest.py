@@ -215,7 +215,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="torch.compile",
         notes="Weightless query RMS norm compiled with torch.compile (row reduction over head_dim); "
-        "standalone replay is in test_fused_activations. The DSv4 module tests cover static-spec "
+        "deterministic FP32 uses eager operators to avoid grad-mode compiler specialization, "
+        "while low precision preserves compiled rounding points. "
+        "Standalone replay and grad/no-grad forward parity are in test_fused_activations. "
+        "The DSv4 module tests cover static-spec "
         "construction and optional latent norms around the registered TE / RoPE / CSA kernels.",
     ),
     # ---------------------------------------------------------------- Megatron Triton fusions
@@ -1041,6 +1044,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             "tests/unit_tests/transformer/experimental_attention_variant/test_csa_deterministic_indexer.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_csa_fused_sparse_attention.py",
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_packed_cp.py",
         ),
         kind="dispatch",
         notes="Stable TopK and fixed-order sparse indexer dK/dW, with batch-local reference/replay; "
@@ -1059,6 +1063,23 @@ KERNELS: Tuple[KernelEntry, ...] = (
         notes="Fixed-order window/sink and compressed-key LSE reductions; teacher-only forward kernels.",
     ),
     KernelEntry(
+        name="csa_deterministic_packed_attention_and_indexer",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/csa.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/cp_utils.py",
+            "megatron/core/transformer/experimental_attention_variant/csa_utils/packed_sparse_attention.py",
+        ),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_packed_cp.py",
+            K + "test_csa_packed_kernels.py",
+        ),
+        kind="dispatch",
+        notes="Packed CP2 strict BF16 full-width attention/indexer replay for ratios 0/4/128; "
+        "CP1/2/4 no-grad/training parity with zero and positive indexer loss; direct-wrapper "
+        "sink-only padding and deterministic compaction regressions. Uses the shared deterministic "
+        "attention/indexer helpers. This is not full-model CP qualification.",
+    ),
+    KernelEntry(
         name="csa_packed_layout_and_loss",
         sources=(
             "megatron/core/transformer/experimental_attention_variant/csa_utils/cp_utils.py",
@@ -1072,8 +1093,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="triton",
         notes="Tensor-based packed layout, index sanitation and compiled KL. "
-        "FlashMLA/cuDNN attention backward remains unqualified for bit-exact replay; "
-        "numerical CP parity is covered by test_dsv4_packed_cp.py.",
+        "Numerical CP parity and strict attention/indexer replay are covered by "
+        "test_dsv4_packed_cp.py; see the separate packed deterministic dispatch entry.",
     ),
     KernelEntry(
         name="dsa_dispatch",
