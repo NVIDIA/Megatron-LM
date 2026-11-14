@@ -488,10 +488,12 @@ def _ordered_reduce_scatter_v_kernel(
     sync_threads()
 
     tid = tl.arange(0, BLOCK_SIZE)
-    rank_token_offset = tl.load(rank_token_offset_ptr)
+    # int64 token indices: the row offsets token * HIDDEN_SIZE reach 2**31 once a buffer holds
+    # 8 GiB of fp32 rows.
+    rank_token_offset = tl.load(rank_token_offset_ptr).to(tl.int64)
     buffer_ptrs = buffer_ptrs_dev.to(tl.pointer_type(tl.uint64))
 
-    for token_offset in range(pid, local_tokens, tl.num_programs(axis=0)):
+    for token_offset in range(pid.to(tl.int64), local_tokens, tl.num_programs(axis=0)):
         global_token = rank_token_offset + token_offset
 
         for channel_offset in range(0, HIDDEN_SIZE, BLOCK_SIZE):
