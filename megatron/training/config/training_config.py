@@ -9,6 +9,16 @@ from typing import List, Literal, Optional
 class TrainingConfig:
     """Configuration settings related to the training loop."""
 
+    check_optimizer_step_success: bool = True
+    """Synchronize optimizer-step success across model-parallel ranks before advancing the scheduler.
+    Disabling this uses each rank's local result and requires consistent results across ranks.
+    """
+
+    skip_sync_grad_norm_across_mp: bool = False
+    """Skip the reporting-only MAX reduction of gradient norm across model-parallel ranks.
+    This does not change gradient clipping or the optimizer's own norm calculation.
+    """
+
     vision_pretraining_type: Literal["classify", "inpaint", "dino"] | None = None
     """Vision pretraining objective, or None when vision pretraining is disabled."""
 
@@ -177,6 +187,11 @@ class ValidationConfig:
 class SchedulerConfig:
     """Configuration settings for the learning rate scheduler and weight decay."""
 
+    max_steps: int | None = None
+    """Full iteration horizon for LR and weight decay when train_iters shortens a run.
+    Overrides lr_decay_iters without changing train_iters; unavailable with train_samples.
+    """
+
     # ---------------- Learning rate config. ----------------
     lr_decay_style: Literal["constant", "linear", "cosine", "inverse-square-root", "WSD"] = "linear"
     """Learning rate decay function."""
@@ -234,7 +249,7 @@ class SchedulerConfig:
     """number of samples to warmup learning rate over. Calculated at runtime from
     lr_warmup_fraction, lr_warmup_iters, or lr_warmup_samples.
     """
-    
+
     override_opt_param_scheduler: bool = field(default=False, metadata={"argparse_meta": {"arg_names": ["--override-opt_param-scheduler", "--override-opt-param-scheduler"]}})
     """Reset the values of the scheduler (learning rate, warmup iterations, minimum learning rate,
     maximum number of iterations, and decay style) from input arguments and ignore values from
@@ -271,6 +286,13 @@ class SchedulerConfig:
         weight_decay: float | None,
     ) -> None:
         """Check this section against the rest of the run it belongs to."""
+        if self.max_steps is not None:
+            if self.max_steps <= 0:
+                raise ValueError("scheduler.max_steps must be positive")
+            if train_samples is not None:
+                raise ValueError("scheduler.max_steps requires iteration-based training")
+            if train_iters is not None and self.max_steps < train_iters:
+                raise ValueError("scheduler.max_steps must be at least train_iters")
         if train_iters and not skip_train:
             # If we use iteration-based training, make sure the
             # sample-based options are off.
@@ -343,8 +365,11 @@ class LoggerConfig:
     to progress.txt file in checkpoint directory.
     """
 
-    timing_log_level: Literal[0, 1, 2] = 0
+    timing_log_level: Literal[-1, 0, 1, 2] = 0
     """Granularity level to measure and report timing.
+    -1: disable timer reports and optional operator timers. Level-0 measurements remain
+        enabled for training progress, throughput, and checkpoint bookkeeping; this does
+        not eliminate their synchronization overhead or suppress ordinary progress metrics.
     0: report only iteration time and make sure timing does not introduce extra overhead.
     1: report timing for operations that are executed very limited times (basically once) during each iteration
         (such as gradient all-reduce)

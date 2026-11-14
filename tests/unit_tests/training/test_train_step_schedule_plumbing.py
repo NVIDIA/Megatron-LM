@@ -187,7 +187,20 @@ def test_model_process_groups_are_found_through_model_wrappers():
     assert training_mod._get_model_pg_collection(wrapped_model) is pg_collection
 
 
-def test_train_step_invokes_tensor_metric_observer_before_optimizer():
+@pytest.mark.parametrize("check_success", [None, False, True])
+@pytest.mark.parametrize("skip_norm_sync", [None, False, True])
+def test_train_step_invokes_tensor_metric_observer_before_optimizer(
+    run_config, check_success, skip_norm_sync
+):
+    if check_success is not None:
+        run_config.train.check_optimizer_step_success = check_success
+    if skip_norm_sync is not None:
+        run_config.train.skip_sync_grad_norm_across_mp = skip_norm_sync
+    check_success = True if check_success is None else check_success
+    skip_norm_sync = False if skip_norm_sync is None else skip_norm_sync
+    run_config.optimizer.log_num_zeros_in_grad = True
+    success_reduction = mock.Mock(return_value=False)
+    stat_reduction = mock.Mock(side_effect=lambda value, group: value + 5.0)
     args = SimpleNamespace(
         save_params_interval=None,
         save_activations_interval=None,
@@ -241,15 +254,15 @@ def test_train_step_invokes_tensor_metric_observer_before_optimizer():
         mock.patch.object(
             training_mod,
             "logical_and_across_model_parallel_group",
-            side_effect=lambda value, group: value,
+            side_effect=success_reduction,
         ),
         mock.patch.object(
             training_mod,
             "reduce_max_stat_across_model_parallel_group",
-            side_effect=lambda value, group: value,
+            side_effect=stat_reduction,
         ),
     ):
-        training_mod.train_step(
+        result = training_mod.train_step(
             forward_step_func=lambda *a, **k: None,
             data_iterator=iter([]),
             model=model,
@@ -263,7 +276,19 @@ def test_train_step_invokes_tensor_metric_observer_before_optimizer():
 
     assert events == ["observer", "optimizer"]
     assert model[0].force_all_reduce is False
-    scheduler.step.assert_called_once_with(increment=1)
+    if check_success:
+        success_reduction.assert_called_once_with(True, group=pg_collection.mp)
+        scheduler.step.assert_not_called()
+        assert result[1] == 1
+    else:
+        success_reduction.assert_not_called()
+        scheduler.step.assert_called_once_with(increment=1)
+        assert result[1] == 0
+    assert result[5] == (1.0 if skip_norm_sync else 6.0)
+    assert result[6] == 5.0
+    calls = [] if skip_norm_sync else [mock.call(1.0, group=pg_collection.mp)]
+    calls.append(mock.call(0, group=pg_collection.mp))
+    assert stat_reduction.call_args_list == calls
 
 
 def test_train_step_scopes_forward_tensor_observation_around_schedule():

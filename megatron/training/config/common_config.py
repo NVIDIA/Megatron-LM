@@ -107,6 +107,9 @@ class ProfilingConfig:
 class DistributedInitConfig:
     """Configuration settings for distributed training initialization."""
 
+    external_gpu_device_mapping: bool = False
+    """Use device zero when an external launcher exposes exactly one GPU per process."""
+
     distributed_backend: Literal["nccl", "gloo"] = "nccl"
     """Which backend to use for distributed training."""
 

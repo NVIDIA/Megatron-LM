@@ -39,6 +39,11 @@ class FaultToleranceConfig:
 class RerunStateMachineConfig:
     """Configuration for the rerun state machine used for result validation or stats."""
 
+    spiky_loss_factor: float = 10.0
+    """Reject GPT/hybrid loss above this multiple of the observed maximum when enabled.
+    Defaults to the existing 10x threshold; RL uses a separate percentage-based check.
+    """
+
     error_injection_rate: int = 0
     """Rate at which to inject unexpected results, e.g. 1000 means
     once every 1000 result validations"""

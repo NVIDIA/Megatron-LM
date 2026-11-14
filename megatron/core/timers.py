@@ -221,7 +221,9 @@ class Timers:
         """Initialize group of timers.
 
         Args:
-            log_level (int): Log level to control what timers are enabled.
+            log_level (int): Log level to control what timers are enabled. -1 disables
+                             timer reports and optional timers, retaining level-0 measurements
+                             required by training progress and checkpoint bookkeeping.
             log_option (str): Setting for logging statistics over ranks for all the timers.
                               Allowed: ['max', 'minmax', 'all'].
         """
@@ -260,12 +262,19 @@ class Timers:
         )
         # Now if the input log level is larger than the one set for
         # the timers class, just ignore it and return a dummy timer.
-        if log_level > self._log_level:
+        if log_level > max(0, self._log_level):
             return self._dummy_timer
         # Otherwise, initalize the timer and set the level.
         self._timers[name] = Timer(name)
         self._log_levels[name] = log_level
         return self._timers[name]
+
+    def _reset_local_timers(self, names, reset):
+        """Preserve measurement boundaries when timer reporting is disabled."""
+        if reset:
+            for name in self._timers if names is None else names:
+                if name in self._timers:
+                    self._timers[name].elapsed(reset=True)
 
     def _get_elapsed_time_all_ranks(self, names, reset, barrier):
         """Returns elapsed times of timers in names.
@@ -400,6 +409,10 @@ class Timers:
             str: Formatted string with the timer values.
         """
 
+        if self._log_level < 0:
+            self._reset_local_timers(names, reset)
+            return None
+
         if names == None:  # get all registered timers
             names = self._timers.keys()
 
@@ -442,6 +455,9 @@ class Timers:
                                       Defaults to False.
         """
 
+        if self._log_level < 0:
+            self._reset_local_timers(names, reset)
+            return
         output_string = self.get_all_timers_string(names, normalizer, reset, barrier)
         # If no input rank is provided, log on last rank.
         if rank is None:
@@ -471,6 +487,9 @@ class Timers:
             barrier (bool, optional): Whether to do a global barrier before time measurments.
                                       Defaults to False.
         """
+        if self._log_level < 0:
+            self._reset_local_timers(names, reset)
+            return
         # currently when using add_scalars,
         # torch.utils.add_scalars makes each timer its own run, which
         # polutes the runs list, so we just add each as a scalar

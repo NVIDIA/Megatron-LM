@@ -365,7 +365,7 @@ def average_losses_across_data_parallel_group(
 
 
 def reduce_max_stat_across_model_parallel_group(
-    stat: float, group: Optional[torch.distributed.ProcessGroup] = None
+    stat: float | None, group: Optional[torch.distributed.ProcessGroup] = None
 ) -> float | None:
     """
     Ranks without an optimizer will have no grad_norm or num_zeros_in_grad stats.

@@ -384,8 +384,9 @@ def _initialize_distributed(get_embedding_ranks, get_position_embedding_ranks, s
         print_rank_0("> initializing torch distributed ...")
         # Manually set the device ids.
         if device_count > 0:
-            torch.cuda.set_device(cfg.dist.local_rank)
-            device_id = torch.device(f'cuda:{cfg.dist.local_rank}')
+            device_index = 0 if cfg.dist.external_gpu_device_mapping else cfg.dist.local_rank
+            torch.cuda.set_device(device_index)
+            device_id = torch.device(f'cuda:{device_index}')
         else:
             device_id = None
 

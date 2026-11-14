@@ -206,7 +206,10 @@ def test_tp_user_buffers_use_config_and_explicit_batch_shape(
     initialize_ub.assert_called_once_with(**expected)
 
 
-def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_config):
+@pytest.mark.parametrize("external_mapping", [None, False, True])
+def test_distributed_initialization_prefers_config_to_args(
+    monkeypatch, run_config, external_mapping
+):
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
@@ -230,6 +233,8 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
         use_tp_pp_dp_mapping=True,
         nccl_communicator_config_path="owned.yaml",
     )
+    if external_mapping is not None:
+        run_config.dist.external_gpu_device_mapping = external_mapping
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     monkeypatch.setattr(initialize, "print_rank_0", Mock())
     monkeypatch.setattr(initialize.torch.cuda, "device_count", lambda: 2)
@@ -238,7 +243,8 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
     monkeypatch.setattr(initialize.torch.distributed, "is_initialized", lambda: False)
     init_pg, init_mpu = Mock(), Mock()
     monkeypatch.setattr(initialize.torch.distributed, "init_process_group", init_pg)
-    monkeypatch.setattr(initialize.inprocess_restart, "maybe_force_nccl_backend_init", Mock())
+    force_init = Mock()
+    monkeypatch.setattr(initialize.inprocess_restart, "maybe_force_nccl_backend_init", force_init)
     monkeypatch.setattr(initialize.mpu, "model_parallel_is_initialized", lambda: False)
     monkeypatch.setattr(initialize.mpu, "initialize_model_parallel", init_mpu)
     for name in (
@@ -253,7 +259,9 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
 
     initialize._initialize_distributed(None, None, store)
 
-    set_device.assert_called_once_with(1)
+    expected_device = 0 if external_mapping else 1
+    set_device.assert_called_once_with(expected_device)
+    force_init.assert_called_once_with(torch.device(f"cuda:{expected_device}"))
     init_pg.assert_called_once_with(
         backend="gloo", store=store, world_size=4, rank=0, timeout=timedelta(minutes=37)
     )

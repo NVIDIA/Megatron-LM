@@ -210,10 +210,6 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
     )
 
 
-# define spiky loss as a loss that's 10x the max loss observed
-SPIKY_LOSS_FACTOR = 10
-
-
 @lru_cache(maxsize=1)
 def _build_cached_logits_loss_func(
     logprobs_dir,
@@ -301,7 +297,7 @@ def loss_func(
             result=loss,
             rejection_func=partial(
                 rerun_state_machine.is_unexpectedly_large,
-                threshold=SPIKY_LOSS_FACTOR,
+                threshold=cfg.rerun_state_machine.spiky_loss_factor,
                 context="loss",
             ),
             message="Spiky loss",

@@ -416,10 +416,17 @@ class PretrainConfigContainer(ConfigContainerBase):
             return
         # Iteration-based training.
         if self.train.train_iters:
-            if self.scheduler.lr_decay_iters is None:
+            horizon = self.scheduler.max_steps
+            if horizon is not None:
+                self.scheduler.lr_decay_iters = horizon
+                if self.scheduler.lr_decay_style == "WSD" and self.scheduler.lr_wsd_decay_iters is None:
+                    self.scheduler.lr_wsd_decay_iters = horizon
+            elif self.scheduler.lr_decay_iters is None:
                 self.scheduler.lr_decay_iters = self.train.train_iters
             self.scheduler.lr_decay_steps = self.scheduler.lr_decay_iters * self.train.global_batch_size
-            self.scheduler.wd_incr_steps = self.train.train_iters * self.train.global_batch_size
+            self.scheduler.wd_incr_steps = (
+                self.train.train_iters if horizon is None else horizon
+            ) * self.train.global_batch_size
             self.scheduler.wsd_decay_steps = None
             if self.scheduler.lr_wsd_decay_iters is not None:
                 self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
