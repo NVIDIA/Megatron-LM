@@ -400,6 +400,24 @@ def select_routed_mxfp8_active_rows(
     return full_rows, "full"
 
 
+def routed_mxfp8_launch_rows(
+    num_tokens: int, top_k: int, num_local_experts: int, padded_hidden_size: int
+) -> int:
+    """Return the rows to launch routed MXFP8 MoE with: num_tokens, plus any unrouted padding.
+
+    FlashInfer 0.7.2's TRT-LLM launcher picks its batched-GEMM tile from the average rows
+    per local expert, num_tokens * top_k / num_local_experts (computeSelectedTileN and
+    selectDefaultTileN in trtllm_fused_moe_kernel_launcher.cu). An average of 64 or less
+    selects a tile of at most 32 rows, which has no kernel config at an expert hidden size
+    that pads to 128 ("No valid config found for the given problem shape"). Such a launch
+    is padded to the fewest rows that average more than 64. The count depends only on
+    shapes, so CUDA graphs keep fixed shapes.
+    """
+    if padded_hidden_size != 128 or num_tokens * top_k > 64 * num_local_experts:
+        return num_tokens
+    return 64 * num_local_experts // top_k + 1
+
+
 def flashinfer_cutlass_mxfp8_moe(
     hidden_states: torch.Tensor,
     routing_map: torch.Tensor,
@@ -482,8 +500,29 @@ def flashinfer_routed_mxfp8_moe_prequantized(
     top_k: int,
     activation_type: int,
 ) -> torch.Tensor:
-    """Launch routed MXFP8 MoE with prequantized input and packed routing."""
+    """Launch routed MXFP8 MoE with prequantized input and packed routing.
+
+    Rows of zeros routed to expert -1 pad the launch to routed_mxfp8_launch_rows; the
+    output has only the input's rows.
+    """
     require_flashinfer_routed_mxfp8()
+    num_tokens = quantized_hidden.shape[0]
+    launch_rows = routed_mxfp8_launch_rows(
+        num_tokens, top_k, fc1_weight.data.shape[0], fc1_weight.padded_cols
+    )
+    if launch_rows > num_tokens:
+        padding = launch_rows - num_tokens
+        quantized_hidden = torch.cat(
+            [quantized_hidden, quantized_hidden.new_zeros(padding, *quantized_hidden.shape[1:])]
+        )
+        hidden_scale = torch.cat(
+            [hidden_scale, hidden_scale.new_zeros(padding, *hidden_scale.shape[1:])]
+        )
+        unrouted = pack_routed_mxfp8_routing(
+            packed_routing.new_full((padding, top_k), -1),
+            torch.ones(padding, top_k, device=packed_routing.device),
+        )
+        packed_routing = torch.cat([packed_routing, unrouted])
     output = trtllm_fp8_block_scale_routed_moe(
         topk_ids=packed_routing,
         routing_bias=None,
@@ -507,11 +546,11 @@ def flashinfer_routed_mxfp8_moe_prequantized(
         use_shuffled_weight=True,
         weight_layout=WeightLayout.MajorK.value,
         do_finalize=True,
-        tune_max_num_tokens=max(quantized_hidden.shape[0], 128),
+        tune_max_num_tokens=max(launch_rows, 128),
         fp8_quantization_type=Fp8QuantizationType.MxFp8,
         activation_type=activation_type,
     )
-    return _unwrap_output(output)[:, : fc2_weight.logical_rows]
+    return _unwrap_output(output)[:num_tokens, : fc2_weight.logical_rows]
 
 
 def flashinfer_routed_mxfp8_moe(

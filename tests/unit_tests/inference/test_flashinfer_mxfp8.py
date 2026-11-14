@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -173,6 +174,102 @@ def test_cutlass_mxfp8_uses_full_rows_and_preserves_output_buffer(monkeypatch):
     assert "swiglu_limit" not in captured["kwargs"]
 
 
+@pytest.mark.parametrize(
+    ("hidden_size", "num_tokens", "top_k", "launch_rows"),
+    [
+        # Four local experts: FlashInfer's tile has a config once a launch averages more than
+        # 64 rows per local expert, i.e. has more than 256 routes.
+        (128, 1, 1, 257),
+        (128, 256, 1, 257),
+        (128, 257, 1, 257),
+        (128, 2, 2, 129),
+        (128, 128, 2, 129),
+        (128, 129, 2, 129),
+        (128, 1, 3, 86),
+        # Zero-padded to 128.
+        (96, 8, 2, 129),
+        # Hidden sizes that pad past 128 launch as they are.
+        (256, 1, 2, 1),
+        (160, 8, 2, 8),
+    ],
+)
+def test_routed_mxfp8_pads_small_launches_at_hidden_128(
+    monkeypatch, hidden_size, num_tokens, top_k, launch_rows
+):
+    """At an expert hidden size that pads to 128, a launch averaging 64 rows or fewer per local
+    expert gets zero rows routed to expert -1, up to the fewest rows averaging more than 64. Only
+    the input's rows reach the output, and the output buffer's other rows keep their values."""
+    monkeypatch.setattr(flashinfer_mxfp8_module, "HAVE_FLASHINFER_ROUTED_MXFP8", True)
+    monkeypatch.setattr(
+        flashinfer_mxfp8_module, "Fp8QuantizationType", SimpleNamespace(MxFp8=0), raising=False
+    )
+    monkeypatch.setattr(
+        flashinfer_mxfp8_module,
+        "WeightLayout",
+        SimpleNamespace(MajorK=SimpleNamespace(value=0)),
+        raising=False,
+    )
+    launched = {}
+
+    def fake_quantize(hidden_states, is_sf_swizzled_layout):
+        scale = torch.full((hidden_states.numel() // 32,), 127, dtype=torch.uint8)
+        return hidden_states.to(torch.float8_e4m3fn), scale
+
+    def fake_routed_moe(*, topk_ids, hidden_states, hidden_states_scale, gemm2_weights, **kwargs):
+        launched.update(routing=topk_ids, hidden=hidden_states, scale=hidden_states_scale)
+        # Row i of the output holds i + 1, so the padding rows are visible if they leak.
+        rows = torch.arange(1, topk_ids.shape[0] + 1, dtype=torch.float32)
+        return [rows[:, None].expand(-1, gemm2_weights.shape[1]).contiguous()]
+
+    monkeypatch.setattr(flashinfer_mxfp8_module, "mxfp8_quantize", fake_quantize, raising=False)
+    monkeypatch.setattr(
+        flashinfer_mxfp8_module, "trtllm_fp8_block_scale_routed_moe", fake_routed_moe, raising=False
+    )
+
+    def weight(rows, cols):
+        padded_rows, padded_cols = -(-rows // 128) * 128, -(-cols // 128) * 128
+        return flashinfer_mxfp8_module.FlashInferRoutedMXFP8Weight(
+            data=torch.empty(4, padded_rows, padded_cols, dtype=torch.float8_e4m3fn),
+            scale=torch.empty(4, padded_rows * padded_cols // 32, dtype=torch.uint8),
+            logical_rows=rows,
+            logical_cols=cols,
+            padded_rows=padded_rows,
+            padded_cols=padded_cols,
+        )
+
+    # Three rows past the bounded prefix, which must not be processed either.
+    total_rows = num_tokens + 3
+    routing_map = torch.arange(total_rows * top_k).reshape(total_rows, top_k) % 4
+    output = torch.full((total_rows, hidden_size), -1.0)
+
+    result = flashinfer_mxfp8_module.flashinfer_routed_mxfp8_moe(
+        torch.ones(total_rows, hidden_size, dtype=torch.bfloat16),
+        routing_map,
+        torch.full((total_rows, top_k), 0.5),
+        weight(128, hidden_size),
+        weight(hidden_size, 128),
+        num_experts=4,
+        local_expert_offset=0,
+        activation_type=6,
+        out=output,
+        token_capacity=num_tokens,
+        use_bounded_rows=True,
+    )
+
+    assert launched["routing"].shape == (launch_rows, top_k)
+    assert torch.equal(launched["routing"][:num_tokens] >> 16, routing_map[:num_tokens].int())
+    assert (launched["routing"][num_tokens:] >> 16 == -1).all()
+    assert launched["hidden"].shape[0] == launched["scale"].shape[0] == launch_rows
+    assert (launched["hidden"][:num_tokens, :hidden_size].view(torch.uint8) != 0).all()
+    assert (launched["hidden"][num_tokens:].view(torch.uint8) == 0).all()
+    assert (launched["scale"][:num_tokens] == 127).all()
+    assert (launched["scale"][num_tokens:] == 0).all()
+    assert result is output
+    rows = torch.arange(1, num_tokens + 1, dtype=torch.float32)
+    assert torch.equal(output[:num_tokens], rows[:, None].expand(-1, hidden_size))
+    assert (output[num_tokens:] == -1).all()
+
+
 def _make_bounded_mxfp8_config(**overrides):
     kwargs = dict(
         num_layers=1,
@@ -293,6 +390,80 @@ def test_flashinfer_clamped_relu2_rejects_unsupported_options(overrides, message
     kwargs.update(overrides)
     with pytest.raises(ValueError, match=message):
         _make_bounded_mxfp8_config(**kwargs)
+
+
+@pytest.mark.parametrize(
+    ("parallel", "moe_ffn_hidden_size", "shard"),
+    [
+        # Expert TP defaults to TP.
+        ({"tensor_model_parallel_size": 2, "expert_tensor_parallel_size": None}, 1920, 960),
+        ({"expert_tensor_parallel_size": 2}, 1920, 960),
+        ({"expert_tensor_parallel_size": 4}, 384, 96),
+    ],
+)
+def test_flashinfer_cutlass_mxfp8_rejects_unaligned_expert_tp_shards(
+    parallel, moe_ffn_hidden_size, shard
+):
+    """A 128-aligned FFN whose expert-TP shards are not is rejected when configured, rather than
+    when the first forward packs the shard's CUTLASS MXFP8 weights."""
+    assert moe_ffn_hidden_size % 128 == 0 and shard % 128
+    with pytest.raises(ValueError, match="per-rank FFN dimensions divisible by 128"):
+        _make_bounded_mxfp8_config(
+            **parallel,
+            moe_ffn_hidden_size=moe_ffn_hidden_size,
+            activation_func_tanh_clamp_scale=16.0,
+            inference_flashinfer_mxfp8_token_capacity=None,
+        )
+
+
+@pytest.mark.parametrize("expert_tensor_parallel_size", [1, 2])
+def test_flashinfer_cutlass_mxfp8_accepts_aligned_expert_tp_shards(
+    monkeypatch, expert_tensor_parallel_size
+):
+    """Each expert-TP rank's FC1 [E, F/ETP, H] and FC2 [E, H, F/ETP] shards pack."""
+    monkeypatch.setattr(flashinfer_mxfp8_module, "HAVE_FLASHINFER_CUTLASS_MXFP8", True)
+    config = _make_bounded_mxfp8_config(
+        expert_tensor_parallel_size=expert_tensor_parallel_size,
+        moe_ffn_hidden_size=256,
+        activation_func_tanh_clamp_scale=16.0,
+        inference_flashinfer_mxfp8_token_capacity=None,
+    )
+    shard = config.moe_ffn_hidden_size // config.expert_tensor_parallel_size
+    for rows, cols in ((shard, config.hidden_size), (config.hidden_size, shard)):
+        weight = MXFP8Tensor(
+            data=torch.zeros(2, rows, cols, dtype=torch.float8_e4m3fn),
+            scale=torch.full((2, rows * cols // 32), 127, dtype=torch.uint8).view(
+                torch.float8_e8m0fnu
+            ),
+            backend="triton",
+        )
+        assert prepare_cutlass_mxfp8_weights(weight).logical_rows == rows
+
+
+def test_flashinfer_cutlass_mxfp8_experts_reject_a_resharded_config(monkeypatch):
+    """RL builds its inference model from a copy of the training config whose expert TP it changes
+    after validation. The experts check the shard they are built with, before any forward."""
+    from megatron.core.transformer.moe import experts as experts_module
+
+    config = _make_bounded_mxfp8_config(
+        moe_ffn_hidden_size=1920,
+        activation_func_tanh_clamp_scale=16.0,
+        inference_flashinfer_mxfp8_token_capacity=None,
+    )
+    inference_config = copy.deepcopy(config)
+    inference_config.expert_tensor_parallel_size = 2
+    monkeypatch.setattr(
+        experts_module.TEGroupedMLP,
+        "__init__",
+        lambda self, *args, **kwargs: torch.nn.Module.__init__(self),
+    )
+
+    with pytest.raises(ValueError, match="per-rank FFN dimensions divisible by 128"):
+        experts_module.InferenceGroupedMLP(
+            num_local_experts=1, config=inference_config, submodules=None
+        )
+    # The training layout's 1920-wide shard is aligned.
+    config.validate_flashinfer_cutlass_mxfp8_expert_shapes()
 
 
 def test_flashinfer_clamp_limit_remains_fp32_after_module_conversion():
@@ -454,6 +625,18 @@ def _blackwell_or_newer() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
 
 
+def _prepare_routed_mxfp8_weight(weight: torch.Tensor):
+    """Quantize a BF16 [E, M, K] expert stack to MCore MXFP8 and repack it for FlashInfer."""
+    quantized = [MXFP8Tensor.from_bf16(expert, backend="triton") for expert in weight]
+    stacked = MXFP8Tensor(
+        data=torch.stack([expert.data for expert in quantized]).contiguous(),
+        scale=torch.stack([expert.scale for expert in quantized]).contiguous(),
+        backend="triton",
+        dtype=torch.bfloat16,
+    )
+    return flashinfer_mxfp8_module.prepare_routed_mxfp8_weights(stacked)
+
+
 @pytest.mark.skipif(
     not HAVE_FLASHINFER_ROUTED_MXFP8 or not _blackwell_or_newer(),
     reason="FlashInfer routed MXFP8 requires Blackwell and FlashInfer >= 0.6.4",
@@ -461,31 +644,17 @@ def _blackwell_or_newer() -> bool:
 @pytest.mark.parametrize("local_expert_offset", [0, 2, 4, 6])
 def test_flashinfer_routed_mxfp8_is_batch_invariant(local_expert_offset):
     """A token's local-EP output must not depend on its batch or row position."""
-    from megatron.core.inference.moe.flashinfer_mxfp8 import (
-        flashinfer_routed_mxfp8_moe,
-        prepare_routed_mxfp8_weights,
-    )
-    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+    from megatron.core.inference.moe.flashinfer_mxfp8 import flashinfer_routed_mxfp8_moe
 
     torch.manual_seed(1234)
     num_experts, hidden_size, intermediate_size, topk = 8, 256, 256, 2
 
-    def _prepare_weight(weight: torch.Tensor):
-        quantized = [MXFP8Tensor.from_bf16(expert, backend="triton") for expert in weight]
-        stacked = MXFP8Tensor(
-            data=torch.stack([expert.data for expert in quantized]).contiguous(),
-            scale=torch.stack([expert.scale for expert in quantized]).contiguous(),
-            backend="triton",
-            dtype=torch.bfloat16,
-        )
-        return prepare_routed_mxfp8_weights(stacked)
-
-    fc1_weight = _prepare_weight(
+    fc1_weight = _prepare_routed_mxfp8_weight(
         torch.randn(
             num_experts, intermediate_size, hidden_size, device="cuda", dtype=torch.bfloat16
         )[local_expert_offset : local_expert_offset + 2]
     )
-    fc2_weight = _prepare_weight(
+    fc2_weight = _prepare_routed_mxfp8_weight(
         torch.randn(
             num_experts, hidden_size, intermediate_size, device="cuda", dtype=torch.bfloat16
         )[local_expert_offset : local_expert_offset + 2]
@@ -529,6 +698,63 @@ def test_flashinfer_routed_mxfp8_is_batch_invariant(local_expert_offset):
         for expert in target_experts.tolist()
     ):
         assert torch.count_nonzero(output_alone).item() == 0
+
+
+def _routed_mxfp8_problem(hidden_size, ffn_hidden_size, num_tokens, num_experts=4, topk=2):
+    fc1 = torch.randn(num_experts, ffn_hidden_size, hidden_size, device="cuda") / 16
+    fc2 = torch.randn(num_experts, hidden_size, ffn_hidden_size, device="cuda") / 16
+    hidden_states = torch.randn(num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16)
+    routing_map = torch.rand(num_tokens, num_experts, device="cuda").argsort(dim=1)[:, :topk]
+    probs = torch.rand(num_tokens, topk, device="cuda", dtype=torch.float32)
+    return fc1.bfloat16(), fc2.bfloat16(), hidden_states, routing_map, probs
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.skipif(not _blackwell_or_newer(), reason="FlashInfer routed MXFP8 needs Blackwell")
+@pytest.mark.parametrize("topk", [1, 2])
+@pytest.mark.parametrize("rows_per_expert", [1, 8, 64])
+def test_flashinfer_routed_mxfp8_runs_small_launches_at_hidden_128(rows_per_expert, topk):
+    """Experts with hidden and FFN 128 run launches of up to 64 rows per local expert, for which
+    FlashInfer's own tile choice has no kernel config ("No valid config found for the given problem
+    shape"), and match a reference computed with the unquantized weights. The padding rows reach
+    neither the output nor the rows of the output buffer past the input's."""
+    torch.manual_seed(1234)
+    num_experts, hidden_size, ffn_hidden_size = 4, 128, 128
+    num_tokens = rows_per_expert * num_experts // topk
+    fc1, fc2, hidden_states, routing_map, probs = _routed_mxfp8_problem(
+        hidden_size, ffn_hidden_size, num_tokens, num_experts, topk
+    )
+    fc1_weight, fc2_weight = _prepare_routed_mxfp8_weight(fc1), _prepare_routed_mxfp8_weight(fc2)
+
+    def run(**kwargs):
+        return flashinfer_mxfp8_module.flashinfer_routed_mxfp8_moe(
+            hidden_states,
+            routing_map,
+            probs,
+            fc1_weight,
+            fc2_weight,
+            num_experts=num_experts,
+            local_expert_offset=0,
+            activation_type=6,
+            **kwargs,
+        )
+
+    out = torch.full((num_tokens + 8, hidden_size), float("nan"), device="cuda")
+    with torch.no_grad():
+        output = run()
+        assert run(out=out) is out
+
+    reference = torch.zeros(num_tokens, hidden_size, device="cuda")
+    for k in range(topk):
+        experts = routing_map[:, k]
+        fc1_output = torch.bmm(fc1[experts].float(), hidden_states.float()[:, :, None])
+        fc2_output = torch.bmm(fc2[experts].float(), torch.relu(fc1_output).square())
+        reference += probs[:, k, None] * fc2_output.squeeze(-1)
+    assert output.shape == (num_tokens, hidden_size)
+    similarity = F.cosine_similarity(output.float(), reference, dim=-1)
+    assert similarity.min() > 0.98, f"lowest per-token cosine similarity {similarity.min()}"
+    assert torch.equal(out[:num_tokens], output.float())
+    assert out[num_tokens:].isnan().all()
 
 
 @pytest.mark.parametrize("clamp_scale", [None, 16.0])

@@ -506,6 +506,62 @@ def test_flashinfer_routed_mxfp8_writeback_replays():
     )
 
 
+@pytest.mark.launch_on_gb200
+def test_flashinfer_routed_mxfp8_padded_launch_replays():
+    """A routed MXFP8 launch at expert hidden 128, padded with unrouted rows, replays exactly."""
+    from megatron.core.inference.moe.flashinfer_mxfp8 import (
+        HAVE_FLASHINFER_ROUTED_MXFP8,
+        flashinfer_routed_mxfp8_moe,
+        prepare_routed_mxfp8_weights,
+        routed_mxfp8_launch_rows,
+    )
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    if not HAVE_FLASHINFER_ROUTED_MXFP8 or torch.cuda.get_device_capability()[0] < 10:
+        pytest.skip("FlashInfer routed MXFP8 needs FlashInfer >= 0.6.4 and Blackwell")
+    seeded()
+    num_experts, tokens, hidden = 8, 64, 128
+
+    def weight(rows, cols):
+        experts = [
+            MXFP8Tensor.from_bf16(
+                torch.randn(rows, cols, device="cuda", dtype=torch.bfloat16), backend="triton"
+            )
+            for _ in range(num_experts)
+        ]
+        return prepare_routed_mxfp8_weights(
+            MXFP8Tensor(
+                data=torch.stack([e.data for e in experts]),
+                scale=torch.stack([e.scale for e in experts]),
+                backend="triton",
+            )
+        )
+
+    fc1, fc2 = weight(128, hidden), weight(hidden, 128)
+    assert routed_mxfp8_launch_rows(tokens, 1, num_experts, fc1.padded_cols) > tokens
+    x = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    routes = torch.randint(0, num_experts, (tokens, 1), device="cuda")
+    probs = torch.rand(tokens, 1, device="cuda")
+
+    def run(x):
+        return flashinfer_routed_mxfp8_moe(
+            x,
+            routes,
+            probs,
+            fc1,
+            fc2,
+            num_experts=num_experts,
+            local_expert_offset=0,
+            activation_type=6,
+        )
+
+    # One route per token keeps the finalize exact.
+    with torch.no_grad():
+        assert_replays_bit_exact(
+            run, (x,), backward=False, contention=True, what="padded routed MXFP8 MoE"
+        )
+
+
 # --- inference MoE permute / unpermute --------------------------------------------------------
 
 
