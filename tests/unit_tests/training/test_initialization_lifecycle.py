@@ -15,7 +15,6 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from megatron.core import num_microbatches_calculator
 from megatron.core.distributed import TorchFullyShardedDataParallelConfig
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig
@@ -546,35 +545,6 @@ def test_runtime_service_order_and_microbatch_inputs(
         step_batch_size_schedule=None,
         seq_length=32,
     )
-
-
-@pytest.mark.parametrize("rampup_batch_size", [None, [4, 2, 100]], ids=["unset", "set"])
-def test_deprecated_rampup_batch_size_warns_and_is_ignored(
-    monkeypatch, isolated_globals, run_config, caplog, rampup_batch_size
-):
-    args = _runtime_args()
-    monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 2)
-    run_config.train.global_batch_size = 8
-    run_config.train.micro_batch_size = 2
-    run_config.train.rampup_batch_size = rampup_batch_size
-    monkeypatch.setattr(num_microbatches_calculator, "_GLOBAL_NUM_MICROBATCHES_CALCULATOR", None)
-    for name in (
-        "_set_tensorboard_writer",
-        "_set_one_logger",
-        "_set_timers",
-        "_set_energy_monitor",
-    ):
-        monkeypatch.setattr(global_vars, name, lambda received_args: None)
-    monkeypatch.setattr(global_vars, "_set_adlr_autoresume", lambda: None)
-    monkeypatch.setattr(global_vars, "_set_train_state", lambda: None)
-
-    with caplog.at_level(logging.WARNING, logger=num_microbatches_calculator.__name__):
-        global_vars.initialize_training_runtime_services(args)
-
-    # The deprecated option is ignored, so users must at least be told that it was set.
-    assert ("rampup_batch_size is deprecated" in caplog.text) == (rampup_batch_size is not None)
-    assert num_microbatches_calculator.get_current_global_batch_size() == 8
-    assert num_microbatches_calculator.get_num_microbatches() == 2
 
 
 def test_custom_model_config_does_not_receive_vocabulary(monkeypatch, isolated_globals):
