@@ -1090,21 +1090,6 @@ def _te_unpatch_for_batch_invariant():
     _te_unpatch_general_grouped_gemm()
 
 
-def _extract_te_gemm_args(args: tuple, kwargs: Dict[str, Any]):
-    """Utility to parse TE general_gemm flexible signature.
-
-    Returns (A, B, out_dtype, layout, out, bias, grad).
-    """
-    A = args[0] if len(args) > 0 else kwargs.get("A")
-    B = args[1] if len(args) > 1 else kwargs.get("B")
-    out_dtype = kwargs.get("out_dtype")
-    layout = kwargs.get("layout", "TN")
-    out = kwargs.get("out")
-    bias = kwargs.get("bias")
-    grad = kwargs.get("grad", False)
-    return A, B, out_dtype, layout, out, bias, grad
-
-
 def _is_supported_dtype_for_bik(t: torch.dtype) -> bool:
     return t in {torch.float16, torch.bfloat16, torch.float32}
 
@@ -1129,6 +1114,11 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         assert isinstance(layout, str) and len(layout) == 2, f"Unsupported layout: {layout}"
         transa = layout[0].upper() == "T"
         transb = layout[1].upper() == "T"
+        # TE flattens both operands to 2D before applying the layout's transposes, and its
+        # output keeps B's leading dims unless B is transposed (getGemmOutputShape).
+        ctx.a_shape, ctx.b_shape = A.shape, B.shape
+        out_leading_shape = None if transb else B.shape[:-1]
+        A, B = A.reshape(-1, A.shape[-1]), B.reshape(-1, B.shape[-1])
 
         opA = A.transpose(0, 1) if transa else A  # [K, O] or [I, O]
         # Triton's persistent GEMM consumes the operand strides directly. A
@@ -1149,7 +1139,7 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
 
         # Flatten all leading dims of opB except the last feature dim to match TE behavior
         if opB.dim() >= 2:
-            leading_shape = opB.shape[:-1]
+            leading_shape = opB.shape[:-1] if out_leading_shape is None else out_leading_shape
             K = opB.shape[-1]
             opB_2d = opB.reshape(-1, K)
         else:
@@ -1230,7 +1220,7 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         else:
             dbias = None
 
-        return dA, dB, dbias, None, None
+        return dA.reshape(ctx.a_shape), dB.reshape(ctx.b_shape), dbias, None, None
 
 
 def _te_apply_normalization_patched(
@@ -1299,21 +1289,49 @@ def _te_apply_normalization_patched(
     return ln_out, None, rsigma.squeeze(-1)
 
 
+@lru_cache(maxsize=None)
+def _te_general_gemm_parameters(general_gemm) -> tuple:
+    """Parameter names of TE's general_gemm, in order, and their defaults."""
+    import inspect
+
+    params = inspect.signature(general_gemm).parameters
+    defaults = {name: p.default for name, p in params.items() if p.default is not p.empty}
+    return tuple(params), defaults
+
+
+@lru_cache(maxsize=None)
+def _te_quantized_tensor_types() -> tuple:
+    """TE's quantized tensor base classes (renamed across TE releases)."""
+    te_tensor = _import_module_if_available("transformer_engine.pytorch.tensor")
+    names = ("QuantizedTensorStorage", "QuantizedTensorBase")
+    return tuple(getattr(te_tensor, name) for name in names if hasattr(te_tensor, name))
+
+
 def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
+    """Batch-invariant replacement for TE general_gemm.
+
+    Computes ``alpha * op(A) @ op(B) + beta * out + bias`` like TE, with the product from
+    the batch-invariant GEMM. ``accumulate`` adds into ``out``, for example a weight
+    gradient into an fp32 ``main_grad`` (``beta`` defaults to 1, as in TE), and
+    ``alpha``/``beta`` scale the product and ``out``; None means TE's default for both.
+    A weight gradient into fp32 keeps the kernel's fp32 accumulator whether or not it
+    accumulates; other calls without alpha or accumulate run the plain GEMM as before.
+    Calls it cannot serve (GELU fusion, output quantization, quantized operands,
+    Userbuffers overlap) fail rather than run TE's cuBLASLt GEMM; TransformerConfig
+    rejects the configurations that lead to them where it can. Returns (gemm_out,
+    bias_grad, gelu_input, extra_output) like TE.
     """
-    Batch-invariant replacement for TE general_gemm.
-    Returns a list of tensors to match TE's API: (gemm_out, bias_grad, gelu_input, extra_output)
-    """
-    global _TE_GENERAL_GEMM_ORIG
-    # If original not captured, do nothing
     if _TE_GENERAL_GEMM_ORIG is None:
         raise RuntimeError("TE general_gemm original not captured; patching order issue")
-
-    A, B, out_dtype, layout, out, bias, grad = _extract_te_gemm_args(args, kwargs)
-    extra_output = kwargs.get("extra_output", None)
-    ub = kwargs.get("ub", None)
-    ub_type = kwargs.get("ub_type", None)
-    bulk_overlap = kwargs.get("bulk_overlap", False)
+    names, defaults = _te_general_gemm_parameters(_TE_GENERAL_GEMM_ORIG)
+    unknown = set(kwargs) - set(names)
+    if len(args) > len(names) or unknown:
+        raise TypeError(f"general_gemm got unexpected arguments {sorted(unknown)}")
+    p = dict(defaults)
+    p.update(zip(names, args))
+    p.update(kwargs)
+    A, B, out_dtype, layout = p["A"], p["B"], p["out_dtype"], p["layout"]
+    out, bias, grad, accumulate = p["out"], p["bias"], p["grad"], p["accumulate"]
 
     # Guardrails: validate inputs
     if A is None or B is None:
@@ -1322,16 +1340,64 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
         raise RuntimeError("Batch-invariant GEMM requires CUDA tensors.")
     if not _is_supported_dtype_for_bik(A.dtype) or not _is_supported_dtype_for_bik(B.dtype):
         raise RuntimeError(f"Unsupported dtype for batch-invariant GEMM: {A.dtype}, {B.dtype}")
-
+    quantized = _te_quantized_tensor_types()
+    if (
+        isinstance(A, quantized)
+        or isinstance(B, quantized)
+        or p.get("quantization_params") is not None
+        or p.get("gelu")
+    ):
+        raise RuntimeError(
+            "Batch-invariant GEMM does not support quantized operands, output quantization "
+            "or GELU fusion; quantized modules need batch_invariant_backend='te_native'."
+        )
     # Disallow GEMM-comm overlap in batch-invariant mode
-    if extra_output is not None or ub is not None or ub_type is not None or bulk_overlap:
+    extra_output = p.get("extra_output")
+    if (
+        extra_output is not None
+        or p.get("ub") is not None
+        or p.get("ub_type") is not None
+        or p.get("bulk_overlap")
+    ):
         raise RuntimeError(
             "Batch-invariant GEMM does not support Userbuffers/overlap "
             "(extra_output/ub/ub_type/bulk_overlap)."
         )
+    # TE treats a None alpha as 1 and a None beta as 1 when accumulating, else 0.
+    alpha = 1.0 if p.get("alpha") is None else float(p["alpha"])
+    beta = p.get("beta")
+    if accumulate:
+        beta = 1.0 if beta is None else float(beta)
+    elif beta not in (None, 0, 0.0):
+        raise ValueError("beta must be zero unless the GEMM accumulates into out.")
+    if accumulate and out is None:
+        raise ValueError("Accumulating GEMM requires an out tensor.")
 
-    # Compute via autograd-aware function matching TE's layout semantics
-    result = BatchInvariantTEGemmFn.apply(A, B, bias if not grad else None, out_dtype, layout)
+    epilogue_bias = bias if not grad else None
+    result_dtype = out.dtype if out is not None else (out_dtype or A.dtype)
+    if result_dtype == torch.float32 and (grad or accumulate):
+        # A weight gradient into fp32 (main_grad), accumulated or not: the product is kept in
+        # fp32 and combined into out in place, as TE does, with no main_grad-sized temporaries.
+        result = _te_gemm_product_fp32(A, B, layout)
+        if alpha != 1.0:
+            result.mul_(alpha)
+        if epilogue_bias is not None:
+            result.add_(epilogue_bias)
+        if accumulate:
+            if beta != 1.0:
+                out.mul_(beta)
+            result = out.add_(result.reshape(out.shape))
+    elif alpha == 1.0 and not accumulate:
+        # Compute via autograd-aware function matching TE's layout semantics
+        result = BatchInvariantTEGemmFn.apply(A, B, epilogue_bias, out_dtype, layout)
+    else:
+        # D = alpha * product + beta * out + bias, combined in fp32 and rounded once.
+        result = alpha * BatchInvariantTEGemmFn.apply(A, B, None, None, layout).float()
+        if epilogue_bias is not None:
+            result = result + epilogue_bias.float()
+        if accumulate:
+            result = result + beta * out.float().reshape(result.shape)
+        result = result.to(result_dtype)
 
     bias_grad = None
     if grad and bias is not None:
@@ -1340,10 +1406,29 @@ def _te_general_gemm_patched(*args, **kwargs) -> List[torch.Tensor]:
         bias_grad = B_flat.sum(dim=0)  # Sum over batch/sequence, keeping output dim
 
     if out is not None:
-        out.copy_(result)
+        if result is not out:
+            out.copy_(result.reshape(out.shape))
         # TE expects (gemm_out, bias_grad, gelu_input, extra_output)
         return (out, bias_grad, None, extra_output)
     return (result, bias_grad, None, extra_output)
+
+
+def _te_gemm_product_fp32(A: torch.Tensor, B: torch.Tensor, layout: str) -> torch.Tensor:
+    """``op(B) @ op(A)`` with TE's layout semantics, computed and returned in fp32.
+
+    Runs the batch-invariant persistent kernel on fp32 copies of the operands, in their
+    given (strided) layout. bf16 and fp16 values are exact in fp32 (and TF32), so the
+    products are exact and accumulate in fp32: the result is not rounded to bf16 before it
+    is added into an fp32 weight gradient.
+    """
+    # TE flattens both operands to 2D before applying the layout's transposes, and its output
+    # keeps B's leading dims unless B is transposed (getGemmOutputShape).
+    transb = layout[1].upper() == "T"
+    A2, B2 = A.reshape(-1, A.shape[-1]), B.reshape(-1, B.shape[-1])
+    opA = A2.transpose(0, 1) if layout[0].upper() == "T" else A2
+    opB = B2.transpose(0, 1) if transb else B2
+    product = matmul_persistent(opB.float(), opA.float())
+    return product if transb else product.reshape(*B.shape[:-1], opA.shape[-1])
 
 
 class BatchInvariantRMSNormFn(torch.autograd.Function):
