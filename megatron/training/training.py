@@ -834,7 +834,7 @@ def _dsv4_attention_flops(transformer_cfg, layer_counts, total_tokens, seqlen_sq
         if layer_counts[symbol]:
             config = copy.copy(transformer_cfg)
             config.compress_ratio = ratio
-            forward += layer_counts[symbol] * DSv4HybridSelfAttention.estimate_flops(
+            forward += layer_counts[symbol] * DSv4HybridSelfAttention._estimate_flops_from_config(
                 config,
                 total_real_tokens_in_batch=total_tokens,
                 seqlen_squared_sum_in_batch=seqlen_squared_sum,
@@ -904,7 +904,7 @@ def num_floating_point_operations(
         total_real_tokens_in_batch = batch_size * llm_seq_length
 
     def estimate(layer_type, config=None):
-        return layer_type.estimate_flops(
+        return layer_type._estimate_flops_from_config(
             legacy_config if config is None else config,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
@@ -962,7 +962,7 @@ def num_floating_point_operations(
                 num_indexers += parsed.mtp_num_depths * count_pattern(parsed.mtp_pattern)
 
         # The detached indexer has loss-dependent backward costs, unlike the layer's x3.
-        return num_indexers * DSAIndexer.estimate_flops(
+        return num_indexers * DSAIndexer._estimate_flops_from_config(
             transformer_cfg,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,

@@ -550,7 +550,7 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
     """
 
     @classmethod
-    def estimate_flops(
+    def _estimate_flops_from_config(
         cls,
         config: MLATransformerConfig,
         *,

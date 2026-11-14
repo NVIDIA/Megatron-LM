@@ -1677,6 +1677,23 @@ class MultiTokenPredictionLayer(MegatronModule):
                     setattr(self.hc_head_scale, "sequence_parallel", True)
         self.offload_context = nullcontext()
 
+    def estimate_flops(
+        self,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
+    ) -> float:
+        """Count the inner layer and this depth's norms and embedding projection."""
+        hidden_size = self.config.hidden_size
+        return self.mtp_model_layer.estimate_flops(
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+            include_backward=include_backward,
+        ) + (6 if include_backward else 2) * total_real_tokens_in_batch * (
+            3 * hidden_size + 2 * hidden_size**2
+        )
+
     def get_inner_quantization_context(self) -> AbstractContextManager:
         """Return the quantization context for fine-grained MTP execution."""
         if self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed:
@@ -2546,6 +2563,13 @@ class MultiTokenPredictionBlock(MegatronModule):
             # Tag MTP params so the optimizer can clip their gradients separately.
             for param in self.parameters():
                 param.grad_norm_group = 'mtp'
+
+    def estimate_flops(self, **kwargs) -> float:
+        """Count each prediction depth, including repeated uses of a shared layer."""
+        return sum(
+            self.layers[0 if self.mtp_use_repeated_layer else depth].estimate_flops(**kwargs)
+            for depth in range(self.config.mtp_num_layers)
+        )
 
     def prepare_cp_layout(
         self,

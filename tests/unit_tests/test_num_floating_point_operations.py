@@ -1092,7 +1092,7 @@ class TestDSAHelperEdgeCases:
         args, _ = _make_dsa_args(loss_coeff, sparse_loss)
         args.dsa_indexer_topk = topk
         assert (
-            DSAIndexer.estimate_flops(
+            DSAIndexer._estimate_flops_from_config(
                 args.transformer,
                 total_real_tokens_in_batch=256,
                 seqlen_squared_sum_in_batch=32768,
@@ -1164,7 +1164,7 @@ class TestDSAFlopsHelpers:
             args, total_tokens, sum_sq, num_dsa_layers=1, num_indexer_layers=0
         )
         expected = (total_tokens * token_term + sum_sq * core_term) / 3
-        assert DSAttention.estimate_flops(
+        assert DSAttention._estimate_flops_from_config(
             args.transformer,
             total_real_tokens_in_batch=total_tokens,
             seqlen_squared_sum_in_batch=sum_sq,
@@ -1380,7 +1380,7 @@ class TestDSAKPool:
         expected = 2 * length * (projections + 2 * 32 * compression) + 2 * length**2 * (
             4 * 32 * scoring
         )
-        flops = DSAIndexer.estimate_flops(
+        flops = DSAIndexer._estimate_flops_from_config(
             args.transformer,
             total_real_tokens_in_batch=2 * length,
             seqlen_squared_sum_in_batch=2 * length**2,
@@ -1414,7 +1414,7 @@ class TestDSAKPool:
         )
         compression = 2 * tokens * compression_scale * args.dsa_indexer_head_dim
         scoring = sum_sq * index_dim * scoring_scale
-        assert DSAIndexer.estimate_flops(
+        assert DSAIndexer._estimate_flops_from_config(
             args.transformer, total_real_tokens_in_batch=tokens, seqlen_squared_sum_in_batch=sum_sq
         ) == pytest.approx(projections + compression + scoring)
 
@@ -1486,7 +1486,7 @@ class TestDSAKPool:
         args, _ = _make_dsa_args()
         args.dsa_indexer_kpool = 4
         with pytest.raises(ValueError, match="indexer loss to be disabled"):
-            DSAIndexer.estimate_flops(
+            DSAIndexer._estimate_flops_from_config(
                 args.transformer,
                 total_real_tokens_in_batch=512,
                 seqlen_squared_sum_in_batch=131072,
@@ -1511,7 +1511,7 @@ class TestDSAKPool:
         args, _ = _make_dsa_args(dsa_indexer_loss_coeff=0)
         args.dsa_indexer_kpool = 4
         assert (
-            DSAIndexer.estimate_flops(
+            DSAIndexer._estimate_flops_from_config(
                 args.transformer, total_real_tokens_in_batch=0, seqlen_squared_sum_in_batch=0
             )
             == 0

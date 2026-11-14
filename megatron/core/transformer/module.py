@@ -78,23 +78,39 @@ class MegatronModule(torch.nn.Module):
         super().__init__()
         self.config = config
 
-    @classmethod
     def estimate_flops(
+        self,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+        include_backward: bool = False,
+    ) -> float:
+        """Estimate this module's work for one global batch.
+
+        Return forward FLOPs by default, or forward plus backward when requested.
+        Ordinary leaves reuse their config formula with a backward multiplier of three.
+        Composites and layers with different backward costs override this method.
+        Custom layers implement this method directly; no registration is required.
+
+        Estimates must be pure, finite, nonnegative real numbers. Do not construct
+        modules, mutate state, or run collectives. Count each child execution once.
+        """
+        forward = self._estimate_flops_from_config(
+            self.config,
+            total_real_tokens_in_batch=total_real_tokens_in_batch,
+            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+        )
+        return (3 if include_backward else 1) * forward
+
+    @classmethod
+    def _estimate_flops_from_config(
         cls,
         config: TransformerConfig,
         *,
         total_real_tokens_in_batch: float,
         seqlen_squared_sum_in_batch: float,
     ) -> float:
-        """Estimate this module's forward FLOPs for one global batch from its config.
-
-        Built-in and custom layers share this optional hook. It must be pure:
-        do not mutate the config, construct modules, or run collectives.
-        Return a finite nonnegative real number. Training accounts for repeated
-        layer executions and applies the forward/backward multiplier separately.
-
-        Include multiply/add operations, but exclude model-level work such as logits.
-        """
+        """Pure built-in leaf formula, also used by legacy config-only reporting."""
         raise NotImplementedError(
             f"{cls.__name__} must implement estimate_flops for layer FLOP accounting."
         )

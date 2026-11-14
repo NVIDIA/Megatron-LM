@@ -681,8 +681,16 @@ class MLASelfAttention(MultiLatentAttention):
     and returns output of the same size.
     """
 
+    def estimate_flops(self, *, include_backward: bool = False, **batch_stats: float) -> float:
+        """Include the constructed sparse core's indexer and optional backward work."""
+        if getattr(self.core_attention, "requires_dsa_inputs", False):
+            return getattr(self.core_attention, "estimate_flops")(
+                absorbed_mla=False, include_backward=include_backward, **batch_stats
+            )
+        return super().estimate_flops(include_backward=include_backward, **batch_stats)
+
     @classmethod
-    def estimate_flops(
+    def _estimate_flops_from_config(
         cls,
         config: MLATransformerConfig,
         *,
@@ -701,7 +709,7 @@ class MLASelfAttention(MultiLatentAttention):
         ):
             from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
 
-            return DSAttention.estimate_flops(
+            return DSAttention._estimate_flops_from_config(
                 config,
                 total_real_tokens_in_batch=total_real_tokens_in_batch,
                 seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
