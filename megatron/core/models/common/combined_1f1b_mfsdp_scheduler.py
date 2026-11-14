@@ -47,10 +47,11 @@ def post_fsdp_backward(module: FsdpModule) -> None:
     module.post_accumulate_grad()
 
 
-def reshard_fsdp_module(module: FsdpModule) -> None:
-    """Reshard the FSDP module after fine-grained computation."""
-    assert isinstance(module, FsdpModule), "Expected an FsdpModule."
-    module.reshard()
+def reshard_fsdp_modules(module: nn.Module) -> None:
+    """Reshard a layer and its independently sharded descendants after forward."""
+    units = [unit for unit in module.modules() if isinstance(unit, FsdpModule)]
+    for unit in reversed(units):
+        unit.reshard()
 
 
 def register_combined_1f1b_hooks(module: FsdpModule) -> None:
@@ -117,5 +118,5 @@ def register_fsdp_schedule_hooks(model: nn.Module, layer_plans) -> tuple[FsdpMod
             for unit in units:
                 post_fsdp_backward(unit)
 
-        plan.set_fsdp_reshard_hooks(reshard_fsdp_module, finish_layer)
+        plan.set_fsdp_reshard_hooks(reshard_fsdp_modules, finish_layer)
     return tuple(remaining)

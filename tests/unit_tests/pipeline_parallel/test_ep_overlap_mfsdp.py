@@ -162,6 +162,12 @@ def test_ep_overlap_mtp(distributed_setup, monkeypatch, delay_wgrad):
             reductions.clear()
             with wrapped.no_sync():
                 previous_loss = run_step(True, previous_loss)
+            if microbatch == 0:
+                # No backward has run yet: every layer, including its independent
+                # expert unit, must already have released its forward weights.
+                for unit in units:
+                    if not unit.is_root():
+                        assert all(not group._unshard_events for group in unit.parameter_groups)
             assert reductions == (expected_reductions if microbatch else {})
         reductions.clear()
         run_step(False, previous_loss)
@@ -254,12 +260,14 @@ def test_train_validate_train_reshards_and_matches_dense(distributed_setup, tied
 def test_schedule_finishes_shared_and_nested_units_once(repeated, wrapped):
     """Schedule boundaries own completion across GraphTasks, not parameter hooks."""
     reductions = []
+    releases = Counter()
 
     class Unit(nn.Module, FsdpModule):
         def __init__(self, name):
             nn.Module.__init__(self)
             self.label = name
             self.weight = nn.Parameter(torch.ones(()))
+            self.unsharded = False
 
         def forward(self, x):
             x = x * self.weight
@@ -271,10 +279,11 @@ def test_schedule_finishes_shared_and_nested_units_once(repeated, wrapped):
             return False
 
         def unshard(self):
-            pass
+            self.unsharded = True
 
         def reshard(self):
-            pass
+            self.unsharded = False
+            releases[self.label] += 1
 
         def post_accumulate_grad(self):
             reductions.append((self.label, self.weight.grad.item()))
@@ -285,6 +294,7 @@ def test_schedule_finishes_shared_and_nested_units_once(repeated, wrapped):
             self.layer = layer
 
         def set_fsdp_reshard_hooks(self, forward, backward):
+            self.finish_forward = lambda: forward(self.layer)
             self.finish = lambda: backward(self.layer)
 
     root, shared, expert, other = [Unit(name) for name in ("root", "shared", "expert", "other")]
@@ -305,6 +315,19 @@ def test_schedule_finishes_shared_and_nested_units_once(repeated, wrapped):
         if isinstance(unit, FsdpModule):
             assert not unit._backward_hooks
             assert not unit.weight._post_accumulate_grad_hooks
+
+    # Exercise the actual schedule callback: the outer layer's reshard must also
+    # release nested experts, including each repeated forward of a shared layer.
+    root.unshard()
+    for plan in plans:
+        with torch.no_grad():
+            plan.layer(torch.ones(()))
+        layer_units = [unit for unit in plan.layer.modules() if isinstance(unit, FsdpModule)]
+        assert all(unit.unsharded for unit in layer_units)
+        plan.finish_forward()
+        assert all(not unit.unsharded for unit in layer_units)
+    assert root.unsharded
+    assert releases == {"shared": 2 if repeated else 1, "expert": 2 if repeated else 1, "other": 1}
 
     # The tied root weight receives contributions before and after layer backward.
     (root.weight * 2).backward()
