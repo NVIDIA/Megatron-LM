@@ -134,6 +134,7 @@ def _forward_backward(model, main_grad_dtype=torch.float32, microbatches=1):
     iteration rather than a single microbatch.
     """
     from megatron.core.tensor_parallel.generalized_tensor_parallelism import (
+        finalize_gtp_forward_counts,
         wait_for_gtp_grad_reduction_on_current_stream,
     )
 
@@ -143,13 +144,15 @@ def _forward_backward(model, main_grad_dtype=torch.float32, microbatches=1):
     gen = torch.Generator(device='cuda').manual_seed(7)
     position_ids = torch.arange(SEQ, device='cuda').unsqueeze(0).expand(BATCH, SEQ)
     losses = []
-    for _ in range(microbatches):
+    for microbatch in range(microbatches):
         # Fresh data per microbatch: identical batches would hide an ordering bug.
         input_ids = torch.randint(0, VOCAB, (BATCH, SEQ), device='cuda', generator=gen)
         labels = torch.randint(0, VOCAB, (BATCH, SEQ), device='cuda', generator=gen)
         # TE rejects fp32 activations against bf16 params outside an autocast region.
         with torch.autocast(device_type='cuda', dtype=torch.bfloat16):
             loss = model(input_ids, position_ids, attention_mask=None, labels=labels).mean()
+        if microbatch == microbatches - 1:
+            finalize_gtp_forward_counts(model)
         loss.backward()
         losses.append(float(loss.item()))
     # The production fence. Without it an accumulated wgrad never flushes and main_grad stays 0.
@@ -389,8 +392,7 @@ def _worker_wgrad_accum_matches_per_backward_rs(
                 for p in model.parameters():
                     if isinstance(p, GTPShardedParam):
                         p._wgrad_accum_enabled = False
-            # The count is learned at the end of iteration 1, so the early flush is unreachable
-            # in a single-iteration test. Warm up, then measure the LAST iteration.
+            # Exercise fresh forward counts across multiple accumulation windows.
             for _ in range(iterations - 1):
                 _forward_backward(
                     model,
@@ -828,7 +830,7 @@ def _worker_dummy_wgrad_not_leaked(rank, world_size, port, repeated_layer=False)
 
 class TestGTPMTP:
     def test_wgrad_accum_steady_state(self):
-        # Iterations 2+ take the early flush; a single-iteration test never reaches it.
+        # Every iteration takes the early flush using its own forward count.
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_wgrad_accum_matches_per_backward_rs, 4, False, False, False, 1, 3)
