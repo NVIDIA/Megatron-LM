@@ -540,13 +540,14 @@ class TestDdpWrap:
         mock_stream_context.assert_called_once_with(shared_stream)
         mock_current_stream.return_value.wait_stream.assert_called_once_with(shared_stream)
 
+    @pytest.mark.parametrize("cuda_graph_impl", ["none", "local"])
     @patch("megatron.training.models.dist_utils.DistributedDataParallel")
     @patch("megatron.training.models.dist_utils.get_model_config")
     @patch("torch.cuda.stream", new_callable=MagicMock)
     @patch("torch.cuda.current_stream")
     @patch("torch.cuda.Stream")
     @patch("megatron.training.models.dist_utils.get_shared_capture_stream")
-    def test_uses_current_stream_when_cuda_graph_is_disabled(
+    def test_uses_current_stream_for_eager_and_local_cuda_graphs(
         self,
         mock_shared_stream,
         mock_stream,
@@ -554,11 +555,12 @@ class TestDdpWrap:
         mock_stream_context,
         mock_config,
         mock_ddp,
+        cuda_graph_impl,
     ):
         mock_stream_context.return_value.__enter__ = Mock(return_value=None)
         mock_stream_context.return_value.__exit__ = Mock(return_value=False)
         current_stream = mock_current_stream.return_value
-        mock_config.return_value.cuda_graph_impl = "none"
+        mock_config.return_value.cuda_graph_impl = cuda_graph_impl
 
         _ddp_wrap(self.model, False, self.ddp_config, False, pg_collection=self.pg)
 
@@ -567,7 +569,7 @@ class TestDdpWrap:
         mock_stream_context.assert_called_once_with(current_stream)
         current_stream.wait_stream.assert_not_called()
 
-    @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
+    @pytest.mark.parametrize("cuda_graph_impl", ["transformer_engine"])
     @patch("megatron.training.models.dist_utils.DistributedDataParallel")
     @patch("megatron.training.models.dist_utils.get_model_config")
     @patch("torch.cuda.stream", new_callable=MagicMock)

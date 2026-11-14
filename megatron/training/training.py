@@ -2401,9 +2401,12 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             # DDP initialization must use the full-iteration capture stream so its retained
             # AccumulateGrad nodes do not reference a different, non-capturing stream.
             ddp_stream = get_shared_capture_stream()
-        elif config.cuda_graph_impl == "none":
+        elif config.cuda_graph_impl in ("none", "local"):
             # Eager initialization is serialized with the current stream. A one-shot side stream
             # can leave cached blocks unavailable to later allocations on the current stream.
+            # Local CUDA graphs also need it: DDP retains every AccumulateGrad node, and a GTP
+            # weight's node receives no autograd grad, so autograd keeps this stream for the leaf
+            # sync at the end of a captured backward; create_bwd_graph joins only this stream.
             ddp_stream = current_stream
         else:
             # Preserve a dedicated initialization stream for all other implementations.

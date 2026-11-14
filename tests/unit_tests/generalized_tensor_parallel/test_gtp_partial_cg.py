@@ -400,7 +400,6 @@ def _worker_gtp_partial_cg_correctness(rank, world_size, port, partial_cg_module
 
 
 class TestGTPPartialCGCorrectness:
-    @pytest.mark.flaky_in_dev
     @pytest.mark.parametrize(
         "partial_cg_modules,opt_in_modules",
         [
@@ -411,11 +410,7 @@ class TestGTPPartialCGCorrectness:
     def test_gtp_partial_cg_loss_and_grad_norm_match_eager(
         self, partial_cg_modules, opt_in_modules
     ):
-        """Local-CG loss trajectory and global grad norm must match eager execution.
-
-        Flaky under a busy shared process (eager/replay drift or a rare Inf grad norm); cause
-        is unconfirmed, suspected GEMM algorithm-selection sensitivity to process-wide GPU state.
-        """
+        """Local-CG loss trajectory and global grad norm must match eager execution."""
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires at least 4 CUDA devices")
         _run_distributed(_worker_gtp_partial_cg_correctness, 4, partial_cg_modules, opt_in_modules)
