@@ -182,13 +182,18 @@ class FlashInferSampling(Sampling):
         top_k_safe = top_k.masked_fill(no_top_k, self._vocab_size)
         top_p_safe = top_p.masked_fill(no_top_p, 1.0)
 
-        probs = torch.softmax(scaled, dim=-1)
-        # Renormalize to the kept set (top-k first, then top-p) to match
-        renormed = flashinfer.sampling.top_k_renorm_probs(probs, top_k_safe)
-        renormed = flashinfer.sampling.top_p_renorm_probs(renormed, top_p_safe)
+        # Apply top-k to the logits, not to fp32 probabilities: a kept token whose
+        # probability underflows (log-probability below about -87) must keep its finite
+        # log-probability instead of becoming -inf.
+        top_k_log_probs = torch.log_softmax(
+            flashinfer.sampling.top_k_mask_logits(scaled, top_k_safe), dim=-1
+        )
+        # Then renormalize to the top-p nucleus. A token whose probability underflows lies
+        # far past any nucleus short of the whole vocabulary, so probabilities suffice here.
+        renormed = flashinfer.sampling.top_p_renorm_probs(top_k_log_probs.exp(), top_p_safe)
         # Unfiltered rows of a mixed batch bypass the renorm rounding entirely.
         return torch.where(
             (no_top_k & no_top_p).unsqueeze(1),
             torch.log_softmax(scaled, dim=-1),
-            torch.log(renormed),
+            torch.where(no_top_p.unsqueeze(1), top_k_log_probs, torch.log(renormed)),
         )
