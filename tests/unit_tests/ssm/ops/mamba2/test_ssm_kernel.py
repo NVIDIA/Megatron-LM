@@ -118,11 +118,12 @@ class TestMambaDynamicInference(unittest.TestCase):
         self.mixer.A_log = nn.Parameter(torch.randn(self.nheads, device=self.device))
         self.mixer.D = nn.Parameter(torch.ones(self.nheads, device=self.device))
 
-        # Bind methods, including the conv-parameter helpers both paths call.
+        # Bind methods, including the conv-parameter and D-layout helpers both paths call.
         self.mixer.training = False
         for name in (
             "ssm_prefill",
             "ssm_decode",
+            "get_ssm_D",
             "_get_conv_params",
             "_use_inference_param_caches",
         ):
