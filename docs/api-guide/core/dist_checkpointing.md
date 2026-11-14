@@ -145,6 +145,61 @@ Starting from mcore v0.17, asynchronous checkpoint saving is supported for `fsdp
 
 Note that async saving for these formats requires the `nvidia-resiliency-ext` package.
 
+## Checkpoint Filesystems
+
+Pass `filesystem=` to select storage for a complete `torch_dist` checkpoint:
+
+```python
+from megatron.core import dist_checkpointing
+from nvidia_resiliency_ext.checkpointing.filesystem import ArrowFileSystem
+
+
+def make_arrow_filesystem():
+    from pyarrow.fs import S3FileSystem
+
+    return S3FileSystem(region="us-east-1", background_writes=False)
+
+
+filesystem = ArrowFileSystem(make_arrow_filesystem, uri_scheme="s3")
+checkpoint_dir = "s3://example-checkpoints/run/step_100"
+dist_checkpointing.save(state, checkpoint_dir, filesystem=filesystem, verify_integrity=True)
+restored = dist_checkpointing.load(
+    target, checkpoint_dir, filesystem=filesystem, verify_integrity=True
+)
+```
+
+The selected filesystem handles sharded data, DCP metadata, `metadata.json`,
+legacy `common.pt`, integrity manifests, and checkpoint path operations. Metadata
+inspection and tensor-removal helpers also accept `filesystem=`. Fully parallel
+strategies forward the same filesystem to their underlying strategy.
+
+Omitting the argument preserves local and mounted NFS storage, or MSC when its
+existing feature flag is enabled. An explicit filesystem takes precedence over
+that flag. Default synchronous saves do not require NVRx. Asynchronous injection
+requires an NVRx version whose `FileSystemWriterAsync` accepts `filesystem`;
+unsupported versions raise before checkpoint preparation. Cached metadata reads
+with an injected filesystem also require a compatible NVRx reader.
+
+NVRx provides `LocalFileSystem`, `MultiStorageFileSystem`, and `ArrowFileSystem`.
+Custom implementations provide PyTorch DCP's `FileSystemBase` methods plus:
+
+```python
+def stat(path): ...       # "file", "directory", or "missing"
+def listdir(path): ...    # Immediate child names
+def sync(stream): ...    # Backend synchronization before close
+```
+
+Streams use binary modes. Reads must be seekable; writable streams do not need a
+file descriptor. Output close must complete the write and propagate errors.
+Filesystem objects used asynchronously must be pickleable and create native
+clients in the process that performs I/O. The Arrow factory above provides that
+ownership without serializing a live client. PyArrow and MSC remain optional.
+
+Pass URI strings unchanged. The adapter owns joining and native-path conversion.
+Keep a checkpoint immutable while readers are using it, and use one writer for
+each checkpoint file. An object-store rename does not provide a transaction
+across all checkpoint files.
+
 ## Subpackages
 
 ```{toctree}

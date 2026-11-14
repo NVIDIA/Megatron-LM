@@ -22,10 +22,13 @@ from megatron.core.dist_checkpointing.exchange_utils import (
     exchange_by_distribution,
     exchange_loaded_objects_gather_object,
 )
+from megatron.core.dist_checkpointing.filesystem import is_default_filesystem
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict, StateDict, is_main_replica
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
     TorchDistSaveShardedStrategy,
+    require_nvrx_filesystem_support,
+    strategy_filesystem_kwargs,
 )
 from megatron.core.dist_checkpointing.utils import (
     _sharded_object_id,
@@ -101,15 +104,23 @@ class FullyParallelSaveStrategyWrapper:
 
         self.cached_distribution: Optional[ShardDistribution] = None
 
-    def async_save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def async_save(
+        self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path, *, filesystem=None
+    ):
         """ """
+        filesystem_kwargs = strategy_filesystem_kwargs(self, "async_save", filesystem)
+        if filesystem is not None and not is_default_filesystem(filesystem):
+            require_nvrx_filesystem_support()
         self.apply_saving_parallelization(sharded_state_dict)
-        return self.base_strategy.async_save(sharded_state_dict, checkpoint_dir)
+        return self.base_strategy.async_save(
+            sharded_state_dict, checkpoint_dir, **filesystem_kwargs
+        )
 
-    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path):
+    def save(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path, *, filesystem=None):
         """ """
+        filesystem_kwargs = strategy_filesystem_kwargs(self, "save", filesystem)
         self.apply_saving_parallelization(sharded_state_dict)
-        return self.base_strategy.save(sharded_state_dict, checkpoint_dir)
+        return self.base_strategy.save(sharded_state_dict, checkpoint_dir, **filesystem_kwargs)
 
     def apply_saving_parallelization(self, sharded_state_dict: ShardedStateDict) -> None:
         """Distributes the save across ranks by exchanging metadata.
@@ -239,7 +250,9 @@ class FullyParallelLoadStrategyWrapper:
         return getattr(self.base_strategy, "stream_ckpt_dequant", False)
 
     @debug_time("FullyParallelLoadStrategyWrapper.load", logger)
-    def load(self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path) -> StateDict:
+    def load(
+        self, sharded_state_dict: ShardedStateDict, checkpoint_dir: Path, *, filesystem=None
+    ) -> StateDict:
         """Distributes the load and calls underlying strategy only for parts of the state dict.
 
         Steps:
@@ -270,10 +283,11 @@ class FullyParallelLoadStrategyWrapper:
         """
         from megatron.core.utils import get_pg_size
 
+        filesystem_kwargs = strategy_filesystem_kwargs(self, "load", filesystem)
         loaded_state_dict = {}
 
         if get_pg_size(self.parallelization_group) <= 1:
-            return self.base_strategy.load(sharded_state_dict, checkpoint_dir)
+            return self.base_strategy.load(sharded_state_dict, checkpoint_dir, **filesystem_kwargs)
 
         if self.stream_ckpt_dequant and self.exchange_algo != 'broadcast':
             raise CheckpointingException(
@@ -325,7 +339,7 @@ class FullyParallelLoadStrategyWrapper:
             all_objects_to_load = {**to_load_objects, **unloaded_objects}
             with debug_time("base_load_ShardedTensorsAndObjects", logger):
                 loaded = self.base_strategy.load(
-                    {**to_load_shards, **all_objects_to_load}, checkpoint_dir
+                    {**to_load_shards, **all_objects_to_load}, checkpoint_dir, **filesystem_kwargs
                 )
             # The base strategy returns the loaded values keyed by the same shard
             # ids we passed in; split them back into tensors and objects. Tensor
@@ -338,9 +352,13 @@ class FullyParallelLoadStrategyWrapper:
             # Default (legacy): load only this rank's main-replica objects and
             # exchange them across ranks below.
             with debug_time("base_load_ShardedObjects", logger):
-                loaded_objects = self.base_strategy.load(to_load_objects, checkpoint_dir)
+                loaded_objects = self.base_strategy.load(
+                    to_load_objects, checkpoint_dir, **filesystem_kwargs
+                )
             with debug_time("base_load_ShardedTensors", logger):
-                loaded_tensors = self.base_strategy.load(to_load_shards, checkpoint_dir)
+                loaded_tensors = self.base_strategy.load(
+                    to_load_shards, checkpoint_dir, **filesystem_kwargs
+                )
 
         with debug_time("self.exchange_loaded_tensors", logger):
 
@@ -485,13 +503,15 @@ class FullyParallelLoadStrategyWrapper:
 
         return precomputed_distribution
 
-    def load_tensors_metadata(self, checkpoint_dir: Path):
+    def load_tensors_metadata(self, checkpoint_dir: Path, *, filesystem=None):
         """ """
-        return self.base_strategy.load_tensors_metadata(checkpoint_dir)
+        filesystem_kwargs = strategy_filesystem_kwargs(self, "load_tensors_metadata", filesystem)
+        return self.base_strategy.load_tensors_metadata(checkpoint_dir, **filesystem_kwargs)
 
-    def load_sharded_metadata(self, checkpoint_dir: Path):
+    def load_sharded_metadata(self, checkpoint_dir: Path, *, filesystem=None):
         """ """
-        return self.base_strategy.load_sharded_metadata(checkpoint_dir)
+        filesystem_kwargs = strategy_filesystem_kwargs(self, "load_sharded_metadata", filesystem)
+        return self.base_strategy.load_sharded_metadata(checkpoint_dir, **filesystem_kwargs)
 
 
 def distribute_main_replicas_with_precomputed_distribution(
