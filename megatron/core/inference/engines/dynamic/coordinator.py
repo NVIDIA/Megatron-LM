@@ -948,10 +948,7 @@ class CoordinatorMixin:
                 # Unlike suspend/resume, an epoch transition does not naturally
                 # re-admit requests. Refresh active request-local state here so
                 # a later checkpoint cannot retain projections from old weights.
-                for entry in self.requests.values():
-                    request = entry.record[-1]
-                    if isinstance(request, DynamicVLMInferenceRequest):
-                        self._refresh_vlm_request_data(request)
+                self._refresh_live_vlm_requests()
             self._generation_epoch = new_generation_epoch
             # Stamp all active requests with the new epoch.
             # Each field stores a sparse list of (start_token_index, epoch) boundaries.
