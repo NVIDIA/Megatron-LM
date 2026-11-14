@@ -4578,6 +4578,12 @@ def train(
     # Preserve a builder-installed finalize hook; only default it when unset.
     if config.finalize_model_grads_func is None:
         config.finalize_model_grads_func = finalize_model_grads
+    if cfg.train.release_initial_grad_sync_cache:
+        from megatron.training.initial_grad_sync import release_initial_grad_sync_cache
+
+        config.finalize_model_grads_func = release_initial_grad_sync_cache(
+            config.finalize_model_grads_func
+        )
 
     if cfg.logger.log_energy:
         energy_monitor.setup()
