@@ -52,6 +52,7 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         pin_cpu_grads: bool = True,
         pin_cpu_params: bool = True,
         overlap_cpu_optimizer_d2h_h2d: bool = True,
+        defer_sub_optimizer_init: bool = False,
         **kwargs,
     ):
         super(HybridDeviceOptimizer, self).__init__(
@@ -77,7 +78,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         self.param_update_in_fp32 = param_update_in_fp32
         self.sub_optimizer_kwargs = kwargs
 
-        self._init_sub_optimizers()
+        if not defer_sub_optimizer_init:
+            self._init_sub_optimizers()
         self._register_load_state_dict_hooks()
 
     def _set_sub_optimizer_grads(self):
