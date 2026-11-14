@@ -560,6 +560,29 @@ class TestPackedSampleAccounting:
         assert train.train_iters == expected_iters
         assert calculator.get_current_global_batch_size() == (8 if schedule else 16)
 
+    def test_sample_schedule_drops_incomplete_final_batch(self, monkeypatch):
+        from megatron.core import num_microbatches_calculator as calculator
+        from megatron.training.config import container
+
+        monkeypatch.setattr(calculator, "_GLOBAL_NUM_MICROBATCHES_CALCULATOR", None)
+        train = TrainingConfig(
+            micro_batch_size=2,
+            global_batch_size=16,
+            train_samples=65,
+            step_batch_size_schedule="0:8 32:16",
+        )
+        calculator.init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=16,
+            micro_batch_size=2,
+            data_parallel_size=1,
+            step_batch_size_schedule="0:8 32:16",
+        )
+        container.update_train_iters(train)
+        # 4 * 8 + 2 * 16 = 64. The next batch of 16 does not fit in the remaining sample.
+        assert train.train_iters == 6
+        assert calculator.get_current_global_batch_size() == 8
+
     @pytest.mark.parametrize(
         "total_cp,num_sequence_shards,weight_shards,samples",
         [(1, 1, 4, 8), (4, 2, 2, 2), (2, 2, 4, 4)],

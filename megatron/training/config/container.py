@@ -868,7 +868,11 @@ def update_train_iters(train: TrainingConfig) -> None:
         consumed_samples = 0
         while consumed_samples < train.train_samples:
             update_num_microbatches(consumed_samples, consistency_check=False)
-            consumed_samples += get_current_global_batch_size()
+            batch_size = get_current_global_batch_size()
+            # drop_last skips a short final batch, so it is not a training iteration.
+            if consumed_samples + batch_size > train.train_samples:
+                break
+            consumed_samples += batch_size
             iterations += 1
         # Reset
         update_num_microbatches(0, consistency_check=False)
