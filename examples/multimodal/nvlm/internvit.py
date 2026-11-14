@@ -37,7 +37,10 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayerSubmodules
-from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
+from megatron.core.transformer.utils import (
+    ensure_metadata_has_dp_cp_group,
+    make_sharded_tensors_for_checkpoint,
+)
 from megatron.core.typed_torch import copy_signature, not_none
 from megatron.core.utils import divide
 
@@ -83,6 +86,8 @@ class InternViTRMSNorm(MegatronModule):
         self.eps = eps
         self.weight = torch.nn.Parameter(torch.ones(hidden_size))
         self._compute_var = compute_var
+        # InternViT runs on the global grid (see _gather_var).
+        self.tp_group = get_tensor_model_parallel_group()
 
         assert not sequence_parallel, "Sequence parallelism is not supported with InternViT."
 
@@ -153,8 +158,15 @@ class InternViTRMSNorm(MegatronModule):
         # are tensor-parallel so must be converted to sharded tensors
         if 'q_layernorm' in prefix or 'k_layernorm' in prefix:
             state_dict = self.state_dict(prefix='', keep_vars=True)
+            # Fill in a missing group on a copy, so that the default argument stays empty.
+            metadata = ensure_metadata_has_dp_cp_group(dict(metadata or {}))
             return make_sharded_tensors_for_checkpoint(
-                state_dict, prefix, {'weight': 0}, sharded_offsets
+                state_dict,
+                prefix,
+                {'weight': 0},
+                sharded_offsets,
+                tp_group=self.tp_group,
+                dp_cp_group=metadata['dp_cp_group'],
             )
         else:
             return super().sharded_state_dict(prefix, sharded_offsets, metadata)
