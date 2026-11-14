@@ -7,7 +7,6 @@ from typing import Any, Callable, Dict, Iterable
 
 import torch
 
-from megatron.core._batch_api_compat import deprecated_hybrid_cp_kwargs
 from megatron.core.packed_seq_params import PackedSeqParams
 
 from .layout import CPLayout, THDCPLayoutPlan, _build_thd_zigzag_metadata, build_thd_cp_layout_plan
@@ -196,7 +195,7 @@ def _build_packed_seq_params(
         max_seqlen_q=max_seqlen,
         max_seqlen_kv=max_seqlen,
         local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
-        cp_group=batch.get('hybrid_cp_group'),
+        cp_group=batch.get('dynamic_cp_group'),
         tp_cp_group=tp_cp_group,
         total_tokens=int(physical_cu_seqlens[-1].item()),
         tokens_per_sample=tokens_per_sample,
@@ -204,7 +203,6 @@ def _build_packed_seq_params(
     )
 
 
-@deprecated_hybrid_cp_kwargs
 def get_batches_on_this_cp_rank(
     batch: Dict[str, Any],
     boundary_layout: CPLayout,

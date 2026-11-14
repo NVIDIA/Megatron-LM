@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """
 This module provides a singleton instance of AsyncCallsQueue which manages
@@ -11,6 +11,7 @@ import time
 from abc import ABC
 from typing import TYPE_CHECKING, Any
 
+from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.dist_checkpointing.strategies.nvrx import make_nvrx_async_request
 from megatron.training import get_args
 from megatron.training.global_vars import get_run_config
@@ -61,9 +62,8 @@ def _get_async_calls_queue():
     if _async_calls_queue is None:
         from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncCallsQueue
 
-        args = get_args()
         _async_calls_queue = AsyncCallsQueue(
-            persistent=getattr(args, "use_persistent_ckpt_worker", False)
+            persistent=get_run_config().checkpoint.use_persistent_ckpt_worker
         )
 
     return _async_calls_queue
@@ -130,7 +130,7 @@ def build_otel_worker_bootstrap(args):
         'span_groups': worker_span_groups,
         'resolved_span_groups': resolved_span_groups,
         'rank': args.rank,
-        'world_size': args.world_size,
+        'world_size': safe_get_world_size(),
         # Same reasoning as _set_telemetry(): building these calls NVML
         # (_detect_gpu_identity), and the worker discards them when 'enabled' is
         # False, so don't build them on the disabled path. The key is always
@@ -147,6 +147,7 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
 
     global _async_calls_queue
     args = get_args()
+    checkpoint = get_run_config().checkpoint
     # Recreate the async_calls_queue for persistent worker
     # This duplicate step is for backward compatiblity
     time_start = time.time()
@@ -155,7 +156,7 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
     _async_calls_queue = AsyncCallsQueue(
         persistent=True,
         **(
-            {"cpu_shm_mode": args.async_ckpt_use_cpu_shm}
+            {"cpu_shm_mode": checkpoint.async_ckpt_use_cpu_shm}
             if "cpu_shm_mode" in inspect.signature(AsyncCallsQueue.__init__).parameters
             else {}
         ),
@@ -163,8 +164,8 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
     # initialize the persistent caller with QoS priorities from args
     warmup_kwargs = {}
     if "cpu_shm_mode" in inspect.signature(AsyncCallsQueue.warmup_persistent_caller).parameters:
-        warmup_kwargs["cpu_shm_mode"] = args.async_ckpt_use_cpu_shm
-    elif args.async_ckpt_use_cpu_shm:
+        warmup_kwargs["cpu_shm_mode"] = checkpoint.async_ckpt_use_cpu_shm
+    elif checkpoint.async_ckpt_use_cpu_shm:
         raise AssertionError(
             "Installed nvidia-resiliency-ext does not support cpu_shm_mode. "
             "Update nvidia-resiliency-ext to use --async-ckpt-use-cpu-shm."
@@ -175,8 +176,8 @@ def init_persistent_async_worker(rank: int, mp_mode: str = 'spawn'):
         warmup_kwargs["otel_bootstrap"] = build_otel_worker_bootstrap(args)
     AsyncCallsQueue.warmup_persistent_caller(
         rank,
-        cpu_priority=args.async_ckpt_cpu_priority,
-        io_priority=args.async_ckpt_io_priority,
+        cpu_priority=checkpoint.async_ckpt_cpu_priority,
+        io_priority=checkpoint.async_ckpt_io_priority,
         **warmup_kwargs,
     )
     # initialize ckpt write results queue
@@ -213,8 +214,7 @@ def maybe_finalize_async_save(blocking: bool = False, terminate=False):
         terminate (bool, optional): if True, the asynchronous queue will
                 be closed as the last action of this function.
     """
-    args = get_args()
-    if not args.async_save:
+    if not get_run_config().checkpoint.async_save:
         return
 
     if blocking and not is_empty_async_queue():

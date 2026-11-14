@@ -114,12 +114,20 @@ def build_model(
         args, "untie_embeddings_and_output_weights", False
     )
 
+    # Tokenizer setup resolves the padded vocabulary on the run config only;
+    # args carries just an explicit CLI/checkpoint value.
+    vocab_size = getattr(args, "padded_vocab_size", None)
+    if vocab_size is None:
+        from megatron.training.global_vars import get_run_config
+
+        vocab_size = get_run_config().tokenizer.padded_vocab_size
+
     return Qwen35VLModel(
         language_config=language_config,
         hybrid_stack_spec=hybrid_stack_spec,
         hybrid_layer_pattern=hybrid_layer_pattern,
         vision_config=vision_config,
-        vocab_size=args.padded_vocab_size,
+        vocab_size=vocab_size,
         max_sequence_length=args.max_position_embeddings,
         image_token_id=getattr(args, "image_token_id", 248056),
         position_embedding_type=args.position_embedding_type,

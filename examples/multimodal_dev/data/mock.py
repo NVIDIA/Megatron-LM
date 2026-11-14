@@ -227,11 +227,18 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     from megatron.training import get_args
 
     args = get_args()
+    # Tokenizer setup resolves the padded vocabulary on the run config only;
+    # args carries just an explicit CLI/checkpoint value.
+    vocab_size = getattr(args, "padded_vocab_size", 248320)
+    if vocab_size is None:
+        from megatron.training.global_vars import get_run_config
+
+        vocab_size = get_run_config().tokenizer.padded_vocab_size
     kwargs = dict(
         seed=getattr(args, "seed", 1234),
         seq_length=getattr(args, "total_seq_length", 1024),
         image_seq_length=getattr(args, "image_seq_length", 256),
-        vocab_size=getattr(args, "padded_vocab_size", 248320),
+        vocab_size=vocab_size,
         image_token_id=getattr(args, "image_token_id", 248056),
         image_size=getattr(args, "image_size", 224),
     )

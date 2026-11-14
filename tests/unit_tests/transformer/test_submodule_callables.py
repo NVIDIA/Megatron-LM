@@ -211,6 +211,7 @@ def test_common_mtp_callables_keep_six_slots_and_intermediate_multistream(monkey
     hidden = torch.randn(3, 1, 4)
     node = SimpleNamespace(
         is_last_layer=False,
+        detach=lambda tensor: tensor.detach(),
         chunk_state=SimpleNamespace(
             mtp_hidden_states=[torch.zeros(3, 1, 2)], mhc_multistream=hidden
         ),

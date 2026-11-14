@@ -48,6 +48,7 @@ MODEL_ARGS:
   --moe-mlp-glu-interleave-size: 32
   --disable-bias-linear: true
   --num-experts: 4
+  --moe-token-dispatcher-type: allgather
   --moe-router-load-balancing-type: sinkhorn
   --moe-router-topk: 1
   --swiglu: true

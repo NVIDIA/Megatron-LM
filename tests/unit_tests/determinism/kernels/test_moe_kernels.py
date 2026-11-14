@@ -36,6 +36,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     PipelineOffloadManager,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.moe import batch_invariant, moe_utils
 from megatron.core.transformer.moe.experts import (
@@ -73,6 +74,7 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a G
 HAVE_TE = moe_utils.HAVE_TE
 HAVE_TE_PERMUTE = HAVE_TE and moe_utils.fused_permute is not None
 HAVE_TE_ROUTER = HAVE_TE and is_te_min_version("2.7.0")
+HAVE_TE_DETERMINISTIC_AUX_LOSS = moe_utils.te_supports_deterministic_moe_aux_loss()
 from megatron.core.transformer.moe.fused_a2a import HAVE_DEEP_EP, HAVE_DEEP_EP_V2
 
 NUM_TOKENS, HIDDEN, NUM_EXPERTS, TOPK = 16384, 2048, 64, 8
@@ -847,18 +849,17 @@ def test_group_limited_topk_replays():
         False,
         pytest.param(
             True,
-            marks=[
-                pytest.mark.skipif(not HAVE_TE_ROUTER, reason="TE>=2.7 needed"),
-                pytest.mark.xfail(
-                    strict=False,
-                    reason="TE fused_moe_aux_loss reduces with atomicAdd (open gap, recorded not gated)",
-                ),
-            ],
+            marks=pytest.mark.skipif(
+                not HAVE_TE_DETERMINISTIC_AUX_LOSS,
+                reason="TE deterministic fused MoE aux loss needed",
+            ),
         ),
     ],
 )
 @pytest.mark.parametrize("all_padding", [False, True])
-def test_switch_load_balancing_loss_replays(fused, all_padding):
+@pytest.mark.parametrize("torch_enabled", [False, True])
+def test_switch_load_balancing_loss_replays(fused, all_padding, torch_enabled):
+    """An explicit deterministic request replays with either PyTorch global setting."""
     seeded()
     routing_map, probs = _routing(num_tokens=65536, num_experts=256, topk=8)
     if all_padding:
@@ -870,12 +871,46 @@ def test_switch_load_balancing_loss_replays(fused, all_padding):
 
     def fn(probs):
         return moe_utils.switch_load_balancing_loss_func(
-            probs, tokens_per_expert, total_num_tokens, 8, 256, 1e-2, fused=fused
+            probs,
+            tokens_per_expert,
+            total_num_tokens,
+            8,
+            256,
+            1e-2,
+            fused=fused,
+            deterministic=True,
         )
 
-    assert_replays_bit_exact(
-        fn, (probs,), replays=4, what=f"aux loss[fused={fused}, all_padding={all_padding}]"
-    )
+    with deterministic_algorithms(torch_enabled):
+        assert_replays_bit_exact(
+            fn,
+            (probs,),
+            replays=4,
+            contention=True,
+            what=f"aux loss[fused={fused}, all_padding={all_padding}, "
+            f"torch_deterministic={torch_enabled}]",
+        )
+
+
+@pytest.mark.skipif(not HAVE_TE_ROUTER, reason="TE>=2.7 needed")
+@pytest.mark.xfail(
+    strict=False,
+    reason="Negative control: floating-point atomic accumulation may repeat on some hardware.",
+)
+def test_default_fused_aux_loss_is_the_racy_path():
+    """The default atomic branch remains non-deterministic without an explicit request."""
+    seeded()
+    routing_map, probs = _routing(num_tokens=65536, num_experts=256, topk=8)
+    tokens_per_expert = routing_map.sum(dim=0)
+
+    def fn(probs):
+        return moe_utils.switch_load_balancing_loss_func(
+            probs, tokens_per_expert, 65536, 8, 256, 1e-2, fused=True
+        )
+
+    with deterministic_algorithms(False):
+        differing = count_differing_replays(fn, (probs,), replays=8, backward=False)
+    assert differing > 0, "atomic aux loss happened to repeat bit-exactly on this hardware/shape"
 
 
 @pytest.mark.parametrize("router_dtype", [torch.float32, torch.float64])
@@ -1316,6 +1351,8 @@ class TestMoEModules:
             moe_router_score_function="sigmoid" if expert_bias else "softmax",
             moe_router_enable_expert_bias=expert_bias,
             moe_router_fusion=True,
+            # Dense TopK coverage should not require TE's deterministic aux-loss API.
+            moe_router_aux_loss_fusion=False,
             moe_token_dispatcher_type="flex",
             moe_flex_dispatcher_backend=backend,
         )
@@ -1608,6 +1645,84 @@ class TestMoEModules:
         finally:
             PipelineOffloadManager.reset_instance()
 
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
+    def test_te_op_fuser_bf16_override_replays_under_mxfp8(self, monkeypatch):
+        """Replay the real BF16 TE ops selected inside an outer MXFP8 context."""
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        from megatron.core.enums import Fp8Recipe
+        from megatron.core.extensions.transformer_engine import (
+            TEQuantizationParams,
+            TEQuantizationRecipe,
+        )
+
+        try:
+            from transformer_engine.pytorch.ops.basic.grouped_linear import (
+                is_op_fuser_grouped_tensor_path_supported,
+            )
+        except ImportError:
+            pytest.skip("TE grouped-tensor operation fuser support is required")
+        available, reason = FP8GlobalStateManager.is_mxfp8_available()
+        if not available:
+            pytest.skip(reason)
+        if not is_op_fuser_grouped_tensor_path_supported(None, torch.bfloat16):
+            pytest.skip("Native BF16 grouped GEMM needs supported hardware and cuBLASLt")
+        self._init()
+        seeded()
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+        config = _moe_config(
+            hidden_size=256,
+            ffn_hidden_size=512,
+            num_moe_experts=4,
+            use_cpu_initialization=False,
+            gradient_accumulation_fusion=False,
+            bias_activation_fusion=False,
+            fp8="e4m3",
+            fp8_recipe=Fp8Recipe.mxfp8,
+            use_transformer_engine_op_fuser=True,
+            moe_token_dispatcher_type="alltoall",
+            moe_router_padding_for_quantization=True,
+        )
+        spec = get_gpt_layer_with_transformer_engine_spec(num_experts=4, moe_grouped_gemm=True)
+        experts = (
+            get_submodules(spec.submodules.mlp)
+            .experts(
+                num_local_experts=4,
+                config=config,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
+            .cuda()
+        )
+        for linear in (experts.linear_fc1, experts.linear_fc2):
+            linear.te_quant_params = TEQuantizationParams(
+                training_recipe=TEQuantizationRecipe(), evaluation_recipe=None
+            )
+        assert experts._with_fused_impl
+        contexts = []
+        make_ops = experts._make_fused_ops
+
+        def make_ops_with_precision_probe():
+            ops = make_ops()
+            ops.register_forward_pre_hook(
+                lambda _ops, _inputs: contexts.append(FP8GlobalStateManager.is_fp8_enabled())
+            )
+            return ops
+
+        monkeypatch.setattr(experts, "_make_fused_ops", make_ops_with_precision_probe)
+        splits = torch.tensor([256, 768, 0, 3072], device="cuda", dtype=torch.int64)
+        hidden = torch.randn(4096, 256, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        probs = torch.rand(4096, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        assert_module_replays_bit_exact(
+            _InQuantizationContext(experts, config),
+            (hidden, splits, probs),
+            replays=3,
+            contention=True,
+            what="TE op fuser[BF16 override under MXFP8]",
+        )
+        assert experts._fused_ops is not None
+        assert contexts == [False] * 3
+
     @pytest.mark.skipif(
         not HAVE_TE or not is_te_min_version("2.14.0"), reason="TE grouped op fuser unavailable"
     )
@@ -1867,6 +1982,105 @@ class TestMoEModules:
             what=f"TEGroupedMLP[tanh clamp, {'op fuser' if op_fuser else 'unfused'}]",
         )
 
+    @pytest.mark.launch_on_gb200
+    @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
+    def test_te_grouped_mlp_replays_under_quantized_precision_override(self, monkeypatch):
+        """Fused ``TEGroupedMLP`` whose ``--te-precision-config-file`` override keeps the experts
+        quantized but with a different recipe than the ambient autocast (MXFP8 experts under a
+        global NVFP4 recipe). Forward and backward must use MXFP8 and replay bit-exactly under
+        stream contention; the quantizer check guards against silently inheriting NVFP4.
+        """
+        if torch.cuda.get_device_capability()[0] < 10:
+            pytest.skip("fused grouped MLP under MXFP8 / NVFP4 needs SM100+")
+        import transformer_engine.pytorch as te
+        from transformer_engine.common.recipe import NVFP4BlockScaling
+        from transformer_engine.pytorch import MXFP8Quantizer
+        from transformer_engine.pytorch.ops import GroupedLinear
+
+        for probe in (te.is_mxfp8_available, te.is_nvfp4_available):
+            available, reason = probe(return_reason=True)
+            if not available:
+                pytest.skip(reason)
+        monkeypatch.setenv("NVTE_CUTEDSL_FUSED_GROUPED_MLP", "1")
+        self._init()
+        seeded()
+        quant_recipe = RecipeConfig.from_config_dict(
+            {
+                "configs": {
+                    "mxfp8": {
+                        "transformer_engine_config_type": "TEQuantizationParams",
+                        "training_recipe": {"fp8_quantization_recipe": "mxfp8"},
+                    }
+                },
+                "matchers": {
+                    "experts_mxfp8": {
+                        "type": "glob",
+                        "enabled": True,
+                        "pattern": "*experts*",
+                        "config": "mxfp8",
+                    }
+                },
+            }
+        )
+        config = _moe_config(
+            hidden_size=2048,
+            ffn_hidden_size=4096,
+            gated_linear_unit=False,
+            activation_func=squared_relu,
+            bias_activation_fusion=False,
+            use_fused_weighted_squared_relu=True,
+            use_transformer_engine_op_fuser=True,
+            use_cpu_initialization=False,
+            quant_recipe=quant_recipe,
+        )
+        spec = get_gpt_layer_with_transformer_engine_spec(num_experts=8, moe_grouped_gemm=True)
+        # Keep BF16 parameter storage; the wrapper below supplies the outer NVFP4 context.
+        # Resolve the MXFP8 override by the experts' module path.
+        experts = get_submodules(spec.submodules.mlp).experts(
+            num_local_experts=8,
+            config=config,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            name="mlp.experts",
+        )
+        assert isinstance(experts, TEGroupedMLP)
+        assert experts._with_fused_impl, "a quantized override must keep fusion"
+        assert experts.linear_fc1.te_quant_params is not None
+        assert experts.linear_fc1.te_quant_params == experts.linear_fc2.te_quant_params
+        experts = experts.cuda()
+        tokens_per_expert = torch.tensor([4096, 17, 0, 2048, 1, 8191, 33, 1998], dtype=torch.int64)
+        rows = int(tokens_per_expert.sum())
+        hidden = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        probs = torch.rand(rows, device="cuda", requires_grad=True)
+
+        class _InNVFP4Autocast(torch.nn.Module):
+            def __init__(self, module) -> None:
+                super().__init__()
+                self.module = module
+
+            def forward(self, *args):
+                with te.fp8_autocast(enabled=True, fp8_recipe=NVFP4BlockScaling()):
+                    return self.module(*args)
+
+        assert_module_replays_bit_exact(
+            _InNVFP4Autocast(experts),
+            (hidden, tokens_per_expert, probs),
+            replays=3,
+            contention=True,
+            what="TEGroupedMLP[op fuser, MXFP8 override under NVFP4 autocast]",
+        )
+        # The grouped GEMMs quantized with the module's MXFP8 recipe, not the ambient NVFP4 one.
+        # Without the CuTeDSL kernel TE runs the same ops unfused, so walk both op layouts.
+        (sequential,) = experts._fused_ops
+        grouped_linears = [
+            basic
+            for op, _ in sequential._module_groups[0]._forward_ops
+            for basic in getattr(op, "basic_ops", [op])
+            if isinstance(basic, GroupedLinear)
+        ]
+        assert len(grouped_linears) == 2, grouped_linears
+        for fc in grouped_linears:
+            assert isinstance(fc.get_quantizer("forward", 1), MXFP8Quantizer)
+
     def test_sequential_mlp_replays_on_uneven_experts(self):
         self._init()
         seeded()
@@ -2097,4 +2311,28 @@ def test_batch_invariant_unpermute_replays(monkeypatch, collective, dtype):
         contention=True,
         grad_outputs={"out": grad},
         what=f"batch-invariant unpermute[{collective=}, {dtype=}]",
+    )
+
+
+@pytest.mark.parametrize("weighted", [False, True], ids=["unweighted", "weighted"])
+def test_ep_invariant_tree_replays(weighted):
+    """moe_ep_invariant_combine's training tree (forward, row and probability gradients)
+    replays bit-exactly, with missing routes and three-expert leaves (96 experts)."""
+    from megatron.core.transformer.moe import ep_invariant_combine as eic
+
+    seeded()
+    tokens, experts, topk, hidden = 4096, 96, 6, 256
+    cols = torch.rand(tokens, experts, device="cuda").topk(topk, 1).indices
+    slot_rows = torch.arange(tokens * topk, device="cuda").view(tokens, topk)
+    slot_rows[::5, 0] = -1
+    rows = torch.randn(
+        tokens * topk, hidden, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    if weighted:
+        probs = torch.rand(tokens, experts, device="cuda", requires_grad=True)
+        fn, inputs = (lambda r, p: eic.tree_combine(r, slot_rows, cols, experts, p)), (rows, probs)
+    else:
+        fn, inputs = (lambda r: eic.tree_combine(r, slot_rows, cols, experts)), (rows,)
+    assert_replays_bit_exact(
+        fn, inputs, replays=3, contention=True, what=f"EP-invariant tree, weighted={weighted}"
     )

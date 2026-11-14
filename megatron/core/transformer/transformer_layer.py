@@ -29,6 +29,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.enums import Fp8Recipe
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.attention_residual import (
@@ -56,7 +57,6 @@ from megatron.core.transformer.residual_connection import (
 )
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.typed_torch import apply_module, copy_signature
@@ -2696,8 +2696,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
     def __call__(self, *args, **kwargs):
         # Extract mhc_recompute_manager before CUDA graph manager processes kwargs,
-        # since MHCCheckpointManager is not a CUDA-graph-supported type.
-        self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
+        # since MHCCheckpointManager is not a CUDA-graph-supported type. mHC layers
+        # take it in their own __call__ and arrive here without the kwarg, so keep
+        # the manager they already stored.
+        if "mhc_recompute_manager" in kwargs or not self.supports_mhc_connections:
+            self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
         kwargs.pop("is_last_layer_in_recompute_block", None)
 
         if self._should_call_local_cudagraph(*args, **kwargs):

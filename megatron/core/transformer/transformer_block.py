@@ -16,9 +16,10 @@ from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
-from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.ops.norm.fused_layer_norm import FusedLayerNorm
+from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.pipeline_parallel.utils import is_vp_first_stage, is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -42,7 +43,6 @@ from megatron.core.transformer.module import (
     mark_keep_in_fp32,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     BaseTransformerLayer,
@@ -81,7 +81,7 @@ elif HAVE_APEX:
     LayerNormImpl = FusedLayerNorm
 
 else:
-    from megatron.core.transformer.torch_norm import WrappedTorchNorm
+    from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 
     LayerNormImpl = WrappedTorchNorm
 

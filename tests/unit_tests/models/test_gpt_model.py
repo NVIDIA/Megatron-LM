@@ -451,7 +451,7 @@ def test_get_mlp_module_spec_interface():
     expected_defaults = {
         "use_te": True,
         "num_experts": None,
-        "moe_grouped_gemm": False,
+        "moe_grouped_gemm": True,
         "fp8": None,
         "use_te_op_fuser": False,
     }

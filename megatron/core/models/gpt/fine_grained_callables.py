@@ -1076,13 +1076,19 @@ def build_mtp_layer_callables(layer):
             hidden_states if layer.config.enable_hyper_connections else None
         )
         hidden_states = layer._postprocess(hidden_states)
-        node.chunk_state.mtp_hidden_states.append(hidden_states)
         if node.is_last_layer:
-            hidden_states = torch.cat(node.chunk_state.mtp_hidden_states, dim=0)
+            hidden_states = torch.cat(node.chunk_state.mtp_hidden_states + [hidden_states], dim=0)
             node.chunk_state.mtp_hidden_states = None
             node.chunk_state.mhc_multistream = None
-        elif pre_contraction_hidden_states is not None:
-            hidden_states = pre_contraction_hidden_states
+        else:
+            # This depth's output feeds both the next depth and the torch.cat in the last
+            # depth's mtp_post_process. Hand the cat a detached copy: otherwise the last
+            # depth's backward would run through this node's graph and free it before this
+            # node's own backward. ``node.detach`` keeps the loss-side gradient that lands
+            # on the copy and adds it back during this node's backward (main #8799).
+            node.chunk_state.mtp_hidden_states.append(node.detach(hidden_states))
+            if pre_contraction_hidden_states is not None:
+                hidden_states = pre_contraction_hidden_states
         return hidden_states
 
     def rng_context_wrapper(func, *args, **kwargs):

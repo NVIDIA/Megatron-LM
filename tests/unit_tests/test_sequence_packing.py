@@ -20,7 +20,7 @@ from megatron.core.datasets.data_schedule import (
 )
 from megatron.core.datasets.data_schedule_utils import (
     create_data_iterator,
-    next_hdp_group_packing_aware,
+    next_dynamic_cp_group_packing_aware,
     reroute_samples_to_dcp_ranks,
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -293,8 +293,8 @@ def test_scheduler_builds_runtime_cp_layout_views(local_cp_size, expected_layout
         )
 
 
-def test_next_hdp_group_packing_aware_can_expand_short_sequence_group():
-    micro_batches, leftovers, exec_times, sample_ids = next_hdp_group_packing_aware(
+def test_next_dynamic_cp_group_packing_aware_can_expand_short_sequence_group():
+    micro_batches, leftovers, exec_times, sample_ids = next_dynamic_cp_group_packing_aware(
         [(0, 6144), (1, 2048)], total_gpus=2, max_seq_len_per_rank=4096
     )
 
@@ -304,8 +304,8 @@ def test_next_hdp_group_packing_aware_can_expand_short_sequence_group():
     assert exec_times[0] == exec_times[1]
 
 
-def test_next_hdp_group_packing_aware_fills_non_power_of_two_group():
-    micro_batches, leftovers, exec_times, sample_ids = next_hdp_group_packing_aware(
+def test_next_dynamic_cp_group_packing_aware_fills_non_power_of_two_group():
+    micro_batches, leftovers, exec_times, sample_ids = next_dynamic_cp_group_packing_aware(
         [(0, 50), (1, 50)], total_gpus=14, max_seq_len_per_rank=100
     )
 
@@ -787,8 +787,8 @@ def test_dsv4_thd_cp_slice_uses_static_partition_total():
 # checks are in tests/unit_tests/data/test_packed_schedule_regressions.py.
 
 
-def test_next_hdp_group_packing_aware_can_use_larger_cp_group_for_short_sequences():
-    micro_batches, leftovers, exec_times, sample_ids = next_hdp_group_packing_aware(
+def test_next_dynamic_cp_group_packing_aware_can_use_larger_cp_group_for_short_sequences():
+    micro_batches, leftovers, exec_times, sample_ids = next_dynamic_cp_group_packing_aware(
         [(0, 6144), (1, 2048)], total_gpus=2, max_seq_len_per_rank=4096
     )
 
@@ -798,8 +798,8 @@ def test_next_hdp_group_packing_aware_can_use_larger_cp_group_for_short_sequence
     assert exec_times[0] == exec_times[1]
 
 
-def test_next_hdp_group_packing_aware_fills_non_power_of_two_dpxcp_group():
-    micro_batches, leftovers, exec_times, sample_ids = next_hdp_group_packing_aware(
+def test_next_dynamic_cp_group_packing_aware_fills_non_power_of_two_dpxcp_group():
+    micro_batches, leftovers, exec_times, sample_ids = next_dynamic_cp_group_packing_aware(
         [(0, 50), (1, 50)], total_gpus=14, max_seq_len_per_rank=100
     )
 
