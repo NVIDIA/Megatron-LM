@@ -28,10 +28,13 @@ from megatron.core.inference.inference_request import (
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     prepare_multimodal_data,
 )
-from megatron.core.inference.utils import detokenize_tokens, model_eos_token_ids
+from megatron.core.inference.utils import model_eos_token_ids
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
 
-from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
+from ..incremental_detokenizer import (
+    HuggingFaceFastIncrementalDetokenizer,
+    detokenize_generated_tokens,
+)
 from ..openai_streaming import (
     StreamingChatParser,
     json_safe_logprobs,
@@ -1178,7 +1181,9 @@ def _chat_logprobs_content(result, tokenizer):
     return content
 
 
-def format_chat_response(batch_results, sampling_params, tokenizer, options, *, parsers, verbose):
+def format_chat_response(
+    batch_results, prompt_tokens, sampling_params, tokenizer, options, *, parsers, verbose
+):
     """Build the OpenAI chat-completion body from the finished replies.
 
     `finish_reason` follows vLLM: "length" at the token limit,
@@ -1191,10 +1196,11 @@ def format_chat_response(batch_results, sampling_params, tokenizer, options, *, 
     prompt_tokens_counts = []
     cached_tokens_counts = []
     for request_idx, result in enumerate(results):
-        text_output = detokenize_tokens(
+        text_output = detokenize_generated_tokens(
             tokenizer,
+            prompt_tokens,
             result["generated_tokens"],
-            remove_EOD=not sampling_params.detokenize_stop_sequence,
+            remove_eos=not sampling_params.detokenize_stop_sequence,
         )
         prompt_len = reply_prompt_length(result)
         prompt_tokens_counts.append(prompt_len)
@@ -1304,7 +1310,12 @@ try:
         # Streaming currently supports only Hugging Face fast tokenizers.
         try:
             incremental_detokenizers = [
-                HuggingFaceFastIncrementalDetokenizer(tokenizer, prompt_tokens) for _ in range(n)
+                HuggingFaceFastIncrementalDetokenizer(
+                    tokenizer,
+                    prompt_tokens,
+                    remove_eos=not sampling_params.detokenize_stop_sequence,
+                )
+                for _ in range(n)
             ]
         except ValueError as error:
             return Response(str(error), status=400)
@@ -1482,6 +1493,7 @@ try:
         # --- 5. Format OpenAI Response ---
         response = format_chat_response(
             batch_results,
+            prompt_tokens,
             sampling_params,
             tokenizer,
             options,

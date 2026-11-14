@@ -5,9 +5,11 @@ import dataclasses
 import logging
 
 from megatron.core.inference.inference_request import prepare_multimodal_data
-from megatron.core.inference.utils import detokenize_tokens
 
-from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
+from ..incremental_detokenizer import (
+    HuggingFaceFastIncrementalDetokenizer,
+    detokenize_generated_tokens,
+)
 from ..openai_streaming import json_safe_logprobs, json_safe_top_n_logprobs, openai_stream
 from .common import (
     add_moe_routing_to_choice,
@@ -133,7 +135,7 @@ def _completions_logprobs(result, tokenizer, echo):
 
 
 def format_completions_response(
-    batch_results, prompts_as_strings, sampling_params, echo, tokenizer
+    batch_results, prompts_as_tokens, prompts_as_strings, sampling_params, echo, tokenizer
 ):
     """Build the OpenAI text-completion body from the finished replies."""
     results, response_uid, response_metadata = unwrap_batch(batch_results)
@@ -143,8 +145,11 @@ def format_completions_response(
     cached_tokens_counts = []
     for request_idx, result in enumerate(results):
         generated_tokens = result.get("generated_tokens") or []
-        full_text = detokenize_tokens(
-            tokenizer, generated_tokens, remove_EOD=not sampling_params.detokenize_stop_sequence
+        full_text = detokenize_generated_tokens(
+            tokenizer,
+            prompts_as_tokens[request_idx],
+            generated_tokens,
+            remove_eos=not sampling_params.detokenize_stop_sequence,
         )
         total_completion_tokens += len(generated_tokens)
         prompt_len = reply_prompt_length(result)
@@ -239,7 +244,11 @@ try:
             # Streaming currently supports only Hugging Face fast tokenizers.
             try:
                 incremental_detokenizers = [
-                    HuggingFaceFastIncrementalDetokenizer(tokenizer, prompt_tokens)
+                    HuggingFaceFastIncrementalDetokenizer(
+                        tokenizer,
+                        prompt_tokens,
+                        remove_eos=not sampling_params.detokenize_stop_sequence,
+                    )
                     for prompt_tokens in prompts_as_tokens
                 ]
             except ValueError as error:
@@ -321,7 +330,12 @@ try:
         # --- 5. Format Response ---
         return jsonify(
             format_completions_response(
-                batch_results, prompts_as_strings, sampling_params, echo, tokenizer
+                batch_results,
+                prompts_as_tokens,
+                prompts_as_strings,
+                sampling_params,
+                echo,
+                tokenizer,
             )
         )
 
