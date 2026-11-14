@@ -23,6 +23,7 @@ from megatron.core.inference.data_parallel_inference_coordinator.handlers import
     HANDLERS,
     handle_engine_reply,
 )
+from megatron.core.inference.data_parallel_inference_coordinator.state import CoordinatorState
 from megatron.core.inference.disaggregation.handoff_ownership import (
     HandoffClaimStatus,
     HandoffOwnership,
@@ -1251,6 +1252,49 @@ class TestRoutingPolicies:
 
         assert "late ENGINE_REPLY_PARTIAL" in caplog.text
         coord.router_socket.send_multipart.assert_not_called()
+
+
+@pytest.mark.parametrize("epoch", [None, 3])
+@pytest.mark.parametrize(
+    "state,signals",
+    [
+        (CoordinatorState.RUNNING, []),
+        (CoordinatorState.PAUSED, [Headers.PAUSE]),
+        (CoordinatorState.SUSPENDED, [Headers.PAUSE, Headers.SUSPEND]),
+    ],
+)
+def test_late_registration_brings_the_engine_to_the_coordinator_state(state, signals, epoch):
+    """An engine that registers late starts RUNNING, with no generation epoch.
+
+    The coordinator first sends it the last generation epoch, so that it stamps its requests
+    as the others do, then the signals that lead to its own state, in order, so that the
+    engine neither steps while the others are paused nor fails the next UNPAUSE or SUSPEND,
+    whose handlers assert that the engine is PAUSED or SUSPENDED.
+    """
+    coord = _make_routing_coordinator(num_ranks=1)
+    coord.known_clients = {b"client"}
+    coord.router_socket = unittest.mock.MagicMock()
+    if epoch is not None:
+        HANDLERS[Headers.SET_GENERATION_EPOCH](
+            coord, b"client", [Headers.SET_GENERATION_EPOCH.value, epoch], []
+        )
+    coord.state = state
+    coord.router_socket.send_multipart.reset_mock()
+
+    coord._handle_rank_registration(b"rank-late")
+
+    assert b"rank-late" in coord.identities_of_data_parallel_ranks
+    sent = [call.args[0] for call in coord.router_socket.send_multipart.call_args_list]
+    expected = ([[Headers.SET_GENERATION_EPOCH.value, epoch]] if epoch is not None else []) + [
+        [s.value] for s in signals
+    ]
+    assert [frames[0] for frames in sent] == [b"rank-late"] * len(expected)
+    assert [msgpack.unpackb(frames[1]) for frames in sent] == expected
+
+    # A rank that is already registered is not signalled again.
+    coord.router_socket.send_multipart.reset_mock()
+    coord._handle_rank_registration(b"rank-late")
+    coord.router_socket.send_multipart.assert_not_called()
 
 
 def test_engine_reply_defaults_to_detokenizing():

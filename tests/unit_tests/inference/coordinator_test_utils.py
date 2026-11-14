@@ -14,6 +14,7 @@ from megatron.core.inference.config import (
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
+from megatron.core.inference.data_parallel_inference_coordinator.state import CoordinatorState
 from megatron.core.inference.disaggregation.handoff_ownership import HandoffOwnership
 
 
@@ -51,6 +52,8 @@ def make_coordinator_direct(
             or ``"rank-{}"``.  The integer rank index is substituted.
     """
     coordinator = object.__new__(DataParallelInferenceCoordinator)
+    coordinator.state = CoordinatorState.RUNNING
+    coordinator.generation_epoch = None
     coordinator.request_id_to_rank = {}
     coordinator.request_id_to_sampling_params = {}
     coordinator.handoff_ownership = HandoffOwnership()

@@ -61,3 +61,13 @@ CONTROL_TRANSITIONS = {
     # No state change; broadcast in any state so engines stay in sync.
     Headers.SET_GENERATION_EPOCH: ControlTransition(allowed_from=_ALL_STATES, new_state=None),
 }
+
+# Every engine starts RUNNING. These are the signals that bring an engine from RUNNING to
+# each coordinator state, in order; an engine that registers while the others are paused or
+# suspended is sent them, so that it joins in the coordinator's state.
+SIGNALS_FROM_RUNNING = {
+    CoordinatorState.RUNNING: (),
+    CoordinatorState.PAUSED: (Headers.PAUSE,),
+    CoordinatorState.SUSPENDED: (Headers.PAUSE, Headers.SUSPEND),
+    CoordinatorState.STOPPING: (),
+}

@@ -32,7 +32,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import detokenize_tokens
 
 from .handlers import HANDLERS
-from .state import CoordinatorState
+from .state import SIGNALS_FROM_RUNNING, CoordinatorState
 
 try:
     import zmq
@@ -230,6 +230,8 @@ class DataParallelInferenceCoordinator:
         self.next_request_id = 0
         self.tokenizer = tokenizer
         self.state = CoordinatorState.RUNNING
+        # The last SET_GENERATION_EPOCH broadcast, replayed to an engine that registers later.
+        self.generation_epoch = None
 
         # Prefix caching state for routing.
         self.block_size_tokens = block_size_tokens
@@ -730,10 +732,30 @@ class DataParallelInferenceCoordinator:
                 break
 
     def _handle_rank_registration(self, sender_identity):
-        """Register a data parallel rank that connected to a running coordinator."""
+        """Register a data parallel rank that connected to a running coordinator.
+
+        Every engine starts RUNNING, with no generation epoch. One that registers late is
+        first sent the last generation epoch, so that it stamps its requests as the others
+        do, and the signals that lead to the coordinator's state, so that it neither steps
+        while the others are paused nor fails the next UNPAUSE or SUSPEND.
+        """
         if sender_identity not in self.identities_of_data_parallel_ranks:
             self.identities_of_data_parallel_ranks.append(sender_identity)
             self._register_rank_identity(sender_identity)
+            if self.generation_epoch is not None:
+                self._send_to_engine(
+                    sender_identity,
+                    [
+                        msgpack.packb(
+                            [Headers.SET_GENERATION_EPOCH.value, self.generation_epoch],
+                            use_bin_type=True,
+                        )
+                    ],
+                )
+            for signal in SIGNALS_FROM_RUNNING[self.state]:
+                self._send_to_engine(
+                    sender_identity, [msgpack.packb([signal.value], use_bin_type=True)]
+                )
 
     def finalize_text(self, finished_request: dict) -> None:
         """Populate ``generated_text`` by detokenizing a finished request's tokens.
