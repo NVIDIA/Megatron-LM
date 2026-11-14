@@ -1,0 +1,32 @@
+--- a/nemo_rl/models/policy/workers/megatron_policy_worker.py
++++ b/nemo_rl/models/policy/workers/megatron_policy_worker.py
+@@ -40,6 +40,7 @@
+ from megatron.bridge.utils.common_utils import get_rank_safe
+ from megatron.core import parallel_state
+ from megatron.core.distributed import DistributedDataParallel
++from megatron.core.distributed.torch_mimo_fsdp import TorchMimoFSDP as torch_MIMO_FSDP
+ from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+     FullyShardedDataParallelV1,
+     FullyShardedDataParallelV2,
+@@ -4917,7 +4918,7 @@
+                         raise ValueError(
+                             f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
+                         )
+-        elif isinstance(model, FullyShardedDataParallelV2):
++        elif isinstance(model, (FullyShardedDataParallelV2, torch_MIMO_FSDP)):
+             # V2 owns its storage through FSDP units, not the V1 flat buffer.
+             # SFT constructs those units on CUDA and keeps them resident. Do not
+             # call Module.to(): it would invalidate the storage held by the units.
+--- a/nemo_rl/models/megatron/setup.py
++++ b/nemo_rl/models/megatron/setup.py
+@@ -2318,6 +2318,10 @@
+         )
+ 
+     dist_cfg = DistributedInitConfig()
++    if config["megatron_cfg"].get("env_vars", {}).get("MCORE_EXPERIMENTAL_TORCH_MIMO_FSDP2") == "1":
++        if not config["megatron_cfg"].get("mimo"):
++            raise ValueError("The Torch MIMO experiment flag requires the MIMO recipe.")
++        dist_cfg.use_torch_fsdp2 = True
+     if "use_gloo_process_groups" in config["megatron_cfg"]:
+         dist_cfg.use_gloo_process_groups = config["megatron_cfg"][
+             "use_gloo_process_groups"

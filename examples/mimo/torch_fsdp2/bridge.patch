@@ -1,0 +1,109 @@
+--- a/src/megatron/bridge/models/megatron_mimo/megatron_mimo_ddp.py
++++ b/src/megatron/bridge/models/megatron_mimo/megatron_mimo_ddp.py
+@@ -54,6 +54,7 @@
+     *,
+     use_layer_wise_distributed_optimizer: bool = False,
+     use_layer_wise_param_layout: bool = True,
++    use_torch_fsdp2: bool = False,
+ ) -> "MimoModel":
+     """Wrap MegatronMIMO model's submodules with mixed precision and DDP.
+ 
+@@ -84,6 +85,13 @@
+     # Lazy import to avoid circular dependency (models layer loads before training layer)
+     from megatron.bridge.training.megatron_mimo_parallel_utils import is_current_rank_in_grid
+ 
++    if use_torch_fsdp2:
++        if ddp_config.use_megatron_fsdp or use_layer_wise_distributed_optimizer:
++            raise ValueError("Torch MIMO requires native FSDP2 ownership and ordinary Adam.")
++        if megatron_mimo_model.role.has_language_module and any(
++            pg is not None for name, pg in pg_collections.items() if name != MIMO_LANGUAGE_MODULE_KEY
++        ):
++            raise ValueError("Torch MIMO requires separate language and encoder ranks.")
+     use_fsdp = ddp_config.use_megatron_fsdp is True
+     if use_fsdp:
+         if ddp_config.megatron_fsdp_version != 2 or use_layer_wise_distributed_optimizer:
+@@ -138,6 +146,12 @@
+                     language_config,
+                     encoder=False,
+                 )
++                if use_torch_fsdp2:
++                    from megatron.core.distributed.torch_mimo_fsdp import TorchMimoFSDP
++
++                    megatron_mimo_model.language_model = language_model
++                    megatron_mimo_model.pg_collection = llm_pg
++                    return TorchMimoFSDP(language_config, ddp_config, megatron_mimo_model, llm_pg)
+                 if use_fsdp:
+                     # MIMO invokes embeddings and language-owned projectors before
+                     # language_model.forward(). Shard the whole local MIMO stage so
+@@ -205,7 +219,7 @@
+                     if ddp_config.overlap_grad_reduce is True or ddp_config.overlap_param_gather is True
+                     else ddp_config
+                 )
+-                if use_fsdp:
++                if use_fsdp or use_torch_fsdp2:
+                     # Vision retains native DDP and distributed Adam in both runs.
+                     encoder_ddp_config = dataclasses.replace(
+                         encoder_ddp_config,
+--- a/src/megatron/bridge/training/setup_megatron_mimo.py
++++ b/src/megatron/bridge/training/setup_megatron_mimo.py
+@@ -213,6 +213,11 @@
+     from megatron.bridge.models.megatron_mimo import build_megatron_mimo_model
+ 
+     megatron_mimo_provider = cfg.model
++    if cfg.dist.use_torch_fsdp2:
++        import os
++
++        if os.environ.get("MCORE_EXPERIMENTAL_TORCH_MIMO_FSDP2") != "1" or not preload_pretrained_weights:
++            raise ValueError("Experimental Torch MIMO requires MCORE_EXPERIMENTAL_TORCH_MIMO_FSDP2=1 and fresh pretrained-before-wrap initialization.")
+     if cfg.ddp.use_megatron_fsdp is True and not preload_pretrained_weights:
+         raise ValueError("MIMO MFSDPv2 currently requires pretrained weights loaded before sharding.")
+     if preload_pretrained_weights:
+@@ -274,6 +279,7 @@
+             megatron_mimo_infra.pg_collections,
+             use_layer_wise_distributed_optimizer=uses_layer_wise_optimizer(cfg.optimizer),
+             use_layer_wise_param_layout=use_layer_wise_param_layout,
++            use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
+         )
+ 
+     logger.info(f"Rank {dist.get_rank()}: Creating multimodule communicator")
+@@ -326,8 +332,10 @@
+     from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
+     from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
+ 
++    from megatron.core.distributed.torch_mimo_fsdp import TorchMimoFSDP
++
+     module_overrides = (
+-        {MIMO_LANGUAGE_MODULE_KEY: model} if isinstance(model, FullyShardedDataParallelV2) else None
++        {MIMO_LANGUAGE_MODULE_KEY: model} if isinstance(model, (FullyShardedDataParallelV2, TorchMimoFSDP)) else None
+     )
+     optimizer = get_mimo_optimizer(
+         unwrapped_model, _to_mcore_optimizer_config(cfg.optimizer), module_overrides=module_overrides
+--- a/src/megatron/bridge/training/megatron_mimo_parallel_utils.py
++++ b/src/megatron/bridge/training/megatron_mimo_parallel_utils.py
+@@ -127,9 +127,11 @@
+         if module_name == MIMO_LANGUAGE_MODULE_KEY:
+             from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
+ 
++            from megatron.core.distributed.torch_mimo_fsdp import TorchMimoFSDP
++
+             module = (
+                 megatron_mimo_model
+-                if isinstance(megatron_mimo_model, FullyShardedDataParallelV2)
++                if isinstance(megatron_mimo_model, (FullyShardedDataParallelV2, TorchMimoFSDP))
+                 else unwrapped_model.language_model
+             )
+         elif hasattr(unwrapped_model, "modality_submodules") and module_name in unwrapped_model.modality_submodules:
+--- a/src/megatron/bridge/training/config.py
++++ b/src/megatron/bridge/training/config.py
+@@ -1656,7 +1656,10 @@
+         if getattr(self.model, "moe_shortcut_connection", False) and (
+             self.dist.use_torch_fsdp2 or self.dist.use_megatron_fsdp or self.ddp.use_megatron_fsdp
+         ):
+-            raise ValueError("moe_shortcut_connection is not supported with FSDP.")
++            import os
++
++            if not (self.dist.use_torch_fsdp2 and os.environ.get("MCORE_EXPERIMENTAL_TORCH_MIMO_FSDP2") == "1"):
++                raise ValueError("moe_shortcut_connection is not supported with FSDP.")
+         # Core also enables LayerWise for legacy dist_* optimizer names.
+         if (
+             self.optimizer.use_layer_wise_distributed_optimizer or self.optimizer.optimizer.startswith("dist_")

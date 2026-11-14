@@ -1,0 +1,2 @@
+# Unified-diff blank context lines contain a required prefix space.
+*.patch -whitespace
