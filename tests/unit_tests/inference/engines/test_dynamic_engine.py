@@ -6837,6 +6837,127 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @torch.inference_mode()
+    def test_abort_of_queued_request_ends_it_without_admission(self):
+        """An abort of a request still in the queue ends it at once.
+
+        The coordinator acknowledges the abort as source-safe, so the engine must not then
+        admit the request and prefill a prompt whose output nobody reads.
+        """
+        env = self._build_test_env(DynamicEngineTestConfig(num_requests=2))
+        engine = env.engine
+        first, queued = env.requests[0], env.requests[1]
+        futures = [engine._add_request(request) for request in (first, queued)]
+        assert list(engine.waiting_request_ids) == [first.request_id, queued.request_id]
+
+        engine.use_coordinator = engine.is_mp_coordinator = True
+        socket = engine.socket_for_receiving_requests = mock.Mock()
+        socket.recv_multipart.side_effect = [
+            [msgpack.packb([Headers.ABORT_REQUEST.value, queued.request_id], use_bin_type=True)],
+            dynamic_engine_coordinator.zmq.Again,
+        ]
+        engine.model_parallel_publisher_socket = mock.Mock()
+        engine.schedule_requests()
+
+        acknowledged = msgpack.unpackb(socket.send.call_args.args[0], raw=False)
+        assert acknowledged == [Headers.REQUEST_ABORTED.value, queued.request_id, True]
+        assert list(engine.waiting_request_ids) == [first.request_id]
+        assert queued.request_id not in engine.requests
+        finished = futures[1].result()
+        assert finished.status == Status.COMPLETED and finished.generated_tokens == []
+        replies = [call.args[0] for call in socket.send_multipart.call_args_list]
+        replied = [[entry[0] for entry in msgpack.unpackb(f[0], raw=False)[1]] for f in replies]
+        assert replied == [[queued.request_id]]
+
+        # The other request runs alone; the aborted one never enters the context.
+        while not futures[0].done():
+            engine.step_modern()
+            rows = engine.context.request_ids[: engine.context.total_request_count].tolist()
+            assert queued.request_id not in rows
+        assert futures[0].result().status == Status.COMPLETED
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("async_sched_mode", list(AsyncScheduleMode))
+    @torch.inference_mode()
+    def test_abort_of_chunked_prefill_ends_it_without_another_chunk(self, async_sched_mode):
+        """An abort part-way through a chunked prefill ends the request between its chunks.
+
+        The coordinator acknowledges the abort as source-safe, so the engine must not run the
+        prompt's remaining chunks, and must release the KV blocks of the chunks already run.
+        """
+        chunk = 256
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                max_sequence_length=4 * chunk,
+                context_max_tokens=chunk,
+                context_max_requests=2,
+                context_block_size_tokens=chunk,
+                enable_chunked_prefill=True,
+                use_cuda_graphs_for_non_decode_steps=False,
+                async_sched_mode=async_sched_mode,
+            )
+        )
+        engine, context = env.engine, env.engine.context
+        vocab_size = DynamicEngineTestConfig.vocab_size
+        engine.controller.inference_wrapped_model.model.forward = partial(
+            mock_forward, vocab_size=vocab_size
+        )
+        free_blocks = context.kv_block_allocator.pool_avail
+        aborted, queued = (
+            DynamicInferenceRequest(
+                request_id=request_id,
+                prompt_tokens=torch.randint(0, vocab_size, (length,), device='cuda'),
+                sampling_params=SamplingParams(num_tokens_to_generate=2),
+            )
+            for request_id, length in ((1, 3 * chunk), (2, 8))
+        )
+        futures = [engine._add_request(request) for request in (aborted, queued)]
+        engine.step_modern()
+        assert context.chunked_prefill_request_id == aborted.request_id
+        assert aborted.finished_chunk_token_count == chunk
+
+        engine.use_coordinator = engine.is_mp_coordinator = True
+        abort = [Headers.ABORT_REQUEST.value, aborted.request_id]
+        messages = [[msgpack.packb(abort, use_bin_type=True)]]
+
+        def receive(flags=0):
+            if not messages:
+                raise dynamic_engine_coordinator.zmq.Again
+            return messages.pop(0)
+
+        socket = engine.socket_for_receiving_requests = mock.Mock()
+        socket.recv_multipart.side_effect = receive
+        engine.model_parallel_publisher_socket = mock.Mock()
+        engine.schedule_requests()
+        acknowledged = msgpack.unpackb(socket.send.call_args.args[0], raw=False)
+        assert acknowledged == [Headers.REQUEST_ABORTED.value, aborted.request_id, True]
+
+        # Drive the engine as its coordinator loop does until the queued request finishes.
+        for _ in range(8):
+            if futures[1].done():
+                break
+            engine.step_modern()
+            engine.schedule_requests()
+        assert futures[1].result().status == Status.COMPLETED
+
+        finished = futures[0].result()
+        assert finished.status == Status.COMPLETED and finished.generated_tokens == []
+        assert aborted.finished_chunk_token_count == chunk
+        sent = socket.send_multipart.call_args_list
+        metadata = [msgpack.unpackb(call.args[0][0], raw=False) for call in sent]
+        replied = [e[0] for m in metadata if m[0] == Headers.ENGINE_REPLY.value for e in m[1]]
+        assert sorted(replied) == [aborted.request_id, queued.request_id]
+        assert context.chunked_prefill_request_id == -1 and not engine.requests
+        assert context.kv_block_allocator.pool_avail == free_blocks
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("gc_mode", ["freeze", "freeze_overlap"])
     @torch.inference_mode()
     def test_gc_mode_releases_frozen_garbage_on_suspend(self, gc_mode):
