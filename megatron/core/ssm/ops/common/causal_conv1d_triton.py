@@ -235,11 +235,23 @@ def causal_conv1d_update(
     conv_state: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None,
-    silu_activation: bool,
+    silu_activation: bool | str | None,
     conv_state_indices: torch.Tensor | None,
     intermediate_conv_states: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Triton implementation of causal_conv1d_update (entrypoint)."""
+    """Triton implementation of causal_conv1d_update (entrypoint).
+
+    ``silu_activation`` is a bool or, as causal_conv1d's ``activation``, None, "silu" or
+    "swish": True, "silu" and "swish" apply SiLU to the output.
+    """
+    if isinstance(silu_activation, bool):
+        apply_silu = silu_activation
+    elif silu_activation in (None, "silu", "swish"):
+        apply_silu = silu_activation is not None
+    else:
+        raise ValueError(
+            f'silu_activation must be a bool, None, "silu" or "swish", got {silu_activation!r}'
+        )
 
     # Check if input is 2D, temporarily treat as 3D for uniform processing
     is_2d = x.dim() == 2
@@ -317,7 +329,7 @@ def causal_conv1d_update(
         HAS_BIAS=has_bias,
         HAS_STATE_INDICES=has_state_indices,
         HAS_INT_STATE=has_int_state,
-        SILU_ACTIVATION=silu_activation == "silu",
+        SILU_ACTIVATION=apply_silu,
     )
 
     if is_2d:
