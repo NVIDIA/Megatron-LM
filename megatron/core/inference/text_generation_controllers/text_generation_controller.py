@@ -16,7 +16,6 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.cuda.nvtx import range_pop, range_push
 
-from megatron.core import parallel_state
 from megatron.core.inference.async_stream import AsyncStream
 from megatron.core.inference.communication_utils import (
     broadcast_from_last_pipeline_stage,
@@ -307,13 +306,13 @@ class TextGenerationController(MTPControllerMixin):
         self.extra_eos_token_id_set = self._build_extra_eos_token_id_set(tokenizer)
         self.num_speculative_tokens = inference_config.num_speculative_tokens
 
-        pg_collection = inference_config.pg_collection
-        if pg_collection is not None:
-            self.pp_group = pg_collection.pp
-            self.dp_group = pg_collection.dp
-        else:
-            self.pp_group = parallel_state.get_pipeline_model_parallel_group()
-            self.dp_group = parallel_state.get_data_parallel_group()
+        # The wrapper resolves the pipeline-parallel group and rejects an unset one.
+        self.pp_group = self.inference_wrapped_model.pp_group
+        # The collection that the wrapper resolved from the same config, which rejects an unset
+        # or None dp group: torch.distributed would take it as the world group, and the seed
+        # offset below would be the global rank.
+        pg_collection = inference_config.resolve_pg_collection(self.inference_wrapped_model.model)
+        self.dp_group = pg_collection.dp
 
         self.model_is_pipeline_parallel = self.model_config.pipeline_model_parallel_size > 1
 
@@ -351,7 +350,7 @@ class TextGenerationController(MTPControllerMixin):
             and not self.model_config.deterministic_mode
         )
         if offset_by_dp:
-            seed += torch.distributed.get_rank(group=self.dp_group)
+            seed += self.dp_group.rank()
         self.sampling_rng.manual_seed(seed)
 
         if not self.num_speculative_tokens:
