@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""A2: count device->host synchronisations per ragged dispatch step (deterministic, not timing).
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""Count device->host synchronisations per ragged dispatch step (deterministic, not timing).
 
-The A2 change removes a redundant `.item()` that re-read a tensor the code had already pulled
+The change removes a redundant `.item()` that re-read a tensor the code had already pulled
 to the host with `.tolist()`. Wall-clock on this shared node cannot resolve that (co-tenant
 noise exceeds the effect), but the effect itself is *deterministic*: it is one fewer
 device->host transfer per ragged step. This probe counts them by wrapping the tensor
 methods that force a sync, so base and patch are compared on a number that does not depend
 on GPU contention at all.
 
-The exact round-trip oracle still runs, so a lower count cannot come from skipping work.
+The exact round-trip oracle and the valid-tokens total still run, so a lower count cannot
+come from skipping work; the probe exits non-zero if either check fails.
 """
 from __future__ import annotations
 
@@ -32,15 +34,15 @@ call_log = []
 def _wrap(name):
     """Wrap a tensor method so it records one sync event (ignoring internal re-entry)."""
     def wrapper(self, *a, **kw):
-        inner = _depth["sync"] > 0
-        if not inner:
-            _depth["sync"] += 1
+        if _depth["sync"] > 0:
+            return _orig[name](self, *a, **kw)
+        _depth["sync"] += 1
+        try:
             counts[name] += 1
-            try:
-                call_log.append((name, tuple(self.shape), str(self.dtype)))
-            finally:
-                _depth["sync"] -= 1
-        return _orig[name](self, *a, **kw)
+            call_log.append((name, tuple(self.shape), str(self.dtype)))
+            return _orig[name](self, *a, **kw)
+        finally:
+            _depth["sync"] -= 1
     return wrapper
 
 
@@ -77,7 +79,6 @@ def main():
     if a.repo_root:
         sys.path.insert(0, a.repo_root)
     from tests.unit_tests.inference.test_moe_dispatching_and_routing import (  # noqa: E402
-        NANOV3_BASE,
         _make_base_config,
     )
     from megatron.core.transformer.moe.moe_utils import get_default_pg_collection  # noqa: E402
@@ -179,6 +180,8 @@ def main():
               f"total={total} by={counts} exact={exact} rows_ok={rows_ok} "
               f"total_ok={total_ok}", flush=True)
     torch.distributed.barrier()
+    if not (exact and rows_ok and total_ok):
+        sys.exit(1)
 
 
 if __name__ == "__main__":

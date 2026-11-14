@@ -169,10 +169,8 @@ class NCCLAllGatherDispatcher(InferenceAllGatherDispatcherBase):
             local_tokens_per_rank = torch.empty(ep_size, dtype=torch.int32, device=device)
             dist.all_gather_into_tensor(local_tokens_per_rank, local_count, group=self.ep_group)
             cls._local_tokens_per_rank = local_tokens_per_rank.tolist()
-            # The per-rank counts were just host-synced by .tolist(), so sum them with a
-            # plain Python sum instead of re-reading the device tensor. The previous
-            # `total.item()` forced a SECOND device->host sync on data that is already on
-            # the host, on every ragged (prefill) step.
+            # .tolist() above is this path's only device->host sync; derive the total from
+            # the host copy instead of reading local_tokens_per_rank again.
             total_tokens = sum(cls._local_tokens_per_rank)
             InferenceAllGatherDispatcherBase._valid_tokens_tensor.fill_(total_tokens)
             InferenceAllGatherDispatcherBase._host_valid_tokens_estimate = total_tokens
