@@ -47,10 +47,7 @@ def test_sft_truncates_conversations_before_packing():
         tokenize_conversation=lambda *a, **kw: (torch.arange(1, 11), torch.arange(1, 11)),
     )
     config = SFTDatasetConfig(
-        random_seed=1234,
-        sequence_length=4,
-        packed_sequence_length=12,
-        tokenizer=tokenizer,
+        random_seed=1234, sequence_length=4, packed_sequence_length=12, tokenizer=tokenizer
     )
     dataset = object.__new__(SFTDataset)
     dataset.config = config
@@ -508,7 +505,10 @@ def test_fim_request_without_a_source_is_rejected(monkeypatch, warnings_log):
 
 @pytest.mark.parametrize(
     "config_cls,dataset_cls",
-    [(SFTDatasetConfig, SFTDataset), (varlen_dataset.VarlenDatasetConfig, varlen_dataset.VarlenDataset)],
+    [
+        (SFTDatasetConfig, SFTDataset),
+        (varlen_dataset.VarlenDatasetConfig, varlen_dataset.VarlenDataset),
+    ],
 )
 def test_online_fast_cache_keeps_sample_indices_without_rank_zero_barriers(
     monkeypatch, tmp_path, config_cls, dataset_cls
@@ -525,7 +525,9 @@ def test_online_fast_cache_keeps_sample_indices_without_rank_zero_barriers(
     )
     monkeypatch.setattr(dataset_cls, "build_low_level_dataset", lambda *args: [[], [], [], []])
     monkeypatch.setattr(
-        torch.distributed, "barrier", lambda *args, **kwargs: pytest.fail("unexpected cache barrier")
+        torch.distributed,
+        "barrier",
+        lambda *args, **kwargs: pytest.fail("unexpected cache barrier"),
     )
     builder = BlendedMegatronDatasetBuilder(dataset_cls, [4, 0, 0], lambda: True, config)
     splits = builder._build_megatron_datasets_parallel(

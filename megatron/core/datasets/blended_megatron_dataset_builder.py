@@ -223,9 +223,7 @@ class BlendedMegatronDatasetBuilder(object):
                         BlendedDataset,
                         self.is_built_on_rank,
                         (
-                            False
-                            if self.config.fast_cache_load
-                            else True
+                            False if self.config.fast_cache_load else True
                         ),  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load # pylint: disable=C0301
                         megatron_datasets[i],
                         weights_i,
@@ -318,9 +316,7 @@ class BlendedMegatronDatasetBuilder(object):
                         BlendedDataset,
                         self.is_built_on_rank,
                         (
-                            False
-                            if self.config.fast_cache_load
-                            else True
+                            False if self.config.fast_cache_load else True
                         ),  # synchronize_ranks, default behavior to build on rank-0 first. Set to False if we are using --dataloader-fast-cache-load # pylint: disable=C0301
                         megatron_datasets,
                         weights,
