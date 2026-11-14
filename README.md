@@ -9,6 +9,10 @@ Megatron-LM and Megatron Core
 [![version](https://img.shields.io/badge/release-0.19.0-green)](https://github.com/NVIDIA/Megatron-LM/releases)
 [![license](https://img.shields.io/badge/license-Apache-blue)](./LICENSE)
 
+<p align="center">
+  <b>English</b> | <a href="https://github.com/NVIDIA/Megatron-LM/blob/main/README.zh.md">简体中文</a>
+</p>
+
 <div align="left">
 
 ## About
