@@ -178,6 +178,89 @@ def _reference_attention(query, keys, values, table, row_requests, row_lengths, 
     return out
 
 
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("batch_invariant", [False, True], ids=["native", "bi"])
+@pytest.mark.parametrize(
+    "query_lengths,kv_lengths,num_decode_requests",
+    [([1, 1], [257, 129], 2), ([7, 11], [263, 139], 0), ([1, 7, 11], [257, 263, 139], 1)],
+    ids=["decode", "prefill", "mixed"],
+)
+@pytest.mark.usefixtures("nondeterministic_decode")
+def test_dynamic_attention_query_layouts(
+    native_context_factory, batch_invariant, query_lengths, kv_lengths, num_decode_requests
+):
+    """Packed THD and singleton-batch SBHD inputs agree through the actual dispatcher."""
+    if torch.cuda.get_device_capability() != (10, 0):
+        pytest.skip("BI DSA requires SM100")
+    if batch_invariant:
+        pytest.importorskip("deep_select")
+    pytest.importorskip("cutlass.cute")
+    torch.manual_seed(89)
+    max_seq_length, max_requests = 1024, 4
+    decode_only = num_decode_requests == len(query_lengths)
+    num_rows = max_requests if decode_only else -(-sum(query_lengths) // 8) * 8
+    context = native_context_factory(
+        max_sequence_length=max_seq_length, max_requests=max_requests, max_tokens=32
+    )
+    context.memory_buffer.normal_()
+    context.dsa_memory_buffer.normal_()
+    context.num_prefill_requests = len(query_lengths) - num_decode_requests
+    context.padded_active_token_count = num_rows
+    context.padded_active_request_count = max_requests
+    table = (
+        torch.randperm(max_requests * max_seq_length // 256, device="cuda")
+        .view(max_requests, -1)
+        .to(torch.int32)
+    )
+    context.dsa_metadata.update(
+        query_lengths,
+        kv_lengths,
+        num_decode_requests=num_decode_requests,
+        padded_tokens=num_rows,
+        padded_requests=max_requests,
+        decode_only=decode_only,
+    )
+    context.dsa_metadata.transfer(table, non_blocking=False)
+    query = torch.randn(num_rows, NUM_HEADS + 2, HEAD_DIM, device="cuda", dtype=torch.bfloat16)[
+        :, :NUM_HEADS
+    ]
+    index_query = torch.randn(num_rows, 1, 1, INDEX_DIM, device="cuda", dtype=torch.bfloat16)
+
+    def attend(query):
+        return dynamic_sparse_attention(
+            query=query,
+            key_cache=context.memory_buffer[0, 0],
+            value_cache=context.memory_buffer[1, 0],
+            index_query=index_query,
+            index_key_cache=context.dsa_memory_buffer[0],
+            inference_context=context,
+            index_topk=TOPK,
+            softmax_scale=HEAD_DIM**-0.5,
+            batch_invariant=batch_invariant,
+            max_seq_length=max_seq_length,
+        )
+
+    expected = attend(query)
+    assert expected.shape == (num_rows, 1, NUM_HEADS * HEAD_DIM)
+    assert torch.count_nonzero(expected[sum(query_lengths) :]) == 0
+    assert torch.equal(attend(query.unsqueeze(1)), expected)
+    with pytest.raises(ValueError, match=r"\[T,1,H,D\]"):
+        attend(query.unsqueeze(1).expand(-1, 2, -1, -1))
+
+    context._using_cuda_graph_this_step = True
+    for query_view in (query, query.unsqueeze(1)):
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            attend(query_view)
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = attend(query_view)
+        graph.replay()
+        assert torch.equal(output, expected)
+
+
 def test_build_row_metadata():
     rows = build_row_metadata(torch.tensor([1, 70, 1]), torch.tensor([9, 135, 4]), row_block=32)
     row_requests, row_lengths, block_starts, block_rows, block_requests = rows
