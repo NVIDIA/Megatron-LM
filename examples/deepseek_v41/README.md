@@ -378,16 +378,16 @@ The optimizations below speed up the 16-GPU 64K proxy on GB300: 40 V/E blocks, h
 5120, 48 experts with Top-6 routing, Engram, 64K-token packed sequences, CP16 and EP8, MXFP8,
 MoK experts, and transformer_engine CUDA graphs of the attention layers. A training step takes
 24.36 s (579 TFLOP/s per GPU) without them and 18.02 s (783 TFLOP/s per GPU) with all of them,
-including the run settings below and the two opt-in switches; the later Engram switches are not
-in these numbers.
+including the run settings below and the opt-in `MCORE_CSA2_CUDNN_INDEXER_LOSS` and
+`MCORE_MHC_SP_CUTILE_PROJ_RMS`; the later Engram switches are not in these numbers.
 
 Each switch is an environment variable, read once at import. Every optimization that keeps
 training results bit-identical is on by default, and its variable is a kill switch. The one
 exception is `MCORE_ROUTER_SAVE_FP32_INPUT`, which trades memory for time and stays opt-in. The
 debugging and profiling aids (`MCORE_CSA2_DEVICE_CHECKS`, `MCORE_ROUTER_CHECK_STATIC_TOKENS`,
-`MCORE_ENGRAM_HASH_CHECKS` and `MCORE_COMPONENT_NVTX`) are off by default. The cuDNN sparse
-indexer loss and the cuTile mHC projection change numerics, so they are opt-in and off by default.
-The router switches (`MCORE_ROUTER_*`, `MCORE_AUX_LOSS_SCALE_0DIM` and
+`MCORE_ENGRAM_HASH_CHECKS` and `MCORE_COMPONENT_NVTX`) are off by default. The cuDNN sparse indexer
+loss, the cuTile mHC projection and the fused Engram gate change numerics, so they are opt-in and
+off by default. The router switches (`MCORE_ROUTER_*`, `MCORE_AUX_LOSS_SCALE_0DIM` and
 `MCORE_RANDOM_STE_EMPTY_LIKE`) apply to every MoE model, with or without MoK; the `MCORE_MOK_*`
 switches apply to the MoK backend only.
 Boolean switches accept `1`, `true`, `yes` or `on` and `0`, `false`, `no` or `off` (any case);
@@ -418,6 +418,7 @@ switches raise one for non-integer values too; `MCORE_CSA2_CANDIDATE_CHUNK_MIB` 
 | `MCORE_ENGRAM_HASH_CHECKS` | off | `1` (debug) | Before each fused Engram hash, asserts on the device that every token id indexes the Engram token map: two compares, an AND, a reduction and a `torch._assert_async` launch (five small kernels) per microbatch, also inside CUDA graphs, where a failing check aborts the CUDA context without a Python stack. Turn it on for a new tokenizer or token map. | Yes: the check changes no tensor |
 | `MCORE_CSA2_CUDNN_INDEXER_LOSS` | off | `1` opts in | Computes the sparse indexer loss with cuDNN Frontend's DSA kernels instead of Triton, about 0.6 s per step faster at 64K. Inputs it does not support keep Triton, with one warning per reason; it needs an SM10x GPU, cuDNN Frontend's DSA wrappers, a BF16 H32/D128 indexer and at most 2048 Top-K slots, among other checks. | No: the score gradient is rounded to BF16, and dK accumulates with unordered FP32 adds (not reproducible run to run) |
 | `MCORE_MHC_SP_CUTILE_PROJ_RMS` | off | `1` opts in | Single-pass mHC computes its mapping projection and RMS with cuTile split-K kernels instead of Inductor and TF32 cuBLAS on an FP32 copy, where the backend policy selects cuTile and the residual qualifies (aligned, K = n * hidden >= 8192); other residuals warn and keep Inductor. | No: TF32 MMAs on the residual dtype and merged FP32 gradients |
+| `MCORE_ENGRAM_FUSED_GATE` | off | `1` opts in | Engram's context gate (the RMS-normalized key/hidden dot product, signed-square-root sigmoid gate and gated value add over the mHC streams) runs as one Triton forward kernel and three backward kernels instead of about 80 eager FP32 kernels, and keeps only its BF16 inputs and four FP32 values per token and stream for backward. With MXFP8 tables, the projection's padded output goes in whole, so backward makes no slice copy of its gradient. Deterministic run to run and capturable in CUDA graphs. Measured on the isolated gate at the proxy shape (4096 tokens, 4 streams of 5120, GB300): about 4.7 ms less GPU time and 680 MiB less activation memory per Engram layer and microbatch; not part of the step times above. Without Triton, or on the CPU, the eager gate runs. | No: its FP32 sums run in another order than the eager gate's (deterministic run to run) |
 | `MCORE_COMPONENT_NVTX` | off | `1` opts in | NVTX ranges per model component (`comp:<name>`) and layer (`layer:<n>`), forward and backward, also recorded during CUDA-graph capture. | Yes: host-only |
 
 "By test" means the equality was checked on GB300 rather than following from the code: re-run
@@ -448,5 +449,6 @@ instead of the baseline's `mla_up_proj mhc` trades activation memory for time; r
 reruns the same kernels on the same inputs, so values are expected to match. The measured runs
 also set `MCORE_CSA2_PAD_ROW_CAPACITY=32`: the proxy data has at most one padding row per
 microbatch. The MoK build and its schedule options are outside Megatron-LM's bit-identity tests:
-keep them fixed when comparing switch settings, and keep `MCORE_CSA2_CUDNN_INDEXER_LOSS` and
-`MCORE_MHC_SP_CUTILE_PROJ_RMS` off when the comparison must be bit-identical.
+keep them fixed when comparing switch settings, and keep `MCORE_CSA2_CUDNN_INDEXER_LOSS`,
+`MCORE_MHC_SP_CUTILE_PROJ_RMS` and `MCORE_ENGRAM_FUSED_GATE` off when the comparison must be
+bit-identical.

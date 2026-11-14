@@ -1083,9 +1083,13 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/models/test_v41_engram_static.py",
             "tests/unit_tests/ops/test_engram.py",
             K + "test_te_wrappers.py",
+            "tests/unit_tests/models/test_v41_engram_gate.py",
         ),
         kind="triton",
-        notes="Sorted repeated-row gradients and real Gloo EP lookup parity, including "
+        notes="Engram.forward's opt-in fused gate dispatch (MCORE_ENGRAM_FUSED_GATE) is compared "
+        "with its eager gate, including the TE projection tuple and MXFP8 row trimming, in "
+        "test_v41_engram_gate.py. "
+        "Sorted repeated-row gradients and real Gloo EP lookup parity, including "
         "uneven shards and FP8 values/scales transport. Blackwell tests compare fused "
         "gather/pack and reorder/columnwise quantization against native TE, and replay "
         "payloads, scale padding, NCCL/HybridEP lookup, projection gradients and master "
@@ -1132,6 +1136,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "rows under contention and the complete EP lookup with its all-to-alls; the model "
         "tests match the NCCL backend and _embedding_row_gradients bit for bit, also after "
         "CUDA-graph replay.",
+    ),
+    KernelEntry(
+        name="v41_engram_fused_gate",
+        sources=("megatron/core/models/deepseek_v41/engram_gate.py",),
+        tests=(K + "test_engram_gate.py", "tests/unit_tests/models/test_v41_engram_gate.py"),
+        kind="triton",
+        notes="Opt-in (MCORE_ENGRAM_FUSED_GATE=1) Engram gate. One program per (token, stream) "
+        "for the forward and per token for the gate-gradient coefficients; token-chunk x "
+        "hidden-block programs for the input gradients, each writing its own slice of FP32 "
+        "q_weight/k_weight partials, which one kernel sums in chunk order. No atomics; launch "
+        "configurations depend on the shapes only. Replayed bit-exactly under contention at the "
+        "proxy shape for B=1, B=2 with token masks, and the MXFP8 lookup's padded [rows, width] "
+        "kv (pad rows of its gradient zeroed); test_v41_engram_gate checks FP64 autograd, the "
+        "eager gate, CUDA graph replay and Engram.forward dispatch.",
     ),
     KernelEntry(
         name="dsa_dispatch",

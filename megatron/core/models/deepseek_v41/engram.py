@@ -11,6 +11,7 @@ from torch import nn
 from megatron.core.enums import Fp8Recipe
 from megatron.core.env_flags import env_flag
 from megatron.core.fp8_utils import get_fp8_context, is_first_last_bf16_layer
+from megatron.core.models.deepseek_v41 import engram_gate
 from megatron.core.models.deepseek_v41.engram_hash import EngramLayout, compute_hash_multipliers
 from megatron.core.models.deepseek_v41.engram_hash_kernels import fused_engram_hash
 from megatron.core.models.engram.distributed_embedding import EPShardedMultiTableEmbedding
@@ -252,6 +253,25 @@ class Engram(MegatronModule):
         kv = self.wkv(embeddings)
         if self.fp8_projection:
             kv = kv[0]
+        if (
+            engram_gate.FUSED_ENGRAM_GATE
+            and engram_gate.HAVE_TRITON
+            and hidden_states.is_cuda
+            and kv.is_cuda
+        ):
+            # Opt-in Triton gate (MCORE_ENGRAM_FUSED_GATE=1); the eager code below is the
+            # reference. The MXFP8 lookup's padded [rows, width] projection output goes in
+            # whole, so backward makes no zero-filled copy of its gradient for the row slice.
+            return engram_gate.fused_engram_gate(
+                hidden_states,
+                kv if self.fp8_lookup else kv.transpose(0, 1),
+                self.q_weight,
+                self.k_weight,
+                token_mask,
+                self.n,
+                self.hidden_size,
+                self.config.layernorm_epsilon,
+            )
         if self.fp8_lookup:
             length, batch = hidden_states.shape[:2]
             kv = kv[: batch * length].view(batch, length, (self.n + 1) * self.hidden_size)
