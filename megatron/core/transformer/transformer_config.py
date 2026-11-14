@@ -233,6 +233,13 @@ class TransformerConfig(ModelParallelConfig):
     attention_dropout: float = 0.1
     """Post attention dropout probability."""
 
+    attention_saved_lse_cudnn_backward: bool = False
+    """Use native FA2 forward with saved-LSE cuDNN backward for qualified BF16 TP1/CP1 shapes.
+    The adapter requires compatible TE/FA2 APIs. Unsupported runtime shapes, masks,
+    precision or inference retain native TE behavior. cuDNN backward is not bitwise
+    identical to FA2 backward; opt-in only, with independent gradient-tolerance tests.
+    """
+
     fp32_residual_connection: bool = False
     """If true, move residual connections to fp32."""
 

@@ -1005,6 +1005,15 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "their own; the capture order is fixed by the callable list and adds no numerics.",
     ),
     KernelEntry(
+        name="fa2_saved_lse_cudnn_backward",
+        sources=("megatron/core/ops/attention/te_saved_lse.py",),
+        tests=(K + "test_attention_saved_lse.py",),
+        kind="dispatch",
+        notes="Preserve native FA2 forward, reuse its saved LSE in cuDNN backward. "
+        "Candidate backward replays bit-exactly in deterministic mode; numerical parity "
+        "with native FA2 backward is tolerance-based, not bit-exact.",
+    ),
+    KernelEntry(
         name="muon_newton_schulz_dispatch",
         sources=("megatron/core/optimizer/layer_sharded_muon.py",),
         tests=(

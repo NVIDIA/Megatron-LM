@@ -2558,6 +2558,14 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             **extra_kwargs,
         )
 
+        if self.config.attention_saved_lse_cudnn_backward:
+            from megatron.core.ops.attention.te_saved_lse import install_saved_lse_attention
+
+            if not install_saved_lse_attention(self):
+                raise RuntimeError(
+                    "Saved-LSE cuDNN backward requires compatible TE FlashAttention APIs."
+                )
+
     @contextmanager
     def _temporary_runtime_context_parallel_group(
         self, packed_seq_params: Optional[PackedSeqParams]
