@@ -235,6 +235,30 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         name: Module instance name passed top-down from its parent module.
     """
 
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: TransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+    ) -> float:
+        """Estimate forward FLOPs with the existing recurrent GDP lower bound."""
+        tokens = total_real_tokens_in_batch
+        hidden = config.hidden_size
+        heads = config.mamba_num_heads
+        inner = 2 * hidden if heads is None else heads * config.mamba_head_dim
+        heads = inner // config.mamba_head_dim if heads is None else heads
+        householder = config.gdp_num_householder
+        grouped_state = config.mamba_num_groups * config.mamba_state_dim
+        in_projection = (inner + grouped_state + heads) * (1 + householder)
+        convolution = inner * householder + grouped_state * (1 + householder)
+        # The existing estimate uses the mixer's default convolution width of four.
+        projections = 2 * tokens * (hidden * in_projection + 4 * convolution + inner * hidden)
+        # FLA chunk kernels may additionally perform score/solve/WY work.
+        recurrence = (4 * householder + 3) * tokens * inner * config.mamba_state_dim
+        return projections + recurrence
+
     def __init__(
         self,
         config: TransformerConfig,
