@@ -150,6 +150,27 @@ def test_config_batch_invariant_device_metadata_gemm(monkeypatch, grouped_tensor
         )
 
 
+@pytest.mark.parametrize("bi_backend", ["deepgemm", "triton"])
+def test_config_rejects_mxfp8_experts_outside_te_native(monkeypatch, bi_backend):
+    """Outside inference mode these experts run TE GroupedLinear, whose MXFP8 GEMMs the
+    deepgemm/triton grouped dispatchers cannot run, so the config is rejected up front."""
+    monkeypatch.setattr(
+        "megatron.core.transformer.custom_layers.batch_invariant_kernels.HAVE_DEEPGEMM_BF16", True
+    )
+    with pytest.raises(AssertionError, match="require batch_invariant_backend='te_native'"):
+        _make_base_config(
+            inference_grouped_gemm_backend="torch",
+            fp8="hybrid",
+            fp8_recipe="mxfp8",
+            fp8_param=True,
+            batch_invariant_mode=True,
+            batch_invariant_backend=bi_backend,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+        )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # InferenceTopKRouter
 # ──────────────────────────────────────────────────────────────────────

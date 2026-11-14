@@ -51,7 +51,7 @@ from tests.unit_tests.determinism.kernels.harness import (
     bytes_equal,
     seeded,
 )
-from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars, is_lts_ci_image
 
 pytestmark = pytest.mark.skipif(
     not (torch.cuda.is_available() and HAVE_TE), reason="needs a GPU and Transformer Engine"
@@ -716,6 +716,50 @@ class TestTEWrappers:
             )
             assert FP8GlobalStateManager.is_fp8_enabled()
         assert not module.fp8
+
+    @pytest.mark.skipif(
+        is_lts_ci_image(),
+        reason="DeepGEMM and cuBLASLt >= 13.4 (TE's grouped-tensor path) are not in the LTS image.",
+    )
+    @pytest.mark.parametrize("backend", ["deepgemm", "triton"])
+    def test_te_grouped_linear_grouped_tensor_batch_invariant_replays(self, backend):
+        """The GroupedTensor path under deepgemm/triton runs DeepGEMM's grouped GEMMs."""
+        from transformer_engine.pytorch.module.grouped_linear import (
+            is_module_grouped_tensor_path_supported,
+        )
+
+        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+            HAVE_DEEPGEMM_BF16,
+        )
+
+        # In the dev image both exist; there a missing one fails rather than skips.
+        assert HAVE_DEEPGEMM_BF16, "the dev CI image ships DeepGEMM with bf16 bindings"
+        assert is_module_grouped_tensor_path_supported(None, torch.bfloat16)
+        seeded()
+        m_splits = [256, 13, 0, 300]
+        module = TEGroupedLinear(
+            len(m_splits),
+            512,
+            256,
+            parallel_mode=None,
+            config=_config(
+                moe_grouped_gemm=True, num_moe_experts=len(m_splits), moe_use_grouped_tensor=True
+            ),
+            init_method=init_method_normal(0.02),
+            bias=False,
+            skip_bias_add=False,
+            is_expert=True,
+        ).cuda()
+        x = torch.randn(sum(m_splits), 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        splits = torch.tensor(m_splits, device="cuda", dtype=torch.int64)
+        with set_batch_invariant_mode(True, backend=backend):
+            assert_module_replays_bit_exact(
+                module,
+                (x, splits),
+                replays=3,
+                contention=True,
+                what=f"TEGroupedLinear[grouped_tensor, {backend}]",
+            )
 
     @pytest.mark.internal
     @pytest.mark.launch_on_gb200
