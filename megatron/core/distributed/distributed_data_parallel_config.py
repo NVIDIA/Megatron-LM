@@ -51,6 +51,11 @@ class DistributedDataParallelConfig:
        enabled. Defaults to 1, which means DistOpt is across entire DP domain.
     """
 
+    expert_num_distributed_optimizer_instances: Optional[int] = None
+    """Same as `num_distributed_optimizer_instances`, for experts; only MFSDP v2 supports a
+       different value. None is replaced with `num_distributed_optimizer_instances`.
+    """
+
     check_for_nan_in_grad: bool = False
     """
     If true, check for NaNs and Infs in gradients _before_ communication collective.
@@ -214,7 +219,8 @@ class DistributedDataParallelConfig:
     """Sharding strategy for the outer expert data-parallel group in MFSDP v2.
     Valid values are ``'no_shard'``, ``'optim'``, ``'optim_grads'``, and
     ``'optim_grads_params'``. None is replaced with
-    ``outer_dp_sharding_strategy`` during finalization.
+    ``outer_dp_sharding_strategy`` during finalization (``'no_shard'`` if only dense parameters
+    have an outer axis).
     """
 
     disable_symmetric_registration: bool = False
@@ -352,10 +358,22 @@ class DistributedDataParallelConfig:
 
     def _canonicalize(self) -> None:
         """Resolve local defaults and aliases after recipe edits."""
+        if self.expert_num_distributed_optimizer_instances is None:
+            self.expert_num_distributed_optimizer_instances = (
+                self.num_distributed_optimizer_instances
+            )
         if self.expert_data_parallel_sharding_strategy is None:
             self.expert_data_parallel_sharding_strategy = self.data_parallel_sharding_strategy
         if self.expert_outer_dp_sharding_strategy is None:
-            self.expert_outer_dp_sharding_strategy = self.outer_dp_sharding_strategy
+            # Experts without an outer axis cannot inherit a dense outer sharding strategy.
+            only_dense_outer = (
+                self.expert_num_distributed_optimizer_instances
+                <= 1
+                < self.num_distributed_optimizer_instances
+            )
+            self.expert_outer_dp_sharding_strategy = (
+                "no_shard" if only_dense_outer else self.outer_dp_sharding_strategy
+            )
         if self.megatron_fsdp_max_pool_double_buffer:
             self.fsdp_double_buffer = True
         if self.use_megatron_fsdp and self.megatron_fsdp_version == 1 and self.nccl_ub:
@@ -383,6 +401,15 @@ class DistributedDataParallelConfig:
                 raise ValueError(
                     f"{name} must be one of {list(_SHARDING_STRATEGIES)}, got {value!r}."
                 )
+        if (
+            self.expert_num_distributed_optimizer_instances is not None
+            and self.expert_num_distributed_optimizer_instances
+            != self.num_distributed_optimizer_instances
+            and not (self.use_megatron_fsdp and self.megatron_fsdp_version == 2)
+        ):
+            raise ValueError(
+                "expert_num_distributed_optimizer_instances can only differ with MFSDP v2."
+            )
         if self.use_megatron_fsdp and self.grad_reduce_in_fp32:
             if self.megatron_fsdp_main_grads_dtype != torch.float32:
                 raise ValueError(
