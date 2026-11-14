@@ -29,6 +29,7 @@ def packed_entrypoint(request, monkeypatch):
         cp=SimpleNamespace(size=lambda: 1, rank=lambda: 0),
     )
     config = SimpleNamespace(
+        attention_cp_layout="zigzag",
         sequence_packing_scheduler="default_dynamic_cp",
         dynamic_context_parallel=True,
         virtual_pipeline_model_parallel_size=3,
@@ -72,7 +73,7 @@ def test_packed_batch_uses_supplied_groups_and_mtp_pipeline_stage(
     assert kwargs["dynamic_cp"] is True
     assert "dynamic_cp_group_func" not in kwargs
     assert "dynamic_tp_cp_group_func" not in kwargs
-    assert kwargs.get("return_context_parallel_batch", False) is (module is pretrain_hybrid)
+    assert kwargs["return_context_parallel_batch"] is True
     bootstrap.assert_not_called()
 
 
@@ -100,10 +101,7 @@ def test_forward_step_passes_groups_from_wrapped_model(packed_entrypoint, monkey
     module, pgs, _ = packed_entrypoint
     output, iterator = object(), object()
     model = _Wrapper(_Wrapper(Mock(spec=[], pg_collection=pgs, vp_stage=2, return_value=output)))
-    if module is pretrain_gpt:
-        batch = (None,) * 7
-    else:
-        batch = SimpleNamespace(get_batch=lambda: {}, get_packed_seq_params=lambda: None)
+    batch = pretrain_gpt.ContextParallelBatch.from_single_layout("zigzag", {}, None)
     fetch = Mock(return_value=batch)
     monkeypatch.setattr(module, "get_batch", fetch)
     monkeypatch.setattr(module, "get_timers", lambda: Mock())

@@ -34,7 +34,7 @@ def run_worker() -> None:
 
     def observe_batch(*args, **kwargs):
         result = original_get_batch(*args, **kwargs)
-        packed = result[5]
+        packed = result.get_packed_seq_params()
         group = packed.cp_group
         cp_size = 1 if group is None else group.size()
         if kwargs.get("dynamic_cp", False):
