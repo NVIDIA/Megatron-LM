@@ -2957,6 +2957,50 @@ def test_refresh_vlm_request_recomputes_embeddings_from_preserved_mask():
     )
 
 
+def test_refresh_vlm_request_after_a_stop_trimmed_its_checkpoint():
+    """A refresh accepts a checkpoint whose stop trim left it shorter than its mask.
+
+    A resume extends a checkpointed request's mask over its generated tokens. A stop
+    sequence spanning the checkpoint then trims generated tokens from the end of the
+    checkpointed prompt, and the next refresh (a resume or a generation-epoch change) must
+    re-encode the request with the mask cut back to the prompt, not fail.
+    """
+    request = DynamicVLMInferenceRequest(
+        request_id=33,
+        # Prompt [99, 99, 5], then generated 7 kept in the checkpoint; 8 was trimmed.
+        prompt_tokens=torch.tensor([99, 99, 5, 7]),
+        sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(1, 2, 4),
+        num_tiles=None,
+        imgs_sizes=torch.tensor([[1, 2]]),
+        decoder_seq_length=0,
+        image_embeddings=None,
+        image_token_mask=torch.tensor([0, 1, -1, -1, -1]),
+    )
+    wrapper = types.SimpleNamespace(
+        _forward_vision_encoder=mock.Mock(return_value=torch.ones(2, 1, 4))
+    )
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.controller = types.SimpleNamespace(inference_wrapped_model=wrapper, tokenizer=object())
+    engine.context = types.SimpleNamespace(add_vlm_request_data=mock.Mock())
+    engine._cache_vision_embedding = mock.Mock()
+
+    engine._refresh_vlm_request_data(request)
+
+    assert request.image_token_mask.tolist() == [0, 1, -1, -1]
+    assert request.image_embeddings is wrapper._forward_vision_encoder.return_value
+    engine.context.add_vlm_request_data.assert_called_once_with(
+        33, image_embeddings=request.image_embeddings, image_token_mask=request.image_token_mask
+    )
+
+    # Media past the prompt's end is still an error.
+    request.image_embeddings = None
+    request.image_token_mask = torch.tensor([0, 1, -1, -1, 2])
+    with pytest.raises(RuntimeError, match="covers media past its end"):
+        engine._refresh_vlm_request_data(request)
+
+
 def test_refresh_vlm_request_without_mask_fails_for_compact_admitted_request():
     request = DynamicVLMInferenceRequest(
         request_id=34,
