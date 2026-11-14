@@ -6347,6 +6347,224 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         assert prefix_skip_tokens == 0
         assert effective_prefill_chunk_length == 211
 
+    @staticmethod
+    def _zero_logit_forward(env):
+        """A model forward returning zero logits; scheduling needs no real values."""
+
+        def forward(*args, **kwargs):
+            tokens = kwargs.get("tokens", args[0] if args else kwargs.get("input_ids"))
+            return torch.zeros(
+                *tokens.shape, env.config.vocab_size, device=tokens.device, dtype=torch.bfloat16
+            )
+
+        return forward
+
+    @staticmethod
+    def _run_to_completion(engine, max_steps):
+        finished = {}
+        for _ in range(max_steps):
+            if not engine.has_unfinished_requests():
+                break
+            for request in engine.step_modern()["finished_requests"]:
+                finished[request.request_id] = request
+        assert not engine.has_unfinished_requests(), list(engine.waiting_request_ids)
+        return {i: len(r.generated_tokens) for i, r in finished.items()}, finished
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_prompt_log_probs_keep_cached_prefix_chain_whole(self) -> None:
+        """A finished request's prompt log-probs must not leave a cached block without its parent.
+
+        8-token blocks, a 12-token step budget, prefix caching with REF_ZERO, and async
+        scheduling. Request 0 returns prompt log-probs for a 24-token prompt, prefilled in
+        chunks of 12 and 12, and finishes after one token; its last chunk's rows are stored
+        after the next admission. Request 1 shares the prompt and waits for that admission.
+        Had the rows' blocks 1 and 2 been held until then, block 0 would leave the cache
+        alone, and request 1's prefix match would find block 1 without its parent.
+        """
+        env = self._build_test_env(
+            DynamicEngineTestConfig(
+                num_requests=0,
+                max_sequence_length=64,
+                context_block_size_tokens=8,
+                context_max_requests=2,
+                context_max_tokens=12,
+                enable_chunked_prefill=True,
+                enable_prefix_caching=True,
+                prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.REF_ZERO,
+                materialize_only_last_token_logits=False,
+                model_provider="gpt",
+            )
+        )
+        engine = env.engine
+        engine.controller.inference_wrapped_model.model.forward = self._zero_logit_forward(env)
+        prompt = torch.arange(1, 25, dtype=torch.int64, device=torch.cuda.current_device())
+
+        def add(request_id, **sampling_kwargs):
+            # The public path computes the prompt's prefix-cache block hashes.
+            engine.add_request(
+                request_id,
+                prompt.clone(),
+                SamplingParams(num_tokens_to_generate=1, termination_id=-1, **sampling_kwargs),
+            )
+
+        add(0, return_log_probs=True, skip_prompt_log_probs=False)
+        # Step until request 0's second chunk is launched.
+        for _ in range(4):
+            if 0 not in engine.waiting_request_ids:
+                break
+            engine.step_modern()
+        assert 0 not in engine.waiting_request_ids
+        assert not engine.get_request(0).generated_tokens
+        hashes = list(engine.get_request(0).precomputed_block_hashes)
+        add(1)
+
+        cached = engine.context.prefix_cache_registry.kv_hash_to_block_id
+        finished = {}
+        for _ in range(10):
+            if not engine.has_unfinished_requests():
+                break
+            for request in engine.step_modern()["finished_requests"]:
+                finished[request.request_id] = request
+            present = [value in cached for value in hashes]
+            assert present == sorted(present, reverse=True), present
+        assert not engine.has_unfinished_requests(), list(engine.waiting_request_ids)
+        assert {i: len(r.generated_tokens) for i, r in finished.items()} == {0: 1, 1: 1}
+        assert len(finished[0].prompt_log_probs) == len(prompt) - 1
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @torch.inference_mode()
+    def test_prompt_log_probs_leave_finished_blocks_evictable(self) -> None:
+        """Under LRU, a finished request's blocks must be evictable before its rows are stored.
+
+        Four usable 8-token blocks, a 12-token step budget, and async scheduling. Request 0
+        returns prompt log-probs for a 24-token prompt, prefilled in chunks of 12 and 12,
+        and finishes after one token; its last chunk's rows are stored after the next
+        admission. Request 1, with another 24-token prompt, then needs two blocks with one
+        free. Had request 0's blocks 1 and 2 been held, block 0 would count as evictable
+        although its child is in use, and the eviction would fall short.
+        """
+
+        def config(**kwargs):
+            return DynamicEngineTestConfig(
+                num_requests=0,
+                max_sequence_length=64,
+                context_block_size_tokens=8,
+                context_max_requests=2,
+                context_max_tokens=12,
+                enable_chunked_prefill=True,
+                enable_prefix_caching=True,
+                prefix_caching_eviction_policy=PrefixCachingEvictionPolicy.LRU,
+                materialize_only_last_token_logits=False,
+                model_provider="gpt",
+                **kwargs,
+            )
+
+        block_size_bytes = self._build_test_env(config()).engine.context.block_size_bytes
+        env = self._build_test_env(
+            config(
+                context_buffer_size_gb=(4 + 1.5) * block_size_bytes / 1024**3,
+                context_paused_buffer_size_gb=0.5 * block_size_bytes / 1024**3,
+            )
+        )
+        engine = env.engine
+        allocator = engine.context.kv_block_allocator
+        assert (allocator.pool_size, allocator.paused_limit) == (5, 0)
+        engine.controller.inference_wrapped_model.model.forward = self._zero_logit_forward(env)
+
+        def add(request_id, first_token, **sampling_kwargs):
+            engine.add_request(
+                request_id,
+                torch.arange(
+                    first_token,
+                    first_token + 24,
+                    dtype=torch.int64,
+                    device=torch.cuda.current_device(),
+                ),
+                SamplingParams(num_tokens_to_generate=1, termination_id=-1, **sampling_kwargs),
+            )
+
+        add(0, 1, return_log_probs=True, skip_prompt_log_probs=False)
+        # Step until request 0's second chunk is launched.
+        for _ in range(4):
+            if 0 not in engine.waiting_request_ids:
+                break
+            engine.step_modern()
+        assert 0 not in engine.waiting_request_ids
+        assert not engine.get_request(0).generated_tokens
+        add(1, 41)
+        assert self._run_to_completion(engine, 10)[0] == {0: 1, 1: 1}
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize(
+        "policy", [PrefixCachingEvictionPolicy.LRU, PrefixCachingEvictionPolicy.REF_ZERO]
+    )
+    @pytest.mark.parametrize("prompt_length, admit_step", [(1, 7), (3, 5), (5, 3)])
+    @torch.inference_mode()
+    def test_prompt_log_probs_do_not_starve_other_requests(
+        self, policy, prompt_length, admit_step
+    ) -> None:
+        """A finished request's blocks must be free to others before its rows are stored.
+
+        Three usable 8-token blocks, a one-block paused budget, and async scheduling.
+        Request 0 decodes 20 tokens. Request 1 returns prompt log-probs for a 16-token
+        prompt and finishes after one token, in the step where request 0 needs another
+        block; its rows are stored after that step's update. Had request 1's two blocks
+        been held until then, request 0 would pause with no request left active.
+        """
+
+        def config(**kwargs):
+            return DynamicEngineTestConfig(
+                num_requests=0,
+                max_sequence_length=64,
+                context_block_size_tokens=8,
+                context_max_requests=2,
+                context_max_tokens=32,
+                enable_prefix_caching=True,
+                prefix_caching_eviction_policy=policy,
+                materialize_only_last_token_logits=False,
+                model_provider="gpt",
+                **kwargs,
+            )
+
+        block_size_bytes = self._build_test_env(config()).engine.context.block_size_bytes
+        env = self._build_test_env(
+            config(
+                context_buffer_size_gb=(3 + 1.5) * block_size_bytes / 1024**3,
+                context_paused_buffer_size_gb=(1 + 0.5) * block_size_bytes / 1024**3,
+            )
+        )
+        engine = env.engine
+        engine.controller.inference_wrapped_model.model.forward = self._zero_logit_forward(env)
+        device = torch.cuda.current_device()
+        engine.add_request(
+            0,
+            torch.arange(1, prompt_length + 1, dtype=torch.int64, device=device),
+            SamplingParams(num_tokens_to_generate=20, termination_id=-1),
+        )
+        for _ in range(admit_step):
+            engine.step_modern()
+        engine.add_request(
+            1,
+            torch.arange(41, 57, dtype=torch.int64, device=device),
+            SamplingParams(
+                num_tokens_to_generate=1,
+                termination_id=-1,
+                return_log_probs=True,
+                skip_prompt_log_probs=False,
+            ),
+        )
+        assert self._run_to_completion(engine, 40)[0] == {0: 20, 1: 1}
+
     @pytest.mark.internal
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
