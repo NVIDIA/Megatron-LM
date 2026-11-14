@@ -263,6 +263,33 @@ class MoELayer(BaseMoELayer):
     strategies such as All-to-All and All-Gather.
     """
 
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: TransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+    ) -> float:
+        """Estimate forward FLOPs for routed/shared experts and latent projections."""
+        tokens = total_real_tokens_in_batch
+        projections = 3 if config.gated_linear_unit else 2
+        expert_width = config.moe_ffn_hidden_size or config.ffn_hidden_size
+        routed_hidden = (
+            config.hidden_size if config.moe_latent_size is None else config.moe_latent_size
+        )
+        routed = 2 * projections * tokens * routed_hidden * expert_width * config.moe_router_topk
+        if config.moe_latent_size is not None:
+            routed += 4 * tokens * config.hidden_size * config.moe_latent_size
+        shared = (
+            2
+            * projections
+            * tokens
+            * config.hidden_size
+            * (config.moe_shared_expert_intermediate_size or 0)
+        )
+        return routed + shared
+
     def __init__(
         self,
         config: TransformerConfig,
