@@ -376,13 +376,21 @@ def _get_replica_id(pg_collection: Optional[ProcessGroupCollection]) -> tuple:
 def _optimizer_config_for_module(
     config: OptimizerConfig, module: torch.nn.Module
 ) -> OptimizerConfig:
-    """Derive an optimizer config whose param-gather overlap matches the module's DDP config."""
+    """Derive optimizer sharding and overlap settings from the module's wrapper."""
     ddp_config = getattr(module, 'ddp_config', None)
     if ddp_config is None:
-        raise ValueError("Active MIMO modules must be DDP-wrapped before optimizer construction.")
+        raise ValueError(
+            "Active MIMO modules must have a ddp_config before optimizer construction."
+        )
     overlap_param_gather = ddp_config.overlap_param_gather
     return replace(
         config,
+        use_distributed_optimizer=(
+            config.use_distributed_optimizer
+            if config.use_layer_wise_distributed_optimizer
+            else ddp_config.use_distributed_optimizer
+        ),
+        reuse_grad_buf_for_mxfp8_param_ag=ddp_config.reuse_grad_buf_for_mxfp8_param_ag,
         overlap_param_gather=overlap_param_gather,
         overlap_param_gather_with_optimizer_step=(
             config.overlap_param_gather_with_optimizer_step and overlap_param_gather
@@ -390,9 +398,19 @@ def _optimizer_config_for_module(
     )
 
 
-def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> MimoOptimizer:
-    """Create optimizer for MimoModel with heterogeneous parallelism."""
+def get_mimo_optimizer(
+    mimo_model: "MimoModel",
+    config: OptimizerConfig,
+    *,
+    module_overrides: Optional[Dict[str, torch.nn.Module]] = None,
+) -> MimoOptimizer:
+    """Create optimizers for MIMO modules with heterogeneous parallelism.
+
+    ``module_overrides`` supplies wrapped local stages when the distributed wrapper
+    encloses the MimoModel rather than its language-model child.
+    """
     from megatron.core.optimizer import get_megatron_optimizer
+    from megatron.core.optimizer.fully_sharded_optimizer import FullyShardedOptimizer
 
     grid_map = mimo_model.mimo_config.module_to_grid_map
     from megatron.core.models.mimo.config.role import MIMO_LANGUAGE_MODULE_KEY
@@ -407,7 +425,9 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
         is_active = False
 
         if grid.is_current_rank_in_grid():
-            if module_name == lang_key:
+            if module_overrides is not None and module_name in module_overrides:
+                module = module_overrides[module_name]
+            elif module_name == lang_key:
                 module = mimo_model.language_model
             else:
                 module = mimo_model.modality_submodules[module_name]
@@ -434,6 +454,12 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
                     use_gloo_process_groups=False,
                     param_group_process_group=pg_collection.intra_dist_opt,
                 )
+                # MFSDP accounts for replication in each gradient's layout. Include
+                # every shard in this module's grid, without unrelated vision ranks
+                # from WORLD or omissions from an optimizer-instance subgroup.
+                for leaf in getattr(optimizer, "chained_optimizers", [optimizer]):
+                    if isinstance(leaf, FullyShardedOptimizer):
+                        leaf.grad_stats_parallel_group = grid.get_pg(grid.dim_names)
 
         module_infos[module_name] = ModuleOptimizerInfo(
             optimizer=optimizer, grid=grid, pg_collection=pg_collection, is_active=is_active
