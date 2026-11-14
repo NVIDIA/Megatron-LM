@@ -435,3 +435,8 @@ class FullCudaGraphWrapper:
         gc.collect()
         # After the collection, so a graph dropped above no longer counts as a pool user.
         release_shared_graph_pool_if_unused()
+        if captured:
+            # A discarded graph's pool memory stays cached in that pool, where eager steps
+            # cannot use it, until the cache is emptied. Without this the eager steps that
+            # follow a reset reserve their working memory on top of it.
+            torch.cuda.empty_cache()
