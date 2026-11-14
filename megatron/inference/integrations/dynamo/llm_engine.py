@@ -49,6 +49,7 @@ from megatron.core.inference.inference_client import (
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.inference.integrations.dynamo.args import Config, parse_args
+from megatron.inference.integrations.dynamo.handoff_channel import HandoffChannel
 from megatron.inference.integrations.dynamo.handoff_recovery import HandoffRelease
 from megatron.inference.integrations.dynamo.telemetry import EngineEventReceiver
 
@@ -128,8 +129,8 @@ class MegatronLLMEngine(LLMEngine):
         self._published_block_hashes: set[int] = set()
         self._event_receiver: Optional[EngineEventReceiver] = None
         self._release_context: zmq.asyncio.Context | None = None
-        self._release_sockets: dict[str, zmq.asyncio.Socket] = {}
-        self._release_locks: dict[str, asyncio.Lock] = {}
+        self._handoff_channels: dict[str, HandoffChannel] = {}
+        self._retired_handoff_channels: set[HandoffChannel] = set()
         self._cleanup_tasks: set[asyncio.Task] = set()
         self._handoff_recovery_task: asyncio.Task | None = None
         self._handoff_owner = config.handoff_owner or uuid.uuid4().hex
@@ -615,57 +616,62 @@ class MegatronLLMEngine(LLMEngine):
             owner=self._handoff_owner,
         )
 
+    def _handoff_channel(self, address: str) -> HandoffChannel:
+        channel = self._handoff_channels.get(address)
+        if channel is None:
+            if self._release_context is None:
+                self._release_context = zmq.asyncio.Context()
+            channel = HandoffChannel(self._release_context, address)
+            self._handoff_channels[address] = channel
+        return channel
+
+    def _retire_handoff_channel(self, address: str, channel: HandoffChannel) -> None:
+        if self._handoff_channels.get(address) is channel:
+            del self._handoff_channels[address]
+        channel.retire()
+        self._retired_handoff_channels = {c for c in self._retired_handoff_channels if not c.closed}
+        if not channel.closed:
+            self._retired_handoff_channels.add(channel)
+
     async def _remote_handoff_command(
         self, address: str, request_id: int, instance_id: str, *, owner: str | None = None
     ) -> None:
-        lock = self._release_locks.setdefault(address, asyncio.Lock())
-        async with asyncio.timeout(_RELEASE_TIMEOUT), lock:
-            socket = self._release_sockets.get(address)
-            if socket is None:
-                if self._release_context is None:
-                    self._release_context = zmq.asyncio.Context()
-                socket = self._release_context.socket(zmq.DEALER)
-                socket.setsockopt(zmq.SNDHWM, 0)
-                socket.setsockopt(zmq.RCVHWM, 0)
-                socket.connect(address)
-                self._release_sockets[address] = socket
-            try:
-                # ZMQ reconnects sockets across coordinator replacement, but the
-                # replacement's known-client set is empty. Register on every use.
-                await socket.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
-                reply = msgpack.unpackb(await socket.recv(), raw=False)
-                if len(reply) != 2 or reply[0] != Headers.CONNECT_ACK.value:
-                    raise RuntimeError("Handoff control requires a coordinator instance ID")
-                if reply[1] != instance_id:
+        if owner is not None:
+            command = [Headers.CLAIM_KV.value, int(request_id), instance_id, owner]
+            expected = [Headers.CLAIM_KV_ACK.value, int(request_id), instance_id]
+        else:
+            command = [Headers.RELEASE_KV.value, int(request_id), instance_id]
+            expected = [Headers.RELEASE_KV_ACK.value, int(request_id), instance_id]
+        channel = self._handoff_channel(address)
+        try:
+            # The deadline covers only this request's own exchanges: requests to
+            # the same source run concurrently instead of queueing on a lock.
+            async with asyncio.timeout(_RELEASE_TIMEOUT):
+                current = await channel.instance_id()
+                if current != instance_id:
+                    # ZMQ reconnects across coordinator replacement, but the
+                    # replacement only knows this socket after a new CONNECT.
+                    current = await channel.instance_id(refresh=True)
+                if current != instance_id:
                     if owner is not None:
                         raise RuntimeError("Cannot claim a handoff from a replaced source")
                     # The old coordinator/engine incarnation is gone. Never
                     # release a recycled request ID in its replacement.
                     return
-                command = (
-                    [Headers.CLAIM_KV.value, int(request_id), instance_id, owner]
-                    if owner is not None
-                    else [Headers.RELEASE_KV.value, int(request_id), instance_id]
-                )
-                await socket.send(msgpack.packb(command, use_bin_type=True))
-                reply = msgpack.unpackb(await socket.recv(), raw=False)
-                expected = (
-                    [Headers.CLAIM_KV_ACK.value, int(request_id), instance_id]
-                    if owner is not None
-                    else [Headers.RELEASE_KV_ACK.value, int(request_id), instance_id]
-                )
-                if owner is not None and reply == [*expected, HandoffClaimStatus.EXPIRED.value]:
-                    # No remote read was submitted. Let Dynamo's migration layer
-                    # replay the request through prefill to obtain a fresh offer.
-                    raise StreamIncomplete("Unclaimed Megatron prefill handoff expired")
-                if owner is not None:
-                    expected.append(HandoffClaimStatus.ACCEPTED.value)
-                if reply != expected:
-                    raise RuntimeError("Unexpected or rejected handoff acknowledgement")
-            except BaseException:
-                self._release_sockets.pop(address, None)
-                socket.close(linger=0)
-                raise
+                reply = await channel.request(command, tuple(expected))
+        except (TimeoutError, zmq.ZMQError, ConnectionError):
+            # Requests already waiting keep their own deadlines. New requests get
+            # a fresh socket, which registers with whichever coordinator answers.
+            self._retire_handoff_channel(address, channel)
+            raise
+        if owner is not None and reply == [*expected, HandoffClaimStatus.EXPIRED.value]:
+            # No remote read was submitted. Let Dynamo's migration layer
+            # replay the request through prefill to obtain a fresh offer.
+            raise StreamIncomplete("Unclaimed Megatron prefill handoff expired")
+        if owner is not None:
+            expected.append(HandoffClaimStatus.ACCEPTED.value)
+        if reply != expected:
+            raise RuntimeError("Unexpected or rejected handoff acknowledgement")
 
     async def _release_completed_handoff(self, metadata: dict) -> None:
         release = HandoffRelease.from_metadata(metadata)
@@ -719,10 +725,10 @@ class MegatronLLMEngine(LLMEngine):
                     str(release["coordinator_addr"]), int(release["request_id"]), instance_id
                 )
                 break
-            except (TimeoutError, zmq.ZMQError):
+            except (TimeoutError, zmq.ZMQError, ConnectionError):
                 if attempt == 1:
                     raise
-                # A timed-out socket is discarded above. Retry registration
+                # A failed channel is retired above. Retry registration
                 # and the idempotent fenced release on a fresh connection.
                 await asyncio.sleep(0.05)
         return True
@@ -762,10 +768,10 @@ class MegatronLLMEngine(LLMEngine):
             self._handoff_recovery_task.cancel()
             await asyncio.gather(self._handoff_recovery_task, return_exceptions=True)
             self._handoff_recovery_task = None
-        for socket in self._release_sockets.values():
-            socket.close(linger=0)
-        self._release_sockets.clear()
-        self._release_locks.clear()
+        channels = [*self._handoff_channels.values(), *self._retired_handoff_channels]
+        self._handoff_channels.clear()
+        self._retired_handoff_channels.clear()
+        await asyncio.gather(*(channel.aclose() for channel in channels))
         if self._release_context is not None:
             self._release_context.term()
             self._release_context = None

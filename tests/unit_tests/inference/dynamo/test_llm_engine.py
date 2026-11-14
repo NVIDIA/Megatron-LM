@@ -509,23 +509,21 @@ async def test_release_reregisters_after_coordinator_replacement():
             try:
                 for engine in engines:
                     await engine._release_remote_handoff(address, 7, instance_id)
-                    socket = engine._release_sockets[address]
-                    # Repeated CONNECT is also acknowledged by the same coordinator.
+                    channel = engine._handoff_channels[address]
+                    # Later requests reuse the registered channel.
                     await engine._release_remote_handoff(address, 8, instance_id)
-                    assert engine._release_sockets[address] is socket
+                    assert engine._handoff_channels[address] is channel
                 assert coordinator._broadcast_to_engines.call_count == 4
                 assert len(coordinator.known_clients) == 2
                 if instance_id == "replacement":
                     # Request 7 may be reused. An old generation's cleanup must
                     # not touch it, including a restart between CONNECT and RELEASE.
                     await engine._release_remote_handoff(address, 7, "original")
-                    await engine._release_sockets[address].send(
-                        msgpack.packb([Headers.RELEASE_KV.value, 7, "original"])
+                    ack = (Headers.RELEASE_KV_ACK.value, 7, "original")
+                    reply = await engine._handoff_channels[address].request(
+                        [Headers.RELEASE_KV.value, 7, "original"], ack
                     )
-                    reply = msgpack.unpackb(
-                        await engine._release_sockets[address].recv(), raw=False
-                    )
-                    assert reply == [Headers.RELEASE_KV_ACK.value, 7, "original"]
+                    assert reply == list(ack)
                     assert coordinator._broadcast_to_engines.call_count == 4
             finally:
                 server.cancel()
@@ -533,32 +531,91 @@ async def test_release_reregisters_after_coordinator_replacement():
                 router.close(linger=0)
     finally:
         for engine in engines:
-            sockets = list(engine._release_sockets.values())
+            channels = list(engine._handoff_channels.values())
             await engine.cleanup()
-            assert all(socket.closed for socket in sockets)
+            assert all(channel.closed and channel.socket.closed for channel in channels)
+        context.term()
+
+
+class _ScriptedSocket:
+    """A DEALER stand-in that answers each sent message from a script."""
+
+    def __init__(self, answer):
+        self.answer = answer
+        self.replies = asyncio.Queue()
+        self.setsockopt = MagicMock()
+        self.connect = MagicMock()
+        self.close = MagicMock()
+
+    async def send(self, frame):
+        reply = self.answer(msgpack.unpackb(frame, raw=False))
+        if reply is not None:
+            self.replies.put_nowait(msgpack.packb(reply))
+
+    async def recv(self):
+        return await self.replies.get()
+
+
+def _connect_ack(instance_id, answer=lambda message: None):
+    return lambda message: (
+        [Headers.CONNECT_ACK.value, instance_id]
+        if message[0] == Headers.CONNECT.value
+        else answer(message)
+    )
+
+
+@pytest.mark.asyncio
+async def test_concurrent_claims_to_one_source_overlap_and_match_acks_out_of_order():
+    context = zmq.asyncio.Context()
+    router = context.socket(zmq.ROUTER)
+    address = f"tcp://127.0.0.1:{router.bind_to_random_port('tcp://127.0.0.1')}"
+
+    async def serve():
+        identity, payload = await router.recv_multipart()
+        assert msgpack.unpackb(payload) == [Headers.CONNECT.value]
+        await router.send_multipart(
+            [identity, msgpack.packb([Headers.CONNECT_ACK.value, "source"])]
+        )
+        claims = [msgpack.unpackb((await router.recv_multipart())[1]) for _ in range(3)]
+        # Every claim is in flight before any ACK: one-at-a-time exchanges
+        # would time out here. Reply in reverse and reject only request 2.
+        for _, request_id, instance_id, _ in reversed(claims):
+            status = HandoffClaimStatus.REJECTED if request_id == 2 else HandoffClaimStatus.ACCEPTED
+            ack = [Headers.CLAIM_KV_ACK.value, request_id, instance_id, status.value]
+            await router.send_multipart([identity, msgpack.packb(ack)])
+
+    server = asyncio.create_task(serve())
+    engine = MegatronLLMEngine(_config("decode"))
+    try:
+        results = await asyncio.gather(
+            *(
+                engine._remote_handoff_command(address, request_id, "source", owner="decode")
+                for request_id in (1, 2, 3)
+            ),
+            return_exceptions=True,
+        )
+        assert results[0] is None and results[2] is None
+        assert isinstance(results[1], RuntimeError)
+        await server
+        # A rejection is an answer, not a transport failure: keep the channel.
+        assert list(engine._handoff_channels) == [address]
+    finally:
+        server.cancel()
+        await asyncio.gather(server, return_exceptions=True)
+        await engine.cleanup()
+        router.close(linger=0)
         context.term()
 
 
 @pytest.mark.asyncio
 async def test_release_requires_acceptance_and_discards_timed_out_socket():
     engine = MegatronLLMEngine(_config("decode"))
-
-    async def no_ack():
-        await asyncio.Future()
-
-    socket = MagicMock(send=AsyncMock())
-    replies = iter([msgpack.packb([Headers.CONNECT_ACK.value, "instance"]), None])
-
-    async def recv():
-        reply = next(replies)
-        return reply if reply is not None else await no_ack()
-
-    socket.recv = recv
+    socket = _ScriptedSocket(_connect_ack("instance"))
     engine._release_context = MagicMock(socket=MagicMock(return_value=socket))
     with patch("megatron.inference.integrations.dynamo.llm_engine._RELEASE_TIMEOUT", 0.05):
         with pytest.raises(TimeoutError):
             await engine._release_remote_handoff("tcp://prefill:5000", 7, "instance")
-    assert not engine._release_sockets
+    assert not engine._handoff_channels
     socket.close.assert_called_once_with(linger=0)
     engine._release_remote_handoff = AsyncMock(side_effect=[TimeoutError, None])
     assert await engine._release_handoff_from_meta_async(
@@ -777,19 +834,12 @@ async def test_unreachable_release_source_does_not_block_other_sources():
     engine = MegatronLLMEngine(_config("decode"))
     connecting = asyncio.Event()
 
-    async def stalled_recv():
+    def stalled_answer(message):
         connecting.set()
-        await asyncio.Future()
 
-    stalled = MagicMock(send=AsyncMock(), recv=stalled_recv)
-    healthy = MagicMock(
-        send=AsyncMock(),
-        recv=AsyncMock(
-            side_effect=[
-                msgpack.packb([Headers.CONNECT_ACK.value, "healthy"]),
-                msgpack.packb([Headers.RELEASE_KV_ACK.value, 2, "healthy"]),
-            ]
-        ),
+    stalled = _ScriptedSocket(stalled_answer)
+    healthy = _ScriptedSocket(
+        _connect_ack("healthy", lambda message: [Headers.RELEASE_KV_ACK.value, *message[1:]])
     )
     engine._release_context = MagicMock(socket=MagicMock(side_effect=[stalled, healthy]))
     with patch("megatron.inference.integrations.dynamo.llm_engine._RELEASE_TIMEOUT", 0.1):
@@ -802,7 +852,7 @@ async def test_unreachable_release_source_does_not_block_other_sources():
         with pytest.raises(TimeoutError):
             await pending
     stalled.close.assert_called_once_with(linger=0)
-    assert list(engine._release_sockets) == ["tcp://healthy:2"]
+    assert list(engine._handoff_channels) == ["tcp://healthy:2"]
     await engine.cleanup()
 
 
