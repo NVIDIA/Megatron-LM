@@ -33,7 +33,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
 from megatron.core.ssm.gated_delta_product import (
-    HAVE_CUTEDSL_GDP_CP,
+    HAVE_CUDNN_GDP_CP,
     GatedDeltaProductMixer,
     GatedDeltaProductMixerSubmodules,
 )
@@ -128,6 +128,7 @@ def _make_config(
         "mamba_head_dim": 16,
         "mamba_num_groups": 4,
         "mamba_state_dim": 16,
+        "gdp_backend": "fla",
         "tensor_model_parallel_size": 1,
         "sequence_parallel": False,
         "context_parallel_size": cp_size,
@@ -423,34 +424,35 @@ class TestGDPPackedSequence:
 
 
 @pytest.mark.internal
+@pytest.mark.skip(reason="Enable after CI upgrades to a cuDNN Frontend release including PR #2067")
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA + NCCL")
-@pytest.mark.skipif(
-    torch.cuda.device_count() < 2 if torch.cuda.is_available() else True,
-    reason="CP=2 test requires at least 2 GPUs",
-)
 @pytest.mark.skipif(not HAVE_MAMBA_DEPS, reason="GDP mixer requires mamba_ssm + einops")
-@pytest.mark.skipif(not HAVE_CUTEDSL_GDP_CP, reason="CuTeDSL GDP CP backend is unavailable")
+@pytest.mark.skipif(not HAVE_CUDNN_GDP_CP, reason="cuDNN GDP CP backend is unavailable")
 @pytest.mark.skipif(
     not is_causal_conv1d_min_version("1.7.0"),
     reason="GDP CP causal convolution requires causal-conv1d >= 1.7.0",
 )
 @pytest.mark.parametrize(
-    "seq_lens,recompute_modules",
+    "cp_size,seq_lens,recompute_modules",
     (
-        pytest.param(None, [], id="blh-single-stream"),
+        pytest.param(2, None, [], id="blh-single-stream"),
         pytest.param(
-            [256], ["gdp_in_proj", "gdp_qkv"], id="thd-single-sequence-selective-recompute"
+            2, [256], ["gdp_in_proj", "gdp_qkv"], id="thd-single-sequence-selective-recompute"
         ),
-        pytest.param([64, 192], [], id="thd-varlen"),
+        pytest.param(2, [64, 192], [], id="thd-varlen"),
+        # The middle sequence spans ranks 0-2; rank 3 starts a separate sequence.
+        pytest.param(4, [64, 320, 128], [], id="thd-multiple-rank-summaries"),
     ),
 )
-def test_cutedsl_chunkwise_forward_and_backward_equivalence(seq_lens, recompute_modules):
-    """CuTeDSL CP=2 matches CP=1 for BLH, packed THD, and selective recompute."""
+def test_cudnn_chunkwise_forward_and_backward_equivalence(cp_size, seq_lens, recompute_modules):
+    """cuDNN CP=2/4 matches CP=1 for BLH, packed THD, and selective recompute."""
+    if _WORLD_SIZE < cp_size or torch.cuda.device_count() < cp_size:
+        pytest.skip(f"CP={cp_size} requires at least {cp_size} GPUs and distributed ranks")
     if torch.cuda.get_device_capability()[0] < 10:
-        pytest.skip("CuTeDSL GDP requires an SM100 GPU")
+        pytest.skip("cuDNN GDP requires an SM100 GPU")
 
     Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=2
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=cp_size
     )
     try:
         model_parallel_cuda_manual_seed(123)
@@ -464,8 +466,8 @@ def test_cutedsl_chunkwise_forward_and_backward_equivalence(seq_lens, recompute_
             mamba_head_dim=64,
             mamba_num_groups=2,
             mamba_state_dim=128,
-            gdp_cutedsl_kernel=True,
-            gdp_num_chunk_states_to_recompute=2,
+            gdp_backend="cudnn",
+            gdp_checkpoint_every_n_tokens=192,
             recompute_granularity="selective" if recompute_modules else None,
             recompute_modules=recompute_modules,
         )
