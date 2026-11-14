@@ -13,6 +13,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 from megatron.core.typed_torch import copy_signature
+from megatron.core.utils import log_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -260,18 +261,23 @@ class RealQuantTransformerLayer(TransformerLayer):
                 self._original_tensor_info[k] = (str(v.dtype), str(v.shape))
 
     def _report_quantize_tensor_info(self):
-        torch.distributed.barrier()
-        if torch.distributed.get_rank() == 0:
-            for k, v in self.state_dict().items():
-                if not isinstance(v, torch.Tensor):
-                    continue
-                original_dtype, original_shape = self._original_tensor_info.get(k, ("-", "-"))
-                logger.info(
-                    "{:<64} {:<16} {:<32} {:<16} {:<32}".format(
-                        k, original_dtype, original_shape, str(v.dtype), str(v.shape)
-                    )
-                )
-        torch.distributed.barrier()
+        """Log each tensor's dtype and shape before and after real quantization.
+
+        Runs once per layer during model construction and issues no collective. Pipeline
+        stages build different numbers of layers, and a model's grid need not span every
+        rank, so a per-layer barrier could hang.
+        """
+        for k, v in self.state_dict().items():
+            if not isinstance(v, torch.Tensor):
+                continue
+            original_dtype, original_shape = self._original_tensor_info.get(k, ("-", "-"))
+            log_single_rank(
+                logger,
+                logging.INFO,
+                "{:<64} {:<16} {:<32} {:<16} {:<32}".format(
+                    k, original_dtype, original_shape, str(v.dtype), str(v.shape)
+                ),
+            )
 
 
 class FP8WeightTransformerLayer(RealQuantTransformerLayer):

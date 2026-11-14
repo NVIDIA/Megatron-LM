@@ -28,8 +28,14 @@ from megatron.core.parallel_state import (
     get_gtp_weight_remat_world_size,
     get_tensor_model_parallel_rank,
 )
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.tensor_observation import suspend_tensor_observations
 from megatron.core.utils import (
+    get_pg_rank,
+    get_pg_size,
     is_te_min_version,
     is_torch_min_version,
     safely_set_viewless_tensor_data,
@@ -566,6 +572,8 @@ def model_parallel_cuda_manual_seed(
     force_reset_rng: bool = False,
     gtp_remat_world_size: Optional[int] = None,
     egtp_remat_world_size: Optional[int] = None,
+    *,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Initialize model parallel cuda seed.
 
@@ -583,7 +591,55 @@ def model_parallel_cuda_manual_seed(
     expert-parallel-seed: This state is only used for the expert layer of MoE models.
     It is different among expert-tensor and expert-model parallel GPUs, and the same
     across expert-data parallel groups.
+
+    Ranks and world sizes that are not passed explicitly come from ``pg_collection``, the
+    process groups of the model being seeded, when it is given: ``tp``, ``ep``, ``expt_tp``
+    (the expert tensor-parallel group, which can differ from ``tp``), ``gtp_remat`` and
+    ``expt_gtp_remat``. The collection should set all five; a group set to None means that
+    axis is off (rank 0, world size 1). A group that it leaves unset is deprecated: its rank
+    and world size then come from the global parallel state, with a
+    ``ProcessGroupFallbackWarning``. Without ``pg_collection`` they all come from the global
+    parallel state. The tracker is shared by the whole process, so its states can follow the
+    layout of only one model per process.
     """
+    if pg_collection is not None:
+
+        def collection_sets(name: str) -> bool:
+            """Whether the collection sets the group; if not, warn that the global one is read."""
+            if name in vars(pg_collection):
+                return True
+            # Migration fallback: collections built before seeding read them, for example
+            # without the GTP_remat groups, keep the ranks of the global parallel state.
+            warn_global_process_group_fallback(
+                "model_parallel_cuda_manual_seed",
+                f"pg_collection.{name}",
+                deprecated_in="0.21",
+                removed_in="0.23",
+            )
+            return False
+
+        if tp_rank is None and collection_sets("tp"):
+            tp_rank = get_pg_rank(pg_collection.tp)
+        if ep_rank is None and collection_sets("ep"):
+            ep_rank = get_pg_rank(pg_collection.ep)
+        if etp_rank is None and collection_sets("expt_tp"):
+            etp_rank = get_pg_rank(pg_collection.expt_tp)
+        if (gtp_remat_rank is None or gtp_remat_world_size is None) and collection_sets(
+            "gtp_remat"
+        ):
+            if gtp_remat_rank is None:
+                gtp_remat_rank = get_pg_rank(pg_collection.gtp_remat)
+            if gtp_remat_world_size is None:
+                gtp_remat_world_size = get_pg_size(pg_collection.gtp_remat)
+        if (egtp_remat_rank is None or egtp_remat_world_size is None) and collection_sets(
+            "expt_gtp_remat"
+        ):
+            if egtp_remat_rank is None:
+                egtp_remat_rank = get_pg_rank(pg_collection.expt_gtp_remat)
+            if egtp_remat_world_size is None:
+                egtp_remat_world_size = get_pg_size(pg_collection.expt_gtp_remat)
+    # Ranks and world sizes that were neither passed nor given by the collection come from the
+    # global parallel state.
     if tp_rank is None:
         tp_rank = get_tensor_model_parallel_rank()
     if ep_rank is None:
