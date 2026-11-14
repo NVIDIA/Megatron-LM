@@ -753,7 +753,8 @@ def test_batch_invariant_sigmoid_topk_routing_replays(num_tokens, topk, scaling_
 
 
 @pytest.mark.parametrize("det_algos", [True, False])
-def test_quantile_balancing_histogram_and_bias_replay(det_algos):
+@pytest.mark.parametrize("replay_action", [None, *RouterReplayAction])
+def test_quantile_balancing_histogram_and_bias_replay(det_algos, replay_action):
     """Replay accumulated integer histograms, routing gradients, and the batch update."""
     seeded()
     num_tokens, num_experts, num_bins = 8192, 64, 128
@@ -761,11 +762,20 @@ def test_quantile_balancing_histogram_and_bias_replay(det_algos):
     bias = torch.linspace(-0.1, 0.1, num_experts, device="cuda")
     bounds = torch.tensor([-1.0, 1.0], device="cuda")
     histogram = torch.zeros(num_experts, num_bins, device="cuda", dtype=torch.int32)
+    targets = (
+        torch.arange(num_tokens, device="cuda")[:, None] + torch.arange(8, device="cuda")[None, :]
+    ) % num_experts
+    replay = None
 
     def fn(logits, histogram):
         # The harness clones the caller-owned histogram before every replay.
         outputs = []
-        for microbatch in logits.chunk(2):
+        if replay is not None:
+            replay.clear_indices()
+            replay.set_router_replay_action(replay_action)
+        for microbatch, target in zip(logits.chunk(2), targets.chunk(2)):
+            if replay is not None:
+                replay.set_target_indices(target)
             outputs.append(
                 moe_utils.topk_routing_with_score_function(
                     microbatch,
@@ -774,8 +784,16 @@ def test_quantile_balancing_histogram_and_bias_replay(det_algos):
                     expert_bias=bias,
                     qb_histogram=histogram,
                     qb_bin_bounds=bounds,
+                    router_replay=replay,
                 )
             )
+            if replay_action == RouterReplayAction.RECORD and replay is not None:
+                recorded_map = torch.zeros_like(microbatch, dtype=torch.bool).scatter(
+                    1, replay.get_recorded_indices(), True
+                )
+                assert torch.equal(outputs[-1][1], recorded_map)
+        if replay_action == RouterReplayAction.REPLAY_BACKWARD and replay is not None:
+            assert not replay.replay_backward_list
         probs = torch.cat([output[0] for output in outputs])
         routing_map = torch.cat([output[1] for output in outputs])
         updated_bias, updated_bounds = moe_utils.get_updated_expert_bias_with_quantile(
@@ -783,15 +801,31 @@ def test_quantile_balancing_histogram_and_bias_replay(det_algos):
         )
         return probs, routing_map, histogram, updated_bias, updated_bounds
 
-    with deterministic_algorithms(det_algos):
-        outputs, grads = assert_replays_bit_exact(
-            fn,
-            (logits, histogram),
-            grad_outputs={"out[0]": torch.randn_like(logits)},
-            replays=3,
-            contention=True,
-            what="global-batch QB histogram and bias update",
-        )
+    with torch.no_grad():
+        reference = fn(logits, histogram.clone())
+    if replay_action is not None:
+        replay = RouterReplay()
+    try:
+        with deterministic_algorithms(det_algos):
+            outputs, grads = assert_replays_bit_exact(
+                fn,
+                (logits, histogram),
+                grad_outputs={"out[0]": torch.randn_like(logits)},
+                replays=3,
+                contention=True,
+                what=f"global-batch QB histogram and bias update[{replay_action}]",
+            )
+    finally:
+        if replay is not None:
+            RouterReplay.global_router_replay_instances.remove(replay)
+    for index in (2, 3, 4):
+        assert bytes_equal(outputs[f"out[{index}]"], reference[index])
+    if replay_action in (RouterReplayAction.REPLAY_FORWARD, RouterReplayAction.REPLAY_BACKWARD):
+        expected_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, targets, True)
+        assert torch.equal(outputs["out[1]"], expected_map)
+    else:
+        for index in (0, 1):
+            assert bytes_equal(outputs[f"out[{index}]"], reference[index])
     assert torch.equal(
         outputs["out[2]"].sum(dim=-1),
         torch.full((num_experts,), num_tokens, device="cuda", dtype=torch.int64),
@@ -1174,6 +1208,107 @@ class TestMoEModules:
             what=f"InferenceTopKRouter[sigmoid+bias, experts={num_experts}, topk={topk}]",
         )
 
+    @pytest.mark.parametrize("fusion", [False, True])
+    @pytest.mark.parametrize("replay_action", list(RouterReplayAction))
+    def test_inference_quantile_router_routing_replay(self, fusion, replay_action, monkeypatch):
+        """Optimized QB inference honors replay even when fusion is configured."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="quantile_balancing",
+            moe_router_quantile_balancing_estimation_scope="global_batch",
+            moe_router_score_function="sigmoid",
+            moe_aux_loss_coeff=0.0,
+            moe_enable_routing_replay=True,
+            moe_router_fusion=fusion,
+        )
+        router = (
+            InferenceTopKRouter(
+                config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+            )
+            .cuda()
+            .eval()
+        )
+        replay = router.router_replay
+        logits = torch.tensor([[[3.0, 2.0, 1.0, 0.0]]], device="cuda")
+        # Fix the gate's output so the policy's [0, 1] differs from replay's [2, 3].
+        monkeypatch.setattr(router, "gating", lambda hidden: logits.expand(hidden.shape[0], 1, 4))
+        hidden = torch.zeros(512, 1, 1024, device="cuda", dtype=torch.bfloat16)
+        targets = torch.tensor([[2, 3]], device="cuda").expand(512, 2).contiguous()
+        histogram = router.qb_histogram.clone()
+
+        def route(hidden):
+            replay.clear_indices()
+            replay.set_target_indices(targets)
+            replay.set_router_replay_action(replay_action)
+            with InferenceMode.active(), torch.inference_mode():
+                probs, indices = router(hidden)
+            if replay_action == RouterReplayAction.RECORD:
+                assert torch.equal(replay.get_recorded_indices(), indices)
+            if replay_action == RouterReplayAction.REPLAY_BACKWARD:
+                assert not replay.replay_backward_list
+            return probs, indices, router.qb_histogram.clone()
+
+        try:
+            outputs, _ = assert_replays_bit_exact(
+                route,
+                (hidden,),
+                replays=3,
+                backward=False,
+                contention=True,
+                what=f"InferenceTopKRouter[QB, {replay_action}, fusion={fusion}]",
+            )
+            expected_indices = (
+                torch.tensor([[0, 1]], device="cuda").expand_as(targets)
+                if replay_action == RouterReplayAction.RECORD
+                else targets
+            )
+            assert torch.equal(outputs["out[1]"], expected_indices)
+            scores = logits.squeeze(1).expand(512, 4).sigmoid().gather(1, expected_indices)
+            torch.testing.assert_close(outputs["out[0]"], scores / scores.sum(dim=-1, keepdim=True))
+            assert bytes_equal(outputs["out[2]"], histogram)
+        finally:
+            RouterReplay.global_router_replay_instances.remove(replay)
+
+    @pytest.mark.parametrize("balancing", ["quantile_balancing", "none"])
+    def test_inference_router_keeps_fusion_without_qb_replay(self, balancing, monkeypatch):
+        """QB's replay fallback leaves other optimized inference calls fused."""
+        self._init()
+        config = _moe_config(
+            num_moe_experts=4,
+            moe_router_topk=2,
+            moe_router_load_balancing_type=balancing,
+            moe_router_quantile_balancing_estimation_scope="global_batch",
+            moe_router_score_function="sigmoid",
+            moe_aux_loss_coeff=0.0,
+            moe_enable_routing_replay=balancing != "quantile_balancing",
+            moe_router_fusion=True,
+        )
+        router = (
+            InferenceTopKRouter(
+                config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+            )
+            .cuda()
+            .eval()
+        )
+        calls = []
+
+        def routing(logits, topk, **kwargs):
+            calls.append(kwargs["fused"])
+            # Inspect the dispatch flag without requiring TE's optional fused kernel.
+            return logits[:, :topk], torch.zeros_like(logits[:, :topk], dtype=torch.int64)
+
+        monkeypatch.setattr(router, "_compiled_topk_routing", routing)
+        try:
+            with InferenceMode.active(), torch.inference_mode():
+                router(torch.zeros(1, 1, 1024, device="cuda", dtype=torch.bfloat16))
+            assert calls == [True]
+        finally:
+            if router.router_replay is not None:
+                RouterReplay.global_router_replay_instances.remove(router.router_replay)
+
     @pytest.mark.skipif(
         not (HAVE_TE_ROUTER and moe_utils.fused_topk_with_score_function_supports_topk_indices),
         reason="TE dense fused router output is not available",
@@ -1212,7 +1347,13 @@ class TestMoEModules:
         )
 
     @pytest.mark.parametrize("accumulate", [True, False])
-    def test_global_batch_quantile_router_replays(self, accumulate):
+    @pytest.mark.parametrize(
+        "replay_action,fusion",
+        [(None, False)]
+        + [(action, False) for action in RouterReplayAction]
+        + [(RouterReplayAction.REPLAY_FORWARD, True)],
+    )
+    def test_global_batch_quantile_router_replays(self, accumulate, replay_action, fusion):
         """Include the router's nonpersistent histogram in the replay comparison."""
         self._init()
         seeded()
@@ -1223,6 +1364,8 @@ class TestMoEModules:
             moe_router_quantile_balancing_estimation_scope="global_batch",
             moe_router_score_function="sigmoid",
             moe_aux_loss_coeff=0.0,
+            moe_enable_routing_replay=replay_action is not None,
+            moe_router_fusion=fusion,
         )
         router = TopKRouter(
             config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
@@ -1232,19 +1375,45 @@ class TestMoEModules:
             router.expert_bias.copy_(torch.linspace(-0.1, 0.1, 64, device="cuda"))
         logits = torch.randn(8192, 64, device="cuda", requires_grad=True)
 
+        targets = (
+            torch.arange(8192, device="cuda")[:, None] + torch.arange(8, device="cuda")[None, :]
+        ) % 64
+        replay = router.router_replay
+
         def fn(logits):
+            if replay is not None:
+                replay.clear_indices()
+                replay.set_target_indices(targets)
+                replay.set_router_replay_action(replay_action)
             router.qb_histogram.zero_()
             probs, routing_map = router.quantile_balancing(logits)
+            if replay_action == RouterReplayAction.RECORD:
+                recorded_map = torch.zeros_like(logits, dtype=torch.bool).scatter(
+                    1, replay.get_recorded_indices(), True
+                )
+                assert torch.equal(routing_map, recorded_map)
+            if replay_action == RouterReplayAction.REPLAY_BACKWARD:
+                assert not replay.replay_backward_list
             return probs, routing_map, router.qb_histogram.clone()
 
-        outputs, grads = assert_replays_bit_exact(
-            fn,
-            (logits,),
-            grad_outputs={"out[0]": torch.randn_like(logits)},
-            replays=3,
-            contention=True,
-            what=f"global-batch TopKRouter[accumulate={accumulate}]",
-        )
+        try:
+            outputs, grads = assert_replays_bit_exact(
+                fn,
+                (logits,),
+                grad_outputs={"out[0]": torch.randn_like(logits)},
+                replays=3,
+                contention=True,
+                what=(
+                    f"global-batch TopKRouter[{replay_action}, "
+                    f"fusion={fusion}, accumulate={accumulate}]"
+                ),
+            )
+        finally:
+            if replay is not None:
+                RouterReplay.global_router_replay_instances.remove(replay)
+        if replay_action in (RouterReplayAction.REPLAY_FORWARD, RouterReplayAction.REPLAY_BACKWARD):
+            expected_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, targets, True)
+            assert torch.equal(outputs["out[1]"], expected_map)
         assert torch.all(outputs["out[2]"].sum(dim=-1) == (8192 if accumulate else 0))
         assert grads["in[0]"].abs().sum() > 0
 
