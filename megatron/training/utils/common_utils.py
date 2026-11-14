@@ -109,8 +109,13 @@ def calc_params_l2_norm(
         # params_data is a dict of device_mesh -> list of local tensors.
         params = []
         for model_chunk in model:
-            model_chunk.stop_communication()
-            for name, param in model_chunk.named_parameters():
+            if hasattr(model_chunk, "distributed_named_parameters"):
+                # Leave the next step's prefetched parameter all-gathers in flight.
+                named_params = model_chunk.distributed_named_parameters()
+            else:
+                model_chunk.stop_communication()
+                named_params = model_chunk.named_parameters()
+            for name, param in named_params:
                 if trainable_only and not param.requires_grad:
                     continue
                 if not hasattr(param, "_local_tensor"):
