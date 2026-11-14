@@ -1,0 +1,49 @@
+type: basic
+format_version: 1
+maintainers: [mcore]
+loggers: [stdout]
+spec:
+  name: "{test_case}_{environment}_{platforms}"
+  model: unit-tests
+  nodes: 1
+  build: mcore-pyt-{environment}
+  gpus: 8
+  platforms: dgx_h100
+  # Each large case takes 35 to 60 s in its own process: about 40 minutes for 56 cases.
+  time_limit_override: 5400
+  script_setup: |
+    set -euo pipefail
+    unset https_proxy
+    umask 077
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> "$HOME/.netrc"
+    trap 'rm -f "$HOME/.netrc"; unset RO_API_TOKEN' EXIT
+
+    # Checkout latest
+    cd /opt
+    rm -rf /opt/megatron-lm; mkdir megatron-lm; cd megatron-lm
+    git init
+    git remote add origin $MCORE_REPO
+    git fetch origin '+refs/merge-requests/*:refs/remotes/merge-requests/*'
+    git fetch origin $MCORE_MR_COMMIT
+    git checkout $MCORE_MR_COMMIT
+    git rev-parse HEAD
+
+    rm -f "$HOME/.netrc"
+    unset RO_API_TOKEN
+  script: |-
+    rm -f "${{HOME}}/.netrc"
+    unset RO_API_TOKEN
+    set -euo pipefail
+    cd /opt/megatron-lm
+    export NVTE_FLASH_ATTN_V4=0
+    bash tests/test_utils/run_large_unit_tests.sh {environment} "{assets_dir}/logs/1/"
+
+products:
+  # Unit tests marked `large` (several GiB each), which unit-test buckets skip. The nightly
+  # pipeline (scope `nightly`, parsed as L2) runs them; PR and merge-queue jobs use other scopes.
+  - test_case: [unit_tests_large]
+    products:
+      - environment: [dev]
+        scope: [L2]
+        cadence: [nightly]
+        platforms: [dgx_h100]
