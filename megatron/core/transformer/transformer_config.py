@@ -506,7 +506,9 @@ class TransformerConfig(ModelParallelConfig):
     gdn_kernel_backend: Literal["transformer_engine", "fla", "torch"] = "fla"
     """Kernel backend for Gated DeltaNet. The selected backend is required to be available;
     there is no automatic fallback. ``torch`` selects the PyTorch-native reference
-    implementation and is required when deterministic mode is enabled."""
+    implementation. Deterministic mode accepts the backends in
+    ``megatron.core.ssm.gdn_kernel_backend.DETERMINISTIC_GDN_BACKENDS`` (``torch`` and
+    ``transformer_engine``, whose cuDNN fused kernel replays bit-exactly) and rejects ``fla``."""
 
     linear_conv_kernel_dim: Optional[int] = 4
     """Conv kernel dimension for the gated delta net."""
@@ -1955,6 +1957,7 @@ class TransformerConfig(ModelParallelConfig):
             is_gated_delta_net_variant,
             normalize_experimental_attention_variant,
         )
+        from megatron.core.ssm.gdn_kernel_backend import check_deterministic_gdn_backend
 
         if self.experimental_attention_variant is not None:
             self.experimental_attention_variant = normalize_experimental_attention_variant(
@@ -2072,11 +2075,7 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if is_gated_delta_net_variant(self.experimental_attention_variant):
-            if self.deterministic_mode and self.gdn_kernel_backend != "torch":
-                raise ValueError(
-                    "deterministic_mode=True requires gdn_kernel_backend='torch' for "
-                    "Gated DeltaNet."
-                )
+            check_deterministic_gdn_backend(self)
 
             # gdn2 may also be enabled for GDN layers built via the hybrid layer pattern
             # symbol 'G', where linear_attention_freq is unused; the GPT experimental

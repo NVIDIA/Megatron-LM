@@ -28,6 +28,7 @@ from megatron.core.ssm.gated_delta_net.common import (
     get_parameter_local_cp,
     l2norm,
 )
+from megatron.core.ssm.gdn_kernel_backend import check_deterministic_gdn_backend
 from megatron.core.ssm.ops.common.causal_conv1d_triton import causal_conv1d_update
 from megatron.core.ssm.ops.common.causal_conv1d_varlen import (
     causal_conv1d_varlen_carry_states,
@@ -111,10 +112,9 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         self.num_householder = 1
 
         backend = self.config.gdn_kernel_backend
-        if self.config.deterministic_mode and backend != "torch":
-            raise ValueError(
-                "deterministic_mode=True requires gdn_kernel_backend='torch' for " "Gated DeltaNet."
-            )
+        # Checked again here: deterministic_mode may be set after TransformerConfig.__post_init__.
+        # A device is at hand here, so the FROST envelope (SM, CuTe DSL) is checked too.
+        check_deterministic_gdn_backend(self.config, check_device=True)
 
         if backend == "torch":
             self.gdn_backend = "torch"
