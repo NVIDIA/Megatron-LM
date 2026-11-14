@@ -5115,15 +5115,19 @@ class TransformerConfig(ModelParallelConfig):
                     "('alltoall', 'flex'), "
                     f"got '{self.moe_token_dispatcher_type}'"
                 )
+                # 'max' pads every rank to max_seqlen_per_dp_cp_rank: token counts are equal.
+                packed_inputs_padded_to_max = self.pad_packed_seq_alignment == "max"
                 if (
                     self.moe_megakernel_backend is None
                     and self.moe_token_dispatcher_type == "flex"
                     and self.moe_flex_dispatcher_backend == "hybridep"
                     and not self.moe_hybridep_pad_uneven_dispatch_inputs
+                    and not packed_inputs_padded_to_max
                 ):
                     raise ValueError(
                         "sequence_packing with HybridEP requires "
-                        "moe_hybridep_pad_uneven_dispatch_inputs=True because packed token "
+                        "moe_hybridep_pad_uneven_dispatch_inputs=True or "
+                        "pad_packed_seq_alignment='max' because packed token "
                         "counts can differ across dispatcher ranks"
                     )
 

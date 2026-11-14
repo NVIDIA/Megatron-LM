@@ -683,13 +683,27 @@ def test_sequence_packing_moe_alltoall_dispatcher_passes():
 
 
 @requires_te_2_9
-def test_sequence_packing_moe_hybridep_requires_uneven_input_padding():
+@pytest.mark.parametrize("alignment", [None, 32, 4096])
+def test_sequence_packing_moe_hybridep_requires_uneven_input_padding(alignment):
     with pytest.raises(ValueError, match="HybridEP requires"):
         _make_packing_config(
             num_moe_experts=2,
             moe_token_dispatcher_type="flex",
             moe_flex_dispatcher_backend="hybridep",
+            pad_packed_seq_alignment=alignment,
         )
+
+
+@requires_te_2_9
+def test_sequence_packing_moe_hybridep_with_max_padded_inputs_passes():
+    config = _make_packing_config(
+        num_moe_experts=2,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        pad_packed_seq_alignment="max",
+    )
+
+    assert not config.moe_hybridep_pad_uneven_dispatch_inputs
 
 
 @requires_te_2_9
