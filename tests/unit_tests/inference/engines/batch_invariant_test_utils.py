@@ -38,6 +38,7 @@ from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
+from megatron.core.tuning import AutotunePolicy, active_policy, install
 from tests.unit_tests.inference.test_data_parallel_inference_coordinator import (
     DummyTokenizer as _DummyTokenizer,
 )
@@ -109,9 +110,14 @@ def invariant_runtime(case):
     DynamicInferenceContext.TOKEN_ROUNDER = 64
     DynamicInferenceContext.REQUEST_ROUNDER = 4
     deterministic = torch.are_deterministic_algorithms_enabled()
+    mamba = case.name.startswith("mamba")
+    policy = active_policy()
     bik.enable_batch_invariant_mode(backend=backend, collective="ordered")
     try:
-        torch.use_deterministic_algorithms(deterministic or case.name.startswith("mamba"))
+        torch.use_deterministic_algorithms(deterministic or mamba)
+        if mamba:
+            # Batch-invariant Mamba layers require their SSM kernels pinned.
+            install(AutotunePolicy(mode="pinned"))
         Utils.initialize_model_parallel(
             case.tp,
             case.pp,
@@ -123,6 +129,8 @@ def invariant_runtime(case):
             yield backend, fa_version
     finally:
         torch.use_deterministic_algorithms(deterministic)
+        if mamba:
+            install(policy or AutotunePolicy(mode="auto"))
         if case.model.get("expert_model_parallel_size", 1) > 1:
             NVLSAllGatherVDispatcher._delete_buffers()
             SymmetricMemoryManager.destroy()
