@@ -10,9 +10,9 @@ from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import torch
 
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.megatron_dataset import LowLevelDataset, MegatronDataset
 from megatron.core.datasets.utils import Split
+from megatron.training.datasets.online_tokenized_dataset_config import OnlineTokenizedDatasetConfig
 from megatron.training.datasets.utils import load_json_arg
 from megatron.training.sequence_lengths import get_dataset_input_length
 
@@ -20,13 +20,16 @@ IGNORE_INDEX = -100
 
 
 @dataclass
-class SFTDatasetConfig(GPTDatasetConfig):
+class SFTDatasetConfig(OnlineTokenizedDatasetConfig):
     """SFT conversation limits and physical pack width."""
 
     packed_sequence_length: Optional[int] = None
     """Physical output width, including alignment padding. The training container derives this
     from the model execution bound; inherited ``sequence_length`` limits each conversation.
     Standalone datasets default to ``sequence_length`` when this is unset."""
+
+    sft_mock_dataset_config_json: Optional[str] = None
+    """JSON string or file configuring MockSFTDataset sequence-length sampling."""
 
 
 class SFTLowLevelDataset:
@@ -73,7 +76,7 @@ class SFTDataset(MegatronDataset):
         indices: np.ndarray,
         num_samples: Optional[int],
         index_split: Split,
-        config: GPTDatasetConfig,
+        config: SFTDatasetConfig,
     ) -> None:
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
         # Pre-calculate padding divisor to avoid redundant computation in get_item
@@ -84,7 +87,7 @@ class SFTDataset(MegatronDataset):
         return len(low_level_dataset)
 
     @staticmethod
-    def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> LowLevelDataset:
+    def build_low_level_dataset(dataset_path: str, config: SFTDatasetConfig) -> LowLevelDataset:
         return SFTLowLevelDataset(dataset_path)
 
     def __len__(self) -> int:
@@ -163,7 +166,6 @@ class SFTDataset(MegatronDataset):
             pack_tokens.extend(tokens_list)
             pack_targets.extend(targets_list)
 
-            assert not self.config.reset_position_ids
             pack_positions.extend(range(len(tokens_list)))
 
             pad_granularity = self.padding_divisor
@@ -210,10 +212,6 @@ class SFTDataset(MegatronDataset):
         loss_mask = torch.ones(pack_length, dtype=torch.float32)
         loss_mask[labels == pad] = 0.0  # Mask paddings
         loss_mask[labels == IGNORE_INDEX] = 0.0  # mask prompts
-
-        # TODO(duncan): Optionally create an attention mask
-        assert not self.config.create_attention_mask and not self.config.reset_attention_mask
-        # attention_mask = None
 
         assert len(cu_seqlens) >= 2
         cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
@@ -321,12 +319,12 @@ class MockSFTDataset(SFTDataset):
         indices: np.ndarray,
         num_samples: Optional[int],
         index_split: Split,
-        config: GPTDatasetConfig,
+        config: SFTDatasetConfig,
     ) -> None:
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
 
     @staticmethod
-    def build_low_level_dataset(dataset_path: str, config: GPTDatasetConfig) -> LowLevelDataset:
+    def build_low_level_dataset(dataset_path: str, config: SFTDatasetConfig) -> LowLevelDataset:
         if config.sft_mock_dataset_config_json is None:
             mock_config = {
                 "mode": "distribution",

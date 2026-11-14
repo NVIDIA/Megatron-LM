@@ -2,10 +2,10 @@
 
 """Resolve configured input widths without confusing them with allocation bounds."""
 
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
+from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 
 
-def get_dataset_input_length(dataset: GPTDatasetConfig) -> int:
+def get_dataset_input_length(dataset: BlendedMegatronDatasetConfig) -> int:
     """Return a dataset's output row width, not an SFT conversation truncation limit."""
     from megatron.training.datasets.sft_dataset import SFTDatasetConfig
 
@@ -14,7 +14,9 @@ def get_dataset_input_length(dataset: GPTDatasetConfig) -> int:
     return dataset.sequence_length
 
 
-def get_model_input_length(model, dataset: GPTDatasetConfig | None = None) -> int | None:
+def get_model_input_length(
+    model, dataset: BlendedMegatronDatasetConfig | None = None
+) -> int | None:
     """Return the configured input width for shared training runtime consumers.
 
     Fixed GPT rows use the dataset width, which can be smaller than the model's

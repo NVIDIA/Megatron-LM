@@ -3267,7 +3267,7 @@ def dummy_train_step(data_iterator):
     # Data predicates and model parallelism describe the batch transfer.
     has_cu_seqlens = cfg.data.has_cu_seqlens()
     dataset = cfg.data.dataset
-    create_attention_mask = dataset.create_attention_mask if dataset is not None else True
+    create_attention_mask = cfg.data.creates_attention_mask() if dataset is not None else True
     dynamic_cp = cfg.model.transformer.dynamic_context_parallel
 
     BATCH_KEYS = [

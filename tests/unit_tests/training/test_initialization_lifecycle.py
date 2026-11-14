@@ -707,11 +707,9 @@ def test_training_batch_topology_uses_model_config(
     assert run_config.get_model_world_size() == (mimo_llm_world_size or world_size)
     assert run_config.get_data_parallel_size() == expected_dp
     assert run_config.get_batch_parallel_size() == expected_batch
-    assert run_config.data.dataset.data_parallel_size == expected_dp
-    assert (
-        run_config.data.dataset.context_parallel_size
-        == run_config.model.transformer.context_parallel_size
-    )
+    # Indexed GPT samples do not consume parallel-padding settings.
+    assert not hasattr(run_config.data.dataset, 'data_parallel_size')
+    assert not hasattr(run_config.data.dataset, 'context_parallel_size')
     assert microbatches.call_args.kwargs['data_parallel_size'] == expected_batch
     assert telemetry[0]['dl.data_parallel.size'] == expected_dp
     assert telemetry[0]['dl.tensor_parallel.size'] == 2
@@ -1537,6 +1535,7 @@ def test_dataset_helpers_use_registered_model(
     arguments.add_megatron_arguments(parser)
     args = parser.parse_args([])
     args.seq_length = 32
+    args.sft = True
     args.data_parallel_size = 999
     args.sequence_packing_scheduler = None if sequence_packing_scheduler else "dp_balanced"
     transformer = TransformerConfig(

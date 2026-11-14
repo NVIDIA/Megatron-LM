@@ -51,10 +51,6 @@ def test_sft_truncates_conversations_before_packing():
         sequence_length=4,
         packed_sequence_length=12,
         tokenizer=tokenizer,
-        reset_position_ids=False,
-        reset_attention_mask=False,
-        eod_mask_loss=False,
-        create_attention_mask=False,
     )
     dataset = object.__new__(SFTDataset)
     dataset.config = config
@@ -70,7 +66,7 @@ def test_sft_truncates_conversations_before_packing():
 MODEL_ARGV = (
     "--num-layers 2 --hidden-size 128 --num-attention-heads 8 --micro-batch-size 1 "
     "--global-batch-size 8 --seq-length 32 --max-position-embeddings 32 "
-    "--tokenizer-type NullTokenizer --vocab-size 2048"
+    "--tokenizer-type NullTokenizer --vocab-size 2048 --no-create-attention-mask-in-dataloader"
 ).split()
 
 # Applied to the validated arguments and mirrored into the container's model and validation
@@ -371,10 +367,19 @@ def test_entry_points_build_the_dataset_config_pretrain_gpt_built(
         # FIM runtime wrapper pretrain_gpt built around an SFT / varlen dataset is gone.
         assert isinstance(expected, GPTFIMDatasetConfig)
         assert not isinstance(actual, GPTFIMDatasetConfig)
-        names = [f.name for f in fields(GPTDatasetConfig)]
+        names = [f.name for f in fields(actual) if f.name != "packed_sequence_length"]
     else:
-        assert isinstance(actual, type(expected))
-        names = [f.name for f in fields(expected)]
+        expected_config_type = (
+            SFTDatasetConfig
+            if args.sft
+            else (
+                varlen_dataset.VarlenDatasetConfig
+                if args.use_varlen_dataset and entry_point != "prepare_cache"
+                else GPTFIMDatasetConfig if args.fim_data else GPTDatasetConfig
+            )
+        )
+        assert type(actual) is expected_config_type
+        names = [f.name for f in fields(actual) if f.name != "packed_sequence_length"]
     if dataset_class in (SFTDataset, MockSFTDataset):
         # Physical pack width is now derived independently of the content limit.
         assert actual.packed_sequence_length == expected.sequence_length
@@ -424,12 +429,14 @@ def test_fields_the_legacy_factories_left_out_are_forwarded(monkeypatch, corpus,
         actual = _entry_point(entry_point).core_gpt_dataset_config_from_args(args)
     else:
         _, actual, _ = _ready(cfg).builder_inputs()
-    names = [f.name for f in fields(GPTDatasetConfig) if f.name != "tokenizer"]
+    names = [
+        f.name for f in fields(actual) if f.name not in ("tokenizer", "packed_sequence_length")
+    ]
     changed = {name for name in names if getattr(actual, name) != getattr(own, name)}
     if entry_point == "hybrid_flex":
-        assert changed - set(LAYOUT_FIELDS) == LEGACY_OMISSIONS[entry_point]
+        assert changed - set(LAYOUT_FIELDS) == (LEGACY_OMISSIONS[entry_point] & set(names))
     else:
-        assert changed == LEGACY_OMISSIONS[entry_point]
+        assert changed == (LEGACY_OMISSIONS[entry_point] & set(names))
     expected = legacy.legacy_gpt_dataset_config(args)
     expected.validate()  # Megatron Core's checks and derivations, which the builder runs
     assert {n: getattr(actual, n) for n in names} == {n: getattr(expected, n) for n in names}
@@ -499,6 +506,35 @@ def test_fim_request_without_a_source_is_rejected(monkeypatch, warnings_log):
         data.validate()
 
 
+@pytest.mark.parametrize(
+    "config_cls,dataset_cls",
+    [(SFTDatasetConfig, SFTDataset), (varlen_dataset.VarlenDatasetConfig, varlen_dataset.VarlenDataset)],
+)
+def test_online_fast_cache_keeps_sample_indices_without_rank_zero_barriers(
+    monkeypatch, tmp_path, config_cls, dataset_cls
+):
+    tokenizer = build_tokenizer(_validated([], {}))
+    config = config_cls(
+        random_seed=1234,
+        sequence_length=32,
+        tokenizer=tokenizer,
+        context_parallel_size=1,
+        blend_per_split=[(["offline"], None), None, None],
+        path_to_cache=str(tmp_path),
+        fast_cache_load=True,
+    )
+    monkeypatch.setattr(dataset_cls, "build_low_level_dataset", lambda *args: [[], [], [], []])
+    monkeypatch.setattr(
+        torch.distributed, "barrier", lambda *args, **kwargs: pytest.fail("unexpected cache barrier")
+    )
+    builder = BlendedMegatronDatasetBuilder(dataset_cls, [4, 0, 0], lambda: True, config)
+    splits = builder._build_megatron_datasets_parallel(
+        ["offline"], [(0.0, 1.0), None, None], [[4, 0, 0]]
+    )
+    assert splits[0][0].indices.tolist() == [0, 1, 2, 3]
+    assert splits[0][0].config is config
+
+
 class TestProvidersBuildMockDatasets:
     """The providers build mock datasets through the real builder, as the legacy code did, and the
     builder receives cfg.data.dataset itself."""
@@ -555,8 +591,9 @@ class TestProvidersBuildMockDatasets:
         args, cfg, _ = _prepare(monkeypatch, *corpus[case])
         data = _ready(cfg)
         plain = data.dataset
-        shared = {f.name: getattr(plain, f.name) for f in fields(GPTDatasetConfig) if f.init}
-        wrapped = GPTFIMDatasetConfig(
+        old_config = legacy.legacy_gpt_dataset_config(args)
+        shared = {f.name: getattr(old_config, f.name) for f in fields(old_config) if f.init}
+        wrapped = legacy.GPTFIMDatasetConfig(
             **shared,
             fim_rate=0.9,
             fim_spm_rate=0.4,

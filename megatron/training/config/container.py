@@ -56,6 +56,7 @@ from megatron.training.config.utils import (
     serialize_value,
 )
 from megatron.training.config.yaml_utils import safe_yaml_representers
+from megatron.training.datasets.online_tokenized_dataset_config import OnlineTokenizedDatasetConfig
 from megatron.training.datasets.sft_dataset import SFTDatasetConfig
 from megatron.training.models import (
     BertModelConfig,
@@ -769,33 +770,34 @@ class PretrainConfigContainer(ConfigContainerBase):
                 "container writes this field at finalize(), leave it unset."
             )
         transformer = self.model.transformer
-        if (
-            dataset.context_parallel_size is not None
-            and dataset.context_parallel_size != transformer.context_parallel_size
-        ):
-            raise ValueError(
-                f"data.dataset.context_parallel_size={dataset.context_parallel_size} disagrees "
-                "with model.transformer.context_parallel_size="
-                f"{transformer.context_parallel_size}; the container writes this field at "
-                "finalize(), leave it unset."
+        if isinstance(dataset, OnlineTokenizedDatasetConfig):
+            if (
+                dataset.context_parallel_size is not None
+                and dataset.context_parallel_size != transformer.context_parallel_size
+            ):
+                raise ValueError(
+                    f"data.dataset.context_parallel_size={dataset.context_parallel_size} disagrees "
+                    "with model.transformer.context_parallel_size="
+                    f"{transformer.context_parallel_size}; the container writes this field at "
+                    "finalize(), leave it unset."
+                )
+            sequence_parallel_size = transformer.tensor_model_parallel_size * int(
+                bool(transformer.sequence_parallel)
             )
-        sequence_parallel_size = transformer.tensor_model_parallel_size * int(
-            bool(transformer.sequence_parallel)
-        )
-        if dataset.sequence_parallel_size not in (0, sequence_parallel_size):
-            raise ValueError(
-                f"data.dataset.sequence_parallel_size={dataset.sequence_parallel_size} disagrees "
-                "with the model layout (tensor_model_parallel_size * sequence_parallel = "
-                f"{sequence_parallel_size}); the container writes this field at finalize(), leave "
-                "it unset."
-            )
-        dynamic_context_parallel = bool(getattr(transformer, "dynamic_context_parallel", False))
-        if dataset.dynamic_context_parallel and not dynamic_context_parallel:
-            raise ValueError(
-                "data.dataset.dynamic_context_parallel=True disagrees with "
-                "model.transformer.dynamic_context_parallel=False; the container writes this field "
-                "at finalize(), leave it unset."
-            )
+            if dataset.sequence_parallel_size not in (0, sequence_parallel_size):
+                raise ValueError(
+                    f"data.dataset.sequence_parallel_size={dataset.sequence_parallel_size} disagrees "
+                    "with the model layout (tensor_model_parallel_size * sequence_parallel = "
+                    f"{sequence_parallel_size}); the container writes this field at finalize(), leave "
+                    "it unset."
+                )
+            dynamic_context_parallel = bool(getattr(transformer, "dynamic_context_parallel", False))
+            if dataset.dynamic_context_parallel and not dynamic_context_parallel:
+                raise ValueError(
+                    "data.dataset.dynamic_context_parallel=True disagrees with "
+                    "model.transformer.dynamic_context_parallel=False; the container writes this field "
+                    "at finalize(), leave it unset."
+                )
         family, _mock = dataset_family_from_type(
             resolve_dataset_class(dataset, self.data.dataset_type)
         )
@@ -842,7 +844,9 @@ class PretrainConfigContainer(ConfigContainerBase):
             # The world size is known here: data_parallel_size gets the agreement check the other
             # fields got at validation, before anything is written.
             data_parallel_size = self.get_data_parallel_size()
-            if dataset.data_parallel_size not in (1, data_parallel_size):
+            if isinstance(
+                dataset, OnlineTokenizedDatasetConfig
+            ) and dataset.data_parallel_size not in (1, data_parallel_size):
                 raise ValueError(
                     f"data.dataset.data_parallel_size={dataset.data_parallel_size} disagrees with "
                     "the model layout and the world size "
@@ -985,14 +989,15 @@ class PretrainConfigContainer(ConfigContainerBase):
                 dataset.packed_sequence_length = transformer.max_seq_length_per_sample
             dataset.full_validation = self.validation.full_validation
             dataset.multiple_validation_sets = self.validation.multiple_validation_sets
-            dataset.data_parallel_size = data_parallel_size
-            dataset.context_parallel_size = transformer.context_parallel_size
-            dataset.sequence_parallel_size = transformer.tensor_model_parallel_size * int(
-                bool(transformer.sequence_parallel)
-            )
-            dataset.dynamic_context_parallel = bool(
-                getattr(transformer, "dynamic_context_parallel", False)
-            )
+            if isinstance(dataset, OnlineTokenizedDatasetConfig):
+                dataset.data_parallel_size = data_parallel_size
+                dataset.context_parallel_size = transformer.context_parallel_size
+                dataset.sequence_parallel_size = transformer.tensor_model_parallel_size * int(
+                    bool(transformer.sequence_parallel)
+                )
+                dataset.dynamic_context_parallel = bool(
+                    getattr(transformer, "dynamic_context_parallel", False)
+                )
         self.data.finalize()
         if self.rl.requires_grad_buffer_offload:
             self.ddp.grad_buffer_offload = True

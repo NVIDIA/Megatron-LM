@@ -16,15 +16,16 @@ import numpy as np
 import pytest
 import torch
 
+from megatron.training.config import DataConfig, DataloaderConfig
+from megatron.training.datasets.sft_dataset import IGNORE_INDEX
+
 # Import via the public module path so this test gets discovered through the
 # regular pytest entry point. The functions under test are pure Python and do
 # not require torch.distributed.
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
-from megatron.training.config import DataConfig, DataloaderConfig
-from megatron.training.datasets.sft_dataset import IGNORE_INDEX
 from megatron.training.datasets.varlen_dataset import (
     MockVarlenDataset,
     VarlenDataset,
+    VarlenDatasetConfig,
     VarlenLowLevelDataset,
     _alpaca_to_messages,
     _looks_like_hf_id,
@@ -702,15 +703,12 @@ def _loader_args(*, use_varlen, sbhd, scheduler, mbs, gbs=None):
 def _loader_section(run_config, *, seq_length, sbhd):
     """The data section the loader reads: a varlen dataset config (a source, so the resolver
     accepts the real class) with the SBHD flag of the run, the single loader, no workers."""
-    dataset = GPTDatasetConfig(
+    dataset = VarlenDatasetConfig(
         sequence_length=seq_length,
         random_seed=1,
         blend=(["prefix"], None),
         split="9,1,0",
         varlen_sbhd_validation=sbhd,
-        reset_position_ids=False,
-        reset_attention_mask=False,
-        eod_mask_loss=False,
     )
     run_config.data = DataConfig(
         dataset=dataset,

@@ -41,9 +41,11 @@ def test_dataset_content_limit_and_execution_bound_are_distinct(run_config, pack
         dataset=(SFTDatasetConfig if packed else GPTDatasetConfig)(
             random_seed=1234,
             sequence_length=8,
-            reset_position_ids=False,
-            reset_attention_mask=False,
-            eod_mask_loss=False,
+            **(
+                {}
+                if packed
+                else dict(reset_position_ids=False, reset_attention_mask=False, eod_mask_loss=False)
+            ),
         ),
         dataset_type=MockSFTDataset if packed else MockGPTDataset,
     )
@@ -97,9 +99,6 @@ def test_sft_pack_validates_physical_shape(run_config, bound, capacity, error):
         dataset=SFTDatasetConfig(
             random_seed=1234,
             sequence_length=9,
-            reset_position_ids=False,
-            reset_attention_mask=False,
-            eod_mask_loss=False,
         ),
         dataset_type=MockSFTDataset,
     )

@@ -55,6 +55,7 @@ from megatron.training.config import (
 )
 from megatron.training.config.dataset_config import dataset_type_from_family
 from megatron.training.datasets.sft_dataset import SFTDatasetConfig
+from megatron.training.datasets.varlen_dataset import VarlenDatasetConfig
 from megatron.training.models import (
     BertModelConfig,
     GPTModelConfig,
@@ -1113,15 +1114,35 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
                 )
         # Otherwise (fim) the real class stays and DataConfig.validate() reports the missing source.
 
+    config_cls = {
+        "gpt": GPTDatasetConfig,
+        "fim": GPTFIMDatasetConfig,
+        "sft": SFTDatasetConfig,
+        "varlen": VarlenDatasetConfig,
+    }[family]
+    config_fields = {item.name for item in fields(config_cls)}
+    if family in ("sft", "varlen") and has_source:
+        # These dataset implementations rejected GPT mask/reset options in __getitem__.
+        # Keep that CLI check here; the family-specific configs no longer expose them.
+        assert not args.reset_position_ids
+        assert not args.reset_attention_mask and not args.create_attention_mask_in_dataloader
     kwargs: dict[str, Any] = {
         field_name: deepcopy(getattr(args, source))
         for field_name, source in _DATASET_FIELD_SOURCES.items()
+        if field_name in config_fields
     }
     kwargs["blend"] = blend
     kwargs["blend_per_split"] = blend_per_split
-    kwargs["sequences_per_dataset"] = sequences_per_dataset
+    if "sequences_per_dataset" in config_fields:
+        kwargs["sequences_per_dataset"] = sequences_per_dataset
     if standalone:
-        kwargs.update(_container_written_fields_from_args(args))
+        kwargs.update(
+            {
+                name: value
+                for name, value in _container_written_fields_from_args(args).items()
+                if name in config_fields
+            }
+        )
     if family == "sft":
         if standalone:
             kwargs["packed_sequence_length"] = (
@@ -1145,7 +1166,7 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
         )
         dataset = GPTFIMDatasetConfig(**kwargs)
     else:
-        dataset = GPTDatasetConfig(**kwargs)
+        dataset = config_cls(**kwargs)
     return DataConfig(
         dataset=dataset, dataloader=dataloader_config_from_args(args), dataset_type=dataset_type
     )

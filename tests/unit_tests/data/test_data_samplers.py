@@ -14,13 +14,16 @@ import pytest
 import torch
 
 import megatron.training.datasets.data_samplers as data_samplers
-from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.utils import Split
 from megatron.core.transformer import TransformerConfig
 from megatron.training.config import DataConfig, DataloaderConfig
 from megatron.training.config.dataset_config import is_packed_sequence
-from megatron.training.datasets.sft_dataset import MockSFTDataset
-from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDatasetConfig
+from megatron.training.datasets.varlen_dataset import (
+    MockVarlenDataset,
+    VarlenDataset,
+    VarlenDatasetConfig,
+)
 from megatron.training.models import GPTModelConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -136,7 +139,6 @@ class TestDataLoaderResume:
             assert batch.shape == (1, 1)
 
 
-BOOLS = dict(reset_position_ids=False, reset_attention_mask=False, eod_mask_loss=False)
 BLEND = (["prefix-a"], None)
 
 
@@ -215,19 +217,18 @@ class TestLoaderSettingsFromTheDataSection:
         Utils.initialize_model_parallel(1, 1)
         run_config.train.micro_batch_size = 1
         monkeypatch.setattr(data_samplers, "get_args", lambda: _legacy_args(), raising=False)
-        plain = GPTDatasetConfig(sequence_length=16, random_seed=1, **BOOLS)
+        plain = VarlenDatasetConfig(sequence_length=16, random_seed=1)
         # Unpacked varlen samples: the identity collate, a list of sample dicts.
         _section(run_config, dataset=plain, dataset_type=MockVarlenDataset)
         batch = _batch(_DictDataset())
         assert isinstance(batch, list) and isinstance(batch[0], dict)
         # Varlen with SBHD validation emits fixed-width samples: the default collate.
-        sbhd = GPTDatasetConfig(
+        sbhd = VarlenDatasetConfig(
             sequence_length=16,
             random_seed=1,
             blend=BLEND,
             split="9,1,0",
             varlen_sbhd_validation=True,
-            **BOOLS,
         )
         _section(run_config, dataset=sbhd, dataset_type=VarlenDataset)
         batch = _batch(_DictDataset())
@@ -254,8 +255,8 @@ class TestLoaderSettingsFromTheDataSection:
         )
         # context_parallel_size is a container-written field (None until finalize); the SFT
         # padding divisor reads it, so give it the value the container would write.
-        config = GPTDatasetConfig(
-            sequence_length=16, random_seed=1, tokenizer=tokenizer, context_parallel_size=1, **BOOLS
+        config = SFTDatasetConfig(
+            sequence_length=16, random_seed=1, tokenizer=tokenizer, context_parallel_size=1
         )
         # The sampler yields one micro-batch per data-parallel rank from world_size samples (the
         # CI runs the data tests on eight ranks), so the mock dataset carries 2 * world_size.

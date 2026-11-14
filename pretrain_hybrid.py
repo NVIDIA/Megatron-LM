@@ -159,7 +159,7 @@ def get_batch(data_iterator, vp_stage=None, pg_collection: Optional[ProcessGroup
 
     # Read after the early return above: an intermediate stage without cu_seqlens never looks at
     # the dataset (a loader-only section has none).
-    create_attention_mask_in_dataloader = cfg.data.dataset.create_attention_mask
+    create_attention_mask_in_dataloader = cfg.data.creates_attention_mask()
     batch = get_batch_on_this_tp_rank(
         batch,
         broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),

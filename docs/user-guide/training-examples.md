@@ -94,8 +94,20 @@ container derives `SFTDatasetConfig.packed_sequence_length` during startup;
 recipes should set the model bound rather than this derived dataset field. Existing
 `--seq-length`-only runs retain their previous widths and packing behavior.
 The SFT-specific config lives alongside `SFTDataset`; Core's `GPTDatasetConfig`
-has no pack-width field. Legacy SFT callers supplying a plain `GPTDatasetConfig`
-retain its single `sequence_length` as the output pack width.
+has no pack-width field.
+
+Dataset config fields follow the dataset family:
+
+- Core's `GPTDatasetConfig` owns indexed bin/idx data and its masking/cache options;
+  `GPTFIMDatasetConfig` adds the FIM options.
+- Training's `SFTDatasetConfig` owns conversation packing and SFT mock options.
+- Training's `VarlenDatasetConfig` owns individual variable-length samples,
+  Varlen mock options, and `varlen_sbhd_validation`.
+
+SFT and Varlen configs share `OnlineTokenizedDatasetConfig` for tokenizer and
+parallel-padding inputs. All families inherit the existing
+`BlendedMegatronDatasetConfig` builder settings. This changes configuration
+ownership, not tokenization, packing, or sample contents.
 
 An oversized allocation bound does not enlarge fixed GPT dataset rows or change
 their token-based batch schedule. T5 retains separate encoder and decoder input
@@ -108,6 +120,12 @@ ModelOpt callbacks reject bounds inconsistent with the rows they actually emit.
 `finalize()` to derive unset/owned fields before any runtime consumer reads them.
 
 ### Python API compatibility
+
+Python SFT/Varlen callers must construct `SFTDatasetConfig` / `VarlenDatasetConfig`
+rather than putting their fields on `GPTDatasetConfig`. CLI flag names are unchanged.
+Container deserialization upgrades the former union schema using its saved
+`dataset_type`, preserving fields consumed by that family and warning when dropping
+known, unused fields. Unknown fields still fail strict loading.
 
 `LLaVAModelConfig.decoder_seq_length` is removed. Python callers and saved
 configurations using this field require updating; strict deserialization rejects

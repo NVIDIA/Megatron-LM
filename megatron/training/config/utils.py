@@ -155,6 +155,14 @@ def sanitize_dataclass_config(config: dict[str, Any], _visited: set | None = Non
         if target_class is not None:
             init_false_fields = _get_init_false_fields(target_class)
 
+            from megatron.training.config.dataset_config import (
+                DataConfig,
+                upgrade_legacy_dataset_section,
+            )
+
+            if target_class is DataConfig:
+                config = upgrade_legacy_dataset_section(config)
+
     # Process all values, filtering init=False fields and recursing into nested dicts
     sanitized = {}
     for key, value in config.items():
