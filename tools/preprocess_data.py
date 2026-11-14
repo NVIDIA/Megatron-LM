@@ -317,7 +317,7 @@ def main():
     args = get_args()
 
     workers = args.workers_to_check if args.find_optimal_num_workers else [args.workers]
-    for num_workers in workers:
+    for num_workers in workers.copy():
         if num_workers % args.partitions != 0:
             print(
                 f"Removing num_workers ({num_workers}) from workers list "
