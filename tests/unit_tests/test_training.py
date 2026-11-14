@@ -290,7 +290,7 @@ def test_ssa_indexer_only_freezes_everything_but_indexers():
     model.router = torch.nn.Linear(2, 2)
     model.router.frozen_expert_bias = False
 
-    assert training._freeze_backbone_for_ssa_indexer([model]) == [model]
+    assert training.freeze_backbone_for_ssa_indexer([model]) == [model]
     trainable = {name for name, param in model.named_parameters() if param.requires_grad}
     assert trainable == {"core_attention.indexer.weight", "core_attention.indexer.bias"}
     assert model.router.frozen_expert_bias
@@ -302,12 +302,12 @@ def test_ssa_indexer_only_freezes_everything_but_indexers():
         freeze_base_model_for_mtp=False,
         ssa_train_indexer_only=True,
     )
-    assert model_config.pre_wrap_hooks == [training._freeze_backbone_for_ssa_indexer]
+    assert model_config.pre_wrap_hooks == [training.freeze_backbone_for_ssa_indexer]
 
 
 def test_ssa_indexer_only_rejects_a_model_without_indexers():
     with pytest.raises(RuntimeError, match="no simplified sparse attention indexer"):
-        training._freeze_backbone_for_ssa_indexer([torch.nn.Linear(2, 2)])
+        training.freeze_backbone_for_ssa_indexer([torch.nn.Linear(2, 2)])
 
 
 def test_indexer_logging_counts_ssa_hybrid_attention_layers():

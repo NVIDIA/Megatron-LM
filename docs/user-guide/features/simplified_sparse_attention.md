@@ -54,6 +54,11 @@ Indexer gradients can be clipped separately from the backbone with
 threshold, `--ssa-indexer-clip-grad`, which defaults to `--clip-grad`; zero leaves
 indexer gradients unclipped. The flags set `OptimizerConfig.dsa_indexer_clip_grad`.
 
+MIMO models support both phases. Indexer-only training freezes every module except
+the language model's indexers, including encoders, projections and router bias
+updates; `--freeze-lm` is rejected. Separate indexer clipping combines the indexer
+and other gradient norms across the module grids.
+
 ### Model FLOP accounting
 
 Throughput counts useful model GEMMs with two FLOPs per multiply-add. For each
