@@ -891,6 +891,15 @@ def test_batch_invariant_kernels_replay():
         backward=False,
         what="matmul_persistent",
     )
+    # aten::addmm's other forms: a strided [M, N] bias, beta and alpha.
+    bias_rows = torch.randn(8192, 4096 + 64, device="cuda", dtype=torch.bfloat16)[:, :4096]
+    assert_replays_bit_exact(
+        lambda a, b: bik.matmul_persistent(a, b, bias_rows, beta=0.5, alpha=2.0),
+        (a, b),
+        replays=4,
+        backward=False,
+        what="matmul_persistent with a strided [M, N] bias, beta and alpha",
+    )
     logits = torch.randn(8192, 32768, device="cuda")
     assert_replays_bit_exact(
         lambda x: bik.log_softmax(x, dim=-1),
@@ -903,6 +912,27 @@ def test_batch_invariant_kernels_replay():
     assert_replays_bit_exact(
         lambda x: bik.mean_dim(x, 1), (x,), replays=4, backward=False, what="bik mean_dim"
     )
+
+
+@pytest.mark.parametrize("backend", ["triton", "deepgemm"])
+def test_batch_invariant_fp32_router_gating_replays(backend):
+    """The router's fp32 logits of bf16 operands, written from the GEMM's fp32 accumulator."""
+    from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
+    from megatron.core.transformer.moe.moe_utils import router_gating_linear
+
+    if backend == "deepgemm" and not bik.HAVE_DEEPGEMM_BF16:
+        pytest.skip("DeepGEMM bf16 bindings are unavailable")
+    seeded()
+    x = torch.randn(8192, 4096, device="cuda", dtype=torch.bfloat16)
+    weight = (torch.randn(256, 4096, device="cuda") * 0.02).to(torch.bfloat16)
+    with torch.no_grad(), bik.set_batch_invariant_mode(True, backend=backend):
+        assert_replays_bit_exact(
+            lambda x, w: router_gating_linear(x, w, None, torch.float32),
+            (x, weight),
+            replays=4,
+            backward=False,
+            what=f"fp32 router_gating_linear[{backend}]",
+        )
 
 
 @pytest.mark.parametrize("zero_centered_gamma", [False, True], ids=["gamma", "zero_centered_gamma"])

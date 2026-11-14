@@ -131,6 +131,10 @@ def matmul_kernel_persistent(
     stride_bn,
     stride_cm,
     stride_cn,
+    stride_biasm,
+    stride_biasn,
+    alpha,
+    beta,
     BLOCK_SIZE_M: tl.constexpr,  #
     BLOCK_SIZE_N: tl.constexpr,  #
     BLOCK_SIZE_K: tl.constexpr,  #
@@ -140,6 +144,7 @@ def matmul_kernel_persistent(
     B_LARGE: tl.constexpr,
     C_LARGE: tl.constexpr,
     HAS_BIAS: tl.constexpr,
+    BIAS_PER_ROW: tl.constexpr,
 ):
     """Persistent matmul Triton kernel backing `matmul_persistent`."""
     start_pid = tl.program_id(axis=0)
@@ -190,10 +195,18 @@ def matmul_kernel_persistent(
             offs_cn = offs_cn.to(tl.int64)
         c_ptrs = c_ptr + stride_cm * offs_cm[:, None] + stride_cn * offs_cn[None, :]
         c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N)
+        # alpha * (a @ b) + beta * bias in fp32, rounded once, as aten::addmm computes it.
+        accumulator = accumulator * alpha
         if HAS_BIAS:
-            bias_ptrs = bias_ptr + offs_cn
-            bias = tl.load(bias_ptrs, mask=offs_cn < N, other=0.0).to(tl.float32)
-            accumulator += bias
+            if BIAS_PER_ROW:
+                bias_ptrs = (
+                    bias_ptr + stride_biasm * offs_cm[:, None] + stride_biasn * offs_cn[None, :]
+                )
+                bias = tl.load(bias_ptrs, mask=c_mask, other=0.0).to(tl.float32)
+            else:
+                bias_ptrs = bias_ptr + stride_biasn * offs_cn
+                bias = tl.load(bias_ptrs, mask=offs_cn < N, other=0.0).to(tl.float32)
+            accumulator += beta * bias
         c = accumulator.to(c_ptr.dtype.element_ty)
         tl.store(c_ptrs, c, mask=c_mask)
 
@@ -222,21 +235,47 @@ def get_compute_units():
     return NUM_SMS
 
 
-def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None):
-    """Persistent matmul kernel used by batch-invariant GEMM."""
+def _max_element_offset(t: torch.Tensor) -> int:
+    """The largest element offset from ``t``'s data pointer that a kernel walking ``t`` reaches."""
+    if t.numel() == 0:
+        return 0
+    return sum((size - 1) * stride for size, stride in zip(t.shape, t.stride()))
+
+
+def matmul_persistent(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+    *,
+    beta: float = 1.0,
+    alpha: float = 1.0,
+):
+    """Persistent matmul kernel used by batch-invariant GEMM.
+
+    Computes ``alpha * (a @ b) + beta * bias`` as `aten::addmm` does: accumulates in fp32, adds
+    the bias in fp32 and rounds once to ``out_dtype`` (default: the inputs' dtype). ``bias`` may
+    be any tensor that broadcasts to [M, N] ([N], [1, N], [M, 1], [M, N]), with any strides.
+    """
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
-    assert (
-        bias is None or bias.dim() == 1
-    ), "Currently assuming bias is 1D, let Horace know if you run into this"
 
     NUM_SMS = get_compute_units()
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
     # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
+    c = torch.empty((M, N), device=a.device, dtype=out_dtype or dtype)
+    if bias is None:
+        bias_strides = (0, 0)
+    else:
+        # A broadcast dimension gets stride 0; the kernel reads the bias through its strides.
+        bias = bias.expand(M, N)
+        bias_strides = bias.stride()
+    # int32 offsets reach 2**31 - 1, and a strided view can reach further than its numel. The
+    # epilogue addresses C and the bias with the same offsets.
+    epilogue_offset = max(_max_element_offset(t) for t in (c, bias) if t is not None)
 
     # 1D launch kernel where each block gets its own program.
     def grid(META):
@@ -284,11 +323,16 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
         b.stride(1),  #
         c.stride(0),
         c.stride(1),  #
+        bias_strides[0],
+        bias_strides[1],
+        float(alpha),
+        float(beta),
         NUM_SMS=NUM_SMS,  #
-        A_LARGE=a.numel() > 2**31,
-        B_LARGE=b.numel() > 2**31,
-        C_LARGE=c.numel() > 2**31,
+        A_LARGE=_max_element_offset(a) >= 2**31,
+        B_LARGE=_max_element_offset(b) >= 2**31,
+        C_LARGE=epilogue_offset >= 2**31,
         HAS_BIAS=bias is not None,
+        BIAS_PER_ROW=bias_strides[0] != 0,
         **configs[dtype],
     )
     return c
@@ -525,31 +569,69 @@ def mean_dim(
     return output
 
 
-# Production uses DeepGEMM for bf16 and the deterministic Triton kernel for
-# intentional higher-precision operations such as the fp32 MoE router.
+# Production uses DeepGEMM for bf16 operands (bf16 output, or fp32 output such as the
+# MoE router's logits) and the deterministic Triton kernel for fp16/fp32 operands.
 _BATCH_INVARIANT_BACKENDS = ("deepgemm", "triton", "te_native")
 _BATCH_INVARIANT_BACKEND: str = "deepgemm"
+# Whether batch-invariant mode turned on DeepGEMM's deterministic algorithms. DeepGEMM
+# has no getter for that switch, so this records what disabling the mode must undo.
+_DEEPGEMM_DETERMINISTIC_SET = False
 
 
-def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """`a @ b` via DeepGEMM `bf16_gemm_nn`. Both inputs are row-major.
+def _set_deepgemm_deterministic_algorithms(enabled: bool) -> None:
+    """Turn DeepGEMM's deterministic algorithms on for the deepgemm backend, or back off.
 
-    Bitwise-identical to `torch.mm` on Hopper/Blackwell, deterministic across
-    runs, batch-invariant.
+    While they are off, DeepGEMM runs its dense bf16 GEMMs on cuBLASLt with the
+    heuristic algorithm, which may split K differently for each M. The switch is
+    process-global and only DeepGEMM's dense GEMMs, einsum and fused mega kernels
+    read it (not the grouped GEMMs the other backends use). DeepGEMM releases
+    without the switch always run their own kernels.
+    """
+    global _DEEPGEMM_DETERMINISTIC_SET
+    use_deterministic_algorithms = getattr(deep_gemm, "use_deterministic_algorithms", None)
+    if use_deterministic_algorithms is None or enabled == _DEEPGEMM_DETERMINISTIC_SET:
+        return
+    use_deterministic_algorithms(enabled)
+    _DEEPGEMM_DETERMINISTIC_SET = enabled
+
+
+def _mm_deepgemm(
+    a: torch.Tensor, b: torch.Tensor, out_dtype: torch.dtype | None = None
+) -> torch.Tensor:
+    """`a @ b` via DeepGEMM `bf16_gemm_nn`, in ``out_dtype``: bf16 (the default) or fp32.
+
+    Deterministic across runs and batch-invariant. Its bits generally differ from
+    `torch.mm`'s, so the processes that must agree bitwise (for example RL
+    training and rollout) must all use this backend.
     """
     if a.dtype != torch.bfloat16:
         raise RuntimeError(
             f"The DeepGEMM batch-invariant backend requires bf16 inputs "
             f"(got {a.dtype}); use backend='triton' for fp16/fp32."
         )
-    # TMA descriptors require 16-byte outer strides, not padded logical shapes.
+    # DeepGEMM reads an operand along its unit-stride dimension, so a column-major
+    # view such as a linear's `weight.t()` is read K-major in place. Its TMA
+    # descriptors need a 16-byte aligned base pointer and outer stride, and the
+    # rows (or columns) must not overlap, which rules out expanded views.
     stride_alignment = 16 // a.element_size()
 
     def _align_outer_stride(t: torch.Tensor) -> torch.Tensor:
-        if t.stride(0) % stride_alignment == 0:
+        # Keep a column-major operand column-major; take anything else row-major.
+        inner = 0 if t.stride(0) == 1 and t.stride(1) != 1 else 1
+        outer = 1 - inner
+        if (
+            t.stride(inner) == 1
+            and t.stride(outer) >= t.shape[inner]
+            and t.stride(outer) % stride_alignment == 0
+            and t.data_ptr() % 16 == 0
+        ):
             return t
-        outer_stride = (t.shape[1] + stride_alignment - 1) // stride_alignment * stride_alignment
-        aligned = t.new_empty_strided(t.shape, (outer_stride, 1))
+        # Copy into that layout with the outer stride padded.
+        strides = [1, 1]
+        strides[outer] = (
+            (t.shape[inner] + stride_alignment - 1) // stride_alignment * stride_alignment
+        )
+        aligned = t.new_empty_strided(t.shape, strides)
         aligned.copy_(t)
         return aligned
 
@@ -557,35 +639,55 @@ def _mm_deepgemm(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     b = _align_outer_stride(b)
     M = a.shape[0]
     N = b.shape[1]
-    output_stride = (N + stride_alignment - 1) // stride_alignment * stride_alignment
-    d = a.new_empty_strided((M, N), (output_stride, 1))
-    deep_gemm.bf16_gemm_nn(a, b, d)
+    # DeepGEMM accumulates in fp32 and rounds once to D's dtype.
+    out_dtype = out_dtype or a.dtype
+    output_alignment = 16 // out_dtype.itemsize
+    output_stride = (N + output_alignment - 1) // output_alignment * output_alignment
+    d = a.new_empty_strided((M, N), (output_stride, 1), dtype=out_dtype)
+    # Compile only N into the JIT kernel. The token count is K in weight-gradient
+    # GEMMs (`grad.t() @ x`, TE's NT layout) and M in all others, so compiling
+    # either would build a new kernel for every new token count.
+    deep_gemm.bf16_gemm_nn(a, b, d, compiled_dims="n")
     return d.contiguous()
 
 
-def mm_batch_invariant(a, b):
-    """Batch-invariant replacement for `aten::mm`."""
+def mm_batch_invariant(a, b, out_dtype: torch.dtype | None = None):
+    """Batch-invariant replacement for `aten::mm`.
+
+    The product is accumulated in fp32 and rounded once to ``out_dtype`` (default: the
+    inputs' dtype), so an fp32 product of bf16 operands is never rounded to bf16.
+    """
+    if (
+        _BATCH_INVARIANT_BACKEND == "deepgemm"
+        and a.dtype == torch.bfloat16
+        and b.dtype == torch.bfloat16
+        and out_dtype in (None, torch.bfloat16, torch.float32)
+    ):
+        return _mm_deepgemm(a, b, out_dtype)
+    return matmul_persistent(a, b, out_dtype=out_dtype)
+
+
+def addmm_batch_invariant(bias, a, b, *, beta=1, alpha=1):
+    """Batch-invariant replacement for `aten::addmm`: ``beta * bias + alpha * (a @ b)``.
+
+    ``bias`` is any tensor that broadcasts to [M, N]. As in aten, a zero ``beta`` ignores it, so
+    its NaN and inf do not propagate.
+    """
+    if beta == 0:
+        bias = None
     if (
         _BATCH_INVARIANT_BACKEND == "deepgemm"
         and a.dtype == torch.bfloat16
         and b.dtype == torch.bfloat16
     ):
-        return _mm_deepgemm(a, b)
-    return matmul_persistent(a, b)
-
-
-def addmm_batch_invariant(bias, a, b):
-    """Batch-invariant replacement for `aten::addmm`."""
-    if (
-        _BATCH_INVARIANT_BACKEND == "deepgemm"
-        and a.dtype == torch.bfloat16
-        and b.dtype == torch.bfloat16
-    ):
+        # DeepGEMM rounds the product to bf16; alpha and the bias are applied after that.
         out = _mm_deepgemm(a, b)
+        if alpha != 1:
+            out = out * alpha
         if bias is not None:
-            out = out + bias
+            out = torch.add(out, bias, alpha=beta)
         return out
-    return matmul_persistent(a, b, bias=bias)
+    return matmul_persistent(a, b, bias=bias, beta=beta, alpha=alpha)
 
 
 def _log_softmax_batch_invariant(input, dim, _half_to_float):
@@ -1131,12 +1233,12 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
         transb = layout[1].upper() == "T"
 
         opA = A.transpose(0, 1) if transa else A  # [K, O] or [I, O]
-        # Triton's persistent GEMM consumes the operand strides directly. A
-        # contiguous copy here materializes large TE projection weights on
-        # every forward, including each CUDA-graph replay. DeepGEMM still
-        # requires contiguous operands, and non-transposed layouts retain
-        # their existing behavior.
-        if not (transa and _BATCH_INVARIANT_BACKEND == "triton"):
+        # Triton's persistent GEMM consumes the operand strides directly, and
+        # DeepGEMM reads the transposed weight K-major in place. A contiguous
+        # copy here materializes large TE projection weights on every forward,
+        # including each CUDA-graph replay. Non-transposed layouts retain their
+        # existing behavior.
+        if not transa:
             opA = opA.contiguous()
         opB = B.transpose(0, 1).contiguous() if transb else B.contiguous()  # [..., K]
 
@@ -1156,8 +1258,10 @@ class BatchInvariantTEGemmFn(torch.autograd.Function):
             leading_shape = ()
             opB_2d = opB
 
-        # Perform GEMM: (N_total, K) @ (K, O) -> (N_total, O)
-        base_2d = mm_batch_invariant(opB_2d, opA)
+        # Perform GEMM: (N_total, K) @ (K, O) -> (N_total, O). Like TE, write `out_dtype`
+        # from the fp32 accumulator: an fp32 product of bf16 operands (the MoE router's
+        # logits) must not be rounded to bf16 first.
+        base_2d = mm_batch_invariant(opB_2d, opA, out_dtype=out_dtype)
 
         # Reshape back to original leading dims with output features at the end
         out = base_2d.reshape(*leading_shape, base_2d.shape[-1])
@@ -1840,7 +1944,11 @@ def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "o
         backend: which kernel to dispatch `aten::mm`/`aten::addmm` through.
             "te_native" (default) keeps the native cuBLASLt kernels and obtains
             invariance via workspace starvation. "deepgemm" routes bf16 CUDA
-            inputs through DeepGEMM `bf16_gemm_nn`. "triton" routes through the batch-invariant
+            inputs through DeepGEMM `bf16_gemm_nn` and turns on DeepGEMM's
+            process-global deterministic algorithms, which
+            `disable_batch_invariant_mode` turns back off; DeepGEMM has no
+            getter, so a value set before enabling is not restored.
+            "triton" routes through the batch-invariant
             Triton `matmul_persistent` kernel (works for bf16/fp16/fp32 and
             on any CUDA device). "te_native" keeps the native cuBLASLt
             kernels (aten and TE) and obtains invariance via workspace
@@ -1865,6 +1973,10 @@ def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "o
         )
     _BATCH_INVARIANT_BACKEND = backend
     dispatch_key = getattr(torch.accelerator.current_accelerator(), "type", "cpu").upper()
+    if backend == "deepgemm":
+        # DeepGEMM sends dense bf16 GEMMs to cuBLASLt's heuristic algorithms unless
+        # its deterministic algorithms are on; the backend needs DeepGEMM's kernels.
+        _set_deepgemm_deterministic_algorithms(True)
     _batch_invariant_MODE = True
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
     if backend == "te_native":
@@ -1900,7 +2012,11 @@ def enable_batch_invariant_mode(backend: str = "te_native", collective: str = "o
 
 
 def disable_batch_invariant_mode():
-    """Disable global batch-invariant mode and restore original kernels."""
+    """Disable global batch-invariant mode and restore original kernels.
+
+    If the mode turned on DeepGEMM's deterministic algorithms (deepgemm backend),
+    they are turned off, also for other DeepGEMM users in the process.
+    """
     global _batch_invariant_MODE, _batch_invariant_LIB
     if _batch_invariant_LIB is not None:
         _batch_invariant_LIB._destroy()
@@ -1910,6 +2026,7 @@ def disable_batch_invariant_mode():
     _te_unpatch_for_batch_invariant()
     _disable_te_native_workspace_starvation()
     _unpin_mamba_autotuners()
+    _set_deepgemm_deterministic_algorithms(False)
 
 
 # (autotuner, original configs list) pairs saved by _pin_mamba_autotuners.
