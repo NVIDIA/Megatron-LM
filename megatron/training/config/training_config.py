@@ -54,6 +54,12 @@ class TrainingConfig:
     0=off, 1=moderate, 2=aggressive.
     """
 
+    prewarm_gdp_kernels: bool = False
+    """Warm an isolated BF16 TP1/CP1/PP1 GDP mixer before starting data workers.
+    Preserves model/gradient storage and all RNG streams. Unsupported precision,
+    parallelism or graph configurations raise rather than silently skipping warmup.
+    """
+
     check_weight_hash_across_dp_replicas_interval: int | None = None
     """Interval to check weight hashes are same across DP replicas. If not specified, weight hashes not checked."""
 
