@@ -53,6 +53,7 @@ def _make_context(
     mtp_use_repeated_layer: bool = True,
     mtp_layer_type_list=None,
     is_hybrid_model: bool = False,
+    layer_type_list=None,
     max_requests: int = 16,
     max_tokens: int = 256,
 ) -> DynamicInferenceContext:
@@ -87,6 +88,7 @@ def _make_context(
             max_requests=max_requests,
             num_speculative_tokens=num_speculative_tokens,
             mamba_inference_state_config=mamba_inference_state_config,
+            layer_type_list=layer_type_list,
             mtp_layer_type_list=mtp_layer_type_list,
             use_flashinfer_fused_rope=None,
             unified_memory_level=0,  # unit tests currently broken with UVM
@@ -160,6 +162,18 @@ class TestMtpKvCacheGating:
             is_hybrid_model=True, mtp_layer_type_list=[Symbols.ATTENTION, Symbols.MLP]
         )
         assert context.enable_mtp_kv_cache is True
+
+    def test_draft_kv_plane_follows_the_hybrid_attention_planes(self):
+        """A hybrid model without recurrent layers has KV planes for its attention layers only,
+        and the draft plane comes right after them."""
+        context = _make_context(
+            layer_type_list=[Symbols.ATTENTION, Symbols.MOE] * 2,
+            mtp_layer_type_list=[Symbols.ATTENTION, Symbols.MLP],
+        )
+        assert context.enable_mtp_kv_cache is True
+        assert context.mtp_kv_layer_slot == 2
+        assert context.num_attention_layers == 3
+        assert context.memory_buffer.shape[1] == 3
 
 
 class TestMtpDecodeBookkeeping:
