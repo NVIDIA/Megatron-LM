@@ -17,7 +17,10 @@ from configs.llava_avlm import (
 )
 
 from examples.mimo.model_providers.hf_clip_encoder import HFCLIPEncoderWrapper
-from examples.mimo.model_providers.hf_whisper_encoder import HFWhisperEncoderWrapper
+from examples.mimo.model_providers.hf_whisper_encoder import (
+    HFWhisperEncoderWrapper,
+    scale_whisper_tp_grad,
+)
 from examples.mimo.utils.logging import print_mimo_structure
 from examples.mimo.utils.model_helpers import load_submodule_ckpt
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -62,10 +65,14 @@ def model_provider_llava_avlm(
     )
 
 
-    # Sync precision flags from global args (if we're running under Megatron training loop)
+    # Sync precision flags from global args (if we're running under Megatron training loop).
+    # The finetune flag has to be read here: the later checkpoint get_args() runs
+    # after the encoder module is built.
+    finetune_whisper = False
     try:
         from megatron.training import get_args  # late import to avoid circular deps
         _args = get_args()
+        finetune_whisper = bool(getattr(_args, "finetune_whisper_encoder", False))
         if getattr(_args, "bf16", False):
             language_config.bf16 = True
             vision_projection_config.bf16 = True
@@ -85,7 +92,10 @@ def model_provider_llava_avlm(
         params=vision_encoder_params,
     )
     # HF audio encoder
-    audio_encoder_params = {"model_name" : "openai/whisper-base"}
+    audio_encoder_params = {
+        "model_name": "openai/whisper-base",
+        "finetune": finetune_whisper,
+    }
     audio_encoder = ModuleSpec(
         module=HFWhisperEncoderWrapper,
         params=audio_encoder_params,
@@ -176,15 +186,30 @@ def model_provider_llava_avlm(
     except (ModuleNotFoundError, AssertionError):
         pass
 
-    # TODO: ykarnati make these configurable and have an API to freeze/unfreeze   
-    # freeze vision encoder and LLM parameters
+    # TODO: ykarnati make these configurable and have an API to freeze/unfreeze
+    # freeze vision encoder and LLM parameters. The Whisper tower stays frozen
+    # unless --finetune-whisper-encoder is set. embed_positions stays at the
+    # HF requires_grad flag either way.
+    whisper_encoder = mimo_model.modality_submodules.audios.encoders.whisper_encoder
     modules_to_freeze = [
         mimo_model.modality_submodules.images.encoders.clip_encoder,
-        mimo_model.modality_submodules.audios.encoders.whisper_encoder,
-        mimo_model.language_model
+        mimo_model.language_model,
     ]
+    if not finetune_whisper:
+        modules_to_freeze.append(whisper_encoder)
     for module in modules_to_freeze:
         for param in module.parameters():
             param.requires_grad = False
+
+    if finetune_whisper:
+        tp_group = pg_collection.tp if pg_collection is not None else None
+        if tp_group is None:
+            raise RuntimeError("finetune_whisper_encoder requires pg_collection.tp")
+        if torch.distributed.get_world_size(tp_group) > 1:
+            for param in whisper_encoder.parameters():
+                if param.requires_grad:
+                    param.register_hook(
+                        lambda grad, group=tp_group: scale_whisper_tp_grad(grad, group)
+                    )
 
     return mimo_model
