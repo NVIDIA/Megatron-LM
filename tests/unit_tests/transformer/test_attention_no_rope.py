@@ -1,12 +1,17 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from unittest import mock
+
 import pytest
 import torch
 
+from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer import attention
 from megatron.core.transformer.attention import SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -209,6 +214,43 @@ class TestParallelAttentionWithNoRope:
         assert output.shape[1] == micro_batch_size
         assert output.shape[2] == config.hidden_size
         assert bias.shape[0] == config.hidden_size
+
+    @pytest.mark.parametrize("layer_number,applies_rope", [(1, True), (4, False)])
+    def test_static_flash_decode_prefill_skips_rope_tables(self, layer_number, applies_rope):
+        """Under flash_decode, attention takes RoPE as cos/sin tables; a no-RoPE layer drops them.
+
+        TransformerConfig refuses flash_decode with no_rope_freq when it is built. flash_decode
+        is set afterwards here, as a runtime toggle would, to check attention itself.
+        """
+        config = self.transformer_config
+        config.no_rope_freq = 4  # [0, 0, 0, 1, 0, 0, 0, 1]: layer 4 takes no RoPE.
+        config.__post_init__()
+        config.flash_decode = True
+        self.parallel_attention.layer_number = layer_number
+        self.parallel_attention.cuda()
+
+        sequence_length, batch_size = 8, 2
+        hidden_states = torch.randn(
+            sequence_length, batch_size, config.hidden_size, device="cuda", dtype=torch.bfloat16
+        )
+        angles = torch.rand(sequence_length, config.kv_channels // 2, device="cuda")
+        with (
+            mock.patch.object(
+                attention,
+                "apply_rotary_pos_emb_with_cos_sin",
+                wraps=attention.apply_rotary_pos_emb_with_cos_sin,
+            ) as rope,
+            torch.no_grad(),
+            InferenceMode.active(),
+        ):
+            self.parallel_attention(
+                hidden_states,
+                None,
+                inference_context=StaticInferenceContext(batch_size, sequence_length),
+                rotary_pos_cos=angles.cos(),
+                rotary_pos_sin=angles.sin(),
+            )
+        assert (rope.call_count > 0) == applies_rope
 
     def test_flash_decode_with_no_rope_freq(self):
         """Test that flash_decode cannot be used with no_rope."""
