@@ -10,7 +10,7 @@ technical report via
 [HuggingFace](https://huggingface.co/collections/nvidia/ssms-666a362c5c3bb7e4a6bcfb9c).
 The code in the `main` branch is no longer compatible with the `Mamba2-*`
 checkpoints. You can load them using the
-[fixed snapshot of the code used for the technical report](https://github.com/NVIDIA/Megatron-LM/tree/ssm/examples/mamba).
+[fixed snapshot of the code used for the technical report](https://github.com/NVIDIA/Megatron-LM/tree/df61e60bf5670b1196fcae2264311401d3bb82db/examples/mamba).
 
 ## Installation
 
@@ -113,5 +113,5 @@ pattern `M*M*` with MTP pattern `MM` repeated for 2 depths.
 
 This codebase currently only supports Mamba-2, and not the original version of
 Mamba. However, the
-[fixed snapshot of the code used for the technical report](https://github.com/NVIDIA/Megatron-LM/tree/ssm/examples/mamba)
+[fixed snapshot of the code used for the technical report](https://github.com/NVIDIA/Megatron-LM/tree/df61e60bf5670b1196fcae2264311401d3bb82db/examples/mamba)
 can be configured to run the original version of Mamba.
