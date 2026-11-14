@@ -753,13 +753,16 @@ def is_first_last_bf16_layer(config: TransformerConfig, layer_no: int):
 def is_mxfp8_output_proj_active(config) -> bool:
     """Return True when the LM-head output projection should run under MXFP8.
 
-    Active when ``fp8_output_proj=True``, ``fp8=True``, ``fp8_recipe='mxfp8'``,
-    and Transformer Engine is installed.
+    Active when ``fp8_output_proj=True`` and Transformer Engine is installed, with either
+    ``fp8=True`` and ``fp8_recipe='mxfp8'``, or an FP4 model (``fp4`` set), whose LM head then
+    runs under its own MXFP8 autocast.
     """
     if not HAVE_TE:
         return False
     if not getattr(config, "fp8_output_proj", False):
         return False
+    if getattr(config, "fp4", None):
+        return True
     if not getattr(config, "fp8", False):
         return False
 
@@ -848,7 +851,7 @@ if HAVE_TE:
         communication payload).
 
         Arguments:
-            a2a_dtype (str): Wire dtype, 'bf16' (returns None) or 'mxfp8'.
+            a2a_dtype (str): Wire dtype, 'bf16' (returns None), 'mxfp8' or 'nvfp4'.
         """
         if a2a_dtype == 'bf16':
             return None
@@ -856,6 +859,8 @@ if HAVE_TE:
             return transformer_engine.common.recipe.MXFP8BlockScaling(
                 fp8_format=transformer_engine.common.recipe.Format.E4M3
             )
+        if a2a_dtype == 'nvfp4':
+            return transformer_engine.common.recipe.NVFP4BlockScaling()
         raise ValueError(f"Unsupported a2a wire dtype: {a2a_dtype!r}.")
 
     def get_fp8_context(
