@@ -191,6 +191,7 @@ linting = [
     "isort==5.13.2",
     "flake8==7.1.0",
     "pylint==3.2.6",
+    "mypy==2.4.1",
 ]
 ci = ["python-gitlab", "slack-sdk", "pandas"]
 batch_invariant = ["deep_gemm"]
