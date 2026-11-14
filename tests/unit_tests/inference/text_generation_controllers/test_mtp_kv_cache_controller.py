@@ -27,6 +27,9 @@ import torch
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.contexts.mtp_context_mixin import MTPContextMixin
 from megatron.core.inference.contexts.mtp_metadata import MTPMetadata
+from megatron.core.inference.text_generation_controllers.mtp_controller_mixin import (
+    MTPControllerMixin,
+)
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
@@ -787,6 +790,89 @@ def _make_draft_loop_controller(
     context.mtp_metadata.advance_decode_step = mock.Mock()
     context.mtp_metadata.end_forward = mock.Mock()
     return controller, model, context
+
+
+class TestGraphedCommitPass:
+    """Routing and input layout of the CUDA-graphed (fixed-shape) commit pass."""
+
+    NUM_DECODE = 3
+    PADDED = 4
+    NUM_SPEC = 2
+
+    def _setup(self, prefill_req_count=0, num_mtp_depths=NUM_SPEC):
+        context = _make_context(
+            num_decode_requests=self.NUM_DECODE, num_speculative_tokens=self.NUM_SPEC
+        )
+        controller, model, context = _make_draft_loop_controller(
+            context,
+            num_mtp_depths=num_mtp_depths,
+            active_request_count=self.NUM_DECODE,
+            graphed=True,
+        )
+        controller._mtp_resolved_padded_count = self.PADDED
+        controller.model_config.cuda_graph_impl = "local"
+        context.padded_batch_dimensions = SimpleNamespace(prefill_req_count=prefill_req_count)
+        # Main-forward rows for PADDED requests of (1 + NUM_SPEC) tokens; row i holds value i.
+        context.mtp_decoder_hidden_states = _hidden(self.PADDED * (self.NUM_SPEC + 1))
+        context._mtp_setup_commit_graphed = mock.Mock()
+        controller._accepted_token_counts_per_request[: self.NUM_DECODE] = torch.tensor(
+            [2, 0, 1], device=DEVICE
+        )
+        kv_writes = []
+
+        def compute_mtp_kv_write(**kwargs):
+            kv_writes.append(kwargs)
+            model.all_forwards.append(("mtp_kv_write", kwargs))
+
+        model.compute_mtp_kv_write = compute_mtp_kv_write
+        model.kv_write_calls = kv_writes
+        return controller, model, context
+
+    def _run(self, controller):
+        base_position = torch.tensor([10, 20, 30], dtype=torch.int64, device=DEVICE)
+        controller._compute_serial_mtp_and_sample(base_position=base_position)
+        return base_position
+
+    def test_decode_only_graphed_step_replays_commit_graph(self):
+        controller, model, context = self._setup()
+        base_position = self._run(controller)
+
+        controller._mtp_commit_pass.assert_not_called()
+        controller._mtp_dummy_prefill_forward.assert_not_called()
+        assert len(model.kv_write_calls) == 1
+        call = model.kv_write_calls[0]
+        assert call["cache_key"] == ("mtp_commit", self.PADDED)
+        assert call["eager"] is False
+        assert call["mtp_inference_context"] is context
+
+        # Request r's slot j reads main row r*(S+1)+j and the input token one row later;
+        # rows of padding requests are zeroed.
+        stride = self.NUM_SPEC + 1
+        rows = [r * stride + j for r in range(self.NUM_DECODE) for j in range(self.NUM_SPEC)]
+        padding = (self.PADDED - self.NUM_DECODE) * self.NUM_SPEC
+        expected_hidden = torch.tensor(rows + [0] * padding, dtype=torch.float32, device=DEVICE)
+        expected_tokens = torch.tensor(
+            [1000 + r + 1 for r in rows] + [0] * padding, dtype=torch.int64, device=DEVICE
+        )
+        assert torch.equal(call["hidden_states"][:, 0, 0], expected_hidden)
+        assert torch.equal(call["next_token_ids"][0], expected_tokens)
+
+        args, kwargs = context._mtp_setup_commit_graphed.call_args
+        assert args == (self.NUM_DECODE, self.PADDED)
+        assert kwargs["accepted_counts"] is controller._accepted_token_counts_per_request
+        assert kwargs["base_positions"] is base_position
+
+    def test_mixed_step_takes_eager_commit(self):
+        controller, model, context = self._setup(prefill_req_count=1)
+        self._run(controller)
+        controller._mtp_commit_pass.assert_called_once()
+        assert model.kv_write_calls == []
+
+    def test_fewer_draft_depths_than_speculative_tokens_takes_eager_commit(self):
+        controller, model, context = self._setup(num_mtp_depths=1)
+        self._run(controller)
+        controller._mtp_commit_pass.assert_called_once()
+        assert model.kv_write_calls == []
 
 
 class TestSerialMtpDraftLoop:
@@ -1689,3 +1775,63 @@ class TestMtpKvCacheCombinations:
             f"{scenario_name}: real rank issued {len(model.all_forwards)} MTP forwards, "
             f"idle rank issued {len(dummy)}"
         )
+
+
+class TestMoeDispatchSpansRanks:
+    """Idle-rank dummy forwards are gated on the dispatch (tp_ep) group, not on EP alone."""
+
+    @staticmethod
+    def _controller(ep_size, etp_size, group=None):
+        context = SimpleNamespace(expert_tensor_and_model_parallel_group=group)
+        return SimpleNamespace(
+            inference_wrapped_model=SimpleNamespace(inference_context=context),
+            model_config=SimpleNamespace(
+                expert_model_parallel_size=ep_size, expert_tensor_parallel_size=etp_size
+            ),
+        )
+
+    @pytest.mark.parametrize(
+        "ep_size, etp_size, expected",
+        [(1, 1, False), (2, 1, True), (1, 4, True), (2, 2, True)],
+        ids=["no-moe-parallelism", "ep-only", "etp-only", "ep-and-etp"],
+    )
+    def test_falls_back_to_config_without_a_group(self, ep_size, etp_size, expected):
+        controller = self._controller(ep_size, etp_size)
+        assert MTPControllerMixin._moe_dispatch_spans_ranks(controller) is expected
+
+    @pytest.mark.parametrize("group_size, expected", [(1, False), (4, True)])
+    def test_uses_the_tp_ep_group_size_when_available(self, group_size, expected):
+        # The group decides even when the config alone would say otherwise.
+        controller = self._controller(ep_size=1, etp_size=1, group=object())
+        with mock.patch(
+            "megatron.core.inference.text_generation_controllers.mtp_controller_mixin.get_pg_size",
+            return_value=group_size,
+        ):
+            assert MTPControllerMixin._moe_dispatch_spans_ranks(controller) is expected
+
+    @pytest.mark.parametrize("kv_cache_on", [False, True])
+    def test_idle_rank_runs_dummy_forwards_under_expert_tp_only(self, kv_cache_on):
+        """EP == 1, ETP > 1: the idle rank must still issue its dummy MTP forwards."""
+        context = _make_context(num_decode_requests=0)
+        context.enable_mtp_kv_cache = kv_cache_on
+        model = _make_model()
+
+        def compute_mtp_single_step(**kwargs):
+            model.all_forwards.append(("mtp_step", kwargs))
+            hidden = kwargs["hidden_states"]
+            n = hidden.shape[0] if hidden is not None else 1
+            return hidden, torch.zeros((n, 1, VOCAB_SIZE), device=DEVICE)
+
+        model.compute_mtp_single_step = compute_mtp_single_step
+        controller = _make_controller(context, model)
+        controller.num_mtp_depths = 2
+        controller.model_config.expert_model_parallel_size = 1
+        controller.model_config.expert_tensor_parallel_size = 4
+        controller._mtp_resolved_padded_count = None
+        context.expert_tensor_and_model_parallel_group = None
+
+        patches = _identity_sp_patches()
+        with patches[0], patches[1]:
+            controller._run_dummy_serial_mtp_forward()
+
+        assert len(model.all_forwards) == 2 + (1 if kv_cache_on else 0)
