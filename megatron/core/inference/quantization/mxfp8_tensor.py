@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import functools
 from dataclasses import dataclass, field
 from typing import Callable, Literal, Optional
 
@@ -27,6 +28,17 @@ from megatron.core.inference.quantization.mxfp8_quantize import (
 
 def _ceil_div(a, b):
     return (a + b - 1) // b
+
+
+@functools.cache
+def _flashinfer_mxfp8_runs_on(device_index: int) -> bool:
+    """Whether FlashInfer's MXFP8 quantization kernel can run on a CUDA device.
+
+    FlashInfer compiles the kernel body only for compute capability 10.0 and newer.
+    On older GPUs the kernel launches, writes nothing and returns its uninitialized
+    output buffers. Host-side and cached per device, so the check never synchronizes.
+    """
+    return torch.cuda.get_device_capability(device_index)[0] >= 10
 
 
 def ensure_mxfp8_scale_dtype(scale: torch.Tensor) -> torch.Tensor:
@@ -238,7 +250,14 @@ class MXFP8Tensor:
         assert x.shape[-1] % group_size == 0
         if backend == "flashinfer":
             assert HAVE_FLASHINFER, "FlashInfer not available"
-            data, scale = flashinfer_mxfp8_quantize(x)
+            if not _flashinfer_mxfp8_runs_on(x.device.index):
+                major, minor = torch.cuda.get_device_capability(x.device)
+                raise RuntimeError(
+                    "FlashInfer MXFP8 quantization requires compute capability 10.0 or newer "
+                    f"(Blackwell); {x.device} has {major}.{minor}. Use backend='triton'."
+                )
+            # FlashInfer requires a contiguous input; contiguous() returns a contiguous x as is.
+            data, scale = flashinfer_mxfp8_quantize(x.contiguous())
             if scale.dtype == torch.float8_e8m0fnu:
                 scale = scale.view(torch.uint8)
             elif scale.dtype != torch.uint8:
