@@ -74,8 +74,7 @@ def _training_inputs(idx, vals):
     return rows, inverse_map
 
 
-def _unpermute(rows, inverse_map, num_experts, ep, monkeypatch, ep_invariant, probs=None):
-    monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: ep)
+def _unpermute(rows, inverse_map, num_experts, ep, ep_invariant, probs=None):
     kwargs = {} if ep_invariant is None else {"ep_invariant": ep_invariant}
     return moe_bi.unpermute(
         rows,
@@ -83,6 +82,7 @@ def _unpermute(rows, inverse_map, num_experts, ep, monkeypatch, ep_invariant, pr
         probs=probs,
         num_experts=num_experts,
         inverse_map=inverse_map,
+        ep_size=ep,
         **kwargs,
     )
 
@@ -189,38 +189,36 @@ def test_check_ep_size():
 
 
 @needs_cuda
-def test_training_unpermute_same_bits_at_every_ep(monkeypatch):
+def test_training_unpermute_same_bits_at_every_ep():
     experts, topk, hidden, tokens = 64, 6, 512, 96
     idx, vals = _case(tokens, experts, topk, hidden, seed=2)
     rows, inverse_map = _training_inputs(idx, vals)
     probs = None
-    ref = _unpermute(rows, inverse_map, experts, 1, monkeypatch, True, probs)
+    ref = _unpermute(rows, inverse_map, experts, 1, True, probs)
     for ep in (1, 2, 4, 8):
-        out = _unpermute(rows, inverse_map, experts, ep, monkeypatch, True, probs)
+        out = _unpermute(rows, inverse_map, experts, ep, True, probs)
         assert torch.equal(out.view(torch.int16), ref.view(torch.int16)), ep
         # Flag off: the existing per-rank combine, unchanged.
         assert torch.equal(
-            _unpermute(rows, inverse_map, experts, ep, monkeypatch, None, probs),
-            _unpermute(rows, inverse_map, experts, ep, monkeypatch, False, probs),
+            _unpermute(rows, inverse_map, experts, ep, None, probs),
+            _unpermute(rows, inverse_map, experts, ep, False, probs),
         )
     # bf16 outputs above; compare the fp32 values too.
-    f = lambda on: moe_bi.unpermute(  # noqa: E731
+    f = lambda on, ep: moe_bi.unpermute(  # noqa: E731
         rows.float(),
         torch.Size((tokens, hidden)),
         probs=None,
         num_experts=experts,
         inverse_map=inverse_map,
         ep_invariant=on,
+        ep_size=ep,
     )
-    monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 4)
-    old4 = f(False)
-    monkeypatch.setattr(parallel_state, "get_expert_model_parallel_world_size", lambda: 1)
-    assert not torch.equal(old4, f(False))  # the old combine depends on EP
-    assert torch.equal(_bits(f(True)), _bits(_reference(idx, vals, experts)))
+    assert not torch.equal(f(False, 4), f(False, 1))  # the old combine depends on EP
+    assert torch.equal(_bits(f(True, 1)), _bits(_reference(idx, vals, experts)))
 
 
 @needs_cuda
-def test_training_unpermute_backward(monkeypatch):
+def test_training_unpermute_backward():
     experts, topk, hidden, tokens = 32, 4, 128, 40
     idx, vals = _case(tokens, experts, topk, hidden, seed=3)
     rows, inverse_map = _training_inputs(idx, vals)
@@ -233,7 +231,7 @@ def test_training_unpermute_backward(monkeypatch):
     for on in (True, None, True):
         r = rows.clone().requires_grad_()
         p = probs.clone().requires_grad_()
-        out = _unpermute(r, inverse_map, experts, 2, monkeypatch, on, p)
+        out = _unpermute(r, inverse_map, experts, 2, on, p)
         outputs.append(out.detach().clone())
         outs.append(torch.autograd.grad(out, (r, p), grad))
     # The tree has the gradient of the plain sum: d_row = grad * prob exactly, and d_prob is
@@ -252,14 +250,14 @@ def test_training_unpermute_backward(monkeypatch):
 
 
 @needs_cuda
-def test_inference_unpermute_same_bits_at_every_ep(monkeypatch):
+def test_inference_unpermute_same_bits_at_every_ep():
     from megatron.core.inference.moe import batch_invariant as inf_bi
 
     experts, topk, hidden, tokens = 64, 6, 512, 80
     idx, vals = _case(tokens, experts, topk, hidden, seed=4)
     valid = torch.tensor([tokens - 3], dtype=torch.int32, device="cuda")
     rows, inverse_map = _training_inputs(idx, vals)
-    train = _unpermute(rows.float(), inverse_map, experts, 2, monkeypatch, True)
+    train = _unpermute(rows.float(), inverse_map, experts, 2, True)
 
     def rank_out(ep, rank, leaves):
         inv, (t, k) = _rank_inverse_map(idx, rank, experts // ep)
