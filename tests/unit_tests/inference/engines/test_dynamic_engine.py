@@ -6837,6 +6837,55 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.skipif(not HAVE_TORCH_MEMORY_SAVER, reason="requires torch_memory_saver")
+    @pytest.mark.parametrize("kv_cache_management_mode", ["offload", "recompute"])
+    @torch.inference_mode()
+    def test_stop_while_suspended_resumes_memory_region(self, kv_cache_management_mode):
+        """A STOP that reaches a suspended engine resumes its torch_memory_saver region.
+
+        The coordinator accepts STOP from SUSPENDED, and the engine then shuts down without
+        a resume. Every context allocates under one region tag, so a context discarded with
+        its region paused would hand unmapped blocks to the next context in the process.
+        """
+        test_config = DynamicEngineTestConfig(
+            kv_cache_management_mode=kv_cache_management_mode, static_kv_memory_pointers=True
+        )
+        env = self._build_test_env(test_config)
+        engine, context = env.engine, env.engine.context
+        assert context._uses_torch_memory_saver
+
+        def signal(header):
+            return [msgpack.packb([header.value], use_bin_type=True)]
+
+        engine.use_coordinator = engine.is_mp_coordinator = True
+        socket = engine.socket_for_receiving_requests = mock.Mock()
+        socket.recv_multipart.side_effect = [
+            signal(Headers.SUSPEND),
+            dynamic_engine_coordinator.zmq.Again,
+            signal(Headers.STOP),
+            dynamic_engine_coordinator.zmq.Again,
+        ]
+        engine.model_parallel_publisher_socket = mock.Mock()
+
+        # The coordinator loop suspends a paused engine, then passes its world barrier.
+        engine.state = EngineState.PAUSED
+        engine.schedule_requests()
+        assert engine.state == EngineState.SUSPENDING
+        assert not context.is_tensor_state_allocated
+        engine.state = EngineState.SUSPENDED
+
+        engine.schedule_requests()
+        assert engine.state == EngineState.STOPPING
+        assert context.is_tensor_state_allocated
+        # The region is mapped again, so its memory can be written.
+        context.memory_buffer.fill_(1)
+        torch.cuda.synchronize()
+        assert bool((context.memory_buffer == 1).all())
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("gc_mode", ["freeze", "freeze_overlap"])
     @torch.inference_mode()
     def test_gc_mode_releases_frozen_garbage_on_suspend(self, gc_mode):

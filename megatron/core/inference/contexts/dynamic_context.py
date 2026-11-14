@@ -1956,6 +1956,21 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.is_tensor_state_allocated = False
             self.initialize_all_tensors()
 
+    def resume_memory_region_before_discard(self):
+        """Resume a suspended context's torch_memory_saver region, so it can be discarded.
+
+        Every context in a process allocates under the same region tag, so their tensors
+        share one allocator pool. A context discarded while its region is paused leaves
+        unmapped blocks in that pool, and the next context built in the process is handed
+        them. An engine that stops while suspended calls this, so that it ends with its
+        context allocated, as an engine that stops from PAUSED does. A no-op unless the
+        context is suspended under torch_memory_saver.
+        """
+        if self.is_tensor_state_allocated or not self._uses_torch_memory_saver:
+            return
+        torch_memory_saver.resume(self.TMS_TAG)
+        self.is_tensor_state_allocated = True
+
     def deallocate_inference_state_buffers(self):
         """Deallocate large tensors (KV cache, Mamba states) during suspend.
 
