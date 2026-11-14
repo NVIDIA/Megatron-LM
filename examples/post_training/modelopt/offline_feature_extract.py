@@ -11,11 +11,11 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 
 
 from examples.post_training.modelopt.finetune import SFTDataset
-from megatron.core import mpu
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.training import get_args, get_model, get_tokenizer, initialize_megatron
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.global_vars import set_run_config
@@ -34,15 +34,21 @@ def add_extract_args(parser):
 
 def extract_feature(dataset, model, output_dir, idx_start, idx_end):
     os.makedirs(output_dir, exist_ok=True)
-    for i in range(idx_start + mpu.get_expert_data_parallel_rank(), idx_end, mpu.get_expert_data_parallel_world_size()):
+    # The samples are split over the expert data-parallel ranks of the model, and the first
+    # rank of its tensor- and expert-parallel groups writes each file.
+    pg_collection = model.pg_collection
+    expt_dp_group = pg_collection.expt_dp_gtp_remat
+    for i in range(idx_start + expt_dp_group.rank(), idx_end, expt_dp_group.size()):
         file_name = "{:08d}.pt".format(i - idx_start)
         file_path = os.path.join(output_dir, file_name)
         if not os.path.exists(file_path):
             input_ids = dataset[i]["input_ids"][:dataset.seq_length].unsqueeze(0).to(torch.cuda.current_device())
             output = model(input_ids, return_eagle_inputs=True)
-            if mpu.get_tensor_model_parallel_rank() == 0 and mpu.get_expert_model_parallel_rank() == 0:
+            if pg_collection.tp.rank() == 0 and pg_collection.ep.rank() == 0:
                 torch.save(output, file_path)
-            torch.distributed.barrier()
+    # One barrier per split, outside the loop: ranks handle different numbers of samples (and
+    # skip the files that already exist), so a per-sample barrier would not pair up across ranks.
+    torch.distributed.barrier()
 
 if __name__ == "__main__":
     args = parse_and_validate_args(extra_args_provider=add_extract_args, args_defaults={
@@ -64,14 +70,16 @@ if __name__ == "__main__":
 
     unwrapped_model = unwrap_model(model)[0]
     unwrapped_model.eval()
+    # Shard the dataset over the expert data-parallel group of the model.
+    expt_dp_group = unwrapped_model.pg_collection.expt_dp_gtp_remat
 
     kwargs = {
         "tokenizer": tokenizer._tokenizer,
         "seq_length": args.seq_length,
         # Optional kwargs
         "hf_dataset": args.finetune_hf_dataset,
-        "num_shards": mpu.get_expert_data_parallel_world_size(),
-        "shard_index": mpu.get_expert_data_parallel_rank(),
+        "num_shards": expt_dp_group.size(),
+        "shard_index": expt_dp_group.rank(),
     }
     sft_dataset = SFTDataset(args.num_samples, None, **kwargs)
 

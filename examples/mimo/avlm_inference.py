@@ -1,3 +1,5 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
 import argparse
 import os
 from pathlib import Path
@@ -16,7 +18,9 @@ import scipy.signal as signal
 
 from examples.mimo.model_providers.llava_avlm import model_provider_llava_avlm
 from megatron.core import dist_checkpointing, parallel_state, tensor_parallel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.utils import get_pg_rank, get_pg_size
 from megatron.training import print_rank_0
 from examples.mimo.data.utils.calculate_audio_tokens import calculate_num_audio_tokens
 
@@ -138,11 +142,25 @@ def main():
 
 
     init_distributed(args.tp, args.pp)
-    model_parallel_cuda_manual_seed(123)
+    # Collect the process groups of the parallel grid once; the rest of this script passes
+    # them explicitly instead of reading the global grid.
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    # get_pg_rank and get_pg_size also accept the None that a grid without GTP weight
+    # rematerialization may hold in gtp_remat and expt_gtp_remat.
+    model_parallel_cuda_manual_seed(
+        123,
+        tp_rank=pg_collection.tp.rank(),
+        ep_rank=pg_collection.ep.rank(),
+        etp_rank=pg_collection.expt_tp.rank(),
+        gtp_remat_rank=get_pg_rank(pg_collection.gtp_remat),
+        egtp_remat_rank=get_pg_rank(pg_collection.expt_gtp_remat),
+        gtp_remat_world_size=get_pg_size(pg_collection.gtp_remat),
+        egtp_remat_world_size=get_pg_size(pg_collection.expt_gtp_remat),
+    )
 
     device = torch.device("cuda")
 
-    model = model_provider_llava_avlm().to(device)
+    model = model_provider_llava_avlm(pg_collection=pg_collection).to(device)
 
     # Load distributed checkpoint if provided.
     if args.ckpt:
@@ -192,7 +210,9 @@ def main():
             
             # All-gather logits across tensor parallel ranks
             # logits shape: [batch, seq, vocab_parallel_size]
-            gathered_logits = tensor_parallel.gather_from_tensor_model_parallel_region(logits)
+            gathered_logits = tensor_parallel.gather_from_tensor_model_parallel_region(
+                logits, group=pg_collection.tp
+            )
 
             # The language model returns logits in [batch, seq, vocab] format.
             next_token_logits = gathered_logits[:, -1, :]

@@ -7,13 +7,14 @@ import json
 import logging
 import os
 import re
-from typing import Callable, List, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
 from megatron.core.transformer.moe.router import Router
 from megatron.core.utils import unwrap_model
@@ -169,10 +170,26 @@ class ActivationLogger:
             hook.remove()
         self._activation_hooks.clear()
 
-    def save_activations(self, iteration: int):
+    def save_activations(
+        self, iteration: int, *, pg_collection: Optional[ProcessGroupCollection] = None
+    ):
+        """Save captured activations to disk and clear the buffer.
+
+        Args:
+            iteration: Iteration the activations were captured in.
+            pg_collection: Process groups of the model the hooks are registered on. Their ranks
+                name the files and select the ranks that write them (see ``save_grads``).
+                Omitting it reads the global parallel grid, which is deprecated and warns.
+        """
         if not self._activations_state_dict:
             return
-        save_grads(self._save_dir, self._activations_state_dict, iteration, "activations")
+        save_grads(
+            self._save_dir,
+            self._activations_state_dict,
+            iteration,
+            "activations",
+            pg_collection=pg_collection,
+        )
         self._activations_state_dict.clear()
 
     # ------------------------------------------------------------------
@@ -280,8 +297,12 @@ def disable_activation_logging():
     _require_logger().remove_activation_hooks()
 
 
-def save_activations(iteration: int):
-    _require_logger().save_activations(iteration)
+def save_activations(iteration: int, *, pg_collection: Optional[ProcessGroupCollection] = None):
+    """Save activations to disk, named by the ranks of ``pg_collection``.
+
+    See ActivationLogger.save_activations.
+    """
+    _require_logger().save_activations(iteration, pg_collection=pg_collection)
 
 
 # -- Tokens-per-expert logging ----------------------------------------

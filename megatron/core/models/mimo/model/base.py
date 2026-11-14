@@ -202,11 +202,15 @@ class MimoModel(MegatronModule):
                 pg = getattr(pg_src, 'pg_collection', None)
                 mod_metadata = metadata
                 if pg is not None:
-                    assert (
-                        hasattr(pg, 'dp_cp') and pg.dp_cp is not None
-                    ), f"pg_collection on '{name}' is missing dp_cp group"
+                    groups = vars(pg)
+                    if groups.get('dp_cp') is None:
+                        raise ValueError(
+                            f"The pg_collection of '{name}' must set dp_cp, which elects the "
+                            "checkpoint writer of each shard, but it is not set or is None."
+                        )
                     mod_metadata = dict(metadata) if metadata else {}
-                    mod_metadata['dp_cp_group'] = getattr(pg, 'dp_cp_gtp_remat', None) or pg.dp_cp
+                    # dp_cp_gtp_remat accompanies dp_cp; a collection without it elects over dp_cp.
+                    mod_metadata['dp_cp_group'] = groups.get('dp_cp_gtp_remat') or groups['dp_cp']
                 # Unwrap wrappers so the sharded keys match the raw load_state_dict keys.
                 inner = module
                 child_prefix = f'{prefix}{name}.'
