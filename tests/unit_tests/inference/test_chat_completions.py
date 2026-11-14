@@ -1618,6 +1618,7 @@ _FTP_IMAGE = {"type": "image_url", "image_url": {"url": "ftp://example.com/a.png
             id="temperature-not-a-number",
         ),
         pytest.param({**CHAT_BODY, "top_k": [1]}, {}, 400, NOT_AN_INT_ERROR, id="top-k-list"),
+        pytest.param({**CHAT_BODY, "n": 0}, {}, 400, "'n' must be at least 1", id="zero-choices"),
         pytest.param(
             {"messages": [{"role": "user", "content": [_FTP_IMAGE]}]},
             {},
