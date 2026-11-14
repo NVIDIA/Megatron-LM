@@ -312,6 +312,7 @@ class TEGroupedMLP(MegatronModule):
             self.config.add_bias_linear and config.bias_dropout_fusion
         ), "bias_dropout_fusion is not supported in TEGroupedMLP when add_bias_linear=True"
 
+        self.pg_collection = pg_collection
         self.ep_group = pg_collection.ep
         self.tp_group = pg_collection.expt_tp
 
@@ -928,7 +929,9 @@ class TEGroupedMLP(MegatronModule):
                 "and linear_fc2. Apply the override to both linears."
             )
         quant_context = (
-            nullcontext() if fc1_recipe is None else _get_fp8_autocast_for_quant_recipe(fc1_recipe)
+            nullcontext()
+            if fc1_recipe is None
+            else _get_fp8_autocast_for_quant_recipe(fc1_recipe, pg_collection=self.pg_collection)
         )
 
         # Construct fused impl if needed

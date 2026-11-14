@@ -45,10 +45,10 @@ try:
 except ImportError:
     HAVE_ZSTANDARD = False
 
-from megatron.core import parallel_state
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.num_microbatches_calculator import get_num_microbatches
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.training import get_args, get_tensorboard_writer
 from megatron.training.distillation.utils import (
     CACHED_LOGITS_INDEX_SENTINEL,
@@ -66,6 +66,7 @@ from megatron.training.distillation.utils import (
     pad_and_stack_cu_seqlens,
     quarantine_contained_tars,
     reassemble_cp_sequence,
+    resolve_distillation_process_groups,
     storage_glob_with_caching,
     storage_makedirs,
     storage_move,
@@ -181,6 +182,9 @@ class LogitsSaverHooks:
             is active, regardless of cumulative mass.  Defaults to 1.
         save_dtype: String name of the dtype for top-K log-probabilities on
             disk.  One of ``'fp16'``, ``'bf16'``, or ``'fp32'``.
+        pg_collection: Process groups of the model the hooks attach to; the
+            saver uses its ``tp``, ``cp``, ``dp_gtp_remat`` and ``tp_dp_cp``
+            groups.  ``None`` selects the groups of the global parallel state.
     """
 
     _DTYPE_MAP = {
@@ -197,6 +201,7 @@ class LogitsSaverHooks:
         p: Optional[float] = None,
         min_k: int = 1,
         save_dtype: str = 'fp16',
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         assert k > 0, "Number of top log-probabilities to save must be positive"
         assert save_dir is not None, "Save directory must be provided"
@@ -220,16 +225,18 @@ class LogitsSaverHooks:
         self.p = p
         self.min_k = min_k
 
-        # Parallel state info
-        self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        self.tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        self.tp_group = parallel_state.get_tensor_model_parallel_group()
-        self.cp_rank = parallel_state.get_context_parallel_rank()
-        self.cp_size = parallel_state.get_context_parallel_world_size()
-        self.cp_group = parallel_state.get_context_parallel_group()
-        self.dp_rank = parallel_state.get_data_parallel_rank()
-        self.dp_size = parallel_state.get_data_parallel_world_size()
-        self._tp_dst_rank_global = parallel_state.get_tensor_model_parallel_src_rank()
+        # Process groups of the model whose logits are saved
+        pg_collection = resolve_distillation_process_groups(pg_collection, "LogitsSaverHooks")
+        self.tp_group = pg_collection.tp
+        self.tp_rank = self.tp_group.rank()
+        self.tp_size = self.tp_group.size()
+        self.cp_group = pg_collection.cp
+        self.cp_rank = self.cp_group.rank()
+        self.cp_size = self.cp_group.size()
+        self.dp_rank = pg_collection.dp_gtp_remat.rank()
+        self.dp_size = pg_collection.dp_gtp_remat.size()
+        self._tp_dp_cp_group = pg_collection.tp_dp_cp
+        self._tp_dst_rank_global = dist.get_global_rank(self.tp_group, 0)
         self._cp_dst_rank_global = dist.get_global_rank(self.cp_group, 0)
 
         # Track number of MTP outputs to ignore
@@ -823,7 +830,9 @@ class LogitsSaverHooks:
         # writer, not something later calls in this (long-lived) process
         # should keep reusing.
         prefix = batched_tar_prefix(self.dp_rank)
-        existing_tars = storage_glob_with_caching(self.save_dir, f"*{prefix}*.tar", cached=False)
+        existing_tars = storage_glob_with_caching(
+            self.save_dir, f"*{prefix}*.tar", cached=False, tp_dp_cp_group=self._tp_dp_cp_group
+        )
 
         if not self._pending_writes:
             return (
