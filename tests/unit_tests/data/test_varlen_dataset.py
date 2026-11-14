@@ -632,25 +632,27 @@ def test_unpack_batch_short_circuits_for_varlen_samples():
     assert int(out[1]["original_seq_len"].item()) == 8
 
 
-def test_unpack_batch_slices_prepacked_cu_seqlens_samples():
+@pytest.mark.parametrize("num_pad_entries", [0, 3])
+def test_unpack_batch_slices_prepacked_cu_seqlens_samples(num_pad_entries):
     from megatron.core.datasets.data_schedule_utils import _unpack_batch
 
     # SFTDataset-style pre-packed sample: two sub-sequences [0:3) and [3:5),
     # described by cu_seqlens, NO padded_seq_len -> takes the slicing path.
+    # SFTDataset pads cu_seqlens to seq_length + 1 entries by repeating seq_length.
     batch = [
         {
             "tokens": torch.arange(5, dtype=torch.int64),
             "labels": torch.arange(5, dtype=torch.int64),
             "loss_mask": torch.ones(5),
             "position_ids": torch.arange(5, dtype=torch.int64),
-            "cu_seqlens": torch.tensor([0, 3, 5], dtype=torch.int32),
+            "cu_seqlens": torch.tensor([0, 3, 5] + [5] * num_pad_entries, dtype=torch.int32),
         }
     ]
     out = _unpack_batch(batch)
     # One packed sample with two sub-sequences -> two unpacked samples.
     assert len(out) == 2
     assert out[0]["tokens"].numel() == 3
-    assert out[1]["tokens"].numel() == 2
+    assert torch.equal(out[1]["tokens"], torch.arange(3, 5))
     assert int(out[0]["padded_seq_len"].item()) == 3
     assert int(out[1]["padded_seq_len"].item()) == 2
 
