@@ -76,13 +76,12 @@ def test_full_reset_publishes_clear_after_cache_reset():
     context.reset_metadata = Mock(side_effect=lambda **_kwargs: order.append("reset_metadata"))
     context.step_count = 17
     context.prefix_cache_lru_clock = 11
-    context.mamba_slot_allocator = Mock()
-    context.mamba_slot_allocator.reset.side_effect = lambda: order.append("reset_mamba")
     listener.side_effect = lambda kind, _payload: order.append(kind)
 
     context.reset()
 
-    assert order == ["reset_tensors", "reset_metadata", "reset_mamba", "cleared"]
+    # reset_metadata clears the KV and Mamba prefix caches together.
+    assert order == ["reset_tensors", "reset_metadata", "cleared"]
 
 
 @pytest.mark.parametrize(
