@@ -558,14 +558,7 @@ def _detect_gpu_identity(local_rank):
 
 
 def build_telemetry_resource_attrs(args, *, include_training: bool = True):
-    """Build the OTel resource-attribute dict from training config.
-
-    Shared by _set_telemetry() (the main process) and
-    megatron.training.async_utils.build_otel_worker_bootstrap() (the persistent
-    checkpoint worker process) so both end up with identical resource attributes
-    by construction, rather than two independently-written implementations that
-    could silently drift apart as args evolve.
-    """
+    """Build the OTel resource-attribute dict from training config."""
     # Attach training config as resource attributes so they appear as
     # Process tags in Jaeger, making it easy to identify and compare runs.
     cfg = get_run_config()
