@@ -101,6 +101,7 @@ class TextGenerationControllerTestBase:
         transformer_impl: str = None,
         position_embedding_type: str = None,
         mtp_use_repeated_layer: bool = False,
+        vocab_size: int = 100,
     ):
         # When transformer_impl == "inference_optimized" the model is built with the
         # NVLS symmetric-memory inference linears (RMSNorm, no bias, flash attention);
@@ -120,7 +121,7 @@ class TextGenerationControllerTestBase:
             model_parallel_cuda_manual_seed(123, inference_rng_tracker=True)
         self.batch_size = batch_size
         self.hidden_size = 32
-        self.vocab_size = 100
+        self.vocab_size = vocab_size
         self.sequence_length = 60 if fp8 else 64  # Test padding for fp8
         transformer_config = TransformerConfig(
             num_layers=4,
@@ -4371,6 +4372,106 @@ class TestTextGenerationControllerParallel(TextGenerationControllerTestBase):
                 assert controller._all_logits_cuda is None
             generated[cuda_graph_impl] = self._generate_dynamic()
             assert controller._all_logits_cuda.dtype is torch.float32
+        assert generated["none"] == generated["local"]
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="multimem collectives need CUDA")
+    def test_vocab_parallel_multimem_ag_layout(self):
+        """`vocab_parallel_multimem_ag` lands each rank's shard in its column block of the
+        output."""
+        from megatron.core.inference.communication.torch_symm_triton import (
+            is_device_nvls_capable,
+            vocab_parallel_multimem_ag,
+        )
+        from megatron.core.inference.symmetric_memory import (
+            HAVE_TORCH_SYMM_MEM,
+            HAVE_TRITON,
+            SymmetricMemoryManager,
+        )
+
+        if not (
+            HAVE_TORCH_SYMM_MEM and HAVE_TRITON and is_device_nvls_capable(torch.device("cuda"))
+        ):
+            pytest.skip("NVLS symmetric memory unavailable on this platform")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        tp_group = parallel_state.get_tensor_model_parallel_group()
+        rank, world_size = tp_group.rank(), tp_group.size()
+        rows, width = 5, 64  # bf16: 128-byte shard rows, 16-byte divisible
+        arena = SymmetricMemoryManager.get_buffer("test_logits", process_group=tp_group, size_mb=1)
+        allocation = arena.maybe_get_tensor([rows, world_size * width], torch.bfloat16)
+        if allocation["tensor"] is None:
+            pytest.skip("symmetric memory unavailable on this platform")
+        output, handle = allocation["tensor"], allocation["handle"]
+        shards = [
+            (torch.arange(rows * width, device="cuda").reshape(rows, width) + 1000 * r).to(
+                torch.bfloat16
+            )
+            for r in range(world_size)
+        ]
+        try:
+            vocab_parallel_multimem_ag(output, shards[rank], handle)
+            torch.cuda.synchronize()
+            assert torch.equal(output, torch.cat(shards, dim=-1))
+        finally:
+            SymmetricMemoryManager.destroy("test_logits")
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("head_emits_fp32", [True, False], ids=["fp32-head", "bf16-head"])
+    def test_logits_buffer_multicast_gather_matches_gathered_generation_tp2(
+        self, head_emits_fp32, monkeypatch
+    ):
+        """With the logits buffer in symmetric memory each rank multicast-stores its shard
+        straight into its column block, zero copies at TP 2, and generation matches the
+        no-buffer run token for token (both run the same eager kernels here). A head that
+        emits bf16 has its shards gathered in bf16 into staging rows and upcast on arrival.
+        The vocab is 128 so a shard row (64 values) is 16-byte divisible in either dtype, as
+        the store requires. Skips only where NVLS symmetric memory is unavailable.
+        """
+        from megatron.core.inference.communication.torch_symm_triton import is_device_nvls_capable
+        from megatron.core.inference.symmetric_memory import HAVE_TORCH_SYMM_MEM, HAVE_TRITON
+
+        if not head_emits_fp32:
+            # As without TE general_gemm: the head emits its compute dtype.
+            monkeypatch.setattr(
+                "megatron.core.models.common.language_module.language_module.lm_head_can_emit",
+                lambda output_layer, dtype: dtype == output_layer.config.params_dtype,
+            )
+
+        generated = {}
+        for cuda_graph_impl in ("none", "local"):
+            if generated:
+                self.teardown_method(None)
+            self.setup_model(
+                torch.bfloat16,
+                tensor_model_parallel_size=2,
+                pipeline_model_parallel_size=1,
+                static=False,
+                use_training_random_init=True,
+                cuda_graph_impl=cuda_graph_impl,
+                vocab_size=128,
+            )
+            controller = self.text_generation_controller
+            context = controller.inference_wrapped_model.inference_context
+            if cuda_graph_impl == "local" and context.logits_buffer_multicast_handle is None:
+                nvls_available = (
+                    HAVE_TORCH_SYMM_MEM
+                    and HAVE_TRITON
+                    and is_device_nvls_capable(torch.device(torch.cuda.current_device()))
+                )
+                assert not nvls_available, "NVLS is available but no symmetric buffer"
+                pytest.skip("NVLS symmetric memory unavailable on this platform")
+            if cuda_graph_impl == "local":
+                # Staging rows are held exactly when the head emits its compute dtype.
+                staging = context.logits_staging_buffer
+                if controller._language_model.lm_head_can_emit_fp32:
+                    assert head_emits_fp32 and staging is None
+                else:
+                    assert staging is not None and staging.dtype == torch.bfloat16
+                    assert context.logits_staging_multicast_handle is not None
+            generated[cuda_graph_impl] = self._generate_dynamic()
         assert generated["none"] == generated["local"]
 
     @pytest.mark.parametrize("static", [True, False])

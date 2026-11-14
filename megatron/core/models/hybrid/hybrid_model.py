@@ -1060,22 +1060,48 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
 
         # Inference consumes logits in fp32: emit them so when the head can, upcast otherwise.
         emit_fp32 = in_inference_mode and self.lm_head_can_emit_fp32
+        # A symmetric-memory logits buffer takes each rank's shard directly: skip the gather.
+        multicast_handle = getattr(inference_context, "logits_buffer_multicast_handle", None)
         logits, _ = self.output_layer(
             hidden_states,
             weight=output_weight,
-            runtime_gather_output=runtime_gather_output,
+            runtime_gather_output=False if multicast_handle is not None else runtime_gather_output,
             output_dtype=torch.float32 if emit_fp32 else None,
         )
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
-        if in_inference_mode:
+        # A shard the head emitted in its compute dtype is gathered as-is and upcast on arrival.
+        staging = getattr(inference_context, "logits_staging_buffer", None)
+        gather_before_upcast = (
+            multicast_handle is not None and staging is not None and logits.dtype == staging.dtype
+        )
+        if in_inference_mode and not gather_before_upcast:
             logits = logits.float()
         # Dynamic inference under CUDA graphs: write the logits into the controller's
         # persistent buffer and return a view of it, so no graph pins its own copy.
         logits_buffer = getattr(inference_context, "logits_output_buffer", None)
         if logits_buffer is not None:
             buffer_rows = logits_buffer[0, : logits.shape[0]]
-            buffer_rows.copy_(logits.squeeze(1))
+            if multicast_handle is None:
+                buffer_rows.copy_(logits.squeeze(1))
+            else:
+                from megatron.core.inference.communication.torch_symm_triton import (
+                    vocab_parallel_multimem_ag,
+                )
+
+                # TP > 1 on NVLS: each rank stores its vocab shard into its column block of
+                # every rank's rows (gather and transpose fused). The store barriers first,
+                # so it lands after every peer's reads of the previous step's rows.
+                if gather_before_upcast:
+                    staging_rows = staging[: logits.shape[0]]
+                    vocab_parallel_multimem_ag(
+                        staging_rows,
+                        logits.squeeze(1),
+                        inference_context.logits_staging_multicast_handle,
+                    )
+                    buffer_rows.copy_(staging_rows)
+                else:
+                    vocab_parallel_multimem_ag(buffer_rows, logits.squeeze(1), multicast_handle)
             logits = buffer_rows.unsqueeze(1)
         gather_output = (
             self.output_layer.gather_output
