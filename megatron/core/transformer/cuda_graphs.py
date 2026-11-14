@@ -9,7 +9,7 @@ import os
 import time
 from collections import defaultdict
 from collections.abc import Iterator
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from copy import deepcopy
 from dataclasses import dataclass, is_dataclass
 from enum import Enum
@@ -28,6 +28,8 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import (
     CudaRNGStatesTracker,
+    _get_all_rng_states,
+    _set_all_rng_states,
     cudagraph_needs_generator_registration,
     get_all_rng_states,
     get_cuda_rng_tracker,
@@ -2990,58 +2992,145 @@ class TECudaGraphHelper:
 
         self._capture_finished = True
 
+    def _validate_fsdp_capture(self):
+        """Reject unsupported v2 compositions before changing global capture state."""
+        partial_modules = {
+            CudaGraphModule.attn,
+            CudaGraphModule.mlp,
+            CudaGraphModule.moe_router,
+            CudaGraphModule.moe_preprocess,
+        }
+        requested_modules = set(self.config.cuda_graph_modules or [])
+        uses_fsdp_v2 = any(
+            hasattr(module, "fsdp_cuda_graph_capture")
+            for chunk in self.model
+            for module in chunk.modules()
+        )
+        if uses_fsdp_v2 and (
+            not self.config.bf16
+            or self.config.fp8
+            or self.config.fp4
+            or not requested_modules
+            or not requested_modules <= partial_modules
+            or self.config.pipeline_model_parallel_size != 1
+            or self.config.tensor_model_parallel_size != 1
+            or self.config.context_parallel_size != 1
+            or self.config.sequence_packing_scheduler is not None
+            or self.config.overlap_moe_expert_parallel_comm
+            or self.config.delay_wgrad_compute
+            or self.config.recompute_granularity is not None
+            or self.config.fine_grained_activation_offloading
+            or self.config.enable_mhc_connections
+            or self.config.mtp_num_layers
+        ):
+            raise ValueError(
+                "MFSDP v2 partial CUDA graphs currently support fixed-shape BF16 "
+                "attention, dense MLP, and MoE router/preprocess capture with TP=PP=CP=1, "
+                "without FP8/FP4, recompute, "
+                "offload, mHC, MTP, or delayed/overlapped expert backward."
+            )
+
     def create_cudagraphs(self):
         """
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
-        start_time = self._start_capturing()
+        self._validate_fsdp_capture()
+        fsdp_modules = [
+            layer for layer in self.flattened_callables if hasattr(layer, "fsdp_cuda_graph_capture")
+        ]
+        original_calls = {type(layer): type(layer).__call__ for layer in fsdp_modules}
+        rng_states = None
+        if fsdp_modules:
+            # Graph-safe RNG states are mutable Generators. A shallow snapshot
+            # advances with TE warmup and cannot restore a failed capture.
+            def clone_rng_state(state):
+                return state.clone_state() if isinstance(state, torch.Generator) else state.clone()
 
-        if not self.flattened_callables:
-            # Check if there are any graphable layers. If not, log a warning and skip capture,
-            # but still call _finish_capturing to ensure all ranks complete the capture phase.
-            logger.warning(
-                'TECudaGraphHelper: No graphable layers found. Skipping CUDA graph capture.'
+            cpu_rng, cuda_rng, tracker_rng = _get_all_rng_states()
+            rng_states = (
+                cpu_rng,
+                clone_rng_state(cuda_rng),
+                {name: clone_rng_state(state) for name, state in tracker_rng.items()},
             )
-        else:
-            # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
-            sample_args, kwargs = self._get_cuda_graph_input_data()
-            if self.config.sequence_parallel:
-                rng_context = get_cuda_rng_tracker().fork()
-            else:
-                rng_context = nullcontext()
-            with rng_context, capture_constants(self):
-                graphs = make_graphed_callables(
-                    tuple(self.flattened_callables), sample_args, **kwargs
+        start_time = self._start_capturing()
+        graphs = ()
+        te_capture_started = False
+        try:
+            if not self.flattened_callables:
+                # Check if there are any graphable layers. If not, log a warning and skip capture,
+                # but still call _finish_capturing to ensure all ranks complete the capture phase.
+                logger.warning(
+                    'TECudaGraphHelper: No graphable layers found. Skipping CUDA graph capture.'
                 )
+            else:
+                # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
+                sample_args, kwargs = self._get_cuda_graph_input_data()
+                if self.config.sequence_parallel:
+                    rng_context = get_cuda_rng_tracker().fork()
+                else:
+                    rng_context = nullcontext()
+                with ExitStack() as stack:
+                    for layer in fsdp_modules:
+                        stack.enter_context(layer.fsdp_cuda_graph_capture())
+                    with rng_context, capture_constants(self):
+                        te_capture_started = True
+                        graphs = make_graphed_callables(
+                            tuple(self.flattened_callables), sample_args, **kwargs
+                        )
+                        te_capture_started = False
 
-            # The returned callables can outlive this helper. Share the capture's
-            # constants with those actual graph owners instead of retaining them here.
-            constants = _CudagraphGlobalRecord.capture_constants.pop(self)
-            for graph in graphs:
-                _CudagraphGlobalRecord.capture_constants[graph] = constants
+                # The returned callables can outlive this helper. Share the capture's
+                # constants with those actual graph owners instead of retaining them here.
+                constants = _CudagraphGlobalRecord.capture_constants.pop(self)
+                for graph in graphs:
+                    _CudagraphGlobalRecord.capture_constants[graph] = constants
 
-            # Push the captured graphs to the corresponding TransformerBlock.
-            num_layers_accumulated = 0
-            for layers in self.callables_per_chunk:
-                for layer_number, layer in enumerate(layers):
+                # Push the captured graphs to the corresponding TransformerBlock.
+                num_layers_accumulated = 0
+                for layers in self.callables_per_chunk:
+                    for layer_number, layer in enumerate(layers):
+                        layer.cuda_graphs = []
+                        for batch_number in range(self.num_microbatches):
+                            if self.config.overlap_moe_expert_parallel_comm:
+                                graph_idx = (
+                                    num_layers_accumulated + layer_number
+                                ) * self.num_microbatches + batch_number
+                            else:
+                                graph_idx = (
+                                    num_layers_accumulated * self.num_microbatches
+                                    + batch_number * len(layers)
+                                    + layer_number
+                                )
+                            layer.cuda_graphs.append(graphs[graph_idx])
+                    num_layers_accumulated += len(layers)
+
+                self._graphs_created = True
+
+            self._finish_capturing(start_time)
+        except BaseException:
+            if fsdp_modules:
+                # Restore TE's temporary class dispatch and capture flag after a
+                # recoverable Python exception; fatal CUDA/NCCL errors are not recoverable.
+                for module_type, original_call in original_calls.items():
+                    module_type.__call__ = original_call
+                if te_capture_started:
+                    te_set_capture_end()
+                # Reset returned graphs before freeing their fixed-address weights.
+                for graph in graphs:
+                    if is_te_min_version("2.10.0"):
+                        graph.reset()
+                    release_capture_constants(graph)
+                for layer in fsdp_modules:
                     layer.cuda_graphs = []
-                    for batch_number in range(self.num_microbatches):
-                        if self.config.overlap_moe_expert_parallel_comm:
-                            graph_idx = (
-                                num_layers_accumulated + layer_number
-                            ) * self.num_microbatches + batch_number
-                        else:
-                            graph_idx = (
-                                num_layers_accumulated * self.num_microbatches
-                                + batch_number * len(layers)
-                                + layer_number
-                            )
-                        layer.cuda_graphs.append(graphs[graph_idx])
-                num_layers_accumulated += len(layers)
-
-            self._graphs_created = True
-
-        self._finish_capturing(start_time)
+                    layer.release_cuda_graph_buffers()
+                release_capture_constants(self)
+                self._graphs_created = False
+                _set_capture_end()
+                if FREEZE_GC:
+                    gc.unfreeze()
+                self._reset_after_capture()
+                _set_all_rng_states(*rng_states)
+            raise
 
     def cuda_graph_set_manual_hooks(self):
         """
@@ -3074,6 +3163,8 @@ class TECudaGraphHelper:
                         graphs_not_reset += 1
                 layer.cuda_graphs = []
                 layer.cuda_graph_manual_hooks = []
+                if hasattr(layer, "release_cuda_graph_buffers"):
+                    layer.release_cuda_graph_buffers()
 
         log_on_each_pipeline_stage(
             logger=logger,

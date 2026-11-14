@@ -170,6 +170,7 @@ class FsdpParameterGroup:
         )
         self._owning_module = ref(owning_module)
         self._unshard_events = {}
+        self._retain_unsharded_storage = False
         self.mesh = mesh
         self.grad_scale = grad_scale
         self.shard_layout = shard_layout
@@ -553,7 +554,10 @@ class FsdpParameterGroup:
             buffers = unsharded_model_weight.planes_for(rowwise=rowwise, columnwise=columnwise)
         with self._symmetric_memory_context():
             for buffer in buffers:
-                buffer.reallocate_storage()
+                # CUDA Storage.resize_ reallocates even at the same size. Keep an
+                # already allocated buffer's address stable for captured compute.
+                if not buffer.is_allocated:
+                    buffer.reallocate_storage()
 
         # This buffer backs unsharded Parameters whose views may be saved by autograd.
         # Autograd records a tensor's version counter when saving it for backward, and
@@ -592,7 +596,7 @@ class FsdpParameterGroup:
 
         # Clear readiness so the next unshard refreshes Parameter data/scales,
         # but never free persistent compute weights or their padded scale copies.
-        if unsharded_model_weight.is_alias_of(self.model_weight):
+        if unsharded_model_weight.is_alias_of(self.model_weight) or self._retain_unsharded_storage:
             return
         if isinstance(unsharded_model_weight, DBuffer):
             assert not rowwise_only

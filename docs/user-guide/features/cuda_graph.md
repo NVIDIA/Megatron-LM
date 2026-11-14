@@ -124,6 +124,50 @@ not enable mHC capture by themselves.
 The same training `--cuda-graph-modules` options apply as for `local`, and the default is likewise
 whole-layer training capture when the flag is omitted.
 
+### Megatron FSDP v2 partial capture
+
+Use explicit partial capture scopes with Megatron FSDP v2:
+
+```bash
+--use-megatron-fsdp \
+--megatron-fsdp-version 2 \
+--ckpt-format fsdp_dtensor \
+--no-gradient-accumulation-fusion \
+--bf16 \
+--cuda-graph-impl transformer_engine \
+--cuda-graph-modules attn moe_router moe_preprocess
+```
+
+The initial integration requires fixed shapes and TP=PP=CP=1. Supported regions are
+attention, dense MLP, MoE router, and MoE preprocess; preprocess requires router capture.
+Dynamic dispatch, routed-expert computation, and combine remain eager. FP8/FP4,
+recomputation, activation offloading, mHC, MTP, sequence-packing scheduling, delayed
+weight gradients, symmetric-memory buffers, and the separate MoE expert-overlap
+schedule are outside this integration.
+
+Capture temporarily suspends the captured units' FSDP execution hooks. Replay restores
+the ordinary module call so the existing hooks gather parameters, release completed
+weights, and reduce accumulated gradients outside the graph. This preserves the existing
+FSDP prefetch and reduction streams: a successor's all-gather can overlap the current
+unit's graph, and completed gradient reductions can overlap independent backward compute.
+Actual overlap and step-time improvements depend on the workload and require GPU traces
+and separate timing measurements. This path does not enable dispatch/combine all-to-all
+overlap with graph computation.
+
+Captured units retain their gathered BF16 weight buffers until graph deletion to preserve
+numerical addresses. This costs a full compute-weight copy for each captured FSDP unit
+on every rank, in addition to the configured training-state shards. GPT's unit is a whole
+TransformerLayer, including its eager MLP weights; HybridModel uses its existing separate
+attention and MLP/MoE layers. Routed-expert units outside capture retain their ordinary
+storage lifecycle. The integration adds no second parameter store.
+
+Delete graphs with `TECudaGraphHelper.delete_cuda_graphs()` before releasing retained
+weight storage. Recapture uses a new helper for the existing model and optimizer. Failed
+capture restores MCore-owned FSDP hooks, capture state and RNG contents. This does not
+guarantee recovery from exceptions inside TE: TE 2.20.2 can leave temporary hooks after
+a warmup exception, requiring process restart unless TE supplies the cleanup fix.
+Fatal CUDA or NCCL failures also require restarting the process.
+
 ---
 
 ## Full-Iteration Training CUDA Graph (`--cuda-graph-impl full_iteration`)
