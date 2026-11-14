@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import inspect
+import os
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass, field
 from typing import Any
 
 import torch
@@ -12,6 +14,46 @@ import torch.distributed as dist
 import torch.nn as nn
 
 from megatron.lite.primitive.optimizers.fsdp2.grad_clip import fused_sq_sum
+
+
+@dataclass(slots=True)
+class _PipelineFrag:
+    """One contiguous piece of a slot: a flattened [start:stop) slice of a single
+    param's master/moments/grad/dest, staged at offset `off` in the slot's pinned
+    buffers. A param larger than the slot spans several fragments (all sharing its
+    per-param `step`)."""
+
+    param: nn.Parameter
+    master: torch.Tensor
+    ea: torch.Tensor
+    es: torch.Tensor
+    grad: torch.Tensor
+    dest: torch.Tensor
+    step: torch.Tensor
+    start: int
+    stop: int
+    off: int
+    length: int
+
+
+@dataclass(slots=True)
+class _PipelineSlot:
+    """A fixed equal-size tile of fragments sharing (lr, wd, dest device)."""
+
+    lr: float
+    wd: float
+    device: torch.device
+    frags: list[_PipelineFrag] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class _D2HPlan:
+    """A slot with its in-flight grad D2H: the pinned fp32 grad buffer and the event
+    marking the copy's completion (the CPU waits on it before the fused kernel)."""
+
+    slot: _PipelineSlot
+    grad_buf: torch.Tensor
+    event: torch.cuda.Event
 
 
 def local_grad_sq_sum(
@@ -35,7 +77,7 @@ def local_grad_sq_sum(
     return fused_sq_sum(grads, dtype=dtype, device=device)
 
 
-def to_local_tensor(tensor):
+def to_local_tensor(tensor) -> torch.Tensor:
     local_tensor = getattr(tensor, "_local_tensor", None)
     if isinstance(local_tensor, torch.Tensor):
         return local_tensor
@@ -48,6 +90,12 @@ def to_local_tensor(tensor):
 def fsdp2_model_param_dtype(param: nn.Parameter) -> torch.dtype | None:
     dtype = getattr(param, "_fsdp2_model_param_dtype", None)
     return dtype if isinstance(dtype, torch.dtype) else None
+
+
+def local_param_shard(param: nn.Parameter) -> torch.Tensor:
+    """The param's writable local storage: its DTensor local shard, or the plain
+    detached tensor. Master/moments are init'd from this, so shapes always match."""
+    return to_local_tensor(param) if is_dtensor_like(param) else param.detach()
 
 
 def has_dtensor_grad_or_param(param: nn.Parameter) -> bool:
@@ -64,15 +112,11 @@ def is_dtensor_like(tensor: Any) -> bool:
 
 
 def copy_local_tensor_to_param_(param: nn.Parameter, local_tensor: torch.Tensor) -> None:
-    if not is_dtensor_like(param):
-        param.detach().copy_(local_tensor.to(device=param.device, dtype=param.dtype))
-        return
-
-    # Copy straight into the param's local shard. Reconstructing via
+    # Copy straight into the param's local shard. Reconstructing a DTensor via
     # DTensor.from_local mis-sizes an unevenly-sharded param (it infers global =
     # local * mesh, e.g. a (3,) param over 8 ranks -> 0 or 8), so copy local->local
     # (master is init'd from this same local shard, so shapes match).
-    local_param = to_local_tensor(param)
+    local_param = local_param_shard(param)
     local_param.copy_(local_tensor.to(device=local_param.device, dtype=local_param.dtype))
 
 
@@ -129,6 +173,7 @@ class FP32AdamW:
         betas: tuple[float, float],
         eps: float,
         cpu_update: bool = False,
+        pipeline: bool = False,
         model_param_dtypes: dict[int, torch.dtype] | None = None,
     ):
         self.param_groups = normalize_param_groups(params, default_weight_decay=weight_decay)
@@ -138,9 +183,25 @@ class FP32AdamW:
         self.betas = betas
         self.eps = eps
         self.cpu_update = bool(cpu_update)
+        # Overlap CPU-offload optimizer D2H/H2D with the fused CPU kernel via the
+        # pipelined step (see _step_param_groups_pipelined). Opt-in via the optimizer
+        # config's overlap_cpu_optimizer_d2h_h2d=True; requires cpu_update.
+        self.pipeline = bool(pipeline)
         self.step_count = 0
-        self.state: dict[nn.Parameter, dict[str, torch.Tensor]] = {}
+        # Per-param optimizer state: fp32 master/moments (Tensors) plus the "step"
+        # counter (int), so the value type is heterogeneous (Any). The fused kernel
+        # builds its own fp32 step tensor per call.
+        self.state: dict[nn.Parameter, dict[str, Any]] = {}
         self._master_for_param: dict[nn.Parameter, torch.Tensor] = {}
+        # Free-list of pinned host buffers, keyed by (numel, dtype), reused across
+        # steps. Bounds resident pinned memory to the pipeline's in-flight window
+        # (see _step_param_groups_pipelined) instead of one buffer per param.
+        self._pin_pool: dict[tuple[int, torch.dtype], list[torch.Tensor]] = {}
+        self._pipeline_logged = False
+        # Dedicated CUDA streams so grad D2H (down-lane) and param writeback H2D
+        # (up-lane) overlap on full-duplex PCIe; created lazily on first pipelined step.
+        self._d2h_stream: torch.cuda.Stream | None = None
+        self._h2d_stream: torch.cuda.Stream | None = None
         self._model_param_dtypes_by_id = dict(model_param_dtypes or {})
         self._model_dtype_for_param: dict[nn.Parameter, torch.dtype] = {}
 
@@ -165,8 +226,13 @@ class FP32AdamW:
 
     def _init_master_param(self, param: nn.Parameter) -> torch.Tensor:
         if self.cpu_update:
-            local_param = to_local_tensor(param.detach())
-            return local_param.detach().to(device="cpu", dtype=torch.float32).clone()
+            local_fp32 = to_local_tensor(param.detach()).to(device="cpu", dtype=torch.float32)
+            # Pin so the pipelined step's writeback can H2D the fp32 master straight to
+            # a GPU staging buffer asynchronously (a pageable source forces a sync copy).
+            # pin_memory/clone both return independent, writable storage (.to may alias
+            # when already CPU fp32); in-place ops (fused kernel, load_state_dict copy_)
+            # then preserve the pinning.
+            return local_fp32.pin_memory() if self.pipeline else local_fp32.clone()
         if self._model_param_dtype(param) is not None:
             return param.detach().to(dtype=torch.float32).clone()
         return (
@@ -201,6 +267,12 @@ class FP32AdamW:
             master.copy_(model_param.to(device=master.device, dtype=master.dtype))
 
     def _step_param_groups(self) -> None:
+        if self.pipeline:
+            self._step_param_groups_pipelined()
+        else:
+            self._step_param_groups_serial()
+
+    def _step_param_groups_serial(self) -> None:
         self.step_count += 1
         beta1, beta2 = self.betas
 
@@ -229,6 +301,186 @@ class FP32AdamW:
                 master.addcdiv_(exp_avg.to(dtype=torch.float32), denom, value=-group_step_size)
                 self._copy_master_to_param(param, master)
 
+    def _acquire_pinned(self, numel: int, dtype: torch.dtype) -> torch.Tensor:
+        """Pop a reusable flat pinned host buffer, or allocate one. Callers view it."""
+        pool = self._pin_pool.get((numel, dtype))
+        return pool.pop() if pool else torch.empty(numel, dtype=dtype, pin_memory=True)
+
+    def _release_pinned(self, buf: torch.Tensor) -> None:
+        self._pin_pool.setdefault((buf.numel(), buf.dtype), []).append(buf.view(-1))
+
+    def _step_param_groups_pipelined(self) -> None:
+        """Pipelined CPU-offload fused AdamW (enabled by overlap_cpu_optimizer_d2h_h2d).
+
+        Params are grouped by (lr, wd, dest device) and tiled into fixed equal-size
+        slots of MLITE_FSDP2_ADAMW_SLOT_NUMEL elements (a param larger than a slot is
+        split across slots). Each slot runs overlapped stages: async grad D2H into one
+        pinned fp32 buffer (down-lane), the fused CPU kernel, and async param writeback
+        (up-lane). The next slot's D2H is issued before the current slot's CPU kernel,
+        so transfers hide under compute. D2H and H2D use dedicated streams so they
+        overlap on full-duplex PCIe. Writeback casts fp32 master -> param dtype on the
+        GPU (symmetric to the free bf16->fp32 cast on grad D2H): H2D the pinned fp32
+        master to a GPU staging buffer and cast there, removing the CPU cast from the
+        critical path. CPU-offload only; masters are pinned at init so the master H2D
+        is async.
+
+        Memory: because the next D2H is issued before the current slot is released, up
+        to DEPTH+1 slots are resident at once, i.e. peak ~= (DEPTH+1) * slot_numel of
+        both pinned fp32 grad buffers (host) and fp32 GPU staging buffers, plus the
+        pinned fp32 masters. Tail/small buckets still allocate a full slot_numel buffer.
+        """
+        assert self.cpu_update, "pipelined AdamW requires cpu_update (CPU offload)"
+
+        if self._d2h_stream is None:
+            self._d2h_stream = torch.cuda.Stream()
+        if self._h2d_stream is None:
+            self._h2d_stream = torch.cuda.Stream()
+        d2h_stream, h2d_stream = self._d2h_stream, self._h2d_stream
+
+        self.step_count += 1
+        beta1, beta2 = self.betas
+        slot_numel = max(1, int(os.getenv("MLITE_FSDP2_ADAMW_SLOT_NUMEL", "268435456")))
+        depth = max(1, int(os.getenv("MLITE_FSDP2_ADAMW_PIPELINE_DEPTH", "3")))
+        free_pin_after_opt = os.getenv(
+            "MLITE_FSDP2_ADAMW_FREE_PIN_AFTER_OPT", "0"
+        ) in ("1", "true", "True")
+
+        if not self._pipeline_logged:
+            self._pipeline_logged = True
+            print(
+                "[mlite-adamw] pipelined CPU-offload AdamW active | "
+                f"MLITE_FSDP2_ADAMW_SLOT_NUMEL={slot_numel} "
+                f"MLITE_FSDP2_ADAMW_PIPELINE_DEPTH={depth} "
+                f"MLITE_FSDP2_ADAMW_FREE_PIN_AFTER_OPT={int(free_pin_after_opt)} "
+                f"OMP_NUM_THREADS={os.getenv('OMP_NUM_THREADS', 'unset')} "
+                f"torch_threads={torch.get_num_threads()} | tune via these env vars",
+                flush=True,
+            )
+
+        # Bump each param's step once (a split param must not double-count), and bucket
+        # grad-bearing params by (lr, wd, dest device) so a slot's writeback stages on a
+        # single GPU. (Per-fragment GPU cast handles mixed dtypes, so dtype needn't key.)
+        buckets: dict[tuple[float, float, torch.device], list[nn.Parameter]] = {}
+        for group in self.param_groups:
+            lr = float(group.get("lr", self.lr))
+            wd = float(group.get("weight_decay", self.weight_decay))
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+                self.state[param]["step"] = int(self.state[param]["step"]) + 1
+                buckets.setdefault((lr, wd, local_param_shard(param).device), []).append(param)
+
+        # Tile each bucket into fixed slots, splitting params at slot boundaries.
+        slots: list[_PipelineSlot] = []
+        for (lr, wd, device), params in buckets.items():
+            frags: list[_PipelineFrag] = []
+            filled = 0
+            for param in params:
+                state = self.state[param]
+                # master/moments are plain CPU fp32 tensors (see __init__); only grad
+                # and the param (dest) are DTensors needing their local shard.
+                master = state["master_param"].view(-1)
+                ea = state["exp_avg"].view(-1)
+                es = state["exp_avg_sq"].view(-1)
+                grad = to_local_tensor(param.grad)
+                assert grad.is_cuda, "pipelined AdamW expects CUDA grads"
+                grad = grad.detach().view(-1)
+                dest = local_param_shard(param).view(-1)
+                step = torch.tensor(float(state["step"]), dtype=torch.float32, device=master.device)
+                pos = 0  # left endpoint of the param's not-yet-tiled remainder
+                while pos < master.numel():
+                    take = min(slot_numel - filled, master.numel() - pos)
+                    frags.append(_PipelineFrag(param, master, ea, es, grad, dest, step,
+                                               pos, pos + take, filled, take))
+                    pos += take
+                    filled += take
+                    if filled == slot_numel:
+                        slots.append(_PipelineSlot(lr, wd, device, frags))
+                        frags, filled = [], 0
+            if frags:
+                slots.append(_PipelineSlot(lr, wd, device, frags))
+        if not slots:
+            return
+
+        # Grad D2H runs on the down-lane stream; it must not start before the bwd
+        # (default) stream has produced the grads. H2D writeback runs on the up-lane.
+        default_stream = torch.cuda.current_stream()
+        d2h_stream.wait_stream(default_stream)
+        gpu_free: list[torch.Tensor] = []  # reusable fp32 GPU staging, bounded by depth
+
+        # Stage 1: async grad D2H of one slot's fragments into a single pinned fp32
+        # buffer on the down-lane. The bf16->fp32 cast runs GPU-side in copy_.
+        def issue_d2h(index: int) -> _D2HPlan:
+            slot = slots[index]
+            grad_buf = self._acquire_pinned(slot_numel, torch.float32)
+            with torch.cuda.stream(d2h_stream):
+                for f in slot.frags:
+                    grad_buf[f.off : f.off + f.length].copy_(f.grad[f.start : f.stop], non_blocking=True)
+            event = torch.cuda.Event()
+            event.record(d2h_stream)
+            return _D2HPlan(slot=slot, grad_buf=grad_buf, event=event)
+
+        # Stage 3: writeback with GPU-side cast. H2D the pinned fp32 master slices to a
+        # GPU staging buffer on the up-lane, then cast fp32->param dtype on the GPU
+        # (same double-track as serial) straight into each param slice -- no CPU cast.
+        def issue_h2d(plan: _D2HPlan) -> tuple[torch.cuda.Event, torch.Tensor]:
+            slot = plan.slot
+            device = slot.device
+            assert device.type == "cuda", "pipelined writeback expects CUDA params"
+            staging = gpu_free.pop() if gpu_free else torch.empty(
+                slot_numel, dtype=torch.float32, device=device
+            )
+            with torch.cuda.stream(h2d_stream):
+                for f in slot.frags:
+                    staging[f.off : f.off + f.length].copy_(f.master[f.start : f.stop], non_blocking=True)
+                for f in slot.frags:
+                    src = staging[f.off : f.off + f.length]
+                    f.dest[f.start : f.stop].copy_(self._master_as_param_dtype(src, f.param))
+            event = torch.cuda.Event()
+            event.record(h2d_stream)
+            return event, staging
+
+        num_slots = len(slots)
+        prefetched = {i: issue_d2h(i) for i in range(min(depth, num_slots))}
+        h2d_inflight: list[tuple[torch.cuda.Event, torch.Tensor]] = []
+
+        for c in range(num_slots):
+            plan = prefetched.pop(c)
+            # Keep the window full: issue the next D2H before this slot's CPU kernel
+            # so it runs concurrently with the (blocking) CPU compute.
+            if c + depth < num_slots:
+                prefetched[c + depth] = issue_d2h(c + depth)
+
+            plan.event.synchronize()  # CPU must see landed grads before reading
+            slot, grad_buf = plan.slot, plan.grad_buf
+            frags = slot.frags
+            torch._fused_adamw_(  # type: ignore[attr-defined]  # private fused kernel, no public API
+                [f.master[f.start : f.stop] for f in frags],
+                [grad_buf[f.off : f.off + f.length] for f in frags],
+                [f.ea[f.start : f.stop] for f in frags],
+                [f.es[f.start : f.stop] for f in frags],
+                [], [f.step for f in frags],
+                lr=slot.lr, beta1=beta1, beta2=beta2,
+                weight_decay=slot.wd, eps=self.eps, amsgrad=False, maximize=False,
+            )
+            self._release_pinned(grad_buf)  # blocking CPU op done: grad fully read
+            h2d_inflight.append(issue_h2d(plan))
+
+            while len(h2d_inflight) > depth:  # bound in-flight GPU staging
+                event, staging = h2d_inflight.pop(0)
+                event.synchronize()
+                gpu_free.append(staging)
+
+        for event, staging in h2d_inflight:  # drain writeback before returning
+            event.synchronize()
+        # Every h2d_stream copy is covered by a synchronized event above, so the stream
+        # is fully drained -- no default_stream.wait_stream(h2d_stream) needed.
+
+        if free_pin_after_opt:
+            # Release the pinned pool so host RAM is free for fwd/bwd (re-allocated
+            # next step). Opt-in for memory-constrained hosts; costs re-pin latency.
+            self._pin_pool.clear()
+
     def _prepare_grad(self, grad: torch.Tensor, master: torch.Tensor) -> torch.Tensor:
         # No .to(float32): add_()/addcmul_() promote into the FP32 accumulators, so a
         # full-size cast here would only cost peak memory.
@@ -237,13 +489,20 @@ class FP32AdamW:
         return grad.detach()
 
     def _copy_master_to_param(self, param: nn.Parameter, master: torch.Tensor) -> None:
+        value = self._master_as_param_dtype(master, param)
+        if not self.cpu_update:
+            param.detach().copy_(value)
+            return
+        copy_local_tensor_to_param_(param, value)
+
+    def _master_as_param_dtype(self, master: torch.Tensor, param: nn.Parameter) -> torch.Tensor:
+        """Cast an fp32 master to the param's storage dtype via the FSDP2 double-track
+        (fp32 -> logical model dtype -> param dtype). The intermediate rounding, when
+        model dtype != param dtype, is load-bearing; serial and pipelined share this."""
         model_dtype = self._model_param_dtype(param)
         if model_dtype is not None:
-            master = master.to(dtype=model_dtype).to(dtype=param.dtype)
-        if not self.cpu_update:
-            param.detach().copy_(master.to(dtype=param.dtype))
-            return
-        copy_local_tensor_to_param_(param, master)
+            master = master.to(dtype=model_dtype)
+        return master.to(dtype=param.dtype)
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -340,6 +599,12 @@ def build_adamw_optimizer(
             betas=betas,
             eps=eps,
             cpu_update=cpu_update,
+            # Opt-in: pipelined CPU-offload path (private torch._fused_adamw_, pinned
+            # masters, extra CUDA streams + GPU staging). Off unless explicitly enabled
+            # via overlap_cpu_optimizer_d2h_h2d=True and torch exposes the CPU fused
+            # kernel; otherwise fall back to the serial path.
+            pipeline=cpu_update and hasattr(torch, "_fused_adamw_")
+            and get_bool_opt(opt, "overlap_cpu_optimizer_d2h_h2d", default=False),
             model_param_dtypes=model_param_dtypes,
         )
     if foreach not in {True, False, "auto"}:
