@@ -134,6 +134,32 @@ class TestFinalizeModelGradsMoEExpertBias:
         assert model.finish_grad_sync_calls == 1
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_finalize_model_grads_updates_heterogeneous_router_expert_bias(self):
+        config = _router_expert_bias_config()
+        device = torch.device("cuda", torch.cuda.current_device())
+        local_tokens = torch.arange(4, dtype=torch.int64, device=device)
+        model = _RouterExpertBiasModel(config, local_tokens)
+        model.router.expert_bias = torch.zeros(4, dtype=torch.float32, device=device)
+        model.second_router = _RouterExpertBiasModel(
+            config, torch.arange(8, dtype=torch.int64, device=device)
+        ).router
+        model.second_router.expert_bias = torch.zeros(8, dtype=torch.float32, device=device)
+
+        finalize_model_grads(
+            [model], pg_collection=_router_bias_pg_collection(tp_dp_cp=dist.group.WORLD)
+        )
+
+        for router in (model.router, model.second_router):
+            num_experts = router.expert_bias.numel()
+            expected_bias = torch.tensor(
+                [0.25] * (num_experts // 2) + [-0.25] * (num_experts // 2), device=device
+            )
+            torch.testing.assert_close(router.expert_bias, expected_bias, rtol=0, atol=0)
+            assert router.local_tokens_per_expert.dtype == torch.int64
+            assert torch.count_nonzero(router.local_tokens_per_expert).item() == 0
+        assert model.finish_grad_sync_calls == 1
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_finalize_model_grads_requires_custom_group_before_grad_sync(self):
         assert not parallel_state.model_parallel_is_initialized()
         config = _router_expert_bias_config()
