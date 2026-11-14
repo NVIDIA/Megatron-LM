@@ -265,6 +265,13 @@ below), not by an operation constructor. Say a library `foo` provides both.
   is an `ImportError` naming the backend when it is selected; the existing values
   never import it.
 
+## Liger RMSNorm
+
+Install `pip install liger-kernel==0.8.5` (or a newer compatible release) and select
+`--transformer-impl local --normalization RMSNorm --use-liger`. The local GPT block spec
+(`get_gpt_decoder_block_spec`) then uses it for the layer, final and MTP norms; custom
+specs choose their own norms.
+
 ## Dependency checks
 
 Optional kernel libraries are checked once, at construction, with

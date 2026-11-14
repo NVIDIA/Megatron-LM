@@ -3,8 +3,20 @@
 """Unit tests for model_provider integration with ModelOpt model_builder."""
 
 from argparse import Namespace
+from types import SimpleNamespace
+
+import pytest
 
 import model_provider as mp
+
+
+def test_modelopt_rejects_liger_before_constructing_specs(monkeypatch, run_config):
+    builder = pytest.importorskip("megatron.post_training.model_builder")
+    monkeypatch.setattr(
+        builder, "core_transformer_config_from_args", lambda args: SimpleNamespace(use_liger=True)
+    )
+    with pytest.raises(ValueError, match="use_liger is not supported by ModelOpt"):
+        builder.modelopt_gpt_hybrid_builder(Namespace(export_model_type="GPTModel"), True, True)
 
 
 def _sentinel_builder(return_value, calls):

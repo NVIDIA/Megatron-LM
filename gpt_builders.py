@@ -39,7 +39,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
                 config=config, vp_stage=vp_stage
             )
-        elif args.num_experts:
+        elif args.num_experts or config.use_liger:
             # Define the decoder block spec
             transformer_layer_spec = get_gpt_decoder_block_spec(
                 config,
@@ -47,6 +47,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
                 normalization=args.normalization,
                 qk_l2_norm=args.qk_l2_norm,
                 vp_stage=vp_stage,
+                pp_rank=pg_collection.pp.rank() if pg_collection is not None else None,
             )
         elif args.heterogeneous_layers_config_path is not None:
             assert not (config.transformer_impl == "inference_optimized")
@@ -153,4 +154,5 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
+            use_liger=config.use_liger,
         )

@@ -835,6 +835,7 @@ def test_gpt_builder_forwards_rope_scaling_factor(run_config):
     """
     run_config.tokenizer.padded_vocab_size = 512
     mock_config = MagicMock()
+    mock_config.use_liger = False
 
     mock_args = MagicMock()
     mock_args.spec = None

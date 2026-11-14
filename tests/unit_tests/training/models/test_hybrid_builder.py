@@ -8,7 +8,11 @@ import torch
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
-from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
+from megatron.training.models.hybrid import (
+    HybridModelBuilder,
+    HybridModelConfig,
+    resolve_hybrid_stack_spec,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -25,6 +29,17 @@ def _make_hybrid_config(**kwargs):
     defaults = dict(transformer=_make_transformer(), vocab_size=32000)
     defaults.update(kwargs)
     return HybridModelConfig(**defaults)
+
+
+def test_liger_needs_a_custom_hybrid_spec():
+    transformer = _make_transformer(
+        use_liger=True, normalization="RMSNorm", transformer_impl="local"
+    )
+    with pytest.raises(ValueError, match="use_liger is not supported by default Hybrid specs"):
+        resolve_hybrid_stack_spec(_make_hybrid_config(transformer=transformer))
+    spec = ModuleSpec(module=object)
+    config = _make_hybrid_config(transformer=transformer, hybrid_stack_spec=spec)
+    assert resolve_hybrid_stack_spec(config) is spec
 
 
 # =============================================================================

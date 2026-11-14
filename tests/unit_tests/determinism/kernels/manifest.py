@@ -283,6 +283,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     # ---------------------------------------------------------------- apex CUDA extensions and local TP layers
     KernelEntry(
+        name="liger_rmsnorm",
+        sources=("megatron/core/ops/norm/liger_norm.py",),
+        tests=(K + "test_liger_norm.py",),
+        kind="external-lib",
+        notes="RMSNorm outputs, input and weight gradients replayed under contention, "
+        "with and without zero-centered gamma and deterministic algorithms.",
+    ),
+    KernelEntry(
         name="fused_layer_norm",
         sources=("megatron/core/ops/norm/fused_layer_norm.py",),
         tests=(K + "test_tensor_parallel_kernels.py",),

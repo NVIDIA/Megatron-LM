@@ -311,12 +311,14 @@ def get_backend(
     cross_entropy_loss_fusion: bool = False,
     cross_entropy_fusion_impl: str = "native",
     cuda_graph_impl: str | None = None,
+    use_liger: bool = False,
 ) -> BackendSpecProvider:
     """Build the provider for a named backend.
 
     Kitchen is enabled independently of ``transformer_impl``. It overrides selected
     operations and delegates the rest to the chosen base provider through ``fallback``.
-    ``use_te_op_fuser`` applies only to the Transformer Engine provider.
+    ``use_te_op_fuser`` applies only to the Transformer Engine provider, ``use_liger``
+    (Liger RMSNorm) only to the local one.
     """
     if transformer_impl == "transformer_engine":
         from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
@@ -334,7 +336,12 @@ def get_backend(
             cuda_graph_impl=cuda_graph_impl,
         )
     elif transformer_impl == "local":
-        base = LocalSpecProvider(
+        local_provider = LocalSpecProvider
+        if use_liger:
+            from megatron.core.extensions.liger_kernel_spec_provider import LigerSpecProvider
+
+            local_provider = LigerSpecProvider
+        base = local_provider(
             cross_entropy_loss_fusion=cross_entropy_loss_fusion,
             cross_entropy_fusion_impl=cross_entropy_fusion_impl,
             cuda_graph_impl=cuda_graph_impl,
@@ -388,4 +395,5 @@ def get_backend_from_config(
         cross_entropy_loss_fusion=getattr(config, "cross_entropy_loss_fusion", False),
         cross_entropy_fusion_impl=getattr(config, "cross_entropy_fusion_impl", "native"),
         cuda_graph_impl=getattr(config, "cuda_graph_impl", None),
+        use_liger=getattr(config, "use_liger", False),
     )

@@ -60,6 +60,7 @@ def _make_dispatch_config(**transformer_kwargs):
     transformer.qk_l2_norm = False
     transformer.multi_latent_attention = False
     transformer.normalization = "LayerNorm"
+    transformer.use_liger = False
     transformer.use_kitchen = False
     transformer.use_kitchen_attention = False
     transformer.kitchen_attention_backend = None
@@ -170,6 +171,7 @@ class TestDefaultLayerSpecDispatch:
         transformer.transformer_impl = "transformer_engine"
         transformer.experimental_attention_variant = None
         transformer.num_moe_experts = None
+        transformer.use_liger = False
         config = Mock()
         config.restore_modelopt_state = False
         config.transformer = transformer
@@ -242,8 +244,17 @@ class TestDefaultLayerSpecDispatch:
             use_kitchen=config.transformer.use_kitchen,
             use_kitchen_attention=config.transformer.use_kitchen_attention,
             kitchen_attention_backend=config.transformer.kitchen_attention_backend,
+            use_liger=config.transformer.use_liger,
         )
         assert result is spec
+
+    @patch("megatron.training.models.gpt.get_gpt_decoder_block_spec")
+    def test_liger_routes_to_decoder_block_spec(self, mock_get_spec):
+        config = _make_dispatch_config(use_liger=True, normalization="RMSNorm")
+        assert default_layer_spec(config, vp_stage=1) is mock_get_spec.return_value
+        config.restore_modelopt_state = True
+        with pytest.raises(ValueError, match="use_liger is not supported by ModelOpt"):
+            default_layer_spec(config, vp_stage=1)
 
 
 # =============================================================================
