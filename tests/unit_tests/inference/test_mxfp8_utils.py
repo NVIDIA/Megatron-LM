@@ -881,6 +881,67 @@ class TestSquaredReluAndQuantizeMxfp8Clamped:
         )
 
 
+@pytest.mark.parametrize("clamp_scale", [None, CLAMP_SCALE], ids=["unclamped", "clamped"])
+def test_squared_relu_and_quantize_mxfp8_propagates_nan(clamp_scale):
+    """A NaN FC1 output quantizes to the E4M3 NaN, as training's F.relu keeps it NaN, instead
+    of being ReLU'd to 0. The fused and unfused routes still agree bit for bit."""
+    from megatron.core.inference.moe.activations import (
+        padded_squared_relu,
+        squared_relu_and_quantize_mxfp8,
+    )
+
+    torch.manual_seed(43)
+    M, K = 128, 128
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    x[0, 3] = x[70, 100] = float("nan")
+    x[1, 6] = float("-inf")
+    x[2, 7] = -0.0
+    perm_map = _make_permutation_map(M, num_padding=0)
+
+    fused = squared_relu_and_quantize_mxfp8(x, perm_map, _vt(M), clamp_scale=clamp_scale)
+    expected_nan = torch.zeros(M, K, dtype=torch.bool, device="cuda")
+    expected_nan[0, 3] = expected_nan[70, 100] = True
+    assert torch.equal(fused.data.float().isnan(), expected_nan)
+
+    unfused = MXFP8Tensor.from_bf16(
+        padded_squared_relu(x, perm_map, _vt(M), clamp_scale=clamp_scale), backend="triton"
+    )
+    assert torch.equal(fused.data.view(torch.uint8), unfused.data.view(torch.uint8))
+    assert torch.equal(fused.scale.view(torch.uint8), unfused.scale.view(torch.uint8))
+
+
+@pytest.mark.parametrize("clamp_scale", [None, CLAMP_SCALE], ids=["unclamped", "clamped"])
+def test_batch_invariant_squared_relu_quantize_mxfp8_propagates_nan(clamp_scale):
+    """The fused batch-invariant squared ReLU + MXFP8 quantize keeps NaN FC1 outputs NaN too,
+    and still matches its unfused route (squared_relu_with_probs, then MXFP8 quantization of
+    the used rows) bit for bit."""
+    from megatron.core.inference.moe.batch_invariant import (
+        squared_relu_with_probs,
+        squared_relu_with_probs_quantize_mxfp8,
+    )
+    from megatron.core.inference.moe.fused_moe import _quantize_mxfp8_used_rows
+
+    torch.manual_seed(43)
+    M, K = 128, 128
+    x = torch.randn(M, K, device="cuda", dtype=torch.bfloat16)
+    x[0, 3] = x[70, 100] = float("nan")
+    x[1, 6] = float("-inf")
+    x[2, 7] = -0.0
+    probs = torch.rand(M, device="cuda", dtype=torch.float32)
+    perm_map = _make_permutation_map(M, num_padding=0)
+
+    fused = squared_relu_with_probs_quantize_mxfp8(x, perm_map, _vt(M), probs, clamp_scale)
+    expected_nan = torch.zeros(M, K, dtype=torch.bool, device="cuda")
+    expected_nan[0, 3] = expected_nan[70, 100] = True
+    assert torch.equal(fused.data.float().isnan(), expected_nan)
+
+    unfused = _quantize_mxfp8_used_rows(
+        squared_relu_with_probs(x, perm_map, _vt(M), probs, clamp_scale, zero_padding=True), _vt(M)
+    )
+    assert torch.equal(fused.data.view(torch.uint8), unfused.data.view(torch.uint8))
+    assert torch.equal(fused.scale.view(torch.uint8), unfused.scale.view(torch.uint8))
+
+
 # ──────────────────────────────────────────────────────────────────────
 # permute_and_quantize_mxfp8
 # ──────────────────────────────────────────────────────────────────────
@@ -966,6 +1027,35 @@ class TestPermuteAndQuantizeMxfp8:
             atol=0,
             rtol=0,
         )
+
+    @pytest.mark.parametrize("zero_padding", [False, True])
+    def test_scale_by_probs_matches_pytorch_ref(self, zero_padding):
+        """moe_apply_probs_on_input: each row quantizes BF16(prob * token), as training's
+        scaled expert input does, and its permuted probability becomes 1."""
+        from megatron.core.inference.moe.permute import permute_and_quantize_mxfp8
+
+        num_tokens, K, num_experts = 64, 256, 8
+        hidden, probs, routing_map = self._make_inputs(num_tokens, K, 1, num_experts)
+
+        fused_mxfp8, permuted_probs, perm_map, offs = permute_and_quantize_mxfp8(
+            hidden,
+            probs,
+            routing_map,
+            0,
+            num_experts,
+            _vt(num_tokens),
+            alignment=128,
+            zero_padding=zero_padding,
+            scale_by_probs=True,
+        )
+
+        real = (perm_map[: offs[-1].item()] >= 0).nonzero(as_tuple=True)[0]
+        src = perm_map[real].long()
+        _, ref_data = ref_to_mxfp((hidden[src].float() * probs[src]).to(torch.bfloat16))
+        torch.testing.assert_close(
+            fused_mxfp8.data[real].view(torch.uint8), ref_data.view(torch.uint8), atol=0, rtol=0
+        )
+        torch.testing.assert_close(permuted_probs[real], torch.ones_like(permuted_probs[real]))
 
     @pytest.mark.parametrize(
         "num_tokens,K,topk,num_experts", [(16, 128, 2, 8), (32, 256, 4, 8), (64, 2688, 8, 128)]
