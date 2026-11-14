@@ -799,7 +799,11 @@ KERNELS: Tuple[KernelEntry, ...] = (
         kind="triton",
         training_path=False,
         exempt_reason="Multi-rank NVLS multimem collectives over torch symmetric memory; the in-switch reduction "
-        "order is hardware defined and needs an NVLink peer group. Batch-invariant mode routes around them.",
+        "order is hardware defined and needs an NVLink peer group. Batch-invariant mode reduces "
+        "with a rank-ordered kernel instead, unless batch_invariant_collective is 'multimem' "
+        "(rejected on Hopper): its batch invariance relies on the in-switch fp32 sum being "
+        "deterministic and batch-invariant, and bitwise parity with training's MoE combine also "
+        "relies on its rounding (measured correct on GB200 at 2 and 4 GPUs).",
     ),
     KernelEntry(
         name="unified_memory_allocator",
