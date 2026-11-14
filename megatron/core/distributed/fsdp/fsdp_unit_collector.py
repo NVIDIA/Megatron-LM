@@ -81,14 +81,22 @@ class FsdpUnitCollector:
         if not isinstance(module, self._fsdp_unit_module_types):
             self._units.append(module)
 
-        # 2. Collect parameter-bearing replay modules for each checkpoint source.
+        # 2. Collect recomputed module regions.
         recomputed_modules = self._collect_recomputed_modules(module)
 
-        # 3. Mark units whose own checkpoints replay their own parameters.
+        # 3. Mark units whose owned parameters are replayed without their hooks.
         for unit in self._units:
             owned = set(self._owned_modules(unit))
-            if any(owned.intersection(recomputed_modules.get(source, ())) for source in owned):
-                self._partially_recomputed_units.add(unit)
+            for rerun in owned.intersection(recomputed_modules):
+                # An external checkpoint re-enters the whole unit's forward hooks.
+                if rerun is unit and unit not in _rerun_submodules(unit):
+                    continue
+                if any(
+                    next(submodule.parameters(recurse=False), None) is not None
+                    for submodule in self._owned_modules(rerun)
+                ):
+                    self._partially_recomputed_units.add(unit)
+                    break
         return self._units
 
     def is_partially_recomputed(self, unit: nn.Module) -> bool:
@@ -102,19 +110,9 @@ class FsdpUnitCollector:
         return unit in self._partially_recomputed_units
 
     @staticmethod
-    def _collect_recomputed_modules(root: nn.Module) -> dict[nn.Module, set[nn.Module]]:
-        """Map checkpoint sources to parameter-bearing replay modules, independent of FSDP."""
-        recomputed = {}
-        for module in root.modules():
-            replayed = {
-                submodule
-                for rerun in _rerun_submodules(module)
-                for submodule in rerun.modules()
-                if next(submodule.parameters(recurse=False), None) is not None
-            }
-            if replayed:
-                recomputed[module] = replayed
-        return recomputed
+    def _collect_recomputed_modules(root: nn.Module) -> set[nn.Module]:
+        """Collect replay-region roots without applying FSDP or parameter checks."""
+        return {rerun for module in root.modules() for rerun in _rerun_submodules(module)}
 
     def _owned_modules(self, module: nn.Module) -> Iterator[nn.Module]:
         """Yield this module and its descendants outside independent child units."""
