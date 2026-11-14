@@ -292,6 +292,13 @@ def test_te_projections_use_configured_initializer_dtype_and_checkpoint_group(fu
         assert projection.weight.allreduce
 
 
+def test_additive_projection_uses_config_initializer_without_zero_init(fusion_pg):
+    spec = _with_params(additive_hidden_state_fusion_spec, zero_init=False)
+    fusion = _fusion(spec, fusion_pg, init_method=partial(torch.nn.init.constant_, val=0.125))
+    weight = fusion.hidden_state_projection.weight
+    torch.testing.assert_close(weight, torch.full_like(weight, 0.125), rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("recompute", [False, True])
 def test_reused_te_projections_accumulate_gradients(recompute, fusion_pg):
     # Enable first-microbatch tracking, but run outside FP8 autocast: this tests
