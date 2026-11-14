@@ -1,6 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-# Adapted from: https://github.com/meta-pytorch/kraken.git
+# Adapted from:
+# https://github.com/meta-pytorch/kraken/blob/819d403b439c7fcb2ca15319dfb3ca9b63f5baee/kraken/_ptx_utils/symm_mem_barrier.py
 
 from unittest.mock import MagicMock
 

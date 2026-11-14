@@ -1,7 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 # syntax=docker/dockerfile:1.3-labs
 
-ARG FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:26.06-py3
+ARG FROM_IMAGE_NAME=nvcr.io/nvidian/nemo:fw-base-26.12.rc0
 FROM ${FROM_IMAGE_NAME} AS base
 ENV PIP_CONSTRAINT=""
 ENV DEBIAN_FRONTEND=noninteractive
@@ -210,6 +210,15 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.32,targ
     trap - EXIT
 EOF
 
+# FLA 0.5.1 lists a nonexistent autotune key that Triton 3.9 rejects at import.
+# Patch after dependency installation so this compatibility fix reuses native builds.
+RUN --mount=type=bind,source=docker/patches/fla-triton-autotune.patch,target=/opt/fla-triton-autotune.patch \
+    bash -ex <<"EOF"
+    FLA_SITE_PACKAGES=$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')
+    patch --batch --forward --fuzz=0 -d "${FLA_SITE_PACKAGES}" -p1 < /opt/fla-triton-autotune.patch
+    python -c 'from fla.ops.cp.chunk_delta_h import merge_fwd_bwd_kernel'
+EOF
+
 # Reuse the wheel without copying a second archive into the final image.
 RUN --mount=type=bind,from=mok-wheel,source=/opt/mok-wheels,target=/opt/mok-wheels \
     bash -ex <<"EOF"
@@ -359,6 +368,30 @@ USER root
 
 # Remove the Nsight Systems EFA metrics plugin to address CVE-2026-27143.
 RUN rm -rf /usr/local/cuda-*/NsightSystems-cli-*/target-linux-x64/plugins/efa_metrics/
+
+# PyTorch 2.15 defaults to eager NCCL2 communicators. Retain the previous backend's
+# lazy allocation and split semantics for the existing distributed test matrix.
+# See https://github.com/pytorch/pytorch/issues/199957.
+ENV TORCH_DIST_USE_NCCL2=0
+
+# Triton 3.9 removed block pointers used by the pinned FLA and GDP kernels.
+# Install the guarded compatibility lowering after native builds to retain their caches.
+RUN --mount=type=bind,source=docker/common/triton_block_ptr_compat.py,target=/opt/triton_block_ptr_compat.py \
+    bash -ex <<"EOF"
+    TRITON_LANGUAGE_DIR=$(python -c 'import pathlib, triton.language; print(pathlib.Path(triton.language.__file__).parent)')
+    install -m 0644 /opt/triton_block_ptr_compat.py "${TRITON_LANGUAGE_DIR}/_megatron_block_ptr_compat.py"
+    printf '\nfrom . import _megatron_block_ptr_compat\n' >> "${TRITON_LANGUAGE_DIR}/__init__.py"
+    python -c 'import triton.language as tl; assert callable(tl.advance)'
+EOF
+
+# Backport FlashAttention#2787 for the image's CuTe code and pinned Quack0.6.5.
+# https://github.com/Dao-AILab/flash-attention/commit/145b1010051dbfd4bdc41a0ae55d495b08d7a458
+RUN --mount=type=bind,source=docker/patches/flash-attn-quack-api.patch,target=/opt/flash-attn-quack-api.patch \
+    bash -ex <<"EOF"
+    FLASH_ATTN_SITE_PACKAGES=$(python -c 'import importlib.util, pathlib; print(pathlib.Path(importlib.util.find_spec("flash_attn").origin).parent.parent)')
+    patch --batch --forward --fuzz=0 -d "${FLASH_ATTN_SITE_PACKAGES}" -p1 < /opt/flash-attn-quack-api.patch
+    python -c 'import cutlass.cute as cute; from flash_attn.cute.utils import ex2_emulation_2; assert callable(cute.arch.sub_packed_f32x2)'
+EOF
 
 ##### For NVIDIANS only #####
 FROM main AS jet

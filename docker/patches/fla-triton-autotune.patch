@@ -1,0 +1,16 @@
+FLA 0.5.1's CP merge kernel has no BT argument. Triton 3.9 validates autotune
+keys at import time; earlier Triton versions ignored this nonexistent key.
+Remove the stale key without changing the kernel or its tuning configurations.
+
+diff --git a/fla/ops/cp/chunk_delta_h.py b/fla/ops/cp/chunk_delta_h.py
+--- a/fla/ops/cp/chunk_delta_h.py
++++ b/fla/ops/cp/chunk_delta_h.py
+@@ -313,7 +313,7 @@
+         for num_stages in [2, 3, 4]
+         for BV in [32, 64]
+     ],
+-    key=['HV', 'K', 'V', 'BT'],
++    key=['HV', 'K', 'V'],
+     use_cuda_graph=USE_CUDA_GRAPH,
+     **autotune_cache_kwargs,
+ )
