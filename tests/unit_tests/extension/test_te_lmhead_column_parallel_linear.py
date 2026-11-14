@@ -227,6 +227,7 @@ class TestGPTModelOutputLayerSelection:
             transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
             vocab_size=128,
             max_sequence_length=8,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         assert isinstance(model.output_layer, TELMHeadColumnParallelLinear)
 
