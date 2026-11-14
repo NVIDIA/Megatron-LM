@@ -16,6 +16,7 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradientFinalizationMode,
     fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
@@ -143,6 +144,9 @@ def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(process_grou
         pg_collection=process_group_collection,
     )
 
+    assert (
+        wrapped.module.context.gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER
+    )
     assert isinstance(wrapped.module, FsdpModule)
 
     parameters = dict(wrapped.module.named_parameters())
@@ -289,27 +293,23 @@ def test_unpadded_shards_pack_parameter_groups_without_padding(process_group_col
         )
 
 
-def test_rejects_shared_context_without_caller_managed_grad_sync(
-    process_group_collection, distributed_setup
-):
-    """The adapter rejects an incompatible shared context before sharding the model."""
+def test_joins_shared_context(process_group_collection, distributed_setup):
+    """The adapter joins a context without construction-time gradient-sync settings."""
     config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
     layer = torch.nn.Linear(16, 16, device=distributed_setup.device)
     with fully_shard_context(FsdpContext(device=distributed_setup.device)) as context:
-        with pytest.raises(ValueError, match="caller_managed_grad_sync=True"):
-            FullyShardedDataParallel(
-                config=config,
-                ddp_config=DistributedDataParallelConfig(
-                    use_megatron_fsdp=True,
-                    megatron_fsdp_version=2,
-                    use_distributed_optimizer=False,
-                    data_parallel_sharding_strategy="optim_grads_params",
-                ),
-                module=layer,
-                pg_collection=process_group_collection,
-            )
-        assert not context.caller_managed_grad_sync
-        assert not isinstance(layer, FsdpModule)
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=layer,
+            pg_collection=process_group_collection,
+        )
+    assert model.module.context is context
 
 
 def test_finish_grad_sync_waits_for_delayed_wgrad(process_group_collection, distributed_setup):

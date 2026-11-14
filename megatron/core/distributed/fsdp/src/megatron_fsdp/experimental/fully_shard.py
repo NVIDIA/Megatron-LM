@@ -195,32 +195,6 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
     return dim_names.index(axis)
 
 
-@contextmanager
-def finalize_gradients(context: FsdpContext, enabled: bool = True) -> Iterator[None]:
-    """Control whether backward finalizes accumulated gradients in this context.
-
-    When enabled, backward launches DP-outer reductions and automatically waits
-    for gradient reductions unless the caller manages that wait. When disabled,
-    inner reductions and weight cleanup still run, but outer reductions and the
-    automatic completion wait are deferred.
-
-    Wrap both forward and backward. This scope only changes the finalization
-    setting; entering or exiting it does not launch reductions or wait for them.
-
-    Args:
-        context: FSDP context whose modules should use this finalization setting.
-        enabled: Whether backward should finalize gradients. Defaults to True.
-    """
-    context.ensure_finalized()
-    previous_state = context.finalize_gradients
-    context.finalize_gradients = enabled
-
-    try:
-        yield
-    finally:
-        context.finalize_gradients = previous_state
-
-
 def _attach_mixin(module: nn.Module) -> None:
     if isinstance(module, FsdpModule):
         return
