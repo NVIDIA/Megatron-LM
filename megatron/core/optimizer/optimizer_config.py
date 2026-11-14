@@ -333,6 +333,15 @@ class OptimizerConfig:
     mode is lost; the default of 1 keeps the bit-exact path. Values > 1 require
     emerging-optimizers >= 0.3.0."""
 
+    muon_expert_ns_batch_size: int = 1
+    """Opt-in duplicated-mode expert NS batching: 1 disables, 32 enables the qualified
+    local FP32-input/BF16-compute polar-express NS16 recipe (spectral scale * 0.2,
+    no Nesterov/SYRK, decoupled decay, singleton expert TP/GTP). Only expert weights
+    shaped (1856, 672) or (672, 1856) are batched; others remain native. Native EMA
+    and updates are retained. Batched GEMMs can change rounding; not bitwise parity
+    with per-matrix NS. Independent of layer-sharded muon_ns_batch_size.
+    """
+
     muon_concurrent_groups: bool = True
     """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
     on its own CUDA stream so one group's compute fills another group's all_to_all stall.
