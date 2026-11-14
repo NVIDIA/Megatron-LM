@@ -773,6 +773,72 @@ async def test_source_release_failure_does_not_block_or_fail_decode(caplog):
 
 
 @pytest.mark.asyncio
+async def test_queued_claim_keeps_its_acknowledgement_deadline():
+    ownership = HandoffOwnership()
+    for request_id in (1, 2):
+        ownership.offer(request_id, b"prefill", require_claim=True)
+    replies = asyncio.Queue()
+    coordinator = SimpleNamespace(
+        instance_id="source",
+        known_clients=set(),
+        _send_to_client=lambda frames: replies.put_nowait(frames[1]),
+        handoff_ownership=ownership,
+    )
+
+    async def send(frame):
+        metadata = msgpack.unpackb(frame, raw=False)
+        HANDLERS[Headers(metadata[0])](coordinator, b"decode", metadata, [])
+
+    # Claim A holds the source's socket for 75% of the deadline. Claim B's own exchange
+    # takes 40% of it, and the source accepts B's claim before its acknowledgement leaves.
+    delays = iter([0.15, 0.15, 0.01, 0.15])
+
+    async def recv():
+        await asyncio.sleep(next(delays))
+        return await replies.get()
+
+    socket = MagicMock(send=AsyncMock(side_effect=send), recv=recv)
+    engine = MegatronLLMEngine(_config("decode"))
+    engine._release_context = MagicMock(socket=MagicMock(return_value=socket))
+    release = lambda request_id: {  # noqa: E731
+        "coordinator_addr": "tcp://prefill:5000",
+        "coordinator_instance_id": "source",
+        "request_id": request_id,
+    }
+    with patch("megatron.inference.integrations.dynamo.llm_engine._RELEASE_TIMEOUT", 0.4):
+        first = asyncio.create_task(engine._claim_remote_handoff(release(1)))
+        await asyncio.sleep(0)
+        # B waits behind A, then still gets a full deadline for its own exchange, so a
+        # claim the source accepted is never abandoned by the adapter.
+        await engine._claim_remote_handoff(release(2))
+        await first
+    assert ownership._handoffs[2].owner == engine._handoff_owner
+    await engine.cleanup()
+
+
+@pytest.mark.asyncio
+async def test_claim_that_cannot_take_its_turn_fails_before_sending():
+    ownership = HandoffOwnership()
+    ownership.offer(7, b"prefill", require_claim=True)
+    socket = MagicMock(send=AsyncMock(), recv=AsyncMock())
+    engine = MegatronLLMEngine(_config("decode"))
+    engine._release_context = MagicMock(socket=MagicMock(return_value=socket))
+    address = "tcp://prefill:5000"
+    turn = engine._release_locks.setdefault(address, asyncio.Lock())
+    await turn.acquire()
+    with patch("megatron.inference.integrations.dynamo.llm_engine._RELEASE_TIMEOUT", 0.05):
+        with pytest.raises(TimeoutError):
+            await engine._claim_remote_handoff(
+                {"coordinator_addr": address, "coordinator_instance_id": "source", "request_id": 7}
+            )
+    # Nothing was sent, so the offer is still unclaimed and can expire normally.
+    socket.send.assert_not_awaited()
+    assert ownership._handoffs[7].owner is None
+    turn.release()
+    await engine.cleanup()
+
+
+@pytest.mark.asyncio
 async def test_unreachable_release_source_does_not_block_other_sources():
     engine = MegatronLLMEngine(_config("decode"))
     connecting = asyncio.Event()
