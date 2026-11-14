@@ -808,7 +808,7 @@ class TransformerConfig(ModelParallelConfig):
     fp8_output_proj: bool = False
     """If True, run the LM-head output projection with a TE ColumnParallelLinear
     under the MXFP8 autocast context. Only active when fp8=True and
-    fp8_recipe='mxfp8'."""
+    fp8_recipe='mxfp8', or with fp4, where the LM head runs under its own MXFP8 autocast."""
 
     fp8_recipe_attrs: Optional[Dict[str, Any]] = None
     """Attributes to set in the FP8 recipe."""
@@ -1257,19 +1257,23 @@ class TransformerConfig(ModelParallelConfig):
     symm-mem buffers are a fixed [recv_capacity, hidden] and cannot be resized per step) and the
     fused op (use_transformer_engine_op_fuser). Defaults to False."""
 
-    moe_dispatch_fwd_dtype: Literal['bf16', 'mxfp8'] = 'bf16'
+    moe_dispatch_fwd_dtype: Literal['bf16', 'mxfp8', 'nvfp4'] = 'bf16'
     """Wire dtype of the MoE dispatch forward payload ('ncclep' flex dispatcher only). With
     'mxfp8', TransformerEngine quantizes the payload before the all-to-all and the receive
     buffer comes back as a per-expert MXFP8 GroupedTensor that the grouped GEMM consumes
-    directly. Requires moe_grouped_gemm and use_transformer_engine_op_fuser. Defaults to
-    'bf16' (no quantization on the wire)."""
+    directly. With 'nvfp4' (FP4 models only), TransformerEngine packs each token to NVFP4 with
+    a per-token scale for the wire and builds the NVFP4 GroupedTensor that the grouped GEMM
+    consumes on the receiver. Requires moe_grouped_gemm and use_transformer_engine_op_fuser.
+    Defaults to 'bf16' (no quantization on the wire)."""
 
-    moe_combine_bwd_dtype: Literal['bf16', 'mxfp8'] = 'bf16'
+    moe_combine_bwd_dtype: Literal['bf16', 'mxfp8', 'nvfp4'] = 'bf16'
     """Wire dtype of the MoE combine backward gradient ('ncclep' flex dispatcher only). With
     'mxfp8', TransformerEngine quantizes the gradient before the all-to-all and the
     expert-output gradient comes back as a per-expert MXFP8 GroupedTensor that the grouped
-    GEMM backward consumes directly. Same requirements as moe_dispatch_fwd_dtype. Defaults to
-    'bf16' (no quantization on the wire)."""
+    GEMM backward consumes directly. With 'nvfp4' (FP4 models only), the gradient goes over the
+    wire in NVFP4 with stochastic rounding, as the NVFP4 recipe quantizes gradients. Same
+    requirements as moe_dispatch_fwd_dtype. Defaults to 'bf16' (no quantization on the
+    wire)."""
 
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
@@ -2264,9 +2268,10 @@ class TransformerConfig(ModelParallelConfig):
         if self.fp8_param and not self.fp8:
             raise ValueError("fp8_param must be used together with fp8 mode.")
 
-        if self.fp8_output_proj:
+        if self.fp8_output_proj and not self.fp4:
+            # FP4 models run the LM head under its own MXFP8 autocast.
             if not self.fp8:
-                raise ValueError("fp8_output_proj must be used together with fp8 mode.")
+                raise ValueError("fp8_output_proj must be used together with fp8 or fp4 mode.")
             if self.fp8_recipe != Fp8Recipe.mxfp8:
                 raise ValueError(
                     f"fp8_output_proj requires fp8_recipe='mxfp8', got " f"'{self.fp8_recipe}'."
@@ -2692,10 +2697,25 @@ class TransformerConfig(ModelParallelConfig):
                 )
             if not (self.use_transformer_engine_op_fuser and self.moe_grouped_gemm):
                 raise ValueError(
-                    "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'mxfp8' require BOTH "
-                    "use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
-                    "grouped GEMM path consumes the pre-quantized MXFP8 GroupedTensor payload."
+                    "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'mxfp8' or 'nvfp4' require "
+                    "BOTH use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
+                    "grouped GEMM path consumes the pre-quantized GroupedTensor payload."
                 )
+            if 'nvfp4' in (self.moe_dispatch_fwd_dtype, self.moe_combine_bwd_dtype):
+                if not (self.fp4 and self.fp4_recipe == Fp4Recipe.nvfp4):
+                    raise ValueError(
+                        "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'nvfp4' require fp4 "
+                        "with fp4_recipe='nvfp4': the experts then quantize their inputs and "
+                        "output gradients to NVFP4 anyway."
+                    )
+                if self.first_last_layers_bf16:
+                    # The dispatcher builds one wire recipe from the global config, so the
+                    # layers kept in BF16 would still get NVFP4 payloads and gradients.
+                    raise ValueError(
+                        "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'nvfp4' cannot be "
+                        "combined with first_last_layers_bf16: the layers kept in BF16 would "
+                        "still receive NVFP4 payloads from the dispatcher."
+                    )
 
         if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:
             raise ValueError("moe_use_norm_before_up_proj requires moe_latent_size to be set.")
@@ -5154,7 +5174,9 @@ class MLATransformerConfig(TransformerConfig):
     """Split the key/value up-projection output, apply RoPE to the key and quantize key and value
     for MXFP8 attention in one Transformer Engine kernel (SM100 only), and quantize the RoPE'd
     query before attention, instead of writing BF16 key and value that attention then
-    quantizes. Bitwise identical. Requires apply_rope_fusion=True, MXFP8 DPA, zero attention
+    quantizes. Bitwise identical. Requires apply_rope_fusion=True, MXFP8 DPA (with fp4, Transformer
+    Engine's NVTE_DPA_FP8_RECIPE=MXFP8BlockScaling and NVTE_DPA_FP8_FORMAT=HYBRID or E4M3, checked
+    at run time; custom recipes use the unfused path), zero attention
     dropout and qk_head_dim=128, qk_pos_emb_head_dim=64, v_head_dim=128; layers with TP or CP
     above 1, THD inputs, FP16 inputs, recomputed up-projections or checkpointed core attention,
     NVTE_FP8_DPA_BWD=0 and evaluation use the unfused path."""
@@ -5252,14 +5274,17 @@ class MLATransformerConfig(TransformerConfig):
                 "backward does not support dropout."
             )
 
+        # FP4 models can run attention in MXFP8 (TE's NVTE_DPA_FP8_RECIPE=MXFP8BlockScaling).
+        # The fused kernel is then used only when that holds at run time; see
+        # _is_mxfp8_attention_active.
+        mxfp8_linear_recipe = self.fp8 is not None and self.fp8_recipe == Fp8Recipe.mxfp8
         if self.use_fused_mla_kv_rope_quant and (
-            self.fp8 is None
-            or self.fp8_recipe != Fp8Recipe.mxfp8
+            not (mxfp8_linear_recipe or self.fp4)
             or not self.fp8_dot_product_attention
             or self.attention_dropout != 0.0
         ):
             raise ValueError(
-                "use_fused_mla_kv_rope_quant requires FP8 with fp8_recipe='mxfp8' and "
+                "use_fused_mla_kv_rope_quant requires FP8 with fp8_recipe='mxfp8' or FP4, and "
                 "fp8_dot_product_attention=True, because it feeds MXFP8 Q/K/V to attention, "
                 "plus attention_dropout=0.0 because MXFP8 attention backward does not support "
                 "dropout."
