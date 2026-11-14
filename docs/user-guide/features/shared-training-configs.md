@@ -1,37 +1,51 @@
-# Shared configuration schemas for training drivers
+# Shared configuration settings for training drivers
 
-Megatron Bridge and Megatron-LM can construct the same dataclass types from
-`megatron.training.config`. Megatron Core continues to own optimizer and DDP
-configuration. Importing these classes does not import Bridge or install any
-optional logging, checkpoint-export, or distributed-runtime package.
+Megatron Bridge can consume canonical Megatron config classes while retaining
+extensions for behavior that has not moved upstream. Core owns optimizer and
+DDP configuration; training-driver settings live in `megatron.training.config`.
+Neither layer imports Bridge.
 
-Some schema fields are consumed by Bridge's Python training driver. Adding them
-to a shared schema preserves typed construction and saved-config reload; it does
-not add their runtime implementation to the native Megatron-LM training loop.
-They are excluded from Megatron-LM's generated CLI until that loop supports them.
+## Native training-loop controls
 
-| Section | Bridge-consumed additions |
-| --- | --- |
-| Training | Fractional `num_epochs`, derived epoch state, optimizer-step checking, gradient-norm synchronization policy; legacy nested evaluation fields |
-| Scheduler | `max_steps` full schedule horizon for shortened runs |
-| Checkpoint | CPU optimizer-state staging, per-rank writer count, write-result multiprocessing mode, per-DP RNG state, custom checkpoint manager, additional Hugging Face export settings |
-| Distributed initialization | External device mapping |
-| Logging | Training-metrics gate, legacy Comet credential, MLflow artifact-upload policy; `timing_log_level=-1` for Bridge's disabled timer logging |
-| Rerun | `spiky_loss_factor` used by Bridge's loss checks |
+`TrainingConfig.check_optimizer_step_success` defaults to `True`. The loop
+performs a logical AND across model-parallel ranks before deciding whether to
+advance the learning-rate scheduler. `--no-check-optimizer-step-success` uses the
+local optimizer result instead. Disable it only when results are consistent
+across model-parallel ranks; otherwise scheduler state can diverge.
 
-Torch FSDP2 is selected by `TorchFullyShardedDataParallelConfig`, and GTP FP32
-reduce-scatter accumulation belongs to DDP configuration. Bridge retains its
-experimental feature switch, process-group routing, evaluation CP rebinding,
-and legacy GTP NCCL-buffer switch locally. The unused positive straggler-startup
-field is removed; `disable_straggler_on_startup` remains the runtime control.
+`TrainingConfig.skip_sync_grad_norm_across_mp` defaults to `False`.
+`--skip-sync-grad-norm-across-mp` skips the reporting-only MAX reduction after the
+optimizer step. It does not change gradient clipping or the optimizer's own norm
+calculation. Ranks without trainable parameters may then report no norm. Zero
+counts still synchronize when their logging option is enabled. Bridge uses the
+same shared reduction helpers with explicit model-parallel groups.
 
-The native CLI retains its existing timing levels, validation flags, defaults,
-and runtime behavior. The separate MLflow/Comet integration supplies the shared
-logger backend fields. This schema change does not implement those integrations.
-Prefer `COMET_API_KEY` over the legacy programmatic credential field.
+## Timing reports
 
-Validation and derived values must run after recipe overrides, through the
-owning driver's runtime initialization. Schema construction alone does not
-validate a complete training run. Bridge keeps its filesystem, optional-package,
-precision, and training-loop checks in its runtime setup. Core's existing explicit
-optimizer and DDP lifecycle methods remain unchanged.
+`--timing-log-level -1` disables timer reports and optional level-1/2 operator
+timers. Level-0 measurements remain active because training progress, throughput,
+evaluation and checkpoint bookkeeping consume them. This does not suppress
+ordinary progress metrics or eliminate required timer synchronization overhead.
+Levels 0, 1, and 2 retain their existing behavior; the default remains 0.
+
+## Shared driver settings
+
+`SchedulerConfig.max_steps` carries Bridge's full schedule horizon for shortened
+runs. `DistributedInitConfig.external_gpu_device_mapping` and its `lazy_init`
+alias preserve driver construction. `RerunStateMachineConfig.spiky_loss_factor`
+sets Bridge's spiky-loss threshold. These fields do not introduce new native CLI
+options or implementations of their Bridge-specific behavior.
+
+## Deferred migrations
+
+- TODO: move `num_epochs` and its private derived state with epoch scheduling.
+- Evaluation iteration counts, intervals, and `skip_train` belong to
+  `ValidationConfig`, never `TrainingConfig`.
+- Checkpoint configuration extensions are deferred to a separate PR.
+- MLflow/Comet fields and artifact policy belong to the dedicated logger migration.
+  The Bridge-only training-metrics gate is not added here.
+- Torch FSDP2 uses `TorchFullyShardedDataParallelConfig`; GTP FP32 accumulation
+  uses the existing DDP field. Bridge retains experimental feature selection,
+  explicit process-group routing, evaluation CP rebinding and its legacy GTP
+  NCCL-buffer switch. The unused positive straggler-startup field is removed;
+  `disable_straggler_on_startup` remains the runtime control.

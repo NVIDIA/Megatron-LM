@@ -9,22 +9,15 @@ from typing import List, Literal, Optional
 class TrainingConfig:
     """Configuration settings related to the training loop."""
 
-    num_epochs: float | None = None
-    """Optional fractional dataset passes, resolved by the dataset-owning training driver."""
-
-    _train_iters_from_num_epochs: bool = field(default=False, init=False, repr=False)
-    """Whether train_iters was derived from the epoch budget rather than supplied by the user."""
-
     check_optimizer_step_success: bool = True
-    """Check optimizer step success in training drivers supporting this policy."""
+    """Synchronize optimizer-step success across model-parallel ranks before advancing the scheduler.
+    Disabling this uses each rank's local result and requires consistent results across ranks.
+    """
 
     skip_sync_grad_norm_across_mp: bool = False
-    """Allow a training driver to omit model-parallel gradient-norm synchronization."""
-
-    eval_iters: int | None = None
-    eval_interval: int | None = None
-    skip_train: bool | None = None
-    """Legacy nested training settings; new configurations use ValidationConfig."""
+    """Skip the reporting-only MAX reduction of gradient norm across model-parallel ranks.
+    This does not change gradient clipping or the optimizer's own norm calculation.
+    """
 
     vision_pretraining_type: Literal["classify", "inpaint", "dino"] | None = None
     """Vision pretraining objective, or None when vision pretraining is disabled."""
@@ -337,15 +330,6 @@ class SchedulerConfig:
 class LoggerConfig:
     """Configuration settings for logging, including TensorBoard and WandB."""
 
-    mlflow_log_artifacts: bool = True
-    """Allow artifact uploads in training drivers implementing MLflow checkpoint export."""
-
-    skip_train_metrics_log: bool = False
-    """Suppress training metrics in drivers supporting a shared logging gate."""
-
-    comet_api_key: str | None = field(default=None, repr=False)
-    """Legacy programmatic credential; prefer the COMET_API_KEY environment variable."""
-
     log_interval: int = 100
     """Report loss and timing interval."""
 
@@ -372,10 +356,11 @@ class LoggerConfig:
     to progress.txt file in checkpoint directory.
     """
 
-    timing_log_level: Literal[-1, 0, 1, 2] = field(
-        default=0, metadata={"argparse_meta": {"choices": [0, 1, 2]}}
-    )
+    timing_log_level: Literal[-1, 0, 1, 2] = 0
     """Granularity level to measure and report timing.
+    -1: disable timer reports and optional operator timers. Level-0 measurements remain
+        enabled for training progress, throughput, and checkpoint bookkeeping; this does
+        not eliminate their synchronization overhead or suppress ordinary progress metrics.
     0: report only iteration time and make sure timing does not introduce extra overhead.
     1: report timing for operations that are executed very limited times (basically once) during each iteration
         (such as gradient all-reduce)
@@ -542,36 +527,6 @@ class LoggerConfig:
 @dataclass(kw_only=True)
 class CheckpointConfig:
     """Configuration settings for model checkpointing (saving and loading)."""
-
-    stage_precision_aware_optimizer_state_on_cpu: bool = False
-    """Stage expanded optimizer state on CPU in supporting checkpoint writers."""
-
-    storage_writers_per_rank: int = 1
-    """Number of writers per saving rank in the distributed checkpoint backend."""
-
-    async_write_results_mp_mode: str = "fork"
-    """Multiprocessing context used by a driver's asynchronous write-result queue."""
-
-    save_rng_state_per_dp_rank: bool = False
-    """Save individual data-parallel RNG streams when the checkpoint writer supports it."""
-
-    custom_manager_class: str | None = None
-    """Import path for a checkpoint manager supplied by the training driver."""
-
-    also_save_hf_checkpoint: bool = False
-    """Ask a driver with a Hugging Face exporter to save an additional weights artifact."""
-
-    hf_source_path: str | None = None
-    """Source model configuration and tokenizer for an additional Hugging Face export."""
-
-    hf_trust_remote_code: bool = False
-    """Allow remote model code while preparing the Hugging Face export."""
-
-    hf_distributed_save: bool = False
-    """Distribute the additional Hugging Face export over multiple ranks."""
-
-    hf_save_every_n_ranks: int = 1
-    """Rank stride for distributed Hugging Face checkpoint export."""
 
     save: str | None = None
     """Output directory to save checkpoints to."""

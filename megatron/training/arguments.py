@@ -2563,24 +2563,7 @@ def _add_fault_tolerance_args(parser):
 def _add_logging_args(parser):
     from megatron.training.config import LoggerConfig
 
-    log_factory = ArgumentGroupFactory(
-        LoggerConfig,
-        exclude=[
-            'log_throughput_to_tensorboard',
-            'throughput_window_size',
-            'memory_keys',
-            'log_l2_norm_grad_to_tensorboard',
-            'log_runtime_to_tensorboard',
-            'runtime_time_unit',
-            'filter_warnings',
-            'modules_to_filter',
-            'set_level_for_all_loggers',
-            'save_config_filepath',
-            'skip_train_metrics_log',
-            'comet_api_key',
-            'mlflow_log_artifacts',
-        ],
-    )
+    log_factory = ArgumentGroupFactory(LoggerConfig, exclude = ["log_throughput_to_tensorboard", "throughput_window_size", "memory_keys", "log_l2_norm_grad_to_tensorboard", "log_runtime_to_tensorboard", "runtime_time_unit", "filter_warnings", "modules_to_filter", "set_level_for_all_loggers", "save_config_filepath"])
     group = log_factory.build_group(parser, title="logging")
 
     return parser
@@ -2710,18 +2693,7 @@ def _add_training_args(parser):
                        'options should be specified in commandline.')
 
     # Keep the legacy vision CLI master switch/defaults at their existing boundary.
-    train_factory = ArgumentGroupFactory(
-        TrainingConfig,
-        exclude=[
-            'vision_pretraining_type',
-            'num_epochs',
-            'check_optimizer_step_success',
-            'skip_sync_grad_norm_across_mp',
-            'eval_iters',
-            'eval_interval',
-            'skip_train',
-        ],
-    )
+    train_factory = ArgumentGroupFactory(TrainingConfig, exclude=["vision_pretraining_type"])
     group = train_factory.build_group(parser, "training")
 
     # Keep this CLI-only until dataset options have their own config dataclass.
@@ -2873,26 +2845,7 @@ def _add_learning_rate_args(parser):
 def _add_checkpointing_args(parser):
     from megatron.training.config import CheckpointConfig
 
-    ckpt_factory = ArgumentGroupFactory(
-        CheckpointConfig,
-        exclude=[
-            'most_recent_k',
-            'save_optim',
-            'save_rng',
-            'load_optim',
-            'load_rng',
-            'stage_precision_aware_optimizer_state_on_cpu',
-            'storage_writers_per_rank',
-            'async_write_results_mp_mode',
-            'save_rng_state_per_dp_rank',
-            'custom_manager_class',
-            'also_save_hf_checkpoint',
-            'hf_source_path',
-            'hf_trust_remote_code',
-            'hf_distributed_save',
-            'hf_save_every_n_ranks',
-        ],
-    )
+    ckpt_factory = ArgumentGroupFactory(CheckpointConfig, exclude=["most_recent_k", "save_optim", "save_rng", "load_optim", "load_rng"])
     group = ckpt_factory.build_group(parser, "checkpointing")
 
     group.add_argument('--no-save-optim', action='store_true', default=None,
