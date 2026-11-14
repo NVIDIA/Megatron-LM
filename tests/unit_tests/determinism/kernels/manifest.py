@@ -763,6 +763,9 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/inference/test_batch_invariant_deepgemm_stride.py",
         ),
         kind="triton",
+        notes="The deepgemm backend's dense GEMM must profile as DeepGEMM's own kernel, not its "
+        "cuBLASLt dispatch, and keep a row's bits across batch sizes. fp32-output GEMMs of bf16 "
+        "operands (the MoE router's logits) write the fp32 accumulator on both GEMM backends.",
     ),
     KernelEntry(
         name="mtp_speculative_decoding_kernels",
