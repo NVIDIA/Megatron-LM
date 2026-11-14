@@ -1003,6 +1003,28 @@ class TEGroupedMLP(MegatronModule):
                 and not is_grouped_tensor(permuted_local_hidden_states)
                 else []
             )
+            post_probs = None
+            if self.config.deterministic_mode:
+                if output_buffer is not None:
+                    raise RuntimeError(
+                        "deterministic operation-fuser grouped MLP does not support NCCL-EP "
+                        "zero-copy output buffers: probability scaling changes the output storage."
+                    )
+                # moe_combine_bwd_dtype is the wire dtype of the gradient that the NCCL-EP combine
+                # all-to-all sends back in backward. With 'mxfp8' that gradient reaches FC2
+                # already quantized, so no autograd op may sit between FC2 and the combine.
+                if self.config.moe_combine_bwd_dtype != "bf16":
+                    raise RuntimeError(
+                        "deterministic operation-fuser grouped MLP requires "
+                        "moe_combine_bwd_dtype='bf16': FC2 consumes the quantized combine "
+                        "gradient as-is, so probability scaling cannot run after FC2."
+                    )
+                # TE's fused scaled-activation dprob uses atomics. Applying the probabilities
+                # after FC2 gives an ordinary torch reduction. FC2 scales its bias by the same
+                # probabilities, so with unit scales the output is still p * (FC2(act) + bias).
+                # Whether the FC2 bias gradient is deterministic is left to TE to enforce.
+                post_probs = permuted_probs
+                permuted_probs = torch.ones_like(permuted_probs)
             with stash_context, quant_context:
                 # NCCL-EP zero-copy: route the fc2 output (fwd combine reads it one-sided) and the
                 # fc1 dgrad (bwd dispatch scatters it one-sided) into caller-provided symm buffers.
@@ -1025,6 +1047,8 @@ class TEGroupedMLP(MegatronModule):
                     *fc2_extra_inputs,  # FC2 splits and, for bias, its per-token scale
                     **({"op_kwargs": op_kwargs} if op_kwargs else {}),
                 )
+                if post_probs is not None:
+                    output = (output * post_probs.unsqueeze(-1).float()).to(output.dtype)
         output = fused_group_mlp_manager.group_offload(
             output, forced_released_tensors=forced_released_tensors
         )

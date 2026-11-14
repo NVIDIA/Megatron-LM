@@ -1289,6 +1289,47 @@ class TestMoEModules:
             what=f"TEGroupedMLP[grouped_tensor={use_grouped_tensor}]",
         )
 
+    @pytest.mark.skipif(not HAVE_TE, reason="TE grouped MLP needs Transformer Engine")
+    @pytest.mark.launch_on_gb200
+    def test_te_grouped_mlp_op_fuser_replays_on_uneven_experts(self):
+        if not is_te_min_version("2.14.0"):
+            pytest.skip("Grouped operation-fuser requires Transformer Engine >=2.14")
+        self._init()
+        seeded()
+        # The weighted squared-ReLU activation selects the operation-fuser path without TE's
+        # CuTe DSL kernel selector. In BF16, TE runs the grouped operations unfused, so this
+        # replays the deterministic routing-probability placement end to end; the placement
+        # itself is checked against a reference in test_grouped_mlp.py.
+        config = _moe_config(
+            hidden_size=2048,
+            ffn_hidden_size=4096,
+            use_transformer_engine_op_fuser=True,
+            activation_func=squared_relu,
+            gated_linear_unit=False,
+            use_fused_weighted_squared_relu=True,
+            bias_activation_fusion=False,
+        )
+        spec = get_gpt_layer_with_transformer_engine_spec(num_experts=8, moe_grouped_gemm=True)
+        experts = get_submodules(spec.submodules.mlp).experts(
+            num_local_experts=8,
+            config=config,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+        )
+        assert isinstance(experts, TEGroupedMLP)
+        assert experts._with_fused_impl
+        experts = experts.cuda()
+        tokens_per_expert = torch.tensor([4096, 17, 0, 2048, 1, 8191, 33, 1998], dtype=torch.int64)
+        rows = int(tokens_per_expert.sum())
+        hidden = torch.randn(rows, 2048, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        probs = torch.rand(rows, device="cuda", requires_grad=True)
+        assert_module_replays_bit_exact(
+            experts,
+            (hidden, tokens_per_expert, probs),
+            replays=3,
+            contention=True,
+            what="TEGroupedMLP[operation_fuser=True]",
+        )
+
     @pytest.mark.parametrize("gated", [False, True], ids=["squared_relu", "swiglu"])
     def test_inference_nvfp4_moe_layer_replays(self, gated):
         """Inference MoELayer through FlashInfer per-token NVFP4 squared-ReLU or SwiGLU experts."""
