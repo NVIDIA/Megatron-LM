@@ -1005,6 +1005,14 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "their own; the capture order is fixed by the callable list and adds no numerics.",
     ),
     KernelEntry(
+        name="shared_native_grouped_expert_buffers",
+        sources=("megatron/core/ops/moe/grouped_expert_buffers.py",),
+        tests=(K + "test_grouped_expert_buffers.py",),
+        kind="dispatch",
+        notes="Native TE grouped GEMMs write disjoint shared output/dgrad views. Tests compare "
+        "native gradients and main-grad accumulation and replay the candidate bit-exactly.",
+    ),
+    KernelEntry(
         name="muon_newton_schulz_dispatch",
         sources=("megatron/core/optimizer/layer_sharded_muon.py",),
         tests=(
