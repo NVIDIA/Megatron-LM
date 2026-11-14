@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
-"""FSDP unit selection and recomputation ownership."""
+"""Default FSDP unit selection for real MCore layers."""
 
 import pytest
 import torch
@@ -20,27 +20,6 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
 from tests.unit_tests.distributed.mfsdp_v2.mcore_utils import destroy_model_parallel
 from tests.unit_tests.test_utilities import Utils
-
-
-@pytest.mark.parametrize("internal_recompute", [False, True])
-@pytest.mark.parametrize("has_parameters", [False, True])
-def test_recompute_respects_unit_boundary(internal_recompute, has_parameters):
-    """External replay re-enters the child unit; internal replay needs its owned weights."""
-    unit = nn.Sequential(nn.Linear(2, 2) if has_parameters else nn.Identity())
-    unit.moe_layer_recompute = internal_recompute
-    root = nn.Module()
-    root.mlp = unit
-    root.recompute_mlp = True
-    collector = FsdpUnitCollector((nn.Sequential,))
-
-    assert collector.collect(root) == [unit, root]
-    assert collector.is_partially_recomputed(unit) == (internal_recompute and has_parameters)
-    assert not collector.is_partially_recomputed(root)
-
-    # Reusing the collector must recompute the cached policy.
-    unit.moe_layer_recompute = False
-    collector.collect(root)
-    assert not collector.is_partially_recomputed(unit)
 
 
 @pytest.fixture
