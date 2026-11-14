@@ -768,6 +768,74 @@ def test_inference_default_unpermute_is_the_racy_path():
     )
 
 
+@pytest.mark.skipif(
+    not hasattr(torch, "float8_e8m0fnu") or torch.cuda.get_device_capability()[0] < 10,
+    reason="the FlashInfer CuTe-DSL MXFP8 MoE needs Blackwell or newer",
+)
+@pytest.mark.xfail(
+    strict=False,
+    raises=AssertionError,
+    reason="Negative control: the CuTe-DSL fused MoE (inference_grouped_gemm_backend="
+    "'flashinfer_cutedsl') scatters every (token, expert) row into the token's output row with "
+    "atomic adds in its FC2 epilogue, so the summation order of the top-k experts varies; "
+    "recorded, not gated.",
+)
+def test_flashinfer_cutedsl_moe_is_the_racy_path():
+    from megatron.core.inference.moe.flashinfer_cutedsl_mxfp8 import (
+        HAVE_FLASHINFER_CUTEDSL_MXFP8,
+        FlashInferCuteDslOptions,
+        flashinfer_cutedsl_mxfp8_moe,
+        prepare_cutedsl_mxfp8_weights,
+    )
+    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+
+    if not HAVE_FLASHINFER_CUTEDSL_MXFP8:
+        pytest.skip("requires the FlashInfer CuTe-DSL MXFP8 MoE")
+    from flashinfer import ActivationType
+
+    seeded()
+    experts, hidden, intermediate, topk, tokens = 16, 512, 256, 8, 2048
+
+    def stack(weights):
+        quantized = [MXFP8Tensor.from_bf16(weight, backend="triton") for weight in weights]
+        return MXFP8Tensor(
+            data=torch.stack([q.data for q in quantized]).contiguous(),
+            scale=torch.stack([q.scale for q in quantized]).contiguous(),
+            backend="triton",
+            dtype=torch.bfloat16,
+        )
+
+    fc1 = stack(
+        torch.randn(experts, intermediate, hidden, device="cuda", dtype=torch.bfloat16) * 0.05
+    )
+    fc2 = stack(
+        torch.randn(experts, hidden, intermediate, device="cuda", dtype=torch.bfloat16) * 0.05
+    )
+    weights = prepare_cutedsl_mxfp8_weights(
+        fc1, fc2, options=FlashInferCuteDslOptions.from_json(None), top_k=topk
+    )
+    hidden_states = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
+    routing = torch.rand(tokens, experts, device="cuda").topk(topk, dim=-1).indices
+    probabilities = torch.rand(tokens, topk, device="cuda")
+
+    def fused(hidden_states):
+        return flashinfer_cutedsl_mxfp8_moe(
+            hidden_states,
+            routing,
+            probabilities,
+            weights,
+            num_experts=experts,
+            local_expert_offset=0,
+            activation_type=ActivationType.Relu2.value,
+        )
+
+    differing = count_differing_replays(fused, (hidden_states,), replays=8, backward=False)
+    assert differing > 0, (
+        "the CuTe-DSL fused MoE replayed bit-exactly 7 times; if its finalize scatter became "
+        "deterministic, drop this control and register the backend as tested"
+    )
+
+
 # --- vLLM-derived fused MoE ---------------------------------------------------------------
 
 

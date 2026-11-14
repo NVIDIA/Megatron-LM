@@ -102,6 +102,12 @@ except ImportError:
 
 from megatron.core.inference.moe import ActivationType as McoreActivationType
 from megatron.core.inference.moe import InferenceGroupedGemmBackend, mcore_fused_moe, vllm_fused_moe
+from megatron.core.inference.moe.flashinfer_cutedsl_mxfp8 import (
+    FlashInferCuteDslOptions,
+    flashinfer_cutedsl_mxfp8_moe,
+    prepare_cutedsl_mxfp8_weights,
+    require_flashinfer_cutedsl_mxfp8,
+)
 from megatron.core.inference.moe.flashinfer_mxfp8 import (
     FlashInferCutlassMXFP8Weight,
     FlashInferRoutedMXFP8Weight,
@@ -112,6 +118,7 @@ from megatron.core.inference.moe.flashinfer_mxfp8 import (
     prepare_routed_mxfp8_weights,
     require_flashinfer_cutlass_mxfp8,
     require_flashinfer_routed_mxfp8,
+    select_routed_mxfp8_active_rows,
 )
 from megatron.core.inference.moe.flashinfer_nvfp4 import (
     flashinfer_routed_nvfp4_moe,
@@ -1422,6 +1429,8 @@ class InferenceGroupedMLP(TEGroupedMLP):
     - Training: delegates to parent TEGroupedMLP
     - Inference + FlashInfer: CUTLASS fused MoE for BF16 and tanh-clamped MXFP8,
       routed block-scale MoE for other MXFP8 activations and per-token NVFP4
+    - Inference + FlashInfer CuTe-DSL: fused MXFP8 MoE, optionally split across the
+      GPU's CUDA locality domains
     - Inference + torch: torch.nn.functional.grouped_mm with GPU-resident cumsum offsets
     - Inference + vLLM: Triton fused MoE for BF16, MCore scaled grouped GEMM for MXFP8
     """
@@ -1460,6 +1469,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
                     "'flashinfer'."
                 )
             self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
+        self._flashinfer_cutedsl_weights = None
+        if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER_CUTEDSL:
+            require_flashinfer_cutedsl_mxfp8()
+            self._flashinfer_activation_type = self._resolve_flashinfer_activation_type()
+            self._flashinfer_cutedsl_options = FlashInferCuteDslOptions.from_json(
+                config.inference_flashinfer_cutedsl_options
+            )
 
         self._mcore_activation_type = self._resolve_mcore_activation_type()
         self._activation_clamp_scale = config.activation_func_tanh_clamp_scale
@@ -1474,8 +1490,13 @@ class InferenceGroupedMLP(TEGroupedMLP):
     def _build_flashinfer_clamp_limit(self, device: torch.device) -> None:
         """Allocate the FP32 limit once during inference warmup, before graph capture."""
         if (
-            self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+            self.inference_grouped_gemm_backend
+            in (
+                InferenceGroupedGemmBackend.FLASHINFER,
+                InferenceGroupedGemmBackend.FLASHINFER_CUTEDSL,
+            )
             and self._activation_clamp_scale is not None
+            and self._flashinfer_clamp_limit is None
         ):
             self._flashinfer_clamp_limit = torch.full(
                 (1,), self._activation_clamp_scale, dtype=torch.float32, device=device
@@ -1600,6 +1621,9 @@ class InferenceGroupedMLP(TEGroupedMLP):
         the canonical tensors write through to it, releasing their storage.
         """
 
+        if self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER_CUTEDSL:
+            self._build_flashinfer_cutedsl_mxfp8_weights()
+            return
         use_flashinfer = (
             self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
         )
@@ -1655,11 +1679,66 @@ class InferenceGroupedMLP(TEGroupedMLP):
 
     @torch.inference_mode(False)
     @torch.no_grad()
+    def _build_flashinfer_cutedsl_mxfp8_weights(self, refresh: bool = False):
+        """Stack the canonical MXFP8 experts and derive the CuTe-DSL execution weights.
+
+        The canonical per-expert MXFP8Tensors are rebound to views of the stacked tensors
+        (the refit destination). The CuTe-DSL copy is derived from them without
+        requantization; with refresh=True it is rewritten in place (graph-stable addresses).
+        """
+        backend = resolve_mxfp8_backend(self.inference_grouped_gemm_backend)
+        if not refresh:
+            for linear_name, buf_name in InferenceGroupedMLP._EXPERT_WEIGHT_GROUPS:
+                stacked_weight = self._stack_mxfp8_linear_weight(linear_name, backend)
+                setattr(self, buf_name, stacked_weight)
+                linear = getattr(self, linear_name)
+                for i in range(self.num_local_experts):
+                    weight = InferenceGroupedMLP._unwrap_mxfp8_weight(getattr(linear, f'weight{i}'))
+                    weight.data = stacked_weight.data[i]
+                    weight.scale = stacked_weight.scale[i]
+        derived = prepare_cutedsl_mxfp8_weights(
+            self._fc1_weight,
+            self._fc2_weight,
+            options=self._flashinfer_cutedsl_options,
+            locality_domains=self.config.inference_moe_locality_domains,
+            sm_split=self.config.inference_moe_locality_domain_sm_split,
+            top_k=self.config.moe_router_topk,
+        )
+        if refresh:
+            current = self._flashinfer_cutedsl_weights
+            for name in ('fc1_data', 'fc1_scale', 'fc2_data', 'fc2_scale'):
+                getattr(current, name).copy_(getattr(derived, name))
+            for old, new in zip(current.localized_shards or [], derived.localized_shards or []):
+                for key in old:
+                    old[key].copy_(new[key])
+        else:
+            self._flashinfer_cutedsl_weights = derived
+            logger.info(
+                "Prepared FlashInfer CuTe-DSL MXFP8 expert weights: experts=%d hidden=%d "
+                "intermediate=%d->%d locality_domains=%s row_splits=%s",
+                self.num_local_experts,
+                derived.hidden_size,
+                derived.intermediate_size,
+                derived.padded_intermediate_size,
+                derived.localized_shards is not None,
+                derived.localized_row_splits,
+            )
+        self._uses_mxfp8_weights = True
+
+    @torch.inference_mode(False)
+    @torch.no_grad()
     def refresh_flashinfer_mxfp8_weights(self) -> bool:
         """Refresh derived FlashInfer expert weights in place after an MXFP8 refit.
 
         Returns whether derived FlashInfer weights were refreshed.
         """
+        if (
+            self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER_CUTEDSL
+            and self._concatenated_weights_built
+            and self._flashinfer_cutedsl_weights is not None
+        ):
+            self._build_flashinfer_cutedsl_mxfp8_weights(refresh=True)
+            return True
         if (
             not self._concatenated_weights_built
             or self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
@@ -1859,6 +1938,34 @@ class InferenceGroupedMLP(TEGroupedMLP):
             expert_tp_group=self.tp_group,
         )
 
+    def _flashinfer_cutedsl_forward(self, hidden_states, routing_map, probs):
+        """FlashInfer CuTe-DSL fused MXFP8 MoE for CUDA-graphed inference iterations."""
+        if self._flashinfer_cutedsl_weights is None:
+            raise TypeError(
+                "inference_grouped_gemm_backend='flashinfer_cutedsl' requires MXFP8 expert "
+                "weights in every MoE layer."
+            )
+        assert probs.dtype == torch.float32, "FlashInfer CuTe-DSL MoE requires fp32 probabilities."
+        # Same bounded decode prefix as the routed MXFP8 path (inference_flashinfer_mxfp8_
+        # token_capacity): rows past the prefix are invalid (-1) in decode-only graphs.
+        active_rows, _ = select_routed_mxfp8_active_rows(
+            hidden_states.shape[0],
+            token_capacity=self._flashinfer_mxfp8_token_capacity,
+            use_bounded_rows=InferenceMode.use_bounded_mxfp8_rows(),
+        )
+        output = flashinfer_cutedsl_mxfp8_moe(
+            hidden_states[:active_rows],
+            routing_map[:active_rows],
+            probs[:active_rows],
+            self._flashinfer_cutedsl_weights,
+            num_experts=self.num_local_experts * self.ep_group.size(),
+            local_expert_offset=self.ep_group.rank() * self.num_local_experts,
+            activation_type=self._flashinfer_activation_type.value,
+            clamped_relu2_limit=self._flashinfer_clamp_limit,
+            out=NVLSAllGatherVDispatcher._get_rsv_tensor() if self._nvls_dispatcher else None,
+        )
+        return output, None
+
     def _mcore_fused_moe_forward(self, hidden_states, probs, routing_map):
         """MCore grouped GEMM for Torch and the vLLM-selected MXFP8 fallback."""
         local_expert_start = self.ep_group.rank() * self.num_local_experts
@@ -1947,6 +2054,11 @@ class InferenceGroupedMLP(TEGroupedMLP):
             assert routing_map is not None, "routing_map is required for FlashInfer forward pass."
             assert not self.training, "FlashInfer forward path is only used in inference mode."
             return self._flashinfer_forward(
+                permuted_local_hidden_states, routing_map, permuted_probs
+            )
+        elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER_CUTEDSL:
+            assert routing_map is not None, "routing_map is required for FlashInfer CuTe-DSL."
+            return self._flashinfer_cutedsl_forward(
                 permuted_local_hidden_states, routing_map, permuted_probs
             )
         elif self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH:
