@@ -6908,6 +6908,58 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
     )
+    @pytest.mark.parametrize("gc_mode", ["freeze", "freeze_overlap"])
+    @torch.inference_mode()
+    def test_gc_mode_direct_llm_shutdown_releases_frozen_garbage(self, gc_mode, monkeypatch):
+        """A direct-mode MegatronLLM has no engine loop whose shutdown leaves the GC mode.
+
+        Its engine freezes the heap when the first batch drains and, under freeze_overlap,
+        disables automatic collection; the LLM's own shutdown must restore both.
+        """
+        import megatron.core.inference.apis._llm_base as llm_base
+        from megatron.core.inference.apis.llm import MegatronLLM
+
+        was_enabled = gc.isenabled()
+        gc.unfreeze()
+        gc.collect()
+        immortal_count = gc.get_freeze_count()
+        try:
+            env = self._build_test_env(DynamicEngineTestConfig(gc_mode=gc_mode))
+            controller = env.engine.controller
+            monkeypatch.setattr(
+                llm_base, "build_dynamic_inference_engine", lambda **kwargs: env.engine
+            )
+            llm = MegatronLLM(
+                model=controller.inference_wrapped_model.model,
+                tokenizer=controller.tokenizer,
+                use_coordinator=False,
+            )
+
+            # A CUDA tensor in a reference cycle that is alive while the engine serves.
+            cycle = [torch.ones(1 << 20, device="cuda")]
+            cycle_tensor = weakref.ref(cycle[0])
+            cycle.append(cycle)
+            prompts = [request.prompt_tokens.tolist() for request in env.requests[:4]]
+            results = llm.generate(prompts, SamplingParams(num_tokens_to_generate=4))
+            assert all(request.status == Status.COMPLETED for request in results)
+            assert gc.get_freeze_count() > immortal_count
+            assert gc.isenabled() is (was_enabled and gc_mode != "freeze_overlap")
+            del cycle
+            gc.collect()
+            assert cycle_tensor() is not None
+
+            llm.shutdown()
+            assert gc.get_freeze_count() == immortal_count
+            assert gc.isenabled() is was_enabled
+            assert not controller._overlap_gc
+            assert cycle_tensor() is None
+        finally:
+            gc.unfreeze()
+            (gc.enable if was_enabled else gc.disable)()
+
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
     @pytest.mark.parametrize("use_checkpoint", [False, True], ids=["persist", "recompute"])
     @torch.inference_mode()
     def test_staleness_tracking(self, use_checkpoint):
