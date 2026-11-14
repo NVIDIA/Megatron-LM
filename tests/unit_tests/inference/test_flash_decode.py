@@ -5,8 +5,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import megatron.core.models.common.embeddings.rope_utils as rope_utils
 import megatron.core.transformer.attention as attention_module
-from megatron.core.models.common.embeddings.rope_utils import apply_rotary_pos_emb_with_cos_sin
+from megatron.core.models.common.embeddings.rope_utils import (
+    _apply_rotary_pos_emb_bshd,
+    apply_rotary_pos_emb_with_cos_sin,
+)
 from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 from megatron.core.transformer.attention import SelfAttention
 
@@ -36,6 +40,41 @@ class TestRotaryEmbeddingWithPrecomputedCosSin:
         assert (
             output_flash_rotary.shape == expected_shape
         ), f"Outputs do not match: {output_flash_rotary.shape} != {expected_shape}"
+
+
+def _reference_rope_angles(seq_len, rot_dim):
+    """RoPE angles of shape [seq_len, rot_dim / 2], laid out like RotaryEmbedding.get_cos_sin."""
+    inv_freq = 1.0 / (10000 ** (torch.arange(0, rot_dim, 2, dtype=torch.float32) / rot_dim))
+    return torch.outer(torch.arange(seq_len, dtype=torch.float32), inv_freq)
+
+
+@pytest.mark.parametrize("rotary_interleaved", [False, True])
+def test_precomputed_cos_sin_fallback_matches_unfused_rope(monkeypatch, rotary_interleaved):
+    """Without flash_attn, apply_rotary_pos_emb_with_cos_sin must rotate like the unfused RoPE."""
+    monkeypatch.setattr(rope_utils, "apply_rotary_emb_flash", None)
+
+    seq_len, batch_size, num_heads, rot_dim, head_dim = 5, 2, 3, 8, 12
+    freqs = _reference_rope_angles(seq_len, rot_dim)
+    cos, sin = torch.cos(freqs), torch.sin(freqs)
+    t = torch.randn(seq_len, batch_size, num_heads, head_dim)
+
+    # Same [s, 1, 1, rot_dim] angle layout that RotaryEmbedding.get_emb feeds to the unfused RoPE.
+    if rotary_interleaved:
+        emb = freqs.repeat_interleave(2, dim=-1)
+    else:
+        emb = torch.cat((freqs, freqs), dim=-1)
+    expected = _apply_rotary_pos_emb_bshd(
+        t, emb[:, None, None, :], rotary_interleaved=rotary_interleaved
+    )
+
+    output = apply_rotary_pos_emb_with_cos_sin(t, cos, sin, rotary_interleaved=rotary_interleaved)
+
+    assert output.shape == t.shape
+    # Position 0 has angle 0 and must come back unchanged.
+    torch.testing.assert_close(output[0], t[0])
+    # Channels past rot_dim are passed through untouched.
+    torch.testing.assert_close(output[..., rot_dim:], t[..., rot_dim:])
+    torch.testing.assert_close(output, expected)
 
 
 @pytest.mark.parametrize(
