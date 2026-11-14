@@ -3,11 +3,7 @@
 from .module import MegatronModule
 from .spec_utils import ModuleSpec, build_module
 from .transformer_config import MLATransformerConfig, TransformerConfig
-from .transformer_layer import (
-    TECudaGraphTransformerLayer,
-    TransformerLayer,
-    TransformerLayerSubmodules,
-)
+from .transformer_layer import TransformerLayer, TransformerLayerSubmodules
 
 # Keep common exports initialized before feature adapters import them.
 # isort: split

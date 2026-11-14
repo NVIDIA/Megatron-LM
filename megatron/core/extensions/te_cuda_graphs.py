@@ -4,8 +4,7 @@
 
 from __future__ import annotations
 
-from functools import lru_cache, partial
-from importlib import import_module
+from functools import partial
 from weakref import WeakKeyDictionary, proxy
 
 import torch
@@ -46,74 +45,6 @@ class _TECudaGraphBackwardDWWrapperMixin:
     def set_graphed_backward_dw_callable(self, graphed_backward_dw_callable):
         """Plug the cuda-graph backward wgrad replay callable."""
         self.graphed_backward_dw_callable = graphed_backward_dw_callable
-
-
-@lru_cache(maxsize=None)
-def get_te_cuda_graph_module_class(module):
-    """Select a TE layer class after the caller checks the configured backend.
-
-    Preserve custom TransformerLayer and MoELayer subclasses and their overrides.
-    Other modules, including those already opting into the mixin, pass through.
-    """
-    from megatron.core.transformer.moe.moe_layer import MoELayer, TECudaGraphMoELayer
-    from megatron.core.transformer.moe.moe_layer_mixins import TEPartialCaptureMoEMixin
-    from megatron.core.transformer.transformer_layer import (
-        TECudaGraphTransformerLayer,
-        TransformerLayer,
-    )
-
-    if not isinstance(module, type):
-        return module
-    if issubclass(module, (TECudaGraphMixin, TEPartialCaptureMoEMixin)):
-        return module
-    if module is TransformerLayer:
-        return TECudaGraphTransformerLayer
-    if module is MoELayer:
-        return TECudaGraphMoELayer
-
-    if issubclass(module, MoELayer):
-        bases = (module, TECudaGraphMoELayer)
-    elif issubclass(module, TransformerLayer):
-        from megatron.core.transformer.hyper_connection_transformer_layer import (
-            HyperConnectionTransformerLayer,
-        )
-        from megatron.core.transformer.transformer_layer_mixins import (
-            TECudaGraphHyperConnectionTransformerLayerMixin,
-        )
-
-        bases = (module, TECudaGraphTransformerLayer)
-        if issubclass(module, HyperConnectionTransformerLayer):
-            bases = (
-                module,
-                TECudaGraphHyperConnectionTransformerLayerMixin,
-                TECudaGraphTransformerLayer,
-            )
-    else:
-        return module
-
-    # Keep the original subclass before the TE adapter so its __call__, input
-    # preparation, and forward overrides retain precedence in the MRO.
-    # Encode the original import path for reconstruction by pickle in another
-    # process; dots in __qualname__ would otherwise mean nested attributes.
-    qualname = (
-        f"_te_cuda_graph_class_{module.__module__.encode().hex()}_"
-        f"{module.__qualname__.encode().hex()}"
-    )
-    return type(
-        f"TECudaGraph{module.__name__}", bases, {"__module__": __name__, "__qualname__": qualname}
-    )
-
-
-def __getattr__(name):
-    """Resolve generated TE layer classes when unpickling an importable subclass."""
-    prefix = "_te_cuda_graph_class_"
-    if not name.startswith(prefix):
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    module_path, class_path = name[len(prefix) :].split("_", 1)
-    module = import_module(bytes.fromhex(module_path).decode())
-    for component in bytes.fromhex(class_path).decode().split("."):
-        module = getattr(module, component)
-    return get_te_cuda_graph_module_class(module)
 
 
 class TECudaGraphOffloadingInterface:
@@ -219,7 +150,7 @@ class TECudaGraphMixin:
 
         Every __init__ in the class chain must call super().__init__(...). This
         mixin's __init__ passes its arguments through unchanged, then sets up the
-        graph state once the module is built.
+        graph state after the base constructor returns.
 
     Default behavior:
         The whole forward() is one graph with a single tensor input, hidden_states.
@@ -427,10 +358,10 @@ class TECudaGraphMixin:
             if delay_offload_until_cuda_graph:
                 off_interface.exit_replay()
 
-    def _te_cuda_graph_prepare_replay(self, hidden_states: torch.Tensor, **kwargs):
+    def _te_cuda_graph_prepare_replay(self, hidden_states: torch.Tensor, *args, **kwargs):
         """Bind tensor inputs for graph replay and its eager continuation."""
         return (
-            partial(self._te_cuda_graph_replay_graph, hidden_states, **kwargs),
+            partial(self._te_cuda_graph_replay_graph, hidden_states, *args, **kwargs),
             self._te_cuda_graph_finish_replay,
         )
 
@@ -444,26 +375,28 @@ class TECudaGraphMixin:
             return TECudaGraphOffloadingInterface.get_instance()
         return None
 
-    def _te_cuda_graph_replay_graph(self, hidden_states: torch.Tensor, **kwargs):
+    def _te_cuda_graph_replay_graph(self, hidden_states: torch.Tensor, *args, **kwargs):
         """Prepare tensor inputs and replay this microbatch's graph."""
         microbatch_idx = getattr(self, 'te_cuda_graph_current_microbatch', 0)
         cg_index = self._te_cuda_graph_index(microbatch_idx)
         cudagraph_args, cudagraph_kwargs = self._get_te_cuda_graph_replay_args(
-            hidden_states, **kwargs
+            hidden_states, *args, **kwargs
         )
 
         for hook, hook_args in self.te_cuda_graph_manual_hooks:
             hook(*hook_args)
         return self.te_cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
 
-    def _get_te_cuda_graph_replay_args(self, hidden_states: torch.Tensor, **kwargs):
+    def _get_te_cuda_graph_replay_args(self, hidden_states: torch.Tensor, *args, **kwargs):
         """Validate the module's tensor inputs and add TE execution metadata."""
         assert isinstance(hidden_states, torch.Tensor), "CUDA graph accepts only Tensor inputs."
+        for arg in args:
+            assert isinstance(arg, torch.Tensor), "CUDA graph accepts only Tensor inputs."
         for value in kwargs.values():
             assert value is None or isinstance(
                 value, torch.Tensor
             ), "CUDA graph accepts only Tensor inputs."
-        cudagraph_args = (hidden_states,)
+        cudagraph_args = (hidden_states, *args)
         cudagraph_kwargs = kwargs.copy()
         cudagraph_kwargs['is_first_microbatch'] = (
             getattr(self, 'te_cuda_graph_current_microbatch', 0) == 0

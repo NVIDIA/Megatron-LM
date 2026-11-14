@@ -388,21 +388,17 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
                 submodules += [self.mlp.shared_experts]
         return submodules
 
-    def _reconstruct_packed_graph_inputs(
-        self,
-        cu_seqlens_q: Tensor,
-        cu_seqlens_kv: Optional[Tensor],
-        cu_seqlens_q_padded: Optional[Tensor],
-        cu_seqlens_kv_padded: Optional[Tensor],
-    ) -> PackedSeqParams:
+    def _reconstruct_packed_graph_inputs(self, kwargs):
         """Rebuild THD metadata inside capture using graph-static scalar capacities."""
+        if "cu_seqlens_q" not in kwargs:
+            return
         capacity = self.config.max_seqlen_per_dp_cp_rank * self.config.context_parallel_size
-        return PackedSeqParams(
+        kwargs["packed_seq_params"] = PackedSeqParams(
             qkv_format="thd",
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_kv=cu_seqlens_kv,
-            cu_seqlens_q_padded=cu_seqlens_q_padded,
-            cu_seqlens_kv_padded=cu_seqlens_kv_padded,
+            cu_seqlens_q=kwargs.pop("cu_seqlens_q"),
+            cu_seqlens_kv=kwargs.pop("cu_seqlens_kv"),
+            cu_seqlens_q_padded=kwargs.pop("cu_seqlens_q_padded"),
+            cu_seqlens_kv_padded=kwargs.pop("cu_seqlens_kv_padded"),
             max_seqlen_q=capacity,
             max_seqlen_kv=capacity,
             # Runtime packs can contain valid/physical gaps. A fixed True value
@@ -425,15 +421,8 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
             positional_inputs.pop("hidden_states")
             kwargs = dict(**positional_inputs, **kwargs)
         kwargs.setdefault("attention_mask", None)
-        cu_seqlens_q = kwargs.pop("cu_seqlens_q", None)
-        cu_seqlens_kv = kwargs.pop("cu_seqlens_kv", None)
-        cu_seqlens_q_padded = kwargs.pop("cu_seqlens_q_padded", None)
-        cu_seqlens_kv_padded = kwargs.pop("cu_seqlens_kv_padded", None)
+        self._reconstruct_packed_graph_inputs(kwargs)
         kwargs = {k: v for k, v in kwargs.items() if v is not None or k == "attention_mask"}
-        if cu_seqlens_q is not None:
-            kwargs["packed_seq_params"] = self._reconstruct_packed_graph_inputs(
-                cu_seqlens_q, cu_seqlens_kv, cu_seqlens_q_padded, cu_seqlens_kv_padded
-            )
 
         context = None
         if (

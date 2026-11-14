@@ -337,14 +337,11 @@ class BaseTransformerLayer(ABC):
         pass
 
 
-class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAttentionLayer):
+class _TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAttentionLayer):
     """A single transformer layer.
 
     Transformer layer takes input with size [s, b, h] and returns an
     output of the same size.
-
-    Use ``build_module`` for configuration-selected TE CUDA graph support, or
-    construct ``TECudaGraphTransformerLayer`` explicitly.
     """
 
     def __init__(
@@ -529,9 +526,10 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     can_recompute_pre_mlp_layernorm
                     and self.config.cuda_graph_impl == "transformer_engine"
                 ):
-                    # pylint: disable-next=line-too-long
-                    can_recompute_pre_mlp_layernorm = TECudaGraphTransformerLayerMixin.can_recompute_pre_mlp_layernorm_for_te_cudagraph(
-                        self.config, self.is_moe_layer
+                    can_recompute_pre_mlp_layernorm = (
+                        self.can_recompute_pre_mlp_layernorm_for_te_cudagraph(
+                            self.config, self.is_moe_layer
+                        )
                     )
                 if can_recompute_pre_mlp_layernorm:
                     self.recompute_pre_mlp_layernorm = True
@@ -1466,9 +1464,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             )
             mlp_output_with_bias = (mlp_output, mlp_bias)
 
-        if self.config.cuda_graph_impl == "transformer_engine" and isinstance(
-            self, TECudaGraphTransformerLayerMixin
-        ):
+        if self.config.cuda_graph_impl == "transformer_engine":
             cuda_graph_output = self._te_cuda_graph_mlp_capture_output(
                 mlp_output_with_bias, residual
             )
@@ -1911,11 +1907,11 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         return
 
 
-class TECudaGraphTransformerLayer(TECudaGraphTransformerLayerMixin, TransformerLayer):
-    """Transformer layer with opt-in TE CUDA graph capture and replay.
+class TransformerLayer(TECudaGraphTransformerLayerMixin, _TransformerLayer):
+    """A single transformer layer mapping [s, b, h] inputs to outputs of the same size.
 
-    ``build_module`` selects this class when ``cuda_graph_impl`` is
-    ``"transformer_engine"``. Direct callers can construct it explicitly.
+    The TE mixin precedes the implementation so it can wrap attention and initialize
+    graph state after layer construction. TE behavior is enabled only by config.
     """
 
 

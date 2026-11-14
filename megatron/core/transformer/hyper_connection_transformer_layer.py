@@ -24,10 +24,15 @@ from megatron.core.transformer.residual_recompute import ResidualStreamRecompute
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer_mixins import (
+    TECudaGraphHyperConnectionTransformerLayerMixin,
+)
 from megatron.core.typed_torch import apply_module
 
 
-class HyperConnectionTransformerLayer(TransformerLayer):
+class HyperConnectionTransformerLayer(
+    TECudaGraphHyperConnectionTransformerLayerMixin, TransformerLayer
+):
     """A transformer layer with Manifold-Constrained Hyper-Connections (mHC).
 
     Extends TransformerLayer by adding hyper connection modules around each active

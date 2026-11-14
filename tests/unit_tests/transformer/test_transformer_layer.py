@@ -39,7 +39,6 @@ from megatron.core.transformer.residual_recompute import (
     ResidualStreamRecomputeContext,
     build_residual_stream_recompute_plan,
 )
-from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import (
     MoETransformerLayer,
@@ -978,7 +977,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
         assert layer.is_moe_layer
         assert (layer.self_attention_hyper_connection is None) == (stages == "mlp")
         assert not hasattr(layer, "cudagraph_manager")
-        assert not hasattr(layer, "_get_submodules_under_cudagraphs")
+        assert not hasattr(layer, "te_cuda_graphs")
 
     @pytest.mark.parametrize(
         "cuda_graph_module",
@@ -1228,7 +1227,7 @@ class TestMHCWithCudaGraph:
     def _create_mhc_layer(self, hidden_size=64, num_streams=4, **extra_config):
         config = _make_mhc_config(hidden_size=hidden_size, num_streams=num_streams, **extra_config)
         layer_spec = _make_mhc_layer_spec()
-        layer = build_module(layer_spec, config=config)
+        layer = HyperConnectionTransformerLayer(config, layer_spec.submodules)
         layer.cuda()
         return layer, config
 

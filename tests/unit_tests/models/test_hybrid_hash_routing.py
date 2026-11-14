@@ -288,12 +288,7 @@ def test_hybrid_mhc_wrapper_discards_managed_pre_mlp_norm_checkpoint():
 
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
 def test_hybrid_stack_preserves_hash_ids_in_cuda_graph_signature(cuda_graph_impl):
-    layer_class = RecordingTransformerLayer
-    if cuda_graph_impl == "transformer_engine":
-        from megatron.core.extensions.te_cuda_graphs import get_te_cuda_graph_module_class
-
-        layer_class = get_te_cuda_graph_module_class(layer_class)
-    transformer_layer = layer_class(cuda_graph_impl=cuda_graph_impl)
+    transformer_layer = RecordingTransformerLayer(cuda_graph_impl=cuda_graph_impl)
     stack = make_stack([transformer_layer])
     input_ids = torch.arange(8).reshape(2, 4)
 

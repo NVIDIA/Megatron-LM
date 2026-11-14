@@ -51,7 +51,7 @@ from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualEx
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.typed_torch import apply_module, not_none
-from megatron.core.utils import internal_api
+from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
 
 try:
     import flashinfer  # pylint: disable=unused-import
@@ -243,7 +243,7 @@ class BaseMoELayer(MegatronModule, ABC):
         self.router.set_layer_number(layer_number)
 
 
-class MoELayer(BaseMoELayer):
+class MoELayer(TEPartialCaptureMoEMixin, BaseMoELayer):
     """Mixture of Experts layer.
 
     This layer implements a Mixture of Experts model, where each token is routed to a
@@ -922,15 +922,6 @@ class MoELayer(BaseMoELayer):
             from megatron.core.extensions.transformer_engine import set_save_original_input
 
             set_save_original_input(self.shared_experts.linear_fc1)
-
-
-class TECudaGraphMoELayer(TEPartialCaptureMoEMixin, MoELayer):
-    """MoE layer with opt-in TE CUDA graph partial capture and resumption.
-
-    ``build_module`` selects this class when ``cuda_graph_impl`` is
-    ``"transformer_engine"``. Direct callers can construct it explicitly.
-    The parent layer retains graph ownership.
-    """
 
 
 class _RecordExpertDgradCompletion(torch.autograd.Function):

@@ -2316,15 +2316,7 @@ class TECudaGraphHelper:
         assert (
             config.cuda_graph_impl == "transformer_engine"
         ), "Option cuda_graph_impl=transformer_engine not enabled."
-        try:
-            from transformer_engine.pytorch.graph import (
-                make_graphed_callables,  # pylint: disable=unused-import
-            )
-        except ImportError as exc:
-            raise RuntimeError(
-                "cuda_graph_impl='transformer_engine' requires Transformer Engine. "
-                "Install TE or use cuda_graph_impl='local'."
-            ) from exc
+        assert HAVE_TE_GRAPHS, "CUDA Graphs are not supported without TE."
         assert (
             "expandable_segments:True" not in os.getenv("PYTORCH_CUDA_ALLOC_CONF", "")
             or os.getenv("NCCL_GRAPH_REGISTER", "") == "0"
@@ -2907,8 +2899,6 @@ class TECudaGraphHelper:
         """
         Start capturing CUDA Graphs.
         """
-        from megatron.core.transformer.cuda_graphs import FREEZE_GC, _set_capture_start
-
         assert not self._capture_finished, "CUDA Graph capture has already been finished."
 
         torch.cuda.synchronize()
@@ -2939,8 +2929,6 @@ class TECudaGraphHelper:
         """
         Finish capturing CUDA Graphs and clean up the related state.
         """
-        from megatron.core.transformer.cuda_graphs import FREEZE_GC, _set_capture_end
-
         log_single_rank(
             logger,
             logging.INFO,
@@ -2969,8 +2957,6 @@ class TECudaGraphHelper:
         Capture CUDA Graphs per TransformerLayer per microbatch.
         """
         from transformer_engine.pytorch.graph import make_graphed_callables
-
-        from megatron.core.transformer.cuda_graphs import _CudagraphGlobalRecord, capture_constants
 
         start_time = self._start_capturing()
 
@@ -3035,8 +3021,6 @@ class TECudaGraphHelper:
         """
         Delete all CUDA graphs.
         """
-        from megatron.core.transformer.cuda_graphs import release_capture_constants
-
         assert self._graphs_created, "No CUDA Graphs were created to delete."
 
         torch.cuda.synchronize()
