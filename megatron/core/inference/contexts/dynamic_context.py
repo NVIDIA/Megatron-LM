@@ -607,6 +607,37 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self.mamba_conv_states_shape, self.mamba_ssm_states_shape = (None, None)
             self.layer_map = {i: i for i in range(self.num_attention_layers)}
 
+        self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
+
+        # Prefill token budget per step. Batch-invariant hybrid chunked prefill ends
+        # every non-final chunk on an SSM chunk boundary, so a step whose decode
+        # tokens leave less than `max_tokens` of room would round its prefill chunk
+        # down by up to a whole SSM chunk. Budget prefill against `max_tokens` alone
+        # and add one SSM chunk of step capacity for the decode tokens, so a mixed
+        # step admits at least as many prefill tokens as without batch invariance.
+        self.max_prefill_tokens = self.max_tokens
+        if (
+            self.batch_invariant_mode
+            and self.is_hybrid_model
+            and inference_config.enable_chunked_prefill
+        ):
+            self.max_tokens += self.ssm_chunk_alignment
+
+        if self.max_tokens % tp_size:
+            raise ValueError(
+                f"max_tokens ({self.max_tokens}) must be divisible by tensor parallel size "
+                f"({tp_size}) so eager prefill padding fits the input buffers."
+            )
+        if (
+            self.batch_invariant_mode
+            and self.round_up_tokens(self.max_tokens, tp_size=tp_size) != self.max_tokens
+        ):
+            raise ValueError(
+                f"max_tokens ({self.max_tokens}) must respect token rounding "
+                f"({self.TOKEN_ROUNDER}) and tensor parallel size ({tp_size}) "
+                "in batch-invariant mode."
+            )
+
         self._mtp_initialize_kv_cache(model_config, inference_config.mtp_layer_type_list)
 
         if self.num_attention_layers == 0:
@@ -886,7 +917,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self._decode_kv_lookahead_tokens / self.block_size_tokens
             )
 
-        # Set max_requests, max_tokens.
+        # Set max_requests.
         if inference_config.max_requests is None:
             # Maximize compute utilization by defaulting to 1 block per request.
             self.max_requests = self.kv_block_allocator.pool_size - 1  # -1 for dummy block
@@ -904,22 +935,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         assert (
             self.max_requests % tp_size == 0
         ), f"max_requests must be divisible by tp_size ({tp_size}), but got {self.max_requests}"
-
-        self.max_tokens = inference_config.max_tokens or self.DEFAULT_MAX_TOKENS
-
-        # Prefill token budget per step. Batch-invariant hybrid chunked prefill ends
-        # every non-final chunk on an SSM chunk boundary, so a step whose decode
-        # tokens leave less than `max_tokens` of room would round its prefill chunk
-        # down by up to a whole SSM chunk. Budget prefill against `max_tokens` alone
-        # and add one SSM chunk of step capacity for the decode tokens, so a mixed
-        # step admits at least as many prefill tokens as without batch invariance.
-        self.max_prefill_tokens = self.max_tokens
-        if (
-            self.batch_invariant_mode
-            and self.is_hybrid_model
-            and inference_config.enable_chunked_prefill
-        ):
-            self.max_tokens += self.ssm_chunk_alignment
 
         # Per-step upper bound on Mamba intermediate-state extractions, shared with
         # MambaMetadata and MambaSlotAllocator so scratch/metadata buffers and the
@@ -2970,7 +2985,9 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                     padded_decode_req_count = padded_token_count
                 padded_prefill_req_count = 0
             else:
-                padded_token_count = self.round_up_tokens(self.active_token_count)
+                padded_token_count = min(
+                    self.max_tokens, self.round_up_tokens(self.active_token_count)
+                )
                 target_padding_req_count = min(
                     self.max_requests,
                     self.round_up_requests(self.total_request_count - self.paused_request_count),
