@@ -211,8 +211,14 @@ class TestDynamicContextTensorParallelSize:
 
     @pytest.mark.parametrize("global_tp, context_tp", [(1, 2), (2, 1)])
     def test_moe_buffers_use_collection_tp_size(
-        self, unit_rounders, build_collection, global_tp, context_tp
+        self, unit_rounders, monkeypatch, build_collection, global_tp, context_tp
     ):
+        # `max_tokens` must be a multiple of the context's TP size, so rounding it up to that
+        # size alone changes nothing. With a token rounder of 3, TP 1 rounds to multiples of 3
+        # and TP 2 to multiples of 4. 62 is a multiple of neither, so the rounded value still
+        # depends on which TP size is used.
+        token_rounder = 3
+        monkeypatch.setattr(DynamicInferenceContext, "TOKEN_ROUNDER", token_rounder)
         ep_size = 2
         _require_world_size_multiple_of(global_tp, context_tp, ep_size)
         Utils.initialize_model_parallel(tensor_model_parallel_size=global_tp)
@@ -234,7 +240,7 @@ class TestDynamicContextTensorParallelSize:
             normalization="RMSNorm",
             add_bias_linear=False,
         )
-        max_tokens = 63
+        max_tokens = 62
         inference_config = InferenceConfig(
             max_sequence_length=64,
             buffer_size_gb=0.01,
@@ -253,7 +259,9 @@ class TestDynamicContextTensorParallelSize:
             DynamicInferenceContext(model_config, inference_config)
 
         # Each TP rank holds its share of a step's padded tokens.
-        per_rank_token_count = _round_up(max_tokens, context_tp) // context_tp
+        per_rank_token_count = (
+            _round_up(max_tokens, _round_up(token_rounder, context_tp)) // context_tp
+        )
         nvls_buffers.assert_called_once()
         assert nvls_buffers.call_args.kwargs["per_rank_worst_case_token_count"] == (
             per_rank_token_count
