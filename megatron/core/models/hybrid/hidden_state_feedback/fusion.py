@@ -109,7 +109,12 @@ class HiddenStateFusion(MegatronModule, ABC):
 class AdditiveHiddenStateFusion(HiddenStateFusion):
     """E + Linear(Norm(H)), inspired by Recycler's additive hidden-state adapter.
 
-    See ByteDance Seed, "Recycler: Cost-Free Latent Reasoning via Hidden State Recycling".
+    ``zero_init=True`` (default) zero-initializes the linear projection, as in Recycler,
+    so training starts from the standard Transformer computation.
+    ``zero_init=False`` uses ``config.init_method`` (default: normal, std 0.02), as in Huang et al.
+
+    See ByteDance Seed, "Recycler: Cost-Free Latent Reasoning via Hidden State Recycling", and
+    Huang et al., "Latent Feedback Is a Compute and Data Amplifier".
     """
 
     def __init__(
