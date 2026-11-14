@@ -144,8 +144,9 @@ def build_transformer_layer_callables(layer: TransformerLayer):
                 )
                 return hidden_states, local_tokens, probs, shared_expert_output
 
+        # hidden_states is positional: TransformerLayer._te_cuda_graph_replay reads args[0].
         hidden_states, local_tokens, probs, shared_expert_output = forward_func(
-            hidden_states=hidden_states,
+            hidden_states,
             attention_mask=node.chunk_state.attention_mask,
             rotary_pos_emb=node.chunk_state.rotary_pos_emb,
             rotary_pos_cos=node.chunk_state.rotary_pos_cos,
