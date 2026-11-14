@@ -11,6 +11,11 @@ from typing import List, Optional, Union
 import torch
 
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    amax_reduction_group,
+    resolve_process_groups,
+)
 from megatron.core.tensor_parallel import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -858,7 +863,13 @@ if HAVE_TE:
             return transformer_engine.common.recipe.NVFP4BlockScaling()
         raise ValueError(f"Unsupported a2a wire dtype: {a2a_dtype!r}.")
 
-    def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
+    def get_fp8_context(
+        config: TransformerConfig,
+        layer_no: int = -1,
+        is_init: bool = False,
+        *,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
         """Return fp8 context manager.
 
         Arguments:
@@ -866,6 +877,14 @@ if HAVE_TE:
             layer_no (int): *Global* layer index (including layers on other
                 pipeline-parallel ranks).
             is_init (bool): Whether the context is fp8_model_init (True) or fp8_autocast (False).
+            pg_collection (ProcessGroupCollection, optional): Process groups of the model that
+                owns the layer. The autocast context reduces amaxes over
+                ``amax_reduction_group(pg_collection, config.tp_only_amax_red)``. Omitting it is
+                deprecated and emits a ``ProcessGroupFallbackWarning``: the context then uses
+                the global amax reduction group of ``parallel_state``, and raises ``ValueError``
+                if an initialized ``parallel_state`` has none. When ``parallel_state`` is not
+                initialized, it passes no group, which Transformer Engine reads as its default
+                group. Unused by fp8_model_init, which does not reduce amaxes.
 
         Returns:
             FP8 context.
@@ -883,13 +902,24 @@ if HAVE_TE:
             # fp8 training and this layer_no is in fp8
             fp8_recipe = get_fp8_recipe(config)
 
-            fp8_group = None
-            if parallel_state.model_parallel_is_initialized():
-                fp8_group = parallel_state.get_amax_reduction_group(
-                    with_context_parallel=True, tp_only_amax_red=config.tp_only_amax_red
-                )
-
             if not is_init:
+                if pg_collection is not None:
+                    fp8_group = amax_reduction_group(pg_collection, config.tp_only_amax_red)
+                else:
+                    # Deprecated fallback for callers that do not pass the model's groups.
+                    global_groups = resolve_process_groups(
+                        None,
+                        owner="get_fp8_context",
+                        required=("tp_cp", "tp_dp_cp"),
+                        deprecated_in="0.21",
+                        removed_in="0.23",
+                    )
+                    # An initialized grid without the group is an error, as it is for a collection.
+                    fp8_group = (
+                        amax_reduction_group(global_groups, config.tp_only_amax_red)
+                        if parallel_state.model_parallel_is_initialized()
+                        else None
+                    )
                 fp8_context = transformer_engine.pytorch.fp8_autocast(
                     enabled=True, fp8_recipe=fp8_recipe, fp8_group=fp8_group
                 )
@@ -955,7 +985,13 @@ else:
             f"a2a wire dtype {a2a_dtype!r} requires TransformerEngine, which is not available."
         )
 
-    def get_fp8_context(config: TransformerConfig, layer_no: int = -1, is_init: bool = False):
+    def get_fp8_context(
+        config: TransformerConfig,
+        layer_no: int = -1,
+        is_init: bool = False,
+        *,
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
         """Returns dummy fp8 context manager since TE is not available."""
         return nullcontext()
 

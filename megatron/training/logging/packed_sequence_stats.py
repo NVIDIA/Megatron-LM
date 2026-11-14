@@ -7,6 +7,11 @@ from typing import Dict, Optional
 import torch
 
 from megatron.core import mpu
+from megatron.core.pipeline_parallel.utils import is_pp_last_stage
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 
 # Optional per-iteration packed SFT statistics. Individual sample lengths are
 # retained so the median for the global batch is exact.
@@ -15,8 +20,19 @@ _packed_sequence_trained_tokens_in_iteration: Optional[torch.Tensor] = None
 _packed_sequence_stats_active: bool = False
 
 
-def update_packed_sequence_stats(sample_lengths, loss_mask):
-    """Accumulate original-sample lengths and trained tokens for one microbatch."""
+def update_packed_sequence_stats(
+    sample_lengths, loss_mask, pg_collection: Optional[ProcessGroupCollection] = None
+):
+    """Accumulate original-sample lengths and trained tokens for one microbatch.
+
+    Args:
+        sample_lengths: Original sample lengths of the packed microbatch; zeros are padding.
+        loss_mask: Loss mask of the microbatch, summed into the trained-token count.
+        pg_collection: Process groups of the model the microbatch is for. Only its last
+            pipeline stage with tensor- and context-parallel rank 0 contributes. Omitting it
+            is deprecated: these ranks are then read from the global parallel state, with a
+            ProcessGroupFallbackWarning.
+    """
     global _packed_sequence_lengths_in_iteration
     global _packed_sequence_trained_tokens_in_iteration
     global _packed_sequence_stats_active
@@ -26,7 +42,17 @@ def update_packed_sequence_stats(sample_lengths, loss_mask):
 
     # Contribute once per data-parallel replica. All model-parallel peers still
     # participate in the global collectives when the accumulator is consumed.
-    if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
+    if pg_collection is not None:
+        if (
+            not is_pp_last_stage(pg_collection.pp)
+            or pg_collection.tp.rank() != 0
+            or pg_collection.cp.rank() != 0
+        ):
+            return
+    elif torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
+        warn_global_process_group_fallback(
+            "update_packed_sequence_stats", deprecated_in="0.21", removed_in="0.23"
+        )
         if (
             not mpu.is_pipeline_last_stage(ignore_virtual=True)
             or mpu.get_tensor_model_parallel_rank() != 0

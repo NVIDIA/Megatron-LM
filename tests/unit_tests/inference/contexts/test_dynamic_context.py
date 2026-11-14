@@ -575,6 +575,11 @@ class TestDynamicContext:
         [(1060, 8, False, "divisible"), (12, 1, True, "batch-invariant")],
     )
     def test_rejects_incompatible_token_capacity(self, max_tokens, tp_size, batch_invariant, match):
+        # The context takes its tensor parallel size from the process groups.
+        if Utils.world_size < tp_size:
+            pytest.skip(f"requires {tp_size} ranks, got {Utils.world_size}")
+        self._setup_model_parallel_group(tensor_parallel_size=tp_size, pipeline_parallel_size=1)
+
         model_config = TransformerConfig(
             num_layers=2,
             hidden_size=128,
@@ -587,8 +592,11 @@ class TestDynamicContext:
             attention_dropout=0.0,
         )
         inference_config = InferenceConfig(max_tokens=max_tokens, max_requests=8)
-        with pytest.raises(ValueError, match=match):
-            DynamicInferenceContext(model_config, inference_config)
+        try:
+            with pytest.raises(ValueError, match=match):
+                DynamicInferenceContext(model_config, inference_config)
+        finally:
+            self._restore_model_parallel()
 
     @pytest.mark.internal
     @rounder_override(64)
