@@ -204,6 +204,21 @@ def test_inference_telemetry_does_not_read_training_fields(monkeypatch, run_conf
     assert "megatron.train_iters" not in attrs
 
 
+def test_inference_telemetry_keeps_the_cli_sequence_length(monkeypatch, run_config):
+    """Inference has no data section: its sequence-length tag is args.seq_length, whether or not
+    the model config carries Megatron Core's per-sample maximum."""
+    monkeypatch.setattr(global_vars, "_detect_gpu_identity", Mock(return_value={}))
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=1024,
+    )
+    assert run_config.model.transformer.max_seq_length_per_sample is None
+    attrs = global_vars.build_telemetry_resource_attrs(
+        Namespace(local_rank=0, seq_length=32), include_training=False
+    )
+    assert attrs["dl.sequence_length"] == 32
+
+
 @pytest.mark.parametrize("training_kwargs", [{}, {"training": False}])
 def test_inference_distributed_initialization_without_training_fields(
     monkeypatch, training_kwargs, run_config
@@ -293,9 +308,15 @@ def test_distributed_training_services_require_explicit_opt_in(
     if native_model:
         run_config.model = model_config_cls(
             transformer=TransformerConfig(
-                num_layers=4, hidden_size=128, num_attention_heads=8, tp_comm_overlap=True
+                num_layers=4,
+                hidden_size=128,
+                num_attention_heads=8,
+                tp_comm_overlap=True,
+                max_seq_length_per_sample=64,  # the training sequence length (--seq-length)
             ),
             seq_length=1024,  # Position capacity must not be used for buffer sizing.
+            # A VLM's resolved decoder length; its finalize() makes it the per-sample maximum.
+            **({"decoder_seq_length": 96} if vlm else {}),
             tp_comm_overlap_cfg={"qkv_fprop": {"method": "ring_exchange"}},
         )
     else:

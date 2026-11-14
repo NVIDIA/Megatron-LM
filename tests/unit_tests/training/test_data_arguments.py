@@ -58,10 +58,15 @@ def _describe(action):
 
 
 def test_every_legacy_data_argument_is_unchanged():
+    """Every legacy action keeps its dest, default, nargs, type, choices, action class, required
+    flag and const, and every legacy option string is still accepted; an action may carry more
+    spellings than the legacy parser (the factory's store-false flags also take ``--disable-*``)."""
     actions = _actions_by_dest(_full_parser())
     for dest, legacy in LEGACY.items():
         assert dest in actions, dest
-        assert _describe(actions[dest]) == legacy, dest
+        current = _describe(actions[dest])
+        assert set(legacy["option_strings"]) <= set(current.pop("option_strings")), dest
+        assert current == {key: value for key, value in legacy.items() if key != "option_strings"}
 
 
 def test_full_parser_has_no_duplicate_option_strings():
@@ -170,3 +175,58 @@ def test_data_section_accepts_everything_validate_args_accepts(warnings_log, ext
     assert data.dataset.create_attention_mask == args.create_attention_mask_in_dataloader
     assert data.dataloader.dataloader_type == args.dataloader_type
     assert data.dataset_type is not None
+
+
+def test_loader_flags_feed_the_section():
+    """The two loader flags of the data section: store_false on pin_memory / persistent_workers,
+    read by dataloader_config_from_args like every other dest; the defaults are today's built-in
+    loader values, and zero workers keeps persistence off whatever the flag says."""
+    from megatron.training.argument_utils import dataloader_config_from_args
+
+    args = _validated([])
+    assert args.pin_memory is True and args.persistent_workers is True
+    loader = dataloader_config_from_args(args)
+    assert loader.pin_memory is True and loader.persistent_workers is True
+    loader = dataloader_config_from_args(
+        _validated(["--no-pin-memory", "--no-persistent-workers", "--num-workers", "2"])
+    )
+    assert loader.pin_memory is False and loader.persistent_workers is False
+    loader = dataloader_config_from_args(_validated(["--num-workers", "0"]))
+    loader.finalize()
+    assert loader.persistent_workers is False
+
+
+def test_loader_options_are_generated_from_the_dataloader_config():
+    """The loader options come from DataloaderConfig's fields (ArgumentGroupFactory): one action
+    per field except drop_last, its help the field docstring; the snapshot test above pins their
+    names, defaults, types and choices to the legacy registrations."""
+    from dataclasses import fields
+
+    from megatron.training.config import DataloaderConfig
+
+    actions = _actions_by_dest(_full_parser())
+    assert "drop_last" not in actions
+    helps = {
+        "dataloader_type": "Single pass vs multiple pass data loader.",
+        "num_workers": "Dataloader number of workers.",
+        "data_sharding": "Shard the dataset per data-parallel rank",
+        "pin_memory": "Pin host memory in the torch DataLoader",
+        "persistent_workers": "Keep the DataLoader workers alive between passes",
+    }
+    assert {f.name for f in fields(DataloaderConfig)} == set(helps) | {"drop_last"}
+    for dest, prefix in helps.items():
+        assert actions[dest].help.startswith(prefix), (dest, actions[dest].help)
+    # The three store-false flags carry the factory's two spellings (no metadata narrows them).
+    for dest in ("data_sharding", "pin_memory", "persistent_workers"):
+        name = dest.replace("_", "-")
+        assert set(actions[dest].option_strings) == {f"--no-{name}", f"--disable-{name}"}, dest
+
+
+def test_inter_document_masking_on_the_cli_builds_a_valid_section():
+    """validate_args clears create_attention_mask_in_dataloader under inter-document masking, so
+    the section the factory builds passes the pair check the container enforces for Python."""
+    args = _validated(["--dataloader-inter-document-masking"])
+    assert args.create_attention_mask_in_dataloader is False
+    data = gpt_data_config_from_args(args)
+    data.validate()
+    assert data.has_cu_seqlens() and not data.dataset.create_attention_mask

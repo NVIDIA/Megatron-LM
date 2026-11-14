@@ -30,9 +30,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
-from megatron.core.transformer.multi_token_prediction import (
-    get_mtp_ranks,
-)
+from megatron.core.transformer.multi_token_prediction import get_mtp_ranks
 from megatron.core.transformer.multi_token_prediction import (
     mtp_on_this_rank as mtp_on_this_rank_func,
 )
@@ -101,7 +99,6 @@ def get_batch(
 ):
     """Generate a batch."""
 
-    args = get_args()
     cfg = get_run_config()
 
     if cfg.model.transformer.sequence_packing_scheduler is not None:
@@ -127,11 +124,11 @@ def get_batch(
             config=cfg.model.transformer,
         )
 
+    # The data section's predicates and the dataset's fields; the packing path above needs
+    # neither them nor the length.
     cp_size = cfg.model.transformer.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    is_sft = args.sft
-    has_cu_seqlens = is_sft or args.dataloader_inter_document_masking
-    create_attention_mask_in_dataloader = args.create_attention_mask_in_dataloader
+    has_cu_seqlens = cfg.data.has_cu_seqlens()
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=cfg.model.transformer.pipeline_model_parallel_layout,
         mtp_num_layers=cfg.model.transformer.mtp_num_layers,
@@ -148,6 +145,8 @@ def get_batch(
     ):
         return [None for _ in BATCH_KEYS]
 
+    # The sample length: the dataset's (the model's per-sample maximum for a loader-only section).
+    seq_length = cfg.sample_length
     batch = {}
     if tp_rank == 0:
         batch = next(data_iterator)
@@ -158,6 +157,9 @@ def get_batch(
                 else None
             )
 
+    # Read after the early return above: an intermediate stage without cu_seqlens never looks at
+    # the dataset (a loader-only section has none).
+    create_attention_mask_in_dataloader = cfg.data.dataset.create_attention_mask
     batch = get_batch_on_this_tp_rank(
         batch,
         broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
@@ -167,8 +169,8 @@ def get_batch(
         create_attention_mask_in_dataloader=create_attention_mask_in_dataloader,
         cp_size=cp_size,
         tp_rank=tp_rank,
-        micro_batch_size=args.micro_batch_size,
-        seq_length=args.seq_length,
+        micro_batch_size=cfg.train.micro_batch_size,
+        seq_length=seq_length,
         mtp_on_this_rank=mtp_on_this_rank,
         pipeline_model_parallel_size=cfg.model.transformer.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
@@ -196,7 +198,7 @@ def get_batch(
         batch,
         dynamic_cp=False,
         cp_group=get_context_parallel_group(),
-        use_per_sequence_balancing=args.dataloader_inter_document_masking and not is_sft,
+        use_per_sequence_balancing=cfg.data.use_per_sequence_balancing(),
     )
 
     # Return values in BATCH_KEYS order so callers can unpack into the fixed
@@ -320,7 +322,6 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
         model (GPTModel): The GPT Model
         return_schedule_plan (bool): Whether to return the schedule plan instead of the output tensor
     """
-    args = get_args()
     cfg = get_run_config()
     timers = get_timers()
 
@@ -388,7 +389,7 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
                     max_seqlen_kv=int(max_seqlen.item()),
                     local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
                     cp_group=dynamic_cp_group,
-                    tokens_per_sample=args.seq_length,
+                    tokens_per_sample=cfg.sample_length,
                 )
 
         # Offline logits KD: record this microbatch's global (un-CP-sharded)

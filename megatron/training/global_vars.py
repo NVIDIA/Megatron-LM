@@ -235,7 +235,7 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         data_parallel_size=cfg.get_batch_parallel_size(),
         decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
         step_batch_size_schedule=cfg.train.step_batch_size_schedule,
-        seq_length=args.seq_length,
+        seq_length=cfg.sample_length,
     )
     _set_tensorboard_writer(args)
     _set_one_logger(args)
@@ -571,7 +571,6 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     cfg = get_run_config()
     resource_attrs = {'dl.local_rank': cfg.dist.local_rank}
     fields = [
-        ('dl.sequence_length', 'seq_length'),
         ('megatron.ckpt_format', 'ckpt_format'),
     ]
     if include_training:
@@ -590,6 +589,12 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
         val = getattr(args, arg_name, None)
         if val is not None:
             resource_attrs[attr] = val
+    # The per-sample length: training reads the container's (the dataset's, or the model's
+    # per-sample maximum for a loader-only section); inference keeps its CLI boundary.
+    # Skipped like any other unset field.
+    sequence_length = cfg.sample_length if include_training else getattr(args, 'seq_length', None)
+    if sequence_length is not None:
+        resource_attrs['dl.sequence_length'] = sequence_length
 
     # Preserve inference's CLI boundary; training's existing model tags use its config owner.
     if include_training:

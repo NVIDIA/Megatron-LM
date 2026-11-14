@@ -2771,9 +2771,6 @@ def _add_training_args(parser):
                        help='Disable pinning of CPU memory for gradients.')
     group.add_argument('--no-pin-cpu-params', action='store_false', dest='pin_cpu_params',
                        help='Disable pinning of CPU memory for parameters.')
-    group.add_argument('--dataloader-type', type=str, default=None,
-                       choices=['single', 'cyclic', 'external'],
-                       help='Single pass vs multiple pass data loader')
     group.add_argument('--no-persist-layer-norm', action='store_true',
                        help='Disable using persistent fused layer norm kernel. '
                        'This kernel supports only a set of hidden sizes. Please '
@@ -3100,6 +3097,13 @@ def _add_tokenizer_args(parser):
 
 
 def _add_data_args(parser):
+    from megatron.training.config import DataloaderConfig
+
+    # The loader options (--dataloader-type, --num-workers, --no-data-sharding, --no-pin-memory,
+    # --no-persistent-workers) come from DataloaderConfig's fields; drop_last stays config-only
+    # until the loader consumers read it.
+    ArgumentGroupFactory(DataloaderConfig, exclude=["drop_last"]).build_group(parser, "dataloader")
+
     group = parser.add_argument_group(title='data and dataloader')
 
     group.add_argument('--data-path', nargs='*', default=None,
@@ -3166,8 +3170,6 @@ def _add_data_args(parser):
                        help='Probability of replacing a token with mask.')
     group.add_argument('--short-seq-prob', type=float, default=0.1,
                        help='Probability of producing a short sequence.')
-    group.add_argument('--num-workers', type=int, default=2,
-                       help="Dataloader number of workers.")
     group.add_argument('--reset-position-ids', action='store_true',
                        help='Reset posistion ids after end-of-document token.')
     group.add_argument('--reset-attention-mask', action='store_true',
@@ -3244,9 +3246,6 @@ def _add_vision_args(parser):
                        help='training with fraction of classes.')
     group.add_argument('--data-per-class-fraction', type=float, default=1.0,
                        help='training with fraction of data per class.')
-    group.add_argument('--no-data-sharding', action='store_false',
-                       help='Disable data sharding.',
-                       dest='data_sharding')
     group.add_argument('--head-lr-mult', type=float, default=1.0,
                        help='learning rate multiplier for head during finetuning')
 

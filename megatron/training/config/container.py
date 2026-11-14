@@ -29,7 +29,11 @@ from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
-from megatron.training.config.dataset_config import DataConfig
+from megatron.training.config.dataset_config import (
+    DataConfig,
+    dataset_family_from_type,
+    resolve_dataset_class,
+)
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
 from megatron.training.config.resilience_config import (
@@ -62,6 +66,7 @@ from megatron.training.models.base import ModelConfig
 
 T = TypeVar("T", bound="ConfigContainerBase")
 logger = logging.getLogger(__name__)
+
 
 @dataclass(kw_only=True)
 class ConfigContainerBase:
@@ -137,7 +142,9 @@ class ConfigContainerBase:
 
         if extra_keys:
             if mode == InstantiationMode.STRICT:
-                raise ValueError(f"Dictionary contains extra keys not in {cls.__qualname__}: {extra_keys}")
+                raise ValueError(
+                    f"Dictionary contains extra keys not in {cls.__qualname__}: {extra_keys}"
+                )
             else:
                 # In lenient mode, remove extra keys
                 for key in extra_keys:
@@ -149,7 +156,9 @@ class ConfigContainerBase:
         return instance
 
     @classmethod
-    def from_yaml(cls: Type[T], yaml_path: str, mode: InstantiationMode = InstantiationMode.LENIENT) -> T:
+    def from_yaml(
+        cls: Type[T], yaml_path: str, mode: InstantiationMode = InstantiationMode.LENIENT
+    ) -> T:
         """
         Create a config container from a YAML file.
 
@@ -239,8 +248,7 @@ class ConfigContainerBase:
         """
         if not HAVE_YAML:
             raise ImportError(
-                "PyYAML is required to save a config to YAML. "
-                "Install via `pip install pyyaml`."
+                "PyYAML is required to save a config to YAML. " "Install via `pip install pyyaml`."
             )
 
         config_dict = self.to_dict(**section_overrides)
@@ -255,8 +263,7 @@ class ConfigContainerBase:
         """
         if not HAVE_YAML:
             raise ImportError(
-                "PyYAML is required to print a config as YAML. "
-                "Install via `pip install pyyaml`."
+                "PyYAML is required to print a config as YAML. " "Install via `pip install pyyaml`."
             )
 
         config_dict = self.to_dict()
@@ -349,6 +356,35 @@ class PretrainConfigContainer(ConfigContainerBase):
         """Return independent batch partitions, including GTP batch shards but not CP."""
         return self.get_parallel_layout(self.get_model_world_size()).batch_parallel_size
 
+    @property
+    def sample_length(self) -> int | None:
+        """The per-sample sequence length the training loop runs at (what ``--seq-length`` set):
+        the dataset's ``sequence_length`` when the data section has a dataset; for a loader-only
+        section (an entry point whose datasets come from its own callback), the model's
+        ``transformer.max_seq_length_per_sample``, which the launcher fills from ``--seq-length``
+        and a model config's ``finalize()`` may replace (``LLaVAModelConfig`` sets its resolved
+        decoder length: text, image tokens and padding). That field is Megatron Core's per-sample
+        maximum, a bound that may exceed the dataset's length, so the loop does not read it for a
+        section with a dataset. The data side reads this length; the model side reads
+        ``model_input_length``."""
+        dataset = self.data.dataset
+        if dataset is not None:
+            return dataset.sequence_length
+        return self.model.transformer.max_seq_length_per_sample
+
+    @property
+    def model_input_length(self) -> int | None:
+        """The length of one sample's input to the model: the model config's ``decoder_seq_length``
+        when it declares one (a VLM: the text tokens, the image tokens and the CP/SP padding),
+        otherwise the sample length. The pipeline shapes, the TP-communicator buffers, the FLOPs and
+        memory estimators, the kernel warmups and the run-level metrics read it; the data side (the
+        micro-batch calculator, ``get_batch``, the token counters, the loader telemetry) reads
+        ``sample_length``, which is the text length when a VLM's data section carries a dataset."""
+        declared = getattr(self.model, "decoder_seq_length", None)
+        if declared is not None:
+            return declared
+        return self.sample_length
+
     def _optimizer_with_model_precision(self) -> OptimizerConfig:
         """Return an optimizer copy with authoritative model precision, without mutation."""
         precision = {
@@ -418,15 +454,23 @@ class PretrainConfigContainer(ConfigContainerBase):
         if self.train.train_iters:
             if self.scheduler.lr_decay_iters is None:
                 self.scheduler.lr_decay_iters = self.train.train_iters
-            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_iters * self.train.global_batch_size
+            self.scheduler.lr_decay_steps = (
+                self.scheduler.lr_decay_iters * self.train.global_batch_size
+            )
             self.scheduler.wd_incr_steps = self.train.train_iters * self.train.global_batch_size
             self.scheduler.wsd_decay_steps = None
             if self.scheduler.lr_wsd_decay_iters is not None:
-                self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
+                self.scheduler.wsd_decay_steps = (
+                    self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
+                )
             if self.scheduler.lr_warmup_fraction is not None:
-                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+                self.scheduler.lr_warmup_steps = (
+                    self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+                )
             else:
-                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_iters * self.train.global_batch_size
+                self.scheduler.lr_warmup_steps = (
+                    self.scheduler.lr_warmup_iters * self.train.global_batch_size
+                )
         # Sample-based training.
         elif self.train.train_samples:
             # We need to set training iters for later use. Technically
@@ -439,7 +483,9 @@ class PretrainConfigContainer(ConfigContainerBase):
             self.scheduler.wd_incr_steps = self.train.train_samples
             self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_samples
             if self.scheduler.lr_warmup_fraction is not None:
-                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+                self.scheduler.lr_warmup_steps = (
+                    self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+                )
             else:
                 self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
 
@@ -632,14 +678,52 @@ class PretrainConfigContainer(ConfigContainerBase):
         )
 
     def _validate_data_section(self) -> None:
-        """Cross-section checks for ``data.dataset``, one per field.
+        """Cross-section checks for the data section, placed by their inputs.
 
-        The model capacity covers the sample length. A value given on the dataset config for one
-        of the six fields other sections own (``CONTAINER_WRITTEN_FIELDS``) must agree with that
-        section: the container writes these fields at ``finalize()``, the arguments and the saved
-        file leave them at Megatron Core's defaults, so a differing explicit value is a mistake.
-        ``data_parallel_size`` needs the world size as well and is checked at ``finalize()``.
+        With a model section, dataset or not: dynamic CP needs the single loader, and a packing
+        scheduler needs per-token loss and ``variable_seq_lengths`` (Core derives the latter at
+        construction; a scheduler selected afterwards must set it). With a dataset: the model capacity covers the sample
+        length, a value given for one of the six fields other sections own
+        (``CONTAINER_WRITTEN_FIELDS``) must agree with that section (the container writes them at
+        ``finalize()``; the arguments and the saved file leave them at Megatron Core's defaults),
+        and the model section's ``max_seq_length_per_sample``, Megatron Core's per-sample maximum,
+        covers the dataset's samples when given (the container fills an unset one from the dataset
+        at ``finalize()``; the loop reads the dataset's length through ``sample_length``).
+        With both: SBHD validation excludes a scheduler, a packed varlen dataset needs one, and the
+        sample length is a multiple of ``2 * cp`` under context parallelism. Each is the condition
+        ``validate_args`` enforces on the CLI; here it holds for a Python or YAML container too.
+        ``data_parallel_size`` and the packed-buffer budget need the world size and are checked at
+        ``finalize()``.
         """
+        transformer = getattr(self.model, "transformer", None)
+        if transformer is not None:
+            loader_type = self.data.dataloader.dataloader_type
+            if getattr(transformer, "dynamic_context_parallel", False) and loader_type not in (
+                None,
+                "single",
+            ):
+                raise ValueError(
+                    "model.transformer.dynamic_context_parallel=True needs "
+                    f"data.dataloader.dataloader_type='single', got {loader_type!r}."
+                )
+            scheduler = getattr(transformer, "sequence_packing_scheduler", None)
+            if scheduler is not None and not getattr(
+                transformer, "calculate_per_token_loss", False
+            ):
+                raise ValueError(
+                    f"model.transformer.sequence_packing_scheduler={scheduler!r} needs "
+                    "model.transformer.calculate_per_token_loss=True: packed micro-batches carry "
+                    "different numbers of trainable tokens, so the per-microbatch mean weights "
+                    "them unevenly."
+                )
+            if scheduler is not None and not getattr(transformer, "variable_seq_lengths", False):
+                raise ValueError(
+                    f"model.transformer.sequence_packing_scheduler={scheduler!r} needs "
+                    "model.transformer.variable_seq_lengths=True: Megatron Core derives it at "
+                    "construction, so a scheduler selected afterwards leaves the pipeline on fixed "
+                    "shapes while the batch path packs; set both, or select the scheduler when the "
+                    "transformer config is constructed."
+                )
         dataset = self.data.dataset
         if dataset is None:
             return
@@ -651,6 +735,18 @@ class PretrainConfigContainer(ConfigContainerBase):
                     "--max-position-embeddings) must be greater than or equal to "
                     f"data.dataset.sequence_length ({dataset.sequence_length}, --seq-length)."
                 )
+        per_sample = getattr(transformer, "max_seq_length_per_sample", None)
+        if (
+            isinstance(per_sample, int)
+            and isinstance(dataset.sequence_length, int)
+            and per_sample < dataset.sequence_length
+        ):
+            raise ValueError(
+                f"model.transformer.max_seq_length_per_sample={per_sample} is smaller than "
+                f"data.dataset.sequence_length={dataset.sequence_length}: Megatron Core's "
+                "per-sample maximum must cover the dataset's samples (left unset, the container "
+                "fills it from the dataset at finalize())."
+            )
         validation = self.validation
         if (
             dataset.full_validation is not None
@@ -699,6 +795,28 @@ class PretrainConfigContainer(ConfigContainerBase):
                 "model.transformer.dynamic_context_parallel=False; the container writes this field "
                 "at finalize(), leave it unset."
             )
+        family, _mock = dataset_family_from_type(
+            resolve_dataset_class(dataset, self.data.dataset_type)
+        )
+        scheduler = getattr(transformer, "sequence_packing_scheduler", None)
+        if family == "varlen" and dataset.varlen_sbhd_validation and scheduler is not None:
+            raise ValueError(
+                "data.dataset.varlen_sbhd_validation=True does not use a packing scheduler; "
+                f"model.transformer.sequence_packing_scheduler={scheduler!r} must be unset."
+            )
+        if self.data.yields_unpacked_samples() and scheduler is None:
+            raise ValueError(
+                "A varlen dataset without SBHD validation emits one unpacked sample per item and "
+                "needs model.transformer.sequence_packing_scheduler ('dp_balanced', or "
+                "'default_dynamic_cp' under dynamic context parallelism); validate_args selects it "
+                "for --use-varlen-dataset, a Python or YAML container sets it explicitly."
+            )
+        context_parallel_size = transformer.context_parallel_size
+        if context_parallel_size > 1 and dataset.sequence_length % (2 * context_parallel_size):
+            raise ValueError(
+                f"data.dataset.sequence_length ({dataset.sequence_length}) must be a multiple of "
+                f"2 * model.transformer.context_parallel_size ({context_parallel_size})."
+            )
 
     def _finalize(self) -> None:
         # Checkpoint derivations first: the RL check below reads the derived load_optim. The
@@ -726,6 +844,20 @@ class PretrainConfigContainer(ConfigContainerBase):
                     f"(data_parallel_size={data_parallel_size}); the container writes this field "
                     "at finalize(), leave it unset."
                 )
+            # The packed-sequence buffer covers one sample: cp ranks, times the data-parallel
+            # replicas under default_dynamic_cp (validate_args's rule, which needs the world size).
+            scheduler = getattr(transformer, "sequence_packing_scheduler", None)
+            budget = getattr(transformer, "max_seqlen_per_dp_cp_rank", None)
+            if scheduler is not None and budget is not None:
+                total_cp_ranks = transformer.context_parallel_size * (
+                    data_parallel_size if scheduler == "default_dynamic_cp" else 1
+                )
+                if total_cp_ranks * budget < dataset.sequence_length:
+                    raise ValueError(
+                        f"The packed-sequence buffer ({total_cp_ranks} ranks * "
+                        f"max_seqlen_per_dp_cp_rank {budget} = {total_cp_ranks * budget}) must "
+                        f"cover one sample (data.dataset.sequence_length {dataset.sequence_length})."
+                    )
         batch_sizes = self._resolve_batch_sizes(self.get_batch_parallel_size())
         self._validate_rl_config(batch_sizes[0])
         # Resolve RNG and model settings before deriving optimizer precision.
@@ -837,6 +969,12 @@ class PretrainConfigContainer(ConfigContainerBase):
         if dataset is not None:
             # The six fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
             # from the validation config, the layout from the required model config.
+            # In the other direction, Megatron Core's per-sample maximum (NCCL EP sizes its
+            # packed-input buffers from it) defaults to the dataset's length, which bounds every
+            # sample; an explicit larger value stays. The loop reads the length through
+            # sample_length, not from this bound.
+            if transformer.max_seq_length_per_sample is None:
+                transformer.max_seq_length_per_sample = dataset.sequence_length
             dataset.full_validation = self.validation.full_validation
             dataset.multiple_validation_sets = self.validation.multiple_validation_sets
             dataset.data_parallel_size = data_parallel_size

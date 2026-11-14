@@ -1,10 +1,11 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
-import time, os
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import os
+import time
 
 from megatron.core._rank_utils import safe_get_world_size
-
-from .global_vars import get_one_logger, get_args
 from megatron.training.global_vars import get_run_config
+
+from .global_vars import get_args, get_one_logger
 
 _one_logger_utils_version = "1.2.0-mlm"
 
@@ -270,7 +271,6 @@ def on_pretrain_start():
     """ Function to be called at the start of pretrain function to track E2E meta data
     """
     cfg = get_run_config()
-    args = get_args()
     one_logger = get_one_logger()
 
     if one_logger:
@@ -292,7 +292,7 @@ def on_pretrain_start():
                 'tensor_model_parallel_size': cfg.model.transformer.tensor_model_parallel_size,
                 'expert_model_parallel_size' : cfg.model.transformer.expert_model_parallel_size,
                 'world_size': safe_get_world_size(),
-                'model_seq_length': args.seq_length,
+                'model_seq_length': cfg.model_input_length,
                 'app_tag_run_name': app_tag_run_name,
                 'app_tag_run_version': app_tag_run_version,
                 'is_log_throughput_enabled': cfg.logger.log_throughput,

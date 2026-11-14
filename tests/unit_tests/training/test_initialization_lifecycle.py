@@ -466,7 +466,12 @@ def test_runtime_service_order_and_microbatch_inputs(
     args.micro_batch_size = 99
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
     cfg.model = GPTModelConfig(
-        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        transformer=TransformerConfig(
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            max_seq_length_per_sample=32,  # the loader-only sample length the calculator takes
+        ),
         seq_length=32,
         vocab_size=128,
     )
@@ -1223,6 +1228,10 @@ def test_mock_vlm_resolves_padding_before_startup(
     assert model.transformer.tp_comm_overlap == overlap
     assert args.dataloader_seq_length == 1792
     assert args.decoder_seq_length == expected
+    # The model config records the resolved length; finalize() makes it the per-sample maximum.
+    assert model.decoder_seq_length == expected
+    model.finalize()
+    assert model.transformer.max_seq_length_per_sample == expected
 
 
 @pytest.mark.parametrize("eval_batch_sizes", [None, (16, 4)])

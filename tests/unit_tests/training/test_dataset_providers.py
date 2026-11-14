@@ -227,6 +227,14 @@ def _layout_from_args(args):
         context_parallel_size=args.context_parallel_size,
         sequence_parallel=args.sequence_parallel,
         dynamic_context_parallel=args.dynamic_context_parallel,
+        # What the shared rank predicate reads from the model section (the real config's values
+        # for these arguments).
+        sequence_packing_scheduler=args.sequence_packing_scheduler,
+        pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
+        mtp_num_layers=args.mtp_num_layers,
+        calculate_per_token_loss=args.calculate_per_token_loss,
+        max_seqlen_per_dp_cp_rank=args.max_seqlen_per_dp_cp_rank,
+        variable_seq_lengths=args.variable_seq_lengths,
         gtp_weight_remat_size=args.gtp_weight_remat_size,
         tensor_parallel_num_sequence_shards=args.gtp_remat_num_sequence_shards
         * (args.tensor_model_parallel_size if args.sequence_parallel else 1),

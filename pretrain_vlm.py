@@ -51,6 +51,9 @@ def set_vlm_sequence_lengths(args: Namespace, model_config: LLaVAModelConfig) ->
 
     An explicit decoder length includes image tokens and padding. Otherwise, derive
     the smallest length that fits the text and image and supports CP/SP splitting.
+    The result is recorded on the model config, whose ``finalize()`` makes it the
+    language transformer's per-sample maximum; the namespace copy serves this
+    script's own readers.
     """
     if not isinstance(model_config, LLaVAModelConfig):
         raise TypeError(
@@ -85,6 +88,7 @@ def set_vlm_sequence_lengths(args: Namespace, model_config: LLaVAModelConfig) ->
         )
     elif padding:
         raise ValueError("--decoder-seq-length must be divisible by the CP/SP padding factor")
+    model_config.decoder_seq_length = args.decoder_seq_length
 
 
 def model_provider(

@@ -54,7 +54,6 @@ from megatron.training.global_vars import (
     get_train_state,
     initialize_runtime_services,
 )
-from megatron.training.models import LLaVAModelConfig
 from megatron.training.utils import is_rank0, print_rank_0, warn_rank_0
 
 logger = logging.getLogger(__name__)
@@ -245,16 +244,12 @@ def initialize_megatron(
                 tp_comm_overlap_cfg = args.tp_comm_overlap_cfg
             else:
                 tp_comm_overlap_cfg = cfg.model.tp_comm_overlap_cfg
-            # Model seq_length is position capacity, not the actual batch length.
-            # VLM overlap uses the padded text+image decoder length.
-            sequence_length = (
-                args.decoder_seq_length
-                if isinstance(cfg.model, LLaVAModelConfig)
-                else args.seq_length
-            )
+            # The model input length: the model config's decoder length when it declares one (a
+            # VLM, whether its data section is loader-only or carries a dataset), otherwise the
+            # sample length. The model's seq_length is position capacity, not a batch length.
             _initialize_tp_communicators(
                 transformer_config,
-                sequence_length=sequence_length,
+                sequence_length=cfg.model_input_length,
                 micro_batch_size=cfg.train.micro_batch_size,
                 tp_comm_overlap_cfg=tp_comm_overlap_cfg,
             )

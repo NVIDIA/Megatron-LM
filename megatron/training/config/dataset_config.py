@@ -17,12 +17,19 @@ layout and the validation flags): the container writes them at ``finalize()``
 class the builder instantiates (``GPTDataset``, ``MockGPTDataset``, ``GPTFIMDataset``, ...). One rule
 serves every GPT entry point: the args-to-config factory forwards every data argument, the class
 follows the family flags, and the provider hands ``cfg.data.dataset`` to the builder unchanged.
+The loop reads the section through its predicates (``is_sft()``, ``has_cu_seqlens()``,
+``use_per_sequence_balancing()``, ``yields_unpacked_samples()``) and the dataset's fields, never
+through ``args``; the sample length it runs at is the container's ``sample_length``: the dataset's
+``sequence_length``, or for a loader-only section the model's ``max_seq_length_per_sample``
+(Megatron Core's per-sample maximum, filled from ``--seq-length`` by the launcher, a VLM's resolved
+decoder length by its model config's ``finalize()``; with a dataset the container checks that it
+covers the samples and fills it when unset).
 Entry points with their own data pipeline carry a loader-only section (``dataset is None``) and
 nothing here runs for them.
 """
 
 from dataclasses import dataclass, field, fields
-from typing import Any
+from typing import Any, Literal, get_args
 
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
@@ -30,7 +37,9 @@ from megatron.training.config.utils import serialize_value
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 
-DATALOADER_TYPES = ("single", "cyclic", "external")
+DataloaderType = Literal["single", "cyclic", "external"]
+"""The loader kinds; the CLI choices of ``--dataloader-type`` come from this annotation."""
+DATALOADER_TYPES = get_args(DataloaderType)
 # Family -> (dataset class, mock dataset class or None): the legacy family flags select the class
 # and DataConfig.validate() checks the class against the config.
 DATASET_CLASSES: dict[str, tuple[type, type | None]] = {
@@ -57,9 +66,12 @@ CONTAINER_WRITTEN_FIELDS = (
 
 @dataclass(kw_only=True)
 class DataloaderConfig:
-    """Settings for building torch DataLoaders on top of a dataset."""
+    """Settings for building torch DataLoaders on top of a dataset. The CLI options are generated
+    from these fields (``ArgumentGroupFactory`` in ``_add_data_args``), except ``drop_last``; the
+    three store-false flags take the factory's ``--no-*`` and ``--disable-*`` spellings and
+    ``dataloader_type``'s choices come from its ``Literal`` annotation."""
 
-    dataloader_type: str | None = None
+    dataloader_type: DataloaderType | None = None
     """Single pass vs multiple pass data loader. 'external' passes the dataset through unchanged.
     Unset selects 'single'."""
 
@@ -70,16 +82,15 @@ class DataloaderConfig:
     """Shard the dataset per data-parallel rank before shuffling (cyclic sampler only)."""
 
     pin_memory: bool = True
-    """Pin host memory in the torch DataLoader. Declared only for now: the training loop keeps its
-    built-in value until the loader consumers read this config."""
+    """Pin host memory in the torch DataLoader (``--no-pin-memory`` turns it off)."""
 
     persistent_workers: bool = True
-    """Keep DataLoader workers alive between epochs. Forced to False when num_workers == 0. Declared
-    only for now: the training loop keeps its built-in value until the loader consumers read it."""
+    """Keep the DataLoader workers alive between passes (``--no-persistent-workers`` turns it off).
+    Forced to False when ``num_workers == 0``: there are no workers to keep."""
 
     drop_last: bool = True
-    """Drop the last incomplete micro-batch. Declared only for now: the training loop keeps its
-    built-in value until the loader consumers read this config."""
+    """Drop the last incomplete micro-batch. Declared only for now (no CLI option): the training
+    loop keeps its built-in value until the loader consumers read this config."""
 
     def validate(self) -> None:
         """Check the loader settings without mutation."""
@@ -222,11 +233,20 @@ class DataConfig:
         Megatron Core's checks that need no tokenizer (``validate_without_tokenizer()``: the blend /
         split rules, the GPT booleans, the FIM rates and tokens) run here too, so a YAML or Python
         section fails at ``cfg.validate()``, before runtime initialization; the checks that need the
-        tokenizer run in ``bind_tokenizer()`` and in the builder.
+        tokenizer run in ``bind_tokenizer()`` and in the builder. Inter-document masking with the
+        dataloader attention mask is rejected here (the CLI normalizes the pair away).
         """
         self.dataloader.validate()
         if self.dataset is not None:
             self.dataset.validate_without_tokenizer()
+            if self.dataset.inter_document_masking and self.dataset.create_attention_mask:
+                raise ValueError(
+                    "data.dataset.inter_document_masking=True needs create_attention_mask=False: "
+                    "the dataset omits the attention mask under inter-document masking, and a "
+                    "batch path told to expect one waits for a broadcast that never comes "
+                    "(validate_args clears the flag for --dataloader-inter-document-masking; a "
+                    "Python or YAML section sets it explicitly)."
+                )
         resolve_dataset_class(self.dataset, self.dataset_type)
 
     def finalize(self) -> None:
@@ -271,6 +291,44 @@ class DataConfig:
                 "cfg.data.bind_tokenizer(tokenizer)."
             )
         return self.dataset_type, self.dataset, is_packed_sequence(self.dataset_type, self.dataset)
+
+    def _family(self) -> str | None:
+        """The family of the dataset class the section entails (resolved read-only, nothing is
+        committed); None for a loader-only section."""
+        if self.dataset is None:
+            return None
+        family, _mock = dataset_family_from_type(
+            resolve_dataset_class(self.dataset, self.dataset_type)
+        )
+        return family
+
+    def is_sft(self) -> bool:
+        """The SFT family exactly (``SFTDataset`` / ``MockSFTDataset``); the loss reductions key on
+        it. Derived from the dataset class, so a mock dataset and its real counterpart agree; False
+        for a loader-only section."""
+        return self._family() == "sft"
+
+    def has_cu_seqlens(self) -> bool:
+        """``get_batch``'s formula: SFT samples and inter-document masking carry ``cu_seqlens``.
+        Read from the section on every rank before any sample is seen: tensor-parallel ranks other
+        than the source receive the batch by broadcast and the middle pipeline stages build only the
+        packed metadata, so neither can find out from a sample. False for a loader-only section."""
+        dataset = self.dataset
+        return dataset is not None and (self.is_sft() or bool(dataset.inter_document_masking))
+
+    def use_per_sequence_balancing(self) -> bool:
+        """``get_batch``'s formula: inter-document masking balances the context-parallel split per
+        sequence, SFT does not. False for a loader-only section."""
+        dataset = self.dataset
+        return dataset is not None and bool(dataset.inter_document_masking) and not self.is_sft()
+
+    def yields_unpacked_samples(self) -> bool:
+        """The dataset emits one variable-length sample dict per item for an upstream packing
+        scheduler (the varlen family without SBHD validation), so the loader keeps the list as is
+        (the identity collate). ``False`` for every other family and for a loader-only section:
+        SFT samples are packed (``is_packed_sequence``) but fixed-width, and go through the
+        default collate."""
+        return self._family() == "varlen" and not bool(self.dataset.varlen_sbhd_validation)
 
     def to_cfg_dict(self) -> dict[str, Any]:
         """Serialize the section.
