@@ -115,6 +115,10 @@ _CUDA_GRAPH_STREAM_POOLS = None
 _CUDA_GRAPH_STREAM_NEXT_SLOT = 0
 logger = logging.getLogger(__name__)
 
+# Graph sets per layer under overlap_moe_expert_parallel_comm at PP=1: the combined 1F1B
+# schedule has at most two micro-batches in flight (forward of s, backward of s-1).
+_EP_OVERLAP_NUM_GRAPH_SETS = 2
+
 
 def _get_cuda_graph_stream() -> torch.cuda.Stream:
     """Assign local CUDA-graph runners across a bounded set of distinct streams.
@@ -2383,7 +2387,7 @@ class TECudaGraphHelper:
         self.p2p_communicator = P2PCommunicator(pp_group=self.pp_group, config=self.config)
         self.num_model_chunks = len(model)
 
-        # Number of microbatches to capture. The value will be set in _get_cuda_graph_input_data().
+        # Number of microbatches to capture. The value is set in _get_cuda_graph_capture_plans().
         self.num_microbatches = None
 
         self._discover_layers()
@@ -2763,8 +2767,19 @@ class TECudaGraphHelper:
 
     def _get_cuda_graph_input_data(self):
         """
+        Return (sample_args, kwargs) for configs captured by a single make_graphed_callables() call.
+        """
+        capture_plans = self._get_cuda_graph_capture_plans()
+        assert len(capture_plans) == 1, "Expected a single capture plan."
+        return capture_plans[0]
+
+    def _get_cuda_graph_capture_plans(self):
+        """
         Create the CUDA Graph capturing input data.
         The data is organized per-chunk per-microbatch per-layer.
+
+        Returns a list of (sample_args, kwargs), one per make_graphed_callables() call: one per
+        graph set under overlap_moe_expert_parallel_comm at PP=1, otherwise a single entry.
         """
 
         # Get the PP and VPP scheduling order.
@@ -2809,6 +2824,8 @@ class TECudaGraphHelper:
             msg=f'Rank {torch.distributed.get_rank()}: ORDER {order}',
         )
         chunk_id_list = None
+        # Per-set capture needs the counts before the overlap branch below flattens them.
+        num_layers_per_chunk_orig = list(self.num_layers_per_chunk)
         if self.config.overlap_moe_expert_parallel_comm:
             wgrad_in_graph_scope = CudaGraphModule.attn in self.config.cuda_graph_modules or (
                 CudaGraphModule.moe_router in self.config.cuda_graph_modules
@@ -2836,10 +2853,30 @@ class TECudaGraphHelper:
                 f'ORDER after overlap_moe_expert_parallel_comm {order}',
             )
 
-        # Generate sample arguments and keyword arguments for capturing.
-        sample_args, sample_kwargs = self._get_sample_arguments(order, chunk_id_list)
+        if self.config.overlap_moe_expert_parallel_comm and self.pp_group.size() == 1:
+            # Replay uses graph set s % num_sets for micro-batch s
+            # (GraphableMegatronModule._te_cuda_graph_index). Each set is captured by its own
+            # make_graphed_callables() call with a one-micro-batch order, so it gets its own
+            # mempool and static inputs: in a shared mempool, one set's forward graphs would
+            # overwrite memory the other set's backward graphs still read.
+            order, chunk_id_list = get_overlap_moe_expert_parallel_comm_order(
+                [1, -1], num_layers_per_chunk_orig, capture_wgrad_graph
+            )
+            num_sets = min(self.num_microbatches, _EP_OVERLAP_NUM_GRAPH_SETS)
+            # _get_sample_arguments() sizes its inputs by self.num_microbatches: 1 per set.
+            # Afterwards self.num_microbatches counts the sets.
+            self.num_microbatches = 1
+            try:
+                capture_plans = [
+                    self._get_sample_arguments(order, chunk_id_list) for _ in range(num_sets)
+                ]
+            finally:
+                self.num_microbatches = num_sets
+        else:
+            # Generate sample arguments and keyword arguments for capturing.
+            capture_plans = [self._get_sample_arguments(order, chunk_id_list)]
 
-        def get_make_graphed_callables_kwargs():
+        def get_make_graphed_callables_kwargs(sample_kwargs):
             kwargs = {
                 'allow_unused_input': True,
                 '_order': order,
@@ -2852,6 +2889,8 @@ class TECudaGraphHelper:
             # make_graphed_callables().
             # 2. There should be at least 10 warmup iterations per layer, counting the MCore warmup
             # steps before going into this capture routine.
+            # Under per-set capture self.num_microbatches counts the sets, and each set's call
+            # warms up its one micro-batch this many times, so rule 2 still holds.
             kwargs['num_warmup_iters'] = max(
                 1,
                 math.ceil(
@@ -2928,8 +2967,10 @@ class TECudaGraphHelper:
                 kwargs['post_warmup_hook'] = off_interface.enable_offload
             return kwargs
 
-        kwargs = get_make_graphed_callables_kwargs()
-        return sample_args, kwargs
+        return [
+            (sample_args, get_make_graphed_callables_kwargs(sample_kwargs))
+            for sample_args, sample_kwargs in capture_plans
+        ]
 
     def _start_capturing(self):
         """
@@ -3001,16 +3042,29 @@ class TECudaGraphHelper:
                 'TECudaGraphHelper: No graphable layers found. Skipping CUDA graph capture.'
             )
         else:
-            # Prepare CUDA Graph capturing input data and call `make_graphed_callables`.
-            sample_args, kwargs = self._get_cuda_graph_input_data()
+            # Prepare CUDA Graph capturing input data and call `make_graphed_callables` per plan.
+            capture_plans = self._get_cuda_graph_capture_plans()
             if self.config.sequence_parallel:
                 rng_context = get_cuda_rng_tracker().fork()
             else:
                 rng_context = nullcontext()
+            # The eager warmup steps leave AccumulateGrad nodes bound to the default stream,
+            # which newer PyTorch rejects at capture unless autograd may redirect them to the
+            # capturing stream. Same process-global setting, left enabled for the same reasons,
+            # as in _CudagraphGlobalRecord._create_cudagraphs().
+            if hasattr(torch.autograd.graph, 'set_override_stale_capture_stream'):
+                torch.autograd.graph.set_override_stale_capture_stream(True)
             with rng_context, capture_constants(self):
-                graphs = make_graphed_callables(
-                    tuple(self.flattened_callables), sample_args, **kwargs
-                )
+                graphs_per_plan = [
+                    make_graphed_callables(tuple(self.flattened_callables), sample_args, **kwargs)
+                    for sample_args, kwargs in capture_plans
+                ]
+            if len(graphs_per_plan) == 1:
+                graphs = graphs_per_plan[0]
+            else:
+                # Each set's plan returned one graph per layer. Interleave them layer-major,
+                # graphs[layer * num_sets + set], as the overlap assembly below expects.
+                graphs = [graph for layer_graphs in zip(*graphs_per_plan) for graph in layer_graphs]
 
             # The returned callables can outlive this helper. Share the capture's
             # constants with those actual graph owners instead of retaining them here.

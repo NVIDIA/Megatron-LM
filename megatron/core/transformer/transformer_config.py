@@ -4237,9 +4237,16 @@ class TransformerConfig(ModelParallelConfig):
         if scheduler_te_graphs:
             assert self.pad_packed_seq_alignment in ("max", self.max_seqlen_per_dp_cp_rank)
             assert self.cuda_graph_thd_max_packed_sequences is not None
-            assert self.cuda_graph_modules == [
-                CudaGraphModule.attn
-            ], "Scheduler-produced THD CUDA graphs currently support attention capture only."
+            # moe_router extends the attention graph through the router. The THD metadata is
+            # still consumed by attention only; the router reads padding_mask (aux/z-loss token
+            # counts, expert bias), which the layer reserves as a static graph input when the
+            # eager warmup steps passed one (TransformerLayer.get_layer_static_inputs).
+            modules = set(self.cuda_graph_modules)
+            supported_modules = {CudaGraphModule.attn, CudaGraphModule.moe_router}
+            assert CudaGraphModule.attn in modules and modules <= supported_modules, (
+                "Scheduler-produced THD CUDA graphs require attention capture "
+                "and optionally support moe_router capture."
+            )
             assert is_te_min_version("2.18.0"), "Packed TE graphs require TE >= 2.18.0."
 
         self.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(
