@@ -92,6 +92,23 @@ def get_model_builder(
             setattr(args, field, get_pg_size(group))
             if getattr(args, "yaml_cfg", None) is not None:
                 setattr(args.model_parallel, field, get_pg_size(group))
+        # The weight / sequence shard counts were derived from the global (tensor / expert tensor)
+        # parallel sizes; re-derive them from this shard's, keeping the GTP factors. Otherwise a
+        # shard with a larger TP than the global one (e.g. a TP8 decode shard next to a TP4
+        # prefill shard) fails the shards >= TP checks, and a smaller one implies a GTP factor.
+        if hasattr(args, "tensor_parallel_num_weight_shards"):
+            args.tensor_parallel_num_weight_shards = args.tensor_model_parallel_size * getattr(
+                args, "gtp_weight_remat_size", 1
+            )
+        if hasattr(args, "tensor_parallel_num_sequence_shards"):
+            sp_size = args.tensor_model_parallel_size if args.sequence_parallel else 1
+            args.tensor_parallel_num_sequence_shards = sp_size * getattr(
+                args, "gtp_remat_num_sequence_shards", 1
+            )
+        if hasattr(args, "expert_tensor_parallel_num_weight_shards"):
+            args.expert_tensor_parallel_num_weight_shards = (
+                args.expert_tensor_parallel_size * getattr(args, "expert_gtp_weight_remat_size", 1)
+            )
     if provider is None:
         provider = args.model_provider
     if provider == "gpt":
