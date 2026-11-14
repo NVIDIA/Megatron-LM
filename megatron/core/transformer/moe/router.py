@@ -28,8 +28,11 @@ from megatron.core.transformer.moe.moe_utils import (
     apply_router_token_dropping,
     compute_normalized_router_scores,
     compute_routing_scores_for_aux_loss,
+    fused_topk_with_aux_loss_scores,
+    fused_topk_with_aux_loss_scores_is_supported,
     fused_topk_with_score_function_supports_topk_indices,
     get_tokens_per_expert_and_token_count,
+    mark_compact_route_probs,
     qb_dual_update,
     router_gating_linear,
     sinkhorn,
@@ -595,11 +598,16 @@ class TopKRouter(Router):
         self,
         probs: torch.Tensor,
         scores_for_aux_loss: torch.Tensor,
-        routing_map: torch.Tensor,
+        routing_map: Optional[torch.Tensor],
         with_padding_mask: bool = False,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        local_tokens_per_expert: Optional[torch.Tensor] = None,
     ):
-        """Apply the auxiliary loss for the given scores and routing map."""
+        """Apply the auxiliary loss for the given scores and routing map.
+
+        local_tokens_per_expert, if given, is ``routing_map.sum(dim=0)`` computed by the fused
+        router; routing_map is then None.
+        """
         aux_loss_coeff = self.get_aux_loss_coeff("aux_loss")
         if aux_loss_coeff == 0:
             return probs
@@ -611,6 +619,8 @@ class TopKRouter(Router):
                 reduce_group=aux_loss_groups.loss_reduce_groups,
                 topk=self.topk,
                 with_padding_mask=with_padding_mask,
+                local_tokens_per_expert=local_tokens_per_expert,
+                num_local_tokens=scores_for_aux_loss.shape[0],
             )
         )
 
@@ -643,11 +653,12 @@ class TopKRouter(Router):
         self,
         probs: torch.Tensor,
         scores_for_aux_loss: torch.Tensor,
-        routing_map: torch.Tensor,
+        routing_map: Optional[torch.Tensor],
         seq_length: int,
         bsz: int,
         with_padding_mask: bool = False,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        local_tokens_per_expert: Optional[torch.Tensor] = None,
     ):
         """Apply the sequence-level auxiliary loss for the given scores and routing map.
 
@@ -655,13 +666,19 @@ class TopKRouter(Router):
         experts dimension. The resulted loss by switch_load_balancing_loss_func is equal
         to the sum of aux loss for each sequence in the batch. And then we divide the aux
         loss by the batch size to get averaged aux loss.
+
+        local_tokens_per_expert, if given, is ``routing_map.sum(dim=0)`` computed by the fused
+        router for bsz == 1; routing_map is then None.
         """
         seq_aux_loss_coeff = self.get_aux_loss_coeff("seq_aux_loss")
         if seq_aux_loss_coeff == 0:
             return probs
 
         scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
-        routing_map = routing_map.reshape(seq_length, -1)
+        if routing_map is not None:
+            routing_map = routing_map.reshape(seq_length, -1)
+        else:
+            assert bsz == 1, "precomputed tokens per expert need bsz == 1 for the seq aux loss"
 
         aux_loss_groups = self._get_aux_loss_groups(packed_seq_params)
         global_tokens_per_expert, local_num_tokens, total_num_tokens = (
@@ -670,6 +687,8 @@ class TopKRouter(Router):
                 reduce_group=aux_loss_groups.loss_reduce_groups,
                 with_padding_mask=with_padding_mask,
                 topk=self.topk * bsz,
+                local_tokens_per_expert=local_tokens_per_expert,
+                num_local_tokens=seq_length,
             )
         )
 
@@ -709,10 +728,15 @@ class TopKRouter(Router):
         self,
         probs: torch.Tensor,
         scores_for_aux_loss: torch.Tensor,
-        routing_map: torch.Tensor,
+        routing_map: Optional[torch.Tensor],
         with_padding_mask: bool = False,
+        local_tokens_per_expert: Optional[torch.Tensor] = None,
     ):
-        """Apply the global auxiliary loss for the given scores and routing map."""
+        """Apply the global auxiliary loss for the given scores and routing map.
+
+        local_tokens_per_expert, if given, is ``routing_map.sum(dim=0)`` computed by the fused
+        router; routing_map is then None.
+        """
         global_aux_loss_coeff = self.get_aux_loss_coeff("global_aux_loss")
         if global_aux_loss_coeff == 0:
             return probs
@@ -724,6 +748,8 @@ class TopKRouter(Router):
                 reduce_group=self.tp_dp_cp_group,
                 with_padding_mask=with_padding_mask,
                 topk=self.topk,
+                local_tokens_per_expert=local_tokens_per_expert,
+                num_local_tokens=scores_for_aux_loss.shape[0],
             )
         )
 
@@ -1085,6 +1111,98 @@ class TopKRouter(Router):
         routing_map = torch.zeros_like(logits, dtype=torch.bool).scatter(1, top_indices, True)
         return routing_probs, routing_map
 
+    def _use_fused_aux_scores(
+        self,
+        logits: torch.Tensor,
+        padding_mask: Optional[torch.Tensor],
+        bsz: int,
+        topk_indices_dtype: Optional[torch.dtype],
+        observe_router_diagnostics: bool,
+    ) -> bool:
+        """Whether this call takes the moe_router_fused_aux_scores path."""
+        config = self.config
+        if not config.moe_router_fused_aux_scores or fused_topk_with_aux_loss_scores is None:
+            return False
+        routing_types = (
+            self.routing_type if isinstance(self.routing_type, list) else [self.routing_type]
+        )
+        return (
+            self.training
+            and torch.is_grad_enabled()
+            and padding_mask is None
+            and not observe_router_diagnostics
+            and not self.is_hash_layer
+            # dense int64 top-k indices for the 'deepep' / 'ncclep' flex dispatchers
+            and topk_indices_dtype == torch.int64
+            and config.moe_flex_dispatcher_backend in ("deepep", "ncclep")
+            and not config.moe_virtual_expert_load_balance
+            and config.moe_expert_capacity_factor is None
+            and self.router_replay is None
+            and set(routing_types) <= {"aux_loss", "seq_aux_loss", "global_aux_loss", "none"}
+            # the fused counts are per expert, not per (sequence, expert)
+            and (bsz == 1 or self.get_aux_loss_coeff("seq_aux_loss") == 0)
+            and (self.expert_bias is None or self.expert_bias.dtype == torch.float32)
+            and (not self.enable_expert_bias or self.local_tokens_per_expert.dtype == torch.int64)
+            and fused_topk_with_aux_loss_scores_is_supported(
+                config.num_moe_experts,
+                self.topk,
+                config.moe_router_num_groups,
+                config.moe_router_group_topk,
+                self.score_function,
+            )
+        )
+
+    def _fused_aux_scores_routing(
+        self,
+        logits: torch.Tensor,
+        seq_length: int,
+        bsz: int,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """Top-k routing, aux-loss scores and token counts in one TE kernel.
+
+        Produces what the moe_router_fusion + moe_router_aux_loss_fusion path produces, bit for
+        bit, except that the probabilities are compact: [num_tokens, topk], aligned with the
+        returned dense top-k indices. With expert TP == 1 they are float32, the dtype the
+        'deepep' and 'ncclep' dispatchers convert them to, so that cast and its backward
+        disappear; with expert TP > 1 they keep the logits dtype so that the dispatcher's
+        per-TP-rank expansion sums their gradient as before.
+        """
+        probs, top_indices, scores_for_aux_loss, aux_tokens_per_expert = (
+            fused_topk_with_aux_loss_scores(
+                logits,
+                self.topk,
+                self.config.moe_router_num_groups,
+                self.config.moe_router_group_topk,
+                self.config.moe_router_topk_scaling_factor,
+                self.score_function,
+                self.expert_bias,
+                # The expert-bias token counts are accumulated by the kernel.
+                tokens_per_expert=self.local_tokens_per_expert if self.enable_expert_bias else None,
+                probs_dtype=torch.float32 if self.expt_tp_group.size() == 1 else None,
+            )
+        )
+        probs = self._apply_aux_loss(
+            probs,
+            scores_for_aux_loss,
+            None,
+            packed_seq_params=packed_seq_params,
+            local_tokens_per_expert=aux_tokens_per_expert,
+        )
+        probs = self._apply_seq_aux_loss(
+            probs,
+            scores_for_aux_loss,
+            None,
+            seq_length,
+            bsz,
+            packed_seq_params=packed_seq_params,
+            local_tokens_per_expert=aux_tokens_per_expert,
+        )
+        probs = self._apply_global_aux_loss(
+            probs, scores_for_aux_loss, None, local_tokens_per_expert=aux_tokens_per_expert
+        )
+        return mark_compact_route_probs(probs), top_indices
+
     def routing(
         self,
         logits: torch.Tensor,
@@ -1142,6 +1260,10 @@ class TopKRouter(Router):
                 "Hash routing requires a layer number. Construct the router through MoELayer "
                 "or call set_layer_number() before routing."
             )
+        if self._use_fused_aux_scores(
+            logits, padding_mask, bsz, topk_indices_dtype, observe_router_diagnostics
+        ):
+            return self._fused_aux_scores_routing(logits, seq_length, bsz, packed_seq_params)
         if self.is_hash_layer:
             assert input_ids is not None, (
                 "input_ids is required for hash-based routing. Pass token IDs through "

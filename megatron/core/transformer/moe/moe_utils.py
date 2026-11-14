@@ -53,6 +53,15 @@ if HAVE_TE:
         fused_unpermute,
         te_general_gemm,
     )
+
+    try:  # Transformer Engine with the single-pass router; re-exported for the router.
+        from transformer_engine.pytorch.router import (  # pylint: disable=unused-import
+            fused_topk_with_aux_loss_scores,
+            fused_topk_with_aux_loss_scores_is_supported,
+        )
+    except ImportError:
+        fused_topk_with_aux_loss_scores = None
+        fused_topk_with_aux_loss_scores_is_supported = None
 else:
     (
         fused_compute_score_for_moe_aux_loss,
@@ -68,6 +77,8 @@ else:
         te_general_gemm,
     ) = (None, None, None, None, None, None, None, None, False, None, None)
     fused_topk_with_score_function_supports_qb = False
+    fused_topk_with_aux_loss_scores = None
+    fused_topk_with_aux_loss_scores_is_supported = None
 
 
 def switch_load_balancing_loss_func(
@@ -296,18 +307,27 @@ def get_capacity(
 
 
 def get_tokens_per_expert_and_token_count(
-    routing_map: torch.Tensor,
+    routing_map: Optional[torch.Tensor],
     reduce_group: Union[torch.distributed.ProcessGroup, Tuple[torch.distributed.ProcessGroup, ...]],
     topk: int = None,
     with_padding_mask: bool = False,
+    local_tokens_per_expert: Optional[torch.Tensor] = None,
+    num_local_tokens: Optional[int] = None,
 ) -> torch.Tensor:
     """
     Compute global_tokens_per_expert, local_num_tokens and total_num_tokens with padding mask.
 
     ``reduce_group`` accepts one group or an ordered tuple of orthogonal groups
     (for example runtime CP followed by TP). The single-group positional API is preserved.
+
+    ``local_tokens_per_expert`` may be given instead of ``routing_map`` when the caller already
+    has ``routing_map.sum(dim=0)`` (e.g. from a fused router kernel); ``num_local_tokens`` is
+    then the number of rows of the routing map it was counted from.
     """
-    local_tokens_per_expert = routing_map.sum(dim=0)
+    if local_tokens_per_expert is None:
+        local_tokens_per_expert = routing_map.sum(dim=0)
+    else:
+        assert routing_map is not None or num_local_tokens is not None
     reduce_groups = reduce_group if isinstance(reduce_group, tuple) else (reduce_group,)
 
     # The reduction all-reduces contiguous tensors in place; reduce a copy so
@@ -324,7 +344,7 @@ def get_tokens_per_expert_and_token_count(
         local_num_tokens = local_tokens_per_expert.sum() // topk
         total_num_tokens = global_tokens_per_expert.sum() // topk
     else:
-        local_num_tokens = routing_map.shape[0]
+        local_num_tokens = routing_map.shape[0] if routing_map is not None else num_local_tokens
         total_num_tokens = local_num_tokens * reduce_world_size
     return global_tokens_per_expert, local_num_tokens, total_num_tokens
 
@@ -1726,6 +1746,23 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)
         return grad_input, grad_weight, grad_bias, None
+
+
+_COMPACT_ROUTE_PROBS_ATTR = "_moe_compact_route_probs"
+
+
+def mark_compact_route_probs(probs: torch.Tensor) -> torch.Tensor:
+    """Tag ``probs`` as compact per-route weights: [num_tokens, topk], aligned with the dense
+    top-k indices returned with them (see TopKRouter's moe_router_fused_aux_scores), instead of
+    the full [num_tokens, num_experts] weights. The tag is explicit because the two can have the
+    same shape (topk == num_experts). Returns ``probs``."""
+    setattr(probs, _COMPACT_ROUTE_PROBS_ATTR, True)
+    return probs
+
+
+def is_compact_route_probs(probs: torch.Tensor) -> bool:
+    """Whether ``probs`` was tagged by :func:`mark_compact_route_probs`."""
+    return getattr(probs, _COMPACT_ROUTE_PROBS_ATTR, False)
 
 
 def router_gating_linear(

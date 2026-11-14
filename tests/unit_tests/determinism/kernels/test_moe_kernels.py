@@ -1211,6 +1211,52 @@ class TestMoEModules:
             router, (hidden,), replays=3, what=f"TopKRouter[flex-{backend}-dense]"
         )
 
+    @pytest.mark.skipif(
+        not (
+            HAVE_TE_ROUTER
+            and moe_utils.fused_topk_with_score_function_supports_topk_indices
+            and moe_utils.fused_topk_with_aux_loss_scores is not None
+        ),
+        reason="TE fused_topk_with_aux_loss_scores is not available",
+    )
+    @pytest.mark.parametrize("backend", ["deepep", "ncclep"])
+    @pytest.mark.parametrize("router_dtype", ["fp32", None], ids=["fp32_logits", "bf16_logits"])
+    def test_topk_router_fused_aux_scores_replays(self, backend, router_dtype):
+        """moe_router_fused_aux_scores: one TE kernel for top-k, aux-loss scores and both
+        token counts (integer atomics) returns compact float32 [tokens, topk] probs, dense
+        indices, the seq aux loss and expert-bias counts, and replays them and the input and
+        router-weight gradients bit-exactly."""
+        self._init()
+        seeded()
+        config = _moe_config(
+            num_moe_experts=256,
+            moe_router_topk=8,
+            moe_router_num_groups=8,
+            moe_router_group_topk=4,
+            moe_router_score_function="sigmoid",
+            moe_router_topk_scaling_factor=2.5,
+            moe_router_enable_expert_bias=True,
+            moe_router_load_balancing_type="seq_aux_loss",
+            moe_router_dtype=router_dtype,
+            moe_router_fusion=True,
+            moe_router_aux_loss_fusion=True,
+            moe_router_fused_aux_scores=True,
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend=backend,
+        )
+        router = TopKRouter(
+            config, pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).cuda()
+        router.set_layer_number(0)
+        hidden = torch.randn(8192, 1, 1024, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        probs, routing_map = router(hidden)
+        assert routing_map.dtype == torch.int64 and routing_map.shape == (8192, 8)
+        assert probs.dtype == torch.float32 and probs.shape == (8192, 8)
+        assert_module_replays_bit_exact(
+            router, (hidden,), replays=3, what=f"TopKRouter[flex-{backend}-fused-aux-scores]"
+        )
+        moe_utils.get_moe_metrics_tracker().clear()
+
     @pytest.mark.parametrize("accumulate", [True, False])
     def test_global_batch_quantile_router_replays(self, accumulate):
         """Include the router's nonpersistent histogram in the replay comparison."""
