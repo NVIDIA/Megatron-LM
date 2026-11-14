@@ -124,7 +124,11 @@ def test_disagg_rl_rejects_ignored_overrides(field):
 @pytest.mark.parametrize("mismatch", [None, "groups", "model"])
 def test_prebuilt_disagg_checks_groups_and_model_config(monkeypatch, mismatch):
     from megatron.core.inference.disaggregation import coordinator_setup as setup
+    from megatron.core.inference.disaggregation.transfer_backends import nccl as nccl_backend
 
+    setup_peer_groups = Mock()
+    monkeypatch.setattr(nccl_backend, "setup_peer_groups", setup_peer_groups)
+    monkeypatch.setattr(setup.torch.cuda, "current_device", lambda: 0)
     monkeypatch.setattr(setup.dist, "get_world_size", lambda: 2)
     monkeypatch.setattr(setup.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(setup, "get_pg_size", lambda group: group)
@@ -139,7 +143,10 @@ def test_prebuilt_disagg_checks_groups_and_model_config(monkeypatch, mismatch):
     engine = SimpleNamespace(
         context=SimpleNamespace(
             enable_prefix_caching=True,
-            config=SimpleNamespace(disaggregation_shards="tp=1,role=prefill+tp=1,role=decode"),
+            config=SimpleNamespace(
+                disaggregation_shards="tp=1,role=prefill+tp=1,role=decode",
+                kv_transport_backend="nccl",
+            ),
         ),
         pg_collection=SimpleNamespace(
             tp=2 if mismatch == "groups" else 1, pp=1, dp=1, ep=1, cp=1, expt_tp=1
@@ -158,6 +165,8 @@ def test_prebuilt_disagg_checks_groups_and_model_config(monkeypatch, mismatch):
     else:
         setup.configure_prebuilt_disagg_engine(engine)
         engine.set_disaggregation_config.assert_called_once()
+        # NCCL transfers get one group per prefill/decode rank pair.
+        assert setup_peer_groups.call_args.args[0] == [(0, 1)]
 
 
 def test_shard_builder_keeps_replica_process_group(monkeypatch):
@@ -308,3 +317,36 @@ def test_cp_accepted_only_when_one():
         InferenceShardSpec(tp=1, cp=2)
     with pytest.raises(ValueError):
         parse_inference_shards_spec("tp=1,cp=2", world_size=1)
+
+
+@pytest.mark.skipif(Utils.world_size < 2, reason="needs 2 ranks")
+def test_shard_pg_collection_satisfies_mtp_hsm_groups():
+    """MultiTokenPredictionBlock with mtp_hsm requires dp and gtp_remat on a passed collection.
+
+    Inference shards have no GTP weight remat, so both GTP_remat axes are singletons over the
+    current rank, matching what the MPU builds for gtp_remat_size=1.
+    """
+    from megatron.core.utils import get_pg_rank, get_pg_size
+
+    Utils.initialize_model_parallel()
+    try:
+        world = Utils.world_size
+        half = world // 2
+        shards = shards_module.build_inference_pg_collections_for_shards(
+            world, f"tp=1,dp={half},role=prefill+tp=1,dp={world - half},role=decode"
+        )
+        pgc = next(shard.pg_collection for shard in shards if shard.pg_collection is not None)
+        # Mirrors MultiTokenPredictionBlock's check for an explicit collection with mtp_hsm.
+        for name in ("tp", "cp", "pp", "dp", "gtp_remat"):
+            assert getattr(pgc, name, None) is not None, name
+        for name in ("gtp_remat", "expt_gtp_remat"):
+            group = getattr(pgc, name)
+            assert get_pg_size(group) == 1 and get_pg_rank(group) == 0
+            assert torch.distributed.get_process_group_ranks(group) == [
+                torch.distributed.get_rank()
+            ]
+        assert get_pg_size(pgc.dp) == (
+            half if torch.distributed.get_rank() < half else world - half
+        )
+    finally:
+        Utils.destroy_model_parallel()

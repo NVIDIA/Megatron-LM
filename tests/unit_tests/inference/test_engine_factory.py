@@ -148,3 +148,26 @@ def test_disaggregation_rejects_disabled_prefix_caching(mock_pipeline):
             tokenizer="tokenizer",
             inference_config=config,
         )
+
+
+@pytest.mark.parametrize("rank, expected_mamba_gb", [(0, 8.0), (1, None)])
+def test_disaggregation_drops_mamba_prefix_cache_on_decode_shards(
+    mock_pipeline, monkeypatch, rank, expected_mamba_gb
+):
+    """A shared launch's mamba prefix-cache budget applies to prefill, not decode, shards."""
+    _, wrapper_cls, _, _ = mock_pipeline
+    monkeypatch.setattr(
+        factory_module, "dist", SimpleNamespace(get_world_size=lambda: 2, get_rank=lambda: rank)
+    )
+    config = InferenceConfig(
+        disaggregation_shards="tp=1,role=prefill+tp=1,role=decode",
+        enable_prefix_caching=True,
+        prefix_caching_mamba_gb=8.0,
+    )
+    factory_module.build_dynamic_inference_engine(
+        model=SimpleNamespace(config=MagicMock()),
+        tokenizer="tokenizer",
+        inference_config=config,
+        inference_wrapper_cls=wrapper_cls,
+    )
+    assert config.prefix_caching_mamba_gb == expected_mamba_gb

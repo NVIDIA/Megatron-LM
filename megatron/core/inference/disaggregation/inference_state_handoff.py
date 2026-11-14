@@ -403,12 +403,20 @@ class InferenceStateHandoffMixin:
                     f"SSM state shape implies {nheads_global} global heads, "
                     f"but model config specifies {configured_nheads}"
                 )
+            # Mamba2 stores recurrent state as [heads, headdim, d_state]; Gated DeltaProduct
+            # stores [heads, d_state, headdim] and packs H value and key conv bands.
+            num_householder = int(getattr(self.context, "gdp_num_householder", 0) or 0)
+            if num_householder > 0:
+                d_state, headdim = int(ssm_shape[-2]), int(ssm_shape[-1])
+            else:
+                headdim, d_state = int(ssm_shape[-2]), int(ssm_shape[-1])
             ssm_dims = SSMStateDims(
                 nheads=nheads_global,
-                headdim=int(ssm_shape[-2]),
-                d_state=int(ssm_shape[-1]),
+                headdim=headdim,
+                d_state=d_state,
                 ngroups=int(model_config.mamba_num_groups),
                 d_conv=int(conv_shape[-1]),
+                num_householder=max(1, num_householder),
             )
             ssm_layout = SSMShardLayout(
                 global_rank=rank,
@@ -1294,6 +1302,10 @@ class InferenceStateHandoffMixin:
             first_token = pending.resume_tokens[0]
             if request.sampling_params.num_tokens_to_generate > 0:
                 request.generated_tokens.append(first_token)
+                if self.context.num_speculative_tokens > 0:
+                    # The prefill engine's step emitted this token; record it as a collocated
+                    # engine would, so acceptance_step_lengths sums to the generated length.
+                    request.acceptance_step_lengths.append(1)
                 if pending.resume_log_probs:
                     request.generated_log_probs = list(pending.resume_log_probs)
                 if self.track_generated_token_events:
