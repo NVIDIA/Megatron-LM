@@ -61,6 +61,22 @@ class InferenceRequestRejected(InferenceRequestError, ValueError):
     """A non-transient admission error, mapped to HTTP 400 by Dynamo."""
 
 
+def _add_attempt(registry: dict[str, set], context_id: str, entry) -> None:
+    """Register one attempt's entry under its Dynamo context."""
+    registry.setdefault(context_id, set()).add(entry)
+
+
+def _remove_attempt(registry: dict[str, set], context_id: str, entry) -> bool:
+    """Remove one attempt's entry; return whether it was still registered."""
+    entries = registry.get(context_id)
+    if entries is None or entry not in entries:
+        return False
+    entries.discard(entry)
+    if not entries:
+        del registry[context_id]
+    return True
+
+
 def build_sampling_params(request: GenerateRequest) -> SamplingParams:
     """Translate one Dynamo generation request to Megatron sampling parameters.
 
@@ -134,9 +150,11 @@ class MegatronLLMEngine(LLMEngine):
         self._handoff_recovery_task: asyncio.Task | None = None
         self._handoff_owner = config.handoff_owner or uuid.uuid4().hex
         self._pending_releases: set[HandoffRelease] = set()
-        self._request_waiters: dict[str, asyncio.Future] = {}
+        # Keyed by Dynamo context. A retried or duplicate attempt of one request can run
+        # beside the first, so each attempt registers and removes only its own entry.
+        self._request_waiters: dict[str, set[asyncio.Future]] = {}
         self._engine_progress = 0
-        self._request_ids: dict[str, int] = {}
+        self._request_ids: dict[str, set[int]] = {}
         self.worker_id: Optional[int] = None
 
     @classmethod
@@ -375,16 +393,19 @@ class MegatronLLMEngine(LLMEngine):
             params.do_kv_handoff = True
             params.num_tokens_to_generate = 0
             stream = self.client.add_request_streaming(token_ids, params)
-            self._request_ids[context_id] = stream.request_id
             # A cancelled client must not discard the final handoff metadata. Let
             # prefill finish and retain an owner that can release its KV/SSM state.
+            # The engine request is therefore never aborted; abort() cancels the waiter.
             result_task = asyncio.create_task(self._collect_prefill_result(stream))
             waiter = asyncio.shield(result_task)
-            self._request_waiters[context_id] = waiter
+            _add_attempt(self._request_waiters, context_id, waiter)
             delivered = False
             try:
                 final = await waiter
-                if self._request_waiters.get(context_id) is not waiter or self._shutting_down:
+                # abort() unregisters (and cancels) every waiter of its context.
+                if not _remove_attempt(self._request_waiters, context_id, waiter):
+                    raise asyncio.CancelledError
+                if self._shutting_down:
                     raise asyncio.CancelledError
                 self._validate_final_result(final)
                 if not self.client.coordinator_instance_id:
@@ -398,8 +419,6 @@ class MegatronLLMEngine(LLMEngine):
                     ),
                 }
                 delivered = True
-                self._request_waiters.pop(context_id, None)
-                self._request_ids.pop(context_id, None)
                 yield {
                     "token_ids": [],
                     "index": 0,
@@ -414,10 +433,9 @@ class MegatronLLMEngine(LLMEngine):
                     "disaggregated_params": disagg,
                 }
             finally:
-                self._request_waiters.pop(context_id, None)
+                _remove_attempt(self._request_waiters, context_id, waiter)
                 if not delivered:
                     self._schedule_cleanup(self._release_cancelled_prefill(result_task))
-                self._request_ids.pop(context_id, None)
             return
 
         release: dict[str, Any] = {}
@@ -429,22 +447,24 @@ class MegatronLLMEngine(LLMEngine):
             # before submitting reads; cancellation must not discard the claim ACK.
             claim_task = asyncio.create_task(self._claim_remote_handoff(release))
             waiter = asyncio.shield(claim_task)
-            self._request_waiters[context_id] = waiter
+            _add_attempt(self._request_waiters, context_id, waiter)
             try:
                 await waiter
-                if self._request_waiters.get(context_id) is not waiter or self._shutting_down:
+                if not _remove_attempt(self._request_waiters, context_id, waiter):
+                    raise asyncio.CancelledError
+                if self._shutting_down:
                     raise asyncio.CancelledError
             except BaseException:
                 self._schedule_cleanup(self._release_unsubmitted_handoff(claim_task, release))
                 raise
             finally:
-                self._request_waiters.pop(context_id, None)
+                _remove_attempt(self._request_waiters, context_id, waiter)
             stream = self.client.add_request_with_kv_handoff_streaming(
                 token_ids, params, disagg.get("kv_meta") or {}, list(disagg.get("block_ids") or [])
             )
         else:
             stream = self.client.add_request_streaming(token_ids, params)
-        self._request_ids[context_id] = stream.request_id
+        _add_attempt(self._request_ids, context_id, stream.request_id)
 
         released = False
         source_safe = False
@@ -461,7 +481,7 @@ class MegatronLLMEngine(LLMEngine):
             source_safe = error.source_safe
             raise
         finally:
-            self._request_ids.pop(context_id, None)
+            _remove_attempt(self._request_ids, context_id, stream.request_id)
             if not released and self.config.role == "decode":
                 if source_safe:
                     self._schedule_cleanup(self._release_completed_handoff(release))
@@ -728,16 +748,24 @@ class MegatronLLMEngine(LLMEngine):
         return True
 
     async def abort(self, context: Context) -> None:
-        waiter = self._request_waiters.pop(str(context.id()), None)
-        if waiter is not None:
+        context_id = str(context.id())
+        # Every attempt of the context is cancelled. An attempt waiting on a prefill
+        # result or a claim has no engine request of its own to abort.
+        for waiter in self._request_waiters.pop(context_id, ()):
             # Cancel only the consumer; the protected prefill/claim task still
             # owns its result until the retained source state can be released.
             waiter.cancel()
-            return
-        request_id = self._request_ids.pop(str(context.id()), None)
-        if request_id is not None and self.client is not None:
+        request_ids = self._request_ids.pop(context_id, ())
+        if request_ids and self.client is not None:
             await asyncio.wait_for(
-                asyncio.shield(self.client.abort_request_and_wait(request_id)),
+                asyncio.shield(
+                    asyncio.gather(
+                        *(
+                            self.client.abort_request_and_wait(request_id)
+                            for request_id in request_ids
+                        )
+                    )
+                ),
                 timeout=self.config.drain_timeout,
             )
 
@@ -751,8 +779,9 @@ class MegatronLLMEngine(LLMEngine):
 
     async def cleanup(self) -> None:
         self._shutting_down = True
-        for waiter in self._request_waiters.values():
-            waiter.cancel()
+        for waiters in self._request_waiters.values():
+            for waiter in waiters:
+                waiter.cancel()
         await self.drain()
         tasks = list(self._cleanup_tasks)
         for task in tasks:
