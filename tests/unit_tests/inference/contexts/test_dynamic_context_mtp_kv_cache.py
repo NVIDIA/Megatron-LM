@@ -36,7 +36,7 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 )
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from tests.unit_tests.inference.paged_attention_test_utils import reference_paged_attention
 from tests.unit_tests.test_utilities import Utils
 
@@ -55,6 +55,7 @@ def _make_context(
     is_hybrid_model: bool = False,
     max_requests: int = 16,
     max_tokens: int = 256,
+    multi_latent_attention: bool = False,
 ) -> DynamicInferenceContext:
     """Build a real `DynamicInferenceContext`, MTP-KV-enabled unless a gate is switched off."""
     if is_hybrid_model:
@@ -68,8 +69,9 @@ def _make_context(
     else:
         mamba_inference_state_config = None
 
+    config_class = MLATransformerConfig if multi_latent_attention else TransformerConfig
     return DynamicInferenceContext(
-        model_config=TransformerConfig(
+        model_config=config_class(
             params_dtype=torch.bfloat16,
             num_layers=NUM_LAYERS,
             kv_channels=16,
@@ -144,8 +146,20 @@ class TestMtpKvCacheGating:
             {"mtp_layer_type_list": [Symbols.MAMBA, Symbols.MLP]},
             {"mtp_layer_type_list": [Symbols.ATTENTION, Symbols.ATTENTION]},
             {"mtp_layer_type_list": [Symbols.MAMBA]},
+            # MLA applies RoPE to its keys, which the draft plane does not support.
+            {"multi_latent_attention": True},
+            {"multi_latent_attention": True, "mtp_layer_type_list": [Symbols.MLA, Symbols.MLP]},
         ],
-        ids=["no-drafts", "no-head", "per-depth", "recurrent-mlp", "two-attentions", "recurrent"],
+        ids=[
+            "no-drafts",
+            "no-head",
+            "per-depth",
+            "recurrent-mlp",
+            "two-attentions",
+            "recurrent",
+            "mla",
+            "hybrid-mla",
+        ],
     )
     def test_unsupported_config_has_no_draft_kv_plane(self, kwargs):
         """Head patterns also gate attention-only backbones, which have no Mamba metadata."""

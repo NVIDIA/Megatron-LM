@@ -13,31 +13,38 @@ Uses DynamicInferenceEngine for CUDA graph warmup so MTP graph capture
 logic matches production code exactly.
 """
 
+import functools
 import itertools
+import subprocess
+import sys
 from unittest import mock
 
 import pytest
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 
 from megatron.core import parallel_state
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
-from megatron.core.inference.inference_request import DynamicInferenceRequest
+from megatron.core.inference.inference_request import DynamicInferenceRequest, Status
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
 from megatron.core.inference.utils import InferenceMode
-from megatron.core.models.backends import LocalSpecProvider
+from megatron.core.models.backends import LocalSpecProvider, get_backend_from_config
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
+    get_gpt_layer_with_inference_spec,
     get_gpt_mtp_block_spec,
+    get_gpt_mtp_block_spec_for_backend,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
@@ -45,6 +52,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
+from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4, HAVE_FMLA
 from megatron.core.transformer.cuda_graphs import delete_cuda_graphs
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.multi_token_prediction import (
@@ -54,8 +62,9 @@ from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayerSubmodules,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.utils import unwrap_model
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 # --------------------------------------------------------------------------- #
 #  HybridModel helpers
@@ -1863,3 +1872,195 @@ class TestMTPBlockScopeCudaGraph:
                     f"scope={inference_cuda_graph_scope}), got a tensor of shape "
                     f"{tuple(context.mtp_decoder_hidden_states.shape)}"
                 )
+
+
+# --------------------------------------------------------------------------- #
+#  TestMLAMTPCudaGraphInference (TP = 2, sequence parallelism)
+# --------------------------------------------------------------------------- #
+
+# FlashMLA's dense decode kernel on a tiny input. A FlashMLA build without kernels for this GPU
+# exits the process at the first launch, so the kernel is probed in a subprocess.
+_FLASH_MLA_DECODE_PROBE = """
+import sys
+
+import torch
+from flash_mla import flash_mla_with_kvcache, get_mla_metadata
+
+torch.cuda.set_device(int(sys.argv[1]))
+q = torch.zeros(1, 1, 16, 576, device="cuda", dtype=torch.bfloat16)
+kv_cache = torch.zeros(1, 64, 1, 576, device="cuda", dtype=torch.bfloat16)
+cache_seqlens = torch.ones(1, device="cuda", dtype=torch.int32)
+block_table = torch.zeros(1, 1, device="cuda", dtype=torch.int32)
+metadata, num_splits = get_mla_metadata(cache_seqlens, 16, 1)
+flash_mla_with_kvcache(q, kv_cache, block_table, cache_seqlens, 512, metadata, num_splits)
+torch.cuda.synchronize()
+"""
+
+
+@functools.cache
+def _flash_mla_decode_runs() -> bool:
+    """Whether FlashMLA's dense decode kernel, which dynamic-batching MLA decode runs, works on
+    this GPU."""
+    if not HAVE_FMLA:
+        return False
+    probe = subprocess.run(
+        [sys.executable, "-c", _FLASH_MLA_DECODE_PROBE, str(torch.cuda.current_device())],
+        capture_output=True,
+        timeout=600,
+    )
+    return probe.returncode == 0
+
+
+class TestMLAMTPCudaGraphInference:
+    """MTP speculative decoding of an MLA model in the dynamic engine, at TP=2 with sequence
+    parallelism and with CUDA graphs.
+
+    Dynamic-batching MLA caches latents, and MLA heads have no MTP draft KV plane (it assumes
+    keys without RoPE). Every draft depth therefore runs the MLA layer without an inference
+    context: the engine captures that forward in the MTP CUDA graphs and replays it after each
+    verification step. Covers a head with one MTP layer per depth (as DeepSeek-V3 checkpoints
+    have) and a repeated head.
+    """
+
+    TP_SIZE = 2
+    VOCAB_SIZE = 128
+    MAX_SEQ_LEN = 256
+    NUM_SPECULATIVE_TOKENS = 2
+    NUM_TOKENS_TO_GENERATE = 8
+    PROMPT_LENGTHS = (70, 7, 45, 130)
+    MAX_STEPS = 200
+
+    @classmethod
+    def setup_class(cls):
+        if Utils.world_size < cls.TP_SIZE:
+            pytest.skip(f"Need at least {cls.TP_SIZE} GPUs")
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=cls.TP_SIZE, pipeline_model_parallel_size=1
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        delete_cuda_graphs()
+        SymmetricMemoryManager.destroy()  # its buffers are registered on this TP group
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self):
+        InferenceMode.unset_active()  # the engine activates it
+        delete_cuda_graphs()
+
+    def _build_engine(self, mtp_use_repeated_layer):
+        # The model sets the NVTE attention variables from its config; drop any set before.
+        clear_nvte_env_vars()
+        model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
+        config = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=512,
+            ffn_hidden_size=512,
+            num_attention_heads=16,
+            # FlashMLA decodes latents of kv_lora_rank 512 with a 64-dim RoPE part.
+            q_lora_rank=128,
+            kv_lora_rank=512,
+            qk_head_dim=64,
+            qk_pos_emb_head_dim=64,
+            v_head_dim=128,
+            qk_layernorm=True,
+            rope_type="rope",
+            cache_mla_latents=True,
+            # Transformer Engine picks the backend of the draft step's attention. Dynamic prefill
+            # runs the newest FlashAttention installed (no flash_attention_version pinned).
+            attention_backend=AttnBackend.auto,
+            normalization="RMSNorm",
+            activation_func=F.silu,
+            gated_linear_unit=True,
+            add_bias_linear=False,
+            # The inference-optimized layers require sequence parallelism at TP > 1.
+            transformer_impl="inference_optimized",
+            tensor_model_parallel_size=self.TP_SIZE,
+            sequence_parallel=True,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            mtp_num_layers=1 if mtp_use_repeated_layer else self.NUM_SPECULATIVE_TOKENS,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
+            cuda_graph_impl="local",
+        )
+        layer_spec = get_gpt_layer_with_inference_spec(
+            qk_layernorm=True, multi_latent_attention=True
+        )
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=layer_spec,
+            vocab_size=self.VOCAB_SIZE,
+            max_sequence_length=self.MAX_SEQ_LEN,
+            parallel_output=True,
+            pre_process=True,
+            post_process=True,
+            # The head's norms and projection come from the layers' (inference-optimized) backend.
+            mtp_block_spec=get_gpt_mtp_block_spec_for_backend(
+                config=config, spec=layer_spec, backend=get_backend_from_config(config)
+            ),
+            # MLA applies its own RoPE; GPTModel then builds none.
+            position_embedding_type="rope",
+        ).eval()
+        context = DynamicInferenceContext(
+            model_config=config,
+            inference_config=InferenceConfig(
+                max_sequence_length=self.MAX_SEQ_LEN,
+                buffer_size_gb=0.1,
+                materialize_only_last_token_logits=False,
+                num_speculative_tokens=self.NUM_SPECULATIVE_TOKENS,
+                block_size_tokens=64,  # required with cached MLA latents
+                max_requests=16,
+                max_tokens=512,
+                num_cuda_graphs=2,
+                unified_memory_level=0,
+            ),
+        )
+        wrapped = GPTInferenceWrapper(model, context)
+        wrapped.model_is_pipeline_parallel = False
+        mock_tokenizer = mock.Mock(eod=self.VOCAB_SIZE - 1)
+        ctrl = TextGenerationController(inference_wrapped_model=wrapped, tokenizer=mock_tokenizer)
+        return DynamicInferenceEngine(ctrl, context)
+
+    @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True], ids=["per-depth", "repeated"])
+    @torch.inference_mode()
+    def test_greedy_generation_with_mtp_cuda_graphs(self, mtp_use_repeated_layer):
+        """The engine captures the MTP CUDA graphs and completes greedy requests, drafting at
+        every decode step."""
+        if not (HAVE_FA4 or HAVE_FA3):
+            # FlashAttention-2's varlen kernel needs equal query/key and value head dims.
+            pytest.skip("MLA prefill with cached latents needs FlashAttention-3 or -4")
+        if not _flash_mla_decode_runs():
+            pytest.skip("MLA decode needs FlashMLA with kernels for this GPU")
+        engine = self._build_engine(mtp_use_repeated_layer)
+        assert not engine.context.enable_mtp_kv_cache
+        assert engine.controller.num_mtp_depths == self.NUM_SPECULATIVE_TOKENS
+
+        # The same prompts on every rank.
+        generator = torch.Generator().manual_seed(1234)
+        for request_id, length in enumerate(self.PROMPT_LENGTHS):
+            engine.add_request(
+                request_id,
+                torch.randint(0, self.VOCAB_SIZE, (length,), generator=generator).cuda(),
+                SamplingParams(
+                    num_tokens_to_generate=self.NUM_TOKENS_TO_GENERATE, termination_id=-1, top_k=1
+                ),
+            )
+        finished = {}
+        for _ in range(self.MAX_STEPS):
+            if not engine.has_unfinished_requests():
+                break
+            for request in engine.step_modern()["finished_requests"]:
+                finished[request.request_id] = request
+        else:
+            pytest.fail(f"the engine did not finish within {self.MAX_STEPS} steps")
+
+        assert sorted(finished) == list(range(len(self.PROMPT_LENGTHS)))
+        for request in finished.values():
+            assert request.status == Status.COMPLETED
+            assert len(request.generated_tokens) == self.NUM_TOKENS_TO_GENERATE
+        assert int(engine._spec_tokens_proposed_per_pos.sum()) > 0
+        TestMTPCudaGraphInference._assert_mtp_cuda_graphs_were_replayed(
+            engine.controller.inference_wrapped_model.model, expect_replayed=True
+        )
