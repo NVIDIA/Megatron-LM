@@ -128,6 +128,15 @@ class FsdpParameterGroup:
     grad_scale: float
     # Padded (equal) or unpadded (unequal) segments for RowAtomic/BlockAtomic layouts.
     shard_layout: ShardLayout
+    # Whether any of these trainable parameters belongs to a Transformer Engine module built with
+    # fuse_wgrad_accumulation=True, which writes its weight gradients into partial_grad, or into
+    # main_grad when no DP-inner reduction is needed.
+    fuse_wgrad_accumulation: bool
+    # With fuse_wgrad_accumulation, the reduce-scatter input of the next or current backward,
+    # allocated before that backward starts. None otherwise.
+    partial_grad: DBuffer | None
+    # Whether main_grad holds a total that TE accumulated unscaled and finalization then scaled.
+    _main_grad_is_scaled: bool
 
     def __init__(
         self,
@@ -178,6 +187,12 @@ class FsdpParameterGroup:
                 "ShardLayout.UNPADDED is incompatible with use_symmetric_memory: NCCL "
                 "symmetric-memory collectives require equal shard sizes."
             )
+        self.fuse_wgrad_accumulation = self.requires_grad and any(
+            getattr(get_parameter_owner(owning_module, fqn)[0], "fuse_wgrad_accumulation", False)
+            for fqns in parameter_to_fqns.values()
+            for fqn in fqns
+        )
+        self.partial_grad = None
         parameters = tuple(parameter_to_fqns)
 
         if parameter_to_owner is not None and _contains_any_placement_type(
@@ -196,6 +211,11 @@ class FsdpParameterGroup:
             mixed_precision_policy,
             use_symmetric_memory,
         )
+        if self.fuse_wgrad_accumulation and not isinstance(self.model_weight, DBuffer):
+            raise ValueError(
+                "Transformer Engine wgrad fusion with MXFP8 parameters is not supported by "
+                "MFSDP v2 yet."
+            )
         self.fsdp_parameters = self._build_fsdp_parameters(parameter_to_fqns)
 
         # Building Parameter views requires live storage. Release temporary gather
@@ -370,6 +390,7 @@ class FsdpParameterGroup:
         self.main_grad = None
         self.pre_optimizer_main_grad = None
         self._main_grad_is_stale = False
+        self._main_grad_is_scaled = False
         grad_dtype = mixed_precision_policy.main_grads_dtype or parameters[0].dtype
         self.grad_comm_dtype = mixed_precision_policy.grad_comm_dtype or grad_dtype
         if not self.requires_grad:
@@ -625,26 +646,56 @@ class FsdpParameterGroup:
     def allocate_partial_grad_buffer(self) -> DBuffer:
         """Allocate the unreduced reduce-scatter input buffer."""
         assert self.main_grad is not None
-
-        grads: list[torch.Tensor] = []
-        for fsdp_parameter in self.fsdp_parameters:
-            if fsdp_parameter.unsharded.grad is None:
-                raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
-            grads.append(fsdp_parameter.unsharded.grad)
         with self._symmetric_memory_context():
             return DBuffer(
                 mesh=self.mesh,
                 placements=[Partial("avg")] * self.mesh.ndim,
                 layout=self.main_weight.layout,
                 dtype=self.grad_comm_dtype,
-                device=grads[0].device,
+                device=self.main_weight.device,
             )
 
-    def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
-        """Pack full local gradients on compute into the reduce-scatter input buffer."""
+    def bind_main_grad(self) -> None:
+        """Expose the views TE accumulates fused wgrads into as each parameter's ``main_grad``.
+
+        Like Megatron's DDP, every parameter gets one; TE uses it only for fused weights. They are
+        partial_grad's views when the group needs a DP-inner reduction. Otherwise main_grad holds
+        full tensors, so TE accumulates into it directly, unscaled, and reduce_outer_gradients()
+        scales the total.
+        """
+        buffer = self.partial_grad if self.requires_inner_reduction else self.main_grad
+        assert buffer is not None
+        # Start the step from zero where the copy path would clear or overwrite main_grad. A module
+        # used twice binds again before its gradients are accumulated.
+        if buffer is self.main_grad and not hasattr(self.fsdp_parameters[0].unsharded, "main_grad"):
+            if self._main_grad_is_stale or not self._has_sharded_grads():
+                buffer.local_buffer.zero_()
+                self._main_grad_is_stale = False
+            elif self._main_grad_is_scaled:
+                # Accumulating on top of a finalized total: undo its scaling.
+                buffer.local_buffer.div_(self.grad_scale)
+            self._main_grad_is_scaled = False
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
-            partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
-            fsdp_parameter.unsharded.grad = None
+            fsdp_parameter.unsharded.main_grad = buffer.get_tensor_view(index)
+
+    def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
+        """Pack full local gradients on compute into the reduce-scatter input buffer.
+
+        With fuse_wgrad_accumulation, TE has already written the fused weight gradients, so add
+        the gradients autograd returned (e.g. biases and LayerNorm weights) and drop main_grad.
+        """
+        for index, fsdp_parameter in enumerate(self.fsdp_parameters):
+            parameter = fsdp_parameter.unsharded
+            destination = partial_grad.get_tensor_view(index)
+            if self.fuse_wgrad_accumulation:
+                del parameter.main_grad
+                if parameter.grad is not None:
+                    destination.add_(parameter.grad)
+            elif parameter.grad is None:
+                raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
+            else:
+                destination.copy_(parameter.grad)
+            parameter.grad = None
 
     def accumulate_local_gradients(self) -> None:
         """Accumulate on compute, retaining source gradients for caller cleanup.
@@ -653,6 +704,11 @@ class FsdpParameterGroup:
         this call and orders any outer reduction after the accumulation.
         """
         assert self.main_grad is not None
+        if self.fuse_wgrad_accumulation:
+            # TE already accumulated the fused wgrads into main_grad, unscaled (bind_main_grad()).
+            self.copy_gradients_to_partial_buffer(self.main_grad)
+            self._install_sharded_grads(self.main_grad)
+            return
         for fsdp_parameter in self.fsdp_parameters:
             if fsdp_parameter.unsharded.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
@@ -754,6 +810,14 @@ class FsdpParameterGroup:
         """
         assert self.main_grad is not None
         assert self.pre_optimizer_main_grad is not None
+        if (
+            self.fuse_wgrad_accumulation
+            and not self.requires_inner_reduction
+            and self.grad_scale != 1
+        ):
+            # TE can't scale what it accumulates into main_grad, so scale the total once here.
+            self.main_grad.local_buffer.mul_(self.grad_scale)
+            self._main_grad_is_scaled = True
         if self.pre_optimizer_main_grad is self.main_grad:
             # Optimizer layout equals the accumulation layout (e.g. plain DP): no
             # DP-outer axis to reduce, so grads already rest finalized.

@@ -11,6 +11,7 @@ import logging
 import pytest
 import torch
 import torch.distributed as dist
+import transformer_engine.pytorch as te
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Partial, Replicate, Shard
@@ -427,3 +428,41 @@ def test_fully_shard_reduces_peak_training_memory(distributed_setup, placements_
         f"Expected FSDP to reduce peak training memory on rank {rank}: "
         f"baseline={_mb(baseline_peak)}, sharded={_mb(sharded_peak)}"
     )
+
+
+@pytest.mark.parametrize(
+    "caller_managed_grad_sync", [False, True], ids=["autograd_callback", "caller_managed"]
+)
+def test_fused_wgrad_releases_buffers(distributed_setup, caller_managed_grad_sync):
+    """No fused gradient buffer outlives its backward, whoever synchronizes gradients."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    model = nn.Sequential(
+        te.LayerNormLinear(16, 32, bias=True, device=device, fuse_wgrad_accumulation=True),
+        te.Linear(32, 16, bias=True, device=device, fuse_wgrad_accumulation=True),
+    )
+    with fully_shard_context(
+        FsdpContext(
+            device=device,
+            runtime_policy=RuntimePolicy(caller_managed_grad_sync=caller_managed_grad_sync),
+        )
+    ) as context:
+        for layer in model:
+            fully_shard(layer, mesh=mesh, placements=_default_placements())
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.05)
+    fully_shard_optimizer(optimizer)
+    x = torch.randn(4, 16, device=device)
+
+    allocated = []
+    for _ in range(3):
+        optimizer.zero_grad(set_to_none=True)
+        model(x).square().mean().backward()
+        if caller_managed_grad_sync:
+            context.finish_grad_sync()
+        optimizer.step()
+        assert all(
+            group.partial_grad is None for layer in model for group in layer.parameter_groups
+        )
+        torch.cuda.synchronize(device)
+        allocated.append(torch.cuda.memory_allocated(device))
+    assert allocated[1] == allocated[2]

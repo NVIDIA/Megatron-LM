@@ -52,6 +52,9 @@ class FsdpModule:
     _trainable_parameter_countdown: Countdown
     _num_trainable_parameters: int
     _schedule_policy: SchedulePolicy
+    # Recorded on the inner reduction stream after the groups' partial_grad for fused wgrads
+    # was last allocated and zeroed.
+    _partial_grad_event: torch.cuda.Event | None
     # ``phase`` is FORWARD between pre_forward() and post_forward(), BACKWARD
     # between pre_backward() and post_backward(), and RESTING otherwise. The only
     # exception is non-reentrant activation recomputation: it runs between pre_backward()
@@ -78,6 +81,7 @@ class FsdpModule:
                 See ``fully_shard``.
         """
         self._context = context
+        self._partial_grad_event = None
         self._phase = Phase.RESTING
         self._schedule_policy = schedule_policy
         owned_parameters = _collect_owned_parameters(self)
@@ -360,6 +364,24 @@ class FsdpModule:
             for group in self._parameter_groups:
                 group.unshard_parameters(phase)
 
+    def _preallocate_partial_grads(self) -> None:
+        """Allocate and zero the partial_grad that TE writes fused wgrads into, if not done yet."""
+        groups = [
+            group
+            for group in self._parameter_groups
+            if group.fuse_wgrad_accumulation
+            and group.requires_inner_reduction
+            and group.partial_grad is None
+        ]
+        if not groups:
+            return
+        inner_reduction_stream = self.context.inner_reduction_stream
+        with torch.cuda.stream(inner_reduction_stream):
+            for group in groups:
+                group.partial_grad = group.allocate_partial_grad_buffer()
+                group.partial_grad.local_buffer.zero_()
+            self._partial_grad_event = inner_reduction_stream.record_event()
+
     def post_forward(self) -> None:
         """Return parameters to their sharded resting state after forward compute."""
         is_recomputing = self.phase is Phase.BACKWARD or is_in_backward()
@@ -419,7 +441,25 @@ class FsdpModule:
             context.register_post_backward_hook()
             context.pre_backward()
 
-        self.unshard(Phase.BACKWARD, prefetch=not context.is_recording_execution_order)
+        prefetch = not context.is_recording_execution_order
+        self.unshard(Phase.BACKWARD, prefetch=prefetch)
+
+        # TE writes fused wgrads into partial_grad, which the previous module in backward order
+        # allocated; the first module allocates its own. Wait for it even so: when that module is
+        # this one's parent, none of its reductions has run yet. Groups that need no DP-inner
+        # reduction have no partial_grad, and TE writes into main_grad instead.
+        self._preallocate_partial_grads()
+        if self._partial_grad_event is not None:
+            current_stream.wait_event(self._partial_grad_event)
+        for group in self._parameter_groups:
+            if group.fuse_wgrad_accumulation:
+                group.bind_main_grad()
+        # Allocate the next module's while prefetching, ahead of this module's reduce-scatter, so
+        # that it is freed right after its own. unshard() advanced the order to that module.
+        if prefetch:
+            next_event = context.execution_order.peek()
+            if next_event is not None and next_event.phase is Phase.BACKWARD:
+                cast(FsdpModule, next_event.module)._preallocate_partial_grads()
 
     def post_backward(self) -> None:
         """Finish this module's backward and release weights when safe."""
@@ -480,14 +520,18 @@ class FsdpModule:
     def _reduce_inner_gradients(self, group: FsdpParameterGroup) -> None:
         """Pack on compute and enqueue reduction on the inner reduction stream.
 
-        Allocate the packing buffer on the inner stream. On return, that stream
-        contains the queued reduction and accumulation into main_grad.
+        Allocate the packing buffer on the inner stream, unless pre_backward() did for fused
+        wgrads. On return, that stream contains the queued reduction and accumulation into
+        main_grad.
         """
         current_stream = self.context.current_stream()
         inner_reduction_stream = self.context.inner_reduction_stream
-        with torch.cuda.stream(inner_reduction_stream):
-            partial_grad = group.allocate_partial_grad_buffer()
-        current_stream.wait_stream(inner_reduction_stream)
+        partial_grad = group.partial_grad
+        group.partial_grad = None
+        if partial_grad is None:
+            with torch.cuda.stream(inner_reduction_stream):
+                partial_grad = group.allocate_partial_grad_buffer()
+            current_stream.wait_stream(inner_reduction_stream)
         group.copy_gradients_to_partial_buffer(partial_grad)
         inner_reduction_stream.wait_stream(current_stream)
         with torch.cuda.stream(inner_reduction_stream):

@@ -466,3 +466,16 @@ def test_mxfp8_backward_unshard_gathers_rowwise_for_recompute_inside_fsdp_module
     assert recomputed == [True]
     assert not _is_rowwise_allocated(model)
     assert not _is_columnwise_allocated(model)
+
+
+@pytest.mark.launch_on_gb200
+@requires_mxfp8
+def test_fused_wgrad_rejects_mxfp8_parameters(distributed_setup):
+    """MFSDP v2 does not yet support TE wgrad fusion for MXFP8 parameters."""
+    device = distributed_setup.device
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
+    with te.quantized_model_init(recipe=MXFP8BlockScaling(), preserve_high_precision_init_val=True):
+        model = te.Linear(128, 128, bias=False, device=device, fuse_wgrad_accumulation=True)
+    with fully_shard_context(FsdpContext(device=device)):
+        with pytest.raises(ValueError, match="MXFP8"):
+            fully_shard(model, mesh=mesh, placements=_ZERO3_PLACEMENTS)
