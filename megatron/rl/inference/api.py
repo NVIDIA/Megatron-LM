@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel
 
-from .. import Request
+from ..generation_api import Request
 
 
 class LLMChatMessage(BaseModel):
