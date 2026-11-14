@@ -611,6 +611,77 @@ FP8 training provides benefits across all three performance walls:
 
 ### MoE Megakernel Backends
 
+#### Transformer Engine with NCCL EP
+
+Select `moe_megakernel_backend="te"` to execute routed experts in a single TE
+`Sequential`: `MoeDispatch -> GroupedLinear -> ScaledSwiGLU -> GroupedLinear -> MoeCombine`.
+MCore retains routing, expert parameters, optimizer state, DDP hooks, and checkpoint keys.
+The backend passes the same NCCL EP `EpBuffer` to dispatch and combine, and allocates a
+new buffer for each forward so pending microbatches retain their own backward routing state.
+Token counts and dispatched routing probabilities stay inside the MegaMoE op through TE channels.
+This path uses NCCL EP communication and TE grouped MLP operations; it does not require
+cuDNN MegaMoE or selection of a whole-MoE fused kernel.
+
+The intended evolution is for TE to implement MegaMoE internally as fused operations,
+covering dispatch, expert computation, and combine, using the NCCL EP `EpBuffer`.
+Routing remains in MCore through `MoELayer.route` in the shared `megakernel_forward` path;
+it is not part of the planned TE fusion. `_make_megamoe_op` constructs the post-router
+TE operation today. Future TE fusion can replace this composition while preserving
+MCore's routing and parameter ownership.
+
+```bash
+--moe-megakernel-backend te \
+--bf16 --swiglu --disable-bias-linear \
+--expert-model-parallel-size 2 --expert-tensor-parallel-size 1 \
+--moe-router-dtype fp32 --moe-single-grouped-weight \
+--moe-megakernel-backend-config '{"max_tokens_per_rank": 4096}'
+```
+
+Use a TE build providing `EpConfig`, `EpBuffer`, `MoeDispatch`, `MoeCombine`, and
+operation-fuser channels, built with NCCL EP support. `use_transformer_engine_op_fuser`
+is not required; `moe_token_dispatcher_type` and `moe_flex_dispatcher_backend` do not
+choose this backend's transport. TP and expert TP must both be one, and EP must be at least two.
+BF16 and MXFP8 compute are supported. For MXFP8 add `--fp8 e4m3 --fp8-recipe mxfp8`;
+native MXFP8 parameters are optional through `--fp8-param-gather`. MXFP8 communication additionally
+uses `--moe-dispatch-fwd-dtype mxfp8 --moe-combine-bwd-dtype mxfp8`, with hidden size
+divisible by 512. Dispatch backward and combine forward retain BF16 communication.
+
+Without a rank capacity factor, NCCL EP sizes receive tensors from actual token counts.
+`moe_expert_rank_capacity_factor` selects a fixed receive allocation, rounded to the
+grouped-MLP token alignment. It must include expert padding and the worst expected routing
+imbalance: overflow fails instead of silently dropping tokens. Zero-copy
+communication, delayed wgrad, native communication overlap, latent MoE,
+GTP weight rematerialization, `--cpu-offloading`, and fine-grained activation offloading
+are not supported by this initial adapter.
+Optional shared experts execute through their native MCore module and are added after combine.
+The token bound defaults to the first forward's maximum token count across EP ranks,
+rounded up to a multiple of 64; later layers share that bound.
+Set `max_tokens_per_rank` explicitly for variable-length workloads and consistently across layers.
+CUDA graph capture requires a fixed receive capacity via `moe_expert_rank_capacity_factor`
+and warmup before capture. Dynamic receive sizing synchronizes with the host and cannot
+be captured. Capture the whole MoE operation or full iteration; partial `moe_router` and
+`moe_preprocess` scopes are not supported by this backend.
+
+With fixed receive capacity, `--moe-paged-stash` packs marked expert activations into
+the existing paged CUDA pool. Set `--moe-paged-stash-buffer-size-factor-cpu` above
+zero to spill to pinned host memory when CUDA pages are exhausted; reloading uses
+the existing paged-stash pipeline schedule. This host-spill path is separate from
+`--cpu-offloading` and fine-grained expert activation offloading, which must not
+claim the same tensors. NCCL EP supplies the active row count after dispatch, and
+stashing uses the existing activation markers from TE's fused grouped MLP.
+On stash exhaustion, the runner retries without stashing and rebuilds the EP context.
+The TE backend retains its fixed receive budget during that retry; receive-capacity
+overflow still fails rather than silently dropping tokens.
+
+The distributed numerical suite compares the MegaMoE op with native all-to-all plus TE grouped
+MLP, including two outstanding forwards before backward, masked routes, empty experts,
+input/router/weight gradients, main-gradient accumulation, and checkpoint reload:
+
+```bash
+python -m torch.distributed.run --standalone --nproc-per-node 2 -m pytest -q \
+  tests/unit_tests/transformer/moe/test_te_megakernel.py
+```
+
 #### MOK
 
 A megakernel backend replaces the native post-router dispatch, expert-compute, and combine path.

@@ -546,7 +546,7 @@ def test_output_gate_autograd_preserves_native_main_grad(monkeypatch, gated, mai
     x = torch.zeros((4, 8), dtype=torch.bfloat16, requires_grad=True)
     probs = torch.zeros((4, 2), requires_grad=True)
     experts = torch.zeros((4, 2), dtype=torch.int32)
-    monkeypatch.setattr(mok_backend, "routing_map_to_mok_inputs", lambda *_: (probs, experts))
+    monkeypatch.setattr(mok_backend, "routing_map_to_indices", lambda *_: (probs, experts))
     # MCore DDP consumes the hook-only sentinel and clears .grad; numerical
     # gradients must remain in the original main_grad buffer across microbatches.
     handles = [

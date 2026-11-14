@@ -82,3 +82,20 @@ Profile how far real routing departs from the **balanced** reference, then pick 
 - **`moe_expert_rank_capacity_factor`:** pick from profiles so **over-budget token drop** is uncommon; set **slightly above** the profiled value so reruns stay rare.
 - **`moe_paged_stash_buffer_size_factor_cuda`:** size from the **same stats** (peaks vs averages) so **stash overflow** is uncommon; undersizing triggers reruns like over-budget.
 - **`moe_paged_stash_buffer_size_factor_cpu`:** set **> 0** to allow **spill to pinned host** when CUDA pages are full—often **avoids overflow / rerun** at the cost of host memory and more overhead from paged stashing.
+
+## TE MegaMoE backend
+
+`--moe-megakernel-backend te` supports the same paged CUDA pool and optional pinned
+host spill when `--moe-expert-rank-capacity-factor` is set. Dispatch, expert compute,
+and combine remain inside one TE operation; routing remains in MCore. The saved-tensor
+hooks obtain token counts after NCCL EP dispatch and stash activations marked by TE's
+fused grouped MLP.
+
+Use `--moe-paged-stash-buffer-size-factor-cuda` and
+`--moe-paged-stash-buffer-size-factor-cpu` to size the two pools. A positive CPU factor
+enables host spill, including when the CUDA factor is zero. Do not combine this with
+`--cpu-offloading` or offloading of `expert_fc1`, `moe_act`, or `fused_group_mlp`.
+
+Stash exhaustion retries the step with stashing disabled and fresh EP state.
+Unlike the native dispatcher retry, TE retains its fixed receive budget; exceeding
+that budget remains an error.

@@ -8,7 +8,7 @@ import torch
 
 from megatron.core import config
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
-from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
+from megatron.core.transformer.moe.megakernel.route_adapter import routing_map_to_indices
 
 
 class PytorchIndicesToMultihot:
@@ -112,7 +112,7 @@ class TestRoutingMapToIndices:
         )
         probs_reference = probs.detach().clone().requires_grad_(True)
 
-        weights, indices = routing_map_to_mok_inputs(probs, routing_map, topk)
+        weights, indices = routing_map_to_indices(probs, routing_map, topk)
 
         gather_indices = expected_indices.clamp_min(0).to(torch.int64)
         expected_weights = torch.gather(probs_reference, dim=1, index=gather_indices)
