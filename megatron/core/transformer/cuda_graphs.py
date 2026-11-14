@@ -2648,7 +2648,9 @@ class TECudaGraphHelper:
                 # te.make_graphed_callables() accepts keyword arguments since 1.10.0.
                 hidden_states = static_inputs.pop("hidden_states")
                 _sample_args = (hidden_states,)
-                if contains_self_attn:
+                # A layer may provide its own rotary input (e.g. batch-dependent mRoPE in VLMs that
+                # report "rope" for the language model); keep it instead of a static embedding.
+                if contains_self_attn and "rotary_pos_emb" not in static_inputs:
                     rotary_pos_emb = get_rotary_pos_emb(chunk_of_the_layer, hidden_states)
                     if rotary_pos_emb is not None:
                         static_inputs["rotary_pos_emb"] = rotary_pos_emb
