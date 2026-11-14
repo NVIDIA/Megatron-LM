@@ -2004,14 +2004,13 @@ def preprocess_fsdp_dtensor_state_dict(config, raw_state_dict, model):
         if 'optimizer' in state_dict:
             state_dict['optimizer'] = optimizer_state_dict
 
-    if (
-        config.gated_linear_unit
-        and config.activation_func is torch.nn.functional.silu
-    ):
-        apply(handle_swiglu_in_state_dict)
-    # Split a fused MLA q/kv down-projection (mla_down_proj_fusion) back into the unfused
-    # layout used on disk. No-op for unfused models.
-    apply(handle_mla_down_proj_in_state_dict)
+    # V1 projection conversion depends on its bucket slice metadata. V2 exposes
+    # native packed DTensors; naming and uneven-DTensor handling remain common.
+    if model.ddp_config.megatron_fsdp_version != 2:
+        if config.gated_linear_unit and config.activation_func is torch.nn.functional.silu:
+            apply(handle_swiglu_in_state_dict)
+        # Split a fused MLA q/kv down-projection into the v1 on-disk layout.
+        apply(handle_mla_down_proj_in_state_dict)
     if config.num_moe_experts:
         state_dict['model'] = handle_experts_in_state_dict(
             state_dict['model'], config.num_moe_experts
