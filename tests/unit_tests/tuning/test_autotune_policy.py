@@ -331,6 +331,9 @@ def test_packaged_entries_name_live_candidates():
             module_name, name = kernel.rsplit(".", 1)
             module = importlib.import_module(module_name)
             tuner = getattr(module, name)
+            # ``@triton.heuristics`` above ``@triton.autotune`` leaves the autotuner one level in.
+            while isinstance(tuner, autotuner.Heuristics):
+                tuner = tuner.fn
             if not isinstance(tuner, autotuner.Autotuner):
                 # The kernel may be tuned through a separate wrapper, as in
                 # ``_autotuned_k = triton.autotune(...)(k)``; find it by the kernel it runs.
