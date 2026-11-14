@@ -62,6 +62,40 @@ def test_get_actual_sequence_lengths_invalid_shape():
         assert "Expected 2D tensor" in str(e)
 
 
+@pytest.mark.parametrize("shape", [(0, 0), (0, 8), (3, 0)])
+def test_get_actual_sequence_lengths_empty_dimensions(shape):
+    sequences = torch.empty(shape, dtype=torch.long)
+
+    assert sequence_packing_utils.get_actual_sequence_lengths(sequences, 42) == [0] * shape[0]
+
+
+@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("pad_token", [-1, 42])
+@pytest.mark.parametrize(
+    "device",
+    [
+        "cpu",
+        pytest.param(
+            "cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+        ),
+    ],
+)
+def test_get_actual_sequence_lengths_noncontiguous(dtype, pad_token, device):
+    # Each row includes interior padding; the last non-padding token defines its length.
+    expected_lengths = [0, 1, 2, 7, 11, 17]
+    storage = torch.full((len(expected_lengths), 34), pad_token, dtype=dtype, device=device)
+    sequences = storage[:, ::2]
+    assert not sequences.is_contiguous()
+    for row, length in enumerate(expected_lengths):
+        if length:
+            sequences[row, :length:2] = 3
+            sequences[row, length - 1] = 5
+
+    assert (
+        sequence_packing_utils.get_actual_sequence_lengths(sequences, pad_token) == expected_lengths
+    )
+
+
 def test_sequence_packing_basic():
     args = arguments.parse_args(ignore_unknown_args=True)
     setattr(args, 'seq_length', 16)
