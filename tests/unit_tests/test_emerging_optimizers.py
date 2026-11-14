@@ -727,6 +727,13 @@ class TestMuonOptimizerMultiRank:
         with pytest.raises(Exception, match='emerging optimizer with fp16 is not supported'):
             get_megatron_optimizer(config=optimizer_config_fp16, model_chunks=[model])
 
+        # Test 2: Distributed Muon requires layer-wise mode.
+        optimizer_config_distributed = OptimizerConfig(
+            optimizer='muon', lr=0.01, bf16=True, use_distributed_optimizer=True
+        )
+        with pytest.raises(ValueError, match='requires use_layer_wise_distributed_optimizer=True'):
+            get_megatron_optimizer(config=optimizer_config_distributed, model_chunks=[model])
+
         # Test 3: Invalid num_ns_steps should raise exception
         optimizer_config_invalid_ns = OptimizerConfig(
             optimizer='muon',
@@ -739,18 +746,23 @@ class TestMuonOptimizerMultiRank:
         with pytest.raises(ValueError, match='num_ns_steps must be at least 1'):
             get_megatron_optimizer(config=optimizer_config_invalid_ns, model_chunks=[model])
 
-    def test_get_megatron_optimizer_layer_wise(self):
+    @pytest.mark.parametrize(
+        'optimizer_name,distributed,layer_wise',
+        [('muon', False, True), ('muon', True, True), ('dist_muon', True, False)],
+    )
+    def test_get_megatron_optimizer_layer_wise(self, optimizer_name, distributed, layer_wise):
         """Test get_megatron_optimizer with layer-wise distributed optimizer."""
         model = Net().bfloat16().cuda()
         model.requires_grad_(True)
         model = self.create_ddp_model_for_layerwise(model)
 
         optimizer_config = OptimizerConfig(
-            optimizer='muon',
+            optimizer=optimizer_name,
             lr=0.01,
             weight_decay=0.01,
             bf16=True,
-            use_layer_wise_distributed_optimizer=True,
+            use_distributed_optimizer=distributed,
+            use_layer_wise_distributed_optimizer=layer_wise,
             muon_momentum=0.95,
             muon_nesterov=True,
             muon_fp32_matmul_prec="medium",
@@ -759,7 +771,7 @@ class TestMuonOptimizerMultiRank:
             muon_tp_mode="duplicated",
         )
 
-        # use_layer_wise_distributed_optimizer=True triggers LayerWiseDistributedOptimizer
+        # Explicit layer-wise mode and dist_muon both select LayerWiseDistributedOptimizer.
         optimizer = get_megatron_optimizer(
             config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
         )
