@@ -324,7 +324,15 @@ class FullCudaGraphWrapper:
 
         training_str = 'training' if training else 'validation'
         curr_iteration = self.curr_iter(training_str)
-        if curr_iteration == self.cuda_graph_warmup_steps:
+        warmup_steps = self.cuda_graph_warmup_steps
+        if not training and FullCudaGraphWrapper.cuda_graph['training'] is not None:
+            # Capture the validation graph on its first step once the training graph exists.
+            # Warmup is there to build lazily created state eagerly, and the training warmup
+            # has done that. Eager validation steps would have to reserve their working
+            # memory next to the training graph's pool, which they cannot use; captured, the
+            # step takes it from that shared pool instead.
+            warmup_steps = 0
+        if FullCudaGraphWrapper.cuda_graph[training_str] is None and curr_iteration >= warmup_steps:
             logger.info(f'Capture CUDA graph for {training_str}!!!')
             if hasattr(torch.autograd.graph, 'set_override_stale_capture_stream'):
                 torch.autograd.graph.set_override_stale_capture_stream(True)
