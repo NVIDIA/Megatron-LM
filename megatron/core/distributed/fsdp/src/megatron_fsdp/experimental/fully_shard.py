@@ -27,6 +27,7 @@ from torch.distributed.tensor.placement_types import Placement
 from ..mixed_precision import MixedPrecisionPolicy
 from .context import FsdpContext
 from .module import FsdpModule
+from .parameter_grouping import ParameterGrouping
 from .placement import ShardLayout
 from .schedule_policy import SchedulePolicy
 
@@ -68,7 +69,8 @@ class Placements:
 
     ``dp_axes`` identifies the parent-mesh axes that form MFSDP's data-parallel
     mesh. Placement sequences are ordered to match those axes. Use Torch's
-    ``Shard(0)`` for public parameter, gradient, and optimizer sharding.
+    ``Shard(0)`` for parameter, gradient, and optimizer sharding. Group membership
+    is controlled independently by ``fully_shard(parameter_grouping=...)``.
     """
 
     dp_axes: Sequence[MeshAxis]
@@ -96,6 +98,7 @@ def fully_shard(
     grad_scale: float = 1.0,
     schedule_policy: SchedulePolicy = SchedulePolicy(),
     shard_layout: ShardLayout = ShardLayout.PADDED,
+    parameter_grouping: ParameterGrouping = ParameterGrouping.PACKED,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -130,6 +133,10 @@ def fully_shard(
             ``ShardLayout.PADDED`` (default) pads every group to equal shards;
             ``ShardLayout.UNPADDED`` packs each group without padding and splits it at row
             boundaries (32-row block boundaries for MXFP8) into generally unequal shards.
+        parameter_grouping: Which parameters share communication buffers. PACKED groups
+            parameters by effective dtype and requires-grad setting. PER_PARAMETER creates
+            one group per physical parameter, preserving tied aliases. Both policies use
+            the same placements, mesh, precision, and shard-layout rules.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
@@ -161,6 +168,7 @@ def fully_shard(
             schedule_policy=schedule_policy,
             use_symmetric_memory=context.use_symmetric_memory,
             shard_layout=shard_layout,
+            parameter_grouping=parameter_grouping,
         )
     except Exception:
         module.__class__ = original_cls

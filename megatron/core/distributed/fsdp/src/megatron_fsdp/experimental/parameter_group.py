@@ -449,6 +449,15 @@ class FsdpParameterGroup:
         for fsdp_parameter in self.fsdp_parameters:
             self._set_module_parameter(fsdp_parameter.fqns, fsdp_parameter.unsharded)
 
+    def reshard_parameters(self) -> None:
+        """Restore sharded bindings and release gathered weight storage.
+
+        The caller invokes this on the all-gather stream after ordering it behind
+        the last compute consumer. This method does not synchronize streams.
+        """
+        self.bind_sharded_parameters()
+        self.release_unsharded_storage()
+
     def sync_model_weight_from_main_weight(self) -> None:
         """Refresh compute weights from optimizer weights."""
         if isinstance(self.post_optimizer_model_weight, DBuffer):
@@ -640,8 +649,23 @@ class FsdpParameterGroup:
                 device=grads[0].device,
             )
 
+    def reduce_gradients(self) -> None:
+        """Pack completed gradients and finalize their reduction on the current stream.
+
+        The caller orders this stream after gradient producers and waits before
+        consuming optimizer gradients. Source gradients are recorded on this stream
+        so clearing their references does not recycle storage before packing finishes.
+        """
+        partial_grad = self.allocate_partial_grad_buffer()
+        stream = torch.cuda.current_stream(self.main_weight.device)
+        for parameter in self.fsdp_parameters:
+            parameter.unsharded.grad.record_stream(stream)
+        self.copy_gradients_to_partial_buffer(partial_grad)
+        self.reduce_inner_gradients(partial_grad)
+        self.reduce_outer_gradients()
+
     def copy_gradients_to_partial_buffer(self, partial_grad: DBuffer) -> None:
-        """Pack full local gradients on compute into the reduce-scatter input buffer."""
+        """Pack full local gradients into the reduce-scatter input buffer."""
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             partial_grad.get_tensor_view(index).copy_(fsdp_parameter.unsharded.grad)
             fsdp_parameter.unsharded.grad = None

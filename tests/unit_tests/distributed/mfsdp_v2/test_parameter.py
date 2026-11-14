@@ -10,6 +10,7 @@ from torch.distributed.tensor import DTensor, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    ParameterGrouping,
     Placements,
     finalize_gradients,
     fully_shard,
@@ -77,6 +78,44 @@ class NonLeafViewModel(nn.Module):
 
 def _default_placements() -> Placements:
     return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
+
+
+@pytest.mark.parametrize("rows", [1, 5])
+def test_per_parameter_grouping_preserves_aliases_and_chunk_geometry(distributed_setup, rows):
+    """Uneven shards and empty ranks match Torch chunking; tied aliases stay tied."""
+    setup = distributed_setup
+    torch.manual_seed(42)
+    model = nn.Linear(7, rows).to(setup.device)
+    model.alias = model.weight
+    originals = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    mesh = init_device_mesh(setup.device.type, (setup.world_size,))
+    placements = _default_placements()
+    with fully_shard_context(FsdpContext(device=setup.device)):
+        fully_shard(
+            model,
+            mesh=mesh,
+            placements=placements,
+            parameter_grouping=ParameterGrouping.PER_PARAMETER,
+        )
+
+    assert len(model.parameter_groups) == 2
+    model.context.allgather_stream.wait_stream(model.context.current_stream())
+    for group in model.parameter_groups:
+        with torch.cuda.stream(model.context.allgather_stream):
+            group.unshard_parameters()
+            group.reshard_parameters()
+        if setup.world_size > 1:
+            assert all(
+                parameter.unsharded.untyped_storage().nbytes() == 0
+                for parameter in group.fsdp_parameters
+            )
+    assert model.alias is model.weight
+    assert model.parameter_groups[0].fsdp_parameters[0].fqns == ("weight", "alias")
+    for name, original in originals.items():
+        chunks = original.chunk(setup.world_size, dim=0)
+        expected = chunks[setup.rank] if setup.rank < len(chunks) else original[:0]
+        torch.testing.assert_close(getattr(model, name).to_local(), expected)
+        torch.testing.assert_close(getattr(model, name).full_tensor(), original)
 
 
 def test_nested_fully_shard_excludes_child_owned_parameters(distributed_setup):

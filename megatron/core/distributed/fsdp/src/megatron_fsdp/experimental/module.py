@@ -39,6 +39,7 @@ from .parameter_group import (
     effective_dtype,
     get_containing_parameter_group,
 )
+from .parameter_grouping import ParameterGrouping
 from .phase import Phase
 from .placement import BlockAtomic, RowAtomic, ShardLayout
 from .schedule_policy import SchedulePolicy
@@ -70,12 +71,14 @@ class FsdpModule:
         schedule_policy: SchedulePolicy = SchedulePolicy(),
         use_symmetric_memory: bool = False,
         shard_layout: ShardLayout = ShardLayout.PADDED,
+        parameter_grouping: ParameterGrouping = ParameterGrouping.PACKED,
     ) -> None:
         """Initialize FSDP runtime state on an already-constructed module.
 
         Args:
             shard_layout: Padded or unpadded rank segments for every parameter group.
                 See ``fully_shard``.
+            parameter_grouping: Parameter-group membership policy. See ``fully_shard``.
         """
         self._context = context
         self._phase = Phase.RESTING
@@ -84,7 +87,7 @@ class FsdpModule:
         if grad_scale <= 0:
             raise ValueError(f"grad_scale must be positive, got {grad_scale}.")
         parameter_groups = []
-        for group_parameters in _group_parameters(owned_parameters):
+        for group_parameters in _group_parameters(owned_parameters, parameter_grouping):
             first_parameter = next(iter(group_parameters.values()))
             group_dtype = effective_dtype(first_parameter)
             parameter_groups.append(
@@ -547,12 +550,20 @@ def _collect_owned_parameters(root_module: nn.Module) -> dict[str, nn.Parameter]
     return parameters
 
 
-def _group_parameters(parameters: dict[str, nn.Parameter]) -> list[dict[str, nn.Parameter]]:
+def _group_parameters(
+    parameters: dict[str, nn.Parameter], parameter_grouping: ParameterGrouping
+) -> list[dict[str, nn.Parameter]]:
+    if parameter_grouping is ParameterGrouping.PER_PARAMETER:
+        by_parameter: dict[nn.Parameter, dict[str, nn.Parameter]] = {}
+        for name, parameter in parameters.items():
+            by_parameter.setdefault(parameter, {})[name] = parameter
+        return list(by_parameter.values())
+
     grouped: dict[tuple[torch.dtype, bool], dict[str, nn.Parameter]] = {}
     for name, parameter in parameters.items():
         key = (effective_dtype(parameter), parameter.requires_grad)
         grouped.setdefault(key, {})[name] = parameter
-    return [grouped[key] for key in grouped]
+    return list(grouped.values())
 
 
 def _specialize_placements(
