@@ -2,6 +2,7 @@
 
 """Collocated parity and exact transfer witnesses for real disaggregated engines."""
 
+from collections import deque
 from dataclasses import replace
 from unittest import mock
 
@@ -19,6 +20,7 @@ from tests.unit_tests.inference.engines.disagg_test_utils import (
     assert_released,
     collocated_reference,
     complete_transfer,
+    decode_peer_meta,
     disagg_config,
     exchange,
     prompt,
@@ -231,3 +233,152 @@ def test_disagg_real_engine_parity(mixer, rope, transport_world, backend, length
                 assert source_shapes
                 assert all(shape[0] >= length for shape in source_shapes)
                 assert any(shape[0] > changes["cuda_graph_max_tokens"] for shape in source_shapes)
+
+
+class _LoopbackP2P:
+    """Match the NCCL backend's planned sends and receives in post order, in one process."""
+
+    class _Work:
+        done = False
+
+        def is_completed(self):
+            return self.done
+
+        def wait(self):
+            assert self.done, "loopback: a point-to-point operation has no peer"
+
+    def __init__(self):
+        self.sends, self.receives = deque(), deque()
+
+    def batch_isend_irecv(self, ops):
+        works = []
+        for op in ops:
+            work = self._Work()
+            (self.sends if op.op is dist.isend else self.receives).append((op.tensor, work))
+            works.append(work)
+        while self.sends and self.receives:
+            (source, sent), (destination, received) = self.sends.popleft(), self.receives.popleft()
+            assert source.shape == destination.shape
+            destination.copy_(source)
+            sent.done = received.done = True
+        return works
+
+
+class _FailedTransfer:
+    """A terminal transfer failure after which the destination is no longer accessed."""
+
+    storage_safe = True
+
+    def poll(self):
+        raise RuntimeError("injected transfer failure")
+
+    def wait(self):
+        raise RuntimeError("injected transfer failure")
+
+
+def _run_engine_iteration(engine):
+    """One iteration of `run_engine()`: poll handoffs, then step only when there is work."""
+    engine._poll_pending_kv_imports()
+    engine._poll_pending_kv_pushes()
+    if (
+        engine.context.get_active_request_count() > 0
+        or engine.waiting_request_ids
+        or engine.has_admittable_kv_import
+    ):
+        engine.step_modern()
+
+
+@pytest.mark.parametrize("ending", ["admitted", "cancelled", "failed"])
+@pytest.mark.parametrize("mode", [AsyncScheduleMode.LEGACY, AsyncScheduleMode.ASYNC])
+@torch.inference_mode()
+def test_decode_paused_behind_an_import_resumes_after_it(mode, ending):
+    """A lone decode paused because an import holds the last blocks waits, then resumes.
+
+    The import is admitted and finishes, is cancelled, or its transfer fails; in each case
+    the paused request resumes under the engine loop's own work check and completes with
+    the collocated engine's tokens. Both real engines run in one process; a loopback
+    carries the NCCL backend's own plans.
+    """
+    Utils.initialize_model_parallel()
+    try:
+        config = disagg_config(async_sched_mode=mode)
+        reference_config = replace(config, async_sched_mode=AsyncScheduleMode.LEGACY)
+        block = config.context_block_size_tokens
+        a_tokens, b_tokens = prompt(block - 1), prompt(6 * block)
+        weights, a_expected = collocated_reference(reference_config, a_tokens, sampling(4))
+        with real_engine(reference_config, weights=weights) as reference:
+            b_reference = reference.add_request(102, b_tokens, sampling(4))
+            b_expected = run_to_completion(reference, b_reference).generated_tokens
+
+        def handoff(engine, request_id, tokens):
+            request = engine.add_request(request_id, tokens, sampling(0, do_kv_handoff=True))
+            return run_to_completion(engine, request).disaggregated_params
+
+        loopback = _LoopbackP2P()
+        with real_engine(config, role="prefill", weights=weights) as prefill:
+            buffer = prefill.context.memory_buffer
+            block_bytes = buffer[:, :, 0].numel() * buffer.element_size()
+            # Eight usable decode blocks.
+            decode_config = disagg_config(
+                async_sched_mode=mode, context_buffer_size_gb=9.5 * block_bytes / 1024**3
+            )
+            with (
+                real_engine(decode_config, role="decode", weights=weights) as decode,
+                mock.patch.object(dist, "batch_isend_irecv", loopback.batch_isend_irecv),
+            ):
+                context, allocator = decode.context, decode.context.kv_block_allocator
+                assert allocator.pool_size - 1 == 8 and allocator.paused_limit >= 1
+                a_meta, b_meta = handoff(prefill, 101, a_tokens), handoff(prefill, 102, b_tokens)
+                decode._notify_kv_transfer_ready = lambda request_id, cached: None
+
+                # A's one-block import completes; its first decode token fills the block.
+                a_future = decode.add_request_with_kv_handoff(
+                    101, a_tokens, sampling(4), a_meta["kv_meta"], a_meta["block_ids"]
+                )
+                a_pending = decode._pending_kv_imports[0]
+                prefill.push_handoff_kv(101, [decode_peer_meta(decode, a_pending)], 0)
+                assert decode._poll_pending_kv_imports() == 1
+
+                # B's import takes the last seven blocks before A is admitted.
+                b_future = decode.add_request_with_kv_handoff(
+                    102, b_tokens, sampling(4), b_meta["kv_meta"], b_meta["block_ids"]
+                )
+                b_pending = decode._pending_kv_imports[-1]
+                assert b_pending.request_id == 102 and allocator.pool_avail == 0
+
+                # A is admitted, needs a new block for its second token, and pauses with no
+                # request active while B's transfer is still in flight.
+                for _ in range(4):
+                    _run_engine_iteration(decode)
+                    if context.paused_request_count == 1:
+                        break
+                assert context.paused_request_count == context.total_request_count == 1
+                assert context.kv_blocks_held_for_imports() == 7
+
+                if ending == "failed":
+                    b_pending.handle = _FailedTransfer()
+                else:
+                    if ending == "cancelled":
+                        assert decode.abort_kv_handoff(102)
+                    prefill.push_handoff_kv(102, [decode_peer_meta(decode, b_pending)], 0)
+                for _ in range(64):
+                    if a_future.done() and b_future.done():
+                        break
+                    _run_engine_iteration(decode)
+                assert a_future.done(), "the paused request never resumed"
+                assert a_future.result().generated_tokens == a_expected
+                if ending == "admitted":
+                    assert b_future.result().generated_tokens == b_expected
+                elif ending == "cancelled":
+                    assert b_future.cancelled()
+                else:
+                    assert isinstance(b_future.exception(), RuntimeError)
+                assert_released(decode)
+
+                prefill._poll_pending_kv_pushes()
+                assert not prefill._pending_kv_pushes
+                prefill.release_handoff_blocks(101)
+                prefill.release_handoff_blocks(102)
+                assert_released(prefill)
+    finally:
+        Utils.destroy_model_parallel()

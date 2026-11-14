@@ -1671,6 +1671,39 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(8)
+    @pytest.mark.parametrize("held_for_imports", [False, True])
+    def test_lone_decode_may_pause_only_behind_blocks_held_for_imports(self, held_for_imports):
+        """A lone decode that pauses with no free block is legal only while imports hold blocks.
+
+        A disaggregated decode engine's imports hold KV blocks outside every request row and
+        become requests when their transfers complete. Blocks held for anything else leave
+        the paused-with-nothing-active state an error, as before.
+        """
+        ctx = self._get_async_sched_context()
+        # The only row's next token crosses into a new block.
+        self._setup_async_sched_decode_rows(
+            ctx, active_request_count=1, last_block_offsets=[ctx.block_size_tokens - 1]
+        )
+        alloc = ctx.kv_block_allocator
+        alloc.paused_limit = 1  # The paused row's one block stays within the budget.
+        held = alloc.allocate_memory_blocks(alloc.pool_avail).clone()
+        assert alloc.get_allocatable_count() == 0
+        if held_for_imports:
+            ctx.kv_blocks_held_for_imports = lambda: held.numel()
+            ctx.update_requests(
+                active_requests_mask=torch.tensor([1]), new_tokens=torch.tensor([90])
+            )
+            assert ctx.total_request_count == 1 and ctx.paused_request_count == 1
+            assert ctx.active_token_count == 0
+        else:
+            with pytest.raises(AssertionError, match="== 0 with 1 paused requests"):
+                ctx.update_requests(
+                    active_requests_mask=torch.tensor([1]), new_tokens=torch.tensor([90])
+                )
+        alloc.release_memory_blocks(held)
+
+    @pytest.mark.internal
+    @rounder_override(8)
     def test_async_sched_commit_sampled_tokens(self):
         """Async scheduling commits sampled CPU tokens after prepare."""
         ctx = self._get_async_sched_context()

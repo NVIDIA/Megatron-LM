@@ -892,6 +892,10 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             pc_state=pc_state,
             prefix_cache_registry=self.prefix_cache_registry if pc_state is not None else None,
         )
+        # KV blocks that the engine holds outside every request row for decode imports;
+        # they become requests when their transfers complete. A disaggregated decode engine
+        # installs the count; collocated engines hold none.
+        self.kv_blocks_held_for_imports: Callable[[], int] = lambda: 0
         self.dynamo_helper = DynamoHelper()
         self.kv_block_allocator.add_blocks_deregistered_observer(
             self.dynamo_helper.on_kv_blocks_deregistered
@@ -5209,10 +5213,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             active_request_count, newly_paused_request_ids
         )
 
+        # Every resident request may wait paused while imports hold blocks: an admitted
+        # import later finishes and frees blocks, or pauses itself and main's eviction applies.
         assert (
             active_request_count > 0
             or self.total_request_count == 0
             or self.chunked_prefill_request_id != -1
+            or self.kv_blocks_held_for_imports() > 0
         ), "active_request_count == %d with %d paused requests and no hidden chunked prefill." % (
             active_request_count,
             self.paused_request_count,

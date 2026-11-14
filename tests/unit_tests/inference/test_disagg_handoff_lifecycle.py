@@ -173,6 +173,7 @@ class _HandoffHarness(InferenceStateHandoffMixin, _SchedulerHarness):
             num_prefill_requests=0,
             chunked_prefill_request_id=-1,
             total_request_count=0,
+            paused_request_count=0,
             max_requests=8,
             active_token_count=0,
             max_tokens=8,
@@ -464,6 +465,12 @@ def test_setup_applies_role_specific_pinning_and_graph_gating(engine_cls, role):
         assert engine._cg_admission_gating_active() == (role == "prefill")
         assert engine.context.config.cuda_graph_all_prefills
         assert engine.context.use_cuda_graphs_for_non_decode_steps
+        # Only a decode engine holds KV blocks for imports outside its request rows.
+        held_for_imports = getattr(engine.context, "kv_blocks_held_for_imports", None)
+        if role == "decode":
+            assert held_for_imports == engine._import_held_block_count
+        else:
+            assert held_for_imports is None
         assert len(engine.context.cuda_graph_batch_dimensions_list) == 1
         engine.setup_kv_transfer(role)
 
@@ -905,6 +912,20 @@ def test_releasing_pending_hybrid_import_returns_live_slot(handoff_loop):
     assert pending.ssm is None
     assert engine.context.mamba_metadata.freed == [20]
     assert engine.context.mamba_metadata.mamba_state_free_slot_count == 1
+
+
+def test_import_held_blocks_count_until_the_import_ends(handoff_loop):
+    engine = _HandoffHarness(handoff_loop)
+    assert engine._import_held_block_count() == 0
+    engine.add_request_with_kv_handoff(
+        7, [1, 2, 3, 4], SamplingParams(num_tokens_to_generate=2), {"resume_tokens": [99]}, [100]
+    )
+    pending = engine._pending_kv_imports[0]
+    # One prompt block and the first decode step's block.
+    assert pending.local_blocks == [10] and pending.continuation_blocks == [11]
+    assert engine._import_held_block_count() == 2
+    engine._release_pending_kv_import(pending)
+    assert engine._import_held_block_count() == 0
 
 
 def test_reset_cancels_capacity_queued_handoffs(handoff_loop):
