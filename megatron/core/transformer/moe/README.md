@@ -548,6 +548,48 @@ EP All-to-All can consume 30-40% of training time without optimization. These fe
 
 > **Full activation recompute with EP A2A Overlap**: `--recompute-granularity full` is supported and is applied per layer segment, so `--recompute-method` and `--recompute-num-layers` carry exactly the same meaning as without `--overlap-moe-expert-parallel-comm`. Both flags are required. This overlap recompute path requires `--cuda-graph-impl none`; CUDA Graph execution, including `full_iteration`, is not supported.
 
+##### Waiting for the Backward PP Receive on the Communication Stream
+
+**Background.** With EP A2A overlap and pipeline parallelism, each step of the steady-state 1F1B phase runs the forward pass of one model chunk together with the backward pass of another, layer by layer. The backward chunk needs the output gradient received from the next pipeline stage; the paired forward layers do not. By default, the wait for this receive (`pre_backward`) is issued on the computation stream before any layer runs. If the gradient arrives late, the computation stream stalls, and the forward work queued behind the wait, including the first paired forward layer's attention and router (its pre-dispatch computation), stalls with it.
+
+**Behavior.** With `ep_overlap_pp_bwd_wait_on_comm_stream`, the communication stream waits for the backward chunk's CUDA event, then waits for the receive, then records the event again. Every backward node of the chunk waits on this event on its own stream before it runs, so everything that reads the gradient stays ordered after the receive. The forward chunk has its own event, so its computation is no longer queued behind the receive. In a paired layer, the computation stream can run the forward pre-dispatch computation while the gradient is in flight. It then waits for the gradient at the first backward node it runs, normally the MLP or expert backward. The kernels and their order on each stream do not change, so results are bitwise identical with and without the flag. The flag hides receive latency; it does not shorten the receive.
+
+**Configuration.**
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--ep-overlap-pp-bwd-wait-on-comm-stream` (`TransformerConfig.ep_overlap_pp_bwd_wait_on_comm_stream`) | Wait for the backward PP receive on the EP communication stream instead of the computation stream | `False` |
+
+The flag requires `--overlap-moe-expert-parallel-comm` (the config asserts this). It only takes effect where the scheduler passes a backward receive wait to the model chunk: in the steady-state 1F1B phase of the interleaved (VPP) schedule with P2P overlap. P2P overlap is on by default with VPP; with `--no-overlap-p2p-communication`, or without pipeline parallelism, the flag has no effect.
+
+```bash
+--pipeline-model-parallel-size 4
+--num-virtual-stages-per-pipeline-rank 2
+--expert-model-parallel-size 32
+--overlap-moe-expert-parallel-comm
+--delay-wgrad-compute
+--ep-overlap-pp-bwd-wait-on-comm-stream
+```
+
+**Applicability and limitations.**
+
+- **MoE layers.** When the backward chunk's last layer is a MoE layer, its first backward op, combine backward, runs on the communication stream behind the receive, while the paired forward layer's pre-dispatch computation runs on the computation stream.
+- **Dense layers and mixed dense/MoE models.** The flag does not require MoE layers in the backward chunk. For a dense layer, dispatch and combine are no-ops, and the paired forward pre-dispatch computation is still issued before the dense MLP backward, which then waits for the gradient on the computation stream. Chunks that end in dense layers, as in mixed dense/MoE models, get the same overlap window.
+- **The overlap window is short.** At most the first paired forward layer's pre-dispatch computation runs ahead of the gradient. The first backward computation node then waits for the gradient. The paired forward dispatch also waits, because it is queued on the communication stream after the backward combine.
+- **Backward work that waits on the chunk event before the paired forward work.** In the following cases, a computation-stream node waits for the chunk event before the paired forward pre-dispatch computation is issued, so most or all of the benefit is lost:
+  - Output-layer backward (`post_process`), which runs before the layer loop. It only exists on the last pipeline stage, which receives no gradient from a next stage, so there the flag has nothing to hide.
+  - MTP post-processing backward, which runs on the computation stream before the MTP layer's combine backward. This matters when the MTP layer is in a chunk that does receive a gradient (standalone MTP placement on an earlier pipeline rank).
+  - Full activation recompute (`--recompute-granularity full`): when the backward chunk's last layer ends a recompute segment, the segment replay runs before that layer's backward, and its first node waits for the chunk event on the computation stream.
+- **Ordering cost.** When the flag is on, the chunk event is recorded on the communication stream. A computation-stream backward node that waits for it therefore also waits for communication-stream work queued earlier.
+
+**Best practices.**
+
+- A/B test the flag on the intended PP/VPP layout and model configuration. The benefit depends on how often and how late the backward receive is, which depends on scale and stage balance.
+- Use a profiler (for example Nsight Systems) to check for exposed backward PP receive latency at the start of 1F1B chunks with the flag off, and whether forward computation actually runs during that receive with the flag on.
+- Validate throughput and numerical parity (for example, loss curves) instead of assuming the flag always helps.
+
+**Example.** DeepSeek-V3 671B with NVFP4 on 64 VR200 nodes (PP4, EP32, VPP) with EP A2A overlap ran at 17.87 s/step without the flag and 17.57 s/step with it (-0.30 s/step). A 4-node proxy did not show the gain, because its backward pipeline receives are rarely late.
+
 ### Compute Optimization
 
 Fine-grained MoE produces many small operations that can underutilize GPU resources. These optimizations reduce kernel launch overhead and improve GPU utilization.
@@ -783,6 +825,7 @@ For MoE models, certain configurations may prevent CUDA Graph capture of MoE lay
 | --moe-grouped-gemm | Use GroupedGEMM; disable with --no-moe-grouped-gemm | True |
 | --overlap-moe-expert-parallel-comm | Batch-level EP overlap | False |
 | --delay-wgrad-compute | Split dgrad/wgrad compute | False |
+| --ep-overlap-pp-bwd-wait-on-comm-stream | Wait for the backward PP receive on the EP comm stream (needs --overlap-moe-expert-parallel-comm) | False |
 | --moe-shared-expert-intermediate-size | Shared expert FFN size | None |
 | --moe-shared-expert-overlap | Overlap shared expert | False |
 
