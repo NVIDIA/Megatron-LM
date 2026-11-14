@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from megatron.core.distributed import TorchFullyShardedDataParallelConfig
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig
 from megatron.training import arguments, global_vars, initialize
@@ -241,18 +242,20 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
     monkeypatch.setattr(initialize.inprocess_restart, "maybe_force_nccl_backend_init", Mock())
     monkeypatch.setattr(initialize.mpu, "model_parallel_is_initialized", lambda: False)
     monkeypatch.setattr(initialize.mpu, "initialize_model_parallel", init_mpu)
+    # The logged sizes come from the collection that initialize_model_parallel returns.
     for name in (
         "get_tensor_model_parallel_world_size",
         "get_pipeline_model_parallel_world_size",
         "get_gtp_weight_remat_world_size",
     ):
-        monkeypatch.setattr(initialize.mpu, name, lambda: 1)
+        monkeypatch.setattr(initialize.mpu, name, Mock(side_effect=AssertionError(name)))
     for name in ("TORCH_FR_DUMP_TEMP_FILE", "TORCH_NCCL_DEBUG_INFO_TEMP_FILE"):
         monkeypatch.delenv(name, raising=False)
     store = object()
 
-    initialize._initialize_distributed(None, None, store)
+    pg_collection = initialize._initialize_distributed(None, None, store)
 
+    assert pg_collection is init_mpu.return_value
     set_device.assert_called_once_with(1)
     init_pg.assert_called_once_with(
         backend="gloo", store=store, world_size=4, rank=0, timeout=timedelta(minutes=37)
@@ -873,7 +876,7 @@ def test_callback_upcycling_uses_temporary_dense_config(monkeypatch, run_config)
     monkeypatch.setattr(training, "unwrap_model", lambda model: model)
     monkeypatch.setattr(training, "checkpoint_exists", lambda path: False)
     # This setup stub builds no process groups for the new startup memory reports.
-    monkeypatch.setattr(training, "_get_model_pg_collection", lambda model_chunk: None)
+    monkeypatch.setattr(training, "_get_model_pg_collection", lambda *args, **kwargs: None)
     monkeypatch.setattr(training, "report_memory", lambda *args, **kwargs: None)
     monkeypatch.setattr(torch.distributed, "barrier", Mock())
     built_configs = []
@@ -890,7 +893,10 @@ def test_callback_upcycling_uses_temporary_dense_config(monkeypatch, run_config)
     monkeypatch.setattr(training, "get_model", build)
     with pytest.raises(ReachedDenseModel):
         training.setup_model_and_optimizer(
-            Mock(), model_provider_func=Mock(), cfg_container=run_config
+            Mock(),
+            model_provider_func=Mock(),
+            cfg_container=run_config,
+            pg_collection=ProcessGroupCollection(),
         )
     assert built_configs[0] is run_config.model.transformer
     assert built_configs[1].num_moe_experts is None
@@ -933,6 +939,11 @@ def test_callbacks_construct_from_registered_model_config(
     monkeypatch.setattr(provider, "get_args", lambda: args)
     build = Mock()
     monkeypatch.setattr(provider, "BertModel" if family == "bert" else "T5Model", build)
+    # Both callbacks resolve the global process groups themselves and pass them on.
+    global_groups = Mock()
+    monkeypatch.setattr(
+        provider.ProcessGroupCollection, "use_mpu_process_groups", Mock(return_value=global_groups)
+    )
     for name in (
         "hidden_size",
         "num_layers",
@@ -955,11 +966,12 @@ def test_callbacks_construct_from_registered_model_config(
     assert build.call_args.kwargs["vocab_size"] == 128
     assert build.call_args.kwargs["max_sequence_length"] == 64
     assert build.call_args.kwargs["share_embeddings_and_output_weights"] is True
+    assert build.call_args.kwargs["pg_collection"] is global_groups
     if family == "bert":
         assert build.call_args.kwargs["add_binary_head"] is binary_head
         assert build.call_args.kwargs["num_tokentypes"] == (2 if binary_head else 0)
         batch = tuple(object() for _ in range(6))
-        monkeypatch.setattr(provider, "get_batch", lambda _: batch)
+        monkeypatch.setattr(provider, "get_batch", lambda _, tp_group=None: batch)
         monkeypatch.setattr(provider, "get_timers", Mock())
         forward = Mock()
         provider.forward_step(None, forward)
@@ -971,7 +983,11 @@ def test_callbacks_construct_from_registered_model_config(
         dataset_builder = Mock()
         dataset_builder.return_value.build.return_value = (None, None, None)
         monkeypatch.setattr(provider, "BlendedMegatronDatasetBuilder", dataset_builder)
-        provider.train_valid_test_datasets_provider([1, 1, 1])
+        # The provider elects the rank that builds the datasets in the TP group it is given.
+        tp_group = SimpleNamespace(rank=lambda: 0, size=lambda: 1)
+        provider.train_valid_test_datasets_provider(
+            [1, 1, 1], pg_collection=ProcessGroupCollection(tp=tp_group)
+        )
         assert dataset_config.call_args.kwargs["classification_head"] is binary_head
     else:
         assert build.call_args.kwargs["encoder_config"].num_layers == 2
@@ -1090,10 +1106,18 @@ def test_llava_callback_consumes_its_model_config(
     monkeypatch.setattr(pretrain_vlm, "get_num_image_embeddings", lambda *a, **kw: 4)
     monkeypatch.setattr(torch.distributed, "get_rank", lambda: 0)
     monkeypatch.setattr(pretrain_vlm.context_parallel, "get_padding", lambda *a: 0)
-    monkeypatch.setattr(pretrain_vlm.parallel_state, "is_pipeline_first_stage", lambda: True)
-    monkeypatch.setattr(pretrain_vlm.parallel_state, "is_pipeline_last_stage", lambda: True)
+    # The callback places the model by its collection's pipeline group.
+    monkeypatch.setattr(pretrain_vlm, "is_pp_first_stage", lambda pp_group: True)
+    monkeypatch.setattr(pretrain_vlm, "is_pp_last_stage", lambda pp_group: True)
     build = Mock()
     monkeypatch.setattr(pretrain_vlm, "LLaVAModel", build)
+    # The VLM callback resolves the global process groups itself and passes them on.
+    global_groups = Mock()
+    monkeypatch.setattr(
+        pretrain_vlm.ProcessGroupCollection,
+        "use_mpu_process_groups",
+        Mock(return_value=global_groups),
+    )
     args.rotary_base = 999
     args.use_rope_scaling = False
     args.padded_vocab_size = 999
@@ -1116,6 +1140,7 @@ def test_llava_callback_consumes_its_model_config(
     assert build.call_args.kwargs["language_rope_scaling"] is True
     assert build.call_args.kwargs["language_transformer_config"].hidden_size == 32
     assert build.call_args.kwargs["vision_transformer_config"].num_layers == 1
+    assert build.call_args.kwargs["pg_collection"] is global_groups
     assert cfg.model.transformer.num_layers == 2
     assert build.call_args.kwargs["img_h"] == 32
     assert build.call_args.kwargs["img_w"] == 48
@@ -1534,23 +1559,29 @@ def test_dataset_helpers_use_registered_model(
     assert dataset.data_parallel_size == 2
     assert dataset.sequence_length == 32  # Actual data length, not position capacity.
 
-    monkeypatch.setattr(entrypoint.mpu, "get_tensor_model_parallel_rank", lambda: 0)
-    monkeypatch.setattr(entrypoint.mpu, "get_pipeline_model_parallel_rank", lambda: 1)
-    monkeypatch.setattr(
-        entrypoint.mpu, "get_virtual_pipeline_model_parallel_world_size", lambda: None
-    )
-    monkeypatch.setattr(
-        "megatron.training.utils.is_first_or_last_pipeline_stage", lambda stage: False
-    )
+    # The dataset predicate reads its ranks from the run's process groups, as the scripts'
+    # providers pass them: here the middle of three pipeline stages, which holds the MTP layer.
+    def run_groups(tp_rank):
+        return ProcessGroupCollection(
+            tp=SimpleNamespace(rank=lambda: tp_rank, size=lambda: 2),
+            pp=SimpleNamespace(rank=lambda: 1, size=lambda: 3),
+        )
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    pg_collection = run_groups(tp_rank=0)
     # MTP requires data here; packing also requires data on every pipeline stage.
-    assert entrypoint.is_dataset_built_on_rank()
-    assert entrypoint.is_dataset_built_on_rank(is_packed_sequence=True)
+    assert entrypoint.is_dataset_built_on_rank(pg_collection=pg_collection)
+    assert entrypoint.is_dataset_built_on_rank(is_packed_sequence=True, pg_collection=pg_collection)
     monkeypatch.setattr(providers, "mtp_on_this_rank", lambda **kwargs: False)
-    assert entrypoint.is_dataset_built_on_rank() is (sequence_packing_scheduler is not None)
-    assert entrypoint.is_dataset_built_on_rank(is_packed_sequence=True)
-    monkeypatch.setattr(entrypoint.mpu, "get_tensor_model_parallel_rank", lambda: 1)
-    assert not entrypoint.is_dataset_built_on_rank()
-    assert not entrypoint.is_dataset_built_on_rank(is_packed_sequence=True)
+    assert entrypoint.is_dataset_built_on_rank(pg_collection=pg_collection) is (
+        sequence_packing_scheduler is not None
+    )
+    assert entrypoint.is_dataset_built_on_rank(is_packed_sequence=True, pg_collection=pg_collection)
+    pg_collection = run_groups(tp_rank=1)
+    assert not entrypoint.is_dataset_built_on_rank(pg_collection=pg_collection)
+    assert not entrypoint.is_dataset_built_on_rank(
+        is_packed_sequence=True, pg_collection=pg_collection
+    )
     assert args.data_parallel_size == 999
     assert args.context_parallel_size == args.tensor_model_parallel_size == 1
     assert args.mtp_num_layers is None

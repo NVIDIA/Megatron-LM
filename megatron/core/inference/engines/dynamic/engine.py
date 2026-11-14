@@ -26,7 +26,6 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.inference.utils import Counter, InferenceMode
-from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import CudaGraphManager, delete_cuda_graphs
 from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.moe.router_replay import RouterReplay, RouterReplayAction
@@ -34,6 +33,7 @@ from megatron.core.utils import (
     deprecate_args,
     experimental_api,
     get_asyncio_loop,
+    get_global_memory_buffer,
     get_pg_size,
     nvtx_range_pop,
     nvtx_range_push,
@@ -202,10 +202,7 @@ class DynamicInferenceEngine(
                 if isinstance(module, ShortcutMoEBlock):
                     module.setup_inference_overlap()
 
-        if inference_config.pg_collection is not None:
-            self.pg_collection = inference_config.pg_collection
-        else:
-            self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        self.pg_collection = inference_config.resolve_pg_collection()
 
         # Initialization options.
         self.controller = controller
@@ -570,8 +567,6 @@ class DynamicInferenceEngine(
         # stable for the graph's lifetime. Only needed when sequence parallel is on
         # (otherwise the "mpu" all-gather path is not taken).
         if getattr(model_config, "sequence_parallel", False):
-            from megatron.core.parallel_state import get_global_memory_buffer
-
             max_ag_numel = self.context.max_tokens * model_config.hidden_size
             get_global_memory_buffer().get_tensor((max_ag_numel,), model_config.params_dtype, "mpu")
 

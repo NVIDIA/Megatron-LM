@@ -4,13 +4,14 @@ from typing import Optional
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.export.data_type import DataType
 from megatron.core.export.trtllm.trtllm_layers import NON_TRANSFORMER_LAYERS_NAMES, TRTLLMLayers
 from megatron.core.export.trtllm.trtllm_layers import get_layer_name_without_prefix as suffix
 from megatron.core.export.trtllm.trtllm_weights_converter.utils import is_gated_activation
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_process_groups
 from megatron.core.tensor_parallel.utils import VocabUtility
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_pg_rank, get_pg_size
 
 try:
     from tqdm import tqdm
@@ -41,6 +42,7 @@ class DistributedTRTLLMModelWeightsConverter:
         multi_query_mode: bool = False,
         activation: str = "gelu",
         scales: Optional[dict] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """Constructor for the TRTLLMModelWeightsConverterGPU class
 
@@ -52,6 +54,9 @@ class DistributedTRTLLMModelWeightsConverter:
             multi_query_mode (bool, optional): Defaults to False.
             activation (str, optional): Defaults to "gelu".
             scales (dict, optional): Dictionary with fp8 scaling factors.
+            pg_collection (ProcessGroupCollection, optional): Process groups of the model being
+                exported; the converter uses its `tp` and `pp` groups. If None, the global
+                process groups from `parallel_state` are used, which is deprecated.
         """
         if scales is None:
             scales = {}
@@ -68,11 +73,28 @@ class DistributedTRTLLMModelWeightsConverter:
                 num_kv_heads = self.transformer_config.num_attention_heads
         self.num_kv_heads = num_kv_heads
 
-        self.inference_pp_size = parallel_state.get_pipeline_model_parallel_world_size()
-        self.inference_tp_size = parallel_state.get_tensor_model_parallel_world_size()
-        self.tp_rank = parallel_state.get_tensor_model_parallel_rank()
-        self.pp_rank = parallel_state.get_pipeline_model_parallel_rank()
-        self.tp_group = parallel_state.get_tensor_model_parallel_group()
+        # Export runs on the grid the model was loaded on. Without a collection, the groups come
+        # from the global grid; see docs/developer/parallel-state-deprecation.md.
+        pg_collection = resolve_process_groups(
+            pg_collection,
+            owner=type(self).__name__,
+            required=("tp", "pp"),
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        # The collection holds None for groups that were never created. get_pg_size(None) is 1, so
+        # without this check an uninitialized grid would export a TP1/PP1 mapping.
+        if pg_collection.tp is None or pg_collection.pp is None:
+            raise RuntimeError(
+                "DistributedTRTLLMModelWeightsConverter needs the tensor- and pipeline-parallel "
+                "groups of the grid the model was loaded on; pass a pg_collection that sets tp "
+                "and pp, or call initialize_model_parallel first."
+            )
+        self.inference_pp_size = get_pg_size(pg_collection.pp)
+        self.inference_tp_size = get_pg_size(pg_collection.tp)
+        self.tp_rank = get_pg_rank(pg_collection.tp)
+        self.pp_rank = get_pg_rank(pg_collection.pp)
+        self.tp_group = pg_collection.tp
         vp_size = self.transformer_config.virtual_pipeline_model_parallel_size
 
         assert (
