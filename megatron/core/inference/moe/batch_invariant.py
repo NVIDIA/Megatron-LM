@@ -18,6 +18,7 @@ from megatron.core.inference.quantization.mxfp8_quantize import (
     MXFP8_BLOCK_SIZE,
     MXFP8_SCALE_COL_BLOCK,
     MXFP8_SCALE_ROW_BLOCK,
+    _mxfp8_group_scales,
 )
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, ensure_mxfp8_scale_dtype
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
@@ -382,14 +383,10 @@ def _squared_relu_with_probs_quantize_kernel(
             # _mxfp8_quant_swizzle_row on x.
             x_grouped = tl.reshape(x, [BLOCK_GROUPS, 32])
             max_vals = tl.max(tl.abs(x_grouped), axis=1)
-            dequant_scale = max_vals / 448.0
-            dequant_exp = (dequant_scale.to(tl.uint32, bitcast=True) + 0x007FFFFF) & 0x7F800000
-            dequant_rounded = dequant_exp.to(tl.float32, bitcast=True)
-            quant_scale = tl.where(dequant_rounded == 0, 0.0, 1.0 / dequant_rounded)
+            scale_exp, quant_scale = _mxfp8_group_scales(max_vals)
             quantized = tl.reshape(x_grouped * quant_scale[:, None], [BLOCK_K])
             tl.store(out_fp8_ptr + row_i64 * K + offs, quantized.to(tl.float8e4nv), mask=mask)
 
-            scale_exp = (dequant_exp >> 23).to(tl.uint8)
             local_row = row_i64 % 128
             tile_idx = (row_i64 // 128) * n_col_blocks + col_offs // 4
             swizzled_offs = tile_idx * 512 + (local_row % 32) * 16 + (local_row // 32) * 4
