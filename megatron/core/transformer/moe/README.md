@@ -943,3 +943,41 @@ If you use Megatron Core MoE in your research, please cite:
     journal={arXiv preprint arXiv:2504.14960},
 }
 ```
+
+## Fake process groups with Flex/DeepEP
+
+For a single-device memory probe, `--fake-process-group` supports the `flex`
+dispatcher with the `deepep` backend, BF16, and
+`--moe-router-force-load-balancing`. No checkpoint or peer processes are required.
+Use the desired logical `WORLD_SIZE`, `RANK`, and model-parallel settings as with
+other FakePG probes. The selected rank constructs its own model shard and runs
+its normal pipeline schedule; probe the first and last logical rank separately
+when representative pipeline endpoints are needed.
+
+The fake backend executes the normal Flex preprocessing, expert computation,
+permutation, and backward paths. Its received hidden-state shape is
+`[local_tokens * effective_topk, hidden_size]`, where the effective top-k includes
+expert tensor-parallel route replication. Every received row represents one
+expert assignment, distributed evenly among local experts. Sending relationships
+are not reconstructed, and tokens routed to multiple experts on one destination
+rank are not deduplicated. This may overallocate receive buffers relative to real
+DeepEP; it is not a guaranteed upper bound on the overall training peak.
+
+DeepEP v1 must still be installed to provide its dispatch/combine buffer-size
+hints. The probe models the shared NVLink/RDMA buffers, a 32 MiB workspace, and
+per-dispatch synthetic handles without constructing a real DeepEP Buffer or
+initializing IPC/NVSHMEM. These allocations use the PyTorch allocator, whereas
+some corresponding native allocations are external to it. NVSHMEM runtime
+memory, exact RDMA metadata, and asynchronous communication lifetimes are not
+reproduced. The probe provides allocation evidence, not distributed timing or
+numerical training validation.
+
+HybridEP, DeepEP v2, quantization, capacity/drop/padding, and CUDA Graph capture
+are outside this initial fake Flex implementation. Unsupported combinations fail
+validation; real distributed training continues to use its selected backend.
+
+For fixed-length, unpacked probes, non-source TP ranks initialize their existing
+receive buffers with synthetic token IDs, labels, loss masks, and positions.
+The trainer enables the requested training steps locally because FakePG cannot
+broadcast the source rank's data-availability flag. Packed and dynamic-CP batch
+metadata cannot be reconstructed by this fixed-shape receiver and is rejected.

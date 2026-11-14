@@ -13,6 +13,7 @@ from megatron.core.fp8_utils import get_fp8_recipe_for_a2a
 from megatron.core.fusions.fused_indices_converter import fused_indices_to_multihot
 from megatron.core.fusions.fused_pad_routing_map import fused_pad_routing_map
 from megatron.core.jit import jit_fuser
+from megatron.core.ops.moe.fake_deepep import is_fake_process_group, validate_fake_flex_config
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel import (
     all_to_all,
@@ -1471,6 +1472,8 @@ class _DeepepManager(_DispatchManager):
             num_experts (int): The total number of experts in the group.
             config (TransformerConfig): The configuration for the transformer model.
         """
+        if is_fake_process_group(group):
+            validate_fake_flex_config(config)
         self.group = group
         self.num_local_experts = num_local_experts
         self.config = config

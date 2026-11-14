@@ -6,6 +6,7 @@
 import inspect
 from typing import Callable, Optional
 
+from megatron.core.ops.moe.fake_deepep import capture_event, get_fake_buffer, is_fake_process_group
 from megatron.core.utils import internal_api
 
 try:
@@ -59,6 +60,8 @@ def get_buffer(group: torch.distributed.ProcessGroup, hidden_bytes: int):
     Returns:
         Buffer: Communication buffer
     """
+    if is_fake_process_group(group):
+        return get_fake_buffer(group, hidden_bytes, Buffer if HAVE_DEEP_EP else None)
     global _buffer
     num_nvl_bytes, num_rdma_bytes = 0, 0
     for config in (
@@ -132,9 +135,7 @@ class FusedDispatch(torch.autograd.Function):
         allocate_on_comm_stream=False,
     ):
         """Forward pass of fused dispatch."""
-        previous_event = None
-        if async_finish:
-            previous_event = EventOverlap(EventHandle())
+        previous_event = capture_event(group, async_finish, EventHandle, EventOverlap)
         # Calculate layout before actual dispatch
         buffer = get_buffer(group, get_hidden_bytes(x))
         (
@@ -194,9 +195,7 @@ class FusedDispatch(torch.autograd.Function):
         """Backward pass of fused dispatch."""
         buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
         handle = ctx.handle
-        previous_event = None
-        if ctx.async_finish:
-            previous_event = EventOverlap(EventHandle())
+        previous_event = capture_event(ctx.group, ctx.async_finish, EventHandle, EventOverlap)
         grad_x, grad_token_probs, after_event = buffer.combine(
             grad_output.contiguous(),
             handle,
@@ -217,9 +216,7 @@ class FusedCombine(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, group, handle, async_finish=False, allocate_on_comm_stream=False):
         """Forward pass of fused combine."""
-        previous_event = None
-        if async_finish:
-            previous_event = EventOverlap(EventHandle())
+        previous_event = capture_event(group, async_finish, EventHandle, EventOverlap)
         buffer = get_buffer(group, get_hidden_bytes(x))
         combined_x, _, after_event = buffer.combine(
             x,
@@ -241,9 +238,7 @@ class FusedCombine(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output, previous_event=None):
         """Backward pass of fused combine."""
-        previous_event = None
-        if ctx.async_finish:
-            previous_event = EventOverlap(EventHandle())
+        previous_event = capture_event(ctx.group, ctx.async_finish, EventHandle, EventOverlap)
         buffer = get_buffer(ctx.group, get_hidden_bytes(grad_output))
         grad_x, _, _, _, _, after_event = buffer.dispatch(
             grad_output.contiguous(),
