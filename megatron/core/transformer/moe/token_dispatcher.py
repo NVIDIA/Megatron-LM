@@ -1739,12 +1739,41 @@ class _DeepepV2Manager(_DeepepManager):
                 "first; replacing it with DeepEP v2 can make the hybridep backend unavailable."
             )
 
-    def _get_buffer(self, hidden_states: torch.Tensor):
+    def _get_num_max_tokens_per_rank(self, hidden_states: torch.Tensor) -> int:
+        """Return the token bound for this dispatch, which DeepEP v2 needs on every rank."""
+        num_tokens = hidden_states.shape[0]
+        bound = self.config.moe_deepepv2_num_max_tokens_per_rank
+        if bound is not None:
+            # Checked on the host from the shape, so there is no GPU sync.
+            if num_tokens > bound:
+                raise ValueError(
+                    f"DeepEP v2 dispatch got {num_tokens} tokens on this rank, more than "
+                    f"moe_deepepv2_num_max_tokens_per_rank={bound}. Raise the bound so that it "
+                    "covers every rank's token count."
+                )
+            return bound
+        if self.config.moe_deepepv2_pad_uneven_dispatch_inputs:
+            # Use the group-wide max, as HybridEP does, so all ranks pass the same bound.
+            max_num_tokens = torch.tensor(
+                [num_tokens], device=hidden_states.device, dtype=torch.long
+            )
+            torch.distributed.all_reduce(
+                max_num_tokens, op=torch.distributed.ReduceOp.MAX, group=self.group
+            )
+            return int(max_num_tokens.item())
+        # The local count; get_elastic_buffer checks at the first build that all ranks agree.
+        return num_tokens
+
+    def _get_buffer(self, hidden_states: torch.Tensor, num_max_tokens_per_rank: int):
+        """Get the DeepEP v2 buffer for this bound, with the deepepv2 settings from the config."""
         self.buffer = get_elastic_buffer(
             self.group,
-            num_max_tokens_per_rank=hidden_states.shape[0],
+            num_max_tokens_per_rank=num_max_tokens_per_rank,
             hidden=hidden_states.shape[1],
             num_topk=self.token_indices.shape[1],
+            allow_hybrid_mode=self.config.moe_deepepv2_allow_hybrid_mode,
+            num_allocated_qps=self.config.moe_deepepv2_num_allocated_qps,
+            deterministic=self.config.moe_deepepv2_deterministic,
         )
         return self.buffer
 
@@ -1754,6 +1783,7 @@ class _DeepepV2Manager(_DeepepManager):
         async_finish: bool = False,
         allocate_on_comm_stream: bool = False,
     ) -> torch.Tensor:
+        """Dispatch hidden_states with DeepEP v2, using the token bound for this dispatch."""
         # DeepEP v2 only supports float32 probs.
         if self.token_probs.dtype != torch.float32:
             if self.token_probs.dtype in [torch.bfloat16, torch.float16]:
@@ -1761,7 +1791,8 @@ class _DeepepV2Manager(_DeepepManager):
                     "DeepEP v2 only supports float32 probs, please set --moe-router-dtype=fp32"
                 )
             self.token_probs = self.token_probs.float()
-        buffer = self._get_buffer(hidden_states)
+        num_max_tokens_per_rank = self._get_num_max_tokens_per_rank(hidden_states)
+        buffer = self._get_buffer(hidden_states, num_max_tokens_per_rank)
         hidden_states, dispatched_indices, dispatched_probs, num_tokens_per_expert, handle = (
             deepepv2_dispatch(
                 buffer,
@@ -1769,7 +1800,7 @@ class _DeepepV2Manager(_DeepepManager):
                 self.token_indices,
                 self.token_probs,
                 self.num_experts,
-                num_max_tokens_per_rank=hidden_states.shape[0],
+                num_max_tokens_per_rank=num_max_tokens_per_rank,
                 expert_alignment=1,
                 num_sms=self.num_sms,
                 async_finish=async_finish,
@@ -2260,7 +2291,8 @@ class MoEFlexTokenDispatcher(MoETokenDispatcher):
             )
             self.cudagraph_attrs = ['_comm_manager.token_probs', '_comm_manager.token_indices']
         elif self.config.moe_flex_dispatcher_backend == "deepepv2":
-            assert self.tp_size * self.ep_size > 1, "DeepEP v2 dispatcher requires TPxEP > 1"
+            if self.tp_size * self.ep_size <= 1:
+                raise ValueError("DeepEP v2 dispatcher requires TPxEP > 1")
             self._comm_manager = _DeepepV2Manager(
                 group=self.tp_ep_group,
                 num_local_experts=self.num_local_experts,

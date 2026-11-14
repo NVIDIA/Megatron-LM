@@ -1879,7 +1879,8 @@ class TestMoEModules:
             pytest.param(
                 "flex",
                 2,
-                {"moe_flex_dispatcher_backend": "deepepv2"},
+                # Pin DeepEP's deterministic mode (the default) so that the replay always covers it.
+                {"moe_flex_dispatcher_backend": "deepepv2", "moe_deepepv2_deterministic": True},
                 id="flex-deepepv2-ep2",
                 marks=pytest.mark.skipif(not HAVE_DEEP_EP_V2, reason="DeepEP v2 not installed"),
             ),

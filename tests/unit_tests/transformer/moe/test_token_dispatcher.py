@@ -206,6 +206,12 @@ class MoEModelTestContainer:
             moe_hybridep_routing_map_mode=kwargs.get("moe_hybridep_routing_map_mode", "bool"),
             moe_expert_rank_capacity_factor=kwargs.get("moe_expert_rank_capacity_factor", None),
             moe_ncclep_zero_copy=kwargs.get("moe_ncclep_zero_copy", False),
+            moe_deepepv2_num_max_tokens_per_rank=kwargs.get(
+                "moe_deepepv2_num_max_tokens_per_rank", None
+            ),
+            moe_deepepv2_pad_uneven_dispatch_inputs=kwargs.get(
+                "moe_deepepv2_pad_uneven_dispatch_inputs", False
+            ),
             moe_dispatch_fwd_dtype=kwargs.get("moe_dispatch_fwd_dtype", 'bf16'),
             moe_combine_bwd_dtype=kwargs.get("moe_combine_bwd_dtype", 'bf16'),
             use_transformer_engine_op_fuser=kwargs.get("use_transformer_engine_op_fuser", False),
@@ -286,33 +292,36 @@ class MoEModelTestContainer:
             hidden_states.grad, ans
         ), "Restored hidden states do not match original hidden states"
 
+    def thd_round_trip(self, num_tokens):
+        """Dispatch and combine packed (THD) input of num_tokens tokens through an identity
+        expert, and check that the output and the input gradient round-trip exactly."""
+        moe_layer = self.moe_layer
+        dispatcher = moe_layer.token_dispatcher
+        hidden_states = torch.randn(
+            (num_tokens, 1, moe_layer.config.hidden_size), dtype=self.test_dtype, device="cuda"
+        )
+        hidden_states.requires_grad = True
+        probs, indices = apply_module(moe_layer.router)(hidden_states)
+        probs = torch.ones_like(probs) / moe_layer.router.topk
+        permuted, permuted_probs = dispatcher.dispatch_preprocess(
+            hidden_states, indices, probs, packed_seq_params=PackedSeqParams(qkv_format="thd")
+        )
+        permuted, permuted_probs = dispatcher.token_dispatch(permuted, permuted_probs)
+        permuted, _, permuted_probs = dispatcher.dispatch_postprocess(permuted, permuted_probs)
+        permuted = (permuted * permuted_probs.unsqueeze(-1)).to(dtype=self.test_dtype)
+        restored, _ = token_unpermutation(dispatcher, permuted)
+        torch.testing.assert_close(restored, hidden_states)
+        torch.autograd.backward(restored, hidden_states)
+        torch.testing.assert_close(hidden_states.grad, hidden_states)
+
     @pytest.mark.internal
     def dispatcher_thd_uneven_tokens_test(self, seq_length):
         """Packed (THD) input: per-rank token counts differ and change between dispatches. The
         dispatcher sizes its buffers once from seq_length and must round-trip every count under
         it, and reject a count above it."""
-        moe_layer = self.moe_layer
-        dispatcher = moe_layer.token_dispatcher
+        dispatcher = self.moe_layer.token_dispatcher
         rank = torch.distributed.get_rank()
-        packed_seq_params = PackedSeqParams(qkv_format="thd")
-
-        def round_trip(num_tokens):
-            hidden_states = torch.randn(
-                (num_tokens, 1, moe_layer.config.hidden_size), dtype=self.test_dtype, device="cuda"
-            )
-            hidden_states.requires_grad = True
-            probs, indices = apply_module(moe_layer.router)(hidden_states)
-            probs = torch.ones_like(probs) / moe_layer.router.topk
-            permuted, permuted_probs = dispatcher.dispatch_preprocess(
-                hidden_states, indices, probs, packed_seq_params=packed_seq_params
-            )
-            permuted, permuted_probs = dispatcher.token_dispatch(permuted, permuted_probs)
-            permuted, _, permuted_probs = dispatcher.dispatch_postprocess(permuted, permuted_probs)
-            permuted = (permuted * permuted_probs.unsqueeze(-1)).to(dtype=self.test_dtype)
-            restored, _ = token_unpermutation(dispatcher, permuted)
-            torch.testing.assert_close(restored, hidden_states)
-            torch.autograd.backward(restored, hidden_states)
-            torch.testing.assert_close(hidden_states.grad, hidden_states)
+        round_trip = self.thd_round_trip
 
         round_trip(64 + 16 * rank)
         round_trip(seq_length - 8 * rank)
@@ -320,6 +329,35 @@ class MoEModelTestContainer:
         assert bound == seq_length, f"bound {bound} should come from seq_length {seq_length}"
         with pytest.raises(RuntimeError, match="sized for"):
             round_trip(bound + 64)
+
+    @pytest.mark.internal
+    def deepepv2_thd_uneven_tokens_test(self, seq_length, mode):
+        """Packed (THD) input on deepepv2: per-rank token counts differ and change between
+        dispatches, but DeepEP v2 needs the same num_max_tokens_per_rank on every rank. With a
+        fixed bound ("bound") or the group maximum ("pad") every count round-trips; by default
+        ("default") the first buffer build raises on every rank instead of hanging."""
+        rank = torch.distributed.get_rank()
+        manager = self.moe_layer.token_dispatcher._comm_manager
+        assert manager.config.moe_deepepv2_pad_uneven_dispatch_inputs == (mode == "pad")
+        assert manager.config.moe_deepepv2_num_max_tokens_per_rank == (
+            seq_length if mode == "bound" else None
+        )
+        group_ranks = torch.distributed.get_process_group_ranks(manager.group)
+        if mode == "default":
+            with pytest.raises(ValueError, match="same num_max_tokens_per_rank on every rank"):
+                self.thd_round_trip(64 + 16 * rank)
+            return
+        self.thd_round_trip(64 + 16 * rank)
+        expected = seq_length if mode == "bound" else 64 + 16 * max(group_ranks)
+        assert manager.buffer.num_max_tokens_per_rank == expected
+        # The bound grows, so with "pad" every rank of the group rebuilds the buffer together.
+        self.thd_round_trip(seq_length - 8 * rank)
+        expected = seq_length if mode == "bound" else seq_length - 8 * min(group_ranks)
+        assert manager.buffer.num_max_tokens_per_rank == expected
+        if mode == "bound":
+            # Every rank is over the bound, so every rank raises before communicating.
+            with pytest.raises(ValueError, match="moe_deepepv2_num_max_tokens_per_rank"):
+                self.thd_round_trip(seq_length + 64)
 
     @pytest.mark.internal
     def dispatcher_thd_parity_vs_alltoall_test(self, rtol, atol):
@@ -1458,6 +1496,33 @@ class TestFlexDispatcher:
             max_seq_length_per_sample=seq_length,
         )
         container.dispatcher_thd_uneven_tokens_test(seq_length)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    @pytest.mark.internal
+    @pytest.mark.timeout(120)
+    @pytest.mark.parametrize("tp_size,ep_size", [(1, 8)])
+    @pytest.mark.parametrize("mode", ["pad", "bound", "default"])
+    def test_deepepv2_thd_uneven_tokens(self, monkeypatch, tp_size, ep_size, mode):
+        if not is_deep_ep_v2_available():
+            pytest.skip("Deep EP v2 is not available")
+        seq_length = 256
+        # Start from no cached buffer, so that the first dispatch builds one.
+        monkeypatch.setattr(fused_a2a, "_elastic_buffer", None)
+        container = MoEModelTestContainer(
+            tp_size=tp_size,
+            ep_size=ep_size,
+            pp_size=1,
+            num_moe_experts=8,
+            moe_router_topk=2,
+            moe_router_load_balancing_type="aux_loss",
+            moe_token_dispatcher_type="flex",
+            moe_flex_dispatcher_backend="deepepv2",
+            hidden_size=1024,
+            test_dtype=torch.bfloat16,
+            moe_deepepv2_num_max_tokens_per_rank=seq_length if mode == "bound" else None,
+            moe_deepepv2_pad_uneven_dispatch_inputs=mode == "pad",
+        )
+        container.deepepv2_thd_uneven_tokens_test(seq_length, mode)
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     @pytest.mark.internal
