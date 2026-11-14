@@ -36,7 +36,6 @@ GPT_MODEL_ARGS=(
 
 TRAINING_ARGS=(
     --micro-batch-size 1 
-    --global-batch-size 1536
     --step-batch-size-schedule "0:16 2.4B:320 4.8B:624 7.2B:928 9.6B:1232 12B:1536"
     --train-iters 500000
     --weight-decay 0.1 
@@ -71,6 +70,7 @@ EVAL_AND_LOGGING_ARGS=(
     --save $CHECKPOINT_PATH 
     --load $CHECKPOINT_PATH 
     --eval-iters 10
+    --eval-global-batch-size 1536
     --tensorboard-dir $TENSORBOARD_LOGS_PATH 
 )
 
