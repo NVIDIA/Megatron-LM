@@ -63,6 +63,22 @@ class FakeCPGroup:
         return self._rank
 
 
+@pytest.mark.parametrize("cp_size,cp_rank", [(1, 0), (2, 0), (2, 1)])
+@pytest.mark.parametrize("packed_seq", [False, True])
+def test_yarn_cache_with_shorter_sequence(cp_size, cp_rank, packed_seq):
+    rope = YarnRotaryEmbedding(
+        32, original_max_position_embeddings=64, cp_group=FakeCPGroup(cp_size, cp_rank)
+    )
+    for seq_len in (64, 32, 64, 16):
+        previous_cache = rope.cos_cached
+        cos, sin = rope.get_cached_cos_sin(seq_len, dtype=torch.bfloat16, packed_seq=packed_seq)
+        emb, scale = rope(seq_len, packed_seq=packed_seq)
+        torch.testing.assert_close(cos, (emb.cos() * scale).bfloat16(), rtol=0, atol=0)
+        torch.testing.assert_close(sin, (emb.sin() * scale).bfloat16(), rtol=0, atol=0)
+        if seq_len < 64 and (cp_size == 1 or packed_seq):
+            assert rope.cos_cached is previous_cache
+
+
 class TestApplyRotaryPosEmbTHD:
     @pytest.mark.parametrize(
         ("unsupported_kwargs", "warning_text"),
