@@ -1836,7 +1836,9 @@ def generate_state_dict(
     # Persist a scalar model-family marker so a config-list-defined HybridModel
     # can be distinguished from GPT without serializing its Python architecture.
     # The legacy pattern remains in args for pattern-defined models.
-    state_dict['args'].is_hybrid_model = any(_contains_hybrid_model(m) for m in model)
+    state_dict['args'].is_hybrid_model = any(
+        _hybrid_model_architecture(m) is not None for m in model
+    )
     state_dict['checkpoint_version'] = 3.1
     if iteration is not None:
         state_dict['iteration'] = iteration
@@ -2720,11 +2722,6 @@ def load_args_from_checkpoint(args, load_arg='load', checkpointing_context=None)
     return args, checkpoint_args
 
 
-def _contains_hybrid_model(module):
-    """Return whether ``module`` contains a HybridModel through known wrappers."""
-    return _hybrid_model_architecture(module) is not None
-
-
 def _hybrid_model_architecture(module):
     """Return ``"config_list"`` or ``"pattern"`` for a contained HybridModel."""
     from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -2760,11 +2757,6 @@ def _hybrid_model_architecture(module):
     return None
 
 
-def _contains_config_list_hybrid_model(module):
-    """Return whether ``module`` contains a config-list-defined HybridModel."""
-    return _hybrid_model_architecture(module) == "config_list"
-
-
 def _validate_checkpoint_model_family(args, ckpt_args, model, *, checkpoint_model=None):
     """Validate HybridModel/GPT families using saved config, with saved args as a fallback.
 
@@ -2772,8 +2764,9 @@ def _validate_checkpoint_model_family(args, ckpt_args, model, *, checkpoint_mode
     distributed-checkpoint translation path. Config-list-defined HybridModels
     cannot use that pattern-based translation.
     """
-    runtime_is_hybrid = any(_contains_hybrid_model(m) for m in model)
-    runtime_uses_config_list = any(_contains_config_list_hybrid_model(m) for m in model)
+    runtime_architectures = {_hybrid_model_architecture(m) for m in model}
+    runtime_is_hybrid = any(architecture is not None for architecture in runtime_architectures)
+    runtime_uses_config_list = "config_list" in runtime_architectures
     ckpt_pattern = _checkpoint_model_arg(checkpoint_model, "hybrid_layer_pattern")
     if ckpt_pattern is _MISSING_CONFIG_VALUE or ckpt_pattern is None:
         ckpt_pattern = _checkpoint_model_arg(checkpoint_model, "hybrid_override_pattern")

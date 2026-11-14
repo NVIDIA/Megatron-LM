@@ -434,26 +434,31 @@ class TestHybridModelBuilderBuildModel:
     def test_config_list_is_forwarded_without_conversion(self, mock_model, mock_args, with_mtp):
         args = Namespace(mtp_num_layers=None)
         mock_args.return_value = args
-        transformer = _make_transformer()
-        layer_config = AttentionLayerConfig.from_config(transformer)
-        source_config_list = [layer_config, layer_config]
+        transformer = AttentionLayerConfig.from_config(_make_transformer())
+        source_config_list = [transformer, transformer]
         if with_mtp:
-            source_config_list.extend([MTPSplit, layer_config])
+            source_config_list.extend([MTPSplit, transformer])
         config = _make_hybrid_config(
             transformer=transformer, hybrid_layer_config_list=source_config_list
         )
+        expected_depth = 1 if with_mtp else None
+        normalized_transformer = type(transformer).from_config(transformer)
+        normalized_transformer.mtp_num_layers = expected_depth
+        mock_model.return_value = Mock(
+            config=normalized_transformer, mtp_num_depths=1 if with_mtp else 0
+        )
 
-        HybridModelBuilder(config).build_model(self.pg, pre_process=True, post_process=True)
+        model = HybridModelBuilder(config).build_model(self.pg, pre_process=True, post_process=True)
 
         forwarded = mock_model.call_args.kwargs["hybrid_layer_config_list"]
         assert forwarded is source_config_list
-        assert forwarded[0] is layer_config
-        assert forwarded[1] is layer_config
-        expected_depth = 1 if with_mtp else None
-        assert mock_model.call_args.kwargs["config"].mtp_num_layers == expected_depth
+        assert forwarded[0] is transformer
+        assert forwarded[1] is transformer
+        assert mock_model.call_args.kwargs["config"] is transformer
+        assert config.transformer is model.config is normalized_transformer
         assert args.mtp_num_layers == expected_depth
         assert args.is_hybrid_model is True
-        assert layer_config.mtp_num_layers is None
+        assert transformer.mtp_num_layers is None
 
 
 class TestHybridModelBuilderBuildDistributedModels:

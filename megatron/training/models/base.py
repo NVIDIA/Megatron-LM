@@ -94,7 +94,7 @@ class ModelConfig:
         Includes:
         - _target_: Full class path for deserialization
         - _builder_: Full builder class path (serialized from ClassVar)
-        - All dataclass fields, including nested dataclasses and config sequences
+        - All dataclass fields, including nested dataclasses
         """
 
         from megatron.training.config.utils import serialize_dataclass

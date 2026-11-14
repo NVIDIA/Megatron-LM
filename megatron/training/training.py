@@ -3770,27 +3770,9 @@ def training_log(
         moe_logging_metadata[3] if moe_logging_metadata is not None else cfg.model.transformer.num_moe_experts is not None
     )
 
-    if moe_logging_metadata is not None and has_moe_layers:
-        moe_loss_scale = 1 / (num_microbatches or get_num_microbatches())
+    if moe_logging_metadata is not None:
         track_names, layers, num_moe_layers, _, num_hash_layers = moe_logging_metadata
-        moe_log_string = get_moe_metrics_tracker().report(
-            loss_scale=moe_loss_scale,
-            iteration=iteration,
-            writer=writer,
-            wandb_writer=wandb_writer,
-            per_layer_logging=cfg.model.transformer.moe_per_layer_logging,
-            force_initialize=True,
-            track_names=track_names,
-            num_layers=layers,
-            num_moe_layers=num_moe_layers,
-            moe_layer_freq=cfg.model.transformer.moe_layer_freq,
-            num_hash_layers=num_hash_layers,
-            pg_collection=pg_collection,
-            total_loss_dict=total_loss_dict,
-        )
-
-    if cfg.model.transformer.num_moe_experts is not None and moe_logging_metadata is None:
-        moe_loss_scale = 1 / (num_microbatches or get_num_microbatches())
+    elif has_moe_layers:
         track_names = []
         if "aux_loss" in cfg.model.transformer.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
@@ -3844,6 +3826,8 @@ def training_log(
 
         layers = cfg.model.transformer.num_layers + (cfg.model.transformer.mtp_num_layers or 0)
 
+    if has_moe_layers:
+        moe_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         moe_log_string = get_moe_metrics_tracker().report(
             loss_scale=moe_loss_scale,
             iteration=iteration,
@@ -4673,6 +4657,8 @@ def train(
     timers = get_timers()
     train_state = get_train_state()
     hybrid_model = _find_hybrid_model_for_runtime_metrics(model[0])
+    moe_logging_metadata = None
+    has_moe_layers = cfg.model.transformer.num_moe_experts is not None
     if hybrid_model is not None and hybrid_model.hybrid_layer_config_list is not None:
         # Validate custom estimates before the first step through the same accounting path.
         num_floating_point_operations(
@@ -4680,9 +4666,6 @@ def train(
             total_real_tokens_in_batch=1, seqlen_squared_sum_in_batch=1,
             hybrid_model=hybrid_model,
         )
-    moe_logging_metadata = None
-    has_moe_layers = cfg.model.transformer.num_moe_experts is not None
-    if hybrid_model is not None and hybrid_model.hybrid_layer_config_list is not None:
         moe_logging_metadata = _hybrid_config_list_moe_logging_metadata(
             hybrid_model.hybrid_layer_config_list,
             hybrid_model.config.mtp_use_repeated_layer,
