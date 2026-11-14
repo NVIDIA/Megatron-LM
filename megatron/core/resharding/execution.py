@@ -331,6 +331,13 @@ def execute_reshard_plan(
     ``transform.should_transform(param_name)`` returns True use the
     transform's prepare_send / prepare_recv / finalize_recv methods instead
     of the default slice-and-copy logic.
+
+    Failure semantics are deliberately non-transactional. An exception from a
+    transport is propagated, but batches completed before that exception may
+    already be visible in ``dst_module``; cache refresh and the final barrier
+    are not run. The caller must keep the destination quiesced, discard its
+    partially updated state, call ``service.close()`` (plus any backend-specific
+    recovery), and retry from a known-good weight generation with a new service.
     """
     service.set_plan(plan, transform=transform)
 
