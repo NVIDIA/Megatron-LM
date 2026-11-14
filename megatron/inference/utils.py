@@ -21,9 +21,7 @@ from megatron.core.inference.quantization.utils import (
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import get_pg_size, log_single_rank, unwrap_model
-from megatron.training import get_args
-from megatron.training import get_model as _get_model
-from megatron.training import get_run_config, get_wandb_writer
+from megatron.training import get_args, get_wandb_writer
 from megatron.training.argument_utils import gpt_config_from_args, hybrid_config_from_args
 from megatron.training.checkpointing import (
     get_checkpoint_name,
@@ -42,7 +40,8 @@ from megatron.training.models import (
 )
 
 try:
-    from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
+    from megatron.post_training.model_config import build_inference_models, build_modelopt_models
+    from megatron.post_training.utils import should_use_modelopt_config
 
     HAS_NVIDIA_MODELOPT = True
 except ImportError:
@@ -117,11 +116,11 @@ def get_model_builder(
     return builder_cls(model_config)
 
 
-def _get_checkpoint_model_modifier(args: Namespace, requested_keys: set):
+def _get_checkpoint_model_modifier(args: Namespace, requested_state_dicts: list):
     """Map model sharded keys onto a checkpoint that nests the model under a prefix.
 
-    Records the resulting keys in `requested_keys` so unloaded checkpoint tensors can be
-    reported after the load.
+    Retains the load templates so unloaded-tensor diagnostics see any aliases resolved
+    after this modifier, rather than a snapshot of the originally requested names.
     """
     prefix = getattr(args, 'checkpoint_model_prefix', '')
     if not prefix:
@@ -129,13 +128,18 @@ def _get_checkpoint_model_modifier(args: Namespace, requested_keys: set):
 
     def modifier(sharded_state_dict):
         apply_prefix_mapping(sharded_state_dict, {'': prefix})
-        requested_keys.update(
-            value.key
-            for value in nested_values(sharded_state_dict)
-            if isinstance(value, (ShardedTensor, ShardedTensorFactory))
-        )
+        requested_state_dicts.append(sharded_state_dict)
 
     return modifier
+
+
+def _checkpoint_tensor_keys(state_dict):
+    """Yield actual storage keys, including aliases resolved inside tensor factories."""
+    for value in nested_values(state_dict):
+        if isinstance(value, ShardedTensorFactory):
+            yield from _checkpoint_tensor_keys(value.build())
+        elif isinstance(value, ShardedTensor):
+            yield value.key
 
 
 def _warn_on_unloaded_checkpoint_tensors(
@@ -192,22 +196,28 @@ def get_model_for_inference(
             complete checkpoint view. Defaults to the global process group.
     """
 
-    args = get_args()
-    tokenizer_config = get_run_config().tokenizer
+    from megatron.training.global_vars import is_run_config_initialized
 
-    if HAS_NVIDIA_MODELOPT and getattr(args, "modelopt_enabled", False):
+    args = get_args()
+    cfg = get_run_config() if is_run_config_initialized() else None
+    declared_modelopt = (
+        cfg is not None and cfg.model is not None and cfg.model.transformations is not None
+    )
+    use_modelopt = declared_modelopt or (
+        HAS_NVIDIA_MODELOPT
+        and should_use_modelopt_config(args, checkpoint=cfg.checkpoint if cfg is not None else None)
+    )
+    if use_modelopt:
+        # The ModelOpt model config is translated with the global parallel sizes.
         if pg_collection is not None:
             raise ValueError(
                 "Custom inference process groups are not supported by the ModelOpt builder"
             )
-        # ModelOpt path keeps the legacy callable-based builder because the
-        # modelopt hooks (custom layer specs, calibration, etc.) have not been
-        # ported to the new ``ModelBuilder`` API yet. ``_get_model`` also takes
-        # care of running the modelopt-checkpoint auto-detection side effect.
-        model = _get_model(modelopt_gpt_hybrid_builder, wrap_with_ddp=False)
+        model = build_inference_models(cfg) if declared_modelopt else build_modelopt_models(args)
     else:
         if pg_collection is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        tokenizer_config = get_run_config().tokenizer
         builder = get_model_builder(args, tokenizer_config, pg_collection=pg_collection)
         model = builder.build_distributed_models(pg_collection=pg_collection, wrap_with_ddp=False)
 
@@ -215,7 +225,7 @@ def get_model_for_inference(
     checkpoint = get_run_config().checkpoint
     assert checkpoint.load is not None
     checkpoint.exit_on_missing_checkpoint = True
-    requested_keys = set()
+    requested_state_dicts = []
     load_checkpoint(
         ddp_model=model,
         optimizer=None,
@@ -227,9 +237,16 @@ def get_model_for_inference(
         dp_group=pg_collection.dp if pg_collection is not None else None,
         expt_dp_group=pg_collection.expt_dp if pg_collection is not None else None,
         checkpoint_group=checkpoint_group,
-        model_sharded_state_dict_modifier=_get_checkpoint_model_modifier(args, requested_keys),
+        model_sharded_state_dict_modifier=_get_checkpoint_model_modifier(
+            args, requested_state_dicts
+        ),
     )
-    if requested_keys:
+    if requested_state_dicts:
+        requested_keys = {
+            key
+            for state_dict in requested_state_dicts
+            for key in _checkpoint_tensor_keys(state_dict)
+        }
         _warn_on_unloaded_checkpoint_tensors(args, checkpoint, requested_keys, checkpoint_group)
 
     # No virtual PP.

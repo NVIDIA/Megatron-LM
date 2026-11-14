@@ -9,7 +9,6 @@ ENV_VARS:
 BEFORE_SCRIPT: |
   mkdir -p ${DATA_CACHE_PATH}/distill && echo $DISTILL_CONFIG | yq -P > ${DATA_CACHE_PATH}/distill/distill_config.yaml
 MODEL_ARGS:
-  --export-te-mcore-model: true
   --export-kd-teacher-load: ${DATA_PATH}/model/gpt_dummy_pyt/ckpt/24.10.0_bf16_teacher
   --export-kd-cfg: ${DATA_CACHE_PATH}/distill/distill_config.yaml
   --auto-detect-ckpt-format: true

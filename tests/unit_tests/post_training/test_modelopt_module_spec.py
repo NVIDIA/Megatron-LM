@@ -1,12 +1,18 @@
 # Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
 import inspect
 import tempfile
+from dataclasses import replace
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
 from packaging.version import Version
 
 from megatron.core import dist_checkpointing, parallel_state
+from megatron.core.dist_checkpointing.layer_key_aliases import remap_sharded_state_dict_for_load
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.dist_checkpointing.optimizer import make_sharded_optimizer_tensor
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import (
@@ -16,7 +22,11 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.post_training.modelopt.gpt.model_specs import get_gpt_modelopt_spec
+from megatron.core.post_training.modelopt.gpt.model_specs import (
+    get_gpt_modelopt_layer_spec,
+    get_gpt_modelopt_mtp_layer_spec,
+    get_gpt_modelopt_spec,
+)
 from megatron.core.post_training.modelopt.gpt.state_dict_hooks import (
     mcore_gpt_load_te_state_dict_pre_hook,
 )
@@ -126,6 +136,72 @@ class TestModelOptGPTModel:
         config: TransformerConfig = self.modelopt_model.config
         model = self.modelopt_model.cuda()
         model_forward(model, config)
+
+    def test_legacy_checkpoint_load_and_canonical_save(self, tmp_path_dist_ckpt):
+        """Load real legacy weights and Adam moments, then save under canonical keys."""
+        model = self.modelopt_model
+        metadata = {
+            "dp_cp_group": parallel_state.get_data_parallel_group(with_context_parallel=True)
+        }
+        # Distinct, rank-independent values so every DP replica expects the stored weights.
+        with torch.no_grad():
+            for i, param in enumerate(model.parameters()):
+                param.fill_(i + 1)
+        expected = {name: param.detach().clone() for name, param in model.named_parameters()}
+
+        # Reproduce the old ModelOpt spec's checkpoint naming for the fixture only.
+        originals = []
+        try:
+            for module in model.modules():
+                submodules = getattr(module, "submodules_config", None)
+                if getattr(submodules, "sharded_state_dict_keys_map", None):
+                    originals.append((module, submodules))
+                    module.submodules_config = replace(submodules, sharded_state_dict_keys_map={})
+            legacy_sd = model.sharded_state_dict(metadata=metadata)
+        finally:
+            for module, submodules in originals:
+                module.submodules_config = submodules
+
+        def optimizer_template(model_sd, value):
+            return {
+                name: make_sharded_optimizer_tensor(
+                    shard, torch.full_like(shard.data, value), "optimizer.state.exp_avg"
+                )
+                for name, shard in model_sd.items()
+                if isinstance(shard, ShardedTensor)
+            }
+
+        canonical_keys = {
+            shard.key
+            for shard in model.sharded_state_dict(metadata=metadata).values()
+            if isinstance(shard, ShardedTensor)
+        }
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / "legacy_keys", sync=True) as legacy_dir,
+            TempNamedDir(tmp_path_dist_ckpt / "canonical_keys", sync=True) as canonical_dir,
+        ):
+            dist_checkpointing.save(
+                {"model": legacy_sd, "optimizer": optimizer_template(legacy_sd, 0.25)}, legacy_dir
+            )
+            with torch.no_grad():
+                for param in model.parameters():
+                    param.fill_(-100)
+
+            model_sd = model.sharded_state_dict(metadata=metadata)
+            request = {"model": model_sd, "optimizer": optimizer_template(model_sd, 0)}
+            remap_sharded_state_dict_for_load([model], request, legacy_dir)
+            loaded = dist_checkpointing.load(request, legacy_dir, strict="raise_all")
+            model.load_state_dict(loaded["model"])
+            for name, param in model.named_parameters():
+                torch.testing.assert_close(param, expected[name], rtol=0, atol=0)
+            for value in loaded["optimizer"].values():
+                torch.testing.assert_close(value, torch.full_like(value, 0.25), rtol=0, atol=0)
+
+            # A fresh save template still uses canonical keys without a cleanup call.
+            dist_checkpointing.save(
+                {"model": model.sharded_state_dict(metadata=metadata)}, canonical_dir
+            )
+            assert canonical_keys <= dist_checkpointing.load_tensors_metadata(canonical_dir).keys()
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
@@ -414,3 +490,68 @@ def test_modelopt_linear_accepts_duplicated_parallel_mode():
 
     with pytest.raises(ValueError, match="only supports parallel_mode"):
         Linear(4, 4, config=config, init_method=config.init_method, parallel_mode="column")
+
+
+_GPT_MODELOPT_SPECS = "megatron.core.post_training.modelopt.gpt.model_specs"
+
+
+def _modelopt_layer_spec_config(**overrides):
+    values = dict(
+        heterogeneous_block_specs=False,
+        transformer_impl="transformer_engine",
+        num_moe_experts=8,
+        qk_layernorm=True,
+        multi_latent_attention=False,
+        experimental_attention_variant=None,
+        qk_l2_norm=False,
+        context_parallel_size=1,
+    )
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_get_gpt_modelopt_layer_spec_heterogeneous_takes_precedence():
+    config = _modelopt_layer_spec_config(heterogeneous_block_specs=True)
+    with patch(f"{_GPT_MODELOPT_SPECS}.get_gpt_heterogeneous_layer_spec") as get_spec:
+        result = get_gpt_modelopt_layer_spec(config, use_default_te_spec=True)
+    get_spec.assert_called_once_with(config=config, use_te=True)
+    assert result is get_spec.return_value
+
+
+def test_get_gpt_modelopt_layer_spec_default_te_spec():
+    config = _modelopt_layer_spec_config()
+    with patch(f"{_GPT_MODELOPT_SPECS}.get_gpt_layer_with_transformer_engine_spec") as get_spec:
+        result = get_gpt_modelopt_layer_spec(
+            config, use_default_te_spec=True, moe_grouped_gemm=False
+        )
+    get_spec.assert_called_once_with(8, False, True, False, None, qk_l2_norm=False)
+    assert result is get_spec.return_value
+
+
+@pytest.mark.parametrize("cp_size,expected_local", [(1, True), (2, False)])
+def test_get_gpt_modelopt_layer_spec_local_spec(cp_size, expected_local):
+    config = _modelopt_layer_spec_config(context_parallel_size=cp_size)
+    with patch(f"{_GPT_MODELOPT_SPECS}.get_gpt_modelopt_spec") as get_spec:
+        result = get_gpt_modelopt_layer_spec(
+            config,
+            local_core_attention=True,
+            remap_te_layernorm=True,
+            real_quant_cfg="fp8_real_quant",
+        )
+    get_spec.assert_called_once_with(
+        config=config,
+        local_core_attention=expected_local,
+        remap_te_layernorm=True,
+        real_quant_cfg="fp8_real_quant",
+    )
+    assert result is get_spec.return_value
+
+
+def test_get_gpt_modelopt_mtp_layer_spec_uses_standard_decoder_spec():
+    config = _modelopt_layer_spec_config(transformer_impl="local")
+    layer_specs = [object(), object()]
+    with patch(
+        f"{_GPT_MODELOPT_SPECS}.get_gpt_decoder_layer_specs", return_value=layer_specs
+    ) as get_specs:
+        assert get_gpt_modelopt_mtp_layer_spec(config) is layer_specs[-1]
+    get_specs.assert_called_once_with(config, use_transformer_engine=False)

@@ -143,7 +143,6 @@ MODEL_ARGS=(
     --position-embedding-type rope
     --rotary-base 10000
     --no-bias-gelu-fusion
-    --export-force-local-attention
     --no-bias-dropout-fusion
     --quick-geglu
     --glu-linear-offset 1.0
@@ -151,7 +150,6 @@ MODEL_ARGS=(
     --window-attn-skip-freq 2
     --activation-func-clamp-value 7.0
     --window-size 127,0
-    --enable-gpt-oss
 )
 
 MOE_ARGS=(

@@ -25,6 +25,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_group,
     get_tensor_model_parallel_rank,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.multi_token_prediction import (
@@ -49,6 +50,7 @@ from megatron.training import (
 )
 from megatron.training.argument_utils import (
     gpt_data_config_from_args,
+    hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
@@ -58,10 +60,13 @@ from megatron.training.utils import is_first_or_last_pipeline_stage
 
 # modelopt distillation
 try:
+    import modelopt.torch.distill.plugins.megatron as _modelopt_megatron  # noqa: F401
+
     from megatron.elastification.loss_func import loss_func as loss_func_modelopt
     from megatron.post_training.arguments import add_modelopt_args
-    from megatron.post_training.model_builder import (
-        modelopt_gpt_mamba_builder as model_provider_modelopt,
+    from megatron.post_training.model_config import (
+        apply_modelopt_model_config,
+        distillation_config_from_args,
     )
     has_nvidia_modelopt = True
 except ImportError:
@@ -84,6 +89,18 @@ def count_parameters_in_layer(model, layer_name):
     return num_params
 
 
+def _build_modelopt_stage(args, pre_process, post_process, vp_stage, pg_collection):
+    """Build one model stage with the stock builder for the ModelOpt config, running its pre-wrap hooks."""
+    model_config = apply_modelopt_model_config(hybrid_config_from_args(args), args)
+    if pg_collection is None:
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    builder = model_config.get_builder_cls()(model_config)
+    models = [builder.build_model(pg_collection, pre_process, post_process, vp_stage)]
+    run_config = get_run_config()
+    models = builder.pre_wrap_hook(run_config.checkpoint, run_config.distillation)(models)
+    return models[0]
+
+
 def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] = None, config = None, pg_collection = None) -> HybridModel:
     """Builds the model.
 
@@ -99,7 +116,7 @@ def model_provider(pre_process=True, post_process=True, vp_stage: Optional[int] 
     cfg_container = get_run_config()
     if has_nvidia_modelopt:
 
-        model = model_provider_modelopt(args, pre_process, post_process, vp_stage=vp_stage, config=config, pg_collection=pg_collection)
+        model = _build_modelopt_stage(args, pre_process, post_process, vp_stage, pg_collection)
         from megatron.elastification.flextron_utils import (
             inject_flextron_forward_logic,
             setup_flextron_model,
@@ -568,6 +585,10 @@ if __name__ == "__main__":
     full_config = pretrain_cfg_container_from_args(
         args, data_cfg=flex_data_config_from_args(args)
     )
+    if has_nvidia_modelopt and getattr(args, "export_kd_teacher_load", None):
+        full_config.distillation = distillation_config_from_args(
+            args, apply_modelopt_model_config(hybrid_config_from_args(args), args)
+        )
     set_run_config(full_config)
     pretrain(full_config,
              train_valid_test_datasets_provider,
