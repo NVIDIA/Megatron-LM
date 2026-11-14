@@ -23,13 +23,21 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from megatron.core.extensions.transformer_engine import TEDotProductAttention
+from megatron.core.extensions.transformer_engine import (
+    TEColumnParallelLinear,
+    TEDotProductAttention,
+    TERowParallelLinear,
+)
 from megatron.core.models.common.embeddings import _yarn_get_mscale, rope_utils
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.attention import SelfAttention
+from megatron.core.transformer.attention import (
+    CrossAttention,
+    CrossAttentionSubmodules,
+    SelfAttention,
+)
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.multi_latent_attention import (
     MLASelfAttention,
@@ -455,7 +463,7 @@ class TestMLASoftmaxScale(_GpuTestFixtureBase):
             assert attention.core_attention.softmax_scale == attention.softmax_scale
 
 
-def _make_yarn_self_attention(apply_rope_fusion, softmax_scale=None, softmax_type="vanilla"):
+def _yarn_config(apply_rope_fusion, softmax_scale=None, softmax_type="vanilla", no_rope_freq=None):
     config = TransformerConfig(
         num_layers=2,
         hidden_size=128,
@@ -465,14 +473,56 @@ def _make_yarn_self_attention(apply_rope_fusion, softmax_scale=None, softmax_typ
         softmax_type=softmax_type,
         apply_rope_fusion=apply_rope_fusion,
         attention_dropout=0.0,
+        no_rope_freq=no_rope_freq,
     )
     # gpt-oss YaRN settings: concentration factor 0.1 * ln(32) + 1.
     config.yarn_rotary_scaling_factor = 32.0
     config.yarn_mscale = None
     config.yarn_mscale_all_dim = None
+    return config
+
+
+def _make_yarn_self_attention(
+    apply_rope_fusion, softmax_scale=None, softmax_type="vanilla", no_rope_freq=None
+):
+    config = _yarn_config(apply_rope_fusion, softmax_scale, softmax_type, no_rope_freq)
     submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
     attn = SelfAttention(config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal)
     return attn.cuda()
+
+
+def _make_yarn_cross_attention(apply_rope_fusion):
+    submodules = CrossAttentionSubmodules(
+        linear_q=TEColumnParallelLinear,
+        linear_kv=TEColumnParallelLinear,
+        core_attention=TEDotProductAttention,
+        linear_proj=TERowParallelLinear,
+    )
+    attn = CrossAttention(
+        _yarn_config(apply_rope_fusion),
+        submodules,
+        layer_number=1,
+        attn_mask_type=AttnMaskType.no_mask,
+    )
+    return attn.cuda()
+
+
+def _assert_matches(got_all, ref_all):
+    (out, dx, dw), (ref_out, ref_dx, ref_dw) = got_all, ref_all
+    assert dw.keys() == ref_dw.keys()
+    # Bound relative to each tensor's largest value. The paths round differently (TF32 GEMMs)
+    # by well under it; dropping the factor squared from the softmax scale exceeds it >10x.
+    for got, ref in [(out, ref_out), (dx, ref_dx)] + [(dw[n], ref_dw[n]) for n in dw]:
+        torch.testing.assert_close(got, ref, rtol=0, atol=1e-3 * ref.abs().max().item())
+
+
+def _run(attn, x, **kwargs):
+    inp = x.clone().requires_grad_(True)
+    out, _ = attn(inp, None, **kwargs)
+    out.backward(torch.ones_like(out))
+    # linear_proj's bias is returned separately and gets no grad here.
+    grads = {n: p.grad for n, p in attn.named_parameters() if p.grad is not None}
+    return out, inp.grad, grads
 
 
 class TestYarnRopeFusionSoftmaxScale(_GpuTestFixtureBase):
@@ -485,7 +535,7 @@ class TestYarnRopeFusionSoftmaxScale(_GpuTestFixtureBase):
     def test_factor_moves_into_softmax_scale(self, softmax_scale):
         unfused = _make_yarn_self_attention(False, softmax_scale)
         assert unfused._rope_mscale == pytest.approx(self.FACTOR)
-        assert not hasattr(unfused, 'softmax_scale')
+        assert not hasattr(unfused, "softmax_scale")
 
         fused = _make_yarn_self_attention(True, softmax_scale)
         base = softmax_scale if softmax_scale is not None else fused.config.kv_channels**-0.5
@@ -500,43 +550,65 @@ class TestYarnRopeFusionSoftmaxScale(_GpuTestFixtureBase):
             assert core.softmax_scale == fused.softmax_scale
 
     @pytest.mark.parametrize("softmax_type", ["vanilla", "learnable"])
-    def test_fused_rope_matches_unfused(self, softmax_type):
-        """Same outputs and grads (fp32) as scaling q and k in the unfused RoPE, with the fused
-        RoPE kernel used for both q and k. The learnable sink logit is not scaled either way."""
-        unfused = _make_yarn_self_attention(False, softmax_type=softmax_type)
-        fused = _make_yarn_self_attention(True, softmax_type=softmax_type)
+    @pytest.mark.parametrize(
+        ("rope", "fused_calls"),
+        [("q_and_k", 2), ("q_only", 1), ("k_only", 1), ("none", 0), ("no_rope_layer", 0)],
+    )
+    def test_fused_rope_matches_unfused(self, softmax_type, rope, fused_calls):
+        """Same outputs and grads (fp32) as scaling q and k in the unfused RoPE, whichever of q
+        and k get RoPE. The learnable sink logit is not scaled either way."""
+        no_rope_freq = [1, 0] if rope == "no_rope_layer" else None
+        unfused = _make_yarn_self_attention(
+            False, softmax_type=softmax_type, no_rope_freq=no_rope_freq
+        )
+        fused = _make_yarn_self_attention(
+            True, softmax_type=softmax_type, no_rope_freq=no_rope_freq
+        )
         fused.load_state_dict(unfused.state_dict())
+        if rope == "no_rope_layer":
+            # A declared no-RoPE layer keeps the plain softmax scale.
+            assert fused._rope_mscale == pytest.approx(self.FACTOR)
+            assert not hasattr(fused, "softmax_scale")
         seq_len, batch, head_dim = 32, 2, unfused.config.kv_channels
-        x = torch.randn(seq_len, batch, unfused.config.hidden_size, device='cuda')
-        freqs = torch.rand(seq_len, 1, 1, head_dim, device='cuda') * 8
+        x = torch.randn(seq_len, batch, unfused.config.hidden_size, device="cuda")
+        freqs = torch.rand(seq_len, 1, 1, head_dim, device="cuda") * 8
+        rotary_pos_emb = {
+            "q_and_k": freqs,
+            "q_only": (freqs, None),
+            "k_only": (None, freqs),
+            "none": None,
+            "no_rope_layer": freqs,
+        }[rope]
 
-        def run(attn):
-            inp = x.clone().requires_grad_(True)
-            out, _ = attn(inp, None, rotary_pos_emb=freqs)
-            out.backward(torch.ones_like(out))
-            # linear_proj's bias is returned separately and gets no grad here.
-            grads = {n: p.grad for n, p in attn.named_parameters() if p.grad is not None}
-            return out, inp.grad, grads
-
-        ref_out, ref_dx, ref_dw = run(unfused)
+        ref = _run(unfused, x, rotary_pos_emb=rotary_pos_emb)
         with patch.object(
-            rope_utils, 'fused_apply_rotary_pos_emb', wraps=rope_utils.fused_apply_rotary_pos_emb
+            rope_utils, "fused_apply_rotary_pos_emb", wraps=rope_utils.fused_apply_rotary_pos_emb
         ) as fused_rope:
-            out, dx, dw = run(fused)
-        assert fused_rope.call_count == 2
-        assert dw.keys() == ref_dw.keys()
-        # Bound relative to each tensor's largest value. The paths round differently (TF32 GEMMs)
-        # by well under it; dropping the factor squared from the softmax scale exceeds it >10x.
-        for got, ref in [(out, ref_out), (dx, ref_dx)] + [(dw[n], ref_dw[n]) for n in dw]:
-            torch.testing.assert_close(got, ref, rtol=0, atol=1e-3 * ref.abs().max().item())
+            got = _run(fused, x, rotary_pos_emb=rotary_pos_emb)
+        assert fused_rope.call_count == fused_calls
+        _assert_matches(got, ref)
+
+    def test_cross_attention_keeps_plain_scale(self):
+        """Cross-attention gets no RoPE, so RoPE fusion leaves its scale alone."""
+        unfused = _make_yarn_cross_attention(False)
+        fused = _make_yarn_cross_attention(True)
+        assert fused._rope_mscale == pytest.approx(self.FACTOR)
+        assert not hasattr(fused, "softmax_scale")
+        fused.load_state_dict(unfused.state_dict())
+        seq_len, ctx_len, batch, hidden = 16, 24, 2, unfused.config.hidden_size
+        x = torch.randn(seq_len, batch, hidden, device="cuda")
+        context = torch.randn(ctx_len, batch, hidden, device="cuda")
+        _assert_matches(
+            _run(fused, x, key_value_states=context), _run(unfused, x, key_value_states=context)
+        )
 
     def test_partial_rotary_raises_with_fusion(self):
         """Partial RoPE scales only the rotated dims, so the softmax-scale form is refused."""
         seq_len, batch = 8, 2
         for apply_rope_fusion in [False, True]:
             attn = _make_yarn_self_attention(apply_rope_fusion)
-            x = torch.randn(seq_len, batch, attn.config.hidden_size, device='cuda')
-            freqs = torch.rand(seq_len, 1, 1, attn.config.kv_channels // 2, device='cuda')
+            x = torch.randn(seq_len, batch, attn.config.hidden_size, device="cuda")
+            freqs = torch.rand(seq_len, 1, 1, attn.config.kv_channels // 2, device="cuda")
             if apply_rope_fusion:
                 with pytest.raises(ValueError, match="whole head dim"):
                     attn(x, None, rotary_pos_emb=freqs)

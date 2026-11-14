@@ -331,12 +331,15 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
 
         # YaRN scales q and k by the concentration factor, so the attention logits by its square.
         # TE's fused RoPE takes no scale: with RoPE fusion, the square goes into the softmax scale.
-        # That is exact only if RoPE covers the whole head; forward() checks it.
+        # That is exact only if RoPE covers the whole head and both q and k; forward() handles the
+        # rest. Declared no-RoPE layers and cross-attention keep the plain scale.
         self._rope_mscale = self._yarn_concentration_factor
         if (
             config.apply_rope_fusion
             and self._yarn_concentration_factor != 1.0
             and not config.multi_latent_attention
+            and attention_type == "self"
+            and not (config.no_rope_freq and config.no_rope_freq[layer_number - 1])
         ):
             base_scale = config.softmax_scale
             if base_scale is None:
@@ -1489,9 +1492,18 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
         if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
             rotary_pos_emb = (rotary_pos_emb,) * 2
 
-        # Partial RoPE scales only the rotated dims, which a softmax-scale factor can't express.
-        if rotary_pos_emb is not None and self._rope_mscale != self._yarn_concentration_factor:
-            if any(
+        # The softmax scale carries the YaRN factor squared, for RoPE on both q and k. For each
+        # side that gets no RoPE in this call, take one factor back out of q.
+        yarn_q_rescale = 1.0
+        if self._rope_mscale != self._yarn_concentration_factor:
+            num_rotated = 0
+            if rotary_pos_emb is not None and (
+                not self.config.flash_decode or inference_context is None
+            ):
+                num_rotated = sum(emb is not None for emb in rotary_pos_emb)
+            yarn_q_rescale = self._yarn_concentration_factor ** (num_rotated - 2)
+            # Partial RoPE scales only the rotated dims, which a softmax-scale factor can't express.
+            if rotary_pos_emb is not None and any(
                 emb is not None and emb.shape[-1] != self.hidden_size_per_attention_head
                 for emb in rotary_pos_emb
             ):
@@ -1549,6 +1561,8 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             else:
                 query, key, value = qkv_output
             mixed_qkv = qkv_split_arg_list = None
+            if yarn_q_rescale != 1.0:
+                query = query * yarn_q_rescale
         else:
             assert (
                 not self.config.attention_output_gate
