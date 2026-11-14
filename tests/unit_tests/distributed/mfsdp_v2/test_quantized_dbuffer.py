@@ -278,6 +278,8 @@ def test_quantized_dbuffer_is_alias_of(distributed_setup):
     assert source.is_alias_of(view)
     assert view.is_alias_of(source)
     assert not source.is_alias_of(separate)
+    assert not source.is_alias_of(source.rowwise_data)
+    assert not source.rowwise_data.is_alias_of(source)
 
     source.release_storage()
     separate.release_storage()

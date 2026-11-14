@@ -15,7 +15,8 @@
 """Distributed tensor buffers for Megatron-FSDP."""
 
 import dataclasses
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
+from typing import TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -29,6 +30,9 @@ from .layout import GlobalLayout, Shape, non_leading_numel
 from .placement import BlockAtomic, ShardLayout, TensorAtomic
 from .range import Range, intersect_ranges
 
+if TYPE_CHECKING:
+    from .quantized_dbuffer import QuantizedDBuffer
+
 
 @dataclasses.dataclass(frozen=True)
 class _OwnedRange:
@@ -37,7 +41,7 @@ class _OwnedRange:
     buffer_relative_offset: int
 
 
-def _validate_placements(placements: Iterable[Placement]) -> None:
+def _validate_placements(placements: Sequence[Placement]) -> None:
     """Validate DBuffer placements form a supported contiguous local layout."""
     seen_shard = False
     for placement in placements:
@@ -325,9 +329,12 @@ class DBuffer:
             self.layout,
         )
 
-    def is_alias_of(self, other: "DBuffer") -> bool:
-        """Whether the local buffers share backing storage, including distinct views."""
-        return self.local_buffer.untyped_storage() is other.local_buffer.untyped_storage()
+    def is_alias_of(self, other: "DBuffer | QuantizedDBuffer") -> bool:
+        """Whether local buffers share storage; different representations never alias."""
+        return (
+            isinstance(other, DBuffer)
+            and self.local_buffer.untyped_storage() is other.local_buffer.untyped_storage()
+        )
 
     @classmethod
     def distribute_tensors(

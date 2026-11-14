@@ -116,7 +116,7 @@ class FsdpModule:
         # required to keep loading a state dict safe when ``schedule_policy.register_hooks`` is
         # False (i.e. execution hooks are disabled), so it must not be turned off
         # together with the auto-execution hooks below.
-        self.register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
+        cast(nn.Module, self).register_load_state_dict_pre_hook(FsdpModule._pre_load_state_dict)
         if schedule_policy.register_hooks:
             self._register_hooks()
         context.register_module(cast(nn.Module, self))

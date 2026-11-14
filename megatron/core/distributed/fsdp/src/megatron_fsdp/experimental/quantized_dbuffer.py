@@ -274,6 +274,7 @@ class QuantizedDBuffer:
         rowwise_data = self.rowwise_data.get_tensor_view(index) if rowwise else None
         columnwise_data = self.columnwise_data.get_tensor_view(index) if columnwise else None
         data = rowwise_data if rowwise_data is not None else columnwise_data
+        assert data is not None
         return MXFP8Tensor(
             shape=data.shape,
             dtype=torch.bfloat16,
@@ -374,9 +375,9 @@ class QuantizedDBuffer:
             self.columnwise_scale.view(_block_atomic_to_flat(placements)),
         )
 
-    def is_alias_of(self, other: "QuantizedDBuffer") -> bool:
-        """Whether every corresponding plane shares backing storage."""
-        return all(
+    def is_alias_of(self, other: "DBuffer | QuantizedDBuffer") -> bool:
+        """Whether all planes share storage; different representations never alias."""
+        return isinstance(other, QuantizedDBuffer) and all(
             plane.is_alias_of(other_plane) for plane, other_plane in zip(self.planes, other.planes)
         )
 
