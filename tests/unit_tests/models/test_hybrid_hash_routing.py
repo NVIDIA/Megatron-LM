@@ -44,7 +44,7 @@ class RecordingTransformerLayer(TransformerLayer):
         if cuda_graph_impl == "local":
             self.cudagraph_manager = self._run_local_cuda_graph
         if cuda_graph_impl == "transformer_engine":
-            self.cuda_graphs = [object()]
+            self.te_cuda_graphs = [object()]
 
     def forward(self, hidden_states, **kwargs):
         self.calls.append(kwargs)
