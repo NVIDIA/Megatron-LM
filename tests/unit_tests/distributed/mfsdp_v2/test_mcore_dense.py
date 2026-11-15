@@ -6,15 +6,19 @@ from dataclasses import replace
 
 import pytest
 import torch
+import torch.distributed as dist
 import transformer_engine.pytorch as te
 from torch.distributed.tensor import DTensor
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
 
 import megatron.core.distributed.fsdp.mcore_adapter_v2 as mcore_adapter_v2
 from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradientFinalizationMode,
+    RuntimePolicy,
     fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
@@ -30,6 +34,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.training.models.dist_utils import _ddp_wrap
 from tests.unit_tests.distributed.mfsdp_v2.mcore_training_utils import (
     run_forward_backward_on_microbatches,
 )
@@ -142,6 +147,10 @@ def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(process_grou
         pg_collection=process_group_collection,
     )
 
+    assert (
+        wrapped.module.context.gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER
+    )
+    assert not wrapped.module.context.autograd_completes_execution
     assert isinstance(wrapped.module, FsdpModule)
 
     parameters = dict(wrapped.module.named_parameters())
@@ -288,27 +297,63 @@ def test_unpadded_shards_pack_parameter_groups_without_padding(process_group_col
         )
 
 
-def test_rejects_shared_context_without_caller_managed_grad_sync(
-    process_group_collection, distributed_setup
-):
-    """The adapter rejects an incompatible shared context before sharding the model."""
+def test_modelbuilder_wrap_matches_unsharded_losses(process_group_collection, distributed_setup):
+    """ModelBuilder constructs an MFSDP context completed by the training schedule."""
+    device = distributed_setup.device
+    config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
+    torch.manual_seed(1234)
+    baseline = torch.nn.Linear(16, 16).to(device)
+    layer = torch.nn.Linear(16, 16).to(device)
+    layer.load_state_dict(baseline.state_dict())
+    layer.config = config
+    layer.pre_process = False
+    layer.share_embeddings_and_output_weights = False
+    ddp_config = DistributedDataParallelConfig(
+        use_megatron_fsdp=True,
+        megatron_fsdp_version=2,
+        data_parallel_sharding_strategy="optim_grads_params",
+    )
+    inputs = torch.randn(4, 16, device=device)
+    expected = run_forward_backward_on_microbatches(
+        baseline, lambda: baseline(inputs).square().mean(), num_microbatches=2
+    )
+    [model] = _ddp_wrap(
+        [layer],
+        False,
+        ddp_config,
+        False,
+        use_megatron_fsdp=True,
+        pg_collection=process_group_collection,
+    )
+    actual = run_forward_backward_on_microbatches(
+        model, lambda: model(inputs).square().mean(), num_microbatches=2
+    )
+    finalize_model_grads([model], pg_collection=process_group_collection)
+    torch.testing.assert_close(actual, expected)
+
+
+def test_joins_shared_context(process_group_collection, distributed_setup):
+    """The adapter joins a context whose execution is completed by the schedule."""
     config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
     layer = torch.nn.Linear(16, 16, device=distributed_setup.device)
-    with fully_shard_context(FsdpContext(device=distributed_setup.device)) as context:
-        with pytest.raises(ValueError, match="caller_managed_grad_sync=True"):
-            FullyShardedDataParallel(
-                config=config,
-                ddp_config=DistributedDataParallelConfig(
-                    use_megatron_fsdp=True,
-                    megatron_fsdp_version=2,
-                    use_distributed_optimizer=False,
-                    data_parallel_sharding_strategy="optim_grads_params",
-                ),
-                module=layer,
-                pg_collection=process_group_collection,
-            )
-        assert not context.caller_managed_grad_sync
-        assert not isinstance(layer, FsdpModule)
+    with fully_shard_context(
+        FsdpContext(
+            device=distributed_setup.device,
+            runtime_policy=RuntimePolicy(autograd_completes_execution=False),
+        )
+    ) as context:
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=layer,
+            pg_collection=process_group_collection,
+        )
+    assert model.module.context is context
 
 
 def test_finish_grad_sync_waits_for_delayed_wgrad(process_group_collection, distributed_setup):
@@ -481,8 +526,9 @@ def test_delayed_wgrad_matches_immediate(
     torch.testing.assert_close(delayed_losses, immediate_losses, rtol=0, atol=0)
 
 
-def test_build_train_and_step(process_group_collection):
-    """Match eager training against an MFSDP v2 train-and-step sequence."""
+@pytest.mark.parametrize("nccl_ub", [False, True], ids=["ordinary", "symmetric"])
+def test_build_train_and_step(process_group_collection, nccl_ub):
+    """Match eager training with MFSDP v2, including a cold symmetric-memory communicator."""
     config = TransformerConfig(
         num_layers=2,
         hidden_size=16,
@@ -504,6 +550,9 @@ def test_build_train_and_step(process_group_collection):
     # requires DDP/FSDP buffer metadata, but the optimizer factory still expects
     # every model chunk to expose ddp_config.
     reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+    if nccl_ub:
+        # Leave the fresh DP communicator's initialization to the adapter.
+        process_group_collection.dp_cp = dist.new_group(backend="nccl")
     model = FullyShardedDataParallel(
         config=config,
         ddp_config=DistributedDataParallelConfig(
@@ -511,6 +560,7 @@ def test_build_train_and_step(process_group_collection):
             megatron_fsdp_version=2,
             use_distributed_optimizer=False,
             data_parallel_sharding_strategy="optim_grads_params",
+            nccl_ub=nccl_ub,
         ),
         module=model,
         pg_collection=process_group_collection,

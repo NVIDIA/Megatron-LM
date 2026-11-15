@@ -14,28 +14,45 @@
 
 """Shared runtime configuration for Megatron-FSDP contexts."""
 
+import enum
 from dataclasses import dataclass
+
+
+class PrefetchOrder(enum.Enum):
+    """How to choose the module order used for prefetching."""
+
+    REGISTRATION = enum.auto()
+    RECORDED = enum.auto()
 
 
 @dataclass(frozen=True)
 class RuntimePolicy:
-    """Configure communication and gradient synchronization for an FSDP context.
-
-    Attributes:
-        use_symmetric_memory: Allocate communication staging buffers from PyTorch's
-            NCCL symmetric-memory pool.
-        overlap_allgather_reduction: Use separate all-gather and reduction streams.
-            Disable to reduce peak transient memory. See
-            https://github.com/NVIDIA/Megatron-LM/issues/6471.
-        overlap_outer_communication: Run the last-microbatch DP-outer reduction on
-            a separate stream, independently of overlap_allgather_reduction.
-        caller_managed_grad_sync: Leave gradient synchronization to the caller
-            while retaining automatic weight cleanup. The caller must call
-            finish_grad_sync() after all backward work, including delayed weight
-            gradients, and before reading or modifying gradients.
-    """
+    """Configure communication allocation, streams, and prefetch for an FSDP context."""
 
     use_symmetric_memory: bool = False
+    """Allocate communication staging buffers from PyTorch's NCCL symmetric-memory pool."""
+
     overlap_allgather_reduction: bool = True
+    """Use separate all-gather and reduction streams.
+
+    Disable to reduce peak transient memory. See
+    https://github.com/NVIDIA/Megatron-LM/issues/6471.
+    """
+
     overlap_outer_communication: bool = False
-    caller_managed_grad_sync: bool = False
+    """Run DP-outer reduction on a separate stream, independently of all-gather overlap."""
+
+    prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION
+    """Use registration order, or record execution until context.post_backward().
+
+    Schedules call post_backward() once after all microbatch backwards. Subsequent
+    schedules must repeat the trace consistently across data-parallel ranks.
+    Discard the context if recording fails.
+    """
+
+    autograd_completes_execution: bool = True
+    """Complete the execution order after each autograd backward.
+
+    Pipeline schedulers disable this and call context.post_backward()
+    explicitly after the complete schedule. Deferred cleanup still runs per backward.
+    """

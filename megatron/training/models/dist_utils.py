@@ -40,6 +40,7 @@ except ImportError:
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradientFinalizationMode,
     RuntimePolicy,
     fully_shard_context,
 )
@@ -378,9 +379,13 @@ def _ddp_wrap(
         construction_context = (
             fully_shard_context(
                 FsdpContext(
+                    gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
                     runtime_policy=RuntimePolicy(
+                        prefetch_order=FullyShardedDataParallelV2.prefetch_order_for(
+                            get_model_config(model[0])
+                        ),
+                        autograd_completes_execution=False,
                         use_symmetric_memory=ddp_config.nccl_ub,
-                        caller_managed_grad_sync=True,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
                     )
                 )

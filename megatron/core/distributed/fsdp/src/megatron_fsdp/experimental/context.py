@@ -15,7 +15,8 @@
 """Shared runtime state for Megatron-FSDP modules."""
 
 import enum
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from weakref import WeakKeyDictionary
 
 import torch
@@ -23,14 +24,31 @@ from torch import nn
 
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .phase import Phase
-from .runtime_policy import RuntimePolicy
+from .runtime_policy import PrefetchOrder, RuntimePolicy
 
 
-class PrefetchOrder(enum.Enum):
-    """How to choose the module order used for prefetching."""
+class GradientFinalizationMode(enum.Enum):
+    """Control outer reduction and the automatic wait for gradient reductions.
 
-    REGISTRATION = enum.auto()
-    RECORDED = enum.auto()
+    | Mode | Outer reduction | Automatic wait at autograd completion |
+    | --- | --- | --- |
+    | SKIP_OUTER | Skip | No |
+    | REDUCE_OUTER | Launch as gradients become ready | No |
+    | REDUCE_OUTER_AND_WAIT (default) | Launch as gradients become ready | Yes |
+
+    Inner reduction or local accumulation runs in every mode. The automatic wait
+    covers both inner and outer reductions. The default applies outside a
+    ``finalize_gradients()`` scope.
+    """
+
+    SKIP_OUTER = enum.auto()
+    """Skip outer reduction and the automatic completion wait during accumulation."""
+
+    REDUCE_OUTER = enum.auto()
+    """Launch outer reduction; the caller must call ``finish_grad_sync()`` afterward."""
+
+    REDUCE_OUTER_AND_WAIT = enum.auto()
+    """Launch outer reduction and wait for all gradient reductions at autograd completion."""
 
 
 class FsdpContext:
@@ -40,11 +58,9 @@ class FsdpContext:
     inner_reduction_stream: torch.cuda.Stream
     # Aliases inner_reduction_stream unless DP-outer overlap is enabled.
     outer_reduction_stream: torch.cuda.Stream
-    # Whether backward should finalize accumulated gradients, including DP-outer
-    # reduction for HSDP/HFSDP. Scoped by finalize_gradients().
-    finalize_gradients: bool
+    # Active mode, controlled by finalize_gradients().
+    _gradient_finalization_mode: GradientFinalizationMode
     use_symmetric_memory: bool
-    caller_managed_grad_sync: bool
     # Prefetch uses construction order unless execution-order recording is enabled.
     execution_order: ExecutionOrder
     # Topology metadata must not keep modules alive after construction.
@@ -54,33 +70,32 @@ class FsdpContext:
     # The optimizer runs on the current stream and must wait for reductions on
     # this context's reduce-scatter stream. Each context owns its own stream, so
     # independent roots sharing a context need only one completion callback.
-    _post_backward_hook_registered: bool
+    _post_autograd_hook_registered: bool
 
     def __init__(
         self,
         device: torch.device | None = None,
         runtime_policy: RuntimePolicy = RuntimePolicy(),
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
-        prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION,
+        gradient_finalization_mode: GradientFinalizationMode = (
+            GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+        ),
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
         Args:
             device: CUDA device on which this context schedules communication. Defaults to
                 the current CUDA device.
-            runtime_policy: Communication allocation, stream, and gradient-synchronization
-                settings shared by all modules constructed in this context.
+            runtime_policy: Communication allocation, stream, and prefetch settings shared by all
+                modules constructed in this context.
             parameter_to_owner: Construction-time owner assignments for TensorAtomic
                 parameters, keyed by the original parameters before sharding. Owners are
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
                 that mesh. Every TensorAtomic parameter needs an entry; other entries are
                 ignored. Tensors are packed by owner without changing logical parameter order.
-            prefetch_order: ``REGISTRATION`` expects a forward/backward pass matching module
-                registration order. ``RECORDED`` gathers parameters on demand and records
-                module calls until the first ``post_backward()``. Subsequent passes must
-                repeat the complete sequence consistently across data-parallel ranks.
-                Recording currently requires the ordinary module hooks; combined 1F1B
-                bypasses them. Discard the context if the recorded pass raises.
+            gradient_finalization_mode: Initial mode restored when a gradient-finalization
+                scope exits. The default waits automatically; callers that own the wait
+                can select REDUCE_OUTER and call finish_grad_sync() after backward.
         """
         overlap_allgather_reduction = runtime_policy.overlap_allgather_reduction
         overlap_outer_communication = runtime_policy.overlap_outer_communication
@@ -89,12 +104,13 @@ class FsdpContext:
         if device.type != "cuda":
             raise ValueError(f"FsdpContext requires a CUDA device, got {device}.")
 
-        self.finalize_gradients = True
+        self._gradient_finalization_mode = gradient_finalization_mode
+        self.autograd_completes_execution = runtime_policy.autograd_completes_execution
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
-        self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
+        self.prefetch_order = runtime_policy.prefetch_order
         self.execution_order = ExecutionOrder()
-        self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
-        self._post_backward_hook_registered = False
+        self._recording_execution_order = runtime_policy.prefetch_order is PrefetchOrder.RECORDED
+        self._post_autograd_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
         ] = []
@@ -125,6 +141,11 @@ class FsdpContext:
             if overlap_outer_communication
             else self.inner_reduction_stream
         )
+
+    @property
+    def gradient_finalization_mode(self) -> GradientFinalizationMode:
+        """Active mode, controlled by ``finalize_gradients()``."""
+        return self._gradient_finalization_mode
 
     @property
     def is_finalized(self) -> bool:
@@ -194,13 +215,47 @@ class FsdpContext:
         """Current stream on this context's device."""
         return torch.cuda.current_stream(self.allgather_stream.device)
 
+    @contextmanager
+    def finalize_gradients(
+        self, mode: GradientFinalizationMode = GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+    ) -> Iterator[None]:
+        """Scope outer reduction and completion-wait behavior for backward calls.
+
+        Use SKIP_OUTER while accumulating gradients across backward calls. For the last
+        backward before the optimizer step, use REDUCE_OUTER_AND_WAIT for automatic
+        completion, or REDUCE_OUTER and call finish_grad_sync() after all backward work,
+        including backward_dw(). Inner reduction and weight cleanup run in every mode.
+
+        Outside a scope, backward uses the mode selected at context construction.
+        Wrap both forward and backward. The scope itself does not launch reductions
+        or wait on entry or exit.
+
+        Nested scopes are allowed. Disallowing nesting could make mode selection
+        clearer, but requires substantial changes to pipeline-parallel synchronization
+        scopes and is deferred to a separate PR.
+
+        Args:
+            mode: Outer reduction and completion-wait behavior within the scope.
+        """
+        self.ensure_finalized()
+        previous_mode = self._gradient_finalization_mode
+        self._gradient_finalization_mode = mode
+
+        try:
+            yield
+        finally:
+            self._gradient_finalization_mode = previous_mode
+
     def validate_grad_sync(self) -> None:
         """Require a caller-owned wait or a pending autograd completion callback."""
-        if self.caller_managed_grad_sync or self._post_backward_hook_registered:
+        if (
+            self._gradient_finalization_mode is not GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+            or self._post_autograd_hook_registered
+        ):
             return
         raise RuntimeError(
             "Gradient reduction has no pending autograd completion callback. "
-            "Use FsdpContext(runtime_policy=RuntimePolicy(caller_managed_grad_sync=True)) "
+            "Use context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER) "
             "and call context.finish_grad_sync() after all backward work, including "
             "delayed weight-gradient computation, before consuming gradients."
         )
@@ -212,6 +267,9 @@ class FsdpContext:
         and before reading or modifying gradients. This enqueues a stream dependency;
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
+        # TODO(wujingyue): Support SKIP_OUTER even on the last microbatch by launching pending
+        # outer reductions here before waiting, instead of requiring backward to launch them.
+
         # A backward prefetch may gather a frozen module that never runs backward.
         # Restore bindings and clear its gather state so the next iteration
         # materializes fresh weights. All backward work, including delayed wgrad,
@@ -222,24 +280,40 @@ class FsdpContext:
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
 
-    def post_backward(self) -> None:
-        """Finish backward cleanup and synchronize gradients when finalization is enabled."""
-        self._run_delayed_post_backward_callbacks()
-        self._recording_execution_order = False
-        # Standalone training can call optimizer.step() immediately after backward.
-        # Wait for reductions on the last microbatch; earlier microbatches keep
-        # overlapping reduction with compute. MCore calls finish_grad_sync() itself
-        # after its schedule completes, including delayed weight gradients.
-        if not self.caller_managed_grad_sync and self.finalize_gradients:
-            self.finish_grad_sync()
-        self._post_backward_hook_registered = False
+    def pre_backward(self) -> None:
+        """Fork the reduce-scatter stream into any active CUDA-graph capture.
 
-    def _run_delayed_post_backward_callbacks(self) -> None:
-        """Run deferred module completion callbacks once."""
+        A stream joins a capture only via a wait_stream edge; without it, the first
+        allocation on the reduce-scatter stream is illegal during capture. The DP-outer
+        reduction stream needs no fork: it joins via its wait on the reduce-scatter stream.
+        """
+        self.inner_reduction_stream.wait_stream(self.current_stream())
+
+    def _finish_execution_order(self) -> None:
+        """Finish recording or validate replay at the execution-window boundary."""
+        if not self._recording_execution_order and self.execution_order.position != 0:
+            raise RuntimeError("FSDP execution ended before the recorded order was complete.")
+        self._recording_execution_order = False
+
+    def post_backward(self) -> None:
+        """Complete the execution order after all backwards in this schedule."""
+        self._finish_execution_order()
+
+    def post_microbatch(self) -> None:
+        """Release deferred module weights after each microbatch backward."""
         # Finish children before parents to close nested backward NVTX ranges.
         while self._delayed_post_backward_callbacks:
             module, callback = self._delayed_post_backward_callbacks.pop()
             callback(module)
+
+    def _post_autograd(self) -> None:
+        """Run deferred cleanup and the configured automatic completion and gradient wait."""
+        self.post_microbatch()
+        self._post_autograd_hook_registered = False
+        if self.autograd_completes_execution:
+            self.post_backward()
+        if self._gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT:
+            self.finish_grad_sync()
 
     def register_post_backward_hook(self) -> None:
         """Register one final callback for deferred cleanup and optional gradient sync.
@@ -250,15 +324,15 @@ class FsdpContext:
         reductions. Wait once at context-level autograd completion instead.
         """
 
-        if self._post_backward_hook_registered:
+        if self._post_autograd_hook_registered:
             # Another root sharing this context already queued the completion wait.
             return
-        self._post_backward_hook_registered = True
+        self._post_autograd_hook_registered = True
 
         # TODO(wujingyue): Switch to torch.autograd.graph.queue_callback() when Megatron-LM
         # requires a PyTorch version that includes it:
         # https://github.com/pytorch/pytorch/pull/193958
-        torch.autograd.Variable._execution_engine.queue_callback(self.post_backward)
+        torch.autograd.Variable._execution_engine.queue_callback(self._post_autograd)
 
 
 def _collect_backward_order(

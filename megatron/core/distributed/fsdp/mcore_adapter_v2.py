@@ -42,11 +42,12 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp import MixedPrecisionPolicy
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
         FsdpContext,
+        GradientFinalizationMode,
         Placements,
+        PrefetchOrder,
         RuntimePolicy,
         SchedulePolicy,
         ShardLayout,
-        finalize_gradients,
         fully_shard,
         fully_shard_context,
     )
@@ -117,6 +118,18 @@ def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | No
         _materialize_meta_module(submodule, device)
 
 
+def _initialize_symmetric_memory_communicators(
+    groups: tuple[dist.ProcessGroup, ...], device: torch.device
+) -> None:
+    """Initialize communicators before symmetric-memory registration.
+
+    NCCL rendezvous can fail as the first operation on a communicator:
+    https://github.com/pytorch/pytorch/issues/188567.
+    """
+    for group in groups:
+        dist.barrier(group=group, device_ids=[device.index])
+
+
 class FullyShardedDataParallelV2(_BaseDataParallel):
     """MFSDP v2 wrapper for the Megatron model.
 
@@ -154,8 +167,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             device: Device used to construct the data-parallel mesh and, when this wrapper
                 opens its own ``fully_shard_context``, that context's device. Defaults to
                 CUDA. When the caller has already opened an ambient context (multi-chunk
-                wrapping), this wrapper joins it and the ambient context's device and
-                ``use_symmetric_memory`` settings apply instead.
+                wrapping), this wrapper joins it and uses that context's device. The
+                context's symmetric-memory setting must match ``ddp_config.nccl_ub``.
             pg_collection: Explicit process groups. The ``dp_cp`` group defines the
                 data-parallel mesh.
 
@@ -164,6 +177,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ValueError: If required process groups are missing or the configuration
                 requests a feature unsupported by MFSDP v2.
         """
+
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
         if pg_collection is None:
@@ -175,6 +189,21 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
+
+        use_symmetric_memory = ddp_config.nccl_ub
+        if use_symmetric_memory:
+            if ddp_config.num_distributed_optimizer_instances > 1:
+                groups = (pg_collection.inter_dist_opt, pg_collection.intra_dp_cp)
+                if config.num_moe_experts is not None:
+                    groups += (pg_collection.intra_expt_dp,)
+            else:
+                groups = (pg_collection.dp_cp,)
+                if config.num_moe_experts is not None:
+                    groups += (pg_collection.expt_dp,)
+            _initialize_symmetric_memory_communicators(
+                tuple(group for group in groups if group is not None),
+                torch.cuda.current_stream(device).device,
+            )
 
         # Optimizer construction reads this attribute; retain the v1 contract for compatibility.
         self.ddp_config = ddp_config
@@ -252,23 +281,36 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # Join the caller's ambient context when one is active (VPP chunks); otherwise
         # open and finalize our own. MCore's finalize_model_grads() owns the wait
         # after the schedule completes, including delayed wgrad and custom 1F1B work.
+        # Execution also ends at that boundary, even for a single pipeline stage.
         active_context = current_fully_shard_context()
+        prefetch_order = self.prefetch_order_for(config)
         if active_context is None:
             construction_context = fully_shard_context(
                 FsdpContext(
                     device=device,
+                    gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
                     runtime_policy=RuntimePolicy(
+                        prefetch_order=prefetch_order,
+                        autograd_completes_execution=False,
                         use_symmetric_memory=ddp_config.nccl_ub,
-                        caller_managed_grad_sync=True,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
                     ),
                 )
             )
         else:
-            if not active_context.caller_managed_grad_sync:
+            if (
+                prefetch_order is PrefetchOrder.RECORDED
+                and active_context.prefetch_order is not PrefetchOrder.RECORDED
+            ):
                 raise ValueError(
-                    "MCore MFSDP v2 requires shared contexts to be constructed with "
-                    "RuntimePolicy(caller_managed_grad_sync=True)."
+                    "Ordinary PP/VPP MFSDP v2 schedules require "
+                    "RuntimePolicy(prefetch_order=PrefetchOrder.RECORDED)."
+                )
+            if active_context.autograd_completes_execution:
+                raise ValueError(
+                    "The MCore adapter requires autograd_completes_execution=False because "
+                    "the caller completes execution through finalize_model_grads() after all "
+                    "microbatch backwards in the schedule."
                 )
             construction_context = nullcontext(active_context)
         with construction_context:
@@ -289,6 +331,16 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         if config.overlap_moe_expert_parallel_comm:
             register_combined_1f1b_hooks(self.module)
+
+    @staticmethod
+    def prefetch_order_for(config: TransformerConfig) -> "PrefetchOrder":
+        """Record ordinary pipeline schedules; combined 1F1B gathers only on demand."""
+        if not config.overlap_moe_expert_parallel_comm and (
+            config.pipeline_model_parallel_size > 1
+            or config.virtual_pipeline_model_parallel_size is not None
+        ):
+            return PrefetchOrder.RECORDED
+        return PrefetchOrder.REGISTRATION
 
     def load_state_dict(self, state_dict, strict=True):
         """Load main weights and refresh the buffers used for forward compute."""
@@ -458,7 +510,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if ddp_config.nccl_ub and not ddp_config.megatron_fsdp_padded_shards:
             raise ValueError(
                 "MFSDP v2 megatron_fsdp_padded_shards=False is incompatible with nccl_ub: "
-                "symmetric-memory collectives require equal shard sizes."
+                "symmetric-memory collectives require equal shard sizes for unsharding. "
+                "Remove --no-megatron-fsdp-padded-shards or disable --use-nccl-ub."
             )
         if ddp_config.fsdp_manual_registration:
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
@@ -485,7 +538,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         MCore's schedules wrap every microbatch but the last in ``no_sync_func``.
         """
-        with finalize_gradients(self.module.context, enabled=False):
+        with self.module.context.finalize_gradients(mode=GradientFinalizationMode.SKIP_OUTER):
             yield
 
     @torch.no_grad()
