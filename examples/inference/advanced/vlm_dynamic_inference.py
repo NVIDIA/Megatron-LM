@@ -519,17 +519,22 @@ def get_model(
     assert checkpoint.load is not None
     # Inference must not start from random weights.
     checkpoint.exit_on_missing_checkpoint = True
+    shard_groups = {}
+    if pg_collection is not None:
+        shard_groups = dict(
+            tp_group=pg_collection.tp,
+            pp_group=pg_collection.pp,
+            dp_cp_group=pg_collection.dp_cp,
+            dp_group=pg_collection.dp,
+            expt_dp_group=pg_collection.expt_dp,
+            checkpoint_group=checkpoint_group,
+        )
     load_checkpoint(
         ddp_model=model,
         optimizer=None,
         opt_param_scheduler=None,
         strict=not args.inference_ckpt_non_strict,
-        tp_group=pg_collection.tp if pg_collection is not None else None,
-        pp_group=pg_collection.pp if pg_collection is not None else None,
-        dp_cp_group=pg_collection.dp_cp if pg_collection is not None else None,
-        dp_group=pg_collection.dp if pg_collection is not None else None,
-        expt_dp_group=pg_collection.expt_dp if pg_collection is not None else None,
-        checkpoint_group=checkpoint_group,
+        **shard_groups,
     )
     if is_mimo:
         _check_mimo_checkpoint_fully_loaded(args, model[0])
