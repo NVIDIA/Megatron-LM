@@ -80,7 +80,7 @@ def resolve_mxfp8_backend(
     )
     # All supported grouped-MoE backends consume MCore's canonical Triton/cuBLAS
     # layout. FlashInfer repacks expert weights into TRT-LLM Major-K layout separately.
-    if grouped_gemm_backend in ("torch", "flashinfer", "vllm"):
+    if grouped_gemm_backend in ("torch", "flashinfer", "flashinfer_cutedsl", "vllm"):
         return "triton"
     raise ValueError(
         "MXFP8 inference does not support "
