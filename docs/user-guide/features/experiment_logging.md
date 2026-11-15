@@ -47,9 +47,16 @@ use these backends. The existing `--inference-wandb-logging` flag enables
 inference reporting to any configured experiment backend. Basic W&B training
 and evaluation scalars now log without TensorBoard, including when evaluation
 sets `write_to_tensorboard=False`; TensorBoard output remains unchanged.
+Standalone evaluation (`--skip-train` or no training data) logs `eval_only/*`
+against `eval_checkpoint_iter`, so evaluating an older checkpoint does not send
+an out-of-order training step to W&B. In-training evaluation keeps its existing
+metric names and training-step axis.
 Custom callbacks use `get_experiment_writer()`, which returns the shared writer
 even when only W&B is configured. It provides `log(metrics, step)` and
 `log_metadata(values)`; normal shutdown closes all enabled backends together.
+Use `on_experiment_log` for callback metrics at `--tensorboard-log-interval`.
+It runs on the rank owning the experiment writer regardless of TensorBoard;
+`on_tensorboard_log` remains restricted to ranks owning a TensorBoard writer.
 Tables and plots use its `table`, `histogram`, and `log_media` methods and currently
 require W&B. Check `supports_media` before preparing media. The separate
 `get_wandb_writer()` accessor is removed; migrate existing callbacks to the shared writer.

@@ -228,17 +228,17 @@ class ExperimentWriter:
         """Configure the inference axis and return its last recorded step on resume."""
         offset = 0
         if self.wandb is not None:
-            self.wandb.define_metric('inference/*', step_metric='inference/inference_step')
+            self.wandb.define_metric("inference/*", step_metric="inference/inference_step")
             run = self.wandb.run
             if run is not None:
-                history = self.wandb.Api().run(f'{run.entity}/{run.project}/{run.id}')
-                for row in history.scan_history(keys=['inference/inference_step']):
-                    value = row.get('inference/inference_step')
+                history = self.wandb.Api().run(f"{run.entity}/{run.project}/{run.id}")
+                for row in history.scan_history(keys=["inference/inference_step"]):
+                    value = row.get("inference/inference_step")
                     if isinstance(value, (int, float)):
                         offset = max(offset, int(value))
         if self.mlflow is not None:
             for metric in self.mlflow.get_metric_history(
-                self._mlflow_run_id, 'inference/inference_step'
+                self._mlflow_run_id, "inference/inference_step"
             ):
                 offset = max(offset, int(metric.value))
         return offset
@@ -247,7 +247,7 @@ class ExperimentWriter:
         """Use an independent inference step without advancing the training axis."""
         if self._closed:
             return
-        self._log_scalars(metrics, int(metrics['inference/inference_step']), independent_step=True)
+        self._log_scalars(metrics, int(metrics["inference/inference_step"]), independent_step=True)
 
     def log_evaluation(self, metrics: dict[str, Any], iteration: int, standalone=False) -> None:
         """Log evaluation scalars, including evaluations of older checkpoints."""
@@ -257,11 +257,11 @@ class ExperimentWriter:
         if self._closed:
             return
         values = {
-            'eval_checkpoint_iter': iteration,
-            **{f'eval_only/{k}': v for k, v in metrics.items()},
+            "eval_checkpoint_iter": iteration,
+            **{f"eval_only/{k}": v for k, v in metrics.items()},
         }
         if self.wandb is not None:
-            self.wandb.define_metric('eval_only/*', step_metric='eval_checkpoint_iter')
+            self.wandb.define_metric("eval_only/*", step_metric="eval_checkpoint_iter")
         self._log_scalars(values, iteration, independent_step=True)
 
     def log_metadata(self, values: dict[str, Any]) -> None:

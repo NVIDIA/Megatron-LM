@@ -62,7 +62,6 @@ class RLLoggingCallback(Callback):
 
     def on_tensorboard_log(self, context: CallbackContext) -> None:
         tensorboard_writer = get_tensorboard_writer()
-        experiment_writer = get_experiment_writer()
         iteration = get_train_state().iteration
         if self._rl_config.rl_use_sequence_packing:
             metrics = get_sequence_packing_tensorboard_metrics(
@@ -70,12 +69,22 @@ class RLLoggingCallback(Callback):
             )
             for name, value in metrics.items():
                 tensorboard_writer.add_scalar(name, value, iteration)
-            if experiment_writer and metrics:
-                experiment_writer.log(metrics, iteration)
         grpo_collection_iteration = iteration // self._iterations_per_collection
-        tensorboard_writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
-        if experiment_writer:
-            experiment_writer.log({'grpo_collection_iteration': grpo_collection_iteration}, iteration)
+        tensorboard_writer.add_scalar(
+            'grpo_collection_iteration', grpo_collection_iteration, iteration
+        )
+
+    def on_experiment_log(self, context: CallbackContext) -> None:
+        """Log collection and packing scalars independently of TensorBoard."""
+        iteration = get_train_state().iteration
+        metrics = {"grpo_collection_iteration": iteration // self._iterations_per_collection}
+        if self._rl_config.rl_use_sequence_packing:
+            metrics.update(
+                get_sequence_packing_tensorboard_metrics(
+                    rl_utils.get_rl_runtime_state().consumed_train_bins, self._micro_batch_size
+                )
+            )
+        get_experiment_writer().log(metrics, iteration)
 
     def on_log(self, context: CallbackContext) -> None:
         experiment_writer = get_experiment_writer()

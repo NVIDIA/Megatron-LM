@@ -53,6 +53,7 @@ VALID_EVENTS: frozenset[str] = frozenset(
         "on_train_step_end",
         "on_log",
         "on_tensorboard_log",
+        "on_experiment_log",
         "on_checkpoint_saved",
         "on_train_end",
         "on_eval_start",
@@ -86,7 +87,8 @@ class CallbackContext:
         total_loss_dict: Aggregated eval losses. Available in on_eval_end.
         timers_to_log: Mutable timer-name list; append to include extra timers. In on_log.
         log_fragments: Mutable list; append strings to extend the stdout log line. In on_log.
-        batch_size: Global batch size of that iteration. In on_log and on_tensorboard_log.
+        batch_size: Global batch size of that iteration. In on_log, on_tensorboard_log,
+            and on_experiment_log.
         elapsed_time_per_iteration: Seconds per iteration over the log interval. In on_log.
         throughput: TFLOP/s per GPU over the log interval, or None when not logged. In on_log.
         durable_iteration: Iteration of the durable checkpoint. In on_checkpoint_saved.
@@ -166,6 +168,13 @@ class Callback:
 
     def on_tensorboard_log(self, context: CallbackContext) -> None:
         """Called on the ranks that own a TensorBoard writer, at --tensorboard-log-interval."""
+        pass
+
+    def on_experiment_log(self, context: CallbackContext) -> None:
+        """Called on ranks owning an experiment writer, at --tensorboard-log-interval.
+
+        Independent of whether TensorBoard is enabled.
+        """
         pass
 
     def on_checkpoint_saved(self, context: CallbackContext) -> None:

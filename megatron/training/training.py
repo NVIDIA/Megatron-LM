@@ -3998,6 +3998,9 @@ def training_log(
         if tensorboard_writer:
             callback_manager.callback_context.batch_size = batch_size
             callback_manager.trigger("on_tensorboard_log")
+        if experiment_writer:
+            callback_manager.callback_context.batch_size = batch_size
+            callback_manager.trigger("on_experiment_log")
     # Log MoE metrics.
     moe_log_string = ""
     if cfg.model.transformer.num_moe_experts is not None:
@@ -6109,8 +6112,10 @@ def evaluate_and_print_results(
                         '{} validation{} ppl vs samples'.format(key, suffix), ppl, train_state.consumed_train_samples
                     )
             if experiment_writer and is_last_rank():
-                experiment_writer.log(
-                    {'{} validation{}'.format(key, suffix): total_loss_dict[key].item()}, iteration
+                experiment_writer.log_evaluation(
+                    {f"{key} validation{suffix}": total_loss_dict[key].item()},
+                    iteration,
+                    standalone=cfg.validation.skip_train or not train_state.do_train,
                 )
 
         if process_non_loss_data_func is not None and tensorboard_writer and is_last_rank():

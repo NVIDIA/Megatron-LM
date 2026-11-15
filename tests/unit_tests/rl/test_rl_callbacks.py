@@ -85,7 +85,9 @@ def test_logging_callback(env, packing, profile):
     scalars = {c.args[0]: c.args[1] for c in env.writer.add_scalar.call_args_list}
     packing_metrics = {"bin-batch-size": 4 * 2 * 3, "consumed-bins": 7} if packing else {}
     assert scalars == {"grpo_collection_iteration": 9 // 4, **packing_metrics}
-    assert all(c.args[1] == 9 for c in env.wandb_writer.log.call_args_list)
+    env.wandb_writer.log.assert_not_called()
+    callback.on_experiment_log(context)
+    env.wandb_writer.log.assert_called_once_with(scalars, 9)
 
 
 @pytest.mark.parametrize("profile", [False, True])
