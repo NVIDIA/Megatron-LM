@@ -159,6 +159,7 @@ def test_matrix_optimizer_step_and_resume(backend, optimizer_name, tmp_path_dist
         reference_optimizer = optimizer_type(
             [reference],
             lr=1e-3,
+            nesterov=optimizer_config.muon_nesterov,
             weight_decay=0.0,
             pg_collection=groups,
             split_qkv=False,
@@ -213,6 +214,9 @@ def test_matrix_optimizer_step_and_resume(backend, optimizer_name, tmp_path_dist
             )
         resumed.load_state_dict(restored["model"])
         resumed_optimizer.load_state_dict(restored["optimizer"])
+        torch.testing.assert_close(
+            optimizer.state_dict(), resumed_optimizer.state_dict(), rtol=0, atol=0
+        )
         step(model, optimizer, weight, 1, reference_optimizer)
         step(resumed, resumed_optimizer, resumed_weight, 1)
         torch.testing.assert_close(weight.main_param, resumed_weight.main_param, rtol=0, atol=0)
