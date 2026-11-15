@@ -16,6 +16,7 @@ support multimodal checkpoints:
 import json
 import os
 import re
+from copy import deepcopy
 from functools import partial
 from typing import Optional
 
@@ -25,7 +26,8 @@ from megatron.core import dist_checkpointing
 from megatron.core.models.vision.encoder_registry import get_spec
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
-from megatron.core.utils import unwrap_model
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_pg_size, unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
 from megatron.training import get_run_config, print_rank_0
@@ -484,6 +486,37 @@ def _detect_vlm_from_checkpoint(args, user_passed_attrs=None):
     return True
 
 
+def _shard_transformer_config(
+    config: TransformerConfig, pg_collection: ProcessGroupCollection
+) -> TransformerConfig:
+    """Return a copy of `config` whose parallel sizes match one inference shard's groups.
+
+    The global config describes the launch-wide layout, which a role-tagged inference shard
+    may override. The language, vision and projection configs of both VLM providers start
+    from this copy. The global config is left unchanged.
+    """
+    shard_config = deepcopy(config)
+    for field, group in (
+        ("tensor_model_parallel_size", pg_collection.tp),
+        ("pipeline_model_parallel_size", pg_collection.pp),
+        ("context_parallel_size", pg_collection.cp),
+        ("expert_model_parallel_size", pg_collection.ep),
+        ("expert_tensor_parallel_size", pg_collection.expt_tp),
+    ):
+        setattr(shard_config, field, get_pg_size(group))
+    # Settings derived from those sizes.
+    if shard_config.tensor_model_parallel_size == 1:
+        # As argument validation does for TP=1; SP and TP overlap need TP > 1.
+        shard_config.sequence_parallel = False
+        shard_config.tp_comm_overlap = False
+    # Inference shards never rematerialize weights (their GTP_remat groups are singletons).
+    shard_config.tensor_parallel_num_weight_shards = None
+    shard_config.gtp_weight_remat_size = 1
+    shard_config.expert_tensor_parallel_num_weight_shards = None
+    shard_config.expert_gtp_weight_remat_size = 1
+    return shard_config
+
+
 def get_model(
     is_vlm: bool,
     pg_collection: Optional[ProcessGroupCollection] = None,
@@ -513,9 +546,19 @@ def get_model(
         from model_provider import model_provider
 
         provider = partial(model_provider, gpt_builder)
-    model = _get_model(provider, wrap_with_ddp=False, pg_collection=pg_collection)
+    cfg = get_run_config()
+    if pg_collection is None:
+        model = _get_model(provider, wrap_with_ddp=False)
+    else:
+        # The providers build every sub-model config from the one passed here.
+        model = _get_model(
+            provider,
+            wrap_with_ddp=False,
+            config=_shard_transformer_config(cfg.model.transformer, pg_collection),
+            pg_collection=pg_collection,
+        )
 
-    checkpoint = get_run_config().checkpoint
+    checkpoint = cfg.checkpoint
     assert checkpoint.load is not None
     # Inference must not start from random weights.
     checkpoint.exit_on_missing_checkpoint = True
