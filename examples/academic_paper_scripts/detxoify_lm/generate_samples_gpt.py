@@ -249,16 +249,12 @@ def generate_and_write_samples_conditional(model):
 def main():
     """Main program."""
 
-    args = parse_and_validate_args(
-        extra_args_provider=add_text_generate_args,
-        args_defaults={
-            'tokenizer_type': 'GPT2BPETokenizer',
-            'no_load_rng': True,
-            'no_load_optim': True,
-            'seq_length': 2048,
-        },
-    )
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    args = parse_and_validate_args(extra_args_provider=add_text_generate_args,
+                            args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
+                                           'no_load_rng': True,
+                                           'no_load_optim': True,
+                                           'seq_length': 2048})
+    set_run_config(inference_cfg_container_from_args(args))
     initialize_megatron()
 
     # Set up model and load checkpoint

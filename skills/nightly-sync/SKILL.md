@@ -359,15 +359,12 @@ Recent regressions the dev-feature audit would have flagged (all
 - `datasets/readme.md` lost the dev-only "Packing Scheduler" section
 - PR #4882 / PR #4318 dropped the `TEFusedDenseMLP` implementation and
   `gpt_layer_specs.py` selection while leaving the config flag and unit test
-- `data_samplers.py` / `utils.py` / `training.py` kept main's
-  `args.hybrid_context_parallel` instead of dev's
-  `args.dynamic_context_parallel` (counts as a MERGE ACCIDENT — dev's
-  reference is present, main's is the deprecated alias that's False
-  when callers pass `--dynamic-context-parallel`). These files are on
-  the override list so the audit treats them as "advisory", but you
-  should still rename `args.hybrid_context_parallel` →
-  `args.dynamic_context_parallel` on every reference after taking
-  main's version of these files.
+- `data_samplers.py` / `utils.py` / `training.py` must consistently use
+  `args.dynamic_context_parallel` so callers passing
+  `--dynamic-context-parallel` activate the scheduler and data-loading paths.
+  These files are on the override list so the audit treats them as
+  "advisory"; still verify every reference after taking main's version of
+  these files.
 
 ### Commit and Push
 

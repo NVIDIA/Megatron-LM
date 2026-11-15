@@ -198,6 +198,9 @@ def validate_at_pretrain(monkeypatch, run_config):
     setup = Mock()
     monkeypatch.setattr(training, "initialize_megatron", initialize)
     monkeypatch.setattr(training.ft_integration, "setup", setup)
+    # pretrain() finalizes the container before fault-tolerance setup; that needs the
+    # registered args, which these validation-order checks stop short of.
+    monkeypatch.setattr(run_config, "finalize", Mock())
 
     def validate(config):
         run_config.profiling = config
@@ -260,7 +263,7 @@ def test_inference_factory_keeps_automatic_model_construction(monkeypatch, expli
     args, _ = cli_config()
     model = object()
     build = Mock(return_value=model)
-    monkeypatch.setattr(argument_utils, "gpt_config_from_args", build)
+    monkeypatch.setattr(argument_utils, "model_config_from_args", build)
     kwargs = {"model_cfg": None} if explicit_none else {}
     config = argument_utils.inference_cfg_container_from_args(args, **kwargs)
     assert config.model is model

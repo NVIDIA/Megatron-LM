@@ -714,15 +714,13 @@ def _patch_pipeline_rank(monkeypatch, pp_rank, pp_size, vp_size, tp_rank=0):
     ids=["pp", "mtp", "vpp", "vpp-mtp"],
 )
 def test_scheduler_runs_on_every_pipeline_stage_from_dataset_placement(
-    single_rank_collectives, monkeypatch, script_name, vp_size, layout, mtp_stage
+    single_rank_collectives, monkeypatch, run_config, script_name, vp_size, layout, mtp_stage
 ):
     """Every PP stage schedules the global batch from the iterators the dataset placement gives it.
 
     Each stage keeps only the fields of its virtual stages, including a standalone MTP stage.
     FLOPs statistics count real tokens, not padding.
     """
-    from megatron.training import arguments, global_vars
-
     script = importlib.import_module(script_name)
     pp_size = 4
     real_lengths = [5, 13, 8, 30, 2, 17, 9, 24]
@@ -732,23 +730,12 @@ def test_scheduler_runs_on_every_pipeline_stage_from_dataset_placement(
         pipeline_layout = PipelineParallelLayerLayout(layout, pp_size)
         mtp_num_layers = 1
         pipeline_layout.validate_layer_layout(layout.count("t"), mtp_num_layers)
-    # The scripts pass the shared predicate (megatron.training.datasets.providers), which reads
-    # the arguments and the transformer config at call time from these two modules.
-    monkeypatch.setattr(
-        global_vars, "get_args", lambda: SimpleNamespace(sequence_packing_scheduler="dp_balanced")
-    )
-    monkeypatch.setattr(
-        arguments,
-        "core_transformer_config_from_args",
-        lambda args: SimpleNamespace(
-            pipeline_model_parallel_layout=pipeline_layout, mtp_num_layers=mtp_num_layers
-        ),
-    )
-    config = SimpleNamespace(
-        virtual_pipeline_model_parallel_size=vp_size,
-        pipeline_model_parallel_layout=pipeline_layout,
-        mtp_num_layers=mtp_num_layers,
-    )
+    # The shared dataset predicate and scheduler use the registered model config.
+    config = run_config.model.transformer
+    config.sequence_packing_scheduler = "dp_balanced"
+    config.virtual_pipeline_model_parallel_size = vp_size
+    config.pipeline_model_parallel_layout = pipeline_layout
+    config.mtp_num_layers = mtp_num_layers
     vp_stages = [None] if vp_size is None else list(range(vp_size))
 
     scheduled_counts = []

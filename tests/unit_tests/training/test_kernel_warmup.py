@@ -9,10 +9,10 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.activations import situlu, squared_relu
-from megatron.core.fusions import fused_cross_entropy
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.ops.loss import fused_cross_entropy
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training import kernel_warmup
 from megatron.training.kernel_warmup import _warmup_training_kernels
@@ -304,17 +304,18 @@ def test_config_activation_storage_reuses_warmed_backward(tp_group, add_bias, fp
 
 
 @pytest.fixture
-def pretrain_until_warmup(monkeypatch):
+def pretrain_until_warmup(monkeypatch, run_config):
     from megatron.training import training
 
     class WarmupReached(Exception):
         pass
 
     monkeypatch.setattr(training, "_STARTUP_TIMESTAMPS", {})
-    monkeypatch.setattr(training.ft_integration, "setup", lambda: None)
+    monkeypatch.setattr(training.ft_integration, "setup", lambda *args, **kwargs: None)
     monkeypatch.setattr(training, "initialize_megatron", lambda **kwargs: None)
     monkeypatch.setattr(training, "get_timers", lambda: None)
-    monkeypatch.setattr(training, "set_jit_fusion_options", lambda **kwargs: None)
+    monkeypatch.setattr(training, "get_train_state", lambda: Namespace())
+    monkeypatch.setattr(training, "set_jit_fusion_options", lambda *args, **kwargs: None)
 
     def invoke(args, model_config, tp_group):
         monkeypatch.setattr(training, "get_args", lambda: args)
@@ -325,12 +326,16 @@ def pretrain_until_warmup(monkeypatch):
             raise WarmupReached
 
         monkeypatch.setattr(kernel_warmup, "_warmup_training_kernels", observe)
-        # Only what pretrain() touches before the warmup call; validate() is a no-op here.
+        # Only what pretrain() touches before the warmup call; validate() and finalize() are
+        # no-ops here.
         cfg = Namespace(
             model=model_config,
+            fault_tolerance=run_config.fault_tolerance,
+            checkpoint=run_config.checkpoint,
             train=Namespace(micro_batch_size=9),
             logger=Namespace(log_progress=False, tensor_metrics=[]),
             validate=lambda: None,
+            finalize=lambda: None,
         )
         with pytest.raises(WarmupReached):
             training.pretrain(cfg, None, None, None, pg_collection=Namespace(tp=tp_group))

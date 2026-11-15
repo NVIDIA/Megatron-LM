@@ -14,6 +14,7 @@ from megatron.core.models.backends import (
     require,
 )
 from megatron.core.models.gpt.moe_module_specs import get_moe_module_spec_for_backend
+from megatron.core.ops.norm.torch_norm import L2Norm
 from megatron.core.transformer.attention import SelfAttention, SelfAttentionSubmodules
 from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
@@ -32,7 +33,6 @@ from megatron.core.transformer.multi_token_prediction import (
 )
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.torch_norm import L2Norm
 from megatron.core.transformer.transformer_block import (
     TransformerBlockSubmodules,
     get_num_layers_to_build,
@@ -63,7 +63,7 @@ def get_gpt_layer_with_inference_submodules(
     multi_latent_attention: Optional[bool] = False,
     qk_l2_norm: Optional[bool] = False,
     num_experts: Optional[int] = None,
-    moe_grouped_gemm: Optional[bool] = False,
+    moe_grouped_gemm: Optional[bool] = True,
 ) -> TransformerLayerSubmodules:
     """Use these submodules for inference optimized linear layers.
     Args:
@@ -164,7 +164,7 @@ def get_gpt_layer_with_inference_spec(*args, **kwargs) -> ModuleSpec:
 
 def get_gpt_layer_with_transformer_engine_submodules(
     num_experts: Optional[int] = None,
-    moe_grouped_gemm: Optional[bool] = False,
+    moe_grouped_gemm: Optional[bool] = True,
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
@@ -187,7 +187,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
 
     Args:
         num_experts (int, optional): Number of experts. Defaults to None.
-        moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
+        moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to True.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
         multi_latent_attention (bool, optional): To use MLA. Defaults to False.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
@@ -367,7 +367,7 @@ def get_gpt_layer_with_transformer_engine_spec(*args, **kwargs) -> ModuleSpec:
 
 def get_gpt_layer_local_submodules(
     num_experts: Optional[int] = None,
-    moe_grouped_gemm: Optional[bool] = False,
+    moe_grouped_gemm: Optional[bool] = True,
     qk_layernorm: Optional[bool] = False,
     multi_latent_attention: Optional[bool] = False,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
@@ -383,7 +383,7 @@ def get_gpt_layer_local_submodules(
 
     Args:
         num_experts (int, optional): Number of experts. Defaults to None.
-        moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
+        moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to True.
         qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
         multi_latent_attention (bool, optional): To use MLA. Defaults to False.
         fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
@@ -497,7 +497,7 @@ def get_gpt_layer_local_spec(*args, **kwargs) -> ModuleSpec:
 def _get_mlp_module_spec(
     use_te: Optional[bool] = True,
     num_experts: Optional[int] = None,
-    moe_grouped_gemm: Optional[bool] = False,
+    moe_grouped_gemm: Optional[bool] = True,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
 ):
     warnings.warn(
@@ -513,7 +513,7 @@ def _get_mlp_module_spec(
 def get_mlp_module_spec(
     use_te: Optional[bool] = True,
     num_experts: Optional[int] = None,
-    moe_grouped_gemm: Optional[bool] = False,
+    moe_grouped_gemm: Optional[bool] = True,
     fp8: Optional[str] = None,  # pylint: disable=unused-argument
     use_te_op_fuser: Optional[bool] = False,
 ) -> MlpBuilder:
@@ -541,7 +541,7 @@ def get_mlp_module_spec(
 def get_mlp_module_spec_for_backend(
     backend: BackendSpecProvider,
     num_experts: Optional[int] = None,
-    moe_grouped_gemm: Optional[bool] = False,
+    moe_grouped_gemm: Optional[bool] = True,
     use_te_op_fuser: Optional[bool] = None,
     use_te_activation_func: bool = False,
     dense_grouped_gemm: bool = False,
