@@ -59,3 +59,52 @@ class TestCountZerosFp32GtpPadding:
         )
 
         assert num_zeros == grad.numel() - 1
+
+
+class TestCountZerosFp32UnderCudaGraphCapture:
+    """Inside the optimizer CUDA graph the count cannot be read on the host: the function
+    returns the device tensor, which every replay refreshes."""
+
+    def setup_method(self):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+
+    def teardown_method(self):
+        Utils.destroy_model_parallel()
+
+    def test_returns_host_number_outside_capture(self):
+        grad = torch.zeros(8, 4, device='cuda')
+        grad[0, 0] = 1.0
+        param = torch.nn.Parameter(torch.zeros_like(grad))
+        param.grad = grad
+
+        num_zeros = count_zeros_fp32(
+            [param], grad_stats_parallel_group=parallel_state.get_model_parallel_group()
+        )
+
+        assert not isinstance(num_zeros, torch.Tensor)
+        assert num_zeros == grad.numel() - 1
+
+    def test_returns_device_tensor_refreshed_by_replay(self, monkeypatch):
+        grad = torch.zeros(8, 4, device='cuda')
+        grad[0, 0] = 1.0
+        param = torch.nn.Parameter(torch.zeros_like(grad))
+        param.grad = grad
+        group = parallel_state.get_model_parallel_group()
+        # On one rank the reduction is the identity. Capturing a collective needs a
+        # communicator set up for it, which this test is not about.
+        monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, **_: None)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            num_zeros = count_zeros_fp32([param], grad_stats_parallel_group=group)
+        assert isinstance(num_zeros, torch.Tensor) and num_zeros.is_cuda
+
+        graph.replay()
+        assert num_zeros.item() == grad.numel() - 1
+
+        # The same tensor reports the new gradient after the next replay.
+        grad[1, :] = 1.0
+        graph.replay()
+        assert num_zeros.item() == grad.numel() - 5
