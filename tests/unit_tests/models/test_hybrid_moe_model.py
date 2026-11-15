@@ -425,6 +425,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "inference_moe_disable_fused_quant_kernels": False,
     "inference_moe_router_backend": "triton",
     "inference_moe_token_dispatcher_type": "nvls",
+    "inference_moe_locality_domains": False,
     "moe_mlp_glu_interleave_size": None,
     "use_transformer_engine_op_fuser": False,
     "moe_single_grouped_weight": False,
