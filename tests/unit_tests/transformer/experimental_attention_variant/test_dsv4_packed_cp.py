@@ -14,12 +14,14 @@ import torch.distributed as dist
 from megatron.core.extensions.transformer_engine import HAVE_TE, TELinear
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel import mappings
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.experimental_attention_variant.csa_utils import (
     cp_utils,
     packed_layout,
     packed_sparse_attention,
 )
+from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.experimental_attention_variant.test_dsv4_hybrid_attention import (
     HAVE_HADAMARD,
@@ -473,7 +475,7 @@ def test_packed_output_rope_backward_contract(monkeypatch, rotate, deterministic
     reason="needs CUDA, TE and the real Hadamard kernel",
 )
 @pytest.mark.parametrize("ratio", [0, 4, 128])
-def test_packed_cp2_full_width_deterministic_replay(ratio):
+def test_packed_cp2_full_width_deterministic_replay(ratio, monkeypatch):
     """Real CP2 collectives/kernels: replay attention outputs and every gradient exactly."""
     if Utils.world_size < 2:
         pytest.skip("requires at least two ranks")
@@ -523,23 +525,77 @@ def test_packed_cp2_full_width_deterministic_replay(ratio):
             recompute_modules=["mla_up_proj"],
         )
         model = _build_attention(cfg, 1, pg).cuda()
-        cu = torch.tensor([0, 128, 256], dtype=torch.int32, device='cuda')
+        # One document spans both ranks: rank 1 must differentiate rank 0's keys.
+        cu = torch.tensor([0, 256], dtype=torch.int32, device="cuda")
         packed = PackedSeqParams(
-            qkv_format='thd',
+            qkv_format="thd",
             cu_seqlens_q=cu,
             cu_seqlens_kv=cu,
             cu_seqlens_q_padded=cu,
             cu_seqlens_kv_padded=cu,
-            max_seqlen_q=128,
-            max_seqlen_kv=128,
+            max_seqlen_q=256,
+            max_seqlen_kv=256,
         )
-        whole = torch.randn(256, 1, 4096, dtype=torch.bfloat16, device='cuda')
+        whole = torch.randn(256, 1, 4096, dtype=torch.bfloat16, device="cuda")
         grad = torch.randn_like(whole)
         rows = slice(pg.cp.rank() * 128, (pg.cp.rank() + 1) * 128)
+        monkeypatch.setattr(DSAIndexerLossAutoScaler, "main_loss_backward_scale", None)
+        observations = {}
+        coverage = []
+        real_forward = packed_sparse_attention._csa_fwd_flash_mla
+        real_boundary_backward = cp_utils._LeftBoundaryExchange.backward
+        real_reduce_scatter = mappings.dist_reduce_scatter_func
+
+        def record_gradient(name, gradient):
+            # Record device scalars before communication, but assert only after all
+            # ranks have finished both backwards; do not interrupt a peer's collective.
+            observations.setdefault(name, []).append(
+                torch.isfinite(gradient).all() & (gradient != 0).any()
+            )
+
+        def capture_forward(query, kv, indices, scale, **kwargs):
+            if pg.cp.rank() == 1:
+                observations.setdefault("window_indices", []).append(
+                    ((indices >= 0) & (indices < 128)).any()
+                )
+                if ratio:
+                    # KV is [128 halo | 128 local | rank-major compressed rows].
+                    # For this document rank 0 owns the first 128/ratio valid groups;
+                    # exclude its extra capacity/halo-copy slots from this check.
+                    observations.setdefault("compressed_indices", []).append(
+                        ((indices >= 256) & (indices < 256 + 128 // ratio)).any()
+                    )
+            return real_forward(query, kv, indices, scale, **kwargs)
+
+        def capture_boundary_backward(ctx, gradient):
+            if pg.cp.rank() == 1:
+                record_gradient("halo_grad", gradient)
+            return real_boundary_backward(ctx, gradient)
+
+        def capture_reduce_scatter(output, input_, **kwargs):
+            if ratio and pg.cp.rank() == 1 and kwargs.get("group") is pg.cp:
+                names = {
+                    cfg.v_head_dim: "compressed_kv_grad",
+                    cfg.dsa_indexer_head_dim: "indexer_k_grad",
+                }
+                if input_.ndim == 2 and input_.shape[1] in names:
+                    # This is rank 1's *unreduced* contribution destined for rank 0,
+                    # not a post-reduction gradient that could be entirely rank-local.
+                    record_gradient(names[input_.shape[1]], input_[: 128 // ratio])
+            return real_reduce_scatter(output, input_, **kwargs)
+
+        monkeypatch.setattr(packed_sparse_attention, "_csa_fwd_flash_mla", capture_forward)
+        monkeypatch.setattr(
+            cp_utils._LeftBoundaryExchange, "backward", staticmethod(capture_boundary_backward)
+        )
+        # Observe both the ratio-4 deferred reductions and ratio-128 gather backward.
+        monkeypatch.setattr(mappings, "dist_reduce_scatter_func", capture_reduce_scatter)
         results = []
         for _ in range(2):
+            observations = {}
             model.zero_grad(set_to_none=True)
             results.append(_run_attention(model, whole[rows], grad[rows], packed, cp_group=pg.cp))
+            coverage.append(observations)
         assert results[0].keys() == results[1].keys()
         for name, first in results[0].items():
             second = results[1][name]
@@ -547,6 +603,21 @@ def test_packed_cp2_full_width_deterministic_replay(ratio):
             assert torch.equal(
                 first.contiguous().view(torch.uint8), second.contiguous().view(torch.uint8)
             ), name
+        if pg.cp.rank() == 1:
+            required = {"window_indices", "halo_grad"}
+            if ratio:
+                required.update(("compressed_indices", "compressed_kv_grad"))
+            if ratio == 4:
+                required.add("indexer_k_grad")
+            for replay, observed in enumerate(coverage):
+                assert required <= observed.keys(), (ratio, replay, observed.keys())
+                checked = {name: all(value.item() for value in observed[name]) for name in required}
+                print(
+                    "DSV4_CP_REMOTE_BACKWARD "
+                    + json.dumps({"ratio": ratio, "replay": replay, "checks": checked}),
+                    flush=True,
+                )
+                assert all(checked.values()), (ratio, replay, checked)
     finally:
         Utils.destroy_model_parallel()
         torch.use_deterministic_algorithms(prior, warn_only=prior_warn)
