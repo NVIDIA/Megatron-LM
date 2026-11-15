@@ -7,7 +7,6 @@ import torch
 import torch.nn.functional as F
 
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.parallel_state import get_context_parallel_group
 from megatron.core.transformer.multi_token_prediction import (
     MTPLossAutoScaler,
     MTPLossLoggingHelper,
@@ -16,14 +15,26 @@ from megatron.core.transformer.multi_token_prediction import (
 from tests.unit_tests.test_utilities import Utils
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def cp_group():
-    """Initialize independent two-rank CP groups within the test world."""
+    """Own only the two-rank CP groups needed by these tests and release them afterward."""
     if Utils.world_size < 2 or Utils.world_size % 2:
         pytest.skip("MTP CP loss tests require an even world size of at least two")
-    Utils.initialize_model_parallel(context_parallel_size=2)
-    yield get_context_parallel_group()
-    Utils.destroy_model_parallel()
+    Utils.initialize_distributed()
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    # Every rank creates groups in the same order; each rank belongs to one CP pair.
+    for first_rank in range(0, world_size, 2):
+        ranks = [first_rank, first_rank + 1]
+        group = torch.distributed.new_group(ranks)
+        if rank in ranks:
+            local_group = group
+    try:
+        yield local_group
+    finally:
+        torch.cuda.synchronize()
+        torch.distributed.barrier()
+        torch.distributed.destroy_process_group(local_group)
 
 
 @pytest.fixture
