@@ -33,6 +33,7 @@ def test_vision_projection_type_accepts_affine():
 
 def test_help_renders():
     """argparse %-formats help text, so a bare '%' or a non-string help breaks --help."""
-    help_text = add_multimodal_extra_args(ArgumentParser()).format_help()
+    # argparse wraps help to the terminal width; compare with whitespace collapsed.
+    help_text = " ".join(add_multimodal_extra_args(ArgumentParser()).format_help().split())
     assert "(80%)" in help_text
     assert "and the area covered by the tiles" in help_text
