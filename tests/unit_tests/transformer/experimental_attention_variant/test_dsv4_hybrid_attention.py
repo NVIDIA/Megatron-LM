@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 import torch
 
-from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.dist_checkpointing.optimizer import get_param_id_to_sharded_param_map
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -837,11 +837,7 @@ class TestDSv4HybridGroupedOutput:
 
         expected_in = (config.v_head_dim * config.num_attention_heads) // output_projection_groups
         weight = attn._linear_o_group_proj_weight
-        expected_shape = (
-            (output_projection_groups, output_projection_lora_rank, expected_in)
-            if attn._uses_te_batched_linear
-            else (output_projection_groups * output_projection_lora_rank, expected_in)
-        )
+        expected_shape = (output_projection_groups * output_projection_lora_rank, expected_in)
         assert weight.shape == expected_shape
         assert weight.requires_grad
         if attn._uses_te_batched_linear:
@@ -906,24 +902,18 @@ class TestDSv4HybridGroupedOutput:
         assert "linear_o_group_proj._extra_state" not in reloaded_state_dict
 
         sharded_state_dict = reloaded_attn.sharded_state_dict()
-        factory = sharded_state_dict["linear_o_group_proj"]
-        assert isinstance(factory, ShardedTensorFactory)
-        assert factory.data is reloaded_weight
+        checkpoint_shard = sharded_state_dict["linear_o_group_proj"]
+        assert isinstance(checkpoint_shard, ShardedTensor)
+        assert checkpoint_shard.data is reloaded_weight
         optim_param_map = get_param_id_to_sharded_param_map(sharded_state_dict, [reloaded_weight])
-        assert optim_param_map[0] is factory
-        checkpoint_shard = factory.build()
-        assert checkpoint_shard.data.shape == checkpoint_shape
+        assert optim_param_map[0] is checkpoint_shard
         assert checkpoint_shard.local_shape == checkpoint_shape
         assert checkpoint_shard.global_shape == checkpoint_shape
         assert checkpoint_shard.global_offset == (0, 0)
-        restored_weight = factory.merge_fn(checkpoint_shard.data)
-        assert restored_weight.shape == runtime_weight.shape
-        torch.testing.assert_close(restored_weight, reloaded_weight, **tolerances)
 
-        factory_with_offset = reloaded_attn.sharded_state_dict(sharded_offsets=((0, 1, 2),))[
+        checkpoint_shard = reloaded_attn.sharded_state_dict(sharded_offsets=((0, 1, 2),))[
             "linear_o_group_proj"
         ]
-        checkpoint_shard = factory_with_offset.build()
         assert checkpoint_shard.global_shape == (2, *checkpoint_shape)
         assert checkpoint_shard.global_offset == (1, 0, 0)
         assert checkpoint_shard.prepend_axis_num == 1
@@ -992,7 +982,13 @@ class TestDSv4HybridGroupedOutput:
             weight.copy_(weight_ref)
         weight_ref.requires_grad_(True)
 
-        output_ref = torch.einsum("...gd,grd->...gr", input_ref, weight_ref)
+        output_ref = torch.einsum(
+            "...gd,grd->...gr",
+            input_ref,
+            weight_ref.view(
+                config.output_projection_groups, config.output_projection_lora_rank, -1
+            ),
+        )
         grad_output = torch.empty_like(output_ref).uniform_(-0.25, 0.25)
         output_ref.backward(grad_output)
 

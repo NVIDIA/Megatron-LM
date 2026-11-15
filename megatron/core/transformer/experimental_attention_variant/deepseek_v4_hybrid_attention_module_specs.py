@@ -32,14 +32,18 @@ else:
 
 
 def get_dsv4_o_group_proj_spec() -> type | None:
-    """Return TE's ``BatchedLinear`` for the grouped output projection, if available.
+    """Return the matrix-parameter TE adapter when ``BatchedLinear`` is available.
 
     ``None`` makes ``DSv4HybridAttention`` fall back to ``torch.einsum``. Shared by the
     config-aware spec below and HybridModel's static stack spec so both select the same op.
     """
     if not HAVE_TE:
         return None
-    return getattr(getattr(te.pytorch, "ops", None), "BatchedLinear", None)
+    if getattr(getattr(te.pytorch, "ops", None), "BatchedLinear", None) is None:
+        return None
+    from megatron.core.extensions.te_batched_linear import TEBatchedLinear
+
+    return TEBatchedLinear
 
 
 class _DSv4BackendSpecProvider(BackendSpecProvider, Protocol):

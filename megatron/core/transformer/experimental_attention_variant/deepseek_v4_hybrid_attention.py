@@ -9,12 +9,7 @@ from typing import Callable, NoReturn, Optional, Union
 import torch
 
 from megatron.core import tensor_parallel
-from megatron.core.dist_checkpointing.mapping import (
-    ReplicaId,
-    ShardedStateDict,
-    ShardedTensor,
-    ShardedTensorFactory,
-)
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict, ShardedTensor
 from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.models.common.embeddings import (
     RotaryEmbedding,
@@ -267,6 +262,15 @@ class DSv4HybridAttention(Attention):
                 ),
                 name=(name + ".linear_o_group_proj") if name is not None else None,
             )
+            expected_weight_shape = (
+                self.output_projection_local_groups * self.config.output_projection_lora_rank,
+                group_proj_in_size,
+            )
+            if tuple(self.linear_o_group_proj.weight.shape) != expected_weight_shape:
+                raise ValueError(
+                    "DSv4 grouped projection must expose its legacy 2D optimizer parameter; "
+                    "use the TEBatchedLinear adapter instead of a bare TE BatchedLinear."
+                )
             set_save_original_input(self.linear_o_group_proj)
             self._register_state_dict_hook(self._linear_o_group_proj_state_dict_hook)
 
@@ -335,7 +339,7 @@ class DSv4HybridAttention(Attention):
         state_dict.pop(f"{prefix}linear_o_group_proj._extra_state", None)
 
     def _load_from_state_dict(self, state_dict, prefix, *args, **kwargs):
-        """Map legacy 2D grouped projection weights into TE's 3D layout."""
+        """Restore the legacy matrix-shaped grouped projection parameter."""
         if self._uses_te_batched_linear:
             checkpoint_key = f"{prefix}linear_o_group_proj"
             runtime_key = f"{checkpoint_key}.weight"
@@ -356,7 +360,7 @@ class DSv4HybridAttention(Attention):
     def sharded_state_dict(
         self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
     ) -> ShardedStateDict:
-        """Map TE's 3D grouped weight to the legacy 2D dist-checkpoint layout."""
+        """Keep the legacy grouped-projection key for model and optimizer checkpoints."""
         sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
         if not self._uses_te_batched_linear:
             return sharded_state_dict
@@ -366,48 +370,11 @@ class DSv4HybridAttention(Attention):
         runtime_sharded_weight = sharded_state_dict.pop(runtime_key)
         sharded_state_dict.pop(f"{prefix}linear_o_group_proj._extra_state", None)
         assert isinstance(runtime_sharded_weight, ShardedTensor)
-        runtime_shape = runtime_sharded_weight.local_shape
-        assert len(runtime_shape) == 3, runtime_shape
-        local_groups, local_rank, local_in_features = runtime_shape
-        checkpoint_shape = (local_groups * local_rank, local_in_features)
-
-        # TP is fixed at one for DSv4. The only possible parameter sharding is
-        # FSDP along the group axis, which becomes axis 0 in the legacy layout.
-        group_axis = len(sharded_offsets)
-        assert runtime_sharded_weight.prepend_axis_num == group_axis
-        assert runtime_sharded_weight.axis_fragmentations is not None
-        group_fragmentation = runtime_sharded_weight.axis_fragmentations[group_axis]
-        group_offset = runtime_sharded_weight.global_offset[group_axis]
-        group_rank, remainder = divmod(group_offset, local_groups)
-        assert remainder == 0
-        checkpoint_group_offset = (group_axis, group_rank, group_fragmentation)
-
-        @torch.no_grad()
-        def build_fn(
-            key: str, tensor: torch.Tensor, replica_id: ReplicaId, flattened_range: Optional[slice]
-        ) -> ShardedTensor:
-            if flattened_range is not None:
-                raise ValueError(
-                    "DSv4 grouped output projection does not support the deprecated "
-                    "fully_sharded_model_space optimizer checkpoint format"
-                )
-            return ShardedTensor.from_rank_offsets(
-                key,
-                tensor.reshape(checkpoint_shape),
-                *sharded_offsets,
-                checkpoint_group_offset,
-                replica_id=replica_id,
-                prepend_axis_num=len(sharded_offsets),
-            )
-
-        def merge_fn(checkpoint_tensor: torch.Tensor) -> torch.Tensor:
-            return checkpoint_tensor.reshape(runtime_shape)
-
-        runtime_weight = runtime_sharded_weight.data
-        assert runtime_weight is not None
-        sharded_state_dict[checkpoint_key] = ShardedTensorFactory(
-            checkpoint_key, runtime_weight, build_fn, merge_fn, runtime_sharded_weight.replica_id
-        )
+        assert len(runtime_sharded_weight.local_shape) == 2
+        # The optimizer and model now share the legacy matrix layout. Keep the
+        # parameter object and shard metadata intact; only its public key changes.
+        runtime_sharded_weight.key = checkpoint_key
+        sharded_state_dict[checkpoint_key] = runtime_sharded_weight
         return sharded_state_dict
 
     def _apply_linear_o_group_proj(self, input_: torch.Tensor) -> torch.Tensor:

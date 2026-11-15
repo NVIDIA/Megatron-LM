@@ -453,6 +453,7 @@ class TestGetDSv4HybridModuleSpec:
         with (
             patch(f"{self.MODULE}.HAVE_TE", True),
             patch(f"{self.MODULE}.te", fake_te, create=True),
+            patch("megatron.core.extensions.te_batched_linear.TEBatchedLinear", _FakeBatchedLinear),
         ):
             spec = self._call()
 
