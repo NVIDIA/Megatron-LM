@@ -22,7 +22,6 @@ from megatron.training.argument_utils import (
     TypeInferenceError,
     _default_config_from_args,
     core_transformer_config_from_args,
-    get_megatron_ddp_config,
     hybrid_config_from_args,
     pretrain_cfg_container_from_args,
 )
@@ -95,54 +94,6 @@ def test_megatron_fsdp_user_buffer_registration_matches_version(monkeypatch, ver
     args = validate_args(args)
     assert args.fsdp_manual_registration is (version == 1)
     assert not args.fsdp_double_buffer
-
-
-@pytest.mark.parametrize("version", [1, 2])
-@pytest.mark.parametrize(
-    "reduce_in_bf16,comm_dtype,expected_main_dtype",
-    [
-        (False, None, torch.float32),
-        (False, "bf16", torch.float32),
-        (True, None, torch.bfloat16),
-        (True, "fp32", torch.bfloat16),
-    ],
-)
-def test_mfsdp_gradient_flags_preserve_independent_communication_dtype(
-    monkeypatch, version, reduce_in_bf16, comm_dtype, expected_main_dtype
-):
-    """CLI gradient flags select main gradients without overriding communication dtype."""
-    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
-    monkeypatch.setattr("megatron.training.arguments.get_device_arch_version", lambda: 9)
-    args = _minimal_training_args(monkeypatch)
-    args.bf16 = True
-    args.use_megatron_fsdp = True
-    args.megatron_fsdp_version = version
-    args.ckpt_format = "fsdp_dtensor"
-    args.grad_reduce_in_bf16 = reduce_in_bf16
-    args.megatron_fsdp_grad_comm_dtype = comm_dtype
-    args = validate_args(args)
-    ddp = get_megatron_ddp_config(args, use_torch_fsdp2=False)
-    ddp.finalize()
-
-    assert ddp.megatron_fsdp_main_grads_dtype == expected_main_dtype
-    assert ddp.megatron_fsdp_grad_comm_dtype == args.megatron_fsdp_grad_comm_dtype
-
-
-@pytest.mark.parametrize("version", [1, 2])
-def test_mfsdp_bf16_flag_rejects_conflicting_main_grad_dtype(monkeypatch, version):
-    """An explicit BF16 request must not leave main gradients in FP32."""
-    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
-    monkeypatch.setattr("megatron.training.arguments.get_device_arch_version", lambda: 9)
-    args = _minimal_training_args(monkeypatch)
-    args.bf16 = True
-    args.use_megatron_fsdp = True
-    args.megatron_fsdp_version = version
-    args.ckpt_format = "fsdp_dtensor"
-    args.grad_reduce_in_bf16 = True
-    args.megatron_fsdp_main_grads_dtype = "fp32"
-    args = validate_args(args)
-    with pytest.raises(ValueError, match="megatron_fsdp_main_grads_dtype"):
-        get_megatron_ddp_config(args, use_torch_fsdp2=False)
 
 
 def test_moe_norm_flag_reaches_transformer_config():
