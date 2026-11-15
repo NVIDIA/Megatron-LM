@@ -1316,10 +1316,22 @@ def test_sbhd_get_batch_returns_dataset_padding_mask(monkeypatch):
         pad_packed_seq_alignment=None,
         pipeline_model_parallel_layout=None,
         mtp_num_layers=0,
+        # Fields main's get_batch now reads from the normalized TransformerConfig.
+        sequence_packing_scheduler=None,
+        context_parallel_size=1,
+        dynamic_context_parallel=False,
+        pipeline_model_parallel_size=2,
     )
 
     monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
-    monkeypatch.setattr(pretrain_gpt, "core_transformer_config_from_args", lambda _: config)
+    # NOTE(nightly-sync 2026-11-12): main's d8ef5cca9 made get_batch read the normalized
+    # TransformerConfig from get_run_config() instead of core_transformer_config_from_args, so
+    # stub the run config, as test_get_batch.py does for the hybrid entrypoint.
+    monkeypatch.setattr(
+        pretrain_gpt,
+        "get_run_config",
+        lambda: SimpleNamespace(model=SimpleNamespace(transformer=config)),
+    )
     # Exercise an intermediate PP stage: it must not take the legacy early return.
     monkeypatch.setattr(pretrain_gpt, "is_first_or_last_pipeline_stage", lambda _: False)
     # Merged pretrain_gpt carries main's aliased import, so patch the alias.
@@ -1360,9 +1372,6 @@ def test_sbhd_dataset_is_built_on_intermediate_pipeline_stage(monkeypatch):
         use_varlen_dataset=True, varlen_sbhd_validation=True, sequence_packing_scheduler=None
     )
     monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
-    monkeypatch.setattr(
-        pretrain_gpt, "core_transformer_config_from_args", lambda _: SimpleNamespace()
-    )
     monkeypatch.setattr(pretrain_gpt.mpu, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(pretrain_gpt, "is_first_or_last_pipeline_stage", lambda _: False)
     # Merged pretrain_gpt carries main's aliased import, so patch the alias. The restored
@@ -1370,13 +1379,26 @@ def test_sbhd_dataset_is_built_on_intermediate_pipeline_stage(monkeypatch):
     monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank_func", lambda *args, **kwargs: False)
     # NOTE(nightly-sync 2026-11-03): main (831aa66d4) moved is_dataset_built_on_rank into
     # megatron.training.datasets.providers, which pretrain_gpt re-exports. It reads the arguments
-    # and the transformer config at call time from global_vars and arguments, so patch those too.
-    from megatron.training import arguments as training_arguments
+    # and the transformer config at call time from global_vars, so patch those too.
     from megatron.training import global_vars
 
     monkeypatch.setattr(global_vars, "get_args", lambda: args)
+    # NOTE(nightly-sync 2026-11-12): main now reads the placement inputs from
+    # get_run_config().model.transformer instead of core_transformer_config_from_args (which
+    # pretrain_gpt no longer imports). Stub a placement that would otherwise keep the dataset
+    # off this intermediate stage, so only the varlen-SBHD disjunct can return True.
     monkeypatch.setattr(
-        training_arguments, "core_transformer_config_from_args", lambda _: SimpleNamespace()
+        global_vars,
+        "get_run_config",
+        lambda: SimpleNamespace(
+            model=SimpleNamespace(
+                transformer=SimpleNamespace(
+                    sequence_packing_scheduler=None,
+                    pipeline_model_parallel_layout=None,
+                    mtp_num_layers=0,
+                )
+            )
+        ),
     )
 
     assert pretrain_gpt.is_dataset_built_on_rank() is True

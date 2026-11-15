@@ -56,13 +56,17 @@ def is_dataset_built_on_rank(
 ) -> bool:
     """``is_dataset_built_on_rank_explicit`` applied to the registered model config: the predicate
     ``pretrain_gpt.py`` and ``pretrain_hybrid.py`` pass, and the default of ``build_gpt_datasets``.
-    The transformer config is read at call time from the run container. The dev-only varlen SBHD
-    validation check reads the arguments from ``megatron.training.global_vars``, which is where
-    tests patch them.
+    The transformer config is read at call time from the run container, so placement never
+    requires the legacy arguments. The dev-only varlen SBHD validation check reads them from
+    ``megatron.training.global_vars`` (where tests patch them) only when they are registered.
     """
     from megatron.training.global_vars import get_args, get_run_config
 
-    args = get_args()
+    try:
+        args = get_args()
+    except AssertionError:
+        # No run has registered the legacy arguments: only the run config drives placement.
+        args = None
     if (
         getattr(args, 'use_varlen_dataset', False)
         and getattr(args, 'varlen_sbhd_validation', False)

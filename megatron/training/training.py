@@ -2880,11 +2880,13 @@ def num_floating_point_operations(
             mtp_num_layers=mtp_num_layers,
             mtp_loss_type=getattr(transformer_cfg, "mtp_loss_type", "cross_entropy"),
             mtp_detach_heads=getattr(transformer_cfg, "mtp_detach_heads", False),
-            q_lora_rank=transformer_cfg.q_lora_rank,
+            # MLA fields exist only on MLATransformerConfig; the defaults match the
+            # --q-lora-rank/--qk-head-dim/--qk-pos-emb-head-dim/--v-head-dim CLI defaults.
+            q_lora_rank=getattr(transformer_cfg, "q_lora_rank", None),
             kv_lora_rank=getattr(transformer_cfg, "kv_lora_rank", 0),
-            qk_head_dim=transformer_cfg.qk_head_dim,
-            qk_pos_emb_head_dim=transformer_cfg.qk_pos_emb_head_dim,
-            v_head_dim=transformer_cfg.v_head_dim,
+            qk_head_dim=getattr(transformer_cfg, "qk_head_dim", 128),
+            qk_pos_emb_head_dim=getattr(transformer_cfg, "qk_pos_emb_head_dim", 64),
+            v_head_dim=getattr(transformer_cfg, "v_head_dim", 128),
             attention_output_gate=getattr(transformer_cfg, "attention_output_gate", False),
             gated_attention_proj_granularity=getattr(
                 transformer_cfg, "gated_attention_proj_granularity", "elementwise"

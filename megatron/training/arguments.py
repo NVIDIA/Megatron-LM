@@ -4362,6 +4362,12 @@ def _add_distributed_args(parser):
         'number of sub-samples assigned to each CP rank when using dynamic context parallel.',
     )
     group.add_argument(
+        '--hybrid-context-parallel',
+        action='store_true',
+        default=False,
+        help='Deprecated alias for --dynamic-context-parallel.',
+    )
+    group.add_argument(
         '--dynamic-context-parallel',
         action='store_true',
         default=False,

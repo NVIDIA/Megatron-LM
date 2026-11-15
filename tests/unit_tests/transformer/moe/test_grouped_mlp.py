@@ -449,7 +449,8 @@ def test_fused_forward_deterministic_mode_applies_probs_on_fc2_output():
         module.quantization_padding = lambda tensor, token_counts: (tensor, token_counts)
         module.quantization_unpadding = lambda tensor, token_counts: tensor
         module._fused_ops = (FakeFusedOps(),)
-        module.linear_fc2 = SimpleNamespace(use_bias=fc2_bias)
+        module.linear_fc1 = SimpleNamespace(te_quant_params=None, training=True)
+        module.linear_fc2 = SimpleNamespace(use_bias=fc2_bias, te_quant_params=None, training=True)
         return module
 
     hidden_states = torch.zeros(2, 4, dtype=torch.bfloat16)
@@ -628,6 +629,10 @@ def _make_precision_fused_forward_module(monkeypatch, *, fc2_bias=False):
     module.config = SimpleNamespace(
         fp8="e4m3",
         fp4=False,
+        # Fields read by dev's _fused_forward, at their TransformerConfig defaults.
+        fp8_recipe="delayed",
+        fp4_recipe="nvfp4",
+        delay_offload_until_cuda_graph=False,
         moe_router_padding_for_quantization=True,
         moe_use_grouped_tensor=True,
         moe_paged_stash=False,

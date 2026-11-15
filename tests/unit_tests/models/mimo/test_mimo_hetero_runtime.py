@@ -303,9 +303,9 @@ def test_builder_rejects_untested_fsdp_modes(mocker, fsdp_kwarg):
 
 def test_builder_rejects_padded_layer_wise_param_layout_request(mocker):
     """MIMO DDP configs keep the compact LayerWise layout, so a padded request is rejected."""
-    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
+    from examples.mimo.training.builder import MimoModelBuilder
 
-    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock()))
+    builder = MimoModelBuilder(_mimo_build_config(_topology=mocker.Mock()))
     wrap = mocker.patch("examples.mimo.training.builder.wrap_active_modules_with_ddp")
 
     with pytest.raises(ValueError, match="compact LayerWise param layout"):

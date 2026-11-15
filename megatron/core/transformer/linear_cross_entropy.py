@@ -23,8 +23,13 @@ class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
         labels: Optional[torch.Tensor] = None,
         reduction: Literal["none", "sum", "mean"] = "none",
         ignore_index: int = -100,
+        output_dtype: Optional[torch.dtype] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]:
-        """Run either the plain ColumnParallelLinear or fused linear+cross-entropy."""
+        """Run either the plain ColumnParallelLinear or fused linear+cross-entropy.
+
+        ``output_dtype`` applies to the plain logits path only (see
+        ``ColumnParallelLinear.forward``); the fused path returns the loss.
+        """
         if output_cross_entropy_loss:
             assert labels is not None, "labels cannot be None when outputting cross-entropy loss."
             return self._compute_linear_and_cross_entropy_loss(
@@ -38,7 +43,7 @@ class LinearCrossEntropyModule(tensor_parallel.ColumnParallelLinear):
         # Fall back to standard ColumnParallelLinear forward.
         # ColumnParallelLinear.forward returns (output, bias) or just output
         # depending on configuration, so keep the return type as Tensor.
-        return super().forward(input_, weight, runtime_gather_output)
+        return super().forward(input_, weight, runtime_gather_output, output_dtype=output_dtype)
 
     def _compute_linear_and_cross_entropy_loss(
         self,

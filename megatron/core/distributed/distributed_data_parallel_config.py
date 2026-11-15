@@ -194,7 +194,9 @@ class DistributedDataParallelConfig:
       The legacy option name is retained for compatibility; the number of buffers in
       each pool is controlled by fsdp_buffer_count. Persistent buffers add memory
       overhead but are required for NCCL user-buffer registration. This option is
-      automatically enabled when nccl_ub=True or the MaxPool allocator is requested.
+      automatically enabled when the MaxPool allocator is requested, or when
+      nccl_ub=True except with Megatron-FSDP v2, which registers NCCL user buffers
+      through symmetric memory.
     """
 
     fsdp_buffer_count: int = 2
@@ -386,9 +388,17 @@ class DistributedDataParallelConfig:
             self.expert_data_parallel_sharding_strategy = self.data_parallel_sharding_strategy
         if self.expert_outer_dp_sharding_strategy is None:
             self.expert_outer_dp_sharding_strategy = self.outer_dp_sharding_strategy
-        if self.nccl_ub or self.megatron_fsdp_max_pool_double_buffer:
+        if self.megatron_fsdp_max_pool_double_buffer or self._nccl_ub_requires_buffer_pool():
             # NCCL user buffers and MaxPoolAllocator require persistent buffer pools.
             self.fsdp_double_buffer = True
+
+    def _nccl_ub_requires_buffer_pool(self) -> bool:
+        """Whether NCCL user buffers force persistent FSDP buffer pools.
+
+        Megatron-FSDP v2 registers NCCL user buffers through symmetric memory
+        instead, so only other configurations need the pools.
+        """
+        return self.nccl_ub and not (self.use_megatron_fsdp and self.megatron_fsdp_version == 2)
 
     def validate(self) -> None:
         """Check user settings without mutation, including edits after construction.
@@ -453,7 +463,9 @@ class DistributedDataParallelConfig:
         # NCCL user buffers and MaxPoolAllocator force persistent buffer pools in
         # _canonicalize(); evaluate that here without requiring canonicalization first.
         fsdp_double_buffer = (
-            self.fsdp_double_buffer or self.nccl_ub or self.megatron_fsdp_max_pool_double_buffer
+            self.fsdp_double_buffer
+            or self.megatron_fsdp_max_pool_double_buffer
+            or self._nccl_ub_requires_buffer_pool()
         )
         if fsdp_double_buffer:
             if self.fsdp_buffer_count < 2:

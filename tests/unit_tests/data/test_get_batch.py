@@ -268,7 +268,9 @@ def test_hybrid_scheduler_prebuilds_balanced_indexer_from_normalized_config(monk
     # TransformerConfig from get_run_config() instead of core_transformer_config_from_args, so
     # stub the run config. The scheduler gate now reads the config, not raw args.
     monkeypatch.setattr(
-        pretrain_hybrid, "get_run_config", lambda: SimpleNamespace(model=SimpleNamespace(transformer=config))
+        pretrain_hybrid,
+        "get_run_config",
+        lambda: SimpleNamespace(model=SimpleNamespace(transformer=config)),
     )
     monkeypatch.setattr(pretrain_hybrid.mpu, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(pretrain_hybrid, "mtp_on_this_rank_func", lambda **_kwargs: False)
@@ -357,7 +359,9 @@ def test_gpt_scheduler_prebuilds_balanced_indexer_from_normalized_config(monkeyp
     # TransformerConfig from get_run_config() instead of core_transformer_config_from_args, so
     # stub the run config. The scheduler gate now reads the config, not raw args.
     monkeypatch.setattr(
-        pretrain_gpt, "get_run_config", lambda: SimpleNamespace(model=SimpleNamespace(transformer=config))
+        pretrain_gpt,
+        "get_run_config",
+        lambda: SimpleNamespace(model=SimpleNamespace(transformer=config)),
     )
     # NOTE(nightly-sync 26_10_2026): main imports this helper under an alias
     # (`mtp_on_this_rank as mtp_on_this_rank_func`), and pretrain_gpt.get_batch binds a local
