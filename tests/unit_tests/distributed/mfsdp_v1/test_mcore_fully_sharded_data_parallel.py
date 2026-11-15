@@ -127,11 +127,18 @@ class TestFullyShardedDataParallel:
         )
         return fsdp_model
 
-    @pytest.mark.parametrize("grad_reduce_in_fp32", [False, True])
-    def test_grad_reduction_flag_controls_main_grad_dtype(self, grad_reduce_in_fp32):
+    @pytest.mark.parametrize(
+        "grad_reduce_in_fp32,grad_comm_dtype",
+        [(False, None), (False, torch.float32), (True, None), (True, torch.bfloat16)],
+    )
+    def test_grad_reduction_flag_controls_main_grad_dtype(
+        self, grad_reduce_in_fp32, grad_comm_dtype
+    ):
         """BF16 compute uses FP32 main gradients exactly when FP32 reduction is requested."""
         model = self._build_fsdp_model(
-            grad_reduce_in_fp32=grad_reduce_in_fp32, params_dtype=torch.bfloat16
+            grad_reduce_in_fp32=grad_reduce_in_fp32,
+            grad_comm_dtype=grad_comm_dtype,
+            params_dtype=torch.bfloat16,
         )
         model.zero_grad_buffer()
         x = torch.randn(4, 13, device="cuda", dtype=torch.bfloat16)
@@ -139,6 +146,7 @@ class TestFullyShardedDataParallel:
         model.finish_grad_sync()
 
         expected_dtype = torch.float32 if grad_reduce_in_fp32 else torch.bfloat16
+        assert model.mp_policy.grad_comm_dtype == grad_comm_dtype
         groups = model.param_and_grad_buffer.parameter_groups
         assert groups
         for group in groups:

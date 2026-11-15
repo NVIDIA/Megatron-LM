@@ -58,9 +58,12 @@ def process_group_collection(distributed_setup):
     destroy_model_parallel()
 
 
-@pytest.mark.parametrize("grad_reduce_in_fp32", [False, True])
+@pytest.mark.parametrize(
+    "grad_reduce_in_fp32,grad_comm_dtype",
+    [(False, None), (False, torch.float32), (True, None), (True, torch.bfloat16)],
+)
 def test_grad_reduction_flag_controls_main_grad_dtype(
-    process_group_collection, grad_reduce_in_fp32
+    process_group_collection, grad_reduce_in_fp32, grad_comm_dtype
 ):
     """The MCore reduction flag controls the main-gradient and reduction buffer dtypes."""
     config = TransformerConfig(
@@ -72,6 +75,7 @@ def test_grad_reduction_flag_controls_main_grad_dtype(
             use_megatron_fsdp=True,
             megatron_fsdp_version=2,
             grad_reduce_in_fp32=grad_reduce_in_fp32,
+            megatron_fsdp_grad_comm_dtype=grad_comm_dtype,
             data_parallel_sharding_strategy="optim_grads_params",
         ),
         module=torch.nn.Linear(8, 8, device="cuda", dtype=torch.bfloat16),
@@ -87,7 +91,7 @@ def test_grad_reduction_flag_controls_main_grad_dtype(
     for group in model.module.parameter_groups:
         assert group.main_grad is not None
         assert group.main_grad.local_buffer.dtype == expected_dtype
-        assert group.grad_comm_dtype == expected_dtype
+        assert group.grad_comm_dtype == (grad_comm_dtype or expected_dtype)
 
 
 @pytest.mark.launch_on_gb200

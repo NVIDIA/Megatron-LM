@@ -2870,7 +2870,9 @@ def _add_mixed_precision_args(parser):
     group = parser.add_argument_group(title='mixed precision')
 
     group.add_argument('--grad-reduce-in-bf16', action='store_true',
-                       help='Reduce gradients in bfloat16.')
+                       help='Use BF16 main gradients with BF16 parameters. '
+                       'Megatron-FSDP communication dtype is controlled separately by '
+                       '--megatron-fsdp-grad-comm-dtype.')
     group.add_argument('--loss-scale', type=float, default=None,
                        help='Static loss scaling, positive power of 2 '
                        'values can improve fp16 convergence. If None, dynamic'

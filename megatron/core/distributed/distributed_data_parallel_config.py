@@ -18,9 +18,10 @@ class DistributedDataParallelConfig:
     """Configuration for DistributedDataParallel."""
 
     grad_reduce_in_fp32: bool = False
-    """If true, accumulate and reduce grads in fp32 with DDP or Megatron-FSDP.
+    """If true, accumulate grads in fp32 with DDP or Megatron-FSDP.
     With Megatron-FSDP, an unset megatron_fsdp_main_grads_dtype resolves to torch.float32.
-    Explicit MFSDP accumulation or communication dtypes must be compatible with FP32.
+    An explicit MFSDP main-gradient dtype must be FP32. DDP also reduces in FP32;
+    MFSDP communication precision is controlled independently by megatron_fsdp_grad_comm_dtype.
     """
 
     overlap_grad_reduce: bool = False
@@ -248,7 +249,8 @@ class DistributedDataParallelConfig:
     """
 
     megatron_fsdp_grad_comm_dtype: Optional[torch.dtype] = None
-    """Data type for gradient gather / scatter communications. Can be utilized to reduce
+    """Data type for gradient gather / scatter communications, independent of the
+      gradient-accumulation flags and main-gradient storage dtype. Can be utilized to reduce
       communication latency, but adds overhead for type-casting and copy operations.
       If using NCCL UBR v2.27+, gradient reduction may be performed in high-precision
       depending on the network domain (NVLink or IB), and can enable mixed-precision
@@ -395,14 +397,6 @@ class DistributedDataParallelConfig:
                     "grad_reduce_in_fp32=True with Megatron-FSDP requires "
                     "megatron_fsdp_main_grads_dtype=torch.float32 or None "
                     "(resolve to FP32) for FP32 accumulation. Use a compatible dtype "
-                    "or set grad_reduce_in_fp32=False to use the configured precision policy."
-                )
-            if self.megatron_fsdp_grad_comm_dtype not in (None, torch.float32):
-                raise ValueError(
-                    "grad_reduce_in_fp32=True with Megatron-FSDP requires "
-                    "megatron_fsdp_grad_comm_dtype=torch.float32 or None "
-                    "(inherit the FP32 main-gradient dtype) for FP32 communication. "
-                    "Set this explicitly "
                     "or set grad_reduce_in_fp32=False to use the configured precision policy."
                 )
         if self.megatron_fsdp_version not in (1, 2):

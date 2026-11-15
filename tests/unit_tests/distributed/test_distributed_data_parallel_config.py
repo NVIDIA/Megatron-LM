@@ -16,8 +16,10 @@ from megatron.core.distributed import DistributedDataParallelConfig
     [
         (True, None, None, torch.float32),
         (True, None, torch.float32, torch.float32),
+        (True, None, torch.bfloat16, torch.float32),
         (True, torch.float32, None, torch.float32),
         (False, None, None, None),
+        (False, torch.bfloat16, torch.float32, torch.bfloat16),
         (False, torch.float32, torch.bfloat16, torch.float32),
     ],
 )
@@ -43,25 +45,17 @@ def test_mfsdp_gradient_precision_resolves_after_recipe_edits(
 
 
 @pytest.mark.parametrize("fsdp_version", [1, 2])
-@pytest.mark.parametrize(
-    "main_dtype,comm_dtype,field",
-    [
-        (torch.bfloat16, None, "megatron_fsdp_main_grads_dtype"),
-        (None, torch.bfloat16, "megatron_fsdp_grad_comm_dtype"),
-    ],
-)
-def test_mfsdp_fp32_reduction_rejects_conflicting_explicit_dtypes(
-    fsdp_version, main_dtype, comm_dtype, field
-):
+@pytest.mark.parametrize("comm_dtype", [None, torch.float32, torch.bfloat16])
+def test_mfsdp_fp32_reduction_rejects_conflicting_explicit_dtypes(fsdp_version, comm_dtype):
     """An explicit lower-precision dtype must not silently defeat FP32 reduction."""
     config = DistributedDataParallelConfig(
         use_megatron_fsdp=True,
         megatron_fsdp_version=fsdp_version,
         grad_reduce_in_fp32=True,
-        megatron_fsdp_main_grads_dtype=main_dtype,
+        megatron_fsdp_main_grads_dtype=torch.bfloat16,
         megatron_fsdp_grad_comm_dtype=comm_dtype,
     )
-    with pytest.raises(ValueError, match=field):
+    with pytest.raises(ValueError, match="megatron_fsdp_main_grads_dtype"):
         config.validate()
-    with pytest.raises(ValueError, match=field):
+    with pytest.raises(ValueError, match="megatron_fsdp_main_grads_dtype"):
         config.finalize()

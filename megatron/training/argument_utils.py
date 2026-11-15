@@ -1183,6 +1183,13 @@ def get_megatron_ddp_config(
         kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
         kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
         kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
+        if args.use_megatron_fsdp and getattr(args, "grad_reduce_in_bf16", False):
+            if args.megatron_fsdp_main_grads_dtype not in (None, torch.bfloat16):
+                raise ValueError(
+                    "grad_reduce_in_bf16=True with Megatron-FSDP requires "
+                    "megatron_fsdp_main_grads_dtype=torch.bfloat16 or None."
+                )
+            kwargs["megatron_fsdp_main_grads_dtype"] = torch.bfloat16
         if args.use_megatron_fsdp and args.megatron_fsdp_version == 1:
             kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
         if args.use_megatron_fsdp and args.cuda_graph_impl != "none":
