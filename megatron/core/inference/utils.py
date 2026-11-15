@@ -59,6 +59,23 @@ def get_language_model(model: torch.nn.Module) -> torch.nn.Module:
     return model if language_model is None else language_model
 
 
+def lm_head_can_emit(output_layer: torch.nn.Module, dtype: torch.dtype) -> bool:
+    """Whether the LM head `output_layer` can emit logits in `dtype`."""
+    if dtype == output_layer.config.params_dtype:
+        return True
+    # Deferred to avoid import loops.
+    from megatron.core.extensions.transformer_engine import te_general_gemm
+    from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+    from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+        is_batch_invariant_mode_enabled,
+    )
+
+    # Batch-invariant mode guarantees logits bitwise-identical to the training forward.
+    if is_batch_invariant_mode_enabled():
+        return False
+    return te_general_gemm is not None and isinstance(output_layer, ColumnParallelLinear)
+
+
 def model_eos_token_ids(tokenizer: Any) -> frozenset:
     """Return the model-level EOS token IDs.
 

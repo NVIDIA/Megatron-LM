@@ -127,6 +127,7 @@ def require_te_fused_srelu_mlp(grouped_mlp_fusions):
 def run_config(monkeypatch):
     """Provide a config owner for isolated training-runtime consumers."""
     from megatron.core.optimizer import OptimizerConfig
+    from megatron.core.transformer import TransformerConfig
     from megatron.training import global_vars
     from megatron.training.config import (
         CheckpointConfig,
@@ -135,11 +136,16 @@ def run_config(monkeypatch):
         SchedulerConfig,
         TrainingConfig,
     )
+    from megatron.training.models import GPTModelConfig
 
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", None)
     container = PretrainConfigContainer(
         train=TrainingConfig(),
-        model=None,
+        model=GPTModelConfig(
+            transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+            seq_length=16,
+            vocab_size=128,
+        ),
         optimizer=OptimizerConfig(),
         scheduler=SchedulerConfig(),
         logger=LoggerConfig(),
