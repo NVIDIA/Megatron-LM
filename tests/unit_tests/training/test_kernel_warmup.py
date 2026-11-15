@@ -314,6 +314,7 @@ def pretrain_until_warmup(monkeypatch, run_config):
             fault_tolerance=run_config.fault_tolerance,
             checkpoint=run_config.checkpoint,
             train=Namespace(micro_batch_size=9),
+            validation=Namespace(eval_micro_batch_size=5),
             logger=Namespace(log_progress=False, tensor_metrics=[]),
             validate=lambda: None,
             finalize=lambda: None,
@@ -356,7 +357,11 @@ def test_pretrain_passes_model_config_and_runtime_batch(
     assert passed_config is config
     assert passed_group is tp_group
     assert inputs == dict(
-        seq_length=16, micro_batch_size=9, padded_vocab_size=padded_vocab, logit_dtype=torch.float32
+        seq_length=16,
+        micro_batch_size=9,
+        padded_vocab_size=padded_vocab,
+        logit_dtype=torch.float32,
+        eval_micro_batch_size=5,
     )
 
 
@@ -369,3 +374,33 @@ def test_warmup_skips_without_model_config(tp_group, monkeypatch, caplog):
         kernel_warmup.warmup_training_kernels(None, tp_group, seq_length=8, micro_batch_size=2)
     if torch.distributed.get_rank() == 0:  # log_single_rank logs on rank 0 only
         assert "Skipping training-kernel warmup" in caplog.text
+
+
+@pytest.mark.parametrize("eval_micro_batch_size", [None, 3])
+def test_warms_up_the_evaluation_residual_kernel(tp_group, eval_micro_batch_size, monkeypatch):
+    """Evaluation uses its own bias-dropout-add function, which no training step compiles.
+
+    Under cuda_graph_impl="full_iteration" the first evaluation step is captured, so the
+    function has to be compiled before that, at the shape and grad mode evaluation uses.
+    """
+    from megatron.core.fusions import fused_bias_dropout
+
+    config, inputs = configuration(tp_group, torch.bfloat16)
+    config.cross_entropy_loss_fusion = False
+    calls = []
+    original = fused_bias_dropout.bias_dropout_add_fused_inference
+
+    def recording_inference(x_with_bias, residual, prob):
+        x, bias = x_with_bias
+        calls.append((tuple(x.shape), x.dtype, x.requires_grad, torch.is_grad_enabled(), bias))
+        return original(x_with_bias, residual, prob)
+
+    monkeypatch.setattr(fused_bias_dropout, "bias_dropout_add_fused_inference", recording_inference)
+    _warmup_training_kernels(
+        config, tp_group, **inputs, eval_micro_batch_size=eval_micro_batch_size
+    )
+
+    batch = eval_micro_batch_size or inputs["micro_batch_size"]
+    shape = (inputs["seq_length"], batch, config.hidden_size)
+    assert calls, "the inference variant was not warmed up"
+    assert set(calls) == {(shape, torch.bfloat16, False, False, None)}
