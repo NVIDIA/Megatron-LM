@@ -387,6 +387,10 @@ class NVLSAllGatherVDispatcher(InferenceAllGatherDispatcherBase):
         cls._ep_invariant_combine = False
         cls._symm_metadata = None
         cls._real_token_count_tensor = None
+        # The registry returns a buffer by name, whatever size is asked for:
+	# drop the entries too, so that the next `allocate_buffers` gets buffers of correct sizes.
+        for key in ("ep_agv_h", "ep_agv_r", "ep_agv_p", "ep_rsv", "ep_meta"):
+            SymmetricMemoryManager.destroy(key)
 
     @classmethod
     def allocate_buffers(

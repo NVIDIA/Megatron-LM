@@ -2020,7 +2020,7 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
     def release_class_level_state() -> None:
         """Release the class-level state a context publishes into other classes."""
         VllmFusedMoeBuffers._delete_buffers()
-        NVLSAllGatherVDispatcher._real_token_count_tensor = None
+        NVLSAllGatherVDispatcher._delete_buffers()
         RouterReplay.clear_global_static_buffers()
         for router in RouterReplay.get_instances():
             router.recorded_topk_idx = None

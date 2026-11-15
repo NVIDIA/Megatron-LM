@@ -7,11 +7,11 @@ import pytest
 import torch
 
 from megatron.core.inference.utils import release_model_inference_buffers
-from megatron.core.ssm.mamba_mixer import MambaMixer
 
 try:
     from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 
+    from megatron.core.ssm.mamba_mixer import MambaMixer
     from megatron.core.ssm.ops.mamba2.batch_invariant_decode import (
         BatchInvariantDecodeBuffers,
         _mamba_chunk_scan_decode_rows,
@@ -1180,6 +1180,9 @@ if __name__ == "__main__":
     unittest.main()
 
 
+@pytest.mark.skipif(
+    not HAVE_BATCH_INVARIANT_DECODE, reason="mamba_ssm / batch_invariant_decode unavailable"
+)
 def test_decode_buffers_keep_their_slot_count_until_released():
     """The decode buffers of a mixer keep the slot count of the first context that ran it: a
     context with more slots is refused until `release_model_inference_buffers` drops them."""

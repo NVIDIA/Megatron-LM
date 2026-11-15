@@ -310,3 +310,9 @@ class SSMDynamicInferenceMixin:
             context.zero_padding_tokens(y)
 
         return self.out_proj(y)
+
+    def release_inference_buffers(self) -> None:
+        """Drop the buffers this mixer sized from an inference context."""
+        decoder = getattr(self, "_batch_invariant_decoder", None)
+        if decoder is not None:
+            decoder.buffers = None
