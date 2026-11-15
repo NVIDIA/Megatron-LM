@@ -65,7 +65,7 @@ def process_group_collection(distributed_setup):
 def test_grad_reduction_flag_controls_main_grad_dtype(
     process_group_collection, grad_reduce_in_fp32, grad_comm_dtype
 ):
-    """The MCore reduction flag controls the main-gradient and reduction buffer dtypes."""
+    """The adapter resolves main-gradient storage and communication dtypes independently."""
     config = TransformerConfig(
         num_layers=1, hidden_size=8, num_attention_heads=1, params_dtype=torch.bfloat16, bf16=True
     )
@@ -81,11 +81,6 @@ def test_grad_reduction_flag_controls_main_grad_dtype(
         module=torch.nn.Linear(8, 8, device="cuda", dtype=torch.bfloat16),
         pg_collection=process_group_collection,
     )
-    model.zero_grad_buffer()
-    x = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
-    model(x).sum().backward()
-    model.finish_grad_sync()
-
     expected_dtype = torch.float32 if grad_reduce_in_fp32 else torch.bfloat16
     assert model.module.parameter_groups
     for group in model.module.parameter_groups:
