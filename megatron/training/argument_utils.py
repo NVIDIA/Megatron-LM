@@ -1183,7 +1183,7 @@ def get_megatron_ddp_config(
         kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
         kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
         kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
-        if args.use_megatron_fsdp and getattr(args, "grad_reduce_in_bf16", False):
+        if args.use_megatron_fsdp and args.grad_reduce_in_bf16:
             if args.megatron_fsdp_main_grads_dtype not in (None, torch.bfloat16):
                 raise ValueError(
                     "grad_reduce_in_bf16=True with Megatron-FSDP requires "
