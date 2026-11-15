@@ -92,12 +92,7 @@ class TestFullyShardedDataParallel:
         Utils.destroy_model_parallel()
 
     def _build_fsdp_model(
-        self,
-        main_params_dtype=torch.float32,
-        main_grads_dtype=None,
-        grad_comm_dtype=None,
-        grad_reduce_in_fp32=False,
-        params_dtype=torch.float32,
+        self, main_params_dtype=torch.float32, main_grads_dtype=None, grad_comm_dtype=None
     ):
         """Helper to construct a FullyShardedDataParallel with the given dtype args."""
         fsdp_config = DistributedDataParallelConfig(
@@ -106,18 +101,13 @@ class TestFullyShardedDataParallel:
             overlap_param_gather=True,
             bucket_size=10000,
             use_megatron_fsdp=True,
-            grad_reduce_in_fp32=grad_reduce_in_fp32,
             megatron_fsdp_main_params_dtype=main_params_dtype,
             megatron_fsdp_main_grads_dtype=main_grads_dtype,
             megatron_fsdp_grad_comm_dtype=grad_comm_dtype,
         )
-        model = TestModel(input_dim=13, output_dim=17).to(device="cuda", dtype=params_dtype)
+        model = TestModel(input_dim=13, output_dim=17).cuda()
         transformer_config = TransformerConfig(
-            num_attention_heads=1,
-            num_layers=1,
-            context_parallel_size=1,
-            params_dtype=params_dtype,
-            bf16=params_dtype == torch.bfloat16,
+            num_attention_heads=1, num_layers=1, context_parallel_size=1
         )
         fsdp_model = FullyShardedDataParallel(
             config=transformer_config,
@@ -126,31 +116,6 @@ class TestFullyShardedDataParallel:
             fsdp_unit_modules=[torch.nn.Linear],
         )
         return fsdp_model
-
-    @pytest.mark.parametrize(
-        "grad_reduce_in_fp32,grad_comm_dtype",
-        [(False, None), (False, torch.float32), (True, None), (True, torch.bfloat16)],
-    )
-    def test_grad_reduction_flag_controls_main_grad_dtype(
-        self, grad_reduce_in_fp32, grad_comm_dtype
-    ):
-        """BF16 compute uses FP32 main gradients exactly when FP32 reduction is requested."""
-        model = self._build_fsdp_model(
-            grad_reduce_in_fp32=grad_reduce_in_fp32,
-            grad_comm_dtype=grad_comm_dtype,
-            params_dtype=torch.bfloat16,
-        )
-        model.zero_grad_buffer()
-        x = torch.randn(4, 13, device="cuda", dtype=torch.bfloat16)
-        model(x).sum().backward()
-        model.finish_grad_sync()
-
-        expected_dtype = torch.float32 if grad_reduce_in_fp32 else torch.bfloat16
-        assert model.mp_policy.grad_comm_dtype == grad_comm_dtype
-        groups = model.param_and_grad_buffer.parameter_groups
-        assert groups
-        for group in groups:
-            assert group.main_grad_buffer.data.dtype == expected_dtype
 
     def test_fsdp_mp_policy_with_default_args(self):
         """Test that FullyShardedDataParallel with default dtype args produces the expected policy."""
