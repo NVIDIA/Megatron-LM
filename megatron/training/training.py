@@ -45,9 +45,11 @@ from megatron.core import mpu, tensor_parallel
 # First-party.
 from megatron.core._rank_utils import safe_get_rank
 from megatron.core.datasets.data_schedule import wrap_data_iterator
+from megatron.core.determinism.context import DeterminismContext, determinism_context
 from megatron.core.determinism.trace import (
     TraceConfig,
     close_determinism_trace,
+    get_determinism_trace,
     initialize_determinism_trace,
 )
 from megatron.core.distributed import DistributedDataParallel as DDP
@@ -3577,7 +3579,10 @@ def train_step(
                 iteration=iteration,
                 pg_collection=metric_pg_collection,
             )
-        with grad_context, tensor_metric_context, _fb_cm:
+        trace_context = nullcontext()
+        if get_determinism_trace() is not None:
+            trace_context = determinism_context(DeterminismContext(iteration=iteration + 1))
+        with grad_context, tensor_metric_context, _fb_cm, trace_context:
             losses_reduced = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=forward_backward_data_iterator,

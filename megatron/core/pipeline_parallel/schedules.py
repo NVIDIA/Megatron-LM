@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
+from dataclasses import replace
 from functools import partial
 from itertools import chain
 from typing import Callable, Dict, Iterator, List, Optional, Union
@@ -9,6 +10,11 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core.determinism.context import (
+    determinism_context,
+    get_determinism_context,
+)
+from megatron.core.determinism.trace import get_determinism_trace
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -522,7 +528,12 @@ def forward_step(
         context_manager = torch.autocast("cuda", dtype=config.autocast_dtype)
     else:
         context_manager = contextlib.nullcontext()
-    with context_manager:
+    trace_context = contextlib.nullcontext()
+    if get_determinism_trace() is not None:
+        trace_context = determinism_context(
+            replace(get_determinism_context(), microbatch=current_microbatch, phase="forward")
+        )
+    with context_manager, trace_context:
         if checkpoint_activations_microbatch is None:
             output_tensor, loss_func = forward_step_func(data_iterator, model)
         else:

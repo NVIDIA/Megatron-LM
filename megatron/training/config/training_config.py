@@ -111,6 +111,9 @@ class TrainingConfig:
     determinism_trace_dir: str | None = None
     """Write rank-local determinism records to this directory. Disabled by default."""
 
+    determinism_trace_layers: bool = False
+    """Enable L1 TransformerLayer boundary observations in an active trace."""
+
     determinism_trace_mode: Literal["metadata", "summary", "sampled", "full"] = "metadata"
     """Tensor evidence captured by the determinism tracer. Stronger modes cost more."""
 

@@ -5,6 +5,8 @@ from typing import List, Optional, Set, Tuple, Union
 from torch import Tensor
 
 from megatron.core.context_parallel import ContextParallelLayoutState, CPLayout
+from megatron.core.determinism.te import bind_layer_trace_context
+from megatron.core.determinism.trace import get_determinism_trace
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.packed_seq_params import PackedSeqParams
@@ -170,7 +172,9 @@ def checkpointed_forward(
                     hidden_states = cp_layout_state.finalize_layer(index, hidden_states)
             return hidden_states, context
 
-        return custom_forward
+        if get_determinism_trace() is None:
+            return custom_forward
+        return bind_layer_trace_context(custom_forward)
 
     def chunk_runner(start: int, end: int, use_checkpoint: bool):
         nonlocal hidden_states, context
