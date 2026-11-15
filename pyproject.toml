@@ -79,7 +79,7 @@ training = [
     "transformers",
     "accelerate",
     "omegaconf",
-    "gigatoken",
+    "gigatoken>=0.11.0",
 ]
 
 ### 'mlm' group is deprecated. please use 'training' instead ###
@@ -91,7 +91,7 @@ mlm = [
     "transformers",
     "accelerate",
     "omegaconf",
-    "gigatoken",
+    "gigatoken>=0.11.0",
 ]
 
 dev = [
