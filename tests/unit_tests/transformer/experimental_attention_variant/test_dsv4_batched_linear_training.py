@@ -195,12 +195,13 @@ def test_matrix_optimizer_step_and_resume(backend, optimizer_name, tmp_path_dist
         resumed, resumed_optimizer, resumed_weight, _ = build()
         metadata = {"dp_cp_group": groups.dp_cp}
         with TempNamedDir(tmp_path_dist_ckpt / "grouped-projection") as checkpoint:
-            model_state = model.sharded_state_dict(metadata=metadata)
+            # Training checkpoints unwrap DDP before constructing the model state.
+            model_state = model.module.sharded_state_dict(metadata=metadata)
             dist_checkpointing.save(
                 {"model": model_state, "optimizer": optimizer.sharded_state_dict(model_state)},
                 checkpoint,
             )
-            resume_state = resumed.sharded_state_dict(metadata=metadata)
+            resume_state = resumed.module.sharded_state_dict(metadata=metadata)
             restored = dist_checkpointing.load(
                 {
                     "model": resume_state,
