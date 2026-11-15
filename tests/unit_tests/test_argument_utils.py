@@ -27,6 +27,7 @@ from megatron.training.argument_utils import (
 )
 from megatron.training.arguments import add_megatron_arguments, parse_args, validate_args
 from megatron.training.config import CheckpointConfig, PretrainConfigContainer
+from megatron.training.models import BertModelConfig
 from megatron.training.models.deepseek_v4 import normalize_dsv4_hybrid_csa_compress_ratios
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
@@ -173,6 +174,19 @@ def _minimal_training_args(monkeypatch):
     return args
 
 
+@pytest.mark.parametrize("version", [1, 2])
+def test_megatron_fsdp_user_buffer_registration_matches_version(monkeypatch, version):
+    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    args = _minimal_training_args(monkeypatch)
+    args.use_megatron_fsdp = True
+    args.megatron_fsdp_version = version
+    args.nccl_ub = True
+    args.ckpt_format = "fsdp_dtensor"
+    args = validate_args(args)
+    assert args.fsdp_manual_registration is (version == 1)
+    assert not args.fsdp_double_buffer
+
+
 def test_moe_norm_flag_reaches_transformer_config():
     """The generated LatentMoE norm flag should populate the model config."""
     parser = ArgumentParser()
@@ -191,9 +205,27 @@ def test_moe_norm_flag_reaches_transformer_config():
     assert config.moe_use_norm_before_up_proj is True
 
 
+@pytest.mark.parametrize("name", ["gtp_remat_nccl_ub", "gtp_expert_remat_nccl_ub"])
+def test_gtp_userbuffer_flags_preserve_cli_contract(name):
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    assert getattr(parser.parse_args([]), name) is False
+    assert getattr(parser.parse_args(["--" + name.replace("_", "-")]), name) is True
+
+
+def test_moe_backend_arguments():
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    args = parser.parse_args([])
+    assert args.moe_token_dispatcher_type == "alltoall"
+    assert args.moe_grouped_gemm is True
+    assert parser.parse_args(["--moe-grouped-gemm"]).moe_grouped_gemm is True
+    assert parser.parse_args(["--no-moe-grouped-gemm"]).moe_grouped_gemm is False
+
+
 def test_no_megatron_fsdp_padded_shards_flag_reaches_ddp_config():
     """--no-megatron-fsdp-padded-shards should disable padded shards in the DDP config."""
-    from megatron.training.training import get_megatron_ddp_config
+    from megatron.training.argument_utils import get_megatron_ddp_config
 
     parser = ArgumentParser()
     add_megatron_arguments(parser)
@@ -1575,25 +1607,36 @@ class TestMegatronMixedPrecisionArguments:
 
 
 def _make_args(**overrides):
-    """Build the minimum Namespace required by pretrain_cfg_container_from_args.
+    """Build CLI defaults with a small valid callback model.
 
     These fields have non-trivial CLI→config name mappings or boolean inversions
     that pretrain_cfg_container_from_args handles explicitly.
     """
-    defaults = {
-        # CheckpointConfig boolean inversions (legacy-style --no-* flags)
-        "no_save_optim": False,
-        "no_save_rng": False,
-        "no_load_optim": False,
-        "no_load_rng": False,
-        # CheckpointConfig custom argparse dest names
-        "ckpt_fully_parallel_save": True,
-        "ckpt_fully_parallel_load": False,
-        # ProfilingConfig: use_nsys_profiler is exposed as --profile on the CLI
-        "profile": False,
-        # RerunStateMachineConfig: field is check_for_nan_in_loss, CLI flag is check_for_nan_in_loss_and_grad
-        "check_for_nan_in_loss_and_grad": True,
-    }
+
+    parser = ArgumentParser()
+    add_megatron_arguments(parser)
+    defaults = vars(parser.parse_args([]))
+    defaults.update(
+        {
+            "num_layers": 2,
+            "hidden_size": 16,
+            "num_attention_heads": 4,
+            "max_position_embeddings": 64,
+            "params_dtype": torch.float32,
+            # CheckpointConfig boolean inversions (legacy-style --no-* flags)
+            "no_save_optim": False,
+            "no_save_rng": False,
+            "no_load_optim": False,
+            "no_load_rng": False,
+            # CheckpointConfig custom argparse dest names
+            "ckpt_fully_parallel_save": True,
+            "ckpt_fully_parallel_load": False,
+            # ProfilingConfig: use_nsys_profiler is exposed as --profile on the CLI
+            "profile": False,
+            # RerunStateMachineConfig: field is check_for_nan_in_loss, CLI flag is check_for_nan_in_loss_and_grad
+            "check_for_nan_in_loss_and_grad": True,
+        }
+    )
     defaults.update(overrides)
     return Namespace(**defaults)
 
@@ -1623,7 +1666,7 @@ def _make_ddp_args(**overrides):
 
 @pytest.fixture
 def mock_optimizer_config():
-    return MagicMock(spec=OptimizerConfig)
+    return OptimizerConfig()
 
 
 @pytest.fixture
@@ -1634,7 +1677,9 @@ def mock_ddp_config():
 @pytest.fixture
 def patch_training_helpers(mock_optimizer_config, mock_ddp_config):
     """Patch the two helper functions called by pretrain_cfg_container_from_args."""
-    with patch("megatron.training.training.get_megatron_ddp_config", return_value=mock_ddp_config):
+    with patch(
+        "megatron.training.argument_utils.get_megatron_ddp_config", return_value=mock_ddp_config
+    ):
         yield
 
 
@@ -1645,7 +1690,7 @@ class TestPretrainContainerFromArgsStructure:
         result = pretrain_cfg_container_from_args(_make_args())
         assert isinstance(result, PretrainConfigContainer)
 
-    @patch("megatron.training.training.get_megatron_ddp_config")
+    @patch("megatron.training.argument_utils.get_megatron_ddp_config")
     def test_ddp_config_comes_from_helper(self, mock_ddp):
         """Test that ddp config comes from get_megatron_ddp_config."""
         mock_ddp_instance = MagicMock(spec=DistributedDataParallelConfig)
@@ -1657,9 +1702,7 @@ class TestPretrainContainerFromArgsStructure:
 
     @pytest.mark.parametrize("enabled", [False, True])
     def test_distributed_cli_flags_keep_their_config_owners(self, monkeypatch, enabled):
-        parser = ArgumentParser()
-        add_megatron_arguments(parser)
-        args = parser.parse_args(["--use-megatron-fsdp", "--fake-process-group"] if enabled else [])
+        args = _make_args(use_megatron_fsdp=enabled, fake_process_group=enabled)
 
         cfg = pretrain_cfg_container_from_args(args)
 
@@ -1723,9 +1766,7 @@ def test_sync_preserves_muon_and_mla_cli_options():
 @pytest.mark.parametrize("valid", [False, True])
 @pytest.mark.parametrize("constraint", ["vpp", "grouped_weights"])
 def test_optimizer_model_constraints_use_the_model_owner(native_model, valid, constraint):
-    parser = ArgumentParser()
-    add_megatron_arguments(parser)
-    args = parser.parse_args([])
+    args = _make_args(moe_grouped_gemm=True, moe_use_grouped_tensor=True)
     args.micro_batch_size = 1
     args.global_batch_size = 1
     args.ckpt_format = "torch"
@@ -1742,7 +1783,15 @@ def test_optimizer_model_constraints_use_the_model_owner(native_model, valid, co
     args_valid = not valid if native_model else valid
     args.virtual_pipeline_model_parallel_size = 2 if args_valid else None
     args.moe_single_grouped_weight = not args_valid
-    model = SimpleNamespace(**model_inputs) if native_model else None
+    model = None
+    if native_model:
+        # Callback models do not proxy TransformerConfig attributes at the top level.
+        transformer = TransformerConfig(num_layers=2, hidden_size=16, num_attention_heads=4)
+        transformer.virtual_pipeline_model_parallel_size = model_inputs[
+            "virtual_pipeline_model_parallel_size"
+        ]
+        transformer.moe_single_grouped_weight = model_inputs["moe_single_grouped_weight"]
+        model = BertModelConfig(transformer=transformer, seq_length=64)
     message = "interleaved pipeline" if constraint == "vpp" else "single-grouped-weight"
     with nullcontext() if valid else pytest.raises(AssertionError, match=message):
         cfg = pretrain_cfg_container_from_args(args, model_cfg=model)

@@ -41,8 +41,48 @@ from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
 
 
+@pytest.mark.parametrize(
+    "overrides,phase,iteration,expected",
+    [
+        ({}, None, 0, (80, 48, 16)),
+        ({"eval_global_batch_size": 4}, None, 0, (80, 24, 8)),
+        ({"full_validation": True}, None, 0, (80, None, 16)),
+        ({"skip_train": True}, None, 0, (80, 16, 16)),
+        ({"start_eval_at_iter": 5}, None, 0, (80, 32, 16)),
+        ({}, [5], 6, (40, 48, 16)),
+    ],
+)
+def test_sample_counts_without_model_or_runtime(monkeypatch, overrides, phase, iteration, expected):
+    train = TrainingConfig(train_iters=10, train_samples=80, global_batch_size=8)
+    validation = ValidationConfig(eval_iters=2, eval_interval=5, **overrides)
+    for name in ("get_args", "get_run_config", "get_train_state"):
+        monkeypatch.setattr(training, name, Mock(side_effect=AssertionError("runtime access")))
+    assert (
+        training.calculate_train_valid_test_num_samples(
+            train, validation, phase_transition_iterations=phase, iteration=iteration
+        )
+        == expected
+    )
+    assert train.train_iters == 10
+    assert validation.eval_global_batch_size == overrides.get("eval_global_batch_size")
+
+
 def mock_train_valid_test_datasets_provider(train_val_test_num_samples):
     return iter([1]), iter([2]), iter([3])
+
+
+@pytest.mark.parametrize("state", [None, SimpleNamespace(iteration=0)])
+def test_sample_counts_before_training_state(monkeypatch, run_config, state):
+    run_config.train.train_iters = 10
+    run_config.train.train_samples = 80
+    run_config.train.global_batch_size = 8
+    run_config.validation.eval_iters = 2
+    run_config.validation.eval_interval = 5
+    monkeypatch.setattr(
+        training, "get_args", lambda: SimpleNamespace(phase_transition_iterations=None)
+    )
+    monkeypatch.setattr(training, "get_train_state", lambda: state)
+    assert training.get_train_valid_test_num_samples() == (80, 48, 16)
 
 
 @pytest.mark.parametrize("enabled", [None, False, True])
@@ -152,7 +192,13 @@ def test_indexer_logging_counts_only_active_legacy_ratios():
         csa_dense_mode=False,
     )
 
-    assert _get_indexer_logging_layer_counts(args) == (3, 2)
+    model_config = SimpleNamespace(transformer=args, hybrid_layer_pattern=args.hybrid_layer_pattern)
+    assert _get_indexer_logging_layer_counts(model_config) == (3, 2)
+
+
+def test_no_optimizer_does_not_require_training_wrapper_config(monkeypatch):
+    monkeypatch.setattr(training, "get_run_config", lambda: SimpleNamespace())
+    assert not training.should_disable_forward_pre_hook(SimpleNamespace(), None)
 
 
 @pytest.mark.parametrize("fsdp2", [False, True])
@@ -165,14 +211,18 @@ def test_native_builder_uses_dist_and_ddp_configs(monkeypatch, run_config, fsdp2
         use_torch_fsdp2=not fsdp2,
         use_megatron_fsdp=not megatron_fsdp,
     )
-    run_config.dist.use_torch_fsdp2 = fsdp2
     run_config.ddp = (
         training.TorchFullyShardedDataParallelConfig(use_megatron_fsdp=megatron_fsdp)
         if fsdp2
         else training.DistributedDataParallelConfig(use_megatron_fsdp=megatron_fsdp)
     )
     builder = Mock()
-    run_config.model = SimpleNamespace(get_builder_cls=lambda: Mock(return_value=builder))
+    from megatron.training.models import GPTModelConfig
+
+    run_config.model = GPTModelConfig(
+        transformer=run_config.model.transformer, seq_length=16, vocab_size=128
+    )
+    monkeypatch.setattr(run_config.model, "get_builder_cls", lambda: Mock(return_value=builder))
     monkeypatch.setattr(training, "get_args", lambda: args)
     monkeypatch.setattr(training, "get_timers", Mock())
     monkeypatch.setattr(training, "get_one_logger", lambda: None)
@@ -202,7 +252,7 @@ def test_should_disable_forward_pre_hook_needs_a_live_optimizer(optimizer, layer
     """The pre-hooks belong to the distributed optimizer's overlapped param-gather, so the loop
     toggles them only when an optimizer was built (not under --skip-train or
     --rl-rollout-only --no-load-optim)."""
-    args = SimpleNamespace(use_megatron_fsdp=False)
+    args = SimpleNamespace(use_megatron_fsdp=True)  # The registered config owns this flag.
     run_config.optimizer.use_distributed_optimizer = not layer_wise
     run_config.optimizer.use_layer_wise_distributed_optimizer = layer_wise
     run_config.optimizer.overlap_param_gather = True
@@ -210,7 +260,8 @@ def test_should_disable_forward_pre_hook_needs_a_live_optimizer(optimizer, layer
     run_config.optimizer.overlap_param_gather = False
     assert not training.should_disable_forward_pre_hook(args, optimizer)
     run_config.optimizer.overlap_param_gather = True
-    args.use_megatron_fsdp = True
+    run_config.ddp.use_megatron_fsdp = True
+    args.use_megatron_fsdp = False
     assert not training.should_disable_forward_pre_hook(args, optimizer)
 
 
@@ -225,13 +276,14 @@ def test_indexer_logging_counts_hybrid_mtp_depths_and_dense_mode():
         csa_dense_mode=False,
     )
 
-    assert _get_indexer_logging_layer_counts(args) == (5, 5)
+    model_config = SimpleNamespace(transformer=args, hybrid_layer_pattern=args.hybrid_layer_pattern)
+    assert _get_indexer_logging_layer_counts(model_config) == (5, 5)
 
     args.mtp_use_repeated_layer = True
-    assert _get_indexer_logging_layer_counts(args) == (5, 3)
+    assert _get_indexer_logging_layer_counts(model_config) == (5, 3)
 
     args.csa_dense_mode = True
-    assert _get_indexer_logging_layer_counts(args) == (5, 0)
+    assert _get_indexer_logging_layer_counts(model_config) == (5, 0)
 
 
 def test_indexer_logging_uses_normalized_hybrid_layer_positions():
@@ -252,7 +304,8 @@ def test_indexer_logging_uses_normalized_hybrid_layer_positions():
     expected_ratios = [0, 0, 4, 128, 0, 4, 128, 0, 4]
     assert args.csa_compress_ratios == expected_ratios
     assert config_kwargs["csa_compress_ratios"] == expected_ratios
-    assert _get_indexer_logging_layer_counts(args) == (6, 3)
+    model_config = SimpleNamespace(transformer=args, hybrid_layer_pattern=args.hybrid_layer_pattern)
+    assert _get_indexer_logging_layer_counts(model_config) == (6, 3)
 
 
 class TestTraining:
@@ -276,31 +329,31 @@ class TestTraining:
     ):
         """Verify the source before clearing integrity checks for unsupported outputs."""
         run_config.validation.skip_train = True
-        args = SimpleNamespace(
-            logits_save_dir=None,
-            logits_load_dir=None,
-            moe_use_upcycling=False,
+        run_config.checkpoint = CheckpointConfig(
             load="source-checkpoints",
-            pretrained_checkpoint=None,
             ckpt_format="torch_dist",
             ckpt_convert_format=ckpt_format,
             ckpt_convert_save="converted-checkpoints",
             verify_integrity=verify_integrity,
         )
+        # The namespace carries no checkpoint settings: the section owns them.
+        args = SimpleNamespace(logits_save_dir=None, logits_load_dir=None, moe_use_upcycling=False)
 
-        def load_checkpoint(*unused_args, **unused_kwargs):
-            assert args.ckpt_format == "torch_dist"
-            assert args.verify_integrity is verify_integrity
+        def load_checkpoint(*unused_args, **kwargs):
+            # The source checkpoint is loaded under the run's own policy.
+            assert "checkpoint" not in kwargs
             return 123, 456
 
-        def save_checkpoint(*unused_args, **unused_kwargs):
-            assert args.ckpt_format == ckpt_format
-            assert args.save == str(Path("converted-checkpoints") / ckpt_format)
-            assert args.use_dist_ckpt is (ckpt_format != "torch")
-            checkpoint = CheckpointConfig(
-                ckpt_format=args.ckpt_format, verify_integrity=args.verify_integrity
-            )
-            assert checkpoint.verify_integrity is (verify_integrity and ckpt_format == "torch_dist")
+        def save_checkpoint(*unused_args, **kwargs):
+            # The target format and directory are passed to this save only.
+            assert "checkpoint" not in kwargs
+            assert kwargs["ckpt_format"] == ckpt_format
+            assert kwargs["save"] == str(Path("converted-checkpoints") / ckpt_format)
+            assert kwargs["verify_integrity"] is (verify_integrity and ckpt_format == "torch_dist")
+            # Neither the registered section nor the namespace is written.
+            assert run_config.checkpoint.ckpt_format == "torch_dist"
+            assert run_config.checkpoint.verify_integrity is verify_integrity
+            assert not hasattr(args, "ckpt_format") and not hasattr(args, "save")
 
         load = Mock(side_effect=load_checkpoint)
         save = Mock(side_effect=save_checkpoint)
@@ -785,6 +838,7 @@ class TestPackedSampleAccounting:
     ):
         """Sequence shards count each sample once for progress and sample-based LR schedules."""
         import megatron.training.training as training
+        from megatron.core.transformer import TransformerConfig
 
         args = SimpleNamespace(
             gtp_remat_num_sequence_shards=num_sequence_shards,
@@ -797,6 +851,15 @@ class TestPackedSampleAccounting:
             micro_batch_size=2,
             train_iters=None,
             train_samples=10_000,
+        )
+        monkeypatch.setattr("megatron.training.config.container.safe_get_world_size", lambda: 8)
+        run_config.model.transformer = TransformerConfig(
+            num_layers=2,
+            hidden_size=32,
+            num_attention_heads=4,
+            context_parallel_size=total_cp,
+            tensor_parallel_num_weight_shards=weight_shards,
+            tensor_parallel_num_sequence_shards=num_sequence_shards,
         )
         run_config.train = TrainingConfig(micro_batch_size=2, train_samples=10_000)
         monkeypatch.setattr(training, "get_num_microbatches", lambda: 3)

@@ -1113,6 +1113,8 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
     @pytest.mark.internal
     def test_hybrid_admission_resumes_after_handoff_releases_live_slot(self):
         ctx = self._mctx(max_requests=1, rounder=1)
+        # setup_kv_transfer(role="prefill") enables transfer and handoff pinning.
+        ctx.kv_transfer_enabled = True
         ctx.kv_block_allocator.enable_handoff_pinning = True
         slot = ctx.mamba_metadata.allocate_slot()
         assert slot is not None
@@ -1134,6 +1136,50 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 
         assert request_available
         assert ctx.mamba_metadata.mamba_state_free_slot_count == 1
+
+    @pytest.mark.internal
+    def test_hybrid_admission_counts_slots_reserved_outside_request_rows(self):
+        """A decode engine reserves live slots for incoming handoffs before they own a row.
+
+        Handoff pinning is off on decode, so the free request row must not be taken
+        as proof of a free recurrent-state slot; otherwise add_request raises.
+        """
+        ctx = self._mctx(max_requests=2, rounder=1, prefix_caching_mamba_gb=None)
+        # setup_kv_transfer(role="decode") enables transfer without handoff pinning.
+        ctx.kv_transfer_enabled = True
+        assert not ctx.kv_block_allocator.enable_handoff_pinning
+        reserved_slots = [ctx.mamba_metadata.allocate_slot() for _ in range(ctx.max_requests)]
+        assert None not in reserved_slots
+        assert ctx.total_request_count < ctx.max_requests
+        assert ctx.mamba_metadata.mamba_state_free_slot_count == 0
+        request = self._req(ctx, self._prompt(ctx.block_size_tokens))
+
+        request_available, _, _ = ctx.check_availability(request)
+
+        assert not request_available
+
+        ctx.mamba_metadata.free_slot(reserved_slots[0])
+
+        request_available, _, _ = ctx.check_availability(request)
+
+        assert request_available
+
+    @pytest.mark.internal
+    def test_hybrid_admission_asserts_slot_per_row_without_kv_transfer(self):
+        """Without KV transfer, a free request row must imply a free recurrent-state slot."""
+        ctx = self._mctx(max_requests=2, rounder=1, prefix_caching_mamba_gb=None)
+        assert not ctx.kv_transfer_enabled
+        request = self._req(ctx, self._prompt(ctx.block_size_tokens))
+
+        request_available, _, _ = ctx.check_availability(request)
+
+        assert request_available
+
+        for _ in range(ctx.max_requests):
+            assert ctx.mamba_metadata.allocate_slot() is not None
+
+        with pytest.raises(AssertionError, match="only KV transfer"):
+            ctx.check_availability(request)
 
     @pytest.mark.internal
     def test_mamba_prefill_skip_and_zero_prefill(self):

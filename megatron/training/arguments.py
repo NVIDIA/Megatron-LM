@@ -3,7 +3,6 @@
 """Megatron arguments."""
 
 import argparse
-import dataclasses
 import json
 import os
 import re
@@ -19,7 +18,6 @@ from megatron.core.config import set_experimental_flag
 from megatron.core.dist_checkpointing.validation import StrictHandling
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
 from megatron.core.model_parallel_config import _parse_pad_packed_seq_alignment
-from megatron.core.msc_utils import MultiStorageClientFeature
 from megatron.core.quantization.utils import (
     kitchen_quantization_recipe_config,
     load_quantization_recipe,
@@ -51,11 +49,13 @@ from megatron.training.argument_utils import (  # noqa: F401 # pylint: disable=u
     _default_config_from_args,
     _resolve_dsa_kernel_backend_cli_default,
     _wide_residual_config_from_args,
+    checkpoint_config_from_args,
     core_transformer_config_from_args,
 )
 from megatron.training.utils import (
     get_device_arch_version,
     print_rank_0,
+    setup_multi_storage_client,
     update_use_dist_ckpt,
     warn_rank_0,
 )
@@ -79,7 +79,6 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_validation_args(parser)
     parser = _add_data_args(parser)
     parser = _add_tokenizer_args(parser)
-    parser = _add_autoresume_args(parser)
     parser = _add_vision_args(parser)
     parser = _add_moe_args(parser)
     parser = _add_mla_args(parser)
@@ -92,7 +91,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_transformer_engine_args(parser)
     parser = _add_experimental_args(parser)
     parser = _add_inprocess_restart_args(parser)
-    parser = _add_ft_package_args(parser)
+    parser = _add_fault_tolerance_args(parser)
     parser = _add_rerun_machine_args(parser)
     parser = _add_msc_args(parser)
     parser = _add_kitchen_quantization_arguments(parser)
@@ -192,18 +191,10 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
         # Preserve legacy semantics: --disable-msc forces MSC off, even if
         # --enable-msc was also passed.
         args.enable_msc = False
-
-    if args.enable_msc:
-        MultiStorageClientFeature.enable()
-        if not MultiStorageClientFeature.is_enabled():
-            raise RuntimeError(
-                "--enable-msc was passed but the multistorageclient package is not "
-                "installed. Install it with `pip install multi-storage-client`."
-            )
-        warn_rank_0('The MSC feature is enabled.')
-    else:
-        MultiStorageClientFeature.disable()
-        assert MultiStorageClientFeature.is_enabled() is False
+    # Applied here, before any path is read. MSC is a process-wide storage feature (datasets,
+    # tokenizers, YAMLs, checkpoints), not a config setting: a script that enables it itself calls
+    # the same helper before any path is read.
+    setup_multi_storage_client(args.enable_msc)
 
     return args
 
@@ -485,25 +476,10 @@ def validate_args(args, defaults={}):
         setattr(args, legacy, new)
         setattr(args, canonical, new)
 
-    # Prep for checkpoint conversion.
+    # Prep for checkpoint conversion. CheckpointConfig.validate() checks the prerequisites below;
+    # the legacy argument copy keeps the derived flag for its remaining readers.
     if args.ckpt_convert_format is not None:
-        assert args.ckpt_convert_save is not None
-        assert args.load is not None
         args.exit_on_missing_checkpoint = True
-
-    # Temporary
-    assert args.non_persistent_ckpt_type in [
-        'global',
-        'local',
-        None,
-    ], 'Currently only global and local checkpoints are supported'
-    if args.non_persistent_ckpt_type == 'local':
-        try:
-            from nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager import (
-                LocalCheckpointManager,
-            )
-        except ModuleNotFoundError as e:
-            raise RuntimeError('nvidia_resiliency_ext is required for local checkpointing') from e
 
     # validate model config args from heterogeneous config (if provided).
     validate_model_config_args_from_heterogeneous_config(args)
@@ -1062,6 +1038,10 @@ def validate_args(args, defaults={}):
 
     if args.use_torch_fsdp2:
         assert is_torch_min_version("2.4.0"), 'FSDP2 requires PyTorch >= 2.4.0 with FSDP 2 support.'
+        assert args.ckpt_format in (
+            'torch_dist',
+            'torch_dcp',
+        ), '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
         assert (
             args.pipeline_model_parallel_size == 1
         ), '--use-torch-fsdp2 is not supported with pipeline parallelism'
@@ -1071,10 +1051,6 @@ def validate_args(args, defaults={}):
         assert (
             not args.gradient_accumulation_fusion
         ), '--use-torch-fsdp2 is not supported with gradient accumulation fusion'
-        assert args.ckpt_format in (
-            'torch_dist',
-            'torch_dcp',
-        ), '--use-torch-fsdp2 requires --ckpt-format torch_dist or torch_dcp'
         assert (
             args.untie_embeddings_and_output_weights
         ), '--use-torch-fsdp2 requires --untie-embeddings-and-output-weights'
@@ -1166,6 +1142,9 @@ def validate_args(args, defaults={}):
         #       Future updates will drop support for `use_custom_fsdp` to avoid confusion.
         args.use_custom_fsdp = True
 
+        assert args.ckpt_format == "fsdp_dtensor", \
+            "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
+
         if args.megatron_fsdp_version == 2:
             assert (
                 not args.use_distributed_optimizer
@@ -1222,10 +1201,6 @@ def validate_args(args, defaults={}):
             os.environ.get('CUDA_DEVICE_MAX_CONNECTIONS') != "1"
         ), 'FSDP requires CUDA_DEVICE_MAX_CONNECTIONS > 1 or unset.'
 
-        assert (
-            args.ckpt_format == "fsdp_dtensor"
-        ), "Megatron-FSDP requires the `fsdp_dtensor` checkpointing format."
-
         if args.megatron_fsdp_prefetch_recompute_forward_weights:
             assert args.data_parallel_sharding_strategy == "optim_grads_params", (
                 "--megatron-fsdp-prefetch-recompute-forward-weights is only supported "
@@ -1240,14 +1215,10 @@ def validate_args(args, defaults={}):
                 "with --overlap-moe-expert-parallel-comm."
             )
 
-        if args.nccl_ub:
-            # In Megatron-LM, required implementation for manual registration is already provided.
-            # So we enable the manual registration by default when nccl-ub and use_megatron_fsdp is set.
+        if args.nccl_ub and args.megatron_fsdp_version == 1:
+            # V1 supplies manual registration; v2 uses symmetric-memory registration instead.
             args.fsdp_manual_registration = True
-            args.fsdp_double_buffer = True
-            warn_rank_0(
-                'FSDP double buffer and manual registration is enabled by default when --nccl-ub is enabled!'
-            )
+            warn_rank_0('FSDP manual registration is enabled by default when --nccl-ub is enabled!')
 
         if args.megatron_fsdp_max_pool_double_buffer:
             # MaxPoolAllocator is a type of FSDP double buffer.
@@ -1404,14 +1375,9 @@ def validate_args(args, defaults={}):
         )
     if args.decoder_seq_length is not None:
         assert args.max_position_embeddings >= args.decoder_seq_length
-    if args.save is not None:
-        assert args.save_interval is not None
-        assert args.save_interval > 0
-        if args.save_retain_interval is not None:
-            assert args.save_retain_interval > 0
-            assert args.save_retain_interval % args.save_interval == 0
-        if args.save_params_interval is not None:
-            assert not args.overlap_param_gather
+    if args.save is not None and args.save_params_interval is not None:
+        assert not args.overlap_param_gather, \
+            '--save-params-interval is not supported with --overlap-param-gather'
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
@@ -1420,7 +1386,7 @@ def validate_args(args, defaults={}):
             args.fp16 or args.bf16
         ), 'residual connection in fp32 only supported when using fp16 or bf16.'
 
-    if args.moe_grouped_gemm:
+    if args.num_experts is not None and args.moe_grouped_gemm and args.transformer_impl != "local":
         dc = torch.cuda.get_device_capability()
         assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
 
@@ -1787,7 +1753,9 @@ def validate_args(args, defaults={}):
     if isinstance(args.moe_aux_loss_coeff, list) and len(args.moe_aux_loss_coeff) == 1:
         args.moe_aux_loss_coeff = args.moe_aux_loss_coeff[0]
 
-    # torch_dcp (torch.distributed.checkpoint) checkpointing format checks.
+    # torch_dcp (torch.distributed.checkpoint) checkpointing format checks. The CLI checks the
+    # checkpoint format against the FSDP wrappers here, for every entry point whatever container
+    # it builds; the containers check the same pairings from their own sections.
     if args.ckpt_format == "torch_dcp":
         assert args.use_torch_fsdp2, "--ckpt-format torch_dcp is only tested with FSDP."
         assert (
@@ -2011,7 +1979,11 @@ def validate_args(args, defaults={}):
             # If using distributed optimizer, must use distributed checkpointing.
             # Legacy checkpointing uses Gloo process groups to collect full distributed
             # optimizer state in the CPU memory of DP rank 0.
-            assert args.use_dist_ckpt
+            assert args.use_dist_ckpt, (
+                '--use-distributed-optimizer without Gloo process groups requires a distributed '
+                'checkpoint format (--ckpt-format torch_dist, torch_dcp or fsdp_dtensor): the legacy '
+                'torch format gathers the optimizer state through Gloo.'
+            )
 
             if args.dist_ckpt_optim_fully_reshardable:
                 assert (
@@ -2061,60 +2033,13 @@ def validate_args(args, defaults={}):
                 "Other algorithms cannot guarantee numerical stability yet."
             )
 
-    # The PG-distribution cache stores one file per parallelization group, keyed by
-    # that group's ordered global ranks, and each file holds both the save and the
-    # load distribution derived from one gather over that group. A single create
-    # run (even one that only loads) therefore covers later saves only when save
-    # and load use the same group; otherwise a read run finds no cache file for the
-    # other side's group. Require both sides to use the same group.
-    if args.ckpt_pg_tensors_cache_path is not None:
-        assert (
-            args.ckpt_fully_parallel_save_process_group
-            == args.ckpt_fully_parallel_load_process_group
-        ), (
-            "--ckpt-pg-tensors-cache-path requires --ckpt-fully-parallel-save-process-group and "
-            "--ckpt-fully-parallel-load-process-group to be identical, but got "
-            f"save='{args.ckpt_fully_parallel_save_process_group}' and "
-            f"load='{args.ckpt_fully_parallel_load_process_group}'. The cache is keyed by the "
-            "parallelization group, so with mixed groups a run that creates the cache for one "
-            "side leaves the other side without a cache file."
-        )
-
-    if args.load_main_params_from_ckpt:
-        assert args.no_load_optim, '--load-main-params-from-ckpt must be used with --no-load-optim.'
-
     if args.stream_ckpt_dequant:
-        # Inference-only load path: the loaded state dict holds the re-quantized params
-        # themselves, so nothing that consumes the loaded values in high precision (optimizer
-        # main params) may run. `load_checkpoint` additionally refuses any optimizer.
-        assert args.no_load_optim and not args.finetune, (
-            '--stream-ckpt-dequant is an inference-only load path: it requires --no-load-optim '
-            'and cannot be used with --finetune.'
-        )
-        assert not args.load_main_params_from_ckpt, (
-            '--stream-ckpt-dequant cannot be used with --load-main-params-from-ckpt: the main '
-            'params would be initialized from the re-quantized params instead of the '
-            'high-precision checkpoint values.'
-        )
+        # The other --stream-ckpt-dequant rules live in CheckpointConfig.validate(); this one pairs
+        # it with the precision recipe, which is not config-owned yet.
         assert args.fp8 is None or args.fp8_recipe != 'delayed', (
             '--stream-ckpt-dequant does not support --fp8-recipe delayed (its scale is only '
             'restored by load_state_dict); use tensorwise, mxfp8, blockwise or nvfp4.'
         )
-        assert (
-            not args.ckpt_fully_parallel_load
-            or args.ckpt_fully_parallel_load_exchange_algo == 'broadcast'
-        ), (
-            '--stream-ckpt-dequant supports --ckpt-fully-parallel-load only with '
-            '--ckpt-fully-parallel-load-exchange-algo broadcast.'
-        )
-
-    if args.use_dist_ckpt and args.async_save:
-        if not args.use_persistent_ckpt_worker:
-            warn_rank_0(
-                '--async-save is not supported without --use-persistent-ckpt-worker. '
-                'Disabling --async-save.'
-            )
-            args.async_save = False
 
     if args.logits_save_dir is not None:
         assert args.async_save, (
@@ -2146,11 +2071,6 @@ def validate_args(args, defaults={}):
                 'Disabling overlap_param_gather.'
             )
             args.overlap_param_gather = False
-
-    if args.override_ckpt_iteration is not None:
-        assert (
-            not args.finetune
-        ), "Cannot override checkpoint iteration together with finetune flag."
 
     # Inference args
     if args.inference_batch_times_seqlen_threshold > -1:
@@ -2233,20 +2153,8 @@ def validate_args(args, defaults={}):
                 "optimizer-state transfers remain overlapped."
             )
 
-    if args.non_persistent_ckpt_type == "local":
-        assert (
-            args.non_persistent_local_ckpt_dir is not None
-        ), "Tried to use local checkpointing without specifying --local-ckpt-dir!"
-    if args.replication:
-        assert (
-            args.replication_jump is not None
-        ), "--replication requires the value of --replication-jump!"
-        assert (
-            args.non_persistent_ckpt_type == "local"
-        ), f"--replication requires args.non_persistent_ckpt_type == 'local', but got: {args.non_persistent_ckpt_type}"
-    elif args.replication_jump:
-        warn_rank_0("--replication-jump was specified despite not using replication. Ignoring.")
-        args.replication_jump = None
+    # Local checkpointing and replication prerequisites, the async-save worker requirement and a
+    # replication jump without replication are checked by CheckpointConfig.validate().
 
     if args.delay_wgrad_compute:
         assert (
@@ -2413,6 +2321,15 @@ def _add_transformer_engine_args(parser):
 
 def _add_inference_args(parser):
     group = parser.add_argument_group(title='inference')
+
+    group.add_argument(
+        '--inference-shortcut-moe-overlap',
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help='Overlap Shortcut MoE inference with its unsplit GDP or attention '
+        'predecessor. Requires dynamic inference_optimized language layers, '
+        'BF16 model parameters, TP=CP=1, and Triton NVLS.',
+    )
 
     group.add_argument(
         '--inference-batch-times-seqlen-threshold',
@@ -2656,6 +2573,25 @@ def _add_inference_args(parser):
         help='Number of speculative tokens generated during decode',
     )
     group.add_argument(
+        '--mamba-replay-ssm',
+        dest='mamba_replay_ssm',
+        action='store_true',
+        default=False,
+        help='For Mamba speculative decoding: enable ReplaySSM state management '
+        '(checkpoint SSM state + ring buffer of cached post-conv inputs, '
+        'output-only decode, flush-on-buffer-full, pointer-move rollback). '
+        'Requires a per-head scalar A (Mamba-2 / TIE_HDIM).',
+    )
+    group.add_argument(
+        '--mamba-replay-buffer-len',
+        dest='mamba_replay_buffer_len',
+        type=int,
+        default=16,
+        help='ReplaySSM committed-history buffer length B (tokens). Logical flush '
+        'threshold is B + (1 + num_speculative_tokens); must satisfy '
+        'B >= 1 + num_speculative_tokens.',
+    )
+    group.add_argument(
         '--inference-dynamic-batching-prefix-caching',
         dest='inference_dynamic_batching_enable_prefix_caching',
         action=argparse.BooleanOptionalAction,
@@ -2808,6 +2744,18 @@ def _add_inference_args(parser):
         '"async" (default) overlaps asynchronous scheduling phases by '
         'reordering them to prepare-before-resolve. Select "legacy" to '
         'disable async scheduling and use the resolve-before-prepare path.',
+    )
+    group.add_argument(
+        '--inference-gc-mode',
+        type=str,
+        default='freeze_overlap',
+        choices=['default', 'freeze', 'freeze_overlap'],
+        help='Python garbage collection policy while the inference engine serves '
+        'requests. "default" leaves automatic collection unchanged. '
+        '"freeze" freezes the long-lived heap after engine setup so '
+        'collections skip it. "freeze_overlap" also runs due collections '
+        'right after each forward pass is submitted, overlapping them with '
+        'GPU work. Defaults to freeze_overlap.',
     )
     group.add_argument(
         '--inference-dynamic-batching-logprobs-mode',
@@ -2996,7 +2944,6 @@ def _add_network_size_args(parser):
         "moe_megakernel_backend_config",
         "max_seqlen_per_dp_cp_rank",
         "pad_packed_seq_alignment",  # integer/max CLI parsing is handled explicitly
-        "hybrid_context_parallel",
         "dynamic_context_parallel",
         "min_dynamic_context_parallel_size",
         "sequence_packing_scheduler",
@@ -3413,28 +3360,11 @@ def _add_inprocess_restart_args(parser):
     return parser
 
 
-def _add_ft_package_args(parser):
-    group = parser.add_argument_group(title='ft_package')
-    group.add_argument(
-        '--enable-ft-package',
-        action='store_true',
-        help='If set, Fault Tolerance package is enabled. '
-        'Note: This feature is for Nvidia internal use only.',
-    )
-    group.add_argument(
-        '--calc-ft-timeouts',
-        action='store_true',
-        help='If set, FT package will try to automatically compute the timeouts. '
-        'Note: This feature is for Nvidia internal use only.',
-    )
-    group.add_argument(
-        '--ft-num-warmup-iters',
-        type=int,
-        default=5,
-        help='Number of warmup iterations before monitoring step section and '
-        'out-of-section timeouts. The first N iterations are excluded from '
-        'timeout monitoring as they can be significantly slower than steady-state. '
-        'Default: 5. Note: This feature is for Nvidia internal use only.',
+def _add_fault_tolerance_args(parser):
+    from megatron.training.config import FaultToleranceConfig
+
+    ArgumentGroupFactory(FaultToleranceConfig, exclude=["fault_injector"]).build_group(
+        parser, "fault tolerance"
     )
     return parser
 
@@ -3992,14 +3922,6 @@ def _add_checkpointing_args(parser):
         help='Do not load rng state when loading checkpoint.',
     )
     group.add_argument(
-        '--override-ckpt-iteration',
-        type=int,
-        default=None,
-        help='Override the iteration stored in the loaded checkpoint. '
-        'Also resets consumed_train_samples accordingly so the '
-        'data loader replays samples from that iteration onward.',
-    )
-    group.add_argument(
         '--use-dist-ckpt',
         action='store_true',
         dest='use_dist_ckpt_deprecated',
@@ -4011,32 +3933,10 @@ def _add_checkpointing_args(parser):
         help='Deprecated: see --ckpt-format.',
     )
     group.add_argument(
-        '--dist-ckpt-workers',
-        type=int,
-        default=1,
-        help='Number of workers for distributed checkpointing. '
-        'Only used for async save. '
-        'If set to 1, the checkpointing is performed in a single process.',
-    )
-    group.add_argument(
         '--ckpt-fully-parallel-save',
         action='store_true',
         dest='ckpt_fully_parallel_save_deprecated',
         help='Deprecated: see --no-ckpt-fully-parallel-save.',
-    )
-    group.add_argument(
-        '--ckpt-drop-redundant-extra-state',
-        action='store_true',
-        default=False,
-        help='Drop TE `_extra_state` artifacts that carry no '
-        'irreplaceable state (no FP8, or block/current FP8 '
-        'scaling) from the distributed checkpoint, keeping them '
-        'local instead of writing them. Only delayed-scaling '
-        '`_extra_state` (amax history + scale) is ever needed and '
-        'it is always persisted regardless of this flag. By '
-        'default (flag off) all `_extra_state` are persisted, '
-        'preserving the previous behavior. Older checkpoints load '
-        'unchanged either way.',
     )
     return parser
 
@@ -4122,6 +4022,13 @@ def _add_distributed_args(parser):
 
     dist_init_factory = ArgumentGroupFactory(DistributedInitConfig)
     group = dist_init_factory.build_group(parser, "distributed init")
+
+    group.add_argument(
+        '--use-torch-fsdp2',
+        action='store_true',
+        default=False,
+        help="Use PyTorch FSDP2. Cannot be used together with use_megatron_fsdp.",
+    )
 
     group.add_argument(
         '--use-megatron-fsdp',
@@ -4321,21 +4228,6 @@ def _add_distributed_args(parser):
         'Cannot be combined with --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub, which require symmetric windows.',
     )
     group.add_argument(
-        '--gtp-remat-nccl-ub',
-        action='store_true',
-        dest='gtp_remat_nccl_ub',
-        default=False,
-        help='Register the wgrad reduce-scatter send buffers with NCCL symmetric '
-        'memory on the GTP group, independent of --use-nccl-ub (which covers the DP group).',
-    )
-    group.add_argument(
-        '--gtp-expert-remat-nccl-ub',
-        action='store_true',
-        dest='gtp_expert_remat_nccl_ub',
-        default=False,
-        help='Like --gtp-remat-nccl-ub but for routed-expert (EGTP) groups.',
-    )
-    group.add_argument(
         '--fsdp-manual-registration',
         action='store_true',
         dest='fsdp_manual_registration',
@@ -4467,13 +4359,7 @@ def _add_distributed_args(parser):
         type=int,
         default=None,
         help='Maximum sequence length per CP rank. This is used to calculate the '
-        'number of sub-samples assigned to each CP rank when using heterogeneous context parallel.',
-    )
-    group.add_argument(
-        '--hybrid-context-parallel',
-        action='store_true',
-        default=False,
-        help='Deprecated alias for --dynamic-context-parallel.',
+        'number of sub-samples assigned to each CP rank when using dynamic context parallel.',
     )
     group.add_argument(
         '--dynamic-context-parallel',
@@ -4774,22 +4660,6 @@ def _add_data_args(parser):
     return parser
 
 
-def _add_autoresume_args(parser):
-    group = parser.add_argument_group(title='autoresume')
-
-    group.add_argument(
-        '--adlr-autoresume', action='store_true', help='Enable autoresume on adlr cluster.'
-    )
-    group.add_argument(
-        '--adlr-autoresume-interval',
-        type=int,
-        default=1000,
-        help='Intervals over which check for autoresume' 'termination signal',
-    )
-
-    return parser
-
-
 def _add_vision_args(parser):
     group = parser.add_argument_group(title="vision")
 
@@ -4900,6 +4770,14 @@ def _add_vision_args(parser):
 def _add_moe_args(parser):
     group = parser.add_argument_group(title="moe")
     # General arguments
+    # TransformerConfig generates --no-moe-grouped-gemm / --disable-moe-grouped-gemm
+    # now that grouped GEMM defaults to True. Keep the existing positive flag too.
+    group.add_argument(
+        "--moe-grouped-gemm",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Enable grouped GEMM for MoE experts (enabled by default).",
+    )
     group.add_argument(
         '--num-experts', type=int, default=None, help='Number of Experts in MoE (None means no MoE)'
     )

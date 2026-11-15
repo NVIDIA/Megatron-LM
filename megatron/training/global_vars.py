@@ -12,6 +12,7 @@ from datetime import timedelta
 import torch
 
 from megatron.core import Timers
+from megatron.core._rank_utils import safe_get_world_size
 from megatron.core.config import set_experimental_flag
 from megatron.core.energy_monitor import EnergyMonitor
 from megatron.core.jit import disable_jit_fuser
@@ -19,7 +20,6 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
-from megatron.core.tensor_parallel.gtp_parallel_layout import get_batch_parallel_size
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.state import TrainState
 
@@ -182,8 +182,10 @@ def set_global_variables(args, cfg_container, build_tokenizer=True):
     cfg_container.validate()
     set_run_config(cfg_container)
     set_args(args)
-    if training:
-        cfg_container.finalize()
+    # Every container is finalized here: the checkpoint derivations apply to inference containers
+    # too, and the checkpoint converters bootstrap through this function without reaching
+    # initialize_megatron. Finalizing constructs no runtime service.
+    cfg_container.finalize()
     initialize_runtime_services(
         args,
         build_tokenizer=build_tokenizer,
@@ -197,13 +199,16 @@ def set_global_variables(args, cfg_container, build_tokenizer=True):
 def initialize_runtime_services(
     args: Namespace, *, build_tokenizer: bool = True, training: bool = False
 ) -> None:
-    """Build services from validated config; normally called by initialize_megatron."""
+    """Build services from finalized config; normally called by initialize_megatron."""
     from megatron.training.argument_utils import resolve_tokenizer_vocab_size
 
     cfg = get_run_config()
     if build_tokenizer:
         _build_tokenizer(cfg, args)
-    resolve_tokenizer_vocab_size(cfg)
+    # Tokenizer-free bootstrap may discover the model family and rebuild the
+    # tokenizer later. Bind known sizes now; otherwise defer until that rebuild.
+    if build_tokenizer or cfg.tokenizer.padded_vocab_size is not None:
+        resolve_tokenizer_vocab_size(cfg)
     _bind_dataset_tokenizer(cfg)
     _set_wandb_writer(args)
     _set_telemetry(args, include_training=training)
@@ -233,14 +238,14 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         global_batch_size=cfg.train.global_batch_size,
         micro_batch_size=cfg.train.micro_batch_size,
         # Independent sequences, including when CP and weight sharding share ranks.
-        data_parallel_size=get_batch_parallel_size(args),
+        data_parallel_size=cfg.get_batch_parallel_size(),
         decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
         step_batch_size_schedule=cfg.train.step_batch_size_schedule,
         seq_length=args.seq_length,
     )
     _set_tensorboard_writer(args)
     _set_one_logger(args)
-    _set_adlr_autoresume(args)
+    _set_adlr_autoresume()
     _set_timers(args)
     _set_energy_monitor(args)
     _set_train_state()
@@ -310,14 +315,12 @@ def _set_train_state():
 
 def _build_tokenizer(cfg, args):
     """Initialize tokenizer."""
-    from megatron.training.models.gpt import GPTModelConfig
-    from megatron.training.models.hybrid import HybridModelConfig
     from megatron.training.vocab_utils import build_tokenizer_and_pad_vocab_size
 
     global _GLOBAL_TOKENIZER
     _ensure_var_is_not_initialized(_GLOBAL_TOKENIZER, 'tokenizer')
 
-    if isinstance(cfg.model, (GPTModelConfig, HybridModelConfig)):
+    if cfg.model is not None:
         make_vocab_size_divisible_by = cfg.model.make_vocab_size_divisible_by
         tp_size = cfg.model.transformer.tensor_model_parallel_size
     else:
@@ -379,7 +382,7 @@ def _set_tensorboard_writer(args):
     global _GLOBAL_TENSORBOARD_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_TENSORBOARD_WRITER, 'tensorboard writer')
 
-    if cfg.logger.tensorboard_dir and args.rank == (args.world_size - 1):
+    if cfg.logger.tensorboard_dir and args.rank == (safe_get_world_size() - 1):
         try:
             from torch.utils.tensorboard import SummaryWriter
 
@@ -410,7 +413,7 @@ def _set_wandb_writer(args):
     cfg = get_run_config()
     global _GLOBAL_WANDB_WRITER
     _ensure_var_is_not_initialized(_GLOBAL_WANDB_WRITER, 'wandb writer')
-    if cfg.logger.wandb_project and args.rank == (args.world_size - 1):
+    if cfg.logger.wandb_project and args.rank == (safe_get_world_size() - 1):
         if cfg.logger.wandb_exp_name == '':
             raise ValueError("Please specify the wandb experiment name!")
 
@@ -420,7 +423,7 @@ def _set_wandb_writer(args):
             save_dir = cfg.logger.wandb_save_dir
         else:
             # Defaults to the save dir.
-            save_dir = os.path.join(args.save, 'wandb')
+            save_dir = os.path.join(cfg.checkpoint.save, 'wandb')
         # Private attributes are runtime state rather than configuration and can be large; keep
         # them out of the wandb config. Copy so the kitchen contents added below stay off args.
         wandb_config = {k: v for k, v in vars(args).items() if not k.startswith('_')}
@@ -462,7 +465,7 @@ def _set_one_logger(args):
     global _GLOBAL_ONE_LOGGER
     _ensure_var_is_not_initialized(_GLOBAL_ONE_LOGGER, 'one logger')
 
-    if cfg.logger.enable_one_logger and args.rank == (args.world_size - 1):
+    if cfg.logger.enable_one_logger and args.rank == (safe_get_world_size() - 1):
         if cfg.logger.one_logger_async or cfg.logger.wandb_project:
             one_logger_async = True
         else:
@@ -486,12 +489,13 @@ def _set_one_logger(args):
             )
 
 
-def _set_adlr_autoresume(args):
+def _set_adlr_autoresume():
     """Initialize ADLR autoresume."""
     global _GLOBAL_ADLR_AUTORESUME
     _ensure_var_is_not_initialized(_GLOBAL_ADLR_AUTORESUME, 'adlr autoresume')
 
-    if args.adlr_autoresume:
+    cfg = get_run_config()
+    if cfg.fault_tolerance.adlr_autoresume:
         from megatron.training.utils import print_rank_0
 
         print_rank_0('enabling autoresume ...')
@@ -595,32 +599,46 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     cfg = get_run_config()
     resource_attrs = {'dl.local_rank': cfg.dist.local_rank}
     fields = [
-        ('dl.tensor_parallel.size', 'tensor_model_parallel_size'),
-        ('dl.pipeline_parallel.size', 'pipeline_model_parallel_size'),
-        ('dl.data_parallel.size', 'data_parallel_size'),
         ('dl.sequence_length', 'seq_length'),
-        ('megatron.num_layers', 'num_layers'),
-        ('megatron.hidden_size', 'hidden_size'),
-        ('megatron.num_attention_heads', 'num_attention_heads'),
         ('megatron.ckpt_format', 'ckpt_format'),
     ]
     if include_training:
-        fields.extend(
-            [
-                ('dl.batch_size', 'global_batch_size'),
-                ('megatron.train_iters', 'train_iters'),
-                ('megatron.micro_batch_size', 'micro_batch_size'),
-            ]
-        )
+        resource_attrs['dl.data_parallel.size'] = cfg.get_data_parallel_size()
+        for attr, name in (
+            ('dl.batch_size', 'global_batch_size'),
+            ('megatron.train_iters', 'train_iters'),
+            ('megatron.micro_batch_size', 'micro_batch_size'),
+        ):
+            value = getattr(cfg.train, name)
+            if value is not None:
+                resource_attrs[attr] = value
+    else:
+        fields.append(('dl.data_parallel.size', 'data_parallel_size'))
     for attr, arg_name in fields:
         val = getattr(args, arg_name, None)
         if val is not None:
             resource_attrs[attr] = val
 
+    # Preserve inference's CLI boundary; training's existing model tags use its config owner.
+    if include_training:
+        model_config = cfg.model.transformer
+    else:
+        model_config = args
+    for attr, name in (
+        ('dl.tensor_parallel.size', 'tensor_model_parallel_size'),
+        ('dl.pipeline_parallel.size', 'pipeline_model_parallel_size'),
+        ('megatron.num_layers', 'num_layers'),
+        ('megatron.hidden_size', 'hidden_size'),
+        ('megatron.num_attention_heads', 'num_attention_heads'),
+    ):
+        val = getattr(model_config, name, None)
+        if val is not None:
+            resource_attrs[attr] = val
+
     # Derive precision from flags
-    if getattr(args, 'fp16', False):
+    if getattr(model_config, 'fp16', False):
         resource_attrs['megatron.precision'] = 'fp16'
-    elif getattr(args, 'bf16', False):
+    elif getattr(model_config, 'bf16', False):
         resource_attrs['megatron.precision'] = 'bf16'
     else:
         resource_attrs['megatron.precision'] = 'fp32'
@@ -720,7 +738,7 @@ def _set_telemetry(args, *, include_training: bool = True):
     )
 
     _GLOBAL_TELEMETRY_HANDLE = setup_telemetry(
-        config, rank=args.rank, world_size=args.world_size, resource_attributes=resource_attrs
+        config, rank=args.rank, world_size=safe_get_world_size(), resource_attributes=resource_attrs
     )
 
     # Bridge Python logging to OTel so logs get exported with trace correlation.

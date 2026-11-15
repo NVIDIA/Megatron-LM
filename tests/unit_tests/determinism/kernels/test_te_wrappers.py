@@ -15,6 +15,7 @@ replays live in ``context_parallel/runtime/test_te_replay.py`` and
 
 import inspect
 import os
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -36,7 +37,9 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     _compute_index_scores,
+    _dsa_index_share_carrier_scope,
     _dsa_weights_proj_forward_gemm,
+    _DSAIndexShareCarrier,
     _DSAWeightsProjection,
 )
 from megatron.core.transformer.mlp import MLPSubmodules
@@ -70,6 +73,50 @@ if HAVE_TE:
 
 HIDDEN, FFN, TOKENS = 2048, 8192, 8192
 _IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+
+
+@pytest.fixture
+def aux_loss_capability_cache():
+    """Keep mocked TE APIs from changing subsequent integration-test dispatch."""
+    helper = te_ext.te_supports_deterministic_moe_aux_loss
+    helper.cache_clear()
+    yield helper
+    helper.cache_clear()
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    "api,expected",
+    [
+        pytest.param(None, False, id="missing"),
+        pytest.param(lambda probs: None, False, id="legacy"),
+        pytest.param(lambda **kwargs: None, False, id="kwargs_only"),
+        pytest.param(lambda deterministic=False: None, True, id="explicit"),
+        pytest.param(lambda *, deterministic=False: None, True, id="keyword_only"),
+        pytest.param(lambda deterministic=False, /: None, False, id="positional_only"),
+    ],
+)
+def test_moe_aux_loss_deterministic_capability(
+    monkeypatch, aux_loss_capability_cache, api, expected
+):
+    monkeypatch.setattr(te_ext, "fused_moe_aux_loss", api)
+    assert aux_loss_capability_cache() is expected
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("error", [TypeError, ValueError])
+def test_moe_aux_loss_uninspectable_api(monkeypatch, aux_loss_capability_cache, error):
+    def unavailable_signature():
+        raise error("signature unavailable")
+
+    class Uninspectable:
+        __signature__ = property(lambda self: unavailable_signature())
+
+        def __call__(self, **kwargs):
+            pass
+
+    monkeypatch.setattr(te_ext, "fused_moe_aux_loss", Uninspectable())
+    assert not aux_loss_capability_cache()
 
 
 def _config(**overrides):
@@ -314,7 +361,7 @@ class TestTEWrappers:
         "backend", ["te", "torch"], ids=["te-general-gemm", "torch-mm-fallback"]
     )
     def test_dsa_indexer_fp32_weights_projection_replays_fwd_bwd(self, backend):
-        """Replay the DSA BF16-operand/FP32-output projection and its custom backward."""
+        """Projection outputs and gradients must be independent of the forward's carrier."""
         seeded()
         x = torch.randn(4096, 2, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         weight = torch.randn(64, 512, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -334,18 +381,29 @@ class TestTEWrappers:
         def project(actual_x, actual_weight):
             return _DSAWeightsProjection.apply(actual_x, actual_weight, linear, indexer)
 
-        outputs, gradients = assert_replays_bit_exact(
-            project,
-            (x, weight),
-            replays=3,
-            backward=True,
-            grad_outputs={"out": grad_output},
-            contention=True,
-            what=f"DSA weights projection[{backend}]",
-        )
-        assert outputs["out"].dtype is torch.float32
-        assert gradients["in[0]"].dtype is torch.bfloat16
-        assert gradients["in[1]"].dtype is torch.bfloat16
+        reference = None
+        # Scope creation and teardown must not change the GEMM dispatch or its numerics.
+        for carrier in (None, _DSAIndexShareCarrier(), _DSAIndexShareCarrier(), None):
+            scope = nullcontext() if carrier is None else _dsa_index_share_carrier_scope(carrier)
+            with scope:
+                outputs, gradients = assert_replays_bit_exact(
+                    project,
+                    (x, weight),
+                    replays=3,
+                    backward=True,
+                    grad_outputs={"out": grad_output},
+                    contention=True,
+                    what=f"DSA weights projection[{backend}, scoped={carrier is not None}]",
+                )
+            assert outputs["out"].dtype is torch.float32
+            assert gradients["in[0]"].dtype is torch.bfloat16
+            assert gradients["in[1]"].dtype is torch.bfloat16
+            if reference is None:
+                reference = outputs, gradients
+            for expected, actual in zip(reference, (outputs, gradients)):
+                assert actual.keys() == expected.keys()
+                for name in expected:
+                    assert bytes_equal(expected[name], actual[name]), name
         assert indexer._weights_proj_te_gemm_supported is te_gemm_supported
 
     @pytest.mark.parametrize("use_relu", [False, True], ids=["no-relu", "relu"])
@@ -613,6 +671,51 @@ class TestTEWrappers:
         assert_module_replays_bit_exact(
             module, (x, m_splits), replays=3, contention=True, what="TEGroupedLinear"
         )
+
+    @pytest.mark.launch_on_gb200
+    def test_te_grouped_linear_bf16_override_replays_under_mxfp8(self):
+        """The per-module autocast override also preserves deterministic gradients."""
+        from transformer_engine.pytorch.fp8 import FP8GlobalStateManager
+
+        from megatron.core.extensions.transformer_engine import (
+            TEQuantizationParams,
+            TEQuantizationRecipe,
+        )
+
+        available, reason = FP8GlobalStateManager.is_mxfp8_available()
+        if not available:
+            pytest.skip(reason)
+        seeded()
+        config = _config(fp8="e4m3", fp8_recipe=Fp8Recipe.mxfp8)
+        module = TEGroupedLinear(
+            4,
+            256,
+            512,
+            parallel_mode=None,
+            config=config,
+            init_method=init_method_normal(0.02),
+            bias=False,
+            skip_bias_add=False,
+            is_expert=True,
+        ).cuda()
+        module.te_quant_params = TEQuantizationParams(
+            training_recipe=TEQuantizationRecipe(), evaluation_recipe=None
+        )
+        splits = [256, 768, 0, 3072]
+        hidden = torch.randn(
+            sum(splits), 256, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        with get_fp8_context(config):
+            assert FP8GlobalStateManager.is_fp8_enabled()
+            assert_module_replays_bit_exact(
+                module,
+                (hidden, splits),
+                replays=3,
+                contention=True,
+                what="TEGroupedLinear[BF16 override under MXFP8]",
+            )
+            assert FP8GlobalStateManager.is_fp8_enabled()
+        assert not module.fp8
 
     @pytest.mark.internal
     @pytest.mark.launch_on_gb200
@@ -901,22 +1004,35 @@ class TestTEWrappers:
 # --- fused RoPE --------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("layout", ["sbhd", "thd"])
-def test_te_fused_rope_replays_fwd_bwd(layout):
+@pytest.mark.parametrize("layout", ["sbhd", "thd", "thd_per_token"])
+@pytest.mark.parametrize("rotary_interleaved", [False, True])
+def test_te_fused_rope_replays_fwd_bwd(layout, rotary_interleaved, monkeypatch):
     from megatron.core.models.common.embeddings import rope_utils
     from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
 
-    if (
-        rope_utils.fused_apply_rotary_pos_emb is None
-        and rope_utils.fused_apply_rotary_pos_emb_thd is None
-    ):
+    kernel_name = (
+        "fused_apply_rotary_pos_emb_thd" if layout == "thd" else "fused_apply_rotary_pos_emb"
+    )
+    kernel = getattr(rope_utils, kernel_name)
+    if kernel is None:
         pytest.skip("TE fused RoPE unavailable")
+    calls = []
+
+    def checked_kernel(t, *args, **kwargs):
+        calls.append(t.shape)
+        return kernel(t, *args, **kwargs)
+
+    monkeypatch.setattr(rope_utils, kernel_name, checked_kernel)
     Utils.initialize_model_parallel()
     try:
         seeded()
-        config = _config(apply_rope_fusion=True)
+        config = _config(apply_rope_fusion=True, rotary_interleaved=rotary_interleaved)
         s, b, h, d = 4096, 2, 32, 128
-        freqs = RotaryEmbedding(kv_channels=d, rotary_percent=1.0)(s)
+        max_seqlen = None if layout == "sbhd" else 2048
+        freq_rows = max_seqlen if layout == "thd" else s
+        freqs = RotaryEmbedding(
+            kv_channels=d, rotary_percent=1.0, rotary_interleaved=rotary_interleaved
+        )(freq_rows)
         if layout == "sbhd":
             t = torch.randn(s, b, h, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
             cu_seqlens = None
@@ -925,9 +1041,22 @@ def test_te_fused_rope_replays_fwd_bwd(layout):
             cu_seqlens = torch.tensor([0, 1000, 1500, 2048, 4096], dtype=torch.int32, device="cuda")
 
         def fn(t):
-            return rope_utils.apply_rotary_pos_emb(t, freqs, config, cu_seqlens=cu_seqlens)
+            return rope_utils.apply_rotary_pos_emb(
+                t, freqs, config, cu_seqlens=cu_seqlens, max_seqlen=max_seqlen
+            )
 
-        assert_replays_bit_exact(fn, (t,), replays=3, what=f"TE fused RoPE[{layout}]")
+        outputs, gradients = assert_replays_bit_exact(
+            fn,
+            (t,),
+            replays=3,
+            grad_outputs={"out": torch.randn_like(t)},
+            contention=True,
+            what=f"TE fused RoPE[{layout}, interleaved={rotary_interleaved}]",
+        )
+        expected_shape = (s, 1, h, d) if layout == "thd_per_token" else t.shape
+        assert calls == [expected_shape] * 3
+        assert outputs["out"].shape == t.shape
+        assert gradients["in[0]"].shape == t.shape
     finally:
         Utils.destroy_model_parallel()
 

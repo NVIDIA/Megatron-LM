@@ -24,6 +24,7 @@ from megatron.core.fusions.fused_mtp_prefix import mtp_e2e_prefix_objective
 from megatron.core.fusions.fused_mtp_tv import vocab_parallel_tv_distance
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
+from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -42,7 +43,6 @@ from megatron.core.transformer.enums import AttnMaskType, LayerType
 from megatron.core.transformer.hyper_connection import learned_output_contract
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import precision_aware_checkpoint
@@ -2558,7 +2558,14 @@ def process_mtp_loss(
                 calculate_per_token_loss=config.calculate_per_token_loss,
             )
         mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
-        if config.calculate_per_token_loss:
+        if config.calculate_per_token_loss and getattr(
+            config, "mtp_normalize_loss_by_main_tokens", False
+        ):
+            # Preserve the loss as a sum. Gradient finalization divides the accumulated main
+            # and MTP gradients once by the global main-loss token count, making the result
+            # invariant to rank and microbatch partitioning.
+            mtp_loss_normalized = mtp_loss_scale * mtp_loss
+        elif config.calculate_per_token_loss:
             # finalize_model_grads divides by the global main-loss token count.
             # Use one main/MTP token ratio for this logical microbatch, independent
             # of its CP partition. Rolling and masking can leave different ratios

@@ -460,6 +460,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         batch_indices: torch.Tensor,
         intermediate_conv_state: torch.Tensor | None = None,
         intermediate_ssm_state: torch.Tensor | None = None,
+        replay_context: DynamicInferenceContext | None = None,
     ) -> torch.Tensor:
         """Run one CUDA-graph-compatible GDN decode token per request.
 
@@ -471,6 +472,7 @@ class GatedDeltaNet(SSMDynamicInferenceMixin, _GDNBase):
         assert (
             intermediate_conv_state is None and intermediate_ssm_state is None
         ), "GDN speculative decoding state capture is not supported."
+        assert replay_context is None, "ReplaySSM supports only Mamba-2 mixers."
 
         qkv, gate, beta, alpha = self._split_projection(projected, batch, seq_len, cp_size=1)
         qkv = causal_conv1d_update(

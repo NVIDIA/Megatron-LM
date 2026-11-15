@@ -785,7 +785,7 @@ def get_global_real_seqlen_stats(batch, dp_group, dev) -> Tuple[float, float]:
 # =============================================================================
 
 
-def next_hdp_group_packing_aware(
+def next_dynamic_cp_group_packing_aware(
     sample_seqlens: List[Tuple[int, int]],
     total_gpus: int,
     max_seq_len_per_rank: int,

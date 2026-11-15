@@ -12,7 +12,7 @@
 CUDA Graphs reduce kernel-launch overhead by recording GPU operations once and replaying the recording on subsequent iterations. Megatron-LM provides three CUDA graph implementations controlled by `--cuda-graph-impl`.
 
 For implementation background and design details, see NVIDIA's
-[Transformer Engine and Megatron-LM CUDA Graph Support](https://docs.nvidia.com/dl-cuda-graph/torch-cuda-graph/te-megatron-cuda-graphs.html).
+[Transformer Engine and Megatron-LM CUDA Graph Support](https://docs.nvidia.com/dl-cuda-graph/latest/torch-cuda-graph/te-megatron-cuda-graphs.html).
 That article is a useful conceptual reference, but some examples there still use older flags such as
 `--enable-cuda-graph` or `--cuda-graph-scope full_iteration`; in this repository, prefer
 `--cuda-graph-impl local|transformer_engine|full_iteration` as documented below.
@@ -256,7 +256,7 @@ models as well:
   `--cuda-graph-impl local`. Use `--inference-cuda-graph-scope layer|block` with
   `local`; all other implementations must set `--inference-cuda-graph-scope none`,
   meaning inference runs in eager mode.
-- Background reference: [Transformer Engine and Megatron-LM CUDA Graph Support](https://docs.nvidia.com/dl-cuda-graph/torch-cuda-graph/te-megatron-cuda-graphs.html),
+- Background reference: [Transformer Engine and Megatron-LM CUDA Graph Support](https://docs.nvidia.com/dl-cuda-graph/latest/torch-cuda-graph/te-megatron-cuda-graphs.html),
   which also covers PyTorch CUDA Graph best practices and lessons learned.
 
 ---

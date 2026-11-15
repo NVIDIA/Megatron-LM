@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from dataclasses import dataclass
+import os
+from dataclasses import asdict, dataclass, field
 from typing import Optional, Tuple
 
 import torch
@@ -17,7 +18,11 @@ class DistributedDataParallelConfig:
     """Configuration for DistributedDataParallel."""
 
     grad_reduce_in_fp32: bool = False
-    """If true, reduce grads in fp32."""
+    """If true, accumulate and reduce grads in fp32 with DDP. With Megatron-FSDP,
+    explicitly set megatron_fsdp_main_grads_dtype to torch.float32 and
+    megatron_fsdp_grad_comm_dtype to torch.float32 or None (inherit main grads).
+    This flag validates those MFSDP settings; it does not override them.
+    """
 
     overlap_grad_reduce: bool = False
     """If true, overlap grad all-reduce / reduce-scatter with backward compute."""
@@ -29,6 +34,12 @@ class DistributedDataParallelConfig:
     """If true, all PP stages will launch param all-gathers simultaneously. Otherwise, each
     PP stage will independently launch as needed.
     """
+
+    create_all_gather_group: bool = False
+    """Create separate data-parallel process groups for parameter all-gathers."""
+
+    gtp_remat_reduce_scatter_with_fp32_accumulation: bool = False
+    """Accumulate the GTP weight-rematerialization reduce-scatter in FP32."""
 
     use_distributed_optimizer: bool = False
     """If true, issue reduce-scatter collectives to aggregate gradients and clean up
@@ -70,6 +81,11 @@ class DistributedDataParallelConfig:
     """Number of buckets for data-parallel communication. Should only specify one of
        `bucket_size` and `num_buckets`. If `num_buckets` is specified, `bucket_size`
        will be determined at runtime."""
+
+    _bucket_size_resolved: bool = field(default=False, repr=False)
+    """Whether bucket_size has been resolved from the model and process-group size.
+    Saved with the config so a resolved num_buckets/bucket_size pair can be restored.
+    """
 
     pad_buckets_for_high_nccl_busbw: bool = False
     """If true, make sure the bucket size is divisible by a large power of 2 (2^16) to
@@ -132,7 +148,7 @@ class DistributedDataParallelConfig:
       (e.g. 'optim' on non-experts and 'optim_grads_params' on experts). Expert parameters are
       already sharded over a narrower DP group than non-expert parameters when expert
       parallelism is enabled, so the two classes have very different traffic-per-byte.
-      None is replaced with `data_parallel_sharding_strategy` during initialization."""
+      None is replaced with `data_parallel_sharding_strategy` during finalization."""
 
     gradient_reduce_div_fusion: bool = True
     """If true, perform gradient reduce and division fusion."""
@@ -218,7 +234,7 @@ class DistributedDataParallelConfig:
     """Sharding strategy for the outer expert data-parallel group in MFSDP v2.
     Valid values are ``'no_shard'``, ``'optim'``, ``'optim_grads'``, and
     ``'optim_grads_params'``. None is replaced with
-    ``outer_dp_sharding_strategy`` during initialization.
+    ``outer_dp_sharding_strategy`` during finalization.
     """
 
     disable_symmetric_registration: bool = False
@@ -355,15 +371,32 @@ class DistributedDataParallelConfig:
         # bucket-group path: forward-scheduled overlap or synchronous grad-buffer reuse.
         return self.overlap_param_gather or self.reuse_grad_buf_for_mxfp8_param_ag
 
-    def __post_init__(self):
-        import os
+    def finalize(self) -> None:
+        """Resolve local defaults after recipe edits and before wrapper construction.
 
-        """Check the validity of the config."""
+        Training containers first derive optimizer-owned fields. Standalone MCore
+        wrappers also call this method; repeated calls preserve resolved settings.
+        """
+        self._canonicalize()
+        self.validate()
+
+    def _canonicalize(self) -> None:
+        """Resolve local defaults and aliases after recipe edits."""
         if self.expert_data_parallel_sharding_strategy is None:
             self.expert_data_parallel_sharding_strategy = self.data_parallel_sharding_strategy
         if self.expert_outer_dp_sharding_strategy is None:
             self.expert_outer_dp_sharding_strategy = self.outer_dp_sharding_strategy
+        if self.nccl_ub or self.megatron_fsdp_max_pool_double_buffer:
+            # NCCL user buffers and MaxPoolAllocator require persistent buffer pools.
+            self.fsdp_double_buffer = True
 
+    def validate(self) -> None:
+        """Check user settings without mutation, including edits after construction.
+
+        Optimizer-owned buffer policy may still be stale here. Its resolved layout
+        is checked by the training container and at DDP wrapper construction.
+        Unresolved defaults are checked without requiring canonicalization first.
+        """
         for name in (
             "data_parallel_sharding_strategy",
             "expert_data_parallel_sharding_strategy",
@@ -371,9 +404,29 @@ class DistributedDataParallelConfig:
             "expert_outer_dp_sharding_strategy",
         ):
             value = getattr(self, name)
+            if value is None and name == "expert_data_parallel_sharding_strategy":
+                value = self.data_parallel_sharding_strategy
+            if value is None and name == "expert_outer_dp_sharding_strategy":
+                value = self.outer_dp_sharding_strategy
             if value not in _SHARDING_STRATEGIES:
                 raise ValueError(
                     f"{name} must be one of {list(_SHARDING_STRATEGIES)}, got {value!r}."
+                )
+        if self.use_megatron_fsdp and self.grad_reduce_in_fp32:
+            if self.megatron_fsdp_main_grads_dtype != torch.float32:
+                raise ValueError(
+                    "grad_reduce_in_fp32=True with Megatron-FSDP requires "
+                    "megatron_fsdp_main_grads_dtype=torch.float32 for FP32 accumulation. "
+                    "The legacy flag does not override MFSDP dtypes. Set this explicitly "
+                    "or set grad_reduce_in_fp32=False to use the configured precision policy."
+                )
+            if self.megatron_fsdp_grad_comm_dtype not in (None, torch.float32):
+                raise ValueError(
+                    "grad_reduce_in_fp32=True with Megatron-FSDP requires "
+                    "megatron_fsdp_grad_comm_dtype=torch.float32 or None "
+                    "(inherit the FP32 main-gradient dtype) for FP32 communication. "
+                    "The legacy flag does not override MFSDP dtypes. Set this explicitly "
+                    "or set grad_reduce_in_fp32=False to use the configured precision policy."
                 )
         if self.megatron_fsdp_version not in (1, 2):
             raise ValueError("megatron_fsdp_version must be either 1 or 2")
@@ -382,9 +435,6 @@ class DistributedDataParallelConfig:
                 raise ValueError("overlap_outer_communication requires Megatron-FSDP.")
             if self.megatron_fsdp_version != 2:
                 raise ValueError("overlap_outer_communication requires Megatron-FSDP v2.")
-
-        if self.reuse_grad_buf_for_mxfp8_param_ag:
-            assert self.fp8_param_gather, "Reuse grad buffer only when keeping params in MXFP8."
 
         if self.megatron_fsdp_prefetch_recompute_forward_weights:
             assert (
@@ -400,10 +450,20 @@ class DistributedDataParallelConfig:
                 self.use_megatron_fsdp
             ), "megatron_fsdp_cache_param_bucket_views requires use_megatron_fsdp."
 
-        if self.grad_buffer_offload and self.reuse_grad_buf_for_mxfp8_param_ag:
+        # NCCL user buffers and MaxPoolAllocator force persistent buffer pools in
+        # _canonicalize(); evaluate that here without requiring canonicalization first.
+        fsdp_double_buffer = (
+            self.fsdp_double_buffer or self.nccl_ub or self.megatron_fsdp_max_pool_double_buffer
+        )
+        if fsdp_double_buffer:
+            if self.fsdp_buffer_count < 2:
+                raise ValueError(
+                    "fsdp_buffer_count must be at least 2 when fsdp_double_buffer is enabled."
+                )
+        elif self.fsdp_buffer_count != 2:
             raise ValueError(
-                "Gradient-buffer offload is incompatible with "
-                "reuse_grad_buf_for_mxfp8_param_ag because parameters share gradient storage."
+                "fsdp_buffer_count may only be changed from its default of 2 when "
+                "fsdp_double_buffer is enabled."
             )
 
         if self.nccl_ub and not is_torch_min_version("2.11.0a0"):
@@ -420,20 +480,37 @@ class DistributedDataParallelConfig:
             )
 
         if self.num_buckets is not None:
-            assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
+            if not self._bucket_size_resolved:
+                assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
             assert self.num_buckets > 0, "num_buckets must be greater than 0"
 
-        if self.nccl_ub or self.megatron_fsdp_max_pool_double_buffer:
-            # NCCL user buffers and MaxPoolAllocator require persistent buffer pools.
-            self.fsdp_double_buffer = True
+    def resolve_bucket_size(self, *, num_parameters: int, data_parallel_size: int) -> None:
+        """Resolve buckets in place after model construction and process-group setup.
 
-        if self.fsdp_double_buffer:
-            if self.fsdp_buffer_count < 2:
-                raise ValueError(
-                    "fsdp_buffer_count must be at least 2 when fsdp_double_buffer is enabled."
-                )
-        elif self.fsdp_buffer_count != 2:
-            raise ValueError(
-                "fsdp_buffer_count may only be changed from its default of 2 when "
-                "fsdp_double_buffer is enabled."
-            )
+        Repeated calls with the same inputs preserve the resolved value. num_buckets,
+        when provided, remains authoritative. An explicit or previously resolved
+        bucket_size is otherwise retained. Per-chunk bucketing overrides stay local
+        to the wrappers and must not overwrite this run-wide setting.
+        Re-resolution is supported before wrapper construction, not after buffers exist.
+        """
+        if self.num_buckets is not None:
+            assert self.num_buckets > 0, "num_buckets must be greater than 0"
+            if not self._bucket_size_resolved:
+                assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
+            bucket_size = num_parameters // self.num_buckets
+        elif self.bucket_size is None:
+            bucket_size = max(40000000, 1000000 * data_parallel_size)
+        else:
+            bucket_size = self.bucket_size
+        self.bucket_size = bucket_size if self.overlap_grad_reduce else None
+        self._bucket_size_resolved = True
+
+    def to_cfg_dict(self) -> dict:
+        """Include the resolution marker when saving the otherwise public config."""
+        return {
+            "_target_": f"{type(self).__module__}.{type(self).__qualname__}",
+            **{
+                key: list(value) if isinstance(value, tuple) else value
+                for key, value in asdict(self).items()
+            },
+        }

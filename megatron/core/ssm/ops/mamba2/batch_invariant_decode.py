@@ -30,8 +30,9 @@ def _masked_update_rows_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     """Copy contiguous rows, skipping entries whose destination index is -1."""
-    src_row = tl.program_id(0)
-    dst_row = tl.load(indices_ptr + src_row)
+    # int64: row * row stride can exceed 2^31 elements on large state pools.
+    src_row = tl.program_id(0).to(tl.int64)
+    dst_row = tl.load(indices_ptr + src_row).to(tl.int64)
     if dst_row < 0:
         return
 

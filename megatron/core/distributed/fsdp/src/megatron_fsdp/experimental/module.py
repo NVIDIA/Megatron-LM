@@ -466,7 +466,7 @@ class FsdpModule:
                 else:
                     self._accumulate_local_gradients(group)
 
-                if not context.is_last_microbatch:
+                if not context.finalize_gradients:
                     continue
                 # Finalize the DP-outer reduction. When overlap is enabled its stream is
                 # distinct, so it overlaps the following group's DP-inner reduce; the

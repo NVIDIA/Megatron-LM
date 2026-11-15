@@ -431,6 +431,7 @@ def test_setup_applies_role_specific_pinning_and_graph_gating(engine_cls, role):
         cuda_graph_batch_dimensions_list=[object()],
         kv_cache_management_mode=KVCacheManagementMode.PERSIST,
         moe_enable_routing_replay=False,
+        cache_dsa_indexer_keys=False,
         kv_block_allocator=allocator,
         memory_buffer=torch.empty(2, 1, 8, 4, 1, 1),
         is_hybrid_model=False,
@@ -490,6 +491,7 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
         config=SimpleNamespace(kv_transport_backend="nixl", cuda_graph_all_prefills=False),
         kv_cache_management_mode=KVCacheManagementMode.PERSIST,
         moe_enable_routing_replay=False,
+        cache_dsa_indexer_keys=False,
         kv_block_allocator=SimpleNamespace(
             enable_prefix_caching=True, enable_handoff_pinning=False, pool_size=8
         ),
@@ -1875,15 +1877,26 @@ def test_decode_role_rejects_prompt_scheduling(handoff_loop):
 
 
 @pytest.mark.parametrize(
-    "mode, routing_replay, error",
+    "mode, routing_replay, dsa, error",
     [
-        (KVCacheManagementMode.OFFLOAD, False, "requires kv_cache_management_mode='persist'"),
-        (KVCacheManagementMode.RECOMPUTE, False, "requires kv_cache_management_mode='persist'"),
-        (KVCacheManagementMode.PERSIST, True, "does not support MoE routing replay"),
+        (
+            KVCacheManagementMode.OFFLOAD,
+            False,
+            False,
+            "requires kv_cache_management_mode='persist'",
+        ),
+        (
+            KVCacheManagementMode.RECOMPUTE,
+            False,
+            False,
+            "requires kv_cache_management_mode='persist'",
+        ),
+        (KVCacheManagementMode.PERSIST, True, False, "does not support MoE routing replay"),
+        (KVCacheManagementMode.PERSIST, False, True, "does not support DSA models"),
     ],
 )
 @pytest.mark.parametrize("role", ["prefill", "decode"])
-def test_transfer_rejects_unsupported_cache_state(mode, routing_replay, error, role):
+def test_transfer_rejects_unsupported_cache_state(mode, routing_replay, dsa, error, role):
     engine = object.__new__(InferenceStateHandoffMixin)
     engine._initialize_disaggregation_state()
     engine.context = SimpleNamespace(
@@ -1891,6 +1904,7 @@ def test_transfer_rejects_unsupported_cache_state(mode, routing_replay, error, r
         is_hybrid_model=False,
         kv_cache_management_mode=mode,
         moe_enable_routing_replay=routing_replay,
+        cache_dsa_indexer_keys=dsa,
     )
     with pytest.raises(ValueError, match=error):
         engine.setup_kv_transfer(role)

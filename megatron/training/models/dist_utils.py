@@ -373,22 +373,10 @@ def _ddp_wrap(
             compute_layout = DistributedOptimizer.compute_full_param_layout
 
     if not use_torch_fsdp2:
-        if ddp_config.num_buckets is not None:
-            num_parameters = sum(
-                [sum([p.nelement() for p in model_module.parameters()]) for model_module in model]
-            )
-            ddp_config.bucket_size = num_parameters // ddp_config.num_buckets
-
-        # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
-        # If bucket_size is not provided as an input, use sane default.
-        # If using very large dp_sizes, make buckets larger to ensure that chunks used in NCCL
-        # ring-reduce implementations are large enough to remain bandwidth-bound rather than
-        # latency-bound.
-        if ddp_config.bucket_size is None:
-            ddp_config.bucket_size = max(40000000, 1000000 * pg_collection.dp_cp.size())
-        # Set bucket_size to infinity if overlap_grad_reduce is False.
-        if not ddp_config.overlap_grad_reduce:
-            ddp_config.bucket_size = None
+        num_parameters = sum(p.nelement() for chunk in model for p in chunk.parameters())
+        ddp_config.resolve_bucket_size(
+            num_parameters=num_parameters, data_parallel_size=pg_collection.dp_cp.size()
+        )
 
     cuda_graph_impl = get_model_config(model[0]).cuda_graph_impl
     current_stream = torch.cuda.current_stream()

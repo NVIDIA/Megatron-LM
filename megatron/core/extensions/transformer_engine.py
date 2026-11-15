@@ -12,6 +12,7 @@ import pickle
 import re
 import warnings
 from contextlib import contextmanager, nullcontext
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Set, Tuple, cast
 
 import torch
@@ -29,6 +30,7 @@ from megatron.core.extensions.transformer_engine_int4_fake_qat import (
     maybe_fake_quantize_int4_weight_tensors,
 )
 from megatron.core.model_parallel_config import ModelParallelConfig
+from megatron.core.ops.norm.torch_norm import LayerNormInterface
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_amax_reduction_group,
@@ -56,7 +58,6 @@ from megatron.core.tensor_parallel.utils import divide
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import is_first_microbatch_tracked
-from megatron.core.transformer.torch_norm import LayerNormInterface
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import (
     ensure_metadata_has_dp_cp_group,
@@ -479,13 +480,28 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         return fp8_autocast(enabled=True, fp8_recipe=quant_recipe, fp8_group=amax_group)
 
 
-def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+def _get_fp8_autocast_recipe_for_quant_params(
+    qparams: TEQuantizationParams | None, training: bool
+) -> TEQuantizationRecipe | None:
+    """Return the active module override, or None when it inherits the surrounding context.
+
+    Resolve this before entering any module-specific context. In particular, op-fuser callers
+    need to compare both linears' overrides against the same surrounding autocast state.
+    """
     if qparams is None:
-        return nullcontext()
+        return None
     elif not training and qparams.evaluation_recipe is not None:
-        return _get_fp8_autocast_for_quant_recipe(qparams.evaluation_recipe)
+        recipe = qparams.evaluation_recipe
     else:
-        return _get_fp8_autocast_for_quant_recipe(qparams.training_recipe)
+        recipe = qparams.training_recipe
+    if FP8GlobalStateManager.is_fp8_enabled():
+        return recipe if recipe.override_quantized_autocast else None
+    return recipe if recipe.override_nonquantized_autocast else None
+
+
+def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+    recipe = _get_fp8_autocast_recipe_for_quant_params(qparams, training)
+    return nullcontext() if recipe is None else _get_fp8_autocast_for_quant_recipe(recipe)
 
 
 def _get_should_context_be_quantized_recipe(
@@ -2243,12 +2259,15 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         input_: torch.Tensor,
         weight: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
+        output_dtype: Optional[torch.dtype] = None,
     ):
         """Run TE MXFP8 output projection. Returns ``(output, bias)``."""
         from megatron.core.fp8_utils import get_fp8_context
 
         if weight is not None and weight is not self.weight:
             raise RuntimeError("TE MXFP8 output projection does not support runtime weight.")
+        if output_dtype is not None and output_dtype != input_.dtype:
+            raise ValueError("TE MXFP8 output projection does not support output_dtype.")
 
         with get_fp8_context(self.config):
             torch.cuda.nvtx.range_push("mxfp8_output_proj_telinear")
@@ -4453,6 +4472,21 @@ else:
     fused_topk_with_score_function_supports_qb = False
     mark_qb_bin_bounds_validated = None
     fused_topk_with_score_function_supports_topk_indices = False
+
+
+@lru_cache(maxsize=1)
+def te_supports_deterministic_moe_aux_loss() -> bool:
+    """Whether the installed TE aux-loss API accepts a deterministic execution request."""
+    if fused_moe_aux_loss is None:
+        return False
+    try:
+        parameter = inspect.signature(fused_moe_aux_loss).parameters.get("deterministic")
+    except (TypeError, ValueError):
+        return False
+    return parameter is not None and parameter.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    )
 
 
 def set_save_original_input(module):
