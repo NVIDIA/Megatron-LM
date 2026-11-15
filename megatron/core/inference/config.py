@@ -827,6 +827,15 @@ class InferenceConfig:
     trtllm-gen token-sparse decode) and FA4 (KV blocks a multiple of 64 tokens), and raises if
     they are missing."""
 
+    dsa_indexer_key_dtype: Literal['bf16', 'nvfp4'] = 'bf16'
+    """Format of the DSA-over-GQA (simplified indexer) index-key cache in dynamic batching. "bf16"
+    caches and scores the indexer's keys and queries in BF16. "nvfp4" quantizes them at cache-write
+    time to NVFP4 (E2M1 values with an E4M3 scale per 16 values, no global scale) and scores NVFP4
+    queries against NVFP4 keys for decode and prefill selection, shrinking the index-key cache from
+    256 to 72 bytes per key. "nvfp4" needs dsa_backend="flashinfer", an indexer head dim of 128, and
+    a FlashInfer build with NVFP4 indexer kernels, and is rejected in batch-invariant mode (tied
+    NVFP4 scores make the top-k selection run-dependent)."""
+
     sampling_backend: Literal['torch', 'flashinfer'] = 'torch'
     """Which sampling kernels to use during inference. Falls back to "torch" with a warning if
     "flashinfer" is requested but the package is not installed."""
@@ -971,6 +980,17 @@ class InferenceConfig:
             raise ValueError(
                 "logprobs_mode='processed_logprobs' is not yet supported with speculative decoding "
                 "(num_speculative_tokens > 0)."
+            )
+
+        if self.dsa_indexer_key_dtype not in ('bf16', 'nvfp4'):
+            raise ValueError(
+                f"Unsupported dsa_indexer_key_dtype {self.dsa_indexer_key_dtype!r}. "
+                "Supported: bf16, nvfp4."
+            )
+        if self.dsa_indexer_key_dtype == 'nvfp4' and self.dsa_backend != 'flashinfer':
+            raise ValueError(
+                "dsa_indexer_key_dtype='nvfp4' needs dsa_backend='flashinfer'; the "
+                f"{self.dsa_backend!r} DSA backend scores BF16 index keys only."
             )
 
         if self.sampling_backend == 'flashinfer':

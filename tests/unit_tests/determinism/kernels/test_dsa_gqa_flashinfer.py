@@ -2,9 +2,11 @@
 
 """Bit-exact replay of DSA-over-GQA inference through FlashInfer's DSA kernels.
 
-Covers the page-table fill and a full mixed decode + prefill step of
-``flashinfer_sparse_attention`` (indexer scoring, threshold selection, exact top-k, and sparse
-attention), with the plan built on the host. Decode replays
+Covers the page-table fill, the NVFP4 index-key and query quantize-and-write, and a full mixed
+decode + prefill step of ``flashinfer_sparse_attention`` (indexer scoring, threshold selection,
+exact top-k, and sparse attention), with the plan built on the host. NVFP4 index keys are
+rejected in batch-invariant mode: their scores often tie at the top-k boundary, and which tied
+key the selection keeps can vary between runs. Decode replays
 bit-exactly only with ``deterministic=True`` (batch-invariant mode), which fixes the order of each
 row's selected keys.
 """
@@ -34,13 +36,52 @@ def test_fill_page_table_replay():
     )
 
 
-def test_flashinfer_sparse_attention_replays():
+def _require_flashinfer_dsa(index_key_dtype="bf16"):
     device = torch.device("cuda", torch.cuda.current_device())
     if not (
         dsa_gqa_flashinfer.HAVE_FLASHINFER_DSA
         and dsa_gqa_flashinfer.flashinfer_dsa_supported(device, TOPK, INDEX_DIM, PAGE, HEADS)
     ):
         pytest.skip("FlashInfer's DSA kernels are not installed or not supported here")
+    if index_key_dtype == "nvfp4" and not dsa_gqa_flashinfer.HAVE_FLASHINFER_DSA_NVFP4:
+        pytest.skip("FlashInfer's NVFP4 indexer kernels are not installed")
+    return device
+
+
+def test_nvfp4_index_key_write_replays():
+    """Quantizing a large step of keys (padding tokens included) into the NVFP4 cache, and its
+    queries into NVFP4 rows, is bit-exact under contention."""
+    device = _require_flashinfer_dsa("nvfp4")
+    seeded()
+    blocks, tokens = 512, 65536
+    keys = torch.randn(tokens, INDEX_DIM, device=device, dtype=torch.bfloat16) * 4
+    query = torch.randn(tokens, INDEX_DIM, device=device, dtype=torch.bfloat16)
+    slot = torch.randperm(blocks * PAGE, device=device)[:tokens]
+    block_idx, positions = slot // PAGE, slot % PAGE
+    block_idx[::5] = -1
+
+    def write(keys, query):
+        cache = torch.zeros(
+            dsa_gqa_flashinfer.nvfp4_index_cache_shape(blocks, PAGE),
+            device=device,
+            dtype=torch.uint8,
+        )
+        packed, scales = dsa_gqa_flashinfer.write_nvfp4_index_keys(
+            keys, query, cache, block_idx, positions
+        )
+        return cache, packed, scales
+
+    assert_replays_bit_exact(
+        write,
+        dict(keys=keys, query=query),
+        backward=False,
+        contention=True,
+        what="FlashInfer NVFP4 index-key write",
+    )
+
+
+def test_flashinfer_sparse_attention_replays():
+    device = _require_flashinfer_dsa()
     seeded()
     query_lengths, kv_lengths = [1, 1, 300, 37], [700, 6000, 3000, 37]
     padded_rows, padded_requests, bound = 384, 4, 6144

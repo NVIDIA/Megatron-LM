@@ -5,8 +5,8 @@
 Without FlashInfer's DSA kernels (``flashinfer.sdsa`` and ``flashinfer.token_sparse``) or FA4
 this module still imports, and ``require_flashinfer_dsa`` raises when the path is requested.
 
-- **Decode rows** (single-token requests): dense BF16 indexer scores (``indexer_scores``), exact
-  top-k (gvr_2), then trtllm-gen token-sparse attention.
+- **Decode rows** (single-token requests): dense indexer scores (``indexer_scores``), exact top-k
+  (gvr_2), then trtllm-gen token-sparse attention.
 - **Prefill rows**, in 128-row tiles of one request each: a threshold from sampled scores, one
   fused sweep that keeps the keys above it (``indexer_threshold_select``, with an exact in-launch
   repair), the exact top-k among them (``top_k_from_candidates``), then FA4 attention over each
@@ -19,6 +19,12 @@ as FlashInfer's 64-key pages (a derived block table), and the ``[blocks, block_s
 caches as page-size-1 slots. The per-step plan (``build_step_plan``) is built on the CPU from
 the step's request lengths with sizes fixed by the padded batch, so every launch has a static
 shape and the whole path can run inside a CUDA graph.
+
+Indexer keys are BF16 by default. With NVFP4 index keys (``dsa_indexer_key_dtype="nvfp4"``) the
+cache holds, for every 64-key page, the keys' packed E2M1 values (64 bytes a key) followed by
+their E4M3 scales (one per 16 values, 8 bytes a key), and ``quantize_write_index_qk_nvfp4``
+quantizes a step's keys into it and its indexer queries into rows of the same format, so decode
+and prefill selection both score NVFP4 queries against NVFP4 keys.
 """
 
 from __future__ import annotations
@@ -51,6 +57,13 @@ try:
 except ImportError:
     HAVE_FLASHINFER_DSA = False
 
+try:
+    from flashinfer.sdsa import quantize_write_index_qk_nvfp4
+
+    HAVE_FLASHINFER_DSA_NVFP4 = HAVE_FLASHINFER_DSA
+except ImportError:
+    HAVE_FLASHINFER_DSA_NVFP4 = False
+
 # FlashInfer's indexer page, and prefill query tiles.
 FI_PAGE = 64
 TILE_ROWS = 128
@@ -59,6 +72,18 @@ TILE_ROWS = 128
 # top-k tie slots. A row the threshold misses is repaired exactly inside the select launch.
 SAMPLES, PAGES = 3, 2
 SELECTOR = {512: (39, 4608), 1024: (60, 6144), 2048: (96, 9216)}
+# NVFP4 index keys of the 128-dim indexer: packed E2M1 bytes and E4M3 scales (one per 16 values)
+# per key; a 64-key cache page holds its keys' bytes, then their scales.
+INDEX_KEY_DTYPES = ("bf16", "nvfp4")
+NVFP4_KEY_BYTES, NVFP4_SCALES = 64, 8
+NVFP4_PAGE_BYTES = FI_PAGE * (NVFP4_KEY_BYTES + NVFP4_SCALES)
+# NVFP4 scores take few distinct values, so keys often tie at a row's top-k boundary, and the
+# selection kernels keep any of the tied keys, in an order that can vary between runs.
+NVFP4_BATCH_INVARIANT_ERROR = (
+    "NVFP4 DSA index keys do not support batch-invariant (deterministic) inference: NVFP4 "
+    "scores often tie at the top-k boundary, and which tied key is selected can vary between "
+    "runs. Use dsa_indexer_key_dtype='bf16'."
+)
 # trtllm-gen token-sparse attention workspace, and the most attention rows it is sized for.
 CORE_WORKSPACE_BYTES = 128 << 20
 MAX_CORE_ROWS = 65535
@@ -69,12 +94,22 @@ def union_group(heads: int) -> int:
     return 1 << ((TILE_ROWS // heads).bit_length() - 1)
 
 
-def require_flashinfer_dsa() -> None:
-    """Raise unless the packages this path needs are installed."""
+def require_flashinfer_dsa(index_key_dtype: str = "bf16") -> None:
+    """Raise unless the packages this path needs, with ``index_key_dtype`` index keys, are
+    installed."""
+    if index_key_dtype not in INDEX_KEY_DTYPES:
+        raise ValueError(
+            f"Unknown DSA indexer key dtype {index_key_dtype!r}; expected one of "
+            f"{INDEX_KEY_DTYPES}."
+        )
     missing = [
         name
         for name, present in (
             ("FlashInfer with DSA kernels (flashinfer.sdsa) and FA4", HAVE_FLASHINFER_DSA),
+            (
+                "FlashInfer's NVFP4 indexer kernels (quantize_write_index_qk_nvfp4)",
+                HAVE_FLASHINFER_DSA_NVFP4 or index_key_dtype != "nvfp4",
+            ),
         )
         if not present
     ]
@@ -272,6 +307,63 @@ def fill_page_table(block_table: torch.Tensor, page_size: int, out: torch.Tensor
     torch.add(offsets, block_table[:, :, None], alpha=per, out=pages)
 
 
+def nvfp4_index_cache_shape(num_blocks: int, block_size: int) -> tuple:
+    """Shape of one layer's NVFP4 index-key cache (uint8): each block's 64-key pages, every page
+    its keys' packed values, then their scales."""
+    if block_size % FI_PAGE:
+        raise ValueError(
+            f"NVFP4 DSA index keys need a KV block size that is a multiple of {FI_PAGE}, "
+            f"got {block_size}."
+        )
+    return (num_blocks, block_size // FI_PAGE, NVFP4_PAGE_BYTES)
+
+
+def nvfp4_index_pages(cache: torch.Tensor):
+    """FlashInfer's views of an NVFP4 index-key cache (``nvfp4_index_cache_shape``): packed keys
+    uint8 ``[pages, 64, 64]`` and their E4M3 scale bytes uint8 ``[pages, 64, 8]``."""
+    pages = cache.view(-1, NVFP4_PAGE_BYTES)
+    split = FI_PAGE * NVFP4_KEY_BYTES
+    keys = pages[:, :split].unflatten(1, (FI_PAGE, NVFP4_KEY_BYTES))
+    scales = pages[:, split:].unflatten(1, (FI_PAGE, NVFP4_SCALES))
+    return keys, scales
+
+
+def write_nvfp4_index_keys(
+    key: torch.Tensor,
+    query: torch.Tensor,
+    cache: torch.Tensor,
+    block_idx: torch.Tensor,
+    positions: torch.Tensor,
+):
+    """Quantize a step's indexer keys ``[tokens, 128]`` into an NVFP4 index-key cache at
+    (``block_idx[t]``, ``positions[t]``) (tokens with a negative block are skipped), and its
+    indexer queries ``[rows, 128]`` into NVFP4 rows, in one launch.
+
+    Returns:
+        The packed queries, uint8 ``[rows, 64]``, and their E4M3 scale bytes, uint8 ``[rows, 8]``.
+    """
+    block_size = cache.size(1) * FI_PAGE
+    keys, scales = nvfp4_index_pages(cache)
+    block_idx = block_idx[: key.size(0)].long()
+    slots = torch.where(
+        block_idx >= 0, block_idx * block_size + positions[: key.size(0)].long(), -1
+    )
+    rows = query.size(0)
+    packed_query = torch.empty(rows, NVFP4_KEY_BYTES, device=query.device, dtype=torch.uint8)
+    query_scales = torch.empty(rows, NVFP4_SCALES, device=query.device, dtype=torch.uint8)
+    quantize_write_index_qk_nvfp4(
+        key.contiguous(),
+        slots,
+        query.contiguous(),
+        torch.arange(rows, device=query.device, dtype=torch.int64),
+        key_cache=keys,
+        key_scales=scales,
+        packed_query=packed_query,
+        query_scales=query_scales,
+    )
+    return packed_query, query_scales
+
+
 def _token_core(query, keys, requests, table, key_rows, value_rows, out, index_topk, scale, heads):
     """Each row of `query` attends to its selected key positions `keys` (-1: none) of request
     `requests[row]` with trtllm-gen token-sparse attention (page size 1)."""
@@ -312,6 +404,7 @@ def flashinfer_sparse_attention(
     index_topk: int,
     softmax_scale: float,
     deterministic: bool = False,
+    index_query_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Attention output ``[rows,Hq,Dv]`` of every step row through FlashInfer's DSA kernels;
     rows with no keys (padding) are zero.
@@ -319,14 +412,20 @@ def flashinfer_sparse_attention(
     Args:
         query: BF16 ``[rows,Hq,D]``.
         key_cache, value_cache: Paged BF16 ``[blocks,block_size,1,D]``.
-        index_query: BF16 indexer queries ``[rows,Di]``.
-        index_key_cache: Paged BF16 indexer keys ``[blocks,block_size,Di]``.
+        index_query: Indexer queries: BF16 ``[rows,Di]``, or with ``index_query_scales`` NVFP4
+            packed uint8 ``[rows,Di/2]`` (``write_nvfp4_index_keys``).
+        index_key_cache: Paged indexer keys: BF16 ``[blocks,block_size,Di]``, or with NVFP4
+            queries the uint8 NVFP4 cache (``nvfp4_index_cache_shape``).
         plan: The step's plan (``StepPlan``), whose page table maps the requests' KV blocks.
         index_topk: Keys each row selects.
         softmax_scale: Attention softmax scale.
         deterministic: Sort each decode row's selected keys so that decode replays bit-exactly
             (the prefill path already does).
+        index_query_scales: E4M3 scale bytes ``[rows,Di/16]`` of NVFP4 indexer queries; None for
+            BF16 queries and keys.
     """
+    if deterministic and index_query_scales is not None:
+        raise ValueError(NVFP4_BATCH_INVARIANT_ERROR)
     device = query.device
     rows, heads, dim = query.shape
     value_dim = value_cache.size(-1)
@@ -335,7 +434,12 @@ def flashinfer_sparse_attention(
     width = -(-max(max_context, index_topk) // 4) * 4
     table = plan.page_table
     assert table.size(1) >= max(-(-width // FI_PAGE), 2 * key_tiles), "page table too narrow"
-    pages = index_key_cache.view(-1, FI_PAGE, index_key_cache.size(-1))
+    nvfp4 = index_query_scales is not None
+    if nvfp4:
+        pages, key_scales = nvfp4_index_pages(index_key_cache)
+        index_query_scales = index_query_scales.contiguous()
+    else:
+        pages, key_scales = index_key_cache.view(-1, FI_PAGE, index_key_cache.size(-1)), None
     key_rows = key_cache.view(-1, 1, 1, dim)
     value_rows = value_cache.view(-1, 1, 1, value_dim)
     index_query = index_query.contiguous()
@@ -353,16 +457,24 @@ def flashinfer_sparse_attention(
         tiled = tiles * TILE_ROWS
         assert tiles <= arrivals.numel()
         query_rows = plan.query_rows
-        packed = (
-            index_query[query_rows.clamp(min=0).long()]
-            * (query_rows >= 0).to(index_query.dtype)[:, None]
-        )
+        live_rows = query_rows.clamp(min=0).long()
+        packed = index_query[live_rows] * (query_rows >= 0).to(index_query.dtype)[:, None]
+        packed_scales = sample_scales = None
+        if nvfp4:
+            # Padding rows: zero values and zero scales, as BF16 padding rows are zero.
+            packed_scales = (
+                index_query_scales[live_rows] * (query_rows >= 0).to(torch.uint8)[:, None]
+            )
         # Threshold samples of each prefill request's keys.
         sample_cap = TILE_ROWS * -(-max_context * SAMPLES // (TILE_ROWS * FI_PAGE * PAGES))
         num_requests = plan.request_rows.numel()
         sample_keys = torch.empty(
             num_requests, sample_cap, pages.size(-1), dtype=pages.dtype, device=device
         )
+        if nvfp4:
+            sample_scales = torch.empty(
+                num_requests, sample_cap, NVFP4_SCALES, dtype=torch.uint8, device=device
+            )
         gather_key_sample(
             pages,
             table.index_select(0, plan.request_rows.long()),
@@ -371,6 +483,8 @@ def flashinfer_sparse_attention(
             sample_keys=sample_keys,
             samples_per_run=SAMPLES,
             pages_per_run=PAGES,
+            key_scales=key_scales,
+            sample_scales=sample_scales,
         )
         sample_table = torch.arange(
             num_requests * sample_cap // FI_PAGE, dtype=torch.int32, device=device
@@ -384,6 +498,10 @@ def flashinfer_sparse_attention(
             sample_row_ends.view(-1, 8).amax(1),
             requests=plan.tile_ordinals.repeat_interleave(TILE_ROWS // 8),
             scores=sample_scores,
+            query_scales=packed_scales,
+            key_scales=(
+                None if sample_scales is None else sample_scales.view(-1, FI_PAGE, NVFP4_SCALES)
+            ),
         )
         sample_top = torch.empty(tiled, rank, dtype=torch.int32, device=device)
         run_varlen(
@@ -416,6 +534,8 @@ def flashinfer_sparse_attention(
             top_k=index_topk,
             arrivals=arrivals[:tiles],
             ranges=ranges,
+            query_scales=packed_scales,
+            key_scales=key_scales,
         )
         # The keys of the exact top-k among each row's candidates and ties (-1 last).
         positions = torch.empty(tiled, index_topk, dtype=torch.int32, device=device)
@@ -461,6 +581,8 @@ def flashinfer_sparse_attention(
             plan.decode_lengths,
             requests=plan.decode_requests,
             scores=scores,
+            query_scales=None if index_query_scales is None else index_query_scales[:decode_rows],
+            key_scales=key_scales,
         )
         topk = torch.empty(decode_rows, index_topk, device=device, dtype=torch.int32)
         run_varlen(
@@ -511,6 +633,7 @@ def dynamic_sparse_attention(
     inference_context,
     index_topk: int,
     softmax_scale: float,
+    index_query_scales: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """DSA attention over paged caches for a decode, prefill, or mixed dynamic batch, through
     FlashInfer's DSA kernels and the step plan in ``inference_context.dsa_metadata``
@@ -521,11 +644,13 @@ def dynamic_sparse_attention(
         query: Queries ``[T,1,Hq,D]`` for the step's padded active tokens.
         key_cache: Paged keys ``[blocks,block_size,1,D]``.
         value_cache: Paged values ``[blocks,block_size,1,Dv]``.
-        index_query: Indexer queries ``[T,1,1,Di]``.
-        index_key_cache: Paged indexer keys ``[blocks,block_size,Di]``.
+        index_query: Indexer queries ``[T,1,1,Di]``, or NVFP4 packed uint8 ``[T,Di/2]``.
+        index_key_cache: Paged indexer keys ``[blocks,block_size,Di]``, or the NVFP4 cache.
         inference_context: The step's dynamic inference context.
         index_topk: Number of keys each query attends to.
         softmax_scale: Attention softmax scale.
+        index_query_scales: E4M3 scale bytes ``[T,Di/16]`` of NVFP4 indexer queries (the cache
+            then holds NVFP4 keys); None for BF16.
 
     Returns:
         Attention output ``[T,1,Hq*Dv]``; rows of padding tokens are zero.
@@ -540,8 +665,10 @@ def dynamic_sparse_attention(
         raise NotImplementedError(
             f"DSA-over-GQA inference needs one local KV group, got {key_cache.size(2)}."
         )
+    # NVFP4 queries pack two values a byte.
+    index_dim = index_query.size(-1) * (2 if index_query_scales is not None else 1)
     if not flashinfer_dsa_supported(
-        query.device, index_topk, index_query.size(-1), key_cache.size(1), num_query_heads
+        query.device, index_topk, index_dim, key_cache.size(1), num_query_heads
     ):
         raise NotImplementedError(
             "FlashInfer's DSA kernels need SM100/SM103, top-k 512/1024/2048, indexer head dim "
@@ -557,5 +684,6 @@ def dynamic_sparse_attention(
         index_topk=index_topk,
         softmax_scale=softmax_scale,
         deterministic=inference_context.batch_invariant_mode,
+        index_query_scales=index_query_scales,
     )
     return output.view(num_tokens, 1, num_query_heads * value_cache.size(-1))
