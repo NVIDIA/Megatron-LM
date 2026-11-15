@@ -1302,10 +1302,6 @@ class InferenceStateHandoffMixin:
             first_token = pending.resume_tokens[0]
             if request.sampling_params.num_tokens_to_generate > 0:
                 request.generated_tokens.append(first_token)
-                if self.context.num_speculative_tokens > 0:
-                    # The prefill engine's step emitted this token; record it as a collocated
-                    # engine would, so acceptance_step_lengths sums to the generated length.
-                    request.acceptance_step_lengths.append(1)
                 if pending.resume_log_probs:
                     request.generated_log_probs = list(pending.resume_log_probs)
                 if self.track_generated_token_events:
@@ -1326,6 +1322,11 @@ class InferenceStateHandoffMixin:
                 if first_token in self._terminating_token_ids(request) or stop_word_hit:
                     # Preserve the cause even when the matched string was stripped.
                     request.finish_reason = "stop"
+                if self.context.num_speculative_tokens > 0 and request.generated_tokens:
+                    # The prefill engine's step emitted this token; record it as a collocated
+                    # engine would, after stop-word trimming, so acceptance_step_lengths sums
+                    # to the generated length.
+                    request.acceptance_step_lengths.append(1)
 
             request.num_cached_tokens = len(pending.prompt)
             finished = request.finish_reason == "stop" or (

@@ -1235,25 +1235,28 @@ def test_transfer_polling_defers_batch_mutation_to_scheduling(handoff_loop):
     finalize.assert_called_once_with(pending)
 
 
+@pytest.mark.parametrize("num_speculative_tokens", [0, 2], ids=["no-mtp", "mtp-2"])
 @pytest.mark.parametrize(
-    "num_tokens_to_generate, termination_id, stop_word_ids, extra_eos_token_id_set, "
-    "stop_token_ids, expected_tokens, expected_reason",
+    "num_tokens_to_generate, termination_id, stop_word_ids, detokenize_stop_sequence, "
+    "extra_eos_token_id_set, stop_token_ids, expected_tokens, expected_reason",
     [
-        (0, -1, None, (), None, [], "length"),
-        (1, -1, None, (), None, [55], "length"),
-        (3, 55, None, (), None, [55], "stop"),
-        (3, -1, [[55]], (), None, [], "stop"),
+        (0, -1, None, False, (), None, [], "length"),
+        (1, -1, None, False, (), None, [55], "length"),
+        (3, 55, None, False, (), None, [55], "stop"),
+        (3, -1, [[55]], False, (), None, [], "stop"),
+        (3, -1, [[55]], True, (), None, [55], "stop"),
         # Declared by the model's generation_config but not the request's
         # termination_id: the imported prefill's token 55 must still stop here
         # rather than resuming decode past it.
-        (3, 2, None, (2, 55), None, [55], "stop"),
-        (1, -1, None, (), [55], [55], "stop"),
+        (3, 2, None, False, (2, 55), None, [55], "stop"),
+        (1, -1, None, False, (), [55], [55], "stop"),
     ],
     ids=[
         "sequence-limit",
         "generation-limit",
         "termination-token",
         "stripped-stop-word",
+        "retained-stop-word",
         "declared-eos",
         "stop-at-budget",
     ],
@@ -1263,12 +1266,15 @@ def test_handoff_finishes_without_an_extra_decode_step(
     num_tokens_to_generate,
     termination_id,
     stop_word_ids,
+    detokenize_stop_sequence,
     extra_eos_token_id_set,
     stop_token_ids,
     expected_tokens,
     expected_reason,
+    num_speculative_tokens,
 ):
     engine = _HandoffHarness(handoff_loop, extra_eos_token_id_set=extra_eos_token_id_set)
+    engine.context.num_speculative_tokens = num_speculative_tokens
     blocks = engine.context.kv_block_allocator.allocate_memory_blocks(2).tolist()
     request_future = handoff_loop.create_future()
     request = DynamicInferenceRequest(
@@ -1278,6 +1284,7 @@ def test_handoff_finishes_without_an_extra_decode_step(
             num_tokens_to_generate=num_tokens_to_generate,
             termination_id=termination_id,
             stop_token_ids=stop_token_ids,
+            detokenize_stop_sequence=detokenize_stop_sequence,
         ),
     )
     request.add_event_add_engine()
@@ -1313,7 +1320,8 @@ def test_handoff_finishes_without_an_extra_decode_step(
         cached_prefix_block_count=0,
         handle=None,
         future=handoff_loop.create_future(),
-        resume_tokens=[55],
+        # The sampled token followed by the prefill engine's MTP proposals.
+        resume_tokens=[55, 56, 57][: num_speculative_tokens + 1],
     )
 
     with (
@@ -1330,6 +1338,11 @@ def test_handoff_finishes_without_an_extra_decode_step(
     admit.assert_not_called()
     complete.assert_called_once_with(7)
     assert request.generated_tokens == expected_tokens
+    # Only a token that survives stop-word trimming counts as an accepted step.
+    expected_steps = [1] if num_speculative_tokens > 0 and expected_tokens else []
+    assert request.acceptance_step_lengths == expected_steps
+    if num_speculative_tokens > 0:
+        assert sum(request.acceptance_step_lengths) == len(request.generated_tokens)
     assert request_future.result().finish_reason == expected_reason
     assert request.sampling_params.num_tokens_to_generate == num_tokens_to_generate
     assert engine.context.kv_block_allocator.pc_state.block_ref_counts[blocks].tolist() == [0, 0]
