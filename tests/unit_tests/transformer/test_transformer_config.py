@@ -437,6 +437,21 @@ def test_shortcut_rejects_incompatible_configurations(overrides, error, message)
         )
 
 
+def test_shortcut_accepts_full_iteration_cuda_graphs():
+    """A whole-step graph holds the overlapped dispatch and combine of every MoE layer."""
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_shortcut_connection=True,
+        cuda_graph_impl="full_iteration",
+    )
+    assert config.cuda_graph_impl == "full_iteration"
+
+
 def test_shortcut_accepts_local_block_cuda_graphs():
     config = TransformerConfig(
         num_layers=2,

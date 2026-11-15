@@ -541,6 +541,32 @@ class TestResidualStreamRecomputeConfig:
                 recompute_modules=["residual_stream"],
             )
 
+    @staticmethod
+    def _config_with_cuda_graphs(**cuda_graph_overrides) -> TransformerConfig:
+        return TransformerConfig(
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=2,
+            recompute_granularity="selective",
+            recompute_modules=["residual_stream"],
+            wide_residual=WideResidualConfig(num_streams=3),
+            **cuda_graph_overrides,
+        )
+
+    @pytest.mark.parametrize("cuda_graph_impl", ["none", "full_iteration"])
+    def test_accepts_eager_and_full_iteration_cuda_graphs(self, cuda_graph_impl):
+        """The checkpoint manager spans layers, which only a whole-step graph can capture."""
+        config = self._config_with_cuda_graphs(cuda_graph_impl=cuda_graph_impl)
+        assert config.cuda_graph_impl == cuda_graph_impl
+        assert "residual_stream" in config.recompute_modules
+
+    def test_rejects_per_layer_cuda_graphs(self):
+        """wide_residual allows local block-scope graphs, but the recompute cannot sit in one."""
+        with pytest.raises(ValueError, match="requires cuda_graph_impl='none' or 'full_iteration'"):
+            self._config_with_cuda_graphs(
+                cuda_graph_impl="local", inference_cuda_graph_scope="block"
+            )
+
     def test_block_size_requires_residual_stream_recompute(self):
         with pytest.raises(ValueError, match="residual_stream_recompute_num_layers requires"):
             TransformerConfig(
