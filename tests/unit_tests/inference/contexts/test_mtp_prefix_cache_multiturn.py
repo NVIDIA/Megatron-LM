@@ -95,7 +95,8 @@ class TestMtpMultiTurnPrefixReuse(PrefixCachingTestBase):
         hashes = req.precomputed_block_hashes
         alloc = ctx.kv_block_allocator
         stats.registered_blocks = next(
-            (k for k, h in enumerate(hashes) if h not in alloc.registry.kv_hash_to_block_id), len(hashes)
+            (k for k, h in enumerate(hashes) if h not in alloc.registry.kv_hash_to_block_id),
+            len(hashes),
         )
         return stats
 
