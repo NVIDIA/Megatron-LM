@@ -471,7 +471,17 @@ def test_setup_applies_role_specific_pinning_and_graph_gating(engine_cls, role):
     assert _Backend.names[-2] != _Backend.names[-1]
 
 
-def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
+# Two heads with headdim 4, d_state 5 and one group. Mamba2 stores recurrent state as
+# [heads, headdim, d_state] and conv channels [x | B | C]; Gated DeltaProduct stores
+# [heads, d_state, headdim] and packs H value and H key bands plus the query band.
+@pytest.mark.parametrize(
+    "gdp_num_householder, recurrent_shape, conv_width, planner_householder",
+    [(0, (2, 4, 5), 18, 1), (1, (2, 5, 4), 18, 1), (3, (2, 5, 4), 44, 3)],
+    ids=["mamba2", "gdp-h1", "gdp-h3"],
+)
+def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache(
+    gdp_num_householder, recurrent_shape, conv_width, planner_householder
+):
     class _Backend:
         instances = []
 
@@ -503,10 +513,21 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
         hidden_size_per_attention_head=1,
         block_size_tokens=4,
         mamba_slot_allocator=object(),
+        gdp_num_householder=gdp_num_householder,
     )
     model_config = SimpleNamespace(
         num_query_groups=1, num_attention_heads=1, mamba_num_heads=2, mamba_num_groups=1
     )
+
+    def assert_ssm_layouts():
+        # Assert the dimensions explicitly: for H = 1 the conv width alone cannot tell a
+        # swapped headdim/d_state apart.
+        for backend in _Backend.instances[1:]:
+            dims = backend.kwargs["ssm_layout"].dims
+            assert (dims.nheads, dims.headdim, dims.d_state) == (2, 4, 5)
+            assert dims.num_householder == planner_householder
+            assert backend.kwargs["ssm_layout"].conv_dim_local == conv_width
+
     engine.controller = SimpleNamespace(
         inference_wrapped_model=SimpleNamespace(model=SimpleNamespace(config=model_config))
     )
@@ -529,13 +550,14 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
         _Backend.instances.clear()
         engine.context.mamba_slot_allocator = None
         engine.context.max_requests = 8
-        engine.context.mamba_conv_states = torch.empty(1, 9, 18, 3)
-        engine.context.mamba_ssm_states = torch.empty(1, 9, 2, 4, 5)
+        engine.context.mamba_conv_states = torch.empty(1, 9, conv_width, 3)
+        engine.context.mamba_ssm_states = torch.empty(1, 9, *recurrent_shape)
         engine.setup_kv_transfer("decode")
 
     assert _Backend.instances[1].kwargs["memory_buffer"] is engine.context.mamba_conv_states
     assert _Backend.instances[2].kwargs["memory_buffer"] is engine.context.mamba_ssm_states
     assert [backend.kwargs["expected_num_blocks"] for backend in _Backend.instances[1:]] == [9, 9]
+    assert_ssm_layouts()
 
     _Backend.instances.clear()
     engine.context.mamba_slot_allocator = object()
@@ -549,6 +571,7 @@ def test_handoff_roles_use_live_ssm_buffers_and_decode_rejects_durable_cache():
     assert _Backend.instances[1].kwargs["memory_buffer"] is engine.context.mamba_conv_states
     assert _Backend.instances[2].kwargs["memory_buffer"] is engine.context.mamba_ssm_states
     assert [backend.kwargs["expected_num_blocks"] for backend in _Backend.instances[1:]] == [9, 9]
+    assert_ssm_layouts()
 
 
 def test_handoff_salt_is_used_for_lookup_and_retained_after_import(handoff_loop):
