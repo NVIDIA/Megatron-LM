@@ -729,8 +729,9 @@ class MTPControllerMixin:
         if self._mtp_resolved_padded_count is not None:
             padded_count = self._mtp_resolved_padded_count
             assert not self._sp_enabled or padded_count % self._tp_size == 0
-        elif has_mtp:
-            # Eager path: use TP-aligned minimum size for dummy tensors.
+        else:
+            # Eager path: use TP-aligned minimum size for dummy tensors. Non-final pipeline
+            # stages need the same count as the receive shape of the PP logits broadcast.
             padded_count = self._tp_size if self._sp_enabled else 1
 
         dummy_hidden = None

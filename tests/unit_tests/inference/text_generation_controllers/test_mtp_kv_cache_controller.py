@@ -1752,3 +1752,54 @@ class TestMoeDispatchSpansRanks:
             controller._run_dummy_serial_mtp_forward()
 
         assert len(model.all_forwards) == 2 + (1 if kv_cache_on else 0)
+
+    @pytest.mark.parametrize("sp_enabled, tp_size", [(False, 1), (True, 2)])
+    def test_eager_pp_stages_agree_on_the_logits_broadcast_shape(self, sp_enabled, tp_size):
+        """EP == 1, ETP > 1, PP > 1, eager: every stage joins the PP broadcast at one shape.
+
+        Non-final stages hold no MTP layer, so they never build the dummy tensors, but they
+        still receive the last stage's per-depth logits broadcast.
+        """
+        num_mtp_depths = 2
+        shapes = {}
+        for is_last_stage in (True, False):
+            context = _make_context(num_decode_requests=0)
+            context.enable_mtp_kv_cache = False
+            model = _make_model()
+
+            def compute_mtp_single_step(**kwargs):
+                hidden = kwargs["hidden_states"]
+                return hidden, torch.zeros((hidden.shape[0], 1, VOCAB_SIZE), device=DEVICE)
+
+            model.compute_mtp_single_step = compute_mtp_single_step
+            controller = _make_controller(context, model, sp_enabled=sp_enabled, tp_size=tp_size)
+            controller.num_mtp_depths = num_mtp_depths
+            controller.model_config.expert_model_parallel_size = 1
+            controller.model_config.expert_tensor_parallel_size = 4
+            context.expert_tensor_and_model_parallel_group = None
+            controller._mtp_resolved_padded_count = None
+            controller._is_last_pp_stage = is_last_stage
+            controller.model_is_pipeline_parallel = True
+            controller.pp_group = None
+            controller._logits_dtype = torch.float32
+
+            broadcast = mock.Mock(side_effect=lambda size, **kwargs: kwargs["tensor"])
+            patches = _identity_sp_patches()
+            with (
+                patches[0],
+                patches[1],
+                mock.patch(
+                    "megatron.core.inference.text_generation_controllers.mtp_controller_mixin."
+                    "broadcast_from_last_pipeline_stage",
+                    broadcast,
+                ),
+            ):
+                controller._run_dummy_serial_mtp_forward()
+
+            assert broadcast.call_count == num_mtp_depths
+            shapes[is_last_stage] = [call.args[0] for call in broadcast.call_args_list]
+            if not is_last_stage:
+                assert all(call.kwargs["tensor"] is None for call in broadcast.call_args_list)
+
+        expected = [[tp_size if sp_enabled else 1, VOCAB_SIZE]] * num_mtp_depths
+        assert shapes[True] == shapes[False] == expected
