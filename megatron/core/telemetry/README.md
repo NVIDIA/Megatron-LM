@@ -5,8 +5,8 @@ built on top of [`nemo-lens`](https://github.com/NVIDIA-NeMo/Lens).
 
 Once the call sites are instrumented, Megatron emits **traces** at training
 framework boundaries (training loop, checkpointing, evaluation, P2P
-communication, pipeline parallel stages, inference) and **metrics** (loss,
-throughput, gradient norm) that export to any OTLP-compatible backend.
+communication, pipeline parallel stages, inference) and training-report span
+events that export to any OTLP-compatible backend.
 
 ## Contents
 
