@@ -37,6 +37,7 @@ from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.ssm.packed_seq_helpers import check_fla_sequence_packing_support
 from megatron.core.tensor_parallel import inference_layers
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.attention import HAVE_FA3
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -56,6 +57,11 @@ from tests.unit_tests.test_utilities import Utils, clear_nvte_env_vars
 
 NUM_TOKENS_TO_GENERATE = 8
 
+# FA4 cannot split KV on SM90, and it picks a split for these batches unless batch-invariant mode
+# pins num_splits=1, which overlap rejects. Pin FA3, Hopper's native kernel, there instead.
+_SM90 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9
+_FLASH_VERSION = (3 if HAVE_FA3 else None) if _SM90 else FLASH_ATTENTION_VERSION
+
 # (expert TP, EP, TP collectives, layer pattern) at TP 2. "nccl" forces the TP layers onto
 # their NCCL fallback, so NCCL TP collectives on the main stream overlap the NVLS dispatch on
 # the side stream. "*E*E" pairs each MoE with attention; "ME*E" also pairs one with GDP.
@@ -69,6 +75,7 @@ LAYOUTS = [
 
 @pytest.mark.internal
 @pytest.mark.skipif(not is_fa_min_version("2.7.3"), reason="need flash attn")
+@pytest.mark.skipif(_SM90 and not HAVE_FA3, reason="FA4 cannot split KV on SM90; needs FA3")
 class TestShortcutMoEOverlapTP:
     """Overlap must reproduce the serial schedule bit for bit at TP 2."""
 
@@ -132,7 +139,7 @@ class TestShortcutMoEOverlapTP:
             is_hybrid_model=True,
             attention_dropout=0.0,
             attention_backend=AttnBackend.flash,
-            flash_attention_version=FLASH_ATTENTION_VERSION,
+            flash_attention_version=_FLASH_VERSION,
         )
         model = HybridModel(
             config=config,
