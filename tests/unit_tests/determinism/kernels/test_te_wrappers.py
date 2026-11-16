@@ -26,6 +26,10 @@ from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP, mark_grouped_tensor
 from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.models.hybrid.hidden_state_feedback.specs import (
+    additive_hidden_state_fusion_spec,
+    gated_hidden_state_fusion_spec,
+)
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
@@ -43,6 +47,7 @@ from megatron.core.transformer.experimental_attention_variant.dsa import (
     _DSAWeightsProjection,
 )
 from megatron.core.transformer.mlp import MLPSubmodules
+from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal
 from tests.unit_tests.determinism.kernels.harness import (
@@ -644,6 +649,46 @@ class TestTEWrappers:
         assert_module_replays_bit_exact(
             module, (x,), replays=3, contention=True, what=f"TENorm[{normalization}]"
         )
+
+    @pytest.mark.parametrize("gated", [False, True], ids=["additive", "gated"])
+    def test_hidden_state_feedback_fusion_replays(self, gated):
+        seeded()
+        config = _config(
+            hidden_size=128,
+            ffn_hidden_size=512,
+            num_attention_heads=4,
+            num_query_groups=4,
+            kv_channels=32,
+            normalization="RMSNorm",
+            gradient_accumulation_fusion=False,
+        )
+        spec = gated_hidden_state_fusion_spec if gated else additive_hidden_state_fusion_spec
+        module = build_module(
+            spec,
+            config=config,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp"]),
+        ).cuda()
+        if not gated:
+            # Nonzero weights expose hidden-state and norm gradients, as after a training update.
+            with torch.no_grad():
+                config.init_method(module.hidden_state_projection.weight)
+        embedding = torch.randn(
+            128, 2, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
+        )
+        hidden = torch.randn_like(embedding, requires_grad=True)
+        outputs, gradients = assert_module_replays_bit_exact(
+            module,
+            (embedding, hidden),
+            grad_output=torch.randn_like(embedding),
+            replays=3,
+            contention=True,
+            what=f"hidden-state feedback[{gated=}]",
+        )
+        assert len(gradients) == len(tuple(module.parameters())) + 2
+        for output in outputs.values():
+            assert output.dtype == torch.bfloat16 and output.shape == embedding.shape
+        for tensor in (*outputs.values(), *gradients.values()):
+            assert torch.isfinite(tensor).all()
 
     @pytest.mark.skipif(TEFusedMLP is None, reason="TE operation-based MLP is unavailable")
     @pytest.mark.parametrize("hash_threshold", [None, 0])

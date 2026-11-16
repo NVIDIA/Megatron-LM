@@ -109,6 +109,18 @@ R = "tests/unit_tests/context_parallel/runtime/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
+        name="hidden_state_feedback_fusion",
+        sources=(
+            "megatron/core/models/hybrid/hidden_state_feedback/fusion.py",
+            "megatron/core/models/hybrid/hidden_state_feedback/specs.py",
+        ),
+        tests=(K + "test_te_wrappers.py",),
+        kind="dispatch",
+        notes="Feedback specs dispatch TENorm and duplicated TELinear; complete BF16 "
+        "additive/gated fusions replay finite outputs, input and parameter gradients "
+        "under side-stream contention.",
+    ),
+    KernelEntry(
         name="csa_output_rope_reconstruction",
         sources=("megatron/core/ops/attention/csa/output_rope.py",),
         tests=(K + "test_csa_output_rope.py",),
