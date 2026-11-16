@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
+import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
@@ -59,7 +60,17 @@ def _resolve_mhc_checkpoint(
 def build_mhc_recompute_layer_plan(
     num_layers: int, mhc_recompute_layer_num: Optional[int], use_mhc_recompute: bool
 ) -> Tuple[list[Optional[CheckpointWithoutOutputManager]], list[bool]]:
-    """Build per-layer mHC recompute managers and recompute-block end markers."""
+    """Deprecated adapter returning per-layer managers and block-end markers.
+
+    Use ``build_residual_stream_recompute_plan`` when recompute is enabled. It returns
+    one context per layer instead of two lists and does not take an enabled flag.
+    """
+    warnings.warn(
+        "build_mhc_recompute_layer_plan is deprecated and will be removed in a future release. "
+        "Use build_residual_stream_recompute_plan when recompute is enabled instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if not use_mhc_recompute or num_layers == 0:
         return [None] * num_layers, [False] * num_layers
 
@@ -72,7 +83,13 @@ def finalize_mhc_recompute_layer(
     hidden_states: Tensor,
     is_last_in_recompute_block: bool,
 ) -> None:
-    """Finalize mHC recompute state when the current recompute block ends."""
+    """Deprecated adapter; use ``ResidualStreamRecomputeContext.finalize`` instead."""
+    warnings.warn(
+        "finalize_mhc_recompute_layer is deprecated and will be removed in a future release. "
+        "Use ResidualStreamRecomputeContext.finalize(hidden_states) instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     finalize_recompute_block(mhc_manager, hidden_states, is_last_in_recompute_block)
 
 
