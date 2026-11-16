@@ -1,7 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
-from types import SimpleNamespace
 
 import pytest
 import torch
@@ -119,6 +118,22 @@ class MuonExcludedMatrixModel(nn.Module):
 
     def forward(self, x):
         return self.muon(F.relu(self.scalar(x)))
+
+
+class ExpertOnlyModel(nn.Module):
+    """Model whose parameters are all expert-parallel (``allreduce=False``).
+
+    It has no dense parameter, so no dp_cp rank owns one, rank 0 included.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.experts = nn.ModuleList([nn.Linear(10, 8), nn.Linear(8, 5)])
+        for param in self.parameters():
+            param.allreduce = False
+
+    def forward(self, x):
+        return self.experts[1](F.relu(self.experts[0](x)))
 
 
 @pytest.mark.skipif(
@@ -317,44 +332,6 @@ class TestLayerWiseOptimizer:
         reference_model = type(model.module)().bfloat16().cuda()
         reference_model.load_state_dict(model.module.state_dict())
         return reference_model
-
-    def test_allgather_params_when_rank_0_owns_no_param(self):
-        """The all-gather helper must not index rank 0's owned list.
-
-        ``allgather_params()`` gathers each dp_cp group's owned params in one flatten /
-        all-gather-v / unflatten pass and read ``params_list[0][0]`` for the device and dtype;
-        rank 0's list is empty when the ping-pong assignment gives it no param of the group, and
-        every rank then died with IndexError. Each rank holds every param (as under DDP), the
-        owner writes a distinct value, and after ``allgather_params()`` every rank must hold the
-        owner's value for every param.
-        """
-        rank, world = torch.distributed.get_rank(), torch.distributed.get_world_size()
-        device = torch.device('cuda', torch.cuda.current_device())
-
-        def param(shape):
-            return torch.nn.Parameter(torch.zeros(shape, dtype=torch.bfloat16, device=device))
-
-        # Ownership: rank 0 -> nothing; rank 1 -> two params; every other rank -> one param.
-        owned = [(param((256, 128)), 1), (param((4, 8)), 1)]
-        owned += [(param((96, 64)), owner) for owner in range(2, world)]
-        params_list = [[] for _ in range(world)]
-        for p, owner in owned:
-            params_list[owner].append(p)
-        for index, (p, owner) in enumerate(owned):
-            if owner == rank:
-                p.data.fill_(float(owner + 1) + 0.5 * index)
-
-        optimizer = object.__new__(LayerWiseDistributedOptimizer)
-        optimizer.pg_collection = SimpleNamespace(dp_cp=torch.distributed.group.WORLD, expt_dp=None)
-        optimizer.dp_cp = torch.distributed.group.WORLD
-        optimizer.expt_dp = None
-        optimizer.dp_cp_params_list = params_list
-        optimizer.expt_dp_params_list = None
-        optimizer.allgather_params()
-
-        for index, (p, owner) in enumerate(owned):
-            expected = torch.full_like(p, float(owner + 1) + 0.5 * index)
-            torch.testing.assert_close(p.data, expected, rtol=0, atol=0)
 
     @pytest.mark.parametrize('use_param_layout', [False, True])
     def test_basic(self, use_param_layout):
@@ -705,6 +682,17 @@ class TestLayerWiseOptimizer:
         This will be insufficient when world size > 2.
         """
         self._run_parameter_update_test(use_param_layout=use_param_layout, model_class=TinyModel)
+
+    def test_parameter_updates_expert_parallel_parameters_only(self):
+        """Test LayerWiseDistributedOptimizer on a model without any dense parameter.
+
+        Every parameter of the model is expert-parallel, so dp_cp rank 0 owns zero dense
+        parameters (as does every other rank) and only the expert list has anything to
+        all-gather. The step used to raise IndexError on every rank: ``allgather_params()``
+        read the device and dtype from rank 0's first dense parameter. The legacy
+        ``allgather_params()`` path only runs without a parameter layout.
+        """
+        self._run_parameter_update_test(use_param_layout=False, model_class=ExpertOnlyModel)
 
     def test_broadcast_vs_allgather(self):
         """Test LayerWiseDistributedOptimizer allgather code agains broadcast code."""
