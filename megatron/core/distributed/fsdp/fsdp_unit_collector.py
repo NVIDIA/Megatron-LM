@@ -119,12 +119,13 @@ class FsdpUnitCollector:
 
     def _owned_modules(self, unit: nn.Module) -> Iterator[nn.Module]:
         """Yield this unit and its descendants outside independent child units."""
+        units = set(self._units)
         stack = [unit]
         while stack:
             owned = stack.pop()
             yield owned
             for child in reversed(list(owned.children())):
-                if child not in self._units:
+                if child not in units:
                     stack.append(child)
 
     def _visit(self, module: nn.Module) -> None:
