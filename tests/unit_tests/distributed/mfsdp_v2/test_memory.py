@@ -456,9 +456,7 @@ def test_fused_wgrad_releases_buffers(distributed_setup, caller_managed_grad_syn
         if caller_managed_grad_sync:
             context.finish_grad_sync()
         optimizer.step()
-        assert all(
-            group.partial_grad is None for layer in model for group in layer.parameter_groups
-        )
+        assert not any(layer._partial_grads for layer in model)
         torch.cuda.synchronize(device)
         allocated.append(torch.cuda.memory_allocated(device))
     assert allocated[1] == allocated[2]

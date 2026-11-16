@@ -129,12 +129,9 @@ class FsdpParameterGroup:
     # Padded (equal) or unpadded (unequal) segments for RowAtomic/BlockAtomic layouts.
     shard_layout: ShardLayout
     # Whether any of these trainable parameters belongs to a Transformer Engine module built with
-    # fuse_wgrad_accumulation=True, which writes its weight gradients into partial_grad, or into
-    # main_grad when no DP-inner reduction is needed.
+    # fuse_wgrad_accumulation=True, which writes its weight gradients into ``main_grad`` (see
+    # bind_main_grad()).
     fuse_wgrad_accumulation: bool
-    # With fuse_wgrad_accumulation, the reduce-scatter input of the next or current backward,
-    # allocated before that backward starts. None otherwise.
-    partial_grad: DBuffer | None
     # Whether main_grad holds a total that TE accumulated unscaled and finalization then scaled.
     _main_grad_is_scaled: bool
 
@@ -192,7 +189,6 @@ class FsdpParameterGroup:
             for fqns in parameter_to_fqns.values()
             for fqn in fqns
         )
-        self.partial_grad = None
         parameters = tuple(parameter_to_fqns)
 
         if parameter_to_owner is not None and _contains_any_placement_type(
@@ -655,7 +651,7 @@ class FsdpParameterGroup:
                 device=self.main_weight.device,
             )
 
-    def bind_main_grad(self) -> None:
+    def bind_main_grad(self, partial_grad: DBuffer | None) -> None:
         """Expose the views TE accumulates fused wgrads into as each parameter's ``main_grad``.
 
         Like Megatron's DDP, every parameter gets one; TE uses it only for fused weights. They are
@@ -663,14 +659,14 @@ class FsdpParameterGroup:
         full tensors, so TE accumulates into it directly, unscaled, and reduce_outer_gradients()
         scales the total.
         """
-        buffer = self.partial_grad if self.requires_inner_reduction else self.main_grad
+        buffer = partial_grad if self.requires_inner_reduction else self.main_grad
         assert buffer is not None
-        # Start the step from zero where the copy path would clear or overwrite main_grad. A module
-        # used twice binds again before its gradients are accumulated.
-        if buffer is self.main_grad and not hasattr(self.fsdp_parameters[0].unsharded, "main_grad"):
+        if buffer is self.main_grad:
             if self._main_grad_is_stale or not self._has_sharded_grads():
+                # The step's first backward. Once .grad is installed, later ones accumulate.
                 buffer.local_buffer.zero_()
                 self._main_grad_is_stale = False
+                self._install_sharded_grads(buffer)
             elif self._main_grad_is_scaled:
                 # Accumulating on top of a finalized total: undo its scaling.
                 buffer.local_buffer.div_(self.grad_scale)
@@ -686,15 +682,14 @@ class FsdpParameterGroup:
         """
         for index, fsdp_parameter in enumerate(self.fsdp_parameters):
             parameter = fsdp_parameter.unsharded
-            destination = partial_grad.get_tensor_view(index)
             if self.fuse_wgrad_accumulation:
                 del parameter.main_grad
                 if parameter.grad is not None:
-                    destination.add_(parameter.grad)
+                    partial_grad.get_tensor_view(index).add_(parameter.grad)
             elif parameter.grad is None:
                 raise RuntimeError(f"Missing gradient for FSDP parameter {fsdp_parameter.fqns!r}.")
             else:
-                destination.copy_(parameter.grad)
+                partial_grad.get_tensor_view(index).copy_(parameter.grad)
             parameter.grad = None
 
     def accumulate_local_gradients(self) -> None:
@@ -707,7 +702,6 @@ class FsdpParameterGroup:
         if self.fuse_wgrad_accumulation:
             # TE already accumulated the fused wgrads into main_grad, unscaled (bind_main_grad()).
             self.copy_gradients_to_partial_buffer(self.main_grad)
-            self._install_sharded_grads(self.main_grad)
             return
         for fsdp_parameter in self.fsdp_parameters:
             if fsdp_parameter.unsharded.grad is None:

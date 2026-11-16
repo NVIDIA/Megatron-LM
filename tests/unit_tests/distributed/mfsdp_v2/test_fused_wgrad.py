@@ -310,23 +310,19 @@ def test_fused_wgrad_with_delayed_weight_gradient(distributed_setup):
 
     fused, copied = make_layer(True), make_layer(False)
     # backward_dw() runs after autograd's end-of-backward callback, so the caller orders the
-    # current stream after the reductions with finish_grad_sync().
+    # current stream after the reductions with finish_grad_sync(). With grad_scale, a reduction
+    # that ran before backward_dw() would change the gradient.
     for layer in (fused, copied):
         with fully_shard_context(
             FsdpContext(device=device, runtime_policy=RuntimePolicy(caller_managed_grad_sync=True))
         ):
-            fully_shard(layer, mesh=mesh, placements=_default_placements())
+            fully_shard(layer, mesh=mesh, placements=_default_placements(), grad_scale=0.5)
 
     x = torch.randn(4, 16, device=device, dtype=torch.bfloat16, requires_grad=True)
     for layer in (fused, copied):
-        [group] = layer.parameter_groups
-        [sharded_weight] = [fsdp_parameter.sharded for fsdp_parameter in group.fsdp_parameters]
         layer(x).float().square().mean().backward()
-        # Reduction installs the sharded gradient, which waits for backward_dw().
-        assert sharded_weight.grad is None
         layer.backward_dw()
         layer.context.finish_grad_sync()
-        assert sharded_weight.grad is not None
     torch.testing.assert_close(fused.weight.grad.full_tensor(), copied.weight.grad.full_tensor())
 
 
@@ -508,11 +504,7 @@ def test_fused_wgrad_buffer_is_allocated_by_the_previous_module(
     )
 
     def allocated() -> list[int]:
-        return [
-            index
-            for index, layer in enumerate(model)
-            if any(group.partial_grad is not None for group in layer.parameter_groups)
-        ]
+        return [index for index, layer in enumerate(model) if layer._partial_grads]
 
     # Registered after fully_shard(), so these run after MFSDP's own backward pre-hooks.
     seen = {}
