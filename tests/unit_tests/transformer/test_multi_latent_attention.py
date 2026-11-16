@@ -3,6 +3,7 @@
 import contextlib
 import os
 from inspect import signature
+from types import SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -686,6 +687,42 @@ class TestContextParallelMLAAttention:
             assert bias.shape[0] == config.hidden_size
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA device")
+@pytest.mark.parametrize(("major", "padded"), [(9, True), (10, False)])
+def test_thd_value_pad_only_before_blackwell(major, padded):
+    """THD pads MLA's V to the QK head dim before Blackwell, and leaves it unpadded from sm100.
+
+    On sm100 the padded (192, 192) shape has no attention backend when sequences are padded,
+    while the unpadded (192, 128) runs on cuDNN.
+    """
+    query = torch.zeros(8, 4, 192, device="cuda", dtype=torch.bfloat16)
+    value = torch.ones(8, 4, 128, device="cuda", dtype=torch.bfloat16)
+    attention = SimpleNamespace(config=SimpleNamespace(experimental_attention_variant=None))
+    packed_seq_params = SimpleNamespace(qkv_format="thd")
+
+    with mock.patch.object(torch.cuda, "get_device_capability", return_value=(major, 0)):
+        prepared, need_v_pad, orig_v_dim, padded_v_dim = (
+            mla_module._prepare_mla_core_attention_value(attention, query, value, packed_seq_params)
+        )
+
+    assert need_v_pad is padded
+    assert orig_v_dim == 128
+    assert prepared.shape[-1] == padded_v_dim == (192 if padded else 128)
+    assert torch.equal(prepared[..., :128], value)
+
+
+def _assert_thd_matches_sbhd(sbhd: torch.Tensor, thd: torch.Tensor) -> None:
+    """THD attention matches SBHD bit for bit before Blackwell.
+
+    On sm100 both layouts run cuDNN at MLA's unequal head dims, but its ragged and dense kernels
+    round differently, so there they must match within bf16 tolerance.
+    """
+    if get_device_arch_version() >= 10:
+        torch.testing.assert_close(thd, sbhd)
+    else:
+        assert torch.equal(sbhd, thd)
+
+
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))
 class TestParallelMLAAttentionPrecision:
 
@@ -798,7 +835,7 @@ class TestParallelMLAAttentionPrecision:
             _core_attn_out_sbhd = (
                 core_attn_out_sbhd.transpose(0, 1).contiguous().view(*core_attn_out_thd.shape)
             )
-            assert torch.equal(_core_attn_out_sbhd, core_attn_out_thd)
+            _assert_thd_matches_sbhd(_core_attn_out_sbhd, core_attn_out_thd)
 
             output_sbhd, bias_sbhd = apply_module(self.parallel_attention.linear_proj)(
                 core_attn_out_sbhd
@@ -807,7 +844,7 @@ class TestParallelMLAAttentionPrecision:
                 core_attn_out_thd
             )
             _output_sbhd = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
-            assert torch.equal(_output_sbhd, output_thd)
+            _assert_thd_matches_sbhd(_output_sbhd, output_thd)
 
             output_thd_fine_grained = output_thd
             bias_thd_fine_grained = bias_thd
@@ -822,7 +859,7 @@ class TestParallelMLAAttentionPrecision:
                 hidden_states_thd, attention_mask_thd, packed_seq_params=packed_seq_params
             )
             _output_sbhd = output_sbhd.transpose(0, 1).contiguous().view(*output_thd.shape)
-            assert torch.equal(_output_sbhd, output_thd)
+            _assert_thd_matches_sbhd(_output_sbhd, output_thd)
             assert bias_thd.shape == bias_sbhd.shape
             assert torch.equal(bias_sbhd, bias_thd)
 
