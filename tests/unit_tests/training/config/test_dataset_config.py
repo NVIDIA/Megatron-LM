@@ -482,26 +482,40 @@ def test_dataloader_config_validation():
 
 
 @pytest.mark.parametrize(
-    "config_cls,dataset_type,owned_field,unused_field",
+    "config_cls,dataset_type,owned_field,unused_field,legacy_sft_target",
     [
         (
             SFTDatasetConfig,
             MockSFTDataset,
             "sft_mock_dataset_config_json",
             "varlen_mock_dataset_config_json",
+            False,
+        ),
+        (
+            SFTDatasetConfig,
+            MockSFTDataset,
+            "sft_mock_dataset_config_json",
+            "varlen_mock_dataset_config_json",
+            True,
         ),
         (
             VarlenDatasetConfig,
             MockVarlenDataset,
             "varlen_mock_dataset_config_json",
             "sft_mock_dataset_config_json",
+            False,
         ),
     ],
 )
 def test_legacy_union_schema_loads_as_the_selected_family(
-    config_cls, dataset_type, owned_field, unused_field, caplog
+    config_cls, dataset_type, owned_field, unused_field, legacy_sft_target, caplog
 ):
     section = DataConfig(dataset=_dataset()).to_cfg_dict()
+    if legacy_sft_target:
+        # #9375's SFT subclass still inherits the full GPT field set.
+        section["dataset"]["_target_"] = (
+            f"{SFTDatasetConfig.__module__}.{SFTDatasetConfig.__qualname__}"
+        )
     section["dataset_type"] = {
         "_target_": f"{dataset_type.__module__}.{dataset_type.__qualname__}",
         "_call_": False,
