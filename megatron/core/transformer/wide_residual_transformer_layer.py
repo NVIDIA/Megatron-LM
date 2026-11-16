@@ -5,16 +5,13 @@ from __future__ import annotations
 
 from typing import Optional
 
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.residual_connection import (
-    ResidualConnection,
-    ResidualConnectionOperation,
-)
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
 from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
+    apply_combined_residual_keys,
     load_residual_state,
 )
 
@@ -59,14 +56,11 @@ class WideResidualTransformerLayer(TransformerLayer):
 
         if config.wide_residual is None:
             raise ValueError("WideResidualTransformerLayer requires wide_residual config.")
-        if not isinstance(self.cross_attention, IdentityOp):
-            raise NotImplementedError(
-                "WideResidualTransformerLayer does not support cross-attention branches."
-            )
+        has_attention, has_mlp = self._validate_residual_branch_layout()
 
         self.residual_read_self_attn = None
         self.residual_write_self_attn = None
-        if not isinstance(self.self_attention, IdentityOp):
+        if has_attention:
             self.residual_read_self_attn = StreamwiseSigmoidWideResidualConnection(
                 config, self.layer_number, "self_attention", operation="read"
             )
@@ -76,7 +70,7 @@ class WideResidualTransformerLayer(TransformerLayer):
 
         self.residual_read_mlp = None
         self.residual_write_mlp = None
-        if not isinstance(self.mlp, IdentityOp):
+        if has_mlp:
             self.residual_read_mlp = StreamwiseSigmoidWideResidualConnection(
                 config, self.layer_number, "mlp", operation="read"
             )
@@ -123,28 +117,10 @@ class WideResidualTransformerLayer(TransformerLayer):
                     f"{connection.branch_hidden_size}."
                 )
 
-    def _get_self_attention_residual_connection(
-        self, operation: ResidualConnectionOperation
-    ) -> ResidualConnection | None:
-        """Return the reader or writer surrounding the self-attention branch."""
-
-        match operation:
-            case "read":
-                return self.residual_read_self_attn
-            case "write":
-                return self.residual_write_self_attn
-            case _:
-                raise ValueError(f"Unsupported residual connection operation: {operation}.")
-
-    def _get_mlp_residual_connection(
-        self, operation: ResidualConnectionOperation
-    ) -> ResidualConnection | None:
-        """Return the reader or writer surrounding the MLP or MoE branch."""
-
-        match operation:
-            case "read":
-                return self.residual_read_mlp
-            case "write":
-                return self.residual_write_mlp
-            case _:
-                raise ValueError(f"Unsupported residual connection operation: {operation}.")
+    def sharded_state_dict(
+        self, prefix: str = "", sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ) -> ShardedStateDict:
+        """Build the sharded state dict, using combined residual keys when loading them."""
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        apply_combined_residual_keys(sharded_state_dict, prefix, metadata)
+        return sharded_state_dict

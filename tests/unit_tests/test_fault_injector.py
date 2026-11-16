@@ -4,6 +4,7 @@ import enum
 import math
 from argparse import ArgumentParser
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -11,6 +12,30 @@ import torch
 import megatron.core.fault_injector as fault_injector
 from megatron.training.argument_utils import ArgumentGroupFactory
 from megatron.training.config import FaultInjectorConfig
+
+
+def test_train_uses_config_for_injection_without_ft_monitoring(monkeypatch, run_config):
+    from megatron.training import training
+
+    injector = FaultInjectorConfig(
+        fault_injector_ranks="0", fault_injector_fault_types="hang", fault_injector_fault_delay=10
+    )
+    run_config.fault_tolerance.fault_injector = injector
+    assert not run_config.fault_tolerance.enable_ft_package
+    monkeypatch.setattr(training, "get_args", lambda: SimpleNamespace())
+    monkeypatch.setattr(training, "get_timers", Mock())
+    monkeypatch.setattr(training, "get_train_state", Mock())
+
+    class StopBeforeFault(Exception):
+        pass
+
+    setup = Mock(side_effect=StopBeforeFault)
+    monkeypatch.setattr(fault_injector, "setup_fault_injection", setup)
+    with pytest.raises(StopBeforeFault):
+        training.train(
+            None, [], None, None, None, None, {}, next_train_iterator=Mock(), run_eval=Mock()
+        )
+    setup.assert_called_once_with(injector)
 
 
 def create_test_config(**overrides):

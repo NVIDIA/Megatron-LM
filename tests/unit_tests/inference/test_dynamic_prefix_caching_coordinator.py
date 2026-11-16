@@ -30,11 +30,8 @@ from megatron.core.inference.data_parallel_inference_coordinator.handlers import
     handle_engine_reply,
     handle_submit_request,
 )
-from megatron.core.inference.engines.dynamic_engine import (
-    DynamicInferenceEngine,
-    RequestEntry,
-    _engine_reply_frames,
-)
+from megatron.core.inference.engines.dynamic.coordinator import _engine_reply_frames
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import (
@@ -103,6 +100,9 @@ class DummyContext:
     def get_active_request_count(self) -> int:
         return self.active_cnt
 
+    def remove_vlm_request_data(self, request_id: int) -> None:
+        pass
+
 
 class DummyController:
     """Dummy inference controller."""
@@ -120,6 +120,7 @@ class DummyEngine(DynamicInferenceEngine):
     def __init__(self):
         self.waiting_request_ids = deque()
         self.requests: Dict[int, RequestEntry] = {}
+        self.finished_request_count = 0
         self.suspend_signal = False
         self.is_suspended = False
         self._loop = get_asyncio_loop()
