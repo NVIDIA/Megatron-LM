@@ -26,12 +26,24 @@ def reference_kl(student, teacher, temperature):
 
 @pytest.fixture(autouse=True)
 def reset_mtp_state():
-    Utils.initialize_model_parallel()
-    MTPLossLoggingHelper.tracker = {}
-    MTPLossAutoScaler.main_loss_backward_scale = torch.tensor(1.0, device="cuda")
-    yield
-    MTPLossLoggingHelper.tracker = {}
-    Utils.destroy_model_parallel()
+    Utils.initialize_distributed()
+    existing_groups = set(torch.distributed.distributed_c10d._world.pg_map)
+    try:
+        Utils.initialize_model_parallel()
+        MTPLossLoggingHelper.tracker = {}
+        MTPLossAutoScaler.main_loss_backward_scale = torch.tensor(1.0, device="cuda")
+        yield
+    finally:
+        MTPLossLoggingHelper.tracker = {}
+        try:
+            Utils.destroy_model_parallel()
+        finally:
+            # MPU teardown clears NCCL references but leaves the groups registered in PyTorch.
+            # Also release groups replaced by the TP/CP tests, preserving the default group
+            # and any groups owned by earlier tests in this shared CI process.
+            for group in reversed(list(torch.distributed.distributed_c10d._world.pg_map)):
+                if group not in existing_groups:
+                    torch.distributed.destroy_process_group(group)
 
 
 @pytest.mark.parametrize("temperature", [0.5, 1.0, 2.0])
