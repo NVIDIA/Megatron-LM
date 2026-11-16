@@ -35,6 +35,9 @@ PARENT_TEAM_SLUGS = ["mcore-reviewers"]
 # Teams synced directly (the team itself, not its children)
 DIRECT_TEAM_SLUGS = ["mcore-engineers"]
 
+# Teams that must not be managed by the GitHub-to-Slack sync.
+EXCLUDED_TEAM_SLUGS = {"ci"}
+
 _usergroups_cache = None
 
 
@@ -349,6 +352,8 @@ def get_team_to_usergroup_mapping(parent_team_slug):
 
     mapping = {}
     for team_slug in child_teams:
+        if team_slug in EXCLUDED_TEAM_SLUGS:
+            continue
         usergroup_handle = github_team_to_slack_usergroup(team_slug)
         mapping[team_slug] = usergroup_handle
 
@@ -377,6 +382,8 @@ def sync_all_teams(dry_run=False, parent_teams=None, direct_teams=None):
         team_to_usergroup.update(mapping)
 
     for team_slug in direct_teams:
+        if team_slug in EXCLUDED_TEAM_SLUGS:
+            continue
         usergroup_handle = github_team_to_slack_usergroup(team_slug)
         team_to_usergroup[team_slug] = usergroup_handle
 
@@ -451,6 +458,8 @@ def main():
             print(f"Fetching child teams of '{parent_slug}'...")
             team_to_usergroup.update(get_team_to_usergroup_mapping(parent_slug))
         for team_slug in direct_teams:
+            if team_slug in EXCLUDED_TEAM_SLUGS:
+                continue
             team_to_usergroup[team_slug] = github_team_to_slack_usergroup(team_slug)
         if not team_to_usergroup:
             sys.exit(1)

@@ -44,6 +44,7 @@ MODEL_ARGS:
   --disable-bias-linear: true
   --sequence-parallel: true
   --num-experts: 8
+  --moe-token-dispatcher-type: allgather
   --moe-router-load-balancing-type: sinkhorn
   --moe-router-topk: 1
   --deterministic-mode: true

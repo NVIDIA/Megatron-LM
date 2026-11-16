@@ -1356,6 +1356,7 @@ class ColumnParallelLinear(torch.nn.Module):
         weight: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
         inference_tp_ag_barrier: bool = False,
+        output_dtype: Optional[torch.dtype] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward of ColumnParallelLinear
 
@@ -1372,6 +1373,8 @@ class ColumnParallelLinear(torch.nn.Module):
                 can copy-out the previous AG output. For more information, refer to
                 ``barrier_before`` in ``multimem_all_gather``
                 (``megatron.core.inference.communication.torch_symm_triton.collectives``).
+            output_dtype (torch.dtype, optional): GEMM output dtype for this call.
+                Default None means the `output_dtype` arg in the constructor will be used.
 
         Returns:
             - output
@@ -1446,7 +1449,7 @@ class ColumnParallelLinear(torch.nn.Module):
             ),
             tp_group=self.tp_group,
             gtp_remat_size=self.gtp_remat_size,
-            output_dtype=self.output_dtype,
+            output_dtype=self.output_dtype if output_dtype is None else output_dtype,
         )
 
         gather_output = self.gather_output
