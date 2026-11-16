@@ -423,6 +423,122 @@ class TestNemoArchiveReaders:
             nemo_audio_configs_from_path(nemo_path)
 
 
+class _PickleRCE:
+    """Pickle payload that runs a shell command on unpickling (CWE-502)."""
+
+    def __init__(self, marker):
+        self.marker = str(marker)
+
+    def __reduce__(self):
+        return (os.system, (f'echo pwned > "{self.marker}"',))
+
+
+def _write_raw_nemo_archive(tmp_path, members, name="evil.nemo") -> str:
+    """Write a tar from ``[(arcname, bytes | None, tarinfo_overrides)]`` entries."""
+    import io
+
+    nemo_path = tmp_path / name
+    with tarfile.open(nemo_path, "w:") as tar:
+        for arcname, data, overrides in members:
+            info = tarfile.TarInfo(name=arcname)
+            for k, v in overrides.items():
+                setattr(info, k, v)
+            if data is None:
+                tar.addfile(info)
+            else:
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+    return str(nemo_path)
+
+
+_MINIMAL_CONFIG_YAML = b"model:\n  encoder:\n    d_model: 16\n  preprocessor:\n    features: 8\n"
+
+
+class TestNemoArchiveSecurity:
+    """Malicious .nemo archives must not lead to code execution or file escape."""
+
+    def test_malicious_pickle_weights_not_executed(self, tmp_path):
+        pytest.importorskip("omegaconf")
+        marker = tmp_path / "pwned.marker"
+        wts = tmp_path / "model_weights.ckpt"
+        torch.save(_PickleRCE(marker), wts)
+        nemo_path = _write_raw_nemo_archive(
+            tmp_path,
+            [
+                ("./model_config.yaml", _MINIMAL_CONFIG_YAML, {}),
+                ("./model_weights.ckpt", wts.read_bytes(), {}),
+            ],
+        )
+
+        with pytest.raises(Exception):
+            extract_nemo_archive(nemo_path)
+        assert not marker.exists(), "pickle payload executed: weights_only=False regression"
+
+    def test_torch_load_uses_weights_only(self, monkeypatch):
+        from megatron.core.models.audio import nemo_audio_checkpoint as mod
+
+        seen = {}
+
+        def fake_load(path, **kwargs):
+            seen.update(kwargs)
+            return {}
+
+        monkeypatch.setattr(mod.torch, "load", fake_load)
+        mod._torch_load("ignored")
+        assert seen.get("weights_only") is True
+
+    def test_no_unsafe_fallback_when_weights_only_unsupported(self, monkeypatch):
+        from megatron.core.models.audio import nemo_audio_checkpoint as mod
+
+        calls = []
+
+        def old_torch_load(path, map_location=None, **kwargs):
+            calls.append(kwargs)
+            if "weights_only" in kwargs:
+                raise TypeError("unexpected keyword argument 'weights_only'")
+            return {}
+
+        monkeypatch.setattr(mod.torch, "load", old_torch_load)
+        with pytest.raises(RuntimeError, match="weights_only"):
+            mod._torch_load("ignored")
+        assert len(calls) == 1, "must not retry torch.load without weights_only"
+
+    def test_symlink_member_rejected(self, tmp_path):
+        pytest.importorskip("omegaconf")
+        target = tmp_path / "secret.txt"
+        target.write_text("secret")
+        nemo_path = _write_raw_nemo_archive(
+            tmp_path,
+            [("./model_config.yaml", None, {"type": tarfile.SYMTYPE, "linkname": str(target)})],
+        )
+        with pytest.raises(ValueError, match="not a regular file"):
+            read_nemo_config(nemo_path)
+
+    def test_path_traversal_member_name_stays_in_tmpdir(self, tmp_path):
+        pytest.importorskip("omegaconf")
+        escaped = tmp_path / "escaped"
+        nested = tmp_path / "out"
+        nemo_path = _write_raw_nemo_archive(
+            tmp_path, [("../../escaped/model_config.yaml", _MINIMAL_CONFIG_YAML, {})]
+        )
+        out_dir = nested / "x"
+        out_dir.mkdir(parents=True)
+        from megatron.core.models.audio.nemo_audio_checkpoint import _extract_member
+
+        with tarfile.open(nemo_path, "r:") as tar:
+            dest = _extract_member(tar, "model_config.yaml", str(out_dir))
+        assert os.path.dirname(dest) == str(out_dir)
+        assert not escaped.exists()
+
+    def test_benign_archive_still_loads(self, tmp_path):
+        pytest.importorskip("omegaconf")
+        ref_model = NemoTransformerAudioModel(_MIN_CFG)
+        nemo_path = _write_fake_nemo_archive(tmp_path, encoder_state=ref_model.encoder.state_dict())
+        cfg, state = extract_nemo_archive(nemo_path)
+        assert "encoder" in cfg
+        assert any(k.startswith("encoder.") for k in state)
+
+
 class TestNemoTransformerAudioCheckpoint:
     def test_load_weights_into_audio_model(self, tmp_path):
         pytest.importorskip("omegaconf")

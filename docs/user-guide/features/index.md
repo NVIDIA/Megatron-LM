@@ -21,6 +21,7 @@ moe
 megatron_fsdp
 dist_optimizer
 checkpoint-merge
+experiment_logging
 optimizer_cpu_offload
 paged_stash
 tokenizers
