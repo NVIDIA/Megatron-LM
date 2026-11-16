@@ -1263,6 +1263,46 @@ class TestRLUtils:
             if sliced:
                 assert torch.all(grad[:, -1, :] == 0)
 
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+    def test_packed_grpo_loss_replays_updated_advantages(self):
+        current = torch.full((1, 12), -1.0, device="cuda")
+        advantages = torch.tensor([1.0, -2.0, 4.0], device="cuda")
+
+        def loss():
+            return rl_utils.calculate_grpo_loss(
+                current_logprobs=current,
+                old_logprobs=current,
+                ref_logprobs=current,
+                advantages=advantages,
+                clamp_eps_lower=0.1,
+                clamp_eps_upper=0.2,
+                kl_beta=0.0,
+                entropy_weight=0.0,
+                inference_logprobs=current,
+                is_truncation_coef=2.0,
+                seq_starts=[0, 5, 10],
+                seq_lengths=[4, 4, 4],
+            )[0]
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            loss()
+        torch.cuda.current_stream().wait_stream(stream)
+
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            packed_loss = loss()
+
+        for scale in (1.0, 3.0):
+            advantages.copy_(torch.tensor([1.0, -2.0, 4.0], device="cuda") * scale)
+            graph.replay()
+            expected = (
+                torch.tensor([[-1, -1, -1, 0, 0, 2, 2, 2, 0, 0, -4, -4]], device="cuda").float()
+                * scale
+            )
+            torch.testing.assert_close(packed_loss, expected, atol=0, rtol=0)
+
     @pytest.mark.parametrize(
         "ratio, advantage, clamp_eps, kl_beta, entropy_weight, expected",
         [

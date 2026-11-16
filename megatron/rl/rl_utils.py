@@ -3183,11 +3183,12 @@ def calculate_grpo_loss(
             (1, bin_size), device=current_logprobs.device, dtype=current_logprobs.dtype
         )
 
+        advantages = advantages.detach().to(device=current_logprobs.device)
         for seq_idx, (start, seq_len) in enumerate(zip(seq_starts, seq_lengths)):
             # Logprobs are 1 token shorter than sequences
             end = min(start + seq_len - 1, bin_size)
             if end > start:
-                packed_advantages[0, start:end] = advantages[seq_idx].item()
+                packed_advantages[0, start:end].copy_(advantages[seq_idx].reshape(()))
 
         advantages = packed_advantages
     else:
@@ -3199,13 +3200,13 @@ def calculate_grpo_loss(
     kl_term = ref_diff.exp() - ref_diff - 1
     entropy_term = -current_logprobs.exp() * current_logprobs
 
-    is_weights = torch.tensor(1.0, dtype=old_logprobs.dtype).to(old_logprobs.device)
+    is_weights = old_logprobs.new_ones(())
     if inference_logprobs is not None:
         is_weights = (old_logprobs - inference_logprobs).exp()
         if is_truncation_coef is not None:
             is_weights = torch.min(
                 is_weights,
-                torch.tensor(is_truncation_coef, dtype=old_logprobs.dtype).to(old_logprobs.device),
+                old_logprobs.new_full((), is_truncation_coef),
             )
 
     loss = (
