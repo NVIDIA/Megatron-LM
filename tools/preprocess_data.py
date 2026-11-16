@@ -317,13 +317,13 @@ def main():
     args = get_args()
 
     workers = args.workers_to_check if args.find_optimal_num_workers else [args.workers]
-    for num_workers in workers.copy():
+    for num_workers in workers:
         if num_workers % args.partitions != 0:
             print(
                 f"Removing num_workers ({num_workers}) from workers list "
                 f"because it's not divisible by num_partitions ({args.partitions})"
             )
-            workers.remove(num_workers)
+    workers[:] = [num_workers for num_workers in workers if num_workers % args.partitions == 0]
     assert workers, "Please, provide valid number of workers which is divisible by number of partitions."
     if args.find_optimal_num_workers:
         args.log_interval = 1000
