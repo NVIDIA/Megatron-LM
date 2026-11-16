@@ -626,17 +626,35 @@ def test_get_data_parallel_size_rejects_an_indivisible_world(container_factory):
         cfg.get_parallel_layout(12)
 
 
-def test_model_capacity_must_cover_the_sample_length(container_factory):
+@pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope", "yarn"])
+def test_model_capacity_must_cover_the_sample_length(container_factory, position_embedding_type):
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
     cfg.model = _layout()
+    cfg.model.position_embedding_type = position_embedding_type
     cfg.model.seq_length = 32
-    with pytest.raises(ValueError, match="model.seq_length \\(32"):
+    if position_embedding_type == "learned_absolute":
+        with pytest.raises(ValueError, match="model.seq_length \\(32"):
+            cfg.validate()
+    else:
         cfg.validate()
     cfg.model.seq_length = 64
     cfg.validate()
     cfg.model = None
     with pytest.raises(ValueError, match="Training requires a model config"):
         cfg.validate()
+
+
+@pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope", "yarn"])
+def test_cli_position_capacity_only_limits_learned_embeddings(position_embedding_type):
+    extra = ["--seq-length", "64", "--position-embedding-type", position_embedding_type]
+    if position_embedding_type == "learned_absolute":
+        with pytest.raises(AssertionError, match="max_position_embeddings"):
+            _validated(extra)
+        # The legacy flag overrides the learned-absolute selection.
+        extra.append("--use-rotary-position-embeddings")
+    args = _validated(extra)
+    assert args.max_position_embeddings == 32
+    assert args.seq_length == 64
 
 
 def test_the_run_execution_length_matches_fixed_dataset_rows(container_factory, monkeypatch):

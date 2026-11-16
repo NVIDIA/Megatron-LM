@@ -1176,12 +1176,15 @@ def validate_args(args, defaults={}):
         assert args.encoder_seq_length is not None
         args.seq_length = args.encoder_seq_length
 
-    if args.seq_length is not None:
-        assert args.max_position_embeddings >= args.seq_length, \
-            f"max_position_embeddings ({args.max_position_embeddings}) must be greater than " \
-            f"or equal to seq_length ({args.seq_length})."
-    if args.decoder_seq_length is not None:
-        assert args.max_position_embeddings >= args.decoder_seq_length
+    # Only learned position tables impose this capacity limit. The legacy RoPE
+    # flag is normalized below and also overrides position_embedding_type.
+    if args.position_embedding_type == 'learned_absolute' and not args.use_rotary_position_embeddings:
+        if args.seq_length is not None:
+            assert args.max_position_embeddings >= args.seq_length, \
+                f"max_position_embeddings ({args.max_position_embeddings}) must be greater than " \
+                f"or equal to seq_length ({args.seq_length})."
+        if args.decoder_seq_length is not None:
+            assert args.max_position_embeddings >= args.decoder_seq_length
     if args.save is not None and args.save_params_interval is not None:
         assert not args.overlap_param_gather, \
             '--save-params-interval is not supported with --overlap-param-gather'

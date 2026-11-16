@@ -741,7 +741,11 @@ class PretrainConfigContainer(ConfigContainerBase):
                     "Learned position capacity must cover the SFT pack's padded positions"
                 )
         capacity = getattr(self.model, "seq_length", None)
-        if isinstance(capacity, int) and isinstance(dataset.sequence_length, int):
+        if (
+            getattr(self.model, "position_embedding_type", "learned_absolute") == "learned_absolute"
+            and isinstance(capacity, int)
+            and isinstance(dataset.sequence_length, int)
+        ):
             if capacity < dataset.sequence_length:
                 raise ValueError(
                     f"model.seq_length ({capacity}, the position-embedding capacity, "

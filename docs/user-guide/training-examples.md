@@ -85,8 +85,11 @@ Dataset content limits and model execution widths have different owners:
   row, or an entire packed THD row, including padding and expanded image tokens.
   This is the maximum for the training run, not the model's architectural capacity.
   `--max-seq-length-per-sample` sets it explicitly; GPT defaults to `--seq-length`.
-- `cfg.model.seq_length` is the model's position capacity (`--max-position-embeddings`),
-  not a dataset truncation limit. RoPE settings are unchanged.
+- `cfg.model.seq_length` retains `--max-position-embeddings`: it sizes learned
+  absolute position tables and is retained as model/export metadata for RoPE.
+  It is not a dataset truncation limit or a RoPE execution bound, and is not an
+  alias of the run's `max_seq_length_per_sample`. Learned tables may be larger
+  than the inputs used in a particular run.
 - `max_seqlen_per_dp_cp_rank` remains the separate per-rank dynamic-CP packing budget.
 
 For example, `--sft --seq-length 2048 --max-seq-length-per-sample 8192` truncates
