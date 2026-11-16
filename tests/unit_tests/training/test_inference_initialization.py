@@ -312,11 +312,9 @@ def test_distributed_training_services_require_explicit_opt_in(
                 hidden_size=128,
                 num_attention_heads=8,
                 tp_comm_overlap=True,
-                max_seq_length_per_sample=64,  # the training sequence length (--seq-length)
+                max_seq_length_per_sample=96 if vlm else 64,
             ),
             seq_length=1024,  # Position capacity must not be used for buffer sizing.
-            # A VLM's resolved decoder length; its finalize() makes it the per-sample maximum.
-            **({"decoder_seq_length": 96} if vlm else {}),
             tp_comm_overlap_cfg={"qkv_fprop": {"method": "ring_exchange"}},
         )
     else:
@@ -373,6 +371,85 @@ def test_distributed_training_services_require_explicit_opt_in(
         assert tp_call.kwargs["tp_comm_overlap_cfg"] == run_config.model.tp_comm_overlap_cfg
     else:
         assert tp_call.kwargs["tp_comm_overlap_cfg"] == args.tp_comm_overlap_cfg
+
+
+@pytest.mark.parametrize("use_mcore,first_rank", [(False, True), (True, True), (True, False)])
+def test_vlm_evaluation_uses_resolved_execution_width(
+    monkeypatch, run_config, use_mcore, first_rank
+):
+    from megatron.training.config.training_config import MultiModalTokenizerConfig
+    from megatron.training.models import LLaVAModelConfig
+
+    # As in the legacy GPT startup test above, isolate the already-removed
+    # generation package and wrapper config; this checks the example's inputs.
+    generation = ModuleType("megatron.inference.text_generation")
+    api = ModuleType(f"{generation.__name__}.api")
+    api.generate_and_post_process = Mock()
+    forward = ModuleType(f"{generation.__name__}.forward_step")
+    forward.ForwardStep = object
+    wrapper_config = ModuleType(
+        "megatron.core.inference.model_inference_wrappers.inference_wrapper_config"
+    )
+    wrapper_config.InferenceWrapperConfig = Mock()
+    for module in (generation, api, forward, wrapper_config):
+        monkeypatch.setitem(sys.modules, module.__name__, module)
+    script_dir = Path(__file__).resolve().parents[3] / "examples/multimodal"
+    monkeypatch.syspath_prepend(str(script_dir))
+    spec = importlib.util.spec_from_file_location(
+        "vlm_generation_inputs", script_dir / "run_text_generation.py"
+    )
+    script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(script)
+
+    transformer = run_config.model.transformer
+    transformer.max_seq_length_per_sample = 128
+    run_config.model = LLaVAModelConfig(transformer=transformer, seq_length=256)
+    run_config.tokenizer = MultiModalTokenizerConfig()
+    # No decoder_seq_length: the canonical execution-width flag alone is supported.
+    args = Namespace(
+        use_mcore_inference=use_mcore,
+        use_tiling=False,
+        max_num_tiles=1,
+        use_thumbnail=False,
+        num_frames=1,
+        num_workers=0,
+        vision_model_type="clip",
+        pixel_shuffle=False,
+        use_tile_tags=False,
+        hidden_size=32,
+        inference_batch_times_seqlen_threshold=512,
+        fp32_residual_connection=False,
+        params_dtype=torch.float32,
+        inference_max_seq_length=128,
+    )
+    monkeypatch.setattr(script, "get_args", lambda: args)
+    monkeypatch.setattr(
+        script, "get_evaluation_dataloader", lambda *a: [(Mock(), Mock(), 0, "?", [], {})]
+    )
+    monkeypatch.setattr(script, "get_num_image_embeddings", lambda *a: 4)
+    monkeypatch.setattr(script, "get_conversation", lambda *a: "prompt")
+    monkeypatch.setattr(script, "is_first_rank", lambda: first_rank)
+    monkeypatch.setattr(script, "StaticInferenceContext", Mock())
+    monkeypatch.setattr(script, "get_tokenizer", Mock())
+    for name in ("InferenceWrapperConfig", "VLMInferenceWrapper", "VLMTextGenerationController"):
+        monkeypatch.setattr(script, name, Mock())
+    engine = Mock()
+    engine.get_new_request_id.return_value = "0"
+    engine.generate.return_value = []
+    monkeypatch.setattr(script, "StaticInferenceEngine", Mock(return_value=engine))
+    generate = Mock(return_value=([], None, None, None))
+    monkeypatch.setattr(script, "generate_and_post_process", generate)
+
+    assert (
+        list(script.generate_samples(Mock(), script.EvaluationConfig(task="inference"), False))
+        == []
+    )
+    if use_mcore:
+        request = engine.generate.call_args.kwargs["inference_requests"][0]
+        assert request.decoder_seq_length == 128
+    else:
+        forward_step = generate.call_args.kwargs["forward_step"]
+        assert forward_step.args[3] == 128
 
 
 @pytest.mark.parametrize("is_vlm,is_mimo", [(False, False), (True, False), (True, True)])

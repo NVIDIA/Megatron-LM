@@ -230,7 +230,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
         conv = get_conversation(config.task, question, metadata)
 
         if not args.use_mcore_inference:
-            forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles, args.decoder_seq_length)
+            forward_step = partial(VLMForwardStep, num_img_embeddings_per_tile, imgs, num_tiles, cfg.model.transformer.max_seq_length_per_sample)
 
         inference_context = StaticInferenceContext(max_batch_size=1, max_sequence_length=args.inference_max_seq_length)
         if is_first_rank():
@@ -244,7 +244,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                    num_img_embeddings_per_tile=num_img_embeddings_per_tile,
                    imgs=imgs,
                    num_tiles=num_tiles,
-                   decoder_seq_length=args.decoder_seq_length,
+                   decoder_seq_length=cfg.model.transformer.max_seq_length_per_sample,
                 )
                 results: List[InferenceRequest] = inference_engine.generate(
                     inference_requests=[inference_request]
@@ -361,7 +361,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                    num_img_embeddings_per_tile=num_img_embeddings_per_tile,
                    imgs=imgs,
                    num_tiles=num_tiles,
-                   decoder_seq_length=args.decoder_seq_length,
+                   decoder_seq_length=cfg.model.transformer.max_seq_length_per_sample,
                 )
                 inference_engine.generate(
                     inference_requests=[inference_request]

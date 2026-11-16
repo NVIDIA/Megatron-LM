@@ -305,11 +305,12 @@ def test_implicit_class_resolution():
         (_fim(), GPTDataset, "requires"),
         (_fim(), SFTDataset, "requires"),
         (_dataset(VarlenDatasetConfig, varlen_sbhd_validation=True), MockVarlenDataset, "requires real data"),
+        (_dataset(VarlenDatasetConfig, varlen_sbhd_validation=True), None, "requires real data"),
         (_dataset(), object, "must be one of the dataset classes"),
         (_dataset(), "GPTDataset", "must be one of the dataset classes"),
     ],
 )  # fmt: skip
-def test_explicit_class_must_match_the_config(dataset, dataset_type, message):
+def test_selected_class_must_match_the_config(dataset, dataset_type, message):
     with pytest.raises(ValueError, match=message):
         resolve_dataset_class(dataset, dataset_type)
 

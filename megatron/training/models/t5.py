@@ -62,11 +62,19 @@ class T5ModelConfig:
         """Check the independent encoder and decoder execution widths."""
         for name in ("encoder_seq_length", "decoder_seq_length"):
             value = getattr(self, name)
+            bound = self.transformer.max_seq_length_per_sample
+            if name == "encoder_seq_length" and value is None:
+                value = bound  # finalize() uses the run bound for an unspecified encoder width.
             if value is not None and value <= 0:
                 raise ValueError(f"{name} must be positive")
-            bound = self.transformer.max_seq_length_per_sample
             if value is not None and bound is not None and value > bound:
                 raise ValueError(f"max_seq_length_per_sample must cover {name}")
+            if (
+                self.position_embedding_type == "learned_absolute"
+                and value is not None
+                and value > self.seq_length
+            ):
+                raise ValueError(f"T5 position capacity must cover {name}")
 
     def finalize(self) -> None:
         """Resolve the encoder width before shared runtime services read the model."""

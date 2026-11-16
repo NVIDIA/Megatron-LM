@@ -256,15 +256,12 @@ def resolve_dataset_class(
         raise TypeError(f"Unsupported dataset config: {type(dataset).__name__}")
     if dataset_type is None:
         family = config_family
-        if source:
-            return dataset_type_from_family(family, mock=False)
-        mock_class = dataset_type_from_family(family, mock=True)
-        if mock_class is None:
+        dataset_type = dataset_type_from_family(family, mock=not source)
+        if dataset_type is None:
             raise ValueError(
                 f"No data source is declared and there is no mock dataset for the {family} "
                 "family; declare blend or blend_per_split."
             )
-        return mock_class
     family, mock = dataset_family_from_type(dataset_type)
     real, mock_class = DATASET_CLASSES[family]
     if mock and source:
