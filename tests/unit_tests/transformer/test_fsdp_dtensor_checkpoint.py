@@ -1185,7 +1185,7 @@ class TestHandleMTPInStateDict:
 class _NumberedLayer(torch.nn.Module):
     """Stands in for a TransformerLayer/MambaLayer: one weight and its global layer_number."""
 
-    def __init__(self, layer_number, inner_layer_numbers=()):
+    def __init__(self, layer_number, inner_layer_numbers=()) -> None:
         super().__init__()
         self.layer_number = layer_number
         self.weight = torch.nn.Parameter(torch.zeros(1))
