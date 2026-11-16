@@ -1137,6 +1137,13 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         }
         return dtype_map.get(key, torch.float32)
 
+    @staticmethod
+    def _common_group_step(param_groups):
+        """Return the step shared by non-empty groups, or None if none has a step."""
+        steps = {group["step"] for group in param_groups if group["params"] and "step" in group}
+        assert len(steps) <= 1, f"steps: {steps}"
+        return next(iter(steps), None)
+
     def state_dict(self):
         """
         The state dict contains all non-DP-rank-dependent (i.e., non-parameter-
@@ -1167,30 +1174,10 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 # No CPU-owned state on this rank: use the FusedAdam counters that
                 # the hybrid optimizer mirrors into its groups, so that groups that
                 # are empty on this rank are still saved with the current step.
-                steps = list(
-                    set(
-                        [
-                            g["step"]
-                            for g in self.optimizer.param_groups
-                            if len(g["params"]) > 0 and "step" in g
-                        ]
-                    )
-                )
-                assert len(steps) <= 1, f"steps: {steps}"
-                step = steps[0] if len(steps) == 1 else None
+                step = self._common_group_step(self.optimizer.param_groups)
         elif USING_TE_OPTIMIZER or USING_APEX_OPTIMIZER:
             # Extract 'step', for TE FusedAdam support.
-            steps = list(
-                set(
-                    [
-                        g["step"]
-                        for g in inner_state_dict["param_groups"]
-                        if len(g["params"]) > 0 and "step" in g
-                    ]
-                )
-            )
-            assert len(steps) <= 1, f"steps: {steps}"
-            step = steps[0] if len(steps) == 1 else None
+            step = self._common_group_step(inner_state_dict["param_groups"])
 
         # Optimizer state (do not store parameter state here).
         state_dict['optimizer'] = {k: v for k, v in inner_state_dict.items() if k != "state"}

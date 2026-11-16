@@ -331,10 +331,21 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
         updated_groups = set()
         if self.gpu_optimizer is not None:
             for group in self.gpu_optimizer.param_groups:
-                if "step" in group:
+                # Torch Adam/AdamW advance per-parameter counters; their group
+                # step is only the stale value copied from HDO before the update.
+                # FusedAdam instead advances the group counter itself.
+                step = next(
+                    (
+                        int(self.gpu_optimizer.state[param]["step"])
+                        for param in group["params"]
+                        if "step" in self.gpu_optimizer.state.get(param, {})
+                    ),
+                    group.get("step"),
+                )
+                if step is not None:
                     orig_param = self.inner_param_to_orig_param[group["params"][0]]
                     outer_group = param_to_group[orig_param]
-                    outer_group["step"] = group["step"]
+                    outer_group["step"] = step
                     updated_groups.add(id(outer_group))
         for optimizer in self.cpu_optimizers:
             for param, state in optimizer.state.items():
@@ -384,7 +395,8 @@ class HybridDeviceOptimizer(torch.optim.Optimizer):
                     if not isinstance(v, torch.Tensor):
                         continue
                     orig_param = self.inner_param_to_orig_param.get(param, param)
-                    if isinstance(optimizer, self.defaults["cpu_optimizer_cls"]):
+                    # Both owners may use the same Torch optimizer class.
+                    if optimizer is not self.gpu_optimizer:
                         self.state[orig_param][k] = state[k] = v.to("cpu")
                     else:
                         self.state[orig_param][k] = state[k] = v.to("cuda")

@@ -1,7 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 import random
 from copy import deepcopy
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -132,12 +131,29 @@ def test_hybrid_decoupled_gradient_and_missing_grad(
                 ), "A supplied gradient did not update its owner"
 
 
-@pytest.mark.parametrize('restore_model_first', [True, False])
-@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize('overlap', [False, True])
-@pytest.mark.skipif(GPUAdam is Adam, reason='Requires TransformerEngine FusedAdam')
+@pytest.mark.parametrize(
+    "dtype,overlap,restore_model_first,gpu_optimizer_cls",
+    [
+        pytest.param(
+            dtype,
+            overlap,
+            restore_model_first,
+            GPUAdam,
+            marks=pytest.mark.skipif(
+                GPUAdam is Adam, reason="Requires TransformerEngine FusedAdam"
+            ),
+        )
+        for dtype in (torch.bfloat16, torch.float32)
+        for overlap in (False, True)
+        for restore_model_first in (True, False)
+    ]
+    + [
+        pytest.param(torch.bfloat16, False, True, Adam, id="torch-adam"),
+        pytest.param(torch.bfloat16, False, True, AdamW, id="torch-adamw"),
+    ],
+)
 def test_hybrid_state_dict_preserves_gpu_steps(
-    dtype: torch.dtype, overlap: bool, restore_model_first: bool
+    dtype: torch.dtype, overlap: bool, restore_model_first: bool, gpu_optimizer_cls
 ) -> None:
     """A native checkpoint must preserve more than the first resumed update.
 
@@ -153,11 +169,20 @@ def test_hybrid_state_dict_preserves_gpu_steps(
     def construct():
         parameters = [nn.Parameter(value.clone()) for value in initial]
         # The first group is owned only by the CPU, the second only by the GPU.
+        param_groups = [{'params': parameters[:2]}, {'params': parameters[2:]}]
+        if gpu_optimizer_cls in (Adam, AdamW):
+            # Exercise CPU-only, mixed and GPU-only groups together: stale GPU
+            # group counters must not mask the steps advanced by Torch Adam.
+            param_groups = [
+                {"params": parameters[:1]},
+                {"params": parameters[1:3]},
+                {"params": parameters[3:]},
+            ]
         optimizer = HybridDeviceOptimizer(
-            [{'params': parameters[:2]}, {'params': parameters[2:]}],
+            param_groups,
             offload_fraction=0.5,
             cpu_optimizer_cls=AdamW,
-            gpu_optimizer_cls=GPUAdam,
+            gpu_optimizer_cls=gpu_optimizer_cls,
             param_update_in_fp32=True,
             overlap_cpu_optimizer_d2h_h2d=overlap,
             lr=0.01,
@@ -181,6 +206,7 @@ def test_hybrid_state_dict_preserves_gpu_steps(
     for index in (1, 2, 3):
         step(parameters, optimizer, index)
     torch.cuda.synchronize()
+    assert all(group['step'] == 3 for group in optimizer.param_groups)
     checkpoint = deepcopy(optimizer.state_dict())
     restored_parameters, restored_optimizer = construct()
     if restore_model_first:
@@ -193,7 +219,10 @@ def test_hybrid_state_dict_preserves_gpu_steps(
         step(restored_parameters, restored_optimizer, index)
         torch.cuda.synchronize()
         for child in (optimizer.gpu_optimizer, restored_optimizer.gpu_optimizer):
-            assert all(group['step'] == index for group in child.param_groups)
+            if gpu_optimizer_cls in (Adam, AdamW):
+                assert all(state['step'] == index for state in child.state.values())
+            else:
+                assert all(group['step'] == index for group in child.param_groups)
         # Outer groups, including any owned only by the CPU, carry the current
         # counter; ChainedOptimizer asserts that all of them agree on save.
         for outer in (optimizer, restored_optimizer):
@@ -260,7 +289,10 @@ def test_gpu_only_hybrid_state_dict_saves_step_for_empty_group() -> None:
     for _ in range(3):
         parameter.decoupled_grad = torch.ones_like(parameter, dtype=torch.float32)
         optimizer.step()
-    saved = DistributedOptimizer.state_dict(SimpleNamespace(optimizer=optimizer, grad_scaler=None))
+    distributed_optimizer = DistributedOptimizer.__new__(DistributedOptimizer)
+    distributed_optimizer.optimizer = optimizer
+    distributed_optimizer.grad_scaler = None
+    saved = distributed_optimizer.state_dict()
     assert [group.get('step') for group in saved['optimizer']['param_groups']] == [3, 3]
 
 
