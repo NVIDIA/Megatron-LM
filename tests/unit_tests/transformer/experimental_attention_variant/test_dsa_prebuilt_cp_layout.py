@@ -330,7 +330,7 @@ def _dsa_config():
 def _prepare(monkeypatch, packed_seq_params, cp_group, config=None, **kwargs):
     """prepare_packed_seq_params with the real THD route prebuild for ``cp_group``."""
 
-    def finalize(params):
+    def finalize(params, **kwargs):
         params.cp_group = cp_group
         prebuild_thd_cp_partition_routes(params, cp_group)
         return params
@@ -1040,7 +1040,7 @@ def test_prebuild_is_idempotent_and_builds_nothing_during_capture(monkeypatch):
     assert prebuild_packed_cp_layout(params) is layout
     # prepare_packed_seq_params on metadata whose routes are kept (a static slot that is
     # prepared again in every step) reuses the attached layout as well.
-    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", lambda p: p)
+    monkeypatch.setattr(packed_seq_utils, "finalize_packed_seq_params", lambda p, **kwargs: p)
     packed_seq_utils.prepare_packed_seq_params(params, _dsa_config())
     assert get_prebuilt_packed_cp_layout(params) is layout
     assert len(builds) == 1

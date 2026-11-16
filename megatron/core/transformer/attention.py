@@ -28,7 +28,11 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb_with_cos_sin,
 )
 from megatron.core.ops.norm.torch_norm import L2Norm, LayerNormBuilder
-from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
+from megatron.core.packed_seq_params import (
+    PackedSeqParams,
+    resolve_cp_group,
+    resolve_tp_cp_group,
+)
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -1594,7 +1598,12 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             packed_seq_params=packed_seq_params,
             cp_group=runtime_cp_group,
             tp_group=self.pg_collection.tp,
-            tp_cp_group=getattr(self.pg_collection, "tp_cp", None),
+            tp_cp_group=resolve_tp_cp_group(
+                getattr(self.pg_collection, "tp_cp", None),
+                packed_seq_params,
+                sequence_parallel=self.config.sequence_parallel,
+                tp_group=self.pg_collection.tp,
+            ),
             target_partition_mode="zigzag",
             sequence_parallel=self.config.sequence_parallel,
             config=self.config,
