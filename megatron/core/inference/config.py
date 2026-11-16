@@ -835,15 +835,13 @@ class InferenceConfig:
     """Mode used to schedule dynamic batching inference work. Defaults to async scheduling; use
     ``AsyncScheduleMode.LEGACY`` to disable it."""
 
-    gc_mode: Literal["default", "freeze", "freeze_overlap"] = "freeze_overlap"
+    gc_mode: Literal["default", "defer_full"] = "defer_full"
     """Python garbage collection policy while the engine serves requests.
 
-    `default` keeps CPython's automatic collection unchanged. `freeze` collects and then
-    freezes the heap after engine setup, and again when the engine first drains after a step,
-    so later collections skip long-lived engine state objects; `freeze_overlap` additionally
-    disables automatic collection once the first-drain freeze is done and triggers GC right after
-    each forward pass is submitted, overlapping GC with the queued GPU work. Defaults to
-    `freeze_overlap`.
+    `default` keeps CPython's automatic collection unchanged.
+    `defer_full` keeps its collections of young objects and defers its full collections
+    (which would walk every live object of the process including the in-flight request states)
+    until the engine is idle, suspended, or shut down. Defaults to `defer_full`.
     """
 
     logprobs_mode: Literal['raw_logprobs', 'processed_logprobs'] = 'raw_logprobs'
@@ -983,10 +981,9 @@ class InferenceConfig:
                 "Supported modes: raw_logprobs, processed_logprobs."
             )
 
-        if self.gc_mode not in ("default", "freeze", "freeze_overlap"):
+        if self.gc_mode not in ("default", "defer_full"):
             raise ValueError(
-                f"Unsupported gc_mode {self.gc_mode!r}. "
-                "Supported modes: default, freeze, freeze_overlap."
+                f"Unsupported gc_mode {self.gc_mode!r}. Supported modes: default, defer_full."
             )
 
         # The speculative log-probs path does not yet apply processed-logprobs.

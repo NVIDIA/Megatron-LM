@@ -3,6 +3,7 @@
 import asyncio
 import concurrent.futures
 import functools
+import gc
 import logging
 import warnings
 from datetime import datetime
@@ -124,6 +125,8 @@ class EngineLoopMixin:
         EngineState.RESUMED,
         EngineState.STOPPED,
     )
+    # CPython's collections per generation at the previous logged step; None before the first.
+    _gc_collections_at_last_log: Optional[Tuple[int, ...]] = None
 
     async def wait_until(self, state: EngineState):
         """Wait until the engine reaches the given state.
@@ -536,6 +539,14 @@ class EngineLoopMixin:
                         msa.max_slots,
                     )
             output_str += self._staging_log_suffix()
+            # Collections per generation since the previous logged step;
+            # with `gc_mode="defer_full"` the last item (full collections) stays 0 while serving.
+            collections = tuple(stats["collections"] for stats in gc.get_stats())
+            previous = self._gc_collections_at_last_log or collections
+            self._gc_collections_at_last_log = collections
+            output_str += " ... gc collections %d/%d/%d" % tuple(
+                now - before for now, before in zip(collections, previous)
+            )
             if color_decode_only:
                 output_str = f"\033[94m{output_str}\033[0m"
             logger.info(output_str)
@@ -560,13 +571,13 @@ class EngineLoopMixin:
         """
         last_step_data = await self.async_forward()
         ret = await self.async_bookkeep(*last_step_data)
-        # The coordinator loop freezes once every EP rank is idle instead.
+        # The coordinator loop collects once every EP rank is idle instead.
         if (
-            self._gc_freeze_pending
+            self.gc_mode == "defer_full"
             and not self.use_coordinator
             and not self.has_unfinished_requests()
         ):
-            self._freeze_gc_after_first_request_drain()
+            self._collect_gc_while_idle()
         # Keep for compatibility with current test suite.
         return ret
 
@@ -783,12 +794,10 @@ class EngineLoopMixin:
                             self.context.prefix_cache_lru_clock += 1
                     else:
                         # No work, but not all pausing means the engine has drained.
-                        self._collect_gc_while_idle(drained=True)
+                        self._collect_gc_while_idle()
                         await asyncio.sleep(0.001 if local_pending_transfers > 0 else 0.02)
 
                 elif self.state == EngineState.PAUSED:
-                    # Paused requests still hold state, so this should not count as the first drain.
-                    self._collect_gc_while_idle(drained=False)
                     await asyncio.sleep(0.02)
 
                 elif self.state == EngineState.UNPAUSING:

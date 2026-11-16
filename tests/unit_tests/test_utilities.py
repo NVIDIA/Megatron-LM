@@ -1,5 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-import gc
 import os
 from argparse import Namespace
 from datetime import timedelta
@@ -11,7 +10,7 @@ from torch.distributed import rendezvous
 
 import megatron.core.parallel_state as ps
 from megatron.core.inference import utils as inference_utils
-from megatron.core.inference.utils import InferenceMode
+from megatron.core.inference.utils import DeferredFullGC, InferenceMode
 from megatron.core.tensor_parallel import random as tp_random
 from megatron.core.transformer import cuda_graphs, multi_token_prediction
 from megatron.training.argument_utils import (
@@ -138,10 +137,9 @@ def snapshot_process_state():
     state = {
         # Set by every engine, cleared only by suspend(); breaks TestInferenceTopKRouter.
         "inference_mode": (InferenceMode._is_active, InferenceMode._use_bounded_mxfp8_rows),
-        # Engines freeze the heap in the freeze gc modes and disable automatic collection in
-        # freeze_overlap; only suspend() or shutdown() undoes it, so a test that stops short
-        # leaves gc disabled and its frozen garbage unreclaimable for every later test.
-        "gc": (gc.isenabled(), gc.get_freeze_count()),
+        # Engines stop automatic full collections in the defer_full gc mode; only suspend() or
+        # shutdown() undoes it, so a test that stops short leaves them off for every later test.
+        "gc": DeferredFullGC.is_active(),
         # The first init fixes the tracker type;
         # TestPartialCudaGraph forces TE, TestMTPCudaGraphInference the no-op one.
         "rng_tracker": (
@@ -162,13 +160,10 @@ def snapshot_process_state():
 def restore_process_state(state):
     """Return every item captured by `snapshot_process_state` to its captured value."""
     InferenceMode._is_active, InferenceMode._use_bounded_mxfp8_rows = state["inference_mode"]
-    gc_enabled, frozen = state["gc"]
-    (gc.enable if gc_enabled else gc.disable)()
-    if gc.get_freeze_count() != frozen:
-        # Unfrozen garbage is only reclaimed by a collection; run it now rather than leave it
-        # for CPython's deferred full collection.
-        gc.unfreeze()
-        gc.collect()
+    if DeferredFullGC.is_active() and not state["gc"]:
+        # The garbage whose collection was deferred is only reclaimed by a full collection,
+        # which this runs rather than leave it for CPython's next one.
+        DeferredFullGC.unset_active()
     tp_random._CUDA_RNG_STATE_TRACKER, tp_random._CUDA_RNG_STATE_TRACKER_INITIALIZED = state[
         "rng_tracker"
     ]

@@ -319,14 +319,14 @@ class TestInferenceConfig:
         assert inference_config.async_sched_mode == expected
 
     def test_gc_mode_flag_reaches_runtime_config(self):
-        """Ensure --inference-gc-mode defaults to freeze_overlap, maps onto InferenceConfig and
+        """Ensure --inference-gc-mode defaults to defer_full, maps onto InferenceConfig and
         is validated."""
-        assert InferenceConfig().gc_mode == "freeze_overlap"
+        assert InferenceConfig().gc_mode == "defer_full"
         with pytest.raises(ValueError, match="Unsupported gc_mode"):
             InferenceConfig(gc_mode="disable")
         parser = _add_inference_args(ArgumentParser())
-        assert parser.parse_args([]).inference_gc_mode == "freeze_overlap"
-        args = parser.parse_args(["--inference-gc-mode", "freeze"])
+        assert parser.parse_args([]).inference_gc_mode == "defer_full"
+        args = parser.parse_args(["--inference-gc-mode", "default"])
         model = SimpleNamespace(
             position_embedding_type="rope",
             max_sequence_length=4096,
@@ -338,7 +338,7 @@ class TestInferenceConfig:
 
         inference_config = setup_config.to_inference_config(model=model, verbose=False)
 
-        assert inference_config.gc_mode == "freeze"
+        assert inference_config.gc_mode == "default"
 
     def test_inference_setup_config_maps_disaggregation_fields(self):
         """Ensure declarative inference config maps disaggregation fields."""
