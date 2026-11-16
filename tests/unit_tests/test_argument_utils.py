@@ -118,8 +118,13 @@ def test_moe_norm_flag_reaches_transformer_config():
 def test_gtp_userbuffer_flags_preserve_cli_contract(name):
     parser = ArgumentParser()
     add_megatron_arguments(parser)
-    assert getattr(parser.parse_args([]), name) is False
-    assert getattr(parser.parse_args(["--" + name.replace("_", "-")]), name) is True
+    flag = "--" + name.replace("_", "-")
+    assert getattr(parser.parse_args([]), name) is None
+    # A bare flag parses to []; validate_args expands it to both collectives.
+    assert getattr(parser.parse_args([flag]), name) == []
+    assert getattr(parser.parse_args([flag, "rs"]), name) == ["rs"]
+    with pytest.raises(SystemExit):
+        parser.parse_args([flag, "foo"])
 
 
 def test_moe_backend_arguments():

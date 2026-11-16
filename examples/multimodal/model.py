@@ -25,6 +25,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import log_single_rank
 from megatron.training import get_args, get_tokenizer, print_rank_0
 from megatron.training.global_vars import get_run_config
+from megatron.training.models import LLaVAModelConfig
 from megatron.training.vocab_utils import model_vocab_size
 
 
@@ -51,6 +52,11 @@ def model_provider(
     """
     args = get_args()
     cfg = get_run_config()
+    if not isinstance(cfg.model, LLaVAModelConfig):
+        raise TypeError(
+            "Expected cfg.model to be LLaVAModelConfig, "
+            f"got {type(cfg.model).__name__}"
+        )
     use_te = args.use_te
 
     print_rank_0('building a multimodal model ...')
@@ -73,11 +79,11 @@ def model_provider(
             )
 
         num_image_embeddings = get_num_image_embeddings(
-            img_h=args.img_h,
-            img_w=args.img_w,
-            patch_dim=args.patch_dim,
+            img_h=cfg.model.img_h,
+            img_w=cfg.model.img_w,
+            patch_dim=cfg.model.patch_dim,
             vision_model_type=args.vision_model_type,
-            disable_vision_class_token=args.disable_vision_class_token,
+            disable_vision_class_token=cfg.model.drop_vision_class_token,
             class_token_len=getattr(args, 'class_token_len', None) or 1,
             pixel_shuffle=args.pixel_shuffle,
             use_tile_tags=args.use_tile_tags,
@@ -276,7 +282,7 @@ def model_provider(
         language_max_sequence_length=args.decoder_seq_length,
         vision_transformer_config=vision_config,
         vision_transformer_layer_spec=vision_transformer_layer_spec,
-        drop_vision_class_token=args.disable_vision_class_token,
+        drop_vision_class_token=cfg.model.drop_vision_class_token,
         vision_projection_config=vision_projection_config,
         vision_projection_layer_spec=vision_projection_layer_spec,
         vision_projection_type=args.vision_projection_type,
@@ -290,9 +296,9 @@ def model_provider(
         post_process=post_process,
         add_encoder=add_encoder,
         add_decoder=add_decoder,
-        img_h=args.img_h,
-        img_w=args.img_w,
-        patch_dim=args.patch_dim,
+        img_h=cfg.model.img_h,
+        img_w=cfg.model.img_w,
+        patch_dim=cfg.model.patch_dim,
         language_rotary_base=cfg.model.rotary_base,
         language_rope_scaling=cfg.model.rope_scaling,
         language_rope_scaling_factor=cfg.model.rope_scaling_factor,
@@ -329,8 +335,8 @@ def model_provider(
     )
 
     model.freeze(
-        freeze_language_model=args.freeze_LM,
-        freeze_vision_model=args.freeze_ViT,
+        freeze_language_model=cfg.model.freeze_language_model,
+        freeze_vision_model=cfg.model.freeze_vision_model,
         freeze_vision_projection=args.freeze_vision_projection,
         unfreeze_router=args.unfreeze_router,
     )

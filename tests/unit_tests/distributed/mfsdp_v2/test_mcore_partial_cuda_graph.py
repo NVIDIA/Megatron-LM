@@ -441,7 +441,6 @@ def test_partial_capture_preserves_communication_streams(
     def run(graphs):
         context = FsdpContext(
             runtime_policy=RuntimePolicy(
-                caller_managed_grad_sync=True,
                 overlap_allgather_reduction=separate_communication_streams,
             )
         )
