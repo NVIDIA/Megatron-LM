@@ -43,8 +43,9 @@ def build_router_diagnostics(
         routing_map_for_aux_loss: Unbiased top-k assignments with the same shape.
         actual_routing_map: Assignments used for token dispatch with the same shape.
         expert_bias: Additive expert-selection correction, or `None` when disabled. Positive
-            values favor an expert. Ordinary bias routing uses score units; quantile balancing
-            uses `-qb_beta` in logit units.
+            values favor an expert. Ordinary bias routing uses score units; micro-batch QB
+            uses `-qb_beta` in logit units. Global-batch QB uses `expert_bias` in its configured
+            score or logit units.
         seq_length: Local sequence length before the token dimension was flattened.
         batch_size: Local micro-batch size.
         padding_mask: Flattened mask where `True` marks padding.
