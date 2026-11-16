@@ -457,8 +457,8 @@ def test_megatron_fsdp_finalization(
         assert ddp.overlap_grad_reduce is (version == 1)
         assert ddp.overlap_param_gather is (version == 1)
         assert run_config.optimizer.overlap_param_gather is (version == 1)
+        assert transformer.gradient_accumulation_fusion is model_overrides
         if version == 2:
-            assert not transformer.gradient_accumulation_fusion
             assert not transformer.deallocate_pipeline_outputs
             assert not ddp.fsdp_all_gather_in_start_param_sync
     for field in ("gradient_accumulation_fusion", "deallocate_pipeline_outputs"):
@@ -467,7 +467,8 @@ def test_megatron_fsdp_finalization(
             for message in caplog.messages
             if f"Disabling model.transformer.{field}" in message
         ]
-        assert len(warnings) == int(version == 2 and model_overrides)
+        disabled = version == 2 and model_overrides and field == "deallocate_pipeline_outputs"
+        assert len(warnings) == int(disabled)
 
 
 @pytest.mark.parametrize("expert_override", [None, "no_shard"])

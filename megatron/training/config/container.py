@@ -1011,12 +1011,18 @@ class PretrainConfigContainer(ConfigContainerBase):
                 self.ddp.align_param_gather = False
             if self.ddp.use_megatron_fsdp:
                 if self.ddp.megatron_fsdp_version == 2:
-                    if transformer.gradient_accumulation_fusion:
+                    if transformer.gradient_accumulation_fusion and (
+                        transformer.fp8_param
+                        or transformer.use_transformer_engine_op_fuser
+                        or transformer.use_grouped_gemm_for_shared_expert
+                        or transformer.cuda_graph_impl != "none"
+                    ):
                         logger.warning(
                             "Disabling model.transformer.gradient_accumulation_fusion: "
-                            "Megatron FSDP v2 does not support gradient accumulation fusion."
+                            "Megatron FSDP v2 does not support it with MXFP8 parameters, "
+                            "Transformer Engine fused ops or CUDA graphs."
                         )
-                    transformer.gradient_accumulation_fusion = False
+                        transformer.gradient_accumulation_fusion = False
                     if transformer.deallocate_pipeline_outputs:
                         logger.warning(
                             "Disabling model.transformer.deallocate_pipeline_outputs: "

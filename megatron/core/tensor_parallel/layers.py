@@ -818,6 +818,15 @@ class LinearWithGradAccumulationAndAsyncCommunication(torch.autograd.Function):
         handle = None
         tp_group = ctx.tp_group
 
+        if (
+            ctx.gradient_accumulation_fusion
+            and main_grad is None
+            and not hasattr(weight, "__fsdp_param__")
+        ):
+            # Megatron-FSDP v2 binds main_grad only during backward, and only for the parameter
+            # groups whose wgrads TE fuses; compute the gradient unfused for the others.
+            main_grad = getattr(weight, "main_grad", None)
+            ctx.gradient_accumulation_fusion = main_grad is not None
         if ctx.gradient_accumulation_fusion:
             weight.main_grad = main_grad
 

@@ -438,8 +438,18 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 f"{ddp_config.expert_outer_dp_sharding_strategy!r} requires "
                 "expert_num_distributed_optimizer_instances > 1."
             )
-        if config.gradient_accumulation_fusion:
-            raise ValueError("MFSDP v2 does not currently support gradient accumulation fusion.")
+        if config.gradient_accumulation_fusion and (
+            config.use_transformer_engine_op_fuser
+            or config.use_grouped_gemm_for_shared_expert
+            or config.defer_embedding_wgrad_compute
+            or config.cuda_graph_impl != "none"
+        ):
+            # TE's fused ops need main_grad at forward and deferred embedding wgrads after
+            # backward, but MFSDP v2 binds it only during backward. CUDA graphs are untested.
+            raise ValueError(
+                "MFSDP v2 does not currently support gradient accumulation fusion with "
+                "Transformer Engine fused ops, deferred embedding wgrads or CUDA graphs."
+            )
         if config.calculate_per_token_loss and (
             config.pipeline_model_parallel_size != 1
             or ddp_config.num_distributed_optimizer_instances != 1
