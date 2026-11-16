@@ -1,5 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from contextlib import nullcontext
+from dataclasses import dataclass, field
+
 import pytest
 import torch
 
@@ -83,8 +86,30 @@ def test_inactive_glu_interleave_accepts_fp32_model_parameters(overrides):
     assert config.params_dtype == torch.float32
 
 
-def _make_overlap_config(mtp_num_layers: int | None) -> TransformerConfig:
-    return TransformerConfig(
+@pytest.mark.parametrize(
+    "size_gib, offload, error",
+    [(size, True, None) for size in (0, 0.5, 8, 3, 152)]
+    + [
+        (size, True, "Pinned offload buffer")
+        for size in (-1, float("nan"), float("inf"), 0.1, 1000 / 2**30, 2**-24)
+    ]
+    + [(0, False, None), (1.5, False, "requires fine_grained_activation_offloading")],
+)
+def test_pinned_offload_buffer_config(size_gib, offload, error):
+    with pytest.raises(ValueError, match=error) if error else nullcontext():
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=8,
+            fine_grained_activation_offloading=offload,
+            offload_modules=["moe_act"],
+            fine_grained_offloading_buffer_size_gib=size_gib,
+        )
+        assert config.fine_grained_offloading_buffer_size_gib == size_gib
+
+
+def _make_overlap_config(mtp_num_layers: int | None, **overrides) -> TransformerConfig:
+    kwargs = dict(
         num_layers=1,
         hidden_size=128,
         num_attention_heads=4,
@@ -95,19 +120,50 @@ def _make_overlap_config(mtp_num_layers: int | None) -> TransformerConfig:
         bf16=True,
         mtp_num_layers=mtp_num_layers,
     )
+    kwargs.update(overrides)
+    return TransformerConfig(**kwargs)
 
 
-@pytest.mark.parametrize("mtp_num_layers", [None, 0, 1])
+_FULL_RECOMPUTE_OVERRIDES = dict(
+    recompute_granularity="full",
+    recompute_method="uniform",
+    recompute_num_layers=1,
+    attention_dropout=0.0,
+    hidden_dropout=0.0,
+)
+
+
+@pytest.mark.parametrize("mtp_num_layers", [None, 0, 1, 2, 3])
 def test_ep_a2a_overlap_accepts_supported_mtp_layer_counts(mtp_num_layers: int | None):
     config = _make_overlap_config(mtp_num_layers)
 
     assert config.mtp_num_layers == mtp_num_layers
 
 
-@pytest.mark.parametrize("mtp_num_layers", [-1, 2])
-def test_ep_a2a_overlap_rejects_unsupported_mtp_layer_counts(mtp_num_layers: int):
-    with pytest.raises(AssertionError, match="MTP supports at most one layer"):
-        _make_overlap_config(mtp_num_layers)
+def test_ep_a2a_overlap_rejects_negative_mtp_layer_count():
+    with pytest.raises(AssertionError, match="mtp_num_layers must be non-negative"):
+        _make_overlap_config(-1)
+
+
+@pytest.mark.parametrize(
+    "overrides,match",
+    [
+        ({"mtp_use_repeated_layer": True}, "mtp_use_repeated_layer with mtp_num_layers > 1"),
+        ({"mtp_hsm": True}, "mtp_hsm is not yet supported"),
+        ({"enable_mhc_connections": True}, "enable_mhc_connections with mtp_num_layers > 1"),
+        (_FULL_RECOMPUTE_OVERRIDES, "full recompute with mtp_num_layers > 1"),
+    ],
+)
+def test_ep_a2a_overlap_rejects_unsupported_multi_mtp_features(overrides: dict, match: str):
+    with pytest.raises(AssertionError, match=match):
+        _make_overlap_config(2, **overrides)
+
+
+@pytest.mark.parametrize("overrides", [{"mtp_use_repeated_layer": True}, _FULL_RECOMPUTE_OVERRIDES])
+def test_ep_a2a_overlap_keeps_single_mtp_layer_features(overrides: dict):
+    config = _make_overlap_config(1, **overrides)
+
+    assert config.mtp_num_layers == 1
 
 
 def test_batch_invariant_backend_rejects_unknown_value_at_construction():
@@ -127,6 +183,19 @@ def test_mhc_fused_backend_defaults_to_auto():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
 
     assert config.mhc_fused_backend == "auto"
+
+
+@pytest.mark.parametrize("flag", ["mhc_norm_eps_inside_sqrt", "mhc_keep_mappings_in_fp32"])
+def test_mhc_fused_rejects_unsupported_precision_at_construction(flag):
+    with pytest.raises(ValueError, match="use_fused_mhc does not support"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=128,
+            num_attention_heads=4,
+            enable_mhc_connections=True,
+            use_fused_mhc=True,
+            **{flag: True},
+        )
 
 
 def _make_dsa_kpool_config(**overrides) -> TransformerConfig:
@@ -188,6 +257,21 @@ def test_explicit_mhc_fused_backend_requires_fused_mhc():
         )
 
 
+def test_mhc_full_recompute_with_distributed_activations_is_configurable():
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        enable_mhc_connections=True,
+        recompute_granularity="full",
+        recompute_method="uniform",
+        recompute_num_layers=1,
+        distribute_saved_activations=True,
+    )
+    assert config.recompute_granularity == "full"
+    assert config.distribute_saved_activations
+
+
 def test_gdp_num_householder_defaults_to_three():
     config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
 
@@ -226,6 +310,49 @@ def test_from_config_creates_independent_target_config_without_reinitializing():
 
     layer_config.dynamic_value["items"].append("changed")
     assert config.dynamic_value == {"items": []}
+
+
+def test_from_config_initializes_subclass_defaults_and_preserves_existing_values():
+    @dataclass
+    class LayerConfig(TransformerConfig):
+        scale: float = 1.5
+        annotations: list = field(default_factory=list)
+        values: list = field(default_factory=list)
+
+        def __post_init__(self):
+            raise AssertionError("from_config must not reinitialize the target config")
+
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    config.values = [3]
+    config.values_alias = config.values
+
+    first = LayerConfig.from_config(config)
+    second = LayerConfig.from_config(config)
+
+    assert first.scale == 1.5
+    assert first.annotations == []
+    assert first.annotations is not second.annotations
+    assert first.values == [3]
+    assert first.values is first.values_alias
+    assert first.values is not config.values
+    assert first.ffn_hidden_size == config.ffn_hidden_size
+
+    first.values = [4]
+    copied = LayerConfig.from_config(first)
+    assert copied.values == [4]
+    assert copied.values is not first.values
+    assert copied.values_alias == [3]
+
+
+def test_from_config_rejects_missing_required_subclass_fields():
+    @dataclass(kw_only=True)
+    class LayerConfig(TransformerConfig):
+        required_value: int
+
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+
+    with pytest.raises(TypeError, match="requires a value for 'required_value'"):
+        LayerConfig.from_config(config)
 
 
 def _make_softcap_config(attn_logit_softcapping) -> TransformerConfig:
@@ -502,6 +629,73 @@ def test_mxfp8_wire_dtypes_require_op_fuser_grouped_gemm(overrides):
         _make_mxfp8_wire_config(**overrides)
 
 
+@pytest.mark.parametrize(
+    "wire_dtypes",
+    [
+        dict(moe_dispatch_fwd_dtype='nvfp4', moe_combine_bwd_dtype='nvfp4'),
+        dict(moe_dispatch_fwd_dtype='nvfp4', moe_combine_bwd_dtype='bf16'),
+        dict(moe_dispatch_fwd_dtype='bf16', moe_combine_bwd_dtype='nvfp4'),
+    ],
+)
+def test_nvfp4_wire_dtypes_accept_fp4_config(wire_dtypes):
+    config = _make_mxfp8_wire_config(fp4="e2m1", **wire_dtypes)
+
+    assert config.moe_dispatch_fwd_dtype == wire_dtypes['moe_dispatch_fwd_dtype']
+    assert config.moe_combine_bwd_dtype == wire_dtypes['moe_combine_bwd_dtype']
+
+
+@pytest.mark.parametrize("compute", [dict(), dict(fp8="e4m3", fp8_recipe="mxfp8")])
+def test_nvfp4_wire_dtypes_require_fp4(compute):
+    with pytest.raises(ValueError, match="'nvfp4' require fp4"):
+        _make_mxfp8_wire_config(
+            moe_dispatch_fwd_dtype='nvfp4', moe_combine_bwd_dtype='bf16', **compute
+        )
+
+
+def test_nvfp4_wire_dtypes_require_op_fuser():
+    with pytest.raises(ValueError, match="require BOTH"):
+        _make_mxfp8_wire_config(
+            fp4="e2m1",
+            moe_dispatch_fwd_dtype='nvfp4',
+            moe_combine_bwd_dtype='nvfp4',
+            use_transformer_engine_op_fuser=False,
+        )
+
+
+@pytest.mark.parametrize(
+    "wire_dtypes",
+    [
+        dict(moe_dispatch_fwd_dtype='nvfp4', moe_combine_bwd_dtype='bf16'),
+        dict(moe_dispatch_fwd_dtype='bf16', moe_combine_bwd_dtype='nvfp4'),
+    ],
+)
+def test_nvfp4_wire_dtypes_reject_first_last_layers_bf16(wire_dtypes):
+    # Layers kept in BF16 run their experts outside the FP4 context, but the dispatcher uses
+    # one global wire recipe, so they would still get NVFP4 payloads; reject the combination.
+    with pytest.raises(ValueError, match="cannot be combined with first_last_layers_bf16"):
+        _make_mxfp8_wire_config(fp4="e2m1", first_last_layers_bf16=True, **wire_dtypes)
+
+    config = _make_mxfp8_wire_config(fp4="e2m1", first_last_layers_bf16=False, **wire_dtypes)
+    assert not config.first_last_layers_bf16
+
+
+@pytest.mark.parametrize(
+    "a2a_dtype, recipe_name",
+    [('bf16', None), ('mxfp8', 'MXFP8BlockScaling'), ('nvfp4', 'NVFP4BlockScaling')],
+)
+def test_get_fp8_recipe_for_a2a(a2a_dtype, recipe_name):
+    te_recipe = pytest.importorskip("transformer_engine.common.recipe")
+    from megatron.core.fp8_utils import get_fp8_recipe_for_a2a
+
+    recipe = get_fp8_recipe_for_a2a(a2a_dtype)
+    if recipe_name is None:
+        assert recipe is None
+    else:
+        assert isinstance(recipe, getattr(te_recipe, recipe_name))
+    with pytest.raises(ValueError, match="Unsupported a2a wire dtype"):
+        get_fp8_recipe_for_a2a('fp16')
+
+
 requires_te_2_9 = pytest.mark.skipif(
     not is_te_min_version("2.9.0"), reason="sequence packing requires Transformer Engine >= 2.9.0"
 )
@@ -525,6 +719,20 @@ def test_sequence_packing_dense_config_passes():
     # must not fail sequence-packing validation.
     config = _make_packing_config()
     assert config.variable_seq_lengths is True
+
+
+@requires_te_2_9
+def test_dynamic_cp_accepts_contiguous_linear_layout():
+    config = _make_packing_config(
+        dynamic_context_parallel=True,
+        calculate_per_token_loss=True,
+        sequence_packing_scheduler="default_dynamic_cp",
+        context_parallel_size=2,
+        linear_cp_layout="contiguous",
+        attention_cp_layout="zigzag",
+    )
+
+    assert config.linear_cp_layout == "contiguous"
 
 
 @requires_te_2_9
@@ -602,3 +810,49 @@ class TestTransformerConfig:
         # num_query_groups then defaults to 0 and the check is skipped.
         config = TransformerConfig(num_layers=1, kv_channels=1)
         assert config.num_query_groups == 0
+
+
+def test_offload_modules_fused_group_mlp_excludes_unfused_expert_knobs():
+    """fused_group_mlp and expert_fc1 + moe_act are equivalent spellings, so combining them is
+    rejected as redundant."""
+    common = dict(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=2,
+        num_moe_experts=2,
+        moe_grouped_gemm=True,
+        use_transformer_engine_op_fuser=True,
+        fine_grained_activation_offloading=True,
+    )
+    TransformerConfig(offload_modules=["fused_group_mlp"], **common)
+    TransformerConfig(offload_modules=["expert_fc1", "moe_act"], **common)
+    with pytest.raises(ValueError, match="cannot be combined with expert_fc1 or moe_act"):
+        TransformerConfig(offload_modules=["fused_group_mlp", "moe_act"], **common)
+
+
+@requires_te_2_9
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        (
+            {"calculate_per_token_loss": True, "cuda_graph_impl": "local"},
+            "Dynamic context parallelism not supported with CUDA Graph",
+        ),
+        (
+            {"calculate_per_token_loss": True, "enable_cuda_graph": True},
+            "Dynamic context parallelism not supported with CUDA Graph",
+        ),
+        ({}, "Dynamic context parallelism must be used with calculate_per_token_loss"),
+        (
+            {"calculate_per_token_loss": True, "moe_z_loss_coeff": 1e-3},
+            "Dynamic context parallelism not supported with moe_z_loss_coeff",
+        ),
+    ],
+)
+def test_dynamic_cp_rejects_unsupported_config(overrides, message):
+    with pytest.raises(AssertionError, match=message):
+        _make_packing_config(
+            dynamic_context_parallel=True,
+            sequence_packing_scheduler="default_dynamic_cp",
+            **overrides,
+        )
