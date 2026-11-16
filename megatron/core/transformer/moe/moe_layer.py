@@ -258,6 +258,11 @@ class MoELayer(BaseMoELayer):
     strategies such as All-to-All and All-Gather.
     """
 
+    def estimate_flops(self, *, include_backward: bool = False, **batch_stats: float) -> float:
+        """Estimate this layer's forward work, optionally including backward."""
+        forward = self._estimate_flops_from_config(self.config, **batch_stats)
+        return (3 if include_backward else 1) * forward
+
     @classmethod
     def _estimate_flops_from_config(
         cls,

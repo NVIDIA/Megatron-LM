@@ -88,31 +88,14 @@ class MegatronModule(torch.nn.Module):
         """Estimate this module's work for one global batch.
 
         Return forward FLOPs by default, or forward plus backward when requested.
-        Ordinary leaves reuse their config formula with a backward multiplier of three.
-        Composites and layers with different backward costs override this method.
+        Each concrete layer implements its own estimate; composites sum their children.
         Custom layers implement this method directly; no registration is required.
 
         Estimates must be pure, finite, nonnegative real numbers. Do not construct
         modules, mutate state, or run collectives. Count each child execution once.
         """
-        forward = self._estimate_flops_from_config(
-            self.config,
-            total_real_tokens_in_batch=total_real_tokens_in_batch,
-            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-        )
-        return (3 if include_backward else 1) * forward
-
-    @classmethod
-    def _estimate_flops_from_config(
-        cls,
-        config: TransformerConfig,
-        *,
-        total_real_tokens_in_batch: float,
-        seqlen_squared_sum_in_batch: float,
-    ) -> float:
-        """Pure built-in leaf formula, also used by legacy config-only reporting."""
         raise NotImplementedError(
-            f"{cls.__name__} must implement estimate_flops for layer FLOP accounting."
+            f"{type(self).__name__} must implement estimate_flops for layer FLOP accounting."
         )
 
     def refresh_cache(self) -> None:

@@ -147,7 +147,8 @@ class AbsorbedMLASelfAttention(Attention):
             return getattr(self.core_attention, "estimate_flops")(
                 absorbed_mla=True, include_backward=include_backward, **batch_stats
             )
-        return super().estimate_flops(include_backward=include_backward, **batch_stats)
+        forward = self._estimate_flops_from_config(self.config, **batch_stats)
+        return (3 if include_backward else 1) * forward
 
     @classmethod
     def _estimate_flops_from_config(
