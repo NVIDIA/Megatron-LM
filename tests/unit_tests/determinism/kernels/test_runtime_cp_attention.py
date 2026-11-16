@@ -440,3 +440,102 @@ def test_flash_decode_dispatch_config_softmax_scale_replays(path):
         assert not bytes_equal(scaled[0]["out"], default[0]["out"])
     finally:
         Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("softmax_type", ["vanilla", "learnable"])
+def test_yarn_rope_fusion_replays(softmax_type, monkeypatch):
+    """YaRN with RoPE fusion (TE fused RoPE, factor squared in the softmax scale) replays."""
+    import math
+    from unittest import mock
+
+    from megatron.core.extensions.transformer_engine import HAVE_TE
+
+    if not HAVE_TE:
+        pytest.skip("requires Transformer Engine")
+
+    from transformer_engine.pytorch.attention.dot_product_attention import (
+        dot_product_attention as te_dpa,
+    )
+
+    from megatron.core.models.common.embeddings import rope_utils
+    from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+    from megatron.core.models.gpt.gpt_layer_specs import (
+        get_gpt_layer_with_transformer_engine_submodules,
+    )
+    from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+    from megatron.core.transformer.attention import SelfAttention
+    from megatron.core.transformer.enums import AttnMaskType
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from tests.unit_tests.test_utilities import Utils
+
+    Utils.initialize_model_parallel()
+    try:
+        model_parallel_cuda_manual_seed(123)
+        seeded()
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        # TE caches backend selection; a preceding test may have chosen another backend.
+        monkeypatch.setattr(
+            te_dpa,
+            "_attention_backends",
+            {
+                "attention_params": None,
+                "use_flash_attention": None,
+                "flash_attention_backend": None,
+                "use_fused_attention": None,
+                "fused_attention_backend": None,
+                "use_unfused_attention": None,
+                "backend_selection_requires_update": False,
+            },
+        )
+        heads, kv_heads, head_dim, seq_len = 8, 2, 64, 512
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=heads * head_dim,
+            num_attention_heads=heads,
+            num_query_groups=kv_heads,
+            kv_channels=head_dim,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            attention_dropout=0.0,
+            hidden_dropout=0.0,
+            add_bias_linear=False,
+            softmax_type=softmax_type,
+            apply_rope_fusion=True,
+            deterministic_mode=True,
+        )
+        # gpt-oss YaRN settings: concentration factor 0.1 * ln(32) + 1.
+        config.yarn_rotary_scaling_factor = 32.0
+        config.yarn_mscale = None
+        config.yarn_mscale_all_dim = None
+        module = SelfAttention(
+            config,
+            get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+        ).cuda()
+        factor = 0.1 * math.log(32.0) + 1.0
+        assert module._rope_mscale == 1.0
+        assert module.softmax_scale == pytest.approx(head_dim**-0.5 * factor**2)
+
+        hidden = torch.randn(seq_len, 2, config.hidden_size, device="cuda", dtype=torch.bfloat16)
+        inputs = dict(
+            hidden_states=hidden.requires_grad_(True),
+            attention_mask=None,
+            rotary_pos_emb=RotaryEmbedding(kv_channels=head_dim, rotary_percent=1.0)(seq_len),
+        )
+        with mock.patch.object(
+            rope_utils, "fused_apply_rotary_pos_emb", wraps=rope_utils.fused_apply_rotary_pos_emb
+        ) as fused_rope:
+            result = assert_module_replays_bit_exact(
+                module,
+                inputs,
+                replays=3,
+                contention=True,
+                what=f"YaRN RoPE fusion, {softmax_type} softmax",
+            )
+        assert fused_rope.call_count >= 2  # q and k use TE's fused RoPE.
+        assert "in.hidden_states" in result[1]
+        for tensors in result:
+            assert all(torch.isfinite(t).all() for t in tensors.values())
+    finally:
+        Utils.destroy_model_parallel()
