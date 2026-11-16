@@ -7,6 +7,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.transformer import TransformerConfig
 from megatron.training import global_vars
@@ -16,6 +17,8 @@ from megatron.training.config import (
     InferenceSetupConfig,
     RLConfig,
 )
+from megatron.training.config.dataset_config import DataConfig
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDatasetConfig
 from megatron.training.models import (
     BertModelConfig,
     GPTModelConfig,
@@ -25,6 +28,110 @@ from megatron.training.models import (
     T5ModelConfig,
 )
 from megatron.training.models.base import ModelConfig
+
+
+@pytest.mark.parametrize("packed", [False, True])
+def test_dataset_content_limit_and_execution_bound_are_distinct(run_config, packed):
+    cfg = run_config
+    cfg.train.micro_batch_size = 1
+    cfg.model.seq_length = 64
+    cfg.model.transformer.max_seq_length_per_sample = 32 if packed else None
+    cfg.data = DataConfig(
+        dataset=(SFTDatasetConfig if packed else GPTDatasetConfig)(
+            random_seed=1234,
+            sequence_length=8,
+            **(
+                {}
+                if packed
+                else dict(reset_position_ids=False, reset_attention_mask=False, eod_mask_loss=False)
+            ),
+        ),
+        dataset_type=MockSFTDataset if packed else MockGPTDataset,
+    )
+    before = copy.deepcopy(cfg.to_dict())
+    cfg.validate()
+    assert cfg.to_dict() == before
+    if packed:
+        assert cfg.data.dataset.packed_sequence_length is None
+    else:
+        assert not hasattr(cfg.data.dataset, "packed_sequence_length")
+    cfg.finalize()
+    assert cfg.data.dataset.sequence_length == 8
+    assert cfg.model.transformer.max_seq_length_per_sample == (32 if packed else 8)
+    saved = cfg.to_dict()
+    restored = type(cfg).from_dict(saved)
+    restored.finalize()
+    assert type(restored.data.dataset) is (SFTDatasetConfig if packed else GPTDatasetConfig)
+    assert restored.model.transformer.max_seq_length_per_sample == (32 if packed else 8)
+    assert restored.to_dict() == saved
+
+
+@pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope", "relative"])
+def test_t5_input_widths_do_not_follow_position_capacity(position_embedding_type):
+    model = T5ModelConfig(
+        transformer=TransformerConfig(
+            num_layers=2, hidden_size=32, num_attention_heads=4, max_seq_length_per_sample=32
+        ),
+        seq_length=128,
+        encoder_num_layers=2,
+        encoder_seq_length=16,
+        decoder_seq_length=32,
+        position_embedding_type=position_embedding_type,
+    )
+    model.validate()
+    model.finalize()
+    assert model.encoder_seq_length == 16
+    assert model.transformer.max_seq_length_per_sample == 32
+    model.seq_length = 16
+    if position_embedding_type == "learned_absolute":
+        with pytest.raises(ValueError, match="position capacity.*decoder_seq_length"):
+            model.validate()
+        model.encoder_seq_length = None
+        with pytest.raises(ValueError, match="position capacity.*encoder_seq_length"):
+            model.validate()
+        model.encoder_seq_length = 16
+    else:
+        model.validate()
+    model.seq_length = 128
+    model.transformer.max_seq_length_per_sample = 16
+    with pytest.raises(ValueError, match="decoder_seq_length"):
+        model.validate()
+
+
+def test_bert_callback_validates_learned_position_capacity(run_config):
+    run_config.model = BertModelConfig(transformer=run_config.model.transformer, seq_length=32)
+    run_config.model.transformer.max_seq_length_per_sample = 64
+    assert run_config.data.dataset is None
+    with pytest.raises(ValueError, match="BERT position capacity"):
+        run_config.validate()
+    run_config.model.seq_length = 128
+    before = copy.deepcopy(run_config.to_dict())
+    run_config.validate()
+    assert run_config.to_dict() == before
+
+
+@pytest.mark.parametrize(
+    "bound,capacity,error", [(33, 64, "alignment"), (64, 32, "position capacity"), (32, 64, None)]
+)
+def test_sft_pack_validates_physical_shape(run_config, bound, capacity, error):
+    cfg = run_config
+    cfg.model.seq_length = capacity
+    cfg.model.position_embedding_type = "learned_absolute"
+    cfg.model.transformer.max_seq_length_per_sample = bound
+    cfg.model.transformer.context_parallel_size = 2
+    cfg.data = DataConfig(
+        dataset=SFTDatasetConfig(
+            random_seed=1234,
+            sequence_length=9,
+        ),
+        dataset_type=MockSFTDataset,
+    )
+    if error is None:
+        # Conversation truncation need not align; the emitted pack must.
+        cfg.validate()
+    else:
+        with pytest.raises(ValueError, match=error):
+            cfg.validate()
 
 
 @pytest.mark.parametrize("inference", [False, True])

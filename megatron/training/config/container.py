@@ -29,7 +29,11 @@ from megatron.core.rerun_state_machine import RerunStateMachine
 from megatron.core.tensor_parallel.gtp_parallel_layout import GTPParallelLayout
 from megatron.core.utils import is_te_min_version, is_torch_min_version
 from megatron.training.config.common_config import DistributedInitConfig, ProfilingConfig, RNGConfig
-from megatron.training.config.dataset_config import DataConfig
+from megatron.training.config.dataset_config import (
+    DataConfig,
+    dataset_family_from_type,
+    resolve_dataset_class,
+)
 from megatron.training.config.inference_config import InferenceSetupConfig
 from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
 from megatron.training.config.resilience_config import (
@@ -52,6 +56,8 @@ from megatron.training.config.utils import (
     serialize_value,
 )
 from megatron.training.config.yaml_utils import safe_yaml_representers
+from megatron.training.datasets.online_tokenized_dataset_config import OnlineTokenizedDatasetConfig
+from megatron.training.datasets.sft_dataset import SFTDatasetConfig
 from megatron.training.models import (
     BertModelConfig,
     LLaVAModelConfig,
@@ -455,6 +461,11 @@ class PretrainConfigContainer(ConfigContainerBase):
         # Config-only topology checks also run when validating a recipe off-cluster.
         # Launch world-size checks remain in the runtime parallel-size helpers.
         transformer = self.model.transformer
+        if (
+            transformer.max_seq_length_per_sample is not None
+            and transformer.max_seq_length_per_sample <= 0
+        ):
+            raise ValueError("model.transformer.max_seq_length_per_sample must be positive")
         tp = transformer.tensor_model_parallel_size
         pp = transformer.pipeline_model_parallel_size
         cp = transformer.context_parallel_size
@@ -632,25 +643,127 @@ class PretrainConfigContainer(ConfigContainerBase):
         )
 
     def _validate_data_section(self) -> None:
-        """Cross-section checks for ``data.dataset``, one per field.
+        """Cross-section checks for the data section, placed by their inputs.
 
-        The model capacity covers the sample length. A value given on the dataset config for one
-        of the six fields other sections own (``CONTAINER_WRITTEN_FIELDS``) must agree with that
-        section: the container writes these fields at ``finalize()``, the arguments and the saved
-        file leave them at Megatron Core's defaults, so a differing explicit value is a mistake.
-        ``data_parallel_size`` needs the world size as well and is checked at ``finalize()``.
+        With a model section, dataset or not: dynamic CP needs the single loader, and a packing
+        scheduler needs per-token loss and ``variable_seq_lengths`` (Core derives the latter at
+        construction; a scheduler selected afterwards must set it). With a dataset: the model capacity covers the sample
+        length, a value given for one of the fields other sections own
+        (``CONTAINER_WRITTEN_FIELDS``) must agree with that section (the container writes them at
+        ``finalize()``; the arguments and the saved file leave them at Megatron Core's defaults),
+        and ``max_seq_length_per_sample`` describes this run's physical input width, not model
+        capacity. Fixed GPT/FIM rows must match it; the container fills an unset value from the
+        dataset at ``finalize()``. SFT's physical pack width is derived from that maximum,
+        independently of its dataset's per-conversation truncation limit.
+        With both: SBHD validation excludes a scheduler, a packed varlen dataset needs one, and the
+        sample length is a multiple of ``2 * cp`` under context parallelism. Each is the condition
+        ``validate_args`` enforces on the CLI; here it holds for a Python or YAML container too.
+        ``data_parallel_size`` and the packed-buffer budget need the world size and are checked at
+        ``finalize()``.
         """
+        transformer = getattr(self.model, "transformer", None)
+        if transformer is not None:
+            loader_type = self.data.dataloader.dataloader_type
+            if getattr(transformer, "dynamic_context_parallel", False) and loader_type not in (
+                None,
+                "single",
+            ):
+                raise ValueError(
+                    "model.transformer.dynamic_context_parallel=True needs "
+                    f"data.dataloader.dataloader_type='single', got {loader_type!r}."
+                )
+            scheduler = getattr(transformer, "sequence_packing_scheduler", None)
+            if scheduler is not None and not getattr(
+                transformer, "calculate_per_token_loss", False
+            ):
+                raise ValueError(
+                    f"model.transformer.sequence_packing_scheduler={scheduler!r} needs "
+                    "model.transformer.calculate_per_token_loss=True: packed micro-batches carry "
+                    "different numbers of trainable tokens, so the per-microbatch mean weights "
+                    "them unevenly."
+                )
+            if scheduler is not None and not getattr(transformer, "variable_seq_lengths", False):
+                raise ValueError(
+                    f"model.transformer.sequence_packing_scheduler={scheduler!r} needs "
+                    "model.transformer.variable_seq_lengths=True: Megatron Core derives it at "
+                    "construction, so a scheduler selected afterwards leaves the pipeline on fixed "
+                    "shapes while the batch path packs; set both, or select the scheduler when the "
+                    "transformer config is constructed."
+                )
         dataset = self.data.dataset
         if dataset is None:
             return
+        execution_bound = self.model.transformer.max_seq_length_per_sample
+        if isinstance(dataset, SFTDatasetConfig) and dataset.packed_sequence_length not in (
+            None,
+            execution_bound,
+        ):
+            raise ValueError(
+                "data.dataset.packed_sequence_length is derived from "
+                "model.transformer.max_seq_length_per_sample; leave it unset"
+            )
+        dataset_type = resolve_dataset_class(dataset, self.data.dataset_type)
+        if (
+            dataset_family_from_type(dataset_type)[0] in ("gpt", "fim")
+            and not isinstance(self.model, (LLaVAModelConfig, T5ModelConfig, MimoBuildConfig))
+            and execution_bound is not None
+            and execution_bound != dataset.sequence_length
+        ):
+            raise ValueError(
+                "model.transformer.max_seq_length_per_sample must equal "
+                "data.dataset.sequence_length for fixed GPT/FIM rows; it describes this run's "
+                "execution width, not the model's position capacity."
+            )
+        if dataset_family_from_type(dataset_type)[0] == "sft":
+            pack_length = (
+                (execution_bound or dataset.sequence_length)
+                if isinstance(dataset, SFTDatasetConfig)
+                else dataset.sequence_length
+            )
+            transformer = self.model.transformer
+            cp_multiple = (
+                2 * transformer.context_parallel_size
+                if transformer.context_parallel_size > 1
+                else 1
+            )
+            sp_multiple = (
+                transformer.tensor_model_parallel_size if transformer.sequence_parallel else 1
+            )
+            if pack_length % (cp_multiple * sp_multiple):
+                raise ValueError(
+                    "SFT pack width must satisfy the dataset's CP/SP padding alignment"
+                )
+            if (
+                getattr(self.model, "position_embedding_type", "learned_absolute") == "learned_absolute"
+                and self.model.seq_length < pack_length
+            ):
+                raise ValueError(
+                    "Learned position capacity must cover the SFT pack's padded positions"
+                )
         capacity = getattr(self.model, "seq_length", None)
-        if isinstance(capacity, int) and isinstance(dataset.sequence_length, int):
+        if (
+            getattr(self.model, "position_embedding_type", "learned_absolute") == "learned_absolute"
+            and isinstance(capacity, int)
+            and isinstance(dataset.sequence_length, int)
+        ):
             if capacity < dataset.sequence_length:
                 raise ValueError(
                     f"model.seq_length ({capacity}, the position-embedding capacity, "
                     "--max-position-embeddings) must be greater than or equal to "
                     f"data.dataset.sequence_length ({dataset.sequence_length}, --seq-length)."
                 )
+        per_sample = getattr(transformer, "max_seq_length_per_sample", None)
+        if (
+            isinstance(per_sample, int)
+            and isinstance(dataset.sequence_length, int)
+            and per_sample < dataset.sequence_length
+        ):
+            raise ValueError(
+                f"model.transformer.max_seq_length_per_sample={per_sample} is smaller than "
+                f"data.dataset.sequence_length={dataset.sequence_length}: Megatron Core's "
+                "per-sample maximum must cover the dataset's samples (left unset, the container "
+                "fills it from the dataset at finalize())."
+            )
         validation = self.validation
         if (
             dataset.full_validation is not None
@@ -672,32 +785,59 @@ class PretrainConfigContainer(ConfigContainerBase):
                 "container writes this field at finalize(), leave it unset."
             )
         transformer = self.model.transformer
+        if isinstance(dataset, OnlineTokenizedDatasetConfig):
+            if (
+                dataset.context_parallel_size is not None
+                and dataset.context_parallel_size != transformer.context_parallel_size
+            ):
+                raise ValueError(
+                    f"data.dataset.context_parallel_size={dataset.context_parallel_size} disagrees "
+                    "with model.transformer.context_parallel_size="
+                    f"{transformer.context_parallel_size}; the container writes this field at "
+                    "finalize(), leave it unset."
+                )
+            sequence_parallel_size = transformer.tensor_model_parallel_size * int(
+                bool(transformer.sequence_parallel)
+            )
+            if dataset.sequence_parallel_size not in (0, sequence_parallel_size):
+                raise ValueError(
+                    f"data.dataset.sequence_parallel_size={dataset.sequence_parallel_size} disagrees "
+                    "with the model layout (tensor_model_parallel_size * sequence_parallel = "
+                    f"{sequence_parallel_size}); the container writes this field at finalize(), leave "
+                    "it unset."
+                )
+            dynamic_context_parallel = bool(getattr(transformer, "dynamic_context_parallel", False))
+            if dataset.dynamic_context_parallel and not dynamic_context_parallel:
+                raise ValueError(
+                    "data.dataset.dynamic_context_parallel=True disagrees with "
+                    "model.transformer.dynamic_context_parallel=False; the container writes this field "
+                    "at finalize(), leave it unset."
+                )
+        family, _mock = dataset_family_from_type(
+            resolve_dataset_class(dataset, self.data.dataset_type)
+        )
+        scheduler = getattr(transformer, "sequence_packing_scheduler", None)
+        if family == "varlen" and dataset.varlen_sbhd_validation and scheduler is not None:
+            raise ValueError(
+                "data.dataset.varlen_sbhd_validation=True does not use a packing scheduler; "
+                f"model.transformer.sequence_packing_scheduler={scheduler!r} must be unset."
+            )
+        if self.data.yields_unpacked_samples() and scheduler is None:
+            raise ValueError(
+                "A varlen dataset without SBHD validation emits one unpacked sample per item and "
+                "needs model.transformer.sequence_packing_scheduler ('dp_balanced', or "
+                "'default_dynamic_cp' under dynamic context parallelism); validate_args selects it "
+                "for --use-varlen-dataset, a Python or YAML container sets it explicitly."
+            )
+        context_parallel_size = transformer.context_parallel_size
         if (
-            dataset.context_parallel_size is not None
-            and dataset.context_parallel_size != transformer.context_parallel_size
+            family != "sft"
+            and context_parallel_size > 1
+            and dataset.sequence_length % (2 * context_parallel_size)
         ):
             raise ValueError(
-                f"data.dataset.context_parallel_size={dataset.context_parallel_size} disagrees "
-                "with model.transformer.context_parallel_size="
-                f"{transformer.context_parallel_size}; the container writes this field at "
-                "finalize(), leave it unset."
-            )
-        sequence_parallel_size = transformer.tensor_model_parallel_size * int(
-            bool(transformer.sequence_parallel)
-        )
-        if dataset.sequence_parallel_size not in (0, sequence_parallel_size):
-            raise ValueError(
-                f"data.dataset.sequence_parallel_size={dataset.sequence_parallel_size} disagrees "
-                "with the model layout (tensor_model_parallel_size * sequence_parallel = "
-                f"{sequence_parallel_size}); the container writes this field at finalize(), leave "
-                "it unset."
-            )
-        dynamic_context_parallel = bool(getattr(transformer, "dynamic_context_parallel", False))
-        if dataset.dynamic_context_parallel and not dynamic_context_parallel:
-            raise ValueError(
-                "data.dataset.dynamic_context_parallel=True disagrees with "
-                "model.transformer.dynamic_context_parallel=False; the container writes this field "
-                "at finalize(), leave it unset."
+                f"data.dataset.sequence_length ({dataset.sequence_length}) must be a multiple of "
+                f"2 * model.transformer.context_parallel_size ({context_parallel_size})."
             )
 
     def _finalize(self) -> None:
@@ -719,13 +859,34 @@ class PretrainConfigContainer(ConfigContainerBase):
             # The world size is known here: data_parallel_size gets the agreement check the other
             # fields got at validation, before anything is written.
             data_parallel_size = self.get_data_parallel_size()
-            if dataset.data_parallel_size not in (1, data_parallel_size):
+            if isinstance(
+                dataset, OnlineTokenizedDatasetConfig
+            ) and dataset.data_parallel_size not in (1, data_parallel_size):
                 raise ValueError(
                     f"data.dataset.data_parallel_size={dataset.data_parallel_size} disagrees with "
                     "the model layout and the world size "
                     f"(data_parallel_size={data_parallel_size}); the container writes this field "
                     "at finalize(), leave it unset."
                 )
+            # The packed-sequence buffer covers one sample: cp ranks, times the data-parallel
+            # replicas under default_dynamic_cp (validate_args's rule, which needs the world size).
+            scheduler = getattr(transformer, "sequence_packing_scheduler", None)
+            budget = getattr(transformer, "max_seqlen_per_dp_cp_rank", None)
+            if scheduler is not None and budget is not None:
+                total_cp_ranks = transformer.context_parallel_size * (
+                    data_parallel_size if scheduler == "default_dynamic_cp" else 1
+                )
+                input_length = (
+                    transformer.max_seq_length_per_sample or dataset.sequence_length
+                    if self.data.is_sft()
+                    else dataset.sequence_length
+                )
+                if total_cp_ranks * budget < input_length:
+                    raise ValueError(
+                        f"The packed-sequence buffer ({total_cp_ranks} ranks * "
+                        f"max_seqlen_per_dp_cp_rank {budget} = {total_cp_ranks * budget}) must "
+                        f"cover one physical sample ({input_length})."
+                    )
         batch_sizes = self._resolve_batch_sizes(self.get_batch_parallel_size())
         self._validate_rl_config(batch_sizes[0])
         # Resolve RNG and model settings before deriving optimizer precision.
@@ -835,18 +996,23 @@ class PretrainConfigContainer(ConfigContainerBase):
         self.scheduler.finalize_scheduler_config(self.optimizer.weight_decay)
         self._resolve_scheduler_step_fields()
         if dataset is not None:
-            # The six fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
+            # Fields other sections own (CONTAINER_WRITTEN_FIELDS): the validation flags
             # from the validation config, the layout from the required model config.
+            if transformer.max_seq_length_per_sample is None:
+                transformer.max_seq_length_per_sample = dataset.sequence_length
+            if isinstance(dataset, SFTDatasetConfig):
+                dataset.packed_sequence_length = transformer.max_seq_length_per_sample
             dataset.full_validation = self.validation.full_validation
             dataset.multiple_validation_sets = self.validation.multiple_validation_sets
-            dataset.data_parallel_size = data_parallel_size
-            dataset.context_parallel_size = transformer.context_parallel_size
-            dataset.sequence_parallel_size = transformer.tensor_model_parallel_size * int(
-                bool(transformer.sequence_parallel)
-            )
-            dataset.dynamic_context_parallel = bool(
-                getattr(transformer, "dynamic_context_parallel", False)
-            )
+            if isinstance(dataset, OnlineTokenizedDatasetConfig):
+                dataset.data_parallel_size = data_parallel_size
+                dataset.context_parallel_size = transformer.context_parallel_size
+                dataset.sequence_parallel_size = transformer.tensor_model_parallel_size * int(
+                    bool(transformer.sequence_parallel)
+                )
+                dataset.dynamic_context_parallel = bool(
+                    getattr(transformer, "dynamic_context_parallel", False)
+                )
         self.data.finalize()
         if self.rl.requires_grad_buffer_offload:
             self.ddp.grad_buffer_offload = True

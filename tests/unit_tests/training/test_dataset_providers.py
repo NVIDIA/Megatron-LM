@@ -34,15 +34,36 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.config import container as container_module
 from megatron.training.datasets import providers, sft_dataset, varlen_dataset
-from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset, SFTDatasetConfig
 from megatron.training.models import GPTModelConfig
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.training import legacy_dataset_factories as legacy
 
+
+def test_sft_truncates_conversations_before_packing():
+    tokenizer = SimpleNamespace(
+        pad=0,
+        eod=99,
+        tokenize_conversation=lambda *a, **kw: (torch.arange(1, 11), torch.arange(1, 11)),
+    )
+    config = SFTDatasetConfig(
+        random_seed=1234, sequence_length=4, packed_sequence_length=12, tokenizer=tokenizer
+    )
+    dataset = object.__new__(SFTDataset)
+    dataset.config = config
+    dataset.dataset = [[{"role": "system"}, {"role": "user"}, {"role": "system"}, {"role": "user"}]]
+    dataset.indices = [0]
+    dataset.padding_divisor = 1
+    sample = dataset[0]
+    assert sample["tokens"].tolist() == [1, 2, 3, 4, 1, 2, 3, 4, 0, 0, 0, 0]
+    assert sample["cu_seqlens"][:3].tolist() == [0, 4, 12]
+    assert sample["loss_mask"][-4:].tolist() == [0, 0, 0, 0]
+
+
 MODEL_ARGV = (
     "--num-layers 2 --hidden-size 128 --num-attention-heads 8 --micro-batch-size 1 "
     "--global-batch-size 8 --seq-length 32 --max-position-embeddings 32 "
-    "--tokenizer-type NullTokenizer --vocab-size 2048"
+    "--tokenizer-type NullTokenizer --vocab-size 2048 --no-create-attention-mask-in-dataloader"
 ).split()
 
 # Applied to the validated arguments and mirrored into the container's model and validation
@@ -227,6 +248,14 @@ def _layout_from_args(args):
         context_parallel_size=args.context_parallel_size,
         sequence_parallel=args.sequence_parallel,
         dynamic_context_parallel=args.dynamic_context_parallel,
+        # What the shared rank predicate reads from the model section (the real config's values
+        # for these arguments).
+        sequence_packing_scheduler=args.sequence_packing_scheduler,
+        pipeline_model_parallel_layout=args.pipeline_model_parallel_layout,
+        mtp_num_layers=args.mtp_num_layers,
+        calculate_per_token_loss=args.calculate_per_token_loss,
+        max_seqlen_per_dp_cp_rank=args.max_seqlen_per_dp_cp_rank,
+        variable_seq_lengths=args.variable_seq_lengths,
         gtp_weight_remat_size=args.gtp_weight_remat_size,
         tensor_parallel_num_sequence_shards=args.gtp_remat_num_sequence_shards
         * (args.tensor_model_parallel_size if args.sequence_parallel else 1),
@@ -335,10 +364,22 @@ def test_entry_points_build_the_dataset_config_pretrain_gpt_built(
         # FIM runtime wrapper pretrain_gpt built around an SFT / varlen dataset is gone.
         assert isinstance(expected, GPTFIMDatasetConfig)
         assert not isinstance(actual, GPTFIMDatasetConfig)
-        names = [f.name for f in fields(GPTDatasetConfig)]
+        names = [f.name for f in fields(actual) if f.name != "packed_sequence_length"]
     else:
-        assert isinstance(actual, type(expected))
-        names = [f.name for f in fields(expected)]
+        expected_config_type = (
+            SFTDatasetConfig
+            if args.sft
+            else (
+                varlen_dataset.VarlenDatasetConfig
+                if args.use_varlen_dataset and entry_point != "prepare_cache"
+                else GPTFIMDatasetConfig if args.fim_data else GPTDatasetConfig
+            )
+        )
+        assert type(actual) is expected_config_type
+        names = [f.name for f in fields(actual) if f.name != "packed_sequence_length"]
+    if dataset_class in (SFTDataset, MockSFTDataset):
+        # Physical pack width is now derived independently of the content limit.
+        assert actual.packed_sequence_length == expected.sequence_length
     assert _signature(actual, names) == _signature(expected, names)
     if entry_point == "prepare_cache":
         return
@@ -385,12 +426,14 @@ def test_fields_the_legacy_factories_left_out_are_forwarded(monkeypatch, corpus,
         actual = _entry_point(entry_point).core_gpt_dataset_config_from_args(args)
     else:
         _, actual, _ = _ready(cfg).builder_inputs()
-    names = [f.name for f in fields(GPTDatasetConfig) if f.name != "tokenizer"]
+    names = [
+        f.name for f in fields(actual) if f.name not in ("tokenizer", "packed_sequence_length")
+    ]
     changed = {name for name in names if getattr(actual, name) != getattr(own, name)}
     if entry_point == "hybrid_flex":
-        assert changed - set(LAYOUT_FIELDS) == LEGACY_OMISSIONS[entry_point]
+        assert changed - set(LAYOUT_FIELDS) == (LEGACY_OMISSIONS[entry_point] & set(names))
     else:
-        assert changed == LEGACY_OMISSIONS[entry_point]
+        assert changed == (LEGACY_OMISSIONS[entry_point] & set(names))
     expected = legacy.legacy_gpt_dataset_config(args)
     expected.validate()  # Megatron Core's checks and derivations, which the builder runs
     assert {n: getattr(actual, n) for n in names} == {n: getattr(expected, n) for n in names}
@@ -407,7 +450,7 @@ def test_hybrid_flex_rejects_the_varlen_family(monkeypatch, warnings_log, corpus
     assert warnings_log == []
     _, cfg, _ = _prepare(monkeypatch, *corpus["sft"], "hybrid_flex")
     data = _ready(cfg)
-    assert data.dataset_type is SFTDataset and type(data.dataset) is GPTDatasetConfig
+    assert data.dataset_type is SFTDataset and type(data.dataset) is SFTDatasetConfig
 
 
 @pytest.mark.parametrize("entry_point", ["gpt", "hybrid", "hybrid_flex"])
@@ -458,6 +501,40 @@ def test_fim_request_without_a_source_is_rejected(monkeypatch, warnings_log):
     assert isinstance(data.dataset, GPTDatasetConfig) and data.dataset.blend is None
     with pytest.raises(ValueError, match="no mock dataset for the fim family"):
         data.validate()
+
+
+@pytest.mark.parametrize(
+    "config_cls,dataset_cls",
+    [
+        (SFTDatasetConfig, SFTDataset),
+        (varlen_dataset.VarlenDatasetConfig, varlen_dataset.VarlenDataset),
+    ],
+)
+def test_online_fast_cache_keeps_sample_indices_without_rank_zero_barriers(
+    monkeypatch, tmp_path, config_cls, dataset_cls
+):
+    tokenizer = build_tokenizer(_validated([], {}))
+    config = config_cls(
+        random_seed=1234,
+        sequence_length=32,
+        tokenizer=tokenizer,
+        context_parallel_size=1,
+        blend_per_split=[(["offline"], None), None, None],
+        path_to_cache=str(tmp_path),
+        fast_cache_load=True,
+    )
+    monkeypatch.setattr(dataset_cls, "build_low_level_dataset", lambda *args: [[], [], [], []])
+    monkeypatch.setattr(
+        torch.distributed,
+        "barrier",
+        lambda *args, **kwargs: pytest.fail("unexpected cache barrier"),
+    )
+    builder = BlendedMegatronDatasetBuilder(dataset_cls, [4, 0, 0], lambda: True, config)
+    splits = builder._build_megatron_datasets_parallel(
+        ["offline"], [(0.0, 1.0), None, None], [[4, 0, 0]]
+    )
+    assert splits[0][0].indices.tolist() == [0, 1, 2, 3]
+    assert splits[0][0].config is config
 
 
 class TestProvidersBuildMockDatasets:
@@ -516,8 +593,9 @@ class TestProvidersBuildMockDatasets:
         args, cfg, _ = _prepare(monkeypatch, *corpus[case])
         data = _ready(cfg)
         plain = data.dataset
-        shared = {f.name: getattr(plain, f.name) for f in fields(GPTDatasetConfig) if f.init}
-        wrapped = GPTFIMDatasetConfig(
+        old_config = legacy.legacy_gpt_dataset_config(args)
+        shared = {f.name: getattr(old_config, f.name) for f in fields(old_config) if f.init}
+        wrapped = legacy.GPTFIMDatasetConfig(
             **shared,
             fim_rate=0.9,
             fim_spm_rate=0.4,

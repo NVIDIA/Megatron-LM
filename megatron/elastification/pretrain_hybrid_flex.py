@@ -54,6 +54,7 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.datasets.providers import build_gpt_datasets
 from megatron.training.global_vars import get_run_config, set_run_config
+from megatron.training.sequence_lengths import get_dataset_input_length
 from megatron.training.utils import is_first_or_last_pipeline_stage
 
 # modelopt distillation
@@ -177,14 +178,16 @@ BATCH_KEYS = [
 def get_batch(data_iterator, vp_stage=None):
     """Generate a batch."""
 
-    args = get_args()
-    config = core_transformer_config_from_args(args)
+    cfg = get_run_config()
+    # The model section's transformer config (the container builder derives one from the
+    # arguments for this script) gives the parallel values; the sample predicates and the
+    # attention-mask field come from the data section, the sample length from the container.
+    config = cfg.model.transformer
 
-    cp_size = args.context_parallel_size
+    cp_size = config.context_parallel_size
     tp_rank = mpu.get_tensor_model_parallel_rank()
-    is_sft = args.sft
-    has_cu_seqlens = is_sft or getattr(args, 'dataloader_inter_document_masking', False)
-    dynamic_cp = args.dynamic_context_parallel
+    has_cu_seqlens = cfg.data.has_cu_seqlens()
+    dynamic_cp = config.dynamic_context_parallel
     mtp_on_this_rank = mtp_on_this_rank_func(
         layout=config.pipeline_model_parallel_layout,
         mtp_num_layers=config.mtp_num_layers,
@@ -211,13 +214,13 @@ def get_batch(data_iterator, vp_stage=None):
         broadcast_group=mpu.get_tensor_model_parallel_group(),
         has_cu_seqlens=has_cu_seqlens,
         dynamic_cp=dynamic_cp,
-        create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
+        create_attention_mask_in_dataloader=cfg.data.creates_attention_mask(),
         cp_size=cp_size,
         tp_rank=tp_rank,
-        micro_batch_size=args.micro_batch_size,
-        seq_length=args.seq_length,
+        micro_batch_size=cfg.train.micro_batch_size,
+        seq_length=get_dataset_input_length(cfg.data.dataset),
         mtp_on_this_rank=mtp_on_this_rank,
-        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        pipeline_model_parallel_size=config.pipeline_model_parallel_size,
         is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
         is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
     )
@@ -235,9 +238,7 @@ def get_batch(data_iterator, vp_stage=None):
         dynamic_cp=dynamic_cp,
         cp_group=get_context_parallel_group(),
         dynamic_cp_group_func=get_dynamic_data_context_parallel_groups,
-        use_per_sequence_balancing=(
-            getattr(args, 'dataloader_inter_document_masking', False) and not is_sft
-        ),
+        use_per_sequence_balancing=cfg.data.use_per_sequence_balancing(),
     )
 
     cu_seqlens = batch.get('cu_seqlens')

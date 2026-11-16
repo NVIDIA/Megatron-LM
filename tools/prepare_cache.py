@@ -7,6 +7,7 @@ Unsupported configurations:
 """
 
 import argparse
+from copy import copy
 from typing import Any, Dict, Optional
 
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
@@ -135,6 +136,10 @@ def core_gpt_dataset_config_from_args(args: Any) -> MCoreGPTDatasetConfig:
     a missing data source is reported before the builder runs.
     """
     _reject_unsupported_modes(args)
+    # This tool has always built indexed GPT caches, even for a command line carrying
+    # the Varlen flag. Select the matching config without changing the caller's args.
+    args = copy(args)
+    args.use_varlen_dataset = False
     return argument_utils.core_gpt_dataset_config_from_args(args, dataset_type=GPTDataset)
 
 

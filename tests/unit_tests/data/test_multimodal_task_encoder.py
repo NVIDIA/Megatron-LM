@@ -5,6 +5,7 @@ import io
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from examples.multimodal.data_loading import task_encoder
@@ -38,6 +39,49 @@ def _encoder(thread_count=8):
     encoder = object.__new__(MultiModalTaskEncoder)
     encoder.args = SimpleNamespace(video_decode_thread_count=thread_count)
     return encoder
+
+
+@pytest.mark.parametrize("sequence_bound,has_trainable_tokens", [(3, False), (4, True)])
+def test_legacy_encoder_limits_targets_to_model_sequence_bound(
+    monkeypatch, run_config, sequence_bound, has_trainable_tokens
+):
+    from megatron.training.config.training_config import MultiModalTokenizerConfig
+    from megatron.training.models import LLaVAModelConfig
+
+    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[3] / "examples/multimodal"))
+    from examples.multimodal import dataset_helpers
+
+    transformer = run_config.model.transformer
+    transformer.max_seq_length_per_sample = sequence_bound
+    run_config.model = LLaVAModelConfig(transformer=transformer, seq_length=sequence_bound)
+    run_config.tokenizer = MultiModalTokenizerConfig()
+    args = SimpleNamespace(
+        prompt_path=None,
+        packing_buffer_size=None,
+        vision_model_type="clip",
+        pixel_shuffle=False,
+        use_tile_tags=False,
+        max_num_tiles=1,
+        use_area_weighted_aspect_ratio=False,
+        dynamic_resolution=False,
+        dynamic_resolution_min_patches=1,
+        dynamic_resolution_min_side=1,
+        match_tiling_dynamic_resolution=False,
+        thumbnail_area_threshold=1,
+    )
+    monkeypatch.setattr(dataset_helpers, "get_args", lambda: args)
+    monkeypatch.setattr(
+        dataset_helpers, "get_tokenizer", lambda: SimpleNamespace(image_token_index=-200, pad=0)
+    )
+    monkeypatch.setattr(dataset_helpers, "get_num_image_embeddings", lambda **kwargs: 1)
+    monkeypatch.setattr(dataset_helpers, "ImageTransform", lambda *args, **kwargs: None)
+    encoder = dataset_helpers.TaskEncoder(image_token_budget=16)
+    assert not hasattr(encoder, "cfg")
+    # A trainable next-token target is just outside the shorter execution window.
+    result = encoder.target_has_trainable_tokens(
+        np.array([1, 2, 3, 4, 5]), [], np.array([-100, -100, -100, -100, 9]), []
+    )
+    assert bool(result) is has_trainable_tokens
 
 
 @pytest.mark.parametrize(

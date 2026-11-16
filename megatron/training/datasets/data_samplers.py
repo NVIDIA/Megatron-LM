@@ -1,4 +1,4 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Dataloaders."""
 
@@ -14,7 +14,6 @@ from torch.utils.data import Dataset
 
 from megatron.core import mpu
 from megatron.core.datasets.utils import Split
-from megatron.training import get_args
 from megatron.training.dist_signal_handler import DistributedSignalHandler
 from megatron.training.global_vars import get_run_config
 
@@ -54,7 +53,10 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     except TypeError:
         pass
     cfg = get_run_config()
-    args = get_args()
+    loader = cfg.data.dataloader
+    # Unset selects 'single', as DataloaderConfig.finalize() and validate_args do (a section can be
+    # registered unfinalized by tests and direct callers).
+    dataloader_type = loader.dataloader_type or 'single'
 
     if hasattr(dataset, 'split'):
         split = dataset.split
@@ -63,7 +65,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     else:
         split = None
 
-    if args.dataloader_type == "external":
+    if dataloader_type == "external":
         # External dataloaders are passed through. User is expected to provide a
         # torch-compatible dataloader and define samplers, if needed.
         return dataset
@@ -77,7 +79,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             total_samples=len(dataset),
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size())
-    elif args.dataloader_type == 'single':
+    elif dataloader_type == 'single':
         # Packing schedulers consume one microbatch at a time and form
         # global/DCP batches themselves.
         batch_sampler = MegatronPretrainingSampler(
@@ -86,7 +88,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             micro_batch_size=micro_batch_size,
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size())
-    elif args.dataloader_type == 'cyclic':
+    elif dataloader_type == 'cyclic':
         batch_sampler = MegatronPretrainingRandomSampler(
             dataset,
             total_samples=len(dataset),
@@ -94,25 +96,25 @@ def build_pretraining_data_loader(dataset, consumed_samples):
             micro_batch_size=micro_batch_size,
             data_parallel_rank=mpu.get_data_parallel_rank(),
             data_parallel_size=mpu.get_data_parallel_world_size(),
-            data_sharding=args.data_sharding,
+            data_sharding=loader.data_sharding,
         )
     else:
-        raise Exception('{} dataloader type is not supported.'.format(args.dataloader_type))
+        raise Exception('{} dataloader type is not supported.'.format(dataloader_type))
 
     maybe_worker_init_fn = (
         partial(
             _worker_init_fn,
             exit_signal_handler=cfg.train.exit_signal_handler,
             exit_signal=cfg.train.exit_signal,
-        ) if args.num_workers > 0 else None
+        ) if loader.num_workers > 0 else None
     )
-    # Identity collate for VarlenDataset and packing-scheduler paths; they emit
-    # one variable-length dict per sample, not stack-able by the default
-    # collate. --varlen-sbhd-validation is excluded: it bypasses packing and
-    # emits fixed-length [seq_length] samples that the default collate stacks
-    # normally.
+    # Identity collate for the datasets that emit one variable-length dict per sample for an
+    # upstream packing scheduler (the varlen family without SBHD validation: the section's
+    # yields_unpacked_samples) and for the dynamic-CP and packing-scheduler paths. SFT samples
+    # are packed but fixed-width and take the default collate. The model-owned half comes from
+    # the model section.
     if (
-        (args.use_varlen_dataset and not args.varlen_sbhd_validation)
+        cfg.data.yields_unpacked_samples()
         or cfg.model.transformer.dynamic_context_parallel
         or cfg.model.transformer.sequence_packing_scheduler is not None
     ):
@@ -127,9 +129,9 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        persistent_workers=True if args.num_workers > 0 else False,
+        num_workers=loader.num_workers,
+        pin_memory=loader.pin_memory,
+        persistent_workers=loader.persistent_workers if loader.num_workers > 0 else False,
         worker_init_fn=maybe_worker_init_fn,
         generator=loader_generator,
         **extra_kwargs,

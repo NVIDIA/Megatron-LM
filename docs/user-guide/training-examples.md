@@ -75,6 +75,82 @@ torchrun --nproc_per_node=8 pretrain_gpt.py \
     --eval-interval 1000
 ```
 
+## Sequence lengths in the training configuration
+
+Dataset content limits and model execution widths have different owners:
+
+- `cfg.data.dataset.sequence_length` limits each GPT/SFT sequence's content. The CLI
+  supplies it with `--seq-length`.
+- `cfg.model.transformer.max_seq_length_per_sample` bounds one physical model input
+  row, or an entire packed THD row, including padding and expanded image tokens.
+  This is the maximum for the training run, not the model's architectural capacity.
+  `--max-seq-length-per-sample` sets it explicitly; GPT defaults to `--seq-length`.
+- `cfg.model.seq_length` retains `--max-position-embeddings`: it sizes learned
+  absolute position tables and is retained as model/export metadata for RoPE.
+  It is not a dataset truncation limit or a RoPE execution bound, and is not an
+  alias of the run's `max_seq_length_per_sample`. Learned tables may be larger
+  than the inputs used in a particular run.
+- `max_seqlen_per_dp_cp_rank` remains the separate per-rank dynamic-CP packing budget.
+
+For example, `--sft --seq-length 2048 --max-seq-length-per-sample 8192` truncates
+individual conversations at 2048 tokens and emits 8192-token padded packs. The
+container derives `SFTDatasetConfig.packed_sequence_length` during startup;
+recipes should set the model bound rather than this derived dataset field. Existing
+`--seq-length`-only runs retain their previous widths and packing behavior.
+The SFT-specific config lives alongside `SFTDataset`; Core's `GPTDatasetConfig`
+has no pack-width field.
+
+Dataset config fields follow the dataset family:
+
+- Core's `GPTDatasetConfig` owns indexed bin/idx data and its masking/cache options;
+  `GPTFIMDatasetConfig` adds the FIM options.
+- Training's `SFTDatasetConfig` owns conversation packing and SFT mock options.
+- Training's `VarlenDatasetConfig` owns individual variable-length samples,
+  Varlen mock options, and `varlen_sbhd_validation`.
+
+SFT and Varlen configs share `OnlineTokenizedDatasetConfig` for tokenizer and
+parallel-padding inputs. All families inherit the existing
+`BlendedMegatronDatasetConfig` builder settings. This changes configuration
+ownership, not tokenization, packing, or sample contents.
+
+Fixed GPT/FIM dataset rows must match the run's execution length; an explicit
+different value is rejected rather than silently selecting another runtime length.
+T5 retains separate encoder and decoder input lengths. Callback datasets such as
+Energon still own truncation and packing; their
+entrypoints bind those inputs before `pretrain()`, and resolve the model execution
+bound before runtime buffers are initialized. Fixed-width BERT, mock VLM, and
+ModelOpt callbacks reject bounds inconsistent with the rows they actually emit.
+
+`validate()` checks these constraints without mutation. Framework startup calls
+`finalize()` to derive unset/owned fields before any runtime consumer reads them.
+
+### Python API compatibility
+
+Python SFT/Varlen callers must construct `SFTDatasetConfig` / `VarlenDatasetConfig`
+rather than putting their fields on `GPTDatasetConfig`. CLI flag names are unchanged.
+Container deserialization upgrades the former union schema using its saved
+`dataset_type`, preserving fields consumed by that family and warning when dropping
+known, unused fields. Unknown fields still fail strict loading.
+
+`LLaVAModelConfig.decoder_seq_length` is removed. Python callers and saved
+configurations using this field require updating; strict deserialization rejects
+the removed LLaVA field. For LLaVA, move the resolved text + image + padding width
+to `model.transformer.max_seq_length_per_sample` before startup.
+
+The `--decoder-seq-length` CLI flag remains accepted: VLM entrypoints translate
+it into their execution width, while T5 retains an independent decoder width.
+Decoder-only models do not acquire a second decoder-length config field.
+
+Core's schedule APIs are unchanged. The training loop passes the resolved model
+execution width as `seq_length`, without a separate decoder override. T5 retains
+separate model/dataset encoder and decoder lengths; its entrypoint does not support
+pipeline parallelism.
+
+Direct Python callers of the migrated callback dataset providers and task encoders
+must pass their length inputs explicitly instead of relying on global arguments.
+The supplied application entrypoints bind these inputs before `pretrain()`; their
+existing CLI invocations remain supported.
+
 ## GPT-3 Training Example
 
 Train a GPT-3 style model:

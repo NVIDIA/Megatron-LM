@@ -218,8 +218,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples: int):
 
     config = T5MaskedWordPieceDatasetConfig(
         random_seed=cfg.rng.seed,
-        sequence_length=args.encoder_seq_length,
-        sequence_length_decoder=args.decoder_seq_length,
+        sequence_length=cfg.model.encoder_seq_length,
+        sequence_length_decoder=cfg.model.decoder_seq_length,
         blend=get_blend_from_list(args.data_path),
         blend_per_split=[
             get_blend_from_list(args.train_data_path),

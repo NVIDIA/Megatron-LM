@@ -13,15 +13,43 @@ field naming introduced in #7047 (``main`` ``ea99fdfce``), so the oracle compare
 """
 
 import json
+from dataclasses import dataclass
 from typing import Any, List, Optional, Tuple
 
-from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.gpt_dataset import GPTDataset
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig as CoreGPTDatasetConfig
+from megatron.core.datasets.gpt_dataset import MockGPTDataset
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
-from megatron.training.datasets.fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
+from megatron.training.datasets.fim_dataset import GPTFIMDataset
+from megatron.training.datasets.fim_dataset import GPTFIMDatasetConfig as CoreGPTFIMDatasetConfig
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.global_vars import get_run_config, get_tokenizer
 from megatron.training.utils import get_blend_and_blend_per_split
+
+
+@dataclass(kw_only=True)
+class _LegacyDatasetFields:
+    """Fields accepted by the frozen factories before the dataset-family split."""
+
+    data_parallel_size: int = 1
+    context_parallel_size: Optional[int] = None
+    sequence_parallel_size: int = 0
+    dynamic_context_parallel: bool = False
+    sft_mock_dataset_config_json: Optional[str] = None
+    varlen_mock_dataset_config_json: Optional[str] = None
+    varlen_sbhd_validation: bool = False
+
+
+@dataclass
+class GPTDatasetConfig(CoreGPTDatasetConfig, _LegacyDatasetFields):
+    """Frozen GPT schema for comparisons, not a production config."""
+
+
+@dataclass
+class GPTFIMDatasetConfig(CoreGPTFIMDatasetConfig, _LegacyDatasetFields):
+    """Frozen FIM schema for comparisons, not a production config."""
+
 
 LEGACY_COMMIT = "438ef0025"
 

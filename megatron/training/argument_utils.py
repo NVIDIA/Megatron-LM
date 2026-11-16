@@ -20,6 +20,7 @@ from typing import Any, Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDatasetConfig
 from megatron.core.distributed import (
@@ -54,6 +55,8 @@ from megatron.training.config import (
     ValidationConfig,
 )
 from megatron.training.config.dataset_config import dataset_type_from_family
+from megatron.training.datasets.sft_dataset import SFTDatasetConfig
+from megatron.training.datasets.varlen_dataset import VarlenDatasetConfig
 from megatron.training.models import (
     BertModelConfig,
     GPTModelConfig,
@@ -430,9 +433,10 @@ def core_transformer_config_from_args(args, config_class=None):
     for f in dataclasses.fields(config_class):
         if hasattr(args, f.name):
             kw_args[f.name] = getattr(args, f.name)
-    # The training sequence length, not max_position_embeddings (which GPTModelConfig.seq_length
-    # carries): core modules that size buffers per sample (NCCL EP) read it from the config.
-    kw_args['max_seq_length_per_sample'] = args.seq_length
+    # Keep the physical row/pack bound separate from the dataset's truncation limit.
+    # Existing scripts specifying only --seq-length retain their original execution width.
+    if kw_args.get('max_seq_length_per_sample') is None:
+        kw_args['max_seq_length_per_sample'] = args.seq_length
     kw_args['persist_layer_norm'] = not args.no_persist_layer_norm
     kw_args['deallocate_pipeline_outputs'] = not _mfsdp_v2_disables_pipeline_output_dealloc(args)
     kw_args['pipeline_dtype'] = args.params_dtype
@@ -842,7 +846,26 @@ def model_config_from_args(
         return hybrid_config_from_args(args, model_config_cls=model_config_cls)
     if issubclass(model_config_cls, BertModelConfig):
         return bert_config_from_args(args, model_config_cls=model_config_cls)
-    return model_config_cls(**_model_config_kwargs_from_args(args, model_config_cls))
+    kwargs = _model_config_kwargs_from_args(args, model_config_cls)
+    if (
+        issubclass(model_config_cls, T5ModelConfig)
+        and getattr(args, "max_seq_length_per_sample", None) is None
+    ):
+        lengths = [
+            length
+            for length in (args.encoder_seq_length, args.decoder_seq_length)
+            if length is not None
+        ]
+        if lengths:
+            kwargs["transformer"].max_seq_length_per_sample = max(lengths)
+    if (
+        issubclass(model_config_cls, LLaVAModelConfig)
+        and getattr(args, "max_seq_length_per_sample", None) is None
+    ):
+        # Legacy VLM launchers name the language execution width --decoder-seq-length.
+        if args.decoder_seq_length is not None:
+            kwargs["transformer"].max_seq_length_per_sample = args.decoder_seq_length
+    return model_config_cls(**kwargs)
 
 
 def bert_config_from_args(
@@ -855,6 +878,12 @@ def bert_config_from_args(
     if args.spec is not None:
         kwargs["transformer_layer_spec"] = (
             bert_layer_local_spec if args.spec[0] == "local" else import_module(args.spec)
+        )
+    bound = kwargs["transformer"].max_seq_length_per_sample
+    if args.seq_length is not None and bound != args.seq_length:
+        raise ValueError(
+            "The BERT callback emits fixed-width rows: --max-seq-length-per-sample "
+            "must equal --seq-length"
         )
     return model_config_cls(**kwargs)
 
@@ -1038,7 +1067,7 @@ def _resolve_data_sources(args: Namespace):
 
 def _container_written_fields_from_args(args: Namespace) -> dict[str, Any]:
     """What a standalone (container-less) dataset config takes from ``args`` for the fields the
-    container writes otherwise (``CONTAINER_WRITTEN_FIELDS``: the layout, the validation flags)."""
+    container writes otherwise (pack width, layout, and validation flags)."""
     return {
         "data_parallel_size": args.data_parallel_size,
         "context_parallel_size": args.context_parallel_size,
@@ -1086,16 +1115,49 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
                 )
         # Otherwise (fim) the real class stays and DataConfig.validate() reports the missing source.
 
+    config_cls = {
+        "gpt": GPTDatasetConfig,
+        "fim": GPTFIMDatasetConfig,
+        "sft": SFTDatasetConfig,
+        "varlen": VarlenDatasetConfig,
+    }[family]
+    config_fields = {item.name for item in fields(config_cls)}
+    if family in ("sft", "varlen") and has_source:
+        # These dataset implementations rejected GPT mask/reset options in __getitem__.
+        # Keep that CLI check here; the family-specific configs no longer expose them.
+        if (
+            args.reset_position_ids
+            or args.reset_attention_mask
+            or args.create_attention_mask_in_dataloader
+        ):
+            raise ValueError(
+                "SFT/Varlen datasets require --no-create-attention-mask-in-dataloader "
+                "and do not support --reset-position-ids or --reset-attention-mask"
+            )
     kwargs: dict[str, Any] = {
         field_name: deepcopy(getattr(args, source))
         for field_name, source in _DATASET_FIELD_SOURCES.items()
+        if field_name in config_fields
     }
     kwargs["blend"] = blend
     kwargs["blend_per_split"] = blend_per_split
-    kwargs["sequences_per_dataset"] = sequences_per_dataset
+    if "sequences_per_dataset" in config_fields:
+        kwargs["sequences_per_dataset"] = sequences_per_dataset
     if standalone:
-        kwargs.update(_container_written_fields_from_args(args))
-    if family == "fim":
+        kwargs.update(
+            {
+                name: value
+                for name, value in _container_written_fields_from_args(args).items()
+                if name in config_fields
+            }
+        )
+    if family == "sft":
+        if standalone:
+            kwargs["packed_sequence_length"] = (
+                getattr(args, "max_seq_length_per_sample", None) or args.seq_length
+            )
+        dataset = SFTDatasetConfig(**kwargs)
+    elif family == "fim":
         kwargs.update(
             fim_rate=args.fim_rate,
             fim_spm_rate=args.fim_spm_rate,
@@ -1112,7 +1174,7 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
         )
         dataset = GPTFIMDatasetConfig(**kwargs)
     else:
-        dataset = GPTDatasetConfig(**kwargs)
+        dataset = config_cls(**kwargs)
     return DataConfig(
         dataset=dataset, dataloader=dataloader_config_from_args(args), dataset_type=dataset_type
     )
@@ -1120,7 +1182,7 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
 
 def core_gpt_dataset_config_from_args(
     args: Namespace, *, tokenizer: Any = None, dataset_type: type | None = None
-) -> GPTDatasetConfig:
+) -> BlendedMegatronDatasetConfig:
     """A standalone dataset config from the legacy arguments, with its tokenizer bound.
 
     The call shape the GPT entry points had before ``cfg.data`` existed, kept for scripts that build
