@@ -23,6 +23,18 @@ class TestTorchSoftmax:
             scale=None,
         )
 
+    def test_default_causal_mask_avoids_quadratic_temporaries(self):
+        sequence_length = 2048
+        torch.cuda.synchronize()
+        allocated = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+
+        mask = get_default_causal_mask(sequence_length)
+
+        peak = torch.cuda.max_memory_allocated() - allocated
+        assert mask.dtype == torch.bool
+        assert peak <= 2 * sequence_length**2
+
     def test_output_shape(self):
         x = torch.randn(8, 2, 4, 4, device="cuda")
         y = self.softmax(x, None, None)
