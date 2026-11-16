@@ -353,7 +353,12 @@ class FullCudaGraphWrapper:
             capture_stream = get_shared_capture_stream()
             symmetric_wgrad_pool.reset_completed_reuse_events()
             rerun_state_machine = get_rerun_state_machine()
+            # torch.compile guards on the grad mode, so a forward-only step recompiles every
+            # compiled function it calls, and PyTorch refuses to compile during a capture.
+            # Use the code that is already compiled and run the rest uncompiled: the graph
+            # records the resulting kernels either way.
             with (
+                torch.compiler.set_stance("eager_on_recompile"),
                 capture_constants(FullCudaGraphWrapper.cuda_graph[training_str]),
                 torch.cuda.graph(
                     FullCudaGraphWrapper.cuda_graph[training_str],
