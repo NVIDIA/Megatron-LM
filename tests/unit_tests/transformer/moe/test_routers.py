@@ -364,6 +364,38 @@ def test_token_count_reduction_keeps_local_count_with_in_place_reduce(monkeypatc
     assert total_tokens == 3
 
 
+def test_unmasked_token_count_sums_unequal_rank_lengths(monkeypatch):
+    """Without a padding mask, total_num_tokens must be the sum of every rank's own length.
+    Ranks in one reduce group can hold different numbers of tokens (variable-length or
+    compacted inputs), so local_length * group_size is wrong."""
+    import megatron.core.tensor_parallel.mappings as mappings
+
+    class _Group:
+        def size(self):
+            return 2
+
+    group = _Group()
+    # The peer rank holds 5 tokens (3 routed to expert 0, 2 to expert 1); this rank holds 2.
+    peer_tokens_per_expert = torch.tensor([3, 2])
+    peer_num_tokens = 5
+
+    def _in_place_all_reduce(tensor, group=None):
+        # The peer contributes its per-expert counts followed by its token count.
+        tensor.add_(torch.cat([peer_tokens_per_expert, torch.tensor([peer_num_tokens])]))
+
+    monkeypatch.setattr(mappings, "get_tensor_model_parallel_group_if_none", lambda g: g)
+    monkeypatch.setattr(torch.distributed, "all_reduce", _in_place_all_reduce)
+    routing_map = torch.tensor([[True, False], [False, True]])
+
+    tokens_per_expert, local_tokens, total_tokens = get_tokens_per_expert_and_token_count(
+        routing_map, reduce_group=group, topk=1
+    )
+
+    assert torch.equal(tokens_per_expert, torch.tensor([4, 3]))
+    assert local_tokens == 2
+    assert total_tokens == 7
+
+
 def test_seq_aux_loss_restores_batch_size_for_per_token_scaling(monkeypatch):
     router = TopKRouter.__new__(TopKRouter)
     object.__setattr__(router, "topk", 2)
