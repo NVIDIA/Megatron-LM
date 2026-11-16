@@ -55,7 +55,7 @@ def canonical_mixer(request):
         batch_invariant_mode=True,
         batch_invariant_backend='te_native',
         attention_backend=AttnBackend.flash,
-        flash_attention_version=4,
+        flash_attention_version=4 if torch.cuda.get_device_capability()[0] >= 10 else 3,
         attention_dropout=0.0,
         hidden_dropout=0.0,
     )
@@ -219,6 +219,14 @@ def test_hybrid_logits_and_raw_logprobs(canonical_mixer, pattern):
             .squeeze(-1)
         )
         assert torch.isfinite(lp).all()
+        print(
+            f"GDP_LOGPROB_PARITY pattern={pattern} "
+            f"updates={model.config.gdp_num_householder} "
+            f"block_size={model.config.gdp_batch_invariant_block_size} "
+            f"max_abs_diff={(lp - reference).abs().max().item()} "
+            f"mismatched={(lp != reference).sum().item()}",
+            flush=True,
+        )
         exact(lp, reference)
 
 
