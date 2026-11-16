@@ -556,6 +556,8 @@ class FsdpParameterGroup:
             for buffer in buffers:
                 # CUDA Storage.resize_ reallocates even at the same size. Keep an
                 # already allocated buffer's address stable for captured compute.
+                # Ordinary reshard frees this storage; graph retention clears only
+                # readiness. Both paths still refresh its contents below.
                 if not buffer.is_allocated:
                     buffer.reallocate_storage()
 

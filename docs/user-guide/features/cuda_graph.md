@@ -138,7 +138,8 @@ Use explicit partial capture scopes with Megatron FSDP v2:
 --cuda-graph-modules attn moe_router moe_preprocess
 ```
 
-The initial integration requires fixed shapes and TP=PP=CP=1. Supported regions are
+The initial integration requires TE >= 2.10 (explicit graph reset), fixed shapes,
+and TP=PP=CP=1. Supported regions are
 attention, dense MLP, MoE router, and MoE preprocess; preprocess requires router capture.
 Dynamic dispatch, routed-expert computation, and combine remain eager. FP8/FP4,
 recomputation, activation offloading, mHC, MTP, sequence-packing scheduling, delayed
@@ -155,18 +156,55 @@ and separate timing measurements. This path does not enable dispatch/combine all
 overlap with graph computation.
 
 Captured units retain their gathered BF16 weight buffers until graph deletion to preserve
-numerical addresses. This costs a full compute-weight copy for each captured FSDP unit
+device addresses. Reshard still clears readiness: the next unshard refreshes current weights
+in the same allocation before compute waits on its new readiness event. This costs a full
+compute-weight copy for each captured FSDP unit
 on every rank, in addition to the configured training-state shards. GPT's unit is a whole
 TransformerLayer, including its eager MLP weights; HybridModel uses its existing separate
 attention and MLP/MoE layers. Routed-expert units outside capture retain their ordinary
 storage lifecycle. The integration adds no second parameter store.
 
 Delete graphs with `TECudaGraphHelper.delete_cuda_graphs()` before releasing retained
-weight storage. Recapture uses a new helper for the existing model and optimizer. Failed
-capture restores MCore-owned FSDP hooks, capture state and RNG contents. This does not
-guarantee recovery from exceptions inside TE: TE 2.20.2 can leave temporary hooks after
-a warmup exception, requiring process restart unless TE supplies the cleanup fix.
-Fatal CUDA or NCCL failures also require restarting the process.
+weight storage. Recapture uses a new helper for the existing model and optimizer, after
+deletion. Capture is serialized; nested capture or recapture over live graphs is rejected.
+Failed capture restores MCore-owned FSDP hooks, capture state and RNG contents. A secondary
+cleanup failure is attached to the original exception and requires process restart; buffers
+are not released if graph reset fails. Fatal CUDA or NCCL failures also require restart.
+
+Normal training works with unmodified TE 2.20.2. Its warmup exceptions can leave temporary
+hooks: same-process retry for that boundary requires the separate
+[TE cleanup fix](https://github.com/NVIDIA/TransformerEngine/pull/3862). MCore does not own or
+remove those TE hooks.
+
+#### Focused validation and prerequisites
+
+The core training, stream-policy and MCore failure tests run on this PR alone:
+
+```bash
+python -m torch.distributed.run --nproc-per-node=2 -m pytest -q --experimental \
+  tests/unit_tests/distributed/mfsdp_v2/test_mcore_partial_cuda_graph.py \
+  -k "not dropout_rng and not delete_recapture"
+```
+
+The full suite additionally exercises train/eval/train and native SwiGLU checkpoint
+restore. These require [#9372](https://github.com/NVIDIA/Megatron-LM/pull/9372) and
+[#9374](https://github.com/NVIDIA/Megatron-LM/pull/9374), respectively. Before they merge,
+apply their pinned changes on a throwaway validation branch from this PR:
+
+```bash
+git switch -c validate-mfsdp-partial-graphs
+git fetch https://github.com/NVIDIA/Megatron-LM.git pull/9372/head pull/9374/head
+git cherry-pick --no-commit 41103622852c379074ad993cf592fb799df65a21 \
+  2886280662e31c1678e9ceb5bb4c94a2c09304e9
+python -m torch.distributed.run --nproc-per-node=2 -m pytest -q --experimental \
+  tests/unit_tests/distributed/mfsdp_v2/test_mcore_partial_cuda_graph.py
+```
+
+Use four ranks to also exercise EP=2 with expert-DP=2. These tests use small real
+GPT/Hybrid MoE modules and synthetic tokens; real-text timing/trace evidence is linked
+from [RFC #9113](https://github.com/NVIDIA/Megatron-LM/issues/9113). The existing MFSDP v2
+unit-test recipe discovers this file; a stock-trainer functional recipe and its CI golden
+values remain pending.
 
 ---
 

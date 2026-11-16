@@ -48,11 +48,13 @@ from tests.unit_tests.test_utilities import Utils
 
 @pytest.fixture
 def process_groups(distributed_setup):
-    """Use EP2 and independent expert-DP shards on four ranks."""
-    if distributed_setup.world_size % 2:
-        pytest.skip("Requires an even world size.")
+    """Use EP2 on multiple ranks and EP1 for single-rank alias-buffer coverage."""
+    if distributed_setup.world_size > 1 and distributed_setup.world_size % 2:
+        pytest.skip("Requires one rank or an even world size.")
     destroy_moe_metrics_tracker()
-    Utils.initialize_model_parallel(1, 1, expert_model_parallel_size=2)
+    Utils.initialize_model_parallel(
+        1, 1, expert_model_parallel_size=min(2, distributed_setup.world_size)
+    )
     groups = ProcessGroupCollection.use_mpu_process_groups()
     init_num_microbatches_calculator(
         rank=distributed_setup.rank,
@@ -106,6 +108,7 @@ def _build_moe_model(config, process_groups, hybrid, capture_modules, strategy, 
     model_parallel_cuda_manual_seed(1234, te_rng_tracker=True, force_reset_rng=True)
     model_config = replace(
         config,
+        expert_model_parallel_size=process_groups.ep.size(),
         cuda_graph_impl="transformer_engine" if graphs else "none",
         cuda_graph_modules=capture_modules,
     )
@@ -321,7 +324,7 @@ def test_partial_cuda_graph_moe_matches_eager(
                     for layer in model.module.decoder.layers:
                         for group in layer.parameter_groups:
                             assert not group._retain_unsharded_storage
-                            if strategy == "optim_grads_params":
+                            if not group._unsharded_model_weight.is_alias_of(group.model_weight):
                                 assert not group._unsharded_model_weight.is_allocated
                     captured_pointers.clear()
                 model.zero_grad_buffer()
@@ -331,21 +334,7 @@ def test_partial_cuda_graph_moe_matches_eager(
                 def forward():
                     tokens = next(iterator)
                     ids, labels = tokens[:, :-1], tokens[:, 1:]
-                    model.eval()
-                    with torch.no_grad():
-                        expected = (
-                            model(ids, positions, attention_mask, labels=labels).float().mean()
-                        )
-                    model.train()
-                    loss = model(ids, positions, attention_mask, labels=labels).float().mean()
-                    torch.testing.assert_close(
-                        loss.detach(),
-                        expected,
-                        rtol=1e-5,
-                        atol=1e-6,
-                        msg=lambda msg: f'graphs={graphs}, step={step}: {msg}',
-                    )
-                    return loss
+                    return model(ids, positions, attention_mask, labels=labels).float().mean()
 
                 with (
                     torch.profiler.profile() if graphs and step == 4 else nullcontext()
@@ -361,6 +350,14 @@ def test_partial_cuda_graph_moe_matches_eager(
                 gradients.append([p.grad.to_local().detach().clone() for p in model.parameters()])
                 for layer in model.module.decoder.layers:
                     for group in layer.parameter_groups:
+                        # Reshard invalidates readiness even when graph storage is retained.
+                        assert not group._unshard_events
+                        buffer = group._unsharded_model_weight
+                        if buffer.local_buffer.numel():
+                            assert buffer.is_allocated == (
+                                group._retain_unsharded_storage
+                                or buffer.is_alias_of(group.model_weight)
+                            )
                         if id(group) in captured_pointers:
                             assert (
                                 group._unsharded_model_weight.local_buffer.data_ptr()
@@ -440,9 +437,7 @@ def test_partial_capture_preserves_communication_streams(
 
     def run(graphs):
         context = FsdpContext(
-            runtime_policy=RuntimePolicy(
-                overlap_allgather_reduction=separate_communication_streams,
-            )
+            runtime_policy=RuntimePolicy(overlap_allgather_reduction=separate_communication_streams)
         )
         streams = (
             context.allgather_stream,
@@ -497,8 +492,17 @@ def _rng_contents():
     )
 
 
-@pytest.mark.parametrize("hybrid", [False, True], ids=["gpt", "hybrid"])
-@pytest.mark.parametrize("failure", ["inputs", "finish"])
+@pytest.mark.parametrize(
+    "hybrid,failure",
+    [
+        (False, "inputs"),
+        (True, "inputs"),
+        (False, "finish"),
+        (True, "finish"),
+        (False, "start"),
+        (False, "cleanup"),
+    ],
+)
 def test_partial_capture_failure_retry(process_groups, hybrid, failure, monkeypatch):
     """Failed real MoE capture must restore its lifecycle before a clean retry."""
     config = replace(_moe_config(hybrid=hybrid), attention_dropout=0.1, hidden_dropout=0.1)
@@ -538,12 +542,30 @@ def test_partial_capture_failure_retry(process_groups, hybrid, failure, monkeypa
                     raise RuntimeError("controlled capture failure")
 
                 with monkeypatch.context() as patch:
-                    if failure == "inputs":
+                    if failure == "start":
+                        original_start = helper._start_capturing
+
+                        def fail_after_start():
+                            original_start()
+                            fail()
+
+                        patch.setattr(helper, "_start_capturing", fail_after_start)
+                    elif failure == "inputs":
                         patch.setattr(helper, "_get_cuda_graph_input_data", fail)
-                    elif failure == "finish":
+                    else:
                         patch.setattr(helper, "_finish_capturing", fail)
-                    with pytest.raises(RuntimeError, match="controlled capture failure"):
+                        if failure == "cleanup":
+
+                            def fail_cleanup():
+                                raise RuntimeError("controlled cleanup failure")
+
+                            patch.setattr(helper, "_reset_after_capture", fail_cleanup)
+                    with pytest.raises(RuntimeError, match="controlled capture failure") as error:
                         helper.create_cudagraphs()
+                    if failure == "cleanup":
+                        assert any(
+                            "controlled cleanup failure" in note for note in error.value.__notes__
+                        )
                 assert not cuda_graphs.is_graph_capturing()
                 for module_type, original_call in original_calls.items():
                     assert module_type.__call__ is original_call
@@ -647,6 +669,13 @@ def test_partial_capture_delete_recapture(process_groups, hybrid, tmp_path_dist_
                         [model], model.config, 16, 1, [optimizer], process_groups
                     )
                     helper.create_cudagraphs()
+                    if index == 3:
+                        duplicate = TECudaGraphHelper(
+                            [model], model.config, 16, 1, [optimizer], process_groups
+                        )
+                        with pytest.raises(RuntimeError, match="Delete existing CUDA graphs"):
+                            duplicate.create_cudagraphs()
+                        assert helper.graphs_created()
                     pointers = {
                         id(group): group._unsharded_model_weight.local_buffer.data_ptr()
                         for layer in helper.flattened_callables
@@ -666,7 +695,10 @@ def test_partial_capture_delete_recapture(process_groups, hybrid, tmp_path_dist_
                             assert not layer.cuda_graphs
                             for group in layer.parameter_groups:
                                 assert not group._retain_unsharded_storage
-                                assert not group._unsharded_model_weight.is_allocated
+                                if not group._unsharded_model_weight.is_alias_of(
+                                    group.model_weight
+                                ):
+                                    assert not group._unsharded_model_weight.is_allocated
                         helper = None
                         if index == 4:
                             with TempNamedDir(

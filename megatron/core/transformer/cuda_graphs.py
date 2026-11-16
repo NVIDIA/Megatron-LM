@@ -3006,6 +3006,8 @@ class TECudaGraphHelper:
             for chunk in self.model
             for module in chunk.modules()
         )
+        if uses_fsdp_v2 and not is_te_min_version("2.10.0"):
+            raise ValueError("MFSDP v2 partial CUDA graphs require TE >= 2.10 for graph reset.")
         if uses_fsdp_v2 and (
             not self.config.bf16
             or self.config.fp8
@@ -3038,6 +3040,10 @@ class TECudaGraphHelper:
         fsdp_modules = [
             layer for layer in self.flattened_callables if hasattr(layer, "fsdp_cuda_graph_capture")
         ]
+        if fsdp_modules and is_graph_capturing():
+            raise RuntimeError("FSDP CUDA graph capture must be serialized.")
+        if any(layer.cuda_graphs for layer in fsdp_modules):
+            raise RuntimeError("Delete existing CUDA graphs before recapturing FSDP modules.")
         original_calls = {type(layer): type(layer).__call__ for layer in fsdp_modules}
         rng_states = None
         if fsdp_modules:
@@ -3052,10 +3058,10 @@ class TECudaGraphHelper:
                 clone_rng_state(cuda_rng),
                 {name: clone_rng_state(state) for name, state in tracker_rng.items()},
             )
-        start_time = self._start_capturing()
         graphs = ()
         te_capture_started = False
         try:
+            start_time = self._start_capturing()
             if not self.flattened_callables:
                 # Check if there are any graphable layers. If not, log a warning and skip capture,
                 # but still call _finish_capturing to ensure all ranks complete the capture phase.
@@ -3107,29 +3113,37 @@ class TECudaGraphHelper:
                 self._graphs_created = True
 
             self._finish_capturing(start_time)
-        except BaseException:
+        except BaseException as error:
             if fsdp_modules:
-                # Restore TE's temporary class dispatch and capture flag after a
-                # recoverable Python exception; fatal CUDA/NCCL errors are not recoverable.
-                for module_type, original_call in original_calls.items():
-                    module_type.__call__ = original_call
-                if te_capture_started:
-                    te_set_capture_end()
-                # Reset returned graphs before freeing their fixed-address weights.
-                for graph in graphs:
-                    if is_te_min_version("2.10.0"):
-                        graph.reset()
-                    release_capture_constants(graph)
-                for layer in fsdp_modules:
-                    layer.cuda_graphs = []
-                    layer.release_cuda_graph_buffers()
-                release_capture_constants(self)
-                self._graphs_created = False
-                _set_capture_end()
-                if FREEZE_GC:
-                    gc.unfreeze()
-                self._reset_after_capture()
-                _set_all_rng_states(*rng_states)
+                try:
+                    with ExitStack() as cleanup:
+                        # Restore global/RNG state even if resource cleanup raises.
+                        cleanup.callback(_set_all_rng_states, *rng_states)
+                        cleanup.callback(self._reset_after_capture)
+                        if FREEZE_GC:
+                            cleanup.callback(gc.unfreeze)
+                        cleanup.callback(_set_capture_end)
+                        # Restore dispatch only; TE owns its temporary warmup hooks.
+                        for module_type, original_call in original_calls.items():
+                            module_type.__call__ = original_call
+                        if te_capture_started:
+                            te_set_capture_end()
+                        # TE warmup may have submitted work on its private stream.
+                        torch.cuda.synchronize()
+                        # If reset fails, leave graph-referenced storage alive.
+                        for graph in graphs:
+                            graph.reset()
+                            release_capture_constants(graph)
+                        for layer in fsdp_modules:
+                            layer.cuda_graphs = []
+                            layer.release_cuda_graph_buffers()
+                        release_capture_constants(self)
+                        self._graphs_created = False
+                except BaseException as cleanup_error:
+                    error.add_note(
+                        f"FSDP CUDA graph cleanup also failed: {cleanup_error!r}. "
+                        "Restart the process before continuing."
+                    )
             raise
 
     def cuda_graph_set_manual_hooks(self):

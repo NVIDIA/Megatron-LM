@@ -244,7 +244,7 @@ class FsdpModule:
         Other units, including routed experts outside attention capture, keep their
         normal storage lifecycle. Replay runs the original FSDP hooks outside the graph.
         """
-        if self.phase is not Phase.RESTING:
+        if self._fsdp_cuda_graph_capturing or self.phase is not Phase.RESTING:
             raise RuntimeError("FSDP CUDA graph capture requires an idle module.")
         for group in self._parameter_groups:
             if group.dtype != torch.bfloat16 or self.context.use_symmetric_memory:
