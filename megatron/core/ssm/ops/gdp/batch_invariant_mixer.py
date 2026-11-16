@@ -101,9 +101,10 @@ def _packed_train(xs, cu, max_length, block_size):
     return output[seq, local].unsqueeze(0)
 
 
-def chunk_forward(mixer, hidden_states, conv_state=None, ssm_state=None, packed_seq_params=None):
+def chunk_forward(
+    mixer, hidden_states, conv_state=None, ssm_state=None, packed_seq_params=None, *, runtime_cp
+):
     """Run common projection/preparation/recurrence for training or static prefill."""
-    runtime_cp = mixer._resolve_runtime_cp(packed_seq_params)
     if runtime_cp.group.size() != 1:
         raise NotImplementedError("Batch-invariant GDP requires runtime CP=1")
     projection, _ = mixer.in_proj(hidden_states)

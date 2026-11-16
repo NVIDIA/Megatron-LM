@@ -47,6 +47,7 @@ def _conv_forward(
     HAS_INITIAL: tl.constexpr,
     VARLEN: tl.constexpr,
     SEQUENCES: tl.constexpr,
+    SAVE_PREACTIVATION: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     channel = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -56,7 +57,8 @@ def _conv_forward(
     slot = tl.load(Slots + seq)
     if slot < 0:
         tl.store(Y + row * D + channel, 0.0, valid)
-        tl.store(P + row * D + channel, 0.0, valid)
+        if SAVE_PREACTIVATION:
+            tl.store(P + row * D + channel, 0.0, valid)
         return
     acc = tl.full((BLOCK,), 0.0, tl.float32)
     if HAS_BIAS:
@@ -74,7 +76,8 @@ def _conv_forward(
         w = tl.load(W + channel * C + tap, valid, other=0).to(tl.float32)
         acc = acc + x * w
     y = acc / (1.0 + tl.exp(-acc))
-    tl.store(P + row * D + channel, acc, valid)
+    if SAVE_PREACTIVATION:
+        tl.store(P + row * D + channel, acc, valid)
     tl.store(Y + row * D + channel, y, valid)
 
 
@@ -135,13 +138,17 @@ def _conv_dx(
     tl.store(DX + row * D + channel, dx, valid)
 
 
-def _forward(x, weight, bias, initial, slots, cu):
+def _forward(x, weight, bias, initial, slots, cu, *, save_preactivation=False):
     b, t, d = x.shape
     c = weight.shape[-1]
     if x.dtype != torch.bfloat16 or not x.is_cuda or not x.is_contiguous():
         raise ValueError("Canonical convolution requires contiguous CUDA BF16 input")
     if c != 4 or weight.numel() != d * c or not weight.is_contiguous() or weight.device != x.device:
         raise ValueError("Canonical GDP convolution requires contiguous width-four weights")
+    if bias is not None and (
+        bias.shape != (d,) or bias.device != x.device or not bias.is_contiguous()
+    ):
+        raise ValueError("Convolution bias must be contiguous [channels] on the input device")
     sequences = b if cu is None else cu.numel() - 1
     if cu is not None and (
         b != 1 or cu.dtype != torch.int32 or not cu.is_contiguous() or cu.device != x.device
@@ -155,11 +162,14 @@ def _forward(x, weight, bias, initial, slots, cu):
     ):
         raise ValueError("Convolution slots must be contiguous int32 on the input device")
     if initial is not None and (
-        initial.shape[1:] != (d, c) or initial.dtype != x.dtype or not initial.is_contiguous()
+        initial.shape[1:] != (d, c)
+        or initial.dtype != x.dtype
+        or initial.device != x.device
+        or not initial.is_contiguous()
     ):
         raise ValueError("Convolution cache must be contiguous BF16 [slots,channels,4]")
     y = torch.empty_like(x)
-    p = torch.empty_like(x, dtype=torch.float32)
+    p = torch.empty_like(x, dtype=torch.float32) if save_preactivation else None
     _conv_forward[(triton.cdiv(d, 128), b * t)](
         x,
         weight,
@@ -168,7 +178,7 @@ def _forward(x, weight, bias, initial, slots, cu):
         slots,
         x if cu is None else cu,
         y,
-        p,
+        x if p is None else p,
         t,
         d,
         c,
@@ -176,6 +186,7 @@ def _forward(x, weight, bias, initial, slots, cu):
         initial is not None,
         cu is not None,
         sequences,
+        save_preactivation,
         128,
         num_warps=4,
         enable_fp_fusion=False,
@@ -188,7 +199,7 @@ class _Conv(torch.autograd.Function):
     def forward(ctx, x, weight, bias, cu):
         sequences = x.shape[0] if cu is None else cu.numel() - 1
         slots = torch.arange(sequences, device=x.device, dtype=torch.int32)
-        y, p = _forward(x, weight, bias, None, slots, cu)
+        y, p = _forward(x, weight, bias, None, slots, cu, save_preactivation=True)
         ctx.save_for_backward(x, weight, bias, cu, p)
         return y
 
@@ -251,16 +262,18 @@ def causal_conv(
     gradients. Inference can carry and update slot-indexed history without CPU sync.
     """
     if torch.is_grad_enabled() and any(z.requires_grad for z in (x, weight, bias) if z is not None):
-        if initial_state is not None or update_state:
-            raise ValueError("Cache mutation is inference-only")
+        if initial_state is not None or update_state or slots is not None:
+            raise ValueError("Convolution cache and slot mapping are inference-only")
         return _Conv.apply(x, weight, bias, cu_seqlens)
     sequences = x.shape[0] if cu_seqlens is None else cu_seqlens.numel() - 1
+    if update_state and initial_state is None:
+        raise ValueError("Updating convolution history requires an explicit cache")
     if slots is None:
+        if initial_state is not None and sequences > initial_state.shape[0]:
+            raise ValueError("Default convolution slots exceed cache capacity")
         slots = torch.arange(sequences, device=x.device, dtype=torch.int32)
     y, _ = _forward(x, weight, bias, initial_state, slots, cu_seqlens)
     if update_state:
-        if initial_state is None:
-            raise ValueError("Updating convolution history requires an explicit cache")
         _conv_update[(sequences, triton.cdiv(x.shape[2] * 4, 128))](
             x,
             initial_state,

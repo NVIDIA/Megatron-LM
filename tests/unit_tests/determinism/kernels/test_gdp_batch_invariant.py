@@ -110,7 +110,11 @@ def test_convolution_replay_and_gradients():
     w = torch.randn(128, 4, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     bias = torch.randn(128, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     assert_replays_bit_exact(causal_conv, (x, w, bias), contention=True, what="canonical conv4")
+    with pytest.raises(ValueError, match="slot mapping are inference-only"):
+        causal_conv(x, w, bias, slots=torch.tensor([1, 0], device="cuda", dtype=torch.int32))
     actual = causal_conv(x, w, bias)
+    with torch.no_grad():
+        exact(actual, causal_conv(x, w, bias))
     go = torch.randn_like(actual)
     grads = torch.autograd.grad(actual, (x, w, bias), go)
     ox, ow, ob = (z.detach().float().requires_grad_() for z in (x, w, bias))

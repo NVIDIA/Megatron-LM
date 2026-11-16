@@ -740,17 +740,17 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
         Prefill passes conv_state and ssm_state so the trailing conv window and the final
         recurrent state are cached for the decode steps.
         """
+        if runtime_cp is None:
+            runtime_cp = self._resolve_runtime_cp(packed_seq_params)
         if self.config.batch_invariant_mode:
             return batch_invariant_mixer.chunk_forward(
-                self, hidden_states, conv_state, ssm_state, packed_seq_params
+                self, hidden_states, conv_state, ssm_state, packed_seq_params, runtime_cp=runtime_cp
             )
 
         if packed_seq_params is not None:
             # ``hidden_states`` is [seq_len, batch, dim]; THD requires batch=1.
             _, batch_size, _ = hidden_states.shape
             assert batch_size == 1, "Packed sequences require batch=1 (THD/varlen format)."
-        if runtime_cp is None:
-            runtime_cp = self._resolve_runtime_cp(packed_seq_params)
 
         if self.recompute_in_proj:
             # Checkpoint the input projection and its preprocessing, discard the z, VKQ,
