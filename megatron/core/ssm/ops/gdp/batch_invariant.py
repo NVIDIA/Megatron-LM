@@ -146,6 +146,7 @@ def _store_cache(
     D: tl.constexpr,
     W: tl.constexpr,
     BV: tl.constexpr,
+    write_state=True,
 ):
     State, Keys, Gates, Factors, Rhs, Cursor = cache
     SS: tl.constexpr = strides[0]
@@ -158,7 +159,8 @@ def _store_cache(
     vs = tl.program_id(1) * BV + tl.arange(0, BV)
     # Cache slabs can exceed 2**31 elements; promote before stride products.
     slot = slot.to(tl.int64)
-    tl.store(State + slot * SS + head * D * W + ds[:, None] * W + vs[None, :], state)
+    if write_state:
+        tl.store(State + slot * SS + head * D * W + ds[:, None] * W + vs[None, :], state)
     valid = cs < pos
     if tl.program_id(1) == 0:
         tl.store(
@@ -220,16 +222,20 @@ def _forward(
     PREPARED: tl.constexpr,
     OUTPUTS: tl.constexpr,
     VARLEN: tl.constexpr,
+    WIDE_OFFSETS: tl.constexpr,
     BV: tl.constexpr,
 ):
+    # Request-local arithmetic stays narrow when the input shape bounds it.
+    # Cache/tape addresses are promoted separately before stride products.
+    offset_dtype: tl.constexpr = tl.int64 if WIDE_OFFSETS else tl.int32
     bh = tl.program_id(0).to(tl.int64)
     batch, head = bh // H, bh % H
     if VARLEN:
         input_start = tl.load(Cu + batch).to(tl.int64)
-        count = tl.load(Cu + batch + 1) - input_start
+        count = (tl.load(Cu + batch + 1) - input_start).to(offset_dtype)
     else:
         input_start = batch * N
-        count = N
+        count = N.to(offset_dtype)
     slot = tl.load(Slots + batch).to(tl.int64)
     if slot < 0:
         for token in range(count):
@@ -244,17 +250,18 @@ def _forward(
     if PREPARED:
         # Prepared scans start at a fresh block boundary. Value tiles own
         # disjoint state/RHS columns; their shared cache fields have one writer.
-        pos = tl.full((), 0, tl.int64)
+        pos = 0
         keys = tl.full((C, D), 0.0, tl.bfloat16)
         gates = tl.full((C,), 0.0, tl.float32)
         factor = tl.full((C, C), 0.0, tl.bfloat16)
         rhs = tl.full((C, BV), 0.0, tl.bfloat16)
     else:
-        pos = tl.load(Cursor + slot * CS + sh).to(tl.int64)
+        pos = tl.load(Cursor + slot * CS + sh)
         keys = tl.load(Keys + slot * KS + sh * C * D + cs[:, None] * D + ds[None, :])
         gates = tl.load(Gates + slot * GS + sh * C + cs)
         factor = tl.load(Factors + slot * FS + sh * C * C + cs[:, None] * C + cs[None, :])
         rhs = tl.load(Rhs + slot * HS + sh * C * W + cs[:, None] * W + vs[None, :])
+    initial_pos = pos
     if CAPTURE:
         real_count = tl.load(SnapshotCount)
         lo, hi = 0, real_count
@@ -270,16 +277,17 @@ def _forward(
         )
         snapshot_end = tl.where(
             (snapshot_index < real_count) & (snapshot_position <= input_start + count),
-            (snapshot_position - input_start) * R,
+            (snapshot_position - input_start).to(offset_dtype) * R,
             count * R + 1,
         )
-    offset = tl.full((), 0, tl.int64)
+    offset = tl.full((), 0, offset_dtype)
     block = 0
     while offset < count * R:
         take = tl.minimum(C - pos, count * R - offset)
         if CAPTURE:
             take = tl.minimum(take, snapshot_end - offset)
-        end = pos + take
+        # A block-local index is bounded by C, even when request offsets are 64-bit.
+        end = pos + take.to(tl.int32)
         new = (cs >= pos) & (cs < end)
         old = cs < pos
         update = offset + cs - pos
@@ -345,7 +353,7 @@ def _forward(
             last = tl.sum(tl.where(cs == C - 1, p, 0.0), 0)
             f = (keys.to(tl.float32) * tl.exp(last - p)[:, None]).to(tl.bfloat16)
             state = state * tl.exp(last) + tl.dot(tl.trans(f), u)
-            pos = tl.full((), 0, tl.int64)
+            pos = 0
         else:
             pos = end
         offset += take
@@ -374,7 +382,7 @@ def _forward(
                 )
                 snapshot_end = tl.where(
                     (snapshot_index < real_count) & (snapshot_position <= input_start + count),
-                    (snapshot_position - input_start) * R,
+                    (snapshot_position - input_start).to(offset_dtype) * R,
                     count * R + 1,
                 )
     _store_cache(
@@ -392,6 +400,8 @@ def _forward(
         D,
         W,
         BV,
+        # A partial-block append leaves the FP32 boundary unchanged.
+        write_state=initial_pos + count * R >= C,
     )
 
 
@@ -681,7 +691,10 @@ def _run(
     c = cache.keys.shape[2]
     nb = triton.cdiv(t * k.shape[2], c)
     if tape or prepared:
-        ts = torch.empty((b, nb, h, d, w), device=q.device, dtype=torch.float32)
+        # Readout consumes BF16 state; only backward needs the FP32 boundary tape.
+        ts = torch.empty(
+            (b, nb, h, d, w), device=q.device, dtype=torch.float32 if tape else torch.bfloat16
+        )
         tt = torch.empty((b, nb, h, c, c), device=q.device, dtype=torch.bfloat16)
         tu = torch.empty((b, nb, h, c, w), device=q.device, dtype=torch.bfloat16)
         th = torch.empty_like(tu) if tape else q
@@ -726,6 +739,7 @@ def _run(
         prepared,
         not prepared,
         cu_seqlens is not None,
+        t * k.shape[2] + c >= 2**31,
         forward_tile,
         num_warps=4,
         enable_fp_fusion=False,
@@ -1307,6 +1321,20 @@ def train(
         or not initial_state.is_contiguous()
     ):
         raise ValueError("initial_state must be contiguous FP32 [B,H,K,V] on input device")
+    if not torch.is_grad_enabled() or not any(
+        x.requires_grad for x in (q, k, v, g, beta, initial_state)
+    ):
+        out, cache = prefill(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state=initial_state.detach(),
+            block_size=block_size,
+            scale=scale,
+        )
+        return out, cache.state
     return _Train.apply(
         q, k, v, g, beta, initial_state, block_size, d**-0.5 if scale is None else scale
     )

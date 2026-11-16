@@ -86,6 +86,17 @@ def main() -> None:
                     "forward_ms": forward_ms,
                     "forward_backward_ms": backward_ms,
                 }
+                with torch.no_grad():
+                    row["no_grad_forward_ms"] = do_bench_cudagraph(forward, rep=100)
+                    torch.cuda.synchronize()
+                    allocated = torch.cuda.memory_allocated()
+                    torch.cuda.reset_peak_memory_stats()
+                    output = forward()
+                    torch.cuda.synchronize()
+                    row["no_grad_peak_allocated_bytes"] = (
+                        torch.cuda.max_memory_allocated() - allocated
+                    )
+                    del output
                 if backend != "native":
                     cache = bi.GDPCache.allocate(batch, heads, key, value, block_size=block)
                     one = tuple(x[:, :1].detach().contiguous() for x in xs)

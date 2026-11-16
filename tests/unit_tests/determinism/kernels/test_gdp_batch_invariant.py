@@ -310,3 +310,28 @@ def test_cache_offsets_beyond_int32():
     exact(actual, expected)
     for value, target in zip(cache.tensors(), reference.tensors()):
         exact(value[slot : slot + 1], target)
+
+
+def test_no_grad_and_initial_state_only_gradient():
+    """Inference dispatch must preserve outputs and an initial-state-only backward."""
+    from tests.unit_tests.ssm.test_gdp_batch_invariant_recurrence import inputs as recurrence_inputs
+
+    xs = tuple(x.requires_grad_() for x in recurrence_inputs(1, 23, 2, 32, 32, 3))
+    initial = torch.randn(1, 2, 32, 32, device="cuda", requires_grad=True)
+    expected, expected_state = train(*xs, initial_state=initial, block_size=32)
+    detached = tuple(x.detach() for x in xs)
+    actual, actual_state = train(*detached, initial_state=initial, block_size=32)
+    exact(actual, expected)
+    exact(actual_state, expected_state)
+    go = torch.randn_like(actual)
+    gs = torch.randn_like(actual_state)
+    expected_gradient = torch.autograd.grad((expected, expected_state), initial, (go, gs))[0]
+    actual_gradient = torch.autograd.grad((actual, actual_state), initial, (go, gs))[0]
+    exact(actual_gradient, expected_gradient)
+    with torch.no_grad():
+        inference, inference_state = train(*xs, initial_state=initial, block_size=32)
+    exact(inference, expected)
+    exact(inference_state, expected_state)
+    no_inputs_require_grad, state = train(*detached, initial_state=initial.detach(), block_size=32)
+    exact(no_inputs_require_grad, expected)
+    exact(state, expected_state)
