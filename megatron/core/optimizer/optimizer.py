@@ -2423,8 +2423,11 @@ class ChainedOptimizer(MegatronOptimizer):
             self.chained_optimizers[0].save_parameter_state(filename)
             return
         save_states = False
-        states = []
+        states: list[Optional[dict]] = []
         for optimizer in self.chained_optimizers:
+            if getattr(optimizer, "is_stub_optimizer", False):
+                states.append(None)
+                continue
             if hasattr(optimizer, 'get_parameter_state_dp_zero'):
                 state_dict = optimizer.get_parameter_state_dp_zero()
 
@@ -2453,6 +2456,8 @@ class ChainedOptimizer(MegatronOptimizer):
             return
         states = None
         for idx, optimizer in enumerate(self.chained_optimizers):
+            if getattr(optimizer, "is_stub_optimizer", False):
+                continue
             if not hasattr(optimizer, 'load_parameter_state_from_dp_zero'):
                 continue
 

@@ -851,6 +851,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         for model_chunk in self.model_chunks:
             assert self.ddp_config == model_chunk.ddp_config
         self.distributed_optimizer_instance_id = distributed_optimizer_instance_id
+        self.data_parallel_group = data_parallel_group
+        self.data_parallel_group_gloo = data_parallel_group_gloo
+        self.data_parallel_group_idx = data_parallel_group_idx
         # Retained only between loading-template creation and load_state_dict().
         self._checkpoint_version_for_load = None
 
@@ -890,9 +893,6 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         assert per_model_buffers is not None, "per_model_buffers must be provided"
         self.buffers = list(itertools.chain(*per_model_buffers.values()))
         self.per_model_buffers = per_model_buffers
-        self.data_parallel_group = data_parallel_group
-        self.data_parallel_group_gloo = data_parallel_group_gloo
-        self.data_parallel_group_idx = data_parallel_group_idx
 
         self.gbuf_idx_to_model_idx_map = {}
         gbuf_idx = 0
@@ -1144,9 +1144,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
         optimizer state (e.g., exp_avg, exp_avg_sq) are stored in a separate
         checkpoint file by calling 'save_parameter_state()'.
         """
-        # A stub optimizer (all parameters frozen) has no state to save.
         if self.is_stub_optimizer:
-            return {}
+            return {"grad_scaler": self.grad_scaler.state_dict()} if self.grad_scaler else {}
         inner_state_dict = self.optimizer.state_dict()
         state_dict = {}
 
@@ -1231,6 +1230,8 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             list.
         """
         if self.is_stub_optimizer:
+            if self.grad_scaler and "grad_scaler" in state_dict:
+                self.grad_scaler.load_state_dict(state_dict["grad_scaler"])
             return
         if self.ddp_config.use_megatron_fsdp:
             # When using Megatron-FSDP, directly load the optimizer state
@@ -1817,7 +1818,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
         Regular state dict parameters are saved on DP rank 0 and loaded on all ranks.
         """
-        if self.is_stub_optimizer:
+        if self.is_stub_optimizer and self.grad_scaler is None:
             return {}
         if sharding_type is not None:
             log_single_rank(
@@ -1853,7 +1854,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             raise NotImplementedError(
                 f"sharding_type {sharding_type} is not supported with Megatron FSDP."
             )
-        if sharding_type == "fsdp_dtensor":
+        if sharding_type == "fsdp_dtensor" and not self.is_stub_optimizer:
             # Megatron-FSDP custom sharded state dict construction.
             state_dict = self.sharded_param_state_fsdp_dtensor(is_loading)
             return state_dict
@@ -1884,6 +1885,9 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                 )
                 for k, v in state_dict.items()
             }
+
+        if self.is_stub_optimizer:
+            return state_dict
 
         if is_loading:
             # Call the distributed optimizer's specialized load_state_dict(),
