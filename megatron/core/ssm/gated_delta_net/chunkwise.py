@@ -9,6 +9,7 @@ from megatron.core.fusions.fused_pre_gated_delta_rule import fused_streamed_pre_
 from megatron.core.ssm.causal_conv1d import _exchange_initial_states
 from megatron.core.ssm.context_parallel.gdn_layout import get_chunkwise_layout
 from megatron.core.ssm.gated_delta_net.chunkwise_core import chunkwise_gdn
+from megatron.core.transformer.enums import CudaGraphModule
 
 
 class _CPGateParameters(torch.autograd.Function):
@@ -48,8 +49,18 @@ def forward_chunkwise(module, hidden_states, packed_seq_params, cp_group):
     halo_tokens = module.conv_kernel_dim - 1
     if hidden_states.shape[0] < halo_tokens:
         raise ValueError("A chunkwise CP shard must contain at least the convolution halo")
+    graph_impl = module.config.cuda_graph_impl
+    graph_layout = graph_impl != "none" and (
+        graph_impl == "full_iteration"
+        or not module.config.cuda_graph_modules
+        or CudaGraphModule.attn in module.config.cuda_graph_modules
+    )
     transport, metadata, extended_cu, extended_ids = get_chunkwise_layout(
-        hidden_states, packed_seq_params, cp_group, module.conv_kernel_dim
+        hidden_states,
+        packed_seq_params,
+        cp_group,
+        module.conv_kernel_dim,
+        use_cuda_graphs=graph_layout,
     )
     kernels = getattr(module, "_chunkwise_gdn_kernels", None)
     if kernels is None:
@@ -57,12 +68,16 @@ def forward_chunkwise(module, hidden_states, packed_seq_params, cp_group):
         module._chunkwise_gdn_kernels = kernels
 
     contiguous_hidden = transport.forward(hidden_states)
-    halo = _exchange_initial_states(contiguous_hidden.transpose(0, 1), halo_tokens, cp_group)
-    extended_hidden = (
-        torch.cat((halo.permute(2, 0, 1), contiguous_hidden), dim=0)
-        if halo_tokens
-        else contiguous_hidden
-    )
+    per_document = hasattr(transport, "extend")
+    if per_document:
+        extended_hidden = transport.extend(contiguous_hidden)
+    else:
+        halo = _exchange_initial_states(contiguous_hidden.transpose(0, 1), halo_tokens, cp_group)
+        extended_hidden = (
+            torch.cat((halo.permute(2, 0, 1), contiguous_hidden), dim=0)
+            if halo_tokens
+            else contiguous_hidden
+        )
     projected, _ = module.in_proj(extended_hidden)
     a_log, dt_bias = _CPGateParameters.apply(module.A_log, module.dt_bias, cp_group)
     query, key, value, gate, beta, g = fused_streamed_pre_gated_delta_rule(
@@ -80,7 +95,8 @@ def forward_chunkwise(module, hidden_states, packed_seq_params, cp_group):
         seq_idx=extended_ids,
     )
     query, key, value, gate, beta, g = (
-        tensor[:, halo_tokens:] for tensor in (query, key, value, gate, beta, g)
+        tensor.index_select(1, transport.local_indices) if per_document else tensor[:, halo_tokens:]
+        for tensor in (query, key, value, gate, beta, g)
     )
     core = chunkwise_gdn(
         query.squeeze(0),
@@ -91,6 +107,7 @@ def forward_chunkwise(module, hidden_states, packed_seq_params, cp_group):
         metadata,
         cp_group,
         kernels,
+        per_document=per_document,
     )
 
     def norm_and_restore(output, output_gate):

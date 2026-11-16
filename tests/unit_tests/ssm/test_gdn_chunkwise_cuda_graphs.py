@@ -2,6 +2,9 @@
 
 """Capture and replay complete chunkwise GDN forward and backward passes."""
 
+from functools import partial
+from unittest.mock import patch
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -15,9 +18,9 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.context_parallel import gdn_layout
+from megatron.core.ssm.gated_delta_net import chunkwise
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.cuda_graphs import capture_constants, release_capture_constants
 
 
 @pytest.mark.skipif(not HAVE_TE_GDN, reason="Transformer Engine GDN is unavailable")
@@ -52,6 +55,7 @@ def test_chunkwise_gdn_cuda_graph(cp_size: int, packed: bool) -> None:
             gdn_gated_output_norm_fusion=True,
             gdn_cp_mode="chunkwise",
             gradient_accumulation_fusion=False,
+            cuda_graph_impl="local",
         )
         groups = ProcessGroupCollection(
             tp=parallel_state.get_tensor_model_parallel_group(),
@@ -82,21 +86,33 @@ def test_chunkwise_gdn_cuda_graph(cp_size: int, packed: bool) -> None:
         torch.cuda.current_stream().wait_stream(stream)
         module.zero_grad(set_to_none=True)
         hidden.grad = None
+        if packed:
+            cu = cu.clone()
+            metadata = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
         graph = torch.cuda.CUDAGraph()
-        with capture_constants(graph), torch.cuda.graph(graph, stream=stream):
+        with torch.cuda.graph(graph, stream=stream):
             output, _ = module(hidden, None, packed_seq_params=metadata)
             output.backward(output_grad)
         captured_grads = (hidden.grad, *(parameter.grad for parameter in parameters))
-        # A graph owns its warmed constants independently of the packing LRU.
+        # Captured metadata construction must survive eager cache eviction.
         with gdn_layout._lock:
             gdn_layout._entries.clear()
-        for _ in range(2):
+        for boundaries in ([0, 8, 520, 1024], [0, 256, 384, 1024]):
+            if packed:
+                cu.copy_(torch.tensor(boundaries, dtype=torch.int32, device="cuda"))
             values, incoming = torch.randn_like(hidden), torch.randn_like(output_grad)
             eager_hidden = values.detach().requires_grad_()
-            eager_output, _ = module(eager_hidden, None, packed_seq_params=metadata)
-            eager_grads = torch.autograd.grad(
-                eager_output, (eager_hidden, *parameters), grad_outputs=incoming
-            )
+            # Compare the same document ownership; eager training normally uses
+            # globally contiguous shards with different local parameter gradients.
+            with patch.object(
+                chunkwise,
+                "get_chunkwise_layout",
+                partial(gdn_layout.get_chunkwise_layout, use_cuda_graphs=True),
+            ):
+                eager_output, _ = module(eager_hidden, None, packed_seq_params=metadata)
+                eager_grads = torch.autograd.grad(
+                    eager_output, (eager_hidden, *parameters), grad_outputs=incoming
+                )
             with torch.no_grad():
                 hidden.copy_(values)
                 output_grad.copy_(incoming)
@@ -109,5 +125,4 @@ def test_chunkwise_gdn_cuda_graph(cp_size: int, packed: bool) -> None:
     finally:
         if graph is not None:
             graph.reset()
-            release_capture_constants(graph)
         Utils.destroy_model_parallel()

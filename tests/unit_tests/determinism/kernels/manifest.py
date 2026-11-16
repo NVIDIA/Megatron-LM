@@ -627,6 +627,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="gdn_chunkwise_state_dispatch",
         sources=(
+            "megatron/core/ssm/context_parallel/gdn_layout.py",
+            "megatron/core/ssm/context_parallel/gdn_graph_layout.py",
             "megatron/core/ssm/gated_delta_net/chunkwise_core.py",
             "megatron/core/ssm/gated_delta_net/chunkwise.py",
         ),
