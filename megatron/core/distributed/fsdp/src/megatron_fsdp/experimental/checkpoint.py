@@ -63,11 +63,7 @@ def save_checkpoint(
 
 
 def load_checkpoint(
-    model: torch.nn.Module,
-    optimizer: torch.optim.Optimizer,
-    checkpoint_dir: str | os.PathLike,
-    *,
-    sync_model_weights: bool = True,
+    model: torch.nn.Module, optimizer: torch.optim.Optimizer, checkpoint_dir: str | os.PathLike
 ) -> None:
     """Load a DCP checkpoint into a ``fully_shard``-wrapped model and its optimizer.
 
@@ -75,13 +71,12 @@ def load_checkpoint(
     module structure and mesh); DCP reshards the on-disk data to this rank's shards.
     :func:`~torch.distributed.checkpoint.state_dict.get_optimizer_state_dict` initializes the
     (empty) optimizer state so DCP has DTensors to load into in place, and the ``set_*`` helpers
-    reinstall the loaded state.
+    reinstall the loaded state. Compute weights are then refreshed from the loaded main weights.
 
     Args:
         model: A module tree sharded with :func:`fully_shard`, whose weights receive the load.
         optimizer: Optimizer whose state receives the load.
         checkpoint_dir: Source directory of the DCP checkpoint.
-        sync_model_weights: Refresh compute weights from the loaded main weights afterwards.
     """
     init_optimizer_state(optimizer)
     model_state_dict = get_model_state_dict(model)
@@ -92,5 +87,4 @@ def load_checkpoint(
     )
     set_model_state_dict(model, model_state_dict)
     set_optimizer_state_dict(model, optimizer, optimizer_state_dict)
-    if sync_model_weights:
-        sync_model_weights_from_main_weights(model.parameters())
+    sync_model_weights_from_main_weights(model.parameters())

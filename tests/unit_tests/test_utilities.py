@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import gc
 import os
 from argparse import Namespace
 from datetime import timedelta
@@ -101,11 +102,15 @@ def _restore_torch_settings(settings):
     mode, warn_only = settings["deterministic"]
     torch.use_deterministic_algorithms(mode, warn_only=warn_only)
     torch.utils.deterministic.fill_uninitialized_memory = settings["fill_uninitialized_memory"]
-    (
-        torch.backends.cudnn.deterministic,
-        torch.backends.cudnn.benchmark,
-        torch.backends.cudnn.allow_tf32,
-    ) = settings["cudnn"]
+    # PyTorch's common_utils freezes bare cuDNN assignments on import. Restore
+    # the snapshot in the same scoped mutation context used by cudnn.flags(),
+    # preserving the caller's frozen/unfrozen state when the context exits.
+    with torch.backends.__allow_nonbracketed_mutation():
+        (
+            torch.backends.cudnn.deterministic,
+            torch.backends.cudnn.benchmark,
+            torch.backends.cudnn.allow_tf32,
+        ) = settings["cudnn"]
     (
         torch.backends.cuda.matmul.allow_tf32,
         torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction,
@@ -113,11 +118,30 @@ def _restore_torch_settings(settings):
     ) = settings["matmul"]
 
 
+def test_restore_torch_settings_with_frozen_backend_flags():
+    original = _snapshot_torch_settings()
+    with torch.backends.__allow_nonbracketed_mutation():
+        try:
+            torch.backends.cudnn.deterministic = not original["cudnn"][0]
+            torch.backends.cudnn.benchmark = not original["cudnn"][1]
+            torch.backends.cudnn.allow_tf32 = not original["cudnn"][2]
+            torch.backends.disable_global_flags()
+            _restore_torch_settings(original)
+            assert _snapshot_torch_settings() == original
+            assert torch.backends.flags_frozen()
+        finally:
+            _restore_torch_settings(original)
+
+
 def snapshot_process_state():
     """Capture process-global settings a test may change; restoring puts back the values."""
     state = {
         # Set by every engine, cleared only by suspend(); breaks TestInferenceTopKRouter.
         "inference_mode": (InferenceMode._is_active, InferenceMode._use_bounded_mxfp8_rows),
+        # Engines freeze the heap in the freeze gc modes and disable automatic collection in
+        # freeze_overlap; only suspend() or shutdown() undoes it, so a test that stops short
+        # leaves gc disabled and its frozen garbage unreclaimable for every later test.
+        "gc": (gc.isenabled(), gc.get_freeze_count()),
         # The first init fixes the tracker type;
         # TestPartialCudaGraph forces TE, TestMTPCudaGraphInference the no-op one.
         "rng_tracker": (
@@ -138,6 +162,13 @@ def snapshot_process_state():
 def restore_process_state(state):
     """Return every item captured by `snapshot_process_state` to its captured value."""
     InferenceMode._is_active, InferenceMode._use_bounded_mxfp8_rows = state["inference_mode"]
+    gc_enabled, frozen = state["gc"]
+    (gc.enable if gc_enabled else gc.disable)()
+    if gc.get_freeze_count() != frozen:
+        # Unfrozen garbage is only reclaimed by a collection; run it now rather than leave it
+        # for CPython's deferred full collection.
+        gc.unfreeze()
+        gc.collect()
     tp_random._CUDA_RNG_STATE_TRACKER, tp_random._CUDA_RNG_STATE_TRACKER_INITIALIZED = state[
         "rng_tracker"
     ]
@@ -319,6 +350,13 @@ class Utils:
         # tests setting them doesn't interfere current test.
         clear_nvte_env_vars()
 
+        if torch.distributed.is_initialized():
+            # Groups from an earlier call (e.g. in setup_method) may still be live. Wait until every
+            # rank has finished creating them before tearing them down: a rank that destroys a Gloo
+            # group while its peers are still connecting to it fails them with "Connection closed
+            # by peer", and the ranks fall out of step.
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
         ps.destroy_model_parallel()
         Utils.initialize_distributed()
         ps.initialize_model_parallel(
@@ -360,3 +398,18 @@ class Utils:
         ps.set_virtual_pipeline_model_parallel_rank(0)
 
         ps.set_pipeline_model_parallel_world_size(pipeline_model_parallel_size)
+
+
+def sync_checkpoint_config(args):
+    """Give the registered run config the checkpoint section these arguments describe.
+
+    Checkpoint settings are owned by the run config's ``CheckpointConfig``, not by the argument
+    namespace. Tests that still describe them on a namespace call this right before saving or
+    loading, after their last write to ``args``; the section is returned for further edits.
+    """
+    from megatron.training.argument_utils import checkpoint_config_from_args
+    from megatron.training.global_vars import get_run_config
+
+    run_config = get_run_config()
+    run_config.checkpoint = checkpoint_config_from_args(args)
+    return run_config.checkpoint

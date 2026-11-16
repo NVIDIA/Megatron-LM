@@ -20,12 +20,12 @@ from megatron.core.inference.disaggregation.utils import transfers_for_dst
 L, Hh, BC, BS, HD = 12, 8, 2, 4, 5  # layers, kv-heads, block_count, block_size, head_dim
 
 
-def _global_kv():
+def _global_kv(num_heads=Hh):
     # [2(K/V), L, BC, BS, H, HD] with unique values per (kv, layer, head)
-    g = torch.zeros(2, L, BC, BS, Hh, HD)
+    g = torch.zeros(2, L, BC, BS, num_heads, HD)
     for kv in range(2):
         for l in range(L):
-            for h in range(Hh):
+            for h in range(num_heads):
                 g[kv, l, :, :, h, :] = (kv * 1_000_000) + l * 1000 + h
     return g
 
@@ -41,7 +41,7 @@ def _shard_of(global_kv, lay: KVShardLayout):
     return sub.permute(2, 0, 1, 3, 4, 5).contiguous()  # [BC,2,ll,BS,hh,HD]
 
 
-def _make_layouts(tp, pp, ep=1, etp=1):
+def _make_layouts(tp, pp, ep=1, etp=1, num_heads=Hh):
     outs = []
     rank = 0
     for p in range(pp):
@@ -51,7 +51,7 @@ def _make_layouts(tp, pp, ep=1, etp=1):
                     outs.append(
                         KVShardLayout(
                             num_layers=L,
-                            num_heads=Hh,
+                            num_heads=num_heads,
                             tp_size=tp,
                             tp_rank=t,
                             pp_size=pp,
@@ -68,7 +68,7 @@ def _make_layouts(tp, pp, ep=1, etp=1):
 
 
 def _run_reshard(src_layouts, dst_layouts):
-    g = _global_kv()
+    g = _global_kv(src_layouts[0].num_heads)
     # src buffers = each src's correct shard of the global KV
     src_buf = {s.global_rank: _shard_of(g, s) for s in src_layouts}
     plan = plan_kv_reshard(src_layouts, dst_layouts)
@@ -147,6 +147,53 @@ def test_hetero_tp_with_expert_replication():
     g, out = _run_reshard(src_layouts, dst_layouts)
     for d in dst_layouts:
         assert torch.equal(out[d.global_rank], _shard_of(g, d))
+
+
+@pytest.mark.parametrize(
+    "num_heads,src,dst",
+    [
+        (2, (4, 1), (4, 1)),  # homogeneous, 2 replicas per head
+        (2, (4, 1), (2, 1)),  # replicated -> split
+        (2, (1, 1), (4, 1)),  # whole -> replicated
+        (2, (4, 2), (8, 3)),  # replica count and PP both change
+        (1, (2, 1), (4, 1)),  # single KV head on every rank (MQA)
+        (4, (8, 1), (2, 2)),  # replicated -> 2 heads per rank
+    ],
+)
+def test_gqa_replicated_heads(num_heads, src, dst):
+    """TP larger than the KV-head count: TP ranks replicate whole heads
+    (as Attention does). Every dst still assembles its shard, and each dst
+    replica reads from its own source replica rather than all from one."""
+    src_layouts = _make_layouts(*src, num_heads=num_heads)
+    dst_layouts = _make_layouts(*dst, num_heads=num_heads)
+    g, out = _run_reshard(src_layouts, dst_layouts)
+    for d in dst_layouts:
+        assert d.local_num_heads() == max(1, num_heads // d.tp_size)
+        assert torch.equal(out[d.global_rank], _shard_of(g, d))
+
+    plan = plan_kv_reshard(src_layouts, dst_layouts)
+    by_rank = {s.global_rank: s for s in src_layouts}
+    for d in dst_layouts:
+        for t in transfers_for_dst(plan, d.global_rank):
+            s = by_rank[t.src_rank]
+            assert s.kv_replica_index() == d.kv_replica_index() % s.kv_replicas()
+    if src == dst:
+        assert all(t.src_rank == t.dst_rank for t in plan)
+
+
+def test_gqa_plan_is_pairwise():
+    """The NCCL push side plans against only its own layout; its transfers
+    must equal its share of the full plan, or sends and receives mismatch."""
+    srcs = _make_layouts(4, 1, num_heads=2)
+    dsts = _make_layouts(2, 1, num_heads=2)
+    full = plan_kv_reshard(srcs, dsts)
+    for s in srcs:
+        assert plan_kv_reshard([s], dsts) == [t for t in full if t.src_rank == s.global_rank]
+
+
+def test_heads_and_tp_must_nest():
+    with pytest.raises(ValueError):
+        KVShardLayout(L, 4, 6, 0, 1, 0, 0)
 
 
 def test_one_prefill_to_multiple_decode_targets_of_different_parallelism():

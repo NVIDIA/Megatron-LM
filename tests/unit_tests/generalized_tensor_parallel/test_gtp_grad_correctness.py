@@ -118,7 +118,9 @@ def _make_wide_config(
 
 def _make_wide_stack(config, pg_collection):
     from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
-    from megatron.core.transformer.wide_residual_layer import WideResidualTransformerLayer
+    from megatron.core.transformer.wide_residual_transformer_layer import (
+        WideResidualTransformerLayer,
+    )
 
     spec = get_gpt_layer_with_transformer_engine_spec()
     return torch.nn.ModuleList(
@@ -425,7 +427,7 @@ def _worker_wide_residual(
             sharded_names.append(name)
         else:
             param.data.copy_(full)
-        if 'residual_connection_' in name:
+        if 'residual_read_' in name or 'residual_write_' in name:
             controller_names.append(name.removeprefix('0.'))
             assert not isinstance(param, GTPShardedParam), f"controller was GTP-sharded: {name}"
 

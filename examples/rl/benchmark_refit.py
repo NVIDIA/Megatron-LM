@@ -26,7 +26,6 @@ from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.global_vars import (
     get_run_config,
-    initialize_runtime_services,
     set_run_config,
 )
 from megatron.training.initialize import initialize_megatron
@@ -95,7 +94,7 @@ def create_refit_service(method, execution_batch_bytes: int | None = None):
         return method
 
 
-def print_config_summary(args, src_config, dst_config, world_size, mode):
+def print_config_summary(cfg, args, src_config, dst_config, world_size, mode):
     """Print benchmark configuration."""
     print_rank_0(f"\n{'='*80}")
     print_rank_0(f"REFIT BENCHMARK - {mode.upper()} MODE")
@@ -103,7 +102,7 @@ def print_config_summary(args, src_config, dst_config, world_size, mode):
     print_rank_0(f"World size: {world_size}")
     print_rank_0(f"Source:      TP={src_config['tp']}, PP={src_config['pp']}, EP={src_config['ep']}, DP={src_config['dp']}")
     print_rank_0(f"Destination: TP={dst_config['tp']}, PP={dst_config['pp']}, EP={dst_config['ep']}, DP={dst_config['dp']}")
-    print_rank_0(f"Model: {args.num_layers}L, {args.hidden_size}H, {args.num_attention_heads} heads, vocab={args.vocab_size}")
+    print_rank_0(f"Model: {args.num_layers}L, {args.hidden_size}H, {args.num_attention_heads} heads, vocab={cfg.tokenizer.vocab_size}")
     if args.num_experts:
         print_rank_0(f"MoE: {args.num_experts} experts, top-{args.moe_router_topk}")
     print_rank_0(f"Backend: {get_run_config().rl.refit_method}")
@@ -230,7 +229,7 @@ def benchmark_collocated():
     # Print config
     src_config = {'tp': src_tp, 'pp': src_pp, 'ep': src_ep, 'dp': src_dp}
     dst_config = {'tp': dst_tp, 'pp': dst_pp, 'ep': dst_ep, 'dp': dst_dp}
-    print_config_summary(args, src_config, dst_config, world_size, 'collocated')
+    print_config_summary(cfg, args, src_config, dst_config, world_size, 'collocated')
 
     # Build source model
     print_rank_0("Building source model...")
@@ -250,7 +249,7 @@ def benchmark_collocated():
         pp_size=dst_pp,
         ep_size=dst_ep,
         expt_tp_size=cfg.rl.rl_inference_expert_tensor_model_parallel_size,
-        use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+        use_tp_pp_dp_mapping=cfg.dist.use_tp_pp_dp_mapping,
     )
 
     dst_config = core_transformer_config_from_args(args)
@@ -331,7 +330,7 @@ def benchmark_non_collocated():
     # Print config
     src_config = {'tp': src_tp, 'pp': src_pp, 'ep': src_ep, 'dp': 1}
     dst_config = {'tp': dst_tp, 'pp': dst_pp, 'ep': dst_ep, 'dp': 1}
-    print_config_summary(args, src_config, dst_config, world_size, 'non-collocated')
+    print_config_summary(cfg, args, src_config, dst_config, world_size, 'non-collocated')
     if world_size > required_size:
         print_rank_0(f"Note: Ranks {required_size}-{world_size-1} are idle\n")
 
@@ -343,7 +342,7 @@ def benchmark_non_collocated():
         pp_size=dst_pp,
         ep_size=dst_ep,
         expt_tp_size=cfg.rl.rl_inference_expert_tensor_model_parallel_size,
-        use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
+        use_tp_pp_dp_mapping=cfg.dist.use_tp_pp_dp_mapping,
         rank_offset=src_world,
     )
     torch.distributed.barrier()
@@ -428,7 +427,6 @@ def main():
     set_run_config(pretrain_cfg_container_from_args(args))
     # This synthetic benchmark does not construct datasets, so it does not
     # require the native dataset index helper.
-    initialize_runtime_services(args, training=True)
     initialize_megatron(training=True, skip_dependency_compilation=True)
 
     args = get_args()
@@ -438,8 +436,8 @@ def main():
         raise ValueError("NCCL M2N supports only non-collocated refit")
 
     # Set default vocab size if not provided
-    if args.vocab_size is None:
-        args.vocab_size = 50257
+    if cfg.tokenizer.vocab_size is None:
+        cfg.tokenizer.vocab_size = 50257
         print_rank_0("Using default vocab_size=50257")
 
     try:

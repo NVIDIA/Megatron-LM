@@ -326,6 +326,8 @@ for i in $(seq 1 $N_REPEAT); do
         export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
         if [[ $NODE_RANK -eq 0 ]]; then
             rm -rf "$CHECKPOINT_SAVE_PATH/iter_0000$TRAIN_ITERS"
+            cp "$CHECKPOINT_SAVE_PATH/iter_$(printf "%07d\n" "$((TRAIN_ITERS / 2))")/train_state.pt" \
+                "$CHECKPOINT_SAVE_PATH/latest_train_state.pt"
         fi
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt
         break
@@ -335,6 +337,9 @@ for i in $(seq 1 $N_REPEAT); do
         export CHECKPOINT_LOAD_PATH=$CHECKPOINT_SAVE_PATH
         if [[ $NODE_RANK -eq 0 ]]; then
             rm -rf "$CHECKPOINT_LOAD_PATH/iter_$(printf "%07d\n" "$TRAIN_ITERS")"
+            # Keep the train-state tracker in sync with the text tracker below.
+            cp "$CHECKPOINT_LOAD_PATH/iter_$(printf "%07d\n" "$((TRAIN_ITERS / 2))")/train_state.pt" \
+                "$CHECKPOINT_LOAD_PATH/latest_train_state.pt"
         fi
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_LOAD_PATH/latest_checkpointed_iteration.txt
 
@@ -358,6 +363,8 @@ for i in $(seq 1 $N_REPEAT); do
         export CHECKPOINT_SAVE_PATH=$_CHECKPOINT_SAVE_PATH
         if [[ $NODE_RANK -eq 0 ]]; then
             rm -rf "$CHECKPOINT_SAVE_PATH/iter_0000$TRAIN_ITERS"
+            cp "$CHECKPOINT_SAVE_PATH/iter_$(printf "%07d\n" "$((TRAIN_ITERS / 2))")/train_state.pt" \
+                "$CHECKPOINT_SAVE_PATH/latest_train_state.pt"
         fi
         echo $((TRAIN_ITERS / 2)) >$CHECKPOINT_SAVE_PATH/latest_checkpointed_iteration.txt
     fi

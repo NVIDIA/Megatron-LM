@@ -113,7 +113,6 @@ CLI flags below are verified to exist in `megatron/training/arguments.py` and/or
 | Feature | CLI / config | Notes |
 |---|---|---|
 | Data-parallel coordinator (ZMQ) | uses `gpt_dynamic_inference_with_coordinator.py`; `--inference-use-synchronous-zmq-collectives` | Cross-rank routing |
-| Disable EP consensus | `--inference-disable-ep-consensus` | Skip all-reduce for single-EP |
 | Tensor / pipeline / expert parallel | `--{tensor,pipeline,expert}-model-parallel-size` | Standard parallel knobs |
 
 ### I. Model-family-specific
@@ -121,7 +120,7 @@ CLI flags below are verified to exist in `megatron/training/arguments.py` and/or
 | Family | Features |
 |---|---|
 | Hybrid (Mamba+Attn) | `--mamba-inference-conv-states-dtype`, `--mamba-inference-ssm-states-dtype`, mamba chunk size |
-| MoE | `--moe-enable-routing-replay` (router replay; requires `--inference-dynamic-batching-async-sched-mode legacy`), `--moe-grouped-gemm`, `--moe-token-dispatcher-type` |
+| MoE | `--moe-enable-routing-replay` (router replay; supports legacy and async scheduling), `--moe-grouped-gemm`, `--moe-token-dispatcher-type` |
 
 ---
 

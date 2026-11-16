@@ -27,7 +27,11 @@ from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint
 from megatron.training.checkpointing import save_checkpoint as _save_checkpoint
-from megatron.training.global_vars import set_global_variables, unset_global_variables
+from megatron.training.global_vars import (
+    get_run_config,
+    set_global_variables,
+    unset_global_variables,
+)
 from megatron.training.training import get_model
 from model_provider import model_provider
 from tests.unit_tests.test_utilities import Utils
@@ -210,7 +214,7 @@ class Pipeline:
 
         # Set global args, build tokenizer.
         unset_global_variables()
-        cfg = inference_cfg_container_from_args(args, build_model_config=False)
+        cfg = inference_cfg_container_from_args(args)
         set_global_variables(args, cfg)
 
         # Random seed.
@@ -238,13 +242,14 @@ class Pipeline:
         if is_model_parallel_rank_0():
             # Generate different data on each DP rank.
             args = get_args()
+            cfg = get_run_config()
 
             orig_numpy_seed = np.random.get_state()[1][0]
             temp_numpy_seed = orig_numpy_seed + torch.distributed.get_rank()
 
             np.random.seed(temp_numpy_seed)
             numpy_input_ids = np.random.randint(
-                low=0, high=args.vocab_size, size=(args.seq_length,), dtype=np.int64
+                low=0, high=cfg.tokenizer.vocab_size, size=(args.seq_length,), dtype=np.int64
             )
             np.random.seed(orig_numpy_seed)
 
@@ -521,9 +526,10 @@ class Pipeline:
             world_size = torch.distributed.get_world_size()
             if rank == world_size - 1:
                 args = get_args()
+                cfg = get_run_config()
                 get_mse = lambda dst_output_tensor: torch.nn.MSELoss()(
-                    src_output_tensor[:, :, : args.vocab_size],
-                    dst_output_tensor[:, :, : args.vocab_size],
+                    src_output_tensor[:, :, : cfg.tokenizer.vocab_size],
+                    dst_output_tensor[:, :, : cfg.tokenizer.vocab_size],
                 ).item()
                 mse_real = get_mse(dst_output_tensor_real)
                 mse_fake = get_mse(dst_output_tensor_fake)
@@ -660,6 +666,7 @@ class LLaVAPipeline(Pipeline):
         if is_model_parallel_rank_0():
             # Generate different data on each DP rank.
             args = get_args()
+            cfg = get_run_config()
 
             orig_numpy_seed = np.random.get_state()[1][0]
             temp_numpy_seed = orig_numpy_seed + torch.distributed.get_rank()
@@ -667,7 +674,7 @@ class LLaVAPipeline(Pipeline):
             np.random.seed(temp_numpy_seed)
             # TODO: CHANGE TEMP SIZE TO SOMETHING REAL
             numpy_input_ids = np.random.randint(
-                low=0, high=args.vocab_size, size=(args.seq_length,), dtype=np.int64
+                low=0, high=cfg.tokenizer.vocab_size, size=(args.seq_length,), dtype=np.int64
             )
             np.random.seed(orig_numpy_seed)
 
@@ -809,13 +816,16 @@ class LLaVAPipeline(Pipeline):
 
         # Parse args.
         from examples.multimodal.multimodal_args import add_multimodal_extra_args
+        from megatron.training.argument_utils import model_config_from_args
+        from megatron.training.models import LLaVAModelConfig
 
         args = parse_args(extra_args_provider=add_multimodal_extra_args)
         validate_args(args)
 
         # Set global args, build tokenizer.
         unset_global_variables()
-        cfg = inference_cfg_container_from_args(args, build_model_config=False)
+        model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+        cfg = inference_cfg_container_from_args(args, model_cfg)
         set_global_variables(args, cfg)
 
         # Random seed.

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Megatron arguments."""
 
@@ -52,7 +52,7 @@ str_dtype_to_torch = {
 }
 
 def validate_yaml(args, defaults={}):
-    
+
     # This is for legacy script env var setting
     if type(args.data_path) is str:
         # If no white space its a single path
@@ -83,7 +83,7 @@ def validate_yaml(args, defaults={}):
         'pipeline parallel size ({}) times context parallel size ({})'.format(
         args.world_size, args.model_parallel.tensor_model_parallel_size,
         args.model_parallel.pipeline_model_parallel_size, args.model_parallel.context_parallel_size)
-    
+
     # data_parallel_size is not in model parallel config
     args.data_parallel_size = args.world_size // (model_parallel_size * args.model_parallel.context_parallel_size)
     if args.rank == 0:
@@ -198,10 +198,6 @@ def validate_yaml(args, defaults={}):
     if args.dataloader_type is None:
         args.dataloader_type = 'single'
 
-    # Consumed tokens.
-    args.consumed_train_samples = 0
-    args.consumed_valid_samples = 0
-
     # Support for variable sequence lengths across batches/microbatches.
     # set it if the dataloader supports generation of variable sequence lengths
     # across batches/microbatches. Due to additional communication overhead
@@ -270,7 +266,7 @@ def validate_yaml(args, defaults={}):
         assert args.language_model.hidden_size % args.language_model.num_attention_heads == 0
         args.language_model.kv_channels = args.language_model.hidden_size // args.language_model.num_attention_heads
 
-    #TODO: Implement arguments for encoder-decoder
+    # TODO: Implement arguments for encoder-decoder
     if args.seq_length is not None:
         assert args.encoder_seq_length is None
         args.encoder_seq_length = args.seq_length
@@ -284,8 +280,6 @@ def validate_yaml(args, defaults={}):
         assert args.max_position_embeddings >= args.decoder_seq_length
     if args.lr is not None:
         assert args.min_lr <= args.lr
-    if args.save is not None:
-        assert args.save_interval is not None
     # Mixed precision checks.
     if args.fp16_lm_cross_entropy:
         assert args.fp16, 'lm cross entropy in fp16 only support in fp16 mode.'
@@ -293,8 +287,11 @@ def validate_yaml(args, defaults={}):
         assert args.model_parallel.fp16 or args.model_parallel.bf16, \
             'residual connection in fp32 only supported when using fp16 or bf16.'
 
-    if args.language_model.moe_grouped_gemm:
-        assert args.model_parallel.bf16, 'Currently GroupedGEMM for MoE only supports bf16 dtype.'
+    if (
+        args.language_model.num_moe_experts is not None
+        and args.language_model.moe_grouped_gemm
+        and args.language_model.transformer_impl != "local"
+    ):
         dc = torch.cuda.get_device_capability()
         assert dc[0] >= 8, "Unsupported compute capability for GroupedGEMM kernels."
 
@@ -347,7 +344,7 @@ def validate_yaml(args, defaults={}):
             raise RuntimeError(
                 "Using sequence parallelism requires setting the environment variable "
                 "CUDA_DEVICE_MAX_CONNECTIONS to 1")
-    
+
     # MoE Spec check
     if args.language_model.num_moe_experts is not None:
         if args.model_parallel.tensor_model_parallel_size > 1:
@@ -365,7 +362,7 @@ def validate_yaml(args, defaults={}):
     # Print arguments.
     _print_args("arguments", args)
 
-    #TODO: Added as much of the global initialization requires the model parallel arguments
+    # TODO: Added as much of the global initialization requires the model parallel arguments
     args = SimpleNamespace(**args.__dict__, **args.model_parallel.__dict__)
     args = SimpleNamespace(**args.__dict__, **args.language_model.__dict__)
     # For GPT Layer spec in pretrain_gpt

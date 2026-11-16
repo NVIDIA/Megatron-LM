@@ -8,12 +8,12 @@ import torch
 
 from megatron.core.models.hybrid.hybrid_block import HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.ssm.wide_residual_mamba_layer import WideResidualMambaLayer
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
-from megatron.core.transformer.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from tests.unit_tests.test_utilities import Utils
 
@@ -45,6 +45,10 @@ class TestMambaLayer:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
+    def test_activation_must_be_positional(self):
+        with pytest.raises(TypeError, match="hidden_states"):
+            self.layer(hidden_states=torch.empty(0), attention_mask=None)
+
     def test_configured_layernorm_epsilon(self):
         assert self.layer.norm.eps == self.layer.config.layernorm_epsilon
 
@@ -72,22 +76,20 @@ class TestMambaLayer:
         monkeypatch.setattr(self.layer, "_prepare_mixer_input", prepare_input)
         monkeypatch.setattr(self.layer, "_apply_mixer_bda", apply_bda)
         context = object()
-        branch_input, residual, state, replay = self.layer._prepare_mixer_state(
+        prepared, replay = self.layer._prepare_mixer_state(
             hidden_states, residual_stream_recompute_context=context
         )
+        branch_input, residual = prepared
         prepare_residual.assert_called_once_with(hidden_states)
         prepare_input.assert_called_once_with(hidden_states)
         assert branch_input is hidden_states
-        assert state is None
         assert replay is None
         assert residual.dtype == (torch.float32 if fp32_residual else torch.bfloat16)
         assert norm.call_args.args[0] is hidden_states
         torch.testing.assert_close(residual, hidden_states.to(residual.dtype), rtol=0, atol=0)
 
         mixer_output = (torch.zeros_like(branch_input), None)
-        output = self.layer._apply_mixer_update(
-            mixer_output, residual, connection_state=(hidden_states,), recompute_context=context
-        )
+        output = self.layer._apply_mixer_update(mixer_output, residual, recompute_context=context)
         apply_bda.assert_called_once_with(mixer_output, residual)
         assert output.dtype == residual.dtype
         torch.testing.assert_close(output, residual, rtol=0, atol=0)
@@ -187,8 +189,7 @@ class TestMambaLayer:
             )
             is split_output
         )
-        assert write.call_args.args[1] is stage_state[1]
-        assert write.call_args.args[2] is stage_state[2]
+        assert write.call_args.args[1] is stage_state[2]
         assert write.call_args.kwargs["recompute_context"] is recompute_context
 
     def test_gpu_forward(self):
