@@ -477,18 +477,20 @@ class TestConfigContainer_ToYaml:
 
     def test_to_yaml_with_msc_url(self, monkeypatch):
         """Test to_yaml with MSC URL."""
+        from multistorageclient.config import RESERVED_POSIX_PROFILE_NAME
+
         config = TestConfigContainer(name="msc_test", value=999)
 
         monkeypatch.setattr(MultiStorageClientFeature, "_enabled", True)
 
         # Verify that the file is created in the temporary directory
         with tempfile.TemporaryDirectory() as temp_dir:
-            config.to_yaml(f"msc://default{temp_dir}/test_output.yaml")
+            # Use MSC's built-in filesystem profile, not a user-configured profile.
+            yaml_url = f"msc://{RESERVED_POSIX_PROFILE_NAME}{temp_dir}/test_output.yaml"
+            config.to_yaml(yaml_url)
             assert os.path.exists(f"{temp_dir}/test_output.yaml")
 
-            loaded_config = TestConfigContainer.from_yaml(
-                f"msc://default{temp_dir}/test_output.yaml"
-            )
+            loaded_config = TestConfigContainer.from_yaml(yaml_url)
             assert config.to_dict() == loaded_config.to_dict()
 
 
