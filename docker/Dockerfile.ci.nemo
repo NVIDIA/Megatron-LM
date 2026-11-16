@@ -5,7 +5,7 @@ ARG FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:26.04-py3
 FROM ${FROM_IMAGE_NAME} AS main
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends gettext && \
+    apt-get install -y --no-install-recommends ca-certificates gettext && \
     apt-get clean && \
     wget https://github.com/mikefarah/yq/releases/download/v4.44.1/yq_linux_amd64 -O /usr/local/bin/yq && \
     chmod a+x /usr/local/bin/yq

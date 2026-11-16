@@ -1,5 +1,7 @@
 FROM nvcr.io/nvidia/pytorch:24.01-py3
 
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
+
 RUN pip uninstall -y triton && \
     pip install triton==2.1.0 sentencepiece==0.1.99 flask-restful
 

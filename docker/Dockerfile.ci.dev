@@ -5,7 +5,7 @@ ARG FROM_IMAGE_NAME=nvcr.io/nvidia/pytorch:26.06-py3
 FROM ${FROM_IMAGE_NAME} AS base
 ENV PIP_CONSTRAINT=""
 ENV DEBIAN_FRONTEND=noninteractive
-ARG UV_VERSION=0.7.2
+ARG UV_VERSION=0.13.5
 ARG TARGETARCH
 ARG YQ_VERSION=4.44.1
 ENV PATH="/usr/local/bin:$PATH"
@@ -18,7 +18,7 @@ ENV UV_LINK_MODE=copy
 RUN bash -ex <<"EOF"
     apt-get update
     # DeepGEMM/DeepJIT requires elfutils/libdwfl.h for its exception support.
-    apt-get install -y --no-install-recommends gettext python3-venv psmisc uuid-runtime libdw-dev
+    apt-get install -y --no-install-recommends ca-certificates gettext python3-venv psmisc uuid-runtime libdw-dev
     apt-get clean
     python -m venv /opt/jet
     ARCH=$(uname -m)
@@ -31,8 +31,8 @@ RUN bash -ex <<"EOF"
     wget https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_${YQ_ARCH} -O /usr/local/bin/yq
     chmod a+x /usr/local/bin/yq
     case "${TARGETARCH}" in \
-      "amd64") UV_ARCH=x86_64; UV_SHA256=cfaab1b5166a6439ff66f020333d3a12bbdf622deee3b510718283e8f06c9de7 ;; \
-      "arm64") UV_ARCH=aarch64; UV_SHA256=2872fdf4785666575d129ba90590c44e6508e22584735f3e7e8a30d773dfc3db ;; \
+      "amd64") UV_ARCH=x86_64; UV_SHA256=f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f ;; \
+      "arm64") UV_ARCH=aarch64; UV_SHA256=4bb69cf95ed13f23713bb7bc09f241896ea0c75b7c557e615a20604b82f9c403 ;; \
       *) echo "Unsupported TARGETARCH for uv: ${TARGETARCH}" >&2; exit 1 ;; \
     esac
     UV_ARCHIVE="uv-${UV_ARCH}-unknown-linux-gnu.tar.gz"
@@ -43,6 +43,9 @@ RUN bash -ex <<"EOF"
     install -m 0755 "/tmp/uv-${UV_ARCH}-unknown-linux-gnu/uv" /usr/local/bin/uv
     install -m 0755 "/tmp/uv-${UV_ARCH}-unknown-linux-gnu/uvx" /usr/local/bin/uvx
     rm -rf "/tmp/${UV_ARCHIVE}" "/tmp/uv-${UV_ARCH}-unknown-linux-gnu"
+    mkdir -p "${XDG_CONFIG_HOME:-$HOME}"/.config/uv
+    # Allow `uv self update`.
+    echo '{"binaries":["uv","uvx"],"binary_aliases":{},"cdylibs":[],"cstaticlibs":[],"install_layout":"unspecified","install_prefix":"/usr/local/bin","modify_path":false,"provider":{"source":"cargo-dist","version":"0.32.0"},"source":{"app_name":"uv","name":"uv","owner":"astral-sh","release_type":"github"},"version":"0.13.5"}' > "${XDG_CONFIG_HOME:-$HOME}"/.config/uv/uv-receipt.json
 EOF
 
 # Cache the MoK wheel independently of the other dev dependencies. The shared base
@@ -179,7 +182,7 @@ RUN --mount=type=cache,id=uv-${TARGETARCH}-${NVTE_CUDA_ARCHS}-cudnn-fe-1.32,targ
     TE_REV=$(sed -n 's/^transformer-engine = .*rev = "\([^"]*\)".*/\1/p' /workspace/pyproject.toml)
     test -n "${TE_REV}"
     TE_SHORT_REV="${TE_REV:0:8}"
-    NCCL_EP_JIT_HEADERS=$(find /root/.cache/uv/git-v0/checkouts \
+    NCCL_EP_JIT_HEADERS=$(find /root/.cache/uv/git-v1/checkouts \
         -type d \
         -path "*/${TE_SHORT_REV}/3rdparty/*/build/include/nccl_ep" \
         -print -quit)
