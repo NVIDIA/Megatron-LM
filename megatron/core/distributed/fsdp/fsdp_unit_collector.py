@@ -14,7 +14,7 @@
 
 """Select MCore modules for MFSDP v2 sharding."""
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from typing import NamedTuple
 
 from torch import nn
@@ -29,17 +29,17 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 
 
 class _SelectiveRecompute(NamedTuple):
-    """A module's selective recompute, which reruns part of its forward in backward.
+    """A rule for a module's internal selective checkpoint.
 
-    The rerun recomputes activations with the rerun part's weights but does not call the
-    forward hooks of the FSDP unit owning those weights.
+    The checkpoint replays an internal callable without re-entering the module's
+    forward hooks. The region conservatively identifies parameters to inspect.
     """
 
     # Name of the bool attribute a module sets to True at construction when it recomputes,
     # e.g. "recompute_mlp" for TransformerLayer.
     recompute_flag_name: str
-    # Name of the module's attribute holding the child that the recompute reruns, e.g. "mlp"
-    # for TransformerLayer, or None when the module reruns itself.
+    # Name of the module's attribute holding the region root, e.g. "mlp" for
+    # TransformerLayer, or None to inspect the current module's subtree.
     recomputed_submodule_name: str | None
 
 
@@ -69,24 +69,24 @@ class FsdpUnitCollector:
             )
         self._fsdp_unit_module_types = tuple(fsdp_unit_module_types)
         self._units: list[nn.Module] = []
-        # Maps each collected unit to itself and its descendants outside nested units.
-        self._owned_modules_by_unit: dict[nn.Module, dict[nn.Module, None]] = {}
+        self._partially_recomputed_units: set[nn.Module] = set()
 
     def collect(self, module: nn.Module) -> list[nn.Module]:
         """Return selected modules children before parents, including the root last."""
         self._units = []
+        self._partially_recomputed_units = set()
+
+        # Collect FSDP units.
         self._visit(module)
         if not isinstance(module, self._fsdp_unit_module_types):
             self._units.append(module)
-        self._owned_modules_by_unit = {unit: {} for unit in self._units}
-        for unit, owned in self._owned_modules_by_unit.items():
-            owned[unit] = None
-            pending = list(unit.children())
-            while pending:
-                submodule = pending.pop()
-                if submodule not in self._owned_modules_by_unit:
-                    owned[submodule] = None
-                    pending.extend(submodule.children())
+
+        # Mark units whose owned parameters are replayed by their internal checkpoints.
+        for unit in self._units:
+            owned_parameters = self._collect_owned_parameters(unit)
+            recomputed_parameters = self._collect_recomputed_parameters(unit)
+            if not owned_parameters.isdisjoint(recomputed_parameters):
+                self._partially_recomputed_units.add(unit)
         return self._units
 
     def is_partially_recomputed(self, unit: nn.Module) -> bool:
@@ -97,17 +97,35 @@ class FsdpUnitCollector:
         SchedulePolicy.unshard_all_planes_in_backward. Modules inside a nested unit don't
         count: their own hooks run during recomputation.
         """
-        owned = self._owned_modules_by_unit[unit]
-        for module in owned:
-            for rerun in _rerun_submodules(module):
-                for submodule in rerun.modules():
-                    # Skip modules of nested units, which own their weights.
-                    if submodule not in owned:
-                        continue
-                    # Skip parameterless modules, e.g. an IdentityOp MLP.
-                    if next(submodule.parameters(recurse=False), None) is not None:
-                        return True
-        return False
+        return unit in self._partially_recomputed_units
+
+    def _collect_owned_parameters(self, unit: nn.Module) -> set[nn.Parameter]:
+        """Collect this unit's parameters, excluding nested FSDP units."""
+        parameters = set()
+        for owned in self._owned_modules(unit):
+            parameters.update(owned.parameters(recurse=False))
+        return parameters
+
+    def _collect_recomputed_parameters(self, unit: nn.Module) -> set[nn.Parameter]:
+        """Collect parameter candidates from checkpoints defined inside this unit.
+
+        Region parameters include nested units' weights; the caller filters by ownership.
+        """
+        recomputed = set()
+        for owned in self._owned_modules(unit):
+            for region in _rerun_submodules(owned):
+                recomputed.update(region.parameters())
+        return recomputed
+
+    def _owned_modules(self, unit: nn.Module) -> Iterator[nn.Module]:
+        """Yield this unit and its descendants outside independent child units."""
+        stack = [unit]
+        while stack:
+            owned = stack.pop()
+            yield owned
+            for child in reversed(list(owned.children())):
+                if child not in self._units:
+                    stack.append(child)
 
     def _visit(self, module: nn.Module) -> None:
         if isinstance(module, HyperConnectionHybridLayer):
@@ -163,7 +181,7 @@ class FsdpUnitCollector:
 
 
 def _rerun_submodules(module: nn.Module) -> list[nn.Module]:
-    """Return the parts of this module's forward that its own checkpoints rerun in backward."""
+    """Return parameter-region roots for checkpoints defined inside this module."""
     # Read the module's own config: hybrid layers may each have one.
     config = getattr(module, "config", None)
     if config is not None and config.recompute_granularity == "full":
