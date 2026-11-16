@@ -22,6 +22,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
 )
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.tuning import policy as tuning_policy
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -33,7 +34,8 @@ def exact(a, b):
 
 
 @pytest.fixture(params=[(1, 32), (3, 16), (3, 32)])
-def canonical_mixer(request):
+def canonical_mixer(request, monkeypatch):
+    monkeypatch.setattr(tuning_policy, "_deterministic_override", True)
     Utils.initialize_model_parallel()
     model_parallel_cuda_manual_seed(123)
     enable_batch_invariant_mode(backend='te_native')

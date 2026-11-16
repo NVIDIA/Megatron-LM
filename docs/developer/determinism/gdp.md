@@ -12,7 +12,8 @@ before constructing the model, as for the existing attention and projection
 backends. Set `gdp_batch_invariant_block_size` to 16 (default) or 32. Blocks count
 **internal updates**, not tokens. The block size is an immutable numerical
 setting: training and serving must agree. C32 gives better long-sequence
-throughput in the measured GB200 configuration.
+training throughput in the measured GB200 configuration; C16 has lower decode
+latency at the measured small batch sizes.
 
 The GDP path supports BF16, convolution width four, CP=1, and no sequence
 parallelism. CuTeDSL GDP, FP8/FP4, selective GDP recompute/offload, prefix caching,
@@ -97,3 +98,29 @@ Fresh static prefill writes parallel-prepared results directly into allocator-ow
 cache storage. Continuation and dynamic packed prefill use the incremental path,
 which retains partial blocks. Prefill does not allocate or write the RHS tape that
 is needed only by backward.
+
+## Measured performance
+
+GB200, PyTorch 2.11.0+cu130, Triton 3.6.0; CUDA graph replay. Prepared recurrence
+inputs have 4096 tokens, 24 heads, K=128, V=64 and three internal updates per token.
+All entries below are forward plus backward in milliseconds.
+
+| Batch | Native FLA | Batch-invariant C16 | Batch-invariant C32 |
+| --- | ---: | ---: | ---: |
+| 1 | 2.18 | 4.59 | 3.19 |
+| 8 | 11.24 | 17.17 | 12.72 |
+
+The shared convolution backward uses deterministic tiled partial sums instead of
+materializing full token-by-channel gathers and products for each tap. A paired
+complete-mixer benchmark (hidden size 1536, the same 24-head geometry, C32) measures
+the effect of that change, including projections, normalization and recurrence:
+
+| Batch | Forward + backward before (ms) | After (ms) | Reduction |
+| --- | ---: | ---: | ---: |
+| 1 | 8.35 | 5.89 | 29% |
+| 8 | 60.74 | 38.52 | 37% |
+
+These are component timings, not whole-model or distributed-training throughput.
+The optimized arithmetic still has a cost relative to native FLA. Inference
+convolution skips the FP32 preactivation buffer used by backward; convolution
+parameter-gradient scratch scales with the number of 256-row tiles.
