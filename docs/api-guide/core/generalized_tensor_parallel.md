@@ -481,7 +481,10 @@ group. Use rank ordering with TP as the innermost axis and PP as the outermost a
 and place each weight-sharding group entirely within one NVLink domain.
 
 GTP sequence sharding requires Megatron DDP and `--ckpt-format torch_dist`;
-dynamic CP, FSDP, and sequence-packing schedulers are unsupported.
+dynamic CP and FSDP are unsupported. The `dp_balanced` sequence-packing scheduler
+is supported without `--context-parallel-size` on top of the sequence shards, or
+with it when the sequence shards span the whole GTP_remat group, as in the example
+above. Otherwise raise `--tensor-parallel-num-sequence-shards` first.
 
 ---
 
