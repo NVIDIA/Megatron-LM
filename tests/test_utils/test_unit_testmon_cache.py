@@ -88,6 +88,44 @@ def test_compatibility_inputs_preserve_lookup_prefix_but_reject_restored_generat
     assert _snapshot(directory) == before
 
 
+@pytest.mark.parametrize(
+    "bucket,changed",
+    [
+        (
+            "tests/unit_tests/inference/test_batch_invariant_fp8.py",
+            "tests/unit_tests/run_ci_test.sh",
+        ),
+        (
+            "tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py",
+            "tests/unit_tests/testmon_selector.py",
+        ),
+        (
+            "tests/unit_tests/inference/test_disagg_transfer_pairwise.py",
+            "tests/unit_tests/run_ci_test.sh",
+        ),
+    ],
+)
+def test_custom_launcher_changes_invalidate_only_its_baseline(
+    source_tree, generation, bucket, changed
+):
+    directory, ordinary = generation
+    for name in ("tests/unit_tests/run_ci_test.sh", "tests/unit_tests/testmon_selector.py"):
+        path = source_tree / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("original launcher")
+    producer = cache.cache_identity(source_tree, bucket, "dgx_h100", IMAGE_ID)
+    cache.finalize(directory, producer, "b" * 40, "123-1")
+    matched_key = producer["cache_prefix"] + "123-1"
+    cache.validate_cache(directory, producer, matched_key)
+
+    (source_tree / changed).write_text("changed launcher")
+    consumer = cache.cache_identity(source_tree, bucket, "dgx_h100", IMAGE_ID)
+    assert consumer["cache_prefix"] == producer["cache_prefix"]
+    with pytest.raises(ValueError, match="compatibility"):
+        cache.validate_cache(directory, consumer, matched_key)
+    assert cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID) == ordinary
+
+
 def test_platform_and_bucket_are_isolated(source_tree):
     root_conftest = "tests/unit_tests/conftest.py"
     nested_conftest = "tests/unit_tests/pipeline_parallel/nested/conftest.py"
