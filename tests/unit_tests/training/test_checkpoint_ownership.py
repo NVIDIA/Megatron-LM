@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from megatron.core.distributed import TorchFullyShardedDataParallelConfig
 from megatron.training import async_utils, global_vars, training
 from megatron.training.argument_utils import (
     checkpoint_config_from_args,
@@ -278,7 +279,7 @@ def test_construction_runs_no_checks():
     "setup, match",
     [
         (
-            dict(dist=dict(use_torch_fsdp2=True), checkpoint=dict(ckpt_format="torch")),
+            dict(ddp=TorchFullyShardedDataParallelConfig(), checkpoint=dict(ckpt_format="torch")),
             "--use-torch-fsdp2 requires",
         ),
         (dict(checkpoint=dict(ckpt_format="torch_dcp")), "only tested with FSDP"),
@@ -294,7 +295,7 @@ def test_construction_runs_no_checks():
         ),
         (
             dict(
-                ddp=dict(overlap_param_gather=True),
+                optimizer=dict(overlap_param_gather=True),
                 checkpoint=dict(save="/s", save_interval=1, save_params_interval=1),
             ),
             None,
@@ -303,8 +304,11 @@ def test_construction_runs_no_checks():
 )
 def test_training_container_checks_the_format_against_its_other_sections(run_config, setup, match):
     for section, values in setup.items():
-        for name, value in values.items():
-            setattr(getattr(run_config, section), name, value)
+        if isinstance(values, dict):
+            for name, value in values.items():
+                setattr(getattr(run_config, section), name, value)
+        else:
+            setattr(run_config, section, values)
     with pytest.raises(AssertionError, match=match):
         run_config.validate()
 
@@ -327,15 +331,10 @@ def test_legacy_checkpoint_gloo_requirement_follows_optimizer_kind(run_config, o
         assert run_config.optimizer.use_layer_wise_distributed_optimizer is False
 
 
-def test_inference_container_checks_the_format_against_dist_only():
-    cfg = _inference_container(ckpt_format="torch")
-    cfg.dist.use_torch_fsdp2 = True
-    with pytest.raises(AssertionError, match="--use-torch-fsdp2 requires"):
-        cfg.validate()
-    with pytest.raises(AssertionError, match="only tested with FSDP"):
-        _inference_container(ckpt_format="torch_dcp").validate()
-    # No ddp or optimizer section: those rules do not apply to inference.
-    _inference_container(ckpt_format="fsdp_dtensor").validate()
+def test_inference_container_does_not_require_training_wrappers():
+    # Inference has no DDP wrapper; its checkpoint format selects the load backend.
+    for ckpt_format in ("torch", "torch_dist", "torch_dcp", "fsdp_dtensor"):
+        _inference_container(ckpt_format=ckpt_format).validate()
 
 
 @pytest.fixture

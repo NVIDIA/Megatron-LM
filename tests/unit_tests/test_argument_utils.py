@@ -83,6 +83,19 @@ def _minimal_training_args(monkeypatch):
     return args
 
 
+@pytest.mark.parametrize("version", [1, 2])
+def test_megatron_fsdp_user_buffer_registration_matches_version(monkeypatch, version):
+    monkeypatch.delenv("CUDA_DEVICE_MAX_CONNECTIONS", raising=False)
+    args = _minimal_training_args(monkeypatch)
+    args.use_megatron_fsdp = True
+    args.megatron_fsdp_version = version
+    args.nccl_ub = True
+    args.ckpt_format = "fsdp_dtensor"
+    args = validate_args(args)
+    assert args.fsdp_manual_registration is (version == 1)
+    assert not args.fsdp_double_buffer
+
+
 def test_moe_norm_flag_reaches_transformer_config():
     """The generated LatentMoE norm flag should populate the model config."""
     parser = ArgumentParser()
@@ -105,8 +118,13 @@ def test_moe_norm_flag_reaches_transformer_config():
 def test_gtp_userbuffer_flags_preserve_cli_contract(name):
     parser = ArgumentParser()
     add_megatron_arguments(parser)
-    assert getattr(parser.parse_args([]), name) is False
-    assert getattr(parser.parse_args(["--" + name.replace("_", "-")]), name) is True
+    flag = "--" + name.replace("_", "-")
+    assert getattr(parser.parse_args([]), name) is None
+    # A bare flag parses to []; validate_args expands it to both collectives.
+    assert getattr(parser.parse_args([flag]), name) == []
+    assert getattr(parser.parse_args([flag, "rs"]), name) == ["rs"]
+    with pytest.raises(SystemExit):
+        parser.parse_args([flag, "foo"])
 
 
 def test_moe_backend_arguments():
@@ -121,7 +139,7 @@ def test_moe_backend_arguments():
 
 def test_no_megatron_fsdp_padded_shards_flag_reaches_ddp_config():
     """--no-megatron-fsdp-padded-shards should disable padded shards in the DDP config."""
-    from megatron.training.training import get_megatron_ddp_config
+    from megatron.training.argument_utils import get_megatron_ddp_config
 
     parser = ArgumentParser()
     add_megatron_arguments(parser)
@@ -1435,7 +1453,9 @@ def mock_ddp_config():
 @pytest.fixture
 def patch_training_helpers(mock_optimizer_config, mock_ddp_config):
     """Patch the two helper functions called by pretrain_cfg_container_from_args."""
-    with patch("megatron.training.training.get_megatron_ddp_config", return_value=mock_ddp_config):
+    with patch(
+        "megatron.training.argument_utils.get_megatron_ddp_config", return_value=mock_ddp_config
+    ):
         yield
 
 
@@ -1446,7 +1466,7 @@ class TestPretrainContainerFromArgsStructure:
         result = pretrain_cfg_container_from_args(_make_args())
         assert isinstance(result, PretrainConfigContainer)
 
-    @patch("megatron.training.training.get_megatron_ddp_config")
+    @patch("megatron.training.argument_utils.get_megatron_ddp_config")
     def test_ddp_config_comes_from_helper(self, mock_ddp):
         """Test that ddp config comes from get_megatron_ddp_config."""
         mock_ddp_instance = MagicMock(spec=DistributedDataParallelConfig)
