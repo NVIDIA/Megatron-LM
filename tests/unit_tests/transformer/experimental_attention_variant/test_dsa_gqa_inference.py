@@ -192,11 +192,17 @@ def test_dynamic_attention_query_layouts(
     """Packed THD and singleton-batch SBHD inputs agree through the actual dispatcher."""
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("BI DSA requires SM100")
-    if batch_invariant:
-        pytest.importorskip("deep_select")
     pytest.importorskip("cutlass.cute")
     torch.manual_seed(89)
     max_seq_length, max_requests = 1024, 4
+    bi_score_buffer_width = None
+    if batch_invariant:
+        pytest.importorskip("deep_select")
+        from megatron.core.transformer.experimental_attention_variant.dsa_batch_invariant import (
+            aligned_score_buffer_width,
+        )
+
+        bi_score_buffer_width = aligned_score_buffer_width(max_seq_length, TOPK)
     decode_only = num_decode_requests == len(query_lengths)
     num_rows = max_requests if decode_only else -(-sum(query_lengths) // 8) * 8
     context = native_context_factory(
@@ -236,8 +242,7 @@ def test_dynamic_attention_query_layouts(
             inference_context=context,
             index_topk=TOPK,
             softmax_scale=HEAD_DIM**-0.5,
-            batch_invariant=batch_invariant,
-            max_seq_length=max_seq_length,
+            bi_score_buffer_width=bi_score_buffer_width,
         )
 
     expected = attend(query)

@@ -228,6 +228,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.hybrid_stack_spec: ModuleSpec = hybrid_stack_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
+        if (
+            self.config.batch_invariant_mode
+            and self.config.dsa_indexer_batch_invariant_max_sequence_length is None
+        ):
+            self.config.dsa_indexer_batch_invariant_max_sequence_length = max_sequence_length
         self.hybrid_layer_pattern = hybrid_layer_pattern
         self.hybrid_layer_config_list = hybrid_layer_config_list_snapshot
         self._has_custom_layers = any(
@@ -612,8 +617,6 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             if hasattr(module, 'finish_init'):
                 quant_config = get_quant_config_or_none(name, self.config.quant_recipe)
                 module.finish_init(quant_config)
-            if hasattr(module, '_set_dsa_bi_max_seq_length'):
-                module._set_dsa_bi_max_seq_length(self.max_sequence_length)
 
     def set_input_tensor(self, input_tensor: Tensor) -> None:
         """Sets input tensor to the model.

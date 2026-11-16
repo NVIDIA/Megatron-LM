@@ -347,11 +347,19 @@ class SimplifiedDSGQAIndexer(MegatronModule):
         self.index_n_heads = 1
         self.index_head_dim = config.dsa_indexer_head_dim
         self.index_topk = config.dsa_indexer_topk
-        self.max_seq_length = None
+        self.max_seq_length = config.dsa_indexer_batch_invariant_max_sequence_length
+        self.bi_score_buffer_width = None
         if config.batch_invariant_mode:
-            from .dsa_batch_invariant import score_width
+            from .dsa_batch_invariant import aligned_score_buffer_width
 
-            score_width(self.index_topk, self.index_topk)
+            if self.max_seq_length is None:
+                raise ValueError(
+                    "Batch-invariant simplified DSA requires "
+                    "dsa_indexer_batch_invariant_max_sequence_length."
+                )
+            self.bi_score_buffer_width = aligned_score_buffer_width(
+                self.max_seq_length, self.index_topk
+            )
             if (
                 config.context_parallel_size != 1
                 or config.sequence_parallel
@@ -446,14 +454,6 @@ class SimplifiedDSGQAIndexer(MegatronModule):
         if self.pg_collection.tp.size() > 1:
             for param in self.parameters():
                 setattr(param, "average_gradients_across_tp_domain", True)
-
-    def _set_dsa_bi_max_seq_length(self, max_seq_length: int) -> None:
-        """Bind routing layouts to the owning model's maximum sequence length, set from hybrid_model.py"""
-        if self.config.batch_invariant_mode:
-            from .dsa_batch_invariant import score_width
-
-            score_width(max_seq_length, self.index_topk)
-            self.max_seq_length = max_seq_length
 
     def _apply_rope(self, q: torch.Tensor, use_rope: bool, packed_seq_params=None):
         if not use_rope or self.rotary_pos_emb is None or self.index_rotary_dim == 0:
@@ -809,8 +809,7 @@ class DSGQACoreAttention(MegatronModule):
             inference_context=inference_context,
             index_topk=self.indexer.index_topk,
             softmax_scale=self.softmax_scale,
-            batch_invariant=getattr(self.config, "batch_invariant_mode", False),
-            max_seq_length=getattr(self.indexer, "max_seq_length", None),
+            bi_score_buffer_width=self.indexer.bi_score_buffer_width,
         )
 
     def _forward_min_memory(

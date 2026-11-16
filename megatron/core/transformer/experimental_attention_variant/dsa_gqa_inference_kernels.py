@@ -63,6 +63,8 @@ ATTENTION_PROGRAMS_PER_SM = 1
 # programs to aim for per SM across a step.
 SCORE_BLOCK_T = 128
 SCORE_PROGRAMS_PER_SM = 8
+# Indexer dimension the Gluon score kernel's TMA tiles and MMA are laid out for.
+SCORE_INDEX_DIM = 128
 BI_SCORE_ROWS = 8
 
 
@@ -634,13 +636,15 @@ def dsa_gqa_indexer_scores(
     if num_blocks == 0 or width == 0:
         return
     if batch_invariant:
-        if not HAVE_GLUON or index_dim != 128:
+        if not HAVE_GLUON or index_dim != SCORE_INDEX_DIM:
             raise ValueError(
-                "Batch-invariant DSA scores require Blackwell Gluon and index_dim=128."
+                f"Batch-invariant DSA scores require Blackwell Gluon and "
+                f"index_dim={SCORE_INDEX_DIM}."
             )
-        if key_cache.size(1) % 128 and block_table.size(1) != 1:
+        if key_cache.size(1) % SCORE_BLOCK_T and block_table.size(1) != 1:
             raise ValueError(
-                "Batch-invariant DSA requires 128-aligned KV pages or single-page storage."
+                f"Batch-invariant DSA requires {SCORE_BLOCK_T}-aligned KV pages or "
+                f"single-page storage."
             )
         from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
 
@@ -653,7 +657,7 @@ def dsa_gqa_indexer_scores(
             query.contiguous(), [BI_SCORE_ROWS, index_dim], shared_layout
         )
         key_desc = TensorDescriptor.from_tensor(
-            key_cache.reshape(-1, index_dim).contiguous(), [128, index_dim], shared_layout
+            key_cache.reshape(-1, index_dim).contiguous(), [SCORE_BLOCK_T, index_dim], shared_layout
         )
         direct_rows = row_requests is not None and row_offset == 0 and out.size(0) == num_rows
         work_blocks = num_rows if direct_rows else num_blocks
@@ -661,7 +665,7 @@ def dsa_gqa_indexer_scores(
         # and rounding remain identical when the grid changes with query scheduling.
         parallel_workers = max(1, _num_sms(query.device.index) // work_blocks)
         workers = workers or min(
-            128, triton.cdiv(width, 128), max(8, 1 << (parallel_workers.bit_length() - 1))
+            128, triton.cdiv(width, SCORE_BLOCK_T), max(8, 1 << (parallel_workers.bit_length() - 1))
         )
         score_tcgen[(num_rows if direct_rows else num_blocks, workers)](
             query_desc,

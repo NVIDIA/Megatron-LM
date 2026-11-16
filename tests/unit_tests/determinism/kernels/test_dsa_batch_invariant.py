@@ -22,10 +22,10 @@ pytestmark = pytest.mark.launch_on_gb200
 pytest.importorskip("deep_select")
 
 from megatron.core.transformer.experimental_attention_variant.dsa_batch_invariant import (  # noqa: E402
+    aligned_score_buffer_width,
     attention_contiguous,
     contiguous_plan,
     route_contiguous,
-    score_width,
     select,
 )
 
@@ -54,7 +54,7 @@ def require_blackwell_and_deepselect():
 @pytest.mark.parametrize("topk", [512, 1024, 2048])
 def test_deepselect_with_same_scores(topk):
     """Make sure the results is invariant if there are multiple identical scores."""
-    width = score_width(8192, topk)
+    width = aligned_score_buffer_width(8192, topk)
     length = topk + 73
     for ties in (True, False):
         scores = torch.zeros(1, width, device="cuda", dtype=torch.float32)
@@ -109,7 +109,7 @@ def test_indexer_scores_match_across_layouts_schedules_and_decode_rows():
 
     torch.manual_seed(43)
     length, batch, index_dim = 2305, 2, 128
-    width = score_width(4096, 512)
+    width = aligned_score_buffer_width(4096, 512)
     iq = torch.randn(length, batch, 1, index_dim, device="cuda", dtype=torch.bfloat16)
     ik = torch.randn_like(iq)
     table = _reversed_page_table(batch, length)
@@ -154,7 +154,7 @@ def test_indexer_scores_match_across_layouts_schedules_and_decode_rows():
 def test_contiguous_paged_chunked_decode_and_graph_are_exact(dim, topk, record_property):
     torch.manual_seed(41)
     length, batch, heads, index_dim = 2305, 2, 16, 128
-    width = score_width(4096, topk)
+    width = aligned_score_buffer_width(4096, topk)
     query = torch.randn(length, batch, heads, dim, device="cuda", dtype=torch.bfloat16)
     key = torch.randn(length, batch, 1, dim, device="cuda", dtype=torch.bfloat16)
     value = torch.randn_like(key)
@@ -358,11 +358,14 @@ def test_training_backward_and_no_grad_recompute(
         assert linear.weight.grad is not None
         assert torch.isfinite(linear.weight.grad).all()
         assert torch.count_nonzero(linear.weight.grad) > 0
-    with _triton_dispatch_enabled(True, score_width(max_seq_length, topk)), torch.no_grad():
+    with (
+        _triton_dispatch_enabled(True, aligned_score_buffer_width(max_seq_length, topk)),
+        torch.no_grad(),
+    ):
         iq = _linear(states, indexer.linear_q.weight).unsqueeze(2)
         ik = _linear(states, indexer.linear_k.weight).unsqueeze(2)
         _, indices = route_contiguous(
-            iq, ik, 0, length, topk, score_width(max_seq_length, topk), 128**-0.5
+            iq, ik, 0, length, topk, aligned_score_buffer_width(max_seq_length, topk), 128**-0.5
         )
     support = torch.zeros(length, length + 1, device="cuda", dtype=torch.bool)
     support.scatter_(1, indices[0].long().masked_fill(indices[0] < 0, length), True)
@@ -450,7 +453,10 @@ def test_training_backward_and_no_grad_recompute(
     assert torch.equal(
         updated, dsa_min_memory_gqa_forward_only(*args, use_indexer_rope=False, query_chunk_size=31)
     )
-    with _triton_dispatch_enabled(True, score_width(max_seq_length, topk)), torch.no_grad():
+    with (
+        _triton_dispatch_enabled(True, aligned_score_buffer_width(max_seq_length, topk)),
+        torch.no_grad(),
+    ):
         iq = _linear(states, indexer.linear_q.weight).reshape(length, 128)
         ik = _linear(states, indexer.linear_k.weight).reshape(1, length, 128)
         for start in (0, length - 1):
@@ -462,7 +468,7 @@ def test_training_backward_and_no_grad_recompute(
                 index_query=iq[start:],
                 index_key_cache=ik,
                 plan=plan,
-                max_context_length=score_width(max_seq_length, topk),
+                max_context_length=aligned_score_buffer_width(max_seq_length, topk),
                 index_topk=topk,
                 softmax_scale=dim**-0.5,
                 batch_invariant=True,
@@ -510,6 +516,7 @@ def test_indexer_projection_norm_and_rope_match_training(interleaved, record_pro
         dsa_indexer_n_heads=1,
         dsa_indexer_head_dim=128,
         dsa_indexer_topk=512,
+        dsa_indexer_batch_invariant_max_sequence_length=4096,
     )
     indexer = SimplifiedDSGQAIndexer(
         config, SimplifiedDSGQAIndexerSubmodules(linear_q=TELinear, linear_k=TELinear)
@@ -519,7 +526,7 @@ def test_indexer_projection_norm_and_rope_match_training(interleaved, record_pro
         "RMSNorm", torch.randn(1024, device="cuda", dtype=torch.bfloat16), None, 1e-6, False
     )
     normalized = _normalized_indexer_input(states, norm)
-    with _triton_dispatch_enabled(True, score_width(4096, 512)):
+    with _triton_dispatch_enabled(True, aligned_score_buffer_width(4096, 512)):
         args = (states, 0, 1025)
         rest = (128, 128, indexer.rotary_pos_emb, interleaved, True, norm)
         train_q = _project_simplified_q_index_tile(*args, indexer.linear_q.weight, *rest)

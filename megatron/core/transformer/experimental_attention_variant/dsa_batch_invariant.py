@@ -40,9 +40,12 @@ def project(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return output.reshape(*hidden.shape[:-1], weight.size(0))
 
 
-def score_width(max_seq_length: int | None, topk: int) -> int:
-    """Align the model's maximum sequence length for DeepSelect score storage."""
-    if max_seq_length is None or not 0 < max_seq_length <= int(2**20):  # 1M context
+def aligned_score_buffer_width(max_seq_length: int, topk: int) -> int:
+    """Align the model's maximum sequence length for DeepSelect score storage.
+    DeepSelect internal tiling and reduction scheduling may change when per-request
+    length varies. So we align this to the maximum sequence length.
+    """
+    if not 0 < max_seq_length <= int(2**20):  # 1M context
         raise ValueError(
             f"Batch-invariant DSA requires a model maximum sequence length in 1M, "
             f"got {max_seq_length}"

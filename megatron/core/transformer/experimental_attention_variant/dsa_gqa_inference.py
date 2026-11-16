@@ -122,12 +122,11 @@ def dynamic_sparse_attention(
     inference_context: DynamicInferenceContext,
     index_topk: int,
     softmax_scale: float,
-    batch_invariant: bool = False,
-    max_seq_length: int | None = None,
+    bi_score_buffer_width: int | None = None,
 ) -> torch.Tensor:
     """Simplified-DSA attention over paged caches for a decode, prefill, or mixed batch.
 
-    Normalize queries to ``[T,Hq,D]`` before dispatching to the BI or native backend.
+    Normalize queries to ``[T,Hq,D]`` before dispatching to the native or batch-invariant backend.
     ``DSAMetadata.plan`` supplies each token's request and causal prefix. The caches
     already hold this step's keys, values, and indexer keys.
 
@@ -140,8 +139,8 @@ def dynamic_sparse_attention(
         inference_context: Dynamic inference context for this step.
         index_topk: Number of keys each query attends to.
         softmax_scale: Attention softmax scale.
-        batch_invariant: Whether to use batch-invariant mode.
-        max_seq_length: Model's maximum sequence length, set from hybrid_model.py
+        bi_score_buffer_width: The indexer's fixed score-buffer width; selects the
+            batch-invariant backend when set.
 
     Returns:
         Attention output ``[T,1,Hq*Dv]``; rows for padding tokens are zero.
@@ -164,14 +163,9 @@ def dynamic_sparse_attention(
             f"DSA row metadata covers {plan.row_requests.numel()} tokens, but the step has "
             f"{num_rows}."
         )
-    if batch_invariant:
-        from .dsa_batch_invariant import score_width
-
-        fixed_width = score_width(max_seq_length, index_topk)
-        if inference_context.max_sequence_length > max_seq_length:
-            raise ValueError(
-                "Inference context exceeds the model's BI DSA maximum sequence length."
-            )
+    if bi_score_buffer_width is not None:
+        if inference_context.max_sequence_length > bi_score_buffer_width:
+            raise ValueError("Inference context exceeds the model's BI DSA score-buffer width.")
         output = _sparse_attention_rows(
             query=query,
             key_cache=key_cache,
@@ -179,7 +173,7 @@ def dynamic_sparse_attention(
             index_query=index_query,
             index_key_cache=index_key_cache,
             plan=plan,
-            max_context_length=fixed_width,
+            max_context_length=bi_score_buffer_width,
             index_topk=index_topk,
             softmax_scale=softmax_scale,
             batch_invariant=True,
@@ -214,7 +208,7 @@ def _native_sparse_attention(
     value_cache: torch.Tensor,
     index_query: torch.Tensor,
     index_key_cache: torch.Tensor,
-    inference_context: BaseInferenceContext,
+    inference_context: DynamicInferenceContext,
     plan: DSARowPlan,
     max_context_length: int,
     index_topk: int,
@@ -328,8 +322,8 @@ def dsa_gqa_decode(
         raise ValueError(
             "Supported top-k values are 512/1024/2048, with context capacity 1..1048576"
         )
-    if page_size <= 0 or page_size % 128:
-        raise ValueError("Native Triton DSA requires pages divisible by 128")
+    if page_size <= 0 or page_size % kernels.SCORE_BLOCK_T:
+        raise ValueError(f"Native Triton DSA requires pages divisible by {kernels.SCORE_BLOCK_T}")
     requests = (
         torch.arange(batch_size, dtype=torch.int32, device=device)
         if request_indices is None
@@ -352,18 +346,23 @@ def dsa_gqa_decode(
     if query.stride(1) != head_dim:
         raise ValueError("Query heads must occupy compact rows")
     if (
-        index_query.shape != (batch_size, 128)
+        index_query.shape != (batch_size, kernels.SCORE_INDEX_DIM)
         or index_query.dtype != torch.bfloat16
         or not index_query.is_contiguous()
     ):
-        raise ValueError("index_query must be contiguous BF16 [batch_size,128]")
+        raise ValueError(
+            f"index_query must be contiguous BF16 [batch_size,{kernels.SCORE_INDEX_DIM}]"
+        )
     if (
         index_key_cache.ndim != 3
-        or index_key_cache.shape[1:] != (page_size, 128)
+        or index_key_cache.shape[1:] != (page_size, kernels.SCORE_INDEX_DIM)
         or index_key_cache.dtype != torch.bfloat16
         or not index_key_cache.is_contiguous()
     ):
-        raise ValueError("index_key_cache must be contiguous BF16 [blocks,page_size,128]")
+        raise ValueError(
+            f"index_key_cache must be contiguous BF16 "
+            f"[blocks,page_size,{kernels.SCORE_INDEX_DIM}]"
+        )
     if key_cache.shape != value_cache.shape or key_cache.shape != (
         index_key_cache.shape[0],
         page_size,
@@ -399,9 +398,13 @@ def dsa_gqa_decode(
     descriptor_layout = gl.NVMMASharedLayout(
         swizzle_byte_width=128, element_bitwidth=16, rank=2, transposed=False
     )
-    query_descriptor = TensorDescriptor.from_tensor(index_query, [8, 128], descriptor_layout)
+    query_descriptor = TensorDescriptor.from_tensor(
+        index_query, [8, kernels.SCORE_INDEX_DIM], descriptor_layout
+    )
     key_descriptor = TensorDescriptor.from_tensor(
-        index_key_cache.view(-1, 128), [128, 128], descriptor_layout
+        index_key_cache.view(-1, kernels.SCORE_INDEX_DIM),
+        [kernels.SCORE_BLOCK_T, kernels.SCORE_INDEX_DIM],
+        descriptor_layout,
     )
     score_workers, score_stages = 8, 3
 
