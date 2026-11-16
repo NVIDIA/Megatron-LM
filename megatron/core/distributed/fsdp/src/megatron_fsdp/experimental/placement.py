@@ -44,8 +44,8 @@ class ShardLayout(enum.Enum):
     """How a ``RowAtomic`` / ``BlockAtomic`` group is split into per-rank segments."""
 
     PADDED = "padded"
-    """Equal segments. The group is padded to a multiple of ``dp_size * LCM(row sizes)``
-    (times the block size for ``BlockAtomic``)."""
+    """Equal segments with minimum padding. Rank boundaries preserve whole rows
+    (or whole row blocks for ``BlockAtomic``)."""
 
     UNPADDED = "unpadded"
     """No padding. Tensors are packed back to back and segments end on the row/block
