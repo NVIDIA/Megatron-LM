@@ -11,6 +11,7 @@ import torch
 
 from megatron.core.inference.config import MediaCacheCoordinatorPolicy
 from megatron.core.inference.data_parallel_inference_coordinator import (
+    CoordinatorState,
     DataParallelInferenceCoordinator,
 )
 from megatron.core.inference.headers import Headers, UnknownHeaderError
@@ -220,6 +221,12 @@ class CoordinatorMixin:
 
         local_ip = hostname or socket.gethostname()
 
+        coordinator_initial_state = (
+            CoordinatorState.SUSPENDED
+            if self.state == EngineState.SUSPENDED
+            else CoordinatorState.RUNNING
+        )
+
         # Spawn a DP coordinator process and get the connection info.
         if disagg_config is not None:
             spawn_coordinator = disagg_config.spawn_coordinator and self.is_mp_coordinator
@@ -260,6 +267,7 @@ class CoordinatorMixin:
                     "schedule_output_path": coordinator_schedule_output_path,
                     "hostname": hostname,
                     "disaggregated": disagg_config is not None,
+                    "initial_state": coordinator_initial_state,
                 },
             )
             self.inference_coordinator_process.start()
