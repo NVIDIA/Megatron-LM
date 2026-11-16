@@ -145,13 +145,6 @@ def _validate_dump_options(args: Any) -> None:
         )
 
 
-def _tokenizer_attr(tokenizer: Any, name: str) -> Any:
-    try:
-        return getattr(tokenizer, name)
-    except (AttributeError, NotImplementedError):
-        return None
-
-
 def tokenizer_identity() -> dict[str, Any]:
     """Describe the tokenizer with the format's canonical fingerprint."""
     return _tokenizer_identity_and_size()[0]
@@ -166,7 +159,7 @@ def _tokenizer_identity_and_size() -> tuple[dict[str, Any], int]:
     """Return the tokenizer setting and the true (non-padded) vocabulary size.
 
     Hugging Face tokenizers (wrapped by Megatron) are fingerprinted exactly as a
-    non-Megatron producer would, from ``get_vocab()`` and HF special-token IDs.
+    non-Megatron producer would, from ``get_vocab()`` and ``len(tokenizer)``.
     Other tokenizers use their vocabulary mapping in the same canonical form.
     """
     from megatron.training import get_tokenizer
@@ -188,8 +181,7 @@ def _tokenizer_identity_and_size() -> tuple[dict[str, Any], int]:
         vocab = {str(index): index for index in range(int(tokenizer.vocab_size))}
     if not isinstance(vocab, dict):
         raise ValueError("Offline KD v3 requires a tokenizer exposing its vocabulary mapping")
-    special_ids = {role: _tokenizer_attr(tokenizer, role) for role in ("bos", "eos", "pad", "unk")}
-    return {"sha256": tokenizer_fingerprint(vocab, special_ids, len(vocab))}, len(vocab)
+    return {"sha256": tokenizer_fingerprint(vocab, len(vocab))}, len(vocab)
 
 
 def student_padding_divisor(args: Any) -> int:
@@ -272,6 +264,8 @@ def _dump_settings(saver: Any) -> dict[str, Any]:
             # Megatron's position embeddings (learned, rope, yarn, mrope) depend only on
             # the position, so a causal teacher's row t never depends on later tokens.
             "prefix_stable": True,
+            # Plain text only; see KNOWN_FEATURES.
+            "features": [],
             "global_batch_size": args.global_batch_size,
         },
         "recorded": {

@@ -15,7 +15,7 @@ import numpy as np
 import pyarrow as pa
 import torch
 
-from .format.arrow import block_range, decode_block, file_meta, read_block, read_block_bytes
+from .format.arrow import block_range, decode_block, load_schema, read_block_bytes
 from .format.blend import MANIFEST_VERSION
 from .format.index_cache import BoundedIndexCache
 from .v3_format import LOGPROB_SENTINEL, TOKEN_FIELDS, mismatched_settings, validate_metadata
@@ -202,10 +202,10 @@ class _Lane:
     def _run(self, items: Callable) -> None:
         reader = self.reader
         try:
-            for key, (storage, data, index, block, label) in items(self.stopped):
-                offset, size = block_range(index, block, inputs_only=not reader.targets)
+            for key, (storage, data, schema, entry, label) in items(self.stopped):
+                offset, size = block_range(entry, inputs_only=not reader.targets)
                 raw = storage.read_range(data, offset, size)
-                future = reader.pool.submit(reader.decode_rows, index, block, raw, label)
+                future = reader.pool.submit(reader.decode_rows, schema, entry, raw, label)
                 if not self._put((key, future)):
                     return
             self._put((None, RuntimeError("Offline KD v3 stream ended before a requested block")))
@@ -261,18 +261,14 @@ class _BlockReader:
         )
         self.lanes: dict[Any, _Lane] = {}
 
-    def read_batch(self, index: dict, block: int, raw: bytes) -> Any:
-        """Decode a block's record batch from the bytes :func:`block_range` names."""
-        return read_block(index, block, raw, inputs_only=not self.targets)
-
     def decode_rows(
-        self, index: dict, block: int, raw: bytes, label: str
+        self, schema: pa.Schema, entry: dict, raw: bytes, label: str
     ) -> tuple[dict, tuple | None]:
-        """Decode and validate one block."""
-        batch = self.read_batch(index, block, raw)
+        """Decode and validate one block with its index's shared schema."""
+        batch = read_block_bytes(schema, raw, entry["length"], inputs_only=not self.targets)
         inputs, targets = decode_block(batch, vocab_size=self.vocab_size)
-        if inputs["sample_offsets"].numel() - 1 != index["blocks"][block]["rows"]:
-            raise ValueError(f"Offline KD v3 block {block} of {label} has wrong rows")
+        if inputs["sample_offsets"].numel() - 1 != entry["rows"]:
+            raise ValueError(f"Offline KD v3 {label} has the wrong number of rows")
         inputs["segment_offsets"] = torch.cat(
             (torch.zeros(1, dtype=torch.int64), torch.cumsum(inputs["segment_counts"].long(), 0))
         )
@@ -404,29 +400,31 @@ class ReplayReader(_BlockReader):
         def load() -> dict:
             group = read_group(self.storage, (span[0] // self.gbs, span[1] // self.gbs))
             directory = flush_dir(REPLAY, group["start_iteration"], group["end_iteration"])
+            self.check_meta(group["settings"], directory)
+            schemas = [load_schema(schema) for schema in group["schemas"]]
             for part in group["parts"]:
                 part["path"] = f"{directory}/{part['path']}"
-                index = part["index"]
-                self.check_meta(file_meta(index), part["path"])
-                index["first_rows"] = [block["first_row"] for block in index["blocks"]]
+                part["arrow_schema"] = schemas[part["schema"]]
+                rows = [block["rows"] for block in part["blocks"]]
+                part["first_rows"] = [0, *itertools.accumulate(rows)][:-1]
             return group
 
         return self.group_cache.get_or_load(span, load)
 
     def check_meta(self, meta: dict, path: str) -> None:
-        """Validate a part's settings against the cache."""
+        """Validate a flush's settings against the cache."""
         validate_metadata(meta)
         required, recorded = mismatched_settings(meta, self.metadata)
         if required:
             raise ValueError(
-                f"Offline KD v3 part {path} disagrees with the cache on {', '.join(required)}; "
+                f"Offline KD v3 flush {path} disagrees with the cache on {', '.join(required)}; "
                 "it was written by an incompatible dump job"
             )
         new = [key for key in recorded if key not in self.reported_differences]
         if new:
             self.reported_differences.update(new)
             print(
-                f"WARNING: offline KD v3 part {path} differs from the cache in recorded "
+                f"WARNING: offline KD v3 flush {path} differs from the cache in recorded "
                 f"settings ({', '.join(new)}); it is still used",
                 flush=True,
             )
@@ -450,14 +448,20 @@ class ReplayReader(_BlockReader):
                     if span is None:
                         return
                     info = self._group(span)
-                    if writer >= info["writers"]:
+                    if writer >= len(info["parts"]):
                         return  # The teacher's DP shrank; a later need restarts the stream.
                     part = info["parts"][writer]
-                    index, label = part["index"], f"{part['path']} (teacher DP rank {writer})"
-                    for block in range(start_block, len(index["blocks"])):
+                    for block in range(start_block, len(part["blocks"])):
                         if stopped.is_set():
                             return
-                        yield (group, block), (self.storage, part["path"], index, block, label)
+                        label = f"{part['path']} block {block} (teacher DP rank {writer})"
+                        yield (group, block), (
+                            self.storage,
+                            part["path"],
+                            part["arrow_schema"],
+                            part["blocks"][block],
+                            label,
+                        )
                     group, start_block = group + 1, 0
 
             lane = self.lanes[writer] = _Lane(self, f"writer{writer}", items)
@@ -475,7 +479,7 @@ class ReplayReader(_BlockReader):
                 self.group_cache.set_pinned([span])
                 self.pinned = span
             info = self._group(span)
-            writers, mbs = info["writers"], info["writer_mbs"]
+            writers, mbs = len(info["parts"]), info["writer_mbs"]
             rows = self.gbs // writers
             iteration, within = divmod(position - self.group_starts[group_index], self.gbs)
             writer, local = divmod(within, rows)
@@ -483,7 +487,7 @@ class ReplayReader(_BlockReader):
             # The teacher's own sample index: Megatron interleaves writers by microbatch.
             sid = span[0] + iteration * self.gbs + ((local // mbs) * writers + writer) * mbs
             sid += local % mbs
-            first_rows = info["parts"][writer]["index"]["first_rows"]
+            first_rows = info["parts"][writer]["first_rows"]
             block = bisect.bisect_right(first_rows, row) - 1
             inputs, targets = self._lane(writer, group_index, block).block((group_index, block))
             samples.append(self.slice_sample(inputs, targets, row - first_rows[block], sid))
@@ -573,27 +577,17 @@ class CorpusReader(_BlockReader):
                     file_id = int(entry["file"])
                     folder = self.manifest["sources"][int(self.files["source"][file_id])]["name"]
                     path = self.files["path"][file_id]
-                    # The one block entry that block_range and read_batch need.
-                    index = {
-                        "blocks": {
-                            block: {
-                                **{key: int(entry[key]) for key in ("rows", "offset", "length")},
-                                "input_length": int(entry["input_length"]),
-                                "schema": int(self.files["schema"][file_id]),
-                            }
-                        }
-                    }
-                    yield (piece,), (self._storage(folder), path, index, block, f"{folder}/{path}")
+                    keys = ("rows", "offset", "length", "input_length")
+                    yield (piece,), (
+                        self._storage(folder),
+                        path,
+                        self.schemas[int(self.files["schema"][file_id])],
+                        {key: int(entry[key]) for key in keys},
+                        f"{folder}/{path} block {block}",
+                    )
 
             stream = self.lanes[lane] = _Lane(self, f"lane{lane}", items)
         return stream
-
-    def read_batch(self, index: dict, block: int, raw: bytes) -> Any:
-        """Decode with the plan's shared schema; the plan keeps no per-file footers."""
-        entry = index["blocks"][block]
-        return read_block_bytes(
-            self.schemas[entry["schema"]], raw, entry["length"], inputs_only=not self.targets
-        )
 
     def samples(self, positions: list[int], available_end: int) -> list[dict[str, Any]]:
         """Fetch samples at global positions (non-decreasing per lane across calls)."""

@@ -4,6 +4,7 @@
 
 import torch
 
+from .format.arrow import share_schemas
 from .format.corpus import CHUNK_VERSION, publish_chunk
 from .v3_options import get_args
 from .v3_saver import PairedLogitsSaver
@@ -51,15 +52,20 @@ class CorpusLogitsSaver(PairedLogitsSaver):
         from .corpus_runtime import corpus_inventory, producer_settings
 
         settings = producer_settings(get_args())
-        chunk = {
-            "chunk_version": CHUNK_VERSION,
-            "parts": sorted(
+        schemas, parts = share_schemas(
+            sorted(
                 [report["part"] for report in reports if report["part"] is not None],
                 key=lambda part: part["path"],
-            ),
+            )
+        )
+        chunk = {
+            "chunk_version": CHUNK_VERSION,
             "producer": {**settings, "start_iteration": start, "end_iteration": end},
+            "settings": self.metadata_dict,
+            "schemas": schemas,
+            "parts": parts,
         }
-        rows = sum(block["rows"] for part in chunk["parts"] for block in part["index"]["blocks"])
+        rows = sum(block["rows"] for part in parts for block in part["blocks"])
         total = self.metadata_dict["contract"]["num_samples"]
         gbs = settings["global_batch_size"]
         if rows != min(total, end * gbs) - min(total, start * gbs):

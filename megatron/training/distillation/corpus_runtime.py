@@ -24,7 +24,6 @@ from typing import Any, Callable
 import torch
 import torch.distributed as dist
 
-from .format.arrow import file_meta
 from .format.contract import blend_contract, mismatched_corpus_order, mismatched_settings
 from .format.corpus import CorpusInventory, check_chunk
 from .v3_options import runtime_options
@@ -109,18 +108,14 @@ def initialize_corpus_metadata(saver: Any, expected: dict) -> dict:
                         "source directory"
                     )
                 a, b = producer["start_iteration"], producer["end_iteration"]
-                rows = sum(
-                    block["rows"] for part in chunk["parts"] for block in part["index"]["blocks"]
-                )
+                rows = sum(block["rows"] for part in chunk["parts"] for block in part["blocks"])
                 if rows != min(total, b * gbs) - min(total, a * gbs):
                     raise ValueError("Corpus chunk has the wrong number of real source rows")
-                for part in chunk["parts"]:
-                    meta = file_meta(part["index"])
-                    differing, recorded = mismatched_settings(meta, expected)
-                    recorded_differences.update(recorded)
-                    differing += mismatched_corpus_order(meta, expected)
-                    if differing:
-                        raise ValueError(f"Corpus source settings changed: {', '.join(differing)}")
+                differing, recorded = mismatched_settings(chunk["settings"], expected)
+                recorded_differences.update(recorded)
+                differing += mismatched_corpus_order(chunk["settings"], expected)
+                if differing:
+                    raise ValueError(f"Corpus source settings changed: {', '.join(differing)}")
             # Preserve the existing cross-source tokenizer check. This listing is
             # performed once on initialization, never during flush or student reads.
             root = Storage(args.kd_corpus_root)

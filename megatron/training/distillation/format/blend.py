@@ -20,6 +20,7 @@ distinct column layout (no per-file footers), and per-lane ``segments`` of
 and schemas one data-parallel rank reads.
 """
 
+import base64
 import hashlib
 import json
 import math
@@ -29,17 +30,15 @@ from typing import Any
 import numpy as np
 
 from ..v3_storage import Storage
-from .arrow import block_schema
 from .contract import blend_contract, mismatched_corpus_order, mismatched_settings
 from .corpus import check_chunk, relative_path
 
-MANIFEST_VERSION = 4
+MANIFEST_VERSION = 5
 DEFAULTS = {"seed": 1234, "lanes": 64}
-# 32 bytes per block: byte ranges are within one file, and rows within one block.
+# 28 bytes per block: byte ranges are within one file, and rows within one block.
 BLOCK_DTYPE = np.dtype(
     [
         ("file", "<i4"),
-        ("first_row", "<i4"),
         ("rows", "<i4"),
         ("supervised", "<i4"),
         ("offset", "<i8"),
@@ -85,7 +84,7 @@ def _part_blocks(index: dict, file_id: int, label: str) -> np.ndarray:
 
 
 def _read_source(
-    root: str, name: str, source_id: int, files: dict, schemas: dict
+    root: str, name: str, source_id: int, files: dict, schemas: dict[bytes, int]
 ) -> tuple[dict, np.ndarray]:
     """Validate one source's chunk indexes (one at a time) into its block table."""
     storage = Storage(os.path.join(root, name))
@@ -106,16 +105,18 @@ def _read_source(
             if differing:
                 raise ValueError(f"Corpus source {name} mixes settings: {', '.join(differing)}")
         metadata = current
+        ids = [
+            schemas.setdefault(base64.b64decode(schema), len(schemas))
+            for schema in chunk["schemas"]
+        ]
         for part in chunk["parts"]:
-            index = part["index"]
             part_path = relative_path(f"{folder}/{part['path']}")
-            schema = schemas.setdefault(block_schema(index), len(schemas))
             file_id = len(files["path"])
             files["source"].append(source_id)
             files["path"].append(part_path)
-            files["size"].append(index["size"])
-            files["schema"].append(schema)
-            tables.append(_part_blocks(index, file_id, f"{name}/{part_path}"))
+            files["size"].append(part["size"])
+            files["schema"].append(ids[part["schema"]])
+            tables.append(_part_blocks(part, file_id, f"{name}/{part_path}"))
     # Matching row totals cannot reveal one range dumped twice and another never.
     intervals.sort()
     for (_, end, first), (start, _, second) in zip(intervals, intervals[1:]):

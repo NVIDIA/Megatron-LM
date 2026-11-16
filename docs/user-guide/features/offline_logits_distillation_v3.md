@@ -204,31 +204,15 @@ regardless of any later blend; the saver excludes final-batch fillers before wri
 The manifest does not store another `weight` field per source: requested weights remain
 in its copy of the blend configuration.
 
-The sources must share tokenizer identity, attention mode and prefix stability. Their
+The sources must share tokenizer identity, attention mode, prefix stability and features. Their
 top-K widths may differ: collation pads K to the batch maximum with masked entries. Teacher identity is recorded per source. The checkpoint pins the plan's hash: a resume re-plans and refuses a different
 file table or sample schedule, but accepts a changed budget that rounds to the same lanes. Changing DP or microbatch size on resume is fine.
 Shuffling flags do not apply. Validation works as with replay, from `--data-path` with
 LM loss only; to hold data out of a blend, dump it as its own source and leave it out.
 
-Outside Megatron, `format/blend.py` plans the same schedule and `format/hf.py` is a
-torch-only reference consumer: `CorpusStream` takes the plan, keeps only its rank's part
-(`rank_plan`), and yields that rank's samples in Megatron's order, `collate` pads them into `input_ids`, `attention_mask`, `position_ids`, `labels`
-and the teacher's top-K targets, and `topk_kl` computes the same sparse KL with the tail
-bucket as Megatron. `CorpusStream` requires the student's Hugging Face tokenizer and
-rejects one whose fingerprint differs from the blend's (`check_student`); pass
-`model_vocab_size` to also check that the model's output width covers the tokenizer. Stored labels are already shifted to line up with the logits at the
-same position.
-
-`CorpusStream` already assigns samples to DP ranks; do not wrap it in another distributed
-dataset sharder (including automatic Trainer/Accelerate sharding). Use a DataLoader with
-`num_workers=0` or `1`; more workers are rejected rather than duplicating the stream.
-Attention follows each sample's stored `segments`. For samples with several segments
-(packed sequences or EOD-reset documents), the collator constructs a 4D additive
-block-causal mask, independent
-of loss weights. Use a standard-attention HF model/backend that honors custom masks
-(`eager` or `sdpa`); FlashAttention and recurrent/linear attention require a dedicated
-boundary adapter. The reference mask uses quadratic memory. Plain causal samples retain
-the usual 2D padding mask. A hand-built sample without `segments` is one causal segment.
+Outside Megatron, `format/blend.py` plans the same schedule (`plan`, then `rank_plan` per
+data-parallel rank). A Hugging Face consumer is provided by ModelOpt rather than Megatron.
+Stored labels are already shifted to line up with the logits at the same position.
 
 ### Reordering, subsets, and growing dumps
 
@@ -375,8 +359,8 @@ than copies of the frozen weights.
 The student blend JSON is an input configuration, not an automatically generated dump
 file. V3 creates no separate input/target files, `metadata.json`, completion marker, or
 student planning artifact inside the dump; the student plans in memory at startup and
-writes no plan files anywhere. Required settings are embedded in every Arrow file and
-also available through the footer copy in its index.
+writes no plan files anywhere. Required settings are embedded in every Arrow file's
+schema metadata and stored once in its flush or chunk index.
 
 Corpus parts have no individual `.index.json` sidecars and there is no `commit.json`.
 The chunk's `index.json` consolidates all part indexes and publishes the entire chunk.
@@ -395,16 +379,16 @@ Unindexed parts remain invisible. Final partial flushes use the same ordering
 synchronously; redo removes affected indexes before overwriting data.
 
 Replay index fields are `group_version` (currently 1), `start_iteration`,
-`end_iteration`, `writers`, `writer_mbs`, and `parts`. Each part has its `writer` (the
-teacher DP rank), its `path` (`part-<writer>.arrow`, relative to the flush directory),
-and the Arrow `index` below. Every writer must appear exactly once with its expected row
+`end_iteration`, `writer_mbs`, `settings`, `schemas` and `parts`. `parts` lists one
+part per teacher DP writer in writer order; part `w` has `path` `part-<w>.arrow`
+(relative to the flush directory) and the part fields below, and holds its expected row
 count. Discovery lists only flush indexes and detects gaps and overlaps. A cache miss
 fetches one flush index without per-part GETs or HEADs. A small bounded cache keeps the
 flush being consumed while streams prefetch later ones.
 
 Corpus planning lists once per source and reads each chunk index once, retaining one
 chunk's JSON at a time. It keeps compact numeric block rows and one Arrow schema per
-distinct column layout, not per-file footers (see
+distinct column layout (see
 [Student corpus manifest](#student-corpus-manifest)). Readers use the plan without
 additional S3 index GETs, HEADs, or globs. A producer keeps its own source's chunk
 indexes in memory for resume checks, and performs one sibling-source listing for
@@ -412,18 +396,17 @@ tokenizer compatibility. Corpus students never poll a growing source.
 
 ### JSON index
 
-Each part's `index`, embedded in its replay or corpus flush index, is a range-read
-directory. Its footer and block
-locations duplicate information obtainable from Arrow so that a reader can start with
-one small index read and then fetch only the blocks it needs.
+A replay flush index and a corpus chunk index share these fields, which let a reader
+start with one small index read and then fetch only the blocks it needs:
 
 | Index key | Meaning and purpose |
 | --- | --- |
-| `index_version` | Currently `1`; versions the custom sidecar representation independently of V3 sample semantics. Unsupported versions fail validation. |
-| `size` | Arrow file size in bytes. Supplies the virtual range reader's file length and bounds block locations. Readers use the published value without a HEAD. It is not a content checksum. |
-| `footer` | Base64 copy of the Arrow IPC footer and trailer, including schema metadata. Avoids a separate footer fetch from the data file. |
-| `blocks` | Ordered array describing the file's Arrow record batches. Enables sample lookup and bounded range reads. |
-| `blocks[].first_row` | Zero-based sample row where the block starts within this writer's file. Enables locating a sample without reading preceding blocks; derivable from preceding row counts. |
+| `settings` | The shared [metadata](#metadata) of every part, stored once. Each data file also carries it in its own schema metadata, so the file stays self-describing. |
+| `schemas` | Base64 Arrow IPC schemas (columns only, without settings), each distinct layout once. Usually one; a second appears only when some writers' `loss_mask` is float32 and others' bool. Readers decode blocks with these, never fetching a data file's footer. |
+| `parts[].path` | The data file, relative to the flush or chunk directory. |
+| `parts[].schema` | Position of the part's schema in `schemas`. |
+| `parts[].size` | Arrow file size in bytes. Bounds block locations; readers use the published value without a HEAD. It is not a content checksum. |
+| `parts[].blocks` | Ordered array describing the file's Arrow record batches. Enables sample lookup and bounded range reads; a block's first row is the sum of the preceding `rows`. |
 | `blocks[].rows` | Number of sample rows in the block. Used for planning and range/row-count validation. |
 | `blocks[].offset` | Byte offset of the record-batch message in the Arrow file. |
 | `blocks[].length` | Byte length to fetch for the complete block, including inputs and targets. |
@@ -445,17 +428,17 @@ partially selected block uses its average per-sample count and is approximate.
 | Key | Meaning and purpose |
 | --- | --- |
 | `chunk_version` | Currently `1`; versions the consolidated publication layout. |
-| `parts` | Nonempty ordered list of completed parts. Empty writers are omitted. |
+| `settings`, `schemas` | As in the [JSON index](#json-index). |
+| `parts` | Nonempty ordered list of completed parts, with the fields of the [JSON index](#json-index). Empty writers are omitted. |
 | `parts[].path` | Unique relative path within this chunk. Absolute paths and parent traversal are rejected. |
-| `parts[].index` | Complete Arrow index described above, including footer and block information. Avoids separate per-part metadata reads. |
 | `producer` | Optional producer-specific resume information. Corpus consumers do not use it to locate samples. |
 | `producer.name` | Megatron writes `megatron`; another producer may omit this object or define its own resume fields. |
 | `producer.start_iteration`, `producer.end_iteration` | Megatron's executed iteration interval, with an exclusive end. Used to validate tracker boundaries, gaps, overlaps and job ownership. |
 | `producer.global_batch_size` | Converts teacher iterations to original source positions. Fixed on producer resume; the rank layout and flush interval may change. |
 
 The rest of this section is the producer-neutral specification. Megatron is one producer;
-other producers (for example a vLLM-based dumper) and consumers (for example a Hugging
-Face loader) implement the same rules. `v3_format.py` has no Megatron dependencies and
+other producers (for example a vLLM-based dumper) and consumers (for example ModelOpt's
+Hugging Face loader) implement the same rules. `v3_format.py` has no Megatron dependencies and
 can be reused directly, as can `format/contract.py` and `format/arrow.py`, which import
 nothing from Megatron. Golden dumps under `tests/offline_kd_cpu/fixtures/` must decode
 identically in every implementation.
@@ -473,6 +456,7 @@ canonical digest described under [Tokenizer fingerprint](#tokenizer-fingerprint)
     "tokenizer": {"sha256": "<canonical tokenizer SHA-256>"},
     "attention_mode": "causal",
     "prefix_stable": true,
+    "features": [],
     "num_samples": 100000
   },
   "recorded": {
@@ -508,16 +492,17 @@ canonical digest described under [Tokenizer fingerprint](#tokenizer-fingerprint)
 Every file stores its inputs next to its targets, so a file is self-consistent on its
 own. Settings needed to interpret a file are required (`contract`). Files in one replay
 cache or corpus source must agree on them. Across sources in a corpus blend, token
-identity, attention mode and prefix stability must agree. Replay writer layout lives
+identity, attention mode, prefix stability and features must agree. Replay writer layout lives
 in each flush index; neither mode needs it in the file contract. The blend manifest
 records its shared contract separately:
 
 | Key | Meaning and reason for storing it |
 | --- | --- |
 | `tokenizer` | Object describing the token-ID space through the field below. Stored token IDs and targets must have the same meaning for the student. |
-| `tokenizer.sha256` | Fingerprint of the complete token-to-ID mapping, true vocabulary size and special-token assignments. Prevents accepting different tokenizers merely because their vocabulary sizes happen to match. |
+| `tokenizer.sha256` | Fingerprint of the complete token-to-ID mapping and true vocabulary size (see [Tokenizer fingerprint](#tokenizer-fingerprint)). Prevents accepting different tokenizers merely because their vocabulary sizes happen to match. |
 | `attention_mode` | `causal`, `causal_eod_reset` or `isolated_segments` (see [Context](#context)). Prevents changing the context available to each teacher/student position. |
 | `prefix_stable` | Whether a retained prefix preserves the teacher's distributions. False for length-dependent position scaling such as dynamic NTK RoPE or LongRoPE's short/long switch. Megatron currently writes true. Shortening a longer sample requires true. |
+| `features` | Must-understand extensions the file uses beyond plain text; empty today. A reader rejects any feature it does not support, so data such as future image references or multi-dimensional positions is never silently read as plain text. Additive extensions declare a feature (files without it stay readable by every V3 reader); incompatible changes bump `format_version` instead. Sources of a blend must list the same features. |
 | `first_iteration` | Replay only: teacher iteration where the intended dump begins. Separates a deliberate nonzero start from a missing initial range. Frozen replay teachers use zero. |
 | `global_batch_size` | Replay only: the teacher's global batch size, fixed for a cache. Converts flush iterations to sample positions. |
 | `num_samples` | Corpus only: real samples in the source epoch. The sum of published part rows must match it exactly. Fillers are removed before writing. Counts prepared GPT windows or SFT rows, not necessarily raw documents or conversations. |
@@ -650,15 +635,14 @@ rows back at their positions; positions without a row get sentinel targets.
   filled with it. K is fixed within an Arrow file; files from different sources may use
   different K. Readers pad narrower rows with masked entries when constructing a batch,
   without changing their stored tail.
-- `tail` (optional, but always written by Megatron) is the log of the
+- `tail` (required) is the log of the
   probability mass outside each row's retained entries, including entries masked by
   top-P: `log(1 - sum(exp(retained)))`. Writers compute it from full-precision log
   probabilities **before** casting values to `save_dtype` (`v3_format.tail_logprob`);
   computing it afterwards from rounded values distorts small tails of confident rows
   (with fp16 values, a 0.1% tail can be off by about 2%). A row whose
   distribution is fully retained stores `-1000`. Readers reject a stored tail unless
-  `sum(exp(retained)) + exp(tail)` is within 0.05 of 1 for every row. Without the field,
-  readers derive the tail from the stored values.
+  `sum(exp(retained)) + exp(tail)` is within 0.05 of 1 for every row.
 - The loss uses the tail as the teacher's ghost bucket against the student's mass outside
   the same entries.
 
@@ -667,7 +651,15 @@ rows back at their positions; positions without a row get sentinel targets.
 | `values` | `fixed_size_list<float16 or float32, K>` | Retained log probabilities; `-1000` marks entries the loss ignores. Actual K and dtype are carried by this Arrow type. |
 | `indices_low` | `fixed_size_list<uint16, K>` | Lower 16 bits of the vocabulary IDs corresponding to `values`. |
 | `indices_high` | `fixed_size_list<uint8, K>`; present for `u16+u8` encoding | Bits 16–23, required to represent IDs above 65535. Sentinel entries' decoded IDs are ignored. |
-| `tail` | float32, optional; always written by Megatron | Teacher probability mass outside retained entries for the mandatory ghost bucket. Preserves the residual calculated before value rounding; absent tails are reconstructed from stored values. |
+| `tail` | float32, required | Teacher probability mass outside retained entries for the mandatory ghost bucket. Preserves the residual calculated before value rounding. |
+
+Columns start with the input columns in this order: `tokens`, `labels`, `position_ids`,
+`loss_mask`, `segments`. Input-only reads select them by position and fetch only the
+byte prefix that holds them, so they must stay first and in order; a new input column
+goes after them but before the target columns, so that `input_length` still covers it.
+Target columns follow: `values`, `indices_low`, `indices_high` when present, and `tail`.
+Readers select columns by name and ignore columns they do not know. A column that must
+not be ignored is declared in the contract's `features`.
 
 The index encoding is derived from the tokenizer size: `u16` up to 65536 tokens, else
 `u16+u8` (up to `2**24`). There is no separately stored `index_encoding` metadata key.
@@ -695,23 +687,21 @@ dataloader attention mask still yields `causal`. Students must reproduce the mod
 
 ### Tokenizer fingerprint
 
-`sha256` hashes the complete vocabulary and special-token assignments, serialized with
+`sha256` hashes the complete token-to-ID mapping and the tokenizer size, serialized with
 `json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)` as UTF-8.
 For example, a three-token tokenizer would use this object:
 
 ```json
-{"vocab": [["<bos>", 0], ["<eos>", 1], ["hello", 2]],
- "special_ids": {"bos": 0, "eos": 1, "pad": null, "unk": null},
- "size": 3}
+{"vocab": [["<bos>", 0], ["<eos>", 1], ["hello", 2]], "size": 3}
 ```
 
 For Hugging Face tokenizers, `vocab` is `get_vocab()` (including added tokens) sorted by
-ID, `special_ids` are the `*_token_id` attributes (null when absent), and `size` is
-`len(tokenizer)` (`v3_format.hf_tokenizer_identity`). Megatron fingerprints its wrapped
-Hugging Face tokenizer the same way. Normalizers, pre-tokenizers and chat templates are
-excluded because inputs are stored as IDs.
-The canonical `special_ids` object participates in the fingerprint but is not separately
-stored in the tokenizer metadata.
+ID and `size` is `len(tokenizer)` (`v3_format.hf_tokenizer_identity`). Megatron
+fingerprints its wrapped Hugging Face tokenizer the same way. Special-token roles (which
+token is pad, unk, bos or eos) are excluded: stored data never depends on them, and
+training scripts commonly assign a pad token, such as EOS, to a tokenizer without one.
+The special tokens themselves are part of the mapping. Normalizers, pre-tokenizers and
+chat templates are excluded because inputs are stored as IDs.
 
 ### Writing V3 from vLLM
 
@@ -757,8 +747,9 @@ row, but its final label is then the sampled token rather than a data label.
 
 - Pack segments into samples with `attention_mode=isolated_segments`; store no padding
   or teacher DP layout. Set `num_samples` to the complete source's row count.
-  `format/arrow.py` (`samples_batch`, `write_file`) writes each part;
-  `format/corpus.publish_chunk` publishes its paths and indexes after all parts finish.
+  `format/arrow.py` (`samples_batch`, `write_file`) writes each part and returns its
+  part index; after all parts finish, number their schemas with `share_schemas` and
+  publish the chunk (`settings`, `schemas`, `parts`) with `format/corpus.publish_chunk`.
   The optional `producer` resume object need not use Megatron's fields.
 - A student checks each pack against its own length after re-padding every segment to
   its SFT divisor (`2·CP`, times TP with sequence parallelism), so leave headroom for the
@@ -803,9 +794,9 @@ storage: the plan lives only in memory and is rebuilt on resume. It writes no
 `manifest.json` or other plan files.
 
 The plan is a few compact NumPy tables rather than JSON indexes. Each block costs
-32 bytes, each schedule piece 12 bytes, and each file its path plus 16 bytes, so a
-25 TB corpus of 32 MiB blocks (about 1.6M blocks) plans in tens of MB on rank 0. Files
-keep no footers: a block is decoded from its ranged bytes with the shared Arrow schema
+28 bytes, each schedule piece 12 bytes, and each file its path plus 16 bytes, so a
+25 TB corpus of 32 MiB blocks (about 1.6M blocks) plans in tens of MB on rank 0. A
+block is decoded from its ranged bytes with the shared Arrow schema
 of its column layout (a source may have a few, such as boolean or float loss masks, or
 `u16` or `u16+u8` indices). Input-only reads still fetch only the input prefix.
 
@@ -827,16 +818,16 @@ reports a changed plan without identifying each changed field.
 
 | Key | Meaning and purpose |
 | --- | --- |
-| `manifest_version` | Currently `4`: compact in-memory tables with shared schemas. |
+| `manifest_version` | Currently `5`: compact in-memory tables with shared schemas. |
 | `config` | Copy of the resolved blend configuration; field meanings are below. Megatron uses its corpus root to locate files. |
 | `budget` | Requested student sample count before rounding up to whole lanes. Descriptive only; not part of the hash. |
 | `lanes` | Number of streams, `L`. Global sample position `p` maps to lane `p % L` and offset `p // L`, independently of student DP. |
 | `lane_samples` | Equal number of samples assigned to each lane. Total planned capacity is `lanes * lane_samples`, at least the requested budget. |
-| `contract` | Shared tokenizer, attention mode and prefix stability. Writer layout is excluded. |
+| `contract` | Shared tokenizer, attention mode, prefix stability and features. Writer layout is excluded. |
 | `sources` | Per-source reporting and provenance summaries; `files.source` indexes this list. |
 | `schemas` | Serialized Arrow schemas (without settings metadata), one per distinct column layout. |
 | `files` | Columns `source` (int32), `path` (explicit source-relative Arrow path such as `chunk-000000000128-000000000256/part-000001.arrow`; the plan never interprets its parts), `size` (int64) and `schema` (int32). |
-| `blocks` | One 32-byte record per block: `file`, `first_row`, `rows`, `supervised`, `offset` (int64), `length` and `input_length` (from the chunk index). |
+| `blocks` | One 28-byte record per block: `file`, `rows`, `supervised`, `offset` (int64), `length` and `input_length` (from the chunk index). |
 | `lane_ids`, `lane_starts` | Lanes held (all of them in a whole plan); lane `lane_ids[i]` has pieces `segments[lane_starts[i]:lane_starts[i + 1]]`. |
 | `segments` | Schedule pieces `(block, first, end)`: rows `[first, end)` of a block, in lane order. Unrelated to the attention `segments` column stored inside Arrow. |
 | `rank` | `null` for a whole plan; `{dp_rank, dp_size, micro_batch_size, start}` for a rank-local plan. |

@@ -14,7 +14,7 @@ import torch.distributed as dist
 from megatron.core.num_microbatches_calculator import get_num_microbatches
 from megatron.training import get_tensorboard_writer, get_tokenizer
 
-from .format.arrow import samples_batch, write_file
+from .format.arrow import samples_batch, share_schemas, write_file
 from .logits_saver import LogitsSaverHooks
 from .v3_format import MAX_VOCAB_SIZE, capture_batch, finalize_record, join_inputs, tail_logprob
 from .v3_options import get_args
@@ -257,7 +257,7 @@ class PairedLogitsSaver(LogitsSaverHooks):
                 data, index = write_file(batches, json.loads(metadata))
                 path = part_name(task["writer"])
                 Storage(root).write(f"{task['directory']}/{path}", data)
-                part = {"writer": task["writer"], "path": path, "index": index}
+                part = {"path": path, **index}
             results[task["key"]] = {**task, "part": part}
         except Exception:
             if failure_event is not None:
@@ -266,26 +266,27 @@ class PairedLogitsSaver(LogitsSaverHooks):
 
     def _publish_flush(self, start: int, end: int, reports: list[dict]) -> None:
         """Publish a replay flush's index once every writer has uploaded its part."""
-        first = reports[0]
-        writers, mbs = first["writers"], first["writer_mbs"]
+        writers, mbs = reports[0]["writers"], reports[0]["writer_mbs"]
         if any((r["writers"], r["writer_mbs"]) != (writers, mbs) for r in reports):
             raise RuntimeError("Replay writers disagree on the writer layout")
-        parts = sorted((r["part"] for r in reports if r["part"]), key=lambda part: part["writer"])
-        if [part["writer"] for part in parts] != list(range(writers)):
+        reports = sorted((r for r in reports if r["part"]), key=lambda report: report["writer"])
+        if [report["writer"] for report in reports] != list(range(writers)):
             raise RuntimeError("Replay flush is missing writer parts")
         rows = (end - start) * get_args().global_batch_size // writers
-        if any(sum(block["rows"] for block in part["index"]["blocks"]) != rows for part in parts):
+        if any(sum(block["rows"] for block in r["part"]["blocks"]) != rows for r in reports):
             raise RuntimeError("Replay flush contains an unexpected writer row count")
+        schemas, parts = share_schemas([report["part"] for report in reports])
         index = {
             "group_version": 1,
             "start_iteration": start,
             "end_iteration": end,
-            "writers": writers,
             "writer_mbs": mbs,
+            "settings": self.metadata_dict,
+            "schemas": schemas,
             "parts": parts,
         }
         Storage(self.save_dir).write(
-            f"{first['directory']}/{INDEX}", json.dumps(index, separators=(",", ":")).encode()
+            f"{reports[0]['directory']}/{INDEX}", json.dumps(index, separators=(",", ":")).encode()
         )
 
     def flush_finalize_fn(self, iteration: int) -> Callable[[], None]:

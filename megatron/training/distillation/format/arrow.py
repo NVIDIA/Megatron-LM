@@ -6,15 +6,21 @@ A data file holds one row per sample: the input columns first, then the teacher'
 target rows (only at positions with nonzero loss weight). Rows are grouped into record
 batches ("blocks") of bounded size. The settings live in the schema metadata.
 
-The index, written after its data file is complete, lists each block's rows, byte
-ranges and supervised-token count, and carries a copy of the file's footer. A reader
-can therefore fetch any block, or only its input columns, with one ranged read and
-never needs to touch the rest of the data file. Its existence also marks the data file
-as published.
+A flush or chunk ``index.json``, written after all its data files are complete, holds
+the shared settings once, each distinct Arrow schema once (base64, without settings),
+and per data file its ``path``, ``schema`` number, ``size`` and blocks (rows, byte
+ranges and supervised-token count). A reader can therefore fetch any block, or only its
+input columns, with one ranged read and decode it with the shared schema, never
+touching the rest of the data file. The data files keep their own footers, so each
+stays self-describing.
+
+Columns start with the input columns in their fixed order (input-only reads select them
+by position), followed by ``values``, ``indices_low``, optionally ``indices_high``, and
+``tail``. Readers select the other columns by name and ignore ones they do not know;
+data that must not be ignored is declared in the contract's ``features``.
 """
 
 import base64
-import io
 import json
 from typing import Any
 
@@ -34,7 +40,6 @@ META_KEY = b"offline_kd"
 INPUT_COLUMNS = ("tokens", "labels", "position_ids", "loss_mask", "segments")
 TOKEN_COLUMNS = ("tokens", "labels", "position_ids", "loss_mask")
 DEFAULT_BLOCK_BYTES = 32 << 20
-INDEX_VERSION = 1
 _MAGIC_BYTES = 8  # "ARROW1" plus padding at the start of an IPC file.
 
 
@@ -55,7 +60,7 @@ def samples_batch(
     inputs: dict[str, Any],
     values: torch.Tensor,
     indices: torch.Tensor,
-    tail: torch.Tensor | None,
+    tail: torch.Tensor,
     *,
     vocab_size: int,
 ) -> pa.RecordBatch:
@@ -64,9 +69,9 @@ def samples_batch(
     ``inputs`` holds ``sample_offsets`` (``[samples + 1]``), the token-aligned
     ``tokens``, ``labels``, ``position_ids`` and ``loss_mask`` (bool, or float32
     weights), and ``segment_lengths``/``segment_counts``. Target row ``i`` belongs to the
-    ``i``-th position with nonzero loss weight, in token order. ``tail`` (the float32 log
-    probability outside the retained entries) is optional; readers derive it from the
-    values when absent, which is exact only for float32 values.
+    ``i``-th position with nonzero loss weight, in token order. ``tail`` is each row's
+    float32 log probability outside the retained entries, computed before the values
+    are cast to the save dtype.
     """
     offsets = _numpy(inputs["sample_offsets"]).astype(np.int64)
     weights = _numpy(inputs["loss_mask"])
@@ -78,7 +83,7 @@ def samples_batch(
         raise ValueError(
             "Offline KD targets must be [rows, K] with one row per nonzero loss weight"
         )
-    if tail is not None and tuple(tail.shape) != values.shape[:1]:
+    if tuple(tail.shape) != values.shape[:1]:
         raise ValueError("Offline KD tail log probabilities must have one value per row")
     if values.dtype not in (np.float16, np.float32):
         raise ValueError("Offline KD target values must be float16 or float32")
@@ -100,8 +105,7 @@ def samples_batch(
     }
     if high is not None:
         columns["indices_high"] = _row_lists(scored, high, pa.uint8())
-    if tail is not None:
-        columns["tail"] = _lists(scored, _numpy(tail).astype(np.float32), pa.float32())
+    columns["tail"] = _lists(scored, _numpy(tail).astype(np.float32), pa.float32())
     return pa.record_batch(columns)
 
 
@@ -169,15 +173,17 @@ def _input_body_size(block: pa.RecordBatch) -> int:
 def write_file(
     batches: list[pa.RecordBatch], meta: dict[str, Any], *, block_bytes: int = DEFAULT_BLOCK_BYTES
 ) -> tuple[bytes, dict[str, Any]]:
-    """Serialize sample batches into ``(data file bytes, index)``.
+    """Serialize sample batches into ``(data file bytes, part index)``.
 
-    Rows are regrouped into blocks of at most ``block_bytes`` uncompressed bytes (a
+    The part index holds the file's base64 ``schema`` (columns only; :func:`share_schemas`
+    numbers the distinct ones of an index), ``size`` and ``blocks``. Rows are regrouped into blocks of at most ``block_bytes`` uncompressed bytes (a
     larger single row gets a block of its own), independent of how they were produced.
     """
     if not batches:
         raise ValueError("Cannot write an empty offline KD file")
     schema = _common_schema(batches)
     table = pa.Table.from_batches([batch.cast(schema) for batch in batches]).combine_chunks()
+    columns = base64.b64encode(schema.serialize().to_pybytes()).decode()
     schema = schema.with_metadata({META_KEY: json.dumps(meta, sort_keys=True).encode()})
     sink = pa.BufferOutputStream()
     spans, start = [], 0
@@ -191,9 +197,8 @@ def write_file(
             spans.append((start, rows, begin, sink.tell(), _input_body_size(block), block))
             start += rows
     data = sink.getvalue().to_pybytes()
-    footer = int.from_bytes(data[-10:-6], "little") + 10
     blocks = []
-    for first_row, rows, begin, end, input_body, block in spans:
+    for _, rows, begin, end, input_body, block in spans:
         reader = pa.BufferReader(pa.py_buffer(data[begin:end]))
         if begin == 0:
             reader.seek(_MAGIC_BYTES)
@@ -205,7 +210,6 @@ def write_file(
         length = end - begin - offset
         blocks.append(
             {
-                "first_row": first_row,
                 "rows": rows,
                 "offset": begin + offset,
                 "length": length,
@@ -213,104 +217,72 @@ def write_file(
                 "supervised": len(block.column("values").flatten()),
             }
         )
-    index = {
-        "index_version": INDEX_VERSION,
-        "size": len(data),
-        "footer": base64.b64encode(data[-footer:]).decode(),
-        "blocks": blocks,
-    }
-    return data, index
+    return data, {"schema": columns, "size": len(data), "blocks": blocks}
 
 
-class _RangeFile(io.RawIOBase):
-    """A file of known size that serves only the byte ranges it was given."""
-
-    def __init__(self, size: int, ranges: dict[int, bytes]):
-        self.size, self.ranges, self.position = size, ranges, 0
-
-    def readable(self) -> bool:
-        return True
-
-    def seekable(self) -> bool:
-        return True
-
-    def tell(self) -> int:
-        return self.position
-
-    def seek(self, offset: int, whence: int = 0) -> int:
-        base = (0, self.position, self.size)[whence]
-        self.position = base + offset
-        return self.position
-
-    def readinto(self, buffer: Any) -> int:
-        count = min(len(buffer), self.size - self.position)
-        for start, raw in self.ranges.items():
-            if start <= self.position and self.position + count <= start + len(raw):
-                buffer[:count] = raw[self.position - start : self.position - start + count]
-                self.position += count
-                return count
-        raise IOError(
-            f"Offline KD reader needs bytes {self.position}-{self.position + count} it did not fetch"
-        )
+def share_schemas(parts: list[dict[str, Any]]) -> tuple[list[str], list[dict[str, Any]]]:
+    """Number the distinct schemas of an index's parts: ``(schemas, parts)``."""
+    schemas: dict[str, int] = {}
+    numbered = [
+        {**part, "schema": schemas.setdefault(part["schema"], len(schemas))} for part in parts
+    ]
+    return list(schemas), numbered
 
 
-def _open(index: dict[str, Any], ranges: dict[int, bytes], **options: Any) -> Any:
-    footer = base64.b64decode(index["footer"])
-    file = _RangeFile(index["size"], {index["size"] - len(footer): footer, **ranges})
-    read_options = pa.ipc.IpcReadOptions(**options) if options else None
-    return pa.ipc.open_file(pa.PythonFile(file, mode="r"), options=read_options)
-
-
-def check_index(index: dict[str, Any], size: int | None = None) -> None:
-    """Reject an index of another version, or one that belongs to a different data file."""
-    if index.get("index_version") != INDEX_VERSION:
-        raise ValueError("Unsupported offline KD index version")
-    if size is not None and size != index["size"]:
+def load_schema(encoded: str) -> pa.Schema:
+    """Decode an index schema; it must hold the format's columns, input columns first."""
+    try:
+        schema = pa.ipc.read_schema(pa.py_buffer(base64.b64decode(encoded, validate=True)))
+    except Exception as error:
+        raise ValueError("Invalid offline KD index schema") from error
+    names = tuple(schema.names)
+    missing = [name for name in ("values", "indices_low", "tail") if name not in names]
+    if names[: len(INPUT_COLUMNS)] != INPUT_COLUMNS or missing:
         raise ValueError(
-            f"Offline KD index describes a {index['size']}-byte data file, but it has {size} "
-            "bytes; it belongs to another version of the file"
+            f"Offline KD columns {', '.join(names)} must start with "
+            f"{', '.join(INPUT_COLUMNS)} and include values, indices_low and tail"
         )
+    return schema
 
 
-def file_meta(index: dict[str, Any]) -> dict[str, Any]:
-    """Return the data file's settings, read from the index's footer copy."""
-    metadata = _open(index, {}).schema.metadata or {}
-    if META_KEY not in metadata:
-        raise ValueError("Offline KD data file carries no settings")
-    return json.loads(metadata[META_KEY])
+def check_parts(index: dict[str, Any], label: str) -> list[int]:
+    """Validate an index's schemas and parts; return each part's row count."""
+    schemas, parts = index.get("schemas"), index.get("parts")
+    if not isinstance(schemas, list) or not schemas or not isinstance(parts, list) or not parts:
+        raise ValueError(f"{label} needs nonempty schemas and parts")
+    for schema in schemas:
+        load_schema(schema)
+    rows = []
+    for part in parts:
+        path, size, blocks = part.get("path"), part.get("size"), part.get("blocks")
+        if type(part.get("schema")) is not int or not 0 <= part["schema"] < len(schemas):
+            raise ValueError(f"{label} part {path} names an unknown schema")
+        if type(size) is not int or not isinstance(blocks, list) or not blocks:
+            raise ValueError(f"{label} part {path} needs a size and blocks")
+        byte_end = _MAGIC_BYTES
+        for block in blocks:
+            if (
+                block["rows"] <= 0
+                or block["offset"] < byte_end
+                or block["length"] <= 0
+                or block["offset"] + block["length"] > size
+                or not 0 < block["input_length"] <= block["length"]
+            ):
+                raise ValueError(f"Invalid block rows or byte ranges in {label} part {path}")
+            byte_end = block["offset"] + block["length"]
+        rows.append(sum(block["rows"] for block in blocks))
+    return rows
 
 
-def block_range(index: dict[str, Any], block: int, *, inputs_only: bool) -> tuple[int, int]:
+def block_range(block: dict[str, Any], *, inputs_only: bool) -> tuple[int, int]:
     """Return ``(offset, size)`` of a block, or of its input columns only."""
-    entry = index["blocks"][block]
-    return entry["offset"], entry["input_length" if inputs_only else "length"]
-
-
-def read_block(
-    index: dict[str, Any], block: int, raw: bytes, *, inputs_only: bool = False
-) -> pa.RecordBatch:
-    """Decode a block from the bytes :func:`block_range` names."""
-    offset, _ = block_range(index, block, inputs_only=inputs_only)
-    options = {"included_fields": list(range(len(INPUT_COLUMNS)))} if inputs_only else {}
-    return _open(index, {offset: raw}, **options).get_batch(block)
-
-
-def block_schema(index: dict[str, Any]) -> bytes:
-    """Serialize a data file's columns, without its settings, from the index's footer.
-
-    Files with the same columns share this schema, which :func:`read_block_bytes` needs
-    in place of each file's footer.
-    """
-    reader = _open(index, {})
-    if reader.num_record_batches != len(index["blocks"]):
-        raise ValueError("Offline KD index and footer disagree on the number of blocks")
-    return reader.schema.remove_metadata().serialize().to_pybytes()
+    return block["offset"], block["input_length" if inputs_only else "length"]
 
 
 def read_block_bytes(
     schema: pa.Schema, raw: bytes, length: int, *, inputs_only: bool = False
 ) -> pa.RecordBatch:
-    """Decode a block from its ranged bytes using a shared :func:`block_schema`.
+    """Decode a block from its :func:`block_range` bytes using its index schema.
 
     ``raw`` is the block's ``length``-byte record batch message or, for the input
     columns only, its ``input_length`` prefix.
@@ -350,7 +322,8 @@ def _flat(column: pa.Array) -> tuple[np.ndarray, np.ndarray]:
 def decode_block(
     batch: pa.RecordBatch, *, vocab_size: int | None = None
 ) -> tuple[dict[str, torch.Tensor], tuple | None]:
-    """Convert a block to flattened inputs and, when present, ``(values, indices, tail)``.
+    """Convert a block to flattened inputs and, unless it was read inputs-only,
+    ``(values, indices, tail)``.
 
     Inputs carry ``sample_offsets``, the token-aligned columns, ``segment_lengths`` and
     ``segment_counts``. Every sample's segments must cover its tokens and its target
@@ -358,9 +331,6 @@ def decode_block(
     bounds every valid target index.
     """
     names = set(batch.schema.names)
-    missing = [name for name in INPUT_COLUMNS if name not in names]
-    if missing:
-        raise ValueError(f"Offline KD block is missing columns: {', '.join(missing)}")
     offsets, tokens = _flat(batch.column("tokens"))
     inputs = {"sample_offsets": _tensor(offsets), "tokens": _tensor(tokens)}
     for key in TOKEN_COLUMNS[1:]:
@@ -387,15 +357,11 @@ def decode_block(
     high = _flat(batch.column("indices_high"))[1] if "indices_high" in names else None
     if vocab_size is not None and (high is None) != (index_encoding_for_vocab(vocab_size) == "u16"):
         raise ValueError("Offline KD target index encoding disagrees with the tokenizer size")
-    tail = _flat(batch.column("tail"))[1] if "tail" in names else None
+    tail = _flat(batch.column("tail"))[1]
     scored = np.concatenate(([0], np.cumsum(_numpy(inputs["loss_mask"]) != 0)))[offsets]
     if not np.array_equal(row_offsets, scored):
         raise ValueError("Offline KD target rows disagree with the number of nonzero loss weights")
-    targets = (
-        _tensor(values),
-        _tensor(join_indices(low, high)),
-        None if tail is None else _tensor(tail),
-    )
+    targets = (_tensor(values), _tensor(join_indices(low, high)), _tensor(tail))
     return inputs, check_targets(*targets, vocab_size=vocab_size)
 
 
@@ -405,12 +371,11 @@ __all__ = [
     "LOGPROB_SENTINEL",
     "META_KEY",
     "block_range",
-    "block_schema",
-    "check_index",
+    "check_parts",
     "decode_block",
-    "file_meta",
-    "read_block",
+    "load_schema",
     "read_block_bytes",
     "samples_batch",
+    "share_schemas",
     "write_file",
 ]

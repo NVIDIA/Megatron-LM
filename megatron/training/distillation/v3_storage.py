@@ -189,9 +189,13 @@ def discard_range(
 
 
 def read_group(storage: Storage, span: tuple[int, int]) -> dict[str, Any]:
-    """Read and validate one published replay flush index with one GET."""
-    from .format.arrow import check_index, file_meta
-    from .format.contract import mismatched_settings, validate_metadata
+    """Read and validate one published replay flush index with one GET.
+
+    The index lists one part per teacher DP writer, in writer order, each split evenly
+    per teacher iteration.
+    """
+    from .format.arrow import check_parts
+    from .format.contract import validate_metadata
 
     name = f"{flush_dir(REPLAY, *span)}/{INDEX}"
     group = json.loads(storage.read(name))
@@ -200,54 +204,25 @@ def read_group(storage: Storage, span: tuple[int, int]) -> dict[str, Any]:
         group.get("end_iteration"),
     ) != tuple(span):
         raise ValueError(f"Invalid replay flush index {name}")
-    writers, mbs = group.get("writers"), group.get("writer_mbs")
-    if type(writers) is not int or writers < 1 or type(mbs) is not int or mbs < 1:
+    validate_metadata(group.get("settings") or {})
+    rows = check_parts(group, name)
+    writers, mbs = len(group["parts"]), group.get("writer_mbs")
+    if type(mbs) is not int or mbs < 1:
         raise ValueError(f"Invalid replay writer layout in {name}")
-    if len(group.get("parts", [])) != writers:
-        raise ValueError(f"Replay flush {name} does not list one part per writer")
-    parts, reference = [None] * writers, None
-    for part in group["parts"]:
-        writer, index = part.get("writer"), part.get("index")
-        if type(writer) is not int or not 0 <= writer < writers or parts[writer] is not None:
-            raise ValueError(f"Invalid or duplicate replay writer in {name}")
-        if part.get("path") != part_name(writer):
-            raise ValueError(
-                f"Replay flush {name} lists an unexpected part path for writer {writer}"
-            )
-        check_index(index)
-        cursor, byte_end = 0, 0
-        for block in index["blocks"]:
-            if (
-                block["first_row"] != cursor
-                or block["rows"] <= 0
-                or block["offset"] < byte_end
-                or block["length"] <= 0
-                or block["offset"] + block["length"] > index["size"]
-                or not 0 < block["input_length"] <= block["length"]
-            ):
-                raise ValueError(f"Invalid block rows or byte ranges for writer {writer} in {name}")
-            cursor += block["rows"]
-            byte_end = block["offset"] + block["length"]
-        metadata = file_meta(index)
-        validate_metadata(metadata)
-        if reference is not None and mismatched_settings(metadata, reference)[0]:
-            raise ValueError(f"Replay flush {name} mixes incompatible file contracts")
-        reference = metadata
-        gbs = metadata["contract"]["global_batch_size"]
-        rows = (span[1] - span[0]) * gbs
-        # Each teacher iteration splits evenly into the writers' microbatches.
-        if gbs % (writers * mbs) or sum(b["rows"] for b in index["blocks"]) != rows // writers:
-            raise ValueError(f"Replay part {name} writer {writer} has the wrong number of samples")
-        parts[writer] = part
-    group["parts"] = parts
+    for writer, part in enumerate(group["parts"]):
+        if part["path"] != part_name(writer):
+            raise ValueError(f"Replay flush {name} lists part {part['path']} as writer {writer}")
+    gbs = group["settings"]["contract"]["global_batch_size"]
+    # Each teacher iteration splits evenly into the writers' microbatches.
+    expected = (span[1] - span[0]) * gbs // writers
+    if gbs % (writers * mbs) or any(count != expected for count in rows):
+        raise ValueError(f"Replay flush {name} has the wrong number of samples per writer")
     return group
 
 
 def read_meta(storage: Storage, span: tuple[int, int]) -> dict[str, Any]:
-    """Read a replay flush's file settings from its first part's footer copy."""
-    from .format.arrow import file_meta
-
-    return file_meta(read_group(storage, span)["parts"][0]["index"])
+    """Read a replay flush's shared settings."""
+    return read_group(storage, span)["settings"]
 
 
 def has_legacy_tars(storage: Storage) -> bool:

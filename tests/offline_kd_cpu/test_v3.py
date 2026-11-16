@@ -10,6 +10,7 @@ Megatron package's GPU initialization code.
 
 import argparse
 import ast
+import base64
 import collections
 import importlib
 import json
@@ -47,11 +48,17 @@ def part_path(rank, begin, finish):
 
 
 def _read_part_index(storage, rank, begin, finish):
-    return storage_module.read_group(storage, (begin, finish))["parts"][rank]["index"]
+    """One writer's part entry (``path``, ``schema``, ``size``, ``blocks``) of a flush."""
+    return storage_module.read_group(storage, (begin, finish))["parts"][rank]
 
 
 def _read_meta(storage, span):
     return storage_module.read_meta(storage, span)
+
+
+def group_schema(storage, span, part):
+    """The base64 Arrow schema a flush index shares with one of its parts."""
+    return storage_module.read_group(storage, span)["schemas"][part["schema"]]
 
 
 def inputs(ids, length=8, packed=False):
@@ -78,6 +85,7 @@ def settings(dp=2, mbs=2, gbs=8, *, contract=None, recorded=None, provenance=Non
         "global_batch_size": gbs,
         "attention_mode": "causal",
         "prefix_stable": True,
+        "features": [],
         "tokenizer": {"sha256": "test"},
     }
     noted = {
@@ -106,25 +114,22 @@ def scored(tokens, loss_mask):
     return torch.where(loss_mask != 0, tokens.long(), 0)
 
 
-def make_record(captured, contract, logprobs=False):
+def make_record(captured, contract):
     """Finalize captured inputs and targets exactly as the saver does.
 
-    Targets are identity rows (value = index = token ID) by default, with no stored
-    tail; with ``logprobs`` they are genuine log probabilities with a stored fp32 tail.
+    Each target row keeps one entry whose index is the token ID, with a genuine log
+    probability and the fp32 tail of the remaining mass.
     Returns ``(record, values, indices, tail)``.
     """
     target_ids = captured["tokens"].to(torch.int64).reshape(-1, 1)
-    values = target_ids.float()
-    if logprobs:
-        values = (0.5 + (target_ids % 7).float() / 20).log()
-    record, values, indices, tail = codec.finalize_record(
+    values = (0.5 + (target_ids % 7).float() / 20).log()
+    return codec.finalize_record(
         captured,
         values,
         target_ids,
         codec.tail_logprob(values),
         isolated=contract["attention_mode"] == "isolated_segments",
     )
-    return record, values, indices, tail if logprobs else None
 
 
 # Small blocks so every file has several and block boundaries are exercised.
@@ -143,7 +148,6 @@ def write_flush(
     gbs=8,
     packed=False,
     source=None,
-    logprobs=False,
     block_bytes=TEST_BLOCK_BYTES,
     vocab_size=len(TEST_VOCAB),
     dp=2,
@@ -162,12 +166,12 @@ def write_flush(
         batch = (source or inputs)(ids, packed=packed)
         batches.append(
             arrow.samples_batch(
-                *make_record(codec.capture_batch(batch), contract, logprobs), vocab_size=vocab_size
+                *make_record(codec.capture_batch(batch), contract), vocab_size=vocab_size
             )
         )
-    data, index = arrow.write_file(batches, metadata, block_bytes=block_bytes)
+    data, part = arrow.write_file(batches, metadata, block_bytes=block_bytes)
     storage.write(part_path(rank, begin, finish), data)
-    return {"writer": rank, "path": storage_module.part_name(rank), "index": index}
+    return {"path": storage_module.part_name(rank), **part}
 
 
 def write_cache(
@@ -183,7 +187,6 @@ def write_cache(
     metadata=None,
     start=0,
     source=None,
-    logprobs=False,
     vocab_size=len(TEST_VOCAB),
 ):
     storage = Storage(str(root))
@@ -209,12 +212,12 @@ def write_cache(
                     gbs=gbs,
                     packed=packed,
                     source=source,
-                    logprobs=logprobs,
                     vocab_size=vocab_size,
                     dp=dp,
                     mbs=mbs,
                 )
             )
+        schemas, parts = arrow.share_schemas(parts)
         storage.write(
             flush_path(begin, finish),
             json.dumps(
@@ -222,8 +225,9 @@ def write_cache(
                     "group_version": 1,
                     "start_iteration": begin,
                     "end_iteration": finish,
-                    "writers": dp,
                     "writer_mbs": mbs,
+                    "settings": metadata,
+                    "schemas": schemas,
                     "parts": parts,
                 }
             ).encode(),
@@ -283,22 +287,28 @@ def test_fractional_mask_and_integer_overflow():
         codec.capture_batch(source)
 
 
+def read_blocks(data, part, *, inputs_only=False):
+    """Decode every block of a data file from its ranged bytes and part index."""
+    schema = arrow.load_schema(part["schema"])
+    batches = []
+    for entry in part["blocks"]:
+        offset, size = arrow.block_range(entry, inputs_only=inputs_only)
+        raw = data[offset : offset + size]
+        batches.append(
+            arrow.read_block_bytes(schema, raw, entry["length"], inputs_only=inputs_only)
+        )
+    return batches
+
+
 def roundtrip(record, values, indices, tail, *, vocab_size=1 << 17, block_bytes=1 << 20):
     """Write one file of these samples and decode every block back."""
     batch = arrow.samples_batch(record, values, indices, tail, vocab_size=vocab_size)
-    data, index = arrow.write_file([batch], settings(), block_bytes=block_bytes)
-    decoded = []
-    for block in range(len(index["blocks"])):
-        offset, size = arrow.block_range(index, block, inputs_only=False)
-        decoded.append(
-            arrow.decode_block(
-                arrow.read_block(index, block, data[offset : offset + size]), vocab_size=vocab_size
-            )
-        )
-    return data, index, decoded
+    data, part = arrow.write_file([batch], settings(), block_bytes=block_bytes)
+    decoded = [arrow.decode_block(b, vocab_size=vocab_size) for b in read_blocks(data, part)]
+    return data, part, decoded
 
 
-def target_roundtrip(values, indices, tail=None, *, vocab_size):
+def target_roundtrip(values, indices, tail, *, vocab_size):
     """Store target rows (one token each) in a file and decode them back."""
     rows = values.shape[0]
     record = {
@@ -322,12 +332,12 @@ def batch_targets(batch):
         else None
     )
     indices = codec.join_indices(arrow._flat(batch.column("indices_low"))[1], high)
-    tail = arrow._flat(batch.column("tail"))[1] if "tail" in batch.schema.names else None
+    tail = arrow._flat(batch.column("tail"))[1]
     return arrow._tensor(values), arrow._tensor(indices), tail
 
 
 def test_files_are_plain_arrow_ipc_with_settings_in_the_schema(tmp_path):
-    storage, metadata = write_cache(tmp_path, iterations=2, logprobs=True)
+    storage, metadata = write_cache(tmp_path, iterations=2)
     name = part_path(1, 0, 2)
     table = pa.ipc.open_file(storage.path(name)).read_all()
     assert table.schema.names == [
@@ -350,31 +360,22 @@ def test_files_are_plain_arrow_ipc_with_settings_in_the_schema(tmp_path):
 
 
 def test_input_only_reads_fetch_one_prefix_range(tmp_path):
-    storage, _ = write_cache(tmp_path, iterations=2, logprobs=True)
+    storage, _ = write_cache(tmp_path, iterations=2)
     name = part_path(0, 0, 2)
-    index = _read_part_index(storage, 0, 0, 2)
+    part = _read_part_index(storage, 0, 0, 2)
+    schema = arrow.load_schema(group_schema(storage, (0, 2), part))
     data = (tmp_path / name).read_bytes()
-    for block, entry in enumerate(index["blocks"]):
+    for entry in part["blocks"]:
         assert entry["input_length"] < entry["length"]
-        offset, size = arrow.block_range(index, block, inputs_only=True)
-        batch = arrow.read_block(index, block, data[offset : offset + size], inputs_only=True)
+        offset, size = arrow.block_range(entry, inputs_only=True)
+        raw = data[offset : offset + size]
+        batch = arrow.read_block_bytes(schema, raw, entry["length"], inputs_only=True)
         assert batch.schema.names == list(arrow.INPUT_COLUMNS)
         inputs_, targets = arrow.decode_block(batch)
         assert targets is None and inputs_["sample_offsets"].numel() == entry["rows"] + 1
         # The prefix alone cannot serve the targets: no other bytes are ever fetched.
-        with pytest.raises(OSError, match="did not fetch"):
-            arrow.read_block(index, block, data[offset : offset + size])
-
-
-def test_index_is_bound_to_its_data_file(tmp_path):
-    storage, metadata = write_cache(tmp_path, iterations=2)
-    name = part_path(0, 0, 2)
-    index = _read_part_index(storage, 0, 0, 2)
-    arrow.check_index(index, storage.size(name))
-    with pytest.raises(ValueError, match="another version of the file"):
-        arrow.check_index(index, storage.size(name) + 1)
-    with pytest.raises(ValueError, match="index version"):
-        arrow.check_index({**index, "index_version": 99})
+        with pytest.raises(ValueError, match="bytes"):
+            arrow.read_block_bytes(schema, raw, entry["length"])
 
 
 def test_binary_and_fractional_loss_masks_share_one_file():
@@ -389,7 +390,7 @@ def test_binary_and_fractional_loss_masks_share_one_file():
             torch.zeros(8),
             isolated=False,
         )
-        batches.append(arrow.samples_batch(*record[:3], None, vocab_size=8))
+        batches.append(arrow.samples_batch(*record, vocab_size=8))
     assert batches[0].schema.field("loss_mask").type == pa.large_list(pa.bool_())
     data, index = arrow.write_file(batches, settings())
     table = pa.ipc.open_file(pa.py_buffer(data)).read_all()
@@ -401,14 +402,15 @@ def test_binary_and_fractional_loss_masks_share_one_file():
 
 
 def test_oversized_sample_gets_its_own_block():
+    values = torch.zeros(24, 1)  # All of each row's mass is retained.
     record = codec.finalize_record(
         codec.capture_batch(inputs([0, 1, 2])),
-        torch.zeros(24, 1),
+        values,
         torch.zeros(24, 1, dtype=torch.long),
-        torch.zeros(24),
+        codec.tail_logprob(values),
         isolated=False,
     )
-    _, index, decoded = roundtrip(*record[:3], None, block_bytes=1)
+    _, index, decoded = roundtrip(*record, block_bytes=1)
     assert [block["rows"] for block in index["blocks"]] == [1, 1, 1]
     assert [block["supervised"] for block in index["blocks"]] == [7, 7, 7]
     assert [inputs_["tokens"].tolist() for inputs_, _ in decoded][1] == list(range(100, 108))
@@ -486,7 +488,7 @@ def test_targets_are_stored_only_where_loss_is_applied():
 
 
 def test_targets_outside_the_tokenizer_are_rejected(tmp_path):
-    storage, metadata = write_cache(tmp_path, iterations=2, logprobs=True, vocab_size=4096)
+    storage, metadata = write_cache(tmp_path, iterations=2, vocab_size=4096)
     full = reader(storage, metadata, vocab_size=4096)
     try:
         assert full.samples([1], 2)[0]["teacher_values"].min() > -1000
@@ -522,7 +524,7 @@ def test_index_encoding_roundtrip(vocab_size, encoding):
         "segment_counts": torch.tensor([1]),
     }
     _, _, [(_, (restored, ids, _))] = roundtrip(
-        record, values, indices, None, vocab_size=vocab_size
+        record, values, indices, codec.tail_logprob(values), vocab_size=vocab_size
     )
     assert torch.equal(restored, values)
     keep = values != -1000.0
@@ -539,19 +541,19 @@ def test_index_encoding_rejects_invalid_vocab_size(vocab_size):
 
 @pytest.mark.parametrize("case", ["bounds", "shape", "high_shape", "integer_values"])
 def test_malformed_targets_rejected(case):
-    values, indices = torch.zeros(1, 2), torch.tensor([[0, 65538]])
+    values, indices, tail = torch.zeros(1, 2), torch.tensor([[0, 65538]]), torch.zeros(1)
     if case == "bounds":  # ID 65538 is not a token of a 65537-entry tokenizer.
         with pytest.raises(ValueError, match="not a token"):
-            codec.check_targets(values, indices, None, vocab_size=65537)
+            codec.check_targets(values, indices, tail, vocab_size=65537)
     elif case == "shape":
         with pytest.raises(ValueError, match="Malformed"):
-            codec.check_targets(values[:, :1], indices, None, vocab_size=None)
+            codec.check_targets(values[:, :1], indices, tail, vocab_size=None)
     elif case == "high_shape":
         with pytest.raises(ValueError, match="Malformed"):
             codec.join_indices(np.zeros((1, 2), np.uint16), np.zeros((1, 1), np.uint8))
     else:
         with pytest.raises(ValueError, match="Malformed"):
-            codec.check_targets(indices, indices, None, vocab_size=None)
+            codec.check_targets(indices, indices, tail, vocab_size=None)
 
 
 @pytest.mark.parametrize("index,value", [(-2, -1000.0), (-1, -1.0), (65537, -1.0)])
@@ -565,6 +567,8 @@ def test_target_encoder_rejects_invalid_ids(index, value):
     [
         {"attention_mode": "unknown"},
         {"prefix_stable": "yes"},
+        {"features": "images"},
+        {"features": ["images"]},
         {"tokenizer": {}},
         {"first_iteration": -1},
         {"global_batch_size": 0},
@@ -631,11 +635,10 @@ def test_effective_attention_mode(sft, inter_document, reset, create, expected):
 
 def test_tokenizer_fingerprint_is_canonical():
     vocab = {"a": 0, "b": 1, "c": 2}
-    special = {"bos": None, "eos": 2, "pad": None, "unk": None}
-    first = codec.tokenizer_fingerprint(vocab, special, 3)
-    assert first == codec.tokenizer_fingerprint(dict(reversed(vocab.items())), special, 3)
-    assert first != codec.tokenizer_fingerprint({**vocab, "d": 3}, special, 4)
-    assert first != codec.tokenizer_fingerprint(vocab, {**special, "pad": 1}, 3)
+    first = codec.tokenizer_fingerprint(vocab, 3)
+    assert first == codec.tokenizer_fingerprint(dict(reversed(vocab.items())), 3)
+    assert first != codec.tokenizer_fingerprint({**vocab, "d": 3}, 4)
+    assert first != codec.tokenizer_fingerprint(vocab, 4)
 
     class HF:
         bos_token_id, eos_token_id, pad_token_id, unk_token_id = None, 2, None, None
@@ -647,6 +650,23 @@ def test_tokenizer_fingerprint_is_canonical():
             return 3
 
     assert codec.hf_tokenizer_identity(HF()) == {"sha256": first}
+
+
+def test_tokenizer_fingerprint_ignores_special_token_roles():
+    """A student that assigns a pad token (commonly EOS) still matches its teacher."""
+
+    class HF:
+        bos_token_id, eos_token_id, pad_token_id, unk_token_id = 0, 2, None, None
+
+        def get_vocab(self):
+            return {"<s>": 0, "a": 1, "</s>": 2}
+
+        def __len__(self):
+            return 3
+
+    padded = HF()
+    padded.pad_token_id = padded.eos_token_id
+    assert codec.hf_tokenizer_identity(padded) == codec.hf_tokenizer_identity(HF())
 
 
 def packed_capture(weights, *, bounds=(0, 4, 8)):
@@ -687,11 +707,13 @@ def test_finalize_drops_fully_masked_segments_and_samples():
     record, *_ = codec.finalize_record(captured, targets.float(), targets, tail, isolated=True)
     assert record["segment_lengths"].tolist() == [4]
     empty = packed_capture([0] * 8)
-    record, values, *_ = codec.finalize_record(empty, targets.float(), targets, tail, isolated=True)
+    record, values, _, kept_tail = codec.finalize_record(
+        empty, targets.float(), targets, tail, isolated=True
+    )
     assert record["sample_offsets"].tolist() == [0, 0]
     assert record["segment_counts"].tolist() == [0]
     assert values.shape == (0, 1)
-    _, _, [(restored, (stored, *_))] = roundtrip(record, values, values.long(), None)
+    _, _, [(restored, (stored, *_))] = roundtrip(record, values, values.long(), kept_tail)
     assert restored["sample_offsets"].tolist() == [0, 0] and stored.shape == (0, 1)
 
 
@@ -716,7 +738,7 @@ def test_malformed_blocks_rejected(case):
         torch.zeros(8),
         isolated=True,
     )
-    batch = arrow.samples_batch(*record[:3], None, vocab_size=8)
+    batch = arrow.samples_batch(*record, vocab_size=8)
     if case == "misaligned":
         name, values = "labels", [[1, 2, 3]]
     else:
@@ -968,7 +990,7 @@ class _CountingStorage(Storage):
 
 @pytest.mark.parametrize("targets", [True, False])
 def test_each_block_is_one_ranged_read(tmp_path, targets):
-    write_cache(tmp_path, logprobs=True)
+    write_cache(tmp_path)
     storage = _CountingStorage(tmp_path)
     metadata = _read_meta(storage, (0, 2))
     live = reader(storage, metadata, targets=targets)
@@ -979,13 +1001,10 @@ def test_each_block_is_one_ranged_read(tmp_path, targets):
     expected = []
     for start, end in ((0, 2), (2, 4)):
         for rank in range(2):
-            index = _read_part_index(storage, rank, start, end)
+            part = _read_part_index(storage, rank, start, end)
             expected += [
-                (
-                    part_path(rank, start, end),
-                    *arrow.block_range(index, block, inputs_only=not targets),
-                )
-                for block in range(len(index["blocks"]))
+                (part_path(rank, start, end), *arrow.block_range(entry, inputs_only=not targets))
+                for entry in part["blocks"]
             ]
     assert sorted(storage.reads) == sorted(expected)
 
@@ -1070,7 +1089,7 @@ def test_teacher_dp_may_change_between_flushes(tmp_path):
     write_cache(tmp_path, dp=2, mbs=2, start=4, iterations=6, metadata=metadata)
     storage = Storage(str(tmp_path))
     assert [
-        storage_module.read_group(storage, span)["writers"] for span in ((0, 2), (2, 4), (4, 6))
+        len(storage_module.read_group(storage, span)["parts"]) for span in ((0, 2), (2, 4), (4, 6))
     ] == [2, 4, 2]
     live = reader(storage, metadata)
     try:
@@ -1106,28 +1125,47 @@ def test_files_differing_in_recorded_settings_warn_and_in_required_ones_fail(tmp
         live.close()
 
 
-@pytest.mark.parametrize("field", ["size", "offset", "first_row", "input_length"])
+@pytest.mark.parametrize("field", ["size", "offset", "rows", "input_length"])
 def test_invalid_group_block_ranges_are_rejected(tmp_path, field):
     storage, metadata = write_cache(tmp_path, iterations=2)
     path = tmp_path / flush_path(0, 2)
     group = json.loads(path.read_text())
-    index = group["parts"][0]["index"]
-    block = index["blocks"][0]
+    part = group["parts"][0]
+    block = part["blocks"][0]
     if field == "size":
-        index["size"] = 1
+        part["size"] = 1
     elif field == "offset":
-        block["offset"] = index["size"] + 1
-    elif field == "first_row":
-        block["first_row"] = 1
+        block["offset"] = part["size"] + 1
+    elif field == "rows":
+        block["rows"] = 0
     else:
         block["input_length"] = block["length"] + 1
     path.write_text(json.dumps(group))
     live = reader(storage, metadata)
     try:
-        with pytest.raises(ValueError, match="Invalid block rows or byte ranges for writer 0"):
+        with pytest.raises(ValueError, match="Invalid block rows or byte ranges in .* part-000000"):
             live.samples([0], 1)
     finally:
         live.close()
+
+
+@pytest.mark.parametrize("case", ["path", "schema", "settings"])
+def test_malformed_flush_indexes_are_rejected(tmp_path, case):
+    storage, _ = write_cache(tmp_path, iterations=2)
+    path = tmp_path / flush_path(0, 2)
+    group = json.loads(path.read_text())
+    if case == "path":  # A writer is its list position; its part must carry its name.
+        group["parts"].reverse()
+        message = "lists part part-000001.arrow as writer 0"
+    elif case == "schema":
+        group["parts"][1]["schema"] = len(group["schemas"])
+        message = "unknown schema"
+    else:
+        del group["settings"]["contract"]["global_batch_size"]
+        message = "global_batch_size"
+    path.write_text(json.dumps(group))
+    with pytest.raises(ValueError, match=message):
+        storage_module.read_group(storage, (0, 2))
 
 
 def test_replay_writers_must_split_every_teacher_iteration_evenly(tmp_path):
@@ -1184,7 +1222,8 @@ def test_stripped_segments_are_repadded_for_the_student(tmp_path, divisor, lengt
     values = batch["_kd_values"][0].reshape(-1)
     target = batch["loss_mask"][0] != 0  # Padding and zero-weight positions have no rows.
     assert (values[~target] == -1000).all()
-    assert (values[target] == torch.tensor(expected)[target]).all()
+    indices = batch["_kd_indices"][0].reshape(-1)
+    assert (indices[target] == torch.tensor(expected)[target]).all()
     # Positions restart per segment and continue through each segment's padding.
     starts = torch.tensor(bounds[:-1])
     for a, b in zip(bounds[:-1], bounds[1:]):
@@ -1743,15 +1782,18 @@ def corpus_source(root, name, *, samples, iterations, base=0, contract=None, met
             batch = arrow.samples_batch(
                 *make_record(captured, metadata["contract"]), vocab_size=len(TEST_VOCAB)
             )
-            data, index = arrow.write_file([batch], metadata, block_bytes=TEST_BLOCK_BYTES)
+            data, part = arrow.write_file([batch], metadata, block_bytes=TEST_BLOCK_BYTES)
             path = storage_module.part_name(rank)
             storage.write(f"{directory}/{path}", data)
-            parts.append({"path": path, "index": index})
+            parts.append({"path": path, **part})
+        schemas, parts = arrow.share_schemas(parts)
         chunks.publish_chunk(
             storage,
             directory,
             {
                 "chunk_version": chunks.CHUNK_VERSION,
+                "settings": metadata,
+                "schemas": schemas,
                 "parts": parts,
                 "producer": {
                     "name": "megatron",
@@ -1789,7 +1831,7 @@ def test_blend_plan_is_deterministic_and_follows_the_weights(tmp_path):
     lengths = np.add.reduceat(pieces["end"] - pieces["first"], starts[:-1])
     assert lengths.tolist() == [10, 10, 10, 10]
     # Compact tables: no per-file footers, one shared schema for identical columns.
-    assert manifest["blocks"].dtype.itemsize == 32 and len(manifest["schemas"]) == 1
+    assert manifest["blocks"].dtype.itemsize == 28 and len(manifest["schemas"]) == 1
     assert len(manifest["files"]["path"]) == len(manifest["files"]["size"]) == 6
     assert blend.plan(blend_config(tmp_path), budget=38)["hash"] == manifest["hash"]
     assert blend.plan(blend_config(tmp_path, seed=2), budget=38)["hash"] != manifest["hash"]
@@ -1972,26 +2014,25 @@ def test_shared_schema_decodes_blocks_without_their_footer():
     for ids, teacher in (([0, 1, 2], "/teacher@1"), ([3, 4], "/teacher@2")):
         metadata = settings(recorded={"teacher": teacher})
         batch = arrow.samples_batch(
-            *make_record(codec.capture_batch(inputs(ids)), metadata["contract"], logprobs=True),
+            *make_record(codec.capture_batch(inputs(ids)), metadata["contract"]),
             vocab_size=len(TEST_VOCAB),
         )
         files.append(arrow.write_file([batch], metadata, block_bytes=TEST_BLOCK_BYTES))
-    schemas = {arrow.block_schema(index) for _, index in files}
+    schemas, parts = arrow.share_schemas([part for _, part in files])
     assert len(schemas) == 1  # Files with different settings share their columns.
-    schema = pa.ipc.read_schema(pa.py_buffer(schemas.pop()))
-    for data, index in files:
-        assert len(index["blocks"]) > 1
-        for block, entry in enumerate(index["blocks"]):
-            for inputs_only in (False, True):
-                offset, size = arrow.block_range(index, block, inputs_only=inputs_only)
-                raw = data[offset : offset + size]
-                shared = arrow.read_block_bytes(
-                    schema, raw, entry["length"], inputs_only=inputs_only
-                )
-                assert shared.equals(arrow.read_block(index, block, raw, inputs_only=inputs_only))
-                assert shared.schema.names == (
-                    list(arrow.INPUT_COLUMNS) if inputs_only else schema.names
-                )
+    assert [part["schema"] for part in parts] == [0, 0]
+    schema = arrow.load_schema(schemas[0])
+    assert schema.metadata is None  # Settings live once in the index, not in its schemas.
+    for (data, _), part in zip(files, parts):
+        footer = pa.ipc.open_file(pa.py_buffer(data))
+        assert len(part["blocks"]) == footer.num_record_batches > 1
+        shared = {**part, "schema": schemas[part["schema"]]}
+        for inputs_only in (False, True):
+            for block, batch in enumerate(read_blocks(data, shared, inputs_only=inputs_only)):
+                expected = footer.get_batch(block)
+                if inputs_only:
+                    expected = expected.select(list(arrow.INPUT_COLUMNS))
+                assert batch.equals(expected)
 
 
 def test_student_trains_on_a_corpus_blend_and_resumes_only_on_the_same_plan(
@@ -2051,109 +2092,6 @@ def test_corpus_blend_validation(tmp_path, runtime_environment, change, message)
         setattr(args, key, value)
     with pytest.raises(ValueError, match=message):
         runtime.validate_options(args)
-
-
-hf = importlib.import_module(f"{_namespace}.format.hf")
-
-
-class StudentTokenizer:
-    """A minimal Hugging Face tokenizer for the HF reference consumer."""
-
-    bos_token_id, eos_token_id, pad_token_id, unk_token_id = None, 2, None, None
-
-    def __init__(self, size=len(TEST_VOCAB)):
-        self.size = size
-
-    def get_vocab(self):
-        return {f"t{i}": i for i in range(self.size)}
-
-    def __len__(self):
-        return self.size
-
-
-def hf_sources(root):
-    """Two corpus sources fingerprinted with :class:`StudentTokenizer`."""
-    two_sources(root, tokenizer=codec.hf_tokenizer_identity(StudentTokenizer()))
-    return blend.plan(blend_config(root), budget=40)
-
-
-def test_hf_stream_checks_the_student_tokenizer(tmp_path):
-    manifest = hf_sources(tmp_path)
-    with pytest.raises(ValueError, match="tokenizer differs"):
-        hf.CorpusStream(str(tmp_path), manifest, tokenizer=StudentTokenizer(4))
-    with pytest.raises(ValueError, match="smaller than the tokenizer"):
-        hf.CorpusStream(str(tmp_path), manifest, tokenizer=StudentTokenizer(), model_vocab_size=2)
-
-
-def test_hf_stream_yields_a_ranks_samples_in_megatron_order(tmp_path):
-    manifest = hf_sources(tmp_path)
-    stream = hf.CorpusStream(
-        str(tmp_path),
-        manifest,
-        tokenizer=StudentTokenizer(),
-        rank=1,
-        world_size=2,
-        micro_batch_size=2,
-    )
-    ids = [sample["sample_id"] for sample in stream]
-    assert ids == [p for p in range(40) if (p % 4) // 2 == 1]
-    resumed = hf.CorpusStream(
-        str(tmp_path),
-        manifest,
-        tokenizer=StudentTokenizer(),
-        rank=1,
-        world_size=2,
-        micro_batch_size=2,
-        start=20,
-    )
-    assert [sample["sample_id"] for sample in resumed] == [p for p in ids if p >= 20]
-
-
-def test_hf_collate_aligns_labels_and_targets(tmp_path):
-    manifest = hf_sources(tmp_path)
-    stream = hf.CorpusStream(
-        str(tmp_path), manifest, tokenizer=StudentTokenizer(), micro_batch_size=2
-    )
-    samples = list(stream)[:3]
-    short = dict(samples[1])  # A shorter sample: its first 5 tokens and their target rows.
-    rows = int((short["loss_mask"][:5] != 0).sum())
-    for key in codec.TOKEN_FIELDS:
-        short[key] = short[key][:5]
-    for key in ("teacher_values", "teacher_indices", "teacher_tail"):
-        short[key] = short[key][:rows]
-    short["segments"] = torch.tensor([5])
-    samples[1] = short
-    batch = hf.collate(samples, pad_token_id=7)
-    assert batch["input_ids"].shape == (3, 8) and batch["input_ids"][1, 5:].tolist() == [7] * 3
-    assert batch["attention_mask"][1].tolist() == [1] * 5 + [0] * 3
-    scored = batch["loss_weights"] != 0
-    assert (batch["labels"][~scored] == -100).all()
-    # Identity targets: the scored rows' teacher index is the token at that position.
-    assert torch.equal(batch["teacher_indices"][..., 0][scored], batch["input_ids"][scored])
-    assert (batch["teacher_values"][~scored] == codec.LOGPROB_SENTINEL).all()
-
-
-def test_hf_topk_kl_matches_megatron(monkeypatch):
-    cached = _loss_namespace(monkeypatch)
-    torch.manual_seed(0)
-    batch, length, vocab, k = 2, 5, 11, 3
-    logits = torch.randn(batch, length, vocab)
-    teacher = torch.randn(batch, length, vocab).log_softmax(-1)
-    values, indices = teacher.topk(k, dim=-1)
-    values[0, 1, 2] = codec.LOGPROB_SENTINEL  # A top-P masked entry.
-    tail = codec.tail_logprob(values.reshape(-1, k)).reshape(batch, length)
-    weights = torch.tensor([[1.0, 1.0, 0.0, 1.0, 0.5], [1.0, 0.0, 1.0, 1.0, 1.0]])
-    reference = cached.topk_kl_div(
-        logits.transpose(0, 1).clone(),
-        values.transpose(0, 1),
-        indices.transpose(0, 1),
-        1,
-        0,
-        None,
-        teacher_tail_logprobs=tail.transpose(0, 1),
-    )
-    expected = (reference * weights).sum() / weights.sum()
-    assert torch.allclose(hf.topk_kl(logits, values, indices, tail, weights), expected, atol=1e-6)
 
 
 def test_unfrozen_teacher_may_use_dropout(runtime_environment):
@@ -2611,21 +2549,45 @@ def test_prefix_shortening_is_checked_per_sample(tmp_path, seq_length, prefix_st
             replay.collate_samples(samples, seq_length, prefix_stable=prefix_stable)
 
 
-@pytest.mark.parametrize("column", [*arrow.INPUT_COLUMNS, "indices_high"])
-def test_blocks_need_every_input_column_and_the_vocabulary_index_width(column):
+def column_layout_batch():
+    """One stored sample whose rows retain all their mass (u16+u8 indices)."""
+    values = torch.zeros(8, 1)
     record = codec.finalize_record(
         codec.capture_batch(inputs([0])),
-        torch.zeros(8, 1),
+        values,
         torch.zeros(8, 1, dtype=torch.long),
-        torch.zeros(8),
+        codec.tail_logprob(values),
         isolated=False,
     )
-    batch = arrow.samples_batch(*record[:3], None, vocab_size=1 << 17)
+    return arrow.samples_batch(*record, vocab_size=1 << 17)
+
+
+@pytest.mark.parametrize("change", [*arrow.INPUT_COLUMNS, "tail", "order"])
+def test_only_the_formats_column_layout_is_accepted(change):
+    def encode(schema):
+        return base64.b64encode(schema.serialize().to_pybytes()).decode()
+
+    batch = column_layout_batch()
+    assert arrow.load_schema(encode(batch.schema)) == batch.schema
+    # An optional column a reader does not know is ignored; required data uses features.
+    entropy = pa.array([[0.5]], pa.large_list(pa.float32()))
+    extra = batch.append_column("teacher_entropy", entropy)
+    assert arrow.load_schema(encode(extra.schema)) == extra.schema
+    arrow.decode_block(extra, vocab_size=1 << 17)
+    if change == "order":  # Input-only reads select the input columns by position.
+        names = batch.schema.names
+        batch = batch.select([names[1], names[0], *names[2:]])
+    else:  # A missing input column, or a missing tail.
+        batch = batch.drop_columns([change])
+    with pytest.raises(ValueError, match="must start with"):
+        arrow.load_schema(encode(batch.schema))
+
+
+def test_blocks_need_the_vocabulary_index_width():
+    batch = column_layout_batch()
     arrow.decode_block(batch, vocab_size=1 << 17)
-    batch = batch.drop_columns([column])
-    message = "index encoding" if column == "indices_high" else "missing columns"
-    with pytest.raises(ValueError, match=message):
-        arrow.decode_block(batch, vocab_size=1 << 17)
+    with pytest.raises(ValueError, match="index encoding"):
+        arrow.decode_block(batch.drop_columns(["indices_high"]), vocab_size=1 << 17)
 
 
 def eod_sample():
@@ -2679,14 +2641,6 @@ def test_student_dense_mask_follows_stored_segments(runtime_environment):
     assert allowed[0, 0, 3].tolist() == [False, False, False, True, False, False]
     # A shorter student keeps a prefix of the documents.
     assert replay.collate_samples([eod_sample()], 2)["_kd_segment_ids"].tolist() == [[0, 1]]
-
-
-def test_hf_collate_masks_stored_segments():
-    batch = hf.collate([eod_sample()])
-    assert batch["attention_mask"].shape == (1, 1, 4, 4)
-    allowed = batch["attention_mask"][0, 0] == 0
-    assert allowed[2].tolist() == [False, True, True, False]
-    assert allowed[3].tolist() == [False, False, False, True]
 
 
 def test_megatron_hf_tokenizer_fingerprint_matches_other_producers(
@@ -2913,7 +2867,7 @@ def test_saver_writes_files_readable_by_replay(tmp_path, runtime_environment, mo
         storage_module.part_name(rank) for rank in (0, 1)
     ]
     saver = finalizing_saver(module.PairedLogitsSaver, dp_size=2)
-    saver.save_dir = str(tmp_path)
+    saver.save_dir, saver.metadata_dict = str(tmp_path), metadata
     saver._publish_flush(0, 2, list(results.values()))
     storage = Storage(str(tmp_path))
     assert storage_module.flush_objects(storage, storage_module.REPLAY) == [
@@ -2922,13 +2876,17 @@ def test_saver_writes_files_readable_by_replay(tmp_path, runtime_environment, mo
         part_path(1, 0, 2),
     ]
     index = json.loads(storage.read(flush_path(0, 2)))
-    assert {key: index[key] for key in index if key != "parts"} == {
+    assert {key: index[key] for key in index if key not in ("schemas", "parts")} == {
         "group_version": 1,
         "start_iteration": 0,
         "end_iteration": 2,
-        "writers": 2,
         "writer_mbs": 2,
+        "settings": metadata,
     }
+    assert len(index["schemas"]) == 1  # Both writers' files share their columns.
+    assert [(part["path"], part["schema"]) for part in index["parts"]] == [
+        (storage_module.part_name(rank), 0) for rank in (0, 1)
+    ]
     assert _read_meta(storage, (0, 2)) == metadata
     live = reader(storage, metadata)
     assert ids_of(live.samples(list(range(16)), 16)) == replay_order(0, 16)
@@ -3117,7 +3075,10 @@ def test_only_v3_extracts_vocabularies_above_17_bits(runtime_environment):
     values, indices = method(saver, logits)
     assert indices.tolist() == [[[1 << 17, (1 << 17) - 1]]]
     restored, ids, _ = target_roundtrip(
-        values.reshape(1, 2), indices.reshape(1, 2), vocab_size=logits.shape[-1]
+        values.reshape(1, 2),
+        indices.reshape(1, 2),
+        codec.tail_logprob(values.reshape(1, 2)),
+        vocab_size=logits.shape[-1],
     )
     assert torch.equal(ids, indices.reshape(1, 2))
     assert torch.equal(restored, values.reshape(1, 2))
@@ -3510,10 +3471,9 @@ def test_top_p_encoded_sentinel_is_excluded_from_kl_and_ghost_mass():
     }
     exec(compile(ast.Module(body=[node], type_ignores=[]), str(path), "exec"), namespace)
     # With a u16 encoding, -1 decodes as 65535, a real vocabulary ID at the limit.
+    values = torch.tensor([[0.7, 0.0]]).log().clamp_min(-1e3)
     values, indices, tail = target_roundtrip(
-        torch.tensor([[0.7, 0.0]]).log().clamp_min(-1e3),
-        torch.tensor([[0, -1]]),
-        vocab_size=1 << 16,
+        values, torch.tensor([[0, -1]]), codec.tail_logprob(values), vocab_size=1 << 16
     )
     assert torch.allclose(tail, torch.tensor([0.3]).log())
     assert indices[0, 1] == 65535
@@ -3646,11 +3606,10 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 FIXTURE_VARIANTS = {
     # name: (write_cache kwargs)
-    "u16_causal": dict(vocab_size=4096),  # No stored tail.
+    "u16_causal": dict(vocab_size=4096),
     "u16u8_packed_stripped": dict(
         packed=True, contract={"padding_divisor": 2}, source=tail_masked, gbs=4, mbs=1
     ),
-    "u16_logprobs_with_tail": dict(vocab_size=4096, logprobs=True),
 }
 
 
@@ -3700,8 +3659,7 @@ def test_golden_fixtures_decode(tmp_path, name):
         storage_module.read_group(storage, first)["parts"][0]["path"]
     )
     schema = pa.ipc.open_file(storage.path(path)).schema
-    assert ("tail" in schema.names) == (name == "u16_logprobs_with_tail")
-    if name == "u16_logprobs_with_tail":
-        assert schema.field("tail").type == pa.large_list(pa.float32())
-        tail = got[0]["teacher_tail"]
-        assert torch.allclose(got[0]["teacher_values"].exp().sum(-1) + tail.exp(), torch.ones(1))
+    assert schema.field("tail").type == pa.large_list(pa.float32())
+    for sample in got:
+        mass = sample["teacher_values"].exp().sum(-1) + sample["teacher_tail"].exp()
+        assert torch.allclose(mass, torch.ones_like(mass))

@@ -15,7 +15,7 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from ..v3_storage import Storage
-from .arrow import check_index, file_meta
+from .arrow import check_parts
 from .contract import mismatched_corpus_order, mismatched_settings, validate_metadata
 
 CHUNK_VERSION = 1
@@ -36,40 +36,16 @@ def relative_path(path: str) -> str:
 
 
 def check_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
-    """Validate all part indexes and return their common file metadata."""
-    if chunk.get("chunk_version") != CHUNK_VERSION or not chunk.get("parts"):
-        raise ValueError("Corpus chunk needs a supported chunk_version and nonempty parts")
-    reference, paths = None, set()
-    for part in chunk["parts"]:
-        path = relative_path(part["path"])
-        if path in paths:
-            raise ValueError(f"Duplicate corpus part {path}")
-        paths.add(path)
-        index = part["index"]
-        check_index(index)
-        cursor = 0
-        for block in index["blocks"]:
-            if block["first_row"] != cursor or block["rows"] <= 0:
-                raise ValueError(f"Invalid corpus block rows in {path}")
-            cursor += block["rows"]
-            if (
-                block["offset"] < 0
-                or block["length"] <= 0
-                or block["offset"] + block["length"] > index["size"]
-                or not 0 < block["input_length"] <= block["length"]
-            ):
-                raise ValueError(f"Invalid corpus block byte range in {path}")
-        if not cursor:
-            raise ValueError(f"Empty corpus part {path}")
-        metadata = file_meta(index)
-        validate_metadata(metadata, replay=False, corpus=True)
-        if reference is not None:
-            differing = mismatched_settings(metadata, reference)[0]
-            differing += mismatched_corpus_order(metadata, reference)
-            if differing:
-                raise ValueError(f"Corpus chunk mixes settings: {', '.join(differing)}")
-        reference = metadata
-    return reference
+    """Validate a chunk index and return its shared settings."""
+    if chunk.get("chunk_version") != CHUNK_VERSION:
+        raise ValueError("Corpus chunk needs a supported chunk_version")
+    metadata = chunk.get("settings") or {}
+    validate_metadata(metadata, replay=False, corpus=True)
+    paths = [relative_path(part.get("path")) for part in chunk.get("parts") or []]
+    if len(set(paths)) != len(paths):
+        raise ValueError("Duplicate corpus part in chunk")
+    check_parts(chunk, "Corpus chunk")
+    return metadata
 
 
 def publish_chunk(storage: Storage, directory: str, chunk: dict[str, Any]) -> None:

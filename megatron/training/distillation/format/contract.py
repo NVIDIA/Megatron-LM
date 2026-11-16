@@ -23,8 +23,13 @@ MASS_TOLERANCE = 0.05
 ATTENTION_MODES = ("causal", "causal_eod_reset", "isolated_segments")
 
 # Required by every reader: what token IDs mean (which also bounds target indices),
-# which attention the inputs assume, and whether a prefix of a sample keeps its targets.
-REQUIRED_KEYS = ("tokenizer", "attention_mode", "prefix_stable")
+# which attention the inputs assume, whether a prefix of a sample keeps its targets, and
+# the must-understand features the file uses beyond plain text.
+REQUIRED_KEYS = ("tokenizer", "attention_mode", "prefix_stable", "features")
+# Features this reader understands. A file listing any other feature carries data (for
+# example multimodal columns) that would be misread as plain text, so it is rejected.
+# Additive changes declare a feature; incompatible ones bump FORMAT_VERSION.
+KNOWN_FEATURES: frozenset[str] = frozenset()
 # A replay cache starts at a teacher iteration and maps iterations to samples by the
 # teacher's global batch size; each flush index separately records its writer layout.
 REPLAY_KEYS = ("first_iteration", "global_batch_size")
@@ -77,6 +82,14 @@ def validate_metadata(meta: dict[str, Any], *, replay: bool = True, corpus: bool
         raise ValueError(f"Unsupported offline KD attention_mode {contract['attention_mode']!r}")
     if type(contract["prefix_stable"]) is not bool:
         raise ValueError("Offline KD metadata prefix_stable must be a boolean")
+    features = contract["features"]
+    if not isinstance(features, list) or not all(isinstance(name, str) for name in features):
+        raise ValueError("Offline KD metadata features must be a list of names")
+    unknown = sorted(set(features) - KNOWN_FEATURES)
+    if unknown:
+        raise ValueError(
+            f"Offline KD data uses features this reader does not support: {', '.join(unknown)}"
+        )
     if replay:
         if type(contract["first_iteration"]) is not int or contract["first_iteration"] < 0:
             raise ValueError("Offline KD metadata first_iteration must be a nonnegative integer")
@@ -124,21 +137,20 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def tokenizer_fingerprint(
-    vocab: dict[str, int], special_ids: dict[str, int | None], size: int
-) -> str:
-    """Hash the ID-to-token mapping that cached inputs and targets depend on.
+def tokenizer_fingerprint(vocab: dict[str, int], size: int) -> str:
+    """Hash the token-to-ID mapping that cached inputs and targets depend on.
 
-    The canonical object is ``{"vocab": [[token, id], ...] sorted by id,
-    "special_ids": {bos, eos, pad, unk}, "size": n}`` serialized as compact,
-    key-sorted UTF-8 JSON. Normalizers, pre-tokenizers, and chat templates are
-    deliberately excluded: inputs are stored as token IDs.
+    The canonical object is ``{"vocab": [[token, id], ...] sorted by id, "size": n}``
+    serialized as compact, key-sorted UTF-8 JSON. Special-token roles (pad, unk, bos,
+    eos) are excluded: stored data never depends on which token plays them, and
+    students commonly assign a pad token. Special tokens themselves are in the mapping.
+    Normalizers, pre-tokenizers, and chat templates are excluded too: inputs are
+    stored as token IDs.
     """
     canonical = {
         "vocab": sorted(
             ([str(token), int(index)] for token, index in vocab.items()), key=lambda item: item[1]
         ),
-        "special_ids": {role: special_ids.get(role) for role in ("bos", "eos", "pad", "unk")},
         "size": int(size),
     }
     return digest(
@@ -148,18 +160,14 @@ def tokenizer_fingerprint(
 
 def hf_tokenizer_identity(tokenizer: Any) -> dict[str, Any]:
     """Describe a Hugging Face tokenizer for the ``tokenizer`` setting."""
-    special_ids = {
-        role: getattr(tokenizer, f"{role}_token_id", None) for role in ("bos", "eos", "pad", "unk")
-    }
-    return {"sha256": tokenizer_fingerprint(tokenizer.get_vocab(), special_ids, len(tokenizer))}
+    return {"sha256": tokenizer_fingerprint(tokenizer.get_vocab(), len(tokenizer))}
 
 
 def tail_logprob(values: torch.Tensor) -> torch.Tensor:
     """Log of the probability mass outside each row's retained entries.
 
     Writers call this on full-precision log probabilities before casting them to the
-    save dtype, so rounding of the retained values does not distort the tail. Readers
-    of records without a stored tail fall back to calling it on the stored values.
+    save dtype, so rounding of the retained values does not distort the tail.
     Sentinel entries count as not retained; an empty tail is ``LOGPROB_SENTINEL``.
     """
     values = values.float()
@@ -196,16 +204,11 @@ def join_indices(low: np.ndarray, high: np.ndarray | None) -> np.ndarray:
 
 
 def check_targets(
-    values: torch.Tensor,
-    indices: torch.Tensor,
-    tail: torch.Tensor | None,
-    *,
-    vocab_size: int | None,
+    values: torch.Tensor, indices: torch.Tensor, tail: torch.Tensor, *, vocab_size: int | None
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Validate decoded target rows and return them with the tail clamped to [-1000, 0].
 
-    A stored tail plus the retained probabilities must sum to 1 within
-    :data:`MASS_TOLERANCE`; without one, the tail is derived from the values.
+    The tail plus the retained probabilities must sum to 1 within :data:`MASS_TOLERANCE`.
     """
     if values.ndim != 2 or values.shape != indices.shape or not values.is_floating_point():
         raise ValueError("Malformed offline KD target values")
@@ -214,8 +217,6 @@ def check_targets(
             f"Offline KD target index is not a token of the {vocab_size}-entry tokenizer; "
             "targets must exclude vocabulary padding"
         )
-    if tail is None:
-        return values, indices, tail_logprob(values)
     if tail.dtype != torch.float32 or tail.shape != values.shape[:1] or tail.isnan().any():
         raise ValueError("Malformed offline KD tail log probabilities")
     tail = tail.clamp(min=LOGPROB_SENTINEL, max=0.0)
