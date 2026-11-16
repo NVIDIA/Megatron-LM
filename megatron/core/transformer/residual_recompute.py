@@ -1,5 +1,5 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
-"""Shared replay contexts, planning, and residual-connection dispatch.
+"""Shared replay contexts, block planning, and finalization.
 
 Connections choose which operations can be replayed and which state stays live.
 Callers register operations in forward order and finalize each block at its live boundary.
@@ -10,22 +10,14 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, TypeVar
+from typing import Any, TypeVar
 
-import torch
 from torch import Tensor
 
 from megatron.core.tensor_parallel.random import (
     CheckpointWithoutOutput,
     CheckpointWithoutOutputManager,
 )
-
-if TYPE_CHECKING:
-    from megatron.core.transformer.residual_connection import (
-        ResidualBranchOutput,
-        ResidualConnection,
-        ResidualConnectionState,
-    )
 
 _R = TypeVar("_R")
 
@@ -176,37 +168,3 @@ def build_residual_stream_recompute_plan(
         ResidualStreamRecomputeContext(manager=manager, is_block_end=is_block_end)
         for manager, is_block_end in zip(managers, block_ends)
     ]
-
-
-def checkpoint_residual_read(
-    connection: ResidualConnection,
-    hidden_states: Tensor,
-    context: ResidualStreamRecomputeContext,
-    *,
-    fp32_residual_connection: bool,
-    branch_input_dtype: torch.dtype | None = None,
-) -> tuple[Tensor, ResidualConnectionState]:
-    """Checkpoint a residual read with its implementation's state and replay policy."""
-
-    return connection._checkpoint_read(
-        hidden_states,
-        context,
-        fp32_residual_connection=fp32_residual_connection,
-        branch_input_dtype=branch_input_dtype,
-    )
-
-
-def checkpoint_residual_write(
-    connection: ResidualConnection,
-    branch_output: ResidualBranchOutput,
-    state: ResidualConnectionState,
-    context: ResidualStreamRecomputeContext,
-    *,
-    dropout_probability: float,
-    training: bool,
-) -> Tensor:
-    """Checkpoint a residual write with its implementation's replay policy."""
-
-    return connection._checkpoint_write(
-        branch_output, state, context, dropout_probability=dropout_probability, training=training
-    )

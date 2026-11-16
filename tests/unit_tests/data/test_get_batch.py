@@ -22,11 +22,14 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import (
     _get_batch_on_this_cp_rank_per_sequence_balancing,
+    _resolve_dynamic_cp_group_for_batch,
     flatten_batch_for_packed_sequences,
+    get_batch_on_this_cp_rank,
 )
-from megatron.training import arguments, global_vars
+from megatron.training import global_vars
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import parse_args, validate_args
+from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import destroy_global_vars, set_global_variables
 from pretrain_hybrid import get_batch
 from tests.unit_tests.test_utilities import Utils
@@ -47,7 +50,7 @@ def initialize_test_environment(
     micro_batch_size: int,
     global_batch_size: int = 1,
     sft: bool = False,
-    hybrid_context_parallel: bool = False,
+    dynamic_context_parallel: bool = False,
     max_seqlen_per_cp_rank: int = 1024,
     create_attention_mask: bool = False,
 ):
@@ -61,15 +64,13 @@ def initialize_test_environment(
     args.sequence_parallel = True if tp_size > 1 else False
     args.pipeline_model_parallel_size = pp_size
     args.context_parallel_size = cp_size
-    args.hybrid_context_parallel = hybrid_context_parallel
+    args.dynamic_context_parallel = dynamic_context_parallel
     args.max_seqlen_per_dp_cp_rank = max_seqlen_per_cp_rank
     args.sft = sft
     args.micro_batch_size = micro_batch_size
     args.create_attention_mask_in_dataloader = create_attention_mask
     args.global_batch_size = global_batch_size
     args.calculate_per_token_loss = True
-    args.vocab_size = 1024
-    args.tokenizer_type = "NullTokenizer"
     args.num_layers = 4
     args.hidden_size = 512
     args.num_attention_heads = 8
@@ -79,13 +80,15 @@ def initialize_test_environment(
     os.environ['NCCL_NVLS_ENABLE'] = '0'  # NOTE(asolergi-nv): Without this, NCCL crashes
 
     validate_args(args)
-    set_global_variables(args, pretrain_cfg_container_from_args(args), build_tokenizer=True)
+    cfg = pretrain_cfg_container_from_args(args)
+    cfg.tokenizer = TokenizerConfig(vocab_size=1024, tokenizer_type="NullTokenizer")
+    set_global_variables(args, cfg, build_tokenizer=True)
 
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
         pipeline_model_parallel_size=pp_size,
         context_parallel_size=cp_size,
-        hybrid_context_parallel=hybrid_context_parallel,
+        dynamic_context_parallel=dynamic_context_parallel,
     )
     return args
 
@@ -206,7 +209,7 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         attention_mask,
         cu_seqlens,
         cu_seqlens_padded,
-        hybrid_cp_group,
+        dynamic_cp_group,
         labels,
         local_cp_size,
         loss_mask,
@@ -228,7 +231,7 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert cu_seqlens is not None
         assert max_seqlen is not None
         assert attention_mask is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
         assert local_cp_size is None
         assert cu_seqlens_padded is None
 
@@ -276,7 +279,7 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert cu_seqlens is not None
         assert max_seqlen is not None
         assert attention_mask is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
         assert local_cp_size is None
         assert cu_seqlens_padded is None
 
@@ -312,7 +315,7 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert cu_seqlens is not None
         assert max_seqlen is not None
         assert attention_mask is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
         assert local_cp_size is None
         assert cu_seqlens_padded is None
 
@@ -348,7 +351,7 @@ def test_sft_batch(tp_size, pp_size, cp_size, seq_length):
         assert loss_mask is None
         assert position_ids is None
         assert attention_mask is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
         assert local_cp_size is None
 
         assert cu_seqlens is not None
@@ -574,7 +577,7 @@ def test_inter_document_masking_batch(tp_size, pp_size, cp_size, seq_length):
         attention_mask,
         cu_seqlens,
         cu_seqlens_padded,
-        hybrid_cp_group,
+        dynamic_cp_group,
         labels,
         local_cp_size,
         loss_mask,
@@ -836,7 +839,7 @@ def test_get_batch_on_this_cp_rank_zigzag_packed(cp_rank, expected_indices, with
         cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout="contiguous" if with_contiguous_layout else "zigzag",
-            is_hybrid_cp=False,
+            dynamic_cp=False,
             cp_group=cp_group,
             additional_layouts=("zigzag",) if with_contiguous_layout else (),
             use_per_sequence_balancing=True,
@@ -904,7 +907,7 @@ def test_metadata_only_cp_batch_skips_sharding():
         cp_batch = get_batches_on_this_cp_rank(
             batch,
             boundary_layout="zigzag",
-            is_hybrid_cp=False,
+            dynamic_cp=False,
             cp_group=MagicMock(),
             tokens_per_sample=16,
         )
@@ -925,7 +928,7 @@ def test_size_one_cp_batch_without_group_skips_sharding():
 
     with patch("megatron.core.utils.get_batch_on_this_cp_rank") as shard_batch:
         cp_batch = get_batches_on_this_cp_rank(
-            batch, boundary_layout="zigzag", is_hybrid_cp=False, cp_group=None, tokens_per_sample=8
+            batch, boundary_layout="zigzag", dynamic_cp=False, cp_group=None, tokens_per_sample=8
         )
 
     shard_batch.assert_not_called()
@@ -948,7 +951,7 @@ def test_intermediate_stage_dynamic_cp_shards_padding_mask_without_token_tensors
             "cu_seqlens_padded": torch.tensor([[0, 8]], dtype=torch.int32),
             "max_seqlen": torch.tensor([8], dtype=torch.int32),
             "local_cp_size": torch.tensor([2], dtype=torch.int32),
-            "hybrid_cp_group": runtime_cp_group,
+            "dynamic_cp_group": runtime_cp_group,
         }
     )
 
@@ -957,7 +960,7 @@ def test_intermediate_stage_dynamic_cp_shards_padding_mask_without_token_tensors
         patch("torch.distributed.get_rank", return_value=0),
     ):
         cp_batch = get_batches_on_this_cp_rank(
-            batch, boundary_layout="zigzag", is_hybrid_cp=True, cp_group=runtime_cp_group
+            batch, boundary_layout="zigzag", dynamic_cp=True, cp_group=runtime_cp_group
         )
 
     torch.testing.assert_close(cp_batch.get_batch()["padding_mask"], padding_mask[:, [0, 1, 6, 7]])
@@ -979,8 +982,9 @@ def test_get_batch_builds_required_cp_layouts():
         micro_batch_size=1,
         global_batch_size=global_batch_size,
     )
-    args.linear_cp_layout = "contiguous"
-    args.attention_cp_layout = "zigzag"
+    cfg = pretrain_hybrid.get_run_config()
+    cfg.model.transformer.linear_cp_layout = "contiguous"
+    cfg.model.transformer.attention_cp_layout = "zigzag"
 
     tokens = torch.arange(seq_length, dtype=torch.int64).view(1, -1)
     batch = {
@@ -1030,7 +1034,7 @@ def test_packed_seq_params_expose_actual_thd_lengths_for_contiguous_cp(
     batch = {
         "cu_seqlens": actual_cu_seqlens,
         "cu_seqlens_padded": padded_cu_seqlens,
-        "hybrid_cp_group": None,
+        "dynamic_cp_group": None,
         "local_cp_size": None,
         "max_seqlen": max_seqlen,
     }
@@ -1074,6 +1078,38 @@ def create_pretrain_data_iterator(
     return iter([batch])
 
 
+def test_intermediate_pipeline_batch_uses_config_layout(monkeypatch):
+    args = SimpleNamespace(
+        sft=False,
+        dataloader_inter_document_masking=False,
+        create_attention_mask_in_dataloader=False,
+        linear_cp_layout="zigzag",
+    )
+    config = SimpleNamespace(
+        sequence_packing_scheduler=None,
+        context_parallel_size=2,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+        dynamic_context_parallel=False,
+        linear_cp_layout="contiguous",
+    )
+    monkeypatch.setattr(pretrain_hybrid, "get_args", lambda: args)
+    monkeypatch.setattr(
+        pretrain_hybrid,
+        "get_run_config",
+        lambda: SimpleNamespace(model=SimpleNamespace(transformer=config)),
+    )
+    monkeypatch.setattr(pretrain_hybrid.mpu, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(pretrain_hybrid, "is_first_or_last_pipeline_stage", lambda stage: False)
+    monkeypatch.setattr(pretrain_hybrid, "mtp_on_this_rank_func", lambda **kwargs: False)
+
+    batch = get_batch(None)
+
+    assert set(batch.batches_by_layout) == {"contiguous"}
+    assert all(value is None for value in batch.get_batch().values())
+    assert batch.get_packed_seq_params() is None
+
+
 def test_sequence_packing_batch_uses_context_parallel_batch_interface():
     tokens = torch.tensor([[1, 2]])
     labels = torch.tensor([[2, 3]])
@@ -1094,8 +1130,10 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
         },
         packed_seq_params_by_layout={"zigzag": packed_seq_params},
     )
-    args = SimpleNamespace(sequence_packing_scheduler="dp_balanced", dynamic_context_parallel=False)
+    args = SimpleNamespace(sequence_packing_scheduler=None, dynamic_context_parallel=True)
     config = SimpleNamespace(
+        sequence_packing_scheduler="dp_balanced",
+        dynamic_context_parallel=False,
         virtual_pipeline_model_parallel_size=None,
         pipeline_model_parallel_layout=None,
         mtp_num_layers=1,
@@ -1104,7 +1142,11 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
 
     with (
         patch.object(pretrain_hybrid, "get_args", return_value=args),
-        patch.object(pretrain_hybrid, "core_transformer_config_from_args", return_value=config),
+        patch.object(
+            pretrain_hybrid,
+            "get_run_config",
+            return_value=SimpleNamespace(model=SimpleNamespace(transformer=config)),
+        ),
         patch.object(pretrain_hybrid, "mtp_on_this_rank_func", return_value=True),
         patch.object(
             pretrain_hybrid,
@@ -1129,41 +1171,42 @@ def test_sequence_packing_batch_uses_context_parallel_batch_interface():
 
 
 @pytest.mark.parametrize("script", [pretrain_gpt, pretrain_hybrid], ids=["gpt", "hybrid"])
-def test_get_batch_caches_config_until_args_replaced(script, monkeypatch):
-    args = SimpleNamespace(sequence_packing_scheduler="dp_balanced", dynamic_context_parallel=False)
+def test_get_batch_reuses_run_config_without_rebuilding(script, monkeypatch):
+    args = SimpleNamespace()
     configs = [
         SimpleNamespace(
+            sequence_packing_scheduler="dp_balanced",
+            dynamic_context_parallel=False,
             virtual_pipeline_model_parallel_size=None,
             pipeline_model_parallel_layout=None,
             mtp_num_layers=None,
         )
         for _ in range(2)
     ]
-    build_config = MagicMock(side_effect=configs)
+    cfg = SimpleNamespace(model=SimpleNamespace(transformer=configs[0]))
     result = object()
     fetch_batch = MagicMock(return_value=result)
-    monkeypatch.setattr(script, "_transformer_config_cache", None)
     monkeypatch.setattr(script, "get_args", lambda: args)
-    monkeypatch.setattr(script, "core_transformer_config_from_args", build_config)
+    monkeypatch.setattr(script, "get_run_config", lambda: cfg)
     monkeypatch.setattr(script, "mtp_on_this_rank_func", lambda **kwargs: False)
     monkeypatch.setattr(script, "get_batch_on_this_rank_for_sequence_packing", fetch_batch)
     pg_collection = ProcessGroupCollection(pp=object())
 
-    # Repeated microbatches with the same args object reuse one config.
+    # Repeated microbatches use the already-built config, regardless of CLI object identity.
     for _ in range(2):
         assert script.get_batch(None, pg_collection=pg_collection) is result
         assert fetch_batch.call_args.kwargs["config"] is configs[0]
-    build_config.assert_called_once_with(args)
-
-    # Replacing args with an equal but distinct object rebuilds the config.
     previous_args = args
     args = SimpleNamespace(**vars(previous_args))
     assert args == previous_args and args is not previous_args
+    assert script.get_batch(None, pg_collection=pg_collection) is result
+    assert fetch_batch.call_args.kwargs["config"] is configs[0]
+
+    # A new run supplies its own model config; no cached CLI config leaks across runs.
+    cfg = SimpleNamespace(model=SimpleNamespace(transformer=configs[1]))
     for _ in range(2):
         assert script.get_batch(None, pg_collection=pg_collection) is result
         assert fetch_batch.call_args.kwargs["config"] is configs[1]
-    assert build_config.call_count == 2
-    assert build_config.call_args.args[0] is args
 
 
 @pytest.mark.parametrize("tp_size", [1, 2, 4])
@@ -1206,7 +1249,7 @@ def test_pretrain_batch(
         attention_mask,
         cu_seqlens,
         cu_seqlens_padded,
-        hybrid_cp_group,
+        dynamic_cp_group,
         labels,
         local_cp_size,
         loss_mask,
@@ -1228,7 +1271,7 @@ def test_pretrain_batch(
         assert cu_seqlens is None
         assert cu_seqlens_padded is None
         assert max_seqlen is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
         assert local_cp_size is None
 
         assert tokens.shape == (
@@ -1276,7 +1319,7 @@ def test_pretrain_batch(
         assert cu_seqlens is None
         assert cu_seqlens_padded is None
         assert max_seqlen is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
         assert local_cp_size is None
 
         assert tokens.shape == (
@@ -1312,7 +1355,7 @@ def test_pretrain_batch(
         assert cu_seqlens is None
         assert cu_seqlens_padded is None
         assert max_seqlen is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
         assert local_cp_size is None
 
         assert labels.shape == (
@@ -1351,13 +1394,13 @@ def test_pretrain_batch(
         assert cu_seqlens is None
         assert cu_seqlens_padded is None
         assert max_seqlen is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
         assert local_cp_size is None
 
     Utils.destroy_model_parallel()
 
 
-def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
+def create_dynamic_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
     """Create a scheduled packed batch for the standard dynamic-CP fetch path."""
     # Pack n_seqs equal-length sequences; total length must be divisible by 2 * cp_size for CP splitting
     n_seqs = max(2, 2 * cp_size)
@@ -1411,7 +1454,7 @@ def create_hybrid_cp_data_iterator(seq_length: int = 1024, cp_size: int = 1):
 @pytest.mark.parametrize("cp_size", [2, 4, 8])
 @pytest.mark.parametrize("seq_length", [1024])
 @pytest.mark.parametrize("create_attention_mask", [False])
-def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
+def test_dynamic_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     if tp_size * cp_size > torch.cuda.device_count():
         pytest.skip(
             f"Skipping test because tp_size * cp_size > torch.cuda.device_count() ({tp_size * cp_size} > {torch.cuda.device_count()})"
@@ -1425,13 +1468,13 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         1,
         16,
         sft=False,
-        hybrid_context_parallel=True,
+        dynamic_context_parallel=True,
         create_attention_mask=create_attention_mask,
     )
 
     data_iterator = None
     if mpu.get_tensor_model_parallel_rank() == 0:
-        data_iterator = create_hybrid_cp_data_iterator(seq_length, cp_size=cp_size)
+        data_iterator = create_dynamic_cp_data_iterator(seq_length, cp_size=cp_size)
 
     cp_batch = get_batch(data_iterator)
     batch = cp_batch.get_batch()
@@ -1439,7 +1482,7 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         attention_mask,
         cu_seqlens,
         cu_seqlens_padded,
-        hybrid_cp_group,
+        dynamic_cp_group,
         labels,
         local_cp_size,
         loss_mask,
@@ -1458,7 +1501,7 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     assert max_seqlen is not None
     assert local_cp_size is not None
 
-    # Data iterator parameters (must match create_hybrid_cp_data_iterator)
+    # Data iterator parameters (must match create_dynamic_cp_data_iterator)
     n_seqs = max(2, 2 * cp_size)
     align = max(1, 2 * cp_size)
     seq_len_each = (seq_length // n_seqs // align) * align
@@ -1466,7 +1509,7 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         seq_len_each = align
     total_seq_len = n_seqs * seq_len_each
 
-    # Shape: HybridCP CP splitting gives total_seq_len // cp_size tokens per rank
+    # Shape: DynamicCP CP splitting gives total_seq_len // cp_size tokens per rank
     seq_len_per_rank = total_seq_len // cp_size
     assert tokens.shape == (
         1,
@@ -1491,7 +1534,7 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
     assert loss_mask.dtype == torch.float32
     assert position_ids.dtype == torch.int64
 
-    # Loss mask is all-ones (no masking in the HybridCP pretrain dataloader)
+    # Loss mask is all-ones (no masking in the DynamicCP pretrain dataloader)
     assert loss_mask.sum().item() == seq_len_per_rank
 
     # cu_seqlens: 2-D int32 (1, n_seqs + 1) after flatten_batch_for_packed_sequences.
@@ -1519,10 +1562,10 @@ def test_hybrid_cp_batch(tp_size, cp_size, seq_length, create_attention_mask):
         assert cu_seqlens_padded.dtype == torch.int32
         assert cu_seqlens_padded[0, 0].item() == 0
         assert cu_seqlens_padded[0, -1].item() == total_seq_len
-        assert hybrid_cp_group is not None
+        assert dynamic_cp_group is not None
     else:
         assert cu_seqlens_padded is None
-        assert hybrid_cp_group is None
+        assert dynamic_cp_group is None
 
     Utils.destroy_model_parallel()
 
@@ -1612,7 +1655,7 @@ def test_inter_document_masking_multi_mbs_batch(tp_size, micro_batch_size, seq_l
         attention_mask,
         cu_seqlens,
         cu_seqlens_padded,
-        hybrid_cp_group,
+        dynamic_cp_group,
         labels,
         local_cp_size,
         loss_mask,
@@ -1675,14 +1718,24 @@ def test_packed_sequence_dataset_built_on_rank(
     tp_rank = mpu.get_tensor_model_parallel_rank()
     pp_rank = mpu.get_pipeline_model_parallel_rank()
 
-    args = SimpleNamespace(sequence_packing_scheduler=sequence_packing_scheduler)
-    config = SimpleNamespace(pipeline_model_parallel_layout=None, mtp_num_layers=None)
+    # Deliberately stale CLI settings must not control config-owned dataset placement.
+    args = SimpleNamespace(
+        sequence_packing_scheduler=None if sequence_packing_scheduler else "dp_balanced"
+    )
+    config = SimpleNamespace(
+        sequence_packing_scheduler=sequence_packing_scheduler,
+        pipeline_model_parallel_layout=None,
+        mtp_num_layers=None,
+    )
     vp_stages = [None] if vp_size is None else range(vp_size)
-    # The scripts pass the shared predicate (megatron.training.datasets.providers), which reads
-    # the arguments and the transformer config at call time from these two modules.
+    # Both scripts use the shared predicate, which reads the run's model config.
     with (
         patch.object(global_vars, "get_args", return_value=args),
-        patch.object(arguments, "core_transformer_config_from_args", return_value=config),
+        patch.object(
+            global_vars,
+            "get_run_config",
+            return_value=SimpleNamespace(model=SimpleNamespace(transformer=config)),
+        ),
     ):
         for vp_stage in vp_stages:
             built = script.is_dataset_built_on_rank(
