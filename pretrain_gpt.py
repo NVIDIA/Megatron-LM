@@ -2,7 +2,7 @@
 
 """Pretrain and SFT GPT."""
 
-# Capture the true program start time BEFORE any heavy imports.
+# Capture entrypoint execution BEFORE heavy imports, after interpreter startup.
 import time
 
 _PROGRAM_START_TIME = time.time()
