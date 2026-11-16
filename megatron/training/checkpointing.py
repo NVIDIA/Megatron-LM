@@ -24,11 +24,6 @@ import numpy as np
 import torch
 from torch.distributed.checkpoint import FileSystemReader, default_planner
 
-try:
-    from nemo.lens.helpers import managed_span as _otel_managed_span
-except ImportError:
-    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
-
 from megatron.core import dist_checkpointing, mpu, tensor_parallel
 from megatron.core._rank_utils import safe_get_rank as get_rank_safe
 from megatron.core._rank_utils import safe_get_world_size
@@ -51,6 +46,7 @@ from megatron.core.post_training.modelopt.checkpointing import (
     save_sharded_modelopt_state,
 )
 from megatron.core.rerun_state_machine import RerunState, get_rerun_state_machine
+from megatron.core.telemetry import telemetry as _otel
 from megatron.core.tokenizers import MegatronTokenizer
 from megatron.core.transformer.wide_residual import has_combined_residual_keys
 from megatron.core.utils import (
@@ -982,7 +978,7 @@ def save_checkpoint(
                 )
         else:
             sharded_sd_metadata = None
-        with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.state_dict', is_goodput_span=True):
+        with _otel.managed_span(_otel.CKPT, 'megatron.checkpoint.save.state_dict'):
             state_dict = generate_state_dict(
                 args,
                 model,
@@ -1073,7 +1069,7 @@ def save_checkpoint(
             logger.debug(
                 f'rank: {rank}, takes {end_ckpt - start_ckpt} to prepare state dict for ckpt '
             )
-            with _otel_managed_span('checkpoint', 'megatron.checkpoint.save.io_write', is_goodput_span=True):
+            with _otel.managed_span(_otel.CKPT, 'megatron.checkpoint.save.io_write'):
                 async_save_request = dist_checkpointing.save(
                     state_dict,
                     checkpoint_name,
@@ -2951,7 +2947,7 @@ def load_checkpoint(
     state_dict = None
     release = False
     if checkpoint.auto_detect_ckpt_format or ckpt_format in ('torch_dist', 'fsdp_dtensor'):
-        with _otel_managed_span('load_checkpoint', 'megatron.checkpoint.load.io_read', is_goodput_span=True):
+        with _otel.managed_span(_otel.CKPT, 'megatron.checkpoint.load.io_read'):
             state_dict, checkpoint_name, release, ckpt_type = _load_base_checkpoint(
                 load_dir,
                 args,

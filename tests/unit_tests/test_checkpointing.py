@@ -1817,7 +1817,7 @@ def test_the_glu_optimizer_guard_follows_the_saved_checkpoint_section(
     monkeypatch.setattr(checkpointing, "get_args", lambda: args)
     monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
     monkeypatch.setattr(
-        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+        checkpointing._otel, "managed_span", lambda *a, **k: contextlib.nullcontext()
     )
     monkeypatch.setattr(
         checkpointing,
@@ -1873,7 +1873,7 @@ def test_the_pretrained_fallback_makes_the_load_weights_only(
     monkeypatch.setattr(checkpointing, "checkpoint_exists", lambda path: path == "/pretrained")
     monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
     monkeypatch.setattr(
-        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+        checkpointing._otel, "managed_span", lambda *a, **k: contextlib.nullcontext()
     )
     monkeypatch.setattr(checkpointing, "_load_base_checkpoint", base_load)
     assert load_checkpoint([object()], None, None) == (0, 0)
@@ -1911,7 +1911,7 @@ def test_the_load_directory_is_the_sections_unless_passed(
     )
     monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
     monkeypatch.setattr(
-        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+        checkpointing._otel, "managed_span", lambda *a, **k: contextlib.nullcontext()
     )
     monkeypatch.setattr(checkpointing, "_load_base_checkpoint", base_load)
 
@@ -1954,7 +1954,7 @@ def test_the_pretrained_reference_load_requests_the_llm_only_metadata(
     monkeypatch.setattr(checkpointing, "checkpoint_exists", lambda path: path == "/pretrained")
     monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
     monkeypatch.setattr(
-        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+        checkpointing._otel, "managed_span", lambda *a, **k: contextlib.nullcontext()
     )
     monkeypatch.setattr(
         checkpointing,
@@ -2017,7 +2017,7 @@ def _stub_loader_to_the_policy(monkeypatch, args, existing, loads):
     monkeypatch.setattr(checkpointing, "checkpoint_exists", lambda path: path in existing)
     monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
     monkeypatch.setattr(
-        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+        checkpointing._otel, "managed_span", lambda *a, **k: contextlib.nullcontext()
     )
     monkeypatch.setattr(checkpointing, "_load_base_checkpoint", base_load)
 
@@ -2141,7 +2141,7 @@ def test_the_fsdp_dtensor_reader_follows_the_train_state_tracker(
     monkeypatch.setattr(checkpointing, "get_args", lambda: args)
     monkeypatch.setattr(checkpointing, "unwrap_model", lambda value: value)
     monkeypatch.setattr(
-        checkpointing, "_otel_managed_span", lambda *a, **k: contextlib.nullcontext()
+        checkpointing._otel, "managed_span", lambda *a, **k: contextlib.nullcontext()
     )
     monkeypatch.setattr(
         checkpointing,

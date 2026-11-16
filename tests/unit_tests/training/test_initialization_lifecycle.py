@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from megatron.core.distributed import TorchFullyShardedDataParallelConfig
+from megatron.core.telemetry import telemetry as telemetry_shim
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig
 from megatron.training import arguments, global_vars, initialize
@@ -42,6 +43,8 @@ from megatron.training.vocab_utils import (
     calculate_padded_vocab_size,
     model_vocab_size,
 )
+
+_REAL_SET_TELEMETRY = global_vars._set_telemetry
 
 
 @pytest.fixture
@@ -656,12 +659,11 @@ def test_training_batch_topology_uses_model_config(
         "_set_train_state",
     ):
         monkeypatch.setattr(global_vars, name, Mock())
-    monkeypatch.setattr(global_vars, "_detect_gpu_identity", Mock(return_value={}))
+    # Run the real telemetry hook and capture the finalized arguments it hands to the shim.
     telemetry = []
+    monkeypatch.setattr(global_vars, "_set_telemetry", _REAL_SET_TELEMETRY)
     monkeypatch.setattr(
-        global_vars,
-        "_set_telemetry",
-        lambda args, **kwargs: telemetry.append(global_vars.build_telemetry_resource_attrs(args)),
+        telemetry_shim, "setup", lambda telemetry_args, **kwargs: telemetry.append(telemetry_args)
     )
     run_config.finalize()
     global_vars.initialize_runtime_services(args, build_tokenizer=False, training=True)
@@ -675,13 +677,12 @@ def test_training_batch_topology_uses_model_config(
         == run_config.model.transformer.context_parallel_size
     )
     assert microbatches.call_args.kwargs['data_parallel_size'] == expected_batch
-    assert telemetry[0]['dl.data_parallel.size'] == expected_dp
-    assert telemetry[0]['dl.tensor_parallel.size'] == 2
-    assert telemetry[0]['megatron.hidden_size'] == 32
-    assert telemetry[0]['dl.batch_size'] == run_config.train.global_batch_size
-    assert telemetry[0]['megatron.micro_batch_size'] == 2
-    assert telemetry[0]['megatron.train_iters'] == 10
-    assert telemetry[0] == global_vars.build_telemetry_resource_attrs(args)
+    assert len(telemetry) == 1
+    assert telemetry[0].data_parallel_size == expected_dp
+    assert telemetry[0].tensor_model_parallel_size == 2
+    assert telemetry[0].global_batch_size == run_config.train.global_batch_size
+    assert telemetry[0].micro_batch_size == 2
+    assert telemetry[0].train_iters == 10
 
     # Explicit layout inspection must not depend on the actual launch or mutate the config.
     monkeypatch.setattr(

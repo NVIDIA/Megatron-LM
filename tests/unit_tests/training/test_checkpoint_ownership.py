@@ -477,7 +477,6 @@ def test_async_finalization_follows_the_section(monkeypatch, run_config, namespa
     monkeypatch.setattr(async_utils, "get_args", lambda: args, raising=False)
     queue = Mock()
     monkeypatch.setattr(async_utils, "_async_calls_queue", queue)
-    monkeypatch.setattr(async_utils, "_tag_current_span_call_idx", Mock())
     monkeypatch.setattr(async_utils, "is_empty_async_queue", lambda: True)
     async_utils.maybe_finalize_async_save(blocking=False)
     assert queue.maybe_finalize_async_calls.called is async_save

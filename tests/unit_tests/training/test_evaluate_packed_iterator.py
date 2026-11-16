@@ -80,7 +80,7 @@ def test_evaluate_stops_cleanly_when_packed_iterator_runs_out(monkeypatch, compl
         ),
         mock.patch.object(training_mod, "is_pp_last_stage", return_value=True),
         mock.patch.object(training_mod, "has_nvidia_modelopt", False),
-        mock.patch.object(training_mod, "_otel_managed_span", return_value=mock.MagicMock()),
+        mock.patch.object(training_mod._otel, "managed_span", return_value=mock.MagicMock()),
         mock.patch.object(training_mod, "wrap_data_iterator", side_effect=schedules),
     ):
         _, _, exited = training_mod.evaluate(
