@@ -135,7 +135,8 @@ def _selective_scan_update_kernel(
     BLOCK_SIZE_DSTATE: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
-    pid_b = tl.program_id(axis=1)
+    # int64: batch * stride_x_batch (and dt, z, out) can exceed 2^31 elements on large steps.
+    pid_b = tl.program_id(axis=1).to(tl.int64)
     pid_h = tl.program_id(axis=2)
 
     offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)

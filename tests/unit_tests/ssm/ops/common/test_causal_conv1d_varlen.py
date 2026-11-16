@@ -269,3 +269,31 @@ class TestCausalConv1dVarlenCarryStates:
             torch.randn(0, 3, device="cuda"), cu_seqlens, previous
         )
         torch.testing.assert_close(got, previous)
+
+
+def test_step_past_2pow31_elements():
+    """Requests at and past element 2**31 of a step match the same requests stepped alone.
+
+    32768 tokens of 66560 channels are 2,181,038,080 elements, so a 32-bit `token * conv_dim`
+    offset wraps from token 32264 on. The step and its output hold 4 GiB of GPU memory each.
+    """
+    torch.cuda.empty_cache()
+    if torch.cuda.mem_get_info()[0] < 10 << 30:
+        pytest.skip("not enough free GPU memory")
+    torch.manual_seed(0)
+    conv_dim, d_conv, dtype = 66560, 4, torch.bfloat16
+    # The second request crosses element 2**31 and the third starts past it.
+    bounds = [0, 32000, 32500, 32768]
+    x = torch.randn(bounds[-1], conv_dim, dtype=dtype, device="cuda")
+    weight = torch.randn(conv_dim, d_conv, dtype=dtype, device="cuda")
+    bias = torch.randn(conv_dim, dtype=dtype, device="cuda")
+    cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device="cuda")
+    states = torch.randn(3, conv_dim, d_conv, dtype=dtype, device="cuda")
+    tail, tail_seqlens = slice(bounds[1], None), cu_seqlens[1:] - bounds[1]
+
+    out = causal_conv1d_varlen_fn(x, weight, bias, cu_seqlens, states[:, :, 1:])
+    ref = causal_conv1d_varlen_fn(x[tail], weight, bias, tail_seqlens, states[1:, :, 1:])
+    torch.testing.assert_close(out[tail], ref, atol=1e-2, rtol=1e-2)
+
+    got = causal_conv1d_varlen_carry_states(x, cu_seqlens, states)
+    torch.testing.assert_close(got[1:], _carry_reference(x[tail], tail_seqlens, states[1:]))

@@ -110,23 +110,24 @@ def merge_16x16_to_64x64_inverse_kernel(
     b_Ai_33 = -tl.where(m_A, b_Ai_33, 0)
     b_Ai_44 = -tl.where(m_A, b_Ai_44, 0)
 
+    # int64: row * H * BT can exceed 2^31 elements of A within one long sequence.
     for i in range(2, min(16, T - i_t * BT)):
-        b_a_11 = -tl.load(A + (i_t * BT + i) * H * BT + o_i)
+        b_a_11 = -tl.load(A + (i_t * BT + i).to(tl.int64) * H * BT + o_i)
         b_a_11 = tl.where(o_i < i, b_a_11, 0.0)
         b_a_11 += tl.sum(b_a_11[:, None] * b_Ai_11, 0)
         b_Ai_11 = tl.where((o_i == i)[:, None], b_a_11, b_Ai_11)
     for i in range(16 + 2, min(32, T - i_t * BT)):
-        b_a_22 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 16)
+        b_a_22 = -tl.load(A + (i_t * BT + i).to(tl.int64) * H * BT + o_i + 16)
         b_a_22 = tl.where(o_i < i - 16, b_a_22, 0.0)
         b_a_22 += tl.sum(b_a_22[:, None] * b_Ai_22, 0)
         b_Ai_22 = tl.where((o_i == i - 16)[:, None], b_a_22, b_Ai_22)
     for i in range(32 + 2, min(48, T - i_t * BT)):
-        b_a_33 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 32)
+        b_a_33 = -tl.load(A + (i_t * BT + i).to(tl.int64) * H * BT + o_i + 32)
         b_a_33 = tl.where(o_i < i - 32, b_a_33, 0.0)
         b_a_33 += tl.sum(b_a_33[:, None] * b_Ai_33, 0)
         b_Ai_33 = tl.where((o_i == i - 32)[:, None], b_a_33, b_Ai_33)
     for i in range(48 + 2, min(64, T - i_t * BT)):
-        b_a_44 = -tl.load(A + (i_t * BT + i) * H * BT + o_i + 48)
+        b_a_44 = -tl.load(A + (i_t * BT + i).to(tl.int64) * H * BT + o_i + 48)
         b_a_44 = tl.where(o_i < i - 48, b_a_44, 0.0)
         b_a_44 += tl.sum(b_a_44[:, None] * b_Ai_44, 0)
         b_Ai_44 = tl.where((o_i == i - 48)[:, None], b_a_44, b_Ai_44)

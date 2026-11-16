@@ -59,7 +59,8 @@ def causal_conv1d_update_kernel(
     SILU_ACTIVATION: tl.constexpr,
 ):
     """Triton implementation of causal_conv1d_update (kernel)."""
-    batch_id = tl.program_id(0)
+    # int64: batch * x_b_stride and batch * out_b_stride can exceed 2^31 elements on large steps.
+    batch_id = tl.program_id(0).to(tl.int64)
     channel_block_id = tl.program_id(1)
 
     channel_offsets = channel_block_id * BLOCK_DIM + tl.arange(0, BLOCK_DIM)

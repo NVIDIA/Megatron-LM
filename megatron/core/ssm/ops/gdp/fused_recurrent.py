@@ -85,7 +85,8 @@ def fused_recurrent_gated_delta_rule_fwd_kernel(
     COMPACT_OUTPUT: tl.constexpr = False,
 ):
     """Walk one sequence token by token, carrying the `[K, V]` state."""
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    # int64: (request * T * H + head) * K can exceed 2^31 elements of q, k, v or o.
+    i_v, i_nh = tl.program_id(0), tl.program_id(1).to(tl.int64)
     i_n, i_hv = i_nh // HV, i_nh % HV
     i_h = i_hv // (HV // H)
 

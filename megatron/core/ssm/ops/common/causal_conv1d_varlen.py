@@ -79,9 +79,10 @@ def _causal_conv1d_varlen_kernel(
         in_seq = src >= req_start  # (BLOCK_T,) — True if source is within the sequence
 
         # Load from x for in-sequence positions (mask out out-of-bounds)
+        # int64: token * conv_dim can exceed 2^31 elements on a large packed step.
         src_safe = tl.maximum(src, 0)
         x_val = tl.load(
-            x_ptr + src_safe[:, None] * conv_dim + c_off[None, :],
+            x_ptr + src_safe.to(tl.int64)[:, None] * conv_dim + c_off[None, :],
             mask=t_mask[:, None] & c_mask[None, :] & in_seq[:, None],
             other=0.0,
         ).to(
@@ -117,7 +118,7 @@ def _causal_conv1d_varlen_kernel(
 
     # Store output (cast back to input dtype)
     tl.store(
-        out_ptr + t_off[:, None] * conv_dim + c_off[None, :],
+        out_ptr + t_off.to(tl.int64)[:, None] * conv_dim + c_off[None, :],
         result,
         mask=t_mask[:, None] & c_mask[None, :],
     )
@@ -316,7 +317,8 @@ def _causal_conv1d_carry_states_kernel(
     over `D_CONV`, so the index arithmetic lands in registers and needs no
     precomputed plan.
     """
-    pid_req = tl.program_id(0)
+    # int64: request * state stride and token * x stride can exceed 2^31 elements.
+    pid_req = tl.program_id(0).to(tl.int64)
     pid_c = tl.program_id(1)
 
     c_off = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
@@ -340,7 +342,7 @@ def _causal_conv1d_carry_states_kernel(
         token = start + offset
         token_ok = (token >= 0) & (token < total_tokens)
         slice_val = tl.load(
-            x_ptr + tl.maximum(token, 0) * x_stride_token + c_off * x_stride_dim,
+            x_ptr + tl.maximum(token, 0).to(tl.int64) * x_stride_token + c_off * x_stride_dim,
             mask=c_mask & token_ok,
             other=0.0,
         )

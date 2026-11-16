@@ -76,7 +76,8 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
     IS_VARLEN: tl.constexpr,
 ):
     """Sweep one sequence's chunks, carrying the `[K, V]` state in registers."""
-    i_v, i_nh = tl.program_id(0), tl.program_id(1)
+    # int64: (token * H + head) * K and request * K * V can exceed 2^31 elements on large steps.
+    i_v, i_nh = tl.program_id(0), tl.program_id(1).to(tl.int64)
     i_n, i_h = i_nh // H, i_nh % H
     if IS_VARLEN:
         bos = tl.load(cu_seqlens + i_n).to(tl.int32)
@@ -139,7 +140,7 @@ def chunk_gated_delta_product_fwd_kernel_h_blockdim64(
     # main recurrence
     for i_t in range(NT):
         if i_t % num_householder == 0:
-            i_t_true = i_t // num_householder
+            i_t_true = (i_t // num_householder).to(tl.int64)
             p_h1 = tl.make_block_ptr(
                 h + i_t_true * stride_h, (K, V), (V, 1), (0, i_v * BV), (64, BV), (1, 0)
             )

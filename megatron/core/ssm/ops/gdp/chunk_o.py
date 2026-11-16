@@ -74,7 +74,8 @@ def chunk_fwd_kernel_o(
     IS_VARLEN: tl.constexpr,
 ):
     """Emit one chunk of output from the chunk-boundary state plus local attention."""
-    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    # int64: (token * H + head) * K can exceed 2^31 elements of q, k, v or o on large steps.
+    i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2).to(tl.int64)
     i_b, i_h = i_bh // H, i_bh % H
 
     if IS_VARLEN:
