@@ -130,7 +130,9 @@ def test_packed_training_and_serving(canonical_mixer):
         slots = torch.tensor([2, 0], device='cuda', dtype=torch.int32)
         context = SimpleNamespace(
             mamba_slot_allocator=None,
-            mamba_metadata=SimpleNamespace(cu_seqlens=cu, batch_indices_prefill=slots),
+            mamba_metadata=SimpleNamespace(
+                cu_seqlens=cu, batch_indices_prefill=slots, intermediate_ssm_out=None
+            ),
         )
         projected = mixer.in_proj(x.detach())[0]
         actual = mixer.out_proj(mixer.ssm_prefill(projected, conv, state, context))[0]

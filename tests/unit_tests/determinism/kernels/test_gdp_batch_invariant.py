@@ -200,3 +200,113 @@ def test_packed_convolution_gradients(with_bias):
         torch.testing.assert_close(
             value.float(), target.to(value.dtype).float(), rtol=0.02, atol=0.02
         )
+
+
+@pytest.mark.parametrize("updates,block_size", [(1, 32), (3, 16), (3, 32)])
+def test_packed_prefix_snapshots_and_restore(updates, block_size):
+    """Snapshots preserve partial blocks and remain valid when graph hit counts change."""
+    from megatron.core.ssm.ops.gdp.batch_invariant import append_packed
+    from tests.unit_tests.ssm.test_gdp_batch_invariant_recurrence import inputs as recurrence_inputs
+
+    prefix = recurrence_inputs(2, 7, 2, 32, 32, updates)
+    xs = recurrence_inputs(1, 84, 2, 32, 32, updates)
+    future = recurrence_inputs(1, 1, 2, 32, 32, updates)
+    cache = GDPCache.allocate(3, 2, 32, 32, block_size=block_size)
+    slots = torch.tensor([2, 0], device="cuda", dtype=torch.int32)
+    append(*(x[:1, :5].contiguous() for x in prefix), cache, slots=slots[:1])
+    append(*(x[1:].contiguous() for x in prefix), cache, slots=slots[1:])
+    original = cache.snapshot(torch.arange(3, device="cuda"))
+    cu = torch.tensor([0, 35, 84], device="cuda", dtype=torch.int32)
+    ends = [1, 13, 35, 36, 64, 84]
+    positions = torch.tensor(ends, device="cuda", dtype=torch.int32)
+    count = torch.zeros(1, device="cuda", dtype=torch.int32)
+    storage = torch.full(
+        (len(ends), GDPCache.storage_size(2, 32, 32, block_size)),
+        9.0,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    snapshots = GDPCache.from_storage(storage, 2, 32, 32, block_size)
+
+    def forward():
+        return append_packed(
+            *xs,
+            cache,
+            cu,
+            slots,
+            snapshots=snapshots,
+            snapshot_positions=positions,
+            snapshot_count=count,
+        )
+
+    expected = forward().clone()
+    cache.restore(torch.arange(3, device="cuda"), original)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = forward()
+    cache.restore(torch.arange(3, device="cuda"), original)
+    count.fill_(len(ends))
+    graph.replay()
+    exact(output, expected)
+    for index, end in enumerate(ends):
+        lane = 0 if end <= 35 else 1
+        start, prefix_length = (0, 5) if lane == 0 else (35, 7)
+        history = tuple(
+            torch.cat([p[lane : lane + 1, :prefix_length], x[:, start:end]], 1).contiguous()
+            for p, x in zip(prefix, xs)
+        )
+        _, reference = prefill(*history, block_size=block_size)
+        for actual, target in zip(snapshots.tensors(), reference.tensors()):
+            exact(actual[index : index + 1], target)
+        restored = GDPCache.allocate(1, 2, 32, 32, block_size=block_size)
+        restored.restore(
+            torch.tensor([0], device="cuda"),
+            snapshots.snapshot(torch.tensor([index], device="cuda")),
+        )
+        resumed = append(*future, restored)
+        complete, _ = prefill(
+            *(
+                torch.cat([past, next_token], 1).contiguous()
+                for past, next_token in zip(history, future)
+            ),
+            block_size=block_size,
+        )
+        exact(resumed, complete[:, -1:])
+    cache.restore(torch.arange(3, device="cuda"), original)
+    count.zero_()
+    storage.fill_(9.0)
+    graph.replay()
+    exact(output, expected)
+    exact(storage, torch.full_like(storage, 9.0))
+
+
+def test_convolution_more_than_65535_rows():
+    """The launch grid must support the token counts produced by batched long sequences."""
+    x = torch.ones(2, 32769, 17, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.ones(17, 4, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    output = causal_conv(x, weight)
+    expected = torch.full_like(output, torch.nn.functional.silu(torch.tensor(4.0)).item())
+    for token in range(3):
+        expected[:, token].fill_(torch.nn.functional.silu(torch.tensor(float(token + 1))).item())
+    exact(output, expected)
+    dx, dw = torch.autograd.grad(output.sum(), (x, weight))
+    assert torch.isfinite(dx).all() and torch.isfinite(dw).all()
+    exact(dx[:1], dx[1:])
+
+
+def test_cache_offsets_beyond_int32():
+    """Slot indexing must promote before multiplying a large cache row stride."""
+    from tests.unit_tests.ssm.test_gdp_batch_invariant_recurrence import inputs as recurrence_inputs
+
+    if torch.cuda.mem_get_info()[0] < 12 * 2**30:
+        pytest.skip("Large-offset regression requires 12 GiB of free GPU memory")
+    slot = 2**31 // (128 * 128)
+    cache = GDPCache.allocate(slot + 1, 1, 128, 128)
+    reference = GDPCache.allocate(1, 1, 128, 128)
+    xs = recurrence_inputs(1, 7, 1, 128, 128, 3)
+    indices = torch.tensor([slot], device="cuda", dtype=torch.int32)
+    expected = append(*xs, reference)
+    actual = append(*xs, cache, slots=indices)
+    exact(actual, expected)
+    for value, target in zip(cache.tensors(), reference.tensors()):
+        exact(value[slot : slot + 1], target)

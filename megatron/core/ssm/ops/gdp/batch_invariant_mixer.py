@@ -4,6 +4,7 @@
 
 import torch
 
+from megatron.core.ssm.ops.common.intermediate_extraction import scatter_intermediate_conv
 from megatron.core.ssm.ops.gdp.batch_invariant import (
     GDPCache,
     append,
@@ -42,10 +43,30 @@ def _cache(mixer, storage):
     )
 
 
-def _prepare(mixer, zvkqba, conv_state=None, slots=None, cu=None, *, runtime_cp):
+def _prepare(
+    mixer,
+    zvkqba,
+    conv_state=None,
+    slots=None,
+    cu=None,
+    *,
+    runtime_cp,
+    snapshot_metadata=None,
+    conv_snapshots=None,
+):
     from fla.modules.l2norm import l2_norm
 
     z, x, ba = mixer._preprocess(zvkqba, runtime_cp=runtime_cp)
+    if conv_snapshots is not None:
+        # Engine extraction offsets align to the SSM chunk quantum (>=64),
+        # so each four-token history is contained in this request's current slice.
+        scatter_intermediate_conv(
+            x,
+            snapshot_metadata.intermediate_abs_positions,
+            snapshot_metadata.intermediate_real_count,
+            conv_snapshots,
+            mixer.d_conv,
+        )
     x = causal_conv(
         x.contiguous(),
         runtime_cp.helper.get_conv1d_weight(),
@@ -158,14 +179,33 @@ def decode(
 
 def packed_prefill(mixer, projected, conv_state, ssm_state, context):
     """Run graph-safe packed prefill, including continuation of partial GDP blocks."""
-    if context.mamba_slot_allocator is not None:
-        raise NotImplementedError('Canonical GDP serving requires prefix caching disabled')
     runtime_cp = mixer._resolve_runtime_cp(None)
     metadata = context.mamba_metadata
     slots = metadata.batch_indices_prefill
     cu = metadata.cu_seqlens
+    snapshots = None
+    conv_snapshots = None
+    if metadata.intermediate_ssm_out is not None:
+        layer = context.layer_map[mixer.layer_number - mixer.pp_layer_offset - 1]
+        snapshots = _cache(mixer, metadata.intermediate_ssm_out[layer])
+        conv_snapshots = metadata.intermediate_conv_out[layer]
     z, xs = _prepare(
-        mixer, projected, conv_state=conv_state, slots=slots, cu=cu, runtime_cp=runtime_cp
+        mixer,
+        projected,
+        conv_state=conv_state,
+        slots=slots,
+        cu=cu,
+        runtime_cp=runtime_cp,
+        snapshot_metadata=metadata,
+        conv_snapshots=conv_snapshots,
     )
-    core = append_packed(*xs, _cache(mixer, ssm_state), cu, slots)
+    core = append_packed(
+        *xs,
+        _cache(mixer, ssm_state),
+        cu,
+        slots,
+        snapshots=snapshots,
+        snapshot_positions=metadata.intermediate_abs_positions if snapshots is not None else None,
+        snapshot_count=metadata.intermediate_real_count if snapshots is not None else None,
+    )
     return mixer._postprocess(core, z, runtime_cp=runtime_cp)

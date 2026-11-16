@@ -50,11 +50,13 @@ def _conv_forward(
     SAVE_PREACTIVATION: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    channel = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    row = tl.program_id(1)
+    program = tl.program_id(0).to(tl.int64)
+    channel_blocks: tl.constexpr = triton.cdiv(D, BLOCK)
+    channel = (program % channel_blocks) * BLOCK + tl.arange(0, BLOCK)
+    row = program // channel_blocks
     valid = channel < D
     seq, start, end = _sequence_bounds(row, T, Cu, VARLEN, SEQUENCES)
-    slot = tl.load(Slots + seq)
+    slot = tl.load(Slots + seq).to(tl.int64)
     if slot < 0:
         tl.store(Y + row * D + channel, 0.0, valid)
         if SAVE_PREACTIVATION:
@@ -93,8 +95,8 @@ def _conv_update(
     VARLEN: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    seq = tl.program_id(0)
-    slot = tl.load(Slots + seq)
+    seq = tl.program_id(0).to(tl.int64)
+    slot = tl.load(Slots + seq).to(tl.int64)
     if slot < 0:
         return
     if VARLEN:
@@ -125,8 +127,10 @@ def _conv_dx(
     SEQUENCES: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
-    channel = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    row = tl.program_id(1)
+    program = tl.program_id(0).to(tl.int64)
+    channel_blocks: tl.constexpr = triton.cdiv(D, BLOCK)
+    channel = (program % channel_blocks) * BLOCK + tl.arange(0, BLOCK)
+    row = program // channel_blocks
     valid = channel < D
     seq, start, end = _sequence_bounds(row, T, Cu, VARLEN, SEQUENCES)
     dx = tl.full((BLOCK,), 0.0, tl.float32)
@@ -152,7 +156,7 @@ def _conv_dw(
     CHANNELS: tl.constexpr,
 ):
     channel = tl.program_id(0) * CHANNELS + tl.arange(0, CHANNELS)
-    part = tl.program_id(1)
+    part = tl.program_id(1).to(tl.int64)
     row = part * ROWS + tl.arange(0, ROWS)
     valid = (row[:, None] < N) & (channel[None, :] < D)
     dp = tl.load(DP + row[:, None] * D + channel[None, :], valid, other=0)
@@ -202,7 +206,7 @@ def _forward(x, weight, bias, initial, slots, cu, *, save_preactivation=False):
         raise ValueError("Convolution cache must be contiguous BF16 [slots,channels,4]")
     y = torch.empty_like(x)
     p = torch.empty_like(x, dtype=torch.float32) if save_preactivation else None
-    _conv_forward[(triton.cdiv(d, 128), b * t)](
+    _conv_forward[(triton.cdiv(d, 128) * b * t,)](
         x,
         weight,
         weight if bias is None else bias,
@@ -245,7 +249,7 @@ class _Conv(torch.autograd.Function):
         dp = (dy.float() * sigmoid * (1.0 + p * (1.0 - sigmoid))).contiguous()
         dx = torch.empty_like(x)
         sequences = b if cu is None else cu.numel() - 1
-        _conv_dx[(triton.cdiv(d, 128), b * t)](
+        _conv_dx[(triton.cdiv(d, 128) * b * t,)](
             dp,
             weight,
             x if cu is None else cu,

@@ -1426,7 +1426,8 @@ class GatedDeltaProductMixer(SSMDynamicInferenceMixin, MegatronModule, TwoStageA
             intermediate_ssm_out = metadata.intermediate_ssm_out[gdp_layer_idx]
             intermediate_conv_out = metadata.intermediate_conv_out[gdp_layer_idx]
 
-        # The batch-invariant path returns above and rejects prefix caching.
+        # The batch-invariant path above captures its complete cache directly;
+        # this extraction indexes the native GDP chunk-state layout.
         extract_intermediates = (
             intermediate_ssm_out is not None and metadata.gdp_intermediate_chunk_indices is not None
         )

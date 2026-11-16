@@ -1,8 +1,8 @@
 # Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
-# The modules in this package are forked from the Gated Delta Product kernels
-# in flash-linear-attention v0.5.1
+# The native inference modules in this package are forked from the Gated Delta
+# Product kernels in flash-linear-attention v0.5.1
 # (https://github.com/fla-org/flash-linear-attention), licensed under the MIT
 # license. See the LICENSE file in the repository root.
 
@@ -10,9 +10,9 @@
 `flash-linear-attention <https://github.com/fla-org/flash-linear-attention>`_
 (v0.5.1).
 
-Training and the static-batching inference path call the pip
-`flash-linear-attention` kernels, which own the backward pass. Only the
-dynamic-batching decode and prefill steps route here:
+With batch-invariant mode disabled, training and static-batching inference call
+the pip `flash-linear-attention` kernels, which own the backward pass. The native
+dynamic-batching decode and prefill steps use this package's fork:
 
 * `fused_recurrent_gated_delta_rule_update` -- decode (shared with GDN, whose
   gate and beta sigmoid it can apply in-kernel).
@@ -20,7 +20,9 @@ dynamic-batching decode and prefill steps route here:
 * `chunk_gated_delta_product_varlen` -- prefill.
 * `gdp_prefill_prepare` -- the reshape/gating step feeding prefill.
 
-All entry points are forward-only.
+These native entry points are forward-only. The independently implemented
+``batch_invariant*`` modules provide the opt-in shared training/inference
+arithmetic, including its backward pass and complete prefix-cache snapshots.
 """
 
 from .chunk import chunk_gated_delta_product_varlen

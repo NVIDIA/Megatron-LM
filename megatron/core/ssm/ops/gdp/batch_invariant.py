@@ -107,7 +107,7 @@ def _prepare(
     K, G, Beta, Trans, Prefix, N, H: tl.constexpr, D: tl.constexpr, R: tl.constexpr, C: tl.constexpr
 ):
     block = tl.program_id(0)
-    bh = tl.program_id(1)
+    bh = tl.program_id(1).to(tl.int64)
     batch, head = bh // H, bh % H
     cs = tl.arange(0, C)
     ds = tl.arange(0, D)
@@ -128,6 +128,53 @@ def _prepare(
     ti = (batch * tl.cdiv(N * R, C) + block) * H + head
     tl.store(Prefix + ti * C + cs, p)
     tl.store(Trans + ti * C * C + cs[:, None] * C + cs[None, :], factor)
+
+
+@triton.jit
+def _store_cache(
+    cache,
+    strides: tl.constexpr,
+    slot,
+    head,
+    state,
+    keys,
+    gates,
+    factor,
+    rhs,
+    pos,
+    C: tl.constexpr,
+    D: tl.constexpr,
+    W: tl.constexpr,
+    BV: tl.constexpr,
+):
+    State, Keys, Gates, Factors, Rhs, Cursor = cache
+    SS: tl.constexpr = strides[0]
+    KS: tl.constexpr = strides[1]
+    GS: tl.constexpr = strides[2]
+    FS: tl.constexpr = strides[3]
+    HS: tl.constexpr = strides[4]
+    CS: tl.constexpr = strides[5]
+    cs, ds = tl.arange(0, C), tl.arange(0, D)
+    vs = tl.program_id(1) * BV + tl.arange(0, BV)
+    # Cache slabs can exceed 2**31 elements; promote before stride products.
+    slot = slot.to(tl.int64)
+    tl.store(State + slot * SS + head * D * W + ds[:, None] * W + vs[None, :], state)
+    valid = cs < pos
+    if tl.program_id(1) == 0:
+        tl.store(
+            Keys + slot * KS + head * C * D + cs[:, None] * D + ds[None, :],
+            tl.where(valid[:, None], keys, 0.0),
+        )
+        tl.store(Gates + slot * GS + head * C + cs, tl.where(valid, gates, 0.0))
+        tl.store(
+            Factors + slot * FS + head * C * C + cs[:, None] * C + cs[None, :],
+            tl.where(valid[:, None], factor, 0.0),
+        )
+        tl.store(Cursor + slot * CS + head, pos)
+    tl.store(
+        Rhs + slot * HS + head * C * W + cs[:, None] * W + vs[None, :],
+        tl.where(valid[:, None], rhs, 0.0),
+    )
 
 
 @triton.jit(do_not_specialize=["N"])
@@ -151,6 +198,11 @@ def _forward(
     TapeU,
     Prefix,
     Cu,
+    Snapshots,
+    SnapshotPositions,
+    SnapshotCount,
+    SNAPSHOT_STRIDES: tl.constexpr,
+    CAPTURE: tl.constexpr,
     SS: tl.constexpr,
     KS: tl.constexpr,
     GS: tl.constexpr,
@@ -170,15 +222,15 @@ def _forward(
     VARLEN: tl.constexpr,
     BV: tl.constexpr,
 ):
-    bh = tl.program_id(0)
+    bh = tl.program_id(0).to(tl.int64)
     batch, head = bh // H, bh % H
     if VARLEN:
-        input_start = tl.load(Cu + batch)
+        input_start = tl.load(Cu + batch).to(tl.int64)
         count = tl.load(Cu + batch + 1) - input_start
     else:
         input_start = batch * N
         count = N
-    slot = tl.load(Slots + batch)
+    slot = tl.load(Slots + batch).to(tl.int64)
     if slot < 0:
         for token in range(count):
             tl.store(O + ((input_start + token) * H + head) * W + tl.arange(0, W), 0.0)
@@ -192,21 +244,41 @@ def _forward(
     if PREPARED:
         # Prepared scans start at a fresh block boundary. Value tiles own
         # disjoint state/RHS columns; their shared cache fields have one writer.
-        pos = 0
+        pos = tl.full((), 0, tl.int64)
         keys = tl.full((C, D), 0.0, tl.bfloat16)
         gates = tl.full((C,), 0.0, tl.float32)
         factor = tl.full((C, C), 0.0, tl.bfloat16)
         rhs = tl.full((C, BV), 0.0, tl.bfloat16)
     else:
-        pos = tl.load(Cursor + slot * CS + sh)
+        pos = tl.load(Cursor + slot * CS + sh).to(tl.int64)
         keys = tl.load(Keys + slot * KS + sh * C * D + cs[:, None] * D + ds[None, :])
         gates = tl.load(Gates + slot * GS + sh * C + cs)
         factor = tl.load(Factors + slot * FS + sh * C * C + cs[:, None] * C + cs[None, :])
         rhs = tl.load(Rhs + slot * HS + sh * C * W + cs[:, None] * W + vs[None, :])
-    offset = 0
+    if CAPTURE:
+        real_count = tl.load(SnapshotCount)
+        lo, hi = 0, real_count
+        while lo < hi:
+            mid = (lo + hi) // 2
+            position = tl.load(SnapshotPositions + mid)
+            after = position > input_start
+            hi = tl.where(after, mid, hi)
+            lo = tl.where(after, lo, mid + 1)
+        snapshot_index = lo
+        snapshot_position = tl.load(
+            SnapshotPositions + snapshot_index, snapshot_index < real_count, other=0
+        )
+        snapshot_end = tl.where(
+            (snapshot_index < real_count) & (snapshot_position <= input_start + count),
+            (snapshot_position - input_start) * R,
+            count * R + 1,
+        )
+    offset = tl.full((), 0, tl.int64)
     block = 0
     while offset < count * R:
         take = tl.minimum(C - pos, count * R - offset)
+        if CAPTURE:
+            take = tl.minimum(take, snapshot_end - offset)
         end = pos + take
         new = (cs >= pos) & (cs < end)
         old = cs < pos
@@ -273,30 +345,54 @@ def _forward(
             last = tl.sum(tl.where(cs == C - 1, p, 0.0), 0)
             f = (keys.to(tl.float32) * tl.exp(last - p)[:, None]).to(tl.bfloat16)
             state = state * tl.exp(last) + tl.dot(tl.trans(f), u)
-            pos = 0
+            pos = tl.full((), 0, tl.int64)
         else:
             pos = end
         offset += take
         block += 1
-    tl.store(State + so, state)
-    # Clear invalid tails so slot reuse and exact cache comparison are unambiguous.
-    valid = cs < pos
-    if tl.program_id(1) == 0:
-        tl.store(
-            Keys + slot * KS + sh * C * D + cs[:, None] * D + ds[None, :],
-            tl.where(valid[:, None], keys, 0.0),
-        )
-        tl.store(Gates + slot * GS + sh * C + cs, tl.where(valid, gates, 0.0))
-        tl.store(
-            Factors + slot * FS + sh * C * C + cs[:, None] * C + cs[None, :],
-            tl.where(valid[:, None], factor, 0.0),
-        )
-    tl.store(
-        Rhs + slot * HS + sh * C * W + cs[:, None] * W + vs[None, :],
-        tl.where(valid[:, None], rhs, 0.0),
+        if CAPTURE:
+            if offset == snapshot_end:
+                _store_cache(
+                    Snapshots,
+                    SNAPSHOT_STRIDES,
+                    snapshot_index,
+                    head,
+                    state,
+                    keys,
+                    gates,
+                    factor,
+                    rhs,
+                    pos,
+                    C,
+                    D,
+                    W,
+                    BV,
+                )
+                snapshot_index += 1
+                snapshot_position = tl.load(
+                    SnapshotPositions + snapshot_index, snapshot_index < real_count, other=0
+                )
+                snapshot_end = tl.where(
+                    (snapshot_index < real_count) & (snapshot_position <= input_start + count),
+                    (snapshot_position - input_start) * R,
+                    count * R + 1,
+                )
+    _store_cache(
+        (State, Keys, Gates, Factors, Rhs, Cursor),
+        (SS, KS, GS, FS, HS, CS),
+        slot,
+        head,
+        state,
+        keys,
+        gates,
+        factor,
+        rhs,
+        pos,
+        C,
+        D,
+        W,
+        BV,
     )
-    if tl.program_id(1) == 0:
-        tl.store(Cursor + slot * CS + sh, pos)
 
 
 @triton.jit(do_not_specialize=["N"])
@@ -315,7 +411,7 @@ def _outputs(
     C: tl.constexpr,
     SCALE: tl.constexpr,
 ):
-    block, bh = tl.program_id(0), tl.program_id(1)
+    block, bh = tl.program_id(0), tl.program_id(1).to(tl.int64)
     batch, head = bh // H, bh % H
     cs, ds, vs = tl.arange(0, C), tl.arange(0, D), tl.arange(0, W)
     row = block * C + cs
@@ -550,11 +646,38 @@ def _run(
     tape: bool = False,
     prepared: bool = False,
     cu_seqlens: torch.Tensor | None = None,
+    snapshots: GDPCache | None = None,
+    snapshot_positions: torch.Tensor | None = None,
+    snapshot_count: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...]]:
     requests = slots.numel() if cu_seqlens is not None else q.shape[0]
     b, t, h, d, w = _validate(q, k, v, g, beta, cache, slots, requests)
     if cu_seqlens is not None and (prepared or tape):
         raise ValueError("Packed inference uses the incremental path")
+    capture = snapshots is not None
+    if capture:
+        if cu_seqlens is None or prepared or tape:
+            raise ValueError("Prefix snapshots require packed incremental inference")
+        _validate(q, k, v, g, beta, snapshots, slots, requests)
+        if (
+            snapshot_positions is None
+            or snapshot_count is None
+            or snapshot_positions.ndim != 1
+            or snapshot_positions.dtype != torch.int32
+            or snapshot_positions.device != q.device
+            or not snapshot_positions.is_contiguous()
+            or snapshot_positions.numel() > snapshots.state.shape[0]
+            or snapshot_count.shape != (1,)
+            or snapshot_count.dtype != torch.int32
+            or snapshot_count.device != q.device
+            or not snapshot_count.is_contiguous()
+            or snapshots.keys.shape[2] != cache.keys.shape[2]
+        ):
+            raise ValueError(
+                "Prefix snapshots require matching cache and int32 CUDA positions/count"
+            )
+    elif snapshot_positions is not None or snapshot_count is not None:
+        raise ValueError("Snapshot positions/count require an output cache")
     c = cache.keys.shape[2]
     nb = triton.cdiv(t * k.shape[2], c)
     if tape or prepared:
@@ -586,6 +709,11 @@ def _run(
         tu,
         prefix,
         q if cu_seqlens is None else cu_seqlens,
+        cache.tensors() if snapshots is None else snapshots.tensors(),
+        q if snapshot_positions is None else snapshot_positions,
+        slots if snapshot_count is None else snapshot_count,
+        tuple(x.stride(0) for x in (cache if snapshots is None else snapshots).tensors()),
+        capture,
         *(x.stride(0) for x in cache.tensors()),
         t,
         h,
@@ -664,6 +792,9 @@ def append_packed(
     slots: torch.Tensor,
     *,
     scale: float | None = None,
+    snapshots: GDPCache | None = None,
+    snapshot_positions: torch.Tensor | None = None,
+    snapshot_count: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Append variable-length slices with device metadata, safe for CUDA graphs.
 
@@ -672,6 +803,12 @@ def append_packed(
     including zero-length slices, and unique active slot IDs (-1 is inactive).
     Slot IDs and offset *values* are a scheduler contract; they are not copied to
     the CPU for validation. Every slice resumes its own partial-block cursor.
+
+    Optional snapshots write complete cache rows at sorted packed token-end
+    positions. snapshot_count is a device int32 scalar; only that many entries
+    are read, allowing zero-hit CUDA graph warmup and changing hits on replay.
+    Positions belong to (sequence_start, sequence_end], and snapshot row i
+    corresponds to snapshot_positions[i]. Partial blocks are preserved.
     """
     if (
         q.shape[0] != 1
@@ -697,6 +834,9 @@ def append_packed(
         slots,
         scale=q.shape[-1] ** -0.5 if scale is None else scale,
         cu_seqlens=cu_seqlens,
+        snapshots=snapshots,
+        snapshot_positions=snapshot_positions,
+        snapshot_count=snapshot_count,
     )[0]
 
 
@@ -746,11 +886,11 @@ def _local_backward(
     SCALE: tl.constexpr,
     BV: tl.constexpr,
 ):
-    block, bh, part = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    block, bh, part = tl.program_id(0), tl.program_id(1).to(tl.int64), tl.program_id(2).to(tl.int64)
     batch, head = bh // H, bh % H
     cs, ds, vs = tl.arange(0, C), tl.arange(0, D), part * BV + tl.arange(0, BV)
     nb = tl.cdiv(N * R, C)
-    span = tl.num_programs(1)
+    span = tl.num_programs(1).to(tl.int64)
     ti = (batch * nb + block) * H + head
     DQ += part * span * N * D
     DK += part * span * N * R * D
@@ -865,7 +1005,7 @@ def _factor_backward(
     C: tl.constexpr,
     PARTS: tl.constexpr,
 ):
-    block, bh = tl.program_id(0), tl.program_id(1)
+    block, bh = tl.program_id(0), tl.program_id(1).to(tl.int64)
     batch, head = bh // H, bh % H
     cs, ds = tl.arange(0, C), tl.arange(0, D)
     row = block * C + cs
@@ -886,7 +1026,7 @@ def _factor_backward(
     dq = tl.full((C, D), 0.0, tl.float32)
     if PARTS > 1:
         dq = tl.load(DQPartial + qbase, qvalid, other=0)
-    span = tl.num_programs(1)
+    span = tl.num_programs(1).to(tl.int64)
     nb = tl.cdiv(N * R, C)
     for part in range(1, PARTS):
         dt += tl.load(DT + part * span * nb * C * C + ti * C * C + cs[:, None] * C + cs[None, :])
@@ -957,7 +1097,7 @@ def _state_backward(
     SCALE: tl.constexpr,
     BV: tl.constexpr,
 ):
-    bh = tl.program_id(0)
+    bh = tl.program_id(0).to(tl.int64)
     batch, head = bh // H, bh % H
     cs, ds, vs = (tl.arange(0, C), tl.arange(0, D), tl.program_id(1) * BV + tl.arange(0, BV))
     dstate = tl.load(DFinal + bh * D * W + ds[:, None] * W + vs[None, :])

@@ -100,6 +100,44 @@ def main() -> None:
                         row["decode_ms"] = do_bench_cudagraph(
                             lambda: bi.append(*one, cache), rep=100
                         )
+                        # Measure snapshot traffic separately from the packed scan.
+                        # Both calls continue the same live cache on every replay.
+                        if tokens >= 256:
+                            packed = tuple(
+                                x.reshape(1, batch * tokens, *x.shape[2:]) for x in detached
+                            )
+                            cu = torch.arange(batch + 1, device="cuda", dtype=torch.int32) * tokens
+                            slots = torch.arange(batch, device="cuda", dtype=torch.int32)
+                            positions = (
+                                (
+                                    cu[:-1, None]
+                                    + torch.arange(256, tokens + 1, 256, device="cuda")[None, :]
+                                )
+                                .flatten()
+                                .to(torch.int32)
+                            )
+                            snapshots = bi.GDPCache.allocate(
+                                positions.numel(), heads, key, value, block_size=block
+                            )
+                            count = torch.tensor(
+                                [positions.numel()], device="cuda", dtype=torch.int32
+                            )
+                            row["packed_append_ms"] = do_bench_cudagraph(
+                                lambda: bi.append_packed(*packed, cache, cu, slots), rep=100
+                            )
+                            row["prefix_snapshot_append_ms"] = do_bench_cudagraph(
+                                lambda: bi.append_packed(
+                                    *packed,
+                                    cache,
+                                    cu,
+                                    slots,
+                                    snapshots=snapshots,
+                                    snapshot_positions=positions,
+                                    snapshot_count=count,
+                                ),
+                                rep=100,
+                            )
+                            row["prefix_snapshot_interval_tokens"] = 256
                 results["cases"].append(row)
                 print(json.dumps(row), flush=True)
                 args.output.write_text(json.dumps(results, indent=2) + "\n")

@@ -600,6 +600,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         tests=(
             K + "test_gdp_batch_invariant.py",
             "tests/unit_tests/ssm/test_gdp_batch_invariant.py",
+            "tests/unit_tests/inference/engines/test_batch_invariant_mamba_prefix_caching.py",
         ),
         kind="dispatch",
         notes="Shared normalization, convolution, cache, and recurrence paths for the GDP mixer.",

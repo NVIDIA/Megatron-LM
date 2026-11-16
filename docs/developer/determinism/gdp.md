@@ -16,8 +16,10 @@ training throughput in the measured GB200 configuration; C16 has lower decode
 latency at the measured small batch sizes.
 
 The GDP path supports BF16, convolution width four, CP=1, and no sequence
-parallelism. CuTeDSL GDP, FP8/FP4, selective GDP recompute/offload, prefix caching,
-and speculative buffers are rejected. Whole-layer checkpointing is supported.
+parallelism. Dynamic prefix caching reuses the existing inference allocator,
+including chunked prefill and CUDA graph replay. CuTeDSL GDP, FP8/FP4, selective
+GDP recompute/offload, and speculative buffers are rejected. Whole-layer
+checkpointing is supported.
 Packed training currently pads sequences to a common length; padding overhead
 has not been optimized.
 
@@ -42,6 +44,14 @@ prefix inputs, inverse factors, RHS, and cursor. Save/restore and slot movement
 must preserve all six. Partial blocks remain in the cache across calls. The
 training API's returned boundary state alone cannot resume a partial block.
 Slot IDs must be unique and in range; `-1` denotes inactive incremental lanes.
+
+Prefix caching captures complete cache rows directly during the packed recurrence,
+plus the corresponding pre-convolution history. It does not reconstruct a state
+from native GDP chunk outputs. The existing allocator owns prefix lookup, eviction,
+restoration, and invalidation after weight refits. Snapshot positions and the real
+snapshot count live on the GPU so captured graphs can replay with different cache
+boundaries or no snapshots. The low-level API also preserves partial blocks at
+arbitrary token boundaries; engine prefix boundaries follow its block policy.
 
 The backward differentiates the saved rounded computation with straight-through
 cast derivatives. It uses a reverse state scan and blockwise triangular adjoint
@@ -74,7 +84,14 @@ uv run python -m torch.distributed.run --standalone --nproc-per-node=1 -m pytest
 The tests cover independent gradient oracles, correlated keys, multiple value
 tiles, exact uneven chunking through 8193 tokens, batch isolation, packed and
 static inference, allocator cache replay, and small hybrid-model logits/raw
-logprobs.
+logprobs. The engine prefix-cache regression additionally compares generated
+tokens and logprobs with uncached eager execution, checks actual skipped prefill
+tokens, and verifies invalidation after a weight refit:
+
+```bash
+uv run python -m torch.distributed.run --standalone --nproc-per-node=1 -m pytest -q \
+  tests/unit_tests/inference/engines/test_batch_invariant_mamba_prefix_caching.py -k gdp
+```
 
 Performance measurements should use prepared recurrence inputs, report forward,
 forward-plus-backward and decode separately, and distinguish CUDA-graph replay
@@ -87,7 +104,10 @@ an independent FP64 recurrence and check native repeat differences separately.
 The benchmark uses prepared BF16 recurrence inputs and CUDA graph replay, with
 native FLA, C16, and C32 on the same GPU. It records the recurrence source hash,
 software versions, training forward/backward, parallel prefill, incremental prompt
-append, and single-token decode latency. It does not measure projection, attention,
+append, and single-token decode latency. For prompts of at least 256 tokens it also
+compares packed append with and without complete prefix snapshots every 256
+tokens. These timings include snapshot writes, without prefix lookup or reuse.
+It does not measure projection, attention,
 or full-model throughput.
 
 ```bash
@@ -107,12 +127,12 @@ All entries below are forward plus backward in milliseconds.
 
 | Batch | Native FLA | Batch-invariant C16 | Batch-invariant C32 |
 | --- | ---: | ---: | ---: |
-| 1 | 2.18 | 4.59 | 3.19 |
-| 8 | 11.24 | 17.17 | 12.72 |
+| 1 | 2.18 | 4.77 | 3.29 |
+| 8 | 11.25 | 17.49 | 13.62 |
 
 The shared convolution backward uses deterministic tiled partial sums instead of
 materializing full token-by-channel gathers and products for each tap. A paired
-complete-mixer benchmark (hidden size 1536, the same 24-head geometry, C32) measures
+complete-mixer benchmark of that reduction change (hidden size 1536, the same 24-head geometry, C32) measures
 the effect of that change, including projections, normalization and recurrence:
 
 | Batch | Forward + backward before (ms) | After (ms) | Reduction |
@@ -124,3 +144,16 @@ These are component timings, not whole-model or distributed-training throughput.
 The optimized arithmetic still has a cost relative to native FLA. Inference
 convolution skips the FP32 preactivation buffer used by backward; convolution
 parameter-gradient scratch scales with the number of 256-row tiles.
+
+
+For the same prepared recurrence geometry, writing complete prefix snapshots
+every 256 tokens adds the following cost to the C32 packed incremental scan:
+
+| Batch | Without snapshots (ms) | With snapshots (ms) |
+| --- | ---: | ---: |
+| 1 | 9.44 | 9.76 |
+| 8 | 11.77 | 12.42 |
+
+This measures snapshot writes only, not the saved prefill work on later prefix
+hits or whole-engine latency. Prefix lookup, convolution and model projections
+are outside this recurrence benchmark.
