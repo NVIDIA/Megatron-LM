@@ -1,4 +1,5 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# License for these changes: BSD-3-Clause.
 
 import warnings
 from dataclasses import dataclass, field
@@ -403,9 +404,19 @@ class ModelParallelConfig:
        Defaults to False.
     """
 
-    cross_entropy_fusion_impl: Literal['native', 'te'] = 'native'
+    cross_entropy_fusion_impl: Literal['native', 'te', 'tiled_te'] = 'native'
     """If 'native', MCore based CE loss fusion is used, if 'te', Parallel CE loss
-       from Transformer Engine library is used. Defaults to 'native'.
+       from Transformer Engine library is used. 'tiled_te' prefers TE >= 2.19 with
+       its memory-efficient API, otherwise uses tiled TP1 Triton cross entropy
+       without a vocabulary-sized FP32 softmax buffer. Defaults to 'native'.
+    """
+
+    cross_entropy_inplace_backward: bool = False
+    """Let Hybrid/MTP transfer private logits to one fused loss backward.
+
+    Requires fused 'tiled_te' cross entropy. Prefer TE's overwrite_input API when
+    supported; otherwise use the TP1 Triton fallback. Tensor observers keep
+    the non-mutating path. Public loss calls never infer ownership.
     """
 
     tp_comm_overlap_disable_qkv: bool = False
@@ -670,6 +681,11 @@ class ModelParallelConfig:
 
         if self.autocast_dtype is None:
             self.autocast_dtype = self.params_dtype
+
+        if self.cross_entropy_inplace_backward and not (
+            self.cross_entropy_loss_fusion and self.cross_entropy_fusion_impl == "tiled_te"
+        ):
+            raise ValueError("Private logits backward requires fused tiled_te cross entropy")
 
         if self.defer_embedding_wgrad_compute and self.pipeline_model_parallel_size == 1:
             raise ValueError(

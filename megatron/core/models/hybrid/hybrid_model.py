@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# License for these changes: BSD-3-Clause.
 
 import logging
 from contextlib import nullcontext
@@ -24,7 +25,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.utils import get_quant_config_or_none
-from megatron.core.tensor_observation import observe_tensor
+from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import gather_from_sequence_parallel_region
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.enums import InferenceCudaGraphScope, ModelType
@@ -1105,6 +1106,9 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             # [s b h] => [b s h]
             return logits.transpose(0, 1).contiguous()
 
-        loss = self.compute_language_model_loss(labels, logits)
+        if self.config.cross_entropy_inplace_backward and not is_observing_tensor("output_logits"):
+            loss = self.compute_language_model_loss(labels, logits, inplace_backward=True)
+        else:
+            loss = self.compute_language_model_loss(labels, logits)
 
         return loss
