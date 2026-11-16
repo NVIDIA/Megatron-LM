@@ -109,6 +109,14 @@ R = "tests/unit_tests/context_parallel/runtime/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
+        name="torch_mimo_fsdp_optimizer",
+        sources=("megatron/core/distributed/torch_mimo_fsdp.py",),
+        tests=(K + "test_torch_mimo_fsdp.py",),
+        kind="external-lib",
+        notes="Native FSDP gradient reductions, FP32-master TE Adam, clipping and copy-back; "
+        "replayed bit-exactly with concurrent stream activity.",
+    ),
+    KernelEntry(
         name="csa_output_rope_reconstruction",
         sources=("megatron/core/ops/attention/csa/output_rope.py",),
         tests=(K + "test_csa_output_rope.py",),

@@ -383,6 +383,12 @@ def _optimizer_config_for_module(
     overlap_param_gather = ddp_config.overlap_param_gather
     return replace(
         config,
+        use_distributed_optimizer=(
+            config.use_distributed_optimizer
+            if config.use_layer_wise_distributed_optimizer
+            else ddp_config.use_distributed_optimizer
+        ),
+        reuse_grad_buf_for_mxfp8_param_ag=ddp_config.reuse_grad_buf_for_mxfp8_param_ag,
         overlap_param_gather=overlap_param_gather,
         overlap_param_gather_with_optimizer_step=(
             config.overlap_param_gather_with_optimizer_step and overlap_param_gather
@@ -390,8 +396,21 @@ def _optimizer_config_for_module(
     )
 
 
-def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> MimoOptimizer:
-    """Create optimizer for MimoModel with heterogeneous parallelism."""
+def get_mimo_optimizer(
+    mimo_model: "MimoModel",
+    config: OptimizerConfig,
+    *,
+    module_overrides: Optional[Dict[str, torch.nn.Module]] = None,
+) -> MimoOptimizer:
+    """Create optimizers for the active module grids.
+
+    Args:
+        mimo_model: Local MIMO model with its module-to-grid mapping.
+        config: Shared optimizer settings, specialized for each active module.
+        module_overrides: Distributed wrappers that enclose an entire local stage
+            rather than only the corresponding MIMO child module.
+    """
+    from megatron.core.distributed.torch_mimo_fsdp import TorchMimoFSDP, TorchMimoOptimizer
     from megatron.core.optimizer import get_megatron_optimizer
 
     grid_map = mimo_model.mimo_config.module_to_grid_map
@@ -407,7 +426,9 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
         is_active = False
 
         if grid.is_current_rank_in_grid():
-            if module_name == lang_key:
+            if module_overrides is not None and module_name in module_overrides:
+                module = module_overrides[module_name]
+            elif module_name == lang_key:
                 module = mimo_model.language_model
             else:
                 module = mimo_model.modality_submodules[module_name]
@@ -416,7 +437,9 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
                 parameter.requires_grad for parameter in module.parameters()
             ):
                 is_active = True
-                pg_collection = getattr(unwrap_model(module), 'pg_collection', None)
+                pg_collection = getattr(module, 'pg_collection', None)
+                if pg_collection is None:
+                    pg_collection = getattr(unwrap_model(module), 'pg_collection', None)
                 assert (
                     pg_collection is not None
                 ), f"Module '{module_name}' must own a ProcessGroupCollection for optimizer setup"
@@ -427,13 +450,21 @@ def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> Mimo
                     f"Module '{module_name}' has "
                     f"{module.ddp_config.num_distributed_optimizer_instances} instances."
                 )
-                optimizer = get_megatron_optimizer(
-                    config=module_config,
-                    model_chunks=[module],
-                    pg_collection=pg_collection,
-                    use_gloo_process_groups=False,
-                    param_group_process_group=pg_collection.intra_dist_opt,
-                )
+                if isinstance(module, TorchMimoFSDP):
+                    optimizer = TorchMimoOptimizer(
+                        module,
+                        module_config,
+                        grid.get_pg(grid.dim_names),
+                        pg_collection.intra_dist_opt,
+                    )
+                else:
+                    optimizer = get_megatron_optimizer(
+                        config=module_config,
+                        model_chunks=[module],
+                        pg_collection=pg_collection,
+                        use_gloo_process_groups=False,
+                        param_group_process_group=pg_collection.intra_dist_opt,
+                    )
 
         module_infos[module_name] = ModuleOptimizerInfo(
             optimizer=optimizer, grid=grid, pg_collection=pg_collection, is_active=is_active
