@@ -368,7 +368,11 @@ def test_seq_aux_loss_restores_batch_size_for_per_token_scaling(monkeypatch):
     router = TopKRouter.__new__(TopKRouter)
     object.__setattr__(router, "topk", 2)
     object.__setattr__(
-        router, "config", SimpleNamespace(num_moe_experts=2, moe_router_aux_loss_fusion=False)
+        router,
+        "config",
+        SimpleNamespace(
+            num_moe_experts=2, moe_router_aux_loss_fusion=False, deterministic_mode=False
+        ),
     )
     object.__setattr__(router, "get_aux_loss_coeff", lambda _name: 1.0)
     object.__setattr__(
@@ -2025,7 +2029,7 @@ class TestHashRouting:
         hidden_states = torch.randn(8, 2, config.hidden_size, device="cuda", requires_grad=True)
         input_ids = torch.randint(0, config.hash_moe_vocab_size, (2, 8), device="cuda")
 
-        output, _ = layer(hidden_states=hidden_states, attention_mask=None, input_ids=input_ids)
+        output, _ = layer(hidden_states, attention_mask=None, input_ids=input_ids)
 
         assert layer.mlp.router.is_hash_layer
         assert output.shape == hidden_states.shape

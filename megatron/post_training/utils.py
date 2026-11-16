@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import inspect
 import os
@@ -10,19 +10,26 @@ from modelopt.torch.quantization.utils import is_quantized
 from packaging.version import Version
 
 
-def maybe_enable_modelopt(args):
+def maybe_enable_modelopt(args, checkpoint=None):
     """Set `args.modelopt_enabled` if a ModelOpt checkpoint or distillation teacher is
     configured. Idempotent and safe to call multiple times (e.g. once early in
     `pretrain_gpt.py` before building the model config, and again as a fallback in
     `training.py` for callers that don't go through that entrypoint).
+
+    `checkpoint` is the checkpoint policy the load directory is inspected with: the registered
+    section at run time. At startup, before any run config exists, it is built from the
+    arguments.
     """
     if getattr(args, "modelopt_enabled", False):
         return
 
     from megatron.post_training.checkpointing import has_modelopt_state
     from megatron.training import print_rank_0
+    from megatron.training.argument_utils import checkpoint_config_from_args
 
-    if args.load is not None and has_modelopt_state(args.load):
+    if checkpoint is None:
+        checkpoint = checkpoint_config_from_args(args)
+    if checkpoint.load is not None and has_modelopt_state(checkpoint.load, checkpoint=checkpoint):
         print_rank_0("ModelOpt checkpoint detected")
         args.modelopt_enabled = True
     if getattr(args, "export_kd_teacher_load", None):

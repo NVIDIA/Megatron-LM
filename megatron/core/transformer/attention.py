@@ -19,6 +19,7 @@ from megatron.core.models.common.embeddings.rope_utils import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_with_cos_sin,
 )
+from megatron.core.ops.norm.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
     get_data_parallel_group,
@@ -35,7 +36,6 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.mappings import all_gather_last_dim_from_tensor_parallel_region
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
-from megatron.core.transformer.torch_norm import L2Norm, LayerNormBuilder
 from megatron.core.transformer.utils import is_layer_window_attention
 from megatron.core.typed_torch import apply_module, copy_signature, not_none
 from megatron.core.utils import (
@@ -1838,6 +1838,29 @@ class SelfAttention(Attention):
     Self-attention layer takes input with size [s, b, h]
     and returns output of the same size.
     """
+
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: TransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+    ) -> float:
+        """Estimate forward QKV/output projections and causal attention, including FMA x2."""
+        hidden = config.hidden_size
+        heads = config.num_attention_heads
+        projection_size = config.kv_channels * heads
+        flops = (
+            4
+            * total_real_tokens_in_batch
+            * projection_size
+            * (hidden + hidden * config.num_query_groups / heads)
+            + 2 * seqlen_squared_sum_in_batch * projection_size
+        )
+        if config.attention_output_gate:
+            flops += 2 * total_real_tokens_in_batch * hidden * projection_size
+        return flops
 
     def __init__(
         self,

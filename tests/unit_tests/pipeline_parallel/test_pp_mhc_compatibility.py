@@ -276,7 +276,7 @@ def _batches(variable, cp_group):
         positions = torch.arange(length, device="cuda").unsqueeze(0)
         tokens = (positions + 3 * microbatch) % 64
         batch = dict(tokens=tokens, labels=(tokens + 1) % 64, position_ids=positions)
-        yield get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=cp_group)
+        yield get_batch_on_this_cp_rank(batch, dynamic_cp=False, cp_group=cp_group)
 
 
 def _run_schedule(config, models):

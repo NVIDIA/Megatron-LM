@@ -15,7 +15,7 @@ import numpy as np
 import soundfile as sf
 from scipy import signal
 import io
-from megatron.training.global_vars import get_tokenizer
+from megatron.training.global_vars import get_run_config, get_tokenizer
 
 sys.path.append(
     os.path.abspath(
@@ -357,6 +357,7 @@ class AVLMTaskEncoder(
 
 def llava_avlm_dataloader_provider(train_val_test_num_samples):
     args = get_args()
+    cfg = get_run_config()
 
     # update global tokenizer if hf_assign_unused_tokens is set
     if args.hf_assign_unused_tokens:
@@ -370,7 +371,7 @@ def llava_avlm_dataloader_provider(train_val_test_num_samples):
             _tokenizer.added_tokens_decoder[id] = token
         get_tokenizer()._tokenizer = _tokenizer
 
-    tokenizer_model_id = args.tokenizer_model
+    tokenizer_model_id = cfg.tokenizer.tokenizer_model
     processor = AutoProcessor.from_pretrained(tokenizer_model_id)
     processor.tokenizer = get_tokenizer()._tokenizer  # update processor to use custom tokenizer
     image_processor = AutoProcessor.from_pretrained(tokenizer_model_id).image_processor

@@ -1,0 +1,811 @@
+{
+ "async_ckpt_cpu_priority": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": 10,
+  "nargs": null,
+  "option_strings": [
+   "--async-ckpt-cpu-priority"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "async_ckpt_io_priority": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": 3,
+  "nargs": null,
+  "option_strings": [
+   "--async-ckpt-io-priority"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "async_ckpt_use_cpu_shm": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--async-ckpt-use-cpu-shm"
+  ],
+  "required": false,
+  "type": null
+ },
+ "async_save": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--async-save"
+  ],
+  "required": false,
+  "type": null
+ },
+ "async_strategy": {
+  "action": "_StoreAction",
+  "choices": [
+   "nvrx"
+  ],
+  "const": null,
+  "default": "nvrx",
+  "nargs": null,
+  "option_strings": [
+   "--async-strategy"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "auto_detect_ckpt_format": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--auto-detect-ckpt-format"
+  ],
+  "required": false,
+  "type": null
+ },
+ "ckpt_assume_constant_structure": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--ckpt-assume-constant-structure"
+  ],
+  "required": false,
+  "type": null
+ },
+ "ckpt_convert_format": {
+  "action": "_StoreAction",
+  "choices": [
+   "torch",
+   "torch_dist"
+  ],
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--ckpt-convert-format"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "ckpt_convert_save": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--ckpt-convert-save"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "ckpt_convert_update_legacy_dist_opt_format": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--ckpt-convert-update-legacy-dist-opt-format"
+  ],
+  "required": false,
+  "type": null
+ },
+ "ckpt_drop_redundant_extra_state": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--ckpt-drop-redundant-extra-state"
+  ],
+  "required": false,
+  "type": null
+ },
+ "ckpt_format": {
+  "action": "_StoreAction",
+  "choices": [
+   "torch",
+   "torch_dist",
+   "torch_dcp",
+   "fsdp_dtensor"
+  ],
+  "const": null,
+  "default": "torch_dist",
+  "nargs": null,
+  "option_strings": [
+   "--ckpt-format"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "ckpt_fully_parallel_load": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--ckpt-fully-parallel-load"
+  ],
+  "required": false,
+  "type": null
+ },
+ "ckpt_fully_parallel_load_exchange_algo": {
+  "action": "_StoreAction",
+  "choices": [
+   "broadcast",
+   "gather_rounds",
+   "gather_object"
+  ],
+  "const": null,
+  "default": "broadcast",
+  "nargs": null,
+  "option_strings": [
+   "--ckpt-fully-parallel-load-exchange-algo"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "ckpt_fully_parallel_load_per_rank_objects": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--ckpt-fully-parallel-load-per-rank-objects"
+  ],
+  "required": false,
+  "type": null
+ },
+ "ckpt_fully_parallel_load_process_group": {
+  "action": "_StoreAction",
+  "choices": [
+   "dp",
+   "ep_dp"
+  ],
+  "const": null,
+  "default": "dp",
+  "nargs": null,
+  "option_strings": [
+   "--ckpt-fully-parallel-load-process-group"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "ckpt_fully_parallel_save": {
+  "action": "_StoreFalseAction",
+  "choices": null,
+  "const": false,
+  "default": true,
+  "nargs": 0,
+  "option_strings": [
+   "--no-ckpt-fully-parallel-save"
+  ],
+  "required": false,
+  "type": null
+ },
+ "ckpt_fully_parallel_save_deprecated": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--ckpt-fully-parallel-save"
+  ],
+  "required": false,
+  "type": null
+ },
+ "ckpt_fully_parallel_save_process_group": {
+  "action": "_StoreAction",
+  "choices": [
+   "dp",
+   "ep_dp"
+  ],
+  "const": null,
+  "default": "dp",
+  "nargs": null,
+  "option_strings": [
+   "--ckpt-fully-parallel-save-process-group"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "ckpt_load_validate_sharding_integrity": {
+  "action": "_StoreFalseAction",
+  "choices": null,
+  "const": false,
+  "default": true,
+  "nargs": 0,
+  "option_strings": [
+   "--no-ckpt-load-validate-sharding-integrity",
+   "--disable-ckpt-load-validate-sharding-integrity"
+  ],
+  "required": false,
+  "type": null
+ },
+ "ckpt_pg_tensors_cache_create": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--ckpt-pg-tensors-cache-create"
+  ],
+  "required": false,
+  "type": null
+ },
+ "ckpt_pg_tensors_cache_path": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--ckpt-pg-tensors-cache-path"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "ckpt_step": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--ckpt-step"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "dist_ckpt_format_deprecated": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--dist-ckpt-format"
+  ],
+  "required": false,
+  "type": null
+ },
+ "dist_ckpt_optim_fully_reshardable": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--dist-ckpt-optim-fully-reshardable"
+  ],
+  "required": false,
+  "type": null
+ },
+ "dist_ckpt_save_pre_mcore_014": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--dist-ckpt-save-pre-mcore-014"
+  ],
+  "required": false,
+  "type": null
+ },
+ "dist_ckpt_strictness": {
+  "action": "_StoreAction",
+  "choices": [
+   "assume_ok_unexpected",
+   "log_unexpected",
+   "log_all",
+   "raise_unexpected",
+   "raise_all",
+   "return_unexpected",
+   "return_all",
+   "ignore_all"
+  ],
+  "const": null,
+  "default": "assume_ok_unexpected",
+  "nargs": null,
+  "option_strings": [
+   "--dist-ckpt-strictness"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "dist_ckpt_workers": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": 1,
+  "nargs": null,
+  "option_strings": [
+   "--dist-ckpt-workers"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "distrib_optim_fully_reshardable_mem_efficient": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--distrib-optim-fully-reshardable-mem-efficient"
+  ],
+  "required": false,
+  "type": null
+ },
+ "exit_on_missing_checkpoint": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--exit-on-missing-checkpoint"
+  ],
+  "required": false,
+  "type": null
+ },
+ "finetune": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--finetune"
+  ],
+  "required": false,
+  "type": null
+ },
+ "load": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--load"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "load_main_params_from_ckpt": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--load-main-params-from-ckpt"
+  ],
+  "required": false,
+  "type": null
+ },
+ "no_load_optim": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": null,
+  "nargs": 0,
+  "option_strings": [
+   "--no-load-optim"
+  ],
+  "required": false,
+  "type": null
+ },
+ "no_load_rng": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": null,
+  "nargs": 0,
+  "option_strings": [
+   "--no-load-rng"
+  ],
+  "required": false,
+  "type": null
+ },
+ "no_save_optim": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": null,
+  "nargs": 0,
+  "option_strings": [
+   "--no-save-optim"
+  ],
+  "required": false,
+  "type": null
+ },
+ "no_save_rng": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": null,
+  "nargs": 0,
+  "option_strings": [
+   "--no-save-rng"
+  ],
+  "required": false,
+  "type": null
+ },
+ "non_persistent_ckpt_type": {
+  "action": "_StoreAction",
+  "choices": [
+   "global",
+   "local",
+   "in_memory"
+  ],
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--non-persistent-ckpt-type"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "non_persistent_global_ckpt_dir": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--non-persistent-global-ckpt-dir"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "non_persistent_local_ckpt_algo": {
+  "action": "_StoreAction",
+  "choices": [
+   "fully_parallel",
+   "atomic"
+  ],
+  "const": null,
+  "default": "fully_parallel",
+  "nargs": null,
+  "option_strings": [
+   "--non-persistent-local-ckpt-algo"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "non_persistent_local_ckpt_dir": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--non-persistent-local-ckpt-dir"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "non_persistent_save_interval": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--non-persistent-save-interval"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "override_ckpt_iteration": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--override-ckpt-iteration"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "pretrained_checkpoint": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--pretrained-checkpoint"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "replication": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--replication"
+  ],
+  "required": false,
+  "type": null
+ },
+ "replication_factor": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": 2,
+  "nargs": null,
+  "option_strings": [
+   "--replication-factor"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "replication_jump": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--replication-jump"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "save": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--save"
+  ],
+  "required": false,
+  "type": "str"
+ },
+ "save_activations_interval": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--save-activations-interval"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "save_dgrads_interval": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--save-dgrads-interval"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "save_interval": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--save-interval",
+   "--persistent-save-interval"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "save_params_interval": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--save-params-interval"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "save_retain_interval": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--save-retain-interval"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "save_tokenizer_assets": {
+  "action": "_StoreFalseAction",
+  "choices": null,
+  "const": false,
+  "default": true,
+  "nargs": 0,
+  "option_strings": [
+   "--no-save-tokenizer-assets",
+   "--disable-save-tokenizer-assets"
+  ],
+  "required": false,
+  "type": null
+ },
+ "save_tokens_per_expert_interval": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--save-tokens-per-expert-interval"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "save_wgrads_interval": {
+  "action": "_StoreAction",
+  "choices": null,
+  "const": null,
+  "default": null,
+  "nargs": null,
+  "option_strings": [
+   "--save-wgrads-interval"
+  ],
+  "required": false,
+  "type": "int"
+ },
+ "stream_ckpt_dequant": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--stream-ckpt-dequant"
+  ],
+  "required": false,
+  "type": null
+ },
+ "strict_fsdp_dtensor_load": {
+  "action": "_StoreFalseAction",
+  "choices": null,
+  "const": false,
+  "default": true,
+  "nargs": 0,
+  "option_strings": [
+   "--no-strict-fsdp-dtensor-load",
+   "--disable-strict-fsdp-dtensor-load"
+  ],
+  "required": false,
+  "type": null
+ },
+ "use_checkpoint_args": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--use-checkpoint-args"
+  ],
+  "required": false,
+  "type": null
+ },
+ "use_dist_ckpt_deprecated": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--use-dist-ckpt"
+  ],
+  "required": false,
+  "type": null
+ },
+ "use_mp_args_from_checkpoint_args": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--use-mp-args-from-checkpoint-args"
+  ],
+  "required": false,
+  "type": null
+ },
+ "use_persistent_ckpt_worker": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--use-persistent-ckpt-worker"
+  ],
+  "required": false,
+  "type": null
+ },
+ "use_tokenizer_model_from_checkpoint_args": {
+  "action": "_StoreFalseAction",
+  "choices": null,
+  "const": false,
+  "default": true,
+  "nargs": 0,
+  "option_strings": [
+   "--no-use-tokenizer-model-from-checkpoint-args",
+   "--disable-use-tokenizer-model-from-checkpoint-args"
+  ],
+  "required": false,
+  "type": null
+ },
+ "verify_integrity": {
+  "action": "_StoreTrueAction",
+  "choices": null,
+  "const": true,
+  "default": false,
+  "nargs": 0,
+  "option_strings": [
+   "--verify-integrity"
+  ],
+  "required": false,
+  "type": null
+ }
+}
