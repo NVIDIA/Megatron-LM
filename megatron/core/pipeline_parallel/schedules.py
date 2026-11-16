@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import contextlib
-from functools import partial
+from functools import lru_cache, partial
 from itertools import chain
 from typing import Callable, Dict, Iterator, List, Optional, Union
 
@@ -9,6 +9,7 @@ import torch
 from torch.autograd.variable import Variable
 
 from megatron.core import parallel_state
+from megatron.core._rank_utils import warn_single_rank
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -113,15 +114,18 @@ def get_forward_backward_func(
     num_microbatches (int, required):
         The number of microbatches to go through
 
-    seq_length (int, required): Sequence length of the current global batch. If this is a dual-stack
-        transformer, this is the encoder's sequence length. This is ignored if variable_seq_lengths
-        in the config is True. Otherwise, each microbatch in the current global batch size must use
-        this sequence length.
+    seq_length (int, required): Resolved sequence length of tensors exchanged between pipeline
+        stages, before context/sequence parallel partitioning. Callers must select the model's
+        pipeline input length (including image-token expansion for VLMs). This is ignored if
+        variable_seq_lengths in the config is True. Otherwise, each microbatch in the current
+        global batch must use this sequence length.
 
     micro_batch_size (int, required): The number of sequences in a microbatch.
 
-    decoder_seq_length (int, optional): The sequence length for the decoder in a dual-stack
-        transformer. This is ignored for a single-stack transformer.
+    decoder_seq_length (int, optional): Deprecated; will be removed in the 0.22 release.
+        Pass the resolved pipeline width as seq_length instead. Until removal, a non-None
+        value overrides seq_length in the non-interleaved schedule and remains ignored by
+        the no-pipeline and interleaved schedules, preserving their previous behavior.
 
     forward_only (optional, default = False): Perform only the forward step.
 
@@ -732,6 +736,21 @@ def _reset_activation_offload(
     off_interface.reset(process_group=pg_collection.tp_dp_cp)
 
 
+@lru_cache(maxsize=2)
+def _warn_decoder_seq_length_deprecated(ignored: bool = False) -> None:
+    """Warn once per compatibility behavior, on the configured logging ranks."""
+    action = (
+        "This schedule ignores decoder_seq_length; remove it and keep seq_length unchanged."
+        if ignored
+        else "Pass the resolved pipeline width as seq_length instead."
+    )
+    warn_single_rank(
+        "decoder_seq_length is deprecated and will be removed in the 0.22 release. " + action,
+        FutureWarning,
+        stacklevel=3,
+    )
+
+
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -740,7 +759,7 @@ def forward_backward_no_pipelining(
     num_microbatches: int,
     seq_length: int,  # unused
     micro_batch_size: int,  # unused
-    decoder_seq_length: Optional[int] = None,  # unused
+    decoder_seq_length: Optional[int] = None,  # deprecated, unused
     forward_only: bool = False,
     collect_non_loss_data: bool = False,
     first_val_step: Optional[bool] = None,
@@ -750,6 +769,9 @@ def forward_backward_no_pipelining(
     force_all_reduce: Optional[bool] = False,
 ):
     """Run forward and backward passes with no pipeline parallelism"""
+
+    if decoder_seq_length is not None:
+        _warn_decoder_seq_length_deprecated(ignored=True)
 
     if pg_collection is None:
         pg_collection = _build_default_pg_collection()
@@ -1018,7 +1040,7 @@ def forward_backward_pipelining_with_interleaving(
     num_microbatches: int,
     seq_length: int,
     micro_batch_size: int,
-    decoder_seq_length: Optional[int] = None,
+    decoder_seq_length: Optional[int] = None,  # deprecated, unused
     forward_only: bool = False,
     collect_non_loss_data: bool = False,
     first_val_step: Optional[bool] = None,
@@ -1031,6 +1053,9 @@ def forward_backward_pipelining_with_interleaving(
     communication between pipeline stages as needed.
 
     Returns dictionary with losses if the last stage, empty dict otherwise."""
+
+    if decoder_seq_length is not None:
+        _warn_decoder_seq_length_deprecated(ignored=True)
 
     # Convention used in this function:
     # num_microbatches for number of microbatches per pipeline stage;
@@ -2124,16 +2149,21 @@ def get_tensor_shapes(
     *,
     seq_length: int,
     micro_batch_size: int,
-    decoder_seq_length: int,
+    decoder_seq_length: Optional[int] = None,
     config,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     cp_group: Optional[torch.distributed.ProcessGroup] = None,
 ):
-    """Determine tensor shapes for pipeline communication.
+    """Determine tensor shapes for the caller-resolved pipeline sequence length.
 
+    The caller selects the pipeline length before calling this function. The deprecated
+    decoder_seq_length override is accepted until the 0.22 release for compatibility.
     Returns [()] for variable_seq_lengths mode (shapes exchanged dynamically),
     or computed shapes for fixed sequence length mode.
     """
+    if decoder_seq_length is not None:
+        _warn_decoder_seq_length_deprecated()
+        seq_length = decoder_seq_length
     tensor_shapes = []
 
     if config.variable_seq_lengths:
@@ -2142,15 +2172,12 @@ def get_tensor_shapes(
         return tensor_shapes
 
     # Fixed sequence lengths - compute shape
-    effective_seq_length = decoder_seq_length if decoder_seq_length is not None else seq_length
-    effective_seq_length = effective_seq_length // cp_group.size()
+    seq_length = seq_length // cp_group.size()
 
     if config.sequence_parallel:
-        effective_seq_length = effective_seq_length // tp_group.size()
+        seq_length = seq_length // tp_group.size()
 
-    tensor_shapes.append(
-        (effective_seq_length, micro_batch_size, _get_pipeline_hidden_size(config))
-    )
+    tensor_shapes.append((seq_length, micro_batch_size, _get_pipeline_hidden_size(config)))
     return tensor_shapes
 
 
@@ -2187,6 +2214,10 @@ def forward_backward_pipelining_without_interleaving(
 ):
     """Run non-interleaved 1F1B schedule, with communication between pipeline
     stages. Returns dictionary with losses if the last stage, empty dict otherwise."""
+
+    if decoder_seq_length is not None:
+        _warn_decoder_seq_length_deprecated()
+        seq_length = decoder_seq_length
 
     if isinstance(model, list):
         assert (
@@ -2326,7 +2357,6 @@ def forward_backward_pipelining_without_interleaving(
     recv_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
         micro_batch_size=micro_batch_size,
-        decoder_seq_length=decoder_seq_length,
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,
@@ -2334,7 +2364,6 @@ def forward_backward_pipelining_without_interleaving(
     send_tensor_shapes = get_tensor_shapes(
         seq_length=seq_length,
         micro_batch_size=micro_batch_size,
-        decoder_seq_length=decoder_seq_length,
         config=config,
         tp_group=tp_group,
         cp_group=cp_group,

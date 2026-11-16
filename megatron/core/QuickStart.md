@@ -31,6 +31,14 @@ For a more comprehensive overview of different installation methods, refer to th
 
 ### Write Your First Training Loop
 
+Pass the resolved pipeline input width as `seq_length` to the forward/backward
+schedule, including expanded image tokens for VLMs. The optional
+`decoder_seq_length` argument is deprecated and will be removed in the 0.22 release.
+Until removal, a non-None value overrides `seq_length` in the non-interleaved
+schedule and `get_tensor_shapes()`; the no-pipeline and interleaved schedules
+continue to ignore it. Non-None uses emit a `FutureWarning` on logging ranks.
+For an ignored argument, remove it without changing `seq_length`.
+
 In this task, you create a sample GPT model split across tensors (Tensor model parallel) on two GPUS, and run a forward pass through it using a MockGPT dataset helper class that was created in Megatron Core.
 
 <br>
@@ -233,7 +241,6 @@ In this task, you create a sample GPT model split across tensors (Tensor model p
                 num_microbatches=1,
                 seq_length=64,
                 micro_batch_size=8,
-                decoder_seq_length=64,
                 forward_only=False)
         
             optim.step()
