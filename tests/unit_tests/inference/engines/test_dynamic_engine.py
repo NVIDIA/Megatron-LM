@@ -9,6 +9,7 @@ import random
 import threading
 import time
 import types
+import weakref
 from collections import OrderedDict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
@@ -46,7 +47,10 @@ from megatron.core.inference.contexts.dynamic_context import (
     RequestOverflowError,
     TokenOverflowError,
 )
-from megatron.core.inference.engines import DynamicInferenceEngine, dynamic_engine
+from megatron.core.inference.engines import DynamicInferenceEngine
+from megatron.core.inference.engines.dynamic import coordinator as dynamic_engine_coordinator
+from megatron.core.inference.engines.dynamic import multimodal as dynamic_engine_multimodal
+from megatron.core.inference.engines.dynamic import requests as dynamic_engine_requests
 from megatron.core.inference.engines.dynamic_engine import EngineState, RequestEntry
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
@@ -169,7 +173,7 @@ def _make_vision_cache_entry(
 ):
     if imgs is None:
         imgs = torch.empty(0)
-    return dynamic_engine._VisionCacheEntry(
+    return dynamic_engine_multimodal._VisionCacheEntry(
         embedding=embedding,
         modality=modality,
         imgs=imgs,
@@ -407,7 +411,9 @@ def test_build_vlm_request_rejects_unexpected_placeholders_after_expanded_prefix
 
 def test_expanded_prefix_metadata_reports_every_missing_preparer_field():
     with pytest.raises(ValueError) as error:
-        dynamic_engine._take_expanded_prefix_stitching_metadata({PREFIX_MEDIA_COUNT_FIELD: 1})
+        dynamic_engine_multimodal._take_expanded_prefix_stitching_metadata(
+            {PREFIX_MEDIA_COUNT_FIELD: 1}
+        )
 
     message = str(error.value)
     assert PREFIX_EXPANDED_TOKEN_COUNT_FIELD in message
@@ -428,7 +434,7 @@ def test_expanded_prefix_metadata_validates_each_field(field, bad_value):
     metadata[field] = bad_value
 
     with pytest.raises(ValueError, match="nonnegative integer"):
-        dynamic_engine._take_expanded_prefix_stitching_metadata(metadata)
+        dynamic_engine_multimodal._take_expanded_prefix_stitching_metadata(metadata)
 
 
 def test_build_vlm_request_expands_only_new_suffix_media():
@@ -503,7 +509,7 @@ def test_build_vlm_request_offsets_suffix_embeddings_after_multiple_prefix_media
 
 
 def test_slice_suffix_video_metadata_uses_frame_offset_for_image_sizes():
-    result = dynamic_engine._slice_suffix_media_metadata(
+    result = dynamic_engine_multimodal._slice_suffix_media_metadata(
         2,
         num_tiles=None,
         imgs_sizes=torch.tensor([[1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6]]),
@@ -520,7 +526,7 @@ def test_slice_suffix_video_metadata_uses_frame_offset_for_image_sizes():
 
 
 def test_slice_suffix_static_tiling_metadata_uses_logical_media_count():
-    result = dynamic_engine._slice_suffix_media_metadata(
+    result = dynamic_engine_multimodal._slice_suffix_media_metadata(
         1,
         num_tiles=torch.tensor([2, 3]),
         imgs_sizes=None,
@@ -535,7 +541,7 @@ def test_slice_suffix_static_tiling_metadata_uses_logical_media_count():
 
 def test_slice_suffix_metadata_rejects_prefix_media_overcount():
     with pytest.raises(ValueError, match="prefix media count exceeds"):
-        dynamic_engine._slice_suffix_media_metadata(
+        dynamic_engine_multimodal._slice_suffix_media_metadata(
             2,
             num_tiles=None,
             imgs_sizes=torch.tensor([[2, 2]]),
@@ -618,7 +624,7 @@ def test_build_vlm_request_reuses_client_media_cache_key():
     wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
 
     with mock.patch(
-        "megatron.core.inference.engines.dynamic_engine.compute_media_cache_key"
+        "megatron.core.inference.engines.dynamic.multimodal.compute_media_cache_key"
     ) as compute_key:
         request = _call_build_vlm_request(
             engine,
@@ -639,7 +645,7 @@ def test_build_vlm_request_reuses_cached_preprocessed_media_without_raw_input():
     engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
     cached_imgs = torch.ones(1, 2, 4)
     cached_sizes = torch.tensor([[2, 2]])
-    cached_entry = dynamic_engine._VisionCacheEntry(
+    cached_entry = dynamic_engine_multimodal._VisionCacheEntry(
         embedding=torch.ones(2, 4),
         modality="image",
         imgs=cached_imgs,
@@ -824,7 +830,7 @@ def test_schedule_requests_skips_cached_media_payload_and_preprocessing():
     engine.requests = {}
     engine.failed_request_ids = []
     engine.add_request = mock.Mock()
-    cached_entry = dynamic_engine._VisionCacheEntry(
+    cached_entry = dynamic_engine_multimodal._VisionCacheEntry(
         embedding=torch.ones(1),
         modality="image",
         imgs=torch.ones(1),
@@ -851,11 +857,11 @@ def test_schedule_requests_skips_cached_media_payload_and_preprocessing():
     engine.socket_for_receiving_requests = mock.Mock()
     engine.socket_for_receiving_requests.recv_multipart.side_effect = [
         message,
-        dynamic_engine.zmq.Again,
+        dynamic_engine_coordinator.zmq.Again,
     ]
 
     with mock.patch.object(
-        dynamic_engine, "resolve_multimodal_data_for_engine"
+        dynamic_engine_coordinator, "resolve_multimodal_data_for_engine"
     ) as resolve_multimodal_data:
         assert engine.schedule_requests() == 1
 
@@ -994,7 +1000,7 @@ def test_encode_waiting_images_falls_back_per_request_after_a_count_mismatch(cap
         )
     )
 
-    with caplog.at_level(logging.WARNING, logger=dynamic_engine.logger.name):
+    with caplog.at_level(logging.WARNING, logger=dynamic_engine_multimodal.logger.name):
         _encode_waiting(engine)
 
     assert "shared vision encoding of 2 requests failed" in caplog.text
@@ -1171,7 +1177,7 @@ def test_encode_waiting_images_falls_back_per_request_when_shared_call_fails(cap
 
     wrapper._forward_vision_encoder.side_effect = _encode
 
-    with caplog.at_level(logging.WARNING, logger=dynamic_engine.logger.name):
+    with caplog.at_level(logging.WARNING, logger=dynamic_engine_multimodal.logger.name):
         _encode_waiting(engine)
 
     assert "shared vision encoding of 2 requests failed" in caplog.text
@@ -1247,7 +1253,7 @@ def test_encode_waiting_images_falls_back_per_request_on_mixed_layouts(caplog):
     requests[1].imgs = requests[1].imgs[0]  # one [P, F] among [1, P, F]
     engine, wrapper = _build_waiting_engine(requests)
 
-    with caplog.at_level(logging.WARNING, logger=dynamic_engine.logger.name):
+    with caplog.at_level(logging.WARNING, logger=dynamic_engine_multimodal.logger.name):
         _encode_waiting(engine)
 
     assert "cannot concatenate image tensors" in caplog.text
@@ -1420,12 +1426,16 @@ class DynamicEngineTestConfig:
     # relevant to the test. The tests only check if the required
     # context attributes are set correctly.
     suspend_resume_interval: Optional[int] = None
+    # Build the engine SUSPENDED; _run_test resumes it before adding requests.
+    start_suspended: bool = False
     kv_cache_management_mode: str = "persist"
     static_kv_memory_pointers: bool = True
     track_generated_token_events: bool = False
     track_paused_request_events: bool = False
     num_speculative_tokens: int = 0
     mtp_num_layers: Optional[int] = None
+    mamba_replay_ssm: bool = False
+    mamba_replay_buffer_len: int = 16
     # A repeated (rather than per-depth) MTP head is one of the gates on
     # DynamicInferenceContext.enable_mtp_kv_cache; set it to exercise the MTP draft KV cache.
     mtp_use_repeated_layer: bool = False
@@ -1449,6 +1459,8 @@ class DynamicEngineTestConfig:
     top_p: float = 0.0
     offset_sampling_seed_by_dp_rank: bool = True
     async_sched_mode: AsyncScheduleMode = AsyncScheduleMode.ASYNC
+    # Tests leave process-wide GC alone unless they exercise a gc mode.
+    gc_mode: str = "default"
     # Sliding-window attention config. When `window_size` is None, SWA is
     # disabled and all layers do full causal attention. When set to a
     # `(left, right)` tuple, layers selected by `window_attn_skip_freq` use a
@@ -1625,10 +1637,14 @@ class DynamicInferenceEngineTestBase:
                 track_generated_token_events=test_config.track_generated_token_events,
                 track_paused_request_events=test_config.track_paused_request_events,
                 num_speculative_tokens=test_config.num_speculative_tokens,
+                mamba_replay_ssm=test_config.mamba_replay_ssm,
+                mamba_replay_buffer_len=test_config.mamba_replay_buffer_len,
                 sampling_backend=test_config.sampling_backend,
                 offset_sampling_seed_by_dp_rank=test_config.offset_sampling_seed_by_dp_rank,
                 async_sched_mode=test_config.async_sched_mode,
                 logprobs_mode=test_config.logprobs_mode,
+                gc_mode=test_config.gc_mode,
+                start_suspended=test_config.start_suspended,
             ),
         )
 
@@ -1951,6 +1967,22 @@ class DynamicInferenceEngineTestBase:
         # Test environment.
         test_config = DynamicEngineTestConfig(**test_config_kwargs)
         env = cls._build_test_env(test_config)
+        if test_config.start_suspended:
+            # Nothing weight-dependent may have run yet: the first resume() captures and enters
+            # gc_mode. The events match a pause() then suspend(), so pause/stop return before it.
+            engine = env.engine
+            assert engine.state == EngineState.SUSPENDED
+            assert engine.capture_stats is None
+            assert not engine.context.is_tensor_state_allocated
+            assert not engine._in_custom_gc_mode
+            assert not InferenceMode.is_active()
+            assert not engine._state_events[EngineState.RUNNING].is_set()
+            assert engine._state_events[EngineState.PAUSED].is_set()
+            assert engine._state_events[EngineState.SUSPENDED].is_set()
+            engine.resume()
+            assert engine.state == EngineState.RUNNING
+            assert InferenceMode.is_active()
+            assert engine._in_custom_gc_mode == (test_config.gc_mode != "default")
 
         # Add requests to engine.
         env.mem_usage["start"] = torch.cuda.memory_stats()
@@ -2192,16 +2224,18 @@ async def test_completion_merges_after_final_scores_and_reuses_failed_result():
     engine.requests = {42: types.SimpleNamespace(record=failed_record, future=failed_future)}
     engine.failed_request_ids = []
     engine.rank, engine.use_coordinator, engine.is_mp_coordinator = 1, True, True
-    submit = dynamic_engine.Headers.SUBMIT_REQUEST.value
+    submit = dynamic_engine_coordinator.Headers.SUBMIT_REQUEST.value
     message = [
-        dynamic_engine.msgpack.packb([submit, 42, params.serialize(), None], use_bin_type=True),
-        dynamic_engine.msgpack.packb([3, 4], use_bin_type=True),
-        dynamic_engine.msgpack.packb(None, use_bin_type=True),
-        dynamic_engine.msgpack.packb(None, use_bin_type=True),
+        dynamic_engine_coordinator.msgpack.packb(
+            [submit, 42, params.serialize(), None], use_bin_type=True
+        ),
+        dynamic_engine_coordinator.msgpack.packb([3, 4], use_bin_type=True),
+        dynamic_engine_coordinator.msgpack.packb(None, use_bin_type=True),
+        dynamic_engine_coordinator.msgpack.packb(None, use_bin_type=True),
     ]
     engine.add_request = lambda *_, **__: engine._handle_failed_request(42)
     socket = engine.socket_for_receiving_requests = mock.Mock()
-    socket.recv_multipart.side_effect = [message, dynamic_engine.zmq.Again]
+    socket.recv_multipart.side_effect = [message, dynamic_engine_coordinator.zmq.Again]
     engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
     engine.local_metadata_ledger_enabled = False
     engine._drain_handoff_completion_notifications = mock.Mock(return_value=[])
@@ -2363,7 +2397,7 @@ def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
                 sampling_params=SamplingParams(),
                 block_size_tokens=block_size,
                 enable_prefix_caching=True,
-                block_hash_salt=dynamic_engine._weight_scoped_salt(0, "img-a"),
+                block_hash_salt=dynamic_engine_requests._weight_scoped_salt(0, "img-a"),
                 media_cache_key="img-a",
                 num_img_embeddings_per_tile=0,
                 imgs=None,
@@ -2382,7 +2416,7 @@ def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
         engine.resume()
         engine.add_request(6, prompt)
 
-    new_salt = dynamic_engine._weight_scoped_salt(1, None)
+    new_salt = dynamic_engine_requests._weight_scoped_salt(1, None)
     for request_id in (3, 4):
         request = engine.get_request(request_id)
         assert request.block_hash_salt == new_salt
@@ -2392,7 +2426,7 @@ def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
     # A post-resume arrival hashes identically, so the two can still share KV.
     assert engine.get_request(6).precomputed_block_hashes == hashes(new_salt)
 
-    vlm_salt = dynamic_engine._weight_scoped_salt(1, "img-a")
+    vlm_salt = dynamic_engine_requests._weight_scoped_salt(1, "img-a")
     assert engine.get_request(5).block_hash_salt == vlm_salt
     assert engine.get_request(5).precomputed_block_hashes == hashes(vlm_salt)
 
@@ -2401,6 +2435,130 @@ def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
         request = engine.get_request(request_id)
         assert request.block_hash_salt is None
         assert request.precomputed_block_hashes == hashes(None)
+
+
+def test_first_resume_reencodes_media_queued_before_the_weights():
+    """Media queued on a start_suspended engine is encoded before the weights are in place.
+
+    The first resume() must re-encode it and restore the context entry the deferred capture
+    cleared, even when stale embeddings are allowed; later cycles honor that flag again.
+    """
+    stale, fresh = torch.zeros(2, 1, 4), torch.ones(2, 1, 4)
+    request = DynamicVLMInferenceRequest(
+        request_id=7,
+        prompt_tokens=torch.tensor([10, 99, 99, 20]),
+        sampling_params=SamplingParams(num_tokens_to_generate=2, termination_id=0),
+        media_cache_key="media",
+        num_img_embeddings_per_tile=2,
+        imgs=torch.ones(1, 3, 4, 4),
+        num_tiles=torch.tensor([1]),
+        decoder_seq_length=0,
+        image_embeddings=stale,
+        image_token_mask=torch.tensor([-1, 0, 1, -1]),
+    )
+    context_media = {7: stale}
+    encoder = mock.Mock(return_value=fresh)
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.context = types.SimpleNamespace(
+        chunked_prefill_request_id=-1,
+        kv_cache_management_mode=KVCacheManagementMode.PERSIST,
+        static_kv_memory_pointers=True,
+        deallocate_inference_state_buffers=mock.Mock(),
+        reinitialize_inference_state_buffers=mock.Mock(),
+        add_vlm_request_data=lambda request_id, image_embeddings, image_token_mask: (
+            context_media.__setitem__(request_id, image_embeddings)
+        ),
+    )
+    engine.controller = types.SimpleNamespace(
+        inference_wrapped_model=types.SimpleNamespace(_forward_vision_encoder=encoder)
+    )
+    engine.requests = {
+        7: types.SimpleNamespace(record=DynamicInferenceRequestRecord.from_request(request))
+    }
+    engine.waiting_request_ids = deque([7])
+    engine.resume_request_ids = []
+    engine.state = EngineState.SUSPENDED
+    engine._deferred_cuda_graph_capture = True
+    # Capturing resets the context, which drops its media entries.
+    engine.create_cuda_graphs = mock.Mock(side_effect=context_media.clear)
+    engine.unified_memory_level = 0
+    engine.use_coordinator = False
+    engine.allow_stale_multimodal_embeddings = True
+    engine.vision_embedding_cache_max_bytes = 1 << 20
+    engine._vision_embedding_cache = OrderedDict(media=_make_vision_cache_entry(stale))
+    engine._vision_embedding_cache_bytes = 0
+    engine._add_request = mock.Mock()
+    engine._notify_cond_for_new_request = mock.Mock(return_value=None)
+    engine._loop = types.SimpleNamespace(call_soon_threadsafe=mock.Mock())
+
+    with (
+        mock.patch.object(DynamicInferenceEngine, "suspend_resume_ctx", return_value=nullcontext()),
+        mock.patch.object(InferenceMode, "unset_active"),
+        mock.patch.object(InferenceMode, "set_active"),
+        mock.patch.object(torch.cuda, "synchronize"),
+    ):
+        engine.resume()
+        assert request.image_embeddings is fresh
+        assert context_media[7] is fresh
+        assert engine._vision_embedding_cache["media"].embedding is fresh
+
+        engine.suspend()
+        engine.resume()
+
+    encoder.assert_called_once()
+    assert request.image_embeddings is fresh
+
+
+def test_collect_gc_while_idle_freezes_only_after_a_drained_step():
+    """The coordinator loop idles before the first request; that idle is not the first drain."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.gc_mode = "freeze_overlap"
+    engine._in_custom_gc_mode = True
+    engine._gc_freeze_pending = True
+    engine._gc_mode_entry_step = 3
+    engine.context = types.SimpleNamespace(step_count=3)
+    engine.controller = types.SimpleNamespace(_overlap_gc=False, _trigger_gc_now=mock.Mock())
+    engine._freeze_gc_after_first_request_drain = mock.Mock()
+
+    engine._collect_gc_while_idle(drained=True)
+    engine._freeze_gc_after_first_request_drain.assert_not_called()
+
+    engine.context.step_count = 4
+    engine._collect_gc_while_idle(drained=False)
+    engine._freeze_gc_after_first_request_drain.assert_not_called()
+    engine._collect_gc_while_idle(drained=True)
+    engine._freeze_gc_after_first_request_drain.assert_called_once_with()
+
+    # Once the first-drain freeze has switched to overlap mode, idle time collects due garbage,
+    # paused or not.
+    engine._gc_freeze_pending = False
+    engine.controller._overlap_gc = True
+    engine._collect_gc_while_idle(drained=False)
+    engine._collect_gc_while_idle(drained=True)
+    assert engine.controller._trigger_gc_now.call_count == 2
+
+
+def test_shutdown_exits_custom_gc_mode_once():
+    """A stopped engine restores process-wide GC even if it was never suspended."""
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine._staging_tasks = set()
+    engine.requests = {}
+    engine.zmq_context = types.SimpleNamespace(closed=True)
+    engine._state_events = {EngineState.STOPPED: asyncio.Event()}
+    engine.gc_mode = "freeze"
+    engine._in_custom_gc_mode = True
+    engine._gc_freeze_pending = True
+    engine.controller = types.SimpleNamespace(_overlap_gc=False)
+
+    with mock.patch.object(gc, "unfreeze") as unfreeze, mock.patch.object(gc, "collect"):
+        asyncio.run(engine.shutdown())
+        assert engine.state == EngineState.STOPPED
+        assert not engine._in_custom_gc_mode
+        assert not engine._gc_freeze_pending
+        unfreeze.assert_called_once_with()
+        # Suspend already exited the mode: shutdown must not unfreeze again.
+        engine._exit_custom_gc_mode()
+        unfreeze.assert_called_once_with()
 
 
 def test_add_request_defaults_sampling_params():
@@ -2416,7 +2574,7 @@ def test_add_request_defaults_sampling_params():
     tokens = torch.tensor([1, 2], dtype=torch.int64)
 
     with mock.patch(
-        "megatron.core.inference.engines.dynamic_engine.torch.tensor", return_value=tokens
+        "megatron.core.inference.engines.dynamic.engine.torch.tensor", return_value=tokens
     ):
         result = engine.add_request(3, [1, 2])
         engine.add_request(4, [1, 2])
@@ -2481,11 +2639,11 @@ def test_drained_reset_preserves_coordinator_runtime_state():
     pending_signals = engine._pending_signals
     with (
         mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.torch.distributed.get_rank",
+            "megatron.core.inference.engines.dynamic.engine.torch.distributed.get_rank",
             return_value=0,
         ),
         mock.patch(
-            "megatron.core.inference.engines.dynamic_engine.torch.cuda.Event",
+            "megatron.core.inference.engines.dynamic.engine.torch.cuda.Event",
             return_value=mock.Mock(),
         ),
     ):
@@ -2765,7 +2923,7 @@ def test_vision_state_invalidation_marks_request_local_embeddings_stale():
     engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
     engine.allow_stale_multimodal_embeddings = False
     engine._vision_embedding_cache = {
-        "media": dynamic_engine._VisionCacheEntry(
+        "media": dynamic_engine_multimodal._VisionCacheEntry(
             embedding=request.image_embeddings,
             modality="image",
             imgs=request.imgs,
@@ -3326,7 +3484,7 @@ async def test_slow_stager_does_not_block_the_engine_loop(caplog):
     """
     stager = _BlockingStager()
     engine = _reply_engine(stager)
-    drain_logger = "megatron.core.inference.engines.dynamic_engine"
+    drain_logger = dynamic_engine_coordinator.logger.name
 
     def drain_messages():
         return [
@@ -3403,7 +3561,7 @@ def test_schedule_kv_handoff_preserves_optional_offload_metadata(offload_params)
     engine.socket_for_receiving_requests = mock.Mock()
     engine.socket_for_receiving_requests.recv_multipart.side_effect = [
         message,
-        dynamic_engine.zmq.Again,
+        dynamic_engine_coordinator.zmq.Again,
     ]
     engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
     engine.local_metadata_ledger_enabled = False
@@ -3676,7 +3834,9 @@ def test_admit_resumed_generation(multimodal, resumed, outcome):
             for e in failed.events
             if e.type is DynamicInferenceEventType.ERROR_NONTRANSIENT
         ]
-        reason = failed.offload_params.pop(dynamic_engine._PROMPT_PREPARATION_ERROR_FIELD, None)
+        reason = failed.offload_params.pop(
+            dynamic_engine_requests._PROMPT_PREPARATION_ERROR_FIELD, None
+        )
         assert failed.status == Status.FAILED and engine.failed_request_ids == [1]
         assert not engine.waiting_request_ids and failed.offload_params == {"ng_capture": "c"}
         if outcome == "overflow":  # a valid resume, admitted and failed as any request is
@@ -3822,8 +3982,8 @@ def test_engine_prompt_preparer_materializes_deferred_multimodal_prefix():
 
     prepared = engine._prepare_submit_request_message(message)
     prepared_params = msgpack.unpackb(prepared[3], raw=False)
-    stitching_metadata, remaining = dynamic_engine._take_expanded_prefix_stitching_metadata(
-        prepared_params
+    stitching_metadata, remaining = (
+        dynamic_engine_multimodal._take_expanded_prefix_stitching_metadata(prepared_params)
     )
 
     assert msgpack.unpackb(prepared[1], raw=False) == [100, 99, 99, 101, 200, 2, 30, 42]
@@ -3864,7 +4024,9 @@ def test_engine_fails_request_when_prepared_prompt_is_not_serializable(bad_resul
     assert prepared[2] is message[2]
     assert offload_params["ng_capture"] == {"rollout_id": "r0"}
     assert RESUMED_GENERATION_FIELD not in offload_params
-    assert offload_params[dynamic_engine._PROMPT_PREPARATION_ERROR_FIELD].startswith("TypeError: ")
+    assert offload_params[dynamic_engine_requests._PROMPT_PREPARATION_ERROR_FIELD].startswith(
+        "TypeError: "
+    )
 
 
 @pytest.mark.parametrize(
@@ -3905,13 +4067,13 @@ def test_schedule_requests_drops_malformed_submit_request(malformed, caplog):
     engine.add_request = mock.Mock()
     engine._fail_submission = mock.Mock()
     socket = engine.socket_for_receiving_requests = mock.Mock()
-    socket.recv_multipart.side_effect = [malformed, good, dynamic_engine.zmq.Again]
+    socket.recv_multipart.side_effect = [malformed, good, dynamic_engine_coordinator.zmq.Again]
     engine.model_parallel_publisher_socket, engine._pending_signals = mock.Mock(), deque()
     engine.local_metadata_ledger_enabled = False
     engine._drain_handoff_completion_notifications = mock.Mock(return_value=[])
     engine._collect_failed_requests = mock.Mock(return_value=[])
 
-    with caplog.at_level(logging.WARNING, logger=dynamic_engine.logger.name):
+    with caplog.at_level(logging.WARNING, logger=dynamic_engine_coordinator.logger.name):
         assert engine.schedule_requests() == 2
 
     assert "dropping malformed SUBMIT_REQUEST" in caplog.text
@@ -4279,12 +4441,19 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                 [51, 70, 22, 1, 87, 42, 36, 26, 27, 56, 82, 32, 8, 80, 20, 43],
             ]
 
+            # Request 4's 11th token is a near-tie of the exponential-race sampler under the
+            # fp32 head (on GB300: 73 at p/q 0.86136 against 35 at 0.86035, a relative margin
+            # of 1.2e-3; every other race of the run has a margin of 9e-3 or more), and the
+            # GPU classes land on different sides of it: Hopper (the dgx_h100 CI) samples 35,
+            # Blackwell 73. Keyed by the compute capability, as the repository keys its other
+            # platform-dependent expectations.
+            hybrid_near_tie_token = 73 if torch.cuda.get_device_capability()[0] >= 10 else 35
             mamba_expected_generated_tokens = [
                 [69, 85, 55, 74, 85, 89, 64, 59, 55, 67, 15, 58, 6, 37, 34, 47],
                 [29, 16, 33, 30, 45, 76, 41, 46, 82, 17, 17, 2, 61, 6, 98, 76],
                 [35, 78, 54, 16, 79, 98, 22, 5, 37, 30, 1, 76, 5, 11, 25, 86],
                 [25, 75, 57, 85, 81, 59, 88, 38, 71, 15, 70, 64, 50, 0, 64, 45],
-                [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, 73, 20, 49, 28, 34, 81],
+                [32, 5, 85, 75, 30, 68, 23, 33, 20, 26, hybrid_near_tie_token, 20, 49, 28, 34, 81],
                 [87, 69, 32, 49, 93, 24, 33, 6, 54, 89, 92, 97, 42, 80, 50, 53],
                 [82, 78, 78, 19, 70, 5, 97, 36, 37, 99],
                 [51, 70, 22, 1, 87, 42, 36, 26, 27, 56, 82, 32, 8, 20, 20, 43],
@@ -4313,6 +4482,41 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
                     f"result ({request.generated_tokens}) != "
                     f"expected ({expected_generated_tokens})."
                 )
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("kv_cache_management_mode", ["persist", "recompute"])
+    @torch.inference_mode()
+    def test_start_suspended(self, kv_cache_management_mode: str) -> None:
+        """The first resume() captures and enters gc_mode; later cycles follow the normal rule."""
+        try:
+            env = self._run_test(
+                num_tokens_to_generate=16,
+                num_cuda_graphs=1,
+                force_build_cuda_graphs=True,
+                context_max_requests=128,
+                use_cuda_graphs_for_non_decode_steps=False,
+                kv_cache_management_mode=kv_cache_management_mode,
+                static_kv_memory_pointers=(kv_cache_management_mode == "persist"),
+                start_suspended=True,
+                gc_mode="freeze",
+            )
+            first_capture = env.engine.capture_stats
+            assert first_capture is not None
+            for request in env.requests:
+                assert request.status == Status.COMPLETED
+
+            # Later cycles follow the normal rule: PERSIST keeps the graphs, RECOMPUTE recaptures.
+            env.engine.suspend()
+            assert not env.engine._in_custom_gc_mode
+            env.engine.resume()
+            assert env.engine._in_custom_gc_mode
+            kept = env.engine.capture_stats is first_capture
+            assert kept == (kv_cache_management_mode == "persist")
+        finally:
+            gc.unfreeze()
 
     @pytest.mark.internal
     @pytest.mark.skipif(
@@ -6754,6 +6958,78 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             context.add_request(env.requests[0])
             assert context.request_last_kv_block_id[0].item() == next_block_id
             assert torch.count_nonzero(context.memory_buffer[1, :, next_block_id]) == 0
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(
+        not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
+    )
+    @pytest.mark.parametrize("gc_mode", ["freeze", "freeze_overlap"])
+    @torch.inference_mode()
+    def test_gc_mode_releases_frozen_garbage_on_suspend(self, gc_mode):
+        """Frozen cyclic garbage, including its CUDA memory, is released by suspend.
+
+        Scheduled collection starts only when the engine first drains after setup or resume.
+        """
+        was_enabled = gc.isenabled()
+        overlap = gc_mode == "freeze_overlap"
+        # Collections move immortal objects into the generation that gc.freeze() uses.
+        gc.unfreeze()
+        gc.collect()
+        immortal_count = gc.get_freeze_count()
+        try:
+            env = self._build_test_env(DynamicEngineTestConfig(gc_mode=gc_mode))
+            engine = env.engine
+            assert gc.get_freeze_count() > immortal_count
+            assert engine._gc_freeze_pending
+            assert not engine.controller._overlap_gc
+            assert gc.isenabled() is was_enabled
+
+            # A CUDA tensor in a reference cycle that is alive when the heap is frozen.
+            cycle = [torch.ones(1 << 20, device="cuda")]
+            cycle_bytes = cycle[0].untyped_storage().nbytes()
+            cycle_tensor = weakref.ref(cycle[0])
+            cycle.append(cycle)
+            engine._collect_and_freeze_gc()
+            del cycle
+            gc.collect()
+            assert cycle_tensor() is not None
+
+            half = len(env.requests) // 2
+            for request in env.requests[:half]:
+                engine._add_request(request)
+            while engine.has_unfinished_requests():
+                self._run_step(env)
+            assert not engine._gc_freeze_pending
+            assert engine.controller._overlap_gc is overlap
+            assert gc.isenabled() is (was_enabled and not overlap)
+
+            with mock.patch.object(
+                engine.controller, "_trigger_gc_now", wraps=engine.controller._trigger_gc_now
+            ) as trigger_gc_now:
+                for request in env.requests[half:]:
+                    engine._add_request(request)
+                while engine.has_unfinished_requests():
+                    self._run_step(env)
+            assert all(request.status == Status.COMPLETED for request in env.requests)
+            assert trigger_gc_now.called is overlap
+
+            gc.collect()
+            allocated = torch.cuda.memory_allocated()
+            engine.suspend()
+            # Earlier engines kept alive by pending event-loop callbacks may be released too.
+            assert cycle_tensor() is None
+            assert allocated - torch.cuda.memory_allocated() >= cycle_bytes
+            assert gc.get_freeze_count() == immortal_count
+            assert gc.isenabled() is was_enabled
+            assert not engine.controller._overlap_gc
+
+            engine.resume()
+            assert gc.get_freeze_count() > immortal_count
+            assert not engine.controller._overlap_gc
+            assert engine._gc_freeze_pending
+        finally:
+            gc.unfreeze()
+            (gc.enable if was_enabled else gc.disable)()
 
     @pytest.mark.skipif(
         not is_fa_min_version("2.7.3"), reason="need latest flash attn for dynamic batching"
@@ -9271,8 +9547,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
         ["all_accepted", "all_rejected", "partial"],
         ids=["accept_all", "reject_all", "partial_reject"],
     )
+    @pytest.mark.parametrize("mamba_replay_ssm", [False, True], ids=["baseline", "replay"])
     @torch.inference_mode()
-    def test_speculative_decoding_mamba_hybrid(self, rejection_mode):
+    def test_speculative_decoding_mamba_hybrid(self, rejection_mode, mamba_replay_ssm):
         """Test speculative decoding with a Mamba hybrid model.
 
         Exercises the intermediate Mamba state commit/rewind path with
@@ -9299,6 +9576,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             max_prompt_length=4,
             num_tokens_to_generate=num_tokens_to_generate,
             num_speculative_tokens=2,
+            mamba_replay_ssm=mamba_replay_ssm,
+            # Small buffer so multiple flush cycles happen within 8 generated tokens.
+            mamba_replay_buffer_len=4,
             materialize_only_last_token_logits=False,
             model_provider="hybrid",
         )

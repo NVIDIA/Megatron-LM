@@ -137,6 +137,10 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             )
         super().__init__(config=config, pg_collection=pg_collection)
         # MTP depth is model-wide; non-MTP pipeline stages still freeze their backbone.
+        if self.config.mtp_kl_loss_weight > 0 and (
+            self.config.mtp_num_layers is None or self.config.mtp_num_layers <= 0
+        ):
+            raise ValueError("MTP KL loss requires positive mtp_num_layers")
         if self.config.freeze_base_model_for_mtp and (
             self.config.mtp_num_layers is None or self.config.mtp_num_layers < 1
         ):
@@ -480,6 +484,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 rotary_pos_emb = self.rotary_pos_emb(
                     position_ids,
                     self.mrope_section,
+                    packed_seq=packed_seq_params is not None
+                    and packed_seq_params.qkv_format == 'thd',
                     cp_group=packed_seq_params.cp_group if packed_seq_params is not None else None,
                 )
             else:
@@ -867,12 +873,26 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 reshaped = hidden_states.squeeze(1).unsqueeze(0)
                 hidden_states = inference_context.last_token_logits(reshaped).unsqueeze(1)
 
+        # Inference consumes logits in fp32: emit them so when the head can, upcast otherwise.
+        emit_fp32 = in_inference_mode and self.lm_head_can_emit_fp32
         logits, _ = self.output_layer(
-            hidden_states, weight=output_weight, runtime_gather_output=runtime_gather_output
+            hidden_states,
+            weight=output_weight,
+            runtime_gather_output=runtime_gather_output,
+            output_dtype=torch.float32 if emit_fp32 else None,
         )
 
         # Apply MuP output scaling to logits
         logits = self._scale_logits(logits)
+        if in_inference_mode:
+            logits = logits.float()
+        # Dynamic inference under CUDA graphs: write the logits into the controller's
+        # persistent buffer and return a view of it, so no graph pins its own copy.
+        logits_buffer = getattr(inference_context, "logits_output_buffer", None)
+        if logits_buffer is not None:
+            buffer_rows = logits_buffer[0, : logits.shape[0]]
+            buffer_rows.copy_(logits.squeeze(1))
+            logits = buffer_rows.unsqueeze(1)
         gather_output = (
             self.output_layer.gather_output
             if runtime_gather_output is None

@@ -117,7 +117,7 @@ def _train(cp_size, per_token, depth, early_backward, initial_state=None):
 
     def forward_step(iterator, wrapped_model):
         batch = get_batch_on_this_cp_rank(
-            next(iterator), is_hybrid_cp=False, cp_group=parallel_state.get_context_parallel_group()
+            next(iterator), dynamic_cp=False, cp_group=parallel_state.get_context_parallel_group()
         )
         mask = batch["loss_mask"]
         output = wrapped_model(

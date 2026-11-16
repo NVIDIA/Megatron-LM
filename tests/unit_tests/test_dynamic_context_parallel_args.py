@@ -16,8 +16,10 @@ from megatron.training.arguments import core_transformer_config_from_args, parse
 _GUARD = "Dynamic context parallelism not supported with CUDA Graph"
 
 
-def _hybrid_cp_args(monkeypatch, **overrides):
-    monkeypatch.setattr(sys, "argv", ["test_hybrid_context_parallel_args.py"])
+def _dynamic_cp_args(monkeypatch, **overrides):
+    monkeypatch.setattr(
+        sys, "argv", ["test_dynamic_context_parallel_args.py", "--dynamic-context-parallel"]
+    )
     args = parse_args()
     # parse_args reads WORLD_SIZE from the environment; pin it so the test does not depend
     # on how the job was launched.
@@ -33,7 +35,6 @@ def _hybrid_cp_args(monkeypatch, **overrides):
     args.lr = 1e-4
     args.tokenizer_type = "NullTokenizer"
     args.vocab_size = 1024
-    args.dynamic_context_parallel = True
     args.max_seqlen_per_dp_cp_rank = 1024
     args.calculate_per_token_loss = True
     args.dataloader_type = "single"
@@ -47,31 +48,31 @@ def _hybrid_cp_args(monkeypatch, **overrides):
     [
         ("local", {}),
         ("transformer_engine", {}),
-        # full_iteration has its own prerequisite, checked before the hybrid-CP guard.
+        # full_iteration has its own prerequisite, checked before the dynamic-CP guard.
         ("full_iteration", {"check_for_nan_in_loss_and_grad": False}),
     ],
 )
-def test_hybrid_context_parallel_rejects_cuda_graph_impl(
+def test_dynamic_context_parallel_rejects_cuda_graph_impl(
     monkeypatch, cuda_graph_impl, prerequisites
 ):
-    args = _hybrid_cp_args(monkeypatch, cuda_graph_impl=cuda_graph_impl, **prerequisites)
+    args = _dynamic_cp_args(monkeypatch, cuda_graph_impl=cuda_graph_impl, **prerequisites)
     validate_args(args)
     with pytest.raises(AssertionError, match=_GUARD):
         core_transformer_config_from_args(args, TransformerConfig)
 
 
 @pytest.mark.parametrize("deprecated_flag", ["enable_cuda_graph", "external_cuda_graph"])
-def test_hybrid_context_parallel_rejects_deprecated_cuda_graph_flags(monkeypatch, deprecated_flag):
+def test_dynamic_context_parallel_rejects_deprecated_cuda_graph_flags(monkeypatch, deprecated_flag):
     # validate_args translates these into cuda_graph_impl and deletes them before the
     # config is built, so the guard must read cuda_graph_impl.
-    args = _hybrid_cp_args(monkeypatch, **{deprecated_flag: True})
+    args = _dynamic_cp_args(monkeypatch, **{deprecated_flag: True})
     validate_args(args)
     with pytest.raises(AssertionError, match=_GUARD):
         core_transformer_config_from_args(args, TransformerConfig)
 
 
-def test_hybrid_context_parallel_without_cuda_graphs_validates(monkeypatch):
-    args = _hybrid_cp_args(monkeypatch)
+def test_dynamic_context_parallel_without_cuda_graphs_validates(monkeypatch):
+    args = _dynamic_cp_args(monkeypatch)
     validate_args(args)
     assert args.cuda_graph_impl == "none"
     assert core_transformer_config_from_args(args, TransformerConfig).dynamic_context_parallel
@@ -80,19 +81,9 @@ def test_hybrid_context_parallel_without_cuda_graphs_validates(monkeypatch):
 def test_hybrid_builder_rejects_dynamic_context_parallel(monkeypatch):
     from hybrid_builders import hybrid_builder
 
-    args = _hybrid_cp_args(monkeypatch)
+    args = _dynamic_cp_args(monkeypatch)
     with pytest.raises(NotImplementedError, match="not yet supported for HybridModel"):
         hybrid_builder(args, pre_process=True, post_process=True)
-
-
-def test_deprecated_hybrid_context_parallel_flag_warns_and_maps(monkeypatch):
-    args = _hybrid_cp_args(
-        monkeypatch, rank=0, dynamic_context_parallel=False, hybrid_context_parallel=True
-    )
-    with pytest.warns(UserWarning, match="--hybrid-context-parallel is deprecated"):
-        validate_args(args)
-    assert args.dynamic_context_parallel
-    assert not args.hybrid_context_parallel
 
 
 @pytest.mark.parametrize("use_varlen_dataset,micro_batch_size", [(False, 1), (True, 2)])
@@ -100,7 +91,7 @@ def test_static_packed_graph_prerequisites_are_preserved(
     monkeypatch, use_varlen_dataset, micro_batch_size
 ):
     """Scoping the graph guard must not relax static packing's input requirements."""
-    args = _hybrid_cp_args(
+    args = _dynamic_cp_args(
         monkeypatch,
         dynamic_context_parallel=False,
         sequence_packing_scheduler="dp_balanced",

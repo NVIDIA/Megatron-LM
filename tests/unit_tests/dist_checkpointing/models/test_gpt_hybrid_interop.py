@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Tests for loading GPT checkpoints into HybridModel runs.
 
@@ -54,22 +54,36 @@ from megatron.training.checkpointing import (
     load_checkpoint,
     save_checkpoint,
 )
+from megatron.training.global_vars import get_run_config
+from megatron.training.models import GPTModelConfig, HybridModelConfig
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.dist_checkpointing.utils import (
     init_checkpointing_mock_args,
     setup_model_and_optimizer,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 
 class TestGPTCompatLayerMaps:
+    @pytest.mark.parametrize("canonical", [{}, {"hybrid_layer_pattern": None}])
+    def test_old_bridge_hybrid_config_uses_regular_load_path(self, canonical):
+        runtime_model = object.__new__(HybridModel)
+        checkpoint_model = {"hybrid_override_pattern": "M*-", **canonical}
+        assert _maybe_setup_gpt_to_hybrid_load(
+            mock.Mock(),
+            SimpleNamespace(),
+            [runtime_model],
+            load_optim=True,
+            saved_save_optim=True,
+            checkpoint_model=checkpoint_model,
+        ) == (None, False)
+
     def test_metadata_less_bridge_checkpoint_uses_regular_load_path(self):
         runtime_model = object.__new__(HybridModel)
 
-        assert _maybe_setup_gpt_to_hybrid_load(mock.Mock(), SimpleNamespace(), [runtime_model]) == (
-            None,
-            False,
-        )
+        assert _maybe_setup_gpt_to_hybrid_load(
+            mock.Mock(), SimpleNamespace(), [runtime_model], load_optim=True, saved_save_optim=True
+        ) == (None, False)
 
     def test_pairs_positions_in_pattern_order(self):
         maps = gpt_compatible_layer_maps('M*-M*-')
@@ -633,7 +647,7 @@ def _unwrap_interop_model(model):
     return model
 
 
-def _configure_checkpoint_args(args, ckpt_dir, parallel, moe, use_megatron_fsdp):
+def _configure_checkpoint_args(args, ckpt_dir, parallel, moe, use_megatron_fsdp, model):
     init_checkpointing_mock_args(args, ckpt_dir, fully_parallel=not use_megatron_fsdp)
     _set_checkpoint_parallel_args(args, parallel, moe)
     args.use_distributed_optimizer = True
@@ -643,6 +657,20 @@ def _configure_checkpoint_args(args, ckpt_dir, parallel, moe, use_megatron_fsdp)
     args.dist_ckpt_optim_fully_reshardable = not use_megatron_fsdp
     args.hidden_size = _OPT_HIDDEN
     args.num_attention_heads = _OPT_HEADS
+    # Checkpoint architecture and layout now come from the model config, not mock args.
+    runtime_model = _unwrap_interop_model(model[0])
+    config_type = HybridModelConfig if isinstance(runtime_model, HybridModel) else GPTModelConfig
+    model_kwargs = dict(
+        transformer=runtime_model.config,
+        vocab_size=runtime_model.vocab_size,
+        should_pad_vocab=False,
+        seq_length=runtime_model.max_sequence_length,
+        position_embedding_type=runtime_model.position_embedding_type,
+        share_embeddings_and_output_weights=runtime_model.share_embeddings_and_output_weights,
+    )
+    if isinstance(runtime_model, HybridModel):
+        model_kwargs['hybrid_layer_pattern'] = runtime_model.hybrid_layer_pattern
+    get_run_config().model = config_type(**model_kwargs)
 
 
 def _run_gpt_to_hybrid_optimizer_load(
@@ -685,8 +713,11 @@ def _run_gpt_to_hybrid_optimizer_load(
                 initialize_fn=partial(gpt_provider_for_opt, num_gpt_layers=num_gpt_layers, moe=moe),
             )
             _seed_optimizer_moments(gpt_optimizer, seed=3)
-            _configure_checkpoint_args(mock_args, ckpt_dir, src_parallel, moe, use_megatron_fsdp)
+            _configure_checkpoint_args(
+                mock_args, ckpt_dir, src_parallel, moe, use_megatron_fsdp, gpt_model
+            )
             mock_args.num_layers = num_gpt_layers
+            sync_checkpoint_config(mock_args)
             save_checkpoint(10, gpt_model, gpt_optimizer, None, 0)
             Utils.destroy_model_parallel()
 
@@ -715,7 +746,9 @@ def _run_gpt_to_hybrid_optimizer_load(
             model_before = _model_parameter_snapshot(hybrid_module)
             moments_before = _optimizer_moment_fingerprint(hybrid_optimizer)
 
-            _configure_checkpoint_args(mock_args, ckpt_dir, dest_parallel, moe, use_megatron_fsdp)
+            _configure_checkpoint_args(
+                mock_args, ckpt_dir, dest_parallel, moe, use_megatron_fsdp, hybrid_model
+            )
             mock_args.finetune = finetune
             mock_args.hybrid_layer_pattern = pattern
             mock_args.num_layers = len(pattern.replace('|', ''))
@@ -729,6 +762,7 @@ def _run_gpt_to_hybrid_optimizer_load(
                     data_parallel_size=data_parallel_size,
                 )
             try:
+                sync_checkpoint_config(mock_args)
                 iteration, _ = load_checkpoint(
                     hybrid_model, hybrid_optimizer, None, restore_training_state=True
                 )

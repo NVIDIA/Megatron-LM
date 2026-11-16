@@ -1109,6 +1109,8 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
     @pytest.mark.internal
     def test_hybrid_admission_resumes_after_handoff_releases_live_slot(self):
         ctx = self._mctx(max_requests=1, rounder=1)
+        # setup_kv_transfer(role="prefill") enables transfer and handoff pinning.
+        ctx.kv_transfer_enabled = True
         ctx.kv_block_allocator.enable_handoff_pinning = True
         slot = ctx.mamba_metadata.allocate_slot()
         assert slot is not None
@@ -1130,6 +1132,50 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
 
         assert request_available
         assert ctx.mamba_metadata.mamba_state_free_slot_count == 1
+
+    @pytest.mark.internal
+    def test_hybrid_admission_counts_slots_reserved_outside_request_rows(self):
+        """A decode engine reserves live slots for incoming handoffs before they own a row.
+
+        Handoff pinning is off on decode, so the free request row must not be taken
+        as proof of a free recurrent-state slot; otherwise add_request raises.
+        """
+        ctx = self._mctx(max_requests=2, rounder=1, prefix_caching_mamba_gb=None)
+        # setup_kv_transfer(role="decode") enables transfer without handoff pinning.
+        ctx.kv_transfer_enabled = True
+        assert not ctx.kv_block_allocator.enable_handoff_pinning
+        reserved_slots = [ctx.mamba_metadata.allocate_slot() for _ in range(ctx.max_requests)]
+        assert None not in reserved_slots
+        assert ctx.total_request_count < ctx.max_requests
+        assert ctx.mamba_metadata.mamba_state_free_slot_count == 0
+        request = self._req(ctx, self._prompt(ctx.block_size_tokens))
+
+        request_available, _, _ = ctx.check_availability(request)
+
+        assert not request_available
+
+        ctx.mamba_metadata.free_slot(reserved_slots[0])
+
+        request_available, _, _ = ctx.check_availability(request)
+
+        assert request_available
+
+    @pytest.mark.internal
+    def test_hybrid_admission_asserts_slot_per_row_without_kv_transfer(self):
+        """Without KV transfer, a free request row must imply a free recurrent-state slot."""
+        ctx = self._mctx(max_requests=2, rounder=1, prefix_caching_mamba_gb=None)
+        assert not ctx.kv_transfer_enabled
+        request = self._req(ctx, self._prompt(ctx.block_size_tokens))
+
+        request_available, _, _ = ctx.check_availability(request)
+
+        assert request_available
+
+        for _ in range(ctx.max_requests):
+            assert ctx.mamba_metadata.allocate_slot() is not None
+
+        with pytest.raises(AssertionError, match="only KV transfer"):
+            ctx.check_availability(request)
 
     @pytest.mark.internal
     def test_mamba_prefill_skip_and_zero_prefill(self):
@@ -1279,6 +1325,52 @@ class TestMambaPrefixCaching(PrefixCachingTestBase):
                 max_tokens=ctx.mamba_chunk_size,
                 max_requests=64,
             )
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("batch_invariant_mode", [False, True])
+    @pytest.mark.parametrize("num_decode", [0, 1, 63, 150])
+    def test_batch_invariant_mamba_chunked_prefill_budget_excludes_decode(
+        self, batch_invariant_mode, num_decode
+    ):
+        ctx = self._mctx(
+            block_size_tokens=32,
+            batch_invariant_mode=batch_invariant_mode,
+            enable_prefix_caching=False,
+            enable_chunked_prefill=True,
+            max_tokens=256,
+            max_requests=160,
+        )
+        chunk = ctx.mamba_chunk_size
+        assert ctx.max_prefill_tokens == 256
+        assert ctx.max_tokens == (256 + chunk if batch_invariant_mode else 256)
+
+        # Resident decode requests: one token each this step.
+        for i in range(num_decode):
+            ctx.add_request(self._req(ctx, self._prompt(1, offset=i), request_id=100 + i))
+        ctx.num_prefill_requests = 0
+        assert ctx.num_decode_requests == num_decode
+        assert ctx.active_token_count == num_decode
+
+        engine = _StubEngine(ctx, enable_chunked_prefill=True)
+        req = self._req(ctx, self._prompt(1000), enable_prefix_caching=False)
+        engine.requests[req.request_id] = SimpleNamespace(
+            record=DynamicInferenceRequestRecord.from_request(req),
+            future=engine._loop.create_future(),
+        )
+        req.status = Status.ACTIVE_AND_GENERATING_TOKENS
+        engine.waiting_request_ids.append(req.request_id)
+        engine.schedule_chunked_prefill()
+
+        admitted = req.finished_chunk_token_count
+        assert ctx.active_token_count == num_decode + admitted <= ctx.max_tokens
+        if batch_invariant_mode:
+            # The full prefill budget while the decode tokens fit in the SSM-chunk headroom;
+            # beyond it, the remaining step capacity rounded down to an SSM chunk.
+            expected = min(256, (256 + chunk - num_decode) // chunk * chunk)
+            assert admitted == expected and admitted % chunk == 0
+            assert admitted >= 256 - num_decode  # never less than without batch invariance
+        else:
+            assert admitted == 256 - num_decode
 
     @pytest.mark.internal
     def test_mamba_intermediate_offsets(self):

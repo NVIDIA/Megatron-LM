@@ -12,7 +12,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP, classify_gtp_remat_chains
 
 if not HAVE_GTP:
     pytest.skip("GTP requires TransformerEngine >= 2.19", allow_module_level=True)
@@ -203,6 +203,8 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
     # Restore initial weights into shards and pre-allocate main_grad for the backward.
     _restore_gtp_shards_and_init_main_grad(layers_gtp, saved_weights, gtp_rank, dtype)
 
+    classify_gtp_remat_chains(layers_gtp)
+    assert len({p.chain_id for p in gtp_params}) == 1, "Mamba projections must share a chain"
     gtp_losses = []
     for step in range(STEPS):
         for p in layers_gtp.parameters():
@@ -281,6 +283,8 @@ def _worker_mamba_gtp_correctness(rank, world_size, port):
         if is_gtp_param(p):
             p.main_grad = torch.zeros(p.shape, dtype=dtype, device='cuda')
 
+    classify_gtp_remat_chains(layers_fp8)
+    assert len({p.chain_id for p in native_fp8}) == 1
     fp8_losses = []
     for step in range(STEPS):
         for p in layers_fp8.parameters():

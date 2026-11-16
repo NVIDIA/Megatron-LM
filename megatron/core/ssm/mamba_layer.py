@@ -20,6 +20,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.context_parallel.chunkwise import PackedSequenceCPMetadata
@@ -29,7 +30,6 @@ from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAt
 from megatron.core.transformer.residual_connection import ResidualBranchInput
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import deprecate_inference_params

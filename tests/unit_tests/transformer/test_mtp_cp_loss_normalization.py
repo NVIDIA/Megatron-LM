@@ -255,11 +255,13 @@ def test_mtp_cp_conditioning_mask_gradients(
     torch.testing.assert_close(actual[2], expected[2], atol=1e-11, rtol=1e-9)
 
 
+@pytest.mark.parametrize("ce_weight", [0.3, 1.0])
 @pytest.mark.parametrize("per_token", [False, True])
-def test_mtp_cp_logged_loss_uses_global_count(cp_group, device, monkeypatch, per_token):
+def test_mtp_cp_logged_loss_uses_global_count(cp_group, device, monkeypatch, per_token, ce_weight):
     """The logging helper must report the CP1 mean in both normalization modes."""
     hidden, weight, labels, config, params, indices = _case(1, False, device, cp_group)
     config.calculate_per_token_loss = per_token
+    config.mtp_ce_loss_weight = ce_weight
     monkeypatch.setattr(MTPLossLoggingHelper, "tracker", {})
     for mask in _masks(device):
         MTPLossLoggingHelper.reset_metrics_tracker()
@@ -280,4 +282,10 @@ def test_mtp_cp_logged_loss_uses_global_count(cp_group, device, monkeypatch, per
         )
         expected = (losses * mask[:, 1:]).sum() / mask[:, 1:].sum().clamp(min=1)
         # The actual logging accumulator stores float32, even for this float64 head.
-        torch.testing.assert_close(actual, expected.float(), atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(actual, ce_weight * expected.float(), atol=1e-6, rtol=1e-6)
+        torch.testing.assert_close(
+            MTPLossLoggingHelper.tracker["ce_loss_values"][0],
+            expected.float(),
+            atol=1e-6,
+            rtol=1e-6,
+        )

@@ -464,7 +464,7 @@ if __name__ == "__main__":
             None,  # we don't need to build any datasets for RL training
             ModelType.encoder_or_decoder,
             forward_step,
-            rl_model_provider,
+            None,
             next_train_iterator=next_train_iterator,
             run_eval=run_eval,
             # --rl-rollout-only iterates the loop collecting rollouts without optimizer updates.
