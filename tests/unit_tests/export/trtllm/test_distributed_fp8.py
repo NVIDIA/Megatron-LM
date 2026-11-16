@@ -212,6 +212,7 @@ class TestTRTLLMSingleDeviceConverterFP8:
                 num_microbatches=1,
                 seq_length=SEQUENCE_LENGTH,
                 micro_batch_size=8,
+                decoder_seq_length=SEQUENCE_LENGTH,
                 forward_only=False,
             )
             optim.step()

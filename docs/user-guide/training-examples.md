@@ -141,18 +141,10 @@ The `--decoder-seq-length` CLI flag remains accepted: VLM entrypoints translate
 it into their execution width, while T5 retains an independent decoder width.
 Decoder-only models do not acquire a second decoder-length config field.
 
-`megatron.core.pipeline_parallel.schedules.get_tensor_shapes()` and all three
-forward/backward schedules use one resolved `seq_length`. Their optional
-`decoder_seq_length` argument is deprecated and will be removed in the 0.22 release.
-For compatibility, a non-None value still overrides `seq_length` in the shape helper
-and non-interleaved schedule; the no-pipeline and interleaved schedules continue
-to ignore it. Supplying a non-None value emits a `FutureWarning` on the logging ranks.
-Callers should select the pipeline width before calling them, including when
-forwarding keywords through ModelOpt's distillation shape adapter. For VLMs, pass
-the expanded LM input width. When migrating an ignored argument, simply remove it.
-T5 retains separate model/dataset encoder and decoder lengths; its entrypoint
-does not support pipeline parallelism. External callers (including Bridge) should
-stop passing the deprecated keyword before upgrading to 0.22.
+Core's schedule APIs are unchanged. The training loop passes the resolved model
+execution width as `seq_length`, without a separate decoder override. T5 retains
+separate model/dataset encoder and decoder lengths; its entrypoint does not support
+pipeline parallelism.
 
 Direct Python callers of the migrated callback dataset providers and task encoders
 must pass their length inputs explicitly instead of relying on global arguments.

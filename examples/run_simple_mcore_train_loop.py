@@ -257,6 +257,7 @@ if __name__ == "__main__":
             num_microbatches=1,
             seq_length=_SEQUENCE_LENGTH,
             micro_batch_size=8,
+            decoder_seq_length=_SEQUENCE_LENGTH,
             forward_only=False,
         )
 
