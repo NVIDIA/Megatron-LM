@@ -128,6 +128,9 @@ class ConfigContainerBase:
 
     def _finalize(self) -> None:
         """Apply shared runtime derivations after all validation has succeeded."""
+        logger_config = getattr(self, "logger", None)
+        if logger_config is not None:
+            logger_config.finalize()
         rng = getattr(self, "rng", None)
         if rng is not None:
             rng.finalize_model_config(getattr(self, "model", None))

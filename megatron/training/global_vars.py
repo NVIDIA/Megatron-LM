@@ -394,7 +394,10 @@ def _set_experiment_writer(args):
     _ensure_var_is_not_initialized(_GLOBAL_EXPERIMENT_WRITER, 'experiment writer')
     cfg = get_run_config()
     if (
-        cfg.logger.wandb_project or cfg.logger.mlflow_experiment or cfg.logger.comet_project
+        cfg.logger.wandb_project
+        or cfg.logger.mlflow_experiment
+        or cfg.logger.mlflow_experiment_id
+        or cfg.logger.comet_project
     ) and args.rank == safe_get_world_size() - 1:
         from megatron.training.logging.experiment_writer import ExperimentWriter
 

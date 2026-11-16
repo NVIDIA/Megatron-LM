@@ -4,6 +4,7 @@
 
 import sys
 from argparse import ArgumentParser, Namespace
+from dataclasses import asdict
 from itertools import product
 from threading import Thread
 from types import SimpleNamespace
@@ -23,6 +24,24 @@ from megatron.training.logging.experiment_writer import ExperimentWriter
 from megatron.training.state import TrainState
 
 
+@pytest.fixture(autouse=True)
+def clean_logger_environment(monkeypatch):
+    """Only the environment settings declared by each test may affect its logger."""
+    for variable in (
+        "MLFLOW_EXPERIMENT_NAME",
+        "MLFLOW_EXPERIMENT_ID",
+        "MLFLOW_RUN_NAME",
+        "MLFLOW_RUN_ID",
+        "WANDB_PROJECT",
+        "WANDB_NAME",
+        "WANDB_ENTITY",
+        "WANDB_RUN_ID",
+        "WANDB_DIR",
+        "WANDB_RESUME",
+    ):
+        monkeypatch.delenv(variable, raising=False)
+
+
 @pytest.fixture
 def tracking_sdks(monkeypatch):
     mlflow = Mock()
@@ -39,6 +58,195 @@ def tracking_sdks(monkeypatch):
     monkeypatch.setitem(sys.modules, "comet_ml", comet)
     monkeypatch.setitem(sys.modules, "wandb", Mock())
     return mlflow, comet
+
+
+@pytest.fixture
+def initialize_logging(monkeypatch, run_config, tracking_sdks):
+    """Exercise container validation/finalization and the real logger enablement check."""
+    monkeypatch.setattr(global_vars, "_GLOBAL_EXPERIMENT_WRITER", None)
+    monkeypatch.setattr(global_vars, "safe_get_world_size", lambda: 1)
+    run_config.train.micro_batch_size = 1
+
+    def initialize(cli_args=()):
+        parser = ArgumentParser()
+        arguments._add_logging_args(parser)
+        run_config.logger = _default_config_from_args(LoggerConfig, parser.parse_args(cli_args))
+        run_config.finalize()
+        global_vars._set_experiment_writer(Namespace(rank=0))
+        return global_vars.get_experiment_writer()
+
+    yield initialize
+    global_vars.finish_experiment_logging()
+
+
+@pytest.mark.parametrize(
+    "variable,value",
+    [
+        pytest.param("MLFLOW_EXPERIMENT_NAME", "launcher-experiment", id="select-by-name"),
+        pytest.param("MLFLOW_EXPERIMENT_ID", "42", id="select-by-id"),
+    ],
+)
+def test_mlflow_environment_alone_enables_tracking(
+    monkeypatch, initialize_logging, tracking_sdks, variable, value
+):
+    monkeypatch.setenv(variable, value)
+    monkeypatch.setenv("MLFLOW_RUN_NAME", "launcher-run")
+
+    writer = initialize_logging()  # No Megatron CLI flags are needed.
+
+    mlflow, _ = tracking_sdks
+    assert writer is not None
+    if variable == "MLFLOW_EXPERIMENT_NAME":
+        mlflow.set_experiment.assert_called_once_with("launcher-experiment")
+    else:
+        mlflow.set_experiment.assert_called_once_with(experiment_id="42")
+    assert mlflow.tracking.MlflowClient.return_value.create_run.call_args.kwargs["run_name"] == (
+        "launcher-run"
+    )
+
+
+@pytest.mark.parametrize("selector", ["--mlflow-experiment", "--mlflow-experiment-id"])
+def test_explicit_mlflow_selection_overrides_both_environment_selectors(
+    monkeypatch, initialize_logging, tracking_sdks, run_config, selector
+):
+    monkeypatch.setenv("MLFLOW_EXPERIMENT_NAME", "ignored-name")
+    monkeypatch.setenv("MLFLOW_EXPERIMENT_ID", "ignored-id")
+    monkeypatch.setenv("MLFLOW_RUN_NAME", "ignored-run")
+
+    initialize_logging([selector, "explicit-selection", "--mlflow-run-name", "explicit-run"])
+
+    mlflow, _ = tracking_sdks
+    if selector == "--mlflow-experiment":
+        mlflow.set_experiment.assert_called_once_with("explicit-selection")
+        assert run_config.logger.mlflow_experiment_id is None
+    else:
+        mlflow.set_experiment.assert_called_once_with(experiment_id="explicit-selection")
+        assert run_config.logger.mlflow_experiment is None
+    assert mlflow.tracking.MlflowClient.return_value.create_run.call_args.kwargs["run_name"] == (
+        "explicit-run"
+    )
+
+
+def test_explicit_mlflow_experiment_keeps_environment_run_name(
+    monkeypatch, initialize_logging, tracking_sdks
+):
+    monkeypatch.setenv("MLFLOW_RUN_NAME", "launcher-run")
+
+    initialize_logging(["--mlflow-experiment", "explicit-experiment"])
+
+    mlflow, _ = tracking_sdks
+    mlflow.set_experiment.assert_called_once_with("explicit-experiment")
+    assert mlflow.tracking.MlflowClient.return_value.create_run.call_args.kwargs["run_name"] == (
+        "launcher-run"
+    )
+
+
+@pytest.mark.parametrize(
+    "matching_name", [True, False], ids=["same-experiment", "different-experiments"]
+)
+def test_mlflow_environment_name_and_id_must_agree(
+    monkeypatch, initialize_logging, tracking_sdks, matching_name
+):
+    monkeypatch.setenv("MLFLOW_EXPERIMENT_NAME", "requested-experiment")
+    monkeypatch.setenv("MLFLOW_EXPERIMENT_ID", "42")
+    monkeypatch.setenv("MLFLOW_RUN_NAME", "launcher-run")
+    mlflow, _ = tracking_sdks
+    client = mlflow.tracking.MlflowClient.return_value
+    client.get_experiment.return_value = SimpleNamespace(
+        experiment_id="42", name="requested-experiment" if matching_name else "another-experiment"
+    )
+
+    if matching_name:
+        initialize_logging()
+        mlflow.set_experiment.assert_called_once_with(experiment_id="42")
+        client.create_run.assert_called_once()
+    else:
+        with pytest.raises(ValueError, match="name and ID must select the same experiment"):
+            initialize_logging()
+        mlflow.set_experiment.assert_not_called()
+        client.create_run.assert_not_called()
+
+
+def test_logger_validation_reads_environment_without_changing_the_recipe(monkeypatch):
+    logger_config = LoggerConfig(mlflow_experiment="recipe-experiment")
+    original = asdict(logger_config)
+    monkeypatch.setenv("MLFLOW_RUN_NAME", "launcher-run")
+
+    logger_config.validate()
+    logger_config.validate()
+    assert asdict(logger_config) == original
+
+    logger_config.finalize()
+    logger_config.finalize()
+    assert logger_config.mlflow_run_name == "launcher-run"
+    monkeypatch.setenv("MLFLOW_RUN_NAME", "later-environment")
+    logger_config.finalize()
+    assert logger_config.mlflow_run_name == "launcher-run"
+
+
+def test_wandb_environment_alone_enables_tracking_and_beats_generated_defaults(
+    monkeypatch, initialize_logging, run_config, tmp_path
+):
+    monkeypatch.setenv("WANDB_PROJECT", "launcher-project")
+    monkeypatch.setenv("WANDB_NAME", "launcher-run")
+    monkeypatch.setenv("WANDB_ENTITY", "launcher-team")
+    monkeypatch.setenv("WANDB_RUN_ID", "existing-run-id")
+    monkeypatch.setenv("WANDB_DIR", str(tmp_path / "environment"))
+    monkeypatch.setenv("WANDB_RESUME", "must")
+    run_config.checkpoint.save = str(tmp_path / "checkpoints")
+
+    writer = initialize_logging()
+
+    kwargs = writer.wandb.init.call_args.kwargs
+    assert kwargs["project"] == "launcher-project"
+    assert kwargs["name"] == "launcher-run"
+    assert kwargs["entity"] == "launcher-team"
+    assert kwargs["id"] == "existing-run-id"  # Not an ID derived from the display name.
+    assert kwargs["dir"] == str(tmp_path / "environment")  # Not checkpoint.save / wandb.
+    assert kwargs["resume"] == "must"
+    assert kwargs["config"]["logger"]["wandb_project"] == "launcher-project"
+
+
+def test_explicit_wandb_settings_override_environment(monkeypatch, initialize_logging, tmp_path):
+    for variable in ("WANDB_PROJECT", "WANDB_NAME", "WANDB_ENTITY", "WANDB_RUN_ID", "WANDB_DIR"):
+        monkeypatch.setenv(variable, "ignored-environment")
+    monkeypatch.setenv("WANDB_RESUME", "must")
+
+    writer = initialize_logging(
+        [
+            "--wandb-project",
+            "explicit-project",
+            "--wandb-exp-name",
+            "explicit-run",
+            "--wandb-entity",
+            "explicit-team",
+            "--wandb-run-id",
+            "explicit-id",
+            "--wandb-save-dir",
+            str(tmp_path),
+            "--wandb-resume",
+            "allow",
+        ]
+    )
+
+    kwargs = writer.wandb.init.call_args.kwargs
+    assert kwargs["project"] == "explicit-project"
+    assert kwargs["name"] == "explicit-run"
+    assert kwargs["entity"] == "explicit-team"
+    assert kwargs["id"] == "explicit-id"
+    assert kwargs["dir"] == str(tmp_path)
+    assert kwargs["resume"] == "allow"
+
+
+def test_no_config_or_environment_leaves_all_experiment_backends_disabled(
+    initialize_logging, tracking_sdks
+):
+    assert initialize_logging() is None
+
+    mlflow, comet = tracking_sdks
+    sys.modules["wandb"].init.assert_not_called()
+    mlflow.tracking.MlflowClient.assert_not_called()
+    comet.Experiment.assert_not_called()
 
 
 @pytest.fixture

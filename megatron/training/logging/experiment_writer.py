@@ -83,10 +83,10 @@ class ExperimentWriter:
                     project=logger_cfg.wandb_project,
                     entity=logger_cfg.wandb_entity,
                     config=config,
-                    resume="allow",
+                    resume=logger_cfg.wandb_resume or "allow",
                 )
                 self.wandb = wandb
-            if logger_cfg.mlflow_experiment:
+            if logger_cfg.mlflow_experiment or logger_cfg.mlflow_experiment_id:
                 params = _flatten_config(config)
                 try:
                     import mlflow
@@ -109,7 +109,22 @@ class ExperimentWriter:
                     self._mlflow_run_id = run_id
                     self._owns_mlflow_run = True
                 else:
-                    experiment = mlflow.set_experiment(logger_cfg.mlflow_experiment)
+                    if logger_cfg.mlflow_experiment_id:
+                        experiment = self.mlflow.get_experiment(logger_cfg.mlflow_experiment_id)
+                        if (
+                            logger_cfg.mlflow_experiment is not None
+                            and experiment.name != logger_cfg.mlflow_experiment
+                        ):
+                            raise ValueError(
+                                "MLflow experiment name and ID must select the same experiment: "
+                                f"{logger_cfg.mlflow_experiment!r} != {experiment.name!r} "
+                                f"(ID {logger_cfg.mlflow_experiment_id})."
+                            )
+                        experiment = mlflow.set_experiment(
+                            experiment_id=logger_cfg.mlflow_experiment_id
+                        )
+                    else:
+                        experiment = mlflow.set_experiment(logger_cfg.mlflow_experiment)
                     tags = dict(logger_cfg.mlflow_tags or {})
                     if logger_cfg.mlflow_description:
                         tags["mlflow.note.content"] = logger_cfg.mlflow_description

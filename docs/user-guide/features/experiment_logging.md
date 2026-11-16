@@ -34,6 +34,69 @@ Use the SDK's environment variables for authentication, for example
 The tracking URI itself is omitted from logged parameters; the serialized run
 config still contains it, so do not embed credentials in the URI.
 
+### Environment defaults and precedence
+
+MLflow and W&B can also be enabled without logging CLI flags:
+
+```bash
+export MLFLOW_EXPERIMENT_NAME=pretraining
+export MLFLOW_RUN_NAME=run-1
+# Or select an existing experiment by ID instead of name:
+# unset MLFLOW_EXPERIMENT_NAME
+# export MLFLOW_EXPERIMENT_ID=42
+
+export WANDB_PROJECT=pretraining
+export WANDB_NAME=run-1
+```
+
+| Environment variable | Logger config / CLI option |
+|---|---|
+| `MLFLOW_EXPERIMENT_NAME` | `mlflow_experiment` / `--mlflow-experiment` |
+| `MLFLOW_EXPERIMENT_ID` | `mlflow_experiment_id` / `--mlflow-experiment-id` |
+| `MLFLOW_RUN_NAME` | `mlflow_run_name` / `--mlflow-run-name` |
+| `WANDB_PROJECT` | `wandb_project` / `--wandb-project` |
+| `WANDB_NAME` | `wandb_exp_name` / `--wandb-exp-name` |
+| `WANDB_ENTITY` | `wandb_entity` / `--wandb-entity` |
+| `WANDB_RUN_ID` | `wandb_run_id` / `--wandb-run-id` |
+| `WANDB_DIR` | `wandb_save_dir` / `--wandb-save-dir` |
+| `WANDB_RESUME` | `wandb_resume` / `--wandb-resume` |
+
+Explicit CLI or recipe settings take precedence over environment defaults.
+Environment defaults take precedence over generated defaults. Only unset (`None`)
+config fields inherit environment values; empty environment values are ignored.
+For example, `WANDB_PROJECT=launcher --wandb-project=recipe` selects `recipe`.
+Overriding the project does not discard an environment-provided run name.
+
+MLflow experiment name and ID are two ways to select the same group of runs:
+
+- An explicit `mlflow_experiment` **or** `mlflow_experiment_id` overrides **both**
+  environment selectors. An unrelated environment ID cannot override a CLI name.
+- With no explicit selection, either environment selector enables MLflow.
+- When both selected name and ID are present, they must identify the same existing
+  experiment. A mismatch raises an error before creating a run; neither silently
+  wins. This also applies when both selectors are explicitly configured.
+- A name alone may create a new experiment; an ID must already exist.
+- A run name is still required, from explicit config or `MLFLOW_RUN_NAME`.
+  As before, resuming a run or attaching to an active run uses that run's existing
+  experiment rather than selecting a new one.
+
+For W&B, an environment run ID wins over the ID otherwise derived from the display
+name, and `WANDB_DIR` wins over the checkpoint-directory fallback. Resume policy
+defaults to `allow` unless config or `WANDB_RESUME` selects `allow`, `must`, `never`,
+or `auto`. `WANDB_RUN_ID` identifies one run, **not** an MLflow-style experiment group.
+
+Validation checks these effective settings without modifying the recipe.
+Container finalization stores the resolved values in `cfg.logger` before logger
+enablement and config logging, so CLI and native recipes follow the same rules.
+With no project/experiment selection in config or environment, the backend stays
+disabled. SDK-managed credentials and connection settings, including `WANDB_API_KEY`,
+`WANDB_BASE_URL`, `WANDB_MODE`, and `MLFLOW_TRACKING_URI`, retain their SDK behavior;
+an explicit `mlflow_tracking_uri` overrides its environment default.
+
+Comet is unchanged: `comet_project` and `comet_experiment_name` must be set in the
+CLI or recipe. SDK environment defaults such as `COMET_API_KEY` and
+`COMET_WORKSPACE` still apply; explicit workspace config wins.
+
 ## Metrics and checkpoints
 
 All three experiment backends receive the same training/evaluation scalar metrics,
