@@ -625,7 +625,8 @@ class DSGQACoreAttention(MegatronModule):
         if key.size(0) != hidden_states.size(0):
             if self.config.sequence_parallel:
                 raise NotImplementedError(
-                    "DSA-GQA does not currently support sequence parallelism."
+                    "DSA-GQA supports sequence parallelism in dynamic-batching inference only; "
+                    "training and static inference need sequence_parallel=False."
                 )
             raise NotImplementedError(
                 "DSA-GQA currently supports full-sequence attention only. Decode-time "
