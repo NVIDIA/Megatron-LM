@@ -708,6 +708,28 @@ def test_expert_all_gather_group():
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize(
+    'order, egtp_remat_size',
+    [('tp-cp-ep-dp-pp', 1), ('tp-cp-dp-ep-pp', 1), ('tp-cp-ep-dp-pp', 2), ('tp-cp-dp-ep-pp', 2)],
+)
+def test_create_all_gather_groups_expert_layout(order, egtp_remat_size):
+    """The expert AG group must have the same ranks as the expert DP replicate group."""
+    if world_size < 4 * egtp_remat_size or world_size % (2 * egtp_remat_size):
+        pytest.skip("Test requires an expert data parallel size > 1")
+    Utils.initialize_model_parallel(
+        expert_model_parallel_size=2, expert_gtp_remat_size=egtp_remat_size, order=order
+    )
+
+    expt_dp_group = ps.get_expert_data_parallel_group(with_gtp_remat=False)
+    _, expt_ag_group = ps.create_all_gather_groups(for_expert_parallelism=True)
+    assert torch.distributed.get_process_group_ranks(
+        expt_ag_group
+    ) == torch.distributed.get_process_group_ranks(expt_dp_group)
+    assert expt_ag_group != expt_dp_group
+
+    Utils.destroy_model_parallel()
+
+
 def test_process_group_collection_defaults():
     """Test that ProcessGroupCollection initializes AG groups to None by default."""
     # Initialize model parallel

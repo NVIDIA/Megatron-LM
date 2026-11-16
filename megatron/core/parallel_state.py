@@ -60,6 +60,8 @@ _GTP_WEIGHT_REMAT_GROUP = None
 _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
 # All dense replica rank lists, also used to construct a separate optimizer AG communicator.
 _WEIGHT_REPLICA_RANK_SETS = None
+# All expert data-parallel rank lists, also used to construct a separate expert AG communicator.
+_EXPERT_DATA_PARALLEL_RANK_SETS = None
 # Inter-layer model parallel group that the current rank belongs to.
 _PIPELINE_MODEL_PARALLEL_GROUP = None
 # Model parallel group (both intra- and pipeline) that the current rank belongs to.
@@ -1625,7 +1627,9 @@ def initialize_model_parallel(
     # Gloo only on the non-EGTP path (EGTP + Gloo out of scope; the EGTP optimizer uses DCP).
     if expert_gtp_remat_size > 1:
         create_gloo_process_groups = False
-    for ranks in expert_decoder_rank_generator.get_ranks("dp"):
+    global _EXPERT_DATA_PARALLEL_RANK_SETS
+    _EXPERT_DATA_PARALLEL_RANK_SETS = expert_decoder_rank_generator.get_ranks("dp")
+    for ranks in _EXPERT_DATA_PARALLEL_RANK_SETS:
         group = create_group(
             ranks,
             timeout=timeout,
@@ -1788,7 +1792,6 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
         )
 
     rank = torch.distributed.get_rank()
-    pp_size = get_pipeline_model_parallel_world_size()
     ep_size = get_expert_model_parallel_world_size()
     # Reuse the resolved weight layout, including rank offsets and CP overlap.
     # Reconstructing it from CP and GTP sizes would count shared ranks twice.
@@ -1807,22 +1810,8 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
     # Create expert DP all-gather group if requested
     expt_dp_ag_group = None
     if for_expert_parallelism and ep_size > 1:
-        expert_tp_size = get_expert_tensor_parallel_world_size()
-        expert_dp_size = get_expert_data_parallel_world_size()
-        egtp_remat_size = get_expert_gtp_weight_remat_world_size() or 1
-
-        expert_rank_gen = RankGenerator(
-            tp=expert_tp_size,
-            ep=ep_size,
-            dp=expert_dp_size,
-            pp=pp_size,
-            cp=1,
-            gtp_remat=egtp_remat_size,
-            order=_inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='ep'),
-            rank_offset=0,
-        )
-
-        for expert_dp_ranks in expert_rank_gen.get_ranks('dp'):
+        # Reuse the layout of the expert DP groups, including order and rank offset.
+        for expert_dp_ranks in _EXPERT_DATA_PARALLEL_RANK_SETS:
             expert_dp_ag = create_group(
                 expert_dp_ranks,
                 timeout=timeout,
@@ -3045,6 +3034,8 @@ def destroy_model_parallel():
     _GTP_WEIGHT_REMAT_GLOBAL_RANKS = None
     global _WEIGHT_REPLICA_RANK_SETS
     _WEIGHT_REPLICA_RANK_SETS = None
+    global _EXPERT_DATA_PARALLEL_RANK_SETS
+    _EXPERT_DATA_PARALLEL_RANK_SETS = None
 
     global _PIPELINE_MODEL_PARALLEL_GROUP
     _PIPELINE_MODEL_PARALLEL_GROUP = None
