@@ -513,9 +513,9 @@ def test_legacy_union_schema_loads_as_the_selected_family(
     section = DataConfig(dataset=_dataset()).to_cfg_dict()
     if legacy_sft_target:
         # #9375's SFT subclass still inherits the full GPT field set.
-        section["dataset"]["_target_"] = (
-            f"{SFTDatasetConfig.__module__}.{SFTDatasetConfig.__qualname__}"
-        )
+        section["dataset"][
+            "_target_"
+        ] = f"{SFTDatasetConfig.__module__}.{SFTDatasetConfig.__qualname__}"
     section["dataset_type"] = {
         "_target_": f"{dataset_type.__module__}.{dataset_type.__qualname__}",
         "_call_": False,
