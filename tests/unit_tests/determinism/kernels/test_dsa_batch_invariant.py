@@ -7,10 +7,6 @@ import torch
 
 from megatron.core.inference.contexts.attention_context.dsa_metadata import DSARowPlan
 from megatron.core.transformer.enums import AttnBackend
-from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference import (
-    _materialized_topk,
-    _sparse_attention_rows,
-)
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     _triton_dispatch_enabled,
 )
@@ -21,12 +17,15 @@ pytestmark = pytest.mark.launch_on_gb200
 
 pytest.importorskip("deep_select")
 
-from megatron.core.transformer.experimental_attention_variant.dsa_batch_invariant import (  # noqa: E402
+from megatron.core.transformer.experimental_attention_variant.dsa_gqa_batch_invariant import (  # noqa: E402
     aligned_score_buffer_width,
     attention_contiguous,
     contiguous_plan,
+    indexer_scores,
+    materialized_topk,
     route_contiguous,
     select,
+    sparse_attention_rows,
 )
 
 
@@ -103,10 +102,6 @@ def _paged(tensor, table):
 
 def test_indexer_scores_match_across_layouts_schedules_and_decode_rows():
     """Every score row is independent of KV layout, capacity, worker grid and row dispatch."""
-    from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference_kernels import (
-        dsa_gqa_indexer_scores,
-    )
-
     torch.manual_seed(43)
     length, batch, index_dim = 2305, 2, 128
     width = aligned_score_buffer_width(4096, 512)
@@ -119,7 +114,7 @@ def test_indexer_scores_match_across_layouts_schedules_and_decode_rows():
 
     def scores(cache, block_table, capacity, workers=None, decode_rows=False):
         out = torch.empty(batch * length, capacity, device="cuda", dtype=torch.float32)
-        dsa_gqa_indexer_scores(
+        indexer_scores(
             rows,
             cache,
             block_table,
@@ -129,7 +124,6 @@ def test_indexer_scores_match_across_layouts_schedules_and_decode_rows():
             plan.block_requests,
             out=out,
             fill_invalid=True,
-            batch_invariant=True,
             row_requests=plan.row_requests if decode_rows else None,
             workers=workers,
         )
@@ -189,26 +183,24 @@ def test_contiguous_paged_chunked_decode_and_graph_are_exact(dim, topk, record_p
         irows = iq[start:stop].permute(1, 0, 2, 3).reshape(-1, index_dim).contiguous()
 
         def run():
-            return _sparse_attention_rows(
+            return sparse_attention_rows(
                 query=rows,
                 key_cache=kc,
                 value_cache=vc,
                 index_query=irows,
                 index_key_cache=ikc,
                 plan=plan,
-                max_context_length=width,
+                score_buffer_width=width,
                 index_topk=topk,
                 softmax_scale=scale,
-                batch_invariant=True,
             )
 
-        selected = _materialized_topk(
+        selected = materialized_topk(
             index_query=irows,
             index_key_cache=ikc,
             plan=plan,
-            max_context_length=width,
+            score_buffer_width=width,
             index_topk=topk,
-            batch_invariant=True,
         )
         assert torch.equal(selected.reshape(batch, stop - start, topk), indices[:, start:stop])
         reference = expected[start:stop].permute(1, 0, 2, 3).reshape_as(rows)
@@ -244,20 +236,19 @@ def test_contiguous_paged_chunked_decode_and_graph_are_exact(dim, topk, record_p
     mixed_reference = expected[positions, requests.long()].masked_fill(~valid[:, None, None], 0)
     # Decode-only steps score through the per-row dispatch instead of row blocks.
     for decode_only in (False, True):
-        mixed = _sparse_attention_rows(
+        mixed = sparse_attention_rows(
             query=mixed_query,
             key_cache=kc,
             value_cache=vc,
             index_query=mixed_index,
             index_key_cache=ikc,
             plan=mixed_plan._replace(decode_only=decode_only),
-            max_context_length=width,
+            score_buffer_width=width,
             index_topk=topk,
             softmax_scale=scale,
-            batch_invariant=True,
         )
         assert torch.equal(mixed, mixed_reference)
-    swapped = _sparse_attention_rows(
+    swapped = sparse_attention_rows(
         query=mixed_query,
         key_cache=kc,
         value_cache=vc,
@@ -268,10 +259,9 @@ def test_contiguous_paged_chunked_decode_and_graph_are_exact(dim, topk, record_p
             block_requests=1 - requests,
             block_table=table.flip(0).contiguous(),
         ),
-        max_context_length=width,
+        score_buffer_width=width,
         index_topk=topk,
         softmax_scale=scale,
-        batch_invariant=True,
     )
     assert torch.equal(swapped, mixed_reference)
 
@@ -461,17 +451,16 @@ def test_training_backward_and_no_grad_recompute(
         ik = _linear(states, indexer.linear_k.weight).reshape(1, length, 128)
         for start in (0, length - 1):
             plan = contiguous_plan(batch, length, start, length, query.device)
-            inferred = _sparse_attention_rows(
+            inferred = sparse_attention_rows(
                 query=query[start:, 0],
                 key_cache=key.permute(1, 0, 2, 3),
                 value_cache=value.permute(1, 0, 2, 3),
                 index_query=iq[start:],
                 index_key_cache=ik,
                 plan=plan,
-                max_context_length=aligned_score_buffer_width(max_seq_length, topk),
+                score_buffer_width=aligned_score_buffer_width(max_seq_length, topk),
                 index_topk=topk,
                 softmax_scale=dim**-0.5,
-                batch_invariant=True,
             )
             assert torch.equal(inferred.reshape(length - start, 1, -1), updated[start:])
     record_property("training_recompute_and_updated_inference_max_abs_diff", 0.0)
@@ -573,17 +562,16 @@ def test_tied_routing_forward_replays(monkeypatch, record_property):
             table,
             direct_rows,
         )
-        return _sparse_attention_rows(
+        return sparse_attention_rows(
             query=query,
             key_cache=key,
             value_cache=value,
             index_query=index_query,
             index_key_cache=index_key,
             plan=plan,
-            max_context_length=1024,
+            score_buffer_width=1024,
             index_topk=512,
             softmax_scale=128**-0.5,
-            batch_invariant=True,
         )
 
     inputs = (query, key, value, index_query, index_key, table, lengths, requests)

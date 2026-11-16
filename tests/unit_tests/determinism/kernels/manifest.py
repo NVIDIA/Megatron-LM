@@ -1110,7 +1110,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="dsa_batch_invariant_forward",
         sources=(
-            "megatron/core/transformer/experimental_attention_variant/dsa_batch_invariant.py",
+            "megatron/core/transformer/experimental_attention_variant/dsa_gqa_batch_invariant.py",
             "megatron/core/transformer/experimental_attention_variant/dsa_gqa_inference_kernels.py",
         ),
         tests=(K + "test_dsa_batch_invariant.py",),

@@ -350,7 +350,7 @@ class SimplifiedDSGQAIndexer(MegatronModule):
         self.max_seq_length = config.dsa_indexer_batch_invariant_max_sequence_length
         self.bi_score_buffer_width = None
         if config.batch_invariant_mode:
-            from .dsa_batch_invariant import aligned_score_buffer_width
+            from .dsa_gqa_batch_invariant import aligned_score_buffer_width
 
             if self.max_seq_length is None:
                 raise ValueError(
@@ -486,7 +486,7 @@ class SimplifiedDSGQAIndexer(MegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Project the indexer's Q and its separately learned K from the layer input."""
-        if getattr(self.config, "batch_invariant_mode", False) and torch.is_grad_enabled():
+        if self.config.batch_invariant_mode and torch.is_grad_enabled():
             raise RuntimeError("Use the min-memory training path for batch-invariant DSA.")
 
         if self.config.sequence_parallel and self.pg_collection.tp.size() > 1:
@@ -497,8 +497,8 @@ class SimplifiedDSGQAIndexer(MegatronModule):
         # Matches the construction context above: high-precision parameters would still be
         # multiplied in FP8 inside an enclosing autocast.
         with get_fp8_disabled_context(self.config):
-            if getattr(self.config, "batch_invariant_mode", False):
-                from .dsa_batch_invariant import project
+            if self.config.batch_invariant_mode:
+                from .dsa_gqa_batch_invariant import project
                 from .dsa_min_memory import _module_weight
 
                 q = project(hidden_states, _module_weight(self.linear_q))
@@ -630,6 +630,10 @@ class DSGQACoreAttention(MegatronModule):
         self.indexer: SimplifiedDSGQAIndexer = build_module(
             submodules.indexer, config=config, pg_collection=pg_collection
         )
+        assert config.batch_invariant_mode == (
+            self.indexer.bi_score_buffer_width is not None
+        ), "When batch-invariant mode is enabled, the indexer must have a fixed score buffer width."
+
         self.dense_core_attention = None
         if (
             getattr(config, "dsa_fwd_use_dense_attn", False)
@@ -680,7 +684,7 @@ class DSGQACoreAttention(MegatronModule):
         sq, b, _, _ = query.size()
         skv = key.size(0)
         dsa_kernel_backend = getattr(self.config, "dsa_kernel_backend", "reference")
-        if getattr(self.config, "batch_invariant_mode", False) or dsa_kernel_backend in (
+        if self.config.batch_invariant_mode or dsa_kernel_backend in (
             "min-memory-triton",
             "min-memory-torch",
         ):
@@ -800,7 +804,7 @@ class DSGQACoreAttention(MegatronModule):
         inference_context.append_dsa_key_cache(provider_layer_number, current_index_key)
         index_key_cache, _ = inference_context.dsa_key_cache(provider_layer_number)
 
-        return dynamic_sparse_attention(
+        attention_args = dict(
             query=query,
             key_cache=key_cache,
             value_cache=value_cache,
@@ -809,8 +813,15 @@ class DSGQACoreAttention(MegatronModule):
             inference_context=inference_context,
             index_topk=self.indexer.index_topk,
             softmax_scale=self.softmax_scale,
-            bi_score_buffer_width=self.indexer.bi_score_buffer_width,
         )
+        if self.config.batch_invariant_mode:
+            from . import dsa_gqa_batch_invariant
+
+            return dsa_gqa_batch_invariant.dynamic_sparse_attention(
+                **attention_args, score_buffer_width=self.indexer.bi_score_buffer_width
+            )
+
+        return dynamic_sparse_attention(**attention_args)
 
     def _forward_min_memory(
         self,
@@ -899,7 +910,7 @@ class DSGQACoreAttention(MegatronModule):
                 loss_coeff=indexer_loss_coeff,
                 use_indexer_rope=use_indexer_rope,
                 simplified_input_norm=indexer_input_norm,
-                use_triton=getattr(self.config, "batch_invariant_mode", False)
+                use_triton=self.config.batch_invariant_mode
                 or dsa_kernel_backend == "min-memory-triton",
             )
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
@@ -922,7 +933,7 @@ class DSGQACoreAttention(MegatronModule):
                 use_indexer_rope=use_indexer_rope,
                 simplified_input_norm=indexer_input_norm,
                 cache_indexer_k=_dsa_caches_indexer_k(self.config),
-                use_triton=getattr(self.config, "batch_invariant_mode", False)
+                use_triton=self.config.batch_invariant_mode
                 or dsa_kernel_backend == "min-memory-triton",
             )
         if not self.training:
@@ -953,7 +964,7 @@ class DSGQACoreAttention(MegatronModule):
             cache_routing=_dsa_caches_routing(self.config),
             cache_indexer_k=_dsa_caches_indexer_k(self.config),
             cache_selected_scores=_dsa_caches_selected_scores(self.config),
-            use_triton=getattr(self.config, "batch_invariant_mode", False)
+            use_triton=self.config.batch_invariant_mode
             or dsa_kernel_backend == "min-memory-triton",
         )
         if sparse_fwd_dense_loss:
@@ -966,7 +977,7 @@ class DSGQACoreAttention(MegatronModule):
                 loss_coeff=indexer_loss_coeff,
                 use_indexer_rope=use_indexer_rope,
                 simplified_input_norm=indexer_input_norm,
-                use_triton=getattr(self.config, "batch_invariant_mode", False)
+                use_triton=self.config.batch_invariant_mode
                 or dsa_kernel_backend == "min-memory-triton",
             )
         DSAIndexerLossLoggingHelper.save_loss_to_tracker(

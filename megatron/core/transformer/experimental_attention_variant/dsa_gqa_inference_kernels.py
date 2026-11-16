@@ -561,8 +561,7 @@ def _require_block_table(block_table: torch.Tensor) -> None:
         raise TypeError("block_table must be int32 [requests,max_pages] with dense rows.")
 
 
-@torch.no_grad()
-def dsa_gqa_indexer_scores(
+def _require_indexer_score_args(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     block_table: torch.Tensor,
@@ -570,37 +569,9 @@ def dsa_gqa_indexer_scores(
     block_starts: torch.Tensor,
     block_rows: torch.Tensor,
     block_requests: torch.Tensor,
-    *,
     out: torch.Tensor,
-    fill_invalid: bool,
-    row_offset: int = 0,
-    batch_invariant: bool = False,
-    row_requests: Optional[torch.Tensor] = None,
-    workers: Optional[int] = None,
+    row_offset: int,
 ) -> None:
-    """Score each row's cached indexer keys against the row's indexer query.
-
-    Args:
-        query: BF16 indexer queries ``[rows,index_dim]``.
-        key_cache: Paged BF16 indexer keys ``[num_pages,page_size,index_dim]``.
-        block_table: Int32 physical-page table ``[requests,max_pages]``.
-        row_lengths: Int32 ``[rows]``; row ``t`` scores keys ``[0, row_lengths[t])``.
-        block_starts, block_rows, block_requests: Int32 score blocks from ``DSAMetadata``;
-            a block with 0 rows is skipped.
-        out: Caller-owned FP32 scores ``[out_rows,width]`` for rows ``row_offset`` to
-            ``row_offset + out_rows - 1``: ``out[t - row_offset, j]`` is the dot product of query
-            ``t`` with its request's key ``j`` for ``j < min(row_lengths[t], width)``. Scoring a
-            step's rows in windows bounds the buffer at long context.
-        fill_invalid: Write negative infinity at positions at or past each row's length.
-            Without it those positions are left unwritten, for a top-k that reads only the
-            first ``row_lengths[t]`` scores of row ``t``. Rows in no block (padding) are
-            never written.
-        row_offset: First row of the window ``out`` covers.
-        batch_invariant: Use the shared SM100 TMA/TCGEN score path. Strided indexer keys
-            are copied to contiguous physical-page storage before constructing the descriptor.
-        row_requests: Optional direct row-to-request addressing for single-query blocks.
-        workers: Optional score-grid parallelism override; every score retains the same MMA tile.
-    """
     if not HAVE_TRITON:
         raise RuntimeError("Triton is required for the DSA indexer kernel.")
     _require_cuda_on(
@@ -632,63 +603,56 @@ def dsa_gqa_indexer_scores(
         raise ValueError(
             f"Score window [{row_offset}, {row_offset + out.size(0)}) exceeds {num_rows} rows."
         )
+
+
+@torch.no_grad()
+def dsa_gqa_indexer_scores(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    row_lengths: torch.Tensor,
+    block_starts: torch.Tensor,
+    block_rows: torch.Tensor,
+    block_requests: torch.Tensor,
+    *,
+    out: torch.Tensor,
+    fill_invalid: bool,
+    row_offset: int = 0,
+) -> None:
+    """Score each row's cached indexer keys against the row's indexer query.
+
+    Args:
+        query: BF16 indexer queries ``[rows,index_dim]``.
+        key_cache: Paged BF16 indexer keys ``[num_pages,page_size,index_dim]``.
+        block_table: Int32 physical-page table ``[requests,max_pages]``.
+        row_lengths: Int32 ``[rows]``; row ``t`` scores keys ``[0, row_lengths[t])``.
+        block_starts, block_rows, block_requests: Int32 score blocks from ``DSAMetadata``;
+            a block with 0 rows is skipped.
+        out: Caller-owned FP32 scores ``[out_rows,width]`` for rows ``row_offset`` to
+            ``row_offset + out_rows - 1``: ``out[t - row_offset, j]`` is the dot product of query
+            ``t`` with its request's key ``j`` for ``j < min(row_lengths[t], width)``. Scoring a
+            step's rows in windows bounds the buffer at long context.
+        fill_invalid: Write negative infinity at positions at or past each row's length.
+            Without it those positions are left unwritten, for a top-k that reads only the
+            first ``row_lengths[t]`` scores of row ``t``. Rows in no block (padding) are
+            never written.
+        row_offset: First row of the window ``out`` covers.
+    """
+    _require_indexer_score_args(
+        query,
+        key_cache,
+        block_table,
+        row_lengths,
+        block_starts,
+        block_rows,
+        block_requests,
+        out,
+        row_offset,
+    )
+    num_rows, index_dim = query.shape
+    num_blocks = block_starts.numel()
     width = out.size(1)
     if num_blocks == 0 or width == 0:
-        return
-    if batch_invariant:
-        if not HAVE_GLUON or index_dim != SCORE_INDEX_DIM:
-            raise ValueError(
-                f"Batch-invariant DSA scores require Blackwell Gluon and "
-                f"index_dim={SCORE_INDEX_DIM}."
-            )
-        if key_cache.size(1) % SCORE_BLOCK_T and block_table.size(1) != 1:
-            raise ValueError(
-                f"Batch-invariant DSA requires {SCORE_BLOCK_T}-aligned KV pages or "
-                f"single-page storage."
-            )
-        from triton.experimental.gluon.nvidia.hopper import TensorDescriptor
-
-        if fill_invalid:
-            out.fill_(float("-inf"))
-        shared_layout = gl.NVMMASharedLayout(
-            swizzle_byte_width=128, element_bitwidth=16, rank=2, transposed=False
-        )
-        query_desc = TensorDescriptor.from_tensor(
-            query.contiguous(), [BI_SCORE_ROWS, index_dim], shared_layout
-        )
-        key_desc = TensorDescriptor.from_tensor(
-            key_cache.reshape(-1, index_dim).contiguous(), [SCORE_BLOCK_T, index_dim], shared_layout
-        )
-        direct_rows = row_requests is not None and row_offset == 0 and out.size(0) == num_rows
-        work_blocks = num_rows if direct_rows else num_blocks
-        # Workers only assign independent 128-key score tiles to CTAs. Each score's MMA
-        # and rounding remain identical when the grid changes with query scheduling.
-        parallel_workers = max(1, _num_sms(query.device.index) // work_blocks)
-        workers = workers or min(
-            128, triton.cdiv(width, SCORE_BLOCK_T), max(8, 1 << (parallel_workers.bit_length() - 1))
-        )
-        score_tcgen[(num_rows if direct_rows else num_blocks, workers)](
-            query_desc,
-            key_desc,
-            block_table,
-            row_lengths,
-            row_requests if direct_rows else block_requests,
-            out,
-            stride_table=block_table.stride(0),
-            WIDTH=width,
-            PAGE=key_cache.size(1),
-            WORKERS=workers,
-            STAGES=3,
-            BlockStarts=block_starts,
-            BlockRows=block_rows,
-            ROW_OFFSET=row_offset,
-            OUT_ROWS=out.size(0),
-            STRIDE_OUT=out.stride(0),
-            SCORE_ROWS=BI_SCORE_ROWS,
-            BATCH_INVARIANT=not direct_rows,
-            SKIP_EMPTY_WORKERS=True,
-            num_warps=4,
-        )
         return
     tiles = triton.cdiv(width, SCORE_BLOCK_T)
     # Size the per-block parallelism by the blocks that can overlap the window: all of them
@@ -733,8 +697,7 @@ def dsa_gqa_indexer_scores(
     )
 
 
-@torch.no_grad()
-def dsa_gqa_sparse_attention(
+def _require_sparse_attention_args(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -742,26 +705,8 @@ def dsa_gqa_sparse_attention(
     row_requests: torch.Tensor,
     row_lengths: torch.Tensor,
     topk_indices: torch.Tensor,
-    softmax_scale: float,
-    *,
     out: torch.Tensor,
-    batch_invariant: bool = False,
 ) -> None:
-    """Attend each row's query heads to its selected paged keys and values.
-
-    Args:
-        query: BF16 ``[rows,query_heads,head_dim]``; the row stride may be pitched.
-        key_cache: Paged BF16 keys ``[num_pages,page_size,query_groups,head_dim]``.
-        value_cache: Paged BF16 values ``[num_pages,page_size,query_groups,value_head_dim]``.
-        block_table: Int32 physical-page table ``[requests,max_pages]``.
-        row_requests: Int32 ``[rows]`` block-table row of each row; -1 for padding rows.
-        row_lengths: Int32 ``[rows]`` valid key length of each row; 0 for padding rows.
-        topk_indices: Int32 logical key positions ``[rows,topk]``. Entries that are negative
-            or not below the row's length are skipped; rows may be pitched.
-        softmax_scale: Attention score scale.
-        out: Caller-owned BF16 output ``[rows,query_heads,value_head_dim]``. A row with no
-            valid selected key gets zeros.
-    """
     if not HAVE_TRITON:
         raise RuntimeError("Triton is required for the DSA sparse attention kernel.")
     _require_cuda_on(
@@ -776,8 +721,7 @@ def dsa_gqa_sparse_attention(
             raise TypeError(f"{name} must be BF16 [pages,page_size,groups,dim], last dim dense.")
     if key_cache.shape[:3] != value_cache.shape[:3] or key_cache.size(3) != head_dim:
         raise ValueError("Key/value cache geometry must agree and key head_dim must match query.")
-    num_pages, page_size, num_groups, _ = key_cache.shape
-    if num_query_heads % num_groups != 0:
+    if num_query_heads % key_cache.size(2) != 0:
         raise ValueError("Query heads must be divisible by the number of KV groups.")
     _require_block_table(block_table)
     _require_int32_vector("row_requests", row_requests, num_rows)
@@ -790,24 +734,58 @@ def dsa_gqa_sparse_attention(
         or topk_indices.stride(-1) != 1
     ):
         raise TypeError("topk_indices must be int32 [rows,topk] with dense rows.")
-    value_dim = value_cache.size(-1)
     if (
         out.dtype != torch.bfloat16
-        or out.shape != (num_rows, num_query_heads, value_dim)
+        or out.shape != (num_rows, num_query_heads, value_cache.size(-1))
         or out.stride(-1) != 1
     ):
         raise TypeError("out must be BF16 [rows,heads,value_head_dim] with dense rows.")
+
+
+@torch.no_grad()
+def _launch_sparse_attention(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    row_requests: torch.Tensor,
+    row_lengths: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    *,
+    out: torch.Tensor,
+    slices: int,
+    sorted_support: bool,
+    combine_kernel,
+) -> None:
+    """Attend each row's query heads to its selected paged keys and values.
+
+    Callers validate the tensors with ``_require_sparse_attention_args`` first.
+
+    Args:
+        query: BF16 ``[rows,query_heads,head_dim]``; the row stride may be pitched.
+        key_cache: Paged BF16 keys ``[num_pages,page_size,query_groups,head_dim]``.
+        value_cache: Paged BF16 values ``[num_pages,page_size,query_groups,value_head_dim]``.
+        block_table: Int32 physical-page table ``[requests,max_pages]``.
+        row_requests: Int32 ``[rows]`` block-table row of each row; -1 for padding rows.
+        row_lengths: Int32 ``[rows]`` valid key length of each row; 0 for padding rows.
+        topk_indices: Int32 logical key positions ``[rows,topk]``. Entries that are negative
+            or not below the row's length are skipped; rows may be pitched.
+        softmax_scale: Attention score scale.
+        out: Caller-owned BF16 output ``[rows,query_heads,value_head_dim]``. A row with no
+            valid selected key gets zeros.
+        slices: Partial reductions each row's selected keys are split into.
+        sorted_support: Whether ``topk_indices`` rows are sorted with trailing -1 padding.
+        combine_kernel: Kernel merging the partial reductions, ``_combine_kernel`` or
+            ``_combine_fixed_kernel``.
+    """
+    num_rows, num_query_heads, head_dim = query.shape
     if num_rows == 0:
         return
+    num_pages, page_size, num_groups, _ = key_cache.shape
+    value_dim = value_cache.size(-1)
     topk = topk_indices.size(1)
     heads_per_group = num_query_heads // num_groups
-    # A fixed support partition preserves every query's reduction tree across schedules.
-    # The partition and MMA tiles depend only on the configured head shape and top-k.
-    slices = (
-        (topk // BLOCK_N if topk == 2048 and head_dim == 128 else triton.cdiv(topk, 256))
-        if batch_invariant
-        else _num_slices(num_rows, num_groups, topk, _num_sms(query.device.index))
-    )
     slice_len = triton.cdiv(topk, slices)
     partial_rows = num_rows * slices * num_query_heads
     partial_out = torch.empty(partial_rows, value_dim, dtype=torch.float32, device=query.device)
@@ -848,13 +826,11 @@ def dsa_gqa_sparse_attention(
         VALUE_DIM_TILE=triton.next_power_of_2(value_dim),
         PAGE_SIZE=page_size,
         BLOCK=BLOCK_N,
-        SORTED_SUPPORT=batch_invariant,
+        SORTED_SUPPORT=sorted_support,
         num_warps=4,
         num_stages=2,
     )
-    # Every BI schedule uses the same tree over the model's fixed support partition.
-    combine = _combine_fixed_kernel if batch_invariant else _combine_kernel
-    combine[(num_rows, num_query_heads)](
+    combine_kernel[(num_rows, num_query_heads)](
         partial_out,
         partial_max,
         partial_sum,
@@ -869,4 +845,4 @@ def dsa_gqa_sparse_attention(
     )
 
 
-__all__ = ["HAVE_TRITON", "SCORE_ROW_BLOCK", "dsa_gqa_indexer_scores", "dsa_gqa_sparse_attention"]
+__all__ = ["HAVE_TRITON", "SCORE_ROW_BLOCK", "dsa_gqa_indexer_scores"]

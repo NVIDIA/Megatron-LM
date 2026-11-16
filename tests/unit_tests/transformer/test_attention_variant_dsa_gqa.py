@@ -872,6 +872,7 @@ def test_min_memory_backend_supports_no_grad_validation_forward(monkeypatch):
         core = SimpleNamespace(
             config=SimpleNamespace(
                 dsa_kernel_backend=backend,
+                batch_invariant_mode=False,
                 dsa_indexer_use_sparse_loss=True,
                 dsa_indexer_rotate_activation=True,
                 fp8=None,
@@ -920,6 +921,7 @@ def test_dense_warmup_no_grad_validation_uses_dense_core_attention():
     core = SimpleNamespace(
         config=SimpleNamespace(
             dsa_kernel_backend="min-memory-triton",
+            batch_invariant_mode=False,
             dsa_fwd_use_dense_attn=True,
             dsa_indexer_use_sparse_loss=False,
             dsa_indexer_rotate_activation=True,
@@ -1404,7 +1406,7 @@ class TestDSGQADynamicInference:
         decode_calls = []
         from megatron.core.transformer.experimental_attention_variant import dsa_gqa_inference
 
-        decode_target, decode_name = dsa_gqa_inference, "dsa_gqa_decode"
+        decode_target, decode_name = dsa_gqa_inference, "_sparse_attn_decode"
         original_decode = getattr(decode_target, decode_name)
 
         def capture_decode(*args, **kwargs):

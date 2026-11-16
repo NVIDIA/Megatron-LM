@@ -19,15 +19,17 @@ from megatron.core.inference.contexts.attention_context.dsa_metadata import (
 )
 from megatron.core.inference.contexts.dynamic_context import HAVE_TORCH_MEMORY_SAVER
 from megatron.core.transformer.experimental_attention_variant import dsa_gqa_inference as dsa_gqa
+from megatron.core.transformer.experimental_attention_variant import (
+    dsa_gqa_inference_kernels as kernels,
+)
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference import (
-    _sparse_attention_rows,
-    dsa_gqa_decode,
+    _sparse_attn_decode,
+    _sparse_attn_prefill,
     dynamic_sparse_attention,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa_inference_kernels import (
     HAVE_TRITON,
     dsa_gqa_indexer_scores,
-    dsa_gqa_sparse_attention,
 )
 from megatron.core.transformer.experimental_attention_variant.dsa_min_memory import (
     _sort_topk_support_by_position,
@@ -158,6 +160,22 @@ def _reference_scores(index_q, index_keys, table, row_requests, row_lengths, pag
     return scores
 
 
+def _sparse_attention(*attention_args, scale, out):
+    """Launch the native sparse attention kernels the way ``_sparse_attn_prefill`` does."""
+    query, keys, _, _, _, _, indices = attention_args
+    kernels._require_sparse_attention_args(*attention_args, out)
+    kernels._launch_sparse_attention(
+        *attention_args,
+        scale,
+        out=out,
+        slices=kernels._num_slices(
+            query.size(0), keys.size(2), indices.size(1), kernels._num_sms(query.device.index)
+        ),
+        sorted_support=False,
+        combine_kernel=kernels._combine_kernel,
+    )
+
+
 def _reference_attention(query, keys, values, table, row_requests, row_lengths, indices, scale):
     """Per-row attention over its valid selected keys; probabilities rounded to BF16 like PV."""
     page_size, groups = keys.size(1), keys.size(2)
@@ -178,34 +196,34 @@ def _reference_attention(query, keys, values, table, row_requests, row_lengths, 
     return out
 
 
-@pytest.mark.launch_on_gb200
-@pytest.mark.parametrize("batch_invariant", [False, True], ids=["native", "bi"])
-@pytest.mark.parametrize(
-    "query_lengths,kv_lengths,num_decode_requests",
-    [([1, 1], [257, 129], 2), ([7, 11], [263, 139], 0), ([1, 7, 11], [257, 263, 139], 1)],
-    ids=["decode", "prefill", "mixed"],
-)
-@pytest.mark.usefixtures("nondeterministic_decode")
-def test_dynamic_attention_query_layouts(
-    native_context_factory, batch_invariant, query_lengths, kv_lengths, num_decode_requests
-):
-    """Packed THD and singleton-batch SBHD inputs agree through the actual dispatcher."""
+DYNAMIC_STEP_ARGS = "query_lengths,kv_lengths,num_decode_requests"
+
+
+# Contexts shorter than top-k: every key is selected, so native outputs replay exactly.
+SHORT_DYNAMIC_STEPS = [
+    pytest.param([1, 1], [257, 129], 2, id="decode"),
+    pytest.param([7, 11], [263, 139], 0, id="prefill"),
+    pytest.param([1, 7, 11], [257, 263, 139], 1, id="mixed"),
+]
+
+
+LONG_DYNAMIC_STEPS = [
+    pytest.param([1, 1], [1021, 767], 2, id="long-decode"),
+    pytest.param([7, 11], [1019, 771], 0, id="long-prefill"),
+    pytest.param([1, 7, 11], [1021, 1019, 771], 1, id="long-mixed"),
+]
+
+
+def _dynamic_step(context_factory, query_lengths, kv_lengths, num_decode_requests):
+    """A step over random paged caches: its context, queries, and attention in either mode."""
     if torch.cuda.get_device_capability() != (10, 0):
         pytest.skip("BI DSA requires SM100")
     pytest.importorskip("cutlass.cute")
     torch.manual_seed(89)
     max_seq_length, max_requests = 1024, 4
-    bi_score_buffer_width = None
-    if batch_invariant:
-        pytest.importorskip("deep_select")
-        from megatron.core.transformer.experimental_attention_variant.dsa_batch_invariant import (
-            aligned_score_buffer_width,
-        )
-
-        bi_score_buffer_width = aligned_score_buffer_width(max_seq_length, TOPK)
     decode_only = num_decode_requests == len(query_lengths)
     num_rows = max_requests if decode_only else -(-sum(query_lengths) // 8) * 8
-    context = native_context_factory(
+    context = context_factory(
         max_sequence_length=max_seq_length, max_requests=max_requests, max_tokens=32
     )
     context.memory_buffer.normal_()
@@ -232,8 +250,21 @@ def test_dynamic_attention_query_layouts(
     ]
     index_query = torch.randn(num_rows, 1, 1, INDEX_DIM, device="cuda", dtype=torch.bfloat16)
 
-    def attend(query):
-        return dynamic_sparse_attention(
+    def attend(query, batch_invariant):
+        attention, mode_args = dynamic_sparse_attention, {}
+        if batch_invariant:
+            pytest.importorskip("deep_select")
+            from megatron.core.transformer.experimental_attention_variant import (
+                dsa_gqa_batch_invariant,
+            )
+
+            attention = dsa_gqa_batch_invariant.dynamic_sparse_attention
+            mode_args = dict(
+                score_buffer_width=dsa_gqa_batch_invariant.aligned_score_buffer_width(
+                    max_seq_length, TOPK
+                )
+            )
+        return attention(
             query=query,
             key_cache=context.memory_buffer[0, 0],
             value_cache=context.memory_buffer[1, 0],
@@ -242,28 +273,57 @@ def test_dynamic_attention_query_layouts(
             inference_context=context,
             index_topk=TOPK,
             softmax_scale=HEAD_DIM**-0.5,
-            bi_score_buffer_width=bi_score_buffer_width,
+            **mode_args,
         )
 
-    expected = attend(query)
-    assert expected.shape == (num_rows, 1, NUM_HEADS * HEAD_DIM)
+    return context, query, attend
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("batch_invariant", [False, True], ids=["native", "bi"])
+@pytest.mark.parametrize(DYNAMIC_STEP_ARGS, SHORT_DYNAMIC_STEPS)
+@pytest.mark.usefixtures("nondeterministic_decode")
+def test_dynamic_attention_query_layouts(
+    native_context_factory, batch_invariant, query_lengths, kv_lengths, num_decode_requests
+):
+    """Packed THD and singleton-batch SBHD inputs agree through the actual dispatcher."""
+    context, query, attend = _dynamic_step(
+        native_context_factory, query_lengths, kv_lengths, num_decode_requests
+    )
+    expected = attend(query, batch_invariant)
+    assert expected.shape == (query.size(0), 1, NUM_HEADS * HEAD_DIM)
     assert torch.count_nonzero(expected[sum(query_lengths) :]) == 0
-    assert torch.equal(attend(query.unsqueeze(1)), expected)
+    assert torch.equal(attend(query.unsqueeze(1), batch_invariant), expected)
     with pytest.raises(ValueError, match=r"\[T,1,H,D\]"):
-        attend(query.unsqueeze(1).expand(-1, 2, -1, -1))
+        attend(query.unsqueeze(1).expand(-1, 2, -1, -1), batch_invariant)
 
     context._using_cuda_graph_this_step = True
     for query_view in (query, query.unsqueeze(1)):
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            attend(query_view)
+            attend(query_view, batch_invariant)
         torch.cuda.current_stream().wait_stream(stream)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            output = attend(query_view)
+            output = attend(query_view, batch_invariant)
         graph.replay()
         assert torch.equal(output, expected)
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize(DYNAMIC_STEP_ARGS, SHORT_DYNAMIC_STEPS + LONG_DYNAMIC_STEPS)
+@pytest.mark.usefixtures("nondeterministic_decode")
+def test_batch_invariant_matches_native(
+    native_context_factory, query_lengths, kv_lengths, num_decode_requests, record_property
+):
+    """Batch-invariant kernels reproduce the native output up to BF16 reduction order."""
+    _, query, attend = _dynamic_step(
+        native_context_factory, query_lengths, kv_lengths, num_decode_requests
+    )
+    batch_invariant, native = attend(query, True).float(), attend(query, False).float()
+    record_property("bi_vs_native_max_abs_diff", (batch_invariant - native).abs().max().item())
+    torch.testing.assert_close(batch_invariant, native, atol=2e-2, rtol=2e-2)
 
 
 def test_build_row_metadata():
@@ -340,8 +400,8 @@ def test_inference_kernels_match_reference_on_mixed_rows(head_dim):
     query = query[:, :heads]
     output = torch.full((num_rows, heads, head_dim), 9.0, device=device, dtype=torch.bfloat16)
     scale = head_dim**-0.5
-    dsa_gqa_sparse_attention(
-        query, keys, values, table, row_requests, row_lengths, indices, scale, out=output
+    _sparse_attention(
+        query, keys, values, table, row_requests, row_lengths, indices, scale=scale, out=output
     )
     expected = _reference_attention(
         query, keys, values, table, row_requests, row_lengths, indices, scale
@@ -400,8 +460,8 @@ def test_inference_kernels_match_reference_across_batches():
         query = torch.randn(num_rows, NUM_HEADS + 3, HEAD_DIM, device=device, dtype=torch.bfloat16)
         query = query[:, :NUM_HEADS]
         output = torch.empty(num_rows, NUM_HEADS, HEAD_DIM, device=device, dtype=torch.bfloat16)
-        dsa_gqa_sparse_attention(
-            query, keys, values, table, row_requests, row_lengths, indices, scale, out=output
+        _sparse_attention(
+            query, keys, values, table, row_requests, row_lengths, indices, scale=scale, out=output
         )
         expected = _reference_attention(
             query, keys, values, table, row_requests, row_lengths, indices, scale
@@ -409,11 +469,15 @@ def test_inference_kernels_match_reference_across_batches():
         torch.testing.assert_close(output.float(), expected, atol=2e-2, rtol=2e-2)
 
 
-def test_sparse_attention_rows_replay_in_cuda_graph():
+@pytest.mark.usefixtures("nondeterministic_decode")
+def test_sparse_attention_rows_replay_in_cuda_graph(topk_workspace):
     """Graph replays with new mixed batches and padding must match eager runs."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("GVR2 top-k requires Blackwell")
+    pytest.importorskip("cutlass.cute")
     device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(31)
-    num_pages, page_size, max_pages, topk = 64, 64, 4, 64
+    num_pages, page_size, max_pages, topk = 64, 64, 4, TOPK
     max_requests, max_rows = 4, 48
     num_blocks = max_requests + -(-max_rows // SCORE_ROW_BLOCK)
     graph_width = max_pages * page_size
@@ -428,7 +492,7 @@ def test_sparse_attention_rows_replay_in_cuda_graph():
     blocks = [torch.zeros(num_blocks, device=device, dtype=torch.int32) for _ in range(3)]
 
     def attend(width):
-        return _sparse_attention_rows(
+        return _sparse_attn_prefill(
             query=query,
             key_cache=keys,
             value_cache=values,
@@ -440,6 +504,7 @@ def test_sparse_attention_rows_replay_in_cuda_graph():
             max_context_length=width,
             index_topk=topk,
             softmax_scale=HEAD_DIM**-0.5,
+            topk_workspace=topk_workspace,
         )
 
     stream = torch.cuda.Stream()
@@ -481,11 +546,15 @@ def test_sparse_attention_rows_replay_in_cuda_graph():
         assert torch.count_nonzero(graph_output[~live]) == 0
 
 
-def test_score_windows_match_one_window(monkeypatch):
+@pytest.mark.usefixtures("nondeterministic_decode")
+def test_score_windows_match_one_window(monkeypatch, topk_workspace):
     """Scoring rows in small windows (not aligned to score blocks) must not change the output."""
+    if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
+        pytest.skip("GVR2 top-k requires Blackwell")
+    pytest.importorskip("cutlass.cute")
     device = torch.device("cuda", torch.cuda.current_device())
     torch.manual_seed(43)
-    page_size, max_pages, topk = 64, 8, 64
+    page_size, max_pages, topk = 64, 8, TOPK
     query_lengths, kv_lengths = [1, 70, 1, 45], [300, 400, 9, 120]
     metadata = build_row_metadata(torch.tensor(query_lengths), torch.tensor(kv_lengths))
     rows = [tensor.to(device) for tensor in metadata]
@@ -498,7 +567,7 @@ def test_score_windows_match_one_window(monkeypatch):
     index_query = torch.randn(num_rows, INDEX_DIM, device=device, dtype=torch.bfloat16)
 
     def attend():
-        return _sparse_attention_rows(
+        return _sparse_attn_prefill(
             query=query,
             key_cache=keys,
             value_cache=values,
@@ -508,10 +577,11 @@ def test_score_windows_match_one_window(monkeypatch):
             max_context_length=max(kv_lengths),
             index_topk=topk,
             softmax_scale=HEAD_DIM**-0.5,
+            topk_workspace=topk_workspace,
         )
 
     one_window = attend()
-    # A 28 KiB buffer holds 14-17 score rows at this width, so windows straddle the 32-row
+    # A 28 KiB buffer holds 14 score rows at this width, so windows straddle the 32-row
     # score blocks and the request boundaries.
     monkeypatch.setattr(dsa_gqa, "SCORE_BUFFER_BYTES", 7 * 1024 * 4)
     torch.testing.assert_close(attend(), one_window, atol=2e-2, rtol=2e-2)
@@ -529,7 +599,9 @@ def test_score_windows_match_one_window(monkeypatch):
     ids=["persist", "offload", "recompute", "offload-static", "recompute-static"],
 )
 @pytest.mark.usefixtures("nondeterministic_decode")
-def test_native_decode_suspend_resume(native_context_factory, cache_mode, static_pointers):
+def test_native_decode_suspend_resume(
+    native_context_factory, cache_mode, static_pointers, topk_workspace
+):
     """Repeated context suspension releases obsolete storage and preserves decode results."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
         pytest.skip("Native DSA decode requires Blackwell")
@@ -595,7 +667,7 @@ def test_native_decode_suspend_resume(native_context_factory, cache_mode, static
         return graph, output
 
     fill_metadata()
-    expected = _sparse_attention_rows(
+    expected = _sparse_attn_prefill(
         query=query,
         key_cache=context.memory_buffer[0, 0],
         value_cache=context.memory_buffer[1, 0],
@@ -605,6 +677,7 @@ def test_native_decode_suspend_resume(native_context_factory, cache_mode, static
         max_context_length=bound,
         index_topk=TOPK,
         softmax_scale=HEAD_DIM**-0.5,
+        topk_workspace=topk_workspace,
     )
     graph, output = capture()
     releases_storage = cache_mode != KVCacheManagementMode.PERSIST and not static_pointers
@@ -656,7 +729,7 @@ def test_native_decode_suspend_resume(native_context_factory, cache_mode, static
 @pytest.mark.parametrize("decode_only", [True, False])
 @pytest.mark.usefixtures("nondeterministic_decode")
 def test_native_decode_and_mixed_batches_replay_in_cuda_graph(
-    decode_only, native_context_factory, monkeypatch
+    decode_only, native_context_factory, monkeypatch, topk_workspace
 ):
     """Two captured layers use temporary activations and match eager rows as inputs change."""
     if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
@@ -760,7 +833,7 @@ def test_native_decode_and_mixed_batches_replay_in_cuda_graph(
         graph.replay()
         metadata = build_row_metadata(torch.tensor(query_lengths), torch.tensor(kv_lengths))
         for layer_idx, graph_output in enumerate(graph_outputs):
-            expected = _sparse_attention_rows(
+            expected = _sparse_attn_prefill(
                 query=query[:real],
                 key_cache=keys[layer_idx],
                 value_cache=values[layer_idx],
@@ -775,6 +848,7 @@ def test_native_decode_and_mixed_batches_replay_in_cuda_graph(
                 max_context_length=bound,
                 index_topk=TOPK,
                 softmax_scale=HEAD_DIM**-0.5,
+                topk_workspace=topk_workspace,
             )
             torch.testing.assert_close(graph_output[:real], expected, atol=2e-2, rtol=2e-2)
             assert torch.count_nonzero(graph_output[real:]) == 0
@@ -948,7 +1022,7 @@ def test_native_decode_matches_training_kernels_and_graph_refresh(
     monkeypatch.setattr(flashinfer, "top_k_varlen", capture_topk)
 
     def run():
-        return dsa_gqa_decode(
+        return _sparse_attn_decode(
             query=query,
             index_query=index_query,
             index_key_cache=index_keys,

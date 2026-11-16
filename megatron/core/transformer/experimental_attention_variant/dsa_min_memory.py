@@ -81,6 +81,11 @@ def _distributed_rank() -> int:
     return 0
 
 
+def _batch_invariant_enabled() -> bool:
+    """Whether the enclosing ``_triton_dispatch_enabled`` scope runs batch-invariant DSA."""
+    return _BI_SCORE_BUFFER_WIDTH.get() is not None
+
+
 @contextmanager
 def _triton_dispatch_enabled(enabled: bool, bi_score_buffer_width: int | None = None):
     previous = set_min_memory_triton_enabled(enabled)
@@ -221,8 +226,8 @@ def _plan_execution(
 
 
 def _linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    if _BI_SCORE_BUFFER_WIDTH.get() is not None:
-        from .dsa_batch_invariant import project
+    if _batch_invariant_enabled():
+        from .dsa_gqa_batch_invariant import project
 
         return project(x, weight)
     return F.linear(x, weight, None)
@@ -542,8 +547,8 @@ def _sparse_attention_tile(
     softmax_scale: float,
     q_start: int,
 ) -> torch.Tensor:
-    if _BI_SCORE_BUFFER_WIDTH.get() is not None:
-        from .dsa_batch_invariant import attention_contiguous
+    if _batch_invariant_enabled():
+        from .dsa_gqa_batch_invariant import attention_contiguous
 
         return attention_contiguous(query_tile, key, value, topk_indices, softmax_scale, q_start)
     triton_output = triton_sparse_attention_tile(
@@ -983,8 +988,8 @@ def _simplified_topk_index_tile(
         use_indexer_rope,
         simplified_input_norm,
     )
-    if _BI_SCORE_BUFFER_WIDTH.get() is not None:
-        from .dsa_batch_invariant import route_contiguous
+    if _batch_invariant_enabled():
+        from .dsa_gqa_batch_invariant import route_contiguous
 
         scores, indices = route_contiguous(
             q_index,
@@ -1095,7 +1100,7 @@ def _simplified_sparse_forward_impl(
             # FP32 for the KL below.
             selected_scores = routing_scores.float()
             loss_indices = topk_indices
-            if _BI_SCORE_BUFFER_WIDTH.get() is not None and topk_indices.size(-1) > key.size(0):
+            if _batch_invariant_enabled() and topk_indices.size(-1) > key.size(0):
                 # DeepSelect's extra slots are a -1 suffix for every row. Keep the configured
                 # support width in forward attention, but omit this empty suffix from KL.
                 loss_indices = topk_indices[..., : key.size(0)].contiguous()
@@ -1327,7 +1332,7 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                             full_k_index=full_k_index,
                         )
 
-                if ctx.bi_score_buffer_width is not None and topk_indices.size(-1) > key.size(0):
+                if _batch_invariant_enabled() and topk_indices.size(-1) > key.size(0):
                     # Backward consumes the same selected support without its empty suffix.
                     topk_indices = topk_indices[..., : key.size(0)].contiguous()
                     if routing_scores is not None:
@@ -1362,11 +1367,11 @@ class DSASimplifiedMinMemoryGQAFn(torch.autograd.Function):
                             grad_value_accum,
                             ctx.attention_softmax_scale,
                             q_start,
-                            fp32_grad=ctx.bi_score_buffer_width is not None,
+                            fp32_grad=_batch_invariant_enabled(),
                         )
 
                 if not triton_attention_done:
-                    if ctx.bi_score_buffer_width is not None and needs_query_grad:
+                    if _batch_invariant_enabled() and needs_query_grad:
                         raise RuntimeError("Unsupported batch-invariant DSA sparse backward shape.")
                     attention_inputs = []
                     query_tile = (
