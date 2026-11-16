@@ -29,6 +29,7 @@ from megatron.core.utils import get_torch_version, is_torch_min_version
 from megatron.training.argument_utils import (
     _mfsdp_v2_disables_pipeline_output_dealloc,
     _model_rng_config,
+    warn_rank_0,
 )
 
 # Taken from https://stackoverflow.com/questions/65414773/parse-environment-variable-from-yaml-with-pyyaml
@@ -280,6 +281,17 @@ def validate_yaml(args, defaults={}):
             assert args.max_position_embeddings >= args.seq_length
         if args.decoder_seq_length is not None:
             assert args.max_position_embeddings >= args.decoder_seq_length
+    elif args.max_position_embeddings < max(
+        args.seq_length or 0,
+        args.decoder_seq_length or 0,
+        getattr(args.model_parallel, "max_seq_length_per_sample", None) or 0,
+        getattr(args.language_model, "max_seq_length_per_sample", None) or 0,
+    ):
+        warn_rank_0(
+            "max_position_embeddings is smaller than the run sequence length. RoPE/YaRN "
+            "does not require a learned position table, but checkpoint/export context-length "
+            "metadata retains max_position_embeddings; set it explicitly for the intended export."
+        )
     if args.lr is not None:
         assert args.min_lr <= args.lr
     # Mixed precision checks.

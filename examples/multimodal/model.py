@@ -59,6 +59,14 @@ def resolve_multimodal_sequence_lengths(args):
         raise ValueError("Provide --decoder-seq-length or --max-seq-length-per-sample")
     if args.max_seq_length_per_sample <= max_image_tokens:
         raise ValueError("Language execution width must exceed the maximum image-token count")
+    if (
+        args.position_embedding_type == "learned_absolute"
+        and args.max_position_embeddings < args.max_seq_length_per_sample
+    ):
+        raise ValueError(
+            "--max-position-embeddings must cover --max-seq-length-per-sample "
+            "(or --decoder-seq-length) for learned_absolute; the position table is not resized"
+        )
     args.max_position_embeddings = max(args.max_position_embeddings, args.max_seq_length_per_sample)
 
 

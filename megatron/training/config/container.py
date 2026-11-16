@@ -716,7 +716,7 @@ class PretrainConfigContainer(ConfigContainerBase):
             )
         if dataset_family_from_type(dataset_type)[0] == "sft":
             pack_length = (
-                execution_bound or dataset.sequence_length
+                (execution_bound or dataset.sequence_length)
                 if isinstance(dataset, SFTDatasetConfig)
                 else dataset.sequence_length
             )
@@ -734,7 +734,7 @@ class PretrainConfigContainer(ConfigContainerBase):
                     "SFT pack width must satisfy the dataset's CP/SP padding alignment"
                 )
             if (
-                self.model.position_embedding_type == "learned_absolute"
+                getattr(self.model, "position_embedding_type", "learned_absolute") == "learned_absolute"
                 and self.model.seq_length < pack_length
             ):
                 raise ValueError(

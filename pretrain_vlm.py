@@ -519,6 +519,15 @@ def resolve_vlm_sequence_lengths(args):
             "The mock VLM callback emits fixed-width rows: --max-seq-length-per-sample "
             "must equal the derived text + image + alignment width"
         )
+    if (
+        args.position_embedding_type == "learned_absolute"
+        and args.max_position_embeddings < decoder_sequence_length
+    ):
+        raise ValueError(
+            "--max-position-embeddings must cover --max-seq-length-per-sample "
+            "(the resolved text + image + padding width, optionally --decoder-seq-length) "
+            "for learned_absolute; the position table is not resized"
+        )
     args.max_position_embeddings = max(args.max_position_embeddings, decoder_sequence_length)
     return text_sequence_length, padding_needed
 

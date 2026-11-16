@@ -1185,6 +1185,14 @@ def validate_args(args, defaults={}):
                 f"or equal to seq_length ({args.seq_length})."
         if args.decoder_seq_length is not None:
             assert args.max_position_embeddings >= args.decoder_seq_length
+    elif args.max_position_embeddings < max(
+        args.seq_length or 0, args.decoder_seq_length or 0, args.max_seq_length_per_sample or 0
+    ):
+        warn_rank_0(
+            "--max-position-embeddings is smaller than the run sequence length. RoPE/YaRN "
+            "does not require a learned position table, but checkpoint/export context-length "
+            "metadata retains --max-position-embeddings; set it explicitly for the intended export."
+        )
     if args.save is not None and args.save_params_interval is not None:
         assert not args.overlap_param_gather, \
             '--save-params-interval is not supported with --overlap-param-gather'

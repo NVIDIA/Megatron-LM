@@ -452,6 +452,60 @@ def test_vlm_evaluation_uses_resolved_execution_width(
         assert forward_step.args[3] == 128
 
 
+@pytest.mark.parametrize("entrypoint", ["mock_vlm", "energon_vlm"])
+@pytest.mark.parametrize("position_type", ["learned_absolute", "rope"])
+def test_vlm_length_resolution_does_not_resize_learned_tables(
+    monkeypatch, entrypoint, position_type
+):
+    if entrypoint == "mock_vlm":
+        import pretrain_vlm as script
+
+        resolve = script.resolve_vlm_sequence_lengths
+        monkeypatch.setattr(script.context_parallel, "get_padding", lambda *a: 0)
+    else:
+        script_dir = Path(__file__).resolve().parents[3] / "examples/multimodal"
+        monkeypatch.syspath_prepend(str(script_dir))
+        spec = importlib.util.spec_from_file_location("vlm_model_inputs", script_dir / "model.py")
+        script = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(script)
+        resolve = script.resolve_multimodal_sequence_lengths
+    monkeypatch.setattr(script, "get_num_image_embeddings", lambda *a, **kw: 4)
+    args = Namespace(
+        seq_length=64,
+        decoder_seq_length=None,
+        max_seq_length_per_sample=128 if entrypoint == "energon_vlm" else None,
+        max_position_embeddings=64,
+        position_embedding_type=position_type,
+        img_h=16,
+        img_w=16,
+        patch_dim=4,
+        disable_vision_class_token=True,
+        context_parallel_size=1,
+        tensor_model_parallel_size=1,
+        sequence_parallel=False,
+        dynamic_resolution=False,
+        pixel_shuffle=False,
+        vision_model_type="clip",
+        use_tile_tags=False,
+        max_num_tiles=1,
+        tokenizer_prompt_format="mistral",
+        use_thumbnail=False,
+        num_frames=1,
+    )
+    if position_type == "learned_absolute":
+        with pytest.raises(
+            ValueError, match="--max-position-embeddings.*--max-seq-length-per-sample"
+        ):
+            resolve(args)
+        assert args.max_position_embeddings == 64
+        args.max_position_embeddings = 256
+        resolve(args)
+        assert args.max_position_embeddings == 256
+    else:
+        resolve(args)
+        assert args.max_position_embeddings == (128 if entrypoint == "energon_vlm" else 68)
+
+
 @pytest.mark.parametrize("is_vlm,is_mimo", [(False, False), (True, False), (True, True)])
 def test_dynamic_server_uses_inference_checkpoint_loader(monkeypatch, run_config, is_vlm, is_mimo):
     from examples.inference.advanced import vlm_dynamic_inference

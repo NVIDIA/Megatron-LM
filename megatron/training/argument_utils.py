@@ -1125,8 +1125,15 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
     if family in ("sft", "varlen") and has_source:
         # These dataset implementations rejected GPT mask/reset options in __getitem__.
         # Keep that CLI check here; the family-specific configs no longer expose them.
-        assert not args.reset_position_ids
-        assert not args.reset_attention_mask and not args.create_attention_mask_in_dataloader
+        if (
+            args.reset_position_ids
+            or args.reset_attention_mask
+            or args.create_attention_mask_in_dataloader
+        ):
+            raise ValueError(
+                "SFT/Varlen datasets require --no-create-attention-mask-in-dataloader "
+                "and do not support --reset-position-ids or --reset-attention-mask"
+            )
     kwargs: dict[str, Any] = {
         field_name: deepcopy(getattr(args, source))
         for field_name, source in _DATASET_FIELD_SOURCES.items()

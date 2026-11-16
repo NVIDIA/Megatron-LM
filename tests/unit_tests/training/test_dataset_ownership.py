@@ -645,7 +645,9 @@ def test_model_capacity_must_cover_the_sample_length(container_factory, position
 
 
 @pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope", "yarn"])
-def test_cli_position_capacity_only_limits_learned_embeddings(position_embedding_type):
+def test_cli_position_capacity_only_limits_learned_embeddings(position_embedding_type, monkeypatch):
+    warnings = []
+    monkeypatch.setattr(arguments, "warn_rank_0", warnings.append)
     extra = ["--seq-length", "64", "--position-embedding-type", position_embedding_type]
     if position_embedding_type == "learned_absolute":
         with pytest.raises(AssertionError, match="max_position_embeddings"):
@@ -655,6 +657,23 @@ def test_cli_position_capacity_only_limits_learned_embeddings(position_embedding
     args = _validated(extra)
     assert args.max_position_embeddings == 32
     assert args.seq_length == 64
+    assert any("checkpoint/export context-length" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize("family_flag", ["--sft", "--use-varlen-dataset"])
+@pytest.mark.parametrize(
+    "unsupported_flag", [None, "--reset-position-ids", "--reset-attention-mask"]
+)
+def test_online_dataset_cli_reports_unsupported_masks(family_flag, unsupported_flag):
+    extra = [family_flag, *SOURCE, "--calculate-per-token-loss"]
+    if unsupported_flag is not None:
+        extra += ["--no-create-attention-mask-in-dataloader", unsupported_flag]
+    args = _validated(extra)
+    with pytest.raises(
+        ValueError,
+        match="--no-create-attention-mask-in-dataloader.*--reset-position-ids.*--reset-attention-mask",
+    ):
+        gpt_data_config_from_args(args)
 
 
 def test_the_run_execution_length_matches_fixed_dataset_rows(container_factory, monkeypatch):
