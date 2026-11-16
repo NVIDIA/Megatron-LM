@@ -664,19 +664,21 @@ class KimiDeltaAttention(_GDNBase):
         if packed_seq_params is not None and packed_seq_params.qkv_format == "thd":
             if batch != 1:
                 raise ValueError("Packed KDA expects batch dimension to be 1.")
-            if cp_size_chunkwise > 1:
-                for boundary_name in ('q', 'kv'):
-                    padded = getattr(packed_seq_params, f'cu_seqlens_{boundary_name}_padded')
-                    offsets = (
-                        padded
-                        if padded is not None
-                        else getattr(packed_seq_params, f'cu_seqlens_{boundary_name}')
-                    )
-                    cpu_offsets = _cpu_cu_seqlens(packed_seq_params, offsets)
-                    if boundary_name == 'q':
-                        cu_seqlens_q_cpu = cpu_offsets
-                    else:
-                        cu_seqlens_kv_cpu = cpu_offsets
+            # One host snapshot of the boundaries per microbatch, shared by every KDA layer
+            # (PR 7881 takes it for chunkwise CP; without CP it equally replaces the per-layer
+            # device-to-host checks of _resolve_cu_seqlens and the Q/KV comparison).
+            for boundary_name in ('q', 'kv'):
+                padded = getattr(packed_seq_params, f'cu_seqlens_{boundary_name}_padded')
+                offsets = (
+                    padded
+                    if padded is not None
+                    else getattr(packed_seq_params, f'cu_seqlens_{boundary_name}')
+                )
+                cpu_offsets = _cpu_cu_seqlens(packed_seq_params, offsets)
+                if boundary_name == 'q':
+                    cu_seqlens_q_cpu = cpu_offsets
+                else:
+                    cu_seqlens_kv_cpu = cpu_offsets
             if self.config.deterministic_mode or causal_conv1d is None:
                 raise ValueError(
                     "Packed KDA requires causal_conv1d and deterministic_mode=False. "

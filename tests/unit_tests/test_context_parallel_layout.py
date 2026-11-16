@@ -510,6 +510,35 @@ def test_prebuild_thd_cp_partition_routes_populates_direct_fields():
     )
 
 
+def test_prebuild_rereads_boundaries_rewritten_in_place():
+    """A reused PackedSeqParams whose boundaries change in place gets new host lists."""
+    cu = torch.tensor([0, 16, 40])
+    packed_seq_params = SimpleNamespace(
+        qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_q_padded=None, cp_partition_route=None
+    )
+    cp_group = _FakeGroup(size=2, rank=0)
+    prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
+    first = packed_seq_params.thd_cp_host_cu_seqlens_q
+    assert first == [0, 16, 40]
+
+    # Unchanged boundaries: the cached lists are reused as they are.
+    prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
+    assert packed_seq_params.thd_cp_host_cu_seqlens_q is first
+
+    # Rewritten in place (a static buffer refreshed for the next pack): read again.
+    cu.copy_(torch.tensor([0, 8, 40]))
+    prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
+    assert packed_seq_params.thd_cp_host_cu_seqlens_q == [0, 8, 40]
+    assert packed_seq_params.thd_cp_host_cu_seqlens_q is not first
+    expected = build_thd_cp_partition_route(cu, 2, 0)
+    _assert_thd_routes_equal(packed_seq_params.cp_partition_route, expected)
+
+    # Another boundary tensor object: read again as well.
+    packed_seq_params.cu_seqlens_q = torch.tensor([0, 24, 40])
+    prebuild_thd_cp_partition_routes(packed_seq_params, cp_group)
+    assert packed_seq_params.thd_cp_host_cu_seqlens_q == [0, 24, 40]
+
+
 def test_prebuild_thd_cp_partition_routes_materializes_aliased_qkv_once(monkeypatch):
     cu_q = torch.tensor([0, 16, 40, 40], dtype=torch.int32)
     expected_route = build_thd_cp_partition_route(cu_q, cp_size=2, cp_rank=1)
