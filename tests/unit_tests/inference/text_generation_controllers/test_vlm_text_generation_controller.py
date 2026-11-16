@@ -12,8 +12,10 @@ from unittest import mock
 import pytest
 import torch
 
-from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
+from megatron.core.inference.config import InferenceConfig, MediaPromptSpec, MultimodalPromptConfig
 from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
 from megatron.core.inference.inference_request import InferenceRequest, Status, VLMInferenceRequest
 from megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper import (
     NemotronOmniInferenceWrapper,
@@ -27,12 +29,16 @@ from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_w
     VLMInferenceWrapper,
 )
 from megatron.core.inference.sampling_params import SamplingParams
+from megatron.core.inference.text_generation_controllers.text_generation_controller import (
+    TextGenerationController,
+)
 from megatron.core.inference.text_generation_controllers.vlm_text_generation_controller import (
     VLMTextGenerationController,
 )
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_submodules
 from megatron.core.models.multimodal.llava_model import LLaVAModel
+from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_local_spec
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import Float16Module
@@ -431,6 +437,126 @@ def test_llava_text_forward_embeds_generated_image_token_as_text():
     assert torch.equal(embedded_input_ids, tokens)
     assert embedded_input_ids is not tokens
     model.forward_lm_only.assert_called_once()
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize(
+    "num_tiles", [[1], [1, 1], [2]], ids=["one-tile", "two-images", "two-tiles"]
+)
+def test_dynamic_engine_places_static_tile_embeddings_in_prompt_order(num_tiles):
+    """A real LLaVA prefill reads each tile's embeddings at the positions the prompt gave them.
+
+    The encoder returns `[per_tile, tiles, hidden]`, and the prompt expansion numbers media
+    positions tile by tile, as LLaVA's own forward places them. With more than one tile in
+    a request (two images, or one image of two tiles), the decoder input at each media
+    position must equal that tile-major embedding.
+    """
+    Utils.initialize_model_parallel(1, 1)
+    model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
+    rounders = DynamicInferenceContext.TOKEN_ROUNDER, DynamicInferenceContext.REQUEST_ROUNDER
+    DynamicInferenceContext.TOKEN_ROUNDER = DynamicInferenceContext.REQUEST_ROUNDER = 1
+    try:
+
+        def config(hidden, heads, **kwargs):
+            return TransformerConfig(
+                num_layers=1,
+                hidden_size=hidden,
+                num_attention_heads=heads,
+                kv_channels=64,
+                params_dtype=torch.bfloat16,
+                pipeline_dtype=torch.bfloat16,
+                use_cpu_initialization=True,
+                transformer_impl="local",
+                **kwargs,
+            )
+
+        language = config(32, 4, inference_rng_tracker=True, inference_sampling_seed=123)
+        language.language_model_type = "dummy"
+        vision = config(16, 2)
+        vision.vision_model_type = "clip"
+        submodules = get_gpt_layer_local_submodules()
+        model = (
+            LLaVAModel(
+                language_transformer_config=language,
+                language_transformer_layer_spec=ModuleSpec(
+                    module=TransformerLayer, submodules=copy.deepcopy(submodules)
+                ),
+                language_vocab_size=128,
+                language_max_sequence_length=64,
+                vision_transformer_config=vision,
+                vision_transformer_layer_spec=get_vit_layer_with_local_spec(),
+                drop_vision_class_token=True,
+                vision_projection_config=config(32, 1, ffn_hidden_size=64),
+                vision_projection_layer_spec=copy.deepcopy(get_submodules(submodules.mlp)),
+                img_h=8,
+                img_w=8,
+                patch_dim=4,
+                image_token_index=-200,
+            )
+            .cuda()
+            .bfloat16()
+            .eval()
+        )
+        context = DynamicInferenceContext(
+            model.config,
+            InferenceConfig(
+                block_size_tokens=4,
+                buffer_size_gb=0.01,
+                max_sequence_length=64,
+                max_requests=4,
+                max_tokens=64,
+            ),
+        )
+        wrapper = VLMInferenceWrapper(model, context)
+        wrapper.prep_model_for_inference()
+        tokenizer = SimpleNamespace(
+            eod=127,
+            vocab_size=128,
+            convert_tokens_to_ids=lambda token: 126 if token == "<image>" else -1,
+            detokenize=lambda tokens: " ".join(map(str, tokens)),
+        )
+        engine = DynamicInferenceEngine(TextGenerationController(wrapper, tokenizer), context)
+        encoded, decoder_inputs = [], []
+        encode, forward_lm_only = wrapper._forward_vision_encoder, model.forward_lm_only
+
+        def observed_encode(*args, **kwargs):
+            encoded.append(encode(*args, **kwargs))
+            return encoded[-1]
+
+        def observed_forward(*args, **kwargs):
+            mask = context.current_image_token_mask()
+            if mask is not None and (mask >= 0).any():
+                decoder_inputs.append((kwargs["combined_embeddings"].clone(), mask.clone()))
+            return forward_lm_only(*args, **kwargs)
+
+        wrapper._forward_vision_encoder = observed_encode
+        model.forward_lm_only = observed_forward
+
+        image = torch.linspace(-1, 1, 3 * 8 * 8).reshape(1, 3, 8, 8)
+        imgs = torch.cat([image + 0.5 * index for index in range(sum(num_tiles))])
+        prompt = [5, 126, 6, 126, 8] if len(num_tiles) == 2 else [5, 126, 6]
+        engine.add_request(
+            request_id=1,
+            prompt=prompt,
+            sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1, top_k=1),
+            imgs=imgs,
+            num_tiles=torch.tensor(num_tiles, dtype=torch.int32),
+            num_img_embeddings_per_tile=4,
+        )
+        while engine.has_unfinished_requests():
+            engine.step_modern()
+
+        assert len(encoded) == 1 and len(decoder_inputs) == 1
+        projected = encoded[0]
+        assert projected.shape[:2] == (4, sum(num_tiles))
+        tile_major = projected.permute(1, 0, 2).reshape(-1, projected.shape[-1])
+        combined, mask = decoder_inputs[0]
+        positions = mask >= 0
+        assert torch.equal(combined[positions], tile_major[mask[positions]].to(combined.dtype))
+    finally:
+        DynamicInferenceContext.TOKEN_ROUNDER, DynamicInferenceContext.REQUEST_ROUNDER = rounders
+        InferenceMode.unset_active()
+        Utils.destroy_model_parallel()
 
 
 class TestVLMTextGenerationController:
