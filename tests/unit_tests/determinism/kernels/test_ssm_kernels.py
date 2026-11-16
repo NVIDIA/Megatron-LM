@@ -784,6 +784,33 @@ def test_torch_chunk_gated_delta_rule_replays_fwd_bwd(use_qk_l2norm_in_kernel):
     assert_replays_bit_exact(fn, (q, k, v, g, beta), replays=3, what="torch_chunk_gated_delta_rule")
 
 
+def test_torch_chunk_gdn2_in_kernel_l2norm_replays_fwd_bwd():
+    """GDN2's in-kernel q/k normalization replays bit-exactly, across a chunk boundary."""
+    from megatron.core.ssm.gated_delta_net.gdn2 import torch_chunk_gdn2
+
+    seeded()
+    B, T, H, K, V = 2, 65, 4, 32, 48
+    q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(B, T, H, V, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    g = (-torch.rand(B, T, H, K, device="cuda") * 0.1).requires_grad_(True)
+    b = torch.rand(B, T, H, K, device="cuda").requires_grad_(True)
+    w = torch.rand(B, T, H, V, device="cuda").requires_grad_(True)
+
+    def fn(q, k, v, g, b, w):
+        return torch_chunk_gdn2(
+            q, k, v, g, b, w, output_final_state=True, use_qk_l2norm_in_kernel=True
+        )
+
+    assert_replays_bit_exact(
+        fn,
+        (q, k, v, g, b, w),
+        replays=3,
+        contention=True,
+        what="torch_chunk_gdn2 in-kernel L2 norm",
+    )
+
+
 def test_kda_gate_jit_path_replays_fwd_bwd():
     """KDA's jit-fused gate reshaping and beta activation replay bit-exactly."""
     from types import SimpleNamespace
