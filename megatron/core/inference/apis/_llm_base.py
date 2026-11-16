@@ -262,6 +262,13 @@ class _MegatronLLMBase:
 
     ``model`` must be in eval mode before construction; this class does not
     modify the model state.
+
+    An ``inference_config`` with ``start_suspended=True`` builds the engine in
+    the ``SUSPENDED`` state (coordinator mode only): ``serve()`` and request
+    submission work immediately, but nothing runs until ``resume()`` and then
+    ``unpause()``. The first ``resume()`` captures the CUDA graphs, so it must
+    occur after the weights are in place; the inference-state buffers are
+    allocated at construction and follow ``kv_cache_management_mode``.
     """
 
     def __init__(
@@ -283,6 +290,8 @@ class _MegatronLLMBase:
             raise ValueError("coordinator_host/port require use_coordinator=True")
         if disaggregated and not use_coordinator:
             raise ValueError("disaggregated inference requires use_coordinator=True")
+        if inference_config.start_suspended and not use_coordinator:
+            raise ValueError("start_suspended requires use_coordinator=True")
 
         if not use_coordinator:
             # Take the EP group from the configured inference process groups, else from the
