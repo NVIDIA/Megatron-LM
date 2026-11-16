@@ -544,8 +544,8 @@ class EngineLoopMixin:
             collections = tuple(stats["collections"] for stats in gc.get_stats())
             previous = self._gc_collections_at_last_log or collections
             self._gc_collections_at_last_log = collections
-            output_str += " ... gc collections %d/%d/%d" % tuple(
-                now - before for now, before in zip(collections, previous)
+            output_str += " ... gc collections " + "/".join(
+                str(now - before) for now, before in zip(collections, previous)
             )
             if color_decode_only:
                 output_str = f"\033[94m{output_str}\033[0m"
