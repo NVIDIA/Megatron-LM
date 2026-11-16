@@ -680,7 +680,8 @@ def initialize_model_parallel(
     dynamic_context_parallel: bool = False,
     min_dynamic_context_parallel_size: int = 1,
     gtp_remat_num_sequence_shards: int = 1,
-) -> None:
+    create_all_gather_group: bool = False,
+) -> Optional[tuple[torch.distributed.ProcessGroup, Optional[torch.distributed.ProcessGroup]]]:
     """Initialize model data parallel groups.
 
     Args:
@@ -826,6 +827,16 @@ def initialize_model_parallel(
             This option is only valid when use_sharp is True.
             By default (None), it is enabled from dp group.
             Available options (choose one): [dp, dp_replica]
+
+        create_all_gather_group (bool, default = False):
+            Create separate dense and, when EP > 1, expert all-gather communicators
+            over the weight-replica ranks. Return their handles to the caller.
+            This creates communicators; parameter-gather overlap is configured separately.
+
+    Returns:
+        None when create_all_gather_group is False; otherwise (dp_cp_ag, expt_dp_ag).
+        The expert handle is None when EP is 1. Attach the returned handles to the
+        application's ProcessGroupCollection; no AG handles are stored in MPU globals.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -1753,6 +1764,14 @@ def initialize_model_parallel(
     # we could stick it there
     _set_global_memory_buffer()
 
+    if create_all_gather_group:
+        return create_all_gather_groups(
+            for_expert_parallelism=expert_model_parallel_size > 1,
+            timeout=timeout,
+            nccl_comm_cfgs=nccl_comm_cfgs,
+        )
+    return None
+
 
 def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_comm_cfgs=None):
     """
@@ -1760,6 +1779,9 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
 
     Creates separate communicators with the same ranks as data parallel groups
     to enable overlapping all-gather operations with reduce-scatter operations.
+    Prefer initialize_model_parallel(create_all_gather_group=True) for standard bootstrap
+    and retain its returned handles. This helper always creates new, caller-owned groups;
+    do not call it again to retrieve groups already created by the initializer.
 
     Args:
         for_expert_parallelism (bool): If True, also creates AG group for expert parameters.

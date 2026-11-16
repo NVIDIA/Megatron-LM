@@ -183,6 +183,19 @@ unset CUDA_DEVICE_MAX_CONNECTIONS
 --fsdp-manual-registration
 ```
 
+#### Separate Parameter All-Gather Groups
+
+Set `dist.create_all_gather_group = True` before distributed initialization to
+create separate dense and, when expert parallelism is enabled, expert parameter
+all-gather communicators. The command-line option is `--create-all-gather-group`.
+Retain the resulting `ProcessGroupCollection` and pass it to model/FSDP
+construction. Parameter-gather overlap is configured separately.
+
+The setting has moved from `DistributedDataParallelConfig` to
+`DistributedInitConfig`. Update programmatic or YAML configurations that use
+`ddp.create_all_gather_group` to use `dist.create_all_gather_group`; the DDP field
+has been removed. The command-line option keeps the same spelling.
+
 ### 🤖 Megatron-Core
 
 Megatron-FSDP has a lower-level `FullyShardedDataParallel` class API that can be used with a simplified version of Megatron-LM's training loop.

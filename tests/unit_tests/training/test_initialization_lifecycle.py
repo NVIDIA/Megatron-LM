@@ -206,10 +206,16 @@ def test_tp_user_buffers_use_config_and_explicit_batch_shape(
     initialize_ub.assert_called_once_with(**expected)
 
 
-def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_config):
+@pytest.mark.parametrize("dist_ag", [False, True])
+@pytest.mark.parametrize("ag_source", ["config", "cli"])
+def test_distributed_initialization_prefers_config_to_args(
+    monkeypatch, run_config, dist_ag, ag_source
+):
     parser = ArgumentParser()
     arguments.add_megatron_arguments(parser)
-    args = parser.parse_args([])
+    # Explicit config wins over opposite CLI values; CLI-derived config reaches bootstrap.
+    cli_ag = dist_ag if ag_source == "cli" else not dist_ag
+    args = parser.parse_args(["--create-all-gather-group"] if cli_ag else [])
     args.rank, args.world_size = 0, 999
     # These topology values are normally resolved by validate_args.
     args.gtp_weight_remat_size = args.expert_gtp_weight_remat_size = 1
@@ -229,14 +235,20 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
         high_priority_stream_groups=["tp"],
         use_tp_pp_dp_mapping=True,
         nccl_communicator_config_path="owned.yaml",
+        create_all_gather_group=dist_ag,
     )
+    if ag_source == "cli":
+        run_config.dist.create_all_gather_group = _default_config_from_args(
+            DistributedInitConfig, args
+        ).create_all_gather_group
     monkeypatch.setattr(initialize, "get_args", lambda: args)
     monkeypatch.setattr(initialize, "print_rank_0", Mock())
     monkeypatch.setattr(initialize.torch.cuda, "device_count", lambda: 2)
     set_device = Mock()
     monkeypatch.setattr(initialize.torch.cuda, "set_device", set_device)
     monkeypatch.setattr(initialize.torch.distributed, "is_initialized", lambda: False)
-    init_pg, init_mpu = Mock(), Mock()
+    ag_groups = (object(), None) if dist_ag else None
+    init_pg, init_mpu = Mock(), Mock(return_value=ag_groups)
     monkeypatch.setattr(initialize.torch.distributed, "init_process_group", init_pg)
     monkeypatch.setattr(initialize.inprocess_restart, "maybe_force_nccl_backend_init", Mock())
     monkeypatch.setattr(initialize.mpu, "model_parallel_is_initialized", lambda: False)
@@ -251,7 +263,8 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
         monkeypatch.delenv(name, raising=False)
     store = object()
 
-    initialize._initialize_distributed(None, None, store)
+    result = initialize._initialize_distributed(None, None, store)
+    assert result is ag_groups
 
     set_device.assert_called_once_with(1)
     init_pg.assert_called_once_with(
@@ -263,6 +276,7 @@ def test_distributed_initialization_prefers_config_to_args(monkeypatch, run_conf
     assert kwargs["order"] == "tp-cp-ep-pp-dp"
     assert kwargs["high_priority_stream_groups"] == ["tp"]
     assert kwargs["use_sharp"] is True
+    assert kwargs["create_all_gather_group"] is dist_ag
     assert kwargs["gtp_remat_num_sequence_shards"] == 1
     assert kwargs["sharp_enabled_group"] == "dp_replica"
     assert kwargs["create_gloo_process_groups"] is False

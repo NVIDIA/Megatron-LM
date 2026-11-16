@@ -646,65 +646,48 @@ def test_valid_dynamic_cp_group_sizes():
         ps.get_valid_dynamic_context_parallel_group_sizes(0)
 
 
-def test_separate_all_gather_group():
-    """AG/RS overlap communicators live on ProcessGroupCollection (via create_all_gather_groups)."""
-    Utils.initialize_model_parallel(context_parallel_size=world_size)
-
-    dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
-    dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
-    dp_cp_ag_group, _expt_ag = ps.create_all_gather_groups(for_expert_parallelism=False)
-    assert dp_cp_ag_group is not None
-    ag_ranks = torch.distributed.get_process_group_ranks(dp_cp_ag_group)
-    assert ag_ranks == dp_cp_ranks, "AG group should have same ranks as dp-cp group"
-    assert dp_cp_ag_group != dp_cp_group, "AG group should be a different communicator"
-
+@pytest.mark.parametrize("create_on_init", [False, True])
+def test_separate_all_gather_group(create_on_init):
+    """Returned AG handles attach to the existing collection without MPU AG globals."""
+    ag_groups = Utils.initialize_model_parallel(
+        context_parallel_size=world_size, create_all_gather_group=create_on_init
+    )
+    if not create_on_init:
+        assert ag_groups is None
+        ag_groups = ps.create_all_gather_groups()
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    pg_collection.dp_cp_ag = dp_cp_ag_group
+    assert pg_collection.dp_cp_ag is None
+    pg_collection.dp_cp_ag, pg_collection.expt_dp_ag = ag_groups
     assert pg_collection.dp_cp_ag is not None
-    assert pg_collection.dp_cp_ag == dp_cp_ag_group
-
+    assert torch.distributed.get_process_group_ranks(pg_collection.dp_cp_ag) == (
+        torch.distributed.get_process_group_ranks(pg_collection.dp_cp)
+    )
+    assert pg_collection.dp_cp_ag != pg_collection.dp_cp
+    assert pg_collection.expt_dp_ag is None
     Utils.destroy_model_parallel()
 
 
-def test_expert_all_gather_group():
-    """Test expert AG groups for MoE models with AG/RS overlap."""
-    # Initialize model parallel with expert parallelism
-    Utils.initialize_model_parallel(
-        expert_model_parallel_size=min(2, world_size),
-        context_parallel_size=max(1, world_size // 2) if world_size > 1 else 1,
+@pytest.mark.parametrize("create_on_init", [False, True])
+def test_expert_all_gather_group(create_on_init):
+    """Default-topology expert AG handles are returned or created explicitly."""
+    if world_size < 8 or world_size % 8:
+        pytest.skip("Requires a world size divisible by eight")
+    ag_groups = Utils.initialize_model_parallel(
+        pipeline_model_parallel_size=2,
+        expert_model_parallel_size=2,
+        create_all_gather_group=create_on_init,
     )
-
-    # Get ranks for both regular and expert AG groups
-    dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
-    dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
-    expt_dp_group = ps.get_expert_data_parallel_group()
-    expt_dp_ranks = torch.distributed.get_process_group_ranks(expt_dp_group)
-
-    # Create AG groups for both regular and expert parameters
-    dp_cp_ag_group = torch.distributed.new_group(ranks=dp_cp_ranks, backend='nccl')
-    expt_dp_ag_group = torch.distributed.new_group(ranks=expt_dp_ranks, backend='nccl')
-
-    # Create ProcessGroupCollection with AG groups
+    if not create_on_init:
+        assert ag_groups is None
+        ag_groups = ps.create_all_gather_groups(for_expert_parallelism=True)
     pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    pg_collection.dp_cp_ag = dp_cp_ag_group
-    pg_collection.expt_dp_ag = expt_dp_ag_group
-
-    # Verify both AG groups are set
-    assert pg_collection.dp_cp_ag is not None
+    assert pg_collection.expt_dp_ag is None
+    pg_collection.dp_cp_ag, pg_collection.expt_dp_ag = ag_groups
     assert pg_collection.expt_dp_ag is not None
-
-    # Verify expert AG group has same ranks as expert dp group
-    expt_dp_group = pg_collection.expt_dp
-    if expt_dp_group is not None:
-        expt_ag_ranks = torch.distributed.get_process_group_ranks(expt_dp_ag_group)
-        expt_dp_ranks_actual = torch.distributed.get_process_group_ranks(expt_dp_group)
-        assert (
-            expt_ag_ranks == expt_dp_ranks_actual
-        ), "Expert AG group should have same ranks as expert dp group"
-        assert (
-            expt_dp_ag_group != expt_dp_group
-        ), "Expert AG group should be a different communicator"
-
+    assert torch.distributed.get_process_group_ranks(pg_collection.expt_dp_ag) == (
+        torch.distributed.get_process_group_ranks(pg_collection.expt_dp)
+    )
+    assert pg_collection.expt_dp_ag != pg_collection.expt_dp
     Utils.destroy_model_parallel()
 
 
