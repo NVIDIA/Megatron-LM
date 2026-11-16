@@ -290,6 +290,11 @@ class InferenceStateHandoffMixin:
         """
         if role not in ("prefill", "decode"):
             raise ValueError(f"KV transfer role must be 'prefill' or 'decode', got {role!r}")
+        if self.context.cache_dsa_indexer_keys:
+            raise ValueError(
+                "Disaggregated KV transfer does not support DSA models yet; "
+                "handoffs do not transfer the prompt's indexer keys"
+            )
         if self.context.is_hybrid_model:
             if role == "decode" and self.context.mamba_slot_allocator is not None:
                 raise RuntimeError(
@@ -312,6 +317,7 @@ class InferenceStateHandoffMixin:
             # a missing graph; existing captured graphs remain usable.
             self.cuda_graph_all_prefills = False
         self._kv_transfer_role = role
+        self.context.kv_transfer_enabled = True
         self._require_handoff_claim = require_handoff_claim
         backend_cls = construct_kv_transfer_backend_class(self.context.config.kv_transport_backend)
 

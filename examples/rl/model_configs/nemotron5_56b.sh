@@ -108,6 +108,7 @@ MODEL_OPTIONS="\
 --ckpt-fully-parallel-save \
     --ckpt-fully-parallel-load \
      --async-save \
+    --use-persistent-ckpt-worker \
     --ckpt-assume-constant-structure \
     --log-progress  \
     --timing-log-option minmax \

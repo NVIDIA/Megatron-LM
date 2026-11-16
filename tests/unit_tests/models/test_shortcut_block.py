@@ -141,7 +141,10 @@ def test_group_layers_into_shortcut_blocks(compute_symbol, parallel):
 
     grouped = group_layers_into_shortcut_blocks(
         torch.nn.ModuleList([leading_moe, compute, paired_moe, trailing_layer]),
-        [LayerSymbols.MOE, compute_symbol, LayerSymbols.MOE, LayerSymbols.MLP],
+        [
+            LayerSymbols.LAYER_CONFIG_MAP[symbol].from_config(config)
+            for symbol in (LayerSymbols.MOE, compute_symbol, LayerSymbols.MOE, LayerSymbols.MLP)
+        ],
         config,
     )
 
@@ -352,7 +355,9 @@ def test_inference_runs_paired_layer_atomically(monkeypatch):
     compute_layer = _FakeCompute(config)
     moe_layer = _FakeMoE(config)
     block = ShortcutMoEBlock(compute_layer, moe_layer, overlap_a2a=False)
-    inference_context = object()
+    inference_context = SimpleNamespace(
+        config=SimpleNamespace(inference_shortcut_moe_overlap=False)
+    )
     observed = {}
 
     def compute_forward(hidden_states, **kwargs):
@@ -458,7 +463,10 @@ def test_group_layers_rejects_invalid_shortcut_pair(compute_symbol, compute, err
     with pytest.raises(ValueError, match=error):
         group_layers_into_shortcut_blocks(
             torch.nn.ModuleList([compute(config), _FakeMoE(config)]),
-            [compute_symbol, LayerSymbols.MOE],
+            [
+                LayerSymbols.LAYER_CONFIG_MAP[symbol].from_config(config)
+                for symbol in (compute_symbol, LayerSymbols.MOE)
+            ],
             config,
         )
 
@@ -469,7 +477,10 @@ def test_group_layers_rejects_pair_split_across_pipeline_stages():
     with pytest.raises(ValueError, match="cannot cross pipeline-stage boundaries"):
         group_layers_into_shortcut_blocks(
             torch.nn.ModuleList([_FakeMoE(config, layer_number=5), _FakeCompute(config)]),
-            [LayerSymbols.MOE, LayerSymbols.MAMBA],
+            [
+                LayerSymbols.LAYER_CONFIG_MAP[symbol].from_config(config)
+                for symbol in (LayerSymbols.MOE, LayerSymbols.MAMBA)
+            ],
             config,
             pp_layer_offset=4,
         )

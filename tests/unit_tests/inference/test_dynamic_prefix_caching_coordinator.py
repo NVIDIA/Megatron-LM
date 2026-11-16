@@ -30,11 +30,8 @@ from megatron.core.inference.data_parallel_inference_coordinator.handlers import
     handle_engine_reply,
     handle_submit_request,
 )
-from megatron.core.inference.engines.dynamic_engine import (
-    DynamicInferenceEngine,
-    RequestEntry,
-    _engine_reply_frames,
-)
+from megatron.core.inference.engines.dynamic.coordinator import _engine_reply_frames
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import (

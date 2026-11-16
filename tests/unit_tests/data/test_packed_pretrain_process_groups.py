@@ -29,15 +29,17 @@ def packed_entrypoint(request, monkeypatch):
         cp=SimpleNamespace(size=lambda: 1, rank=lambda: 0),
     )
     config = SimpleNamespace(
+        sequence_packing_scheduler="default_dynamic_cp",
+        dynamic_context_parallel=True,
         virtual_pipeline_model_parallel_size=3,
         pipeline_model_parallel_layout=None,
         mtp_num_layers=1,
     )
-    args = SimpleNamespace(
-        sequence_packing_scheduler="default_dynamic_cp", dynamic_context_parallel=True
-    )
+    args = SimpleNamespace(sequence_packing_scheduler=None, dynamic_context_parallel=False)
     monkeypatch.setattr(module, "get_args", lambda: args)
-    monkeypatch.setattr(module, "core_transformer_config_from_args", lambda args: config)
+    monkeypatch.setattr(
+        module, "get_run_config", lambda: SimpleNamespace(model=SimpleNamespace(transformer=config))
+    )
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
 
     def fail(*args, **kwargs):

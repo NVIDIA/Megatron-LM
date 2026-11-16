@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import filecmp
 import os
@@ -19,7 +19,7 @@ from tests.unit_tests.dist_checkpointing import (
     init_checkpointing_mock_args,
     setup_model_and_optimizer,
 )
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 
 class TestNonPersistentSaveAndLoad:
@@ -54,6 +54,7 @@ class TestNonPersistentSaveAndLoad:
             init_checkpointing_mock_args(mock_args, non_persistent_ckpt_dir)
             mock_args.non_persistent_ckpt_type = "global"
 
+            sync_checkpoint_config(mock_args)
             save_checkpoint(
                 2,
                 model,
@@ -63,9 +64,11 @@ class TestNonPersistentSaveAndLoad:
                 {},
                 non_persistent_ckpt=True,
             )
+            sync_checkpoint_config(mock_args)
             save_checkpoint(
                 3, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {}
             )
+            sync_checkpoint_config(mock_args)
             save_checkpoint(
                 4,
                 model,
@@ -75,17 +78,21 @@ class TestNonPersistentSaveAndLoad:
                 {},
                 non_persistent_ckpt=True,
             )
+            sync_checkpoint_config(mock_args)
             iteration, _ = load_checkpoint(
                 model, optimizer, opt_param_scheduler, restore_training_state=True
             )
             assert iteration == 4
+            sync_checkpoint_config(mock_args)
             save_checkpoint(
                 6, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {}
             )
+            sync_checkpoint_config(mock_args)
             iteration, _ = load_checkpoint(
                 model, optimizer, opt_param_scheduler, restore_training_state=True
             )
             assert iteration == 6
+            sync_checkpoint_config(mock_args)
             save_checkpoint(
                 8,
                 model,
@@ -95,6 +102,7 @@ class TestNonPersistentSaveAndLoad:
                 {},
                 non_persistent_ckpt=True,
             )
+            sync_checkpoint_config(mock_args)
             iteration, _ = load_checkpoint(
                 model, optimizer, opt_param_scheduler, restore_training_state=True
             )
@@ -145,9 +153,11 @@ class TestLegacySaveAndLoad:
             init_basic_mock_args(mock_args, tp, pp)
             init_checkpointing_mock_args(mock_args, legacy_ckpt_dir)
 
+            sync_checkpoint_config(mock_args)
             save_checkpoint(
                 2, model, optimizer, opt_param_scheduler, num_floating_point_operations_so_far, {}
             )
+            sync_checkpoint_config(mock_args)
             iteration, _ = load_checkpoint(
                 model, optimizer, opt_param_scheduler, restore_training_state=True
             )

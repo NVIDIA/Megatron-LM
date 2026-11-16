@@ -6,6 +6,7 @@ from dataclasses import replace
 
 import pytest
 import torch
+import torch.distributed as dist
 import transformer_engine.pytorch as te
 from torch.distributed.tensor import DTensor
 from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Tensor
@@ -15,6 +16,7 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradientFinalizationMode,
     fully_shard_context,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
@@ -142,6 +144,9 @@ def test_init_model_with_meta_device_initializes_fsdp_v2_parameters(process_grou
         pg_collection=process_group_collection,
     )
 
+    assert (
+        wrapped.module.context.gradient_finalization_mode is GradientFinalizationMode.REDUCE_OUTER
+    )
     assert isinstance(wrapped.module, FsdpModule)
 
     parameters = dict(wrapped.module.named_parameters())
@@ -288,27 +293,23 @@ def test_unpadded_shards_pack_parameter_groups_without_padding(process_group_col
         )
 
 
-def test_rejects_shared_context_without_caller_managed_grad_sync(
-    process_group_collection, distributed_setup
-):
-    """The adapter rejects an incompatible shared context before sharding the model."""
+def test_joins_shared_context(process_group_collection, distributed_setup):
+    """The adapter joins a context without construction-time gradient-sync settings."""
     config = TransformerConfig(num_layers=1, hidden_size=16, num_attention_heads=4)
     layer = torch.nn.Linear(16, 16, device=distributed_setup.device)
     with fully_shard_context(FsdpContext(device=distributed_setup.device)) as context:
-        with pytest.raises(ValueError, match="caller_managed_grad_sync=True"):
-            FullyShardedDataParallel(
-                config=config,
-                ddp_config=DistributedDataParallelConfig(
-                    use_megatron_fsdp=True,
-                    megatron_fsdp_version=2,
-                    use_distributed_optimizer=False,
-                    data_parallel_sharding_strategy="optim_grads_params",
-                ),
-                module=layer,
-                pg_collection=process_group_collection,
-            )
-        assert not context.caller_managed_grad_sync
-        assert not isinstance(layer, FsdpModule)
+        model = FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=layer,
+            pg_collection=process_group_collection,
+        )
+    assert model.module.context is context
 
 
 def test_finish_grad_sync_waits_for_delayed_wgrad(process_group_collection, distributed_setup):
@@ -471,13 +472,19 @@ def test_delayed_wgrad_matches_immediate(
             losses.append(torch.stack(microbatch_losses).mean())
         return torch.stack(losses)
 
+    def backward_dw():
+        # Delayed wgrad needs the full parameter binding, but not its weight storage.
+        assert delayed_layer.weight.untyped_storage().nbytes() == 0
+        delayed_layer.backward_dw()
+
     immediate_losses = train(immediate_layer)
-    delayed_losses = train(delayed_layer, delayed_layer.backward_dw)
+    delayed_losses = train(delayed_layer, backward_dw)
     torch.testing.assert_close(delayed_losses, immediate_losses, rtol=0, atol=0)
 
 
-def test_build_train_and_step(process_group_collection):
-    """Match eager training against an MFSDP v2 train-and-step sequence."""
+@pytest.mark.parametrize("nccl_ub", [False, True], ids=["ordinary", "symmetric"])
+def test_build_train_and_step(process_group_collection, nccl_ub):
+    """Match eager training with MFSDP v2, including a cold symmetric-memory communicator."""
     config = TransformerConfig(
         num_layers=2,
         hidden_size=16,
@@ -499,6 +506,9 @@ def test_build_train_and_step(process_group_collection):
     # requires DDP/FSDP buffer metadata, but the optimizer factory still expects
     # every model chunk to expose ddp_config.
     reference_model.ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=False)
+    if nccl_ub:
+        # Leave the fresh DP communicator's initialization to the adapter.
+        process_group_collection.dp_cp = dist.new_group(backend="nccl")
     model = FullyShardedDataParallel(
         config=config,
         ddp_config=DistributedDataParallelConfig(
@@ -506,6 +516,7 @@ def test_build_train_and_step(process_group_collection):
             megatron_fsdp_version=2,
             use_distributed_optimizer=False,
             data_parallel_sharding_strategy="optim_grads_params",
+            nccl_ub=nccl_ub,
         ),
         module=model,
         pg_collection=process_group_collection,
@@ -712,3 +723,49 @@ def test_gradient_clipping_reaches_global_norm(
     torch.testing.assert_close(
         global_norm([p.grad.to_local() for p in parameters]), clip_grad, rtol=1e-3, atol=0
     )
+
+
+def test_transformer_layer_weights_released_before_final_callback(process_group_collection):
+    """Layer input gradients release full weights before final autograd cleanup."""
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        ffn_hidden_size=32,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+    )
+    block = TransformerBlock(config=config, spec=get_gpt_layer_local_spec()).to(
+        device="cuda", dtype=config.params_dtype
+    )
+    model = FullyShardedDataParallel(
+        config=config,
+        ddp_config=DistributedDataParallelConfig(
+            use_megatron_fsdp=True,
+            megatron_fsdp_version=2,
+            use_distributed_optimizer=False,
+            data_parallel_sharding_strategy="optim_grads_params",
+        ),
+        module=block,
+        pg_collection=process_group_collection,
+    )
+    released = []
+
+    def check_weights_released(_grad):
+        # Input backward precedes final autograd cleanup; checking after backward
+        # returns would miss weights retained until that cleanup.
+        for layer in block.layers:
+            for group in layer.parameter_groups:
+                assert not group._unsharded_model_weight.is_allocated
+        released.append(True)
+
+    x = torch.randn(
+        8, 2, config.hidden_size, device="cuda", dtype=config.params_dtype, requires_grad=True
+    )
+    x.register_hook(check_weights_released)
+    run_forward_backward_on_microbatches(
+        model, lambda: model(x, attention_mask=None).float().square().mean()
+    )
+    assert released == [True]
