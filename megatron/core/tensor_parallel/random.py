@@ -1090,8 +1090,11 @@ class CheckpointWithoutOutputManager:
 
     def __init__(self):
         self.checkpoints = []
-        # Set by TransformerBlock before each layer forward.
-        # When True, the layer should keep block-boundary output uncheckpointed.
+        # Legacy block-end flag. HybridStack sets it for the Hybrid mHC wrapper, and
+        # HyperConnectionTransformerLayer reads it only via the deprecated
+        # mhc_recompute_manager keyword; TransformerBlock passes an immutable
+        # ResidualStreamRecomputeContext instead. When True, the layer should keep
+        # block-boundary output uncheckpointed.
         self.is_last_layer_in_recompute_block = False
 
     def add_checkpoint(self, ckpt):

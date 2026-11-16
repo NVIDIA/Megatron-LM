@@ -26,6 +26,7 @@ from megatron.core.ssm.gated_delta_product import (
 
 pytestmark = pytest.mark.launch_on_gb200
 
+
 if HAVE_FLA_GDP_CP:
     import megatron.core.ssm.context_parallel.gdp as gdp_cp_module
 else:
