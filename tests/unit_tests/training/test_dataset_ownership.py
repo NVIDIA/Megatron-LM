@@ -144,10 +144,10 @@ def _validated(extra):
 @pytest.fixture
 def container_factory(monkeypatch):
     """pretrain_cfg_container_from_args on parsed arguments, without the optimizer / DDP setup."""
-    from megatron.training import training
+    from megatron.training import argument_utils
 
     monkeypatch.setattr(
-        training, "get_megatron_ddp_config", lambda args, **_: DistributedDataParallelConfig()
+        argument_utils, "get_megatron_ddp_config", lambda args, **_: DistributedDataParallelConfig()
     )
 
     def build(argv, *, data=False, **kwargs):

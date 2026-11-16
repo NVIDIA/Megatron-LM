@@ -401,7 +401,7 @@ def check_flashinfer_jit_cache_installed(log_version: bool = False):
     raise RuntimeError(
         "Expert parallel inference with the FlashInfer backend requires FlashInfer's "
         f"pre-compiled kernels (flashinfer-jit-cache), but {missing}. Install them with "
-        "`flashinfer download-kernels`, or `uv sync --group flashinfer_kernels` in this repo."
+        "`flashinfer download-kernels`, or `uv sync --extra inference` in this repo."
     )
 
 

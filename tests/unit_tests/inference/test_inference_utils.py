@@ -5,8 +5,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.inference import utils as inference_utils
 from megatron.core.inference.utils import (
     Counter,
+    check_flashinfer_jit_cache_installed,
     detokenize_tokens,
     get_language_model,
     lm_head_can_emit,
@@ -136,3 +138,13 @@ class TestInferenceUtils:
         assert model.lm_head_can_emit_fp32 is False
         mode["enabled"] = False
         assert model.lm_head_can_emit_fp32 is True
+
+    def test_flashinfer_jit_cache_missing_hint(self, monkeypatch):
+        missing = (
+            "no flashinfer-jit-cache provider for sm100 at FlashInfer 0.7.2.post1 is installed"
+        )
+        monkeypatch.setattr(inference_utils, "missing_flashinfer_prebuilt_kernels", lambda: missing)
+        with pytest.raises(RuntimeError, match="flashinfer-jit-cache") as excinfo:
+            check_flashinfer_jit_cache_installed()
+        assert missing in str(excinfo.value)
+        assert "uv sync --extra inference" in str(excinfo.value)
