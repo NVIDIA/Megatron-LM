@@ -444,6 +444,53 @@ def test_pack_inference_logprobs_multi_region():
     assert filled_mask.tolist() == [[True, False, True, False, True, True, False]]
 
 
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+@pytest.mark.parametrize('stacked', [False, True])
+def test_pack_inference_logprobs_partial_rank(device, stacked):
+    """Preserve row order, skipped positions and empty bins for a sharded batch."""
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('CUDA required for device-to-host staging')
+
+    # Only rows 3 and 0 are assigned to this rank, in that order.
+    packing_info = sequence_packing_utils.PackingInfo(
+        bin_seq_indices=[[3, 0], []],
+        seq_starts={0: [0, 6]},
+        seq_lengths=[4, 8, 8, 4],
+        seq_to_bin_idx=[0, None, None, 0],
+        packing_algo='fifo',
+    )
+    masks = torch.tensor(
+        [
+            [False, True, True, True, False, False, False, False],
+            [True] * 8,
+            [True] * 8,
+            [True, True, False, True, False, True, False, False],
+        ],
+        device=device,
+    )
+    # Row 3 starts with a generated position zero, then has an out-of-range
+    # generation at position 5. Row 0 has more generated tokens than logprobs.
+    logits = torch.tensor(
+        [[10.0, 11.0, 12.0, 13.0], [80.0] * 4, [90.0] * 4, [30.0, 31.0, 0.0, 33.0]], device=device
+    )
+    if stacked:
+        logprobs = logits
+    else:
+        logprobs = [logits[0, :1], None, None, logits[3]]
+    packed, filled = sequence_packing_utils.pack_inference_logprobs(
+        logprobs, packing_info, masks, 10
+    )
+
+    expected = torch.zeros(2, 9)
+    expected[0, [0, 2, 6]] = torch.tensor([31.0, 0.0, 10.0])
+    if stacked:
+        expected[0, 7:9] = torch.tensor([11.0, 12.0])
+    torch.testing.assert_close(packed, expected, rtol=0, atol=0)
+    expected_filled = expected != 0
+    expected_filled[0, 2] = True  # A logprob of zero can still come from the engine.
+    assert torch.equal(filled, expected_filled)
+
+
 def test_packing_observability_metrics():
     """Test various observability metrics related to sequence packing."""
 
