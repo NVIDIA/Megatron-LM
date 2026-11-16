@@ -99,7 +99,9 @@ def test_training_static_decode(canonical_mixer):
             context.sequence_len_offset += 1
         exact(expected, torch.cat(parts))
         isolated = StaticInferenceContext(max_batch_size=1, max_sequence_length=128)
-        alone = mixer(x[:, 1:2].detach(), inference_context=isolated)[0]
+        isolated_input = x[:, 1:2].detach()
+        assert not isolated_input.is_contiguous()
+        alone = mixer(isolated_input, inference_context=isolated)[0]
         exact(expected[:, 1:2], alone)
 
 

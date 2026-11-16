@@ -107,7 +107,8 @@ def chunk_forward(
     """Run common projection/preparation/recurrence for training or static prefill."""
     if runtime_cp.group.size() != 1:
         raise NotImplementedError("Batch-invariant GDP requires runtime CP=1")
-    projection, _ = mixer.in_proj(hidden_states)
+    # Native TE normalization requires a contiguous token matrix.
+    projection, _ = mixer.in_proj(hidden_states.contiguous())
     cu = None
     if packed_seq_params is not None:
         if hidden_states.shape[1] != 1 or ssm_state is not None:
