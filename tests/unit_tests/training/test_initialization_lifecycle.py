@@ -983,6 +983,7 @@ def test_callbacks_construct_from_registered_model_config(
         assert build.call_args.kwargs["encoder_config"].num_layers == 2
         assert build.call_args.kwargs["relative_attention_num_buckets"] == 32
         assert build.call_args.kwargs["relative_attention_max_distance"] == 128
+        assert build.call_args.kwargs["pg_collection"] is global_groups
 
 
 @pytest.mark.parametrize("fp8_recipe", ["delayed", "tensorwise"])
