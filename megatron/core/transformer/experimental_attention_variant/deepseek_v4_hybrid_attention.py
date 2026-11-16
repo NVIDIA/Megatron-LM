@@ -549,6 +549,64 @@ class DSv4HybridSelfAttention(DSv4HybridAttention):
     and returns output of the same size.
     """
 
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: MLATransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+    ) -> float:
+        """Estimate forward W/C/H attention, including projections, compression and indexing.
+
+        Packed top-k saturation uses the token-weighted mean sequence length, as the
+        batch aggregates do not retain individual document lengths. Includes FMA x2.
+        """
+        if config.compress_ratio not in (0, 4, 128):
+            raise ValueError(f"Unsupported CSA compression ratio: {config.compress_ratio}")
+        if total_real_tokens_in_batch == 0:
+            return 0
+        hidden = config.hidden_size
+        heads = config.num_attention_heads
+        # The stack config may still carry ordinary MLA's qk_head_dim default.
+        head_dim = config.v_head_dim
+        q_rank = config.q_lora_rank
+        output_rank = config.output_projection_lora_rank
+        output_groups = config.output_projection_groups
+        sequence_length = seqlen_squared_sum_in_batch / total_real_tokens_in_batch
+        token_term = (
+            q_rank * (hidden + heads * head_dim + 1)
+            + hidden * head_dim
+            + head_dim
+            + heads * head_dim * output_rank
+            + output_groups * output_rank * hidden
+            + heads * config.csa_window_size * head_dim * 2
+        )
+        core_term = 0
+        if config.compress_ratio == 128:
+            token_term += hidden * head_dim * 2
+            core_term += heads * head_dim / 128
+        elif config.compress_ratio == 4:
+            # Ratio-4 compression overlaps two windows.
+            token_term += hidden * (2 * head_dim) * 2
+            if config.csa_dense_mode:
+                core_term += heads * head_dim / 4
+            else:
+                indexer_heads = config.dsa_indexer_n_heads
+                indexer_dim = config.dsa_indexer_head_dim
+                topk = min(config.dsa_indexer_topk, sequence_length // 4)
+                average_compressed_keys = topk * (1 - topk * 4 / (2 * sequence_length))
+                token_term += heads * average_compressed_keys * head_dim * 2
+                token_term += (
+                    hidden * (2 * indexer_dim) * 2
+                    + q_rank * indexer_heads * indexer_dim
+                    + hidden * indexer_heads
+                )
+                core_term += indexer_heads * indexer_dim / 4
+        return 2 * (
+            token_term * total_real_tokens_in_batch + core_term * seqlen_squared_sum_in_batch
+        )
+
     def __init__(
         self,
         config: MLATransformerConfig,
