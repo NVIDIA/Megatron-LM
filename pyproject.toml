@@ -146,7 +146,7 @@ ssm = [
 [dependency-groups]
 test = [
     "coverage",
-    "nltk",
+    "nltk>=3.10.4",
     "wrapt",
     "pytest==9.1.1",
     "pytest-mock",
