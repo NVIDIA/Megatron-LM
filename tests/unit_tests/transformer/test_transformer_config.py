@@ -408,6 +408,25 @@ def test_hybrid_gdn_does_not_require_gpt_layer_frequency():
     assert config.linear_attention_freq is None
 
 
+def test_mla_default_kv_channels_follows_the_mla_query_head_dim():
+    """MLA heads need not divide hidden_size, so the default cannot be that quotient."""
+    from megatron.core.transformer.transformer_config import MLATransformerConfig
+
+    config = MLATransformerConfig(
+        num_layers=1,
+        hidden_size=7168,
+        num_attention_heads=96,
+        qk_head_dim=128,
+        qk_pos_emb_head_dim=64,
+    )
+    assert config.kv_channels == 192
+
+
+def test_non_mla_default_kv_channels_is_hidden_size_per_head():
+    config = TransformerConfig(num_layers=1, hidden_size=128, num_attention_heads=4)
+    assert config.kv_channels == 32
+
+
 @pytest.mark.parametrize(
     "legacy_fusion, expected", [(None, "cudnn"), (True, "cudnn"), (False, "none")]
 )
