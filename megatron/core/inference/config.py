@@ -554,7 +554,8 @@ class InferenceConfig:
     max_tokens: Optional[int] = None
     """
     Max number of tokens to use for forward passes. This is primarily limited by prefill activation
-    memory usage. (Defaults to 16384).
+    memory usage. Must be divisible by the tensor parallel size. Batch-invariant inference also
+    requires alignment to the dynamic context's token rounding size. (Defaults to 16384).
     """
 
     unified_memory_level: int = 0
@@ -570,6 +571,14 @@ class InferenceConfig:
     """
     Mode used to determine how large tensors are handled by the allocate and deallocate methods.
     See `KVCacheManagementMode` for options.
+    """
+
+    start_suspended: bool = False
+    """
+    Construct the engine in the `SUSPENDED` state instead of `RUNNING`, so it can be built
+    before its weights are in place. CUDA-graph capture waits for the first `resume()`.
+    The inference-state buffers are still allocated at construction and are then held or
+    released according to `kv_cache_management_mode`, as after a regular `suspend()`.
     """
 
     # =================================

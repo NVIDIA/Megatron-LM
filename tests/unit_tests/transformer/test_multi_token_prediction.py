@@ -4637,6 +4637,7 @@ class TestMultiTokenPredictionHybrid:
             pre_process=False,
             post_process=True,
             hybrid_layer_config_list=None,
+            _has_custom_layers=False,
             position_embedding_type='none',
             decoder=decoder,
             share_embeddings_and_output_weights=False,
