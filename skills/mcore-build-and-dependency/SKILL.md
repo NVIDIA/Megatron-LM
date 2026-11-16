@@ -1,8 +1,7 @@
 ---
 name: mcore-build-and-dependency
-description: Container-based dev environment setup and dependency management for Megatron-LM. Covers acquiring and launching the CI container, uv package management, and updating uv.lock.
+description: Container-based dev environment setup and dependency management for Megatron-LM. Covers acquiring and launching the CI container, uv package management, and updating uv.lock. Use when adding, removing, or updating a dependency; editing pyproject.toml or uv.lock; uv.lock merge conflict; setting up a dev environment; pulling or building the CI container; container build errors; uv errors; 'how do I install', 'uv sync fails', 'ModuleNotFoundError'.
 license: Apache-2.0
-when_to_use: Adding, removing, or updating a dependency; editing pyproject.toml or uv.lock; uv.lock merge conflict; setting up a dev environment; pulling or building the CI container; container build errors; uv errors; 'how do I install', 'uv sync fails', 'ModuleNotFoundError'.
 metadata:
   author: Oliver Koenig <okoenig@nvidia.com>
 ---

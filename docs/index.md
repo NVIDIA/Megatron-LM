@@ -76,6 +76,7 @@ user-guide/data-loading
 user-guide/features/megatron_energon
 user-guide/features/megatron_rl
 user-guide/features/tokenizers
+developer/gdn_ew_fusion
 ```
 
 ```{toctree}
@@ -105,10 +106,10 @@ user-guide/observability/extending
 :caption: Developer Guide
 
 developer/contribute
+developer/parallel-state-deprecation
 developer/submit
 developer/oncall
 developer/generate_docs
-developer/gdn_ew_fusion
 ```
 
 ```{toctree}

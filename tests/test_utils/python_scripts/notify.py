@@ -48,7 +48,7 @@ def get_project() -> Any:
 
 
 def _bridge_gpu(bridge_name: str) -> str:
-    for gpu in ("GB300", "GB200", "H100", "A100"):
+    for gpu in ("GB300", "GB200", "H100"):
         if gpu.lower() in bridge_name.lower():
             return gpu
     return "Unknown"

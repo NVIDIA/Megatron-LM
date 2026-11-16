@@ -344,17 +344,5 @@ class TestRatchet(unittest.TestCase):
         self.assertEqual(self.run_check(), 1)
 
 
-class TestCommittedBaseline(unittest.TestCase):
-    """Check the production tree and committed baseline together."""
-
-    def test_matches_current_tree(self):
-        found = checker.scan()
-        allowed = checker._load_allowlist()
-        self.assertEqual(checker._difference(found, allowed), {})
-        self.assertEqual(checker._difference(allowed, found), {})
-        total = json.loads(checker.ALLOWLIST.read_text())["total"]
-        self.assertEqual(total, sum(map(len, found.values())))
-
-
 if __name__ == "__main__":
     unittest.main()

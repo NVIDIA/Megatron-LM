@@ -1,16 +1,21 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import dataclasses
+import sys
+import types
 from argparse import ArgumentParser
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
 import torch
 
+from megatron.core.activations import squared_relu
 from megatron.core.inference.config import (
     AsyncScheduleMode,
     ImageProcessingConfig,
     InferenceConfig,
+    KVCacheManagementMode,
     MambaInferenceStateConfig,
     MediaCacheCoordinatorPolicy,
     MediaPromptSpec,
@@ -23,6 +28,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
 from megatron.core.ssm.mamba_mixer import MambaMixer
 from megatron.core.ssm.ops.gdp.common import CHUNK_SIZE as GDP_CHUNK_SIZE
+from megatron.core.transformer.enums import InferenceCudaGraphScope
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.training.arguments import _add_inference_args
 from megatron.training.config.inference_config import InferenceSetupConfig
@@ -280,6 +286,7 @@ class TestInferenceConfig:
             max_sequence_length=4096,
             pg_collection="pg",
             decoder=SimpleNamespace(layer_type_list=None),
+            config=SimpleNamespace(inference_cuda_graph_scope=InferenceCudaGraphScope.none),
         )
         kwargs = (
             {}
@@ -288,15 +295,53 @@ class TestInferenceConfig:
         )
         setup_config = InferenceSetupConfig(**kwargs)
 
-        inference_config = setup_config.to_inference_config(
-            model=model,
-            kv_cache_management_mode="persist",
-            static_kv_memory_pointers=False,
-            enable_cuda_graphs=False,
-            verbose=False,
-        )
+        inference_config = setup_config.to_inference_config(model=model, verbose=False)
 
         assert inference_config.async_sched_mode == expected
+
+    def test_gc_mode_flag_reaches_runtime_config(self):
+        """Ensure --inference-gc-mode defaults to freeze_overlap, maps onto InferenceConfig and
+        is validated."""
+        assert InferenceConfig().gc_mode == "freeze_overlap"
+        with pytest.raises(ValueError, match="Unsupported gc_mode"):
+            InferenceConfig(gc_mode="disable")
+        parser = _add_inference_args(ArgumentParser())
+        assert parser.parse_args([]).inference_gc_mode == "freeze_overlap"
+        args = parser.parse_args(["--inference-gc-mode", "freeze"])
+        model = SimpleNamespace(
+            position_embedding_type="rope",
+            max_sequence_length=4096,
+            pg_collection="pg",
+            decoder=SimpleNamespace(layer_type_list=None),
+            config=SimpleNamespace(inference_cuda_graph_scope=InferenceCudaGraphScope.none),
+        )
+        setup_config = InferenceSetupConfig(inference_gc_mode=args.inference_gc_mode)
+
+        inference_config = setup_config.to_inference_config(model=model, verbose=False)
+
+        assert inference_config.gc_mode == "freeze"
+
+    def test_inference_setup_config_maps_disaggregation_fields(self):
+        """Ensure declarative inference config maps disaggregation fields."""
+        model = SimpleNamespace(
+            position_embedding_type="rope",
+            max_sequence_length=4096,
+            pg_collection="pg",
+            decoder=SimpleNamespace(layer_type_list=None),
+            config=SimpleNamespace(inference_cuda_graph_scope=InferenceCudaGraphScope.none),
+        )
+        shards = "tp=1,role=prefill+tp=1,role=decode"
+        setup_config = InferenceSetupConfig(
+            inference_dynamic_batching_async_sched_mode="async",
+            inference_shards=shards,
+            disagg_kv_transport_backend="nccl",
+        )
+
+        inference_config = setup_config.to_inference_config(model=model, verbose=False)
+
+        assert inference_config.async_sched_mode == AsyncScheduleMode.ASYNC
+        assert inference_config.disaggregation_shards == shards
+        assert inference_config.kv_transport_backend == "nccl"
 
     def test_inference_setup_config_maps_multimodal_fields(self):
         """Ensure declarative inference config maps multimodal fields to runtime config."""
@@ -305,6 +350,7 @@ class TestInferenceConfig:
             max_sequence_length=4096,
             pg_collection="pg",
             decoder=SimpleNamespace(layer_type_list=None),
+            config=SimpleNamespace(inference_cuda_graph_scope=InferenceCudaGraphScope.none),
         )
         setup_config = InferenceSetupConfig(
             inference_dynamic_batching_async_sched_mode="async",
@@ -314,13 +360,7 @@ class TestInferenceConfig:
             inference_dynamic_batching_allow_stale_multimodal_embeddings=True,
         )
 
-        inference_config = setup_config.to_inference_config(
-            model=model,
-            kv_cache_management_mode="persist",
-            static_kv_memory_pointers=False,
-            enable_cuda_graphs=False,
-            verbose=False,
-        )
+        inference_config = setup_config.to_inference_config(model=model, verbose=False)
 
         assert inference_config.async_sched_mode == AsyncScheduleMode.ASYNC
         assert (
@@ -347,18 +387,104 @@ class TestInferenceConfig:
             max_sequence_length=4096,
             pg_collection="pg",
             decoder=SimpleNamespace(layer_type_list=None),
+            config=SimpleNamespace(inference_cuda_graph_scope=InferenceCudaGraphScope.none),
         )
         setup_config = InferenceSetupConfig(offset_sampling_seed_by_dp_rank=False)
 
-        inference_config = setup_config.to_inference_config(
-            model=model,
-            kv_cache_management_mode="persist",
-            static_kv_memory_pointers=False,
-            enable_cuda_graphs=False,
-            verbose=False,
-        )
+        inference_config = setup_config.to_inference_config(model=model, verbose=False)
 
         assert inference_config.offset_sampling_seed_by_dp_rank is False
+
+    def test_kv_cache_policy_is_an_inference_setting(self, monkeypatch):
+        """Both flag spellings fill the section; the policy and the CUDA-graph gate come from the
+        section and the model, not from the caller."""
+        parser = _add_inference_args(ArgumentParser())
+        default_args = parser.parse_args([])
+        assert default_args.kv_cache_management_mode == "persist"
+        assert default_args.static_kv_memory_pointers is False
+        for argv in (
+            [
+                "--inference-kv-cache-management-mode",
+                "offload",
+                "--inference-static-kv-memory-pointers",
+            ],
+            ["--rl-kv-cache-management-mode", "offload", "--rl-persist-cuda-graphs"],
+        ):
+            args = parser.parse_args(argv)
+            assert (args.kv_cache_management_mode, args.static_kv_memory_pointers) == (
+                "offload",
+                True,
+            )
+        for negation in ("--no-inference-static-kv-memory-pointers", "--no-rl-persist-cuda-graphs"):
+            assert parser.parse_args([negation]).static_kv_memory_pointers is False
+
+        monkeypatch.setitem(
+            sys.modules, "torch_memory_saver", types.ModuleType("torch_memory_saver")
+        )
+        setup_config = InferenceSetupConfig(
+            kv_cache_management_mode="offload",
+            static_kv_memory_pointers=True,
+            inference_dynamic_batching_num_cuda_graphs=4,
+        )
+        for scope, expected_num_cuda_graphs in (
+            (InferenceCudaGraphScope.none, None),
+            (InferenceCudaGraphScope.block, 4),
+        ):
+            model = SimpleNamespace(
+                position_embedding_type="rope",
+                max_sequence_length=4096,
+                pg_collection="pg",
+                decoder=SimpleNamespace(layer_type_list=None),
+                config=SimpleNamespace(inference_cuda_graph_scope=scope),
+            )
+            inference_config = setup_config.to_inference_config(model=model, verbose=False)
+            assert inference_config.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
+            assert inference_config.static_kv_memory_pointers is True
+            assert inference_config.num_cuda_graphs == expected_num_cuda_graphs
+
+    @pytest.mark.parametrize(
+        "kwargs, saver_installed, match",
+        [
+            ({}, False, None),
+            (dict(kv_cache_management_mode="recompute"), False, None),
+            (
+                dict(
+                    kv_cache_management_mode="recompute",
+                    static_kv_memory_pointers=True,
+                    inference_dynamic_batching_unified_memory_level=1,
+                ),
+                False,
+                None,
+            ),
+            (dict(kv_cache_management_mode="offload", static_kv_memory_pointers=True), True, None),
+            (
+                dict(kv_cache_management_mode="offload"),
+                True,
+                "requires --inference-static-kv-memory-pointers",
+            ),
+            (
+                dict(
+                    kv_cache_management_mode="offload",
+                    static_kv_memory_pointers=True,
+                    inference_dynamic_batching_unified_memory_level=1,
+                ),
+                True,
+                "incompatible with UVM",
+            ),
+            (
+                dict(kv_cache_management_mode="recompute", static_kv_memory_pointers=True),
+                False,
+                "torch_memory_saver",
+            ),
+        ],
+    )
+    def test_kv_cache_policy_validation(self, monkeypatch, kwargs, saver_installed, match):
+        """Offload needs fixed addresses, UVM makes offload pointless, and fixed addresses for a
+        cache that leaves GPU memory need UVM or torch_memory_saver."""
+        saver = types.ModuleType("torch_memory_saver") if saver_installed else None
+        monkeypatch.setitem(sys.modules, "torch_memory_saver", saver)
+        with pytest.raises(ValueError, match=match) if match else nullcontext():
+            InferenceSetupConfig(**kwargs).validate()
 
 
 def _ssm_model(mixers):
@@ -477,3 +603,84 @@ class TestSSMChunkAlignment:
             mamba_chunk_size=64,
         )
         assert config.ssm_chunk_alignment == 64
+
+
+def test_shortcut_overlap_model_validation():
+    model_config = TransformerConfig(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_moe_experts=2,
+        moe_router_topk=1,
+        moe_router_pre_softmax=True,
+        moe_router_dtype="fp32",
+        moe_shortcut_connection=True,
+        expert_tensor_parallel_size=1,
+        transformer_impl="inference_optimized",
+        normalization="RMSNorm",
+        add_bias_linear=False,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        inference_grouped_gemm_backend="vllm",
+        inference_moe_token_dispatcher_type="nvls",
+        activation_func=squared_relu,
+    )
+    config = InferenceConfig(inference_shortcut_moe_overlap=True, verbose=False)
+    for backend in InferenceGroupedGemmBackend:
+        for mxfp8 in (False, True):
+            candidate = dataclasses.replace(
+                model_config,
+                inference_grouped_gemm_backend=backend,
+                fp8="hybrid" if mxfp8 else None,
+                fp8_recipe="mxfp8" if mxfp8 else "delayed",
+                fp8_param=mxfp8,
+            )
+            if mxfp8:
+                with pytest.raises(ValueError, match="requires further testing"):
+                    config.validate_shortcut_moe_model(candidate)
+            else:
+                config.validate_shortcut_moe_model(candidate)
+    model_config.fp8 = "e4m3"
+    with pytest.raises(ValueError, match="requires further testing"):
+        config.validate_shortcut_moe_model(model_config)
+
+
+def test_shortcut_overlap_setup_validation():
+    assert not InferenceSetupConfig().inference_shortcut_moe_overlap
+    InferenceSetupConfig(
+        inference_shortcut_moe_overlap=True, inference_dynamic_batching=True
+    ).validate()
+    for overrides in (
+        {"inference_dynamic_batching": False},
+        {"use_legacy_static_engine": True},
+        {"num_speculative_tokens": 1},
+    ):
+        settings = dict(inference_shortcut_moe_overlap=True, inference_dynamic_batching=True)
+        settings.update(overrides)
+        with pytest.raises(ValueError, match="Shortcut MoE overlap"):
+            InferenceSetupConfig(**settings).validate()
+
+
+def test_shortcut_overlap_cli_and_runtime_config():
+    parser = ArgumentParser()
+    _add_inference_args(parser)
+    for flags, expected in (
+        ([], False),
+        (["--inference-shortcut-moe-overlap"], True),
+        (["--inference-shortcut-moe-overlap", "--no-inference-shortcut-moe-overlap"], False),
+    ):
+        args = parser.parse_args(flags)
+        setup = InferenceSetupConfig(
+            inference_shortcut_moe_overlap=args.inference_shortcut_moe_overlap,
+            inference_dynamic_batching=True,
+        )
+        model = SimpleNamespace(
+            config=SimpleNamespace(inference_cuda_graph_scope=InferenceCudaGraphScope.none),
+            position_embedding_type="none",
+            max_sequence_length=256,
+            pg_collection=None,
+            modules=lambda: [],
+            decoder=SimpleNamespace(layer_type_list=None),
+        )
+        runtime = setup.to_inference_config(model, verbose=False)
+        assert runtime.inference_shortcut_moe_overlap is expected

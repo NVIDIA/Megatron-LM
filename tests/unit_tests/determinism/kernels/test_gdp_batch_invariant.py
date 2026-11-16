@@ -134,3 +134,21 @@ def test_convolution_replay_and_gradients():
             1,
         )
     exact(actual, decoded)
+
+
+@pytest.mark.parametrize("block_size", [16, 32])
+def test_prefill_writes_allocator_storage(block_size):
+    """Parallel prefill must preserve the complete caller-owned cache and decode tail."""
+    xs = inputs(2, 23, heads=4)
+    expected, expected_cache = prefill(*xs, block_size=block_size)
+    storage = torch.zeros(
+        2, GDPCache.storage_size(4, 128, 64, block_size), device="cuda", dtype=torch.float32
+    )
+    cache = GDPCache.from_storage(storage, 4, 128, 64, block_size)
+    actual, returned = prefill(*xs, cache=cache, block_size=block_size)
+    assert returned is cache
+    exact(actual, expected)
+    for a, b in zip(cache.tensors(), expected_cache.tensors()):
+        exact(a, b)
+    one = tuple(x[:, :1].contiguous() for x in xs)
+    exact(append(*one, cache), append(*one, expected_cache))

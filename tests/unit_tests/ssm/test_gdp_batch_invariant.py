@@ -32,11 +32,11 @@ def exact(a, b):
     )
 
 
-@pytest.fixture
-def canonical_mixer():
+@pytest.fixture(params=[(1, 32), (3, 16), (3, 32)])
+def canonical_mixer(request):
     Utils.initialize_model_parallel()
     model_parallel_cuda_manual_seed(123)
-    enable_batch_invariant_mode(backend='triton')
+    enable_batch_invariant_mode(backend='te_native')
     cfg = TransformerConfig(
         num_layers=1,
         hidden_size=64,
@@ -49,10 +49,11 @@ def canonical_mixer():
         mamba_num_groups=4,
         mamba_head_dim=16,
         mamba_state_dim=32,
-        gdp_num_householder=3,
+        gdp_num_householder=request.param[0],
+        gdp_batch_invariant_block_size=request.param[1],
         is_hybrid_model=True,
         batch_invariant_mode=True,
-        batch_invariant_backend='triton',
+        batch_invariant_backend='te_native',
         attention_backend=AttnBackend.flash,
         flash_attention_version=4,
         attention_dropout=0.0,

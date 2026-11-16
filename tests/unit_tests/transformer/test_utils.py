@@ -517,3 +517,63 @@ class TestIsLayerWindowAttentionIntegration:
         # Verify some results
         assert len(results) == 100
         assert isinstance(results[0], bool)
+
+
+def _scale(value, factor=1):
+    return value * factor
+
+
+def _unexpected_checkpoint(*args, **kwargs):
+    raise AssertionError("used the checkpoint implementation for the other precision")
+
+
+@pytest.mark.parametrize("precision", [{"fp8": "e4m3"}, {"fp4": "nvfp4"}])
+def test_precision_aware_checkpoint_uses_te_checkpoint_for_fp8_and_fp4(precision, monkeypatch):
+    calls = []
+
+    def fake_te_checkpoint(
+        function, distribute_saved_activations, get_rng_state_tracker, tp_group, *args, **kwargs
+    ):
+        calls.append((distribute_saved_activations, get_rng_state_tracker, tp_group, args, kwargs))
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "megatron.core.extensions.transformer_engine.te_checkpoint", fake_te_checkpoint
+    )
+    monkeypatch.setattr(transformer_utils.tensor_parallel, "checkpoint", _unexpected_checkpoint)
+    config = SimpleNamespace(**{"fp8": None, "fp4": None, **precision})
+    tp_group = object()
+
+    output = transformer_utils.precision_aware_checkpoint(
+        _scale, config, tp_group, 3, distribute_saved_activations=True, factor=2
+    )
+
+    assert output == 6
+    assert calls == [
+        (
+            True,
+            transformer_utils.tensor_parallel.random.get_cuda_rng_tracker,
+            tp_group,
+            (3,),
+            {"factor": 2},
+        )
+    ]
+
+
+def test_precision_aware_checkpoint_binds_kwargs_for_tensor_parallel_checkpoint(monkeypatch):
+    calls = []
+
+    def fake_checkpoint(function, distribute_saved_activations, *args):
+        calls.append((distribute_saved_activations, args))
+        return function(*args)
+
+    monkeypatch.setattr(transformer_utils.tensor_parallel, "checkpoint", fake_checkpoint)
+    monkeypatch.setattr(
+        "megatron.core.extensions.transformer_engine.te_checkpoint", _unexpected_checkpoint
+    )
+    config = SimpleNamespace(fp8=None, fp4=None)
+
+    output = transformer_utils.precision_aware_checkpoint(_scale, config, object(), 3, factor=2)
+
+    assert output == 6
+    assert calls == [(False, (3,))]

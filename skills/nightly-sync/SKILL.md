@@ -1,7 +1,6 @@
 ---
 name: nightly-sync
-description: Domain knowledge for the nightly main-to-dev sync workflow. Covers merge strategy, CI architecture, failure investigation, and known issues.
-when_to_use: Working on the nightly sync PR; investigating a nightly sync failure; resolving merge conflicts between main and dev; 'nightly sync failed', 'main-to-dev merge', 'sync bot'.
+description: Domain knowledge for the nightly main-to-dev sync workflow. Covers merge strategy, CI architecture, failure investigation, and known issues. Use when working on the nightly sync PR; investigating a nightly sync failure; resolving merge conflicts between main and dev; 'nightly sync failed', 'main-to-dev merge', 'sync bot'.
 ---
 
 # Nightly Sync: Main to Dev
@@ -200,23 +199,22 @@ continue to diverge:
 
 ### Special Handling: data_schedule.py
 
-Main and dev have completely different classes in this file:
-- Main: `HybridCPDataLoaderWrapper` (imported by main's `training.py`)
-- Dev: `BasePackingScheduler`, `DpBalancedScheduler`,
+Dynamic CP uses the scheduling implementation from dev:
+- `BasePackingScheduler`, `DpBalancedScheduler`,
   `DefaultDynamicCPScheduler`, `wrap_data_iterator`,
   `get_batch_on_this_rank_for_sequence_packing` (imported by `pretrain_gpt.py`
   and tests)
 
-**Do NOT take either version wholesale.** Keep dev's file and append main's
-`HybridCPDataLoaderWrapper` class (plus any missing imports like
-`BalancedCPScheduler`, `Any`, `List`) at the end.
+Do not append the legacy main-only scheduling path. Training and evaluation
+must use `wrap_data_iterator` so `RerunDataIterator`, PP, and VPP behavior stay
+on the standard schedules.
 
 ### Restore Deleted Files
 
 Compare `git ls-tree` between `origin/main` and HEAD to find files in main
 that are missing from the merged tree. For each:
 - **Restore** if main's code imports/references it and would break without it
-  (e.g. `hybrid_cp_schedule.py` if `data_schedule.py` imports from it)
+  (after first checking that the import is still intentional)
 - **Do NOT restore** if dev intentionally deleted it — check
   `git log origin/dev -- <file>` for the deletion commit to understand intent
 - When in doubt, check whether any file in the merged tree imports from the
@@ -358,15 +356,12 @@ Recent regressions the dev-feature audit would have flagged (all
 - `datasets/readme.md` lost the dev-only "Packing Scheduler" section
 - PR #4882 / PR #4318 dropped the `TEFusedDenseMLP` implementation and
   `gpt_layer_specs.py` selection while leaving the config flag and unit test
-- `data_samplers.py` / `utils.py` / `training.py` kept main's
-  `args.hybrid_context_parallel` instead of dev's
-  `args.dynamic_context_parallel` (counts as a MERGE ACCIDENT — dev's
-  reference is present, main's is the deprecated alias that's False
-  when callers pass `--dynamic-context-parallel`). These files are on
-  the override list so the audit treats them as "advisory", but you
-  should still rename `args.hybrid_context_parallel` →
-  `args.dynamic_context_parallel` on every reference after taking
-  main's version of these files.
+- `data_samplers.py` / `utils.py` / `training.py` must consistently use
+  `args.dynamic_context_parallel` so callers passing
+  `--dynamic-context-parallel` activate the scheduler and data-loading paths.
+  These files are on the override list so the audit treats them as
+  "advisory"; still verify every reference after taking main's version of
+  these files.
 
 ### Commit and Push
 

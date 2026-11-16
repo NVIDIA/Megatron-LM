@@ -7,9 +7,9 @@ Resolve MLA and DSA Q/KV norm configuration from a layer specification.
 from typing import NoReturn
 
 from megatron.core.models.backends import get_backend
+from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 
 __all__ = []

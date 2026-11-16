@@ -281,17 +281,22 @@ class MTPMetadata:
         self.block_table[:n].copy_(block_table_src[:n], non_blocking=True)
         self._enter_decode(n, padded_count, graphed)
 
-    def begin_decode_for_capture(self, padded_count: int) -> None:
-        """Stage synthetic (scratch-only) draft state for CUDA-graph capture at warmup.
+    def begin_decode_for_capture(self, padded_count: int, graphed: bool = True) -> None:
+        """Stage synthetic (scratch-only) draft state for a forward whose output is discarded.
 
-        Every row is pointed at the dummy block at position 0, so the captured append/attend
-        touch only scratch KV. Replay overwrites all of it, so only the shapes and the fixed
-        launch bounds matter here, and those match the runtime graphed step.
+        Every row is pointed at the dummy block at position 0, so the append/attend touch only
+        scratch KV. Used for CUDA-graph capture at warmup, where replay overwrites all of it so
+        only the shapes and the fixed launch bounds matter, and for the EP dummy MTP forwards,
+        which only need to issue the MoE all-to-alls.
+
+        Args:
+            padded_count (int): Request/token slots the forwards launch over.
+            graphed (bool): Whether the forwards replay captured CUDA graphs.
         """
         assert self.enabled
         self.offsets[:padded_count].zero_()
         self.block_table[:padded_count].fill_(self.dummy_block_idx)
-        self._enter_decode(padded_count, padded_count, graphed=True)
+        self._enter_decode(padded_count, padded_count, graphed=graphed)
 
     def _enter_decode(self, active_request_count: int, padded_count: int, graphed: bool) -> None:
         """Enter MTP-forward mode and refresh the active views."""

@@ -80,3 +80,20 @@ forward-plus-backward and decode separately, and distinguish CUDA-graph replay
 from eager launch overhead. Record the kernel source hash and dependency versions.
 Native FLA output is not an accuracy oracle: compare approximation accuracy with
 an independent FP64 recurrence and check native repeat differences separately.
+
+## Reproducing performance measurements
+
+The benchmark uses prepared BF16 recurrence inputs and CUDA graph replay, with
+native FLA, C16, and C32 on the same GPU. It records the recurrence source hash,
+software versions, training forward/backward, parallel prefill, incremental prompt
+append, and single-token decode latency. It does not measure projection, attention,
+or full-model throughput.
+
+```bash
+uv run python tools/benchmark_gdp_batch_invariant.py --updates 1 3 --output gdp-benchmark.json
+```
+
+Fresh static prefill writes parallel-prepared results directly into allocator-owned
+cache storage. Continuation and dynamic packed prefill use the incremental path,
+which retains partial blocks. Prefill does not allocate or write the RHS tape that
+is needed only by backward.

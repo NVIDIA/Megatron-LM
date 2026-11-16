@@ -125,19 +125,24 @@ def _mla_rope_fwd_inplace_kernel(
     Q = Q + pid_m * stride_x_seq + pid_head * BLOCK_H * stride_x_nheads
 
     x_off = tl.arange(0, BLOCK_H)[:, None] * stride_x_nheads + nope_dim
-    mask = x_off < head_num * stride_x_nheads
-    # x1 = t[..., 0::2], x2 = t[..., 1::2]
-    x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
-    x_2_off = x_1_off + 1
-    x_1 = tl.load(Q + x_1_off, mask=mask)
-    x_2 = tl.load(Q + x_2_off, mask=mask)
+    mask = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
+    # x1 = t[..., 0::2], x2 = t[..., 1::2], split from one contiguous load of the emb_dim elements.
+    x_emb_off = x_off + tl.arange(0, emb_dim)[None, :]
+    x = tl.load(Q + x_emb_off, mask=mask)
+    x_1, x_2 = tl.split(tl.reshape(x, (BLOCK_H, emb_dim // 2, 2)))
 
-    x_left = x_1 * cos_left - x_2 * sin_left
-    x_right = x_2 * cos_right + x_1 * sin_right
+    # x_left = x_1 * cos_left - x_2 * sin_left, x_right = x_2 * cos_right + x_1 * sin_right.
+    # The products are paired into FMAs explicitly: the pairing the compiler picks on its own
+    # changes with the load pattern and with BLOCK_H. These are the pairings the kernel compiled
+    # to with two stride-2 loads, so the rounding is unchanged.
+    x_left = tl.fma(x_1, cos_left, -(x_2 * sin_left))
+    if INVERSE:
+        x_right = tl.fma(x_2, cos_right, x_1 * sin_right)
+    else:
+        x_right = tl.fma(x_1, sin_right, x_2 * cos_right)
 
     if REMOVE_INTERLEAVING:
-        tl.store(Q + x_1_off, x_left, mask=mask)
-        tl.store(Q + x_2_off, x_right, mask=mask)
+        tl.store(Q + x_emb_off, tl.interleave(x_left, x_right), mask=mask)
     else:
         # The interleaved input and split output layouts alias. Finish all loads
         # before any warp stores to the overlapping destination addresses.
@@ -226,7 +231,7 @@ def _mla_rope_bwd_inplace_kernel(
     DO = DO + pid_m * stride_x_seq + pid_head * BLOCK_H * stride_x_nheads
 
     x_off = tl.arange(0, BLOCK_H)[:, None] * stride_x_nheads + nope_dim
-    mask = x_off < head_num * stride_x_nheads
+    mask = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
     if REMOVE_INTERLEAVING:
         x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
         x_2_off = x_1_off + 1
@@ -577,7 +582,7 @@ def _mla_rope_fwd_kv_split_kernel(
 
     KV_ptr = KV + pid_m * stride_kv_seq + pid_head * BLOCK_H * stride_kv_nheads
     kv_off = tl.arange(0, BLOCK_H)[:, None] * stride_kv_nheads
-    mask = kv_off < head_num * stride_kv_nheads
+    mask = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
     k_in_off = kv_off + tl.arange(0, k_dim)[None, :]
     v_in_off = kv_off + k_dim + tl.arange(0, v_dim)[None, :]
     k = tl.load(KV_ptr + k_in_off, mask=mask)
@@ -687,7 +692,7 @@ def _mla_rope_bwd_kv_split_kernel(
 
     dKV_ptr = dKV + pid_m * stride_dkv_seq + pid_head * BLOCK_H * stride_dkv_nheads
     dkv_off = tl.arange(0, BLOCK_H)[:, None] * stride_dkv_nheads
-    mask = dkv_off < head_num * stride_dkv_nheads
+    mask = (pid_head * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
     dk_out_off = dkv_off + tl.arange(0, k_dim)[None, :]
     dv_out_off = dkv_off + k_dim + tl.arange(0, v_dim)[None, :]
 
@@ -706,17 +711,21 @@ def _mla_rope_bwd_kv_split_kernel(
         for i in tl.static_range(triton.cdiv(head_num, BLOCK_H)):
             dK_ptr = dK + pid_m * stride_dk_seq + i * BLOCK_H * stride_dk_nheads
             x_off = tl.arange(0, BLOCK_H)[:, None] * stride_dk_nheads + k_dim
-            mask = x_off < head_num * stride_dk_nheads
+            mask = (i * BLOCK_H + tl.arange(0, BLOCK_H))[:, None] < head_num
+            # ``other=0`` is required, not cosmetic: a masked-out lane is undefined without it,
+            # and these values are added unconditionally into the accumulators below and then
+            # reduced with ``tl.sum``. Every other masked load in this file feeds a masked store,
+            # which discards the invalid lanes; a reduction cannot.
             if REMOVE_INTERLEAVING:
                 x_1_off = x_off + tl.arange(0, emb_dim // 2)[None, :] * 2
                 x_2_off = x_1_off + 1
-                x_left = tl.load(dK_ptr + x_1_off, mask=mask)
-                x_right = tl.load(dK_ptr + x_2_off, mask=mask)
+                x_left = tl.load(dK_ptr + x_1_off, mask=mask, other=0.0)
+                x_right = tl.load(dK_ptr + x_2_off, mask=mask, other=0.0)
             else:
                 x_left_off = x_off + tl.arange(0, emb_dim // 2)[None, :]
                 x_right_off = x_left_off + emb_dim // 2
-                x_left = tl.load(dK_ptr + x_left_off, mask=mask)
-                x_right = tl.load(dK_ptr + x_right_off, mask=mask)
+                x_left = tl.load(dK_ptr + x_left_off, mask=mask, other=0.0)
+                x_right = tl.load(dK_ptr + x_right_off, mask=mask, other=0.0)
             x_left_accum += x_left
             x_right_accum += x_right
         x_left_accum = tl.sum(x_left_accum, axis=0)

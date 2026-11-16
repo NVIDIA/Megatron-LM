@@ -260,13 +260,14 @@ def _forward(
                 output,
                 (new & (r == R - 1))[:, None],
             )
-        if TAPE:
+        if TAPE or PREPARED:
             nb = tl.cdiv(N * R, C)
             ti = (batch * nb + block) * H + head
             tl.store(TapeS + ti * D * W + ds[:, None] * W + vs[None, :], state)
             if not PREPARED:
                 tl.store(TapeT + ti * C * C + cs[:, None] * C + cs[None, :], factor)
-            tl.store(TapeH + ti * C * W + cs[:, None] * W + vs[None, :], rhs)
+            if TAPE:
+                tl.store(TapeH + ti * C * W + cs[:, None] * W + vs[None, :], rhs)
             tl.store(TapeU + ti * C * W + cs[:, None] * W + vs[None, :], u)
         if end == C:
             last = tl.sum(tl.where(cs == C - 1, p, 0.0), 0)
@@ -559,8 +560,8 @@ def _run(
     if tape or prepared:
         ts = torch.empty((b, nb, h, d, w), device=q.device, dtype=torch.float32)
         tt = torch.empty((b, nb, h, c, c), device=q.device, dtype=torch.bfloat16)
-        th = torch.empty((b, nb, h, c, w), device=q.device, dtype=torch.bfloat16)
-        tu = torch.empty_like(th)
+        tu = torch.empty((b, nb, h, c, w), device=q.device, dtype=torch.bfloat16)
+        th = torch.empty_like(tu) if tape else q
     else:
         ts = tt = th = tu = q
     prefix = torch.empty((b, nb, h, c), device=q.device, dtype=torch.float32) if prepared else q
@@ -593,7 +594,7 @@ def _run(
         k.shape[2],
         c,
         scale,
-        tape or prepared,
+        tape,
         prepared,
         not prepared,
         cu_seqlens is not None,
@@ -1180,14 +1181,23 @@ def prefill(
     *,
     block_size: int = 16,
     initial_state: torch.Tensor | None = None,
+    cache: GDPCache | None = None,
     scale: float | None = None,
 ) -> tuple[torch.Tensor, GDPCache]:
-    """Prefill fresh sequences with parallel factor preparation and return full cache."""
+    """Prefill fresh sequences with parallel preparation, using allocator storage if given.
+
+    A supplied cache must contain fresh request slots with zero cursors. Its state
+    supplies the initial boundary state unless initial_state is also provided.
+    Use append/append_packed for continuation of partially filled blocks.
+    """
     if torch.is_grad_enabled() and any(x.requires_grad for x in (q, k, v, g, beta)):
         raise ValueError("Use train for gradients")
-    cache = GDPCache.allocate(
-        q.shape[0], q.shape[2], q.shape[3], v.shape[-1], block_size=block_size, device=q.device
-    )
+    if cache is None:
+        cache = GDPCache.allocate(
+            q.shape[0], q.shape[2], q.shape[3], v.shape[-1], block_size=block_size, device=q.device
+        )
+    elif cache.keys.shape[2] != block_size:
+        raise ValueError("Cache block size must match block_size")
     if initial_state is not None:
         if (
             initial_state.shape != cache.state.shape

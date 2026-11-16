@@ -31,15 +31,14 @@ BUCKET = "tests/unit_tests/pipeline_parallel/**/*.py"
 @pytest.fixture
 def source_tree(tmp_path):
     root = tmp_path / "source"
-    for name in (
-        *cache.COMPATIBILITY_FILES,
-        "docker/.ngc_version.dev",
-        "docker/Dockerfile.ci.dev",
-        ".dockerignore",
-    ):
+    for name in (*cache.COMPATIBILITY_FILES, "docker/.ngc_version.dev", "docker/Dockerfile.ci.dev"):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(name)
+    for definition in cache.PLATFORMS.values():
+        recipe = root / definition["recipe"]
+        recipe.parent.mkdir(parents=True, exist_ok=True)
+        recipe.write_text("recipe fixture")
     return root
 
 
@@ -67,15 +66,15 @@ def _snapshot(directory):
 
 def test_source_edits_preserve_identity(source_tree):
     before = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
+    (source_tree / "megatron/core").mkdir(parents=True)
     (source_tree / "megatron/core/ordinary.py").write_text("changed source")
     assert cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID) == before
 
 
 @pytest.mark.parametrize(
-    "changed",
-    ["uv.lock", "docker/.ngc_version.dev", ".dockerignore", "tests/unit_tests/find_test_cases.py"],
+    "changed", ["tests/test_utils/python_scripts/download_unit_tests_dataset.py"]
 )
-def test_build_inputs_preserve_lookup_prefix_but_reject_restored_generation(
+def test_compatibility_inputs_preserve_lookup_prefix_but_reject_restored_generation(
     source_tree, generation, changed
 ):
     directory, producer = generation
@@ -90,6 +89,12 @@ def test_build_inputs_preserve_lookup_prefix_but_reject_restored_generation(
 
 
 def test_platform_and_bucket_are_isolated(source_tree):
+    root_conftest = "tests/unit_tests/conftest.py"
+    nested_conftest = "tests/unit_tests/pipeline_parallel/nested/conftest.py"
+    for name in (root_conftest, nested_conftest):
+        path = source_tree / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("fixture")
     identities = [
         cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID),
         cache.cache_identity(source_tree, BUCKET, "dgx_gb200", IMAGE_ID),
@@ -99,6 +104,43 @@ def test_platform_and_bucket_are_isolated(source_tree):
     assert all(
         identity["cache_prefix"].startswith("unit-testmon-v1-main-") for identity in identities
     )
+    assert all(root_conftest in identity["compatibility"]["inputs"] for identity in identities)
+    assert all(
+        nested_conftest in identity["compatibility"]["inputs"] for identity in identities[:2]
+    )
+    assert nested_conftest not in identities[2]["compatibility"]["inputs"]
+
+    unrelated = source_tree / "tests/unit_tests/tuning/conftest.py"
+    unrelated.parent.mkdir()
+    unrelated.write_text("unrelated fixture")
+    for identity in identities:
+        assert (
+            cache.cache_identity(
+                source_tree,
+                identity["compatibility"]["bucket"],
+                identity["compatibility"]["platform"],
+                IMAGE_ID,
+            )
+            == identity
+        )
+
+
+def test_new_platform_uses_registry_without_hashing_its_recipe(source_tree, monkeypatch):
+    recipe = "tests/test_utils/recipes/gb300/unit-tests.yaml"
+    monkeypatch.setitem(cache.PLATFORMS, "dgx_gb300", {"cloud": "gb300-test", "recipe": recipe})
+    (source_tree / recipe).parent.mkdir(parents=True)
+    (source_tree / recipe).write_text("original recipe")
+
+    before = cache.cache_identity(source_tree, BUCKET, "dgx_gb300", IMAGE_ID)
+    assert before["cache_prefix"].startswith("unit-testmon-v1-main-dgx_gb300-")
+    assert "tests/unit_tests/testmon_cache.py" not in before["compatibility"]["inputs"]
+    assert recipe not in before["compatibility"]["inputs"]
+
+    (source_tree / recipe).write_text("changed recipe")
+    after = cache.cache_identity(source_tree, BUCKET, "dgx_gb300", IMAGE_ID)
+    assert after == before
+    with pytest.raises(ValueError, match="unsupported Testmon platform"):
+        cache.cache_identity(source_tree, BUCKET, "dgx_unknown", IMAGE_ID)
 
 
 def test_runtime_tracks_normalized_exact_versions_and_duplicate_distributions(monkeypatch):
@@ -340,18 +382,100 @@ def test_producer_result_requires_cache_publication(mode, publication, expected)
         "error",
         "invalid",
         "identity-error",
+        "artifact-error",
+        "artifact-skipped",
+        "empty-artifact-dir",
+        "artifact-missing",
+        "missing-metadata",
+        "missing-files",
+        "invalid-metadata",
+        "invalid-metadata-type",
+        "string-file-count",
+        "boolean-file-count",
+        "negative-file-count",
+        "fractional-file-count",
+        "string-path-count",
+        "boolean-path-count",
+        "negative-path-count",
+        "fractional-path-count",
+        "missing-path-count",
+        "truncated-files",
+        "empty-pr",
+        "renamed-files",
+        "maximum-renames",
+        "too-many-files",
+        "too-many-paths",
+        "wrong-sha",
     ],
 )
 def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
     generation, source_tree, tmp_path, restore
 ):
     directory, identity = generation
+    # Every bucket consumes the same immutable artifact without querying GitHub
+    # or comparing the PR commit with the Testmon baseline.
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    command_log = tmp_path / "unexpected-commands.log"
+    for name in ("gh", "git"):
+        fake_command = fake_bin / name
+        fake_command.write_text('#!/bin/sh\necho "$0 $*" >> "$COMMAND_LOG"\nexit 99\n')
+        fake_command.chmod(0o755)
+    if restore == "empty-pr":
+        expected_files = []
+    elif restore in {"maximum-renames", "too-many-files", "too-many-paths"}:
+        count = {"maximum-renames": 6000, "too-many-files": 3001, "too-many-paths": 6001}[restore]
+        expected_files = [f"megatron/core/file_{index}.py" for index in range(count)]
+    else:
+        expected_files = ["megatron/core/a.py", "tests/unit_tests/test_b.py"]
+        if restore == "renamed-files":
+            expected_files.append("megatron/core/old_a.py")
+    pr_files_dir = tmp_path / "pr-files"
+    pr_files_dir.mkdir()
+    (pr_files_dir / "changed-files").write_text("".join(f"{path}\n" for path in expected_files))
+    metadata = {
+        "tested_sha": ("d" if restore == "wrong-sha" else "c") * 40,
+        "changed_files": {
+            "empty-pr": 0,
+            "too-many-files": 3001,
+            "maximum-renames": 3000,
+            "too-many-paths": 3000,
+            "string-file-count": "2",
+            "boolean-file-count": True,
+            "negative-file-count": -1,
+            "fractional-file-count": 1.5,
+        }.get(restore, 2),
+        "changed_paths": {
+            "truncated-files": 3,
+            "string-path-count": "2",
+            "boolean-path-count": True,
+            "negative-path-count": -1,
+            "fractional-path-count": 1.5,
+        }.get(restore, len(expected_files)),
+    }
+    if restore == "missing-path-count":
+        metadata.pop("changed_paths")
+    metadata_file = pr_files_dir / "metadata.json"
+    metadata_file.write_text(json.dumps(metadata))
+    if restore == "artifact-missing":
+        shutil.rmtree(pr_files_dir)
+    elif restore == "missing-metadata":
+        metadata_file.unlink()
+    elif restore == "missing-files":
+        (pr_files_dir / "changed-files").unlink()
+    elif restore == "invalid-metadata":
+        metadata_file.write_text("{")
+    elif restore == "invalid-metadata-type":
+        metadata_file.write_text("[]")
+    artifact_before = _snapshot(pr_files_dir) if pr_files_dir.exists() else {}
     if restore == "different-image":
         identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100", "sha256:" + "c" * 64)
     elif restore == "missing-image":
         identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100")
     elif restore == "changed-config":
-        (source_tree / "tests/unit_tests/find_test_cases.py").write_text("changed")
+        (source_tree / "tests/test_utils/python_scripts/download_unit_tests_dataset.py").write_text(
+            "changed"
+        )
         identity = cache.cache_identity(source_tree, BUCKET, "dgx_h100", IMAGE_ID)
     runtime_dir = tmp_path / "runtime"
     runtime_dir.mkdir()
@@ -372,7 +496,16 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
         cwd=tmp_path,
         env={
             **os.environ,
-            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"],
+            "PATH": os.pathsep.join(
+                (str(fake_bin), str(Path(sys.executable).parent), os.environ["PATH"])
+            ),
+            "COMMAND_LOG": str(command_log),
+            "PR_FILES_OUTCOME": {"artifact-error": "failure", "artifact-skipped": "skipped"}.get(
+                restore, "success"
+            ),
+            "PR_FILES_DIR": "" if restore == "empty-artifact-dir" else str(pr_files_dir),
+            # The tested PR commit is deliberately independent of baseline b*40.
+            "TESTED_SHA": "c" * 40,
             "REQUESTED_MODE": "enforce",
             "IDENTITY_OUTCOME": "failure" if restore == "identity-error" else "success",
             "RESTORE_OUTCOME": "failure" if restore == "error" else "success",
@@ -387,15 +520,29 @@ def test_action_resolver_uses_prefix_restores_and_never_bootstraps(
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    valid = restore in {"valid", "different-image", "missing-image"}
+    valid = restore in {
+        "valid",
+        "different-image",
+        "missing-image",
+        "empty-pr",
+        "renamed-files",
+        "maximum-renames",
+    }
     assert output.read_text().strip() == ("mode=enforce" if valid else "mode=full")
     after = _snapshot(directory)
     after.pop("summary.md", None)
+    changed_files = after.pop("changed-files", None)
     assert after == before
+    assert not command_log.exists()
+    assert (_snapshot(pr_files_dir) if pr_files_dir.exists() else {}) == artifact_before
     if valid:
         assert "b" * 40 in summary.read_text()
+        assert f"Changed paths in PR: {len(expected_files)}" in summary.read_text()
+        assert changed_files is not None
+        assert changed_files[0].decode().splitlines() == expected_files
     else:
         assert "without recording or saving" in summary.read_text()
+        assert changed_files is None
 
 
 @pytest.mark.parametrize(

@@ -349,6 +349,7 @@ class TestHybridChunkedPrefillIntermediateState:
         """Create a hybrid (SSM + attention) model with the requested mixer."""
         cuda_graph_impl = "local" if num_cuda_graphs else "none"
         config = TransformerConfig(
+            flash_attention_version=2,
             params_dtype=torch.bfloat16,
             num_layers=3,
             hidden_size=256,
@@ -516,7 +517,7 @@ class TestHybridChunkedPrefillIntermediateState:
 
         # Verify req0 cached its Mamba state.
         assert (
-            len(ctx.mamba_slot_allocator.hash_to_block_id) > 0
+            len(ctx.mamba_slot_allocator.registry.mamba_hash_to_block_id) > 0
         ), "req0 should have cached Mamba state"
 
         # Phase 2: add req1 + req2 simultaneously.
