@@ -1239,6 +1239,33 @@ class AbsorbedMLASelfAttention(Attention):
         assert kv_compressed is None or kv_compressed.is_contiguous()
         v_up_weight = self._get_v_up_weight()
 
+        # DSA's indexer reads hidden_states (x) next to q_compressed (qr): its key, head
+        # weights and KPool gate come from x, its queries from qr. Under a caller layout other
+        # than zigzag, get_query_key_value_tensors converted qr (and the main latents) to
+        # zigzag, so the core gets the zigzag rows of hidden_states too; otherwise the
+        # indexer would pair zigzag queries with caller-layout key rows. The output gate keeps
+        # reading the caller-layout hidden_states.
+        core_hidden_states = hidden_states
+        if (
+            source_cp_partition_mode is not None
+            and source_cp_partition_mode != "zigzag"
+            and self.config.experimental_attention_variant == "dsa"
+        ):
+            core_hidden_states = CpPartitionModeConverter(
+                cp_group=self.pg_collection.cp,
+                packed_seq_params=packed_seq_params,
+                source_partition_mode=source_cp_partition_mode,
+                target_partition_mode="zigzag",
+                config=self.config,
+                tp_group=self.pg_collection.tp,
+                tp_cp_group=resolve_tp_cp_group(
+                    getattr(self.pg_collection, "tp_cp", None),
+                    packed_seq_params,
+                    sequence_parallel=self.config.sequence_parallel,
+                    tp_group=self.pg_collection.tp,
+                ),
+            ).convert(hidden_states, seq_dim=0, sequence_parallel=self.config.sequence_parallel)
+
         # ==================================
         # Core attention computation
         # ==================================
@@ -1246,7 +1273,7 @@ class AbsorbedMLASelfAttention(Attention):
             core_attn_out = self._checkpointed_attention_forward(
                 q_absorbed,
                 kv_compressed,
-                hidden_states,
+                core_hidden_states,
                 q_compressed,
                 attention_mask,
                 v_up_weight,
@@ -1259,7 +1286,7 @@ class AbsorbedMLASelfAttention(Attention):
                 kv_compressed,
                 value=None,
                 attention_mask=attention_mask,
-                x=hidden_states,
+                x=core_hidden_states,
                 qr=q_compressed,
                 up_v_weight=v_up_weight,
                 position_ids=position_ids,
