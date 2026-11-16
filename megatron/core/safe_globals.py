@@ -11,8 +11,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy
-import 
+import torch
 import torch.distributed.checkpoint.filesystem as _dcp_filesystem
+import types
 from numpy import dtype, ndarray
 from numpy.core.multiarray import _reconstruct
 from numpy.dtypes import UInt32DType
