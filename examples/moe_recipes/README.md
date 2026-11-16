@@ -2,7 +2,7 @@
 
 This directory contains self-contained MoE training recipes. Each YAML file includes:
 
-- `DEPENDENCIES`: PyTorch base image and Dockerfile content used for the recipe.
+- `DEPENDENCIES`: Base image and Dockerfile or qualified runtime artifact requirements.
 - `ENV_VARS`: Environment variables expected by the runtime.
 - `ARGS`: Megatron-LM training arguments.
 
@@ -201,6 +201,31 @@ This directory contains self-contained MoE training recipes. Each YAML file incl
       <td>4/512/4096</td>
       <td>MXFP8; paged stash; full CG</td>
       <td>646.8</td>
+    </tr>
+    <tr>
+      <td rowspan="3"><a href="glm5_3_flash/README.md">GLM-5.3-Flash</a></td>
+      <td><a href="glm5_3_flash/gb300/mxfp8_THD4K_64GPU_TP1PP2EP32_mok.yaml">GB300 MXFP8 THD 4K</a></td>
+      <td>64</td>
+      <td>1/2/32/1/1</td>
+      <td>1/2560/4096</td>
+      <td>KDA + DSA hybrid; packed THD; KPool cuDNN selection; fused mHC (Triton projection pair and Sinkhorn); MoK; Muon; selective mHC recompute</td>
+      <td>325.1 trained indexer, 340.9 frozen (<a href="glm5_3_flash/README.md#validation-scope">validation</a>)</td>
+    </tr>
+    <tr>
+      <td><a href="glm5_3_flash/gb300/mxfp8_THD128K_64GPU_TP1PP2EP32CP8_mok.yaml">GB300 MXFP8 THD 128K</a></td>
+      <td>64</td>
+      <td>1/2/32/8/1</td>
+      <td>1/64/131072</td>
+      <td>KDA + DSA hybrid; packed THD with contiguous CP; KPool cuDNN selection; fused mHC (Triton projection pair and Sinkhorn); MoK; Muon; selective recompute; Long Context</td>
+      <td>636.6 trained indexer, 655.3 frozen (<a href="glm5_3_flash/README.md#validation-scope">validation</a>)</td>
+    </tr>
+    <tr>
+      <td><a href="glm5_3_flash/gb300/mxfp8_THD1M_64GPU_TP1PP1EP32CP64_mok.yaml">GB300 MXFP8 THD 1M</a></td>
+      <td>64</td>
+      <td>1/1/32/64/1</td>
+      <td>1/16/1048576</td>
+      <td>KDA + DSA hybrid; packed THD with contiguous CP; KPool cuDNN selection with DeepSelect; fused mHC (Triton projection pair and Sinkhorn); MoK; Muon; selective recompute; linear CE; optimizer-state offload; Long Context</td>
+      <td>611.0 trained indexer, 616.0 frozen (<a href="glm5_3_flash/README.md#validation-scope">validation</a>)</td>
     </tr>
   </tbody>
 </table>
