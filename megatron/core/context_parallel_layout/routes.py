@@ -526,12 +526,73 @@ def resolve_tp_cp_group_rank_by_logical_rank(
         return None
 
 
+# PackedSeqParams attribute naming the boundary tensors (and their versions) that the cached
+# host lists thd_cp_host_cu_seqlens_q / _kv were read from.
+_HOST_CU_SEQLENS_SOURCE_ATTR = "_thd_cp_host_cu_seqlens_source"
+
+
+def _tensor_version(tensor: Optional[torch.Tensor]) -> Optional[int]:
+    """The tensor's version counter, or None (no tensor, or one without a counter)."""
+    if tensor is None:
+        return None
+    try:
+        return tensor._version
+    except RuntimeError:  # inference tensors track no version
+        return None
+
+
+def _host_cu_seqlens_source(cu_q, cu_kv):
+    return (cu_q, _tensor_version(cu_q), cu_kv, _tensor_version(cu_kv))
+
+
+def _cached_host_cu_seqlens_are_current(packed_seq_params: "PackedSeqParams", cu_q, cu_kv) -> bool:
+    """Whether the cached host boundaries still describe these boundary tensors.
+
+    A PackedSeqParams can be reused with its boundaries rewritten in place (static buffers
+    refreshed for the next pack). Lists that a route prebuild cached carry a record of the
+    tensors and versions they were read from, and stay current only for the same tensor objects
+    at the same versions (tensors without a version counter never do). Lists supplied without
+    such a record are trusted, as before the record existed.
+    """
+    source = getattr(packed_seq_params, _HOST_CU_SEQLENS_SOURCE_ATTR, None)
+    if source is None:
+        return True
+    src_q, ver_q, src_kv, ver_kv = source
+    if src_q is not cu_q or src_kv is not cu_kv:
+        return False
+    if ver_q is None or ver_q != _tensor_version(cu_q):
+        return False
+    if cu_kv is not None and (ver_kv is None or ver_kv != _tensor_version(cu_kv)):
+        return False
+    return True
+
+
 def _thd_route_host_cu_seqlens(packed_seq_params: "PackedSeqParams") -> Optional[List[int]]:
-    """Return the compact host boundaries stored by a previous route prebuild, if any."""
+    """Return the compact host boundaries stored by a previous route prebuild, if current.
+
+    Boundaries rewritten in place since that prebuild make the stored lists stale; they are
+    then not returned, and the caller builds from the device boundaries.
+    """
     host_cu = getattr(packed_seq_params, "thd_cp_host_cu_seqlens_q", None)
     if host_cu is None:
         return None
+    cu_q = get_packed_seq_params_cp_partition_cu_seqlens(packed_seq_params)
+    cu_kv = _route_kv_cu_seqlens(packed_seq_params)
+    if not _cached_host_cu_seqlens_are_current(packed_seq_params, cu_q, cu_kv):
+        return None
     return list(host_cu)
+
+
+def _route_kv_cu_seqlens(packed_seq_params: "PackedSeqParams") -> Optional[torch.Tensor]:
+    """The key-side boundaries a route prebuild reads (padded when present)."""
+    # getattr: the pre-existing contract of the route helpers is any object carrying the
+    # q-side fields, so the kv-side reads must not widen it.
+    cu_kv_padded = getattr(packed_seq_params, "cu_seqlens_kv_padded", None)
+    return (
+        cu_kv_padded
+        if cu_kv_padded is not None
+        else getattr(packed_seq_params, "cu_seqlens_kv", None)
+    )
 
 
 def get_thd_cp_partition_route(
@@ -692,6 +753,13 @@ def prebuild_thd_cp_partition_routes(
     )
     host_q = getattr(packed_seq_params, "thd_cp_host_cu_seqlens_q", None)
     host_kv = getattr(packed_seq_params, "thd_cp_host_cu_seqlens_kv", None)
+    if host_q is not None and not _cached_host_cu_seqlens_are_current(
+        packed_seq_params, cu_q, cu_kv
+    ):
+        # The boundaries were rewritten in place (or come from other tensors) since the lists
+        # were cached: read them again, which also gives consumers keyed by the lists'
+        # identity (DSA's prebuilt packed-CP layout) new lists.
+        host_q = host_kv = None
     with nvtx_range("cp_layout/thd/route"):
         if host_q is None:
             host_q, host_kv = _materialize_compact_thd_qkv_cu_seqlens(cu_q, cu_kv)
@@ -701,6 +769,7 @@ def prebuild_thd_cp_partition_routes(
             )
     packed_seq_params.thd_cp_host_cu_seqlens_q = host_q
     packed_seq_params.thd_cp_host_cu_seqlens_kv = host_kv
+    setattr(packed_seq_params, _HOST_CU_SEQLENS_SOURCE_ATTR, _host_cu_seqlens_source(cu_q, cu_kv))
 
     # CP-local sequences (CP-local module inputs, the sequence-gathered core-attention
     # output, or the composed fallback of unfusable groups): CP-only route.
