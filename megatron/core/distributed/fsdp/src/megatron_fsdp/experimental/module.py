@@ -29,7 +29,7 @@ from torch.distributed.tensor import Shard
 from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .context import FsdpContext
+from .context import FsdpContext, GradientFinalizationMode
 from .countdown import Countdown
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .module_utils import get_parameter_owner, is_in_backward
@@ -218,10 +218,6 @@ class FsdpModule:
                         "Transformer Engine does not accumulate their gradients. See "
                         "https://github.com/NVIDIA/TransformerEngine/issues/3437"
                     )
-                if not self.context.caller_managed_grad_sync:
-                    raise ValueError(
-                        "Delayed weight gradients require caller_managed_grad_sync=True."
-                    )
                 parameter_module, _ = get_parameter_owner(module, fsdp_parameter.fqns[0])
                 parameter_module.register_wgrad_accumulation_and_reduce_hooks(
                     lambda parameter=parameter: post_accumulate_grad_hook_per_parameter(parameter)
@@ -233,6 +229,13 @@ class FsdpModule:
             if not group.requires_grad:
                 continue
             yield from group.fsdp_parameters
+
+    def _has_delayed_weight_gradients(self) -> bool:
+        """Whether any owned trainable parameter computes its gradient in backward_dw()."""
+        return any(
+            getattr(parameter.unsharded, "skip_backward_post_hook", False)
+            for parameter in self._trainable_fsdp_parameters()
+        )
 
     @staticmethod
     def _pre_load_state_dict(
@@ -410,6 +413,17 @@ class FsdpModule:
         if self.phase is Phase.BACKWARD:
             # A shared invocation may still be awaiting the final callback.
             return
+        if (
+            self.context.gradient_finalization_mode
+            is GradientFinalizationMode.REDUCE_OUTER_AND_WAIT
+            and self._has_delayed_weight_gradients()
+        ):
+            raise RuntimeError(
+                "Delayed weight gradients require "
+                "context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER) "
+                "around backward and backward_dw(), then finish_grad_sync() before "
+                "the optimizer step. Use SKIP_OUTER for earlier accumulation calls."
+            )
         self.phase = Phase.BACKWARD
         torch.cuda.nvtx.range_push(self._nvtx_label("backward"))
         context = self.context
@@ -454,7 +468,7 @@ class FsdpModule:
                 else:
                     self._accumulate_local_gradients(group)
 
-                if not context.finalize_gradients:
+                if context.gradient_finalization_mode is GradientFinalizationMode.SKIP_OUTER:
                     continue
                 # Finalize the DP-outer reduction. When overlap is enabled its stream is
                 # distinct, so it overlaps the following group's DP-inner reduce; the
