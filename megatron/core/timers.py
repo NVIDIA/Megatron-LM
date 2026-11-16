@@ -128,6 +128,7 @@ class Timer(TimerBase):
         self._elapsed = 0.0
         self._active_time = 0.0
         self._started = False
+        self._skipped = False
         # Note that None will default to the global process group
         self._barrier_group = None
         self._start_time = time.time()
@@ -147,11 +148,17 @@ class Timer(TimerBase):
             barrier (bool, optional): Synchronizes ranks before starting. Defaults to False.
         """
         assert not self._started, 'timer has already been started'
+        self._started = True
+        # Inside a CUDA graph capture (e.g. the full-iteration graph around forward_backward_func)
+        # neither a barrier nor a device synchronize is allowed, and the host time spent capturing
+        # is not the time of the recorded work, so the interval is not timed.
+        self._skipped = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+        if self._skipped:
+            return
         if barrier:
             torch.distributed.barrier(group=self._barrier_group)
         torch.cuda.synchronize()
         self._start_time = time.time()
-        self._started = True
 
     def stop(self, barrier=False):
         """Stop the timer.
@@ -160,6 +167,9 @@ class Timer(TimerBase):
             barrier (bool, optional): Synchronizes ranks before stopping. Defaults to False.
         """
         assert self._started, 'timer is not started'
+        if self._skipped:
+            self._started = False
+            return
         if barrier:
             torch.distributed.barrier(group=self._barrier_group)
         torch.cuda.synchronize()
