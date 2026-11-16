@@ -419,6 +419,10 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
             )
 
         # Validate the full architecture, including MTP heads on other pipeline stages.
+        if self.config.mtp_kl_loss_weight > 0 and (
+            self.config.mtp_num_layers is None or self.config.mtp_num_layers <= 0
+        ):
+            raise ValueError("MTP KL loss requires positive mtp_num_layers")
         if self.mtp_num_depths > 0 and any(
             getattr(layer_config, "overlap_moe_expert_parallel_comm", False)
             for layer_config in mtp_overlap_configs
