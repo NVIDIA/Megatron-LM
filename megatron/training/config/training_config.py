@@ -799,12 +799,12 @@ class CheckpointConfig:
     unchanged either way."""
 
     custom_manager_class: str | None = None
-    """Fully qualified class name of a custom checkpoint manager, e.g.
-    ``mypackage.checkpoint.MyCheckpointManager``. The training loop then saves, resumes and
-    finalizes asynchronous saves through it instead of the default manager. The class is built with
-    this config and must implement ``save(ctx)``, ``load(ctx)`` and
-    ``finalize_async_saves(blocking, terminate)`` (see ``megatron.training.checkpoint_manager``).
-    The path must be permitted by the ``_target_`` allowlist (``target_allowlist``)."""
+    """Fully qualified class name for a custom CheckpointManager implementation.
+    When set, checkpoint operations will instantiate and delegate to this class instead of the default
+    checkpoint manager. The custom class must implement the `CheckpointManager` protocol
+    defined in `megatron.bridge.training.checkpointing`.
+    Example: ``'mypackage.checkpoint.MyCheckpointManager'``
+    """
 
     @property
     def use_dist_ckpt(self) -> bool:
