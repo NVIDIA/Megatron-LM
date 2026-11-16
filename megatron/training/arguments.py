@@ -3601,7 +3601,7 @@ def _add_engram_args(parser):
         type=int,
         default=4,
         help='Kernel size of the depthwise causal short convolution, dilated by the maximum '
-        'n-gram order.',
+        'n-gram order. Unused by the deepseek_v41 variant, which has no convolution.',
     )
     group.add_argument(
         '--engram-hash-seed', type=int, default=0, help='Seed of the n-gram hash multipliers.'
@@ -3610,22 +3610,25 @@ def _add_engram_args(parser):
         '--engram-pad-token-id',
         type=int,
         default=None,
-        help='Token ID padded before the sequence start (deepseek variant).',
+        help='Token ID padded before the sequence start (deepseek and deepseek_v41 variants).',
     )
     group.add_argument(
         '--engram-tokenizer-map',
         type=str,
         default=None,
-        help='Versioned token-ID compression and hash-constant artifact (deepseek variant).',
+        help='Versioned token-ID compression and hash-constant artifact (deepseek and '
+        'deepseek_v41 variants).',
     )
     group.add_argument(
         '--engram-variant',
         type=str,
         choices=sorted(ENGRAM_VARIANTS),
         default=DEEPSEEK_VARIANT_NAME,
-        help='Hashing/layout variant: deepseek (offline tokenizer map + PCG64 multipliers) or '
-        'qwen (raw token IDs, splitmix64 multipliers, per-head nth-prime tables, EOS-reset '
-        'n-gram windows, fused bias-free projections with zero-centered group norms).',
+        help='Hashing/layout variant: deepseek (offline tokenizer map + PCG64 multipliers), '
+        'deepseek_v41 (the deepseek hashing with the DeepSeek-V4.1 fusion: one bias-free '
+        'projection, FP32 gate, no short convolution) or qwen (raw token IDs, splitmix64 '
+        'multipliers, per-head nth-prime tables, EOS-reset n-gram windows, fused bias-free '
+        'projections with zero-centered group norms).',
     )
     group.add_argument(
         '--engram-eos-token-id',
