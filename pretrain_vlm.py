@@ -169,11 +169,16 @@ def model_provider(
         language_transformer_layer_spec = import_module(args.spec)
     elif language_transformer_config.transformer_impl == "transformer_engine":
         language_transformer_layer_spec = decoder_model_with_transformer_engine_default_spec(
-            language_transformer_config.num_moe_experts, language_transformer_config.moe_grouped_gemm
+            language_transformer_config.num_moe_experts,
+            language_transformer_config.moe_grouped_gemm,
+            qk_layernorm=language_transformer_config.qk_layernorm,
         )
     else:  # transformer_impl == "local"
         language_transformer_layer_spec = decoder_model_with_local_default_spec(
-            language_transformer_config.num_moe_experts, language_transformer_config.moe_grouped_gemm
+            language_transformer_config.num_moe_experts,
+            language_transformer_config.moe_grouped_gemm,
+            qk_layernorm=language_transformer_config.qk_layernorm,
+            normalization=language_transformer_config.normalization,
         )
 
     # Prepare mask type for any required padding to support CP/SP sequence sharding.
