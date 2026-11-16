@@ -3254,7 +3254,19 @@ class TransformerConfig(ModelParallelConfig):
             self.ffn_hidden_size = 4 * self.hidden_size
 
         if self.kv_channels is None:
-            self.kv_channels = self.hidden_size // self.num_attention_heads
+            if (
+                getattr(self, "multi_latent_attention", False)
+                and getattr(self, "qk_head_dim", None) is not None
+            ):
+                # MLA head dim is set by qk_head_dim / qk_pos_emb_head_dim and need not satisfy
+                # hidden_size % num_attention_heads == 0 (e.g. Kimi-K3 / K3.1). kv_channels is
+                # unused by the MLA forward but must be sane for the MuP softmax scale and the
+                # simplified-DSA indexer default, so derive it from the MLA query head dim
+                # rather than the standard hidden_size // num_attention_heads (which would be a
+                # meaningless truncated value when the heads do not divide hidden_size).
+                self.kv_channels = self.qk_head_dim + (getattr(self, "qk_pos_emb_head_dim", 0) or 0)
+            else:
+                self.kv_channels = self.hidden_size // self.num_attention_heads
 
         if self.num_query_groups is None:
             self.num_query_groups = self.num_attention_heads
@@ -3402,15 +3414,17 @@ class TransformerConfig(ModelParallelConfig):
 
         if has_context_parallelism:
             if self.cp_partition_mode == "contiguous":
-                # MultiLatentAttention converts its input to the zigzag layout internally,
-                # like Attention, so it no longer restricts cp_partition_mode.
-                if self.experimental_attention_variant != "dsv4_hybrid" and not (
-                    is_gated_delta_net_variant(self.experimental_attention_variant)
-                ):
+                # MultiLatentAttention and AbsorbedMLASelfAttention (the 'dsa' variant's
+                # full-attention layers) convert their input to the zigzag layout internally,
+                # like Attention, so they no longer restrict cp_partition_mode.
+                if self.experimental_attention_variant not in (
+                    "dsv4_hybrid",
+                    "dsa",
+                ) and not is_gated_delta_net_variant(self.experimental_attention_variant):
                     raise ValueError(
                         "cp_partition_mode='contiguous' with context parallelism currently "
-                        "requires experimental_attention_variant to be 'dsv4_hybrid', 'gdn', "
-                        "or 'kda'."
+                        "requires experimental_attention_variant to be 'dsv4_hybrid', 'dsa', "
+                        "'gdn', or 'kda'."
                     )
                 if (
                     is_gated_delta_net_variant(self.experimental_attention_variant)

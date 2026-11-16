@@ -106,6 +106,15 @@ def cp_config(request):
         pytest.param(
             dict(
                 cp_partition_mode="contiguous",
+                experimental_attention_variant="dsa",
+                cp_comm_type="all_gather",
+            ),
+            None,
+            id="dsa-contiguous",
+        ),
+        pytest.param(
+            dict(
+                cp_partition_mode="contiguous",
                 experimental_attention_variant="gdn",
                 mtp_num_layers=1,
                 tensor_model_parallel_size=2,
