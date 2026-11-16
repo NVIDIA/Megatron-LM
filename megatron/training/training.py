@@ -174,7 +174,7 @@ from megatron.training.logging.packed_sequence_stats import (
     update_packed_sequence_stats,
 )
 from megatron.training.models import ModelConfig, T5ModelConfig
-from megatron.training.sequence_lengths import get_dataset_input_length, get_model_input_length
+from megatron.training.sequence_lengths import get_dataset_input_length
 from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
@@ -1903,7 +1903,7 @@ def pretrain(
     if cfg_container.logger.log_progress:
         append_to_progress_log(cfg_container.checkpoint.save, "Starting job")
 
-    sequence_length = get_model_input_length(cfg_container.model, cfg_container.data.dataset)
+    sequence_length = cfg_container.model.transformer.max_seq_length_per_sample
     set_jit_fusion_options(
         cfg_container.model.transformer,
         sequence_length=sequence_length,
@@ -3262,7 +3262,7 @@ def setup_model_and_optimizer(
 def dummy_train_step(data_iterator):
     """Single dummy training step."""
     cfg = get_run_config()
-    sequence_length = get_model_input_length(cfg.model, cfg.data.dataset)
+    sequence_length = cfg.model.transformer.max_seq_length_per_sample
     tp_rank = mpu.get_tensor_model_parallel_rank()
     # Data predicates and model parallelism describe the batch transfer.
     has_cu_seqlens = cfg.data.has_cu_seqlens()
@@ -3486,7 +3486,7 @@ def train_step(
     """
     args = get_args()
     cfg = get_run_config()
-    sequence_length = get_model_input_length(cfg.model, cfg.data.dataset)
+    sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
 
     # OTel: set up per-step sub-span support.
@@ -3849,7 +3849,7 @@ def training_log(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
-    sequence_length = get_model_input_length(cfg.model, cfg.data.dataset)
+    sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
     writer = get_tensorboard_writer()
     wandb_writer = get_wandb_writer()
@@ -4368,7 +4368,9 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     sequence_length = (
         get_dataset_input_length(dataset)
         if dataset is not None
-        else get_model_input_length(cfg.model)
+        else cfg.model.encoder_seq_length
+        if isinstance(cfg.model, T5ModelConfig)
+        else cfg.model.transformer.max_seq_length_per_sample
     )
     checkpoint = cfg.checkpoint
     train_state = get_train_state()
@@ -4895,7 +4897,7 @@ def train(
     # Temporary args/config duplication during the training-loop refactor:
     # migrated settings use config; remaining settings still use legacy args.
     cfg = get_run_config()
-    sequence_length = get_model_input_length(cfg.model, cfg.data.dataset)
+    sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
     train_state = get_train_state()
 
@@ -5805,7 +5807,7 @@ def evaluate(
     callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
     cfg = get_run_config()
-    sequence_length = get_model_input_length(cfg.model, cfg.data.dataset)
+    sequence_length = cfg.model.transformer.max_seq_length_per_sample
     timers = get_timers()
     train_state = get_train_state()
 

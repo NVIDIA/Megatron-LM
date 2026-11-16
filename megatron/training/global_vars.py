@@ -21,7 +21,7 @@ from megatron.core.num_microbatches_calculator import (
     unset_num_microbatches_calculator,
 )
 from megatron.training.dist_signal_handler import DistributedSignalHandler
-from megatron.training.sequence_lengths import get_dataset_input_length, get_model_input_length
+from megatron.training.sequence_lengths import get_dataset_input_length
 from megatron.training.state import TrainState
 
 _GLOBAL_ARGS = None
@@ -221,6 +221,9 @@ def initialize_runtime_services(
 
 def initialize_training_runtime_services(args: Namespace) -> None:
     """Initialize training-only services after the shared runtime services."""
+    # Model imports depend on training globals, so defer until startup.
+    from megatron.training.models import T5ModelConfig
+
     cfg = get_run_config()
     if cfg.train.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back
@@ -240,7 +243,9 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         seq_length=(
             get_dataset_input_length(dataset)
             if dataset is not None
-            else get_model_input_length(cfg.model)
+            else cfg.model.encoder_seq_length
+            if isinstance(cfg.model, T5ModelConfig)
+            else cfg.model.transformer.max_seq_length_per_sample
         ),
     )
     _set_tensorboard_writer(args)
@@ -572,6 +577,8 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     by construction, rather than two independently-written implementations that
     could silently drift apart as args evolve.
     """
+    from megatron.training.models import T5ModelConfig
+
     # Attach training config as resource attributes so they appear as
     # Process tags in Jaeger, making it easy to identify and compare runs.
     cfg = get_run_config()
@@ -601,7 +608,9 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
         sequence_length = (
             get_dataset_input_length(dataset)
             if dataset is not None
-            else get_model_input_length(cfg.model)
+            else cfg.model.encoder_seq_length
+            if isinstance(cfg.model, T5ModelConfig)
+            else cfg.model.transformer.max_seq_length_per_sample
         )
     else:
         sequence_length = getattr(args, 'seq_length', None)

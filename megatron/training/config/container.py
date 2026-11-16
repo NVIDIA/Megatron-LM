@@ -651,9 +651,9 @@ class PretrainConfigContainer(ConfigContainerBase):
         length, a value given for one of the fields other sections own
         (``CONTAINER_WRITTEN_FIELDS``) must agree with that section (the container writes them at
         ``finalize()``; the arguments and the saved file leave them at Megatron Core's defaults),
-        and the model section's ``max_seq_length_per_sample``, Megatron Core's per-sample maximum,
-        covers the dataset's samples when given (the container fills an unset one from the dataset
-        at ``finalize()``). SFT's physical pack width is derived from that maximum,
+        and ``max_seq_length_per_sample`` describes this run's physical input width, not model
+        capacity. Fixed GPT/FIM rows must match it; the container fills an unset value from the
+        dataset at ``finalize()``. SFT's physical pack width is derived from that maximum,
         independently of its dataset's per-conversation truncation limit.
         With both: SBHD validation excludes a scheduler, a packed varlen dataset needs one, and the
         sample length is a multiple of ``2 * cp`` under context parallelism. Each is the condition
@@ -703,6 +703,17 @@ class PretrainConfigContainer(ConfigContainerBase):
                 "model.transformer.max_seq_length_per_sample; leave it unset"
             )
         dataset_type = resolve_dataset_class(dataset, self.data.dataset_type)
+        if (
+            dataset_family_from_type(dataset_type)[0] in ("gpt", "fim")
+            and not isinstance(self.model, (LLaVAModelConfig, T5ModelConfig, MimoBuildConfig))
+            and execution_bound is not None
+            and execution_bound != dataset.sequence_length
+        ):
+            raise ValueError(
+                "model.transformer.max_seq_length_per_sample must equal "
+                "data.dataset.sequence_length for fixed GPT/FIM rows; it describes this run's "
+                "execution width, not the model's position capacity."
+            )
         if dataset_family_from_type(dataset_type)[0] == "sft":
             pack_length = (
                 execution_bound or dataset.sequence_length

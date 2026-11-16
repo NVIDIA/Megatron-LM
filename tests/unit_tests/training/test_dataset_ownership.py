@@ -46,7 +46,6 @@ from megatron.training.datasets.varlen_dataset import (
     VarlenDatasetConfig,
 )
 from megatron.training.models import GPTModelConfig, LLaVAModelConfig, T5ModelConfig
-from megatron.training.sequence_lengths import get_model_input_length
 
 MODEL_ARGV = (
     "--num-layers 2 --hidden-size 128 --num-attention-heads 8 --micro-batch-size 1 "
@@ -640,33 +639,25 @@ def test_model_capacity_must_cover_the_sample_length(container_factory):
         cfg.validate()
 
 
-def test_the_model_per_sample_maximum_covers_the_dataset(container_factory, monkeypatch):
-    """model.transformer.max_seq_length_per_sample is Megatron Core's per-sample maximum, a bound:
-    unset, the container fills it from the dataset's sequence_length at finalize(); a larger
-    explicit value stays (the loop reads the dataset's length); a smaller one
-    is rejected at validation. The launcher fills both from --seq-length."""
+def test_the_run_execution_length_matches_fixed_dataset_rows(container_factory, monkeypatch):
+    """Finalize an unset run length; reject either mismatch without mutating the config."""
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
     cfg.model = _layout()
     assert cfg.model.transformer.max_seq_length_per_sample is None
-    assert get_model_input_length(cfg.model, cfg.data.dataset) == 64
     cfg.validate()
     cfg.finalize()
     assert cfg.model.transformer.max_seq_length_per_sample == 64
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
-    cfg.model = _layout(max_seq_length_per_sample=128)  # a bound above the sample length
-    cfg.validate()
-    cfg.finalize()
-    assert cfg.model.transformer.max_seq_length_per_sample == 128  # kept, not overwritten
-    assert get_model_input_length(cfg.model, cfg.data.dataset) == 64
-    cfg.model = _layout(max_seq_length_per_sample=32)
-    with pytest.raises(ValueError, match="max_seq_length_per_sample=32 is smaller than"):
-        cfg.validate()
+    for width in (128, 32):
+        cfg.model = _layout(max_seq_length_per_sample=width)
+        with pytest.raises(ValueError, match="must equal"):
+            cfg.validate()
+        assert cfg.model.transformer.max_seq_length_per_sample == width
     args = _validated(["--seq-length", "48", "--max-position-embeddings", "48", "--mock-data"])
     cfg = pretrain_cfg_container_from_args(args, data_cfg=gpt_data_config_from_args(args))
     assert cfg.model.transformer.max_seq_length_per_sample == 48
     assert cfg.data.dataset.sequence_length == 48
-    assert get_model_input_length(cfg.model, cfg.data.dataset) == 48
     cfg.validate()
 
 
@@ -812,8 +803,7 @@ def test_set_global_variables_finalizes_a_dataset_section(
 def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
     """dummy_train_step (the skip-iteration path) runs for any container: the batch flags come
     from the data section, the model-parallel values from the model section, the sample length
-    from the container (the dataset's, or the model's per-sample maximum without a dataset); the
-    poisoned namespace shows which source won."""
+    from the model's resolved run maximum; the poisoned namespace shows which source won."""
     from megatron.training import training
     from megatron.training.config import DataConfig
 
@@ -893,6 +883,7 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
         pipeline_model_parallel_size=1,
         dynamic_context_parallel=True,
         sequence_packing_scheduler=None,
+        max_seq_length_per_sample=16,
     )
     monkeypatch.setattr(
         training,
@@ -1052,24 +1043,19 @@ def test_packed_buffer_budget_is_checked_at_finalize(container_factory, monkeypa
     cfg.finalize()
 
 
-def test_the_loop_reads_the_dataset_length_and_a_loader_only_section_the_model_maximum(
-    container_factory, monkeypatch
-):
-    """Four different numbers: the dataset's sequence_length, a larger model per-sample maximum
-    (Megatron Core's bound, never the
-    loop's length), a stale args.seq_length (never read) and the model capacity. The calculator
-    and the OTel resource attributes read the dataset's length. A loader-only section has no dataset:
-    its sample length is the model's per-sample maximum, which the launcher fills from
-    --seq-length; nothing reads the namespace."""
+def test_runtime_services_read_config_lengths_not_legacy_args(container_factory, monkeypatch):
+    """Runtime reads the resolved run length, not position capacity or stale CLI values.
+
+    Dataset token accounting retains T5 encoder rows and excludes VLM image expansion.
+    """
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
     args, cfg = container_factory(["--seq-length", "16", "--mock-data"], data=True)
     args.rank = 0  # the calculator takes the rank from the namespace
-    cfg.model = _layout(max_seq_length_per_sample=32)
+    cfg.model = _layout(max_seq_length_per_sample=16)
     cfg.model.seq_length = 128
     cfg.validate()
     cfg.finalize()
-    assert cfg.model.transformer.max_seq_length_per_sample == 32
-    assert get_model_input_length(cfg.model, cfg.data.dataset) == 16
+    assert cfg.model.transformer.max_seq_length_per_sample == 16
     args.seq_length = 64  # stale, must not be read
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
     assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 16
@@ -1099,17 +1085,15 @@ def test_the_loop_reads_the_dataset_length_and_a_loader_only_section_the_model_m
     loader_only = pretrain_cfg_container_from_args(args)
     assert loader_only.data.dataset is None
     assert loader_only.model.transformer.max_seq_length_per_sample == 64
-    assert get_model_input_length(loader_only.model) == 64
     args.seq_length = 999  # stale
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", loader_only)
     assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 64
     global_vars.initialize_training_runtime_services(args)
     assert calls.pop()["seq_length"] == 64
     loader_only.model.transformer.max_seq_length_per_sample = None
-    assert get_model_input_length(loader_only.model) is None
     assert "dl.sequence_length" not in global_vars.build_telemetry_resource_attrs(args)
 
-    # T5's encoder rows must not be confused with its larger decoder or allocation bound.
+    # T5 dataset token accounting uses encoder rows, not the run's maximum across both sides.
     loader_only.model = T5ModelConfig(
         transformer=_layout(max_seq_length_per_sample=64).transformer,
         seq_length=128,
@@ -1145,10 +1129,9 @@ def test_vlm_resolves_expanded_width_before_startup(monkeypatch, with_dataset, r
     )
     assert not hasattr(model, "decoder_seq_length")
     assert model.transformer.max_seq_length_per_sample == width
-    assert get_model_input_length(model, cfg.data.dataset) == width
     cfg.validate()
     cfg.finalize()
-    assert get_model_input_length(model, cfg.data.dataset) == width
+    assert model.transformer.max_seq_length_per_sample == width
     if with_dataset:
         assert cfg.data.dataset.sequence_length == 64
         monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
@@ -1157,7 +1140,7 @@ def test_vlm_resolves_expanded_width_before_startup(monkeypatch, with_dataset, r
     assert "decoder_seq_length" not in saved["model"]
     restored = type(cfg).from_dict(saved)
     restored.finalize()
-    assert get_model_input_length(restored.model, restored.data.dataset) == width
+    assert restored.model.transformer.max_seq_length_per_sample == width
     assert restored.to_dict() == saved
 
 
