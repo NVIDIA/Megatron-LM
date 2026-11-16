@@ -45,7 +45,7 @@ except ImportError:
     HAVE_DTENSOR = False
 
 from megatron.core import parallel_state
-from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.dist_checkpointing.mapping import ShardedTensor, set_checkpoint_parameter_id
 
 try:
     from packaging.version import Version as PkgVersion
@@ -1158,9 +1158,8 @@ def make_tp_sharded_tensor_for_checkpoint(
             if is_float8tensor(tensor):
                 fp8_param = tensor
                 tensor = dequantize_gtp_native_fp8(tensor)
-                # Backlink to the live FP8 param: optimizer sharded_state_dict matches params
-                # to model entries by id(entry.data), which this dequantized copy would break
-                # (see _backfill_gtp_sharded_param_map in optimizer.py).
+                set_checkpoint_parameter_id(tensor, fp8_param)
+                # Keep the legacy backlink for existing GTP checkpoint consumers.
                 tensor._gtp_dequant_src = fp8_param
 
     if replica_id is None:
@@ -1203,7 +1202,9 @@ def resolve_gtp_pad_for_alignment(*, fp4=False, fp8_recipe=None, fp8=False):
     return 1
 
 
-def grant_shape_mismatch_for_gtp_padding(sharded_state_dict, checkpoint_dir, pad_for_alignment):
+def grant_shape_mismatch_for_gtp_padding(
+    sharded_state_dict, checkpoint_dir, pad_for_alignment, sharded_strategy=None
+):
     """Decide, per tensor, whether a checkpoint-vs-expected shape mismatch is GTP padding.
 
     Reads the checkpoint's real on-disk shape and sets ``allow_shape_mismatch`` for every
@@ -1220,6 +1221,9 @@ def grant_shape_mismatch_for_gtp_padding(sharded_state_dict, checkpoint_dir, pad
 
     ``pad_for_alignment`` must come from the caller (the training recipe), not ``GTP_CONFIG`` --
     that global is only set when GTP is active in *this* process.
+
+    ``sharded_strategy`` reads the checkpoint metadata; pass the strategy of the load that follows
+    so that both share its metadata cache. Defaults to the default load strategy.
     """
     from megatron.core.dist_checkpointing.dict_utils import nested_values
 
@@ -1230,7 +1234,7 @@ def grant_shape_mismatch_for_gtp_padding(sharded_state_dict, checkpoint_dir, pad
     try:
         from megatron.core.dist_checkpointing.serialization import load_tensors_metadata
 
-        checkpoint_metadata = load_tensors_metadata(str(checkpoint_dir))
+        checkpoint_metadata = load_tensors_metadata(str(checkpoint_dir), sharded_strategy)
     except Exception as e:  # noqa: BLE001
         logger.warning(
             f"grant_shape_mismatch_for_gtp_padding: could not read metadata, "

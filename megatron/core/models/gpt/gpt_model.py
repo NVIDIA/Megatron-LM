@@ -137,6 +137,10 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             )
         super().__init__(config=config, pg_collection=pg_collection)
         # MTP depth is model-wide; non-MTP pipeline stages still freeze their backbone.
+        if self.config.mtp_kl_loss_weight > 0 and (
+            self.config.mtp_num_layers is None or self.config.mtp_num_layers <= 0
+        ):
+            raise ValueError("MTP KL loss requires positive mtp_num_layers")
         if self.config.freeze_base_model_for_mtp and (
             self.config.mtp_num_layers is None or self.config.mtp_num_layers < 1
         ):
@@ -882,6 +886,13 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         logits = self._scale_logits(logits)
         if in_inference_mode:
             logits = logits.float()
+        # Dynamic inference under CUDA graphs: write the logits into the controller's
+        # persistent buffer and return a view of it, so no graph pins its own copy.
+        logits_buffer = getattr(inference_context, "logits_output_buffer", None)
+        if logits_buffer is not None:
+            buffer_rows = logits_buffer[0, : logits.shape[0]]
+            buffer_rows.copy_(logits.squeeze(1))
+            logits = buffer_rows.unsqueeze(1)
         gather_output = (
             self.output_layer.gather_output
             if runtime_gather_output is None
