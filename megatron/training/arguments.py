@@ -1660,8 +1660,8 @@ def validate_args(args, defaults={}):
             'restored by load_state_dict); use tensorwise, mxfp8, blockwise or nvfp4.'
         )
 
-    if (args.logits_save_inputs or args.logits_load_inputs or args.kd_corpus_dump
-            or args.kd_corpus_blend or args.logits_load_shuffle_shards is not None):
+    if (args.logits_save_inputs or args.logits_load_inputs or args.logits_save_corpus_source
+            or args.logits_load_corpus_blend or args.logits_load_shuffle_shards is not None):
         from megatron.training.distillation.v3_runtime import validate_options
 
         validate_options(args)
@@ -3676,12 +3676,12 @@ def _add_logits_distillation_args(parser):
                        help='Directory to load logits.')
     group.add_argument('--logits-load-inputs', action='store_true',
                        help='Use a v3 cache as the training dataset and KD target source.')
-    group.add_argument('--kd-corpus-dump', type=str, default=None, metavar='SOURCE',
+    group.add_argument('--logits-save-corpus-source', type=str, default=None, metavar='SOURCE',
                        help='Dump a v3 corpus source: score the whole single --data-path '
                             'dataset once, in its dataset order, with a frozen teacher, into '
                             '<--logits-save-dir>/SOURCE/. The run sizes itself to the source; '
                             '--train-iters and --split are ignored.')
-    group.add_argument('--kd-corpus-blend', type=str, default=None, metavar='CONFIG',
+    group.add_argument('--logits-load-corpus-blend', type=str, default=None, metavar='CONFIG',
                        help='Train on a blend of v3 corpus sources described by a JSON config '
                             '(corpus directory, source weights in samples, seed, lanes). '
                             'The schedule is planned at startup for the training budget and '

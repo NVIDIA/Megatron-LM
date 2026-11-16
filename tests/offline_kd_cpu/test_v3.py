@@ -1520,7 +1520,7 @@ corpus = importlib.import_module(f"{_namespace}.corpus_runtime")
 def corpus_args(args, tmp_path, name="web"):
     dump_args(args)
     args.logits_save_dir = str(tmp_path)
-    args.kd_corpus_dump = name
+    args.logits_save_corpus_source = name
     args.save = str(tmp_path / "progress" / name)
     args.data_path, args.mock_data, args.eval_iters, args.train_samples = (
         ["web_text"],
@@ -1535,7 +1535,7 @@ def test_corpus_dump_validation_sets_its_folder_and_one_epoch_budget(tmp_path, r
     args, runtime, _ = runtime_environment
     corpus_args(args, tmp_path)
     runtime.validate_options(args)
-    assert args.logits_save_inputs and args.kd_corpus_root == str(tmp_path)
+    assert args.logits_save_inputs and args.logits_save_corpus_root == str(tmp_path)
     assert args.logits_save_dir == str(tmp_path / "web")
     assert args.split == "100,0,0"  # The whole source; a corpus source is never split.
     assert args.train_iters * args.global_batch_size >= 1 << 39  # Until the epoch is known.
@@ -1550,7 +1550,7 @@ def test_corpus_dump_validation_sets_its_folder_and_one_epoch_budget(tmp_path, r
         ({"data_path": ["0.5", "a", "0.5", "b"]}, "exactly one unweighted"),
         ({"eval_iters": 10}, "--eval-iters 0"),
         ({"train_samples": 100}, "omit --train-samples"),
-        ({"kd_corpus_dump": "a/b"}, "plain directory name"),
+        ({"logits_save_corpus_source": "a/b"}, "plain directory name"),
         ({"valid_data_path": ["v"]}, "valid-data-path"),
         ({"dataloader_type": "cyclic"}, "dataloader-type single"),
     ],
@@ -1587,7 +1587,7 @@ def test_corpus_epoch_preserves_dataset_order_and_pads_to_whole_batches():
 
 def test_corpus_epoch_length_sizes_the_run(runtime_environment):
     args, _, _ = runtime_environment
-    args.kd_corpus_dump, args.kd_corpus_samples = "web", 17
+    args.logits_save_corpus_source, args.logits_save_corpus_samples = "web", 17
     corpus.agree_corpus_epoch(args)
     assert args.train_iters == 3  # 17 samples in global batches of 8.
 
@@ -1596,7 +1596,7 @@ def test_corpus_metadata_requires_the_epoch_size(tmp_path, runtime_environment):
     args, runtime, _ = runtime_environment
     corpus_args(args, tmp_path)
     runtime.validate_options(args)
-    args.kd_corpus_samples = 20
+    args.logits_save_corpus_samples = 20
     metadata = runtime._dump_settings(teacher_saver(runtime, tmp_path))
     assert metadata["contract"]["num_samples"] == 20 and "train_samples" not in metadata["recorded"]
     assert "split" not in metadata["recorded"]
@@ -1610,7 +1610,7 @@ def test_corpus_sources_must_share_a_tokenizer(tmp_path, runtime_environment, ca
     args, runtime, _ = runtime_environment
     corpus_args(args, tmp_path, name="code")
     runtime.validate_options(args)
-    args.kd_corpus_samples = 32
+    args.logits_save_corpus_samples = 32
     metadata = runtime._dump_settings(teacher_saver(runtime, tmp_path))
     other = json.loads(json.dumps(metadata))
     other["contract"]["num_samples"] = 64  # Sources differ in size and data, but share a teacher.
@@ -1675,7 +1675,7 @@ def test_corpus_saver_drops_fillers_by_global_position(runtime_environment):
     saver.dp_rank, saver.dp_size = 1, 2
     # The last global batch (positions 16-23) of a 20-sample epoch; with MBS 2 this
     # writer holds positions 18, 19, 22 and 23, in that order.
-    args.kd_corpus_samples, args.consumed_train_samples = 20, 16
+    args.logits_save_corpus_samples, args.consumed_train_samples = 20, 16
     captured = codec.capture_batch(inputs([18, 19, 22, 23]))
     ids = captured["tokens"].long().reshape(-1, 1)
     kept, values, indices, tail = saver._prepare_record(
@@ -1693,7 +1693,7 @@ def test_corpus_writers_publish_chunks_that_jobs_rewrite_from_their_start(
     args, runtime, _ = runtime_environment
     corpus_args(args, tmp_path)
     runtime.validate_options(args)
-    args.kd_corpus_samples, args.train_iters = 20, 3
+    args.logits_save_corpus_samples, args.train_iters = 20, 3
     job = teacher_saver(runtime, tmp_path / "web", dp_size=1)
     metadata = runtime.initialize_dump_metadata(job)  # Empty source.
     saver = finalizing_saver(
@@ -2047,14 +2047,14 @@ def test_student_trains_on_a_corpus_blend_and_resumes_only_on_the_same_plan(
         None,
         None,
     )
-    args.kd_corpus_blend = str(config)
+    args.logits_load_corpus_blend = str(config)
     args.sequence_packing_scheduler = args.hybrid_context_parallel = args.use_varlen_dataset = False
     args.mtp_num_layers, args.dataloader_type, args.train_iters = None, "single", 5
     runtime.validate_options(args)
     assert args.logits_load_inputs and args.logits_load_dir == str(tmp_path)
     runtime.initialize_replay(args)
     assert runtime._PLAN["corpus"] and runtime._PLAN["available"] == 40
-    planned = args.kd_corpus_manifest_hash
+    planned = args.logits_load_corpus_manifest_hash
     iterator = build_loader_iterator(runtime, args, 0)
     try:
         batch = next(iterator)
@@ -2068,7 +2068,7 @@ def test_student_trains_on_a_corpus_blend_and_resumes_only_on_the_same_plan(
     # A resume plans the same schedule; a changed config is refused.
     runtime._PLAN, args.consumed_train_samples = None, 8
     runtime.initialize_replay(args)
-    assert args.kd_corpus_manifest_hash == planned
+    assert args.logits_load_corpus_manifest_hash == planned
     runtime._PLAN = None
     config.write_text(json.dumps(blend_config(tmp_path, seed=9)))
     with pytest.raises(RuntimeError, match="no longer plans the schedule"):
@@ -2086,7 +2086,7 @@ def test_corpus_blend_validation(tmp_path, runtime_environment, change, message)
     args, runtime, _ = runtime_environment
     config = tmp_path / "blend.json"
     config.write_text(json.dumps(blend_config(tmp_path)))
-    args.kd_corpus_blend = str(config)
+    args.logits_load_corpus_blend = str(config)
     args.logits_load_shuffle_shards = None
     for key, value in change.items():
         setattr(args, key, value)

@@ -118,8 +118,8 @@ def initialize_corpus_metadata(saver: Any, expected: dict) -> dict:
                     raise ValueError(f"Corpus source settings changed: {', '.join(differing)}")
             # Preserve the existing cross-source tokenizer check. This listing is
             # performed once on initialization, never during flush or student reads.
-            root = Storage(args.kd_corpus_root)
-            seen = {args.kd_corpus_dump}
+            root = Storage(args.logits_save_corpus_root)
+            seen = {args.logits_save_corpus_source}
             for path in root.list("*/chunk-*/index.json"):
                 source = path.split("/", 1)[0]
                 if source in seen:
@@ -152,14 +152,16 @@ def initialize_corpus_metadata(saver: Any, expected: dict) -> dict:
 
 
 def validate_corpus_dump(args: Any) -> None:
-    """Check and apply ``--kd-corpus-dump`` settings (idempotent)."""
-    name = getattr(args, "kd_corpus_dump", None)
+    """Check and apply ``--logits-save-corpus-source`` settings (idempotent)."""
+    name = getattr(args, "logits_save_corpus_source", None)
     if not name:
         return
     if not args.logits_save_dir:
-        raise ValueError("--kd-corpus-dump requires --logits-save-dir (the corpus directory)")
+        raise ValueError(
+            "--logits-save-corpus-source requires --logits-save-dir (the corpus directory)"
+        )
     if os.sep in name or name in ("", ".", ".."):
-        raise ValueError(f"--kd-corpus-dump source name {name!r} must be a plain directory name")
+        raise ValueError(f"--logits-save-corpus-source {name!r} must be a plain directory name")
     if not getattr(args, "freeze_all_layers", False):
         raise ValueError("Corpus dumps require a frozen teacher (--freeze-all-layers)")
     if getattr(args, "rampup_batch_size", None):
@@ -184,10 +186,10 @@ def validate_corpus_dump(args: Any) -> None:
         raise ValueError(
             "Corpus dumps score the whole source and no validation; use --eval-iters 0"
         )
-    if getattr(args, "kd_corpus_root", None) is None:
+    if getattr(args, "logits_save_corpus_root", None) is None:
         if getattr(args, "train_samples", None):
             raise ValueError("Corpus dumps size themselves to one epoch; omit --train-samples")
-        args.kd_corpus_root = args.logits_save_dir
+        args.logits_save_corpus_root = args.logits_save_dir
         args.logits_save_dir = os.path.join(args.logits_save_dir, name)
         args.train_iters = _UNTIL_EPOCH_END // args.global_batch_size
     # The whole source is the training part: a corpus source is never split.
@@ -196,13 +198,14 @@ def validate_corpus_dump(args: Any) -> None:
 
 
 def validate_corpus_blend(args: Any) -> None:
-    """Check and apply ``--kd-corpus-blend``: corpus loading reuses the replay path."""
-    path = getattr(args, "kd_corpus_blend", None)
+    """Check and apply ``--logits-load-corpus-blend``: corpus loading reuses the replay path."""
+    path = getattr(args, "logits_load_corpus_blend", None)
     if not path:
         return
     from .format.blend import load_config
 
-    if getattr(args, "logits_save_inputs", False) or getattr(args, "kd_corpus_dump", None):
+    dumping = getattr(args, "logits_save_corpus_source", None)
+    if getattr(args, "logits_save_inputs", False) or dumping:
         raise ValueError("A run cannot both dump and load offline KD v3 data")
     if getattr(args, "logits_load_shuffle_shards", None) is not None:
         raise ValueError("A corpus blend is ordered by its plan; omit --logits-load-shuffle-shards")
@@ -249,7 +252,7 @@ def build_corpus_dump_datasets(args: Any, provider: Callable) -> tuple:
     if dataset is None:
         raise ValueError("Corpus dump source has no samples")
     epoch = CorpusEpoch(dataset, global_batch_size=args.global_batch_size)
-    args.kd_corpus_samples = epoch.num_samples
+    args.logits_save_corpus_samples = epoch.num_samples
     return epoch, None, None
 
 
@@ -257,17 +260,17 @@ def agree_corpus_epoch(args: Any) -> None:
     """Share the epoch length with every rank and size the run to it (collective)."""
     args = runtime_options(args)
     length = torch.tensor(
-        [getattr(args, "kd_corpus_samples", 0)],
+        [getattr(args, "logits_save_corpus_samples", 0)],
         dtype=torch.long,
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
     if dist.is_initialized():
         dist.all_reduce(length, op=dist.ReduceOp.MAX)
-    args.kd_corpus_samples = int(length.item())
-    args.train_iters = -(-args.kd_corpus_samples // args.global_batch_size)
+    args.logits_save_corpus_samples = int(length.item())
+    args.train_iters = -(-args.logits_save_corpus_samples // args.global_batch_size)
     if not dist.is_initialized() or dist.get_rank() == 0:
         print(
-            f"Offline KD corpus dump: {args.kd_corpus_samples} samples of "
-            f"{args.kd_corpus_dump} in {args.train_iters} iterations",
+            f"Offline KD corpus dump: {args.logits_save_corpus_samples} samples of "
+            f"{args.logits_save_corpus_source} in {args.train_iters} iterations",
             flush=True,
         )

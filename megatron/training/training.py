@@ -6260,7 +6260,7 @@ def build_train_valid_test_data_loaders(
     if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
 
         # Build datasets.
-        if getattr(args, "kd_corpus_dump", None):
+        if getattr(args, "logits_save_corpus_source", None):
             from megatron.training.distillation.corpus_runtime import build_corpus_dump_datasets
 
             train_ds, valid_ds, test_ds = build_corpus_dump_datasets(
@@ -6304,7 +6304,7 @@ def build_train_valid_test_data_loaders(
     else:
         do_train, do_valid, do_test = False, False, False
 
-    if getattr(args, "kd_corpus_dump", None):
+    if getattr(args, "logits_save_corpus_source", None):
         from megatron.training.distillation.corpus_runtime import agree_corpus_epoch
 
         agree_corpus_epoch(args)  # Every rank sizes the run to the source's epoch.

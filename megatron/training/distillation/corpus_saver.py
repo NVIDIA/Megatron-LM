@@ -28,7 +28,7 @@ class CorpusLogitsSaver(PairedLogitsSaver):
             + self.dp_rank * mbs
             + rows.remainder(mbs)
         )
-        keep = positions < args.kd_corpus_samples
+        keep = positions < args.logits_save_corpus_samples
         lengths = offsets[1:] - offsets[:-1]
         tokens = torch.repeat_interleave(keep, lengths)
         selected = {

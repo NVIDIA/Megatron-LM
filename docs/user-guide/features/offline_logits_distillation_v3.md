@@ -94,7 +94,7 @@ Megatron's GPT windows or SFT rows at the teacher's `--seq-length`. The dump ign
 ```sh
 for source in web_crawl math_sft code; do
   torchrun ... pretrain_gpt.py <frozen teacher args> --eval-iters 0 \
-    --data-path "$DATA/$source" --kd-corpus-dump "$source" \
+    --data-path "$DATA/$source" --logits-save-corpus-source "$source" \
     --logits-save-dir "$CORPUS" --logits-save-top-k 128 \
     --save "$PROGRESS/$source" --save-interval 100
 done
@@ -174,7 +174,7 @@ the original dataset; `--logits-load-ignore-errors` is rejected.
 ### Training on a corpus blend
 
 A student trains on a blend of corpus sources (see [Corpus dumps](#corpus-dumps)) with
-`--kd-corpus-blend blend.json` instead of `--logits-load-inputs`:
+`--logits-load-corpus-blend blend.json` instead of `--logits-load-inputs`:
 
 ```json
 {"corpus": "/data/corpus", "sources": {"web_crawl": 0.7, "math_sft": 0.3},
@@ -324,11 +324,11 @@ Each replay index records its own `writers` and `writer_mbs`, so teacher DP and
 microbatch size may change between dump jobs; the global batch size may not.
 
 A corpus root contains independent chunks per source. The source directory name comes
-from `--kd-corpus-dump`, and the student blend configuration refers to that name:
+from `--logits-save-corpus-source`, and the student blend configuration refers to that name:
 
 ```text
 /data/corpus/                         # teacher --logits-save-dir; blend "corpus"
-├── web_crawl/                        # --kd-corpus-dump web_crawl
+├── web_crawl/                        # --logits-save-corpus-source web_crawl
 │   ├── chunk-000000000000-000000000128/
 │   │   ├── part-000000.arrow
 │   │   ├── part-000001.arrow
@@ -337,7 +337,7 @@ from `--kd-corpus-dump`, and the student blend configuration refers to that name
 │   │   ├── part-000000.arrow
 │   │   └── index.json
 │   └── ...
-└── math_sft/                         # --kd-corpus-dump math_sft
+└── math_sft/                         # --logits-save-corpus-source math_sft
     ├── chunk-000000000000-000000000128/
     │   ├── part-000000.arrow
     │   └── index.json
@@ -809,7 +809,7 @@ otherwise a rank may need many or all lanes. Planning errors are broadcast so th
 ranks fail together. Within a source, chunks whose producer iteration ranges overlap are
 rejected, since matching row totals could otherwise hide one range dumped twice.
 
-The student checkpoint stores only the plan's hash in `args.kd_corpus_manifest_hash`,
+The student checkpoint stores only the plan's hash in `args.logits_load_corpus_manifest_hash`,
 alongside the normal consumed-sample cursor. Comparing this digest avoids checkpointing
 the potentially large old schedule solely to compare it field by field. A mismatch
 reports a changed plan without identifying each changed field.

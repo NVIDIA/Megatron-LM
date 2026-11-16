@@ -293,12 +293,12 @@ def _dump_settings(saver: Any) -> dict[str, Any]:
             "save_interval": args.save_interval,
         },
     }
-    if getattr(args, "kd_corpus_dump", None):
+    if getattr(args, "logits_save_corpus_source", None):
         # A corpus source's extent is part of its contract: it defines completeness.
         settings["recorded"].pop("train_samples")
         # A chunk index records the producer's batch size; corpus parts have no origin.
         settings["contract"].pop("global_batch_size")
-        settings["contract"]["num_samples"] = args.kd_corpus_samples
+        settings["contract"]["num_samples"] = args.logits_save_corpus_samples
         settings["recorded"].pop("split")  # A corpus source is never split.
         # A basename is useful provenance for replay, but insufficient to identify a
         # corpus source when appending another job's part of the same epoch.
@@ -330,7 +330,7 @@ def initialize_dump_metadata(saver: Any) -> dict:
 
     args = get_args()
     expected = _dump_settings(saver)
-    if getattr(args, "kd_corpus_dump", None):
+    if getattr(args, "logits_save_corpus_source", None):
         from .corpus_runtime import initialize_corpus_metadata
 
         return initialize_corpus_metadata(saver, expected)
@@ -431,7 +431,7 @@ def initialize_replay(args: Any) -> None:
     global _PLAN
     if not getattr(args, "logits_load_inputs", False) or _PLAN is not None:
         return
-    if getattr(args, "kd_corpus_blend", None):
+    if getattr(args, "logits_load_corpus_blend", None):
         _PLAN = _initialize_corpus(args)
         return
     shuffle = args.logits_load_shuffle_shards is not None
@@ -527,12 +527,12 @@ def _initialize_corpus(args: Any) -> dict:
     result = [None]
     if rank == 0:
         try:
-            config = load_config(args.kd_corpus_blend)
+            config = load_config(args.logits_load_corpus_blend)
             budget = args.train_samples or args.train_iters * args.global_batch_size
             manifest = plan(config, budget=budget)
             metadata = {"format_version": FORMAT_VERSION, "contract": manifest["contract"]}
             _check_student_compatibility(args, metadata, replay=False)
-            expected = getattr(args, "kd_corpus_manifest_hash", None)
+            expected = getattr(args, "logits_load_corpus_manifest_hash", None)
             if expected is not None and expected != manifest["hash"]:
                 raise ValueError(
                     "The corpus blend no longer plans the schedule this checkpoint was trained "
@@ -559,7 +559,7 @@ def _initialize_corpus(args: Any) -> dict:
         start=args.consumed_train_samples,
     )
     # Saved with the checkpoint's args so a resume must replay the same schedule.
-    args.kd_corpus_manifest_hash = manifest["hash"]
+    args.logits_load_corpus_manifest_hash = manifest["hash"]
     return {
         **result[0],
         "manifest": manifest,
@@ -913,7 +913,7 @@ def bind_student_logits(sidecar: dict | None) -> dict | None:
 
 def v3_saver_class(args: Any) -> type:
     """The teacher saver for a v3 dump: a corpus source, or a replay cache."""
-    if getattr(args, "kd_corpus_dump", None):
+    if getattr(args, "logits_save_corpus_source", None):
         from .corpus_saver import CorpusLogitsSaver
 
         return CorpusLogitsSaver
