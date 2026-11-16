@@ -261,7 +261,7 @@ if __name__ == "__main__":
                 dump_router_weights=cfg.logger.moe_routing_trace_dump_weights,
             )
 
-        engine = _build_engine_for_vlm_or_gpt(is_vlm=is_vlm)
+        engine = _build_engine_for_vlm_or_gpt(cfg, is_vlm=is_vlm)
         model = engine.controller.inference_wrapped_model.model
 
         tracer = get_moe_router_tracer()

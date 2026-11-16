@@ -6,6 +6,7 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.global_vars import get_run_config
 from model_provider import count_parameters_in_layer
 
 
@@ -30,10 +31,11 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
     else:
         raise ValueError("You must provide a valid hybrid layer spec via --spec")
 
+    cfg_container = get_run_config()
     model = HybridModel(
         config=config,
         hybrid_stack_spec=hybrid_stack_spec,
-        vocab_size=args.padded_vocab_size,
+        vocab_size=cfg_container.tokenizer.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         hybrid_layer_pattern=args.hybrid_layer_pattern,
         pre_process=pre_process,

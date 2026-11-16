@@ -12,6 +12,7 @@ from collections import defaultdict
 from functools import partial
 from typing import List, Literal, Tuple, TypedDict, Union
 
+from megatron.training.global_vars import get_run_config
 import numpy as np
 import torch
 from PIL import Image
@@ -33,6 +34,8 @@ from megatron.energon import stateless
 from megatron.energon.av import AVDecoder
 from megatron.energon.edataclass import edataclass
 from megatron.training import get_args, get_tokenizer
+from megatron.training.global_vars import get_run_config
+from megatron.training.models import LLaVAModelConfig, MimoBuildConfig
 
 from .conversation_sample import ConversationSample, ImageMedia, Media, VideoFrameMedia, VideoMedia
 from .cookers.conversation import (
@@ -329,7 +332,19 @@ class MultiModalTaskEncoder(
         super().__init__()
         self.is_val = is_val
         self.args = get_args()
+        cfg = get_run_config()
+        if not isinstance(cfg.model, (LLaVAModelConfig, MimoBuildConfig)):
+            raise TypeError(
+                "Expected cfg.model to be LLaVAModelConfig or MimoBuildConfig, "
+                f"got {type(cfg.model).__name__}"
+            )
+        # Copy the model's preprocessing inputs for workers.
+        self.img_h = cfg.model.img_h
+        self.img_w = cfg.model.img_w
+        self.patch_dim = cfg.model.patch_dim
+        self.drop_vision_class_token = cfg.model.drop_vision_class_token
         self.tokenizer = get_tokenizer()
+        self.cfg = cfg
         with open(self.args.prompt_path, "r") as f:
             self.manual_prompts = json.load(f)
         # TODO: There is four seq lengths now: seq_length, decoder_seq_length, dataloader_seq_length, packing_seq_length
@@ -353,7 +368,6 @@ class MultiModalTaskEncoder(
 
         self.txt_to_token_dict = {}
 
-        self.img_h, self.img_w = self.args.img_h, self.args.img_w
         self.img_token_id = self.tokenizer.image_token_index
         # This map is used to reduce the number of tiles used per image if the number of tokens is
         # larger than the decoder_seq_length.
@@ -362,7 +376,7 @@ class MultiModalTaskEncoder(
         self.tiling_augment_prob = tiling_augment_prob
 
         # Create the image tiling strategy using the refactored function
-        self.image_tiling_strategy = create_image_tiling_strategy(self.args)
+        self.image_tiling_strategy = create_image_tiling_strategy(self.args, self.cfg)
 
         # Validate temporal compression settings
         temporal_patch_size = getattr(self.args, 'video_temporal_patch_size', 1)
@@ -805,7 +819,7 @@ class MultiModalTaskEncoder(
             if self.args.only_keep_samples_with_img and len(image_media) == 0:
                 raise ValueError(f"Sample has no image: {sample.__key__}")
 
-            prompt_format = self.args.tokenizer_prompt_format
+            prompt_format = self.cfg.tokenizer.tokenizer_prompt_format
 
             if (
                 not skip_chat_template
@@ -1363,8 +1377,8 @@ class MultiModalTaskEncoder(
         if has_fp8 and self.args.dynamic_resolution and no_cp:
             img_seq_len = 0
             for img in imgs:
-                img_seq_len += (img.shape[1] // self.args.patch_dim) * (
-                    img.shape[2] // self.args.patch_dim
+                img_seq_len += (img.shape[1] // self.patch_dim) * (
+                    img.shape[2] // self.patch_dim
                 )
             padding_needed = get_padding(
                 img_seq_len,
@@ -1377,7 +1391,7 @@ class MultiModalTaskEncoder(
             )
             if padding_needed > 0:
                 pad_img = torch.zeros(
-                    [3, self.args.patch_dim, padding_needed * self.args.patch_dim]
+                    [3, self.patch_dim, padding_needed * self.patch_dim]
                 )
                 imgs.append(pad_img)
                 has_pad_img = torch.tensor(True)
