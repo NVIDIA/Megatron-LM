@@ -14,7 +14,9 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import _set_capture_end, _set_capture_start
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.moe.experts import TEGroupedMLP
 from megatron.core.transformer.moe.moe_layer import MoELayer, MoESubmodules
+from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher
 from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -135,6 +137,27 @@ _MEGAKERNEL_GRAPH_MODULES = pytest.mark.parametrize(
 
 class TestMoELayerInit:
 
+    def test_default_moe_backends(self):
+        Utils.initialize_model_parallel(1, 1)
+        try:
+            model_parallel_cuda_manual_seed(123)
+            config = TransformerConfig(
+                num_layers=1,
+                hidden_size=128,
+                num_attention_heads=4,
+                num_moe_experts=2,
+                add_bias_linear=False,
+                use_cpu_initialization=True,
+            )
+            submodules = get_submodules(
+                get_gpt_layer_with_transformer_engine_submodules(num_experts=2).mlp
+            )
+            layer = MoELayer(config, submodules)
+            assert isinstance(layer.experts, TEGroupedMLP)
+            assert isinstance(layer.token_dispatcher, MoEAlltoAllTokenDispatcher)
+        finally:
+            Utils.destroy_model_parallel()
+
     @pytest.mark.skipif(
         not is_te_min_version("1.7.0.dev0"),
         reason="Expert with TE Linear is only supported in TE 1.7.0 and later.",
@@ -171,9 +194,7 @@ class TestMoELayerInit:
                 del args, kwargs
                 pytest.fail("megakernel path must not construct a native token dispatcher")
 
-            monkeypatch.setattr(
-                moe_layer_module, "MoEAllGatherTokenDispatcher", fail_if_constructed
-            )
+            monkeypatch.setattr(moe_layer_module, "MoEAlltoAllTokenDispatcher", fail_if_constructed)
             monkeypatch.setattr(
                 moe_layer_module, "build_megakernel_backend", lambda **kwargs: backend
             )
