@@ -109,6 +109,17 @@ R = "tests/unit_tests/context_parallel/runtime/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
+        name="torch_grouped_weight_gradients",
+        sources=(
+            "megatron/core/extensions/torch_grouped_wgrad.py",
+            "megatron/core/extensions/transformer_engine.py",
+        ),
+        tests=(K + "test_torch_grouped_wgrad_replay.py",),
+        kind="external-lib",
+        notes="SM90 BF16 TE forward/dgrad with PyTorch grouped dW; empty and ragged groups, "
+        "including backward replay under side-stream contention.",
+    ),
+    KernelEntry(
         name="csa_output_rope_reconstruction",
         sources=("megatron/core/ops/attention/csa/output_rope.py",),
         tests=(K + "test_csa_output_rope.py",),
