@@ -3,6 +3,7 @@
 """Unit tests for the high-level inference APIs."""
 
 import asyncio
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -14,6 +15,7 @@ from megatron.core.inference.apis._llm_base import _MegatronLLMBase
 from megatron.core.inference.apis.async_llm import MegatronAsyncLLM
 from megatron.core.inference.apis.llm import MegatronLLM
 from megatron.core.inference.apis.serve_config import ServeConfig
+from megatron.core.inference.config import InferenceConfig
 
 
 @pytest.fixture
@@ -43,6 +45,10 @@ def fake_model_and_tokenizer():
     return model, tokenizer
 
 
+async def _no_teardown():
+    """Stand-in for ``_shutdown_impl`` when there is no coordinator to tear down."""
+
+
 def _make_worker_instance(cls):
     """Build a coordinator-mode worker-rank instance without running the
     constructor's engine/runtime setup."""
@@ -63,13 +69,21 @@ class TestConstructorValidation:
     """Constructor-time validation for both ``MegatronLLM`` and ``MegatronAsyncLLM``."""
 
     @pytest.mark.parametrize(
-        "extra_kwargs", [{"coordinator_host": "x"}, {"coordinator_port": 5000}]
+        "extra_kwargs, match",
+        [
+            ({"coordinator_host": "x"}, "coordinator_host/port require use_coordinator=True"),
+            ({"coordinator_port": 5000}, "coordinator_host/port require use_coordinator=True"),
+            (
+                {"inference_config": InferenceConfig(start_suspended=True)},
+                "start_suspended requires use_coordinator=True",
+            ),
+        ],
     )
-    def test_coordinator_host_or_port_without_use_coordinator_raises(
-        self, mock_pipeline, fake_model_and_tokenizer, extra_kwargs
+    def test_direct_mode_rejects_coordinator_only_options(
+        self, mock_pipeline, fake_model_and_tokenizer, extra_kwargs, match
     ):
         model, tok = fake_model_and_tokenizer
-        with pytest.raises(ValueError, match="coordinator_host/port require use_coordinator=True"):
+        with pytest.raises(ValueError, match=match):
             MegatronLLM(model=model, tokenizer=tok, use_coordinator=False, **extra_kwargs)
 
     def test_megatron_llm_direct_mode_succeeds(self, mock_pipeline, fake_model_and_tokenizer):
@@ -170,83 +184,93 @@ class TestLifecycleGuards:
         llm.serve(ServeConfig(), blocking=False)
         assert llm._serve_started is False
 
-    def test_sync_serve_primary_rank_starts_frontend(self, monkeypatch):
-        """Primary rank starts the HTTP frontend against the coordinator
-        address and records ``_serve_started`` for shutdown teardown."""
-        tgs = pytest.importorskip(
-            "megatron.core.inference.text_generation_server.dynamic_text_gen_server"
-            ".text_generation_server"
-        )
-        import torch.distributed as dist
-
-        llm = _make_worker_instance(MegatronLLM)
-        llm._is_primary_rank = True
-        llm._coord_runtime = MagicMock()
-        llm._coord_runtime.coord_addr = "tcp://coord:5555"
-
-        started = {}
-        monkeypatch.setattr(dist, "get_rank", lambda: 0)
-        monkeypatch.setattr(tgs, "start_text_gen_server", lambda **kw: started.update(kw))
-
-        sock = MagicMock()
-        llm.serve(
-            ServeConfig(
-                port=1234,
-                sock=sock,
-                default_temperature=0.7,
-                default_top_p=0.95,
-                default_top_k=20,
-                eval_mode=True,
-            ),
-            blocking=False,
-        )
-        assert llm._serve_started is True
-        assert started["coordinator_addr"] == "tcp://coord:5555"
-        assert started["server_port"] == 1234
-        assert started["sock"] is sock
-        assert started["default_temperature"] == 0.7
-        assert started["default_top_p"] == 0.95
-        assert started["default_top_k"] == 20
-        assert started["eval_mode"] is True
-
     @pytest.mark.asyncio
-    async def test_async_serve_primary_rank_starts_frontend(self, monkeypatch):
-        """Async serving forwards sampling defaults to the HTTP frontend."""
+    @pytest.mark.parametrize(
+        "cls, shutdown_races",
+        [
+            (MegatronLLM, False),
+            (MegatronLLM, True),
+            (MegatronAsyncLLM, False),
+            (MegatronAsyncLLM, True),
+        ],
+        ids=["sync", "sync-shutdown-races", "async", "async-shutdown-races"],
+    )
+    async def test_serve_primary_rank_starts_frontend(self, monkeypatch, cls, shutdown_races):
+        """Primary rank starts the HTTP frontend against the coordinator address with the
+        configured defaults. ``serve()`` blocks its caller until the replicas listen, so only
+        another thread's ``shutdown()`` can race it; that cannot stop replicas that do not
+        exist yet, so the starter stops them itself on return."""
         tgs = pytest.importorskip(
             "megatron.core.inference.text_generation_server.dynamic_text_gen_server"
             ".text_generation_server"
         )
         import torch.distributed as dist
 
-        llm = _make_worker_instance(MegatronAsyncLLM)
+        llm = _make_worker_instance(cls)
         llm._is_primary_rank = True
-        llm._coord_runtime = MagicMock()
-        llm._coord_runtime.coord_addr = "tcp://coord:5555"
-
-        started = {}
+        llm._coord_runtime = MagicMock(coord_addr="tcp://coord:5555")
+        # A real runtime loop: embedders drive the async facade through run_sync on it.
+        llm._loop_manager = base_mod._EventLoopManager()
+        llm._loop_manager.start()
+        monkeypatch.setattr(llm, "_shutdown_impl", _no_teardown)
         monkeypatch.setattr(dist, "get_rank", lambda: 0)
-        monkeypatch.setattr(tgs, "start_text_gen_server", lambda **kw: started.update(kw))
+
+        started, calls = {}, []
+        starting, stopping, release = threading.Event(), threading.Event(), threading.Event()
+
+        def fake_start(**kw):
+            started.update(kw)
+            calls.append("start")
+            if shutdown_races:
+                starting.set()
+                release.wait()  # the replicas are coming up until the test lets them
+
+        def fake_stop():
+            calls.append("stop")
+            stopping.set()
+
+        monkeypatch.setattr(tgs, "start_text_gen_server", fake_start)
+        monkeypatch.setattr(tgs, "stop_text_gen_server", fake_stop)
 
         sock = MagicMock()
-        await llm.serve(
-            ServeConfig(
-                port=1234,
-                sock=sock,
-                default_temperature=0.7,
-                default_top_p=0.95,
-                default_top_k=20,
-                eval_mode=True,
-            ),
-            blocking=False,
+        config = ServeConfig(
+            port=1234,
+            sock=sock,
+            default_temperature=0.7,
+            default_top_p=0.95,
+            default_top_k=20,
+            eval_mode=True,
         )
-        assert llm._serve_started is True
-        assert started["coordinator_addr"] == "tcp://coord:5555"
-        assert started["server_port"] == 1234
-        assert started["sock"] is sock
-        assert started["default_temperature"] == 0.7
-        assert started["default_top_p"] == 0.95
-        assert started["default_top_k"] == 20
-        assert started["eval_mode"] is True
+        if cls is MegatronAsyncLLM:
+            serving = asyncio.to_thread(llm.run_sync, llm.serve(config, blocking=False))
+        else:
+            serving = asyncio.to_thread(llm.serve, config, blocking=False)
+        serving = asyncio.ensure_future(serving)
+        if shutdown_races:
+            await asyncio.to_thread(starting.wait)
+            shutting_down = asyncio.ensure_future(
+                llm.shutdown() if cls is MegatronAsyncLLM else asyncio.to_thread(llm.shutdown)
+            )
+            await asyncio.to_thread(stopping.wait)  # shutdown() found nothing to stop yet
+            release.set()
+            await shutting_down
+        await serving
+        llm._loop_manager.stop()
+
+        forwarded = dict(
+            coordinator_addr="tcp://coord:5555",
+            server_port=1234,
+            sock=sock,
+            default_temperature=0.7,
+            default_top_p=0.95,
+            default_top_k=20,
+            eval_mode=True,
+        )
+        assert {k: started[k] for k in forwarded} == forwarded
+        # Without a race the frontend stays up. With one, shutdown()'s own stop is followed
+        # by the starter's once the replicas actually exist.
+        assert calls == (["start", "stop", "stop"] if shutdown_races else ["start"])
+        assert llm._serve_started is (not shutdown_races)
 
 
 class TestNormalizePrompts:

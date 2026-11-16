@@ -1,4 +1,4 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """Helpers for VLM dynamic-batching inference.
 
@@ -26,7 +26,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.utils import unwrap_model
 from megatron.training import get_args
 from megatron.training import get_model as _get_model
-from megatron.training import print_rank_0
+from megatron.training import get_run_config, print_rank_0
 from megatron.training.checkpointing import (
     get_checkpoint_name,
     get_checkpoint_tracker_filename,
@@ -221,7 +221,16 @@ def _enable_checkpoint_expert_bias(args):
     can hold trained biases while its saved args disable them (e.g. quantile balancing that
     estimates expert_bias from global-batch histograms), and --use-checkpoint-args would then
     build routers without them.
+
+    Global-batch quantile balancing registers and applies expert_bias without this flag, and
+    config validation rejects enabling both, so such checkpoints are left unchanged.
     """
+    balancing = getattr(args, "moe_router_load_balancing_type", None)
+    if (
+        balancing in ("quantile_balancing", ["quantile_balancing"])
+        and getattr(args, "moe_router_quantile_balancing_estimation_scope", None) == "global_batch"
+    ):
+        return
     if any(key.endswith('router.expert_bias') for key in _checkpoint_tensor_keys(args)):
         if not args.moe_router_enable_expert_bias:
             print_rank_0(
@@ -492,8 +501,10 @@ def get_model(is_vlm: bool) -> MegatronModule:
 
         model = _get_model(partial(model_provider, gpt_builder), wrap_with_ddp=False)
 
-    assert args.load is not None
-    args.exit_on_missing_checkpoint = True
+    checkpoint = get_run_config().checkpoint
+    assert checkpoint.load is not None
+    # Inference must not start from random weights.
+    checkpoint.exit_on_missing_checkpoint = True
     load_checkpoint(
         ddp_model=model,
         optimizer=None,

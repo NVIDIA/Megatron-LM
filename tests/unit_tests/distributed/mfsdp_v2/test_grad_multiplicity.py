@@ -13,8 +13,8 @@ from torch.distributed.tensor import Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     FsdpContext,
+    GradientFinalizationMode,
     Placements,
-    RuntimePolicy,
     SchedulePolicy,
     fully_shard,
     fully_shard_context,
@@ -27,11 +27,7 @@ def _sharded_unit(setup, model, grad_accumulation_count):
     """Shard one unit with caller-managed execution and gradient synchronization."""
     mesh = init_device_mesh(setup.device.type, (setup.world_size,))
     placements = Placements([0], [Shard(0)], [Shard(0)], [Shard(0)])
-    with fully_shard_context(
-        FsdpContext(
-            device=setup.device, runtime_policy=RuntimePolicy(caller_managed_grad_sync=True)
-        )
-    ):
+    with fully_shard_context(FsdpContext(device=setup.device)):
         fully_shard(
             model,
             mesh=mesh,
@@ -42,18 +38,19 @@ def _sharded_unit(setup, model, grad_accumulation_count):
         )
     # The test drives materialization around each GraphTask; the completion hook
     # only reduces gradients once all declared contributions have accumulated.
-    model.register_post_backward_hook(FsdpModule._reduce_gradient_groups)
+    model.register_post_accumulate_grad_hook(FsdpModule.post_accumulate_grad)
     return model
 
 
 def _graph_task(model, inputs, node):
     """Materialize one unit for an independently executed forward/backward node."""
-    model.context.allgather_stream.wait_stream(model.context.current_stream())
-    model.unshard()
-    consumer = model if node is None else model[node]
-    loss = consumer(inputs).square().mean()
-    loss.backward()
-    model.reshard()
+    with model.context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER):
+        model.context.allgather_stream.wait_stream(model.context.current_stream())
+        model.unshard()
+        consumer = model if node is None else model[node]
+        loss = consumer(inputs).square().mean()
+        loss.backward()
+        model.reshard()
     return loss.detach()
 
 

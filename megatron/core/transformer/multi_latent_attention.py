@@ -26,6 +26,8 @@ from megatron.core.models.common.embeddings import (
     _yarn_get_mscale,
     apply_rotary_pos_emb,
 )
+from megatron.core.ops.norm.torch_norm import LayerNormBuilder
+from megatron.core.packed_seq_params import resolve_cp_group
 from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
     FineGrainedActivationOffloadingInterface as off_interface,
 )
@@ -40,7 +42,6 @@ from megatron.core.transformer.attention import Attention, LinearProjBuilder
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mla_qk_norm_config import QKNormConfigResolver
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
-from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import MLATransformerConfig
 from megatron.core.typed_torch import apply_module, not_none
 from megatron.core.utils import (
@@ -181,17 +182,35 @@ class _FusedKVRoPEQuantForFusedAttn(torch.autograd.Function):
         return d_kv, d_emb, None, None, None, None, None
 
 
+# Transformer Engine's DotProductAttention reads these once, when it is imported; mirror that.
+_DPA_FP8_RECIPE = os.getenv("NVTE_DPA_FP8_RECIPE", "")
+_DPA_FP8_FORMAT = os.getenv("NVTE_DPA_FP8_FORMAT", "HYBRID")
+
+
 def _is_mxfp8_attention_active() -> bool:
     """Whether attention runs in MXFP8 here: in an FP8 autocast with an MXFP8 recipe and FP8 DPA
-    (layers kept in BF16 run outside it), with an FP8 backward. With NVTE_FP8_DPA_BWD=0, attention
-    keeps the BF16 q/k/v for its backward, which pre-quantized inputs would replace by their
-    dequantized values."""
+    (layers kept in BF16 run outside it), or in an NVFP4 autocast with FP8 DPA that Transformer
+    Engine runs in MXFP8 (NVTE_DPA_FP8_RECIPE=MXFP8BlockScaling), with an FP8 backward. With
+    NVTE_FP8_DPA_BWD=0, attention keeps the BF16 q/k/v for its backward, which pre-quantized
+    inputs would replace by their dequantized values."""
     if not FP8GlobalStateManager.is_fp8_enabled():
         return False
     if int(os.getenv("NVTE_FP8_DPA_BWD", "1")) == 0:
         return False
     recipe = FP8GlobalStateManager.get_fp8_recipe()
-    return recipe.mxfp8() and recipe.fp8_dpa
+    if recipe.custom():
+        # Custom recipes take their attention quantizers from their factory, not the env.
+        return False
+    if recipe.nvfp4() and recipe.fp8_dpa:
+        # TE builds the MXFP8 attention recipe in NVTE_DPA_FP8_FORMAT; the fused kernel writes
+        # E4M3, the forward format of HYBRID and E4M3.
+        return _DPA_FP8_RECIPE == "MXFP8BlockScaling" and _DPA_FP8_FORMAT in ("HYBRID", "E4M3")
+    # TE switches MXFP8 attention to BF16 or to a delayed/current-scaling recipe for these.
+    return (
+        recipe.mxfp8()
+        and recipe.fp8_dpa
+        and _DPA_FP8_RECIPE not in ("F16", "DelayedScaling", "Float8CurrentScaling")
+    )
 
 
 def _prepare_mla_core_attention_value(parallel_attention, query, value, packed_seq_params):
@@ -662,6 +681,54 @@ class MLASelfAttention(MultiLatentAttention):
     and returns output of the same size.
     """
 
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: MLATransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+    ) -> float:
+        """Estimate forward MLA projections and attention, excluding any DSA indexer."""
+        from megatron.core.transformer.experimental_attention_variant.dsa_layer_config import (
+            DSALayerConfig,
+        )
+        from megatron.core.transformer.mla_layer_config import MLALayerConfig
+
+        if isinstance(config, DSALayerConfig) or (
+            not isinstance(config, MLALayerConfig)
+            and config.experimental_attention_variant == "dsa"
+        ):
+            from megatron.core.transformer.experimental_attention_variant.dsa import DSAttention
+
+            return DSAttention.estimate_flops(
+                config,
+                total_real_tokens_in_batch=total_real_tokens_in_batch,
+                seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+                absorbed_mla=False,
+            )
+        q_dim = config.qk_head_dim + config.qk_pos_emb_head_dim
+        q_term = (
+            config.hidden_size * config.num_attention_heads * q_dim
+            if config.q_lora_rank is None
+            else config.q_lora_rank * (config.hidden_size + config.num_attention_heads * q_dim + 1)
+        )
+        projections = 2 * (
+            q_term
+            + config.kv_lora_rank
+            * (
+                config.hidden_size
+                + config.num_attention_heads * (config.qk_head_dim + config.v_head_dim)
+                + 1
+            )
+            + config.hidden_size * config.qk_pos_emb_head_dim
+            + config.num_attention_heads * config.v_head_dim * config.hidden_size
+        )
+        return (
+            total_real_tokens_in_batch * projections
+            + seqlen_squared_sum_in_batch * config.num_attention_heads * (q_dim + config.v_head_dim)
+        )
+
     def __init__(
         self,
         config: MLATransformerConfig,
@@ -870,13 +937,9 @@ class MLASelfAttention(MultiLatentAttention):
         assert (
             hidden_states.ndim == 3
         ), f"hidden_states should be 3D, [s, b, n*h], got {hidden_states.ndim}D"
-        if packed_seq_params is not None:
-            assert (
-                packed_seq_params.local_cp_size is None
-            ), "hybrid_context_parallel is not supported with MLA yet and is planned for future. \
-            Please disable hybrid_context_parallel."
-
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        runtime_cp_group = resolve_cp_group(self.pg_collection.cp, packed_seq_params)
+        assert runtime_cp_group is not None, "MLA requires a context-parallel group"
 
         # =========================================
         # Prepare RoPE and seqlen related params
@@ -1001,7 +1064,7 @@ class MLASelfAttention(MultiLatentAttention):
                 rotary_pos_emb,
                 config=self.config,
                 cu_seqlens_q=cu_seqlens_q,
-                cp_group=self.pg_collection.cp,
+                cp_group=runtime_cp_group,
                 mscale=mscale,
             )
             # k_pos_emb:[num_tokens, 1, qk_pos_emb_head_dim]
@@ -1009,7 +1072,7 @@ class MLASelfAttention(MultiLatentAttention):
                 k_pos_emb,
                 rotary_pos_emb,
                 config=self.config,
-                cp_group=self.pg_collection.cp,
+                cp_group=runtime_cp_group,
                 mscale=mscale,
             )
 
@@ -1053,7 +1116,7 @@ class MLASelfAttention(MultiLatentAttention):
                 and self.config.apply_rope_fusion
                 and self.config.q_lora_rank is not None
                 and q_compressed.ndim == 3
-                and self.pg_collection.cp.size() == 1
+                and runtime_cp_group.size() == 1
             )
 
             if use_fused_q_uproj:
@@ -1123,7 +1186,7 @@ class MLASelfAttention(MultiLatentAttention):
                 and not self.checkpoint_core_attention
                 and kv.ndim == 4
                 and cu_seqlens_kv is None
-                and self.pg_collection.cp.size() == 1
+                and runtime_cp_group.size() == 1
                 and kv.shape[0] % 128 == 0
                 and kv.dtype == torch.bfloat16
                 and k_pos_emb.dtype == torch.bfloat16
@@ -1158,8 +1221,8 @@ class MLASelfAttention(MultiLatentAttention):
 
             # todo add assert about fusions and caching
             if self.config.apply_rope_fusion:
-                cp_rank = self.pg_collection.cp.rank()
-                cp_size = self.pg_collection.cp.size()
+                cp_rank = runtime_cp_group.rank()
+                cp_size = runtime_cp_group.size()
                 if not use_fused_q_uproj:
                     query = fused_apply_mla_rope_for_q(
                         q,
@@ -1194,7 +1257,7 @@ class MLASelfAttention(MultiLatentAttention):
                     sequence_start = inference_context.sequence_len_offset
                     sequence_end = sequence_start + q_len
                     rotary_pos_emb = rotary_pos_emb[sequence_start:sequence_end]
-                elif packed_seq_params is None or self.config.context_parallel_size == 1:
+                elif packed_seq_params is None or runtime_cp_group.size() == 1:
                     # Shorten rotary_pos_emb to the sequence length when inference_params
                     # is not provided. This makes sure we can run forward directly with
                     # any sequence length. During training, the sequence length is always
@@ -1224,7 +1287,7 @@ class MLASelfAttention(MultiLatentAttention):
                     config=self.config,
                     cu_seqlens=cu_seqlens_q,
                     mscale=mscale,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=runtime_cp_group,
                     mla_rotary_interleaved=True,
                     max_seqlen=rope_freqs_max_seqlen,
                 )
@@ -1235,7 +1298,7 @@ class MLASelfAttention(MultiLatentAttention):
                     config=self.config,
                     cu_seqlens=cu_seqlens_kv,
                     mscale=mscale,
-                    cp_group=self.pg_collection.cp,
+                    cp_group=runtime_cp_group,
                     mla_rotary_interleaved=True,
                     max_seqlen=rope_freqs_max_seqlen,
                 )

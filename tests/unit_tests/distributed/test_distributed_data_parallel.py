@@ -27,6 +27,29 @@ class TestModel(torch.nn.Module):
         return x
 
 
+@pytest.mark.parametrize("fp8_param_gather", [False, True])
+def test_invalid_buffer_reuse_is_rejected_before_ddp_setup(fp8_param_gather):
+    kwargs = dict(
+        reuse_grad_buf_for_mxfp8_param_ag=True,
+        fp8_param_gather=fp8_param_gather,
+        grad_buffer_offload=fp8_param_gather,
+    )
+    error = ValueError if fp8_param_gather else AssertionError
+    match = "Gradient-buffer offload" if fp8_param_gather else "Reuse grad buffer"
+    ddp_config = DistributedDataParallelConfig(**kwargs)
+    ddp_config.finalize()
+    model_config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=1)
+    with pytest.raises(error, match=match):
+        DistributedDataParallel(model_config, ddp_config, TestModel(8, 8))
+
+    # Standalone callers can also edit the config after construction.
+    ddp_config = DistributedDataParallelConfig()
+    for name, value in kwargs.items():
+        setattr(ddp_config, name, value)
+    with pytest.raises(error, match=match):
+        DistributedDataParallel(model_config, ddp_config, TestModel(8, 8))
+
+
 class TestDistributedDataParallel:
     @classmethod
     def setup_class(cls):
@@ -41,7 +64,8 @@ class TestDistributedDataParallel:
         reason="Device mesh feature requires PyTorch 2.3 or later",
     )
     @pytest.mark.parametrize("dp_size", [2, 8])  # Test with 2 or 8 GPUs
-    def test_ddp_with_dp_process_groups(self, dp_size):
+    @pytest.mark.parametrize("bucket_policy", ["size", "automatic", "count", "no-overlap"])
+    def test_ddp_with_dp_process_groups(self, dp_size, bucket_policy):
         """Test that DDP works correctly with dp pgs from parallel state and user defined pgs."""
 
         # Skip test if we don't have enough GPUs
@@ -54,7 +78,16 @@ class TestDistributedDataParallel:
         output_dim = 17
 
         # Setup DDP config
-        ddp_config = DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=10000)
+        ddp_config = DistributedDataParallelConfig(
+            overlap_grad_reduce=bucket_policy != "no-overlap",
+            bucket_size=10000 if bucket_policy == "size" else None,
+            num_buckets=2 if bucket_policy in ("count", "no-overlap") else None,
+        )
+        expected_bucket_size = (
+            10000 if bucket_policy == "size" else max(40000000, 1000000 * dp_size)
+        )
+        if bucket_policy == "no-overlap":
+            expected_bucket_size = None
 
         # Create two identical models
         model1 = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
@@ -72,6 +105,12 @@ class TestDistributedDataParallel:
         ddp_model1 = DistributedDataParallel(
             transformer_config, ddp_config=ddp_config, module=model1
         )
+        ddp_config.validate()
+        assert ddp_config.bucket_size == expected_bucket_size
+        if bucket_policy != "size":
+            assert ddp_config._bucket_size_resolved
+        assert ddp_config.expert_data_parallel_sharding_strategy == "no_shard"
+        assert ddp_config.expert_outer_dp_sharding_strategy == "no_shard"
 
         # Initialize torch.distributed if not already initialized
         if not torch.distributed.is_initialized():
@@ -93,6 +132,8 @@ class TestDistributedDataParallel:
         ddp_model2 = DistributedDataParallel(
             transformer_config, ddp_config=ddp_config, module=model2, pg_collection=pg_collection
         )
+        ddp_config.validate()
+        assert ddp_config.bucket_size == expected_bucket_size
 
         # Create identical inputs with integer values
         batch_size = 2

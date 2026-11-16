@@ -54,7 +54,13 @@ def import_module(module_path: Tuple[str]):
 
     try:
         return vars(module)[name]
-    except KeyError as exc:
+    except KeyError:
+        pass
+    # A deprecated import path (megatron.core.ops._compat) serves its names through module
+    # __getattr__, which vars() does not see.
+    try:
+        return getattr(module, name)
+    except AttributeError as exc:
         raise ImportError(f"Could not find spec '{name}' in module '{base_path}'") from exc
 
 

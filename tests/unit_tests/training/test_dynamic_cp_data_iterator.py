@@ -8,9 +8,9 @@ from megatron.core.rerun_state_machine import RerunDataIterator, RerunMode, Reru
 
 def test_dynamic_cp_data_iterator_returns_rerun_iterator():
     """The rerun state machine asserts on the RerunDataIterator type at every
-    train step (rerun_state_machine._sanitize_data_iterators); the hybrid-CP
+    train step (rerun_state_machine._sanitize_data_iterators); the dynamic-CP
     wrap must preserve it. Regression: a raw iter() around
-    HybridCPDataLoaderWrapper stripped the wrapping and crashed before the
+    a dataloader wrapper stripped the wrapping and crashed before the
     first iteration.
     """
     fake_group = SimpleNamespace(size=lambda: 1, rank=lambda: 0)

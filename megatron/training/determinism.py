@@ -28,15 +28,12 @@ import torch.utils.deterministic
 
 # Maps each arg name to the value it must hold for bit-exact execution;
 # verified by :func:`apply_determinism_to_args`.
-ARG_VALUES_REQUIRED_FOR_DETERMINISM = {
-    "cross_entropy_loss_fusion": False,
-    "tp_comm_overlap": False,
-}
+ARG_VALUES_REQUIRED_FOR_DETERMINISM = {"cross_entropy_loss_fusion": False, "tp_comm_overlap": False}
 
 # Not in the dict above because it inherits: unset means "follow moe_router_fusion".
-# TE's fused aux-loss kernel is non-deterministic: on identical input it returns a
-# different aux loss run to run, while the unfused path is bit-identical. The fused TopK
-# routing has no such report against it, so it is not required off.
+# Older TE aux-loss kernels accumulate with unordered floating-point atomics. Keep their
+# fusion off under determinism; newer APIs accept a deterministic execution request.
+# Fused TopK routing can remain enabled independently.
 AUX_LOSS_FUSION_ARG = "moe_router_aux_loss_fusion"
 
 # Env-var defaults required for bit-exact reproducibility.
@@ -158,9 +155,9 @@ def apply_determinism_env(env: MutableMapping[str, str]) -> None:
     # haven't validated as deterministic; unset is fine.
     for name, accepted in ACCEPTED_ENV_VAR_VALUES.items():
         val = env.get(name)
-        assert val is None or val in accepted, (
-            f"{name}={val!r} is not a deterministic setting. Accepted: {sorted(accepted)}."
-        )
+        assert (
+            val is None or val in accepted
+        ), f"{name}={val!r} is not a deterministic setting. Accepted: {sorted(accepted)}."
 
     # Mamba SSM and causal_conv1d auto-follow torch when unset; only reject an
     # explicit non-deterministic override.
@@ -235,7 +232,16 @@ def apply_determinism_to_args(args) -> None:
     if aux_loss_fusion is None:
         aux_loss_fusion = getattr(args, "moe_router_fusion", False)
     if aux_loss_fusion:
-        mismatched.append(f"{AUX_LOSS_FUSION_ARG}=False (got {aux_loss_fusion!r})")
+        from megatron.core.extensions.transformer_engine import (
+            te_supports_deterministic_moe_aux_loss,
+        )
+
+        if not te_supports_deterministic_moe_aux_loss():
+            mismatched.append(
+                f"{AUX_LOSS_FUSION_ARG}=False (got {aux_loss_fusion!r}); "
+                "upgrade Transformer Engine to support fused_moe_aux_loss(deterministic=...) "
+                "or set --no-moe-router-aux-loss-fusion"
+            )
 
     assert (
         not mismatched

@@ -84,6 +84,14 @@ spec:
 # Keep inference in a separate process: the MFSDP v2 fixtures select the NCCL
 # symmetric-memory backend process-wide, and the NVLS dispatcher needs the CUDA backend.
 products:
+  # Run the same runtime-CP regressions on four ranks, outside the catch-all bucket.
+  - test_case: [tests/unit_tests/context_parallel/runtime/**/*.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   # This file runs in isolated one-rank processes; other buckets exclude it.
   - test_case: [tests/unit_tests/inference/test_batch_invariant_fp8.py]
     products:
