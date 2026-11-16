@@ -138,6 +138,38 @@ def _conv_dx(
     tl.store(DX + row * D + channel, dx, valid)
 
 
+@triton.jit
+def _conv_dw(
+    X,
+    DP,
+    Starts,
+    Partial,
+    N,
+    D: tl.constexpr,
+    PARTS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    ROWS: tl.constexpr,
+    CHANNELS: tl.constexpr,
+):
+    channel = tl.program_id(0) * CHANNELS + tl.arange(0, CHANNELS)
+    part = tl.program_id(1)
+    row = part * ROWS + tl.arange(0, ROWS)
+    valid = (row[:, None] < N) & (channel[None, :] < D)
+    dp = tl.load(DP + row[:, None] * D + channel[None, :], valid, other=0)
+    start = tl.load(Starts + row, row < N, other=N)
+    for tap in tl.static_range(4):
+        source = row + tap - 3
+        x = tl.load(
+            X + source[:, None] * D + channel[None, :],
+            valid & (source[:, None] >= start[:, None]),
+            other=0,
+        ).to(tl.float32)
+        dw = tl.sum(x * dp, 0)
+        tl.store(Partial + (tap * PARTS + part) * D + channel, dw, channel < D)
+    if HAS_BIAS:
+        tl.store(Partial + (4 * PARTS + part) * D + channel, tl.sum(dp, 0), channel < D)
+
+
 def _forward(x, weight, bias, initial, slots, cu, *, save_preactivation=False):
     b, t, d = x.shape
     c = weight.shape[-1]
@@ -233,15 +265,27 @@ class _Conv(torch.autograd.Function):
         else:
             ids = torch.bucketize(rows, cu[1:], right=True)
             starts = cu[ids]
-        dw = []
-        flat = x.reshape(b * t, d)
-        for tap in range(c):
-            source = rows + tap - c + 1
-            selected = flat[source.clamp_min(0)].float()
-            selected = selected.masked_fill((source < starts)[:, None], 0.0)
-            dw.append((selected * dp.reshape(b * t, d)).sum(0))
-        dw = torch.stack(dw, -1).reshape_as(weight).to(weight.dtype)
-        db = None if bias is None else dp.sum((0, 1)).to(bias.dtype)
+        parts = triton.cdiv(b * t, 256)
+        partial = torch.empty(
+            (4 + (bias is not None), parts, d), device=x.device, dtype=torch.float32
+        )
+        _conv_dw[(triton.cdiv(d, 32), parts)](
+            x,
+            dp,
+            starts,
+            partial,
+            b * t,
+            d,
+            parts,
+            bias is not None,
+            256,
+            32,
+            num_warps=4,
+            enable_fp_fusion=False,
+        )
+        reduced = partial.sum(1)
+        dw = reduced[:4].T.contiguous().reshape_as(weight).to(weight.dtype)
+        db = None if bias is None else reduced[4].to(bias.dtype)
         return dx, dw, db, None
 
 

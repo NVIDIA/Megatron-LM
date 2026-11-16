@@ -156,3 +156,47 @@ def test_prefill_writes_allocator_storage(block_size):
         exact(a, b)
     one = tuple(x[:, :1].contiguous() for x in xs)
     exact(append(*one, cache), append(*one, expected_cache))
+
+
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_packed_convolution_gradients(with_bias):
+    """Tiled parameter gradients must respect packed boundaries and odd channel counts."""
+    x = torch.randn(1, 517, 127, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(127, 4, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    bias = (
+        torch.randn(127, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        if with_bias
+        else None
+    )
+    offsets = [0, 1, 9, 129, 256, 517]
+    cu = torch.tensor(offsets, device="cuda", dtype=torch.int32)
+    variables = (x, weight, bias) if with_bias else (x, weight)
+    assert_replays_bit_exact(
+        lambda *args: causal_conv(*args, cu_seqlens=cu),
+        variables,
+        contention=True,
+        what="packed canonical conv4 gradients",
+    )
+    actual = causal_conv(*variables, cu_seqlens=cu)
+    grad_output = torch.randn_like(actual)
+    gradients = torch.autograd.grad(actual, variables, grad_output)
+    reference_variables = tuple(v.detach().double().requires_grad_() for v in variables)
+    rx, rw = reference_variables[:2]
+    outputs = []
+    for start, end in zip(offsets, offsets[1:]):
+        segment = rx[:, start:end]
+        acc = (
+            reference_variables[2][None, None, :].expand_as(segment)
+            if with_bias
+            else torch.zeros_like(segment)
+        )
+        for tap in range(4):
+            shifted = torch.nn.functional.pad(segment, (0, 0, 3 - tap, 0))[:, : end - start]
+            acc = acc + shifted * rw[:, tap]
+        outputs.append(torch.nn.functional.silu(acc))
+    reference = torch.cat(outputs, 1)
+    expected = torch.autograd.grad(reference, reference_variables, grad_output.double())
+    for value, target in zip(gradients, expected):
+        torch.testing.assert_close(
+            value.float(), target.to(value.dtype).float(), rtol=0.02, atol=0.02
+        )
