@@ -141,10 +141,13 @@ The `--decoder-seq-length` CLI flag remains accepted: VLM entrypoints translate
 it into their execution width, while T5 retains an independent decoder width.
 Decoder-only models do not acquire a second decoder-length config field.
 
-Core's schedule APIs are unchanged. The training loop passes the resolved model
-execution width as `seq_length`, without a separate decoder override. T5 retains
-separate model/dataset encoder and decoder lengths; its entrypoint does not support
-pipeline parallelism.
+Core's optional `decoder_seq_length` schedule argument is deprecated and will be
+removed in the 0.22 release. For compatibility, a supplied value still overrides
+`seq_length` in `get_tensor_shapes()` and the non-interleaved schedule; the
+no-pipeline and interleaved schedules continue to ignore it. The training loop
+passes the resolved model execution width as `seq_length`, without a separate
+decoder override. T5 retains separate model/dataset encoder and decoder lengths;
+its entrypoint does not support pipeline parallelism.
 
 Direct Python callers of the migrated callback dataset providers and task encoders
 must pass their length inputs explicitly instead of relying on global arguments.
