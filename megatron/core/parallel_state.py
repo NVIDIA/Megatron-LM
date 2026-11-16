@@ -34,7 +34,7 @@ import logging
 import os
 import warnings
 from datetime import timedelta
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 import torch
@@ -43,6 +43,9 @@ from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 
 from .tensor_parallel.gtp_parallel_layout import GTPParallelLayout
 from .utils import GlobalMemoryBuffer, is_torch_min_version
+
+if TYPE_CHECKING:
+    from .process_groups_config import ProcessGroupCollection
 
 logger = logging.getLogger(__name__)
 
@@ -681,7 +684,7 @@ def initialize_model_parallel(
     min_dynamic_context_parallel_size: int = 1,
     gtp_remat_num_sequence_shards: int = 1,
     create_all_gather_group: bool = False,
-) -> Optional[tuple[torch.distributed.ProcessGroup, Optional[torch.distributed.ProcessGroup]]]:
+) -> "ProcessGroupCollection":
     """Initialize model data parallel groups.
 
     Args:
@@ -830,13 +833,16 @@ def initialize_model_parallel(
 
         create_all_gather_group (bool, default = False):
             Create separate dense and, when EP > 1, expert all-gather communicators
-            over the weight-replica ranks. Return their handles to the caller.
+            over the weight-replica ranks. Include them in the returned collection.
             This creates communicators; parameter-gather overlap is configured separately.
 
     Returns:
-        None when create_all_gather_group is False; otherwise (dp_cp_ag, expt_dp_ag).
-        The expert handle is None when EP is 1. Attach the returned handles to the
-        application's ProcessGroupCollection; no AG handles are stored in MPU globals.
+        ProcessGroupCollection containing the initialized ordinary groups and optional
+        all-gather groups. The AG fields are None when create_all_gather_group is False;
+        expt_dp_ag is also None when EP is 1. Retain this collection and pass it to model
+        components. Ordinary groups still use the existing single-grid MPU bootstrap;
+        no AG handles are stored in MPU globals. Callers may ignore the return value,
+        but it is no longer None.
 
     Let's say we have a total of 16 GPUs denoted by g0 ... g15 and we
     use 2 GPUs to parallelize the model tensor, and 4 GPUs to parallelize
@@ -1764,13 +1770,18 @@ def initialize_model_parallel(
     # we could stick it there
     _set_global_memory_buffer()
 
+    # Bootstrap compatibility: ordinary groups still come from the existing MPU grid.
+    # Import here because process_groups_config itself imports parallel_state.
+    from .process_groups_config import ProcessGroupCollection
+
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     if create_all_gather_group:
-        return create_all_gather_groups(
+        pg_collection.dp_cp_ag, pg_collection.expt_dp_ag = create_all_gather_groups(
             for_expert_parallelism=expert_model_parallel_size > 1,
             timeout=timeout,
             nccl_comm_cfgs=nccl_comm_cfgs,
         )
-    return None
+    return pg_collection
 
 
 def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_comm_cfgs=None):
@@ -1780,7 +1791,7 @@ def create_all_gather_groups(for_expert_parallelism=False, timeout=None, nccl_co
     Creates separate communicators with the same ranks as data parallel groups
     to enable overlapping all-gather operations with reduce-scatter operations.
     Prefer initialize_model_parallel(create_all_gather_group=True) for standard bootstrap
-    and retain its returned handles. This helper always creates new, caller-owned groups;
+    and retain its returned collection. This helper always creates new, caller-owned groups;
     do not call it again to retrieve groups already created by the initializer.
 
     Args:

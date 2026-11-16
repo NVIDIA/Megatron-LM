@@ -144,8 +144,8 @@ class DistributedInitConfig:
 
     create_all_gather_group: bool = False
     """Create separate parameter all-gather communicators over dense and, when EP > 1,
-    expert weight-replica ranks. Initialization returns handles for the application to
-    attach to its ProcessGroupCollection. Parameter-gather overlap is configured separately.
+    expert weight-replica ranks. Initialization includes these groups in its returned
+    ProcessGroupCollection. Parameter-gather overlap is configured separately.
     """
 
     use_sharp: bool = False

@@ -16,6 +16,7 @@ import pytest
 import torch
 
 from megatron.core.distributed import TorchFullyShardedDataParallelConfig
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer import TransformerConfig
 from megatron.training import arguments, global_vars, initialize
@@ -247,8 +248,10 @@ def test_distributed_initialization_prefers_config_to_args(
     set_device = Mock()
     monkeypatch.setattr(initialize.torch.cuda, "set_device", set_device)
     monkeypatch.setattr(initialize.torch.distributed, "is_initialized", lambda: False)
-    ag_groups = (object(), None) if dist_ag else None
-    init_pg, init_mpu = Mock(), Mock(return_value=ag_groups)
+    pg_collection = ProcessGroupCollection()
+    pg_collection.dp_cp_ag = object() if dist_ag else None
+    pg_collection.expt_dp_ag = None
+    init_pg, init_mpu = Mock(), Mock(return_value=pg_collection)
     monkeypatch.setattr(initialize.torch.distributed, "init_process_group", init_pg)
     monkeypatch.setattr(initialize.inprocess_restart, "maybe_force_nccl_backend_init", Mock())
     monkeypatch.setattr(initialize.mpu, "model_parallel_is_initialized", lambda: False)
@@ -264,7 +267,7 @@ def test_distributed_initialization_prefers_config_to_args(
     store = object()
 
     result = initialize._initialize_distributed(None, None, store)
-    assert result is ag_groups
+    assert result is pg_collection
 
     set_device.assert_called_once_with(1)
     init_pg.assert_called_once_with(

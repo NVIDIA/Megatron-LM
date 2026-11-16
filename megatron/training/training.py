@@ -1440,7 +1440,7 @@ def pretrain(
     skip_random_seed = isinstance(pg_collection, MultiModuleProcessGroupCollection)
 
     # Initalize and get arguments, timers, and Tensorboard writer.
-    ag_groups = initialize_megatron(
+    initialized_pg_collection = initialize_megatron(
         training=True,
         build_tokenizer=build_tokenizer,
         get_embedding_ranks=get_embedding_ranks,
@@ -1724,11 +1724,13 @@ def pretrain(
             args, train_valid_test_dataset_provider
         )
 
-    # Attach returned handles here; lazy bootstrap may return a continuation instead.
-    if isinstance(ag_groups, tuple):
+    # Lazy bootstrap may return a continuation; skipped setup retains the caller's groups.
+    if isinstance(initialized_pg_collection, ProcessGroupCollection):
         if pg_collection is None:
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-        pg_collection.dp_cp_ag, pg_collection.expt_dp_ag = ag_groups
+            pg_collection = initialized_pg_collection
+        elif cfg_container.dist.create_all_gather_group:
+            pg_collection.dp_cp_ag = initialized_pg_collection.dp_cp_ag
+            pg_collection.expt_dp_ag = initialized_pg_collection.expt_dp_ag
 
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)

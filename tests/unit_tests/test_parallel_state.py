@@ -648,16 +648,17 @@ def test_valid_dynamic_cp_group_sizes():
 
 @pytest.mark.parametrize("create_on_init", [False, True])
 def test_separate_all_gather_group(create_on_init):
-    """Returned AG handles attach to the existing collection without MPU AG globals."""
-    ag_groups = Utils.initialize_model_parallel(
+    """Initialization returns ordinary groups plus optional AG groups without AG globals."""
+    pg_collection = Utils.initialize_model_parallel(
         context_parallel_size=world_size, create_all_gather_group=create_on_init
     )
+    assert isinstance(pg_collection, ProcessGroupCollection)
+    assert pg_collection.tp is ps.get_tensor_model_parallel_group()
+    assert pg_collection.pp is ps.get_pipeline_model_parallel_group()
     if not create_on_init:
-        assert ag_groups is None
-        ag_groups = ps.create_all_gather_groups()
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    assert pg_collection.dp_cp_ag is None
-    pg_collection.dp_cp_ag, pg_collection.expt_dp_ag = ag_groups
+        assert pg_collection.dp_cp_ag is None
+        assert pg_collection.expt_dp_ag is None
+        pg_collection.dp_cp_ag, pg_collection.expt_dp_ag = ps.create_all_gather_groups()
     assert pg_collection.dp_cp_ag is not None
     assert torch.distributed.get_process_group_ranks(pg_collection.dp_cp_ag) == (
         torch.distributed.get_process_group_ranks(pg_collection.dp_cp)
@@ -669,20 +670,22 @@ def test_separate_all_gather_group(create_on_init):
 
 @pytest.mark.parametrize("create_on_init", [False, True])
 def test_expert_all_gather_group(create_on_init):
-    """Default-topology expert AG handles are returned or created explicitly."""
+    """The returned collection includes ordinary expert groups and optional expert AG."""
     if world_size < 8 or world_size % 8:
         pytest.skip("Requires a world size divisible by eight")
-    ag_groups = Utils.initialize_model_parallel(
+    pg_collection = Utils.initialize_model_parallel(
         pipeline_model_parallel_size=2,
         expert_model_parallel_size=2,
         create_all_gather_group=create_on_init,
     )
+    assert isinstance(pg_collection, ProcessGroupCollection)
+    assert pg_collection.expt_dp is ps.get_expert_data_parallel_group(with_gtp_remat=False)
     if not create_on_init:
-        assert ag_groups is None
-        ag_groups = ps.create_all_gather_groups(for_expert_parallelism=True)
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
-    assert pg_collection.expt_dp_ag is None
-    pg_collection.dp_cp_ag, pg_collection.expt_dp_ag = ag_groups
+        assert pg_collection.dp_cp_ag is None
+        assert pg_collection.expt_dp_ag is None
+        pg_collection.dp_cp_ag, pg_collection.expt_dp_ag = ps.create_all_gather_groups(
+            for_expert_parallelism=True
+        )
     assert pg_collection.expt_dp_ag is not None
     assert torch.distributed.get_process_group_ranks(pg_collection.expt_dp_ag) == (
         torch.distributed.get_process_group_ranks(pg_collection.expt_dp)

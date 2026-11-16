@@ -191,6 +191,12 @@ all-gather communicators. The command-line option is `--create-all-gather-group`
 Retain the resulting `ProcessGroupCollection` and pass it to model/FSDP
 construction. Parameter-gather overlap is configured separately.
 
+Core's `initialize_model_parallel()` returns the complete `ProcessGroupCollection`,
+including ordinary groups and optional `dp_cp_ag` / `expt_dp_ag` groups. It returns
+a collection even when AG creation is disabled; callers may still ignore the
+result. Ordinary groups currently come from the existing single-grid MPU
+bootstrap, so this return interface does not introduce independent per-model grids.
+
 The setting has moved from `DistributedDataParallelConfig` to
 `DistributedInitConfig`. Update programmatic or YAML configurations that use
 `ddp.create_all_gather_group` to use `dist.create_all_gather_group`; the DDP field
