@@ -27,31 +27,26 @@ class PrefetchOrder(enum.Enum):
 
 @dataclass(frozen=True)
 class RuntimePolicy:
-    """Configure communication, prefetch, and gradient synchronization for an FSDP context.
-
-    Attributes:
-        use_symmetric_memory: Allocate communication staging buffers from PyTorch's
-            NCCL symmetric-memory pool.
-        overlap_allgather_reduction: Use separate all-gather and reduction streams.
-            Disable to reduce peak transient memory. See
-            https://github.com/NVIDIA/Megatron-LM/issues/6471.
-        overlap_outer_communication: Run the last-microbatch DP-outer reduction on
-            a separate stream, independently of overlap_allgather_reduction.
-            prefetch_order: ``REGISTRATION`` expects a forward/backward pass matching module
-                registration order. ``RECORDED`` gathers parameters on demand and records
-                module calls until the first ``post_backward()``. Subsequent passes must
-                repeat the complete sequence consistently across data-parallel ranks.
-                Recording currently requires the ordinary module hooks; combined 1F1B
-                bypasses them. Discard the context if the recorded pass raises.
-        caller_managed_grad_sync: Leave gradient synchronization to the caller
-            while retaining automatic weight cleanup. The caller must call
-            finish_grad_sync() after all backward work, including delayed weight
-            gradients, and before reading or modifying gradients.
-    """
+    """Configure communication allocation, streams, and prefetch for an FSDP context."""
 
     use_symmetric_memory: bool = False
+    """Allocate communication staging buffers from PyTorch's NCCL symmetric-memory pool."""
+
     overlap_allgather_reduction: bool = True
+    """Use separate all-gather and reduction streams.
+
+    Disable to reduce peak transient memory. See
+    https://github.com/NVIDIA/Megatron-LM/issues/6471.
+    """
+
     overlap_outer_communication: bool = False
-    caller_managed_grad_sync: bool = False
+    """Run DP-outer reduction on a separate stream, independently of all-gather overlap."""
 
     prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION
+    """``REGISTRATION`` expects a forward/backward pass matching module
+    registration order. ``RECORDED`` gathers parameters on demand and records
+    module calls until the first ``post_backward()``. Subsequent passes must
+    repeat the complete sequence consistently across data-parallel ranks.
+    Recording currently requires the ordinary module hooks; combined 1F1B
+    bypasses them. Discard the context if the recorded pass raises.
+    """
