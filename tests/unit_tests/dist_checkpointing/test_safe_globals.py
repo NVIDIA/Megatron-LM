@@ -180,3 +180,25 @@ class TestSafeNumpyLoad:
         assert not errors
         for i, arr in arrays.items():
             np.testing.assert_array_equal(results[i], arr)
+
+
+class TestSafeDCPMetadata:
+    def test_dcp_metadata_roundtrip_and_malicious(self, tmp_path_dist_ckpt):
+        import os
+        import torch.distributed.checkpoint as dcp
+
+        sd = {"a": torch.randn(4, 4), "b": torch.ones(2, dtype=torch.bfloat16)}
+        ckpt = tmp_path_dist_ckpt / "dcp_meta"
+        dcp.save(sd, checkpoint_id=str(ckpt))
+
+        out = {k: torch.zeros_like(v) for k, v in sd.items()}
+        dcp.load(out, checkpoint_id=str(ckpt))  # legit metadata still loads
+        assert torch.equal(out["a"], sd["a"])
+
+        class Evil:
+            def __reduce__(self):
+                return (os.system, ("echo pwned",))
+
+        (ckpt / ".metadata").write_bytes(pickle.dumps(Evil()))
+        with pytest.raises(Exception, match="Refusing to unpickle"):
+            dcp.load(out, checkpoint_id=str(ckpt))
