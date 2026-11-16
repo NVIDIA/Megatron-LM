@@ -19,12 +19,10 @@ experimental:
   basepath-aware: true
 
 versions:
-  - display-name: "nightly"
-    ref: main
-    slug: nightly
-  - display-name: "0.20.0 (latest)"
+  - display-name: "Nightly"
     path: ../docs/index.yml
-    slug: latest
+    slug: nightly
+    default: true
   - display-name: "Archives"
     path: versions/archives.yml
     slug: archives
