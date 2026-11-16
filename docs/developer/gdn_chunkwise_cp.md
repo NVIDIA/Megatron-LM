@@ -8,8 +8,10 @@ the forward and backward state-summary operations.
 
 The initial implementation supports TP1, no sequence parallelism, batch-one
 packed THD or dense input, and fused pre-GDN preparation. Physical packed lengths
-must be divisible by twice the CP size. CUDA graph capture and deterministic
-mode are unsupported. CP1 retains the ordinary local GDN path.
+must be divisible by twice the CP size. CUDA graphs support fixed physical packing
+after warming the exact graph input buffers outside capture. Changing physical
+packing requires recapture. Deterministic mode is unsupported. CP1 retains the
+ordinary local GDN path.
 
 Input and output retain per-document zigzag ownership. Inside each GDN layer,
 hidden states move to globally contiguous shards, exchange a convolution halo,

@@ -6,7 +6,14 @@ import pytest
 import torch
 from tests.unit_tests.test_utilities import Utils
 
-from megatron.core.ssm.context_parallel.gdn_layout import _Redistributor, build_layout_plan
+from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.ssm.context_parallel import gdn_layout
+from megatron.core.ssm.context_parallel.gdn_layout import (
+    _Redistributor,
+    build_layout_plan,
+    get_chunkwise_layout,
+)
+from megatron.core.transformer.cuda_graphs import capture_constants, release_capture_constants
 
 
 @pytest.mark.parametrize("boundaries", [(0, 64), (0, 8, 32, 64), (0, 16, 48, 128)])
@@ -45,7 +52,8 @@ def test_reject_invalid_physical_packing(boundaries):
 
 
 @pytest.mark.parametrize("size", [2, 4])
-def test_transport_values_and_adjoint(size):
+@pytest.mark.parametrize("capture", [False, True])
+def test_transport_values_and_adjoint(size, capture):
     """A weighted loss checks both ownership and the reverse collective in backward."""
     Utils.initialize_model_parallel(context_parallel_size=size)
     try:
@@ -65,8 +73,45 @@ def test_transport_values_and_adjoint(size):
             .requires_grad_()
         )
         transport = _Redistributor(build_layout_plan(boundaries, size, rank), group, x.device)
-        y = transport.forward(x)
         expected = torch.arange(rank * len(x), (rank + 1) * len(x), device=x.device).unsqueeze(-1)
+        if capture:
+            cu = torch.tensor(boundaries, dtype=torch.int32, device=x.device)
+            packed = PackedSeqParams(qkv_format="thd", cu_seqlens_q=cu, cu_seqlens_kv=cu)
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                for _ in range(3):
+                    transport, *_ = get_chunkwise_layout(x, packed, group, 4)
+                    transport.forward(x).sum().backward()
+            torch.cuda.current_stream().wait_stream(stream)
+            x.grad = None
+            graph = torch.cuda.CUDAGraph()
+            with capture_constants(graph), torch.cuda.graph(graph, stream=stream):
+                transport, *_ = get_chunkwise_layout(x, packed, group, 4)
+                y = transport.forward(x)
+                restored = transport.inverse(y)
+                (y * (expected + 1)).sum().backward()
+            # Replay must retain the index and metadata buffers after LRU eviction.
+            with gdn_layout._lock:
+                gdn_layout._entries.clear()
+            del transport
+            for offset in (0, 17):
+                with torch.no_grad():
+                    x.copy_(torch.tensor(positions, device=x.device).unsqueeze(-1) + offset)
+                    x.grad.zero_()
+                graph.replay()
+                torch.testing.assert_close(y, expected.float() + offset, rtol=0, atol=0)
+                torch.testing.assert_close(restored, x, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    x.grad,
+                    torch.tensor(positions, device=x.device).unsqueeze(-1).float() + 1,
+                    rtol=0,
+                    atol=0,
+                )
+            graph.reset()
+            release_capture_constants(graph)
+            return
+        y = transport.forward(x)
         torch.testing.assert_close(y, expected.float(), rtol=0, atol=0)
         torch.testing.assert_close(transport.inverse(y), x, rtol=0, atol=0)
         (y * (expected + 1)).sum().backward()

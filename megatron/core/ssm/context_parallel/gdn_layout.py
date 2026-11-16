@@ -11,6 +11,7 @@ from threading import RLock
 import torch
 
 from megatron.core.ssm.context_parallel.chunkwise import build_packed_sequence_cp_metadata
+from megatron.core.transformer.cuda_graphs import register_capture_constant
 
 
 @dataclass(frozen=True)
@@ -161,11 +162,10 @@ def get_chunkwise_layout(hidden, packed, group, conv_kernel):
     """Reuse immutable packing across GDN layers with bounded, stream-safe storage.
 
     Weak references and tensor mutation versions prevent stale identity reuse.
-    Inference tensors without versions bypass caching. Graph capture is currently
-    unsupported because cache misses require validation of physical boundaries.
+    Inference tensors without versions bypass caching. Capture reuses a layout
+    warmed with these input buffers; physical packing is constant until recapture.
     """
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError("GDN chunkwise CP does not yet support CUDA graph capture")
+    capturing = torch.cuda.is_current_stream_capturing()
     cu, kv = None, None
     if packed is not None:
         if packed.qkv_format != "thd":
@@ -185,6 +185,8 @@ def get_chunkwise_layout(hidden, packed, group, conv_kernel):
     try:
         versions = tuple(t._version if t is not None else None for t in (cu, kv))
     except RuntimeError:
+        if capturing:
+            raise RuntimeError("GDN CUDA graph packing tensors must have mutation versions")
         return _build_layout(hidden, cu, kv, group, conv_kernel)
     key = (
         id(cu),
@@ -208,7 +210,15 @@ def get_chunkwise_layout(hidden, packed, group, conv_kernel):
                 current.wait_event(ready)
                 for tensor in tensors:
                     tensor.record_stream(current)
+            if capturing:
+                for tensor in tensors:
+                    register_capture_constant(tensor)
             return result
+        if capturing:
+            raise RuntimeError(
+                "Warm the GDN chunkwise layout outside capture with the graph's physical "
+                "packing buffers; changed physical packing requires recapture"
+            )
         result = _build_layout(hidden, cu, kv, group, conv_kernel)
         tensors = tuple(_tensors(result))
         current = torch.cuda.current_stream(hidden.device)
