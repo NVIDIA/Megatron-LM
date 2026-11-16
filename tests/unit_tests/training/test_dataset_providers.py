@@ -47,7 +47,14 @@ def test_sft_truncates_conversations_before_packing():
         tokenize_conversation=lambda *a, **kw: (torch.arange(1, 11), torch.arange(1, 11)),
     )
     config = SFTDatasetConfig(
-        random_seed=1234, sequence_length=4, packed_sequence_length=12, tokenizer=tokenizer
+        random_seed=1234,
+        sequence_length=4,
+        packed_sequence_length=12,
+        tokenizer=tokenizer,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        create_attention_mask=False,
     )
     dataset = object.__new__(SFTDataset)
     dataset.config = config
@@ -369,11 +376,7 @@ def test_entry_points_build_the_dataset_config_pretrain_gpt_built(
         expected_config_type = (
             SFTDatasetConfig
             if args.sft
-            else (
-                varlen_dataset.VarlenDatasetConfig
-                if args.use_varlen_dataset and entry_point != "prepare_cache"
-                else GPTFIMDatasetConfig if args.fim_data else GPTDatasetConfig
-            )
+            else GPTFIMDatasetConfig if args.fim_data else GPTDatasetConfig
         )
         assert type(actual) is expected_config_type
         names = [f.name for f in fields(actual) if f.name != "packed_sequence_length"]
@@ -501,40 +504,6 @@ def test_fim_request_without_a_source_is_rejected(monkeypatch, warnings_log):
     assert isinstance(data.dataset, GPTDatasetConfig) and data.dataset.blend is None
     with pytest.raises(ValueError, match="no mock dataset for the fim family"):
         data.validate()
-
-
-@pytest.mark.parametrize(
-    "config_cls,dataset_cls",
-    [
-        (SFTDatasetConfig, SFTDataset),
-        (varlen_dataset.VarlenDatasetConfig, varlen_dataset.VarlenDataset),
-    ],
-)
-def test_online_fast_cache_keeps_sample_indices_without_rank_zero_barriers(
-    monkeypatch, tmp_path, config_cls, dataset_cls
-):
-    tokenizer = build_tokenizer(_validated([], {}))
-    config = config_cls(
-        random_seed=1234,
-        sequence_length=32,
-        tokenizer=tokenizer,
-        context_parallel_size=1,
-        blend_per_split=[(["offline"], None), None, None],
-        path_to_cache=str(tmp_path),
-        fast_cache_load=True,
-    )
-    monkeypatch.setattr(dataset_cls, "build_low_level_dataset", lambda *args: [[], [], [], []])
-    monkeypatch.setattr(
-        torch.distributed,
-        "barrier",
-        lambda *args, **kwargs: pytest.fail("unexpected cache barrier"),
-    )
-    builder = BlendedMegatronDatasetBuilder(dataset_cls, [4, 0, 0], lambda: True, config)
-    splits = builder._build_megatron_datasets_parallel(
-        ["offline"], [(0.0, 1.0), None, None], [[4, 0, 0]]
-    )
-    assert splits[0][0].indices.tolist() == [0, 1, 2, 3]
-    assert splits[0][0].config is config
 
 
 class TestProvidersBuildMockDatasets:

@@ -40,11 +40,7 @@ from megatron.training.config import (
 from megatron.training.config import container as container_module
 from megatron.training.config.dataset_config import CONTAINER_WRITTEN_FIELDS
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
-from megatron.training.datasets.varlen_dataset import (
-    MockVarlenDataset,
-    VarlenDataset,
-    VarlenDatasetConfig,
-)
+from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 from megatron.training.models import GPTModelConfig, LLaVAModelConfig, T5ModelConfig
 
 MODEL_ARGV = (
@@ -68,7 +64,7 @@ CORE_DEFAULTS = {
 
 
 def _written_fields(dataset):
-    return {name: getattr(dataset, name) for name in CORE_DEFAULTS if hasattr(dataset, name)}
+    return {name: getattr(dataset, name) for name in CORE_DEFAULTS}
 
 
 @pytest.fixture(scope="module")
@@ -210,8 +206,7 @@ def test_container_from_args_builds_the_core_fields_from_every_data_argument(
     dataset = data.dataset
     assert type(dataset) is GPTDatasetConfig and data.dataset_type is GPTDataset
     for field_name, source in _DATASET_FIELD_SOURCES.items():
-        if hasattr(dataset, field_name):
-            assert getattr(dataset, field_name) == getattr(args, source), field_name
+        assert getattr(dataset, field_name) == getattr(args, source), field_name
     assert dataset.sequence_length == 64 and dataset.split == "9,1,0"
     assert dataset.blend == BLEND and dataset.blend_per_split is None
     assert dataset.sequences_per_dataset == {"prefix-a": [10, 2], "prefix-b": [20, 4]}
@@ -227,9 +222,7 @@ def test_container_from_args_builds_the_core_fields_from_every_data_argument(
     # Runtime state and the fields the container writes are not taken from the arguments by the
     # container factory.
     assert dataset.tokenizer is None
-    assert _written_fields(dataset) == {
-        k: v for k, v in CORE_DEFAULTS.items() if hasattr(dataset, k)
-    }
+    assert _written_fields(dataset) == CORE_DEFAULTS
     assert data.dataloader == DataloaderConfig(
         dataloader_type="cyclic", num_workers=0, data_sharding=False
     )
@@ -350,8 +343,8 @@ def test_every_data_argument_is_forwarded(files, tmp_path):
         _parse([*argv, "--per-dataset-sequences-path", files["sequences"]])
     ).dataset
     assert dataset.allow_ambiguous_pad_tokens is True and dataset.inter_document_masking is True
-    assert not hasattr(dataset, "sft_mock_dataset_config_json")
-    assert not hasattr(dataset, "varlen_mock_dataset_config_json")
+    assert dataset.sft_mock_dataset_config_json == "{}"
+    assert dataset.varlen_mock_dataset_config_json == "{}"
     assert dataset.sequences_per_dataset == {"prefix-a": [10, 2], "prefix-b": [20, 4]}
     with pytest.raises(FileNotFoundError):
         gpt_data_config_from_args(
@@ -374,9 +367,14 @@ def test_standalone_config_takes_the_container_written_fields_from_args():
     standalone = gpt_data_config_from_args(args, standalone=True).dataset
     assert standalone.random_seed == 99 and standalone.full_validation is True
     assert standalone.multiple_validation_sets is False
-    assert not any(hasattr(standalone, name) for name in LAYOUT_FIELDS)
+    assert standalone.data_parallel_size == args.data_parallel_size
+    assert standalone.context_parallel_size == args.context_parallel_size
+    assert standalone.sequence_parallel_size == args.tensor_model_parallel_size * int(
+        args.sequence_parallel
+    )
+    assert standalone.dynamic_context_parallel is False
     owned = gpt_data_config_from_args(args).dataset
-    assert _written_fields(owned) == {k: v for k, v in CORE_DEFAULTS.items() if hasattr(owned, k)}
+    assert _written_fields(owned) == CORE_DEFAULTS
     assert owned.random_seed == 99  # the seed is the section's own setting
     assert set(argument_utils._container_written_fields_from_args(args)) == (
         set(CONTAINER_WRITTEN_FIELDS) - {"packed_sequence_length"}
@@ -1011,7 +1009,13 @@ def test_varlen_datasets_and_the_packing_scheduler(container_factory):
     from megatron.training.config import DataConfig
 
     _, cfg = container_factory(["--seq-length", "64"])
-    plain = VarlenDatasetConfig(sequence_length=64, random_seed=1)
+    plain = GPTDatasetConfig(
+        sequence_length=64,
+        random_seed=1,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
     cfg.data = DataConfig(
         dataset=plain, dataset_type=MockVarlenDataset, dataloader=cfg.data.dataloader
     )
@@ -1020,12 +1024,15 @@ def test_varlen_datasets_and_the_packing_scheduler(container_factory):
         cfg.validate()
     cfg.model = _layout(sequence_packing_scheduler="dp_balanced")
     cfg.validate()
-    sbhd = VarlenDatasetConfig(
+    sbhd = GPTDatasetConfig(
         sequence_length=64,
         random_seed=1,
         blend=(["prefix-a"], None),
         split="9,1,0",
         varlen_sbhd_validation=True,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
     )
     cfg.data = DataConfig(dataset=sbhd, dataset_type=VarlenDataset, dataloader=cfg.data.dataloader)
     with pytest.raises(ValueError, match="does not use a packing scheduler"):
@@ -1295,7 +1302,13 @@ def test_a_scheduler_selected_after_construction_needs_variable_seq_lengths(
         transformer.sequence_packing_scheduler = "dp_balanced"  # after construction
     _, cfg = container_factory(["--seq-length", "16", "--mock-data", "--sft"], data=True)
     cfg.data = DataConfig(
-        dataset=VarlenDatasetConfig(random_seed=1, sequence_length=16),
+        dataset=GPTDatasetConfig(
+            random_seed=1,
+            sequence_length=16,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+        ),
         dataset_type=MockVarlenDataset,
     )
     cfg.model = GPTModelConfig(transformer=transformer, seq_length=64, vocab_size=16)

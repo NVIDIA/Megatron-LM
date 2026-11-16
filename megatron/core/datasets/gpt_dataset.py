@@ -48,20 +48,64 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
        output tokens are both of the desired sequence length
     """
 
-    mmap_bin_files: bool = True
-    """Whether to mmap indexed .bin files rather than use file pointers."""
-
     object_storage_cache_path: Optional[str] = None
     """Path for caching indices for s3 or msc dataloading."""
+
+    data_parallel_size: int = 1
+    """Option to enable data parallelism"""
+
+    sequence_parallel_size: int = 0
+    """Option to indicate the sequence parallelism size when using TP
+    Set to 0 if sequence parallel is not enabled regardless of TP size.
+    """
+
+    dynamic_context_parallel: bool = False
+    """Option to enable dynamic context parallelism. When setting this to True,
+    each sample should be divisible by the data parallel size * context parallel size * 2.
+    If sequence parallel is enabled, it should be divisible by the
+    data parallel size * context parallel size * sequence parallel size * 2.
+    """
 
     sequences_per_dataset: Optional[Dict[str, int]] = None
     """If provided, the sequence and document counts for each dataset. 
        Check --per-dataset-sequences-path
     """
 
+    context_parallel_size: Optional[int] = None
+    """The size of the context parallel group. Needed for padding in packed sequences."""
+
     inter_document_masking: bool = False
     """When True, return cu_seqlens marking document boundaries within each sample so
     that attention is restricted to individual documents."""
+    sft_mock_dataset_config_json: Optional[str] = None
+    """JSON string (or path to a JSON file) configuring the mock SFT dataset's
+    sequence-length distribution. Two modes:
+
+      * ``{"mode": "file", "path": "/path/to/seqlens.csv"}`` -- read the
+        per-sample sequence lengths from a CSV file.
+      * ``{"mode": "distribution", "type": "lognormal", "min_seq_len": 1024,
+        "max_seq_len": 8192, "mean_seq_len": 4096, "lognormal_sigma": 1.1}``
+        -- draw lengths from a clipped lognormal distribution.
+
+    Consumed by ``MockSFTLowLevelDataset`` in
+    ``megatron/training/datasets/sft_dataset.py``, which documents the fields.
+    """
+
+    varlen_mock_dataset_config_json: Optional[str] = None
+    """Mock-dataset config (same JSON schema as ``sft_mock_dataset_config_json``)
+    used by the ``--use-varlen-dataset`` path; kept separate so the varlen path
+    does not implicitly inherit SFT-specific knobs."""
+
+    varlen_sbhd_validation: bool = False
+    """When True, :class:`VarlenDataset.__getitem__` emits SBHD samples padded
+    to ``sequence_length`` (no ``cu_seqlens`` / ``original_seq_len`` /
+    ``padded_seq_len``), bypassing the packed-sequence path. Used to obtain a
+    SBHD reference run that mirrors the THD path's tokenization but skips all
+    packing — useful for THD numerical-correctness validation.
+
+    NOTE: this is a debugging/verification knob, not a training feature.
+    TODO: drop this field once a functional test covers THD-vs-SBHD numerical
+    parity in CI."""
 
     def validate(self) -> None:
         """Check a complete config: ``validate_without_tokenizer()``, then the tokenizer and what
@@ -85,7 +129,8 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
             fix the tokenizer."
 
     def validate_without_tokenizer(self) -> None:
-        """Check the base settings and the three masking / loss booleans without a tokenizer.
+        """The checks that need no tokenizer: the base class's, the three masking / loss booleans,
+        and the SBHD / dynamic-CP exclusion.
         ``validate()`` runs them first; a caller that checks a config before its tokenizer exists
         runs this alone."""
         super().validate_without_tokenizer()
@@ -93,6 +138,12 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
         assert self.reset_position_ids is not None, "reset_position_ids must be defined."
         assert self.reset_attention_mask is not None, "reset_attention_mask must be defined."
         assert self.eod_mask_loss is not None, "eod_mask_loss must be defined."
+
+        if self.varlen_sbhd_validation:
+            assert not self.dynamic_context_parallel, (
+                "--varlen-sbhd-validation is incompatible with "
+                "--dynamic-context-parallel (SBHD mode is not packed)."
+            )
 
     @property
     def token_dtype_code(self) -> Optional[int]:

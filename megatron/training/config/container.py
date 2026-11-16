@@ -56,7 +56,6 @@ from megatron.training.config.utils import (
     serialize_value,
 )
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.datasets.online_tokenized_dataset_config import OnlineTokenizedDatasetConfig
 from megatron.training.datasets.sft_dataset import SFTDatasetConfig
 from megatron.training.models import (
     BertModelConfig,
@@ -68,6 +67,7 @@ from megatron.training.models.base import ModelConfig
 
 T = TypeVar("T", bound="ConfigContainerBase")
 logger = logging.getLogger(__name__)
+
 
 @dataclass(kw_only=True)
 class ConfigContainerBase:
@@ -143,7 +143,9 @@ class ConfigContainerBase:
 
         if extra_keys:
             if mode == InstantiationMode.STRICT:
-                raise ValueError(f"Dictionary contains extra keys not in {cls.__qualname__}: {extra_keys}")
+                raise ValueError(
+                    f"Dictionary contains extra keys not in {cls.__qualname__}: {extra_keys}"
+                )
             else:
                 # In lenient mode, remove extra keys
                 for key in extra_keys:
@@ -155,7 +157,9 @@ class ConfigContainerBase:
         return instance
 
     @classmethod
-    def from_yaml(cls: Type[T], yaml_path: str, mode: InstantiationMode = InstantiationMode.LENIENT) -> T:
+    def from_yaml(
+        cls: Type[T], yaml_path: str, mode: InstantiationMode = InstantiationMode.LENIENT
+    ) -> T:
         """
         Create a config container from a YAML file.
 
@@ -245,8 +249,7 @@ class ConfigContainerBase:
         """
         if not HAVE_YAML:
             raise ImportError(
-                "PyYAML is required to save a config to YAML. "
-                "Install via `pip install pyyaml`."
+                "PyYAML is required to save a config to YAML. " "Install via `pip install pyyaml`."
             )
 
         config_dict = self.to_dict(**section_overrides)
@@ -261,8 +264,7 @@ class ConfigContainerBase:
         """
         if not HAVE_YAML:
             raise ImportError(
-                "PyYAML is required to print a config as YAML. "
-                "Install via `pip install pyyaml`."
+                "PyYAML is required to print a config as YAML. " "Install via `pip install pyyaml`."
             )
 
         config_dict = self.to_dict()
@@ -424,15 +426,23 @@ class PretrainConfigContainer(ConfigContainerBase):
         if self.train.train_iters:
             if self.scheduler.lr_decay_iters is None:
                 self.scheduler.lr_decay_iters = self.train.train_iters
-            self.scheduler.lr_decay_steps = self.scheduler.lr_decay_iters * self.train.global_batch_size
+            self.scheduler.lr_decay_steps = (
+                self.scheduler.lr_decay_iters * self.train.global_batch_size
+            )
             self.scheduler.wd_incr_steps = self.train.train_iters * self.train.global_batch_size
             self.scheduler.wsd_decay_steps = None
             if self.scheduler.lr_wsd_decay_iters is not None:
-                self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
+                self.scheduler.wsd_decay_steps = (
+                    self.scheduler.lr_wsd_decay_iters * self.train.global_batch_size
+                )
             if self.scheduler.lr_warmup_fraction is not None:
-                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+                self.scheduler.lr_warmup_steps = (
+                    self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+                )
             else:
-                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_iters * self.train.global_batch_size
+                self.scheduler.lr_warmup_steps = (
+                    self.scheduler.lr_warmup_iters * self.train.global_batch_size
+                )
         # Sample-based training.
         elif self.train.train_samples:
             # We need to set training iters for later use. Technically
@@ -445,7 +455,9 @@ class PretrainConfigContainer(ConfigContainerBase):
             self.scheduler.wd_incr_steps = self.train.train_samples
             self.scheduler.wsd_decay_steps = self.scheduler.lr_wsd_decay_samples
             if self.scheduler.lr_warmup_fraction is not None:
-                self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+                self.scheduler.lr_warmup_steps = (
+                    self.scheduler.lr_warmup_fraction * self.scheduler.lr_decay_steps
+                )
             else:
                 self.scheduler.lr_warmup_steps = self.scheduler.lr_warmup_samples
 
@@ -715,6 +727,15 @@ class PretrainConfigContainer(ConfigContainerBase):
                 "execution width, not the model's position capacity."
             )
         if dataset_family_from_type(dataset_type)[0] == "sft":
+            if (
+                not isinstance(dataset, SFTDatasetConfig)
+                and execution_bound is not None
+                and execution_bound != dataset.sequence_length
+            ):
+                raise ValueError(
+                    "Use SFTDatasetConfig to separate conversation truncation from the "
+                    "model execution width; GPTDatasetConfig emits sequence_length tokens."
+                )
             pack_length = (
                 (execution_bound or dataset.sequence_length)
                 if isinstance(dataset, SFTDatasetConfig)
@@ -785,34 +806,33 @@ class PretrainConfigContainer(ConfigContainerBase):
                 "container writes this field at finalize(), leave it unset."
             )
         transformer = self.model.transformer
-        if isinstance(dataset, OnlineTokenizedDatasetConfig):
-            if (
-                dataset.context_parallel_size is not None
-                and dataset.context_parallel_size != transformer.context_parallel_size
-            ):
-                raise ValueError(
-                    f"data.dataset.context_parallel_size={dataset.context_parallel_size} disagrees "
-                    "with model.transformer.context_parallel_size="
-                    f"{transformer.context_parallel_size}; the container writes this field at "
-                    "finalize(), leave it unset."
-                )
-            sequence_parallel_size = transformer.tensor_model_parallel_size * int(
-                bool(transformer.sequence_parallel)
+        if (
+            dataset.context_parallel_size is not None
+            and dataset.context_parallel_size != transformer.context_parallel_size
+        ):
+            raise ValueError(
+                f"data.dataset.context_parallel_size={dataset.context_parallel_size} disagrees "
+                "with model.transformer.context_parallel_size="
+                f"{transformer.context_parallel_size}; the container writes this field at "
+                "finalize(), leave it unset."
             )
-            if dataset.sequence_parallel_size not in (0, sequence_parallel_size):
-                raise ValueError(
-                    f"data.dataset.sequence_parallel_size={dataset.sequence_parallel_size} disagrees "
-                    "with the model layout (tensor_model_parallel_size * sequence_parallel = "
-                    f"{sequence_parallel_size}); the container writes this field at finalize(), leave "
-                    "it unset."
-                )
-            dynamic_context_parallel = bool(getattr(transformer, "dynamic_context_parallel", False))
-            if dataset.dynamic_context_parallel and not dynamic_context_parallel:
-                raise ValueError(
-                    "data.dataset.dynamic_context_parallel=True disagrees with "
-                    "model.transformer.dynamic_context_parallel=False; the container writes this field "
-                    "at finalize(), leave it unset."
-                )
+        sequence_parallel_size = transformer.tensor_model_parallel_size * int(
+            bool(transformer.sequence_parallel)
+        )
+        if dataset.sequence_parallel_size not in (0, sequence_parallel_size):
+            raise ValueError(
+                f"data.dataset.sequence_parallel_size={dataset.sequence_parallel_size} disagrees "
+                "with the model layout (tensor_model_parallel_size * sequence_parallel = "
+                f"{sequence_parallel_size}); the container writes this field at finalize(), leave "
+                "it unset."
+            )
+        dynamic_context_parallel = bool(getattr(transformer, "dynamic_context_parallel", False))
+        if dataset.dynamic_context_parallel and not dynamic_context_parallel:
+            raise ValueError(
+                "data.dataset.dynamic_context_parallel=True disagrees with "
+                "model.transformer.dynamic_context_parallel=False; the container writes this field "
+                "at finalize(), leave it unset."
+            )
         family, _mock = dataset_family_from_type(
             resolve_dataset_class(dataset, self.data.dataset_type)
         )
@@ -859,9 +879,7 @@ class PretrainConfigContainer(ConfigContainerBase):
             # The world size is known here: data_parallel_size gets the agreement check the other
             # fields got at validation, before anything is written.
             data_parallel_size = self.get_data_parallel_size()
-            if isinstance(
-                dataset, OnlineTokenizedDatasetConfig
-            ) and dataset.data_parallel_size not in (1, data_parallel_size):
+            if dataset.data_parallel_size not in (1, data_parallel_size):
                 raise ValueError(
                     f"data.dataset.data_parallel_size={dataset.data_parallel_size} disagrees with "
                     "the model layout and the world size "
@@ -1004,15 +1022,14 @@ class PretrainConfigContainer(ConfigContainerBase):
                 dataset.packed_sequence_length = transformer.max_seq_length_per_sample
             dataset.full_validation = self.validation.full_validation
             dataset.multiple_validation_sets = self.validation.multiple_validation_sets
-            if isinstance(dataset, OnlineTokenizedDatasetConfig):
-                dataset.data_parallel_size = data_parallel_size
-                dataset.context_parallel_size = transformer.context_parallel_size
-                dataset.sequence_parallel_size = transformer.tensor_model_parallel_size * int(
-                    bool(transformer.sequence_parallel)
-                )
-                dataset.dynamic_context_parallel = bool(
-                    getattr(transformer, "dynamic_context_parallel", False)
-                )
+            dataset.data_parallel_size = data_parallel_size
+            dataset.context_parallel_size = transformer.context_parallel_size
+            dataset.sequence_parallel_size = transformer.tensor_model_parallel_size * int(
+                bool(transformer.sequence_parallel)
+            )
+            dataset.dynamic_context_parallel = bool(
+                getattr(transformer, "dynamic_context_parallel", False)
+            )
         self.data.finalize()
         if self.rl.requires_grad_buffer_offload:
             self.ddp.grad_buffer_offload = True

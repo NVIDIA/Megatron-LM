@@ -100,18 +100,11 @@ recipes should set the model bound rather than this derived dataset field. Exist
 The SFT-specific config lives alongside `SFTDataset`; Core's `GPTDatasetConfig`
 has no pack-width field.
 
-Dataset config fields follow the dataset family:
-
-- Core's `GPTDatasetConfig` owns indexed bin/idx data and its masking/cache options;
-  `GPTFIMDatasetConfig` adds the FIM options.
-- Training's `SFTDatasetConfig` owns conversation packing and SFT mock options.
-- Training's `VarlenDatasetConfig` owns individual variable-length samples,
-  Varlen mock options, and `varlen_sbhd_validation`.
-
-SFT and Varlen configs share `OnlineTokenizedDatasetConfig` for tokenizer and
-parallel-padding inputs. All families inherit the existing
-`BlendedMegatronDatasetConfig` builder settings. This changes configuration
-ownership, not tokenization, packing, or sample contents.
+Core's existing `GPTDatasetConfig` remains shared by the GPT, SFT, and Varlen
+dataset implementations. `GPTFIMDatasetConfig` adds FIM settings. The small training-side
+`SFTDatasetConfig(GPTDatasetConfig)` subclass adds only the derived physical pack
+width; Varlen continues to use `GPTDatasetConfig` with an explicit dataset class.
+Separating the remaining family-specific fields is deferred to a follow-up.
 
 Fixed GPT/FIM dataset rows must match the run's execution length; an explicit
 different value is rejected rather than silently selecting another runtime length.
@@ -126,11 +119,11 @@ ModelOpt callbacks reject bounds inconsistent with the rows they actually emit.
 
 ### Python API compatibility
 
-Python SFT/Varlen callers must construct `SFTDatasetConfig` / `VarlenDatasetConfig`
-rather than putting their fields on `GPTDatasetConfig`. CLI flag names are unchanged.
-Container deserialization upgrades the former union schema using its saved
-`dataset_type`, preserving fields consumed by that family and warning when dropping
-known, unused fields. Unknown fields still fail strict loading.
+Python SFT callers use `SFTDatasetConfig` for a pack width distinct from the
+conversation limit. Container deserialization upgrades saved SFT sections from
+`GPTDatasetConfig` to this subclass using the saved `dataset_type`, preserving
+all fields. Unknown fields still fail strict loading. Varlen callers and CLI flag
+names are unchanged.
 
 `LLaVAModelConfig.decoder_seq_length` is removed. Python callers and saved
 configurations using this field require updating; strict deserialization rejects

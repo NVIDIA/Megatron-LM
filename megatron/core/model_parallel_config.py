@@ -153,16 +153,12 @@ class ModelParallelConfig:
     """
 
     max_seq_length_per_sample: Optional[int] = None
-    """Maximum number of tokens any model input row can hold, before CP/SP partitioning.
-    For THD this bounds the whole pack, not an individual conversation within it. Include
-    modality expansion and alignment padding. Actual batch widths and constituent lengths
-    remain runtime metadata and may be smaller; the dataset's sequence_length controls content
-    truncation. Core does not require all inputs to reach this maximum. MLM's fixed-width
-    GPT/FIM training path requires it to match the dataset row width because that path also
-    uses this field to size fixed pipeline tensors; this is a training-loop constraint.
-    NCCL EP derives its per-rank allocation bound from this value when
-    max_seqlen_per_dp_cp_rank is unset. This is not a position-table size or RoPE reference
-    length. The CLI defaults it from --seq-length for existing training scripts.
+    """Maximum sequence length of one sample, or of one packed (THD) sequence: the training
+    sequence length (--seq-length). Communication backends that size their buffers once
+    (NCCL EP) derive the per-rank token bound from it when max_seqlen_per_dp_cp_rank is not
+    set. This is not the position-embedding capacity: GPTModelConfig.seq_length and
+    HybridModelConfig.seq_length hold that (GPTModel.max_sequence_length, filled from
+    --max-position-embeddings by the launcher) and are never read by core modules.
     """
 
     dynamic_context_parallel: bool = False

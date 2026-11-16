@@ -56,7 +56,6 @@ from megatron.training.config import (
 )
 from megatron.training.config.dataset_config import dataset_type_from_family
 from megatron.training.datasets.sft_dataset import SFTDatasetConfig
-from megatron.training.datasets.varlen_dataset import VarlenDatasetConfig
 from megatron.training.models import (
     BertModelConfig,
     GPTModelConfig,
@@ -1119,12 +1118,11 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
         "gpt": GPTDatasetConfig,
         "fim": GPTFIMDatasetConfig,
         "sft": SFTDatasetConfig,
-        "varlen": VarlenDatasetConfig,
+        "varlen": GPTDatasetConfig,
     }[family]
-    config_fields = {item.name for item in fields(config_cls)}
     if family in ("sft", "varlen") and has_source:
         # These dataset implementations rejected GPT mask/reset options in __getitem__.
-        # Keep that CLI check here; the family-specific configs no longer expose them.
+        # Report unsupported CLI options before dataset construction.
         if (
             args.reset_position_ids
             or args.reset_attention_mask
@@ -1137,20 +1135,12 @@ def gpt_data_config_from_args(args: Namespace, *, standalone: bool = False) -> D
     kwargs: dict[str, Any] = {
         field_name: deepcopy(getattr(args, source))
         for field_name, source in _DATASET_FIELD_SOURCES.items()
-        if field_name in config_fields
     }
     kwargs["blend"] = blend
     kwargs["blend_per_split"] = blend_per_split
-    if "sequences_per_dataset" in config_fields:
-        kwargs["sequences_per_dataset"] = sequences_per_dataset
+    kwargs["sequences_per_dataset"] = sequences_per_dataset
     if standalone:
-        kwargs.update(
-            {
-                name: value
-                for name, value in _container_written_fields_from_args(args).items()
-                if name in config_fields
-            }
-        )
+        kwargs.update(_container_written_fields_from_args(args))
     if family == "sft":
         if standalone:
             kwargs["packed_sequence_length"] = (

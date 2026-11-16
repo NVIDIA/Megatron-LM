@@ -3,7 +3,7 @@
 settings and the dataset class.
 
 ``DataConfig.dataset`` is Core's ``GPTDatasetConfig`` or its FIM subclass, or training's
-``SFTDatasetConfig`` / ``VarlenDatasetConfig``, the object ``BlendedMegatronDatasetBuilder`` consumes,
+``SFTDatasetConfig`` subclass, the object ``BlendedMegatronDatasetBuilder`` consumes,
 constructed from the arguments or
 a YAML file before the tokenizer exists: nothing runs at construction, Core's checks that need no
 tokenizer (``validate_without_tokenizer()``) run at ``cfg.validate()``, and the complete
@@ -28,20 +28,14 @@ Entry points with their own data pipeline carry a loader-only section (``dataset
 nothing here runs for them.
 """
 
-import logging
 from dataclasses import dataclass, field, fields
 from typing import Any, Literal, get_args
 
-from megatron.core.datasets.blended_megatron_dataset_config import BlendedMegatronDatasetConfig
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.config.utils import serialize_value
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset, SFTDatasetConfig
-from megatron.training.datasets.varlen_dataset import (
-    MockVarlenDataset,
-    VarlenDataset,
-    VarlenDatasetConfig,
-)
+from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 
 DataloaderType = Literal["single", "cyclic", "external"]
 """The loader kinds; the CLI choices of ``--dataloader-type`` come from this annotation."""
@@ -72,71 +66,31 @@ CONTAINER_WRITTEN_FIELDS = (
 
 
 def upgrade_legacy_dataset_section(section: dict) -> dict:
-    """Move saved union-schema dataset fields to the class selected by dataset_type.
+    """Load saved SFT configs with the subclass that supports a separate pack width.
 
-    Only known legacy targets/fields are handled. Unknown fields remain for strict
-    deserialization to reject. This is a load-boundary adapter, not runtime derivation.
+    Older SFT checkpoints used GPTDatasetConfig. Preserve every field, including
+    unknown keys for strict deserialization to reject; only update the class.
     """
     dataset = section.get("dataset")
-    if not isinstance(dataset, dict):
-        return section
-    targets = {
-        f"{cls.__module__}.{cls.__qualname__}": cls
-        for cls in (GPTDatasetConfig, GPTFIMDatasetConfig, SFTDatasetConfig)
-    }
-    old_cls = targets.get(dataset.get("_target_"))
-    if old_cls is None:
+    if not isinstance(dataset, dict) or dataset.get("_target_") != (
+        f"{GPTDatasetConfig.__module__}.{GPTDatasetConfig.__qualname__}"
+    ):
         return section
     selected = section.get("dataset_type")
     if isinstance(selected, dict):
         selected = selected.get("_target_")
-    config_cls = old_cls
-    for family, pair in DATASET_CLASSES.items():
-        if any(
-            cls is not None
-            and (selected is cls or selected == f"{cls.__module__}.{cls.__qualname__}")
-            for cls in pair
-        ):
-            config_cls = {
-                "gpt": GPTDatasetConfig,
-                "fim": GPTFIMDatasetConfig,
-                "sft": SFTDatasetConfig,
-                "varlen": VarlenDatasetConfig,
-            }[family]
-            break
-    # Only the former union GPT schema could represent another family.
-    if old_cls is not GPTDatasetConfig and config_cls is not old_cls:
-        return section
-    expected = {item.name for item in fields(config_cls)}
-    legacy = (
-        {item.name for item in fields(GPTDatasetConfig)}
-        | set(CONTAINER_WRITTEN_FIELDS)
-        | {
-            "sft_mock_dataset_config_json",
-            "varlen_mock_dataset_config_json",
-            "varlen_sbhd_validation",
-            "token_dtype_code",
-        }
-    )
-    dataset = dict(dataset)
-    removed = (dataset.keys() & legacy) - expected
-    real_online_targets = {
-        f"{cls.__module__}.{cls.__qualname__}" for cls in (SFTDataset, VarlenDataset)
-    }
-    if config_cls in (SFTDatasetConfig, VarlenDatasetConfig) and (
-        selected is SFTDataset or selected is VarlenDataset or selected in real_online_targets
+    if not any(
+        selected is cls or selected == f"{cls.__module__}.{cls.__qualname__}"
+        for cls in (SFTDataset, MockSFTDataset)
     ):
-        for name in ("reset_position_ids", "reset_attention_mask", "create_attention_mask"):
-            if dataset.get(name):
-                raise ValueError(f"{config_cls.__name__} does not support {name}=True")
-    if removed:
-        logging.getLogger(__name__).warning(
-            "Dropping legacy fields not consumed by %s: %s", config_cls.__name__, sorted(removed)
-        )
-        for name in removed:
-            dataset.pop(name)
-    dataset["_target_"] = f"{config_cls.__module__}.{config_cls.__qualname__}"
-    return {**section, "dataset": dataset}
+        return section
+    return {
+        **section,
+        "dataset": {
+            **dataset,
+            "_target_": f"{SFTDatasetConfig.__module__}.{SFTDatasetConfig.__qualname__}",
+        },
+    }
 
 
 @dataclass(kw_only=True)
@@ -212,12 +166,12 @@ def dataset_family_from_type(dataset_type: Any) -> tuple[str, bool]:
     )
 
 
-def has_data_source(dataset: BlendedMegatronDatasetConfig) -> bool:
+def has_data_source(dataset: GPTDatasetConfig) -> bool:
     """Whether a blend is declared: the inverse of Megatron Core's ``mock``."""
     return not dataset.mock
 
 
-def is_packed_sequence(dataset_type: type, dataset: BlendedMegatronDatasetConfig) -> bool:
+def is_packed_sequence(dataset_type: type, dataset: GPTDatasetConfig) -> bool:
     """Packed (THD) samples: built on every pipeline stage, and get_batch expects cu_seqlens."""
     family, _mock = dataset_family_from_type(dataset_type)
     if family == "sft":
@@ -228,14 +182,15 @@ def is_packed_sequence(dataset_type: type, dataset: BlendedMegatronDatasetConfig
 
 
 def resolve_dataset_class(
-    dataset: BlendedMegatronDatasetConfig | None, dataset_type: type | None
+    dataset: GPTDatasetConfig | None, dataset_type: type | None
 ) -> type | None:
     """The dataset class the config entails, or the given one checked against the config.
 
     Read-only: ``DataConfig.validate()`` calls it and ``DataConfig.finalize()`` commits its result.
     With no class given, a ``GPTFIMDatasetConfig`` with a source resolves to ``GPTFIMDataset``, a
     plain config with a source to ``GPTDataset`` and a plain config without one to
-    ``MockGPTDataset``. SFT and Varlen configs resolve to their respective families. An
+    ``MockGPTDataset``; SFTDatasetConfig selects SFT. Varlen uses the shared GPT config
+    and must be selected explicitly. An
     explicit class must match the config (mock without a source, real with one, the FIM class with
     the FIM config); nothing is silently rewritten.
     """
@@ -246,16 +201,14 @@ def resolve_dataset_class(
     source = has_data_source(dataset)
     if isinstance(dataset, GPTFIMDatasetConfig):
         config_family = "fim"
-    elif isinstance(dataset, GPTDatasetConfig):
-        config_family = "gpt"
     elif isinstance(dataset, SFTDatasetConfig):
         config_family = "sft"
-    elif isinstance(dataset, VarlenDatasetConfig):
-        config_family = "varlen"
+    elif isinstance(dataset, GPTDatasetConfig):
+        config_family = None
     else:
         raise TypeError(f"Unsupported dataset config: {type(dataset).__name__}")
     if dataset_type is None:
-        family = config_family
+        family = config_family or "gpt"
         dataset_type = dataset_type_from_family(family, mock=not source)
         if dataset_type is None:
             raise ValueError(
@@ -277,12 +230,14 @@ def resolve_dataset_class(
         raise ValueError(
             f"{dataset_type.__name__} needs a data source (blend or blend_per_split); {hint}."
         )
-    if family != config_family:
+    if (config_family is not None and family != config_family) or (
+        family == "fim" and config_family != "fim"
+    ):
         raise ValueError(
             f"{type(dataset).__name__} requires the {config_family} dataset family, "
             f"got {dataset_type.__name__}."
         )
-    if isinstance(dataset, VarlenDatasetConfig) and dataset.varlen_sbhd_validation and mock:
+    if family == "varlen" and dataset.varlen_sbhd_validation and mock:
         raise ValueError("varlen_sbhd_validation requires real data (VarlenDataset, not its mock).")
     return dataset_type
 
@@ -295,7 +250,7 @@ class DataConfig:
     nothing dataset-related is validated, bound or built for it.
     """
 
-    dataset: BlendedMegatronDatasetConfig | None = None
+    dataset: GPTDatasetConfig | None = None
     """GPT/FIM, SFT, or Varlen dataset config, handed to
     ``BlendedMegatronDatasetBuilder`` as is."""
 
@@ -360,7 +315,7 @@ class DataConfig:
             )
         self.dataset.validate()
 
-    def builder_inputs(self) -> tuple[type, BlendedMegatronDatasetConfig, bool]:
+    def builder_inputs(self) -> tuple[type, GPTDatasetConfig, bool]:
         """``(dataset class, dataset config with its tokenizer, is_packed_sequence)`` for the
         builder."""
         if self.dataset is None or self.dataset_type is None:
@@ -398,19 +353,17 @@ class DataConfig:
         than the source receive the batch by broadcast and the middle pipeline stages build only the
         packed metadata, so neither can find out from a sample. False for a loader-only section."""
         dataset = self.dataset
-        return isinstance(dataset, SFTDatasetConfig) or (
-            isinstance(dataset, GPTDatasetConfig) and dataset.inter_document_masking
-        )
+        return dataset is not None and (self.is_sft() or bool(dataset.inter_document_masking))
 
     def use_per_sequence_balancing(self) -> bool:
         """``get_batch``'s formula: inter-document masking balances the context-parallel split per
         sequence, SFT does not. False for a loader-only section."""
         dataset = self.dataset
-        return isinstance(dataset, GPTDatasetConfig) and dataset.inter_document_masking
+        return dataset is not None and bool(dataset.inter_document_masking) and not self.is_sft()
 
     def creates_attention_mask(self) -> bool:
         """Whether this dataset emits the explicit attention-mask tensor for TP broadcast."""
-        return isinstance(self.dataset, GPTDatasetConfig) and self.dataset.create_attention_mask
+        return self._family() in ("gpt", "fim") and self.dataset.create_attention_mask
 
     def yields_unpacked_samples(self) -> bool:
         """The dataset emits one variable-length sample dict per item for an upstream packing
@@ -418,10 +371,7 @@ class DataConfig:
         (the identity collate). ``False`` for every other family and for a loader-only section:
         SFT samples are packed (``is_packed_sequence``) but fixed-width, and go through the
         default collate."""
-        return (
-            isinstance(self.dataset, VarlenDatasetConfig)
-            and not self.dataset.varlen_sbhd_validation
-        )
+        return self._family() == "varlen" and not bool(self.dataset.varlen_sbhd_validation)
 
     def to_cfg_dict(self) -> dict[str, Any]:
         """Serialize the section.

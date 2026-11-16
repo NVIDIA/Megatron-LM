@@ -40,11 +40,9 @@ def test_dataset_content_limit_and_execution_bound_are_distinct(run_config, pack
         dataset=(SFTDatasetConfig if packed else GPTDatasetConfig)(
             random_seed=1234,
             sequence_length=8,
-            **(
-                {}
-                if packed
-                else dict(reset_position_ids=False, reset_attention_mask=False, eod_mask_loss=False)
-            ),
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
         ),
         dataset_type=MockSFTDataset if packed else MockGPTDataset,
     )
@@ -123,6 +121,9 @@ def test_sft_pack_validates_physical_shape(run_config, bound, capacity, error):
         dataset=SFTDatasetConfig(
             random_seed=1234,
             sequence_length=9,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
         ),
         dataset_type=MockSFTDataset,
     )
@@ -132,6 +133,25 @@ def test_sft_pack_validates_physical_shape(run_config, bound, capacity, error):
     else:
         with pytest.raises(ValueError, match=error):
             cfg.validate()
+
+
+def test_legacy_sft_config_requires_matching_execution_width(run_config):
+    cfg = run_config
+    cfg.model.transformer.max_seq_length_per_sample = 32
+    cfg.data = DataConfig(
+        dataset=GPTDatasetConfig(
+            random_seed=1234,
+            sequence_length=16,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+        ),
+        dataset_type=MockSFTDataset,
+    )
+    with pytest.raises(ValueError, match="Use SFTDatasetConfig"):
+        cfg.validate()
+    cfg.model.transformer.max_seq_length_per_sample = 16
+    cfg.validate()
 
 
 @pytest.mark.parametrize("inference", [False, True])

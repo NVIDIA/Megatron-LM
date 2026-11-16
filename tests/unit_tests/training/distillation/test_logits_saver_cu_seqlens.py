@@ -18,7 +18,7 @@ import torch
 
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.training.config import DataConfig
-from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDatasetConfig
+from megatron.training.datasets.sft_dataset import MockSFTDataset
 from megatron.training.distillation import logits_saver
 from megatron.training.distillation import utils as distillation_utils
 from megatron.training.distillation.logits_saver import LogitsSaverHooks
@@ -36,8 +36,6 @@ def _run_config_for(sft: bool):
         reset_attention_mask=False,
         eod_mask_loss=False,
     )
-    if sft:
-        dataset = SFTDatasetConfig(sequence_length=16, random_seed=1)
     dataset_type = MockSFTDataset if sft else MockGPTDataset
     return SimpleNamespace(data=DataConfig(dataset=dataset, dataset_type=dataset_type))
 

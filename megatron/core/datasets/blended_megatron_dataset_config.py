@@ -48,6 +48,9 @@ class BlendedMegatronDatasetConfig:
     path_to_cache: Optional[str] = None
     """Where all re-useable dataset indices are to be cached."""
 
+    mmap_bin_files: bool = True
+    """Whether to mmap the .bin files or use file pointers."""
+
     tokenizer: Optional[MegatronTokenizerBase] = None
     """The MegatronTokenizerBase instance. Required for datasets that do online tokenization."""
 

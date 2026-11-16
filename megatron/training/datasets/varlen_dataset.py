@@ -50,15 +50,14 @@ Limitations (raise a clear ``ValueError`` instead of silently mishandling):
 
 import json
 import os
-from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
 
+from megatron.core.datasets.gpt_dataset import GPTDatasetConfig
 from megatron.core.datasets.megatron_dataset import LowLevelDataset
 from megatron.core.datasets.utils import Split
-from megatron.training.datasets.online_tokenized_dataset_config import OnlineTokenizedDatasetConfig
 from megatron.training.datasets.sft_dataset import (
     IGNORE_INDEX,
     MockSFTDataset,
@@ -309,26 +308,6 @@ class VarlenLowLevelDataset(SFTLowLevelDataset):
         return self._converter(self.dataset[idx])
 
 
-@dataclass
-class VarlenDatasetConfig(OnlineTokenizedDatasetConfig):
-    """Individual samples for runtime packing, or the unpacked SBHD reference path."""
-
-    varlen_mock_dataset_config_json: Optional[str] = None
-    """JSON string or file configuring MockVarlenDataset sequence-length sampling."""
-
-    varlen_sbhd_validation: bool = False
-    """Emit individually padded SBHD samples without packing metadata for parity checks."""
-
-    def validate_without_tokenizer(self) -> None:
-        """Check the existing exclusion between SBHD validation and dynamic CP."""
-        super().validate_without_tokenizer()
-        if self.varlen_sbhd_validation:
-            assert not self.dynamic_context_parallel, (
-                "--varlen-sbhd-validation is incompatible with "
-                "--dynamic-context-parallel (SBHD mode is not packed)."
-            )
-
-
 class VarlenDataset(SFTDataset):
     """Variable-length single-sample SFT dataset for the packed-sequence path.
 
@@ -356,7 +335,7 @@ class VarlenDataset(SFTDataset):
         indices: np.ndarray,
         num_samples: Optional[int],
         index_split: Split,
-        config: VarlenDatasetConfig,
+        config: GPTDatasetConfig,
     ) -> None:
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
 
@@ -365,7 +344,9 @@ class VarlenDataset(SFTDataset):
         return len(low_level_dataset)
 
     @staticmethod
-    def build_low_level_dataset(dataset_path: str, config: VarlenDatasetConfig) -> LowLevelDataset:
+    def build_low_level_dataset(
+        dataset_path: str, config: GPTDatasetConfig
+    ) -> LowLevelDataset:
         return VarlenLowLevelDataset(dataset_path)
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
@@ -385,6 +366,9 @@ class VarlenDataset(SFTDataset):
         #    (alpaca / sharegpt / openai-messages) this is a messages list;
         #    for the pretrain-text schema it is a raw string.
         item = self.dataset[int(self.indices[idx % len(self.indices)])]
+
+        assert not self.config.reset_position_ids
+        assert not self.config.create_attention_mask and not self.config.reset_attention_mask
 
         # 2. Tokenize. SFT schemas go through tokenize_conversation (chat
         #    template + role-aware target masking); pretrain-text bypasses
@@ -504,7 +488,9 @@ class MockVarlenDataset(MockSFTDataset):
     """
 
     @staticmethod
-    def build_low_level_dataset(dataset_path: str, config: VarlenDatasetConfig) -> LowLevelDataset:
+    def build_low_level_dataset(
+        dataset_path: str, config: GPTDatasetConfig
+    ) -> LowLevelDataset:
         if config.varlen_mock_dataset_config_json is None:
             mock_config = {
                 "mode": "distribution",

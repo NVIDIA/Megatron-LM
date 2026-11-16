@@ -9,8 +9,8 @@ import pytest
 
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
 from megatron.training.config import DataConfig
-from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDatasetConfig
-from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDatasetConfig
+from megatron.training.datasets.sft_dataset import MockSFTDataset
+from megatron.training.datasets.varlen_dataset import MockVarlenDataset
 from megatron.training.distillation import utils as distillation_utils
 
 BOOLS = dict(reset_position_ids=False, reset_attention_mask=False, eod_mask_loss=False)
@@ -39,10 +39,6 @@ def test_packedness_follows_the_data_section(
             create_attention_mask=not inter_document_masking,
             **BOOLS,
         )
-        if dataset_type is MockSFTDataset:
-            dataset = SFTDatasetConfig(sequence_length=16, random_seed=1)
-        elif dataset_type is MockVarlenDataset:
-            dataset = VarlenDatasetConfig(sequence_length=16, random_seed=1)
         data = DataConfig(dataset=dataset, dataset_type=dataset_type)
     monkeypatch.setattr(distillation_utils, "get_run_config", lambda: SimpleNamespace(data=data))
     monkeypatch.setattr(
