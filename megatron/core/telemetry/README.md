@@ -15,7 +15,6 @@ megatron/core/telemetry/
 ├── telemetry.py         — Megatron's nemo-lens shim and span registry.
 ├── resource_attrs.py    — Megatron-owned trainer Resource mapping.
 ├── training_metrics.py  — OTel instruments for the training loop.
-├── fallbacks.py         — Legacy no-op shims for MCore call sites not yet on telemetry.py.
 └── __init__.py
 ```
 

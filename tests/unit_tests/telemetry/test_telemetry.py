@@ -149,32 +149,6 @@ def _global_vars_function_ast(name):
     return _module_function_ast(GLOBAL_VARS_PATH, name)
 
 
-LEGACY_FALLBACKS_MODULE = "megatron.core.telemetry.fallbacks"
-
-
-def _legacy_guarded_lens_imports(tree):
-    """Return Lens imports guarded by the legacy ``fallbacks`` ImportError handler.
-
-    MCore call sites move to the shim one subsystem at a time. Until the follow-up
-    that deletes ``fallbacks.py``, a module that has not moved yet keeps the original
-    ``try: from nemo.lens.helpers import ... except ImportError: from
-    megatron.core.telemetry.fallbacks import ...`` block. Only that block is exempt.
-    """
-    exempt = set()
-    for node in ast.walk(tree):
-        if not isinstance(node, ast.Try):
-            continue
-        handler_modules = {
-            child.module
-            for handler in node.handlers
-            for child in ast.walk(handler)
-            if isinstance(child, ast.ImportFrom)
-        }
-        if LEGACY_FALLBACKS_MODULE in handler_modules:
-            exempt.update(child for child in node.body if isinstance(child, ast.ImportFrom))
-    return exempt
-
-
 def _run_real_lens_shim_probe():
     from nemo.lens import SpanRegistry
 
@@ -432,9 +406,8 @@ def test_call_sites_do_not_import_lens_helpers_directly():
         if path == shim:
             continue
         tree = ast.parse(path.read_text(), filename=str(path))
-        legacy_imports = _legacy_guarded_lens_imports(tree)
         for node in ast.walk(tree):
-            if not isinstance(node, ast.ImportFrom) or node in legacy_imports:
+            if not isinstance(node, ast.ImportFrom):
                 continue
             module = node.module or ""
             imported_names = {alias.name for alias in node.names}
@@ -445,6 +418,15 @@ def test_call_sites_do_not_import_lens_helpers_directly():
                 offenders.append(f"{path.relative_to(repo)} imports {names} from nemo.lens")
             if module == "nemo.lens.groups" and "SpanRegistry" in imported_names:
                 offenders.append(f"{path.relative_to(repo)} imports SpanRegistry from {module}")
+
+    assert offenders == []
+
+
+def test_legacy_fallbacks_module_is_not_referenced():
+    offenders = []
+    for path in (REPO_ROOT / "megatron").rglob("*.py"):
+        if "megatron.core.telemetry.fallbacks" in path.read_text():
+            offenders.append(str(path.relative_to(REPO_ROOT)))
 
     assert offenders == []
 
@@ -491,11 +473,7 @@ def test_call_sites_do_not_use_unregistered_group_literals():
     offenders = []
     for path in (repo / "megatron").rglob("*.py"):
         text = path.read_text()
-        legacy_module = LEGACY_FALLBACKS_MODULE in text
         for match in call.finditer(text):
-            if legacy_module and not match.group(0).startswith("_otel."):
-                # Not-yet-migrated MCore modules keep their legacy group literals.
-                continue
             group = match.group("group")
             if group not in EXPECTED_GROUPS:
                 offenders.append(f"{path.relative_to(repo)} uses unregistered group {group!r}")

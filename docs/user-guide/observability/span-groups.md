@@ -41,6 +41,13 @@ A group's registration does not itself create spans. The instrumentation at a
 call site determines its emitted name and attributes. Old unnamespaced names
 such as `job`, `checkpoint`, `step`, and `microbatch` are not Megatron aliases.
 
+## MCore detailed instrumentation
+
+`megatron.detail` owns the canonical `nv.mcore.microbatch.*`, `nv.mcore.p2p.*`,
+`nv.mcore.grad_sync.*`, and `nv.mcore.layer.*` operation spans. See
+[Pipeline and MCore instrumentation](pipeline-parallel.md) for their names and
+attributes.
+
 ## Examples
 
 ```bash
