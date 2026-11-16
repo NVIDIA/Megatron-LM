@@ -43,6 +43,7 @@ MODEL_ARGS:
   --disable-bias-linear: true
   --sequence-parallel: true
   --num-experts: 8
+  --moe-token-dispatcher-type: allgather
   --moe-router-load-balancing-type: aux_loss
   --moe-router-topk: 2
   --moe-aux-loss-coeff: 1e-2

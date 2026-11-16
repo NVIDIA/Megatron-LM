@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Unit tests for saving/loading ``train_state.pt`` (see megatron/training/state.py,
 megatron/training/utils/checkpoint_utils.py and the train-state block in
 megatron.training.checkpointing.save_checkpoint)."""
@@ -31,7 +31,7 @@ from megatron.training.utils.checkpoint_utils import (
     read_train_state,
 )
 from tests.unit_tests.dist_checkpointing import TempNamedDir
-from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.test_utilities import Utils, sync_checkpoint_config
 
 pytestmark = pytest.mark.usefixtures("run_config")
 
@@ -170,6 +170,7 @@ def _save_a_checkpoint(
     optimizer = MockState({"state": {}, "param_groups": []})
     opt_param_scheduler = MockState({"opt_param_scheduler": "scheduler_state"})
 
+    sync_checkpoint_config(args)
     save_checkpoint(
         iteration,
         [model],
