@@ -121,7 +121,9 @@ def vision_projection_config(args, language_config: TransformerConfig, add_bias:
         num_layers=1,
         hidden_size=language_config.hidden_size,
         ffn_hidden_size=language_config.hidden_size,
-        num_attention_heads=1,
+        # The projection is an MLP with no attention, but TransformerConfig requires a head
+        # count divisible by the TP size; one head per TP rank keeps TP > 1 buildable.
+        num_attention_heads=language_config.tensor_model_parallel_size,
         activation_func=_PROJECTION_ACTIVATIONS[args.vision_projection_activation],
         gated_linear_unit=False,
         add_bias_linear=add_bias,
