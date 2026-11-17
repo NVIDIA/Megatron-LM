@@ -2091,14 +2091,21 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
         weight: Optional[torch.Tensor] = None,
         runtime_gather_output: Optional[bool] = None,
         output_dtype: Optional[torch.dtype] = None,
+        out: Optional[torch.Tensor] = None,
     ):
-        """Run TE MXFP8 output projection. Returns ``(output, bias)``."""
+        """Run TE MXFP8 output projection. Returns ``(output, bias)``.
+
+        `out` is accepted to preserve the `ColumnParallelLinear` forward signature but raises:
+        TE modules allocate their own GEMM output.
+        """
         from megatron.core.fp8_utils import get_fp8_context
 
         if weight is not None and weight is not self.weight:
             raise RuntimeError("TE MXFP8 output projection does not support runtime weight.")
         if output_dtype is not None and output_dtype != input_.dtype:
             raise ValueError("TE MXFP8 output projection does not support output_dtype.")
+        if out is not None:
+            raise ValueError("TE MXFP8 output projection does not support a preallocated `out`.")
 
         if self.config.fp4:
             # An FP4 model has no FP8 context: run the LM head under its own MXFP8 autocast.

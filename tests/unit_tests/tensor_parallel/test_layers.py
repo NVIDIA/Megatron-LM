@@ -16,6 +16,8 @@ from megatron.core.tensor_parallel.layers import (
     linear_with_grad_accumulation_and_async_allreduce,
 )
 from megatron.core.tensor_parallel.mappings import gather_from_tensor_model_parallel_region
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -544,3 +546,51 @@ class TestWgradGemmAccumulate:
         once = out.clone()
         _wgrad_gemm(out, grad_output, total_input)
         torch.testing.assert_close(out, once, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "tensor_parallel,out_dtype",
+    [
+        (1, torch.bfloat16),
+        pytest.param(
+            1,
+            torch.float32,
+            marks=pytest.mark.skipif(
+                te_general_gemm is None, reason="fp32 output needs Transformer Engine general_gemm"
+            ),
+        ),
+        (8, torch.bfloat16),
+    ],
+    ids=["tp1-bf16", "tp1-fp32", "tp8-bf16"],
+)
+def test_linear_out_buffer_writes_gemm_result_in_place(tensor_parallel, out_dtype):
+    """`out=` makes the GEMM (torch matmul in the input dtype, TE general_gemm for fp32) write
+    the caller's buffer, sized to this rank's vocab shard, and return it, bitwise what the
+    unbuffered path produces; a conflicting output_dtype, a wrong shape, an output gather
+    at TP > 1 and grad mode are rejected."""
+    Utils.initialize_model_parallel(tensor_parallel, 1)
+    try:
+        model_parallel_cuda_manual_seed(42)
+        config = TransformerConfig(
+            num_layers=1, hidden_size=16, num_attention_heads=4, params_dtype=torch.bfloat16
+        )
+        layer = ColumnParallelLinear(
+            16, 64, init_method=config.init_method, bias=False, gather_output=False, config=config
+        )
+        input_data = torch.randn(4, 1, 16, device="cuda", dtype=torch.bfloat16)
+        out = torch.empty(4, 1, 64 // tensor_parallel, device="cuda", dtype=out_dtype)
+        with torch.inference_mode():
+            output, _ = layer(input_data, out=out)
+            assert output.data_ptr() == out.data_ptr() and output.dtype == out_dtype
+            assert torch.equal(output, layer(input_data, output_dtype=out_dtype)[0])
+            with pytest.raises(ValueError, match="output_dtype"):
+                layer(input_data, output_dtype=torch.float64, out=out)
+            with pytest.raises(ValueError, match="shape"):
+                layer(input_data, out=out[..., :-1])
+            if tensor_parallel > 1:
+                with pytest.raises(ValueError, match="gather"):
+                    layer(input_data, runtime_gather_output=True, out=out)
+        with pytest.raises(RuntimeError, match="grad"):
+            layer(input_data, out=out)
+    finally:
+        Utils.destroy_model_parallel()
