@@ -12,7 +12,11 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import (
+    InferenceConfig,
+    KVCacheManagementMode,
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts import zero_padding_rows_kernel
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
@@ -25,6 +29,8 @@ from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.inference.paged_attention_test_utils import reference_paged_attention
@@ -274,6 +280,7 @@ class TestDynamicContext:
         expert_tensor_parallel_size: int = None,
         reserve_recurrent_state_dummy_slot: bool = False,
         mamba_memory_ratio: float = None,
+        kv_cache_management_mode: KVCacheManagementMode = KVCacheManagementMode.PERSIST,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -319,6 +326,7 @@ class TestDynamicContext:
                 max_requests=max_requests,
                 reserve_recurrent_state_dummy_slot=reserve_recurrent_state_dummy_slot,
                 mamba_memory_ratio=mamba_memory_ratio,
+                kv_cache_management_mode=kv_cache_management_mode,
             ),
         )
         return dynamic_context
@@ -569,6 +577,102 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    @pytest.mark.parametrize(
+        "max_tokens,tp_size,batch_invariant,match",
+        [(1060, 8, False, "divisible"), (12, 1, True, "batch-invariant")],
+    )
+    def test_rejects_incompatible_token_capacity(self, max_tokens, tp_size, batch_invariant, match):
+        model_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=8,
+            tensor_model_parallel_size=tp_size,
+            params_dtype=torch.bfloat16,
+            batch_invariant_mode=batch_invariant,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=3,
+            attention_dropout=0.0,
+        )
+        inference_config = InferenceConfig(max_tokens=max_tokens, max_requests=8)
+        with pytest.raises(ValueError, match=match):
+            DynamicInferenceContext(model_config, inference_config)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("max_tokens,mixed", [(12, False), (1064, False), (1064, True)])
+    def test_eager_prefill_padding_fits_token_capacity(self, max_tokens, mixed):
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.bfloat16,
+            num_layers=2,
+            kv_channels=16,
+            num_attention_heads=8,
+            max_sequence_length=2048,
+            buffer_size_gb=0.01,
+            block_size_tokens=128,
+            max_tokens=max_tokens,
+            max_requests=4,
+        )
+        if mixed:
+            ctx.add_request(
+                DynamicInferenceRequest(
+                    request_id=0,
+                    prompt_tokens=torch.tensor([7]),
+                    sampling_params=SamplingParams(num_tokens_to_generate=4),
+                )
+            )
+            ctx.initialize_attention_state()
+            ctx.update_requests(
+                active_requests_mask=torch.ones(1, dtype=torch.int32, device="cuda"),
+                new_tokens=torch.tensor([9], device="cuda"),
+            )
+        prompt_length = max_tokens - 1 - int(mixed)
+        prompt = torch.arange(prompt_length)
+        ctx.add_request(
+            DynamicInferenceRequest(
+                request_id=1,
+                prompt_tokens=prompt,
+                sampling_params=SamplingParams(num_tokens_to_generate=4),
+            )
+        )
+        ctx.initialize_attention_state()
+        inputs, positions = ctx.current_input_and_position_ids()
+
+        assert not ctx.using_cuda_graph_this_step()
+        assert ctx.max_tokens == max_tokens
+        assert ctx.active_token_count == max_tokens - 1
+        assert ctx.padded_active_token_count == max_tokens
+        assert inputs.shape == positions.shape == (1, max_tokens)
+        assert ctx.num_decode_requests == int(mixed)
+        assert ctx.num_prefill_requests == 1
+        assert torch.equal(inputs[0, int(mixed) : max_tokens - 1].cpu(), prompt)
+        assert inputs[0, -1].item() == 0
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_graph_prefill_padding_keeps_selected_dimensions(self):
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.bfloat16,
+            num_layers=2,
+            kv_channels=16,
+            num_attention_heads=8,
+            max_sequence_length=2048,
+            buffer_size_gb=0.01,
+            block_size_tokens=128,
+            max_tokens=1064,
+            max_requests=4,
+            num_cuda_graphs=4,
+        )
+        graph = next(
+            dims for dims in ctx.cuda_graph_batch_dimensions_list if dims.prefill_req_count > 0
+        )
+        ctx.initialize_attention_state(construct_graph_dimensions=graph)
+        inputs, positions = ctx.current_input_and_position_ids()
+        assert ctx.using_cuda_graph_this_step()
+        assert ctx.padded_batch_dimensions == graph
+        assert inputs.shape == positions.shape == (1, graph.token_count)
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_current_input_and_position_ids_view_cache(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -745,6 +849,37 @@ class TestDynamicContext:
         expected[dynamic_context.padding_slice] = 0.0
         dynamic_context.zero_padding_tokens(activations)
         assert torch.equal(activations, expected)
+
+    @pytest.mark.internal
+    def test_nvls_routing_mask_reads_the_token_count_after_a_recompute_resume(self, monkeypatch):
+        """A RECOMPUTE resume rebuilds gpu_view; the NVLS dispatcher must read the new one."""
+        monkeypatch.setattr(NVLSAllGatherVDispatcher, "_real_token_count_tensor", None)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.bfloat16,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=256,
+            buffer_size_gb=0.05,
+            block_size_tokens=256,
+            max_tokens=None,
+            max_requests=16,
+            kv_cache_management_mode=KVCacheManagementMode.RECOMPUTE,
+        )
+        # The dispatcher itself needs an EP group; binding its mask only needs this flag.
+        dynamic_context._nvls_dispatcher = True
+        dynamic_context.deallocate_inference_state_buffers()
+        dynamic_context.reinitialize_inference_state_buffers()
+
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(5, device="cuda"),
+                sampling_params=SamplingParams(num_tokens_to_generate=2, termination_id=-1),
+            )
+        )
+        dynamic_context.initialize_attention_state()
+        assert NVLSAllGatherVDispatcher._real_token_count_tensor.item() == 5
 
     @pytest.mark.internal
     @rounder_override(8)
