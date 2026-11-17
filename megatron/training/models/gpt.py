@@ -51,8 +51,15 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 )
 
 
-def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
-    """Determine the most appropriate layer specification based on availability."""
+def default_layer_spec(
+    config: "GPTModelConfig", vp_stage: int, pp_rank: int | None = None
+) -> ModuleSpec:
+    """Determine the most appropriate layer specification based on availability.
+
+    ``pp_rank`` selects this stage's layers for block specs (dense Liger and MoE); when
+    omitted, ``get_gpt_decoder_block_spec`` falls back to the global ``parallel_state``
+    pipeline rank, which can disagree with a supplied ``pg_collection``.
+    """
     transformer_cfg = config.transformer
     if transformer_cfg.use_liger and config.restore_modelopt_state:
         raise ValueError("use_liger is not supported by ModelOpt GPT specs.")
@@ -96,6 +103,7 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
             normalization=transformer_cfg.normalization,
             qk_l2_norm=transformer_cfg.qk_l2_norm,
             vp_stage=vp_stage,
+            pp_rank=pp_rank,
         )
     elif isinstance(transformer_cfg, HeterogeneousTransformerConfig):
         return get_gpt_heterogeneous_layer_spec(transformer_cfg, use_te)
@@ -287,7 +295,9 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         """
         transformer_layer_spec = self._model_config.transformer_layer_spec
         if transformer_layer_spec is None:
-            transformer_layer_spec = default_layer_spec(self._model_config, vp_stage)
+            transformer_layer_spec = default_layer_spec(
+                self._model_config, vp_stage, pp_rank=pg_collection.pp.rank()
+            )
         elif not isinstance(transformer_layer_spec, ModuleSpec) and callable(transformer_layer_spec):
             # Check if the transformer_layer_spec function accepts vp_stage parameter
             if "vp_stage" in inspect.signature(transformer_layer_spec).parameters:

@@ -320,6 +320,11 @@ def get_backend(
     ``use_te_op_fuser`` applies only to the Transformer Engine provider, ``use_liger``
     (Liger RMSNorm) only to the local one.
     """
+    if use_liger and transformer_impl != "local":
+        raise ValueError(
+            f"use_liger (Liger RMSNorm) is only supported by the local backend, not "
+            f"transformer_impl={transformer_impl!r}."
+        )
     if transformer_impl == "transformer_engine":
         from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
 

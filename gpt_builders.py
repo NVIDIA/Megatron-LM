@@ -20,6 +20,7 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.global_vars import get_run_config
+from megatron.training.utils import warn_rank_0
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 
@@ -31,6 +32,11 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         else:
             config = core_transformer_config_from_args(args)
     if args.spec is not None:
+        if config.use_liger:
+            warn_rank_0(
+                "use_liger is ignored when a custom --spec is provided; the spec chooses "
+                "its own norms."
+            )
         transformer_layer_spec = import_module(args.spec)
     else:
         use_te = args.transformer_impl == "transformer_engine"

@@ -7,6 +7,7 @@ from megatron.core.transformer.spec_utils import ModuleSpec, import_module
 from megatron.training import print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.global_vars import get_run_config
+from megatron.training.utils import warn_rank_0
 from model_provider import count_parameters_in_layer
 
 
@@ -18,6 +19,9 @@ def hybrid_builder(args, pre_process, post_process, vp_stage=None, config=None, 
         )
     if config is None:
         config = core_transformer_config_from_args(args, TransformerConfig)
+
+    if config.use_liger:
+        warn_rank_0("use_liger is ignored by the Hybrid builder; it has no Liger norm path.")
 
     if config.transformer_impl == "inference_optimized":
         hybrid_stack_spec = hybrid_inference_stack_spec

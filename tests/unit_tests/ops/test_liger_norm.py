@@ -9,7 +9,7 @@ import pytest
 import torch
 
 from megatron.core.extensions.liger_kernel_spec_provider import LigerSpecProvider
-from megatron.core.models.backends import LocalSpecProvider, get_backend_from_config
+from megatron.core.models.backends import LocalSpecProvider, get_backend, get_backend_from_config
 from megatron.core.ops.norm.liger_norm import LigerRMSNorm
 from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
@@ -27,6 +27,12 @@ def test_unselected_paths_do_not_import_liger(monkeypatch):
     assert LocalSpecProvider().layer_norm(rms_norm=True) is WrappedTorchNorm
     with pytest.raises(ImportError, match="Liger RMSNorm requires liger_kernel.megatron"):
         provider.layer_norm(rms_norm=True)
+
+
+def test_get_backend_rejects_liger_on_non_local():
+    for impl in ("transformer_engine", "inference_optimized"):
+        with pytest.raises(ValueError, match="only supported by the local backend"):
+            get_backend(impl, use_liger=True)
 
 
 def test_config_rejects_unsupported_setups():
