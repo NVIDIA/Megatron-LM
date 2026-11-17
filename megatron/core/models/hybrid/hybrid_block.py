@@ -712,17 +712,21 @@ class HybridStack(MegatronModule):
         use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
         use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
         use_fp4_context = self.config.fp4 is not None
-        outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
+        outer_fp8_context = (
+            get_fp8_context(self.config, pg_collection=self.pg_collection)
+            if use_outer_fp8_context
+            else nullcontext()
+        )
 
         if use_inner_fp8_context:
 
             def get_inner_quant_context(config, layer_number):
-                return get_fp8_context(config, layer_number)
+                return get_fp8_context(config, layer_number, pg_collection=self.pg_collection)
 
         elif use_fp4_context:
 
             def get_inner_quant_context(config, layer_number):
-                return get_fp4_context(config, layer_number)
+                return get_fp4_context(config, layer_number, pg_collection=self.pg_collection)
 
         else:
 
@@ -994,15 +998,20 @@ class HybridStack(MegatronModule):
         """
 
         sharded_offsets = sharded_offsets or ()
-        sharded_state_dict = {}
-        layer_prefix = f'{prefix}layers.'
-
+        # Replica ids span the stack's GTP-inclusive DP x CP group, the group the global default
+        # stands for.
+        dp_cp_group = self.pg_collection.dp_cp_gtp_remat or self.pg_collection.dp_cp
         if self._has_custom_layers:
+            # Custom layers take the caller's group or the stack's, never the global one.
             metadata = dict(metadata or {})
             if metadata.get("dp_cp_group") is None:
-                metadata["dp_cp_group"] = getattr(self.pg_collection, "dp_cp", None)
+                metadata["dp_cp_group"] = dp_cp_group
             if metadata["dp_cp_group"] is None:
                 raise ValueError("Custom layer checkpoints require pg_collection.dp_cp.")
+        # Guard for cases metadata is not provided.
+        metadata = ensure_metadata_has_dp_cp_group(metadata, dp_cp_group)
+        sharded_state_dict = {}
+        layer_prefix = f'{prefix}layers.'
 
         for local_layer_idx, layer in enumerate(self.layers):
 
@@ -1038,7 +1047,6 @@ class HybridStack(MegatronModule):
         local_state_dict: dict = {}
         self._save_to_state_dict(local_state_dict, '', keep_vars=True)
         if local_state_dict:
-            metadata = ensure_metadata_has_dp_cp_group(metadata)
             sharded_state_dict.update(
                 make_sharded_tensors_for_checkpoint(
                     local_state_dict,

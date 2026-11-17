@@ -19,9 +19,9 @@ NOTE: For faster performance, if your entire model will fit into gpu memory, pre
 
 ##### 1.1 Understanding The Code
 ***STEP 1 - We initialize model parallel and other default arguments***
-We initalize tp and pp to 1 so that we can get the full model state dict on cpu
+We initalize tp and pp to 1 so that we can get the full model state dict on cpu. `initialize_distributed` returns the process groups of the parallel grid it builds; the model takes them explicitly.
 ```python
-    initialize_distributed(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
+    pg_collection = initialize_distributed(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
 ```
 
 ***STEP 2 - We load the model using the model_provider_function***
@@ -41,6 +41,7 @@ NOTE: We create a simple gpt model
         transformer_layer_spec=get_gpt_layer_local_spec(), 
         vocab_size=100, 
         max_sequence_length=_SEQUENCE_LENGTH,
+        pg_collection=pg_collection,
     )
 
     # Optionally you can also load a model using this code 

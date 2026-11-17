@@ -33,6 +33,7 @@ from megatron.core.utils import (
     deprecate_args,
     experimental_api,
     get_asyncio_loop,
+    get_global_memory_buffer,
     get_pg_size,
     nvtx_range_pop,
     nvtx_range_push,
@@ -587,8 +588,6 @@ class DynamicInferenceEngine(
         # stable for the graph's lifetime. Only needed when sequence parallel is on
         # (otherwise the "mpu" all-gather path is not taken).
         if getattr(model_config, "sequence_parallel", False):
-            from megatron.core.parallel_state import get_global_memory_buffer
-
             max_ag_numel = self.context.max_tokens * model_config.hidden_size
             get_global_memory_buffer().get_tensor((max_ag_numel,), model_config.params_dtype, "mpu")
 

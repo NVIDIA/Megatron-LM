@@ -5,6 +5,7 @@ from unittest.mock import Mock
 
 import torch
 
+from megatron.core.transformer.moe import paged_stash
 from megatron.core.transformer.moe.paged_stash import PagedStashManager, PagedStashRunner
 
 
@@ -248,3 +249,94 @@ def test_retry_stages_only_overlapped_reused_mxfp8_buffers(monkeypatch):
     overlapped._copy_main_params_to_param_buffer.assert_called_once_with()
     nonoverlapped._copy_main_params_to_param_buffer.assert_not_called()
     dedicated_buffer._copy_main_params_to_param_buffer.assert_not_called()
+
+
+class _CapacityDispatcher:
+    """An NCCL EP dispatcher that went over budget and reports the receive capacity it needed."""
+
+    def __init__(self, required):
+        self._required = required
+        self._comm_manager = SimpleNamespace(_max_tokens_per_rank=100, router_topk=2)
+
+    def check_over_budget(self):
+        return torch.tensor([self._required is not None])
+
+    def check_required_capacity(self):
+        return None if self._required is None else torch.tensor([self._required])
+
+
+def _overflow_runner(dispatchers):
+    runner = PagedStashRunner.__new__(PagedStashRunner)
+    runner.moe_layers = [SimpleNamespace(token_dispatcher=d) for d in dispatchers]
+    return runner
+
+
+def _all_reduce_with(calls, other_vote, other_required):
+    """all_reduce over this rank and one other rank that contributes the given tensors."""
+
+    def all_reduce(tensor, op=None, group=None):
+        calls.append((op, tuple(tensor.shape)))
+        if op == torch.distributed.ReduceOp.SUM:
+            tensor.add_(other_vote.to(tensor.dtype))
+        else:
+            tensor.copy_(torch.maximum(tensor, other_required.to(tensor.dtype)))
+
+    return all_reduce
+
+
+def _check_two_ranks(monkeypatch, moe_rank, other_rank, moe_rank_required):
+    monkeypatch.setattr(
+        paged_stash, "check_paged_stash_overflow", lambda: torch.zeros(1, dtype=torch.bool)
+    )
+    monkeypatch.setattr(
+        paged_stash, "check_paged_stash_host_spill", lambda: torch.zeros(1, dtype=torch.bool)
+    )
+    moe_calls, other_calls = [], []
+    monkeypatch.setattr(
+        torch.distributed, "all_reduce", _all_reduce_with(moe_calls, torch.zeros(3), torch.zeros(2))
+    )
+    assert moe_rank.check_moe_overflow() == (0, 1, 0)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        _all_reduce_with(other_calls, torch.tensor([0, 1, 0]), moe_rank_required),
+    )
+    assert other_rank.check_moe_overflow() == (0, 1, 0)
+    return moe_calls, other_calls
+
+
+def test_overflow_check_runs_the_same_collectives_on_a_stage_without_moe_layers(monkeypatch):
+    """A pipeline stage of dense layers enters the capacity reduction of an over-budget step too,
+    so the stages that hold MoE layers do not wait in it alone, and it learns the same capacity."""
+    moe_rank = _overflow_runner([_CapacityDispatcher(1234)])
+    dense_rank = _overflow_runner([])
+
+    moe_calls, dense_calls = _check_two_ranks(
+        monkeypatch, moe_rank, dense_rank, torch.tensor([1234, 200])
+    )
+
+    assert (
+        dense_calls
+        == moe_calls
+        == [(torch.distributed.ReduceOp.SUM, (3,)), (torch.distributed.ReduceOp.MAX, (2,))]
+    )
+    for runner in (moe_rank, dense_rank):
+        assert runner._required_recv_capacity == 1234
+        assert runner._required_capacity_factor == 1234 / 200
+
+
+def test_overflow_check_leaves_the_capacity_unset_when_no_rank_reports_one(monkeypatch):
+    """Over budget on a backend that reports no required capacity (HybridEP): every rank still
+    enters the reduction, and none grows a receive capacity."""
+    moe_rank = _overflow_runner([_CapacityDispatcher(None)])
+    moe_rank.moe_layers[0].token_dispatcher.check_over_budget = lambda: torch.tensor([True])
+    dense_rank = _overflow_runner([])
+
+    moe_calls, dense_calls = _check_two_ranks(
+        monkeypatch, moe_rank, dense_rank, torch.tensor([0, 200])
+    )
+
+    assert dense_calls == moe_calls
+    for runner in (moe_rank, dense_rank):
+        assert runner._required_recv_capacity is None
+        assert runner._required_capacity_factor is None

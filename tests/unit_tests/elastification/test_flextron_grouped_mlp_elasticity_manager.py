@@ -4,8 +4,9 @@
 
 Covers the multi-hook MLP masking pipeline: setup-mask init, the
 input/fc1-post/output hook trio that applies emb + intermediate masking,
-and detach. The fc1_post_hook calls into expert-tensor-parallel state,
-so we initialize MPU at world_size=1 (mask split is the whole mask).
+and detach. The fc1_post_hook splits the mask over the module's expert
+tensor-parallel group, so we initialize MPU at world_size=1 (mask split is
+the whole mask) and give the stub the expert tensor-parallel group of that grid.
 
 Run with:
     torchrun --nproc_per_node=1 -m pytest tests/unit_tests/elastification/test_flextron_grouped_mlp_elasticity_manager.py
@@ -17,6 +18,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from megatron.core import parallel_state
 from megatron.elastification.flextron_elasticity_hooks import (
     FlextronGroupedMLPElasticityManager,
     add_flextron_grouped_mlp_elasticity,
@@ -42,14 +44,16 @@ class _StubGroupedMLP(nn.Module):
     """Minimal module exposing the surface attach_hooks needs:
     - register_forward_*_hook (inherited from nn.Module)
     - a ``linear_fc1`` child (for fc1_post_hook)
+    - ``tp_group``, the expert tensor-parallel group the FC1 output is sharded over
 
     Forward chain mimics a real GroupedMLP: hidden -> fc1 -> ffn-sized
     "intermediate" -> projected back to hidden-sized output. Both stages
     return ``(tensor, None)`` so the hooks see the (out, bias) tuple shape
     they expect."""
 
-    def __init__(self, hidden_size, ffn_hidden_size):
+    def __init__(self, hidden_size, ffn_hidden_size, tp_group):
         super().__init__()
+        self.tp_group = tp_group
         self.hidden_size = hidden_size
         self.ffn_hidden_size = ffn_hidden_size
         # Stash the captured intermediate so tests can inspect what fc1_post_hook
@@ -86,7 +90,15 @@ class TestFlextronGroupedMLPElasticityManager:
         Utils.destroy_model_parallel()
 
     def _make_module(self, cfg):
-        return _StubGroupedMLP(cfg.hidden_size, cfg.ffn_hidden_size).cuda().to(torch.bfloat16)
+        return (
+            _StubGroupedMLP(
+                cfg.hidden_size,
+                cfg.ffn_hidden_size,
+                parallel_state.get_expert_tensor_parallel_group(),
+            )
+            .cuda()
+            .to(torch.bfloat16)
+        )
 
     def test_attach_registers_expected_hook_count(self):
         cfg = _config()
@@ -203,7 +215,15 @@ class TestAddFlextronGroupedMLPElasticity:
 
     def test_factory_returns_manager_with_layer_idx(self):
         cfg = _config()
-        mod = _StubGroupedMLP(cfg.hidden_size, cfg.ffn_hidden_size).cuda().to(torch.bfloat16)
+        mod = (
+            _StubGroupedMLP(
+                cfg.hidden_size,
+                cfg.ffn_hidden_size,
+                parallel_state.get_expert_tensor_parallel_group(),
+            )
+            .cuda()
+            .to(torch.bfloat16)
+        )
         mgr = add_flextron_grouped_mlp_elasticity(mod, cfg, layer_idx=0)
         assert isinstance(mgr, FlextronGroupedMLPElasticityManager)
         assert mgr.layer_idx == 0
