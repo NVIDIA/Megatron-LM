@@ -21,6 +21,7 @@ from .kernel_utils import (
     _descriptor,
     _fma2,
     _mul2,
+    named_jit,
     qualified_device,
     reduce_jobs,
     validate_num_streams,
@@ -192,7 +193,7 @@ def backward(
     # Reset on every invocation (also under graph replay) so every handoff word starts at tag 0.
     epochs.zero_()
     pp.zero_()
-    _backward[(grid,)](**kw)
+    BACKWARD_KERNELS[n][(grid,)](**kw)
 
     # Reduce controller chunks, then all gamma and controller gradients.
     retention, two = saved.has_retention, n == 2
@@ -207,7 +208,7 @@ def backward(
     beta0, beta1 = coefficients(2), coefficients(3) if two else None
     write, retain = coefficients(0), coefficients(1) if retention else None
     # Per controller (write, retention, then each reader's read): its partial plane and the
-    # raw rows/coefficients its final reduction combines (see _reduce_jobs).
+    # raw rows/coefficients its final reduction combines (see _bwd_wr_reduce).
     kinds = (
         (0, (chunks[raw_b], beta0, chunks[raw_b + 1] if two else None, beta1, True)),
         (1, (plane(2), beta0, plane(3) if two else None, beta1) if retention else None),
@@ -497,8 +498,7 @@ def _load_residual(residuals, cols, part, stream: gl.constexpr, h: gl.constexpr)
     return value
 
 
-@g.jit
-def _backward(
+def _backward_body(
     inputs,
     outputs,
     GEOMETRY: gl.constexpr,
@@ -894,3 +894,10 @@ def _backward(
 
         row_tile = next_rp
         iteration += 1
+
+
+# One kernel body; its profiler name gives the variant (reader count).
+BACKWARD_KERNELS = {
+    1: named_jit(_backward_body, "_bwd_wr_read_norm_wr_write"),
+    2: named_jit(_backward_body, "_bwd_wr_read_norm_wr_write_2reader"),
+}

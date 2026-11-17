@@ -94,7 +94,7 @@ def taped_forward(forward, *args, **kwargs):
 
 def forbid_backward_state(monkeypatch):
     """Fail if inference enters autograd or allocates backward state; returns a list that
-    gains one entry per non-warmup ``_forward`` launch."""
+    gains one entry per non-warmup forward kernel launch."""
 
     def forbidden(*args, **kwargs):
         raise AssertionError("inference entered autograd or allocated backward state")
@@ -102,18 +102,21 @@ def forbid_backward_state(monkeypatch):
     monkeypatch.setattr(api._Boundary, "apply", forbidden)
     monkeypatch.setattr(ReplayInterval, "record", forbidden)
     monkeypatch.setattr(forward_kernel, "SavedWrite", forbidden)
-    launch = forward_kernel._forward.run
     observed = []
 
-    def inspect(*args, **kwargs):
-        if not kwargs.get("warmup"):
-            write, readers = args[0], kwargs["read_tensors"]
-            assert kwargs["saved_coefficients"] is None and write.summed_update is None
-            assert all(stat is None for stat in readers.rstd)
-            observed.append(True)
-        return launch(*args, **kwargs)
+    def inspected(launch):
+        def inspect(*args, **kwargs):
+            if not kwargs.get("warmup"):
+                write, readers = args[0], kwargs["read_tensors"]
+                assert kwargs["saved_coefficients"] is None and write.summed_update is None
+                assert all(stat is None for stat in readers.rstd)
+                observed.append(True)
+            return launch(*args, **kwargs)
 
-    monkeypatch.setattr(forward_kernel._forward, "run", inspect)
+        return inspect
+
+    for kernel in forward_kernel.FORWARD_KERNELS.values():
+        monkeypatch.setattr(kernel, "run", inspected(kernel.run))
     return observed
 
 
@@ -176,7 +179,7 @@ INFERENCE = [
     + [(1024, 10240, 2, 2)]
 ]
 # backward: (streams, readers, hidden, rows, retention, grid, routes, updates, BF16 residual).
-# Column routes only prepend _replay_mx launches (per reader index); explicit grids include
+# Column routes only prepend _bwd_wr_recompute_mxfp8quant launches (per reader index); explicit grids include
 # idle groups that must skip their bootstrap transfers.
 EXPLICIT_GRIDS = [(32, 1), (96, 1), (128, 64), (288, 4), (4128, 34), (4096, 32)]
 EXPLICIT_GRIDS += [(4096, 960), (3072, 24), (10240, 80)]

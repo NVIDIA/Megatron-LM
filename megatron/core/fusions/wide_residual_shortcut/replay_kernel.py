@@ -16,7 +16,7 @@ from .kernel_utils import _emit_mxfp8, _forward_value, _mul_rn, allocate_operand
 
 
 @g.jit
-def _replay_transitions(
+def _bwd_wr_recompute(
     checkpoint,
     updates,
     coefficients,
@@ -57,7 +57,7 @@ def _replay_transitions(
 
 
 @g.jit
-def _replay_mx(
+def _bwd_wr_recompute_mxfp8quant(
     checkpoint,
     updates,
     cs,
@@ -160,7 +160,7 @@ def _column_inputs(checkpoint, tapes, requested, columns):
 
 def _launch_columns(checkpoint, tapes, outputs, data, scales, requested, terminal, reader):
     m, h = tapes[0].update.shape
-    _replay_mx[(triton.cdiv(m, 128) * 4 * triton.cdiv(h, 128) * 4,)](
+    _bwd_wr_recompute_mxfp8quant[(triton.cdiv(m, 128) * 4 * triton.cdiv(h, 128) * 4,)](
         checkpoint,
         tuple(t.update for t in tapes),
         tuple(t.coefficients for t in tapes),
@@ -258,7 +258,7 @@ def replay_interval(
             checkpoint, tapes, outputs, data, scales, requested, terminal_output, reader
         )
     elif transitions := (tapes if terminal_output is not None else tapes[:-1]):
-        _replay_transitions[(m * triton.cdiv(h, 512),)](
+        _bwd_wr_recompute[(m * triton.cdiv(h, 512),)](
             checkpoint,
             tuple(t.update for t in transitions),
             tuple(t.coefficients for t in transitions),
