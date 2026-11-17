@@ -219,18 +219,20 @@ def run_with_scratch(backward, *args, **kwargs):
 
         return allocate
 
-    original_run = backward_kernel._backward.run
+    def record_launch(original_run):
+        def record(*args, **kwargs):
+            kernel = original_run(*args, **kwargs)
+            if not kwargs.get("warmup", False):
+                launches.append(kernel)
+            return kernel
 
-    def record_launch(*args, **kwargs):
-        kernel = original_run(*args, **kwargs)
-        if not kwargs.get("warmup", False):
-            launches.append(kernel)
-        return kernel
+        return record
 
     with ExitStack() as stack:
         for owner, name in ((torch, "empty"), (torch, "empty_like"), (torch.Tensor, "new_empty")):
             stack.enter_context(patch.object(owner, name, record_allocation(getattr(owner, name))))
-        stack.enter_context(patch.object(backward_kernel._backward, "run", record_launch))
+        for variant in backward_kernel.BACKWARD_KERNELS.values():
+            stack.enter_context(patch.object(variant, "run", record_launch(variant.run)))
         grads, columns = backward(*args, **kwargs)
     # TE allocates column buffers in C++; include those through returned operands.
     allocations.extend(workspace_tensors((grads, columns)))
@@ -644,7 +646,8 @@ def test_rejects_invalid_inputs():
         with pytest.raises(ValueError, match=match):
             backward_kernel.backward(saved, None, (None,))
     _, args = backward_args(inputs(3, 1, 4096, 128))
-    with patch.object(backward_kernel._backward, "run", side_effect=AssertionError("launch")):
+    single_reader = backward_kernel.BACKWARD_KERNELS[1]
+    with patch.object(single_reader, "run", side_effect=AssertionError("launch")):
         for grid in (None, 0, -32, 31, True):
             with pytest.raises(ValueError, match="grid"):
                 backward_kernel.backward(*args, config=grid)
@@ -1313,7 +1316,7 @@ def test_generic_norm_matches_unfused_oracle(hidden):
     actual_rs = torch.empty(rows, device=x.device, dtype=F32)
     actual = quantizer.make_empty(x.shape, dtype=BF16, device=x.device)
     actual._rowwise_scale_inv.zero_()
-    forward_kernel._forward[(rows,)](
+    forward_kernel.FORWARD_KERNELS[True, 1][(rows,)](
         forward_kernel._WriteArgs(2 * x, update, update, torch.empty_like(x), None),
         read_tensors=forward_kernel._ReadArgs(
             (gamma,), (actual_rs,), (actual._rowwise_data,), (actual._rowwise_scale_inv,)
