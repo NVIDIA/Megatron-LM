@@ -30,16 +30,14 @@ def test_backward_gather_preserves_other_chunk_forward(dtype, grouped):
     layers = [make_layer() for _ in range(3)]
     gtp.classify_gtp_remat_chains(layers)
     anchors = [layer.weight0 if grouped else layer.weight for layer in layers]
-    for index, anchor in enumerate(anchors):
-        for weight in anchor._weights:
+    for index, layer in enumerate(layers):
+        for weight in layer.parameters():
             weight.data.fill_(3 + 3 * index)
 
     forward, _ = anchors[0]._all_gather_weight(async_op=False, fwd=True)
-    if grouped:
-        # Nonadjacent grouped blocks reuse the same double-buffer parity.
-        for weight in anchors[1]._weights:
-            weight._double_buffer_parity()
-    anchors[2]._all_gather_weight(async_op=False, fwd=False)
+    # Two other chunks also exercise reuse of both grouped double buffers.
+    for anchor in anchors[1:]:
+        anchor._all_gather_weight(async_op=False, fwd=False)
 
     tensors = forward if grouped else [forward]
     for tensor in tensors:
@@ -72,7 +70,7 @@ def test_interleaved_chunks_preserve_forward_values(monkeypatch):
             for chunk, reference in zip(chunks, expected):
                 for weight in chunk.parameters():
                     weight.main_grad.zero_()
-                output = chunk(x.detach().clone().requires_grad_())
+                output = chunk(x.clone().requires_grad_())
                 torch.testing.assert_close(output, reference, atol=0, rtol=0)
                 output.sum().backward()
     finally:
