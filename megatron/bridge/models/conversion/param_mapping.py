@@ -48,7 +48,7 @@ from megatron.bridge.models.conversion.utils import (
     is_modelopt_dynamic_module,
     remove_non_pickleables,
 )
-from megatron.bridge.utils.common_utils import extract_expert_number_from_param
+from megatron.bridge.utils.common import extract_expert_number_from_param
 from megatron.core import mpu
 from megatron.core.fp8_utils import FP8_TENSOR_CLASS, HAVE_TE_FP8_TENSOR_CLASS
 from megatron.core.transformer.module import MegatronModule
@@ -3585,7 +3585,7 @@ class FusedExpertMapping(AutoMapping):
         )
 
     def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module: nn.Module) -> torch.Tensor:
-        from megatron.bridge.utils.common_utils import extract_expert_number_from_param
+        from megatron.bridge.utils.common import extract_expert_number_from_param
 
         expert_idx = extract_expert_number_from_param(self.megatron_param)
         expert_weight = hf_weights[expert_idx] if hf_weights.ndim >= 3 else hf_weights
@@ -3683,7 +3683,7 @@ class FusedGatedExpertMapping(AutoMapping):
         )
 
     def hf_to_megatron(self, hf_weights: torch.Tensor, megatron_module: nn.Module) -> torch.Tensor:
-        from megatron.bridge.utils.common_utils import extract_expert_number_from_param
+        from megatron.bridge.utils.common import extract_expert_number_from_param
 
         expert_idx = extract_expert_number_from_param(self.megatron_param)
         expert_weight = hf_weights[expert_idx] if hf_weights.ndim >= 3 else hf_weights

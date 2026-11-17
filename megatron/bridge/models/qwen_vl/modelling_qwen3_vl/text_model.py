@@ -32,7 +32,7 @@ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_block import 
     Qwen3VLTransformerBlock,
 )
 from megatron.bridge.models.transformer_config import TransformerConfig
-from megatron.bridge.utils.packed_seq_utils import get_packed_seq_q_cu_seqlens
+from megatron.bridge.utils.packed_seq import get_packed_seq_q_cu_seqlens
 from megatron.core import tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.inference.contexts import BaseInferenceContext

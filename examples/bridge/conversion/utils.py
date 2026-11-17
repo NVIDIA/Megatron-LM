@@ -39,7 +39,7 @@ def _configure_distributed_env() -> None:
     if os.environ.get("WORLD_SIZE") is not None or os.environ.get("SLURM_NTASKS") is None:
         return
 
-    from megatron.bridge.utils.slurm_utils import (
+    from megatron.bridge.utils.slurm import (
         resolve_slurm_master_addr,
         resolve_slurm_master_port,
     )

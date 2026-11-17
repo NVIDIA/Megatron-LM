@@ -37,7 +37,7 @@ import torch
 
 from megatron.bridge.models.common.base import ModelConfig
 from megatron.bridge.models.logit_dtype import logit_dtype_kwarg
-from megatron.bridge.utils.packed_seq_utils import get_packed_seq_cp_partition_indices
+from megatron.bridge.utils.packed_seq import get_packed_seq_cp_partition_indices
 from megatron.core import tensor_parallel
 from megatron.core.fp8_utils import get_fp8_align_size
 from megatron.core.models.hybrid.hybrid_model import HybridModel

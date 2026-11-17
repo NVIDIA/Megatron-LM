@@ -1589,7 +1589,7 @@ class MegatronModelBridge(
         Returns:
             Merged weights dict when the group is complete, ``None`` otherwise.
         """
-        from megatron.bridge.utils.common_utils import extract_expert_number_from_param
+        from megatron.bridge.utils.common import extract_expert_number_from_param
 
         # Use the mapping's process group rather than the global parallel-state
         # singleton. Decentralized callers such as MegatronMIMO install

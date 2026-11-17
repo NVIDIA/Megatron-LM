@@ -41,7 +41,7 @@ from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.utils import (
     split_deepstack_embs,
 )
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.vision_model import Qwen3VLVisionModel
-from megatron.bridge.utils.packed_seq_utils import (
+from megatron.bridge.utils.packed_seq import (
     get_packed_seq_cp_partition_indices,
     get_packed_seq_q_cu_seqlens,
     preprocess_packed_seqs,

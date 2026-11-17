@@ -24,7 +24,7 @@ from torch import Tensor
 from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.transformer_config import (
     Qwen3VLTransformerConfig,
 )
-from megatron.bridge.utils.packed_seq_utils import get_packed_seq_q_cu_seqlens
+from megatron.bridge.utils.packed_seq import get_packed_seq_q_cu_seqlens
 from megatron.core.inference.contexts import BaseInferenceContext
 from megatron.core.models.common.embeddings.rope_utils import (
     _apply_rotary_pos_emb_bshd,
