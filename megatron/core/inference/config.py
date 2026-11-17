@@ -554,7 +554,8 @@ class InferenceConfig:
     max_tokens: Optional[int] = None
     """
     Max number of tokens to use for forward passes. This is primarily limited by prefill activation
-    memory usage. (Defaults to 16384).
+    memory usage. Must be divisible by the tensor parallel size. Batch-invariant inference also
+    requires alignment to the dynamic context's token rounding size. (Defaults to 16384).
     """
 
     unified_memory_level: int = 0
@@ -570,6 +571,14 @@ class InferenceConfig:
     """
     Mode used to determine how large tensors are handled by the allocate and deallocate methods.
     See `KVCacheManagementMode` for options.
+    """
+
+    start_suspended: bool = False
+    """
+    Construct the engine in the `SUSPENDED` state instead of `RUNNING`, so it can be built
+    before its weights are in place. CUDA-graph capture waits for the first `resume()`.
+    The inference-state buffers are still allocated at construction and are then held or
+    released according to `kv_cache_management_mode`, as after a regular `suspend()`.
     """
 
     # =================================
@@ -914,6 +923,23 @@ class InferenceConfig:
                 "inference_shortcut_moe_overlap requires further testing with batch-invariant mode "
                 "or CuTeDSL GDP kernels"
             )
+
+    def resolve_pg_collection(self) -> ProcessGroupCollection:
+        """Return the configured process groups, falling back to the MPU globals.
+
+        This is the compatibility boundary for inference: engines and wrappers call it and can then
+        assume a collection, instead of each re-deriving one from global state. Resolution is lazy
+        so it happens after ``initialize_model_parallel``, not at config construction.
+
+        The fallback is returned without being stored on the config. ``pg_collection`` stays
+        ``None`` unless the caller set it, because the inference context and controller read that
+        field and treat ``None`` as "no explicit collection". Storing the global groups would
+        change which branch they take depending on which component resolved first, and would pin
+        the groups of one parallel-state initialization onto a long-lived config.
+        """
+        if self.pg_collection is not None:
+            return self.pg_collection
+        return ProcessGroupCollection.use_mpu_process_groups()
 
     def __post_init__(self, verbose: bool):
         self._verbose = verbose
