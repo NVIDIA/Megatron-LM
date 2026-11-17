@@ -9,6 +9,9 @@ from typing import List, Literal, Optional
 class TrainingConfig:
     """Configuration settings related to the training loop."""
 
+    vision_pretraining_type: Literal["classify", "inpaint", "dino"] | None = None
+    """Vision pretraining objective, or None when vision pretraining is disabled."""
+
     micro_batch_size: int | None = None
     """Batch size per model instance (local batch size). Global batch size is local batch size times
     data parallel size times number of micro batches."""
