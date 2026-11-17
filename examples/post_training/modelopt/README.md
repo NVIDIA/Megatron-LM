@@ -246,7 +246,7 @@ deployment.
 ```sh
 \
     TP=1 \
-    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_CKPT=<megatron_core_checkpoint> \
     MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3 \
     ./eagle3.sh meta-llama/Llama-3.2-1B-Instruct
 
@@ -268,10 +268,9 @@ Then only the draft model is called during training. AL is no longer reported du
 ```sh
 \
     # Convert to online eagle3 model for base model feature extraction
-    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_CKPT=<megatron_core_checkpoint> \
     MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3 \
-    MLM_EXTRA_ARGS="--algorithm eagle3" \
-    ./convert.sh meta-llama/Llama-3.2-1B-Instruct
+    ./convert_speculative.sh meta-llama/Llama-3.2-1B-Instruct
 
 \
     # Dump base model feature to disk
@@ -281,10 +280,10 @@ Then only the draft model is called during training. AL is no longer reported du
 
 \
     # Convert to offline eagle3 model
-    HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+    MLM_MODEL_CKPT=<megatron_core_checkpoint> \
     MLM_MODEL_SAVE=/tmp/Llama-3.2-1B-Eagle3-offline \
-    MLM_EXTRA_ARGS="--algorithm eagle3 --export-offline-model" \
-    ./convert.sh meta-llama/Llama-3.2-1B-Instruct
+    MLM_EXTRA_ARGS="--export-offline-model" \
+    ./convert_speculative.sh meta-llama/Llama-3.2-1B-Instruct
 
 \
     # Train the offline eagle3 model using extracted features
@@ -320,7 +319,7 @@ Example for depth pruning Qwen3-8B from 36 to 24 layers:
 ```sh
 PP=1 \
 MLM_EXTRA_ARGS='--prune-export-config {"num_layers":24}' \
-HF_MODEL_CKPT=<pretrained_model_name_or_path> \
+MLM_MODEL_CKPT=<megatron_core_checkpoint> \
 MLM_MODEL_SAVE=Qwen3-8B-Pruned \
 ./prune.sh Qwen/Qwen3-8B
 ```
