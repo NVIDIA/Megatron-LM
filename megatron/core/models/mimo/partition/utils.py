@@ -16,7 +16,7 @@ from megatron.core.context_parallel import (
     get_batches_on_this_cp_rank,
 )
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.parallel_state import get_context_parallel_group, get_tensor_model_parallel_group
+from megatron.core.process_groups_config import resolve_process_groups
 from megatron.core.utils import get_pg_size
 
 
@@ -48,15 +48,42 @@ class PartitionConfig:
     ) -> "PartitionConfig":
         """
         Creates a PartitionConfig from a ModelParallelConfig.
+
+        ``cp_group``, ``tp_group`` and ``tp_cp_group`` are the language model's context-parallel,
+        tensor-parallel and combined groups. Omitting ``cp_group`` with context parallelism, or
+        ``tp_group`` with sequence parallelism, is deprecated: the group of the global parallel
+        state is used, with a ``ProcessGroupFallbackWarning``.
         """
         if not isinstance(mp, ModelParallelConfig):
             raise TypeError("mp must be a ModelParallelConfig instance")
 
+        # Deprecated fallbacks for callers that do not pass the language model's groups.
         if mp.context_parallel_size > 1 and cp_group is None:
-            cp_group = get_context_parallel_group()
-
+            cp_group = resolve_process_groups(
+                None,
+                owner="PartitionConfig.from_mp_config",
+                required=("cp",),
+                argument="cp_group",
+                deprecated_in="0.21",
+                removed_in="0.23",
+            ).cp
         if mp.sequence_parallel and tp_group is None:
-            tp_group = get_tensor_model_parallel_group()
+            tp_group = resolve_process_groups(
+                None,
+                owner="PartitionConfig.from_mp_config",
+                required=("tp",),
+                argument="tp_group",
+                deprecated_in="0.21",
+                removed_in="0.23",
+            ).tp
+        if (mp.context_parallel_size > 1 and cp_group is None) or (
+            mp.sequence_parallel and tp_group is None
+        ):
+            raise ValueError(
+                "PartitionConfig.from_mp_config needs cp_group with context parallelism and "
+                "tp_group with sequence parallelism, and parallel_state has no global grid to "
+                "fall back to. Pass the language model's groups."
+            )
 
         return cls(
             seq_parallel=mp.sequence_parallel,

@@ -14,6 +14,7 @@ from datasets import load_dataset
 from modelopt.torch.utils.plugins import megatron_generate
 from utils import get_hf_tokenizer
 
+from megatron.core.parallel_state import get_registered_process_groups
 from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
 from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
@@ -104,7 +105,12 @@ if __name__ == "__main__":
             UserWarning,
         )
 
-    model = get_model(functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False)
+    # Build the model on the groups that initialize_megatron() registered.
+    model = get_model(
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder),
+        wrap_with_ddp=False,
+        pg_collection=get_registered_process_groups(),
+    )
     report_current_memory_info()
 
     unwrapped_model = unwrap_model(model)[0]

@@ -118,6 +118,7 @@ def test_parameter_state_round_trip(dtypes, precision_aware):
             ),
             [ddp],
             use_gloo_process_groups=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         if hasattr(optimizer, "chained_optimizers"):
             assert len(optimizer.chained_optimizers) == 1
@@ -195,6 +196,7 @@ def test_mhc_bf16_parameter_state_round_trip(precision_aware):
             ),
             [ddp],
             use_gloo_process_groups=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         if hasattr(optimizer, "chained_optimizers"):
             assert len(optimizer.chained_optimizers) == 1

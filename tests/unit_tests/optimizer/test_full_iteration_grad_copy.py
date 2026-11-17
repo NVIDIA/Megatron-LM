@@ -267,7 +267,9 @@ def test_distributed_optimizer_enables_graph_copy_from_config(
             optimizer_cuda_graph=optimizer_cuda_graph,
         )
         # get_megatron_optimizer always returns a chain; this model yields one member.
-        (optimizer,) = get_megatron_optimizer(config, [model]).chained_optimizers
+        (optimizer,) = get_megatron_optimizer(
+            config, [model], pg_collection=ProcessGroupCollection.use_mpu_process_groups()
+        ).chained_optimizers
         assert isinstance(optimizer, DistributedOptimizer)
         assert (optimizer._cudagraphed_grad_copy is not None) is enabled
     finally:
