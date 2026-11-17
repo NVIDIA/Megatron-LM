@@ -57,12 +57,15 @@ logger = getLogger(__name__)
 
 
 def _sqrt(value: Union[float, torch.Tensor]) -> Union[float, torch.Tensor]:
-    """Return the square root of a Python number, or of a tensor without synchronizing the host.
+    """Return the square root of a gradient norm, without synchronizing the host under capture.
 
-    A child optimizer may return its gradient norm as a tensor, as FullyShardedOptimizer does, so
-    that the step can be captured in a CUDA graph.
+    A child optimizer may return its gradient norm as a tensor, as FullyShardedOptimizer does.
+    While a CUDA graph is captured, the tensor's own square root avoids a host synchronization.
+    Otherwise math.sqrt keeps the eager result bitwise unchanged: it rounds in double precision.
     """
-    return value.sqrt() if isinstance(value, torch.Tensor) else math.sqrt(value)
+    if isinstance(value, torch.Tensor) and torch.cuda.is_current_stream_capturing():
+        return value.sqrt()
+    return math.sqrt(value)
 
 
 def _zero_grad_group_helper(
