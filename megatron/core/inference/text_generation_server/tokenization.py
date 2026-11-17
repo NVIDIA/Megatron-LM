@@ -2,20 +2,31 @@
 
 """Tokenization utilities."""
 
+from typing import Optional
 
 import torch
 
-from megatron.core import parallel_state
 from megatron.core.inference.communication_utils import broadcast_int_list, broadcast_tensor
+from megatron.core.process_groups_config import ProcessGroupCollection, resolve_process_groups
 
 
 def tokenize_prompts(
-    tokenizer, prompts=None, tokens_to_generate=None, add_BOS=None, rank=0, data_parallel=False
+    tokenizer,
+    prompts=None,
+    tokens_to_generate=None,
+    add_BOS=None,
+    rank=0,
+    data_parallel=False,
+    pg_collection: Optional[ProcessGroupCollection] = None,
 ):
     """Tokenize prompts and make them avaiable on all ranks.
 
     Args:
         data_parallel (bool): Broadcast tokens across a single data parallel model replica.
+        pg_collection: Process groups of the model, used with `data_parallel`: the ranks whose
+            `dp` group starts at global rank `rank` tokenize, and each `mp` group broadcasts the
+            tokens from its first rank. If None, the global groups are used; that fallback is
+            deprecated.
     """
 
     # On all ranks set to None so we can pass them to functions
@@ -25,8 +36,23 @@ def tokenize_prompts(
 
     # On the specified rank, build the above.
     src_rank = torch.distributed.get_rank()
+    mp_group = None
     if data_parallel:
-        src_rank = parallel_state.get_data_parallel_src_rank()
+        pg_collection = resolve_process_groups(
+            pg_collection,
+            owner="tokenize_prompts",
+            required=("dp", "mp"),
+            deprecated_in="0.21",
+            removed_in="0.23",
+        )
+        dp_group, mp_group = pg_collection.dp, pg_collection.mp
+        # torch.distributed treats a None group as the whole world.
+        if dp_group is None or mp_group is None:
+            raise ValueError(
+                "tokenize_prompts with data_parallel=True broadcasts within the dp and mp "
+                "groups; pg_collection must not set them to None."
+            )
+        src_rank = torch.distributed.get_global_rank(dp_group, 0)
 
     if src_rank == rank:
         assert prompts is not None
@@ -43,7 +69,7 @@ def tokenize_prompts(
 
     # First, broadcast the sizes.
     sizes_tensor = broadcast_int_list(
-        2, int_list=sizes_list, rank=rank, data_parallel=data_parallel
+        2, int_list=sizes_list, rank=rank, data_parallel=data_parallel, mp_group=mp_group
     )
 
     # Now that we have the sizes, we can boradcast the tokens
@@ -55,6 +81,7 @@ def tokenize_prompts(
         tensor=prompts_tokens_cuda_long_tensor,
         rank=rank,
         data_parallel=data_parallel,
+        mp_group=mp_group,
     )
     prompts_length_cuda_long_tensor = broadcast_tensor(
         sizes[0],
@@ -62,6 +89,7 @@ def tokenize_prompts(
         tensor=prompts_length_cuda_long_tensor,
         rank=rank,
         data_parallel=data_parallel,
+        mp_group=mp_group,
     )
 
     return prompts_tokens_cuda_long_tensor, prompts_length_cuda_long_tensor
