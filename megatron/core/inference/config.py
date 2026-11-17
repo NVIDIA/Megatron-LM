@@ -976,8 +976,23 @@ class InferenceConfig:
             raise ValueError("inference_shortcut_moe_overlap requires BF16 model parameters")
         if model_config.fp8 or model_config.fp4:
             raise ValueError("Shortcut MoE overlap with FP8 or FP4 requires further testing")
-        if model_config.tensor_model_parallel_size != 1 or model_config.context_parallel_size != 1:
-            raise ValueError("inference_shortcut_moe_overlap requires TP=1 and CP=1")
+        if model_config.context_parallel_size != 1:
+            raise ValueError("inference_shortcut_moe_overlap requires CP=1")
+        # TP > 1 is safe because every TP-group collective stays on the main stream: see
+        # ShortcutMoEBlock._forward_inference_overlap. These checks keep it that way.
+        if model_config.tensor_model_parallel_size > 1 and not model_config.sequence_parallel:
+            raise ValueError("inference_shortcut_moe_overlap with TP>1 requires sequence_parallel")
+        if model_config.moe_shared_expert_overlap:
+            # Would run the shared expert's TP collectives on a third stream.
+            raise ValueError(
+                "inference_shortcut_moe_overlap requires moe_shared_expert_overlap=False"
+            )
+        if model_config.inference_fuse_tp_communication:
+            # Its fused reduce-scatter writes the residual (the pair input) in place on the
+            # main stream while the shortcut stream reads that input.
+            raise ValueError(
+                "inference_shortcut_moe_overlap requires inference_fuse_tp_communication=False"
+            )
         if model_config.inference_moe_token_dispatcher_type != "nvls":
             raise ValueError("inference_shortcut_moe_overlap requires the NVLS dispatcher")
         if model_config.inference_disable_triton_nvls_kernels:
