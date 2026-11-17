@@ -81,7 +81,7 @@ bridge = [
     "pyyaml>=6.0.2",
     "rich",
     "safetensors>=0.4.5",
-    "transformers>=5.15,<5.21",
+    "transformers>=5.21.1,<5.24",
 ]
 
 training = [

@@ -31,14 +31,14 @@ uv sync --extra training --extra dev --extra ssm --extra bridge --group test
 ```
 
 The optional `bridge` extra declares Transformers, safetensors, Accelerate,
-OmegaConf, PyYAML, Pydantic, einops and Rich. The NeMo Run launcher additionally
+OmegaConf, PyYAML, Pydantic, einops and Rich. Transformers follows Bridge's
+`>=5.21.1,<5.24` range, with 5.23.0 in the lockfile. The NeMo Run launcher additionally
 uses `nemo-run`, included in MLM's test dependency group; direct worker invocation
 does not require that launcher.
 
 Use a pinned HF revision for remote inputs. `--trust-remote-code` explicitly
 permits executing the checkpoint's custom Python code; use it only for trusted
-sources. Native Super VL configurations require Transformers >=5.18; older
-supported environments require the model's original remote-code configuration.
+sources. The supported Transformers range includes native Super VL configurations.
 
 ## GPU import/export
 
