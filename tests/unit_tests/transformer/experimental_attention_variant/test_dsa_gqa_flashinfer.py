@@ -23,6 +23,8 @@ NUM_HEADS = 16
 HEAD_DIM = 256
 INDEX_DIM = 128
 TOPK = 512
+# The threshold-sample rank of TOPK, the sample top-k a prefill step runs over every tile row.
+SELECTOR_RANK = dsa_gqa_flashinfer.SELECTOR[TOPK][0]
 
 
 def _config(**overrides) -> TransformerConfig:
@@ -173,6 +175,25 @@ def test_fill_page_table():
     dsa_gqa_flashinfer.fill_page_table(table, 256, pages)
     assert pages[:2, :8].tolist() == [[8, 9, 10, 11, 0, 1, 2, 3], [20, 21, 22, 23, 4, 5, 6, 7]]
     assert (pages[:, 8:] == -7).all() and (pages[2] == -7).all()
+
+
+@requires_flashinfer_dsa
+def test_top_k_rows_past_one_launch():
+    """Top-k over more rows than one gvr_2 launch holds (65535), as a prefill plan with a large
+    request budget has, matches torch.topk on every row."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    # The sample width of a 196608-token context: wide rows take gvr_2's row-per-grid-row engines.
+    rows, width, top_k = 65536 + 128, 4608, SELECTOR_RANK
+    scores = torch.randn(rows, width, device=device)
+    lengths = torch.full((rows,), width, dtype=torch.int32, device=device)
+    out = torch.empty(rows, top_k, dtype=torch.int32, device=device)
+    workspace = torch.zeros(
+        dsa_gqa_flashinfer.workspace_bytes() // 4, dtype=torch.int32, device=device
+    )
+    dsa_gqa_flashinfer._top_k_rows(scores, lengths, out, workspace, top_k)
+    # Compare the selected scores, not indices: rows tied at the k-th score may pick either key.
+    selected = scores.gather(1, out.long()).sort(dim=1, descending=True).values
+    assert torch.equal(selected, scores.topk(top_k, dim=1).values)
 
 
 def _rows_of(query_lengths, kv_lengths):

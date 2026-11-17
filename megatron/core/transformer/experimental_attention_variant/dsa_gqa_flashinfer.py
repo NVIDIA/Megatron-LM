@@ -72,6 +72,10 @@ TILE_ROWS = 128
 # top-k tie slots. A row the threshold misses is repaired exactly inside the select launch.
 SAMPLES, PAGES = 3, 2
 SELECTOR = {512: (39, 4608), 1024: (60, 6144), 2048: (96, 9216)}
+# gvr_2's top-k launches one grid row per input row, and a grid's y dimension holds at most
+# 65535. A prefill plan pads a tile per request, so a large request budget exceeds that; select
+# in slabs of rows instead, as FlashInfer's own prefill top-k does.
+TOPK_ROW_SLAB = 32768
 # NVFP4 index keys of the 128-dim indexer: packed E2M1 bytes and E4M3 scales (one per 16 values)
 # per key; a 64-key cache page holds its keys' bytes, then their scales.
 INDEX_KEY_DTYPES = ("bf16", "nvfp4")
@@ -364,6 +368,23 @@ def write_nvfp4_index_keys(
     return packed_query, query_scales
 
 
+def _top_k_rows(scores, lengths, out, workspace, top_k):
+    """Each row's ``top_k`` largest of its first ``lengths[row]`` scores (gvr_2), in slabs of
+    at most ``TOPK_ROW_SLAB`` rows. Rows are independent, so slabbing doesn't change the result."""
+    for start in range(0, scores.size(0), TOPK_ROW_SLAB):
+        end = start + TOPK_ROW_SLAB
+        run_varlen(
+            scores[start:end],
+            None,
+            lengths[start:end],
+            out[start:end],
+            next_n=1,
+            max_seq_len=scores.size(1),
+            workspace=workspace,
+            top_k=top_k,
+        )
+
+
 def _token_core(query, keys, requests, table, key_rows, value_rows, out, index_topk, scale, heads):
     """Each row of `query` attends to its selected key positions `keys` (-1: none) of request
     `requests[row]` with trtllm-gen token-sparse attention (page size 1)."""
@@ -504,16 +525,7 @@ def flashinfer_sparse_attention(
             ),
         )
         sample_top = torch.empty(tiled, rank, dtype=torch.int32, device=device)
-        run_varlen(
-            sample_scores,
-            None,
-            sample_row_ends,
-            sample_top,
-            next_n=1,
-            max_seq_len=sample_cap,
-            workspace=topk_ws,
-            top_k=rank,
-        )
+        _top_k_rows(sample_scores, sample_row_ends, sample_top, topk_ws, rank)
         thresholds = torch.empty(tiled, device=device)
         counters = torch.empty(tiled, 2, dtype=torch.int32, device=device)
         thresholds_from_sample(sample_scores, sample_top, thresholds=thresholds, counters=counters)
@@ -585,16 +597,7 @@ def flashinfer_sparse_attention(
             key_scales=key_scales,
         )
         topk = torch.empty(decode_rows, index_topk, device=device, dtype=torch.int32)
-        run_varlen(
-            scores,
-            None,
-            plan.decode_lengths,
-            topk,
-            next_n=1,
-            max_seq_len=width,
-            workspace=topk_ws,
-            top_k=index_topk,
-        )
+        _top_k_rows(scores, plan.decode_lengths, topk, topk_ws, index_topk)
         if deterministic:
             # gvr_2 returns the selected keys in an order that varies between runs, and
             # attention sums in that order; sorting (descending, so -1 padding stays last)
