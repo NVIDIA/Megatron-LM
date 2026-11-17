@@ -283,7 +283,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="streamwise_residual_ops",
         sources=("megatron/core/transformer/streamwise_residual_ops.py",),
-        tests=(K + "test_streamwise_residual_ops.py",),
+        tests=(K + "test_streamwise_residual_ops.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         notes="Fused streamwise read/write with fixed-order controller-gradient reductions; "
         "replay covers identity carry and learned retention.",
@@ -506,7 +506,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="inference_routing_mask_kernel",
         sources=("megatron/core/transformer/moe/inference_routing_mask_kernel.py",),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(K + "test_inference_kernels.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         training_path=False,
     ),
@@ -587,7 +587,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/ops/common/intermediate_extraction.py",
             "megatron/core/ssm/ops/common/determinism.py",
         ),
-        tests=(K + "test_ssm_kernels.py",),
+        tests=(K + "test_ssm_kernels.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         notes="determinism.py provides ordered workspaces and re-exports the shared tuning "
         "policy; SSM replay checks that runtime pinning covers the module-level autotuners, "
@@ -609,7 +609,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/ssm/ops/gdp/wy_fast.py",
             "megatron/core/ssm/context_parallel/gdp.py",
         ),
-        tests=(K + "test_ssm_kernels.py",),
+        tests=(K + "test_ssm_kernels.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         notes="Gated Delta Product varlen chunk scan (drives cumsum/l2norm/kkt/solve_tril/wy_fast/chunk_h/chunk_o), "
         "fused recurrent decode, and the decode- and prefill-prepare kernels. The decode kernels are "
@@ -726,22 +726,31 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/inference/contexts/attention_context/triton/tensor_ops.py",
             "megatron/core/inference/contexts/fused_kv_append_kernel.py",
         ),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(K + "test_inference_kernels.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         training_path=False,
     ),
     KernelEntry(
         name="inference_zero_padding_rows",
         sources=("megatron/core/inference/contexts/zero_padding_rows_kernel.py",),
-        tests=(K + "test_inference_kernels.py",),
+        tests=(K + "test_inference_kernels.py", K + "test_inference_triton_pdl.py"),
         kind="triton",
         training_path=False,
+    ),
+    KernelEntry(
+        name="inference_triton_pdl",
+        sources=("megatron/core/inference/triton_pdl.py",),
+        kind="triton",
+        training_path=False,
+        exempt_reason="Launch helper only (griddepcontrol.wait and the PDL launch option of the "
+        "registered inference Triton kernels); its no-op fallback is never compiled.",
     ),
     KernelEntry(
         name="sigmoid_topk_router",
         sources=("megatron/core/inference/moe/sigmoid_topk.py",),
         tests=(
             K + "test_inference_kernels.py",
+            K + "test_inference_triton_pdl.py",
             "tests/unit_tests/transformer/moe/test_moe_batch_invariant_router.py",
         ),
         kind="triton",
@@ -763,6 +772,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "tests/unit_tests/inference/test_ep_invariant_ordered_rsv.py",
             "tests/unit_tests/inference/test_moe_dispatching_and_routing.py",
             K + "test_inference_kernels.py",
+            K + "test_inference_triton_pdl.py",
             "tests/unit_tests/transformer/moe/test_moe_batch_invariant.py",
         ),
         kind="triton",
