@@ -329,8 +329,11 @@ class ScheduleNode:
                 if isinstance(input, torch.Tensor):
                     real_input = make_viewless(input).detach()
                     real_input.requires_grad_(input.requires_grad)
+                    # Backward releases retained inputs after enqueueing their kernels.
+                    # Protect every input until this consumer stream finishes, even
+                    # when the detached leaf keeps its storage through forward.
+                    input.record_stream(self.stream)
                     if self.free_input:
-                        input.record_stream(self.stream)
                         grad_source = ScheduleNodeInputWrapper(real_input)
                         real_input = grad_source.unwrap_real_tensor()
                     else:

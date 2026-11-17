@@ -1,6 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest import mock
 
 import pytest
@@ -179,6 +179,7 @@ def make_stack(layers, **config_overrides):
         use_cpu_initialization=True,
         **config_overrides,
     )
+    submodules = HybridStackSubmodules(attention_layer=IdentityOp, mamba_layer=IdentityOp)
     pattern = ''.join(
         LayerSymbols.ATTENTION if isinstance(layer, TransformerLayer) else LayerSymbols.MAMBA
         for layer in layers
@@ -187,7 +188,7 @@ def make_stack(layers, **config_overrides):
     with mock.patch("megatron.core.models.hybrid.hybrid_block.build_module", side_effect=layers):
         return HybridStack(
             config=config,
-            submodules=HybridStackSubmodules(),
+            submodules=submodules,
             layer_config_list=validate_segment_layers(pattern, config),
             post_process=False,
             post_layer_norm=False,
@@ -313,6 +314,7 @@ def test_hybrid_model_passes_ids_to_decoder_only_for_hash_routing(
     model = SimpleNamespace(
         config=config,
         hybrid_layer_config_list=None,
+        _has_custom_layers=False,
         decoder=decoder,
         position_embedding_type='none',
         pre_process=True,
@@ -356,6 +358,7 @@ def test_hybrid_model_sequence_shards_hash_ids_with_decoder_input(monkeypatch, p
     )
     model = SimpleNamespace(
         hybrid_layer_config_list=None,
+        _has_custom_layers=False,
         config=SimpleNamespace(
             fine_grained_activation_offloading=False,
             moe_paged_stash=False,
@@ -440,6 +443,7 @@ def test_hybrid_model_scatters_embedding_for_sequence_parallel(monkeypatch):
         decoder=decoder,
         embedding=embedding,
         hybrid_layer_config_list=None,
+        _has_custom_layers=False,
         position_embedding_type="none",
         pre_process=True,
         post_process=False,
@@ -508,6 +512,7 @@ def test_hybrid_model_shards_each_layout_padding_mask(
         ),
         decoder=decoder,
         hybrid_layer_config_list=None,
+        _has_custom_layers=False,
         position_embedding_type="none",
         pre_process=pre_process,
         post_process=False,
@@ -547,6 +552,7 @@ def test_chunked_hash_moe_keeps_ids_and_padding_aligned():
         is_moe_layer=True,
         recompute_mlp=False,
     )
+    layer._run_mlp_in_chunks = MethodType(TransformerLayer._run_mlp_in_chunks, layer)
     hidden_states = torch.randn(4, 2, 8)
     input_ids = torch.arange(8).reshape(2, 4)
     padding_mask = torch.tensor(

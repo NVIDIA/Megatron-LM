@@ -55,7 +55,9 @@ def _expert_parallel_kwargs(moe, world_size):
     return dict(expert_model_parallel_size=2, expert_gtp_remat_size=world_size // 2)
 
 
-def _build_mtp_gpt_model(repeated_layer=False, moe=False):
+def _build_mtp_gpt_model(
+    repeated_layer=False, moe=False, kv_channels=HIDDEN // NUM_HEADS, ffn_hidden_size=FFN_HIDDEN
+):
     """Full GPTModel (embedding + decoder + output_layer) with an MTP block attached.
 
     ``moe=True`` puts grouped experts in both the decoder and the MTP layer, which is what puts
@@ -86,8 +88,8 @@ def _build_mtp_gpt_model(repeated_layer=False, moe=False):
         num_layers=NUM_LAYERS,
         hidden_size=HIDDEN,
         num_attention_heads=NUM_HEADS,
-        kv_channels=HIDDEN // NUM_HEADS,
-        ffn_hidden_size=FFN_HIDDEN,
+        kv_channels=kv_channels,
+        ffn_hidden_size=ffn_hidden_size,
         use_cpu_initialization=False,
         params_dtype=dtype,
         bf16=True,
@@ -202,7 +204,25 @@ def _assert_grouped_chains_used(model, moe):
         assert not grouped_mtp, f"dense variant unexpectedly used grouped chains: {grouped_mtp}"
 
 
-def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, moe=False):
+def _assert_eh_proj_shares_rs_key_with_attention_proj(model):
+    """The MTP eh_proj and attention output projection draw RS outputs from one cache key, so
+    the shapes test keeps exercising the buffer collision it guards against."""
+    from megatron.core.tensor_parallel.generalized_tensor_parallelism import get_global_GTP_cache
+
+    params = dict(model.named_parameters())
+    eh_proj = [p for n, p in params.items() if n.startswith("mtp.") and "eh_proj" in n]
+    proj = [
+        p for n, p in params.items() if n.startswith("mtp.") and "self_attention.linear_proj" in n
+    ]
+    assert len(eh_proj) == 1 and len(proj) == 1, (sorted(params), eh_proj, proj)
+    slots = get_global_GTP_cache()._slots
+    keys = [slots[p._rs_ticket].key for p in (eh_proj[0], proj[0])]
+    assert keys[0] == keys[1], f"eh_proj and linear_proj RS cache keys differ: {keys}"
+
+
+def _worker_shared_weight_grads(
+    rank, world_size, port, repeated_layer=False, moe=False, shapes=None
+):
     """Async reduce-scatter path must produce the same gradients as the sync path, with MTP.
 
     Both phases run the SAME model, sharding (gtp_remat=world), init weights and batch -- only
@@ -235,7 +255,7 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
             torch.manual_seed(42)
             GTP_CONFIG.async_reduction = use_async
 
-            model = _build_mtp_gpt_model(repeated_layer, moe)
+            model = _build_mtp_gpt_model(repeated_layer, moe, **(shapes or {}))
             classify_gtp_remat_chains([model])
             shared = [
                 n
@@ -251,6 +271,8 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
 
             losses[phase] = _forward_backward(model)
             grads[phase] = _gathered_main_grads(model)
+            if shapes is not None and use_async:
+                _assert_eh_proj_shares_rs_key_with_attention_proj(model)
 
             del model
             ps.destroy_model_parallel()
@@ -286,7 +308,7 @@ def _worker_shared_weight_grads(rank, world_size, port, repeated_layer=False, mo
             max_err, worst = rel, name
     print(f"[mtp-shared] max relative grad error async-vs-sync = {max_err:.3e} (worst: {worst})")
 
-    assert max_err < 2e-2, (
+    assert max_err < 1e-4, (
         f"MTP shared-weight gradient mismatch between the async and sync GTP reduce-scatter "
         f"paths (max rel err {max_err:.3e} on {worst}). A weight consumed more than once per "
         f"forward had one of its wgrad reduce-scatters dropped or overwritten."
@@ -853,6 +875,19 @@ class TestGTPMTP:
         if torch.cuda.device_count() < 4:
             pytest.skip("Requires 4 CUDA devices")
         _run_distributed(_worker_shared_weight_grads, 4, repeated_layer, moe)
+
+    def test_mtp_grads_match_sync_when_eh_proj_shares_rs_buffer(self):
+        """eh_proj and the MTP attention output projection with one shape share an RS buffer key.
+
+        That needs num_heads * kv_channels == 2 * hidden (asserted on the RS cache keys), and an FFN
+        width unlike eh_proj's so no buffer parity separates eh_proj from its chain predecessor. eh_proj's
+        depth-2 reduce-scatter stays pending across the whole depth-1 block, so the projection's
+        depth-1 reduce-scatter must not write into that pending output.
+        """
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        shapes = dict(kv_channels=2 * HIDDEN // NUM_HEADS, ffn_hidden_size=3 * HIDDEN)
+        _run_distributed(_worker_shared_weight_grads, 4, True, False, shapes)
 
     @pytest.mark.parametrize("moe", [False, True], ids=["dense", "moe"])
     @pytest.mark.parametrize("repeated_layer", [False, True])

@@ -131,7 +131,7 @@ def main():
             'exit_on_missing_checkpoint': True,
         },
     )
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    set_run_config(inference_cfg_container_from_args(args))
     initialize_megatron()
 
     model = get_model_for_inference()
