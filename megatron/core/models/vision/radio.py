@@ -97,7 +97,12 @@ class RADIOViTModel(VisionModule):
         super().__init__(config=transformer_config)
 
         if has_config_logger_enabled(transformer_config):
-            log_config_to_disk(transformer_config, locals(), prefix=type(self).__name__)
+            log_config_to_disk(
+                transformer_config,
+                locals(),
+                prefix=type(self).__name__,
+                pg_collection=pg_collection,
+            )
 
         self.class_token_len = class_token_len
         self.visual_hidden_size = transformer_config.hidden_size
@@ -175,6 +180,7 @@ class RADIOViTModel(VisionModule):
                 disable_grad_reduce=True,
                 init_method=lambda tensor: torch.nn.init.normal_(tensor, mean=0.0, std=1.0),
                 tp_group=pg_collection.tp if pg_collection is not None else None,
+                pg_collection=pg_collection,
             )
             self.video_embedder = ColumnParallelLinear(
                 input_size=3 * self.temporal_patch_dim * self.patch_dim * self.patch_dim,
@@ -185,6 +191,7 @@ class RADIOViTModel(VisionModule):
                 disable_grad_reduce=True,
                 init_method=lambda tensor: torch.nn.init.normal_(tensor, mean=0.0, std=1.0),
                 tp_group=pg_collection.tp if pg_collection is not None else None,
+                pg_collection=pg_collection,
             )
         else:
             self.embedder = ColumnParallelLinear(
@@ -196,6 +203,7 @@ class RADIOViTModel(VisionModule):
                 disable_grad_reduce=True,
                 init_method=lambda tensor: torch.nn.init.normal_(tensor, mean=0.0, std=1.0),
                 tp_group=pg_collection.tp if pg_collection is not None else None,
+                pg_collection=pg_collection,
             )
         transformer_config.sequence_parallel = orig_sequence_parallel
 
