@@ -54,7 +54,7 @@ def _import_script(name):
         if isinstance(error, ImportError):
             missing_from = error.name or ""
         else:
-            # convert_model.py reads attributes of ModelOpt modules while it is imported.
+            # convert_speculative.py reads attributes of ModelOpt modules while it is imported.
             missing_from = getattr(getattr(error, "obj", None), "__name__", "")
         if missing_from.split(".")[0] != "modelopt":
             raise
@@ -178,7 +178,7 @@ def test_prune_counts_parameters_over_the_model_groups(monkeypatch):
 
 
 def test_convert_builds_the_model_on_the_stage_of_its_groups(monkeypatch):
-    convert_model = _import_script("convert_model")
+    convert_speculative = _import_script("convert_speculative")
 
     pg_collection = _pg_collection(pp_rank=1, pp_size=2)
     built_with = []
@@ -189,17 +189,17 @@ def test_convert_builds_the_model_on_the_stage_of_its_groups(monkeypatch):
 
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(
-        convert_model, "get_args", lambda: SimpleNamespace(init_model_with_meta_device=False)
+        convert_speculative, "get_args", lambda: SimpleNamespace(init_model_with_meta_device=False)
     )
     # The script collects the groups of the grid initialize_megatron built exactly once.
     monkeypatch.setattr(
-        convert_model,
+        convert_speculative,
         "ProcessGroupCollection",
         SimpleNamespace(use_mpu_process_groups=lambda: pg_collection),
     )
 
     with forbid_global_process_groups():
-        convert_model.get_model(model_provider)
+        convert_speculative.get_model(model_provider)
 
     assert built_with == [
         {"pre_process": False, "post_process": True, "pg_collection": pg_collection}
