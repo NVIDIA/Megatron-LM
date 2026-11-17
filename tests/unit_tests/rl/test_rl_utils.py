@@ -584,6 +584,15 @@ class TestRLUtils:
             rollout, rollout.trajectory[-1], seq_len=16, eod=99
         )
 
+    @pytest.mark.parametrize("last_token, ok", [(2, True), (7, False)])
+    def test_compute_group_stats_single_turn_end_tokens(self, last_token, ok):
+        """A single-turn rollout may end in any end token the model declares, and in no other."""
+        tokenizer = MockTokenizer()
+        tokenizer.eod, tokenizer.generation_config = 11, {"eos_token_id": [2, 11]}
+        rollout = make_token_rollout([[1, 5, last_token]], [[0.1, 0.2]], [[False, True, True]])
+        with nullcontext() if ok else pytest.raises(AssertionError, match="must end in eod"):
+            rl_utils.compute_group_stats([[rollout]], tokenizer, 8, _ledger_for(rollout))
+
     def test_rl_granularity_defaults(self):
         args = self.create_test_args(perform_rl_step=True, grpo_prompts_per_step=8)
         cfg = _default_config_from_args(RLConfig, args)
