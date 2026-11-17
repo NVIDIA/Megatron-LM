@@ -42,14 +42,24 @@ def reshard_fsdp_module(module: FsdpModule) -> None:
 def register_combined_1f1b_hooks(module: FsdpModule) -> None:
     """Install the sub-module hooks required by MCore combined 1F1B."""
 
+    from megatron.core.transformer.moe.experts import TEGroupedMLP
+
     def register_hooks(submodule, owner):
         if isinstance(submodule, FsdpModule):
             owner = submodule  # BEFORE registering: an FSDP unit owns itself
-        if len(list(submodule.parameters(recurse=False))) > 0:
+        intact_expert = (
+            isinstance(submodule, TEGroupedMLP)
+            and isinstance(submodule, FsdpModule)
+            and not any(isinstance(child, FsdpModule) for child in list(submodule.modules())[1:])
+        )
+        if intact_expert or len(list(submodule.parameters(recurse=False))) > 0:
             submodule.register_forward_pre_hook(
                 _make_unshard_forward_hook(owner), prepend=True, with_kwargs=True
             )
             submodule.register_full_backward_pre_hook(_make_unshard_backward_hook(owner))
+        # The schedule calls this expert intact; its fused FC1/FC2 bypass child hooks.
+        if intact_expert:
+            return
         for child in submodule.children():
             register_hooks(child, owner)
 
