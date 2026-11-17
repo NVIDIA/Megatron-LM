@@ -835,7 +835,6 @@ class TestA2AOverlapPaddingMask:
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
     # Dev correctness quarantine: run 41516078360 (NCCL-EP expert gradients).
-    # Re-enable after repeated finite, bitwise parity at TP=2/4 with layers=[1, 1].
     @pytest.mark.parametrize(
         "tp_size,layers,dispatcher_type,flex_backend",
         [
