@@ -742,25 +742,33 @@ class _CudagraphGlobalRecord:
                     return f"{sign}{n / 1024**p:.1f} {s}"
             return f"{sign}{n} bytes"
 
-        for g_idx, g in progress_bar:
-            if torch.distributed.get_rank() == 0:
-                mem_stats = torch.cuda.memory_stats()
-                progress_str = "create cuda graphs | mem: alloc %s, res %s" % (
-                    format_mem_bytes(mem_stats["allocated_bytes.all.current"]),
-                    format_mem_bytes(mem_stats["reserved_bytes.all.current"]),
-                )
-                if HAVE_TQDM:
-                    progress_bar.set_description(progress_str)
-                elif g_idx % 100 == 0 or g_idx == len(cls.cudagraph_record) - 1:
-                    logger.info(f"{g_idx}/{len(cls.cudagraph_record)}. {progress_str}")
+        # Warm up and capture on the capture stream. Autograd nodes created during warmup (and by
+        # DDP, which is built on this stream) record it, so the backward capture runs on the
+        # stream they carry and autograd has no other leaf stream to wait on.
+        capture_stream = CudaGraphManager.global_capture_stream
+        outer_stream = torch.cuda.current_stream()
+        capture_stream.wait_stream(outer_stream)
+        with torch.cuda.stream(capture_stream):
+            for g_idx, g in progress_bar:
+                if torch.distributed.get_rank() == 0:
+                    mem_stats = torch.cuda.memory_stats()
+                    progress_str = "create cuda graphs | mem: alloc %s, res %s" % (
+                        format_mem_bytes(mem_stats["allocated_bytes.all.current"]),
+                        format_mem_bytes(mem_stats["reserved_bytes.all.current"]),
+                    )
+                    if HAVE_TQDM:
+                        progress_bar.set_description(progress_str)
+                    elif g_idx % 100 == 0 or g_idx == len(cls.cudagraph_record) - 1:
+                        logger.info(f"{g_idx}/{len(cls.cudagraph_record)}. {progress_str}")
 
-            runner, graph_type = g[0:2]
-            if graph_type == 'fwd':
-                args, kwargs, out = g[2:]
-                runner.create_fwd_graph(args, kwargs, out, clone_inputs=True)
-            else:
-                assert fwd_buffer_reuse_ref_count == 0
-                runner.create_bwd_graph()
+                runner, graph_type = g[0:2]
+                if graph_type == 'fwd':
+                    args, kwargs, out = g[2:]
+                    runner.create_fwd_graph(args, kwargs, out, clone_inputs=True)
+                else:
+                    assert fwd_buffer_reuse_ref_count == 0
+                    runner.create_bwd_graph()
+        outer_stream.wait_stream(capture_stream)
 
         # Memory usage.
         time_end = time.time()
@@ -805,7 +813,10 @@ class _CudagraphGlobalRecord:
             te_set_capture_end()
             cls._te_capture_started = False
 
-        torch.cuda.set_stream(torch.cuda.default_stream())
+        # Train on the default stream from here on (see CudaGraphManager.__init__).
+        default_stream = torch.cuda.default_stream()
+        default_stream.wait_stream(torch.cuda.current_stream())
+        torch.cuda.set_stream(default_stream)
 
         # Return capture time and memory usage.
         return capture_stats
@@ -1500,7 +1511,10 @@ class _CudaGraphRunner(torch.nn.Module):
                     capture_comm_context as capture_comms,
                     capture_constants(self.fwd_graph),
                     torch.cuda.graph(
-                        self.fwd_graph, pool=self.mempool, capture_error_mode="thread_local"
+                        self.fwd_graph,
+                        pool=self.mempool,
+                        stream=CudaGraphManager.global_capture_stream,
+                        capture_error_mode="thread_local",
                     ),
                 ):
 
@@ -1635,23 +1649,15 @@ class _CudaGraphRunner(torch.nn.Module):
             gc.freeze()
 
         capture_comm_context = track_gtp_capture_comms() if self.gtp_remat else nullcontext(None)
-        # Eager warmup ran on this stream, and the autograd nodes it keeps alive (e.g. parameter
-        # AccumulateGrad) carry it. autograd.grad ends by making the capturing stream wait on the
-        # streams of its captured inputs, so fork this stream into the capture and join it back.
-        # The legacy default stream cannot join a capture; its stale references are left to
-        # set_override_stale_capture_stream.
-        outer_stream = torch.cuda.current_stream()
-        if outer_stream == torch.cuda.default_stream():
-            outer_stream = None
         with (
             capture_comm_context as capture_comms,
             _preserve_parameter_grads_during_backward_capture(self),
             capture_constants(self.bwd_graph),
-            torch.cuda.graph(self.bwd_graph, pool=self.mempool),
+            torch.cuda.graph(
+                self.bwd_graph, pool=self.mempool, stream=CudaGraphManager.global_capture_stream
+            ),
         ):
-            capture_stream = torch.cuda.current_stream()
-            if outer_stream is not None:
-                outer_stream.wait_stream(capture_stream)
+
             grad_inputs = torch.autograd.grad(
                 outputs=tuple(o for o in self.fwd_graph_output_surface if o.requires_grad),
                 inputs=tuple(i for i in self.fwd_graph_input_surface if i.requires_grad),
@@ -1660,8 +1666,6 @@ class _CudaGraphRunner(torch.nn.Module):
                 only_inputs=True,
                 allow_unused=True,
             )
-            if outer_stream is not None:
-                capture_stream.wait_stream(outer_stream)
             # Accumulate wgrads directly into main_grad inside the graph
             n_act_grads = sum(
                 1 for i in self.fwd_graph_input_surface[: self.num_dgrads] if i.requires_grad
@@ -2009,6 +2013,9 @@ class CudaGraphManager(torch.nn.Module):
     """A global mempool for when 'cuda_graph_use_single_mempool' is used."""
     global_mempool = None
 
+    """The stream local CUDA graphs warm up and capture on."""
+    global_capture_stream = None
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -2077,13 +2084,18 @@ class CudaGraphManager(torch.nn.Module):
         # Therefore modules will always execute in the same order, so cudagraphs
         # can both be reused and share a single mempool.
         self.reuse_cudagraphs = self.pg_collection.pp.size() == 1
-        if CudaGraphManager.global_mempool is None:
-            self._initialize_mempool()
-            # Cudagraph stream capture requires no operations on the default stream prior to the
-            # capture, so change to a side stream.
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            torch.cuda.set_stream(stream)
+        self._initialize_mempool()
+        if CudaGraphManager.global_capture_stream is None:
+            # Capture on the stream DDP is initialized on, so the AccumulateGrad nodes DDP retains
+            # carry the capturing stream.
+            from megatron.core.full_cuda_graph import get_shared_capture_stream
+
+            CudaGraphManager.global_capture_stream = get_shared_capture_stream()
+            # Switch to it for the rest of model, optimizer and DDP construction and the eager
+            # iterations before capture. Training returns to the default stream after capture,
+            # whose allocator cache then holds no long-lived state to fragment it.
+            CudaGraphManager.global_capture_stream.wait_stream(torch.cuda.current_stream())
+            torch.cuda.set_stream(CudaGraphManager.global_capture_stream)
 
         # Enable one hook for the eager recording phase. Repeated manager construction is
         # idempotent, and graph creation removes the hook before capture begins.
