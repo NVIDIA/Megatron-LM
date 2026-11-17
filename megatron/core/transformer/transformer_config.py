@@ -570,6 +570,41 @@ class TransformerConfig(ModelParallelConfig):
     and clamps every reader to the kernel's per-row column limit. Other scorer paths, and
     frontends without the switch, keep the prefill. Disable for A/B comparisons."""
 
+    dsa_indexer_topk_backend: Literal["cudnn", "deepselect"] = "cudnn"
+    """Kernel of the non-deterministic DSA indexer top-k on the cuDNN fused DSA path.
+
+    ``'cudnn'`` runs the cuDNN frontend radix top-k in row chunks whose scratch fits
+    ``dsa_cudnn_topk_scratch_gib``.
+    ``'deepselect'`` selects every row in one DeepSelect launch with no scratch, using the
+    tuned ``ds_tune`` build if it imports, else upstream ``deep_select``. On GB300 (CUDA
+    graph) ``ds_tune`` took 5.90 ms against 14.34 ms per 1M-token CP64 rank-0 call
+    (16384 x 1048576 scores) and 0.43 ms against 0.57 ms at 128K (4096 x 131072; cuDNN with
+    an 8 GiB top-k scratch budget), ``deep_select`` 7.94 ms at 1M; both are slower than cuDNN
+    on narrow rows. It applies only where DeepSelect
+    is installed, validated and fast
+    (SM 10.3: the sm_100a kernels for GB200 have not run on a GPU, so SM 10.0 keeps cuDNN with
+    a warning; FP32 or BF16 scores starting 16-byte aligned with a row stride that is a
+    multiple of 1024 bytes, row width to below 2**23 and from 65536 for FP32 ``ds_tune``
+    (81920 for calls of more than 4096 rows), 16384 for BF16 ``ds_tune`` or 524288 for
+    ``deep_select``, a compiled config for the score dtype and top-k <= 4096 and top-k a
+    multiple of 8, of 16 for BF16); every other call keeps the cuDNN top-k, and the choice is
+    logged once per reason and score dtype.
+    BF16 scores (``ds_tune`` config ``h_t256_o2_b2_2k_d3``: 4.20 against 6.08 ms for FP32 at
+    1M, 0.337 against 0.469 ms at 128K) have their own width threshold: on GB300 ``ds_tune``
+    BF16 was 1.70-2.69x faster than cuDNN's BF16 radix top-k at every measured width
+    16384..131072 and row count 2048..16384 (top-k 2048; the threshold is applied to every row
+    count and top-k), narrower BF16 rows (not measured) keep cuDNN, and ``deep_select`` (not
+    timed on BF16) keeps 524288; selected values keep the scores' dtype.
+    ``ds_tune`` is built against one torch version and does not import under another, which
+    also falls back with one warning: check for the "DSA indexer top-k uses DeepSelect" log
+    line. Selected sets equal cuDNN's except for which equal scores fill the last slots. A
+    query row longer than top-k that sees a NaN score selects its first top-k in-row columns
+    with NaN scores, so with the sparse indexer loss (selected scores kept) it ends with
+    ``topk_length`` 0 and attends to no key, and without it attends to those first columns;
+    cuDNN keeps top-k - 1 real keys there. Requires ``dsa_kernel_backend='cudnn'``. KPool
+    selection (``dsa_indexer_kpool > 1``) does not run this top-k, so the option has no
+    effect there."""
+
     dsa_cudnn_topk_scratch_gib: float = 2.0
     """Per-launch scratch budget, in GiB, of the cuDNN radix top-k of the DSA indexer.
 
@@ -582,8 +617,8 @@ class TransformerConfig(ModelParallelConfig):
     CP64 rank-0 call (16384 x 1048576 scores) from 21.05 ms (64 launches of 256 rows at 2 GiB)
     to 14.26 ms (16 launches of 1024 rows), and runs all 4096 rows of the 128K CP32 rank-0 call
     in one launch (0.593 to 0.566 ms). Budgets above 2 GiB only change the executors that hand
-    the top-k a whole score buffer: the general packed THD scorer and the dense indexer loss
-    (loss on, ``dsa_indexer_use_sparse_loss=False``). The
+    the top-k a whole score buffer: the general packed THD scorer (cuDNN scores or DeepGEMM
+    logits) and the dense indexer loss (loss on, ``dsa_indexer_use_sparse_loss=False``). The
     plain causal, unfused bounds and single-sequence packed CP executors score in chunks of at
     most 1 GiB of FP32 scores, whose top-k needs at most 2 GiB of scratch, so the default
     already runs each chunk in one launch there. The cost is transient memory, eagerly and
@@ -592,10 +627,100 @@ class TransformerConfig(ModelParallelConfig):
     scores exceed 1 GiB, e.g. 8 GiB instead of 2 GiB for a 32K-token CP1 packed THD call with
     4 GiB of scores. The scratch is sized as for FP32 scores, which over-estimates BF16 ones.
     Applies with ``dsa_kernel_backend='cudnn'`` to every cuDNN top-k of the DSA indexer; the
-    ``dsv4_hybrid`` CSA paths size their own."""
+    DeepSelect top-k (``dsa_indexer_topk_backend``) needs no scratch, and the ``dsv4_hybrid``
+    CSA paths size their own."""
+
+    dsa_indexer_scorer_backend: Literal["cudnn", "deepgemm"] = "cudnn"
+    """Kernel of the DSA indexer's MXFP8 selection scorer (``dsa_indexer_precision='mxfp8'``).
+
+    ``'cudnn'`` runs the cuDNN frontend MXFP8 dense scorer. ``'deepgemm'`` runs DeepGEMM's
+    ``fp8_fp4_mqa_logits`` on the general packed THD path (any CP size): TE MXFP8 Q and
+    original K, per-row key ranges ``[starts, starts + length)``, BF16 logits of half the
+    FP32 size, read in place by DeepSelect's BF16 top-k (``dsa_indexer_topk_backend=
+    'deepselect'``, the intended pairing) or by cuDNN's BF16 radix top-k on narrower rows or
+    with ``'cudnn'``. Per 1M-token CP64 rank-0 call (16384 x 1048576 scores) on GB300 (CUDA
+    graph): 28.8 ms against 43.0 ms for the cuDNN MXFP8 scorer and 58.1 ms for BF16 (both with
+    DeepSelect FP32); 1.04 / 1.84 / 2.38 ms at 128K CP32. Paired with ``'cudnn'`` it keeps
+    little of that at wide rows: cuDNN's BF16 radix top-k is slower than its FP32 one there
+    (22.75 against 14.44 ms at the 1M CP64 rank-0 call, frontend 1.31 binary with an 8 GiB top-k
+    scratch budget; DeepSelect BF16 took 4.2 ms).
+    Calls of more query rows than one DeepGEMM call takes (116208 with 32 heads, 58104 with 64)
+    are split by rows. Its recall matches the cuDNN MXFP8 scorer's within 0.1 percentage points,
+    and the two selections overlap 99.2 percent (MXFP8 itself cost 2-4 percentage points of
+    recall@2048 against BF16 on untrained-indexer inputs, so this is experimental).
+    The indexer loss never uses DeepGEMM's values: as for any MXFP8 scorer
+    (``dsa_indexer_precision='mxfp8'``), the selected keys' scores are recomputed in FP32
+    from the BF16 indexer Q/K/weights, so this option changes only which keys are selected,
+    and a call that falls back to the cuDNN MXFP8 scorer feeds the loss the same way (the
+    87.3-nat KL saturation described there applies to both).
+    It needs a ``deep_gemm >= 2.8.1`` build importable under the running torch (imported at the
+    first call), SM 10.3, cuDNN frontend >= 1.29 (the radix top-k out-of-bounds lane guard,
+    since DeepGEMM leaves the logits past each row's length unwritten), 32 or 64 indexer
+    heads of dim 128, BF16 weights and Transformer Engine MXFP8. Without them, on SM 10.0
+    (not validated yet) or when DeepGEMM's JIT warm-up fails (not a CUDA out-of-memory error,
+    which propagates), a call falls back to the cuDNN MXFP8 scorer, logged once per reason:
+    check for the "DSA indexer scorer uses DeepGEMM" line. A fallback scores in FP32, so its
+    score buffer is twice DeepGEMM's BF16 one (64 against 32 GiB per 1M CP64 rank-0 call);
+    memory budgeted for DeepGEMM may not hold it. Requires ``dsa_indexer_precision='mxfp8'``
+    (and with it every MXFP8 requirement). Kernels JIT-compile at the first eager call per
+    device and head count: set ``DG_JIT_CACHE_DIR`` to a persistent
+    directory shared by all ranks and run at least one eager step before CUDA graph capture
+    (capturing a cold kernel raises). A process runs DeepGEMM on one device, the first that
+    calls it (its JIT keeps one kernel handle per process); a call on another device falls
+    back. Ties: BF16 logits tie far more often than FP32 scores; which tied keys fill the
+    last slots is unspecified. A layer recomputed without
+    ``dsa_indexer_reuse_checkpoint_topk`` selects again in its replay, which must repeat the
+    first call's choice. On GB300 (cuDNN frontend 1.31) DeepSelect BF16 repeats bitwise but
+    cuDNN's BF16 radix top-k picks other tied keys on a repeat, and it takes every call
+    DeepSelect declines (all calls with ``dsa_indexer_topk_backend='cudnn'``, the narrow ones
+    with ``'deepselect'``). So full recompute and selective ``core_attn`` recompute (the
+    recomputes that replay the indexer) require ``dsa_indexer_reuse_checkpoint_topk``, with the
+    indexer loss on or frozen (a config error otherwise): the replay's selection feeds the
+    recomputed attention, whose gradients must match the first call's output; selective
+    recompute of other modules (e.g. ``layernorm``) does not replay the indexer.
+    NaN: a NaN in an indexer Q or K row can make the affected logits NaN; a query row longer
+    than the top-k that sees a NaN logit then selects its first top-k keys under DeepSelect,
+    while cuDNN's radix top-k ranks a positive NaN above every number (one slot per NaN key)
+    and a negative one below; with the indexer loss on, every selected slot whose logit is
+    not finite is dropped, as for the cuDNN scorers. A per-rank fallback (one node without
+    the build) under tensor parallelism would select different keys on different TP ranks;
+    install the build on every node."""
 
     dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
-    """Precision used only by the fused compact DSA indexer forward and Top-K."""
+    """Precision of the DSA indexer scorer that produces the scores for Top-K selection.
+
+    ``dsv4_hybrid`` uses it for the fused compact CSA indexer forward and Top-K. For
+    ``dsa`` with ``dsa_kernel_backend='cudnn'``, ``'mxfp8'`` quantizes the indexer Q and K
+    (E4M3 with E8M0 1x32 scales) for the cuDNN dense scorer on the general packed THD path;
+    it needs SM100+, cuDNN frontend >= 1.29, ``dsa_indexer_head_dim=128``, 32 or 64 indexer
+    heads, BF16 indexer weights, the sparse indexer loss and the fused DSA kernels
+    (``attention_backend`` other than unfused). Other DSA scorer paths, and any layer that
+    would fall back to the BF16 PyTorch reference indexer, raise. Weights and the indexer
+    loss/backward stay BF16, and MXFP8 decides only which keys are selected: with the
+    indexer loss on, the selected keys' scores that feed the sparse KL (and that
+    ``dsa_indexer_reuse_checkpoint_topk`` keeps for the checkpoint replay) are recomputed
+    in FP32 from the BF16 indexer Q/K/weights (cuDNN
+    ``sparse_indexer_score_recompute_wrapper``), so given the selection the KL gradient is
+    the BF16 path's. That is one sparse recompute per loss-on scorer call, estimated (not
+    measured) at about 1.5-3 ms per 1M-token CP64 rank-0 call (16384 x 1048576 scores) and
+    0.1-0.5 ms per 128K-token CP32 rank-0 call (4096 x 131072); frozen-indexer and
+    selection-only calls keep only indices and never recompute.
+    The KL value equals the BF16 path's too, except that a selected key whose indexer
+    probability underflows FLT_MIN (a logit more than 87.3 below the row's log-sum-exp over
+    the selection, which exceeds the row's maximum by up to ln(top-k): from about 79.7 below
+    the maximum at top-k 2048) contributes at most about 87.3 nats where the BF16 path's term
+    keeps growing.
+    The recompute follows this compute precision only, not the scorer kernel
+    (``dsa_indexer_scorer_backend``, including its fallback) or the dtype of its scores;
+    ``'bf16'`` keeps the BF16 scorer's own FP32 scores (a scorer computing in BF16 with BF16
+    scores would keep its values too), and ``dsv4_hybrid`` keeps its own indexer-loss
+    semantics. ``'mxfp8'`` cannot be combined with KPool selection
+    (``dsa_indexer_kpool > 1``), which bypasses the dense scorer; use
+    ``dsa_indexer_kpool_use_quantization`` for quantized KPool scoring instead.
+    ``dsa_indexer_qk_proj_use_quantization`` only picks the precision context of the indexer
+    Q/K projection GEMMs, whose BF16 outputs the MXFP8 scorer then quantizes itself, so the
+    two are independent. The DSA MXFP8 scale storage is allocated per scorer call, so
+    ``dsa_compact_indexer_workspace_sharing`` (CSA only) does not apply to it."""
 
     dsa_compact_indexer_workspace_sharing: bool = True
     """Under CUDA graphs the fused compact DSA indexer keeps a persistent workspace per static
@@ -3347,12 +3472,40 @@ class TransformerConfig(ModelParallelConfig):
                 f"{linear_head_parallel_size=} for {self.linear_cp_mode=} "
                 f"and {self.experimental_attention_variant=}."
             )
+        if self.dsa_indexer_topk_backend not in ("cudnn", "deepselect"):
+            raise ValueError(
+                "dsa_indexer_topk_backend must be 'cudnn' or 'deepselect', "
+                f"got {self.dsa_indexer_topk_backend!r}."
+            )
+        if self.dsa_indexer_topk_backend == "deepselect" and (
+            self.experimental_attention_variant != "dsa" or self.dsa_kernel_backend != "cudnn"
+        ):
+            raise ValueError(
+                "dsa_indexer_topk_backend='deepselect' replaces the top-k of the cuDNN fused DSA "
+                "indexer and requires experimental_attention_variant='dsa' with "
+                f"dsa_kernel_backend='cudnn', got {self.experimental_attention_variant!r} and "
+                f"{self.dsa_kernel_backend!r}."
+            )
         if not (
             math.isfinite(self.dsa_cudnn_topk_scratch_gib) and self.dsa_cudnn_topk_scratch_gib > 0
         ):
             raise ValueError(
                 "dsa_cudnn_topk_scratch_gib must be a positive number of GiB, "
                 f"got {self.dsa_cudnn_topk_scratch_gib!r}."
+            )
+        if self.dsa_indexer_scorer_backend not in ("cudnn", "deepgemm"):
+            raise ValueError(
+                "dsa_indexer_scorer_backend must be 'cudnn' or 'deepgemm', "
+                f"got {self.dsa_indexer_scorer_backend!r}."
+            )
+        if self.dsa_indexer_scorer_backend == "deepgemm" and (
+            self.experimental_attention_variant != "dsa" or self.dsa_kernel_backend != "cudnn"
+        ):
+            raise ValueError(
+                "dsa_indexer_scorer_backend='deepgemm' replaces the MXFP8 scorer of the cuDNN "
+                "fused DSA indexer and requires experimental_attention_variant='dsa' with "
+                f"dsa_kernel_backend='cudnn', got {self.experimental_attention_variant!r} and "
+                f"{self.dsa_kernel_backend!r}."
             )
         if self.experimental_attention_variant == "dsa":
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
@@ -3365,6 +3518,60 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"dsa_indexer_topk_freq must be positive, got {self.dsa_indexer_topk_freq}."
                 )
+            if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
+                raise ValueError(
+                    "dsa_indexer_precision must be 'bf16' or 'mxfp8', "
+                    f"got {self.dsa_indexer_precision!r}."
+                )
+            if self.dsa_indexer_precision == "mxfp8":
+                # Static requirements of the cuDNN MXFP8 dense indexer scorer. The SM100+
+                # device and the installed frontend's MXFP8 API are checked at the first
+                # scorer call, since config validation can run without a GPU.
+                from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+                    use_fused_dsa_kernels,
+                )
+
+                if self.dsa_kernel_backend != "cudnn":
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA requires "
+                        f"dsa_kernel_backend='cudnn', got {self.dsa_kernel_backend!r}."
+                    )
+                if not use_fused_dsa_kernels(self):
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA requires the fused DSA kernels "
+                        "(attention_backend != unfused); the unfused path scores the indexer "
+                        "in BF16 only."
+                    )
+                if self.dsa_indexer_head_dim != 128 or self.dsa_indexer_n_heads not in (32, 64):
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA requires dsa_indexer_head_dim=128 "
+                        "and dsa_indexer_n_heads of 32 or 64, got "
+                        f"head_dim={self.dsa_indexer_head_dim}, "
+                        f"n_heads={self.dsa_indexer_n_heads}."
+                    )
+                if not self.dsa_indexer_use_sparse_loss:
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA supports only the sparse "
+                        "indexer loss; set dsa_indexer_use_sparse_loss=True."
+                    )
+                if self.dsa_indexer_weights_proj_output_dtype != "bf16":
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA requires BF16 indexer weights; "
+                        "set dsa_indexer_weights_proj_output_dtype='bf16'."
+                    )
+                if self.dsa_indexer_kpool > 1:
+                    raise ValueError(
+                        "dsa_indexer_precision='mxfp8' for DSA is the per-token cuDNN dense "
+                        "scorer; KPool selection (dsa_indexer_kpool > 1) bypasses it. Use "
+                        "dsa_indexer_kpool_use_quantization for quantized KPool scoring."
+                    )
+            if self.dsa_indexer_scorer_backend == "deepgemm":
+                if self.dsa_indexer_precision != "mxfp8":
+                    raise ValueError(
+                        "dsa_indexer_scorer_backend='deepgemm' is the MXFP8 selection scorer; "
+                        "set dsa_indexer_precision='mxfp8', got "
+                        f"{self.dsa_indexer_precision!r}."
+                    )
             if self.dsa_indexer_skip_topk_offset < 0:
                 raise ValueError(
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
@@ -4754,6 +4961,40 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_granularity = "selective"
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
+
+        # DeepGEMM's BF16 logits under activation recompute, checked once the recompute options
+        # above are final. A checkpoint replay that runs the DSA indexer again selects again,
+        # and its selection feeds the recomputed sparse attention, whose backward gives the
+        # gradients (and, with the indexer loss on, that loss). cuDNN's BF16 radix top-k, which
+        # takes every call DeepSelect declines (all calls with dsa_indexer_topk_backend='cudnn',
+        # the narrow ones with 'deepselect'), does not repeat its choice among tied BF16 logits
+        # (measured on GB300 with cuDNN frontend 1.31), so a replay could use other keys than
+        # the first call, whose output the forward already used. This holds for a frozen
+        # indexer as well: its replay without the reuse reruns the dense indexer and top-k.
+        if (
+            self.dsa_indexer_scorer_backend == "deepgemm"
+            and not self.dsa_indexer_reuse_checkpoint_topk
+        ):
+            replay = None
+            if self.recompute_granularity == "full":
+                replay = "recompute_granularity='full'"
+            elif self.recompute_granularity == "selective" and "core_attn" in (
+                self.recompute_modules or []
+            ):
+                replay = "selective recompute of 'core_attn'"
+            if replay is not None:
+                raise ValueError(
+                    f"dsa_indexer_scorer_backend='deepgemm' with {replay} requires "
+                    "dsa_indexer_reuse_checkpoint_topk=True, with the indexer loss on or "
+                    "frozen: the checkpoint replay would select the top-k again from BF16 "
+                    "logits, and cuDNN's BF16 radix top-k (every call DeepSelect declines) does "
+                    "not repeat its choice among tied keys, so the replay could recompute the "
+                    "attention (its gradients, and the indexer loss when it is on) on other keys "
+                    "than the first call, whose output the forward used. Set "
+                    "dsa_indexer_reuse_checkpoint_topk=True (with dsa_indexer_topk_freq > 1), "
+                    "use a recompute that does not replay core attention (e.g. selective "
+                    "'layernorm'), or dsa_indexer_scorer_backend='cudnn'."
+                )
 
         # A trainable KPool indexer under activation recompute, checked once the recompute
         # options above are final. A checkpoint replay of the DSA layer selects its pools
