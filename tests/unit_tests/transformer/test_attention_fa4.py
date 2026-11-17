@@ -224,7 +224,7 @@ def _paged_reference(q, k_cache, v_cache, cu_seqlens_q, seqlens_k, block_table, 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a CUDA GPU")
 @pytest.mark.parametrize("is_decode_only", [False, True], ids=["prefill", "decode"])
-def test_fa4_paged_attention_on_sm100(is_decode_only):
+def test_fa4_paged_attention_on_sm100(is_decode_only, request):
     """FA4's SM100 forward compiles and matches a reference through flash_decode_and_prefill.
 
     Head dim 128 enables FA4's emulated exp2 on SM100, the path that calls quack-kernels.
@@ -242,6 +242,9 @@ def test_fa4_paged_attention_on_sm100(is_decode_only):
         bf16=True,
         params_dtype=torch.bfloat16,
     )
+    # Attention needs real tensor- and context-parallel groups; a single rank's suffice.
+    Utils.initialize_model_parallel(1, 1)
+    request.addfinalizer(Utils.destroy_model_parallel)
     submodules = SelfAttentionSubmodules(
         linear_qkv=IdentityOp, core_attention=IdentityOp, linear_proj=IdentityOp
     )
@@ -250,7 +253,7 @@ def test_fa4_paged_attention_on_sm100(is_decode_only):
         submodules,
         layer_number=1,
         attn_mask_type=AttnMaskType.causal,
-        pg_collection=ProcessGroupCollection(tp=None, cp=None),
+        pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"]),
     ).eval()
 
     # A fresh 64-token prompt and a 300-token request spanning two blocks: chunked prefill of
