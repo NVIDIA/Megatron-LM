@@ -129,6 +129,7 @@ PARALLEL_ARGS=(
     --use-megatron-fsdp
     --megatron-fsdp-version 2
     --data-parallel-sharding-strategy optim_grads_params
+    --megatron-fsdp-main-grads-dtype fp32
     --suggested-communication-unit-size 0
     --no-gradient-accumulation-fusion
     --sequence-parallel
