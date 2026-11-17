@@ -185,7 +185,16 @@ class TestSafeNumpyLoad:
 class TestSafeDCPMetadata:
     def test_dcp_metadata_roundtrip_and_malicious(self, tmp_path_dist_ckpt):
         import os
+
         import torch.distributed.checkpoint as dcp
+
+        if Utils.world_size > 1:
+            Utils.initialize_distributed()
+        is_rank0 = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
+
+        def barrier():
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
 
         sd = {"a": torch.randn(4, 4), "b": torch.ones(2, dtype=torch.bfloat16)}
         ckpt = tmp_path_dist_ckpt / "dcp_meta"
@@ -199,6 +208,10 @@ class TestSafeDCPMetadata:
             def __reduce__(self):
                 return (os.system, ("echo pwned",))
 
-        (ckpt / ".metadata").write_bytes(pickle.dumps(Evil()))
+        # All ranks must finish loading before rank 0 overwrites the shared file.
+        barrier()
+        if is_rank0:
+            (ckpt / ".metadata").write_bytes(pickle.dumps(Evil()))
+        barrier()
         with pytest.raises(Exception, match="Refusing to unpickle"):
             dcp.load(out, checkpoint_id=str(ckpt))
