@@ -303,9 +303,9 @@ def test_builder_rejects_untested_fsdp_modes(mocker, fsdp_kwarg):
 
 
 def test_builder_rejects_explicit_device_placement(mocker):
-    from examples.mimo.training.builder import MimoBuildConfig, MimoModelBuilder
+    from examples.mimo.training.builder import MimoModelBuilder
 
-    builder = MimoModelBuilder(MimoBuildConfig(_topology=mocker.Mock()))
+    builder = MimoModelBuilder(_mimo_build_config(_topology=mocker.Mock()))
 
     with pytest.raises(NotImplementedError, match="device placement"):
         builder.build_distributed_models(mocker.Mock(), device="cpu")

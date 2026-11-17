@@ -329,7 +329,9 @@ class TestModelOptCheckpointSelection:
             )
             return {}, reads[-1], release, checkpointing.CheckpointType.GLOBAL
 
-        monkeypatch.setattr(checkpointing, "_get_checkpoint_format", lambda *a: "torch_dist")
+        monkeypatch.setattr(
+            checkpointing, "_get_checkpoint_format", mock.Mock(return_value="torch_dist")
+        )
         monkeypatch.setattr(checkpointing, "_load_global_dist_base_checkpoint", read_weights)
         resolved, fallback = checkpointing.resolve_checkpoint_load_dir(checkpoint)
         assert fallback is (case == "pretrained_fallback")

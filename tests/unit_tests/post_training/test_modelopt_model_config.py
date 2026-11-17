@@ -761,7 +761,7 @@ class TestTeacherCheckpointConfig:
         monkeypatch.setattr(training_checkpointing, "get_args", lambda: args)
         monkeypatch.setattr(training_checkpointing, "unwrap_model", lambda models: models)
         monkeypatch.setattr(
-            training_checkpointing, "_get_checkpoint_format", lambda *a: "torch_dist"
+            training_checkpointing, "_get_checkpoint_format", Mock(return_value="torch_dist")
         )
         monkeypatch.setattr(training_checkpointing, "_load_global_dist_base_checkpoint", read)
         teacher = Mock()
