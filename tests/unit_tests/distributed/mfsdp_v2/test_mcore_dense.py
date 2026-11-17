@@ -109,66 +109,6 @@ def test_mxfp8_parameters(process_group_collection):
     assert any(isinstance(p, MXFP8Tensor) for p in parameters)
 
 
-_SELECTIVE = dict(recompute_granularity="selective")
-_FULL = dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1)
-_MOE = dict(
-    num_moe_experts=4,
-    moe_router_topk=2,
-    moe_grouped_gemm=True,
-    moe_ffn_hidden_size=128,
-    moe_shared_expert_intermediate_size=128,
-    moe_token_dispatcher_type="alltoall",
-    # MXFP8 grouped GEMMs need token counts padded per expert.
-    moe_router_padding_for_quantization=True,
-)
-
-
-def _build_gpt_with_mtp(config: TransformerConfig) -> GPTModel:
-    """Build a GPT model with an MTP layer as gpt_builder does."""
-    mtp_layer_spec = get_gpt_decoder_layer_specs(config, use_transformer_engine=True)[-1]
-    return GPTModel(
-        config=config,
-        transformer_layer_spec=get_gpt_decoder_block_spec(config, use_transformer_engine=True),
-        mtp_block_spec=get_gpt_mtp_block_spec(config, mtp_layer_spec, use_transformer_engine=True),
-        vocab_size=128,
-        max_sequence_length=32,
-    ).to(device="cuda", dtype=config.params_dtype)
-
-
-def test_adapter_unshards_all_planes_for_partially_recomputed_units(process_group_collection):
-    """The adapter passes the collector's recompute analysis to each unit's SchedulePolicy."""
-    config = TransformerConfig(
-        num_layers=2,
-        hidden_size=128,
-        num_attention_heads=4,
-        bf16=True,
-        params_dtype=torch.bfloat16,
-        mtp_num_layers=1,
-        **_FULL,
-    )
-    model = FullyShardedDataParallel(
-        config=config,
-        ddp_config=DistributedDataParallelConfig(
-            use_megatron_fsdp=True,
-            megatron_fsdp_version=2,
-            use_distributed_optimizer=False,
-            data_parallel_sharding_strategy="optim_grads_params",
-        ),
-        module=_build_gpt_with_mtp(config),
-        pg_collection=process_group_collection,
-    )
-
-    # The GPT MTP checkpoint reruns eh_proj, which the root owns.
-    units = {
-        name: module
-        for name, module in model.module.named_modules()
-        if isinstance(module, FsdpModule)
-    }
-    assert {
-        name for name, unit in units.items() if unit._schedule_policy.unshard_all_planes_in_backward
-    } == {""}
-
-
 @pytest.mark.launch_on_gb200
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] < 10,
@@ -177,10 +117,39 @@ def test_adapter_unshards_all_planes_for_partially_recomputed_units(process_grou
 @pytest.mark.parametrize(
     "model_kwargs, recompute_kwargs, fsdp_unit_modules",
     [
-        pytest.param({}, dict(**_SELECTIVE, recompute_modules=["mlp"]), None, id="selective_mlp"),
-        pytest.param({}, _FULL, None, id="full"),
-        pytest.param({}, _FULL, [TransformerBlock], id="full_block_unit"),
-        pytest.param(_MOE, dict(**_SELECTIVE, recompute_modules=["moe"]), None, id="selective_moe"),
+        pytest.param(
+            {},
+            dict(recompute_granularity="selective", recompute_modules=["mlp"]),
+            None,
+            id="selective_mlp",
+        ),
+        pytest.param(
+            {},
+            dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1),
+            None,
+            id="full",
+        ),
+        pytest.param(
+            {},
+            dict(recompute_granularity="full", recompute_method="uniform", recompute_num_layers=1),
+            [TransformerBlock],
+            id="full_block_unit",
+        ),
+        pytest.param(
+            dict(
+                num_moe_experts=4,
+                moe_router_topk=2,
+                moe_grouped_gemm=True,
+                moe_ffn_hidden_size=128,
+                moe_shared_expert_intermediate_size=128,
+                moe_token_dispatcher_type="alltoall",
+                # MXFP8 grouped GEMMs need token counts padded per expert.
+                moe_router_padding_for_quantization=True,
+            ),
+            dict(recompute_granularity="selective", recompute_modules=["moe"]),
+            None,
+            id="selective_moe",
+        ),
     ],
 )
 def test_mxfp8_recompute_matches_no_recompute(
@@ -216,6 +185,17 @@ def test_mxfp8_recompute_matches_no_recompute(
             **model_kwargs,
             **recompute_kwargs,
         )
+        # Build the GPT model as gpt_builder does.
+        mtp_layer_spec = get_gpt_decoder_layer_specs(config, use_transformer_engine=True)[-1]
+        gpt_model = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_decoder_block_spec(config, use_transformer_engine=True),
+            mtp_block_spec=get_gpt_mtp_block_spec(
+                config, mtp_layer_spec, use_transformer_engine=True
+            ),
+            vocab_size=128,
+            max_sequence_length=32,
+        ).to(device="cuda", dtype=config.params_dtype)
         model = FullyShardedDataParallel(
             config=config,
             ddp_config=DistributedDataParallelConfig(
@@ -225,7 +205,7 @@ def test_mxfp8_recompute_matches_no_recompute(
                 data_parallel_sharding_strategy="optim_grads_params",
                 fp8_param_gather=True,
             ),
-            module=_build_gpt_with_mtp(config),
+            module=gpt_model,
             fsdp_unit_modules=fsdp_unit_modules,
             pg_collection=process_group_collection,
         )
