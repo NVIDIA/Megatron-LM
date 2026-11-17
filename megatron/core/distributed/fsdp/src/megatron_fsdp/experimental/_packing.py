@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Exact packing of contiguous tensors into equal block-atomic rank segments."""
+"""Bounded exact packing of contiguous tensors into equal block-atomic segments."""
 
 import math
 from collections.abc import Iterator
@@ -46,50 +46,121 @@ def _earliest_start(end: int, length: int, alignment: int, shard: int) -> int | 
     return boundary + shard - per_shard * alignment
 
 
-def _pack_at_shard(
-    lengths: tuple[int, ...],
-    alignments: tuple[int, ...],
-    ranks: int,
-    shard: int,
-    max_states: int | None,
-) -> tuple[int, ...] | None:
-    """Decide feasibility using the smallest attainable end offset for each subset."""
-    count = len(lengths)
-    states = 1 << count
-    if max_states is not None and states > max_states:
-        raise ValueError(
-            f"Exact block-atomic packing needs {states:,} states for {count} tensors; "
-            f"max_states={max_states:,}. Increase max_states explicitly if resources permit."
-        )
-    capacity = ranks * shard
-    ends = [capacity + 1] * states
-    last = [-1] * states
-    ends[0] = 0
-    for mask, end in enumerate(ends):
-        if end > capacity:
-            continue
-        missing = (states - 1) ^ mask
-        while missing:
-            bit = missing & -missing
-            missing ^= bit
-            index = bit.bit_length() - 1
-            start = _earliest_start(end, lengths[index], alignments[index], shard)
-            if start is None:
+class _SearchLimit(Exception):
+    """The deterministic budget cannot accommodate another candidate search."""
+
+
+class _PackingSearch:
+    """Count interchangeable tensors instead of distinguishing their permutations."""
+
+    def __init__(
+        self,
+        lengths: tuple[int, ...],
+        alignments: tuple[int, ...],
+        max_states: int | None,
+        max_work: int | None,
+    ) -> None:
+        grouped: dict[tuple[int, int], list[int]] = {}
+        for index, pair in enumerate(zip(lengths, alignments)):
+            grouped.setdefault(pair, []).append(index)
+        self.types = tuple(grouped)
+        self.ids = tuple(tuple(indices) for indices in grouped.values())
+        self.strides: list[int] = []
+        self.states = 1
+        for indices in self.ids:
+            self.strides.append(self.states)
+            self.states *= len(indices) + 1
+        self.count = len(lengths)
+        self.max_states = max_states
+        self.remaining_work = max_work
+
+    def pack(self, ranks: int, shard: int) -> tuple[int, ...] | None:
+        """Decide feasibility, or stop before allocation when the budget is exhausted."""
+        if self.max_states is not None and self.states > self.max_states:
+            raise _SearchLimit
+        # Reserve a conservative whole-candidate bound: two table initializations,
+        # one state scan, and at most k type checks per state. Charging up front
+        # bounds cumulative work without rank-dependent clocks or partial layouts.
+        work = self.states * (len(self.types) + 3)
+        if self.remaining_work is not None:
+            if work > self.remaining_work:
+                raise _SearchLimit
+            self.remaining_work -= work
+
+        capacity = ranks * shard
+        ends = [capacity + 1] * self.states
+        last = [-1] * self.states
+        ends[0] = 0
+        for state, end in enumerate(ends):
+            if end > capacity:
                 continue
-            next_end = start + lengths[index]
-            following = mask | bit
-            if next_end < ends[following]:
-                ends[following] = next_end
-                last[following] = index
-    if ends[-1] > capacity:
-        return None
-    offsets = [0] * count
-    mask = states - 1
-    while mask:
-        index = last[mask]
-        offsets[index] = ends[mask] - lengths[index]
-        mask ^= 1 << index
-    return tuple(offsets)
+            for kind, ((length, alignment), indices, stride) in enumerate(
+                zip(self.types, self.ids, self.strides)
+            ):
+                used = state // stride % (len(indices) + 1)
+                if used == len(indices):
+                    continue
+                start = _earliest_start(end, length, alignment, shard)
+                if start is None:
+                    continue
+                next_end = start + length
+                following = state + stride
+                if next_end < ends[following]:
+                    ends[following] = next_end
+                    last[following] = kind
+        if ends[-1] > capacity:
+            return None
+        offsets = [0] * self.count
+        state = self.states - 1
+        while state:
+            kind = last[state]
+            indices, stride = self.ids[kind], self.strides[kind]
+            used = state // stride % (len(indices) + 1)
+            offsets[indices[used - 1]] = ends[state] - self.types[kind][0]
+            state -= stride
+        return tuple(offsets)
+
+
+def _greedy_bound(
+    lengths: tuple[int, ...], alignments: tuple[int, ...], ranks: int
+) -> tuple[tuple[int, ...], int]:
+    """Retain the original padded builder's regular/conjugate/fragment packing."""
+    chunk = math.lcm(*alignments)
+    regular = [index for index, length in enumerate(lengths) if length >= chunk]
+    fragments = sorted(
+        (index for index, length in enumerate(lengths) if length < chunk),
+        key=lambda index: -lengths[index],
+    )
+    offsets, end = [0] * len(lengths), 0
+    while regular:
+        index = regular.pop(0)
+        length = lengths[index]
+        offsets[index] = end
+        remainder = length % chunk
+        if not remainder:
+            end += length
+            continue
+        gap = end + length
+        end += _round_up(length, chunk)
+        gap_end = end
+        for other in regular:
+            other_remainder = lengths[other] % chunk
+            if other_remainder and remainder + other_remainder <= chunk:
+                regular.remove(other)
+                offsets[other] = end - other_remainder
+                gap_end = offsets[other]
+                end += lengths[other] // chunk * chunk
+                break
+        for fragment in fragments[:]:
+            start = _round_up(gap, alignments[fragment])
+            if start + lengths[fragment] <= gap_end:
+                offsets[fragment] = start
+                gap = start + lengths[fragment]
+                fragments.remove(fragment)
+    for fragment in fragments:
+        offsets[fragment] = _round_up(end, alignments[fragment])
+        end = offsets[fragment] + lengths[fragment]
+    return tuple(offsets), _round_up(end, ranks * chunk) // ranks
 
 
 def _candidate_shards(
@@ -149,8 +220,9 @@ def pack_block_atomic(
     ranks: int,
     *,
     max_states: int | None = 1 << 20,
+    max_work: int | None = 10_000_000,
 ) -> tuple[tuple[int, ...], int]:
-    """Return tensor offsets and the minimum feasible equal shard size.
+    """Improve a greedy equal-shard layout by exact search within fixed budgets.
 
     Inputs come from the layout builder: nonnegative lengths divisible by their
     positive alignments, and a positive rank count. Tensor IDs are preserved;
@@ -168,17 +240,26 @@ def pack_block_atomic(
       Hence an optimum exists on the g grid.
     * For a fixed S, the earliest legal placement of a tensor is monotone in
       the previous end offset. Only the smallest end for each subset matters;
-      every physical tensor order is considered by the subset recurrence.
+      every physical type order is considered by the recurrence. Tensors with
+      identical (length, alignment) are interchangeable, so a mixed-radix state
+      records how many of each type have been placed. Original IDs are restored
+      in stable order when reconstructing the offsets.
     * Candidate sizes are visited in increasing order, skipping only those
       ruled out by an individual tensor. Feasibility is not monotone in S,
       so binary search would be invalid. The first feasible size is optimal.
 
-    A cheap feasible bound sometimes certifies optimality without subset search,
-    even for large groups. Otherwise M tested sizes cost O(M * n * 2**n) time
-    and O(2**n) space, in addition to polynomial preprocessing and output.
-    M depends on normalized input magnitudes. ``max_states`` raises before a
-    larger DP allocation; there is no heuristic fallback or runtime bound.
+    For k types with multiplicities c_i, P = product(c_i + 1) states cost
+    O(M * k * P) time and O(P) space over M candidates, plus preprocessing and
+    output. Cheap bounds can certify optimality without DP. Otherwise the best
+    of the original greedy layout and five simple orders is retained. If either
+    budget would be exceeded, return that valid bound with no padding regression
+    against the original builder; optimality is then not guaranteed. ``max_work``
+    reserves P * (k + 3) units per candidate across the entire search. Limits are
+    deterministic, not wall-clock timeouts. None removes the corresponding limit.
     """
+    for name, limit in (("max_states", max_states), ("max_work", max_work)):
+        if limit is not None and (type(limit) is not int or limit < 0):
+            raise ValueError(f"{name} must be a nonnegative integer or None, got {limit!r}.")
     nonempty = tuple(index for index, length in enumerate(lengths) if length)
     if not nonempty:
         return (0,) * len(lengths), 0
@@ -198,12 +279,19 @@ def pack_block_atomic(
     small_alignments = tuple(alignments[index] // unit for index in nonempty)
     upper_offsets, upper = _aligned_bound(small_lengths, small_alignments, ranks)
     lower = max(max(small_alignments), (sum(small_lengths) + ranks - 1) // ranks)
+    if next(_candidate_shards(small_lengths, small_alignments, lower, upper)) < upper:
+        # Include empty tensors' original alignments in this baseline to exactly
+        # preserve the old greedy algorithm. They do not constrain exact search.
+        greedy_offsets, greedy_shard = _greedy_bound(lengths, alignments, ranks)
+        if greedy_shard < upper * unit:
+            upper = greedy_shard // unit
+            upper_offsets = tuple(greedy_offsets[index] // unit for index in nonempty)
+    search = _PackingSearch(small_lengths, small_alignments, max_states, max_work)
     for shard in _candidate_shards(small_lengths, small_alignments, lower, upper):
-        offsets = (
-            upper_offsets
-            if shard == upper
-            else _pack_at_shard(small_lengths, small_alignments, ranks, shard, max_states)
-        )
+        try:
+            offsets = upper_offsets if shard == upper else search.pack(ranks, shard)
+        except _SearchLimit:
+            offsets, shard = upper_offsets, upper
         if offsets is not None:
             result = [ranks * shard * unit] * len(lengths)
             for index, offset in zip(nonempty, offsets):

@@ -64,17 +64,60 @@ def test_layout_ignores_empty_tensors_when_minimizing_padding(shapes, dp_size):
 def test_layout_large_group_can_be_certified_without_subset_search():
     """A zero-padding bound proves a 256-tensor expert-like group optimal without DP."""
     layout = layout_builder.build_for_row_atomic(
-        [(128, 64)] * 256, dp_size=2, block_size=32, max_states=1
+        [(128, 64)] * 256, dp_size=2, block_size=32, max_states=0, max_work=0
     )
     assert layout.size == 256 * 128 * 64
     layout.validate_for_row_atomic(block_size=32)
 
 
-def test_layout_reports_exact_search_resource_limit():
-    """When bounds do not meet, exceeding the explicit guard never returns an approximation."""
+@pytest.mark.parametrize("budget", [{"max_states": 4}, {"max_work": 0}])
+def test_layout_falls_back_deterministically_when_search_is_limited(budget):
+    """Insufficient search resources still return a valid layout with no greedy regression."""
     shapes = [(5, 4), (2, 6), (3,)]
-    with pytest.raises(ValueError, match="Exact block-atomic packing needs 8 states"):
-        layout_builder.build_for_row_atomic(shapes, dp_size=2, max_states=4)
+    layout = layout_builder.build_for_row_atomic(shapes, dp_size=2, **budget)
+    assert layout.size == 48  # Original greedy size; the proven optimum is 38.
+    assert layout.tensor_shapes == tuple(torch.Size(shape) for shape in shapes)
+    assert layout.has_equal_shard_sizes
+    layout.validate_for_row_atomic()
+    assert layout == layout_builder.build_for_row_atomic(shapes, dp_size=2, **budget)
+
+
+def test_layout_compresses_equivalent_tensors_and_preserves_their_shapes():
+    """Twenty interchangeable A tensors and one B require 42 count states, not 2**21."""
+    shapes = [(32, 128)] * 10 + [(32, 4, 32)] * 10 + [(32, 192)]
+    layout = layout_builder.build_for_row_atomic(shapes, dp_size=2, block_size=32, max_states=42)
+    # Volume lower bound rounded to the 2048-element GCD: optimal with 2048 padding.
+    assert layout.size == 90112
+    assert layout.tensor_shapes == tuple(torch.Size(shape) for shape in shapes)
+    layout.validate_for_row_atomic(block_size=32)
+    limited = layout_builder.build_for_row_atomic(shapes, dp_size=2, block_size=32, max_states=41)
+    assert limited.size == 98304
+    limited.validate_for_row_atomic(block_size=32)
+
+
+@pytest.mark.parametrize("max_work, expected_size", [(72, 24), (144, 20), (None, 20)])
+def test_layout_work_budget_is_shared_across_candidate_sizes(max_work, expected_size):
+    """S=9 is infeasible; S=10 is optimal. A budget for one candidate must not reset."""
+    shapes = [(1, 2), (1, 2), (2, 3), (2, 4)]
+    # 12 count states, 3 types: each candidate reserves 12 * (3 + 3) work units.
+    layout = layout_builder.build_for_row_atomic(shapes, dp_size=2, max_work=max_work)
+    assert layout.size == expected_size
+    layout.validate_for_row_atomic()
+
+
+def test_layout_fallback_keeps_original_greedy_when_it_beats_simple_orders():
+    """The five-order heuristic alone allocates 688128; old gap-filling needs 589824."""
+    shapes = [(32, 256), (704, 192), (416, 96), (640, 384), (64, 128), (160, 384), (704, 128)]
+    layout = layout_builder.build_for_row_atomic(shapes, dp_size=4, block_size=32, max_states=0)
+    assert layout.size == 589824
+    layout.validate_for_row_atomic(block_size=32)
+
+
+@pytest.mark.parametrize("budget", [{"max_states": -1}, {"max_work": -1}, {"max_work": 0.5}])
+def test_layout_rejects_invalid_search_budgets(budget):
+    """Invalid controls are errors; an exhausted valid budget is a fallback."""
+    with pytest.raises(ValueError, match="must be a nonnegative integer or None"):
+        layout_builder.build_for_row_atomic([(5, 4), (2, 6), (3,)], dp_size=2, **budget)
 
 
 def _brute_feasible(lengths, alignments, ranks, shard):
@@ -109,8 +152,8 @@ def _brute_feasible(lengths, alignments, ranks, shard):
 
 def test_layout_optimum_matches_independent_small_grid_oracle():
     """Exhaust smaller integer shard sizes, including values outside the GCD grid."""
-    # These types cover unequal atomic sizes, repeated tensors, and multi-block tensors.
-    types = [(1, 2), (2, 2), (1, 3), (2, 3)]
+    # Equal lengths with different atomic sizes must not be compressed together.
+    types = [(1, 2), (2, 2), (1, 3), (2, 3), (3, 2)]
     for shapes in itertools.combinations_with_replacement(types, 3):
         for scale, ranks in itertools.product((1, 2), (2, 3)):
             scaled = [(rows, cols * scale) for rows, cols in shapes]

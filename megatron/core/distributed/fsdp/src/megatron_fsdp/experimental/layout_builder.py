@@ -37,12 +37,17 @@ def build_row_atomic_layout(
 
 
 def build_for_row_atomic(
-    shapes: Iterable[Shape], dp_size: int, *, block_size: int = 1, max_states: int | None = 1 << 20
+    shapes: Iterable[Shape],
+    dp_size: int,
+    *,
+    block_size: int = 1,
+    max_states: int | None = 1 << 20,
+    max_work: int | None = 10_000_000,
 ) -> GlobalLayout:
-    """Build minimum-padding equal rank segments for RowAtomic or BlockAtomic.
+    """Build equal rank segments with bounded padding optimization.
 
     Tensor IDs and contiguity are preserved. Physical order and offsets are chosen
-    to minimize total allocation, subject to every rank boundary inside a tensor
+    to reduce total allocation, subject to every rank boundary inside a tensor
     falling on a whole ``block_size``-row boundary relative to that tensor's start.
     Neither globally aligned tensor starts nor common-LCM shard sizes are required.
     The returned offsets and shard size remain multiples of the GCD of the nonempty
@@ -56,23 +61,32 @@ def build_for_row_atomic(
         shapes: Logical tensor shapes in tensor-id order, including empty tensors.
         dp_size: Positive data-parallel shard count for this global layout.
         block_size: Number of consecutive rows kept on one rank. Defaults to one.
-        max_states: Maximum subset-DP states per candidate shard size, or None to
-            remove the allocation guard. A group may be solved without any DP.
+        max_states: Maximum count-DP states per candidate shard size, or None to
+            remove the allocation guard. Identical packing types share a count.
+            A group may be solved without any DP.
+        max_work: Total deterministic DP work budget, or None to remove this
+            limit. Each candidate reserves P * (k + 3) units for P states and k
+            packing types, covering table initialization, scanning, and type
+            checks. This is a conservative work bound, not elapsed time.
 
     Returns:
-        Globally minimum-size layout under these constraints with equal rank sizes.
+        A valid equal-shard layout no larger than the original greedy result.
+        The size is globally minimal if search completes. If a budget would be
+        exceeded, return the best cheap layout without claiming optimality.
 
     Raises:
-        ValueError: For invalid dimensions or sizes, or if exact search needs more
-            than ``max_states`` states. The guard does not bound candidate count
-            or runtime. No approximate fallback is used.
+        ValueError: For invalid dimensions, sizes, or budget values.
     """
     if dp_size <= 0:
         raise ValueError(f"DP size must be positive, got {dp_size}.")
     tensor_shapes = tuple(torch.Size(shape) for shape in shapes)
     alignments = _row_atomic_alignments(tensor_shapes, block_size)
     tensor_to_offset, segment = pack_block_atomic(
-        tuple(shape.numel() for shape in tensor_shapes), alignments, dp_size, max_states=max_states
+        tuple(shape.numel() for shape in tensor_shapes),
+        alignments,
+        dp_size,
+        max_states=max_states,
+        max_work=max_work,
     )
     layout = GlobalLayout(
         tensor_shapes=tensor_shapes,
