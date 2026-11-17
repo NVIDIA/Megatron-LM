@@ -986,7 +986,9 @@ if HAVE_TE:
         _pad_func = Fp8Padding(1)
         _unpad_func = Fp8Unpadding(1)
 
-        original_forward = module.forward
+        # Ordered TP reductions must see the unpadded local GEMM output.
+        wrap_te_forward = type(module).forward is TELinear.forward
+        original_forward = module._te_forward if wrap_te_forward else module.forward
 
         @wraps(original_forward)
         def padded_forward(input_tensor, *args, **kwargs):
@@ -1051,7 +1053,10 @@ if HAVE_TE:
             else:
                 return unpadded_output
 
-        module.forward = padded_forward
+        if wrap_te_forward:
+            module._te_forward = padded_forward
+        else:
+            module.forward = padded_forward
         _fp8_inference_wrapped_modules.add(module)
 
     def prepare_model_for_fp8_inference(model):

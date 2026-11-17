@@ -25,7 +25,7 @@ import megatron.core.extensions.transformer_engine as te_ext
 from megatron.core import parallel_state
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import HAVE_TE, TEFusedMLP, mark_grouped_tensor
-from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor
+from megatron.core.fp8_utils import get_fp8_context, is_mxfp8tensor, prepare_model_for_fp8_inference
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
@@ -1271,5 +1271,16 @@ def test_te_row_parallel_linear_batch_invariant_replays(tp, shards, sequence_par
                 contention=True,
                 what=f"TERowParallelLinear batch-invariant tp={tp} shards={shards} mxfp8={mxfp8}",
             )
+            if mxfp8:
+                module.eval()
+                prepare_model_for_fp8_inference(module)
+                with torch.no_grad():
+                    assert_replays_bit_exact(
+                        lambda inputs: module(inputs)[0],
+                        (x[:12].detach().contiguous(),),
+                        replays=3,
+                        contention=True,
+                        what="MXFP8 padded inference before ordered TP reduction",
+                    )
     finally:
         Utils.destroy_model_parallel()

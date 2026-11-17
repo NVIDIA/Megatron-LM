@@ -10,7 +10,7 @@ import torch.distributed as dist
 
 from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions.transformer_engine import TERowParallelLinear, _BITPForward
-from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.fp8_utils import get_fp8_context, prepare_model_for_fp8_inference
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.ops.collectives import ordered_reduce as orr
 from megatron.core.ops.linear import ordered as orl
@@ -758,6 +758,23 @@ def test_mxfp8_ordered_linear_matches_te_and_batch_layout(sequence_parallel):
                     output = full
                 outputs.append(output)
             assert torch.equal(_bits(outputs[0]), _bits(outputs[1][:32]))
+        module.eval()
+        reference.eval()
+        prepare_model_for_fp8_inference(module)
+        with (
+            torch.no_grad(),
+            set_batch_invariant_mode(True, backend="te_native"),
+            get_fp8_context(config),
+        ):
+            for length in (12, 32):
+                inputs = x[:length].detach().contiguous()
+                padded = torch.nn.functional.pad(inputs, (0, 0, 0, 0, 0, 32 - length))
+                partial = reference(padded)[:length].contiguous()
+                reduce = orr.ordered_reduce_scatter if sequence_parallel else orr.ordered_all_reduce
+                expected = reduce(partial, group)
+                actual, _ = module(inputs)
+                assert actual.shape == expected.shape
+                assert torch.equal(_bits(actual), _bits(expected))
     finally:
         torch.cuda.synchronize()
         dist.barrier()

@@ -1668,6 +1668,16 @@ class TELinear(te.pytorch.Linear):
             self.te_quant_params, self.training, is_context_quantized
         )
 
+    def _te_forward(self, x: torch.Tensor) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        """Run TE's linear; inference padding wraps this before any caller-side TP reduction."""
+        _is_first_microbatch = _resolve_is_first_microbatch(self)
+        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+
+        with quant_context:
+            out = super().forward(x, is_first_microbatch=_is_first_microbatch)
+        self.is_first_microbatch = False
+        return out
+
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
         if self._bi_tp_forward is _BITPForward.SHARD_GEMMS:
@@ -1679,12 +1689,7 @@ class TELinear(te.pytorch.Linear):
             and not torch.is_autocast_enabled()
         ):
             return self._bi_tp_row_forward(x)
-        _is_first_microbatch = _resolve_is_first_microbatch(self)
-        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
-
-        with quant_context:
-            out = super().forward(x, is_first_microbatch=_is_first_microbatch)
-        self.is_first_microbatch = False
+        out = self._te_forward(x)
 
         if self._bi_tp_forward is _BITPForward.ORDERED_REDUCE:
             if self.bi_tp_reduce_by_caller:
