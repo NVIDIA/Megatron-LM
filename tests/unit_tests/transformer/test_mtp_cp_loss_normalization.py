@@ -126,6 +126,7 @@ def _case(depth, packed, device, cp_group, layout="zigzag", early_backward=False
     weight = torch.randn(7, 4, device=device, dtype=torch.float64, generator=generator)
     labels = torch.randint(0, 7, (1, 16), device=device, generator=generator)
     config = SimpleNamespace(
+        tensor_model_parallel_size=1,
         mtp_num_layers=depth,
         mtp_detach_heads=False,
         mtp_loss_scaling_factor=0.3,
