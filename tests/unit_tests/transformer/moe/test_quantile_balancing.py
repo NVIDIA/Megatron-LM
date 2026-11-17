@@ -348,6 +348,22 @@ def test_qb_finalize_without_active_router_is_a_noop():
     _update_router_expert_bias_with_quantile([model], config, reduction_groups=())
 
 
+def test_qb_finalize_marks_bounds_only_for_te_that_validates_them():
+    """TE before 2.21 validates updated QB bounds unless marked; TE 2.21 never validates them.
+
+    TE 2.21's mark_qb_bin_bounds_validated is a deprecated no-op that warns on every call, so
+    the finalizer must not call it once per step.
+    """
+    te_router = pytest.importorskip("transformer_engine.pytorch.router")
+    from megatron.core.utils import is_te_min_version
+
+    marker = _update_router_expert_bias_with_quantile.__globals__["mark_qb_bin_bounds_validated"]
+    if is_te_min_version("2.21.0"):
+        assert marker is None
+    else:
+        assert marker is getattr(te_router, "mark_qb_bin_bounds_validated", None)
+
+
 def test_qb_router_maintains_float32_bias_and_bounds():
     from megatron.core.transformer.moe.router import TopKRouter
 
