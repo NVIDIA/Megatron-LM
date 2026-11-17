@@ -51,7 +51,12 @@ def test_precomputed_mtp_mask_uses_embedding_shard_and_runtime_cp(
         )
 
     block = SimpleNamespace(
-        config=SimpleNamespace(mtp_detach_heads=False, mtp_hsm=False, mtp_num_layers=2),
+        config=SimpleNamespace(
+            mtp_detach_heads=False,
+            mtp_hsm=False,
+            mtp_num_layers=2,
+            mtp_repeated_layer_shared_components=None,
+        ),
         cp_group=base_cp_group,
         tp_group=tp_group,
         sequence_parallel=True,

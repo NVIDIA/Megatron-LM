@@ -18,6 +18,7 @@ from megatron.core.models.gpt.experimental_attention_variant_module_specs import
     get_dsa_module_spec_for_backend,
     get_experimental_attention_variant_module_spec,
 )
+from megatron.core.models.gpt.gpt_layer_specs import _validate_dsa_mtp_index_share_pipeline_split
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
@@ -138,6 +139,7 @@ class TestDSAIndexShareHelpers:
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            mtp_repeated_layer_shared_components=None,
             kv_channels=16,
         )
 
@@ -155,11 +157,29 @@ class TestDSAIndexShareHelpers:
         assert attention.indexer is None
         assert attention.source_layer == 1
 
+    @pytest.mark.parametrize("shared_components", [["latent_kv"], ["sparse_attention_index"]])
+    def test_repeated_mtp_index_share_rejects_cross_segment_source(self, shared_components):
+        config = SimpleNamespace(
+            experimental_attention_variant="dsa",
+            mtp_repeated_layer_shared_components=shared_components,
+            dsa_indexer_topk_freq=4,
+            dsa_indexer_skip_topk_offset=3,
+        )
+
+        _validate_dsa_mtp_index_share_pipeline_split(
+            config, local_decoder_layer_ids=[2], mtp_layer_number=4
+        )
+        with pytest.raises(RuntimeError, match="repeated-MTP IndexShare pipeline split"):
+            _validate_dsa_mtp_index_share_pipeline_split(
+                config, local_decoder_layer_ids=[], mtp_layer_number=4
+            )
+
     def test_index_share_holder_uses_attention_mask_without_packed_seq_params(self):
         config = SimpleNamespace(
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            mtp_repeated_layer_shared_components=None,
             kv_channels=16,
         )
         attention = DSAttention(
@@ -186,6 +206,7 @@ class TestDSAIndexShareHelpers:
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            mtp_repeated_layer_shared_components=None,
             kv_channels=16,
         )
         attention = DSAttention(
@@ -218,6 +239,7 @@ class TestDSAIndexShareHelpers:
             dsa_indexer_topk=8,
             dsa_indexer_topk_freq=4,
             dsa_indexer_skip_topk_offset=1,
+            mtp_repeated_layer_shared_components=None,
             kv_channels=16,
         )
         attention = DSAttention(
@@ -520,6 +542,7 @@ def test_absorbed_mla_qkv_rope_uses_microbatch_cp_group(
         _get_kv_up_weights=lambda: (k_up_weight, None),
         recompute_up_proj=recompute_up_proj,
         cache_mla_latents=False,
+        core_attention=SimpleNamespace(mtp_latent_kv_share=False),
     )
     reference = copy.copy(attention)
     reference.config = make_config(effective_cp_size, False)

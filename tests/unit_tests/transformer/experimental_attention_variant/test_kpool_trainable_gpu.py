@@ -448,8 +448,8 @@ def _run_layer(
         )
     published = None
     if attention.index_share:
-        holder = attention._get_index_share_topk_holder(packed_seq_params, attention_mask)
-        topk = holder.get(attention.layer_number)
+        payload = attention._get_dsa_index_sharing_payload(packed_seq_params, attention_mask)
+        topk = payload.topk_by_layer.get(attention.layer_number)
         published = None if topk is None else topk.detach().clone()
     if grad and backward:
         output.backward(inputs["grad_output"].view_as(output))
@@ -1645,10 +1645,10 @@ def _run_stack_stage(monkeypatch, config, pg_collection, stage_layers, *, seed):
         current["layer"] = None
         outputs.append(output)
         output_grads.append(inputs["grad_output"].view_as(output))
-    holder = next(iter(layers.values()))._get_index_share_topk_holder(None, None)
+    payload = next(iter(layers.values()))._get_dsa_index_sharing_payload(None, None)
     published = {
         number: SimpleNamespace(data_ptr=topk.data_ptr(), value=topk.detach().clone())
-        for number, topk in holder.items()
+        for number, topk in payload.topk_by_layer.items()
     }
     torch.autograd.backward(outputs, output_grads)
     torch.cuda.synchronize()

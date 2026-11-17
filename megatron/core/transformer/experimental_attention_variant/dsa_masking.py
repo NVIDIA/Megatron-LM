@@ -57,6 +57,8 @@ def can_prove_all_topk_rows_nonempty(
 
     Backend callers may pass their normalized plain-causal layout as
     ``varlen_is_plain_causal=True`` after dropping the equivalent explicit bounds.
+    Callers that reuse another layer's top-k pass ``computes_topk=True`` only when that
+    producer published this certificate for the same tensors.
     """
     if (
         not computes_topk
