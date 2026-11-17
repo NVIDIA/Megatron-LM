@@ -32,15 +32,23 @@ from .simplified_sparse_attention_cudnn import (
 )
 
 
-def _ssa_pair_counts(config: TransformerConfig, total_tokens: float, seqlen_squared_sum: float):
+def _ssa_pair_counts(
+    config: TransformerConfig,
+    total_tokens: float,
+    seqlen_squared_sum: float,
+    selected_pairs: Optional[float] = None,
+):
     """Return the causal and the top-k selected (query, key) pair counts for a batch.
 
-    Sequences are taken at the length-weighted mean length ``sum(L^2) / sum(L)``, which is exact
+    ``selected_pairs`` is the exact per-sequence count from packed metadata. Without it,
+    sequences are taken at the length-weighted mean length ``sum(L^2) / sum(L)``, which is exact
     for equal-length sequences such as unpadded SBHD batches.
     """
     if total_tokens <= 0 or seqlen_squared_sum <= 0:
         return 0.0, 0.0
     causal_pairs = (seqlen_squared_sum + total_tokens) / 2
+    if selected_pairs is not None:
+        return causal_pairs, selected_pairs
     seq_length = seqlen_squared_sum / total_tokens
     topk = min(config.dsa_indexer_topk, seq_length)
     selected_pairs = total_tokens * topk - (total_tokens / seq_length) * topk * (topk - 1) / 2
@@ -84,6 +92,7 @@ class SimplifiedSparseIndexer(MegatronModule):
         total_real_tokens_in_batch: float,
         seqlen_squared_sum_in_batch: float,
         include_backward: bool = False,
+        selected_pairs_in_batch: Optional[float] = None,
     ) -> float:
         """Estimate one indexer execution, optionally including its loss-dependent backward.
 
@@ -97,7 +106,7 @@ class SimplifiedSparseIndexer(MegatronModule):
         indexer_dim = 128
         total_tokens = total_real_tokens_in_batch
         causal_pairs, selected_pairs = _ssa_pair_counts(
-            config, total_tokens, seqlen_squared_sum_in_batch
+            config, total_tokens, seqlen_squared_sum_in_batch, selected_pairs_in_batch
         )
         projections = 4 * total_tokens * config.hidden_size * indexer_dim
         if not include_backward:
@@ -302,6 +311,7 @@ class SimplifiedSparseAttention(SelfAttention):
         *,
         total_real_tokens_in_batch: float,
         seqlen_squared_sum_in_batch: float,
+        selected_pairs_in_batch: Optional[float] = None,
     ) -> float:
         """Estimate forward QKV/output projections and the attention core, without the indexer.
 
@@ -316,7 +326,7 @@ class SimplifiedSparseAttention(SelfAttention):
             seqlen_squared_sum_in_batch=0,
         )
         causal_pairs, selected_pairs = _ssa_pair_counts(
-            config, total_real_tokens_in_batch, seqlen_squared_sum_in_batch
+            config, total_real_tokens_in_batch, seqlen_squared_sum_in_batch, selected_pairs_in_batch
         )
         attended_pairs = causal_pairs if config.ssa_train_indexer_only else selected_pairs
         query_dim = config.num_attention_heads * config.kv_channels

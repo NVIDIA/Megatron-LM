@@ -64,7 +64,8 @@ and other gradient norms across the module grids.
 
 Throughput counts useful model GEMMs with two FLOPs per multiply-add. For each
 unpadded sequence of length `S`, causal scoring has `S*(S+1)/2` pairs and sparse
-attention has `S*k-k*(k-1)/2` pairs, where `k=min(topk,S)`. Training counts sparse
+attention has `S*k-k*(k-1)/2` pairs, where `k=min(topk,S)`. With packed THD inputs, each real
+`cu_seqlens` document is one sequence and padding is excluded. Training counts sparse
 attention forward and backward, full causal indexer scoring, and selected-support
 indexer gradients. The two indexer projections count forward and weight gradients,
 without input gradients because their inputs are detached. With a zero auxiliary
