@@ -20,6 +20,7 @@ from .kernel_utils import (
     _emit_mxfp8,
     _tensor,
     allocate_operand,
+    named_jit,
     operand_buffers,
     validate_num_streams,
 )
@@ -383,28 +384,30 @@ def forward(
         enable_fp_fusion=False,
         launch_pdl=dependent,
     )
+    kernel = FORWARD_KERNELS[bool(mxfp8_handoff), n]
     if config.CLUSTER > 1:
         kwargs["EXCHANGE"] = _exchange_asm(config.CLUSTER, 1 if config.SPLIT else n)
         launch = dict(CONFIG=config, num_warps=config.NUM_WARPS, maxnreg=config.MAXNREG)
         # The launch must repeat the warmup's keyword order to hit the patched kernel.
         if not (
             _programmatic_launch(device)
-            and _as_cluster(write_args, grid, config.CLUSTER, kwargs | launch)
+            and _as_cluster(kernel, write_args, grid, config.CLUSTER, kwargs | launch)
         ):
             # Same slices, one CTA per row.
             config, kwargs["EXCHANGE"] = config._replace(CLUSTER=1), None
-    _forward[grid](
+    kernel[grid](
         write_args, **kwargs, CONFIG=config, num_warps=config.NUM_WARPS, maxnreg=config.MAXNREG
     )
     return current, saved, tuple(qs)
 
 
-def _as_cluster(write_args, grid, ctas, kwargs):
-    """Launch ``_forward`` as ``ctas``-CTA clusters via Triton 3.7's private packed metadata.
+def _as_cluster(kernel, write_args, grid, ctas, kwargs):
+    """Launch the forward ``kernel`` as ``ctas``-CTA clusters via Triton 3.7's private packed
+    metadata.
 
     An exchange without its peers would hang, so an unexpected form returns False (unclustered).
     """
-    kernel = _forward.warmup(write_args, grid=grid, **kwargs)
+    kernel = kernel.warmup(write_args, grid=grid, **kwargs)
     meta = kernel.packed_metadata
     if not (isinstance(meta, tuple) and len(meta) == 3 and meta[1] in (1, ctas)):
         return False
@@ -702,8 +705,7 @@ def _prepare_coefficients(
     return coefficient
 
 
-@g.jit
-def _forward(
+def _forward_body(
     write_tensors,
     saved_coefficients,
     read_tensors,
@@ -886,3 +888,12 @@ def _forward(
                             gl.num_programs(0) // K if PAD_ROWS else None,
                         )
                 queue = queue[1:]
+
+
+# One kernel body; its profiler name gives the variant (MXFP8 reader zero, reader count).
+FORWARD_KERNELS = {
+    (False, 1): named_jit(_forward_body, "_fwd_wr_read_norm_wr_write"),
+    (False, 2): named_jit(_forward_body, "_fwd_wr_read_norm_wr_write_2reader"),
+    (True, 1): named_jit(_forward_body, "_fwd_wr_read_norm_wr_write_mxfp8quant"),
+    (True, 2): named_jit(_forward_body, "_fwd_wr_read_norm_wr_write_mxfp8quant_2reader"),
+}

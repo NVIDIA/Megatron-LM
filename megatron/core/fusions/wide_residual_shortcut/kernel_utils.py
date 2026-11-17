@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Shared tensor contracts, numerical primitives and storage utilities."""
 
+import types
 from dataclasses import dataclass
 
 import torch
@@ -235,8 +236,17 @@ def _forward_value(previous, update, write, retain, rows, stream):
     return gl.where(contracted, gl.fma(write, update, retained), separate)
 
 
+def named_jit(fn, name):
+    """Gluon-jit ``fn`` under ``name``, the kernel name profilers show: one kernel body appears
+    under a descriptive name per variant (each name compiles only its own specializations)."""
+    copy = types.FunctionType(fn.__code__, fn.__globals__, name, fn.__defaults__, fn.__closure__)
+    copy.__qualname__, copy.__module__, copy.__doc__ = name, fn.__module__, fn.__doc__
+    copy.__annotations__, copy.__kwdefaults__ = dict(fn.__annotations__), fn.__kwdefaults__
+    return g.jit(copy)
+
+
 @triton.jit
-def _reduce_jobs(JOBS):
+def _bwd_wr_reduce(JOBS):
     """Reduce disjoint matrix tiles in one launch, preserving each axis's sum tree."""
     for job in tl.static_range(len(JOBS)):
         if tl.program_id(0) >= JOBS[job][3][6] and tl.program_id(0) < JOBS[job][3][7]:
@@ -299,4 +309,4 @@ def reduce_jobs(jobs):
         packed.append((source, output, factor, tl.constexpr(spec), combo))
         grid = end
     if packed:
-        _reduce_jobs[(grid,)](tuple(packed), num_warps=4, enable_fp_fusion=False)
+        _bwd_wr_reduce[(grid,)](tuple(packed), num_warps=4, enable_fp_fusion=False)
