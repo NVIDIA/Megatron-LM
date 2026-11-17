@@ -31,11 +31,11 @@ from megatron.bridge.models.qwen_vl.qwen35_vl_config import (
     Qwen35VLModelConfig,
     Qwen35VLTransformerConfig,
 )
-from megatron.bridge.utils.yaml_utils import dump_dataclass_to_yaml
 from megatron.core.dist_checkpointing.core import CheckpointingConfig, save_config
 from megatron.core.dist_checkpointing.mapping import ShardedTensor
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.training.config.utils import serialize_value
+from megatron.training.config.yaml_utils import safe_yaml_representers
 
 _BUILDER_MODULE = "megatron.bridge.models.qwen_vl.qwen35_vl_builder"
 
@@ -155,7 +155,8 @@ class TestQwen35VLModelConfig:
             vision_dp_when_cp=True,
         )
         serialized = serialize_value(config)
-        (tmp_path / "run_config.yaml").write_text(dump_dataclass_to_yaml({"model": serialized}))
+        with safe_yaml_representers():
+            (tmp_path / "run_config.yaml").write_text(yaml.safe_dump({"model": serialized}))
 
         save_config(
             CheckpointingConfig(sharded_backend="torch_dist", sharded_backend_version=1), tmp_path

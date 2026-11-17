@@ -250,7 +250,7 @@ def _maybe_generate_pipeline_layout(
         return False
     if hasattr(bridge._model_bridge, "configure_pipeline_layout"):
         bridge._model_bridge.configure_pipeline_layout(model_provider)
-        from megatron.bridge.utils.common_utils import print_rank_0
+        from megatron.training.utils.common_utils import print_rank_0
 
         stage_sizes = [
             stage.count("decoder") for stage in model_provider.pipeline_model_parallel_layout or []
@@ -269,7 +269,7 @@ def _maybe_generate_pipeline_layout(
     if layout is None:
         return False
     model_provider.pipeline_model_parallel_layout = layout
-    from megatron.bridge.utils.common_utils import print_rank_0
+    from megatron.training.utils.common_utils import print_rank_0
 
     print_rank_0(
         f"Auto-generated pipeline layout for PP={pp} ({num_layers} layers, {mtp_layers} MTP)"

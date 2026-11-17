@@ -88,13 +88,13 @@ from megatron.bridge.models.model_provider import ModelProviderMixin
 from megatron.bridge.models.transformer_config import TransformerConfig as BridgeTransformerConfig
 from megatron.bridge.utils import fusions
 from megatron.bridge.utils.activation_map import ACTIVATION_FUNC_MAP
-from megatron.bridge.utils.common_utils import print_rank_0
 from megatron.core import parallel_state
 from megatron.core.pipeline_parallel.utils import is_pp_first_stage, is_pp_last_stage
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.core.utils import get_pg_size
 from megatron.training.models.base import ModelConfig
+from megatron.training.utils.common_utils import print_rank_0
 
 logger = logging.getLogger(__name__)
 

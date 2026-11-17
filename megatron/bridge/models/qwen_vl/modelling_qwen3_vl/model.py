@@ -46,7 +46,6 @@ from megatron.bridge.utils.packed_seq_utils import (
     get_packed_seq_q_cu_seqlens,
     preprocess_packed_seqs,
 )
-from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core import InferenceParams, tensor_parallel
 from megatron.core.extensions.transformer_engine import (
     TEColumnParallelLinear,
@@ -59,6 +58,7 @@ from megatron.core.pipeline_parallel.utils import is_pp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.training.vocab_utils import calculate_padded_vocab_size
 
 
 def _is_mrope_position_ids(position_ids: torch.Tensor | None) -> bool:

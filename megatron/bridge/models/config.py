@@ -24,8 +24,8 @@ from typing import Any, Dict, Literal, Optional, Protocol, Type, TypeVar, Union,
 import yaml
 from omegaconf import OmegaConf
 
-from megatron.bridge.utils.instantiate_utils import InstantiationMode, instantiate
-from megatron.bridge.utils.yaml_utils import safe_yaml_representers
+from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
+from megatron.training.config.yaml_utils import safe_yaml_representers
 
 # For TOML support
 try:

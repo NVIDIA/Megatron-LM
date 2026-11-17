@@ -40,7 +40,7 @@ from megatron.bridge import AutoBridge
 from megatron.bridge.models.decorators import torchrun_main
 from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.hf_pretrained.utils import is_safe_repo
-from megatron.bridge.utils.common_utils import print_rank_0
+from megatron.training.utils.common_utils import print_rank_0
 
 _IGNORE_PRECISION_PARAMS = (
     "e_score_correction_bias",

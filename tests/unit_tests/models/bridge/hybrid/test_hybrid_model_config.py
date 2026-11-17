@@ -31,7 +31,7 @@ from megatron.bridge.models.hybrid.model_config import (
     BridgeHybridModelConfig,
 )
 from megatron.bridge.models.transformer_config import MLATransformerConfig, TransformerConfig
-from megatron.bridge.utils.common_utils import get_rank_safe
+from megatron.core._rank_utils import safe_get_rank
 from megatron.core.activations import squared_relu
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.models.hybrid.hybrid_layer_specs import (
@@ -192,7 +192,7 @@ class TestFinalize:
         config = _make_model_config(hybrid_layer_pattern=None, hybrid_override_pattern="M*E-")
 
         # Distributed MLM tests run on every rank; only rank zero emits the warning.
-        if get_rank_safe() == 0:
+        if safe_get_rank() == 0:
             with pytest.warns(DeprecationWarning, match="hybrid_override_pattern is deprecated"):
                 config.finalize()
         else:

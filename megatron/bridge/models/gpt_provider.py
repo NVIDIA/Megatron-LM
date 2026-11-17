@@ -29,7 +29,6 @@ from megatron.bridge.models.model_provider import ModelProviderMixin
 from megatron.bridge.models.transformer_config import TransformerConfig
 from megatron.bridge.utils import fusions
 from megatron.bridge.utils.cuda_graph import validate_cuda_graph_configuration
-from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
 from megatron.core.models.gpt import GPTModel as MCoreGPTModel
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_spec,
@@ -49,6 +48,7 @@ from megatron.core.transformer.dot_product_attention import (
 )
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.utils import get_pg_rank
+from megatron.training.vocab_utils import calculate_padded_vocab_size
 
 logger = logging.getLogger(__name__)
 

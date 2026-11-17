@@ -83,10 +83,10 @@ from megatron.bridge.models.model_provider import (
     ModelProviderMixin,
     build_distributed_models,
 )
-from megatron.bridge.utils.common_utils import get_local_rank_preinit
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.training.models.base import ModelConfig
+from megatron.training.utils.common_utils import get_local_rank_preinit
 
 logger = logging.getLogger(__name__)
 
@@ -580,7 +580,7 @@ class AutoBridge(Generic[MegatronModelT]):
             load_model_config,
         )
         from megatron.bridge.models.conversion.utils import conform_config_to_reference
-        from megatron.bridge.utils.instantiate_utils import register_allowed_target_prefix
+        from megatron.training.config.instantiate_utils import target_allowlist
 
         checkpoint_path = Path(megatron_path)
         if not checkpoint_path.exists():
@@ -608,7 +608,7 @@ class AutoBridge(Generic[MegatronModelT]):
                 "from the model repository. Only use this with models you trust."
             )
             # The run config can restore config classes from the repository code, such as a VLM's vision config.
-            register_allowed_target_prefix("transformers_modules.")
+            target_allowlist.add_prefix("transformers_modules.")
         megatron_cfg, _ = load_model_config(str(run_config.parent))
         text_reference = None
         if getattr(megatron_cfg, "hf_model_text_only", False) is True:
@@ -1713,9 +1713,9 @@ class AutoBridge(Generic[MegatronModelT]):
         from megatron.bridge.models.conversion.checkpoint import load_megatron_model
 
         if self.trust_remote_code:
-            from megatron.bridge.utils.instantiate_utils import register_allowed_target_prefix
+            from megatron.training.config.instantiate_utils import target_allowlist
 
-            register_allowed_target_prefix("transformers_modules.")
+            target_allowlist.add_prefix("transformers_modules.")
 
         return load_megatron_model(self, path, mp_overrides=mp_overrides, **kwargs)
 

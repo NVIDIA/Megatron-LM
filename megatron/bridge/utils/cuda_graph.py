@@ -96,32 +96,6 @@ def clear_cuda_graph_modules(config: Any) -> None:
     set_cuda_graph_modules(config, [])
 
 
-def set_full_iteration_cuda_graph(config: Any) -> None:
-    """Enable full-iteration CUDA graph capture using the current MCore API."""
-
-    if _supports_cuda_graph_modules(config):
-        config.cuda_graph_impl = "full_iteration"
-        config.cuda_graph_modules = []
-        if hasattr(config, "cuda_graph_scope"):
-            config.cuda_graph_scope = None
-    else:
-        config.cuda_graph_impl = "local"
-        config.cuda_graph_scope = [CudaGraphScope.full_iteration]
-
-
-def has_cuda_graph_module(config: Any, module: Any) -> bool:
-    """Return whether a per-layer CUDA graph module is enabled.
-
-    Supports both the current MCore ``cuda_graph_modules`` API and the deprecated
-    ``cuda_graph_scope`` values still present in older Bridge configs.
-    """
-
-    module_name = _member_name(module)
-    module_names = _member_names(getattr(config, "cuda_graph_modules", None))
-    legacy_scope_names = _member_names(getattr(config, "cuda_graph_scope", None))
-    return module_name in module_names or module_name in legacy_scope_names
-
-
 def is_full_iteration_cuda_graph(config: Any) -> bool:
     """Return whether config enables full-iteration CUDA graph capture."""
 

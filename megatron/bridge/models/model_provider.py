@@ -38,8 +38,6 @@ except ImportError:
 import torch
 
 from megatron.bridge.models.config import from_hf_pretrained, save_hf_pretrained
-from megatron.bridge.utils.common_utils import get_local_rank_preinit
-from megatron.bridge.utils.instantiate_utils import InstantiationMode
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
@@ -54,7 +52,9 @@ from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.utils import get_model_config
+from megatron.training.config.instantiate_utils import InstantiationMode
 from megatron.training.models.base import ModelConfig
+from megatron.training.utils.common_utils import get_local_rank_preinit
 
 try:
     from megatron.core.fp8_utils import correct_amax_history_if_needed

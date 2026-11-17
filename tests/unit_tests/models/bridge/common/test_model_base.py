@@ -26,12 +26,7 @@ from megatron.bridge.models.common.base import ModelBuilder, ModelConfig, compos
 from megatron.bridge.models.hybrid.model_config import BridgeHybridModelConfig
 from megatron.bridge.models.qwen.modeling_qwen35.model_config import Qwen35HybridModelConfig
 from megatron.bridge.models.transformer_config import TransformerConfig
-from megatron.bridge.utils.instantiate_utils import (
-    _ALLOWED_TARGET_PREFIXES,
-    InstantiationException,
-    register_allowed_target_prefix,
-    target_allowlist,
-)
+from megatron.training.config.instantiate_utils import InstantiationException
 
 
 @dataclass
@@ -109,21 +104,6 @@ class DummyDerivedModelConfig(ModelConfig):
 
 
 DummyDerivedModelConfig.builder = f"{DummyModelBuilder.__module__}.DummyModelBuilder"
-
-
-@pytest.fixture(autouse=True)
-def _register_test_target_prefix():
-    prefix = f"{__name__}."
-    added_to_bridge = prefix not in _ALLOWED_TARGET_PREFIXES
-    added_to_mlm = prefix not in target_allowlist.allowed_prefixes
-
-    register_allowed_target_prefix(prefix)
-    yield
-
-    if added_to_bridge:
-        _ALLOWED_TARGET_PREFIXES.discard(prefix)
-    if added_to_mlm:
-        target_allowlist.remove_prefix(prefix)
 
 
 def test_model_config_get_builder_cls_uses_validated_target() -> None:

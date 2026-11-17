@@ -23,7 +23,7 @@ from dataclasses import is_dataclass
 from typing import Any, ClassVar
 
 from megatron.bridge.models.transformer_config import MLATransformerConfig, TransformerConfig
-from megatron.bridge.utils.instantiate_utils import _resolve_target, instantiate
+from megatron.training.config.instantiate_utils import _resolve_target, instantiate
 from megatron.training.models.base import BuildConfigT  # noqa: F401
 from megatron.training.models.base import ModelBuilder  # noqa: F401
 from megatron.training.models.base import ModelT  # noqa: F401

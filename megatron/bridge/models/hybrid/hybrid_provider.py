@@ -33,8 +33,7 @@ from megatron.bridge.models.logit_dtype import logit_dtype_kwarg
 from megatron.bridge.models.model_provider import ModelProviderMixin
 from megatron.bridge.models.transformer_config import TransformerConfig
 from megatron.bridge.utils import fusions
-from megatron.bridge.utils.common_utils import get_rank_safe
-from megatron.bridge.utils.vocab_utils import calculate_padded_vocab_size
+from megatron.core._rank_utils import safe_get_rank
 from megatron.core.models.hybrid.hybrid_layer_specs import (
     hybrid_inference_stack_spec as default_hybrid_inference_stack_spec,
 )
@@ -57,6 +56,7 @@ from megatron.core.ssm.mamba_hybrid_layer_allocation import (
 )
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.enums import AttnBackend
+from megatron.training.vocab_utils import calculate_padded_vocab_size
 
 logger = logging.getLogger(__name__)
 
@@ -191,7 +191,7 @@ class HybridModelProvider(TransformerConfig, ModelProviderMixin[MCoreHybridModel
                 "hybrid_override_pattern and hybrid_layer_pattern cannot both be specified. "
                 "hybrid_override_pattern is deprecated; use hybrid_layer_pattern instead."
             )
-            if get_rank_safe() == 0:
+            if safe_get_rank() == 0:
                 warnings.warn(
                     "hybrid_override_pattern is deprecated. Use hybrid_layer_pattern instead.",
                     DeprecationWarning,

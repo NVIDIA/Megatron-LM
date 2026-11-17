@@ -18,11 +18,10 @@
 """Shared bidirectional mapping between activation function names and callables.
 
 Used by:
-- ``omegaconf_utils`` for CLI override serialization/deserialization
+- Model configs for activation serialization/deserialization
 - ``ModelBridge`` for HuggingFace <-> Megatron activation conversion
 """
 
-import logging
 from typing import Callable
 
 import torch
@@ -36,8 +35,6 @@ except ImportError:
     # Fallback if fused_bias_geglu is not available in the pinned MCore version
     quick_gelu = F.gelu
 
-
-logger = logging.getLogger(__name__)
 
 # Canonical name -> callable.
 # Short names come first; fully-qualified aliases are added below.

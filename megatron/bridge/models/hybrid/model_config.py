@@ -30,8 +30,7 @@ from megatron.bridge.models.common.base import (
 from megatron.bridge.models.hybrid.hybrid_builder import DEFAULT_MAMBA_CHUNK_SIZE, HybridModelConfig
 from megatron.bridge.models.transformer_config import TransformerConfig
 from megatron.bridge.utils.activation_map import callable_to_str, str_to_callable
-from megatron.bridge.utils.common_utils import get_rank_safe
-from megatron.bridge.utils.instantiate_utils import _resolve_target
+from megatron.core._rank_utils import safe_get_rank
 from megatron.core.models.hybrid.hybrid_layer_allocation import (
     Symbols,
     get_hybrid_total_layer_count,
@@ -39,6 +38,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 )
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+from megatron.training.config.instantiate_utils import _resolve_target
 
 logger = logging.getLogger(__name__)
 
@@ -109,7 +109,7 @@ class BridgeHybridModelConfig(ModelConfigOverrideMixin, HybridModelConfig, Model
         self.validate()
 
         if self.hybrid_override_pattern is not None:
-            if get_rank_safe() == 0:
+            if safe_get_rank() == 0:
                 warnings.warn(
                     "hybrid_override_pattern is deprecated. Use hybrid_layer_pattern instead.",
                     DeprecationWarning,

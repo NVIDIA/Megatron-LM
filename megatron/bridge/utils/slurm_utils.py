@@ -23,10 +23,7 @@ distributed training configuration from SLURM environment variables.
 import os
 import warnings
 
-from megatron.core._slurm_utils import is_slurm_job  # noqa: F401
-from megatron.core._slurm_utils import resolve_slurm_local_rank  # noqa: F401
-from megatron.core._slurm_utils import resolve_slurm_rank  # noqa: F401
-from megatron.core._slurm_utils import resolve_slurm_world_size  # noqa: F401
+from megatron.core._slurm_utils import is_slurm_job
 
 
 def resolve_slurm_master_addr() -> str | None:
