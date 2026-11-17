@@ -36,6 +36,7 @@ def main() -> None:
         raise ValueError("Testmon selection requires main")
     platform = os.environ["RECIPE_PLATFORM"]
     generation = f"{os.environ['GITHUB_RUN_ID']}-{os.environ['GITHUB_RUN_ATTEMPT']}"
+    baseline_generation = os.environ.get("TESTMON_GENERATION", "")
     temporary = Path(os.environ["RUNNER_TEMP"])
     cache_dir = Path("assets_dir/testmon")
     plan = "assets_dir/testmon-plan/plan.json"
@@ -68,13 +69,27 @@ def main() -> None:
         matched_key = ""
         key_file = temporary / "unit-testmon-matched-key"
         prefix = identity["cache_prefix"]
+        requested_key = prefix + (baseline_generation or f"lookup-{generation}")
         try:
             _actions(
-                "restore", str(cache_dir), f"{prefix}lookup-{generation}", prefix, str(key_file)
+                "restore",
+                str(cache_dir),
+                requested_key,
+                "" if baseline_generation else prefix,
+                str(key_file),
             )
             matched_key = key_file.read_text()
-        except subprocess.CalledProcessError:
-            logger.warning("Testmon cache restore failed for %s", bucket)
+            if baseline_generation and matched_key:
+                manifest = json.loads((cache_dir / "manifest.json").read_text())
+                if (
+                    matched_key != requested_key
+                    or not isinstance(manifest, dict)
+                    or manifest.get("source_sha") != os.environ.get("TESTMON_BASE_SHA")
+                ):
+                    raise ValueError("cache does not match the pinned baseline")
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            logger.warning("Testmon cache restore failed for %s: %s", bucket, error)
+            matched_key = ""
         result = _python(
             "testmon_selector.py",
             [

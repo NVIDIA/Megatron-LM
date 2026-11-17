@@ -9,31 +9,18 @@ from packaging import version
 
 import megatron.core.parallel_state as parallel_state
 from megatron.core.hyper_comm_grid import HyperCommGrid
-from megatron.core.models.common.embeddings.rope_utils import (
-    get_pos_emb_on_this_cp_rank as get_tensor_on_this_cp_rank,
-)
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
 )
-from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import Attention, SelfAttention
 from megatron.core.transformer.enums import AttnMaskType
-from megatron.core.utils import is_te_min_version, unwrap_model
-from megatron.training.arguments import parse_args
-from megatron.training.checkpointing import load_checkpoint, save_checkpoint
-from megatron.training.global_vars import set_args
-from megatron.training.training import get_model
-from tests.unit_tests.dist_checkpointing import (
-    TempNamedDir,
-    init_basic_mock_args,
-    init_checkpointing_mock_args,
-)
+from megatron.core.utils import is_te_min_version
 from tests.unit_tests.test_utilities import Utils
-from tests.unit_tests.transformer.test_multi_latent_attention import make_test_packed_seq_params
+from tests.unit_tests.transformer.parallel_test_utils import _test_parallel_attention_correctness
 
 pytestmark = pytest.mark.usefixtures("run_config")
 
@@ -65,6 +52,9 @@ class TestParallelAttention:
             self.transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
 
     def teardown_method(self):
@@ -79,6 +69,53 @@ class TestParallelAttention:
             assert num_weights == 82816
         else:
             assert num_weights == 66304
+
+    @pytest.mark.parametrize('missing_group', ['tp', 'cp'])
+    def test_constructor_rejects_omitted_process_group(self, missing_group):
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        delattr(pg_collection, missing_group)
+        with pytest.raises(ValueError, match=f'must have {missing_group} process group'):
+            SelfAttention(
+                self.transformer_config,
+                get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+                layer_number=1,
+                pg_collection=pg_collection,
+            )
+
+    def test_constructor_rejects_none_process_groups(self):
+        """A group that is present but None is as unusable as an omitted one."""
+        submodules = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
+
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        pg_collection.tp = None
+        with pytest.raises(ValueError, match='non-None tp process group'):
+            SelfAttention(
+                self.transformer_config, submodules, layer_number=1, pg_collection=pg_collection
+            )
+
+        # cp may be None only while context parallelism is off for the module.
+        context_parallel_config = copy.copy(self.transformer_config)
+        context_parallel_config.context_parallel_size = 2
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        pg_collection.cp = None
+        with pytest.raises(ValueError, match='non-None cp process group'):
+            SelfAttention(
+                context_parallel_config, submodules, layer_number=1, pg_collection=pg_collection
+            )
+
+    def test_constructor_requires_dp_group_for_test_mode_qk_layernorm(self):
+        """The realtime consistency check reads the DP group; fail at build, not on first forward."""
+        test_mode_config = copy.copy(self.transformer_config)
+        test_mode_config.test_mode = True
+        test_mode_config.qk_layernorm = True
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+        with pytest.raises(ValueError, match='requires a dp process group'):
+            SelfAttention(
+                test_mode_config,
+                get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
+                layer_number=1,
+                pg_collection=pg_collection,
+            )
 
     def test_cpu_forward(self):
         # we can't currently do this because the global memory buffer is on GPU
@@ -159,6 +196,9 @@ class TestParallelAttention:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
         config = checkpointed_parallel_attention.config
 
@@ -209,6 +249,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
 
         with pytest.raises(ValueError, match="qk_clip option needs to be enabled"):
@@ -229,6 +272,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
 
         with pytest.raises(ValueError, match="current_max_attn_logits is None"):
@@ -249,6 +295,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
         attention.cuda()
 
@@ -283,6 +332,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
         attention.cuda()
 
@@ -318,6 +370,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
         attention.cuda()
 
@@ -352,6 +407,9 @@ class TestClipQK:
             transformer_config,
             get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules,
             layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
         )
         attention.cuda()
 
@@ -470,201 +528,6 @@ class TestSelfAttention:
         self.run_self_attention(pg_collection)
 
 
-def _test_parallel_attention_correctness(
-    transformer_config,
-    transformer_layer_spec,
-    tmp_path_dist_ckpt,
-    atol,
-    rtol,
-    tp=1,
-    sp=False,
-    cp=1,
-    seed=123,
-    sequence_length=256,
-    micro_batch_size=4,
-    sequence_packing=False,
-    cp_partition_mode="zigzag",
-    input_grad_atol=None,
-    input_grad_rtol=None,
-):
-    # Model initialization function
-    def initialize_gpt_model(
-        config, pre_process=True, post_process=True, vp_stage=None, pg_collection=None
-    ):
-        gpt_model = GPTModel(
-            config=config,
-            transformer_layer_spec=transformer_layer_spec,
-            vocab_size=128,
-            max_sequence_length=sequence_length,
-            pre_process=pre_process,
-            post_process=post_process,
-            vp_stage=vp_stage,
-            pg_collection=pg_collection,
-        )
-        return gpt_model
-
-    # Initialize baseline parallel state
-    Utils.initialize_model_parallel(
-        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, context_parallel_size=1
-    )
-
-    # Initialize input hidden states
-    torch.manual_seed(seed)
-    model_parallel_cuda_manual_seed(seed)
-    input_hidden_states = (
-        torch.rand((sequence_length, micro_batch_size, transformer_config.hidden_size))
-        .cuda()
-        .bfloat16()
-        .requires_grad_(True)
-    )
-
-    with TempNamedDir(tmp_path_dist_ckpt / 'test_parallel_attn', sync=True) as ckpt_dir:
-        # Set argument
-        mock_args = parse_args(ignore_unknown_args=True)
-        mock_args.save_tokenizer_assets = False
-        set_args(mock_args)
-
-        # Initialize baseline model
-        init_basic_mock_args(mock_args, 1, 1, bf16=True)
-        mock_args.context_parallel_size = 1
-        mock_args.sequence_parallel = 1
-        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
-
-        # Initialize args and save checkpoint
-        init_checkpointing_mock_args(mock_args, ckpt_dir, False)
-        mock_args.no_save_optim = True
-        mock_args.no_save_rng = True
-        mock_args.no_load_optim = True
-        mock_args.no_load_rng = True
-        save_checkpoint(10, gpt_model, None, None, 0)
-
-        # Calculate baseline output
-        attention = gpt_model[0].decoder.layers[0].self_attention
-        output_hidden_states_baseline, bias_hidden_states_baseline = attention(
-            input_hidden_states, attention_mask=None
-        )
-        output_hidden_states_baseline.sum().backward()
-
-        # Save baseline output
-        input_grad_baseline = input_hidden_states.grad.detach()
-        output_hidden_states_baseline = output_hidden_states_baseline.detach()
-        bias_hidden_states_baseline = bias_hidden_states_baseline
-        if bias_hidden_states_baseline is not None:
-            bias_hidden_states_baseline = bias_hidden_states_baseline.detach()
-            has_bias = True
-        else:
-            has_bias = False
-
-        # Initialize parallel model
-        Utils.destroy_model_parallel()
-        Utils.initialize_model_parallel(
-            tensor_model_parallel_size=tp, pipeline_model_parallel_size=1, context_parallel_size=cp
-        )
-        torch.manual_seed(seed)
-        model_parallel_cuda_manual_seed(seed)
-        transformer_config.context_parallel_size = cp
-        transformer_config.tensor_model_parallel_size = tp
-        transformer_config.sequence_parallel = sp
-        init_basic_mock_args(mock_args, tp, 1, bf16=True)
-        mock_args.context_parallel_size = cp
-        mock_args.sequence_parallel = sp
-        gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
-        with mock.patch('megatron.training.checkpointing.check_checkpoint_args'):
-            load_checkpoint(gpt_model, None, None)
-
-        # Function to get tensor on this tp and cp rank
-        cp_group = parallel_state.get_context_parallel_group()
-        tp_rank = parallel_state.get_tensor_model_parallel_rank()
-
-        def get_tensor_on_this_rank(tensor):
-            if cp > 1 and cp_partition_mode == "zigzag":
-                tensor = get_tensor_on_this_cp_rank(tensor, 0, cp_group)
-            if sequence_packing:
-                tensor = tensor.transpose(0, 1).contiguous().view(-1, 1, *tensor.shape[2:])
-            if cp > 1 and cp_partition_mode == "contiguous":
-                # Packed contiguous CP partitions the flattened token stream, not each sequence.
-                tensor = tensor.chunk(cp, dim=0)[cp_group.rank()].contiguous()
-            if tp > 1 and sp:
-                sp_seg = tensor.shape[0] // tp
-                tensor = tensor[tp_rank * sp_seg : (tp_rank + 1) * sp_seg]
-            return tensor
-
-        # Calculate parallel model output
-        if sequence_packing:
-            cu_seqlens = [i * sequence_length for i in range(micro_batch_size + 1)]
-            packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
-            packed_seq_params.cp_partition_mode = cp_partition_mode
-        else:
-            packed_seq_params = None
-        input_hidden_states = get_tensor_on_this_rank(input_hidden_states)
-        input_hidden_states = input_hidden_states.detach().requires_grad_(True)
-        parallel_attention = gpt_model[0].decoder.layers[0].self_attention
-        output_hidden_states_parallel, bias_hidden_states_parallel = parallel_attention(
-            input_hidden_states, attention_mask=None, packed_seq_params=packed_seq_params
-        )
-        output_hidden_states_parallel.sum().backward()
-        input_grad_parallel = input_hidden_states.grad.detach()
-
-        # Check if the output is close
-        output_hidden_states_baseline = get_tensor_on_this_rank(output_hidden_states_baseline)
-        input_grad_baseline = get_tensor_on_this_rank(input_grad_baseline)
-
-        assert torch.all(
-            ~torch.isnan(output_hidden_states_baseline)
-        ), "output_hidden_states_baseline contains nan"
-        assert torch.all(
-            ~torch.isinf(output_hidden_states_baseline)
-        ), "output_hidden_states_baseline contains inf"
-        assert torch.all(~torch.isnan(input_grad_baseline)), "input_grad_baseline contains nan"
-        assert torch.all(~torch.isinf(input_grad_baseline)), "input_grad_baseline contains inf"
-        assert torch.all(
-            ~torch.isnan(output_hidden_states_parallel)
-        ), "output_hidden_states_parallel contains nan"
-        assert torch.all(
-            ~torch.isinf(output_hidden_states_parallel)
-        ), "output_hidden_states_parallel contains inf"
-        assert torch.all(~torch.isnan(input_grad_parallel)), "input_grad_parallel contains nan"
-        assert torch.all(~torch.isinf(input_grad_parallel)), "input_grad_parallel contains inf"
-        if has_bias:
-            assert torch.all(
-                ~torch.isnan(bias_hidden_states_baseline)
-            ), "bias_hidden_states_baseline contains nan"
-            assert torch.all(
-                ~torch.isinf(bias_hidden_states_baseline)
-            ), "bias_hidden_states_baseline contains inf"
-            assert torch.all(
-                ~torch.isnan(bias_hidden_states_parallel)
-            ), "bias_hidden_states_parallel contains nan"
-            assert torch.all(
-                ~torch.isinf(bias_hidden_states_parallel)
-            ), "bias_hidden_states_parallel contains inf"
-
-        torch.testing.assert_close(
-            output_hidden_states_baseline,
-            output_hidden_states_parallel,
-            atol=atol,
-            rtol=rtol,
-            msg=lambda msg: f"Mismatch in output_hidden_states: {msg}",
-        )
-        torch.testing.assert_close(
-            input_grad_baseline,
-            input_grad_parallel,
-            atol=atol if input_grad_atol is None else input_grad_atol,
-            rtol=rtol if input_grad_rtol is None else input_grad_rtol,
-            msg=lambda msg: f"Mismatch in input_grad: {msg}",
-        )
-        if has_bias:
-            torch.testing.assert_close(
-                bias_hidden_states_baseline,
-                bias_hidden_states_parallel,
-                atol=atol,
-                rtol=rtol,
-                msg=lambda msg: f"Mismatch in bias_hidden_states: {msg}",
-            )
-
-        Utils.destroy_model_parallel()
-
-
 @pytest.mark.parametrize("sequence_packing", [False, True])
 @pytest.mark.parametrize("apply_rope_fusion", [False, True])
 @pytest.mark.parametrize(
@@ -771,7 +634,14 @@ def test_qk_layernorm_from_config_fallback():
         )
         base = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
         submodules = replace(base, q_layernorm=None, k_layernorm=None)
-        attn = SelfAttention(config, submodules, layer_number=1)
+        attn = SelfAttention(
+            config,
+            submodules,
+            layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
+        )
         assert isinstance(attn.q_layernorm, te_pytorch.LayerNorm)
         assert isinstance(attn.k_layernorm, te_pytorch.LayerNorm)
     finally:
@@ -783,7 +653,7 @@ def test_qk_l2_norm_from_config_fallback():
     pytest.importorskip("transformer_engine.pytorch")
     from dataclasses import replace
 
-    from megatron.core.transformer.torch_norm import L2Norm
+    from megatron.core.ops.norm.torch_norm import L2Norm
 
     Utils.initialize_model_parallel(1, 1)
     model_parallel_cuda_manual_seed(123)
@@ -797,7 +667,14 @@ def test_qk_l2_norm_from_config_fallback():
         )
         base = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
         submodules = replace(base, q_layernorm=None, k_layernorm=None)
-        attn = SelfAttention(config, submodules, layer_number=1)
+        attn = SelfAttention(
+            config,
+            submodules,
+            layer_number=1,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=['tp', 'cp', 'dp']
+            ),
+        )
         assert isinstance(attn.q_layernorm, L2Norm)
         assert isinstance(attn.k_layernorm, L2Norm)
     finally:
@@ -809,7 +686,7 @@ def test_qk_layernorm_spec_config_mismatch_raises():
     pytest.importorskip("transformer_engine")
     from dataclasses import replace
 
-    from megatron.core.transformer.torch_norm import L2Norm
+    from megatron.core.ops.norm.torch_norm import L2Norm
 
     Utils.initialize_model_parallel(1, 1)
     model_parallel_cuda_manual_seed(123)
@@ -820,7 +697,14 @@ def test_qk_layernorm_spec_config_mismatch_raises():
         base = get_gpt_layer_with_transformer_engine_submodules().self_attention.submodules
         submodules = replace(base, q_layernorm=L2Norm, k_layernorm=L2Norm)
         with pytest.raises(ValueError, match="qk_layernorm"):
-            SelfAttention(config, submodules, layer_number=1)
+            SelfAttention(
+                config,
+                submodules,
+                layer_number=1,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(
+                    required_pgs=['tp', 'cp', 'dp']
+                ),
+            )
     finally:
         Utils.destroy_model_parallel()
 

@@ -14,6 +14,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state
+from megatron.core._rank_utils import warn_single_rank
 
 logger = logging.getLogger(__name__)
 
@@ -387,6 +388,24 @@ def apply_rotary_pos_emb(
                 warnings.warn(
                     "inverse RoPE is not supported by TE's fused RoPE. "
                     "Using unfused implementation."
+                )
+                use_unfused = True
+            # Like unfused THD, infer packed-token frequencies from rows > max_seqlen.
+            # These rows continue across sequences; shared position tables restart at row 0.
+            freqs_in_packed_order = max_seqlen is not None and freqs.size(0) > max_seqlen
+            if not use_unfused and freqs_in_packed_order:
+                if cp_group.size() == 1 and freqs.size(0) == t.size(0):
+                    # Frequencies already align with local tokens. RoPE is token-wise,
+                    # so the SBHD kernel can treat them as one sequence with batch size 1.
+                    assert (
+                        fused_apply_rotary_pos_emb is not None
+                    ), "apply_rope_fusion is not available."
+                    return fused_apply_rotary_pos_emb(
+                        t.unsqueeze(1), freqs, interleaved=config.rotary_interleaved
+                    ).squeeze(1)
+                warn_single_rank(
+                    "apply_rope_fusion supports per-token RoPE frequencies only with one row per "
+                    "token and no context parallelism. Using unfused implementation."
                 )
                 use_unfused = True
             if not use_unfused:

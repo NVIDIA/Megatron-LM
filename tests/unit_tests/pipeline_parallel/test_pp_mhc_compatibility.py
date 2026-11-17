@@ -276,7 +276,7 @@ def _batches(variable, cp_group):
         positions = torch.arange(length, device="cuda").unsqueeze(0)
         tokens = (positions + 3 * microbatch) % 64
         batch = dict(tokens=tokens, labels=(tokens + 1) % 64, position_ids=positions)
-        yield get_batch_on_this_cp_rank(batch, is_hybrid_cp=False, cp_group=cp_group)
+        yield get_batch_on_this_cp_rank(batch, dynamic_cp=False, cp_group=cp_group)
 
 
 def _run_schedule(config, models):
@@ -401,8 +401,24 @@ def fresh_mhc_compile_cache():
     ],
 )
 def test_mhc_schedule_matches_pp1(
-    kind, vp_size, tp_size, cp_size, variable, standalone, empty, mtp, overlap, recompute
+    kind,
+    vp_size,
+    tp_size,
+    cp_size,
+    variable,
+    standalone,
+    empty,
+    mtp,
+    overlap,
+    recompute,
+    monkeypatch,
 ):
+    if cp_size == 1:
+        # FP32 schedule parity needs IEEE PyTorch GEMMs on both sides, independent
+        # of TF32 kernel selection for the different PP partitions. TE's own FP32
+        # GEMMs use TF32 compute regardless of these flags.
+        monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+        monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
     if Utils.world_size % (2 * tp_size * cp_size) != 0:
         pytest.skip("Requires a world size divisible by 2 * TP * CP")
     kwargs = dict(

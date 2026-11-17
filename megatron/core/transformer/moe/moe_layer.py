@@ -33,6 +33,7 @@ from megatron.core.transformer.moe.moe_utils import (
     maybe_skip_or_early_return_by_cudagraph,
 )
 from megatron.core.transformer.moe.router import TopKRouter
+from megatron.core.transformer.moe.router_replay import RouterReplay
 from megatron.core.transformer.moe.shared_experts import SharedExpertMLP
 from megatron.core.transformer.moe.token_dispatcher import (
     MoEAllGatherTokenDispatcher,
@@ -43,6 +44,9 @@ from megatron.core.transformer.moe.token_dispatcher import (
 from megatron.core.transformer.moe.token_dispatcher_inference import (
     NCCLAllGatherDispatcher,
     NVLSAllGatherVDispatcher,
+)
+from megatron.core.transformer.moe.training_matches_inference import (
+    training_matches_inference_forward,
 )
 from megatron.core.transformer.moe.virtual_expert_load_balancer import VirtualExpertLoadBalancer
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -253,6 +257,33 @@ class MoELayer(BaseMoELayer):
     subset of experts. This implementation supports different token dispatching
     strategies such as All-to-All and All-Gather.
     """
+
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: TransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+    ) -> float:
+        """Estimate forward FLOPs for routed/shared experts and latent projections."""
+        tokens = total_real_tokens_in_batch
+        projections = 3 if config.gated_linear_unit else 2
+        expert_width = config.moe_ffn_hidden_size or config.ffn_hidden_size
+        routed_hidden = (
+            config.hidden_size if config.moe_latent_size is None else config.moe_latent_size
+        )
+        routed = 2 * projections * tokens * routed_hidden * expert_width * config.moe_router_topk
+        if config.moe_latent_size is not None:
+            routed += 4 * tokens * config.hidden_size * config.moe_latent_size
+        shared = (
+            2
+            * projections
+            * tokens
+            * config.hidden_size
+            * (config.moe_shared_expert_intermediate_size or 0)
+        )
+        return routed + shared
 
     def __init__(
         self,
@@ -556,20 +587,28 @@ class MoELayer(BaseMoELayer):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        replay_topk_idx: Optional[torch.Tensor] = None,
     ):
         """Compute token routing for preprocessing.
 
         This method uses the router to determine which experts to send each token to,
         producing routing probabilities and a mapping. The input padding mask is batch-first;
-        routing consumes it sequence-first to align with ``hidden_states``.
+        routing consumes it sequence-first to align with ``hidden_states``. With routing replay,
+        ``replay_topk_idx`` ([num_tokens, topk]) replaces the micro-batch's indices for this call.
         """
         if padding_mask is not None:
             padding_mask = padding_mask.transpose(0, 1).bool()
         if self.token_dispatcher is not None:
             hidden_states = self.token_dispatcher.wrap_layer_input(hidden_states)
-        probs, routing_map = apply_module(self.router)(
-            hidden_states, padding_mask, input_ids=input_ids, packed_seq_params=packed_seq_params
-        )
+        with RouterReplay.replay_indices_for_call(
+            getattr(self.router, "router_replay", None), replay_topk_idx
+        ):
+            probs, routing_map = apply_module(self.router)(
+                hidden_states,
+                padding_mask,
+                input_ids=input_ids,
+                packed_seq_params=packed_seq_params,
+            )
         return probs, routing_map
 
     @maybe_skip_or_early_return_by_cudagraph("preprocess")
@@ -579,13 +618,14 @@ class MoELayer(BaseMoELayer):
         probs: torch.Tensor,
         routing_map: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """Preprocess token routing for dispatch.
 
         This method preprocesses the hidden states and routing probabilities for the token
         dispatcher. The optional padding mask is the batch-first mask given to ``route``; it is
         passed through untouched and the dispatcher decides whether its backend excludes padded
-        rows.
+        rows. ``packed_seq_params`` tells the dispatcher whether the input is packed (THD).
         """
         # Latent-MoE + NVLS-inference shared-expert overlap: launch the shared
         # expert on its side stream BEFORE fc1_latent_proj so it sees the full
@@ -616,9 +656,14 @@ class MoELayer(BaseMoELayer):
         if self.config.moe_latent_size:
             hidden_states, _ = self.fc1_latent_proj(hidden_states)
         if isinstance(self.token_dispatcher, MoEFlexTokenDispatcher):
-            # Only the flex dispatcher takes the mask (dropless HybridEP excludes padded rows).
+            # Only the flex dispatcher takes the mask (dropless HybridEP and NCCL EP exclude
+            # padded rows) and the packed-sequence metadata.
             hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
-                hidden_states, routing_map, probs, padding_mask=padding_mask
+                hidden_states,
+                routing_map,
+                probs,
+                padding_mask=padding_mask,
+                packed_seq_params=packed_seq_params,
             )
         else:
             hidden_states, probs = self.token_dispatcher.dispatch_preprocess(
@@ -744,6 +789,7 @@ class MoELayer(BaseMoELayer):
         padding_mask: Optional[torch.Tensor] = None,
         input_ids: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
+        replay_topk_idx: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Forward pass for the MoE layer.
 
@@ -760,6 +806,10 @@ class MoELayer(BaseMoELayer):
                                                    False = valid. Defaults to None.
             input_ids (torch.Tensor, optional): Token IDs with shape
                 [batch_size, seq_length]. Required by hash routing.
+            replay_topk_idx (torch.Tensor, optional): Routing replay indices of exactly these
+                tokens, ``[seq_length * bsz, topk]``, replayed in place of the micro-batch's
+                (see ``ChunkedRouterReplay``). Being an argument, they are also what a
+                recompute of this call replays.
         Returns:
             A tuple containing the output tensor and the MLP bias, if any.
         """
@@ -779,7 +829,11 @@ class MoELayer(BaseMoELayer):
 
             def megakernel_forward(hidden_states, padding_mask):
                 probs, routing_map = self.route(
-                    hidden_states, padding_mask, input_ids, packed_seq_params=packed_seq_params
+                    hidden_states,
+                    padding_mask,
+                    input_ids,
+                    packed_seq_params=packed_seq_params,
+                    replay_topk_idx=replay_topk_idx,
                 )
                 return apply_module(self.megakernel_experts)(hidden_states, probs, routing_map)
 
@@ -803,10 +857,18 @@ class MoELayer(BaseMoELayer):
                         shared_expert_output = self.shared_experts_compute(layer_input)
 
                     probs, routing_map = self.route(
-                        layer_input, padding_mask, input_ids, packed_seq_params=packed_seq_params
+                        layer_input,
+                        padding_mask,
+                        input_ids,
+                        packed_seq_params=packed_seq_params,
+                        replay_topk_idx=replay_topk_idx,
                     )
                     hidden_states, probs = self.preprocess(
-                        layer_input, probs, routing_map, padding_mask
+                        layer_input,
+                        probs,
+                        routing_map,
+                        padding_mask,
+                        packed_seq_params=packed_seq_params,
                     )
 
                     if self.run_shared_experts_after_router:
@@ -826,8 +888,7 @@ class MoELayer(BaseMoELayer):
                 if intermediate_tensors is not None:
                     hidden_states, probs = intermediate_tensors
 
-                dispatched_input, probs = self.dispatch(hidden_states, probs)
-                output, mlp_bias = self.routed_experts_compute(dispatched_input, probs)
+                output, mlp_bias = self.routed_experts_compute(*self.dispatch(hidden_states, probs))
                 assert (
                     mlp_bias is None
                 ), f"mlp_bias is not supported for {type(self.token_dispatcher)}"
@@ -846,6 +907,11 @@ class MoELayer(BaseMoELayer):
                     return output
 
             return output, mlp_bias
+
+        if self.config.moe_training_matches_inference and not InferenceMode.is_active():
+            return training_matches_inference_forward(
+                self, custom_forward, hidden_states, intermediate_tensors, padding_mask, input_ids
+            )
 
         if self.moe_layer_recompute and self.training:
             outputs = precision_aware_checkpoint(

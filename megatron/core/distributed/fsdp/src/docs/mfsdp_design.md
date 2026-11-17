@@ -267,32 +267,38 @@ teardown. See https://github.com/NVIDIA/Megatron-LM/pull/6230.
 
 ### FsdpContext
 
-Context-wide options are grouped in an immutable `RuntimePolicy`:
+`FsdpContext` shares communication streams and prefetch state across FSDP modules.
+`fully_shard_context` associates newly sharded modules with the context and finalizes
+its roots and prefetch orders on exit. Runtime options live in an immutable `RuntimePolicy`:
 
 ```python
-with fully_shard_context(
+context = FsdpContext(
     device=device,
     runtime_policy=RuntimePolicy(
         use_symmetric_memory=True,
-        unify_communication_stream=True,
-        caller_managed_grad_sync=True,
+        overlap_allgather_reduction=False,
     ),
-) as context:
+)
+with fully_shard_context(context):
     fully_shard(model, mesh=mesh, placements=placements)
 ```
 
-`device` and the construction-only `parameter_to_owner` map remain separate
-arguments. All runtime-policy flags default to `False`. When the caller manages
-gradient synchronization, call `context.finish_grad_sync()` after all backward
-work and before consuming gradients.
+For delayed weight gradients, keep both backward and `backward_dw()` inside the scope,
+then wait before the optimizer step:
 
-- Created by `fully_shard_context` and shared by every `FsdpModule` constructed in that
-  scope. On exit, it identifies FSDP roots and finalizes the static forward and backward
-  prefetch orders.
-- Per-device all-gather and reduce-scatter streams. Module compute runs on PyTorch’s
-  current stream.
-- Last-microbatch state for HSDP/HFSDP gradient accumulation.
-- An optional PyTorch NCCL symmetric-memory pool for communication staging buffers.
+```python
+with context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER):
+    loss = model(inputs).sum()
+    loss.backward()
+    model.backward_dw()
+context.finish_grad_sync()
+optimizer.step()
+```
+
+The MCore adapter starts in `REDUCE_OUTER` mode. Its `no_sync()` scopes temporarily
+select `SKIP_OUTER` for accumulation, and `finalize_model_grads()` waits after all
+backward work. Scopes restore the previous mode; `finish_grad_sync()` waits for
+submitted reductions without launching skipped ones.
 
 ### FsdpModule
 
