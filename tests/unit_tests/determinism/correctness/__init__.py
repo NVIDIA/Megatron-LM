@@ -15,4 +15,8 @@ import os
 
 from megatron.training.determinism import apply_determinism_env
 
+# Same vLLM guard as ``kernels/__init__.py``: importing vLLM sets TRITON_CACHE_AUTOTUNING=1,
+# which apply_determinism_env rejects without a shared TRITON_CACHE_DIR.
+if os.environ.get("TRITON_CACHE_AUTOTUNING", "1") == "1" and not os.environ.get("TRITON_CACHE_DIR"):
+    os.environ["TRITON_CACHE_AUTOTUNING"] = "0"
 apply_determinism_env(os.environ)

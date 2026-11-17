@@ -913,6 +913,10 @@ class TestMegatronFSDPE2E:
                     bf16=True,
                     num_distributed_optimizer_instances=2,
                     outer_dp_sharding_strategy="optim",
+                    # MXFP8 needs GEMM dims divisible by 32. Mamba in_proj has
+                    # 2 * d_inner + 2 * groups * d_state + heads rows: 3088 with the
+                    # default 16 heads, 5152 with 32.
+                    mamba_num_heads=32,
                 ),
                 id="optim_grads_params_mxfp8_double_buffer",
             ),
@@ -965,10 +969,12 @@ class TestMegatronFSDPE2E:
             pytest.skip("Requires PyTorch & CUDA device with TE MXFP8Tensor support")
 
         nd_topology_str = "_".join([f"{k}{v}" for k, v in nd_topology.items()])
-        if nd_topology_str not in ref_cache:
+        # The MXFP8 case changes the model and precision, so it gets its own reference.
+        ref_key = nd_topology_str + ("_mxfp8" if spec_configs.get("fp8_recipe") == "mxfp8" else "")
+        if ref_key not in ref_cache:
             distopt_spec_configs = copy.deepcopy(spec_configs)
             distopt_spec_configs["fp8_param_gather"] = False
-            ref_cache[nd_topology_str] = TestMegatronFSDPE2E._training_loop(
+            ref_cache[ref_key] = TestMegatronFSDPE2E._training_loop(
                 use_distributed_optimizer=True, **distopt_spec_configs
             )
 
@@ -983,7 +989,7 @@ class TestMegatronFSDPE2E:
             gradient_accumulation_fusion=False,
             **spec_configs,
         )
-        reference_outputs = ref_cache[nd_topology_str]
+        reference_outputs = ref_cache[ref_key]
 
         if torch.distributed.get_rank() == 0:
             for step, (output, ref_output) in enumerate(zip(outputs, reference_outputs)):

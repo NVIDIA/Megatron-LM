@@ -349,7 +349,7 @@ def test_param_norm_linear(use_distributed_optimizer: bool):
         assert param.requires_grad
     mock_args = SimpleNamespace(bf16=True)
 
-    with mock.patch('megatron.training.utils.get_args', new=lambda: mock_args):
+    with mock.patch('megatron.training.utils.common_utils.get_args', new=lambda: mock_args):
         # Make sure norm is correct when `main_param` attribute is not available.
         assert training_util.calc_params_l2_norm(
             model, force_create_fp32_copy=False
@@ -418,7 +418,7 @@ def test_param_norm_moe(use_distributed_optimizer: bool):
         assert param.requires_grad
     mock_args = SimpleNamespace(bf16=True)
 
-    with mock.patch('megatron.training.utils.get_args', new=lambda: mock_args):
+    with mock.patch('megatron.training.utils.common_utils.get_args', new=lambda: mock_args):
         # Make sure norm is correct when `main_param` attribute is not available.
         norm_no_fp32_copy = training_util.calc_params_l2_norm(model, force_create_fp32_copy=False)
         norm_fp32_copy = training_util.calc_params_l2_norm(model, force_create_fp32_copy=True)

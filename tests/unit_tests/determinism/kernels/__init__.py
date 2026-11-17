@@ -24,6 +24,12 @@ install(AutotunePolicy(mode="pinned"))
 # External Mamba and causal-conv libraries retain their own environment controls.
 os.environ.setdefault("MAMBA_DETERMINISTIC", "1")
 os.environ.setdefault("CAUSAL_CONV1D_DETERMINISTIC", "1")
+# Importing vLLM, where it is installed, sets TRITON_CACHE_AUTOTUNING=1, which
+# apply_determinism_env rejects without a shared TRITON_CACHE_DIR. Replays pin their
+# autotuners and need no on-disk autotune cache, so without a cache directory use "0",
+# which also keeps a later vLLM import from turning it on. Other values stay validated.
+if os.environ.get("TRITON_CACHE_AUTOTUNING", "1") == "1" and not os.environ.get("TRITON_CACHE_DIR"):
+    os.environ["TRITON_CACHE_AUTOTUNING"] = "0"
 apply_determinism_env(os.environ)
 
 # Most kernel tests never initialise a process group, so pin each ``torch.distributed.run``
