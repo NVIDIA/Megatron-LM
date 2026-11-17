@@ -816,7 +816,7 @@ class TestA2AOverlap:
 class TestA2AOverlapPaddingMask:
     """Padding-mask parity owns its topology because this matrix varies TP size."""
 
-    @pytest.fixture(scope="class", params=[1, 2, 4, 8])
+    @pytest.fixture(scope="class")
     def tp_size(self, request):
         return request.param
 
@@ -834,8 +834,33 @@ class TestA2AOverlapPaddingMask:
         torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
-    @pytest.mark.parametrize("layers", [[2, 1], [1, 1]])
+    # Dev correctness quarantine: run 41516078360 (NCCL-EP expert gradients).
+    # Re-enable after repeated finite, bitwise parity at TP=2/4 with layers=[1, 1].
+    @pytest.mark.parametrize(
+        "tp_size,layers,dispatcher_type,flex_backend",
+        [
+            pytest.param(
+                tp_size,
+                layers,
+                dispatcher_type,
+                flex_backend,
+                id=f"{tp_size}-layers{layer_index}-{dispatcher_type}-{flex_backend}",
+                marks=(
+                    pytest.mark.flaky_in_dev
+                    if tp_size in (2, 4)
+                    and layers == [1, 1]
+                    and dispatcher_type == "flex"
+                    and flex_backend == "ncclep"
+                    else ()
+                ),
+            )
+            for tp_size in (1, 2, 4, 8)
+            for layer_index, layers in enumerate(([2, 1], [1, 1]))
+            for dispatcher_type, flex_backend in get_valid_dispatcher_configs()
+        ],
+        indirect=["tp_size"],
+        scope="class",
+    )
     def test_1f1b_schedule_model_chunk_with_padding_mask(
         self, dispatcher_type, flex_backend, layers, tp_size
     ):

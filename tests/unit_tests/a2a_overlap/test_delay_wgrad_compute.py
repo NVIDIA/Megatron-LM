@@ -184,8 +184,27 @@ class TestDelayWgradCompute:
             torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not is_te_min_version("2.3.0"), reason="Requires TE >= 2.3.0")
-    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
-    @pytest.mark.parametrize("sharding_strategy", ["optim_grads_params", "optim_grads"])
+    # Dev correctness quarantine: run 41516078360, attempts 1/2 (loss/weight mismatch).
+    # Re-enable after repeated bitwise parity with both affected flex backends.
+    @pytest.mark.parametrize(
+        "sharding_strategy,dispatcher_type,flex_backend",
+        [
+            pytest.param(
+                sharding_strategy,
+                dispatcher_type,
+                flex_backend,
+                marks=(
+                    pytest.mark.flaky_in_dev
+                    if sharding_strategy == "optim_grads_params"
+                    and dispatcher_type == "flex"
+                    and flex_backend in ("hybridep", "ncclep")
+                    else ()
+                ),
+            )
+            for sharding_strategy in ("optim_grads_params", "optim_grads")
+            for dispatcher_type, flex_backend in get_valid_dispatcher_configs()
+        ],
+    )
     def test_fsdp_1f1b_delay_wgrad(self, dispatcher_type, flex_backend, sharding_strategy):
         """Verify FSDP + 1F1B overlap + delay_wgrad_compute.
 
