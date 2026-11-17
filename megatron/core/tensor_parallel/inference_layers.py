@@ -113,8 +113,11 @@ class InferenceLinear(TELinear):
             symmetric_ar_type=symmetric_ar_type,
             tp_group=tp_group,
             name=name,
-            # TELinear takes the resolved group rather than the collection.
-            gtp_remat_group=resolve_gtp_remat_group(pg_collection, is_expert),
+            # TELinear takes the resolved GTP group rather than reading it from the collection.
+            gtp_remat_group=resolve_gtp_remat_group(
+                pg_collection, is_expert, owner=type(self).__name__
+            ),
+            pg_collection=pg_collection,
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, None]:

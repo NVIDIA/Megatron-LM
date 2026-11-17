@@ -19,6 +19,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.multi_latent_attention import MLASelfAttention
@@ -90,6 +91,7 @@ def check_mla_parallel_correctness(
             pre_process=pre_process,
             post_process=post_process,
             vp_stage=vp_stage,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         return gpt_model
 
