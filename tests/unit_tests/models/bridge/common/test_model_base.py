@@ -22,11 +22,12 @@ from typing import ClassVar
 import pytest
 import torch
 
-from megatron.bridge.models.common.base import ModelBuilder, ModelConfig, compose_hooks
+from megatron.bridge.models.common.base import ModelConfig
 from megatron.bridge.models.hybrid.model_config import BridgeHybridModelConfig
 from megatron.bridge.models.qwen.modeling_qwen35.model_config import Qwen35HybridModelConfig
 from megatron.bridge.models.transformer_config import TransformerConfig
 from megatron.training.config.instantiate_utils import InstantiationException
+from megatron.training.models.base import ModelBuilder, compose_hooks
 
 
 @dataclass

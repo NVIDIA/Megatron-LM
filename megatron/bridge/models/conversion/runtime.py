@@ -20,10 +20,8 @@
 from collections.abc import Mapping
 from typing import Any
 
-import torch
-
-from megatron.core import parallel_state
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.training.utils.common_utils import is_gtp_remat_active
 
 
 def get_transformer_config(model_config: Any) -> Any:
@@ -87,24 +85,6 @@ def _validate_checkpoint_weight_topology(
     )
 
 
-def _get_dataloader_process_group(
-    pg_collection: ProcessGroupCollection,
-) -> torch.distributed.ProcessGroup:
-    """Return DP x dense GTP, excluding CP ranks that repeat the same samples."""
-    remat_group = getattr(pg_collection, "gtp_remat", None)
-    if remat_group is not None and remat_group.size() > 1:
-        return parallel_state.get_data_parallel_group(with_gtp_remat=True)
-    return pg_collection.dp
-
-
-def is_gtp_remat_active(model_config: Any) -> bool:
-    """Return whether dense or expert GTP weight rematerialization is enabled."""
-    transformer_config = get_transformer_config(model_config)
-    dense_size = getattr(transformer_config, "gtp_weight_remat_size", 1)
-    expert_size = getattr(transformer_config, "expert_gtp_weight_remat_size", 1)
-    return any(isinstance(size, int) and size > 1 for size in (dense_size, expert_size))
-
-
 def configure_gtp_remat(
     model_config: Any,
     *,
@@ -125,10 +105,10 @@ def configure_gtp_remat(
         RuntimeError: GTP is active but the required Transformer Engine support is missing.
         ValueError: GTP is active and nccl_ub is enabled without process groups.
     """
-    if not is_gtp_remat_active(model_config):
+    transformer_config = get_transformer_config(model_config)
+    if not is_gtp_remat_active(transformer_config):
         return
 
-    transformer_config = get_transformer_config(model_config)
     try:
         from megatron.core.tensor_parallel import gtp_api
     except ImportError as error:
@@ -150,33 +130,3 @@ def configure_gtp_remat(
         from megatron.core.process_groups_config import resolve_gtp_remat_group
 
         gtp_api.register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=False))
-
-
-def classify_gtp_remat_chains(model: list[torch.nn.Module], model_config: Any) -> None:
-    """Classify all model chunks after distributed wrapping and before first forward."""
-    if not is_gtp_remat_active(model_config):
-        return
-
-    transformer_config = get_transformer_config(model_config)
-    try:
-        from megatron.core.tensor_parallel import gtp_api
-    except ImportError as error:
-        raise RuntimeError("GTP requires TransformerEngine >= 2.19.") from error
-
-    gtp_api.classify_gtp_remat_chains(
-        model,
-        cuda_graph_modules=transformer_config.cuda_graph_modules,
-        moe_shared_expert_overlap=transformer_config.moe_shared_expert_overlap,
-        cuda_graph_impl=transformer_config.cuda_graph_impl,
-    )
-
-
-def get_data_distribution_group(
-    pg_collection: ProcessGroupCollection, model_config: Any, *, with_context_parallel: bool = False
-) -> torch.distributed.ProcessGroup:
-    """Return the group spanning every rank that consumes distinct input data."""
-    if not is_gtp_remat_active(model_config):
-        return pg_collection.dp_cp if with_context_parallel else pg_collection.dp
-    if with_context_parallel:
-        return pg_collection.dp_cp_gtp_remat
-    return parallel_state.get_data_parallel_group(with_gtp_remat=True)

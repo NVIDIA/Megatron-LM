@@ -2039,17 +2039,23 @@ class AutoBridge(Generic[MegatronModelT]):
                 ]
 
             model_config.finalize()
-            from megatron.bridge.models.conversion.runtime import (
-                classify_gtp_remat_chains,
-                configure_gtp_remat,
-            )
+            from megatron.bridge.models.conversion.runtime import configure_gtp_remat
+            from megatron.training.utils.common_utils import is_gtp_remat_active
 
             configure_gtp_remat(model_config)
             if pg_collection is None:
                 pg_collection = self._get_or_initialize_pg_collection(transformer_config)
             kwargs.setdefault("data_parallel_random_init", False)
             models = build_distributed_models(model_config, pg_collection, **kwargs)
-            classify_gtp_remat_chains(models, model_config)
+            if is_gtp_remat_active(transformer_config):
+                from megatron.core.tensor_parallel import gtp_api
+
+                gtp_api.classify_gtp_remat_chains(
+                    models,
+                    cuda_graph_modules=transformer_config.cuda_graph_modules,
+                    moe_shared_expert_overlap=transformer_config.moe_shared_expert_overlap,
+                    cuda_graph_impl=transformer_config.cuda_graph_impl,
+                )
             for model in models:
                 model.model_config = model_config
             succeeded = True

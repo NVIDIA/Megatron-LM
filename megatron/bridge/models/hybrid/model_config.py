@@ -27,7 +27,7 @@ from megatron.bridge.models.common.base import (
     ModelConfig,
     ModelConfigOverrideMixin,
 )
-from megatron.bridge.models.hybrid.hybrid_builder import DEFAULT_MAMBA_CHUNK_SIZE, HybridModelConfig
+from megatron.bridge.models.hybrid.hybrid_builder import DEFAULT_MAMBA_CHUNK_SIZE
 from megatron.bridge.models.transformer_config import TransformerConfig
 from megatron.bridge.utils.activation_map import callable_to_str, str_to_callable
 from megatron.core._rank_utils import safe_get_rank
@@ -39,6 +39,7 @@ from megatron.core.models.hybrid.hybrid_layer_allocation import (
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
 from megatron.training.config.instantiate_utils import _resolve_target
+from megatron.training.models.hybrid import HybridModelConfig
 
 logger = logging.getLogger(__name__)
 

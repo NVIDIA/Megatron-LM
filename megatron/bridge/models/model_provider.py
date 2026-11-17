@@ -23,8 +23,6 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Generic, Mapping, Self, TypedDict, TypeVar, Union
 
-from megatron.bridge.models.common.unimodal import _ddp_wrap, _print_num_params
-
 try:
     from typing import Unpack
 except ImportError:
@@ -54,6 +52,7 @@ from megatron.core.transformer.module import Float16Module, MegatronModule
 from megatron.core.utils import get_model_config
 from megatron.training.config.instantiate_utils import InstantiationMode
 from megatron.training.models.base import ModelConfig
+from megatron.training.models.dist_utils import _ddp_wrap, _print_num_params
 from megatron.training.utils.common_utils import get_local_rank_preinit
 
 try:

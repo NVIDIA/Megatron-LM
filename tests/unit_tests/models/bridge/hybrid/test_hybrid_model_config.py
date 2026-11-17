@@ -25,7 +25,7 @@ from transformers import DeepseekV3Config
 from megatron.bridge.models.common.base import ModelConfig
 from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
 from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
-from megatron.bridge.models.hybrid.hybrid_builder import BridgeHybridModelBuilder, HybridModelConfig
+from megatron.bridge.models.hybrid.hybrid_builder import BridgeHybridModelBuilder
 from megatron.bridge.models.hybrid.model_config import (
     BridgeHybridMLAModelConfig,
     BridgeHybridModelConfig,
@@ -41,6 +41,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import (
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.dot_product_attention import DotProductAttention
 from megatron.core.transformer.enums import AttnBackend
+from megatron.training.models.hybrid import HybridModelConfig
 
 
 def _make_model_config(**kwargs) -> BridgeHybridModelConfig:

@@ -14,7 +14,6 @@
 # Adapted from https://github.com/NVIDIA-NeMo/Megatron-Bridge/blob/53c20f81cb575f19af34ff0ae1749fb13b07999b/tests/unit_tests/models/hybrid/test_hybrid_builder.py
 # Source license: Apache-2.0.
 
-import inspect
 from unittest.mock import Mock, patch
 
 import pytest
@@ -22,17 +21,13 @@ import torch
 
 from megatron.bridge.models.common import ModelConfig
 from megatron.bridge.models.hybrid.hybrid_builder import (
-    HybridModelBuilder,
-    HybridModelConfig,
     get_default_hybrid_stack_spec,
     modelopt_hybrid_stack_spec,
     transformer_engine_hybrid_stack_spec,
 )
 from megatron.bridge.models.transformer_config import TransformerConfig
-from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.transformer import ModuleSpec
-from megatron.training.models.hybrid import HybridModelBuilder as MLMHybridModelBuilder
-from megatron.training.models.hybrid import HybridModelConfig as MLMHybridModelConfig
+from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 
 
 def _make_transformer(**kwargs):
@@ -99,13 +94,6 @@ class TestHybridStackSpecs:
 
 
 class TestHybridModelConfig:
-    def test_bridge_extends_upstream_hybrid_config(self):
-        assert issubclass(HybridModelConfig, MLMHybridModelConfig)
-        assert issubclass(HybridModelBuilder, MLMHybridModelBuilder)
-
-    def test_builder_classvar(self):
-        assert HybridModelConfig.builder == "megatron.bridge.models.hybrid.HybridModelBuilder"
-
     def test_rejects_mamba_stack_spec_argument(self):
         module_spec = ModuleSpec(module=object)
 
@@ -132,8 +120,6 @@ class TestHybridModelConfig:
     def test_from_dict_with_hybrid_builder_target(self):
         config = HybridModelConfig(transformer=_make_transformer(), vocab_size=32000)
         data = config.as_dict()
-        data["_target_"] = "megatron.bridge.models.hybrid.hybrid_builder.HybridModelConfig"
-        data["_builder_"] = "megatron.bridge.models.hybrid.hybrid_builder.HybridModelBuilder"
 
         restored = ModelConfig.from_dict(data)
 
@@ -219,10 +205,6 @@ class TestHybridModelBuilder:
         assert kw["parallel_output"] is False
         assert kw["share_embeddings_and_output_weights"] is True
 
-    @pytest.mark.skipif(
-        "logit_dtype" not in inspect.signature(HybridModel).parameters,
-        reason="Installed MCore predates logit_dtype",
-    )
     @patch("megatron.training.models.hybrid.HybridModel")
     def test_requested_logit_dtype_reaches_new_mcore_builder(self, mock_model):
         self.config.logit_dtype = torch.float32
@@ -230,16 +212,6 @@ class TestHybridModelBuilder:
         self.builder.build_model(self.pg, pre_process=True, post_process=True)
 
         assert mock_model.call_args.kwargs["logit_dtype"] is torch.float32
-
-    @pytest.mark.skipif(
-        "logit_dtype" in inspect.signature(HybridModel).parameters,
-        reason="Installed MCore supports logit_dtype",
-    )
-    def test_requested_logit_dtype_fails_before_old_mcore_builder(self):
-        self.config.logit_dtype = torch.float32
-
-        with pytest.raises(RuntimeError, match="Megatron-LM PR #6252"):
-            self.builder.build_model(self.pg, pre_process=True, post_process=True)
 
     @patch("megatron.training.models.hybrid.compose_hooks")
     @patch("megatron.training.models.hybrid.unimodal_build_distributed_models")

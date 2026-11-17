@@ -24,11 +24,6 @@ from typing import Any, ClassVar
 
 from megatron.bridge.models.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.training.config.instantiate_utils import _resolve_target, instantiate
-from megatron.training.models.base import BuildConfigT  # noqa: F401
-from megatron.training.models.base import ModelBuilder  # noqa: F401
-from megatron.training.models.base import ModelT  # noqa: F401
-from megatron.training.models.base import Serializable  # noqa: F401
-from megatron.training.models.base import compose_hooks  # noqa: F401
 from megatron.training.models.base import ModelConfig as _MegatronModelConfig
 
 
