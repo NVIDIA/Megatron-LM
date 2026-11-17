@@ -2051,7 +2051,7 @@ class TestDynamicContext:
         dynamic_context.add_request(
             DynamicInferenceRequest(
                 request_id=0,
-                prompt_tokens=torch.arange(0, context_length, dtype=torch.long, device='cpu'),
+                prompt_tokens=torch.arange(0, context_length, dtype=torch.long, device="cpu"),
                 sampling_params=SamplingParams(num_tokens_to_generate=10),
             )
         )
@@ -2646,6 +2646,69 @@ class TestDynamicContext:
                 gathered, pool_size, group=parallel_state.get_pipeline_model_parallel_group()
             )
             assert len({t.item() for t in gathered}) == 1
+        finally:
+            self._restore_model_parallel()
+
+    def _get_context_for_stage_layer_types(self, stage_layer_types):
+        """Build a PP=2 context for a hybrid model without recurrent layers, whose stage i
+        holds the layer types `stage_layer_types[i]`."""
+        params_dtype = torch.float32
+        layer_type_list = stage_layer_types[parallel_state.get_pipeline_model_parallel_rank()]
+        return DynamicInferenceContext(
+            model_config=TransformerConfig(
+                params_dtype=params_dtype,
+                num_layers=sum(len(types) for types in stage_layer_types),
+                kv_channels=64,
+                num_attention_heads=8,
+                pipeline_model_parallel_size=2,
+                tensor_model_parallel_size=1,
+                pipeline_dtype=params_dtype,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=128,
+                buffer_size_gb=0.1,
+                block_size_tokens=16,
+                max_tokens=1024,
+                unified_memory_level=0,
+                layer_type_list=layer_type_list,
+            ),
+        )
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_pipeline_stage_without_attention_layers_initializes(self):
+        """In the pattern `*|-`, the MLP-only stage 1 initializes alongside the attention stage.
+
+        It has no KV-cache layer to map, so it keeps one placeholder plane and the stages
+        agree on the KV block capacity that drives scheduling.
+        """
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=2)
+        try:
+            context = self._get_context_for_stage_layer_types(([Symbols.ATTENTION], [Symbols.MLP]))
+            rank = parallel_state.get_pipeline_model_parallel_rank()
+            assert context.layer_map == ({0: 0} if rank == 0 else {})
+            assert context.num_attention_layers == 1
+            assert context.memory_buffer.shape[1] == 1
+
+            pool_size = torch.tensor(
+                [context.kv_block_allocator.pool_size], device="cuda", dtype=torch.long
+            )
+            gathered = [torch.zeros_like(pool_size) for _ in range(2)]
+            torch.distributed.all_gather(
+                gathered, pool_size, group=parallel_state.get_pipeline_model_parallel_group()
+            )
+            assert len({t.item() for t in gathered}) == 1
+        finally:
+            self._restore_model_parallel()
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_pipeline_without_attention_layers_is_rejected_on_every_stage(self):
+        """A model with no KV-cache layer on any stage is still rejected, by every stage."""
+        self._setup_model_parallel_group(tensor_parallel_size=1, pipeline_parallel_size=2)
+        try:
+            with pytest.raises(NotImplementedError, match="with no attention is not supported"):
+                self._get_context_for_stage_layer_types(([Symbols.MLP], [Symbols.MLP]))
         finally:
             self._restore_model_parallel()
 

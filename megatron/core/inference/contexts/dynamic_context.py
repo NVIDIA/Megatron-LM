@@ -595,10 +595,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
 
         self._mtp_initialize_kv_cache(model_config, inference_config.mtp_layer_type_list)
 
-        if self.num_attention_layers == 0:
-            raise NotImplementedError(
-                f"Using `DynamicInferenceContext` with no attention is not supported."
-            )
+        has_local_kv_layers = self.num_attention_layers > 0
+        if not has_local_kv_layers:
+            if pp_size == 1:
+                raise NotImplementedError(
+                    f"Using `DynamicInferenceContext` with no attention is not supported."
+                )
+            # A pipeline stage can hold no KV-cache layer while other stages do, as stage 1 of
+            # the hybrid pattern `*|-` does. It keeps one placeholder plane that no layer maps
+            # to, so it sizes its cache and joins the pipeline collective below like the other
+            # stages. That collective rejects a model with no KV-cache layer on any stage.
+            self.num_attention_layers = 1
 
         # Block size tokens, bytes.
         kv_dtype_size_bytes = model_config.params_dtype.itemsize
@@ -762,13 +769,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # pipeline stages have different layer allocations. Non-uniform block counts
         # can lead to some ranks pausing requests earlier than other ranks
         # (i.e., divergence in the scheduling behavior). The same collective reports
-        # whether every stage holds recurrent (Mamba/GDN) layers; the MIN of the
-        # negated flag is the negated MAX.
+        # whether every and whether any stage holds recurrent (Mamba/GDN) layers, and
+        # whether any stage holds KV-cache layers; the MIN of a negated flag is the
+        # negated MAX.
         self.pipeline_has_recurrent_layers = self.is_hybrid_model
         if pp_size > 1:
             has_recurrent_layers = int(self.is_hybrid_model)
             block_count_tensor = torch.tensor(
-                (block_count, paused_block_count, has_recurrent_layers, -has_recurrent_layers),
+                (
+                    block_count,
+                    paused_block_count,
+                    has_recurrent_layers,
+                    -has_recurrent_layers,
+                    -int(has_local_kv_layers),
+                ),
                 dtype=torch.int32,
                 device=torch.cuda.current_device(),
             )
@@ -781,6 +795,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             paused_block_count = block_count_tensor[1].item()
             all_stages_recurrent = block_count_tensor[2].item() == 1
             self.pipeline_has_recurrent_layers = block_count_tensor[3].item() == -1
+            # Every stage sees the same flag, so all of them raise here together.
+            if block_count_tensor[4].item() == 0:
+                raise NotImplementedError(
+                    "Using `DynamicInferenceContext` with no attention is not supported."
+                )
 
             # Every stage must skip the same prompt tokens on a prefix-cache hit. With a
             # Mamba cache budget, a recurrent stage skips only the blocks whose Mamba
