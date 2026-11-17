@@ -224,6 +224,16 @@ Once a recipe is stable, the following options reduce memory further:
   - `--exp-avg-dtype {fp32, fp16, bf16, fp8}`
   - `--exp-avg-sq-dtype {fp32, fp16, bf16, fp8}`
 
+  With the distributed optimizer, `--no-load-optim --load-main-params-from-ckpt`
+  initializes master weights directly from the checkpoint's model tensors while
+  starting fresh optimizer history. TE-owned masters require a Transformer Engine
+  build providing `FusedAdam.update_param`. That API handles the configured
+  master representation, including INT16 remainders, without first rounding the
+  supplied weights through the BF16 model. It cannot recover precision already
+  lost in the saved tensors or during checkpoint deserialization. Refreshing
+  existing TE-owned masters with `reload_model_params()` also requires this API;
+  ordinary initialization from model weights with fresh optimizer state does not.
+
 ## Configuration Cookbook
 
 The following minimal recipes are starting points. All assume a BF16 model
