@@ -3465,6 +3465,14 @@ class MultiTokenPredictionLayer(MegatronModule):
                 )
             return outputs
 
+        if getattr(self.config, "dsa_indexer_reuse_checkpoint_topk", False):
+            from megatron.core.transformer.experimental_attention_variant.dsa import (
+                dsa_checkpoint_phase_wrapper,
+            )
+
+            # DSA layers reuse their first call's top-k in this checkpoint's replay.
+            custom_forward = dsa_checkpoint_phase_wrapper(custom_forward)
+
         # Decide the outer quantization context, matching
         # ``transformer_block._checkpointed_forward``. Only ``fp8 + delayed
         # scaling`` needs an active context at the ``te_checkpoint`` entry

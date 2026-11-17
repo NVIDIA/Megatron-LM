@@ -15,10 +15,9 @@ from megatron.core import tensor_parallel
 from megatron.core.extensions.transformer_engine import TELinear, TENorm
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.transformer.enums import AttnBackend, AttnMaskType
+from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import dsa as dsa_module
-from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels
+from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels, dsa_kernels
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
@@ -29,9 +28,14 @@ from megatron.core.transformer.multi_token_prediction import (
     mtp_repeated_depth_scope,
 )
 from megatron.core.transformer.spec_utils import ModuleSpec
-from megatron.core.transformer.transformer_config import MLATransformerConfig
-from megatron.core.utils import init_method_normal, scaled_init_method_normal
 from tests.unit_tests.test_utilities import Utils
+from tests.unit_tests.transformer.experimental_attention_variant.test_dsa_checkpoint_topk_reuse import (
+    _assert_similar,
+    _checkpoint_function,
+    _make_config,
+    _make_inputs,
+    _skip_if_cudnn_dsa_unavailable,
+)
 from tests.unit_tests.transformer.experimental_attention_variant.test_mtp_dsa_cross_depth_sharing import (
     _make_config as make_small_dsa_config,
 )
@@ -41,135 +45,6 @@ _SEQ_LEN = 4
 # select their own top-k and layer 4 reuses layer 3's.
 _PRODUCER_LAYER = 3
 _SKIP_LAYER = 4
-
-
-def _checkpoint_function(function, packed_seq_params, attention_mask, config):
-    """``function`` as the decoder's recompute hands it to the checkpoint.
-
-    Without PackedSeqParams the replay rebinds the first call's sharing carrier, since
-    checkpointing hands it a detached copy of the mask.
-    """
-    bind_carrier = dsa_module.dsa_forward_carrier_binder(packed_seq_params, attention_mask, config)
-
-    def wrapped(*args):
-        with bind_carrier():
-            return function(*args)
-
-    return wrapped
-
-
-def _skip_if_cudnn_dsa_unavailable(world_size: int) -> None:
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for the cuDNN DSA backend")
-    if torch.cuda.get_device_capability()[0] < 9:
-        pytest.skip("cuDNN fused DSA path requires SM90+")
-    if Utils.world_size < world_size:
-        pytest.skip(f"requires at least {world_size} distributed ranks")
-    try:
-        from cudnn import DSA  # noqa: F401
-        from flash_mla import flash_mla_sparse_fwd  # noqa: F401
-    except ImportError as exc:
-        pytest.skip(f"cuDNN fused DSA dependencies are unavailable: {exc}")
-
-
-def _make_config(*, tp: int, cp: int) -> MLATransformerConfig:
-    config = MLATransformerConfig(
-        multi_latent_attention=True,
-        experimental_attention_variant="dsa",
-        num_layers=2,
-        hidden_size=1024,
-        num_attention_heads=64,
-        num_query_groups=64,
-        q_lora_rank=512,
-        kv_lora_rank=512,
-        qk_head_dim=128,
-        qk_pos_emb_head_dim=64,
-        v_head_dim=128,
-        kv_channels=128,
-        dsa_indexer_n_heads=64,
-        dsa_indexer_head_dim=128,
-        dsa_indexer_topk=64,
-        dsa_indexer_topk_freq=2,
-        dsa_indexer_skip_topk_offset=1,
-        dsa_indexer_loss_coeff=0.01,
-        dsa_indexer_use_sparse_loss=True,
-        dsa_indexer_rotate_activation=False,
-        dsa_indexer_k_norm_epsilon=1e-6,
-        dsa_kernel_backend="cudnn",
-        attention_backend=AttnBackend.auto,
-        add_bias_linear=False,
-        bf16=True,
-        params_dtype=torch.bfloat16,
-        layernorm_epsilon=1e-6,
-        normalization="RMSNorm",
-        qk_layernorm=True,
-        tensor_model_parallel_size=tp,
-        sequence_parallel=tp > 1,
-        context_parallel_size=cp,
-        cp_comm_type="allgather",
-        apply_rope_fusion=False,
-        rope_type="rope",
-        rotary_base=10000,
-        gradient_accumulation_fusion=False,
-        init_method=init_method_normal(0.02),
-        output_layer_init_method=scaled_init_method_normal(0.02, 1, multiplier=2.0),
-        use_cpu_initialization=False,
-        perform_initialization=True,
-    )
-    return config
-
-
-def _make_inputs(config: MLATransformerConfig, *, tp_rank: int, cp_rank: int, cp: int):
-    """THD inputs for one packed sequence; each CP rank holds two zigzag chunks."""
-    local_rows = 128
-    global_rows = local_rows * cp
-    tp = config.tensor_model_parallel_size
-    heads = config.num_attention_heads
-    local_heads = heads // tp
-    absorbed_dim = config.kv_lora_rank + config.qk_pos_emb_head_dim
-    generator = torch.Generator(device="cuda")
-    generator.manual_seed(2026 + cp_rank)
-
-    def randn(*shape, scale=1.0):
-        return torch.randn(shape, device="cuda", dtype=torch.bfloat16, generator=generator) * scale
-
-    query = randn(local_rows, 1, heads, absorbed_dim)
-    key = randn(local_rows, 1, 1, absorbed_dim)
-    # Large indexer inputs keep the selected scores away from top-k ties, which would make
-    # the two selections legitimately differ.
-    x = randn(local_rows, 1, config.hidden_size, scale=8.0)
-    qr = randn(local_rows, 1, config.q_lora_rank, scale=8.0)
-    up_v_weight = randn(heads, config.v_head_dim, config.kv_lora_rank)
-    head_slice = slice(tp_rank * local_heads, (tp_rank + 1) * local_heads)
-    rows_per_tp = local_rows // tp
-    row_slice = slice(tp_rank * rows_per_tp, (tp_rank + 1) * rows_per_tp)
-    cu_seqlens = torch.tensor([0, global_rows], dtype=torch.int32, device="cuda")
-    return {
-        "query": query[:, :, head_slice].contiguous(),
-        "key": key.contiguous(),
-        "x": (x[row_slice] if tp > 1 else x).contiguous(),
-        "qr": (qr[row_slice] if tp > 1 else qr).contiguous(),
-        "up_v_weight": up_v_weight[head_slice].contiguous(),
-        "packed_seq_params": PackedSeqParams(
-            qkv_format="thd",
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_kv=cu_seqlens,
-            cu_seqlens_q_padded=cu_seqlens.clone(),
-            cu_seqlens_kv_padded=cu_seqlens.clone(),
-            max_seqlen_q=global_rows,
-            max_seqlen_kv=global_rows,
-        ),
-    }
-
-
-def _assert_similar(actual: torch.Tensor, expected: torch.Tensor, *, label: str, eps: float):
-    assert torch.isfinite(actual).all(), f"{label} has non-finite values"
-    actual, expected = actual.double().flatten(), expected.double().flatten()
-    cosine = torch.nn.functional.cosine_similarity(actual, expected, dim=0).item()
-    norm_ratio = (actual.norm() / expected.norm().clamp_min(1e-30)).item()
-    assert cosine > 1 - eps, f"{label}: cosine={cosine:.8f}"
-    assert abs(norm_ratio - 1) < eps, f"{label}: norm_ratio={norm_ratio:.8f}"
-
 
 
 @pytest.fixture
@@ -579,6 +454,64 @@ def test_skip_layer_replay_reads_certificate_published_by_first_call(
     assert leaves["query"].grad is not None
 
 
+@pytest.mark.parametrize(
+    "producer_mask_type", [AttnMaskType.causal, None], ids=["causal", "explicit-empty-row"]
+)
+def test_frozen_producer_replay_reuses_its_first_call_certificate(
+    cpu_dsa_layers, certificates, cpu_checkpoint_rng, monkeypatch, producer_mask_type
+):
+    """dsa_indexer_reuse_checkpoint_topk with a frozen indexer: the producer's replay takes its
+    first call's indices from the carrier entries that call published, and the certificate
+    published with them."""
+    # Enable the fused dispatch; without a kernel backend it falls back to PyTorch.
+    monkeypatch.setattr(dsa_kernels, "use_fused_dsa_kernels", lambda _config: True)
+    config = make_small_dsa_config(num_layers=_SKIP_LAYER)
+    assert not config.dsa_indexer_loss_coeff
+    config.dsa_indexer_reuse_checkpoint_topk = True
+    producer = _make_cpu_layer(config, _PRODUCER_LAYER)
+    indexer_calls = []
+
+    def counting_forward_before_topk(x, qr, packed_seq_params):
+        indexer_calls.append(torch.is_grad_enabled())
+        return _fake_forward_before_topk(x, qr, packed_seq_params)
+
+    producer.indexer.forward_before_topk = counting_forward_before_topk
+    mask = _mask_with_empty_first_row()
+    inputs = _cpu_inputs(config)
+    leaves = {
+        name: inputs[name].clone().requires_grad_(True) for name in ("query", "key", "up_v_weight")
+    }
+
+    def layer(query, key, x, qr, up_v_weight, attention_mask):
+        layer_inputs = dict(query=query, key=key, x=x, qr=qr, up_v_weight=up_v_weight)
+        return _cpu_forward(producer, layer_inputs, attention_mask, producer_mask_type)
+
+    output = tensor_parallel.checkpoint(
+        _checkpoint_function(layer, None, mask, config),
+        False,
+        leaves["query"],
+        leaves["key"],
+        inputs["x"],
+        inputs["qr"],
+        leaves["up_v_weight"],
+        mask,
+    )
+    payload = dsa_module.get_dsa_index_sharing_payload(None, mask, config)
+    published = payload.topk_rows_nonempty_by_layer[_PRODUCER_LAYER]
+    output.sum().backward()
+
+    certified = producer_mask_type is not None
+    assert published is certified
+    # Only the first call runs the indexer.
+    assert indexer_calls == [False]
+    assert [(call.certificate, call.grad_enabled) for call in certificates] == [
+        (certified, False),
+        (certified, True),
+    ]
+    assert certificates[1].topk is certificates[0].topk
+    assert leaves["query"].grad is not None
+
+
 # Index sharing typically runs 1-3 consumers per producer; two exercise the consumer-to-consumer
 # order.
 _CONSUMERS = 2
@@ -596,6 +529,7 @@ def _make_gpu_config(*, tp: int, cp: int, consumer: str, recompute: str):
         config.mtp_num_layers = 1 + _CONSUMERS
         config.mtp_use_repeated_layer = True
         config.mtp_repeated_layer_shared_components = ["sparse_attention_index"]
+    config.dsa_indexer_reuse_checkpoint_topk = recompute == "full-reuse-topk"
     return config
 
 
@@ -754,11 +688,13 @@ def _shared_topk_step(calls, inputs, *, consumer: str, recompute: str, share_cer
     [
         ("skip-layers", "none"),
         ("skip-layers", "full"),
+        # The producer's replay reuses the very top-k tensors the consumers' backward used.
+        ("skip-layers", "full-reuse-topk"),
         ("mtp-depths", "none"),
     ],
 )
 def test_shared_certificate_is_bitwise_identical_on_cudnn(
-    tp, cp, consumer, recompute, cudnn_certificates
+    tp, cp, consumer, recompute, cudnn_certificates, monkeypatch
 ):
     _skip_if_cudnn_dsa_unavailable(tp * cp)
     Utils.initialize_model_parallel(tensor_model_parallel_size=tp, context_parallel_size=cp)
@@ -772,8 +708,20 @@ def test_shared_certificate_is_bitwise_identical_on_cudnn(
         inputs = _make_inputs(
             config, tp_rank=pg_collection.tp.rank(), cp_rank=pg_collection.cp.rank(), cp=cp
         )
+        reused_topk_losses = []
+        from_topk = dsa_cudnn_kernels.run_sparse_indexer_loss_from_topk
+
+        def counting_from_topk(*args, **kwargs):
+            reused_topk_losses.append(None)
+            return from_topk(*args, **kwargs)
+
+        monkeypatch.setattr(
+            dsa_cudnn_kernels, "run_sparse_indexer_loss_from_topk", counting_from_topk
+        )
+
         results = {}
         for share_certificate in (False, True):
+            reused_topk_losses.clear()
             for recorded in cudnn_certificates.values():
                 recorded.clear()
             results[share_certificate] = _shared_topk_step(
@@ -783,6 +731,7 @@ def test_shared_certificate_is_bitwise_identical_on_cudnn(
                 recompute=recompute,
                 share_certificate=share_certificate,
             )
+            assert len(reused_topk_losses) == int(recompute == "full-reuse-topk")
             # Before certificates were shared, every consumer call received False.
             consumer_flags = [share_certificate] * _CONSUMERS
             forward_flags = [True] + consumer_flags
