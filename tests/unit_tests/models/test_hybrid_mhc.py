@@ -474,7 +474,17 @@ class TestHybridStackMHC:
             add_bias_linear=False,
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'pp', 'cp', 'ep', 'expt_tp', 'tp_ep', 'expt_dp']
+            required_pgs=[
+                'tp',
+                'pp',
+                'cp',
+                'ep',
+                'expt_tp',
+                'tp_ep',
+                'tp_cp',
+                'tp_dp_cp',
+                'expt_dp',
+            ]
         )
         stack = HybridStack(
             config=config,
@@ -508,7 +518,17 @@ class TestHybridStackMHC:
             add_bias_linear=False,
         )
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-            required_pgs=['tp', 'pp', 'cp', 'ep', 'expt_tp', 'tp_ep', 'expt_dp']
+            required_pgs=[
+                'tp',
+                'pp',
+                'cp',
+                'ep',
+                'expt_tp',
+                'tp_ep',
+                'tp_cp',
+                'tp_dp_cp',
+                'expt_dp',
+            ]
         )
 
         def build_stack(config):
@@ -555,6 +575,7 @@ class TestHybridStackMHC:
             max_sequence_length=8,
             hybrid_layer_pattern="M*-",
             parallel_output=False,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         input_ids = torch.arange(8, dtype=torch.int64, device="cuda").repeat((2, 1))
         position_ids = torch.arange(8, dtype=torch.int64, device="cuda").repeat((2, 1))
@@ -580,6 +601,7 @@ class TestHybridStackMHC:
                 max_sequence_length=8,
                 hybrid_layer_pattern="M*-",
                 parallel_output=False,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             .cuda()
             .eval()
@@ -619,6 +641,7 @@ class TestHybridStackMHC:
             max_sequence_length=8,
             hybrid_layer_pattern="-/-",
             parallel_output=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         input_ids = torch.arange(8, dtype=torch.int64, device="cuda").repeat((2, 1))
         position_ids = torch.arange(8, dtype=torch.int64, device="cuda").repeat((2, 1))

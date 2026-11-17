@@ -674,20 +674,25 @@ def fully_shard_optimizer(
             """
             # Retrieve a template optimizer state.
             optim_state_template = next(iter(optimizer.state.values())) if optimizer.state else {}
+            # Only track keys associated with DTensors for DCP.
+            local_dtensor_keys = [
+                key for key, val in optim_state_template.items() if isinstance(val, DTensor)
+            ]
             # All-gather the optimizer state keys as this rank could have empty state.
-            optim_state_dtensor_keys = [None] * torch.distributed.get_world_size()
-            torch.distributed.all_gather_object(
-                optim_state_dtensor_keys,
-                [
-                    # Only track keys associated with DTensors for DCP.
-                    key
-                    for key, val in optim_state_template.items()
-                    if isinstance(val, DTensor)
-                ],
-            )
-            optim_state_dtensor_keys = list(
-                set([key for state in optim_state_dtensor_keys for key in state])
-            )
+            # Only the ranks that shard this model's parameters take part: the (hybrid)
+            # DP group, whose ranks together hold every DP shard of each non-expert
+            # parameter, and the expert DP group when it exists. Ranks of a model on
+            # another DeviceMesh do not take part.
+            dist_index = mfsdp_model.dist_index
+            key_gather_groups = [dist_index.get_dp_group()]
+            if dist_index.get_dp_group(is_expert_parallel=True) is not None:
+                key_gather_groups.append(dist_index.get_dp_group(is_expert_parallel=True))
+            optim_state_dtensor_keys = set()
+            for group in key_gather_groups:
+                gathered_keys = [None] * torch.distributed.get_world_size(group)
+                torch.distributed.all_gather_object(gathered_keys, local_dtensor_keys, group=group)
+                optim_state_dtensor_keys.update(key for keys in gathered_keys for key in keys)
+            optim_state_dtensor_keys = list(optim_state_dtensor_keys)
 
             # NOTE(@cspades): Re-construct the Megatron-FSDP distributed parameter
             # to index mapping as implemented in torch.optim.Optimizer.state_dict():

@@ -113,6 +113,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 config=self.config,
                 layer_number=self.layer_number,
             )
+            # The mHC weights are replicated across the layer's tensor-parallel group, which sets
+            # their checkpoint replica ids.
+            self.self_attention_hyper_connection.tp_group = self.tp_group
             self.residual_read_self_attn = HyperConnectionResidualConnection(
                 self.config, operation="read", use_input_residual=True
             )
@@ -127,6 +130,9 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             self.mlp_hyper_connection = build_module(
                 submodules.mlp_hyper_connection, config=self.config, layer_number=self.layer_number
             )
+            # The mHC weights are replicated across the layer's tensor-parallel group, which sets
+            # their checkpoint replica ids.
+            self.mlp_hyper_connection.tp_group = self.tp_group
             self.residual_read_mlp = HyperConnectionResidualConnection(
                 self.config, operation="read", use_input_residual=True
             )

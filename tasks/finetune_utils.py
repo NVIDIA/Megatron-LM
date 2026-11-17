@@ -76,9 +76,13 @@ def build_data_loader(dataset, micro_batch_size, num_workers, drop_last,
         task_collate_fn=None):
     """Data loader. Note that batch-size is the local (per GPU) batch-size."""
 
-    # Sampler.
-    world_size = mpu.get_data_parallel_world_size()
-    rank = mpu.get_data_parallel_rank()
+    # Sampler, over the data-parallel group of the grid that initialize_megatron() registered.
+    # Collections that predate the GTP weight-remat fields carry only the replicate group.
+    pg_collection = mpu.get_registered_process_groups()
+    assert pg_collection is not None, 'the model-parallel grid is not initialized'
+    data_parallel_group = pg_collection.dp_gtp_remat or pg_collection.dp
+    world_size = data_parallel_group.size()
+    rank = data_parallel_group.rank()
     sampler = torch.utils.data.distributed.DistributedSampler(
         dataset, num_replicas=world_size, rank=rank)
 
