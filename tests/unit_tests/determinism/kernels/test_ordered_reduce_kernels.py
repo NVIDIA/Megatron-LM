@@ -15,11 +15,19 @@ from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.ops.collectives import ordered_reduce as orr
 from megatron.core.ops.linear import ordered as orl
 from megatron.core.ops.loss.vocab_sum import batch_invariant_vocab_sum
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import mappings
+from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
 from tests.unit_tests.test_utilities import Utils
+
+if HAVE_GTP:
+    from megatron.core.extensions.transformer_engine import TERowParallelLinear
+    from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
 
@@ -85,16 +93,8 @@ class TestOrderedReduceKernels:
         self, local_shards, sequence_parallel, fused_wgrad, monkeypatch
     ):
         """Real GTP weights: fixed-shard output, rematerialized dgrad and accumulated wgrad."""
-        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
-
         if not HAVE_GTP:
             pytest.skip("GTP requires TransformerEngine >= 2.19")
-
-        from megatron.core.extensions.transformer_engine import TERowParallelLinear
-        from megatron.core.process_groups_config import ProcessGroupCollection
-        from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
-        from megatron.core.transformer.enums import AttnBackend
-        from megatron.core.transformer.transformer_config import TransformerConfig
 
         Utils.initialize_model_parallel(2, 1, gtp_remat_size=2)
         self._tp = 2

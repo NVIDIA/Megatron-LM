@@ -60,6 +60,7 @@ from megatron.core.tensor_parallel.random import (
     get_expert_parallel_rng_tracker_name,
 )
 from megatron.core.tensor_parallel.utils import divide
+from megatron.core.transformer.custom_layers import batch_invariant_kernels as bi_kernels
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.module import is_first_microbatch_tracked
@@ -1592,18 +1593,12 @@ class TELinear(te.pytorch.Linear):
         MXFP8 compute keeps TE's quantizers and autograd, then reduces its BF16 partials
         through the ordered collective fallback. The direct path accepts unquantized GEMMs.
         """
-        # Backend selection patches these wrappers, so resolve it after module import.
-        from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-            get_batch_invariant_backend,
-            is_batch_invariant_mode_enabled,
-        )
-
         return (
             self._bi_tp_forward is _BITPForward.ORDERED_REDUCE
             and self._bi_tp_direct_gemm
             and (
-                not is_batch_invariant_mode_enabled()
-                or get_batch_invariant_backend() == "te_native"
+                not bi_kernels.is_batch_invariant_mode_enabled()
+                or bi_kernels.get_batch_invariant_backend() == "te_native"
             )
             and not self.bi_tp_reduce_by_caller
             and _resolve_is_first_microbatch(self) is None

@@ -13,6 +13,7 @@ from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.ops.collectives import ordered_reduce as orr
 from megatron.core.ops.linear import ordered as orl
 from megatron.core.tensor_parallel import mappings
+from megatron.core.tensor_parallel.inference_layers import InferenceRowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.core.transformer.enums import AttnBackend
@@ -334,8 +335,6 @@ def _check_te_row_parallel_linear(sequence_parallel):
 @requires_tp4
 def test_inference_row_linear_uses_only_inference_scratch():
     """An inference layer must not reserve the separate 512 MiB training pool."""
-    from megatron.core.tensor_parallel.inference_layers import InferenceRowParallelLinear
-
     Utils.initialize_model_parallel(TP, 1)
     try:
         group = get_tensor_model_parallel_group_if_none(tp_group=None)
