@@ -548,12 +548,6 @@ def mm_batch_invariant(a, b):
 def mm_out_batch_invariant(a, b, *, out):
     """Batch-invariant replacement for `aten::mm.out`: same bits as `mm_batch_invariant`,
     written into ``out`` (so `torch.matmul(..., out=buffer)` needs no extra copy)."""
-    if (
-        _BATCH_INVARIANT_BACKEND == "deepgemm"
-        and a.dtype == torch.bfloat16
-        and b.dtype == torch.bfloat16
-    ):
-        return out.copy_(_mm_deepgemm(a, b))
     matmul_persistent(a, b, out=out)
     return out
 
