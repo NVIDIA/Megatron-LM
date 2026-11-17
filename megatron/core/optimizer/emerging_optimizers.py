@@ -9,9 +9,10 @@ To add a new emerging optimizer:
 """
 
 import inspect
+import itertools
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Literal, Optional, get_args
+from typing import Any, Callable, Dict, Generator, Literal, NamedTuple, Optional, Sequence, get_args
 
 import torch
 from torch.optim.optimizer import ParamsT
@@ -167,6 +168,69 @@ def _get_qkv_split_shapes(model_cfg) -> list[int]:
             model_cfg.kv_channels,
         ]
     return [query_projection_size, model_cfg.kv_channels, model_cfg.kv_channels]
+
+
+def split_qkv_shard_rows(
+    qkv_split_shapes: Sequence[int], rows: int, shard_rows: int, rank: int
+) -> list[list[tuple[int, int, int]]]:
+    """Where the projection pieces of a fused qkv weight sit in one GTP row shard.
+
+    The fused matrix has ``rows`` logical rows laid out per query group as
+    ``[q | (gate |) k | v]`` with the widths ``qkv_split_shapes``; GTP padding rows trail them.
+    It is split into row shards of ``shard_rows`` rows, and shard ``rank`` covers fused rows
+    ``[rank * shard_rows, (rank + 1) * shard_rows)``. A piece's rows are its query groups'
+    slabs concatenated in group order, the layout the duplicated split orthogonalizes.
+
+    Returns, per piece, the runs ``(local_start, local_end, piece_start)``: local rows
+    ``[local_start, local_end)`` of the shard are piece rows
+    ``[piece_start, piece_start + local_end - local_start)``. Runs are in piece-row order;
+    padding rows belong to no piece.
+    """
+    group_rows = sum(qkv_split_shapes)
+    if rows % group_rows != 0:
+        raise RuntimeError(
+            f"Muon QKV split shape mismatch: rows={rows}, split_shapes={list(qkv_split_shapes)}"
+        )
+    lo, hi = rank * shard_rows, (rank + 1) * shard_rows
+    runs: list[list[tuple[int, int, int]]] = []
+    offset = 0
+    for width in qkv_split_shapes:
+        piece_runs = []
+        for g in range(rows // group_rows):
+            start = g * group_rows + offset
+            a, b = max(start, lo), min(start + width, hi)
+            if a < b:
+                piece_runs.append((a - lo, b - lo, g * width + a - start))
+        runs.append(piece_runs)
+        offset += width
+    return runs
+
+
+class _ChainStep(NamedTuple):
+    """One step a Muon chain generator hands to its driver; the driver sends back the result.
+
+    ``kind`` tells a driver what it may do with the step: ``"collective"`` is a
+    ``torch.distributed`` collective (a step scheduler may issue it on a communication
+    stream), ``"distributed_ns"`` is a distributed Newton-Schulz over ``args[1]`` (a scheduler
+    may run it as its own per-step chain). :func:`run_serially` runs every step as written.
+    """
+
+    kind: Literal["collective", "distributed_ns"]
+    fn: Callable
+    args: tuple
+    kwargs: dict
+
+
+def run_serially(chain: Generator[_ChainStep, Any, Any]) -> Any:
+    """Drive a chain generator to completion on the current stream: every yielded
+    :class:`_ChainStep` runs synchronously and its result is sent back. Returns the
+    generator's return value."""
+    try:
+        step = next(chain)
+        while True:
+            step = chain.send(step.fn(*step.args, **step.kwargs))
+    except StopIteration as stop:
+        return stop.value
 
 
 # ===========================================================================
@@ -335,6 +399,7 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         self._tp_mode_cache: Dict[tuple, str] = {}
         self._hw_profile = _hardware_profile() if tp_mode == "auto" else None
         self._warned_qkv_split_disabled = False
+        self._split_qkv_modes_cache: Dict[tuple, tuple[bool, ...]] = {}
 
         weight_decay_method = "decoupled" if use_decoupled_weight_decay else "l2"
         # Use explicit class call instead of super() so that subclasses with
@@ -395,6 +460,148 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
             )
         return self._tp_mode_cache[key]
 
+    def _split_qkv_piece_modes(
+        self, p, qkv_split_shapes, gtp_active, gtp_remat_size, is_expert, tp_group, partition_dim
+    ) -> Optional[tuple[bool, ...]]:
+        """Split-QKV under the distributed mode: per projection piece of ``p``, whether it runs
+        the distributed Newton-Schulz on its rows of the GTP shards
+        (:meth:`_split_qkv_distributed_chain`). Under ``tp_mode="distributed"`` every piece
+        does; under ``auto`` the cost model resolves each piece on its own logical shape, like
+        any other dense matrix (:meth:`_resolve_tp_mode`). None when that chain cannot serve
+        ``p``: no split, ``tp_mode`` neither ``distributed`` nor ``auto``, or ``p`` is not a
+        dense weight with GTP as its only sharding axis. Cached per shape.
+
+        TODO: the chain has no test with ``use_syrk`` yet (it needs an emerging_optimizers
+        build with the SYRK kernel); a rank that holds no row of a distributed piece hands the
+        distributed Newton-Schulz an empty shard."""
+        if not qkv_split_shapes or self.tp_mode not in ("distributed", "auto"):
+            return None
+        if not gtp_active or is_expert:
+            return None
+        if partition_dim is not None and tp_group is not None and get_pg_size(tp_group) > 1:
+            return None  # GTP + TP two-step weights keep their existing behaviour.
+        rows = p.shape[0] * gtp_remat_size - getattr(p, 'pad_length', 0)
+        cols = p.shape[1]
+        key = (rows, cols, gtp_remat_size, tuple(qkv_split_shapes))
+        if key not in self._split_qkv_modes_cache:
+            group_rows = sum(qkv_split_shapes)
+            if rows % group_rows != 0:
+                raise RuntimeError(
+                    f"Muon QKV split shape mismatch: rows={rows}, "
+                    f"split_shapes={list(qkv_split_shapes)}"
+                )
+            piece_rows = [rows // group_rows * width for width in qkv_split_shapes]
+            modes = [
+                (
+                    "distributed"
+                    if self.tp_mode == "distributed"
+                    else self._resolve_tp_mode(piece, cols, gtp_remat_size)
+                )
+                for piece in piece_rows
+            ]
+            self._split_qkv_modes_cache[key] = tuple(mode == "distributed" for mode in modes)
+            log_single_rank(
+                logger,
+                logging.INFO,
+                f"muon split-QKV tp_mode={self.tp_mode}: ({rows}, {cols}) "
+                f"group_size={gtp_remat_size} pieces {piece_rows} x {cols} -> {modes}",
+            )
+        return self._split_qkv_modes_cache[key]
+
+    def _split_qkv_distributed_chain(
+        self, grad, gtp_group, tp_group, partition_dim, pad_length, qkv_split_shapes, distributed
+    ) -> Generator[_ChainStep, Any, torch.Tensor]:
+        """Projection-level split-QKV of a GTP-sharded fused qkv momentum without gathering it.
+
+        A chain generator: every collective and the pieces' distributed Newton-Schulz are
+        yielded as ``_ChainStep`` requests, so the same code serves the serial step
+        (:func:`run_serially`) and a step scheduler. ``grad`` is this rank's ``[R, K]`` row
+        shard of the padded fused matrix. Every projection piece is its own Newton-Schulz
+        problem, scaled by its logical shape, exactly the duplicated split's rule.
+        ``distributed[j]`` (:meth:`_split_qkv_piece_modes`) says how piece ``j`` runs:
+
+        - a distributed piece (Q at production sizes): the distributed chain over
+          ``gtp_group`` on this rank's rows of the piece. The Gram is over the complete
+          columns, so the row order inside the shard does not matter and a rank without rows
+          contributes zeros.
+        - the other pieces (K and V at production sizes, which the cost model keeps
+          duplicated): ONE all-reduce of the zero-filled pieces assembles them on every rank
+          (each row has exactly one contributor, so the sum is the exact copy the duplicated
+          path all-gathers), then the duplicated split's own Newton-Schulz call on the ranks
+          that hold rows of the piece: bitwise its result.
+
+        Order: the assembled pieces' all-reduce, the distributed pieces' chains, then the
+        assembled pieces' Newton-Schulz. Run before the chains, that host-launch-bound
+        Newton-Schulz would hold every rank at the first chain collective until the ranks
+        holding K / V rows finish it; queued behind the chains, its launches hide under their
+        GPU time. Padding rows stay zero. Every rank issues the same collectives in the same
+        order: the assembled pieces' Newton-Schulz is a direct call on the ranks that hold
+        their rows, which is only sound because TP is not a sharding axis here (checked on
+        entry), so that call involves no other rank.
+        """
+        if partition_dim is not None and tp_group is not None and get_pg_size(tp_group) > 1:
+            # The assembled pieces' Newton-Schulz below runs only on the ranks that hold their
+            # rows and is not a yielded step: with TP as a sharding axis it would all-gather
+            # over the TP group on some ranks only.
+            raise RuntimeError(
+                "The split-aware split-QKV chain requires GTP to be the weight's only sharding "
+                f"axis, got a TP group of size {get_pg_size(tp_group)} with "
+                f"partition_dim={partition_dim}"
+            )
+        group_size, rank = get_pg_size(gtp_group), get_pg_rank(gtp_group)
+        shard_rows, cols = grad.shape
+        rows = shard_rows * group_size - pad_length
+        runs = split_qkv_shard_rows(qkv_split_shapes, rows, shard_rows, rank)
+        piece_rows = [rows // sum(qkv_split_shapes) * width for width in qkv_split_shapes]
+        out = torch.zeros_like(grad)
+
+        gathered = [j for j, is_distributed in enumerate(distributed) if not is_distributed]
+        starts = list(itertools.accumulate((piece_rows[j] for j in gathered), initial=0))
+        assembled = grad.new_zeros(starts[-1], cols)
+        if gathered:
+            for j, at in zip(gathered, starts):
+                for lo, hi, piece_start in runs[j]:
+                    assembled[at + piece_start : at + piece_start + hi - lo] = grad[lo:hi]
+            yield _ChainStep(
+                "collective", torch.distributed.all_reduce, (assembled,), {"group": gtp_group}
+            )
+
+        for j, is_distributed in enumerate(distributed):
+            if not is_distributed:
+                continue
+            local = (
+                torch.cat([grad[lo:hi] for lo, hi, _ in runs[j]])
+                if runs[j]
+                else grad.new_zeros(0, cols)
+            )
+            orth = yield _ChainStep(
+                "distributed_ns",
+                self.scaled_orthogonalize_fn,
+                (local, gtp_group),
+                {
+                    "partition_dim": 0,
+                    "tp_mode_this_group": "distributed",
+                    "scale_shape": (piece_rows[j], cols),
+                },
+            )
+            at = 0
+            for lo, hi, _ in runs[j]:
+                out[lo:hi] = orth[at : at + hi - lo]
+                at += hi - lo
+
+        for j, at in zip(gathered, starts):
+            if not runs[j]:
+                continue  # no row of this piece here: its result is not needed
+            orth = self.scaled_orthogonalize_fn(
+                assembled[at : at + piece_rows[j]],
+                tp_group,
+                partition_dim,
+                tp_mode_this_group="duplicated",
+            )
+            for lo, hi, piece_start in runs[j]:
+                out[lo:hi] = orth[piece_start : piece_start + hi - lo]
+        return out
+
     def scaled_orthogonalize_fn_with_gtp_remat(
         self, p, grad, tp_group, partition_dim, qkv_split_shapes=None
     ):
@@ -416,9 +623,14 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         distributed keeps the padding needed by its collective, but applies Muon's scale
         factor using the unpadded logical matrix shape.
 
-        ``qkv_split_shapes`` (when set) runs Newton-Schulz on q, k and v separately. The
-        split needs the whole matrix, so under GTP it is available on the duplicated path
-        only -- blockwise and distributed fall back to whole-matrix NS and warn once.
+        ``qkv_split_shapes`` (when set) runs Newton-Schulz on q, k and v separately. Under
+        GTP the duplicated path splits the gathered matrix. Under distributed and under auto a
+        dense weight whose only sharding axis is GTP gets a mode per projection piece
+        (:meth:`_split_qkv_piece_modes`: every piece distributed under distributed, the cost
+        model's answer for each piece under auto) and runs the same split without gathering
+        the matrix (:meth:`_split_qkv_distributed_chain`); where auto keeps every piece
+        duplicated it runs the duplicated split. Every other blockwise / distributed case
+        cannot keep the q/k/v boundaries: it falls back to whole-matrix NS and warns once.
         """
         if qkv_split_shapes is not None and not qkv_split_shapes:
             raise ValueError(
@@ -442,7 +654,15 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         gtp_remat_size = get_pg_size(gtp_remat_group) if gtp_active else 1
 
         mode = self.tp_mode
-        if mode == "auto":
+        split_modes = self._split_qkv_piece_modes(
+            p, qkv_split_shapes, gtp_active, gtp_remat_size, is_expert, tp_group, partition_dim
+        )
+        if split_modes is not None:
+            # A split qkv weight the distributed split chain can serve has one mode per
+            # projection piece: any distributed piece runs the chain, none (auto only) is the
+            # duplicated split.
+            mode = "distributed" if any(split_modes) else "duplicated"
+        elif mode == "auto":
             if qkv_split_shapes is not None:
                 # Only duplicated can honor a split; the cost model below doesn't know
                 # that, so pin it here instead of letting the shape decide.
@@ -489,6 +709,26 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
 
         gtp_rank = get_pg_rank(gtp_remat_group)
         pad_length = getattr(p, 'pad_length', 0)
+
+        if split_modes is not None and mode == "distributed":
+            # The decision above reads p's layout and the chain reads grad's: they must be the
+            # same shard (the plain distributed path checks this for padded weights below).
+            if grad.shape != p.shape:
+                raise RuntimeError(
+                    "Split-aware distributed split-QKV requires the momentum and parameter "
+                    f"layouts to match, got grad={tuple(grad.shape)} and p={tuple(p.shape)}"
+                )
+            return run_serially(
+                self._split_qkv_distributed_chain(
+                    grad,
+                    gtp_remat_group,
+                    tp_group,
+                    partition_dim,
+                    pad_length,
+                    qkv_split_shapes,
+                    split_modes,
+                )
+            )
 
         if qkv_split_shapes is not None and mode != "duplicated":
             # Fall back, not raise: these configs ran before the qkv fix, so an abort
