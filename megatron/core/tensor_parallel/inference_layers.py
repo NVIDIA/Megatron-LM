@@ -414,6 +414,9 @@ class InferenceRowParallelLinear(TERowParallelLinear):
     Inference optimized version of TERowParallelLinear.
     """
 
+    def _prepare_bi_tp_scratch(self, tp_group) -> None:
+        """Inference uses its existing TP pool; prepare training scratch only on training use."""
+
     def __init__(
         self,
         input_size: int,

@@ -1556,9 +1556,11 @@ class TELinear(te.pytorch.Linear):
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
         if self._bi_tp_forward is _BITPForward.SHARD_GEMMS or self._bi_tp_can_direct():
-            # The symmetric GEMM scratch is allocated here (collective),
-            # never inside a forward or a CUDA-graph capture.
-            prepare_ordered_reduce(tp_group)
+            self._prepare_bi_tp_scratch(tp_group)
+
+    def _prepare_bi_tp_scratch(self, tp_group) -> None:
+        """Prepare training scratch collectively before forward or CUDA-graph capture."""
+        prepare_ordered_reduce(tp_group)
 
     def _set_bi_row_parallel_attributes(self):
         """Restore row-parallel parameter metadata on a layer built with TE parallel_mode=None.

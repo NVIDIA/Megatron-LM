@@ -332,6 +332,56 @@ def _check_te_row_parallel_linear(sequence_parallel):
 
 
 @requires_tp4
+def test_inference_row_linear_uses_only_inference_scratch():
+    """An inference layer must not reserve the separate 512 MiB training pool."""
+    from megatron.core.tensor_parallel.inference_layers import InferenceRowParallelLinear
+
+    Utils.initialize_model_parallel(TP, 1)
+    try:
+        group = get_tensor_model_parallel_group_if_none(tp_group=None)
+        cfg = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=8,
+            tensor_model_parallel_size=TP,
+            sequence_parallel=True,
+            params_dtype=torch.bfloat16,
+            batch_invariant_mode=True,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+        )
+        layer = (
+            InferenceRowParallelLinear(
+                256,
+                256,
+                config=cfg,
+                init_method=init_method_normal(0.02),
+                bias=False,
+                input_is_parallel=True,
+                skip_bias_add=True,
+                is_expert=False,
+                tp_group=group,
+            )
+            .cuda()
+            .eval()
+        )
+        x = _partials((32, 1, 64), torch.bfloat16, seed=17)
+        with set_batch_invariant_mode(True, backend="te_native"), torch.no_grad():
+            out, _ = layer(x)
+            expected = _left_fold(_all_partials(x @ layer.weight.t(), group))
+        expected = expected[group.rank() * 8 : (group.rank() + 1) * 8]
+        assert torch.equal(_bits(out), _bits(expected))
+        assert SymmetricMemoryManager.is_initialized("tp")
+        assert not SymmetricMemoryManager.is_initialized(orl._training_buffer_key(group))
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier()
+        SymmetricMemoryManager.destroy()
+        Utils.destroy_model_parallel()
+
+
+@requires_tp4
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 def test_direct_gemm_falls_back_when_scratch_does_not_fit(dtype):
     """A larger eager/captured input keeps the same bits through all-to-all."""
