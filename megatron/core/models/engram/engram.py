@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import math
+from typing import NamedTuple
 
 import torch
 import torch.nn.functional as F
@@ -34,14 +35,22 @@ from megatron.core.utils import get_pg_rank, get_pg_size, nvtx_range_pop, nvtx_r
 
 from .config import EngramConfig
 from .cp_layout import (
+    CONTIGUOUS_CP_LAYOUT,
     gather_sequence_thd,
+    resolve_layer_cp_layout,
     restore_zigzag,
     scatter_sequence_thd,
+    select_contiguous,
     select_zigzag,
+    stack_mixes_cp_layouts,
     thd_partition_index,
 )
 from .distributed_embedding import EPShardedMultiTableEmbedding
-from .hashing import build_ngram_hashes, slice_hashes_for_sequence_parallel
+from .hashing import (
+    build_ngram_hashes,
+    slice_hashes_for_sequence_parallel,
+    valid_positions_from_cu_seqlens,
+)
 from .symmetric_lookup import select_engram_lookup
 from .table_sharding import ENGRAM_PARAMETER_DOMAIN, resolve_engram_groups, tag_engram_tables
 from .variants import GATED_FUSION
@@ -49,12 +58,30 @@ from .variants import GATED_FUSION
 logger = logging.getLogger(__name__)
 
 
-class _SequenceParallelConvHalo(torch.autograd.Function):
-    """Differentiable fetch of the previous TP rank's trailing convolution context.
+class EngramLookupResult(NamedTuple):
+    """What :meth:`Engram.lookup` hands to :meth:`Engram.forward` for one microbatch.
 
-    Under sequence parallelism each TP rank owns one contiguous sequence slice, so the causal
-    short convolution needs the last ``history_length`` positions of the previous rank's slice.
-    The first rank keeps zeros, matching the true sequence start. Backward returns the received
+    ``memory`` holds the looked-up rows of this rank's positions, ``[S_local, B,
+    total_memory_dim]`` in the table dtype, and carries the gradient edge to the tables.
+    ``valid`` marks the positions that hold a token (``[1, S_local, 1]``), or is None for an
+    unpacked row and for a fusion that does not gate on it. ``cu_seqlens`` holds the positions
+    of the documents of a packed row, or None for an unpacked one; the short convolution splits
+    a context-parallel row by them. No field has a default, so a result that is rebuilt from
+    its tensors cannot drop one.
+    """
+
+    memory: Tensor
+    valid: Tensor | None
+    cu_seqlens: Tensor | None
+
+
+class _PreviousRankConvHalo(torch.autograd.Function):
+    """Differentiable fetch of the previous rank's trailing convolution context.
+
+    Serves a group whose ranks own consecutive slices of the sequence: the TP group under
+    sequence parallelism, and the CP group in the contiguous layout. The causal short
+    convolution needs the last ``history_length`` positions of the previous rank's slice. The
+    first rank keeps zeros, matching the true sequence start. Backward returns the received
     context's gradient to the sending rank's trailing positions.
     """
 
@@ -84,7 +111,7 @@ class _SequenceParallelConvHalo(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, local_slice: Tensor, history_length: int, group) -> Tensor:
-        """Fetch the previous TP rank's trailing ``history_length`` rows."""
+        """Fetch the previous rank's trailing ``history_length`` rows."""
         ctx.group = group
         ctx.history_length = history_length
         ctx.local_shape = local_slice.shape
@@ -93,14 +120,14 @@ class _SequenceParallelConvHalo(torch.autograd.Function):
         ctx.rank, ctx.size = rank, size
         send_tensor = local_slice[-history_length:] if rank < size - 1 else None
         recv_tensor = local_slice.new_zeros((history_length, *local_slice.shape[1:]))
-        _SequenceParallelConvHalo._exchange(
+        _PreviousRankConvHalo._exchange(
             send_tensor, recv_tensor if rank > 0 else None, rank + 1, rank - 1, group
         )
         return recv_tensor
 
     @staticmethod
     def backward(ctx, grad_history: Tensor):
-        """Send the history gradient back to the previous TP rank."""
+        """Send the history gradient back to the previous rank."""
         rank, size = ctx.rank, ctx.size
         send_tensor = grad_history if rank > 0 else None
         recv_tensor = (
@@ -108,7 +135,7 @@ class _SequenceParallelConvHalo(torch.autograd.Function):
             if rank < size - 1
             else None
         )
-        _SequenceParallelConvHalo._exchange(send_tensor, recv_tensor, rank - 1, rank + 1, ctx.group)
+        _PreviousRankConvHalo._exchange(send_tensor, recv_tensor, rank - 1, rank + 1, ctx.group)
         grad_local = grad_history.new_zeros(ctx.local_shape)
         if recv_tensor is not None:
             grad_local[-ctx.history_length :] = recv_tensor
@@ -152,17 +179,22 @@ def _at_least_fp32(tensor: Tensor) -> Tensor:
     return tensor.float() if tensor.dtype in (torch.float16, torch.bfloat16) else tensor
 
 
-def _gather_tokens_across_cp(input_ids: Tensor, cp_group, cu_seqlens: Tensor | None) -> Tensor:
+def _gather_tokens_across_cp(
+    input_ids: Tensor, cp_group, cu_seqlens: Tensor | None, contiguous: bool = False
+) -> Tensor:
     """Restore the globally ordered token row from this rank's context-parallel shard.
 
     Token IDs are not differentiable, so this is a plain all-gather plus the inverse of the
     partitioning the batch went through: a plain zigzag for an unpacked row, and the
-    per-document zigzag for a packed one.
+    per-document zigzag for a packed one. In the contiguous layout the rank-major gather is
+    the row already, packed or not.
     """
     cp_size = get_pg_size(cp_group)
     parts = [torch.empty_like(input_ids) for _ in range(cp_size)]
     torch.distributed.all_gather(parts, input_ids.contiguous(), group=cp_group)
     gathered = torch.cat(parts, dim=1)
+    if contiguous:
+        return gathered
     if cu_seqlens is None:
         return restore_zigzag(gathered, cp_size, sequence_dim=1)
     total_length = int(cu_seqlens[-1].item())
@@ -183,6 +215,26 @@ def _row_cu_seqlens(packed_seq_params: PackedSeqParams | None) -> Tensor | None:
     if cu_seqlens is None:
         return None
     return cu_seqlens.reshape(-1)
+
+
+def _row_document_bounds(
+    packed_seq_params: PackedSeqParams | None, contiguous_cp: bool
+) -> tuple[Tensor | None, Tensor | None]:
+    """Return the row positions of the packed documents and, if known, their token counts.
+
+    ``cu_seqlens_q`` holds the positions the documents occupy in the row. The exception is a
+    context-parallel row in the contiguous layout (``contiguous_cp``): its ``cu_seqlens_q``
+    counts the tokens of the documents, and ``cu_seqlens_q_padded``, which a row that pads
+    its documents carries, holds the positions. The token counts are returned for such a row
+    only, and are None otherwise.
+    """
+    cu_seqlens = _row_cu_seqlens(packed_seq_params)
+    if cu_seqlens is None or not contiguous_cp:
+        return cu_seqlens, None
+    cu_seqlens_padded = getattr(packed_seq_params, "cu_seqlens_q_padded", None)
+    if cu_seqlens_padded is None:
+        return cu_seqlens, None
+    return cu_seqlens_padded.reshape(-1), cu_seqlens.diff()
 
 
 class _ContextParallelConvHalo(torch.autograd.Function):
@@ -319,6 +371,9 @@ class Engram(MegatronModule):
         self.pg_collection = pg_collection
         self.tp_group = pg_collection.tp
         self.cp_group = getattr(pg_collection, "cp", None)
+        # The layout this layer's hidden states and token IDs are in under context parallelism.
+        self.cp_layout = resolve_layer_cp_layout(config)
+        self._stack_mixes_cp_layouts = stack_mixes_cp_layouts(config)
         self.num_streams = config.mhc_num_residual_streams if config.enable_mhc_connections else 1
         self.hidden_size = config.hidden_size
         device = (
@@ -509,13 +564,14 @@ class Engram(MegatronModule):
                 f"(kernel_size - 1 = {self.engram_config.kernel_size - 1} times dilation "
                 f"{self.engram_config.max_ngram_order}); got {normed.shape[0]}."
             )
-        return _SequenceParallelConvHalo.apply(normed, self.conv_history_length, self.tp_group)
+        return _PreviousRankConvHalo.apply(normed, self.conv_history_length, self.tp_group)
 
     def _short_convolution(self, value: Tensor, cu_seqlens: Tensor | None = None) -> Tensor:
         if get_pg_size(self.cp_group) <= 1:
             return self._short_convolution_local(value)
         # The context-parallel paths need the CP-local sequence whole: the zigzag chunk
-        # boundaries sit inside the sequence-parallel split. Every TP rank convolves all of it
+        # boundaries sit inside the sequence-parallel split, and a contiguous slice takes its
+        # context from the whole previous CP rank. Every TP rank convolves all of it
         # but keeps, and so backpropagates, only its own slice. The gather's backward then
         # reduce-scatters the input gradient, and the TP sum of the sequence-parallel
         # parameters adds each slice's parameter gradient exactly once.
@@ -525,7 +581,11 @@ class Engram(MegatronModule):
             value = gather_from_sequence_parallel_region(
                 value, tensor_parallel_output_grad=True, group=self.tp_group
             )
-        if cu_seqlens is not None:
+        if self.cp_layout == CONTIGUOUS_CP_LAYOUT:
+            # One slice per rank, packed or not, and the convolution does not stop at a
+            # document boundary: the previous CP rank's tail is the whole left context.
+            convolved = self._short_convolution_contiguous(value)
+        elif cu_seqlens is not None:
             # Packed rows zigzag per document, so the chunk map changes with the batch and
             # the halo's fixed neighbour pattern no longer describes it. Restore the row,
             # convolve it from the sequence start (zero left context), and scatter it back.
@@ -566,6 +626,20 @@ class Engram(MegatronModule):
         normed = self.conv_norm(value.flatten(start_dim=-2)).view_as(value)
         return self._convolve_with_history(normed, self._convolution_history(normed))
 
+    def _short_convolution_contiguous(self, value: Tensor) -> Tensor:
+        """Convolve this rank's contiguous CP slice with the previous CP rank's tail as context."""
+        history_length = self.conv_history_length
+        normed = self.conv_norm(value.flatten(start_dim=-2)).view_as(value)
+        if history_length == 0:
+            return self._convolve_with_history(normed, normed[:0])
+        if normed.shape[0] < history_length:
+            raise RuntimeError(
+                "Engram context-parallel convolution requires each contiguous slice to own at "
+                f"least {history_length} positions; got {normed.shape[0]}."
+            )
+        history = _PreviousRankConvHalo.apply(normed, history_length, self.cp_group)
+        return self._convolve_with_history(normed, history)
+
     def _short_convolution_cp_halo(self, value: Tensor) -> Tensor:
         """Give each of this rank's two zigzag chunks its own one-hop left context (CP halo).
 
@@ -605,47 +679,53 @@ class Engram(MegatronModule):
             dim=0,
         )
 
-    def forward(
+    def lookup(
         self,
-        hidden_states: Tensor,
         input_ids: Tensor,
         packed_seq_params: PackedSeqParams | None = None,
-        add_to_hidden_states: bool = False,
-    ) -> Tensor:
-        """Return an Engram residual with the same standard or mHC layout as input.
+        *,
+        local_sequence_length: int | None = None,
+    ) -> EngramLookupResult:
+        """Hash the token IDs and look up this rank's rows: the first step of :meth:`forward`.
 
-        ``packed_seq_params`` carries the packed (THD) document boundaries, as positions of
-        the row. They stop an n-gram window from reaching back into the previous document of the
-        same row; the causal convolution deliberately still mixes across the boundary, matching
-        both published reference implementations. The ``gated`` fusion also closes its gate on
-        the positions after the last boundary. The ``--sft`` rows have none: their last document
-        ends at the end of the row and holds the padding.
+        :meth:`forward` runs this step itself unless it is handed the result, so a caller that
+        wants the lookup ahead of the fusion, for instance in front of a region it recomputes,
+        calls this method and passes the result on with ``forward(..., lookup=result)``.
 
-        With ``add_to_hidden_states`` the hidden states are returned with the residual added,
-        which is what the layers ask for. The ``gated`` fusion then adds half-precision hidden
-        states in FP32 and rounds once, as DeepSeek-V4.1 does; the ``gated_conv`` fusion adds in
-        the hidden dtype.
+        ``input_ids`` is this rank's ``[B, S]`` token row in the layer's context-parallel
+        layout, not sliced over the tensor-parallel group, and ``packed_seq_params`` describes
+        the packed row as in :meth:`forward`. ``local_sequence_length`` is the length of the
+        hidden states the result is fused into; left out, it is the row length, divided by the
+        tensor-parallel size under sequence parallelism. The result holds everything the fusion
+        needs from the row, so ``forward`` takes it alone.
+
+        The result carries the gradient edge to the tables, and the lookup is a collective over
+        the ranks that share the tables. So every result must be made with gradients enabled
+        when the tables train, and be consumed by exactly one :meth:`forward`, the same one on
+        every rank, with the calls in the same order on every rank.
         """
-        if hidden_states.ndim != 3:
-            raise ValueError(f"Engram hidden_states must be [S,B,H], got {hidden_states.shape}.")
-        expected_hidden = self.num_streams * self.hidden_size
-        if hidden_states.shape[-1] != expected_hidden:
-            raise ValueError(
-                f"Engram expected hidden width {expected_hidden}, got {hidden_states.shape[-1]}."
-            )
+        cp_size = get_pg_size(self.cp_group)
+        contiguous_cp = cp_size > 1 and self.cp_layout == CONTIGUOUS_CP_LAYOUT
+        row_cu_seqlens, document_lengths = _row_document_bounds(packed_seq_params, contiguous_cp)
+        if cp_size > 1 and row_cu_seqlens is not None:
+            self._check_packed_cp_partition(packed_seq_params)
+        if local_sequence_length is None:
+            # The hidden states are sliced over TP under sequence parallelism; the row is not.
+            local_sequence_length = input_ids.shape[1]
+            tp_size = get_pg_size(self.tp_group)
+            if self.config.sequence_parallel and tp_size > 1:
+                local_sequence_length //= tp_size
 
-        row_cu_seqlens = _row_cu_seqlens(packed_seq_params)
         message = "engram.hash"
         nvtx_range_push(message)
         try:
-            cp_size = get_pg_size(self.cp_group)
             # Hash windows and the causal convolution both read positions that CP may have
             # placed on another rank, so the memory is computed on the restored global
             # sequence and re-selected afterwards. input_ids is a small int64 tensor, so the
             # gather costs far less than threading a second token channel through the model.
             if cp_size > 1:
                 global_input_ids = _gather_tokens_across_cp(
-                    input_ids, self.cp_group, row_cu_seqlens
+                    input_ids, self.cp_group, row_cu_seqlens, contiguous=contiguous_cp
                 )
             else:
                 global_input_ids = input_ids
@@ -660,14 +740,15 @@ class Engram(MegatronModule):
                 reset_at_boundary=self.engram_config.variant_spec.resets_windows_at_boundary_token,
                 cu_seqlens=row_cu_seqlens,
             )
-            local_sequence_length = hidden_states.shape[0]
             hash_ids = self._select_local_positions(hash_ids, row_cu_seqlens, local_sequence_length)
             valid = None
             if self._gated_fusion and row_cu_seqlens is not None:
-                # Positions after the last document boundary belong to no document.
-                positions = torch.arange(global_input_ids.shape[1], device=row_cu_seqlens.device)
+                # A position after the last document boundary belongs to no document, and a
+                # position in the padding of a document holds no token.
                 valid = self._select_local_positions(
-                    (positions < row_cu_seqlens[-1]).view(1, -1, 1),
+                    valid_positions_from_cu_seqlens(
+                        row_cu_seqlens, global_input_ids.shape[1], document_lengths
+                    ).view(1, -1, 1),
                     row_cu_seqlens,
                     local_sequence_length,
                 )
@@ -680,6 +761,57 @@ class Engram(MegatronModule):
             memory = self._lookup(hash_ids).flatten(start_dim=-2).transpose(0, 1).contiguous()
         finally:
             nvtx_range_pop(message)
+        return EngramLookupResult(memory, valid, row_cu_seqlens)
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        input_ids: Tensor | None = None,
+        packed_seq_params: PackedSeqParams | None = None,
+        add_to_hidden_states: bool = False,
+        *,
+        lookup: EngramLookupResult | None = None,
+    ) -> Tensor:
+        """Return an Engram residual with the same standard or mHC layout as input.
+
+        ``packed_seq_params`` carries the packed (THD) document boundaries, as positions of
+        the row. They stop an n-gram window from reaching back into the previous document of the
+        same row; the causal convolution deliberately still mixes across the boundary, matching
+        both published reference implementations. The ``gated`` fusion also closes its gate on
+        the positions after the last boundary. The ``--sft`` rows have none: their last document
+        ends at the end of the row and holds the padding. A context-parallel row in the
+        contiguous layout carries the token counts of its documents next to their positions,
+        and the ``gated`` fusion closes its gate on the padding of every document too.
+
+        With ``add_to_hidden_states`` the hidden states are returned with the residual added,
+        which is what the layers ask for. The ``gated`` fusion then adds half-precision hidden
+        states in FP32 and rounds once, as DeepSeek-V4.1 does; the ``gated_conv`` fusion adds in
+        the hidden dtype.
+
+        ``lookup`` takes the result of an earlier :meth:`lookup` call for the same microbatch;
+        ``input_ids`` and ``packed_seq_params`` are then unused. Without it the lookup runs
+        here, which is the same computation in one call.
+        """
+        if hidden_states.ndim != 3:
+            raise ValueError(f"Engram hidden_states must be [S,B,H], got {hidden_states.shape}.")
+        expected_hidden = self.num_streams * self.hidden_size
+        if hidden_states.shape[-1] != expected_hidden:
+            raise ValueError(
+                f"Engram expected hidden width {expected_hidden}, got {hidden_states.shape[-1]}."
+            )
+
+        if lookup is None:
+            if input_ids is None:
+                raise ValueError("Engram needs input_ids, or the result of an earlier lookup().")
+            lookup = self.lookup(
+                input_ids, packed_seq_params, local_sequence_length=hidden_states.shape[0]
+            )
+        memory, valid, row_cu_seqlens = lookup
+        if memory.shape[:2] != hidden_states.shape[:2]:
+            raise ValueError(
+                "Engram lookup result does not match the hidden states: looked up "
+                f"[S,B]={tuple(memory.shape[:2])}, hidden states {tuple(hidden_states.shape[:2])}."
+            )
         if self._gated_fusion:
             message = "engram.gate-projection"
             nvtx_range_push(message)
@@ -716,6 +848,27 @@ class Engram(MegatronModule):
         output = output.reshape(hidden_states.shape)
         return hidden_states + output if add_to_hidden_states else output
 
+    def _check_packed_cp_partition(self, packed_seq_params: PackedSeqParams) -> None:
+        """Reject a packed context-parallel row whose partition this layer does not follow.
+
+        The partition of the row is cross-checked when the parameters record it
+        (``cp_partition_mode``); it is the layer's own layout otherwise.
+        """
+        partition = getattr(packed_seq_params, "cp_partition_mode", None)
+        if partition is not None and partition != self.cp_layout:
+            raise ValueError(
+                f"Engram layer {self.layer_number} runs in the {self.cp_layout} context-parallel "
+                f"layout, but its packed row is partitioned in the {partition} layout."
+            )
+        if self.cp_layout != CONTIGUOUS_CP_LAYOUT and self._stack_mixes_cp_layouts:
+            raise NotImplementedError(
+                f"Engram layer {self.layer_number} runs in the zigzag context-parallel layout of "
+                "a stack whose linear_cp_layout and attention_cp_layout differ. A packed row "
+                "reaches a zigzag layer of such a stack in the padded per-sequence zigzag, which "
+                "Engram does not follow; place the memory on a layer that runs in the contiguous "
+                "layout, or use one layout for the stack."
+            )
+
     def _select_local_positions(
         self, tensor: Tensor, cu_seqlens: Tensor | None, local_sequence_length: int
     ) -> Tensor:
@@ -727,7 +880,9 @@ class Engram(MegatronModule):
         cp_size = get_pg_size(self.cp_group)
         if cp_size > 1:
             cp_rank = get_pg_rank(self.cp_group)
-            if cu_seqlens is not None:
+            if self.cp_layout == CONTIGUOUS_CP_LAYOUT:
+                tensor = select_contiguous(tensor, cp_size, cp_rank, sequence_dim=1)
+            elif cu_seqlens is not None:
                 tensor = tensor.index_select(1, thd_partition_index(cu_seqlens, cp_size, cp_rank))
             else:
                 tensor = select_zigzag(tensor, cp_size, cp_rank, sequence_dim=1)
