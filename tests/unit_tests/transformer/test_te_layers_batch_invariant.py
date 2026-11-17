@@ -19,6 +19,11 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     HAVE_DEEPGEMM_BF16,
     assert_te_supports_batch_invariant_attention,
+    disable_batch_invariant_mode,
+    enable_batch_invariant_mode,
+    get_batch_invariant_backend,
+    get_batch_invariant_collective,
+    is_batch_invariant_mode_enabled,
     matmul_persistent,
     mean_batch_invariant,
     set_batch_invariant_mode,
@@ -88,6 +93,118 @@ def test_full_mean_under_batch_invariant_mode():
     torch.testing.assert_close(out.detach(), ref)
     torch.testing.assert_close(out_fn.detach(), ref)
     torch.testing.assert_close(x.grad, torch.full_like(x, 1.0 / x.numel()))
+
+
+_BIK_MODULE = "megatron.core.transformer.custom_layers.batch_invariant_kernels"
+
+
+@pytest.fixture
+def batch_invariant_mode_off(monkeypatch):
+    """Start with batch-invariant mode off; restore its backend and collective afterwards."""
+    assert not is_batch_invariant_mode_enabled(), "batch-invariant mode leaked from another test"
+    monkeypatch.setattr(f"{_BIK_MODULE}._BATCH_INVARIANT_BACKEND", get_batch_invariant_backend())
+    monkeypatch.setattr(
+        f"{_BIK_MODULE}._BATCH_INVARIANT_COLLECTIVE", get_batch_invariant_collective()
+    )
+    yield
+    disable_batch_invariant_mode()
+
+
+def _batch_invariant_state():
+    return (
+        is_batch_invariant_mode_enabled(),
+        get_batch_invariant_backend(),
+        get_batch_invariant_collective(),
+    )
+
+
+@pytest.mark.parametrize("collective", ("ordered", "multimem"))
+def test_set_batch_invariant_mode_nested_restores_enclosing_state(
+    batch_invariant_mode_off, collective
+):
+    """Leaving a nested scope, normally or by an exception, restores the enclosing mode,
+    backend and collective."""
+    enable_batch_invariant_mode(backend="te_native", collective=collective)
+    outer = (True, "te_native", collective)
+    assert _batch_invariant_state() == outer
+
+    with set_batch_invariant_mode(True, backend="te_native", collective=collective):
+        assert _batch_invariant_state() == outer
+    assert _batch_invariant_state() == outer
+
+    other = "ordered" if collective == "multimem" else "multimem"
+    with pytest.raises(RuntimeError, match="Cannot switch batch-invariant collective"):
+        with set_batch_invariant_mode(True, collective=other):
+            pass
+    assert _batch_invariant_state() == outer
+
+    with set_batch_invariant_mode(False):
+        assert not is_batch_invariant_mode_enabled()
+    assert _batch_invariant_state() == outer
+
+    with pytest.raises(RuntimeError, match="raised inside the scope"):
+        with set_batch_invariant_mode(False):
+            raise RuntimeError("raised inside the scope")
+    assert _batch_invariant_state() == outer
+
+
+def test_set_batch_invariant_mode_outermost_restores_disabled_state(batch_invariant_mode_off):
+    """An outermost scope leaves the backend and collective it found, whether it is left
+    normally or by an exception, or its entry is rejected."""
+    enable_batch_invariant_mode(backend="te_native", collective="multimem")
+    disable_batch_invariant_mode()
+    before = (False, "te_native", "multimem")
+    assert _batch_invariant_state() == before
+
+    with set_batch_invariant_mode(True, collective="ordered"):
+        assert _batch_invariant_state() == (True, "triton", "ordered")
+    assert _batch_invariant_state() == before
+
+    with pytest.raises(RuntimeError, match="raised inside the scope"):
+        with set_batch_invariant_mode(True, collective="ordered"):
+            raise RuntimeError("raised inside the scope")
+    assert _batch_invariant_state() == before
+
+    with pytest.raises(ValueError, match="Unknown batch-invariant backend"):
+        with set_batch_invariant_mode(True, backend="unknown", collective="ordered"):
+            pass
+    assert _batch_invariant_state() == before
+
+
+@pytest.mark.parametrize("collective", ("ordered", "multimem"))
+def test_set_batch_invariant_mode_keeps_configured_collective(batch_invariant_mode_off, collective):
+    """An outermost scope enables the collective the process was configured with by default."""
+    enable_batch_invariant_mode(backend="te_native", collective=collective)
+    disable_batch_invariant_mode()
+
+    with set_batch_invariant_mode(True):
+        assert _batch_invariant_state() == (True, "triton", collective)
+    assert _batch_invariant_state() == (False, "te_native", collective)
+
+
+def test_enable_batch_invariant_mode_rolls_back_on_failure(batch_invariant_mode_off, monkeypatch):
+    """A failure after enabling has started leaves the previous state, not a half-on mode."""
+
+    def fail():
+        raise RuntimeError("last enable step failed")
+
+    # Fail at the last step, after the aten library, TE patches and workspace pin are in place.
+    monkeypatch.setattr(f"{_BIK_MODULE}._pin_mamba_autotuners", fail)
+    monkeypatch.setattr(f"{_BIK_MODULE}._BATCH_INVARIANT_BACKEND", "triton")
+    monkeypatch.setattr(f"{_BIK_MODULE}._BATCH_INVARIANT_COLLECTIVE", "ordered")
+    before = (False, "triton", "ordered")
+    env_before = os.environ.get("CUBLASLT_WORKSPACE_SIZE")
+
+    with pytest.raises(RuntimeError, match="last enable step failed"):
+        enable_batch_invariant_mode(backend="te_native", collective="multimem")
+    assert _batch_invariant_state() == before
+    assert os.environ.get("CUBLASLT_WORKSPACE_SIZE") == env_before
+
+    with pytest.raises(RuntimeError, match="last enable step failed"):
+        with set_batch_invariant_mode(True, backend="te_native", collective="multimem"):
+            pass
+    assert _batch_invariant_state() == before
+    assert os.environ.get("CUBLASLT_WORKSPACE_SIZE") == env_before
 
 
 # ============================================================================
