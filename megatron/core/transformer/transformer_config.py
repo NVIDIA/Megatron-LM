@@ -1349,8 +1349,9 @@ class TransformerConfig(ModelParallelConfig):
     same way, unless mtp_use_repeated_layer runs a block for several MTP depths or
     keep_mtp_in_bf16 keeps it out of FP8/FP4 training. Pairing is skipped with a warning when EP
     communication overlap, delay_wgrad_compute, fine-grained activation offloading,
-    sequence_packing_scheduler, mHC, wide residual streams or context parallelism is enabled. Has
-    no effect with other cuda_graph_impl values."""
+    sequence_packing_scheduler, mHC or context parallelism is enabled. Wide residual streams do
+    not support Transformer Engine CUDA graphs; configuration validation rejects that combination.
+    Has no effect with other cuda_graph_impl values."""
 
     external_cuda_graph: bool = False
     """DEPRECATED and replaced by cuda_graph_impl.
