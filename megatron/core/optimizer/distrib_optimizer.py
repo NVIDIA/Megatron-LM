@@ -3578,7 +3578,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
 
     @torch.no_grad()
     def _reload_te_main_params(self, state_dict=None):
-        """Reload TE-owned masters, leaving their storage representation to TE."""
+        """Reload TE-owned masters"""
         has_master_state = any(
             self.optimizer.state.get(
                 self.optimizer.param_groups[group_index]["params"][group_order]
