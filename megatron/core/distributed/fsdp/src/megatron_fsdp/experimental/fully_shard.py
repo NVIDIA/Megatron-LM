@@ -104,7 +104,9 @@ def fully_shard(
 
     Args:
         module: Module whose currently unowned parameters are managed by FSDP.
-        mesh: Parent device mesh containing the data-parallel axes.
+        mesh: Parent device mesh containing the data-parallel axes. With symmetric memory,
+            the mesh provider must initialize each data-parallel NCCL communicator before
+            construction, for example with a barrier on each mesh-axis group.
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
@@ -191,32 +193,6 @@ def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
     if dim_names is None or axis not in dim_names:
         raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
     return dim_names.index(axis)
-
-
-@contextmanager
-def finalize_gradients(context: FsdpContext, enabled: bool = True) -> Iterator[None]:
-    """Control whether backward finalizes accumulated gradients in this context.
-
-    When enabled, backward launches DP-outer reductions and automatically waits
-    for gradient reductions unless the caller manages that wait. When disabled,
-    inner reductions and weight cleanup still run, but outer reductions and the
-    automatic completion wait are deferred.
-
-    Wrap both forward and backward. This scope only changes the finalization
-    setting; entering or exiting it does not launch reductions or wait for them.
-
-    Args:
-        context: FSDP context whose modules should use this finalization setting.
-        enabled: Whether backward should finalize gradients. Defaults to True.
-    """
-    context.ensure_finalized()
-    previous_state = context.finalize_gradients
-    context.finalize_gradients = enabled
-
-    try:
-        yield
-    finally:
-        context.finalize_gradients = previous_state
 
 
 def _attach_mixin(module: nn.Module) -> None:
