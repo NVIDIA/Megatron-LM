@@ -12,6 +12,7 @@ from pathlib import Path
 import torch
 
 from megatron.core.config import set_experimental_flag
+from megatron.core.model_parallel_config import normalize_gtp_nccl_ub
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
@@ -1395,14 +1396,21 @@ def validate_args(args, defaults={}):
                 "buffer via replace_raw_data is unsupported)."
             )
 
+        for attr in ("gtp_remat_nccl_ub", "gtp_expert_remat_nccl_ub"):
+            setattr(args, attr, normalize_gtp_nccl_ub(getattr(args, attr, None)))
+
+        gtp_ub_collectives = (args.gtp_remat_nccl_ub or []) + (args.gtp_expert_remat_nccl_ub or [])
+
         # GTP symmetric memory registers pools with symmetric=True (NVLS needs symmetric
         # windows), which contradicts --disable-symmetric-registration.
-        if getattr(args, 'gtp_remat_nccl_ub', False) or getattr(args, 'gtp_expert_remat_nccl_ub', False):
+        if gtp_ub_collectives:
             assert not getattr(args, 'disable_symmetric_registration', False), (
                 "--gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub require symmetric window registration and "
                 "cannot be combined with --disable-symmetric-registration."
             )
-            if getattr(args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False):
+            if "rs" in gtp_ub_collectives and getattr(
+                args, 'gtp_remat_reduce_scatter_with_fp32_accumulation', False
+            ):
                 print_rank_0(
                     "WARNING: --gtp-remat-nccl-ub/--gtp-expert-remat-nccl-ub take precedence over "
                     "--gtp-remat-reduce-scatter-with-fp32-accumulation on their groups: NVLS "
@@ -1618,6 +1626,22 @@ def validate_args(args, defaults={}):
             if args.dist_ckpt_optim_fully_reshardable:
                 assert not args.distrib_optim_fully_reshardable_mem_efficient, \
                     '--distrib-optim-fully-reshardable-mem-efficient requires -enable-gloo-process-groups'
+
+        # Other optimizers (e.g. Muon) with the distributed optimizer take the layer-wise path,
+        # which builds a separate DistributedOptimizer for their non-matrix parameters unless
+        # --no-use-layer-wise-param-layout is set. Its memory-efficient fully reshardable save
+        # gathers over Gloo as well.
+        if (
+            args.optimizer not in ('sgd', 'adam')
+            and (args.use_distributed_optimizer or args.optimizer == 'dist_muon')
+            and getattr(args, 'use_layer_wise_param_layout', True)
+            and args.dist_ckpt_optim_fully_reshardable
+        ):
+            assert not args.distrib_optim_fully_reshardable_mem_efficient, (
+                '--distrib-optim-fully-reshardable-mem-efficient needs Gloo process groups for '
+                'the DistributedOptimizer of the layer-wise optimizer. Drop '
+                '--disable-gloo-process-groups or pass --no-use-layer-wise-param-layout.'
+            )
 
     if args.fake_process_group:
         assert args.moe_token_dispatcher_type != "flex", "Fake process group is not supported with flex token dispatcher."

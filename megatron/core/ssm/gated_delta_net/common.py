@@ -164,6 +164,29 @@ class _GDNBase(MegatronModule, TwoStageAttentionLayer):
 
     gated_delta_rule: GatedDeltaRuleInterface
 
+    @classmethod
+    def _estimate_flops(
+        cls, config: TransformerConfig, total_real_tokens_in_batch: float, *, use_gdn2: bool
+    ) -> float:
+        """Share the GDN/GDN2 forward estimate without enabling it for other variants."""
+        qk_dim = (config.linear_key_head_dim or 128) * (config.linear_num_key_heads or 16)
+        value_head_dim = config.linear_value_head_dim or 128
+        value_heads = config.linear_num_value_heads or 32
+        value_dim = value_head_dim * value_heads
+        input_dim = (
+            4 * qk_dim + 3 * value_dim if use_gdn2 else 2 * qk_dim + 2 * value_dim + 2 * value_heads
+        )
+        return (
+            2
+            * total_real_tokens_in_batch
+            * (
+                config.hidden_size * input_dim
+                + (config.linear_conv_kernel_dim or 4) * (2 * qk_dim + value_dim)
+                + value_heads * value_head_dim**2 * 4  # KK^T, VK^T, S(a(I-bKK^T)), and SQ.
+                + config.hidden_size * value_dim
+            )
+        )
+
     def __init__(
         self,
         config: TransformerConfig,
