@@ -69,22 +69,25 @@ def test_static_loader_preserves_tensors_after_pipeline_batch_preparation(stage,
             if pointers is not None:
                 assert current_pointers == pointers
             pointers = current_pointers
-            get_batch_on_this_tp_rank(
-                batch=batch,
-                has_cu_seqlens=False,
-                dynamic_cp=False,
-                create_attention_mask_in_dataloader=False,
-                broadcast_src_rank=parallel_state.get_tensor_model_parallel_src_rank(),
-                broadcast_group=parallel_state.get_tensor_model_parallel_group(),
-                cp_size=1,
-                tp_rank=0,
-                micro_batch_size=1,
-                seq_length=8,
-                mtp_on_this_rank=False,
-                pipeline_model_parallel_size=2,
-                is_pipeline_first_stage=first_stage,
-                is_pipeline_last_stage=not first_stage,
-            )
+            # A broadcast over the one-rank TP group leaves the batch unchanged, and
+            # skipping it keeps each case from creating another NCCL communicator.
+            with patch("torch.distributed.broadcast"):
+                get_batch_on_this_tp_rank(
+                    batch=batch,
+                    has_cu_seqlens=False,
+                    dynamic_cp=False,
+                    create_attention_mask_in_dataloader=False,
+                    broadcast_src_rank=parallel_state.get_tensor_model_parallel_src_rank(),
+                    broadcast_group=parallel_state.get_tensor_model_parallel_group(),
+                    cp_size=1,
+                    tp_rank=0,
+                    micro_batch_size=1,
+                    seq_length=8,
+                    mtp_on_this_rank=False,
+                    pipeline_model_parallel_size=2,
+                    is_pipeline_first_stage=first_stage,
+                    is_pipeline_last_stage=not first_stage,
+                )
             discarded_fields = (
                 ("labels", "loss_mask") if first_stage else ("tokens", "position_ids")
             )
