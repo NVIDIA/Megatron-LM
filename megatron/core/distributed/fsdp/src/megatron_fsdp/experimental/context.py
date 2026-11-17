@@ -14,7 +14,6 @@
 
 """Shared runtime state for Megatron-FSDP modules."""
 
-import enum
 from collections.abc import Callable
 from weakref import WeakKeyDictionary
 
@@ -23,14 +22,7 @@ from torch import nn
 
 from .execution_order import ExecutionEvent, ExecutionOrder
 from .phase import Phase
-from .runtime_policy import RuntimePolicy
-
-
-class PrefetchOrder(enum.Enum):
-    """How to choose the module order used for prefetching."""
-
-    REGISTRATION = enum.auto()
-    RECORDED = enum.auto()
+from .runtime_policy import PrefetchOrder, RuntimePolicy
 
 
 class FsdpContext:
@@ -40,10 +32,9 @@ class FsdpContext:
     inner_reduction_stream: torch.cuda.Stream
     # Aliases inner_reduction_stream unless DP-outer overlap is enabled.
     outer_reduction_stream: torch.cuda.Stream
-    # HFSDP/HSDP need explicit last-microbatch state. First-microbatch state is
-    # unnecessary because each parameter group tracks whether model_weight is stale
-    # after syncing from main_weight.
-    is_last_microbatch: bool
+    # Whether backward should finalize accumulated gradients, including DP-outer
+    # reduction for HSDP/HFSDP. Scoped by finalize_gradients().
+    finalize_gradients: bool
     use_symmetric_memory: bool
     caller_managed_grad_sync: bool
     # Prefetch uses construction order unless execution-order recording is enabled.
@@ -62,26 +53,19 @@ class FsdpContext:
         device: torch.device | None = None,
         runtime_policy: RuntimePolicy = RuntimePolicy(),
         parameter_to_owner: dict[nn.Parameter, int] | None = None,
-        prefetch_order: PrefetchOrder = PrefetchOrder.REGISTRATION,
     ) -> None:
         """Create rank-local runtime state for FSDP modules on ``device``.
 
         Args:
             device: CUDA device on which this context schedules communication. Defaults to
                 the current CUDA device.
-            runtime_policy: Communication allocation, stream, and gradient-synchronization
+            runtime_policy: Communication allocation, stream, prefetch, and gradient-synchronization
                 settings shared by all modules constructed in this context.
             parameter_to_owner: Construction-time owner assignments for TensorAtomic
                 parameters, keyed by the original parameters before sharding. Owners are
                 ranks in each parameter group's 1-D data-parallel mesh and must agree across
                 that mesh. Every TensorAtomic parameter needs an entry; other entries are
                 ignored. Tensors are packed by owner without changing logical parameter order.
-            prefetch_order: ``REGISTRATION`` expects a forward/backward pass matching module
-                registration order. ``RECORDED`` gathers parameters on demand and records
-                module calls until the first ``post_backward()``. Subsequent passes must
-                repeat the complete sequence consistently across data-parallel ranks.
-                Recording currently requires the ordinary module hooks; combined 1F1B
-                bypasses them. Discard the context if the recorded pass raises.
         """
         overlap_allgather_reduction = runtime_policy.overlap_allgather_reduction
         overlap_outer_communication = runtime_policy.overlap_outer_communication
@@ -90,11 +74,11 @@ class FsdpContext:
         if device.type != "cuda":
             raise ValueError(f"FsdpContext requires a CUDA device, got {device}.")
 
-        self.is_last_microbatch = True
+        self.finalize_gradients = True
         self.use_symmetric_memory = runtime_policy.use_symmetric_memory
         self.caller_managed_grad_sync = runtime_policy.caller_managed_grad_sync
         self.execution_order = ExecutionOrder()
-        self._recording_execution_order = prefetch_order is PrefetchOrder.RECORDED
+        self._recording_execution_order = runtime_policy.prefetch_order is PrefetchOrder.RECORDED
         self._post_backward_hook_registered = False
         self._delayed_post_backward_callbacks: list[
             tuple[nn.Module, Callable[[nn.Module], None]]
@@ -207,25 +191,40 @@ class FsdpContext:
         )
 
     def finish_grad_sync(self) -> None:
-        """Wait on submitted gradient reductions.
+        """Reshard remaining weights and wait on submitted gradient reductions.
 
         Call after all backward work, including delayed weight-gradient computation,
         and before reading or modifying gradients. This enqueues a stream dependency;
         it does not block the CPU or wait for reductions that have not yet been launched.
         """
+        # A backward prefetch may gather a frozen module that never runs backward.
+        # Restore bindings and clear its gather state so the next iteration
+        # materializes fresh weights. All backward work, including delayed wgrad,
+        # must be complete here.
+        for module in self._module_names:
+            module.reshard()
         self.current_stream().wait_stream(self.inner_reduction_stream)
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
 
+    def pre_backward(self) -> None:
+        """Fork the reduce-scatter stream into any active CUDA-graph capture.
+
+        A stream joins a capture only via a wait_stream edge; without it, the first
+        allocation on the reduce-scatter stream is illegal during capture. The DP-outer
+        reduction stream needs no fork: it joins via its wait on the reduce-scatter stream.
+        """
+        self.inner_reduction_stream.wait_stream(self.current_stream())
+
     def post_backward(self) -> None:
-        """Finish backward cleanup and automatically synchronize the last microbatch."""
+        """Finish backward cleanup and synchronize gradients when finalization is enabled."""
         self._run_delayed_post_backward_callbacks()
         self._recording_execution_order = False
         # Standalone training can call optimizer.step() immediately after backward.
         # Wait for reductions on the last microbatch; earlier microbatches keep
         # overlapping reduction with compute. MCore calls finish_grad_sync() itself
         # after its schedule completes, including delayed weight gradients.
-        if not self.caller_managed_grad_sync and self.is_last_microbatch:
+        if not self.caller_managed_grad_sync and self.finalize_gradients:
             self.finish_grad_sync()
         self._post_backward_hook_registered = False
 

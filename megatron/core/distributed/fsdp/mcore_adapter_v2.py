@@ -31,12 +31,9 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
-from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import log_single_rank
 
 __all__ = ["FullyShardedDataParallelV2"]
@@ -49,9 +46,9 @@ try:
         RuntimePolicy,
         SchedulePolicy,
         ShardLayout,
+        finalize_gradients,
         fully_shard,
         fully_shard_context,
-        microbatch,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
         current_fully_shard_context,
@@ -120,6 +117,18 @@ def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | No
         _materialize_meta_module(submodule, device)
 
 
+def _initialize_symmetric_memory_communicators(
+    groups: tuple[dist.ProcessGroup, ...], device: torch.device
+) -> None:
+    """Initialize communicators before symmetric-memory registration.
+
+    NCCL rendezvous can fail as the first operation on a communicator:
+    https://github.com/pytorch/pytorch/issues/188567.
+    """
+    for group in groups:
+        dist.barrier(group=group, device_ids=[device.index])
+
+
 class FullyShardedDataParallelV2(_BaseDataParallel):
     """MFSDP v2 wrapper for the Megatron model.
 
@@ -146,17 +155,19 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             module: Root model module to shard.
             fsdp_unit_modules: Module types to shard as child FSDP units. If
                 unspecified, transformer and Mamba layers, shortcut MoE blocks, and
-                TEGroupedMLP/SequentialMLP expert containers are used. An explicit list
-                replaces these defaults. Expert containers use the expert-DP mesh;
-                custom lists must include them when expert and dense sharding settings
-                differ.
+                mHC wrappers are used. An explicit list replaces these defaults.
+                Routed experts always receive independent units on the expert-DP mesh.
+                Parameterized mHC replay modules also receive independent units so
+                their hooks run during replay. Known layers own their remaining
+                submodules; configured types are matched during traversal of other
+                containers.
             disable_bucketing: Compatibility argument that must remain ``False`` for
                 MFSDP v2.
             device: Device used to construct the data-parallel mesh and, when this wrapper
                 opens its own ``fully_shard_context``, that context's device. Defaults to
                 CUDA. When the caller has already opened an ambient context (multi-chunk
-                wrapping), this wrapper joins it and the ambient context's device and
-                ``use_symmetric_memory`` settings apply instead.
+                wrapping), this wrapper joins it and uses that context's device. The
+                context's symmetric-memory setting must match ``ddp_config.nccl_ub``.
             pg_collection: Explicit process groups. The ``dp_cp`` group defines the
                 data-parallel mesh.
 
@@ -165,10 +176,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ValueError: If required process groups are missing or the configuration
                 requests a feature unsupported by MFSDP v2.
         """
+
         if not HAVE_MEGATRON_FSDP:
             raise IMPORT_MEGATRON_FSDP_ERROR
         if pg_collection is None:
             raise ValueError("MFSDP v2 requires an explicit ProcessGroupCollection.")
+        ddp_config.finalize()
         FullyShardedDataParallelV2._validate_config(
             config, ddp_config, module, pg_collection, disable_bucketing
         )
@@ -176,21 +189,27 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if has_config_logger_enabled(config):
             log_config_to_disk(config, locals(), prefix=type(self).__name__)
 
+        use_symmetric_memory = ddp_config.nccl_ub
+        if use_symmetric_memory:
+            if ddp_config.num_distributed_optimizer_instances > 1:
+                groups = (pg_collection.inter_dist_opt, pg_collection.intra_dp_cp)
+                if config.num_moe_experts is not None:
+                    groups += (pg_collection.intra_expt_dp,)
+            else:
+                groups = (pg_collection.dp_cp,)
+                if config.num_moe_experts is not None:
+                    groups += (pg_collection.expt_dp,)
+            _initialize_symmetric_memory_communicators(
+                tuple(group for group in groups if group is not None),
+                torch.cuda.current_stream(device).device,
+            )
+
         # Optimizer construction reads this attribute; retain the v1 contract for compatibility.
         self.ddp_config = ddp_config
 
         # Importing experts at module load creates a cycle through pipeline schedules
         # and fsdp_dtensor_checkpoint, which then incorrectly marks MFSDP unavailable.
         from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
-
-        if fsdp_unit_modules is None:
-            fsdp_unit_modules = [
-                TransformerLayer,
-                MambaLayer,
-                ShortcutMoEBlock,
-                TEGroupedMLP,
-                SequentialMLP,
-            ]
 
         log_single_rank(
             logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
@@ -281,7 +300,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             construction_context = nullcontext(active_context)
         with construction_context:
-            collector = FsdpUnitCollector(tuple(fsdp_unit_modules))
+            collector = FsdpUnitCollector(fsdp_unit_modules)
             for submodule in collector.collect(module):
                 is_expert = isinstance(submodule, (TEGroupedMLP, SequentialMLP))
                 if config.init_model_with_meta_device:
@@ -447,7 +466,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if ddp_config.nccl_ub and not ddp_config.megatron_fsdp_padded_shards:
             raise ValueError(
                 "MFSDP v2 megatron_fsdp_padded_shards=False is incompatible with nccl_ub: "
-                "symmetric-memory collectives require equal shard sizes."
+                "symmetric-memory collectives require equal shard sizes for unsharding. "
+                "Remove --no-megatron-fsdp-padded-shards or disable --use-nccl-ub."
             )
         if ddp_config.fsdp_manual_registration:
             raise ValueError("MFSDP v2 does not support fsdp_manual_registration.")
@@ -474,7 +494,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         MCore's schedules wrap every microbatch but the last in ``no_sync_func``.
         """
-        with microbatch(self.module.context, is_last=False):
+        with finalize_gradients(self.module.context, enabled=False):
             yield
 
     @torch.no_grad()
