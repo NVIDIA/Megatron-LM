@@ -20,7 +20,10 @@ from megatron.core.extensions.transformer_engine import (
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    _CUBLASLT_FALLBACK_WARNING,
     HAVE_DEEPGEMM_BF16,
+    _disable_aten_gemm_workspace_starvation,
+    _enable_aten_gemm_workspace_starvation,
     assert_te_supports_batch_invariant_attention,
     matmul_persistent,
     mean_batch_invariant,
@@ -848,6 +851,33 @@ def test_batch_invariant_prefers_cublaslt_and_restores_it(backend):
     # Outside the mode the fallback is a warning again, not an error.
     with warnings.catch_warnings(record=True):
         warnings.warn(_CUBLASLT_FALLBACK, UserWarning)
+
+
+@pytest.mark.parametrize("shadowed", [False, True])
+def test_batch_invariant_keeps_caller_fallback_filter(shadowed):
+    """A caller's own rule for the cuBLAS fallback warning, equal to the one the mode adds,
+    survives the mode in its place. With a broader ignore rule ahead of the caller's rule,
+    the mode's rule still wins while the mode is on. Needs no GPU."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=_CUBLASLT_FALLBACK_WARNING, category=UserWarning)
+        if shadowed:
+            warnings.filterwarnings("ignore", category=UserWarning)
+        filters_before = list(warnings.filters)
+        _enable_aten_gemm_workspace_starvation()
+        try:
+            assert warnings.filters[1:] == filters_before
+            with pytest.raises(UserWarning, match=_CUBLASLT_FALLBACK):
+                warnings.warn(_CUBLASLT_FALLBACK, UserWarning)
+        finally:
+            _disable_aten_gemm_workspace_starvation()
+        assert len(warnings.filters) == len(filters_before)
+        assert all(rule is before for rule, before in zip(warnings.filters, filters_before))
+        if shadowed:
+            # The caller's ignore rule keeps its precedence over the caller's error rule.
+            warnings.warn(_CUBLASLT_FALLBACK, UserWarning)
+        else:
+            with pytest.raises(UserWarning, match=_CUBLASLT_FALLBACK):
+                warnings.warn(_CUBLASLT_FALLBACK, UserWarning)
 
 
 # Runs in a fresh process. With "first", it enables the mode before its first GEMM and only then

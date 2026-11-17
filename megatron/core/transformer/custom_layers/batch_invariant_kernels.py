@@ -1791,8 +1791,13 @@ def _enable_aten_gemm_workspace_starvation():
         _ATEN_GEMM_BLAS_ORIG = torch.backends.cuda.preferred_blas_library()
         torch.backends.cuda.preferred_blas_library("cublaslt")
     if _ATEN_GEMM_FALLBACK_FILTER is None:
+        caller_filters = list(warnings.filters)
         warnings.filterwarnings("error", message=_CUBLASLT_FALLBACK_WARNING, category=UserWarning)
         _ATEN_GEMM_FALLBACK_FILTER = warnings.filters[0]
+        # filterwarnings drops an equal rule the caller installed before prepending its own.
+        # Keep the caller's rules as they were, behind the mode's, so that disabling the mode
+        # removes only the mode's rule and the caller's policy and precedence survive.
+        warnings.filters[1:] = caller_filters
 
 
 def _disable_aten_gemm_workspace_starvation():
@@ -1801,8 +1806,11 @@ def _disable_aten_gemm_workspace_starvation():
 
     global _ATEN_GEMM_CUBLASLT_WORKSPACE_ORIG, _ATEN_GEMM_BLAS_ORIG, _ATEN_GEMM_FALLBACK_FILTER
     if _ATEN_GEMM_FALLBACK_FILTER is not None:
-        if _ATEN_GEMM_FALLBACK_FILTER in warnings.filters:
-            warnings.filters.remove(_ATEN_GEMM_FALLBACK_FILTER)
+        # Match by identity: a caller's rule can equal the mode's, and must stay.
+        for i, rule in enumerate(warnings.filters):
+            if rule is _ATEN_GEMM_FALLBACK_FILTER:
+                del warnings.filters[i]
+                break
         _ATEN_GEMM_FALLBACK_FILTER = None
     if _ATEN_GEMM_BLAS_ORIG is not None:
         torch.backends.cuda.preferred_blas_library(_ATEN_GEMM_BLAS_ORIG)
