@@ -222,8 +222,13 @@ def get_compute_units():
     return NUM_SMS
 
 
-def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None):
-    """Persistent matmul kernel used by batch-invariant GEMM."""
+def matmul_persistent(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out: torch.Tensor | None = None,
+):
+    """Persistent matmul kernel used by batch-invariant GEMM, into ``out`` if given."""
     # Check constraints.
     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
     assert a.dtype == b.dtype, "Incompatible dtypes"
@@ -235,8 +240,11 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
     M, K = a.shape
     K, N = b.shape
     dtype = a.dtype
-    # Allocates output.
-    c = torch.empty((M, N), device=a.device, dtype=dtype)
+    if out is None:
+        c = torch.empty((M, N), device=a.device, dtype=dtype)
+    else:
+        assert out.shape == (M, N) and out.dtype == dtype, (out.shape, out.dtype)
+        c = out
 
     # 1D launch kernel where each block gets its own program.
     def grid(META):
@@ -574,6 +582,23 @@ def mm_batch_invariant(a, b):
     return matmul_persistent(a, b)
 
 
+def mm_out_batch_invariant(a, b, *, out):
+    """`a @ b` written into `out` by the triton / deepgemm backends' GEMM.
+
+    `torch.matmul(..., out=...)` lowers to aten::mm.out, which these backends do not replace,
+    so a caller that writes a GEMM into a given buffer (the inference row-parallel layers write
+    into symmetric memory) calls this instead.
+    """
+    if (
+        _BATCH_INVARIANT_BACKEND == "deepgemm"
+        and a.dtype == torch.bfloat16
+        and b.dtype == torch.bfloat16
+    ):
+        # _mm_deepgemm lays out its own TMA-aligned output.
+        return out.copy_(_mm_deepgemm(a, b))
+    return matmul_persistent(a, b, out=out)
+
+
 def addmm_batch_invariant(bias, a, b):
     """Batch-invariant replacement for `aten::addmm`."""
     if (
@@ -630,6 +655,18 @@ _TE_RMSNORM_FUNC_ORIGS: Dict[str, Any] = {}
 _TE_GEMM_FUNC_ORIGS: Dict[str, Any] = {}
 _TE_GROUPED_GEMM_FUNC_ORIGS: Dict[str, Any] = {}
 _TE_APPLY_NORM_ORIGS: Dict[str, Any] = {}
+_TE_TP_COLLECTIVE_ORIGS: Dict[str, Any] = {}
+
+# TE modules whose tensor-parallel reductions are called through these module-level names:
+# the row-parallel output (Linear, LayerNormMLP's FC2, the op fuser's BasicLinear under
+# sequence parallelism) and the column-parallel input gradient in backward.
+_TE_TP_COLLECTIVE_MODULES = (
+    "transformer_engine.pytorch.distributed",
+    "transformer_engine.pytorch.module.linear",
+    "transformer_engine.pytorch.module.layernorm_linear",
+    "transformer_engine.pytorch.module.layernorm_mlp",
+    "transformer_engine.pytorch.ops.basic.basic_linear",
+)
 
 
 def _import_module_if_available(name: str):
@@ -643,11 +680,75 @@ def _import_module_if_available(name: str):
     return importlib.import_module(name)
 
 
+def _te_reduce_scatter_along_first_dim_patched(inp, tp_group, async_op=False, output=None):
+    """TE's reduce_scatter_along_first_dim, summing each element in rank order."""
+    from megatron.core.tensor_parallel.batch_invariant_reduction import (
+        batch_invariant_reduce_scatter,
+    )
+
+    return batch_invariant_reduce_scatter(inp, tp_group, output=output, async_op=async_op)
+
+
+def _te_allreduce_patched(inp, tp_group=None, async_op=False):
+    """TE's allreduce, summing each element in rank order."""
+    from megatron.core.tensor_parallel.batch_invariant_reduction import batch_invariant_all_reduce
+
+    return batch_invariant_all_reduce(inp, tp_group, async_op=async_op)
+
+
+def _te_symmetric_all_reduce_patched(
+    inp, tp_group=None, async_op=False, all_reduce_type="multimem_all_reduce"
+):
+    """TE's symmetric_all_reduce (any all_reduce_type), summing each element in rank order."""
+    return _te_allreduce_patched(inp, tp_group, async_op=async_op)
+
+
+_TE_TP_COLLECTIVE_PATCHES = {
+    "reduce_scatter_along_first_dim": _te_reduce_scatter_along_first_dim_patched,
+    "allreduce": _te_allreduce_patched,
+    "symmetric_all_reduce": _te_symmetric_all_reduce_patched,
+}
+
+
+def _te_patch_tp_collectives() -> None:
+    """Route TE's tensor-parallel reduce-scatter and all-reduce through Megatron's rank-order
+    reduction (megatron.core.tensor_parallel.batch_invariant_reduction).
+
+    NCCL's ring adds a token's partials in an order set by its position in the step, so with
+    TP >= 3 TE's row-parallel layers were not batch invariant, in training or inference. The
+    reductions are patched at every module that imported them by name; with async_op the
+    patched reduction returns a handle whose wait() finishes it, so TE's backward still
+    overlaps its input-gradient reduction with the weight-gradient GEMM. TE's operation fuser
+    and the Userbuffers reduce-scatter overlaps reduce inside TE itself; TransformerConfig
+    rejects them in batch-invariant mode at TP >= 3.
+    """
+    for mod_name in _TE_TP_COLLECTIVE_MODULES:
+        mod = _import_module_if_available(mod_name)
+        if mod is None:
+            continue
+        for name, patched in _TE_TP_COLLECTIVE_PATCHES.items():
+            key = f"{mod_name}.{name}"
+            if hasattr(mod, name) and key not in _TE_TP_COLLECTIVE_ORIGS:
+                _TE_TP_COLLECTIVE_ORIGS[key] = getattr(mod, name)
+                setattr(mod, name, patched)
+
+
+def _te_unpatch_tp_collectives() -> None:
+    """Restore the originals captured by _te_patch_tp_collectives."""
+    for key, orig in list(_TE_TP_COLLECTIVE_ORIGS.items()):
+        mod_name, name = key.rsplit(".", 1)
+        mod = _import_module_if_available(mod_name)
+        if mod is not None:
+            setattr(mod, name, orig)
+        _TE_TP_COLLECTIVE_ORIGS.pop(key)
+
+
 def _te_patch_for_batch_invariant(skip_gemm: bool = False, skip_rmsnorm: bool = False):
-    """Patch Transformer Engine modules to use batch-invariant GEMM and RMSNorm.
+    """Patch Transformer Engine modules to use batch-invariant GEMM, RMSNorm and TP reductions.
 
     This monkey-patches TE's GEMM and RMSNorm entry points to dispatch to the
-    batch-invariant implementations when batch-invariant mode is enabled.
+    batch-invariant implementations when batch-invariant mode is enabled, and its
+    tensor-parallel reductions under every backend (see _te_patch_tp_collectives).
     Safe no-op if TE is unavailable.
 
     Args:
@@ -664,6 +765,8 @@ def _te_patch_for_batch_invariant(skip_gemm: bool = False, skip_rmsnorm: bool = 
     global _TE_GENERAL_GEMM_ORIG, _TE_RMSNORM_ORIG_FWD, _MEG_TE_GENERAL_GEMM_ORIG
     import transformer_engine.pytorch as te
     import transformer_engine.pytorch.cpp_extensions as te_cpp
+
+    _te_patch_tp_collectives()
 
     if not skip_gemm:
         # Patch general_gemm once
@@ -1009,6 +1112,7 @@ def _batch_invariant_te_grouped_wgrad(A, B, out, m_splits, use_bias, accumulate)
 def _te_unpatch_for_batch_invariant():
     """Restore original Transformer Engine functions if they were patched."""
     global _TE_GENERAL_GEMM_ORIG, _TE_RMSNORM_ORIG_FWD, _MEG_TE_GENERAL_GEMM_ORIG
+    _te_unpatch_tp_collectives()
     te_cpp = _import_module_if_available("transformer_engine.pytorch.cpp_extensions")
     te = _import_module_if_available("transformer_engine.pytorch")
     if te_cpp is None or te is None:

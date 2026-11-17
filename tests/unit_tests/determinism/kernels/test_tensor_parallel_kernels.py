@@ -13,6 +13,10 @@
   ``general_gemm`` forward plus the corresponding input- and weight-gradient paths.
 * apex ``FusedLayerNorm`` (persistent and non-persistent) and ``FusedScaleMaskSoftmax``
   (causal and padding CUDA kernels).
+* The rank-order sum of batch-invariant mode's TP reduction, on the all-to-all output it
+  reduces when there is no symmetric memory and on peers' symmetric buffers (local buffers
+  stand in for the peers), at power-of-two and other TP sizes. Its multi-rank paths are checked
+  bit for bit in ``tests/unit_tests/tensor_parallel/test_batch_invariant_reduction.py``.
 """
 
 import importlib.util
@@ -29,6 +33,7 @@ from megatron.core.ops.loss.cross_entropy import (
     vocab_parallel_cross_entropy,
 )
 from megatron.core.ops.norm import fused_layer_norm
+from megatron.core.tensor_parallel.batch_invariant_reduction import _rank_ordered_sum
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -40,6 +45,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import attention_mask_func
 from megatron.core.utils import init_method_normal
 from tests.unit_tests.determinism.kernels.harness import (
+    LocalSymmetricPeers,
     assert_module_replays_bit_exact,
     assert_replays_bit_exact,
     deterministic_algorithms,
@@ -392,3 +398,56 @@ def test_windowed_config_with_fusion_uses_torch_path_replays(with_caller_mask):
         replays=3,
         what=f"FusedScaleMaskSoftmax[torch, swa-fusion{'+padding' if with_caller_mask else ''}]",
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("world_size", [3, 8])
+def test_batch_invariant_rank_ordered_sum_replays(dtype, world_size):
+    """Each element is summed over the ranks' partials in a fixed order: bit-exact on replay,
+    and equal to the fp32 rank-order sum rounded once."""
+    seeded()
+    numel = 1 << 21
+    partials = torch.randn(world_size * numel, device="cuda").to(dtype)
+    ref = partials.view(world_size, numel)[0].float()
+    for p in partials.view(world_size, numel)[1:]:
+        ref = ref + p.float()
+    out, _ = assert_replays_bit_exact(
+        lambda x: _rank_ordered_sum(
+            torch.empty(numel, dtype=dtype, device="cuda"), x, world_size, 0
+        ),
+        (partials,),
+        replays=3,
+        backward=False,
+        contention=True,
+        what=f"_rank_ordered_sum[{dtype}, {world_size} ranks]",
+    )
+    assert torch.equal(out["out"], ref.to(dtype))
+
+
+@pytest.mark.parametrize("world_size", [3, 6, 8])
+def test_batch_invariant_rank_ordered_sum_from_peers_replays(world_size):
+    """The symmetric-memory reading: this rank's segment of every peer's buffer, summed in rank
+    order. TP sizes that are not powers of two pad and mask the barrier's arange."""
+    seeded()
+    numel, rank = 1 << 20, world_size - 1
+    peers = LocalSymmetricPeers(world_size, world_size * numel, torch.bfloat16, rank=rank)
+    for buf in peers.buffers:
+        buf.copy_(torch.randn(buf.numel(), device="cuda"))
+    ref = peers.buffers[0].view(world_size, numel)[rank].float()
+    for buf in peers.buffers[1:]:
+        ref = ref + buf.view(world_size, numel)[rank].float()
+
+    def reduce():
+        peers.prime()
+        out = torch.empty(numel, dtype=torch.bfloat16, device="cuda")
+        return _rank_ordered_sum(out, peers.buffers[rank], world_size, rank, peers)
+
+    out, _ = assert_replays_bit_exact(
+        reduce,
+        (),
+        replays=3,
+        backward=False,
+        contention=True,
+        what=f"_rank_ordered_sum[symmetric memory, {world_size} ranks]",
+    )
+    assert torch.equal(out["out"], ref.to(torch.bfloat16))

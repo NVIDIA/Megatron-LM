@@ -856,3 +856,70 @@ def test_dynamic_cp_rejects_unsupported_config(overrides, message):
             sequence_packing_scheduler="default_dynamic_cp",
             **overrides,
         )
+
+
+def _make_batch_invariant_config(**overrides) -> TransformerConfig:
+    from megatron.core.transformer.enums import AttnBackend
+
+    return TransformerConfig(
+        num_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        batch_invariant_mode=True,
+        params_dtype=torch.bfloat16,
+        bf16=True,
+        attention_backend=AttnBackend.flash,
+        flash_attention_version=3,
+        attention_dropout=0.0,
+        sequence_parallel=True,
+        **overrides,
+    )
+
+
+_NO_UB_REDUCE_SCATTER = dict(
+    tp_comm_overlap_rs=False, tp_comm_overlap_rs_dgrad=False, tp_comm_bulk_wgrad=False
+)
+
+
+@pytest.mark.parametrize(
+    "overrides, match",
+    [
+        # TP > 2: the Userbuffers reduce-scatter overlaps and TE's operation fuser reduce
+        # inside TE, out of reach of the rank-order reduction.
+        (dict(tp_comm_overlap=True), "Userbuffers reduce-scatter overlaps"),
+        (
+            dict(tp_comm_overlap=True, **{**_NO_UB_REDUCE_SCATTER, "tp_comm_bulk_wgrad": True}),
+            "tp_comm_bulk_wgrad",
+        ),
+        (dict(use_transformer_engine_op_fuser=True), "use_transformer_engine_op_fuser"),
+        # Under triton and deepgemm the GEMM that replaces TE's cannot run Userbuffers at all.
+        (
+            dict(tp_comm_overlap=True, batch_invariant_backend="triton", **_NO_UB_REDUCE_SCATTER),
+            "only with batch_invariant_backend='te_native'",
+        ),
+    ],
+)
+def test_batch_invariant_rejects_tp_reductions_inside_te(overrides, match):
+    with pytest.raises(AssertionError, match=match):
+        _make_batch_invariant_config(tensor_model_parallel_size=4, **overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        # The all-gather overlaps sum nothing, at any TP.
+        dict(tensor_model_parallel_size=4, tp_comm_overlap=True, **_NO_UB_REDUCE_SCATTER),
+        # With two ranks each element is a single add.
+        dict(tensor_model_parallel_size=2, tp_comm_overlap=True),
+        dict(tensor_model_parallel_size=2, use_transformer_engine_op_fuser=True),
+    ],
+)
+def test_batch_invariant_accepts_tp_communication_without_te_internal_reductions(overrides):
+    _make_batch_invariant_config(**overrides)
+
+
+def test_batch_invariant_rejects_userbuffers_under_substituted_gemms():
+    with pytest.raises(AssertionError, match="only with batch_invariant_backend='te_native'"):
+        _make_batch_invariant_config(
+            tensor_model_parallel_size=2, tp_comm_overlap=True, batch_invariant_backend="deepgemm"
+        )
