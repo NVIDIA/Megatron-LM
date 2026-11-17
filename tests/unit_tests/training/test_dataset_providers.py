@@ -34,15 +34,43 @@ from megatron.training.argument_utils import (
 from megatron.training.arguments import parse_args, validate_args
 from megatron.training.config import container as container_module
 from megatron.training.datasets import providers, sft_dataset, varlen_dataset
-from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset, SFTDatasetConfig
 from megatron.training.models import GPTModelConfig
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.training import legacy_dataset_factories as legacy
 
+
+def test_sft_truncates_conversations_before_packing():
+    tokenizer = SimpleNamespace(
+        pad=0,
+        eod=99,
+        tokenize_conversation=lambda *a, **kw: (torch.arange(1, 11), torch.arange(1, 11)),
+    )
+    config = SFTDatasetConfig(
+        random_seed=1234,
+        sequence_length=4,
+        packed_sequence_length=12,
+        tokenizer=tokenizer,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+        create_attention_mask=False,
+    )
+    dataset = object.__new__(SFTDataset)
+    dataset.config = config
+    dataset.dataset = [[{"role": "system"}, {"role": "user"}, {"role": "system"}, {"role": "user"}]]
+    dataset.indices = [0]
+    dataset.padding_divisor = 1
+    sample = dataset[0]
+    assert sample["tokens"].tolist() == [1, 2, 3, 4, 1, 2, 3, 4, 0, 0, 0, 0]
+    assert sample["cu_seqlens"][:3].tolist() == [0, 4, 12]
+    assert sample["loss_mask"][-4:].tolist() == [0, 0, 0, 0]
+
+
 MODEL_ARGV = (
     "--num-layers 2 --hidden-size 128 --num-attention-heads 8 --micro-batch-size 1 "
     "--global-batch-size 8 --seq-length 32 --max-position-embeddings 32 "
-    "--tokenizer-type NullTokenizer --vocab-size 2048"
+    "--tokenizer-type NullTokenizer --vocab-size 2048 --no-create-attention-mask-in-dataloader"
 ).split()
 
 # Applied to the validated arguments and mirrored into the container's model and validation
@@ -343,10 +371,18 @@ def test_entry_points_build_the_dataset_config_pretrain_gpt_built(
         # FIM runtime wrapper pretrain_gpt built around an SFT / varlen dataset is gone.
         assert isinstance(expected, GPTFIMDatasetConfig)
         assert not isinstance(actual, GPTFIMDatasetConfig)
-        names = [f.name for f in fields(GPTDatasetConfig)]
+        names = [f.name for f in fields(actual) if f.name != "packed_sequence_length"]
     else:
-        assert isinstance(actual, type(expected))
-        names = [f.name for f in fields(expected)]
+        expected_config_type = (
+            SFTDatasetConfig
+            if args.sft
+            else GPTFIMDatasetConfig if args.fim_data else GPTDatasetConfig
+        )
+        assert type(actual) is expected_config_type
+        names = [f.name for f in fields(actual) if f.name != "packed_sequence_length"]
+    if dataset_class in (SFTDataset, MockSFTDataset):
+        # Physical pack width is now derived independently of the content limit.
+        assert actual.packed_sequence_length == expected.sequence_length
     assert _signature(actual, names) == _signature(expected, names)
     if entry_point == "prepare_cache":
         return
@@ -393,12 +429,14 @@ def test_fields_the_legacy_factories_left_out_are_forwarded(monkeypatch, corpus,
         actual = _entry_point(entry_point).core_gpt_dataset_config_from_args(args)
     else:
         _, actual, _ = _ready(cfg).builder_inputs()
-    names = [f.name for f in fields(GPTDatasetConfig) if f.name != "tokenizer"]
+    names = [
+        f.name for f in fields(actual) if f.name not in ("tokenizer", "packed_sequence_length")
+    ]
     changed = {name for name in names if getattr(actual, name) != getattr(own, name)}
     if entry_point == "hybrid_flex":
-        assert changed - set(LAYOUT_FIELDS) == LEGACY_OMISSIONS[entry_point]
+        assert changed - set(LAYOUT_FIELDS) == (LEGACY_OMISSIONS[entry_point] & set(names))
     else:
-        assert changed == LEGACY_OMISSIONS[entry_point]
+        assert changed == (LEGACY_OMISSIONS[entry_point] & set(names))
     expected = legacy.legacy_gpt_dataset_config(args)
     expected.validate()  # Megatron Core's checks and derivations, which the builder runs
     assert {n: getattr(actual, n) for n in names} == {n: getattr(expected, n) for n in names}
@@ -415,7 +453,7 @@ def test_hybrid_flex_rejects_the_varlen_family(monkeypatch, warnings_log, corpus
     assert warnings_log == []
     _, cfg, _ = _prepare(monkeypatch, *corpus["sft"], "hybrid_flex")
     data = _ready(cfg)
-    assert data.dataset_type is SFTDataset and type(data.dataset) is GPTDatasetConfig
+    assert data.dataset_type is SFTDataset and type(data.dataset) is SFTDatasetConfig
 
 
 @pytest.mark.parametrize("entry_point", ["gpt", "hybrid", "hybrid_flex"])
@@ -524,8 +562,9 @@ class TestProvidersBuildMockDatasets:
         args, cfg, _ = _prepare(monkeypatch, *corpus[case])
         data = _ready(cfg)
         plain = data.dataset
-        shared = {f.name: getattr(plain, f.name) for f in fields(GPTDatasetConfig) if f.init}
-        wrapped = GPTFIMDatasetConfig(
+        old_config = legacy.legacy_gpt_dataset_config(args)
+        shared = {f.name: getattr(old_config, f.name) for f in fields(old_config) if f.init}
+        wrapped = legacy.GPTFIMDatasetConfig(
             **shared,
             fim_rate=0.9,
             fim_spm_rate=0.4,

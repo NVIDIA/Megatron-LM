@@ -21,6 +21,7 @@ from megatron.core.num_microbatches_calculator import (
     unset_num_microbatches_calculator,
 )
 from megatron.training.dist_signal_handler import DistributedSignalHandler
+from megatron.training.sequence_lengths import get_dataset_input_length
 from megatron.training.state import TrainState
 
 _GLOBAL_ARGS = None
@@ -220,6 +221,9 @@ def initialize_runtime_services(
 
 def initialize_training_runtime_services(args: Namespace) -> None:
     """Initialize training-only services after the shared runtime services."""
+    # Model imports depend on training globals, so defer until startup.
+    from megatron.training.models import T5ModelConfig
+
     cfg = get_run_config()
     if cfg.train.step_batch_size_schedule is not None:
         # Imported here, as elsewhere in this module: megatron.training.utils imports back
@@ -227,6 +231,7 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         from megatron.training.utils import print_rank_0
         print_rank_0(f'> using step batch size schedule: {cfg.train.step_batch_size_schedule}')
 
+    dataset = cfg.data.dataset
     init_num_microbatches_calculator(
         rank=args.rank,
         global_batch_size=cfg.train.global_batch_size,
@@ -235,7 +240,13 @@ def initialize_training_runtime_services(args: Namespace) -> None:
         data_parallel_size=cfg.get_batch_parallel_size(),
         decrease_batch_size_if_needed=cfg.train.decrease_batch_size_if_needed,
         step_batch_size_schedule=cfg.train.step_batch_size_schedule,
-        seq_length=cfg.sample_length,
+        seq_length=(
+            get_dataset_input_length(dataset)
+            if dataset is not None
+            else cfg.model.encoder_seq_length
+            if isinstance(cfg.model, T5ModelConfig)
+            else cfg.model.transformer.max_seq_length_per_sample
+        ),
     )
     _set_tensorboard_writer(args)
     _set_one_logger(args)
@@ -566,6 +577,8 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
     by construction, rather than two independently-written implementations that
     could silently drift apart as args evolve.
     """
+    from megatron.training.models import T5ModelConfig
+
     # Attach training config as resource attributes so they appear as
     # Process tags in Jaeger, making it easy to identify and compare runs.
     cfg = get_run_config()
@@ -589,10 +602,18 @@ def build_telemetry_resource_attrs(args, *, include_training: bool = True):
         val = getattr(args, arg_name, None)
         if val is not None:
             resource_attrs[attr] = val
-    # The per-sample length: training reads the container's (the dataset's, or the model's
-    # per-sample maximum for a loader-only section); inference keeps its CLI boundary.
-    # Skipped like any other unset field.
-    sequence_length = cfg.sample_length if include_training else getattr(args, 'seq_length', None)
+    # Loader telemetry describes dataset rows, not VLM's expanded model input.
+    if include_training:
+        dataset = cfg.data.dataset
+        sequence_length = (
+            get_dataset_input_length(dataset)
+            if dataset is not None
+            else cfg.model.encoder_seq_length
+            if isinstance(cfg.model, T5ModelConfig)
+            else cfg.model.transformer.max_seq_length_per_sample
+        )
+    else:
+        sequence_length = getattr(args, 'seq_length', None)
     if sequence_length is not None:
         resource_attrs['dl.sequence_length'] = sequence_length
 

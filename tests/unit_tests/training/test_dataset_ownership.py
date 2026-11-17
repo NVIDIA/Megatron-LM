@@ -41,7 +41,7 @@ from megatron.training.config import container as container_module
 from megatron.training.config.dataset_config import CONTAINER_WRITTEN_FIELDS
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
-from megatron.training.models import GPTModelConfig, LLaVAModelConfig
+from megatron.training.models import GPTModelConfig, LLaVAModelConfig, T5ModelConfig
 
 MODEL_ARGV = (
     "--num-layers 2 --hidden-size 128 --num-attention-heads 8 --micro-batch-size 1 "
@@ -64,7 +64,7 @@ CORE_DEFAULTS = {
 
 
 def _written_fields(dataset):
-    return {name: getattr(dataset, name) for name in CONTAINER_WRITTEN_FIELDS}
+    return {name: getattr(dataset, name) for name in CORE_DEFAULTS}
 
 
 @pytest.fixture(scope="module")
@@ -272,7 +272,9 @@ def test_dataset_class_follows_the_legacy_flag_precedence(
     gpt, with --mock-data (or no data source) selecting the family's mock class."""
     from megatron.training.datasets.varlen_dataset import VarlenDataset
 
-    data = gpt_data_config_from_args(_parse(["--seq-length", "32", *extra]))
+    data = gpt_data_config_from_args(
+        _parse(["--seq-length", "32", "--no-create-attention-mask-in-dataloader", *extra])
+    )
     expected = VarlenDataset if dataset_type is None else dataset_type
     assert data.dataset_type is expected
     assert isinstance(data.dataset, GPTFIMDatasetConfig) is fim_config
@@ -374,9 +376,17 @@ def test_standalone_config_takes_the_container_written_fields_from_args():
     owned = gpt_data_config_from_args(args).dataset
     assert _written_fields(owned) == CORE_DEFAULTS
     assert owned.random_seed == 99  # the seed is the section's own setting
-    assert set(argument_utils._container_written_fields_from_args(args)) == set(
-        CONTAINER_WRITTEN_FIELDS
+    assert set(argument_utils._container_written_fields_from_args(args)) == (
+        set(CONTAINER_WRITTEN_FIELDS) - {"packed_sequence_length"}
     )
+    sft_args = _validated(["--mock-data", "--sft", "--max-seq-length-per-sample", "64"])
+    standalone_sft = gpt_data_config_from_args(sft_args, standalone=True).dataset
+    assert standalone_sft.data_parallel_size == sft_args.data_parallel_size
+    assert standalone_sft.context_parallel_size == sft_args.context_parallel_size
+    assert standalone_sft.sequence_parallel_size == 0
+    assert standalone_sft.dynamic_context_parallel is False
+    assert standalone_sft.sequence_length == 32
+    assert standalone_sft.packed_sequence_length == 64
 
 
 def test_requested_family_precedence(warnings_log):
@@ -446,7 +456,8 @@ def test_run_config_fixture_is_loader_only(run_config, monkeypatch):
 
 def test_container_writes_the_owned_fields_at_finalize(container_factory, monkeypatch):
     args, cfg = container_factory(
-        ["--seq-length", "64", "--mock-data", "--seed", "99", "--full-validation"], data=True
+        ["--seq-length", "64", "--mock-data", "--sft", "--seed", "99", "--full-validation"],
+        data=True,
     )
     dataset = cfg.data.dataset
     assert args.seed == 99 and cfg.rng.seed == 99 and dataset.random_seed == 99
@@ -476,7 +487,7 @@ def test_container_writes_the_owned_fields_at_finalize(container_factory, monkey
     assert dataset.full_validation is True and dataset.multiple_validation_sets is True
     assert (dataset.context_parallel_size, dataset.sequence_parallel_size) == (2, 2)
     assert dataset.dynamic_context_parallel is True and dataset.data_parallel_size == 2
-    assert cfg.data.dataset_type is MockGPTDataset
+    assert cfg.data.dataset_type is MockSFTDataset
     assert not (set(CONTAINER_WRITTEN_FIELDS) & set(cfg.to_dict()["data"]["dataset"]))
     assert cfg.to_dict()["data"]["dataset"]["random_seed"] == 99
     cfg.validate()  # the written values agree with their owners
@@ -488,7 +499,7 @@ def test_a_layout_field_at_core_default_carries_no_explicit_value(container_fact
     """The layout fields keep Megatron Core's fields and defaults (1, 0, False): a value equal to
     the default is not an explicit value, so it agrees with any layout and is written over; a
     different value must agree with the layout."""
-    _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
+    _, cfg = container_factory(["--seq-length", "64", "--mock-data", "--sft"], data=True)
     dataset = cfg.data.dataset
     cfg.model = _layout(
         tensor_model_parallel_size=2,
@@ -511,7 +522,7 @@ def test_a_layout_field_at_core_default_carries_no_explicit_value(container_fact
 
 def test_model_owned_dataset_layout_survives_a_reload(container_factory, monkeypatch, tokenizer):
     """Reloading reconstructs dataset layout from the authoritative model section."""
-    _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
+    _, cfg = container_factory(["--seq-length", "64", "--mock-data", "--sft"], data=True)
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 8)
     cfg.finalize()
     cfg.data.bind_tokenizer(tokenizer)
@@ -527,7 +538,7 @@ def test_model_owned_dataset_layout_survives_a_reload(container_factory, monkeyp
 def test_dataset_layout_requires_a_model_section(container_factory):
     """A dataset's layout fields cannot replace the required model owner."""
     _, cfg = container_factory(
-        ["--seq-length", "64", "--mock-data", "--full-validation"], data=True
+        ["--seq-length", "64", "--mock-data", "--sft", "--full-validation"], data=True
     )
     cfg.model = None
     dataset = cfg.data.dataset
@@ -557,10 +568,11 @@ def test_each_owned_field_is_checked_against_its_owner(container_factory, field,
     """One explicit check per field: a value given on the dataset config must agree with the
     section that owns it (data_parallel_size needs the world size and is checked at finalize())."""
     _, cfg = container_factory(
-        ["--seq-length", "64", "--mock-data", "--full-validation"], data=True
+        ["--seq-length", "64", "--mock-data", "--sft", "--full-validation"], data=True
     )
     cfg.model = _layout(tensor_model_parallel_size=2, context_parallel_size=2)
     cfg.validate()
+    assert hasattr(cfg.data.dataset, field)
     setattr(cfg.data.dataset, field, value)
     with pytest.raises(ValueError, match=re.escape(message)):
         cfg.validate()
@@ -612,11 +624,16 @@ def test_get_data_parallel_size_rejects_an_indivisible_world(container_factory):
         cfg.get_parallel_layout(12)
 
 
-def test_model_capacity_must_cover_the_sample_length(container_factory):
+@pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope", "yarn"])
+def test_model_capacity_must_cover_the_sample_length(container_factory, position_embedding_type):
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
     cfg.model = _layout()
+    cfg.model.position_embedding_type = position_embedding_type
     cfg.model.seq_length = 32
-    with pytest.raises(ValueError, match="model.seq_length \\(32"):
+    if position_embedding_type == "learned_absolute":
+        with pytest.raises(ValueError, match="model.seq_length \\(32"):
+            cfg.validate()
+    else:
         cfg.validate()
     cfg.model.seq_length = 64
     cfg.validate()
@@ -625,33 +642,57 @@ def test_model_capacity_must_cover_the_sample_length(container_factory):
         cfg.validate()
 
 
-def test_the_model_per_sample_maximum_covers_the_dataset(container_factory, monkeypatch):
-    """model.transformer.max_seq_length_per_sample is Megatron Core's per-sample maximum, a bound:
-    unset, the container fills it from the dataset's sequence_length at finalize(); a larger
-    explicit value stays (the loop reads the dataset's length, cfg.sample_length); a smaller one
-    is rejected at validation. The launcher fills both from --seq-length."""
+@pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope", "yarn"])
+def test_cli_position_capacity_only_limits_learned_embeddings(position_embedding_type, monkeypatch):
+    warnings = []
+    monkeypatch.setattr(arguments, "warn_rank_0", warnings.append)
+    extra = ["--seq-length", "64", "--position-embedding-type", position_embedding_type]
+    if position_embedding_type == "learned_absolute":
+        with pytest.raises(AssertionError, match="max_position_embeddings"):
+            _validated(extra)
+        # The legacy flag overrides the learned-absolute selection.
+        extra.append("--use-rotary-position-embeddings")
+    args = _validated(extra)
+    assert args.max_position_embeddings == 32
+    assert args.seq_length == 64
+    assert any("checkpoint/export context-length" in warning for warning in warnings)
+
+
+@pytest.mark.parametrize("family_flag", ["--sft", "--use-varlen-dataset"])
+@pytest.mark.parametrize(
+    "unsupported_flag", [None, "--reset-position-ids", "--reset-attention-mask"]
+)
+def test_online_dataset_cli_reports_unsupported_masks(family_flag, unsupported_flag):
+    extra = [family_flag, *SOURCE, "--calculate-per-token-loss"]
+    if unsupported_flag is not None:
+        extra += ["--no-create-attention-mask-in-dataloader", unsupported_flag]
+    args = _validated(extra)
+    with pytest.raises(
+        ValueError,
+        match="--no-create-attention-mask-in-dataloader.*--reset-position-ids.*--reset-attention-mask",
+    ):
+        gpt_data_config_from_args(args)
+
+
+def test_the_run_execution_length_matches_fixed_dataset_rows(container_factory, monkeypatch):
+    """Finalize an unset run length; reject either mismatch without mutating the config."""
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
     cfg.model = _layout()
     assert cfg.model.transformer.max_seq_length_per_sample is None
-    assert cfg.sample_length == 64
     cfg.validate()
     cfg.finalize()
     assert cfg.model.transformer.max_seq_length_per_sample == 64
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
-    cfg.model = _layout(max_seq_length_per_sample=128)  # a bound above the sample length
-    cfg.validate()
-    cfg.finalize()
-    assert cfg.model.transformer.max_seq_length_per_sample == 128  # kept, not overwritten
-    assert cfg.sample_length == 64  # the loop runs at the dataset's length
-    assert cfg.model_input_length == 64  # a GPT model declares no decoder length
-    cfg.model = _layout(max_seq_length_per_sample=32)
-    with pytest.raises(ValueError, match="max_seq_length_per_sample=32 is smaller than"):
-        cfg.validate()
+    for width in (128, 32):
+        cfg.model = _layout(max_seq_length_per_sample=width)
+        with pytest.raises(ValueError, match="must equal"):
+            cfg.validate()
+        assert cfg.model.transformer.max_seq_length_per_sample == width
     args = _validated(["--seq-length", "48", "--max-position-embeddings", "48", "--mock-data"])
     cfg = pretrain_cfg_container_from_args(args, data_cfg=gpt_data_config_from_args(args))
     assert cfg.model.transformer.max_seq_length_per_sample == 48
-    assert cfg.data.dataset.sequence_length == 48 == cfg.sample_length
+    assert cfg.data.dataset.sequence_length == 48
     cfg.validate()
 
 
@@ -797,8 +838,7 @@ def test_set_global_variables_finalizes_a_dataset_section(
 def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
     """dummy_train_step (the skip-iteration path) runs for any container: the batch flags come
     from the data section, the model-parallel values from the model section, the sample length
-    from the container (the dataset's, or the model's per-sample maximum without a dataset); the
-    poisoned namespace shows which source won."""
+    from the model's resolved run maximum; the poisoned namespace shows which source won."""
     from megatron.training import training
     from megatron.training.config import DataConfig
 
@@ -841,10 +881,11 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
         pipeline_model_parallel_size=4,
         dynamic_context_parallel=False,
         sequence_packing_scheduler=None,
+        max_seq_length_per_sample=64,
     )
 
     # A loader-only section (an entry point whose datasets come from its own callbacks): the
-    # length is the container's sample_length (the model's per-sample maximum, --seq-length),
+    # length is the model's per-sample maximum, resolved before startup,
     # the flags are the plain-GPT ones whatever args.sft says, the model-parallel values are the
     # model section's.
     monkeypatch.setattr(
@@ -854,7 +895,6 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
             model=SimpleNamespace(transformer=transformer),
             data=DataConfig(),
             train=train,
-            sample_length=64,
         ),
     )
     training.dummy_train_step(None)
@@ -878,6 +918,7 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
         pipeline_model_parallel_size=1,
         dynamic_context_parallel=True,
         sequence_packing_scheduler=None,
+        max_seq_length_per_sample=16,
     )
     monkeypatch.setattr(
         training,
@@ -886,7 +927,6 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
             model=SimpleNamespace(transformer=transformer),
             data=DataConfig(dataset=dataset, dataset_type=MockGPTDataset),
             train=train,
-            sample_length=16,  # the dataset's sequence_length
         ),
     )
     training.dummy_train_step(None)
@@ -968,9 +1008,14 @@ def test_varlen_datasets_and_the_packing_scheduler(container_factory):
     it); SBHD validation excludes one."""
     from megatron.training.config import DataConfig
 
-    bools = dict(reset_position_ids=False, reset_attention_mask=False, eod_mask_loss=False)
     _, cfg = container_factory(["--seq-length", "64"])
-    plain = GPTDatasetConfig(sequence_length=64, random_seed=1, **bools)
+    plain = GPTDatasetConfig(
+        sequence_length=64,
+        random_seed=1,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
+    )
     cfg.data = DataConfig(
         dataset=plain, dataset_type=MockVarlenDataset, dataloader=cfg.data.dataloader
     )
@@ -985,7 +1030,9 @@ def test_varlen_datasets_and_the_packing_scheduler(container_factory):
         blend=(["prefix-a"], None),
         split="9,1,0",
         varlen_sbhd_validation=True,
-        **bools,
+        reset_position_ids=False,
+        reset_attention_mask=False,
+        eod_mask_loss=False,
     )
     cfg.data = DataConfig(dataset=sbhd, dataset_type=VarlenDataset, dataloader=cfg.data.dataloader)
     with pytest.raises(ValueError, match="does not use a packing scheduler"):
@@ -1010,7 +1057,7 @@ def test_packed_buffer_budget_is_checked_at_finalize(container_factory, monkeypa
     budget must cover one sample; it needs the world size, so it runs at finalize(), before any
     derived field is written."""
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 4)
-    _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
+    _, cfg = container_factory(["--seq-length", "64", "--mock-data", "--sft"], data=True)
     cfg.model = _layout(
         context_parallel_size=2,
         sequence_packing_scheduler="dp_balanced",
@@ -1030,7 +1077,7 @@ def test_packed_buffer_budget_is_checked_at_finalize(container_factory, monkeypa
     )
     cfg.finalize()
     assert cfg.data.dataset.data_parallel_size == 2
-    _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
+    _, cfg = container_factory(["--seq-length", "64", "--mock-data", "--sft"], data=True)
     cfg.model = _layout(  # 2 cp ranks * 2 replicas * 16 = 64 covers the sample
         context_parallel_size=2,
         dynamic_context_parallel=True,
@@ -1040,24 +1087,19 @@ def test_packed_buffer_budget_is_checked_at_finalize(container_factory, monkeypa
     cfg.finalize()
 
 
-def test_the_loop_reads_the_dataset_length_and_a_loader_only_section_the_model_maximum(
-    container_factory, monkeypatch
-):
-    """Four different numbers: the dataset's sequence_length (what the loop runs at, through
-    cfg.sample_length), a larger model per-sample maximum (Megatron Core's bound, never the
-    loop's length), a stale args.seq_length (never read) and the model capacity. The calculator
-    and the OTel resource attributes read cfg.sample_length. A loader-only section has no dataset:
-    its sample length is the model's per-sample maximum, which the launcher fills from
-    --seq-length; nothing reads the namespace."""
+def test_runtime_services_read_config_lengths_not_legacy_args(container_factory, monkeypatch):
+    """Runtime reads the resolved run length, not position capacity or stale CLI values.
+
+    Dataset token accounting retains T5 encoder rows and excludes VLM image expansion.
+    """
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
     args, cfg = container_factory(["--seq-length", "16", "--mock-data"], data=True)
     args.rank = 0  # the calculator takes the rank from the namespace
-    cfg.model = _layout(max_seq_length_per_sample=32)
+    cfg.model = _layout(max_seq_length_per_sample=16)
     cfg.model.seq_length = 128
     cfg.validate()
     cfg.finalize()
-    assert cfg.model.transformer.max_seq_length_per_sample == 32
-    assert cfg.sample_length == 16
+    assert cfg.model.transformer.max_seq_length_per_sample == 16
     args.seq_length = 64  # stale, must not be read
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
     assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 16
@@ -1087,65 +1129,63 @@ def test_the_loop_reads_the_dataset_length_and_a_loader_only_section_the_model_m
     loader_only = pretrain_cfg_container_from_args(args)
     assert loader_only.data.dataset is None
     assert loader_only.model.transformer.max_seq_length_per_sample == 64
-    assert loader_only.sample_length == 64
     args.seq_length = 999  # stale
     monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", loader_only)
     assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 64
     global_vars.initialize_training_runtime_services(args)
     assert calls.pop()["seq_length"] == 64
     loader_only.model.transformer.max_seq_length_per_sample = None
-    assert loader_only.sample_length is None
     assert "dl.sequence_length" not in global_vars.build_telemetry_resource_attrs(args)
 
+    # T5 dataset token accounting uses encoder rows, not the run's maximum across both sides.
+    loader_only.model = T5ModelConfig(
+        transformer=_layout(max_seq_length_per_sample=64).transformer,
+        seq_length=128,
+        encoder_num_layers=2,
+        encoder_seq_length=16,
+        decoder_seq_length=32,
+    )
+    global_vars.initialize_training_runtime_services(args)
+    assert calls.pop()["seq_length"] == 16
+    assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 16
 
-def test_a_vlm_runs_at_its_decoder_length(container_factory, monkeypatch):
-    """A VLM's data section is loader-only, so the loop's length is the model's per-sample
-    maximum. The launcher fills it from --seq-length, the text length; LLaVAModelConfig records
-    the decoder length (text, image tokens, CP/SP padding) and its finalize() makes it the
-    per-sample maximum before the runtime services, so the pipeline shapes, the TP-communicator
-    buffers, the estimators and the counters run at the decoder length."""
+
+@pytest.mark.parametrize("with_dataset", [False, True])
+@pytest.mark.parametrize("requested_length", [None, 96])
+def test_vlm_resolves_expanded_width_before_startup(monkeypatch, with_dataset, requested_length):
+    """Text rows and expanded model inputs stay distinct without a second VLM length field."""
     import pretrain_vlm
 
     monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 1)
-    args = _validated(
-        ["--seq-length", "64", "--decoder-seq-length", "96", "--max-position-embeddings", "128"]
-    )
-    model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
-    cfg = pretrain_cfg_container_from_args(args, model_cfg=model)
-    assert cfg.data.dataset is None
-    assert model.decoder_seq_length == 96  # --decoder-seq-length
-    assert cfg.sample_length == 64  # the text length until finalize()
-    assert cfg.model_input_length == 96  # the model side sees the decoder length from the start
-    cfg.validate()
-    cfg.finalize()
-    assert model.transformer.max_seq_length_per_sample == 96 == cfg.sample_length
-    assert cfg.model_input_length == 96
-    # A VLM whose data section carries a dataset: the data side keeps the text length, the model
-    # side the decoder length, before and after finalize(); the bound becomes the decoder length.
-    args = _validated(
-        ["--seq-length", "64", "--decoder-seq-length", "96", "--max-position-embeddings", "128",
-         "--mock-data"]
-    )  # fmt: skip
-    model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
-    cfg = pretrain_cfg_container_from_args(
-        args, model_cfg=model, data_cfg=gpt_data_config_from_args(args)
-    )
-    assert cfg.data.dataset.sequence_length == 64 == cfg.sample_length
-    assert cfg.model_input_length == 96
-    cfg.validate()
-    cfg.finalize()
-    assert model.transformer.max_seq_length_per_sample == 96
-    assert cfg.sample_length == 64 and cfg.model_input_length == 96
-    # Without --decoder-seq-length the VLM resolver derives the length and records it.
-    args = _validated(["--seq-length", "64", "--max-position-embeddings", "128"])
-    model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
-    assert model.decoder_seq_length is None
     monkeypatch.setattr(pretrain_vlm, "get_num_image_embeddings", lambda *a, **kw: 4)
     monkeypatch.setattr(pretrain_vlm.context_parallel, "get_padding", lambda *a: 0)
-    pretrain_vlm.set_vlm_sequence_lengths(args, model)
-    assert args.decoder_seq_length == 68 == model.decoder_seq_length
-    model.finalize()
-    assert model.transformer.max_seq_length_per_sample == 68
+    argv = MODEL_ARGV + ["--seq-length", "64", "--max-position-embeddings", "128", "--mock-data"]
+    if requested_length is not None:
+        argv += ["--decoder-seq-length", str(requested_length)]
+    with patch("sys.argv", ["test"] + argv):
+        args = validate_args(parse_args(extra_args_provider=pretrain_vlm.add_vlm_extra_args))
+    text_length, padding = pretrain_vlm.resolve_vlm_sequence_lengths(args)
+    width = requested_length or 68
+    assert (text_length, padding) == (64, width - 68)
+    model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
+    cfg = pretrain_cfg_container_from_args(
+        args, model_cfg=model, data_cfg=gpt_data_config_from_args(args) if with_dataset else None
+    )
+    assert not hasattr(model, "decoder_seq_length")
+    assert model.transformer.max_seq_length_per_sample == width
+    cfg.validate()
+    cfg.finalize()
+    assert model.transformer.max_seq_length_per_sample == width
+    if with_dataset:
+        assert cfg.data.dataset.sequence_length == 64
+        monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+        assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 64
+    saved = cfg.to_dict()
+    assert "decoder_seq_length" not in saved["model"]
+    restored = type(cfg).from_dict(saved)
+    restored.finalize()
+    assert restored.model.transformer.max_seq_length_per_sample == width
+    assert restored.to_dict() == saved
 
 
 @pytest.mark.parametrize("entry_point", ["gpt", "hybrid", "hybrid_flex"])
@@ -1188,7 +1228,6 @@ def test_get_batch_ignores_the_poisoned_data_arguments(monkeypatch, entry_point)
         model=SimpleNamespace(transformer=transformer),
         data=DataConfig(dataset=dataset, dataset_type=MockGPTDataset),
         train=SimpleNamespace(micro_batch_size=5),
-        sample_length=16,  # the dataset's sequence_length
     )
     args = SimpleNamespace(  # poisoned: none of these may reach the batch path
         sft=True,
@@ -1261,8 +1300,17 @@ def test_a_scheduler_selected_after_construction_needs_variable_seq_lengths(
     )
     if not scheduler_at_construction:
         transformer.sequence_packing_scheduler = "dp_balanced"  # after construction
-    _, cfg = container_factory(["--seq-length", "16", "--mock-data"], data=True)
-    cfg.data.dataset_type = MockVarlenDataset
+    _, cfg = container_factory(["--seq-length", "16", "--mock-data", "--sft"], data=True)
+    cfg.data = DataConfig(
+        dataset=GPTDatasetConfig(
+            random_seed=1,
+            sequence_length=16,
+            reset_position_ids=False,
+            reset_attention_mask=False,
+            eod_mask_loss=False,
+        ),
+        dataset_type=MockVarlenDataset,
+    )
     cfg.model = GPTModelConfig(transformer=transformer, seq_length=64, vocab_size=16)
     if scheduler_at_construction:
         assert transformer.variable_seq_lengths is True
@@ -1293,9 +1341,7 @@ def test_gpt_forward_step_uses_dataset_length_for_packed_metadata(monkeypatch, l
         reset_attention_mask=False,
         eod_mask_loss=False,
     )
-    cfg = SimpleNamespace(
-        data=DataConfig(dataset=dataset), model=SimpleNamespace(seq_length=64), sample_length=16
-    )
+    cfg = SimpleNamespace(data=DataConfig(dataset=dataset), model=SimpleNamespace(seq_length=64))
     cu_seqlens = torch.tensor([[0, 8, 16]], dtype=torch.int32)
     tokens = torch.zeros((1, 16), dtype=torch.long)
     batch = (

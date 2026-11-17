@@ -12,7 +12,7 @@ sys.path.append(
 )
 
 from dataloader_provider import is_first_or_last_stage, train_valid_test_dataloaders_provider
-from model import model_provider
+from model import model_provider, resolve_multimodal_sequence_lengths
 from multimodal_args import add_multimodal_extra_args
 
 from megatron.core import parallel_state, tensor_parallel
@@ -577,11 +577,18 @@ if __name__ == "__main__":
     )
     from megatron.training.argument_utils import model_config_from_args
 
+    resolve_multimodal_sequence_lengths(args)
     model_cfg = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
-    full_config = pretrain_cfg_container_from_args(args, model_cfg)
-    set_run_config(full_config)
+    train_valid_test_dataloaders_provider = partial(
+        train_valid_test_dataloaders_provider,
+        sequence_length=args.dataloader_seq_length,
+        packing_sequence_length=args.packing_seq_length,
+        image_token_budget=args.seq_length,
+    )
     train_valid_test_dataloaders_provider.is_distributed = True
     train_valid_test_dataloaders_provider.supports_train_full_dataset = True
+    full_config = pretrain_cfg_container_from_args(args, model_cfg)
+    set_run_config(full_config)
     pretrain(
         full_config,
         train_valid_test_dataloaders_provider,

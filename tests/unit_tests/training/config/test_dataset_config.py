@@ -24,10 +24,14 @@ from megatron.training.config.dataset_config import (
     is_packed_sequence,
     resolve_dataset_class,
 )
-from megatron.training.config.instantiate_utils import InstantiationMode, instantiate
+from megatron.training.config.instantiate_utils import (
+    InstantiationException,
+    InstantiationMode,
+    instantiate,
+)
 from megatron.training.config.utils import sanitize_dataclass_config, serialize_value
 from megatron.training.config.yaml_utils import safe_yaml_representers
-from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset, SFTDatasetConfig
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 
 BOOLS = dict(reset_position_ids=False, reset_attention_mask=False, eod_mask_loss=False)
@@ -35,10 +39,12 @@ BLEND = (["prefix-a", "prefix-b"], [0.3, 0.7])
 FIM_TOKENS = {"prefix": "<p>", "middle": "<m>", "suffix": "<s>", "pad": "<x>", "eod": "<e>"}
 
 
-def _dataset(**overrides):
-    kwargs = dict(sequence_length=16, random_seed=1234, **BOOLS)
+def _dataset(cls=GPTDatasetConfig, **overrides):
+    kwargs = dict(sequence_length=16, random_seed=1234)
+    if issubclass(cls, GPTDatasetConfig):
+        kwargs.update(BOOLS)
     kwargs.update(overrides)
-    return GPTDatasetConfig(**kwargs)
+    return cls(**kwargs)
 
 
 def _fim(**overrides):
@@ -119,7 +125,11 @@ def test_bind_tokenizer_runs_megatron_cores_checks(tokenizer):
         DataConfig(dataset=_dataset(reset_position_ids=None)).validate()
     with pytest.raises(AssertionError):
         DataConfig(dataset=_dataset(reset_position_ids=None)).bind_tokenizer(tokenizer)
-    sbhd = DataConfig(dataset=_dataset(varlen_sbhd_validation=True, dynamic_context_parallel=True))
+    sbhd = DataConfig(
+        dataset=_dataset(
+            GPTDatasetConfig, varlen_sbhd_validation=True, dynamic_context_parallel=True
+        )
+    )
     with pytest.raises(AssertionError, match="varlen-sbhd-validation"):
         sbhd.validate()
     with pytest.raises(AssertionError, match="varlen-sbhd-validation"):
@@ -183,12 +193,14 @@ def test_container_written_fields_are_the_layout_and_the_validation_flags():
     """The six fields other sections own, left at Megatron Core's defaults until the container
     writes them; the seed is the section's own setting, not one of them."""
     assert CONTAINER_WRITTEN_FIELDS == (
+        "packed_sequence_length",
         "data_parallel_size", "context_parallel_size", "sequence_parallel_size",
         "dynamic_context_parallel",
         "multiple_validation_sets", "full_validation",
     )  # fmt: skip
-    defaults = {f.name: f.default for f in fields(GPTDatasetConfig)}
+    defaults = {f.name: f.default for f in fields(SFTDatasetConfig)}
     assert {name: defaults[name] for name in CONTAINER_WRITTEN_FIELDS} == {
+        "packed_sequence_length": None,
         "data_parallel_size": 1, "context_parallel_size": None, "sequence_parallel_size": 0,
         "dynamic_context_parallel": False,
         "multiple_validation_sets": None, "full_validation": None,
@@ -198,8 +210,7 @@ def test_container_written_fields_are_the_layout_and_the_validation_flags():
 
 def test_to_cfg_dict_omits_tokenizer_owned_and_derived_fields(tokenizer):
     data = DataConfig(
-        dataset=_dataset(blend=BLEND, split="9,1,0", data_parallel_size=4, full_validation=True),
-        dataset_type=GPTDataset,
+        dataset=_dataset(blend=BLEND, split="9,1,0", full_validation=True), dataset_type=GPTDataset
     )
     before = data.to_cfg_dict()
     assert before["_target_"] == "megatron.training.config.dataset_config.DataConfig"
@@ -218,7 +229,7 @@ def test_to_cfg_dict_omits_tokenizer_owned_and_derived_fields(tokenizer):
         sanitize_dataclass_config(copy.deepcopy(before)), mode=InstantiationMode.STRICT
     )
     assert type(restored) is DataConfig and type(restored.dataset) is GPTDatasetConfig
-    assert restored.dataset.tokenizer is None and restored.dataset.data_parallel_size == 1
+    assert restored.dataset.tokenizer is None
     assert restored.dataset.full_validation is None and restored.dataset.random_seed == 1234
     assert restored.to_cfg_dict() == before
     fim = DataConfig(dataset=_fim()).to_cfg_dict()["dataset"]
@@ -260,6 +271,12 @@ def test_data_section_round_trips_through_yaml_with_the_class():
 
 
 def test_implicit_class_resolution():
+    sft = _dataset(SFTDatasetConfig)
+    assert resolve_dataset_class(sft, None) is MockSFTDataset
+    sft.blend, sft.split = BLEND, "1,1,1"
+    assert resolve_dataset_class(sft, None) is SFTDataset
+    with pytest.raises(ValueError, match="SFTDatasetConfig requires"):
+        resolve_dataset_class(sft, GPTDataset)
     assert resolve_dataset_class(_dataset(blend=BLEND, split="1,1,1"), None) is GPTDataset
     assert resolve_dataset_class(_dataset(), None) is MockGPTDataset
     assert (
@@ -280,15 +297,15 @@ def test_implicit_class_resolution():
         (_dataset(), GPTDataset, "select MockGPTDataset"),
         (_dataset(), VarlenDataset, "select MockVarlenDataset"),
         (_fim(blend=None, split=None), GPTFIMDataset, "no mock dataset for the fim family"),
-        (_dataset(blend=BLEND, split="1,1,1"), GPTFIMDataset, "go together"),
-        (_fim(), GPTDataset, "go together"),
-        (_fim(), SFTDataset, "go together"),
-        (_dataset(varlen_sbhd_validation=True), MockVarlenDataset, "requires real data"),
+        (_dataset(blend=BLEND, split="1,1,1"), GPTFIMDataset, "requires"),
+        (_fim(), GPTDataset, "requires"),
+        (_fim(), SFTDataset, "requires"),
+        (_dataset(GPTDatasetConfig, varlen_sbhd_validation=True), MockVarlenDataset, "requires real data"),
         (_dataset(), object, "must be one of the dataset classes"),
         (_dataset(), "GPTDataset", "must be one of the dataset classes"),
     ],
 )  # fmt: skip
-def test_explicit_class_must_match_the_config(dataset, dataset_type, message):
+def test_selected_class_must_match_the_config(dataset, dataset_type, message):
     with pytest.raises(ValueError, match=message):
         resolve_dataset_class(dataset, dataset_type)
 
@@ -298,15 +315,33 @@ def test_explicit_class_must_match_the_config(dataset, dataset_type, message):
     [
         (_dataset(blend=BLEND, split="1,1,1"), GPTDataset),
         (_dataset(), MockGPTDataset),
-        (_dataset(blend=BLEND, split="1,1,1"), SFTDataset),
-        (_dataset(), MockSFTDataset),
-        (_dataset(), MockVarlenDataset),
-        (_dataset(blend=BLEND, split="1,1,1", varlen_sbhd_validation=True), VarlenDataset),
+        (_dataset(SFTDatasetConfig, blend=BLEND, split="1,1,1"), SFTDataset),
+        (_dataset(SFTDatasetConfig), MockSFTDataset),
+        (_dataset(GPTDatasetConfig), MockVarlenDataset),
+        (
+            _dataset(GPTDatasetConfig, blend=BLEND, split="1,1,1", varlen_sbhd_validation=True),
+            VarlenDataset,
+        ),
         (_fim(), GPTFIMDataset),
     ],
 )
 def test_explicit_classes_accepted(dataset, dataset_type):
     assert resolve_dataset_class(dataset, dataset_type) is dataset_type
+
+
+def test_varlen_sbhd_validation_excludes_dynamic_cp(tokenizer):
+    cfg = _dataset(
+        GPTDatasetConfig,
+        tokenizer=tokenizer,
+        varlen_sbhd_validation=True,
+        dynamic_context_parallel=True,
+    )
+    with pytest.raises(AssertionError, match="varlen-sbhd-validation"):
+        cfg.validate()
+    with pytest.raises(AssertionError, match="varlen-sbhd-validation"):
+        cfg.validate_without_tokenizer()
+    cfg.dynamic_context_parallel = False
+    cfg.validate()
 
 
 def test_class_table_and_packedness():
@@ -317,8 +352,12 @@ def test_class_table_and_packedness():
         dataset_type_from_family("bert", mock=False)
     plain = _dataset()
     assert is_packed_sequence(SFTDataset, plain) and is_packed_sequence(MockSFTDataset, plain)
-    assert is_packed_sequence(VarlenDataset, plain) and is_packed_sequence(MockVarlenDataset, plain)
-    assert not is_packed_sequence(VarlenDataset, _dataset(varlen_sbhd_validation=True))
+    assert is_packed_sequence(VarlenDataset, _dataset(GPTDatasetConfig)) and is_packed_sequence(
+        MockVarlenDataset, _dataset(GPTDatasetConfig)
+    )
+    assert not is_packed_sequence(
+        VarlenDataset, _dataset(GPTDatasetConfig, varlen_sbhd_validation=True)
+    )
     assert not is_packed_sequence(GPTDataset, plain) and not is_packed_sequence(
         GPTFIMDataset, plain
     )
@@ -342,11 +381,12 @@ def test_sample_predicates_and_the_collate_term_per_family(
     """is_sft() is the SFT family exactly, is_packed_sequence the THD metadata (SFT and unpacked
     varlen), yields_unpacked_samples() the loader's identity-collate term (unpacked varlen only):
     SFT samples are packed but fixed-width and must go through the default collate."""
-    data = DataConfig(dataset=_dataset(**overrides), dataset_type=dataset_type)
+    config_cls = SFTDatasetConfig if is_sft else GPTDatasetConfig
+    data = DataConfig(dataset=_dataset(config_cls, **overrides), dataset_type=dataset_type)
     assert data.is_sft() is is_sft
     assert is_packed_sequence(dataset_type, data.dataset) is packed
     assert data.yields_unpacked_samples() is unpacked
-    assert data.dataset.inter_document_masking is False and data.dataset.create_attention_mask
+    assert data.creates_attention_mask() is (dataset_type in (GPTDataset, MockGPTDataset))
     assert data.has_cu_seqlens() is is_sft and data.use_per_sequence_balancing() is False
 
 
@@ -358,9 +398,7 @@ def test_sample_predicate_formulas_and_fim():
     assert masked.dataset_type is None  # resolved read-only: nothing committed
     assert masked.is_sft() is False
     assert masked.dataset.create_attention_mask is False
-    sft_masked = DataConfig(
-        dataset=_dataset(inter_document_masking=True), dataset_type=MockSFTDataset
-    )
+    sft_masked = DataConfig(dataset=_dataset(SFTDatasetConfig), dataset_type=MockSFTDataset)
     assert sft_masked.has_cu_seqlens() is True and sft_masked.use_per_sequence_balancing() is False
     fim = DataConfig(dataset=_fim(), dataset_type=GPTFIMDataset)
     assert not is_packed_sequence(GPTFIMDataset, fim.dataset) and not fim.yields_unpacked_samples()
@@ -412,7 +450,7 @@ def test_finalize_commits_the_class_and_dataset_build_needs_the_tokenizer(tokeni
     assert dataset_type is MockGPTDataset and config is data.dataset and packed is False
     data.finalize()  # idempotent
     assert data.dataset_type is MockGPTDataset
-    sft = DataConfig(dataset=_dataset(), dataset_type=MockSFTDataset)
+    sft = DataConfig(dataset=_dataset(SFTDatasetConfig), dataset_type=MockSFTDataset)
     sft.validate()
     sft.finalize()
     sft.bind_tokenizer(tokenizer)
@@ -428,6 +466,48 @@ def test_dataloader_config_validation():
     loader.validate()
     loader.finalize()
     assert loader.dataloader_type == "single" and loader.persistent_workers is True
+
+
+@pytest.mark.parametrize(
+    "config_cls,dataset_type,owned_field,unused_field",
+    [
+        (
+            SFTDatasetConfig,
+            MockSFTDataset,
+            "sft_mock_dataset_config_json",
+            "varlen_mock_dataset_config_json",
+        ),
+        (
+            GPTDatasetConfig,
+            MockVarlenDataset,
+            "varlen_mock_dataset_config_json",
+            "sft_mock_dataset_config_json",
+        ),
+    ],
+)
+def test_legacy_union_schema_loads_as_the_selected_family(
+    config_cls, dataset_type, owned_field, unused_field, caplog
+):
+    section = DataConfig(dataset=_dataset()).to_cfg_dict()
+    section["dataset_type"] = {
+        "_target_": f"{dataset_type.__module__}.{dataset_type.__qualname__}",
+        "_call_": False,
+    }
+    section["dataset"].update({owned_field: '{"seed": 7}', unused_field: '{}'})
+    original = copy.deepcopy(section)
+    restored = instantiate(sanitize_dataclass_config(section), mode=InstantiationMode.STRICT)
+    assert section == original  # loading does not mutate the checkpoint dictionary
+    assert type(restored.dataset) is config_cls
+    assert getattr(restored.dataset, owned_field) == '{"seed": 7}'
+    assert getattr(restored.dataset, unused_field) == "{}"
+    assert "Dropping legacy fields" not in caplog.text
+    restored.validate()
+    saved = restored.to_cfg_dict()
+    reloaded = instantiate(sanitize_dataclass_config(saved), mode=InstantiationMode.STRICT)
+    assert reloaded.to_cfg_dict() == saved
+    section["dataset"]["unknown_dataset_field"] = 1
+    with pytest.raises(InstantiationException, match="unknown_dataset_field"):
+        instantiate(sanitize_dataclass_config(section), mode=InstantiationMode.STRICT)
 
 
 def test_legacy_derived_keys_are_dropped_on_load():

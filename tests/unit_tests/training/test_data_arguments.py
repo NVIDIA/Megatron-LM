@@ -125,7 +125,7 @@ def test_legacy_mixed_fim_flags_still_validate(warnings_log):
         ["--sft", "--fim-data"],
         ["--use-varlen-dataset", "--fim-data", "--calculate-per-token-loss"],
     ):
-        args = _validated([*extra, "--data-path", "a"])
+        args = _validated([*extra, "--data-path", "a", "--no-create-attention-mask-in-dataloader"])
         assert args.fim_data is True
         data = gpt_data_config_from_args(args)
         data.validate()
@@ -156,7 +156,13 @@ def test_validate_args_rejects_contradictory_data_flags(extra, message):
         ["--train-data-path", "a", "--valid-data-path", "b", "--test-data-path", "c"],
         ["--sft", "--mock-data", "--sft-mock-dataset-config-json", "{}"],
         ["--use-varlen-dataset", "--mock-data", "--calculate-per-token-loss"],
-        ["--use-varlen-dataset", "--data-path", "a", "--varlen-sbhd-validation"],
+        [
+            "--use-varlen-dataset",
+            "--data-path",
+            "a",
+            "--varlen-sbhd-validation",
+            "--no-create-attention-mask-in-dataloader",
+        ],
         ["--fim-data", "--data-path", "a", "--fim-rate", "0.9"],
         ["--train-data-path", "a", "--data-cache-path", "/c", "--dataloader-fast-cache-load"],
         ["--data-path", "a", "--dataloader-inter-document-masking", "--reset-position-ids"],
@@ -172,7 +178,9 @@ def test_data_section_accepts_everything_validate_args_accepts(warnings_log, ext
     data.validate()
     data.finalize()
     assert isinstance(data.dataset, GPTFIMDatasetConfig) is bool(args.fim_data)
-    assert data.dataset.create_attention_mask == args.create_attention_mask_in_dataloader
+    assert data.creates_attention_mask() == (
+        args.create_attention_mask_in_dataloader and not (args.sft or args.use_varlen_dataset)
+    )
     assert data.dataloader.dataloader_type == args.dataloader_type
     assert data.dataset_type is not None
 

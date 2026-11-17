@@ -9,6 +9,7 @@ from unittest import mock
 import pytest
 
 from megatron.training import training as training_mod
+from megatron.training.models import T5ModelConfig
 
 
 @pytest.fixture(autouse=True)
@@ -94,10 +95,22 @@ def test_train_step_returns_scheduled_microbatch_count():
     assert captured['data_iterator'] is packed_iterator
 
 
-def test_train_step_forwards_schedule_plumbing():
+@pytest.mark.parametrize("encoder_decoder", [False, True])
+def test_train_step_forwards_schedule_plumbing(run_config, encoder_decoder):
+    run_config.model.transformer.max_seq_length_per_sample = 32
+    if encoder_decoder:
+        run_config.model = T5ModelConfig(
+            transformer=run_config.model.transformer,
+            seq_length=128,
+            encoder_num_layers=2,
+            encoder_seq_length=32,
+            decoder_seq_length=16,
+        )
     p2p, pg = object(), object()
     captured = _run(p2p_communicator=p2p, pg_collection=pg)
     assert captured["p2p_communicator"] is p2p and captured["pg_collection"] is pg
+    assert captured["seq_length"] == 32
+    assert "decoder_seq_length" not in captured
 
 
 def test_train_step_defaults_to_none():

@@ -2,15 +2,16 @@
 """The ``data`` section of ``PretrainConfigContainer``: Megatron Core's GPT dataset config, the loader
 settings and the dataset class.
 
-``DataConfig.dataset`` is ``megatron.core.datasets.gpt_dataset.GPTDatasetConfig`` itself (or its FIM
-subclass), the object ``BlendedMegatronDatasetBuilder`` consumes, constructed from the arguments or
+``DataConfig.dataset`` is Core's ``GPTDatasetConfig`` or its FIM subclass, or training's
+``SFTDatasetConfig`` subclass, the object ``BlendedMegatronDatasetBuilder`` consumes,
+constructed from the arguments or
 a YAML file before the tokenizer exists: nothing runs at construction, Core's checks that need no
 tokenizer (``validate_without_tokenizer()``) run at ``cfg.validate()``, and the complete
 ``validate()``, which needs the tokenizer, runs in ``DataConfig.bind_tokenizer`` once the runtime
 services bind the run's tokenizer (the builder runs it again before building).
 ``random_seed`` is Core's required constructor argument, filled from ``--seed`` by the factory and
-saved with the section. Six Core fields are owned by other container sections (the parallel
-layout and the validation flags): the container writes them at ``finalize()``
+saved with the section. Parallel layout, validation flags and SFT's physical pack width are owned
+by other container sections: the container writes them at ``finalize()``
 (``CONTAINER_WRITTEN_FIELDS``) and they are not serialized with the section.
 
 ``DataConfig`` groups the dataset config, the ``DataloaderConfig`` and ``dataset_type``, the dataset
@@ -19,11 +20,10 @@ serves every GPT entry point: the args-to-config factory forwards every data arg
 follows the family flags, and the provider hands ``cfg.data.dataset`` to the builder unchanged.
 The loop reads the section through its predicates (``is_sft()``, ``has_cu_seqlens()``,
 ``use_per_sequence_balancing()``, ``yields_unpacked_samples()``) and the dataset's fields, never
-through ``args``; the sample length it runs at is the container's ``sample_length``: the dataset's
-``sequence_length``, or for a loader-only section the model's ``max_seq_length_per_sample``
-(Megatron Core's per-sample maximum, filled from ``--seq-length`` by the launcher, a VLM's resolved
-decoder length by its model config's ``finalize()``; with a dataset the container checks that it
-covers the samples and fills it when unset).
+through ``args``. The dataset's ``sequence_length`` controls content truncation/chunking;
+SFT's ``packed_sequence_length`` is derived from the model's execution bound at finalization.
+Callback applications resolve their model input width before startup, including image expansion
+for VLMs. The model's positional capacity is independent of these dataset and execution lengths.
 Entry points with their own data pipeline carry a loader-only section (``dataset is None``) and
 nothing here runs for them.
 """
@@ -34,7 +34,7 @@ from typing import Any, Literal, get_args
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.datasets.gpt_fim_dataset import GPTFIMDataset, GPTFIMDatasetConfig
 from megatron.training.config.utils import serialize_value
-from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
+from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset, SFTDatasetConfig
 from megatron.training.datasets.varlen_dataset import MockVarlenDataset, VarlenDataset
 
 DataloaderType = Literal["single", "cyclic", "external"]
@@ -50,11 +50,12 @@ DATASET_CLASSES: dict[str, tuple[type, type | None]] = {
 }
 DATASET_FAMILIES = tuple(DATASET_CLASSES)
 
-# Fields of the dataset config that other container sections own: the parallel layout (the model
-# config) and the validation flags (the validation config). PretrainConfigContainer writes them at
+# Fields of the dataset config that other container sections own: the physical pack width and
+# parallel layout (the model config), and validation flags. PretrainConfigContainer writes them at
 # finalize(), the container-oriented factory leaves them unset and the section serializes without
 # them: they are recorded once, in their owning sections.
 CONTAINER_WRITTEN_FIELDS = (
+    "packed_sequence_length",
     "data_parallel_size",
     "context_parallel_size",
     "sequence_parallel_size",
@@ -62,6 +63,34 @@ CONTAINER_WRITTEN_FIELDS = (
     "multiple_validation_sets",
     "full_validation",
 )
+
+
+def upgrade_legacy_dataset_section(section: dict) -> dict:
+    """Load saved SFT configs with the subclass that supports a separate pack width.
+
+    Older SFT checkpoints used GPTDatasetConfig. Preserve every field, including
+    unknown keys for strict deserialization to reject; only update the class.
+    """
+    dataset = section.get("dataset")
+    if not isinstance(dataset, dict) or dataset.get("_target_") != (
+        f"{GPTDatasetConfig.__module__}.{GPTDatasetConfig.__qualname__}"
+    ):
+        return section
+    selected = section.get("dataset_type")
+    if isinstance(selected, dict):
+        selected = selected.get("_target_")
+    if not any(
+        selected is cls or selected == f"{cls.__module__}.{cls.__qualname__}"
+        for cls in (SFTDataset, MockSFTDataset)
+    ):
+        return section
+    return {
+        **section,
+        "dataset": {
+            **dataset,
+            "_target_": f"{SFTDatasetConfig.__module__}.{SFTDatasetConfig.__qualname__}",
+        },
+    }
 
 
 @dataclass(kw_only=True)
@@ -160,7 +189,8 @@ def resolve_dataset_class(
     Read-only: ``DataConfig.validate()`` calls it and ``DataConfig.finalize()`` commits its result.
     With no class given, a ``GPTFIMDatasetConfig`` with a source resolves to ``GPTFIMDataset``, a
     plain config with a source to ``GPTDataset`` and a plain config without one to
-    ``MockGPTDataset``; sft and varlen share the plain config class and are always explicit. An
+    ``MockGPTDataset``; SFTDatasetConfig selects SFT. Varlen uses the shared GPT config
+    and must be selected explicitly. An
     explicit class must match the config (mock without a source, real with one, the FIM class with
     the FIM config); nothing is silently rewritten.
     """
@@ -169,18 +199,22 @@ def resolve_dataset_class(
             raise ValueError("dataset_type needs a dataset: cfg.data.dataset is None.")
         return None
     source = has_data_source(dataset)
-    config_family = "fim" if isinstance(dataset, GPTFIMDatasetConfig) else None
+    if isinstance(dataset, GPTFIMDatasetConfig):
+        config_family = "fim"
+    elif isinstance(dataset, SFTDatasetConfig):
+        config_family = "sft"
+    elif isinstance(dataset, GPTDatasetConfig):
+        config_family = None
+    else:
+        raise TypeError(f"Unsupported dataset config: {type(dataset).__name__}")
     if dataset_type is None:
         family = config_family or "gpt"
-        if source:
-            return dataset_type_from_family(family, mock=False)
-        mock_class = dataset_type_from_family(family, mock=True)
-        if mock_class is None:
+        dataset_type = dataset_type_from_family(family, mock=not source)
+        if dataset_type is None:
             raise ValueError(
                 f"No data source is declared and there is no mock dataset for the {family} "
                 "family; declare blend or blend_per_split."
             )
-        return mock_class
     family, mock = dataset_family_from_type(dataset_type)
     real, mock_class = DATASET_CLASSES[family]
     if mock and source:
@@ -196,13 +230,14 @@ def resolve_dataset_class(
         raise ValueError(
             f"{dataset_type.__name__} needs a data source (blend or blend_per_split); {hint}."
         )
-    if (family == "fim") != (config_family == "fim"):
+    if (config_family is not None and family != config_family) or (
+        family == "fim" and config_family != "fim"
+    ):
         raise ValueError(
-            "GPTFIMDataset and GPTFIMDatasetConfig go together: the FIM fields live on that config "
-            f"class and only GPTFIMDataset reads them (got {dataset_type.__name__} with "
-            f"{type(dataset).__name__})."
+            f"{type(dataset).__name__} requires the {config_family} dataset family, "
+            f"got {dataset_type.__name__}."
         )
-    if dataset.varlen_sbhd_validation and family == "varlen" and mock:
+    if family == "varlen" and dataset.varlen_sbhd_validation and mock:
         raise ValueError("varlen_sbhd_validation requires real data (VarlenDataset, not its mock).")
     return dataset_type
 
@@ -216,7 +251,7 @@ class DataConfig:
     """
 
     dataset: GPTDatasetConfig | None = None
-    """Megatron Core's GPT dataset config (or ``GPTFIMDatasetConfig``), handed to
+    """GPT/FIM, SFT, or Varlen dataset config, handed to
     ``BlendedMegatronDatasetBuilder`` as is."""
 
     dataloader: DataloaderConfig = field(default_factory=DataloaderConfig)
@@ -239,7 +274,11 @@ class DataConfig:
         self.dataloader.validate()
         if self.dataset is not None:
             self.dataset.validate_without_tokenizer()
-            if self.dataset.inter_document_masking and self.dataset.create_attention_mask:
+            if (
+                isinstance(self.dataset, GPTDatasetConfig)
+                and self.dataset.inter_document_masking
+                and self.dataset.create_attention_mask
+            ):
                 raise ValueError(
                     "data.dataset.inter_document_masking=True needs create_attention_mask=False: "
                     "the dataset omits the attention mask under inter-document masking, and a "
@@ -321,6 +360,10 @@ class DataConfig:
         sequence, SFT does not. False for a loader-only section."""
         dataset = self.dataset
         return dataset is not None and bool(dataset.inter_document_masking) and not self.is_sft()
+
+    def creates_attention_mask(self) -> bool:
+        """Whether this dataset emits the explicit attention-mask tensor for TP broadcast."""
+        return self._family() in ("gpt", "fim") and self.dataset.create_attention_mask
 
     def yields_unpacked_samples(self) -> bool:
         """The dataset emits one variable-length sample dict per item for an upstream packing

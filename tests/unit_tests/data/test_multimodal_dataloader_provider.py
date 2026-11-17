@@ -69,7 +69,7 @@ def test_new_dataloader_prefetch_factor(
     monkeypatch.setattr(
         dataloader_provider,
         "datasets_provider",
-        lambda task_encoder, worker_config: ("train-dataset", None, None),
+        lambda task_encoder, worker_config, **kwargs: ("train-dataset", None, None),
     )
     monkeypatch.setattr(dataloader_provider, "use_new_dataloader_path", lambda: True)
     monkeypatch.setattr(dataloader_provider, "FileStoreCachePool", lambda **kwargs: kwargs)
@@ -142,7 +142,9 @@ def strict_resume_provider(monkeypatch):
     ):
         monkeypatch.setattr(dataloader_provider.parallel_state, name, Mock(return_value=value))
     monkeypatch.setattr(dataloader_provider, "WorkerConfig", lambda **kw: kw)
-    monkeypatch.setattr(dataloader_provider, "datasets_provider", lambda *a: (object(), None, None))
+    monkeypatch.setattr(
+        dataloader_provider, "datasets_provider", lambda *a, **kw: (object(), None, None)
+    )
     monkeypatch.setattr(dataloader_provider, "use_new_dataloader_path", lambda: True)
     monkeypatch.setattr(dataloader_provider, "FileStoreCachePool", lambda **kw: None)
     monkeypatch.setattr(dataloader_provider, "get_savable_loader", lambda *a, **kw: loader)
