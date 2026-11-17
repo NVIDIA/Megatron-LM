@@ -33,6 +33,12 @@ The 26-percentage-point improvement motivates supervision from reuse layers.
 These are published LongCat-Flash-Lite results, not measurements of this
 implementation or guarantees for other models and sharing frequencies.
 
+Private training evaluations also showed quality gains on the order of ten
+score points (0-100 scale) across evaluated benchmarks versus CLI-disabled
+index-sharing DSA at sharing frequency 4. This is a coarse description, not an
+average or a guaranteed gain; detailed scores are omitted. These evaluations
+are separate from the focused validation of this revision.
+
 ## Objective and loss scaling
 
 The sparse CLI objective follows Section 3.2, equation (8) of
