@@ -1,0 +1,534 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+
+"""The schedules run on the caller's process groups, or warn once and use the global ones."""
+
+import inspect
+import warnings
+from contextlib import contextmanager, nullcontext
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+import megatron.core.pipeline_parallel.schedules as schedule
+from megatron.core import ModelParallelConfig, parallel_state, process_groups_config
+from megatron.core.enums import ModelType
+from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.pipeline_parallel import combined_1f1b
+from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
+from megatron.core.pipeline_parallel.utils import is_pp_last_stage
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
+from tests.unit_tests.test_utilities import Utils, destroy_test_pg_collection
+
+_NO_PIPELINING = "forward_backward_no_pipelining"
+_WITHOUT_INTERLEAVING = "forward_backward_pipelining_without_interleaving"
+_WITH_INTERLEAVING = "forward_backward_pipelining_with_interleaving"
+
+# Tensor, pipeline and virtual-pipeline sizes of the global grid that each schedule runs on.
+_GRIDS = {
+    _NO_PIPELINING: (2, 1, None),
+    _WITHOUT_INTERLEAVING: (1, 4, None),
+    _WITH_INTERLEAVING: (1, 4, 2),
+}
+_SEQ_LENGTH, _MICRO_BATCH_SIZE, _HIDDEN_SIZE = 8, 2, 4
+_NUM_MICROBATCHES = 8
+
+requires_4_ranks = pytest.mark.skipif(
+    Utils.world_size < 4 or Utils.world_size % 4 != 0, reason="needs a multiple of 4 ranks"
+)
+
+
+@pytest.fixture(autouse=True)
+def fresh_warning_registry(monkeypatch):
+    """Each test observes the first fallback warning of every owner."""
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+
+@contextmanager
+def _forbid_global_process_groups():
+    """Make every read of the global process groups in parallel_state raise inside the block."""
+
+    def forbid(*args, **kwargs):
+        raise AssertionError("read the global process groups in parallel_state")
+
+    with pytest.MonkeyPatch.context() as patch:
+        for name, value in list(vars(parallel_state).items()):
+            if callable(value) and name.startswith(("get_", "is_pipeline_")):
+                patch.setattr(parallel_state, name, forbid)
+        patch.setattr(ProcessGroupCollection, "use_mpu_process_groups", forbid)
+        yield
+
+
+def _assert_one_fallback_warning(record, owner, argument):
+    """Check that ``record`` holds exactly one fallback warning, from ``owner``, raised here."""
+    fallbacks = [w for w in record if issubclass(w.category, ProcessGroupFallbackWarning)]
+    assert len(fallbacks) == 1, [str(w.message) for w in fallbacks]
+    (warning,) = fallbacks
+    message = str(warning.message)
+    assert f"{owner} was called without `{argument}`" in message
+    assert "deprecated since Megatron Core 0.21 and will be removed in 0.23" in message
+    # The warning points at the code that omitted the argument, not at Megatron Core.
+    assert warning.filename == __file__
+
+
+class _FakeGroup:
+    """Stand-in for a process group exposing only rank() and size()."""
+
+    def __init__(self, rank=0, size=1):
+        self._rank = rank
+        self._size = size
+
+    def rank(self):
+        return self._rank
+
+    def size(self):
+        return self._size
+
+
+class _StageModel(torch.nn.Module):
+    """A pipeline stage that receives the activation of the previous stage."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.model_type = ModelType.encoder_or_decoder
+        self.input_tensor = None
+
+    def set_input_tensor(self, input_tensor):
+        (self.input_tensor,) = input_tensor
+
+
+def _forward_step_func(data_iterator, model):
+    """The first stage starts from the microbatch index and every later stage adds one."""
+    if model.input_tensor is None:
+        shape = (_SEQ_LENGTH, _MICRO_BATCH_SIZE, _HIDDEN_SIZE)
+        output = torch.full(shape, float(next(data_iterator)), device="cuda")
+    else:
+        output = model.input_tensor + 1
+
+    def loss_func(output_tensor):
+        loss = output_tensor.mean()
+        return loss, {"value": loss.item()}
+
+    return output, loss_func
+
+
+def _config(owner):
+    tensor, pipeline, virtual = _GRIDS[owner]
+    config = ModelParallelConfig(
+        tensor_model_parallel_size=tensor,
+        pipeline_model_parallel_size=pipeline,
+        virtual_pipeline_model_parallel_size=virtual,
+        pipeline_dtype=torch.float,
+    )
+    config.hidden_size = _HIDDEN_SIZE
+    return config
+
+
+def _run_schedule(owner, config, **groups):
+    """Run the forward passes of ``owner`` on one model chunk per virtual stage."""
+    num_chunks = _GRIDS[owner][2] or 1
+    return getattr(schedule, owner)(
+        forward_step_func=_forward_step_func,
+        data_iterator=[iter(range(_NUM_MICROBATCHES)) for _ in range(num_chunks)],
+        model=[_StageModel(config) for _ in range(num_chunks)],
+        num_microbatches=_NUM_MICROBATCHES,
+        seq_length=_SEQ_LENGTH,
+        micro_batch_size=_MICRO_BATCH_SIZE,
+        forward_only=True,
+        **groups,
+    )
+
+
+@requires_4_ranks
+@pytest.mark.parametrize("owner", [_NO_PIPELINING, _WITHOUT_INTERLEAVING, _WITH_INTERLEAVING])
+def test_schedule_without_groups_warns_once_and_matches_explicit_groups(owner):
+    tensor, pipeline, virtual = _GRIDS[owner]
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tensor,
+        pipeline_model_parallel_size=pipeline,
+        virtual_pipeline_model_parallel_size=virtual,
+    )
+    pg_collection = None
+    try:
+        config = _config(owner)
+        # The layout of the global grid (order tp-cp-ep-dp-pp) on distinct communicators.
+        grid = HyperCommGrid(
+            [tensor, 1, Utils.world_size // (tensor * pipeline), pipeline], ["tp", "cp", "dp", "pp"]
+        )
+        pp_group = grid.create_pg("pp")
+        pg_collection = ProcessGroupCollection(
+            tp=grid.create_pg("tp"), cp=grid.create_pg("cp"), pp=pp_group
+        )
+        explicit_groups = {"pg_collection": pg_collection}
+        if owner != _NO_PIPELINING:
+            explicit_groups["p2p_communicator"] = P2PCommunicator(pp_group=pp_group, config=config)
+
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            default_results = [_run_schedule(owner, config) for _ in range(2)]
+        _assert_one_fallback_warning(record, owner, "pg_collection")
+
+        with _forbid_global_process_groups(), warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
+            explicit_results = _run_schedule(owner, config, **explicit_groups)
+
+        num_stages = pipeline * (virtual or 1)
+        expected = []
+        if is_pp_last_stage(pp_group):
+            expected = [{"value": float(i + num_stages - 1)} for i in range(_NUM_MICROBATCHES)]
+        assert default_results == [expected, expected]
+        assert explicit_results == expected
+    finally:
+        # Utils.destroy_model_parallel only destroys the groups that parallel_state created.
+        if pg_collection is not None:
+            destroy_test_pg_collection(pg_collection)
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("missing", ["tp", "cp"])
+@pytest.mark.parametrize("owner", [_NO_PIPELINING, _WITHOUT_INTERLEAVING, _WITH_INTERLEAVING])
+def test_schedule_rejects_a_collection_without_tp_or_cp(owner, missing):
+    groups = {"tp": _FakeGroup(), "cp": _FakeGroup()}
+    del groups[missing]
+    config = ModelParallelConfig()
+    with (
+        _forbid_global_process_groups(),
+        pytest.raises(ValueError, match=f"{owner} requires pg_collection to set {missing}"),
+    ):
+        _run_schedule(
+            owner,
+            config,
+            pg_collection=ProcessGroupCollection(**groups),
+            p2p_communicator=SimpleNamespace(config=config),
+        )
+
+
+@pytest.mark.parametrize("given", ["pg_collection", "p2p_communicator"])
+@pytest.mark.parametrize("owner", [_WITHOUT_INTERLEAVING, _WITH_INTERLEAVING])
+def test_pipelined_schedule_takes_both_groups_or_neither(owner, given):
+    groups = {
+        "pg_collection": ProcessGroupCollection(tp=_FakeGroup(), cp=_FakeGroup()),
+        "p2p_communicator": SimpleNamespace(),
+    }
+    with (
+        _forbid_global_process_groups(),
+        pytest.raises(
+            ValueError,
+            match=f"{owner}: provide both p2p_communicator and pg_collection, or neither",
+        ),
+    ):
+        _run_schedule(owner, ModelParallelConfig(), **{given: groups[given]})
+
+
+def test_get_pp_rank_microbatches_reads_the_communicator():
+    p2p_communicator = SimpleNamespace(
+        pp_group=_FakeGroup(rank=1, size=4), virtual_pipeline_model_parallel_size=None
+    )
+    with _forbid_global_process_groups(), warnings.catch_warnings():
+        warnings.simplefilter("error", ProcessGroupFallbackWarning)
+        by_keyword = schedule.get_pp_rank_microbatches(8, 1, 1, p2p_communicator=p2p_communicator)
+        # The communicator keeps the positional slot it was released in.
+        by_position = schedule.get_pp_rank_microbatches(8, 1, 1, False, False, p2p_communicator)
+    # Total, all in warmup, warmup (stages after this one), remaining.
+    assert by_keyword == by_position == (8, False, 2, 6)
+
+
+@requires_4_ranks
+def test_get_pp_rank_microbatches_without_a_communicator_warns_once():
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, pipeline_model_parallel_size=4)
+    try:
+        p2p_communicator = SimpleNamespace(
+            pp_group=parallel_state.get_pipeline_model_parallel_group(),
+            virtual_pipeline_model_parallel_size=None,
+        )
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            default_microbatches = [schedule.get_pp_rank_microbatches(8, 1, 1) for _ in range(2)]
+        _assert_one_fallback_warning(record, "get_pp_rank_microbatches", "p2p_communicator")
+
+        with _forbid_global_process_groups():
+            microbatches = schedule.get_pp_rank_microbatches(
+                8, 1, 1, p2p_communicator=p2p_communicator
+            )
+        assert default_microbatches == [microbatches, microbatches]
+    finally:
+        Utils.destroy_model_parallel()
+
+
+def _calc_loss(**stage):
+    """Run forward_step_calc_loss on a loss of 8 over 4 microbatches; return the loss and store."""
+    forward_data_store = []
+    loss, _ = schedule.forward_step_calc_loss(
+        None,  # model
+        torch.tensor(8.0),
+        lambda output: (output.clone(), {"value": output.item()}),
+        SimpleNamespace(timers=None),
+        None,  # vp_stage
+        False,  # collect_non_loss_data
+        4,  # num_microbatches
+        forward_data_store,
+        **stage,
+    )
+    return loss.item(), forward_data_store
+
+
+@requires_4_ranks
+def test_forward_step_calc_loss_without_cp_size_and_last_stage_warns_once():
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=2, context_parallel_size=2
+    )
+    try:
+        cp_size = parallel_state.get_context_parallel_group().size()
+        is_last_stage = is_pp_last_stage(parallel_state.get_pipeline_model_parallel_group())
+        assert cp_size == 2
+
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            default_results = [_calc_loss() for _ in range(2)]
+        _assert_one_fallback_warning(
+            record, "forward_step_calc_loss", "cp_group_size/is_last_stage"
+        )
+
+        with _forbid_global_process_groups(), warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
+            explicit_result = _calc_loss(cp_group_size=cp_size, is_last_stage=is_last_stage)
+
+        # Only the last stage computes the loss, scaled by the CP size over the microbatches.
+        expected = (4.0, [{"value": 8.0}]) if is_last_stage else (8.0, [])
+        assert default_results == [expected, expected]
+        assert explicit_result == expected
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize(
+    "stage, message",
+    [
+        ({"cp_group_size": 4}, "is_last_stage must be True or False"),
+        ({"is_last_stage": True}, "cp_group_size must be set on the last stage"),
+    ],
+)
+def test_forward_step_calc_loss_takes_cp_size_and_last_stage_or_neither(stage, message):
+    with _forbid_global_process_groups(), pytest.raises(ValueError, match=message):
+        _calc_loss(**stage)
+
+
+def test_no_pipelining_passes_the_collection_cp_size_to_combined_1f1b(monkeypatch):
+    combined_schedule = schedule.combined_1f1b_schedule_for_no_pipelining
+    cp_group_sizes = []
+
+    def record_cp_group_size(*args, **kwargs):
+        arguments = inspect.signature(combined_schedule).bind(*args, **kwargs).arguments
+        cp_group_sizes.append(arguments["cp_group_size"])
+        return arguments["forward_data_store"], arguments["total_num_tokens"]
+
+    monkeypatch.setattr(schedule, "combined_1f1b_schedule_for_no_pipelining", record_cp_group_size)
+    config = ModelParallelConfig(overlap_moe_expert_parallel_comm=True)
+    with _forbid_global_process_groups():
+        schedule.forward_backward_no_pipelining(
+            forward_step_func=_forward_step_func,
+            data_iterator=iter(range(1)),
+            model=[_StageModel(config)],
+            num_microbatches=1,
+            seq_length=_SEQ_LENGTH,
+            micro_batch_size=_MICRO_BATCH_SIZE,
+            # A tensor-parallel size that differs from the context-parallel one.
+            pg_collection=ProcessGroupCollection(tp=_FakeGroup(), cp=_FakeGroup(size=2)),
+        )
+    assert cp_group_sizes == [2]
+
+
+def _run_interleaved_combined_1f1b(monkeypatch, **groups):
+    """Run the forward steps of both virtual chunks through the interleaved combined 1F1B
+    helper; return the CP size and last-stage flag that each combined step receives."""
+    received = []
+
+    def combined_step(*args, cp_group_size=None, is_last_stage=None, **kwargs):
+        received.append((cp_group_size, is_last_stage))
+        return None, None, None
+
+    monkeypatch.setattr(combined_1f1b, "combined_forward_backward_step", combined_step)
+    monkeypatch.setattr(combined_1f1b, "set_streams", lambda **kwargs: None)
+    # The stage helpers read a group's rank and size only once torch.distributed is initialized.
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    config = SimpleNamespace(
+        high_priority_a2a_comm_stream=False, virtual_pipeline_model_parallel_size=2
+    )
+    for virtual_microbatch_id in range(2):
+        combined_1f1b.combined_1f1b_schedule_for_interleaved_pipelining(
+            config,
+            None,  # forward_step_func
+            [None, None],  # data_iterator
+            [None, None],  # model
+            1,  # num_microbatches
+            [],  # forward_data_store
+            lambda *args: None,  # forward_step_helper_preprocess
+            lambda *args: None,  # forward_step_helper_postprocess
+            None,  # backward_step_helper_preprocess
+            None,  # backward_step_helper_postprocess
+            lambda virtual_microbatch_id, forward: 0,  # get_microbatch_id_in_model_chunk
+            lambda virtual_microbatch_id, forward: virtual_microbatch_id,  # get_model_chunk_id
+            lambda cond: cond,  # check_first_val_step
+            lambda virtual_microbatch_id: True,  # is_first_microbatch_for_model_chunk
+            False,  # collect_non_loss_data
+            virtual_microbatch_id,  # f_virtual_microbatch_id, in its released positional slot
+            **groups,
+        )
+    return received
+
+
+@pytest.mark.parametrize("pp_rank", [0, 1])
+def test_interleaved_combined_1f1b_takes_cp_size_and_last_stage_from_its_groups(
+    monkeypatch, pp_rank
+):
+    with _forbid_global_process_groups():
+        received = _run_interleaved_combined_1f1b(
+            monkeypatch, cp_group_size=2, pp_group=_FakeGroup(rank=pp_rank, size=2)
+        )
+    # Only the last virtual chunk on the last pipeline rank is the last stage.
+    assert received == [(2, False), (2, pp_rank == 1)]
+
+
+def test_interleaved_combined_1f1b_without_groups_leaves_the_stage_to_the_loss_step(monkeypatch):
+    with _forbid_global_process_groups():
+        # forward_step_calc_loss falls back to the global grid only when it gets neither value.
+        assert _run_interleaved_combined_1f1b(monkeypatch) == [(None, None), (None, None)]
+        for groups in ({"cp_group_size": 2}, {"pp_group": _FakeGroup(size=2)}):
+            with pytest.raises(ValueError, match="both cp_group_size and pp_group, or neither"):
+                _run_interleaved_combined_1f1b(monkeypatch, **groups)
+
+
+def _run_no_pipelining_combined_1f1b(monkeypatch, *cp_group_size):
+    """Run the no-pipelining combined 1F1B helper on two microbatches with the 14 positional
+    arguments it was released with, plus ``cp_group_size`` if given; return the CP size and
+    last-stage flag that each combined step receives."""
+    received = []
+
+    def combined_step(*args, cp_group_size=None, is_last_stage=None, **kwargs):
+        received.append((cp_group_size, is_last_stage))
+        return None, 0, None
+
+    monkeypatch.setattr(combined_1f1b, "combined_forward_backward_step", combined_step)
+    monkeypatch.setattr(combined_1f1b, "set_streams", lambda **kwargs: None)
+    combined_1f1b.combined_1f1b_schedule_for_no_pipelining(
+        None,  # forward_step_func
+        None,  # data_iterator
+        None,  # model
+        2,  # num_microbatches
+        None,  # input_tensor
+        None,  # output_tensor_grad
+        [],  # forward_data_store
+        SimpleNamespace(high_priority_a2a_comm_stream=False),  # config
+        False,  # collect_non_loss_data
+        None,  # first_val_step
+        False,  # forward_only
+        nullcontext,  # no_sync_func
+        0,  # total_num_tokens
+        lambda cond: cond,  # check_first_val_step
+        *cp_group_size,
+    )
+    return received
+
+
+def test_no_pipelining_combined_1f1b_takes_a_cp_size_or_leaves_the_stage_to_the_loss_step(
+    monkeypatch,
+):
+    with _forbid_global_process_groups():
+        # A forward-only, a forward-backward and a backward-only step. forward_step_calc_loss
+        # falls back to the global grid only when it gets neither value.
+        assert _run_no_pipelining_combined_1f1b(monkeypatch) == [(None, None)] * 3
+        # With a CP size, every microbatch runs on the last (only) pipeline stage.
+        assert _run_no_pipelining_combined_1f1b(monkeypatch, 2) == [(2, True)] * 3
+
+
+@requires_4_ranks
+def test_get_forward_backward_func_without_sizes_warns_once():
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1,
+        pipeline_model_parallel_size=4,
+        virtual_pipeline_model_parallel_size=2,
+    )
+    try:
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            for _ in range(2):
+                selected = schedule.get_forward_backward_func()
+                assert selected is schedule.forward_backward_pipelining_with_interleaving
+        _assert_one_fallback_warning(record, "get_forward_backward_func", "pp_size/vp_size")
+
+        with _forbid_global_process_groups(), warnings.catch_warnings():
+            warnings.simplefilter("error", ProcessGroupFallbackWarning)
+            for pp_size, vp_size, expected in (
+                (4, 2, schedule.forward_backward_pipelining_with_interleaving),
+                (4, None, schedule.forward_backward_pipelining_without_interleaving),
+                (1, None, schedule.forward_backward_no_pipelining),
+            ):
+                selected = schedule.get_forward_backward_func(pp_size=pp_size, vp_size=vp_size)
+                assert selected is expected
+    finally:
+        Utils.destroy_model_parallel()
+
+
+@requires_4_ranks
+def test_default_groups_keep_the_data_parallel_ranks_of_the_global_grid(monkeypatch):
+    """Under GTP-remat, the default collection's readers reduce over the same ranks as before."""
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1, gtp_remat_size=2
+    )
+    try:
+        received = []
+
+        def finalize_model_grads(model, num_tokens, pg_collection, force_all_reduce):
+            received.append(pg_collection)
+
+        config = ModelParallelConfig()
+        config.calculate_per_token_loss = False
+        config.finalize_model_grads_func = finalize_model_grads
+        monkeypatch.setattr(schedule, "backward_step", lambda *args: None)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ProcessGroupFallbackWarning)
+            schedule.forward_backward_no_pipelining(
+                forward_step_func=_forward_step_func,
+                data_iterator=iter(range(1)),
+                model=[_StageModel(config)],
+                num_microbatches=1,
+                seq_length=_SEQ_LENGTH,
+                micro_batch_size=_MICRO_BATCH_SIZE,
+                forward_only=False,
+            )
+        (pg_collection,) = received
+        groups = vars(pg_collection)
+
+        data_parallel = parallel_state.get_data_parallel_group(with_context_parallel=True)
+        replicate = parallel_state.get_data_parallel_group(
+            with_context_parallel=True, with_gtp_remat=False
+        )
+        assert data_parallel.size() == 2 * replicate.size()
+        # finalize_model_grads uses dp_cp_gtp_remat when it is set.
+        assert (groups["dp_cp_gtp_remat"] or groups["dp_cp"]) is data_parallel
+
+        # The fields map to parallel_state as in use_mpu_process_groups(): dp_cp is the
+        # replicate group, and no field outside the ones the readers use is set.
+        assert groups["dp_cp"] is replicate
+        expected = {
+            "tp": parallel_state.get_tensor_model_parallel_group(),
+            "cp": parallel_state.get_context_parallel_group(),
+            "pp": parallel_state.get_pipeline_model_parallel_group(),
+            "embd": parallel_state.get_embedding_group(check_initialized=False),
+            "pos_embd": parallel_state.get_position_embedding_group(check_initialized=False),
+            "dp_cp": replicate,
+            "dp_cp_gtp_remat": data_parallel,
+            "tp_dp_cp": parallel_state.get_tensor_and_data_parallel_group(
+                with_context_parallel=True
+            ),
+            "gtp_remat": parallel_state.get_gtp_weight_remat_group(),
+            "expt_gtp_remat": parallel_state.get_expert_gtp_weight_remat_group(
+                check_initialized=False
+            ),
+        }
+        assert set(groups) == set(expected)
+        for name, group in expected.items():
+            assert groups[name] is group, name
+    finally:
+        Utils.destroy_model_parallel()

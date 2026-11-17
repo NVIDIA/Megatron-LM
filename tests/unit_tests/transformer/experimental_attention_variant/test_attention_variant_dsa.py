@@ -255,7 +255,7 @@ class TestDSAIndexShareHelpers:
         )
         checkpoint_calls = []
 
-        def fake_checkpoint(function, _distribute_saved_activations, *args):
+        def fake_checkpoint(function, _distribute_saved_activations, *args, tp_group=None):
             checkpoint_calls.append((function, args))
             with torch.no_grad():
                 return function(*args)
