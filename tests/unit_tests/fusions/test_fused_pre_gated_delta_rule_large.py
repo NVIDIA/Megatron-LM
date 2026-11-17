@@ -10,6 +10,8 @@ outside the buffers. The test compares the last rows of a long sequence with the
 computed alone.
 """
 
+import os
+
 import pytest
 import torch
 
@@ -23,13 +25,6 @@ SEQ_LEN = 261376  # rows 260617 .. 261375 are past 2**31 elements
 TAIL = 2048  # rows recomputed alone
 CHECK = TAIL - 64  # rows compared; their causal conv window lies inside the tail
 REQUIRED_GIB = 48
-
-
-def _enough_gpu_memory():
-    if not torch.cuda.is_available():
-        return False
-    free, _ = torch.cuda.mem_get_info()
-    return free >= REQUIRED_GIB * 2**30
 
 
 def _tail(tensor, seq_len, rows):
@@ -63,11 +58,15 @@ def _run(qkvzba, weight, a_log, dt_bias, probes):
     return [t.detach().clone() for t in tails], grads
 
 
-@pytest.mark.skipif(
-    not _enough_gpu_memory(), reason=f"needs a GPU with {REQUIRED_GIB} GiB free memory"
-)
 def test_rows_past_two_to_31_elements_match_the_same_rows_alone():
     pytest.importorskip("triton")
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    # Every torch.distributed.run rank runs this test: use the GPU of this rank.
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")) % torch.cuda.device_count())
+    free, _ = torch.cuda.mem_get_info()
+    if free < REQUIRED_GIB * 2**30:
+        pytest.skip(f"needs a GPU with {REQUIRED_GIB} GiB free memory")
     assert SEQ_LEN * IN_PROJ_DIM > 2**31 and SEQ_LEN - CHECK < FIRST_WRAPPED_ROW < SEQ_LEN
     device = torch.device("cuda")
     gen = torch.Generator(device=device).manual_seed(1234)

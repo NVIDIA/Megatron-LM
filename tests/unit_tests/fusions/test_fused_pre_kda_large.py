@@ -9,6 +9,8 @@ rows computed alone. The kernels are called directly: the convolution of the ful
 through causal-conv1d, which has a limit of its own (2**32 elements).
 """
 
+import os
+
 import pytest
 import torch
 
@@ -18,13 +20,6 @@ CHANNELS = NUM_HEADS * HEAD_DIM
 SEQ_LEN = 261376  # raw_g and gate hold more than 2**31 elements
 TAIL = 4096  # rows recomputed alone; they start before row 2**31 / CHANNELS
 REQUIRED_GIB = 32
-
-
-def _enough_gpu_memory():
-    if not torch.cuda.is_available():
-        return False
-    free, _ = torch.cuda.mem_get_info()
-    return free >= REQUIRED_GIB * 2**30
 
 
 def _long(tail):
@@ -42,11 +37,15 @@ def _last_rows(tensor):
     return tensor.narrow(dim, SEQ_LEN - TAIL, TAIL)
 
 
-@pytest.mark.skipif(
-    not _enough_gpu_memory(), reason=f"needs a GPU with {REQUIRED_GIB} GiB free memory"
-)
 def test_rows_past_two_to_31_elements_match_the_same_rows_alone():
     pytest.importorskip("triton")
+    if not torch.cuda.is_available():
+        pytest.skip("needs a GPU")
+    # Every torch.distributed.run rank runs this test: use the GPU of this rank.
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")) % torch.cuda.device_count())
+    free, _ = torch.cuda.mem_get_info()
+    if free < REQUIRED_GIB * 2**30:
+        pytest.skip(f"needs a GPU with {REQUIRED_GIB} GiB free memory")
     from megatron.core.fusions.fused_pre_kda import (
         _triton_prepare_kda_tail,
         _triton_prepare_kda_tail_backward,
