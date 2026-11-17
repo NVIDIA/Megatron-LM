@@ -1,5 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+import contextlib
 import os
 from inspect import signature
 from unittest import mock
@@ -9,6 +10,7 @@ import torch
 
 import megatron.core.transformer.multi_latent_attention as mla_module
 from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
+from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
@@ -22,6 +24,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_mtp_block_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.attention import Attention
@@ -101,6 +104,7 @@ class TestParallelMLAAttention:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -216,6 +220,7 @@ class TestParallelMLAAttention:
                 get_mla_self_attn_submodules(),
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             config = checkpointed_parallel_attention.config
 
@@ -350,6 +355,7 @@ class TestParallelMLAAttention:
                 get_mla_self_attn_submodules(),
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
             sequence_length = 32
@@ -400,6 +406,7 @@ class TestParallelMLAAttention:
                 get_mla_self_attn_submodules(),
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             config = checkpointed_parallel_attention.config
 
@@ -439,6 +446,7 @@ class TestParallelMLAAttention:
                 get_mla_self_attn_submodules(),
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
             config = checkpointed_parallel_attention.config
 
@@ -501,6 +509,7 @@ class TestSequenceParallelMLAAttention:
             get_mla_self_attn_submodules(linear_qkv_down_proj=linear_qkv_down_proj),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -917,6 +926,7 @@ class TestTensorParallelMLAAttention:
             get_mla_self_attn_submodules(linear_qkv_down_proj=linear_qkv_down_proj),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -988,6 +998,7 @@ class TestContextParallelMLAAttention:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).bfloat16()
 
     def teardown_method(self, method):
@@ -1084,6 +1095,7 @@ class TestParallelMLAAttentionPrecision:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -1246,6 +1258,7 @@ class TestContextParallelMLAAttentionPrecision:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).bfloat16()
 
     def teardown_method(self, method):
@@ -1396,6 +1409,7 @@ class TestParallelMLAAttentionPrecisionWithRopeFusion:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -1564,6 +1578,7 @@ class TestMLAClipQK:
                 get_mla_self_attn_submodules(),
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
             with pytest.raises(ValueError, match="qk_clip option needs to be enabled"):
@@ -1577,6 +1592,7 @@ class TestMLAClipQK:
                 get_mla_self_attn_submodules(),
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
             with pytest.raises(ValueError, match="current_max_attn_logits is None"):
@@ -1592,6 +1608,7 @@ class TestMLAClipQK:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         attention.cuda()
 
@@ -1629,6 +1646,7 @@ class TestMLAClipQK:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         attention.cuda()
 
@@ -1666,6 +1684,7 @@ class TestMLAClipQK:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         attention.cuda()
 
@@ -1720,6 +1739,7 @@ class TestMLAClipQK:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         attention.cuda()
 
@@ -1897,7 +1917,11 @@ class TestMLAUpProjectionInput:
         submodules.linear_q_up_proj = ColumnParallelLinear
         submodules.linear_kv_up_proj = ColumnParallelLinear
         attention = MLASelfAttention(
-            config, submodules, layer_number=1, attn_mask_type=AttnMaskType.causal
+            config,
+            submodules,
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         seq_len, batch = 32, 2
         hidden_states = torch.randn(seq_len, batch, config.hidden_size, device="cuda")
@@ -2062,6 +2086,7 @@ class TestFusedMLASelfAttention:
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -2223,7 +2248,11 @@ class TestFusedMLAGradientFlow:
 
         config = self.transformer_config
         fused = FusedMLASelfAttention(
-            config, get_fused_mla_submodules(), layer_number=1, attn_mask_type=AttnMaskType.causal
+            config,
+            get_fused_mla_submodules(),
+            layer_number=1,
+            attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         fused.cuda()
 
@@ -2277,12 +2306,14 @@ class TestFusedMLALoadFromStateDict:
             get_mla_self_attn_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         fused = FusedMLASelfAttention(
             self.transformer_config,
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         unfused_sd = unfused.state_dict()
@@ -2312,6 +2343,7 @@ class TestFusedMLALoadFromStateDict:
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         sharded_sd = fused.sharded_state_dict(prefix="")
@@ -2334,6 +2366,7 @@ class TestFusedMLALoadFromStateDict:
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         seen = []
 
@@ -2358,6 +2391,7 @@ class TestFusedMLALoadFromStateDict:
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         sharded_sd = fused.sharded_state_dict(prefix="")
@@ -2377,6 +2411,7 @@ class TestFusedMLALoadFromStateDict:
             get_fused_mla_submodules(),
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         config = self.transformer_config
         q_weight = torch.randn(config.q_lora_rank, config.hidden_size)
@@ -2429,6 +2464,7 @@ class TestFusedMLARequiresQLora:
                 get_fused_mla_submodules(),
                 layer_number=1,
                 attn_mask_type=AttnMaskType.causal,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
 
@@ -2628,6 +2664,7 @@ class TestFusedMLAQUpProjIntegration:
                     get_mla_self_attn_submodules(),
                     layer_number=1,
                     attn_mask_type=AttnMaskType.causal,
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
                 )
                 .cuda()
                 .bfloat16()
@@ -2695,6 +2732,86 @@ def test_fused_kv_rope_quant_config_requires_mxfp8_attention(dpa_option):
         _fused_kv_rope_quant_config(**overrides)
 
 
+def test_fused_kv_rope_quant_config_accepts_fp4():
+    """FP4 models may run MXFP8 attention; whether they do is decided at run time."""
+    config = _fused_kv_rope_quant_config(fp8=None, fp4="e2m1")
+    assert config.use_fused_mla_kv_rope_quant and config.fp4
+
+
+def _gate_with_recipe(recipe, dpa_recipe="", dpa_format="HYBRID", dpa_bwd="1"):
+    """Evaluate _is_mxfp8_attention_active under recipe. NVTE_DPA_FP8_RECIPE and
+    NVTE_DPA_FP8_FORMAT are read at import (as Transformer Engine does), so patch the module
+    constants rather than the environment."""
+    manager = mock.Mock()
+    manager.is_fp8_enabled.return_value = True
+    manager.get_fp8_recipe.return_value = recipe
+    with (
+        mock.patch.object(mla_module, "FP8GlobalStateManager", manager),
+        mock.patch.object(mla_module, "_DPA_FP8_RECIPE", dpa_recipe),
+        mock.patch.object(mla_module, "_DPA_FP8_FORMAT", dpa_format),
+        mock.patch.dict(os.environ, {"NVTE_FP8_DPA_BWD": dpa_bwd}),
+    ):
+        return mla_module._is_mxfp8_attention_active()
+
+
+@pytest.mark.parametrize(
+    "recipe_name, dpa_recipe, dpa_format, expected",
+    [
+        ("MXFP8BlockScaling", "", "HYBRID", True),
+        ("MXFP8BlockScaling", "MXFP8BlockScaling", "E5M2", True),
+        ("MXFP8BlockScaling", "Float8CurrentScaling", "HYBRID", False),
+        ("MXFP8BlockScaling", "DelayedScaling", "HYBRID", False),
+        ("MXFP8BlockScaling", "F16", "HYBRID", False),
+        ("NVFP4BlockScaling", "MXFP8BlockScaling", "HYBRID", True),
+        ("NVFP4BlockScaling", "MXFP8BlockScaling", "E4M3", True),
+        ("NVFP4BlockScaling", "MXFP8BlockScaling", "E5M2", False),
+        ("NVFP4BlockScaling", "", "E4M3", False),
+        ("NVFP4BlockScaling", "DelayedScaling", "E4M3", False),
+        ("NVFP4BlockScaling", "Float8CurrentScaling", "E4M3", False),
+        ("Float8CurrentScaling", "MXFP8BlockScaling", "E4M3", False),
+    ],
+)
+def test_is_mxfp8_attention_active(recipe_name, dpa_recipe, dpa_format, expected):
+    """Attention runs in MXFP8 for MXFP8 recipes unless NVTE_DPA_FP8_RECIPE switches it away, and
+    for NVFP4 recipes only with NVTE_DPA_FP8_RECIPE=MXFP8BlockScaling in an E4M3-forward format."""
+    te_recipe = pytest.importorskip("transformer_engine.common.recipe")
+    recipe = getattr(te_recipe, recipe_name)(fp8_dpa=True)
+    assert _gate_with_recipe(recipe, dpa_recipe, dpa_format) is expected
+
+
+@pytest.mark.parametrize("recipe_name", ["MXFP8BlockScaling", "NVFP4BlockScaling"])
+def test_is_mxfp8_attention_active_requires_fp8_dpa_and_fp8_backward(recipe_name):
+    """Without FP8 DPA or with NVTE_FP8_DPA_BWD=0 attention does not take MXFP8 inputs."""
+    te_recipe = pytest.importorskip("transformer_engine.common.recipe")
+    with_dpa = getattr(te_recipe, recipe_name)(fp8_dpa=True)
+    assert _gate_with_recipe(with_dpa, "MXFP8BlockScaling", "E4M3") is True
+    assert _gate_with_recipe(with_dpa, "MXFP8BlockScaling", "E4M3", dpa_bwd="0") is False
+    without_dpa = getattr(te_recipe, recipe_name)(fp8_dpa=False)
+    assert _gate_with_recipe(without_dpa, "MXFP8BlockScaling", "E4M3") is False
+
+
+def test_is_mxfp8_attention_active_custom_recipe():
+    """Custom recipes take their attention quantizers from their factory, so an
+    NVTE_DPA_FP8_RECIPE left over from an NVFP4 run must not enable the fused path."""
+    te_recipe = pytest.importorskip("transformer_engine.common.recipe")
+    if not hasattr(te_recipe, "CustomRecipe"):
+        pytest.skip("Transformer Engine lacks CustomRecipe")
+    recipe = te_recipe.CustomRecipe(qfactory=lambda *args, **kwargs: None, fp8_dpa=True)
+    assert recipe.custom()
+    assert _gate_with_recipe(recipe, "MXFP8BlockScaling", "E4M3") is False
+    assert _gate_with_recipe(recipe, "MXFP8BlockScaling", "HYBRID") is False
+
+
+def test_is_mxfp8_attention_active_ignores_runtime_dpa_env():
+    """Transformer Engine reads NVTE_DPA_FP8_RECIPE/FORMAT once, at import, so setting them
+    later does not change its attention recipe, and must not change the gate either."""
+    te_recipe = pytest.importorskip("transformer_engine.common.recipe")
+    recipe = te_recipe.NVFP4BlockScaling(fp8_dpa=True)
+    env = {"NVTE_DPA_FP8_RECIPE": "MXFP8BlockScaling", "NVTE_DPA_FP8_FORMAT": "E4M3"}
+    with mock.patch.dict(os.environ, env):
+        assert _gate_with_recipe(recipe, dpa_recipe="", dpa_format="HYBRID") is False
+
+
 @pytest.mark.launch_on_gb200
 @pytest.mark.skipif(
     get_device_arch_version() < 10,
@@ -2710,7 +2827,7 @@ class TestFusedMLAKVRoPEQuant:
         yield
         Utils.destroy_model_parallel()
 
-    @pytest.mark.parametrize("variant", ["mla", "fused_mla", "fused_q_uproj"])
+    @pytest.mark.parametrize("variant", ["mla", "fused_mla", "fused_q_uproj", "fp4"])
     def test_matches_unfused_path(self, variant):
         if mla_module.fused_mla_kv_rope_mxfp8 is None:
             pytest.skip("Transformer Engine lacks fused_mla_kv_rope_mxfp8")
@@ -2734,7 +2851,26 @@ class TestFusedMLAKVRoPEQuant:
             "NVTE_FLASH_ATTN": "0",
             "NVTE_ALLOW_NONDETERMINISTIC_ALGO": "0",
         }
-        with mock.patch.dict(os.environ, env, clear=False):
+        quantization_context, dpa_recipe = get_fp8_context, contextlib.nullcontext()
+        mla_dpa_recipe = contextlib.nullcontext()
+        if variant == "fp4":
+            # NVFP4 linears with MXFP8 attention. TE and the gate read NVTE_DPA_FP8_RECIPE and
+            # NVTE_DPA_FP8_FORMAT at import, so patch their module-level copies too.
+            from transformer_engine.common.recipe import Format
+            from transformer_engine.pytorch.attention.dot_product_attention import (
+                dot_product_attention as te_dpa,
+            )
+
+            overrides = dict(fp8=None, fp4="e2m1")
+            env.update(NVTE_DPA_FP8_RECIPE="MXFP8BlockScaling", NVTE_DPA_FP8_FORMAT="E4M3")
+            quantization_context = get_fp4_context
+            dpa_recipe = mock.patch.multiple(
+                te_dpa, _dpa_fp8_recipe="MXFP8BlockScaling", _dpa_fp8_format=Format.E4M3
+            )
+            mla_dpa_recipe = mock.patch.multiple(
+                mla_module, _DPA_FP8_RECIPE="MXFP8BlockScaling", _DPA_FP8_FORMAT="E4M3"
+            )
+        with mock.patch.dict(os.environ, env, clear=False), dpa_recipe, mla_dpa_recipe:
             attention_cls, submodules = (
                 (FusedMLASelfAttention, get_fused_mla_submodules())
                 if variant == "fused_mla"
@@ -2767,7 +2903,9 @@ class TestFusedMLAKVRoPEQuant:
             results = []
             for attention in (reference, fused):
                 x = hidden_states.clone().requires_grad_(True)
-                with spy as kernel, get_fp8_context(config):
+                # NVFP4 stochastic rounding draws from the RNG: give both passes the same draws.
+                torch.manual_seed(1)
+                with spy as kernel, quantization_context(config):
                     output, _ = attention(x, None)
                 output.backward(grad_output)
                 calls = kernel.call_count

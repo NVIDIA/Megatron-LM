@@ -19,8 +19,9 @@ launching for the whole training step.
 Window registration is delegated to ``nccl_allocator.register_mem_pool``
 (which calls ``ncclCommWindowRegister``), which accepts this memory and runs its
 symmetric kernels on it. Building the extension requires nvcc and libcuda at
-runtime; ``init``/``create_vmm_mem_pool`` raise if it cannot build, and callers
-decide whether to fall back to ``ncclMemAlloc``-backed pools.
+runtime; ``init``/``create_vmm_mem_pool`` raise if it cannot build.
+``create_symm_mem_pool`` wraps both and falls back to an ``ncclMemAlloc``-backed
+pool instead.
 """
 
 import logging
@@ -112,6 +113,27 @@ def init() -> None:
     log_single_rank(
         logger, logging.INFO, "[MCORE][VMM_SYMM_ALLOCATOR] Initialized the VMM Allocator"
     )
+
+
+def create_symm_mem_pool() -> torch.cuda.MemPool:
+    """
+    Create a symmetric memory pool from the VMM allocator, falling back to an
+    ``ncclMemAlloc``-backed pool (same pool API) if the extension cannot build.
+    """
+    try:
+        init()
+        return create_vmm_mem_pool()
+    except RuntimeError as e:
+        log_single_rank(
+            logger,
+            logging.WARNING,
+            f"[MCORE][VMM_SYMM_ALLOCATOR] {e}\n"
+            "[MCORE][VMM_SYMM_ALLOCATOR] FALLING BACK to ncclMemAlloc-backed symmetric "
+            "pools. ncclMemAlloc maps every allocation on all P2P-visible peer GPUs, "
+            "which slows CPU-side kernel launching at scale.",
+        )
+        nccl_allocator.init()
+        return nccl_allocator.create_nccl_mem_pool(symmetric=True)
 
 
 def register_mem_pool(pool: torch.cuda.MemPool, group) -> None:
