@@ -45,8 +45,8 @@ CHUNK_H_LARGE = {
     "start-times-heads": (128, 8, 8, 2**31 // (CHUNK_SIZE * 128), "after"),
     "start-times-heads-fits": (128, 8, 8, 2**31 // (CHUNK_SIZE * 128) - 1, "after"),
 }
-# name: (H, K, V, M, lead). The output kernel launches one program per chunk on grid axis 1,
-# which CUDA caps at 65535, so these use 32 heads to reach 2**31 in fewer chunks.
+# name: (H, K, V, M, lead). The output kernel's chunks share grid axis 0 with its value tiles.
+# The multi-head shapes reach 2**31 elements with fewer chunks.
 CHUNK_O_LARGE = {
     # the query and key base token lead * CHUNK_SIZE * H * K (GDN's H and K)
     "queries": (32, 128, 16, 1, 2**31 // (CHUNK_SIZE * 32 * 128)),
