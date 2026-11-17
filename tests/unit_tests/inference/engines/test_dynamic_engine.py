@@ -5072,8 +5072,9 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
 
         FA4's split heuristic engages once the KV sequence spans more than four 128-token
         tiles. A 1000-token prompt crosses that in prefill and decode, and under CUDA graphs
-        decode runs with max_seqlen_k = max_sequence_length. Unpinned (FA3 if installed, else
-        unsplit FA4) and FA4-pinned runs must complete and match FA2 token for token.
+        decode runs with max_seqlen_k = max_sequence_length. Unpinned (automatic selection picks
+        FA4 when it is installed) and FA4-pinned runs must complete and match FA2 token for
+        token.
         """
         if not HAVE_FA4 or torch.cuda.get_device_capability()[0] != 9:
             pytest.skip("needs FlashAttention-4 on a Hopper (SM90) GPU")
@@ -6415,8 +6416,6 @@ class TestDynamicInferenceEngine(DynamicInferenceEngineTestBase):
             enable_chunked_prefill=True,
             enable_prefix_caching=True,
             use_cuda_graphs_for_non_decode_steps=False,
-            # The forward is mocked below, and FlashAttention-2 cannot read 16-token blocks.
-            flash_attention_version=None,
         )
 
         env = self._build_test_env(test_config)

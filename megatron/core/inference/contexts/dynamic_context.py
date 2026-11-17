@@ -457,33 +457,6 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 inference_config.block_size_tokens == 64
             ), "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-block-size 64 to fix this assert"
 
-        # A pinned FlashAttention-2 must be able to read the paged KV cache. A plain transformer's
-        # attention runs this config's pin (attention variants use their own kernels), so its cache
-        # is checked here. A hybrid's layers run their own configs' pins, which a
-        # hybrid_layer_config_list sets apart from this root config, so Attention checks each layer
-        # where FA2 runs, as it does for automatic selection.
-        if (
-            model_config.flash_attention_version == 2
-            and model_config.experimental_attention_variant is None
-            and not model_config.is_hybrid_model
-            and inference_config.mamba_inference_state_config is None
-        ):
-            from megatron.core.transformer.attention import check_flash_attn_2_paged_kv
-
-            if self.cache_mla_latent:
-                # Prefill attends over the up-projected latents.
-                qk_head_dim = model_config.qk_head_dim + model_config.qk_pos_emb_head_dim
-                v_head_dim = model_config.v_head_dim
-            else:
-                qk_head_dim = v_head_dim = model_config.kv_channels
-            check_flash_attn_2_paged_kv(
-                inference_config.block_size_tokens,
-                qk_head_dim,
-                v_head_dim,
-                self.cache_mla_latent,
-                torch.cuda.current_device() if torch.cuda.is_available() else None,
-            )
-
         # Per partition num heads and hidden size.
         num_attention_heads = model_config.num_query_groups or model_config.num_attention_heads
         projection_size = model_config.kv_channels * num_attention_heads
