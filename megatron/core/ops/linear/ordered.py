@@ -3,7 +3,9 @@
 """Ordered row-parallel GEMMs, operation-owned symmetric scratch, and autograd.
 
 Inputs are local K shards [..., K/TP]; outputs are sequence shards or replicated rows.
-The caller supplies the process group. Backward keeps ordinary TP collectives."""
+The caller supplies the process group. Backward keeps ordinary TP collectives.
+Scratch is allocated on first eager use; CUDA graphs reuse it after warmup or use
+the all-to-all fallback when captured without warmup."""
 
 from typing import Optional
 
@@ -46,22 +48,6 @@ except ImportError:
 
 def _training_buffer_key(group) -> str:
     return f"tp_ordered_training:{group.group_name}"
-
-
-def prepare_ordered_reduce(group) -> None:
-    """Collectively allocate per-TP GEMM scratch before CUDA-graph capture.
-
-    The fixed-capacity pool is shared by row-parallel layers. Outputs do not alias it and
-    backward saves only inputs and weights. Oversized GEMMs and unavailable peer access
-    use the all-to-all fallback, without allocating symmetric memory inside capture.
-    """
-    if group.size() >= 2:
-        key = _training_buffer_key(group)
-        assert (
-            SymmetricMemoryManager.is_initialized(key)
-            or not torch.cuda.is_current_stream_capturing()
-        ), "allocate ordered row-linear scratch at layer construction or during eager warmup"
-        SymmetricMemoryManager.get_buffer(key, process_group=group)
 
 
 def row_parallel_shard_partials(
@@ -157,14 +143,17 @@ class _TPShardRowLinear(torch.autograd.Function):
         shape = (num_shards, *x.shape[:-1], weight.shape[0])
         scratch = {"tensor": None, "handle": None}
         key = _training_buffer_key(group)
-        if group.size() > 1 and x.shape[0] % group.size() == 0:
-            if (
-                not SymmetricMemoryManager.is_initialized(key)
-                and not torch.cuda.is_current_stream_capturing()
-            ):
-                prepare_ordered_reduce(group)
-            if SymmetricMemoryManager.is_initialized(key):
-                scratch = SymmetricMemoryManager.get_buffer(key).maybe_get_tensor(shape, x.dtype)
+        if (
+            group.size() > 1
+            and x.shape[0] % group.size() == 0
+            and (
+                SymmetricMemoryManager.is_initialized(key)
+                or not torch.cuda.is_current_stream_capturing()
+            )
+        ):
+            scratch = SymmetricMemoryManager.get_buffer(key, process_group=group).maybe_get_tensor(
+                shape, x.dtype
+            )
         if use_te_gemm:
             # Keep TE's GEMM definition: a torch GEMM need not have the same fp32 bits.
             assert num_shards == 1

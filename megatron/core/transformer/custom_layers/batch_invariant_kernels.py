@@ -548,8 +548,7 @@ def mm_batch_invariant(a, b):
 def mm_out_batch_invariant(a, b, *, out):
     """Batch-invariant replacement for `aten::mm.out`: same bits as `mm_batch_invariant`,
     written into ``out`` (so `torch.matmul(..., out=buffer)` needs no extra copy)."""
-    matmul_persistent(a, b, out=out)
-    return out
+    return matmul_persistent(a, b, out=out)
 
 
 def addmm_batch_invariant(bias, a, b):

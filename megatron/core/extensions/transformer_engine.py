@@ -26,7 +26,7 @@ from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedState
 from megatron.core.dist_checkpointing.utils import replace_prefix_for_sharding
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.model_parallel_config import ModelParallelConfig
-from megatron.core.ops.linear.ordered import prepare_ordered_reduce, tp_shard_row_linear
+from megatron.core.ops.linear.ordered import tp_shard_row_linear
 from megatron.core.ops.norm.torch_norm import LayerNormInterface
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
@@ -1495,7 +1495,6 @@ class TELinear(te.pytorch.Linear):
         # Set by a caller that runs the TP communication itself (shared-expert overlap): the
         # forward then returns this rank's partial and the caller reduces it.
         self.bi_tp_reduce_by_caller = False
-        self._bi_tp_direct_gemm = not config.cpu_offloading and not config.delay_wgrad_compute
         if self._bi_tp_forward is not _BITPForward.TE:
             input_size = divide(input_size, tp_size)
             te_parallel_mode = None
@@ -1560,12 +1559,6 @@ class TELinear(te.pytorch.Linear):
 
         tp_group = get_tensor_model_parallel_group_if_none(tp_group, is_expert=is_expert)
         self._tp_group = tp_group
-        if self._bi_tp_forward is _BITPForward.SHARD_GEMMS or self._bi_tp_can_direct():
-            self._prepare_bi_tp_scratch(tp_group)
-
-    def _prepare_bi_tp_scratch(self, tp_group) -> None:
-        """Prepare training scratch collectively before forward or CUDA-graph capture."""
-        prepare_ordered_reduce(tp_group)
 
     def _set_bi_row_parallel_attributes(self):
         """Restore row-parallel parameter metadata on a layer built with TE parallel_mode=None.
@@ -1595,7 +1588,8 @@ class TELinear(te.pytorch.Linear):
         """
         return (
             self._bi_tp_forward is _BITPForward.ORDERED_REDUCE
-            and self._bi_tp_direct_gemm
+            and not self.config.cpu_offloading
+            and not self.config.delay_wgrad_compute
             and (
                 not bi_kernels.is_batch_invariant_mode_enabled()
                 or bi_kernels.get_batch_invariant_backend() == "te_native"

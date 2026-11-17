@@ -419,14 +419,15 @@ def _check_te_row_parallel_linear(sequence_parallel):
         is_expert=False,
     ).cuda()
     assert layer._bi_tp_forward is _BITPForward.ORDERED_REDUCE
-    # The shared GEMM scratch is allocated at construction, outside any forward or graph capture.
-    assert SymmetricMemoryManager.is_initialized(orl._training_buffer_key(layer._tp_group))
+    assert not SymmetricMemoryManager.is_initialized(orl._training_buffer_key(layer._tp_group))
     assert layer.weight.shape == (768, cfg.hidden_size // TP)
     assert layer.weight.tensor_model_parallel and layer.weight.partition_dim == 1
     assert layer.bias.sequence_parallel == sequence_parallel
 
     with set_batch_invariant_mode(True, backend="te_native"):
         x = _partials((64, 2, cfg.hidden_size // TP), torch.bfloat16, seed=21)
+        layer(x)
+        assert SymmetricMemoryManager.is_initialized(orl._training_buffer_key(group))
         scratch = SymmetricMemoryManager.get_buffer(
             orl._training_buffer_key(group)
         ).maybe_get_tensor((1, *x.shape[:-1], 768), dtype=x.dtype)
@@ -467,6 +468,23 @@ def _check_te_row_parallel_linear(sequence_parallel):
         reference_grads = torch.autograd.grad(reference, (x, layer.weight, layer.bias), dy)
         for got, expected_grad in zip(actual_grads, reference_grads):
             torch.testing.assert_close(got, expected_grad, rtol=0, atol=0)
+
+        with torch.no_grad():
+            static_x = x.detach().clone()
+            eager, _ = layer(static_x)
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                layer(static_x)
+            torch.cuda.current_stream().wait_stream(stream)
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured, _ = layer(static_x)
+            for _ in range(3):
+                graph.replay()
+            torch.cuda.synchronize()
+            assert torch.equal(_bits(captured), _bits(eager))
 
         # A caller that reduces itself (shared-expert overlap) gets this rank's partial.
         no_bias = TERowParallelLinear(
