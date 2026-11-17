@@ -17,21 +17,21 @@ def _build(cp_rank, cu=HOST_CU):
     )
 
 
-def test_same_layout_returns_the_cached_table():
+def test_same_layout_returns_the_cached_tables():
     dsa_layout._KPOOL_POOL_REORDER_CACHE.clear()
     first = _build(1)
     second = _build(1)
-    assert first is second
+    assert first[0] is second[0] and first[1] is second[1]
 
 
-def test_cached_table_equals_a_fresh_build_and_differs_by_layout():
+def test_cached_tables_equal_a_fresh_build_and_differ_by_layout():
     dsa_layout._KPOOL_POOL_REORDER_CACHE.clear()
     cached = _build(2)
     dsa_layout._KPOOL_POOL_REORDER_CACHE.clear()
     fresh = _build(2)
-    assert torch.equal(cached, fresh)
+    assert torch.equal(cached[0], fresh[0]) and torch.equal(cached[1], fresh[1])
     other = _build(2, cu=[0, 128, 192])
-    assert other is not fresh
+    assert other[0] is not fresh[0]
 
 
 def test_cache_is_bounded():
