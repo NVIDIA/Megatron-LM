@@ -1039,10 +1039,12 @@ def _dsa_indexer_flops(
     Multiply ``token_linear`` by the real token count and ``core`` by
     ``sum_i(L_i ** 2)``.
 
-    With KPool (``dsa_indexer_kpool > 1``) the indexer is forward only and
-    scores complete key pools plus a per-token gate; that case delegates to the
-    shared counter in ``megatron.training.logging.dsa_flops``, which needs the
-    batch statistics ``total_tokens`` and ``seqlen_squared_sum``.
+    With KPool (``dsa_indexer_kpool > 1``) the indexer scores complete key pools
+    plus a per-token gate: forward only when frozen, and with the backward of
+    the sparse pool-level loss when trained (KPool rejects the dense loss);
+    that case delegates to the shared counter in
+    ``megatron.training.logging.dsa_flops``, which needs the batch statistics
+    ``total_tokens`` and ``seqlen_squared_sum``.
     """
     if dsa_indexer_kpool > 1:
         return _dsa_kpool_indexer_flops(
@@ -2210,9 +2212,9 @@ def num_floating_point_operations(
                 dsa_indexer_kpool=dsa_indexer_kpool,
             )
             # The indexer carries its own forward/backward factor (forward only
-            # unless its KL loss is on; KPool requires the loss off, so it is
-            # forward only there), so it is added after the global factor 3
-            # below rather than inside it.
+            # unless its KL loss is on; with KPool only the sparse KL is
+            # allowed), so it is added after the global factor 3 below rather
+            # than inside it.
             dsa_indexer_flops_total = (
                 indexer_token_linear * total_tokens + indexer_core * seqlen_squared_sum
             )

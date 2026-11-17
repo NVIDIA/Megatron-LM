@@ -2,6 +2,7 @@
 
 """Layout helpers for DeepSeek sparse attention."""
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -128,6 +129,76 @@ def ensure_sbhd(tensor: torch.Tensor, name: str) -> Tuple[torch.Tensor, bool]:
     if tensor.ndim == 3:
         return tensor.unsqueeze(1), True
     raise ValueError(f"{name} must be 3D ([t,h,d]) or 4D ([s,b,h,d]), got {tensor.ndim}D")
+
+
+def packed_kpool_pool_alignment_error(
+    host_cu_seqlens_kv: Optional[List[int]], *, cp_size: int, pool_size: int, local_rows: int
+) -> Optional[str]:
+    """Why a packed CP pack cannot be pooled before the all-gather (None if it can).
+
+    Pooling each CP rank's tokens before the gather needs every zigzag span to hold whole
+    pools of its document: each document's padded length must be a multiple of
+    ``2 * cp_size * pool_size``. The boundaries must also cover exactly this rank's
+    ``local_rows`` (no rows beyond the last document).
+    """
+    if host_cu_seqlens_kv is None:
+        return "the packed THD boundaries are not on the host (no CP route was prebuilt)"
+    cu = [int(v) for v in host_cu_seqlens_kv]
+    divisor = 2 * cp_size * pool_size
+    lengths = [b - a for a, b in zip(cu[:-1], cu[1:])]
+    if any(length % divisor for length in lengths):
+        return (
+            "every packed document's padded length must be a multiple of 2 * cp_size * "
+            f"dsa_indexer_kpool = {divisor}, got lengths {lengths}"
+        )
+    if cu[-1] != local_rows * cp_size:
+        return (
+            f"the packed THD boundaries end at {cu[-1]}, not at the {local_rows * cp_size} "
+            "rows of the CP group"
+        )
+    return None
+
+
+_KPOOL_POOL_REORDER_CACHE: "OrderedDict[tuple, torch.Tensor]" = OrderedDict()
+_KPOOL_POOL_REORDER_CACHE_SIZE = 4
+
+
+def build_packed_kpool_pool_reorder_from_host(
+    host_cu_seqlens_kv: List[int], *, cp_size: int, cp_rank: int, pool_size: int, device
+) -> torch.Tensor:
+    """Reorder of all-gathered per-rank pools into packed global pool order.
+
+    For a pack that :func:`packed_kpool_pool_alignment_error` accepts, every zigzag span of
+    every document holds whole pools, so the pools of the packed layout are the packed
+    layout of the boundaries in pool units: the packed key reorder of ``host_cu_seqlens_kv``
+    divided by ``pool_size``. The gathered pools then sit document by document, each
+    document's pools from its first token, which is the pool axis
+    ``_kpool_compress_keys_per_seg`` builds from the gathered tokens.
+
+    The tables depend only on the pack's boundaries and the CP layout, which every DSA
+    layer of a microbatch shares, so the last few are kept: rebuilding them costs a host
+    pass over every pool (about 5 ms at 1M context, a GPU stall when the host has fallen
+    behind) for each layer, forward and recompute. Callers only read the returned tensor.
+    """
+    key = (
+        tuple(int(v) for v in host_cu_seqlens_kv),
+        cp_size,
+        cp_rank,
+        pool_size,
+        str(torch.device(device)),
+    )
+    cached = _KPOOL_POOL_REORDER_CACHE.get(key)
+    if cached is not None:
+        _KPOOL_POOL_REORDER_CACHE.move_to_end(key)
+        return cached
+    pool_cu = [int(v) // pool_size for v in host_cu_seqlens_kv]
+    _, reorder = build_packed_allgather_cp_query_positions_and_key_reorder_from_host(
+        pool_cu, pool_cu, cp_size, cp_rank, device
+    )
+    _KPOOL_POOL_REORDER_CACHE[key] = reorder
+    while len(_KPOOL_POOL_REORDER_CACHE) > _KPOOL_POOL_REORDER_CACHE_SIZE:
+        _KPOOL_POOL_REORDER_CACHE.popitem(last=False)
+    return reorder
 
 
 def build_zigzag_cp_local_positions(

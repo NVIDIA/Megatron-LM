@@ -522,11 +522,18 @@ class TransformerConfig(ModelParallelConfig):
     """Coefficient for the DSA indexer KL divergence loss.
     Set to 0 to disable indexer loss; in that mode the non-differentiable indexer projections are
     frozen and excluded from gradient/optimizer bookkeeping.
+    With KPool selection (``dsa_indexer_kpool > 1``), a positive coefficient trains the whole
+    KPool indexer, its pool gate and slot bias included, with a sparse pool-level KL over the
+    selected pools; it requires ``dsa_indexer_use_sparse_loss=True``. Unset or 0 keeps the KPool
+    selector frozen.
     """
 
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
-    top-k indices."""
+    top-k indices. KPool selection trains only with the sparse loss, computed over the selected
+    pools: the teacher is the main attention's probability mass of each selected pool (the
+    query-local tail counts in each head's normalizer, not in the target), summed over heads and
+    L1-normalized; the student is the selector's own pool score."""
 
     dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
     """Precision used only by the fused compact DSA indexer forward and Top-K."""
@@ -579,6 +586,13 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_scoring_relu: bool = True
     """Whether DSA indexer should apply ReLU to q@k scores before weighting."""
+
+    dsa_indexer_hf_scoring: bool = False
+    """Use the KPool scoring order of the Hugging Face reference indexer for
+    zai-org/GLM-5.3-Flash (transformers v5.16.1, Glm5NextTextIndexer): upcast projected
+    head weights before scaling, scale FP32 q@k before ReLU, and reduce heads with FP32
+    matmul. Compression rounding and score-input quantization remain independent options.
+    """
 
     dsa_indexer_qk_proj_use_quantization: bool = True
     """Whether indexer query/key projections use the enclosing FP8/FP4 context.
@@ -656,12 +670,29 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_kpool: int = 1
     """Number of keys per softmax-weighted indexer pool; 1 keeps per-token selection.
-    When greater than one, ``dsa_indexer_topk`` must be divisible by this value.
+    When greater than one, ``dsa_indexer_topk`` must be divisible by this value. The KPool
+    selector is frozen unless ``dsa_indexer_loss_coeff > 0``, which trains it with the sparse
+    pool-level indexer loss (``dsa_indexer_use_sparse_loss=True``). A trainable KPool indexer
+    rejects FP8 KPool scoring, ``cuda_graph_impl='full_iteration'``, full recompute and
+    selective ``core_attn`` recompute; at runtime it rejects explicit attention masks,
+    CP-local lengths that are not a multiple of ``2 * dsa_indexer_kpool`` and, for packed THD
+    with context parallelism, packs whose padded documents are not multiples of
+    ``2 * cp_size * dsa_indexer_kpool`` or that lack the host boundaries of the prebuilt CP
+    routes. Not supported with ``dsa_indexer_mode='simplified'``.
     """
 
     dsa_indexer_kpool_use_quantization: bool = False
     """Quantize KPool scoring inputs to E4M3 with power-of-two scales after Hadamard
-    rotation. This does not change projection parameter or GEMM precision.
+    rotation. This does not change projection parameter or GEMM precision. Frozen KPool
+    selectors only: the E4M3 round trip has no training gradient.
+    """
+
+    dsa_indexer_kpool_key_dtype_compression: bool = False
+    """Cast pool probabilities to the key dtype before multiplication and reduction.
+    This matches the compression arithmetic of the Hugging Face reference indexer
+    (transformers v5.16.1, Glm5NextTextIndexer.get_pooled_states). False preserves
+    FP32 weighted reduction from the upstream KPool implementation. Score-input
+    quantization is independent of this compression precision choice.
     """
 
     dsa_indexer_kpool_always_select_tail: bool = True
@@ -3252,6 +3283,15 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"dsa_indexer_kpool must be positive, got {self.dsa_indexer_kpool}."
                 )
+            if self.dsa_indexer_hf_scoring and (
+                self.dsa_indexer_kpool <= 1
+                or self.dsa_indexer_weights_proj_output_dtype != "bf16"
+                or not self.dsa_indexer_scoring_relu
+            ):
+                raise ValueError(
+                    "dsa_indexer_hf_scoring requires KPool > 1, BF16 projection output "
+                    "and ReLU scoring."
+                )
             if self.dsa_indexer_kpool > 1:
                 if self.dsa_indexer_topk is None:
                     raise ValueError(
@@ -3270,7 +3310,7 @@ class TransformerConfig(ModelParallelConfig):
                     )
             if self.dsa_indexer_kpool > 1 and self.dsa_indexer_mode == "simplified":
                 # The simplified (GQA) indexer has no pool code; without this rule a KPool
-                # config would be accepted and KPool silently ignored.
+                # config with a frozen indexer would be accepted and KPool silently ignored.
                 raise ValueError(
                     "dsa_indexer_mode='simplified' does not support KPool selection "
                     "(dsa_indexer_kpool > 1): the simplified indexer has no pool compression, "
@@ -3278,10 +3318,24 @@ class TransformerConfig(ModelParallelConfig):
                     f"dsa_indexer_kpool={self.dsa_indexer_kpool}."
                 )
             if self.dsa_indexer_kpool > 1 and (self.dsa_indexer_loss_coeff or 0.0) > 0:
-                raise ValueError(
-                    "DSA indexer loss is not supported with kpool selection; set "
-                    "dsa_indexer_loss_coeff=0 or dsa_indexer_kpool=1."
-                )
+                # A positive coefficient trains the KPool indexer with the sparse pool-level
+                # loss. The remaining trainable-KPool rules (full_iteration CUDA graphs and
+                # recompute that replays the selection) are checked once those options are
+                # final, below.
+                if not self.dsa_indexer_use_sparse_loss:
+                    raise ValueError(
+                        "DSA indexer loss is not supported with kpool selection unless it is "
+                        "the sparse pool-level loss: set dsa_indexer_use_sparse_loss=True to "
+                        "train the KPool indexer, dsa_indexer_loss_coeff=0 to keep it frozen, "
+                        "or dsa_indexer_kpool=1."
+                    )
+                if self.dsa_indexer_kpool_use_quantization:
+                    raise ValueError(
+                        "A trainable KPool indexer (dsa_indexer_kpool > 1 with "
+                        "dsa_indexer_loss_coeff > 0) does not support FP8 KPool scoring "
+                        "(dsa_indexer_kpool_use_quantization): its E4M3 round trip has no "
+                        "defined training gradient."
+                    )
         elif self.experimental_attention_variant == "dsv4_hybrid":
             if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
                 raise ValueError(
@@ -4520,6 +4574,31 @@ class TransformerConfig(ModelParallelConfig):
             if "moe" not in self.recompute_modules:
                 self.recompute_modules.append("moe")
 
+        # A trainable KPool indexer under activation recompute, checked once the recompute
+        # options above are final. A checkpoint replay of the DSA layer selects its pools
+        # again, and top-k selection need not repeat its choice among tied scores, so the
+        # replayed sparse attention and indexer loss could use other pools than the first
+        # call, whose output the forward used. KPool has no checkpoint top-k reuse, so reject
+        # the replaying recomputes.
+        if self.dsa_indexer_kpool > 1 and (self.dsa_indexer_loss_coeff or 0.0) > 0:
+            replay = None
+            if self.recompute_granularity == "full":
+                replay = "recompute_granularity='full'"
+            elif self.recompute_granularity == "selective" and "core_attn" in (
+                self.recompute_modules or []
+            ):
+                replay = "selective recompute of 'core_attn'"
+            if replay is not None:
+                raise ValueError(
+                    "A trainable KPool indexer (dsa_indexer_kpool > 1 with "
+                    f"dsa_indexer_loss_coeff > 0) does not support {replay}: the checkpoint "
+                    "replay would select the pools again, and top-k selection need not repeat "
+                    "its choice among tied scores, so the replayed sparse attention and "
+                    "indexer loss could use other pools than the first call, whose output the "
+                    "forward used. Use a recompute that does not replay core attention (e.g. "
+                    "selective 'mla_up_proj' or 'mhc')."
+                )
+
         # Validation for "mhc" in recompute_modules
         if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
             if not self.enable_hyper_connections:
@@ -5606,6 +5685,17 @@ class TransformerConfig(ModelParallelConfig):
         assert not (
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
+
+        if (
+            self.cuda_graph_impl == "full_iteration"
+            and self.dsa_indexer_kpool > 1
+            and (self.dsa_indexer_loss_coeff or 0.0) > 0
+        ):
+            # The trainable KPool loss path has no full-iteration capture test yet.
+            raise ValueError(
+                "A trainable KPool indexer (dsa_indexer_kpool > 1 with dsa_indexer_loss_coeff "
+                "> 0) does not support cuda_graph_impl='full_iteration'."
+            )
 
         if (
             self.mlp_chunks_for_training > 1
