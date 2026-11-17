@@ -1743,7 +1743,7 @@ class TransformerConfig(ModelParallelConfig):
     offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
-             "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "gdp_qkv",
+             "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "fused_moe_op", "gdp_qkv",
              "shortcut_post_norm".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
@@ -1759,6 +1759,9 @@ class TransformerConfig(ModelParallelConfig):
         path: a fused instance offloads the block input, an unfused instance offloads the fc1
         and activation inputs. So either spelling covers a model that mixes fused (quantized)
         and unfused (e.g. bf16 MTP) experts.
+    "fused_moe_op": offload eligible saved activations of the complete TE MoE operation,
+        including dispatch, expert computation, and combine, independently of TE fusion choices.
+        Requires moe_megakernel_backend="te"; excludes routing and shared experts.
     "gdp_qkv": offload the input of the causal conv and QKV preparation in the
                GatedDeltaProduct mixer.
     "shortcut_post_norm": offload the input of the shortcut output normalization.
@@ -1884,7 +1887,7 @@ class TransformerConfig(ModelParallelConfig):
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
 
-    def _validate_te_megakernel(self) -> None:
+    def _validate_te_fused_moe_op(self) -> None:
         """Validate the NCCL EP plus TE grouped-MLP execution contract."""
         if not self.num_moe_experts or not self.moe_grouped_gemm:
             raise ValueError("The TE MoE backend requires grouped MoE experts")
@@ -1917,7 +1920,6 @@ class TransformerConfig(ModelParallelConfig):
             "moe_virtual_expert_load_balance",
             "moe_shortcut_connection",
             "cpu_offloading",
-            "fine_grained_activation_offloading",
         )
         for name in unsupported:
             if getattr(self, name):
@@ -2954,7 +2956,7 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.moe_megakernel_backend == "te":
-            self._validate_te_megakernel()
+            self._validate_te_fused_moe_op()
 
         if self.moe_megakernel_backend == "mok":
             if self.moe_router_dtype == "fp64":
@@ -3520,6 +3522,7 @@ class TransformerConfig(ModelParallelConfig):
                 "attn_proj",
                 "expert_fc1",
                 "fused_group_mlp",
+                "fused_moe_op",
                 "moe_act",
                 "attn_norm",
                 "mlp_norm",
@@ -3532,6 +3535,17 @@ class TransformerConfig(ModelParallelConfig):
                 f'Invalid choices for offload_modules: {invalid_modules}. '
                 f'Allowed modules are: {allowed_modules}'
             )
+            if "fused_moe_op" in self.offload_modules and self.moe_megakernel_backend != "te":
+                raise ValueError("fused_moe_op offloading requires moe_megakernel_backend='te'.")
+            if self.moe_megakernel_backend == "te":
+                expert_offload_modules = {"expert_fc1", "moe_act", "fused_group_mlp"} & set(
+                    self.offload_modules
+                )
+                if expert_offload_modules:
+                    raise ValueError(
+                        "The TE MoE backend requires offload_modules=['fused_moe_op'] "
+                        f"for expert activations instead of {sorted(expert_offload_modules)}."
+                    )
             if "attn_proj" in self.offload_modules and "core_attn" not in self.offload_modules:
                 raise ValueError(
                     "attn_proj cannot be set to offload_modules alone without core_attn "
@@ -3550,9 +3564,12 @@ class TransformerConfig(ModelParallelConfig):
                     "nothing for the gdp_qkv offload group to keep on the host."
                 )
             if self.recompute_granularity == "selective" and "moe" in self.recompute_modules:
-                offload_inside_moe = {"moe_act", "expert_fc1", "fused_group_mlp"} & set(
-                    self.offload_modules
-                )
+                offload_inside_moe = {
+                    "moe_act",
+                    "expert_fc1",
+                    "fused_group_mlp",
+                    "fused_moe_op",
+                } & set(self.offload_modules)
                 assert not offload_inside_moe, (
                     f"Cannot offload {offload_inside_moe} while recomputing the entire MoE layer. "
                     f"'moe' in recompute_modules wraps the full MoE forward in a checkpoint, "
@@ -3605,13 +3622,16 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_paged_stash requires moe_expert_rank_capacity_factor to be set; "
                     "there is no need to use paged stashing without it."
                 )
-            moe_offload_conflict = {"expert_fc1", "moe_act", "fused_group_mlp"} & set(
-                self.offload_modules
-            )
+            moe_offload_conflict = {
+                "expert_fc1",
+                "moe_act",
+                "fused_group_mlp",
+                "fused_moe_op",
+            } & set(self.offload_modules)
             if moe_offload_conflict:
                 raise ValueError(
                     "When moe_paged_stash is enabled, offload_modules must not include "
-                    f"expert_fc1, moe_act, or fused_group_mlp "
+                    f"expert_fc1, moe_act, fused_group_mlp, or fused_moe_op "
                     f"(paged stash covers those activations). "
                     f"Remove: {moe_offload_conflict}"
                 )
@@ -4530,12 +4550,17 @@ class TransformerConfig(ModelParallelConfig):
             if self.fine_grained_activation_offloading:
                 offload_modules = set(self.offload_modules or [])
                 if self.cuda_graph_impl == "local":
-                    local_supported_offload_modules = {"expert_fc1", "moe_act", "fused_group_mlp"}
+                    local_supported_offload_modules = {
+                        "expert_fc1",
+                        "moe_act",
+                        "fused_group_mlp",
+                        "fused_moe_op",
+                    }
                     unsupported_offload_modules = offload_modules - local_supported_offload_modules
                     assert not unsupported_offload_modules, (
                         "fine-grained activation offloading with cuda_graph_impl='local' "
-                        "only supports offload_modules 'expert_fc1', 'moe_act', and "
-                        "'fused_group_mlp'. "
+                        "only supports offload_modules 'expert_fc1', 'moe_act', "
+                        "'fused_group_mlp', and 'fused_moe_op'. "
                         f"Unsupported offload_modules: {sorted(unsupported_offload_modules)}."
                     )
                     assert self.cuda_graph_modules, (
@@ -4545,7 +4570,8 @@ class TransformerConfig(ModelParallelConfig):
                 local_partial_moe_offload = (
                     self.cuda_graph_impl == "local"
                     and bool(offload_modules)
-                    and offload_modules <= {"expert_fc1", "moe_act", "fused_group_mlp"}
+                    and offload_modules
+                    <= {"expert_fc1", "moe_act", "fused_group_mlp", "fused_moe_op"}
                     and CudaGraphModule.moe not in self.cuda_graph_modules
                 )
                 assert (
@@ -4555,7 +4581,7 @@ class TransformerConfig(ModelParallelConfig):
                     "fine-grained activation offloading is only supported with "
                     "transformer_engine CUDA graph implementation or local CUDA graph "
                     "implementation with partial MoE offload. Local partial CUDA graphs "
-                    "are supported only for expert_fc1, moe_act, or fused_group_mlp "
+                    "are supported only for expert_fc1, moe_act, fused_group_mlp, or fused_moe_op "
                     "offload when the full MoE module is not captured."
                 )
                 assert (

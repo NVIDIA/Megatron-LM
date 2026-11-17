@@ -988,7 +988,7 @@ class TestNcclEpPagedStashing:
         if zero_copy and not is_nccl_ep_zero_copy_available():
             pytest.skip("NCCL EP zero-copy TE API is not available")
         if zero_copy and megakernel_backend == "te":
-            pytest.skip("The TE megakernel backend does not support zero-copy")
+            pytest.skip("The TE fused MoE op backend does not support zero-copy")
         if (
             megakernel_backend is None
             and wire_dtype == "mxfp8"

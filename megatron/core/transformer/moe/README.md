@@ -611,10 +611,10 @@ FP8 training provides benefits across all three performance walls:
 
 ### MoE Megakernel Backends
 
-#### Transformer Engine with NCCL EP
+#### Transformer Engine fused MoE op with NCCL EP
 
-Select `moe_megakernel_backend="te"` to execute routed experts in a single TE
-`Sequential`: `MoeDispatch -> GroupedLinear -> ScaledSwiGLU -> GroupedLinear -> MoeCombine`.
+Select `moe_megakernel_backend="te"` to execute routed experts through `TEFusedMoEOp`,
+currently composed as a TE `Sequential`: `MoeDispatch -> GroupedLinear -> ScaledSwiGLU -> GroupedLinear -> MoeCombine`.
 MCore retains routing, expert parameters, optimizer state, DDP hooks, and checkpoint keys.
 The backend passes the same NCCL EP `EpBuffer` to dispatch and combine, and allocates a
 new buffer for each forward so pending microbatches retain their own backward routing state.
@@ -651,8 +651,8 @@ Without a rank capacity factor, NCCL EP sizes receive tensors from actual token 
 grouped-MLP token alignment. It must include expert padding and the worst expected routing
 imbalance: overflow fails instead of silently dropping tokens. Zero-copy
 communication, delayed wgrad, native communication overlap, latent MoE,
-GTP weight rematerialization, `--cpu-offloading`, and fine-grained activation offloading
-are not supported by this initial adapter.
+GTP weight rematerialization, and layer-level `--cpu-offloading` are not supported
+by this adapter.
 Optional shared experts execute through their native MCore module and are added after combine.
 The token bound defaults to the first forward's maximum token count across EP ranks,
 rounded up to a multiple of 64; later layers share that bound.
@@ -673,13 +673,25 @@ On stash exhaustion, the runner retries without stashing and rebuilds the EP con
 The TE backend retains its fixed receive budget during that retry; receive-capacity
 overflow still fails rather than silently dropping tokens.
 
+For host activation offloading, use `--fine-grained-activation-offloading`
+with `--offload-modules fused_moe_op`. The TE MegaMoE backend wraps its complete
+dispatch/expert-compute/combine operation in the existing fine-grained offload manager,
+which copies eligible saved activations to pinned host storage and reloads them for backward.
+This request is independent of TE's internal fusion choices.
+`fused_group_mlp`, `expert_fc1`, and `moe_act` remain specific to existing grouped-MLP
+paths and are not accepted for TE MegaMoE expert offloading.
+`--use-transformer-engine-op-fuser` is not required for this backend.
+Routing and optional shared experts remain outside this offload group. Do not combine
+expert activation offloading with `--moe-paged-stash`; both would own the same saved
+activations. MOK and native token-dispatcher offloading behavior are unchanged.
+
 The distributed numerical suite compares the MegaMoE op with native all-to-all plus TE grouped
 MLP, including two outstanding forwards before backward, masked routes, empty experts,
 input/router/weight gradients, main-gradient accumulation, and checkpoint reload:
 
 ```bash
 python -m torch.distributed.run --standalone --nproc-per-node 2 -m pytest -q \
-  tests/unit_tests/transformer/moe/test_te_megakernel.py
+  tests/unit_tests/transformer/moe/test_te_fused_moe_op.py
 ```
 
 #### MOK

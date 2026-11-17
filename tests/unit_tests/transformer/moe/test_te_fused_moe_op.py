@@ -67,6 +67,40 @@ def test_te_backend_precision_config(precision):
         ({"moe_megakernel_backend_config": {"max_tokens_per_rank": 0}}, "positive integer"),
         ({"moe_megakernel_backend_config": {"max_tokens_per_rank": True}}, "positive integer"),
         ({"moe_megakernel_backend_config": {"unknown": 64}}, "only max_tokens_per_rank"),
+        (
+            {"fine_grained_activation_offloading": True, "offload_modules": ["expert_fc1"]},
+            "fused_moe_op",
+        ),
+        (
+            {"fine_grained_activation_offloading": True, "offload_modules": ["moe_act"]},
+            "fused_moe_op",
+        ),
+        (
+            {
+                "fine_grained_activation_offloading": True,
+                "offload_modules": ["fused_group_mlp"],
+                "use_transformer_engine_op_fuser": True,
+            },
+            "fused_moe_op",
+        ),
+        (
+            {
+                "fine_grained_activation_offloading": True,
+                "offload_modules": ["fused_moe_op"],
+                "moe_paged_stash": True,
+                "moe_expert_rank_capacity_factor": 16.0,
+            },
+            "paged_stash",
+        ),
+        (
+            {
+                "fine_grained_activation_offloading": True,
+                "offload_modules": ["fused_moe_op"],
+                "recompute_granularity": "selective",
+                "recompute_modules": ["moe"],
+            },
+            "Cannot offload",
+        ),
     ],
 )
 def test_te_backend_rejects_unsupported_config(overrides, match):

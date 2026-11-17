@@ -14,6 +14,9 @@ from megatron.core.extensions.transformer_engine import (
     _get_fp8_autocast_for_quant_recipe,
     _get_fp8_autocast_recipe_for_quant_params,
 )
+from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+    FineGrainedActivationOffloadingInterface as off_interface,
+)
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.route_adapter import routing_map_to_indices
 
@@ -21,7 +24,7 @@ if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
 
 
-class TEMegakernel(MegakernelBackend):
+class TEFusedMoEOp(MegakernelBackend):
     """Compose TE operations while native MCore experts own all trainable parameters."""
 
     def __init__(
@@ -56,6 +59,9 @@ class TEMegakernel(MegakernelBackend):
         self.config = config
         self.ep_group = ep_group
         self.num_local_experts = num_local_experts
+        self.offload_fused_moe_op = (
+            config.fine_grained_activation_offloading and "fused_moe_op" in config.offload_modules
+        )
         self._native_experts = (routed_experts, shared_experts)
         self._mega_op = None
         self._ep_config = None
@@ -207,7 +213,6 @@ class TEMegakernel(MegakernelBackend):
         context = (
             nullcontext() if fc1_recipe is None else _get_fp8_autocast_for_quant_recipe(fc1_recipe)
         )
-        stash_context = nullcontext()
         if self.config.moe_paged_stash:
             from megatron.core.transformer.moe.paged_stash import (
                 get_paged_stash_context,
@@ -216,7 +221,7 @@ class TEMegakernel(MegakernelBackend):
             )
 
             tokens = paged_stash_group_start(tokens)
-            stash_context = get_paged_stash_context(
+            activation_context = get_paged_stash_context(
                 name="megamoe",
                 max_num_tokens=config.recv_capacity_per_rank,
                 num_tokens_tensor=buffer.total_recv_tokens,
@@ -225,10 +230,18 @@ class TEMegakernel(MegakernelBackend):
                     config.recv_capacity_per_rank / self.config.moe_expert_rank_capacity_factor
                 ),
             )
-        with context, stash_context:
+        elif self.offload_fused_moe_op:
+            activation_context = off_interface(True, tokens, "fused_moe_op")
+        else:
+            activation_context = nullcontext()
+        with context, activation_context as offloaded_tokens:
+            if self.offload_fused_moe_op:
+                tokens = offloaded_tokens
             output = mega_op(tokens, indices, weights, indices).view(shape)
         if self.config.moe_paged_stash:
             output = paged_stash_group_commit(output, name="megamoe")
+        elif self.offload_fused_moe_op:
+            output = activation_context.group_offload(output)
         if shared_experts is not None:
             output = output + shared_experts(hidden_states)
         return output
