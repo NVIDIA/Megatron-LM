@@ -14,7 +14,6 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelGroupedLinear,
 )
 from megatron.core.ops.loss.backends import CrossEntropyTarget, select_cross_entropy
-from megatron.core.ops.norm.backends import select_rms_norm
 from megatron.core.ops.norm.torch_norm import LayerNormBuilder, WrappedTorchNorm
 from megatron.core.tensor_parallel.inference_layers import (
     InferenceColumnParallelLinear,
@@ -129,12 +128,10 @@ class LocalSpecProvider(BackendSpecProvider):
         cross_entropy_loss_fusion: bool = False,
         cross_entropy_fusion_impl: str = "native",
         cuda_graph_impl: Optional[str] = None,
-        use_liger: bool = False,
     ) -> None:
         self._cross_entropy_loss_fusion = cross_entropy_loss_fusion
         self._cross_entropy_fusion_impl = cross_entropy_fusion_impl
         self._cuda_graph_impl = cuda_graph_impl
-        self._use_liger = use_liger
 
     def column_parallel_linear(self) -> type:
         """Which column parallel linear module the backend uses"""
@@ -165,7 +162,7 @@ class LocalSpecProvider(BackendSpecProvider):
         """
         del for_qk, has_residual
         if rms_norm:
-            return select_rms_norm(WrappedTorchNorm, use_liger=self._use_liger)
+            return WrappedTorchNorm
         from megatron.core.ops.norm.fused_layer_norm import HAVE_FUSED_LAYER_NORM, FusedLayerNorm
 
         return FusedLayerNorm if HAVE_FUSED_LAYER_NORM else WrappedTorchNorm
@@ -253,7 +250,7 @@ class InferenceSpecProvider(LocalSpecProvider):
             from megatron.core.ops.norm.fused_layer_norm import FusedLayerNorm
 
             return not_none(FusedLayerNorm)
-        return select_rms_norm(TENorm, use_liger=self._use_liger) if rms_norm else TENorm
+        return TENorm
 
     def core_attention(self) -> type[TEDotProductAttention]:
         """Which module to use for attention"""
@@ -314,15 +311,12 @@ def get_backend(
     cross_entropy_loss_fusion: bool = False,
     cross_entropy_fusion_impl: str = "native",
     cuda_graph_impl: str | None = None,
-    use_liger: bool = False,
 ) -> BackendSpecProvider:
     """Build the provider for a named backend.
 
     Kitchen is enabled independently of ``transformer_impl``. It overrides selected
     operations and delegates the rest to the chosen base provider through ``fallback``.
-    ``use_te_op_fuser`` applies only to the Transformer Engine provider. ``use_liger``
-    (Liger RMSNorm) applies to every provider's standalone RMSNorm slots; a norm fused into
-    a Transformer Engine linear stays Transformer Engine's.
+    ``use_te_op_fuser`` applies only to the Transformer Engine provider.
     """
     if transformer_impl == "transformer_engine":
         from megatron.core.extensions.transformer_engine_spec_provider import TESpecProvider
@@ -332,21 +326,18 @@ def get_backend(
             cross_entropy_loss_fusion=cross_entropy_loss_fusion,
             cross_entropy_fusion_impl=cross_entropy_fusion_impl,
             cuda_graph_impl=cuda_graph_impl,
-            use_liger=use_liger,
         )
     elif transformer_impl == "inference_optimized":
         base = InferenceSpecProvider(
             cross_entropy_loss_fusion=cross_entropy_loss_fusion,
             cross_entropy_fusion_impl=cross_entropy_fusion_impl,
             cuda_graph_impl=cuda_graph_impl,
-            use_liger=use_liger,
         )
     elif transformer_impl == "local":
         base = LocalSpecProvider(
             cross_entropy_loss_fusion=cross_entropy_loss_fusion,
             cross_entropy_fusion_impl=cross_entropy_fusion_impl,
             cuda_graph_impl=cuda_graph_impl,
-            use_liger=use_liger,
         )
     else:
         raise ValueError(
@@ -397,5 +388,4 @@ def get_backend_from_config(
         cross_entropy_loss_fusion=getattr(config, "cross_entropy_loss_fusion", False),
         cross_entropy_fusion_impl=getattr(config, "cross_entropy_fusion_impl", "native"),
         cuda_graph_impl=getattr(config, "cuda_graph_impl", None),
-        use_liger=getattr(config, "use_liger", False),
     )

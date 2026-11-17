@@ -848,14 +848,15 @@ class TransformerConfig(ModelParallelConfig):
     use_kitchen: bool = False
     """Use the kitchen extension for transformer quantization."""
 
-    use_liger: bool = False
-    """Use Liger RMSNorm for every standalone RMSNorm, including the final and MTP norms.
+    rmsnorm_impl: Literal["native", "liger"] = "native"
+    """Kernel for the RMSNorm modules built by `TENorm` and `WrappedTorchNorm`.
 
-    Norms fused into a Transformer Engine linear stay Transformer Engine's. Requires
-    `normalization="RMSNorm"` and `transformer_impl` "local" or "transformer_engine", and cannot
-    be combined with `fused_residual_rmsnorm`, `use_kitchen`, an experimental attention variant
-    or heterogeneous layers. Does not
-    change the cross-entropy implementation.
+    "liger" uses Liger-Kernel for every such RMSNorm (layer, QK, final and MTP norms, in GPT
+    and HybridModel specs); norms fused into a Transformer Engine linear and Mamba's gated norm
+    are unchanged. It is not a speedup: Liger is usually slower than the native norms. On
+    `transformer_impl="local"` it adds sequence parallelism and zero-centered gamma, which the
+    PyTorch norm lacks. Requires `normalization="RMSNorm"` and `transformer_impl` "local" or
+    "transformer_engine"; see `__post_init__` for the other restrictions.
     """
 
     use_kitchen_attention: bool = False
@@ -1914,18 +1915,25 @@ class TransformerConfig(ModelParallelConfig):
         details.
         """
         super().__post_init__()
-        if self.use_liger and (
-            self.normalization != "RMSNorm"
-            or self.transformer_impl not in ("local", "transformer_engine")
-            or self.fused_residual_rmsnorm
-            or self.use_kitchen
-            or self.experimental_attention_variant is not None
-        ):
+        if self.rmsnorm_impl not in ("native", "liger"):
             raise ValueError(
-                "use_liger requires normalization='RMSNorm', transformer_impl 'local' or "
-                "'transformer_engine', fused_residual_rmsnorm=False, use_kitchen=False and no "
-                "experimental_attention_variant."
+                f"rmsnorm_impl must be 'native' or 'liger', not {self.rmsnorm_impl!r}."
             )
+        for unsupported, requirement in (
+            (self.normalization != "RMSNorm", "normalization='RMSNorm'"),
+            (
+                self.transformer_impl not in ("local", "transformer_engine"),
+                "transformer_impl 'local' or 'transformer_engine'",
+            ),
+            (
+                self.fused_residual_rmsnorm,
+                "fused_residual_rmsnorm=False (Liger has no residual fusion)",
+            ),
+            (self.use_kitchen, "use_kitchen=False"),
+            (self.experimental_attention_variant is not None, "no experimental_attention_variant"),
+        ):
+            if self.rmsnorm_impl == "liger" and unsupported:
+                raise ValueError(f"rmsnorm_impl='liger' requires {requirement}.")
         self._validate_cp_layouts()
 
         for name in ("mtp_ce_loss_weight", "mtp_kl_loss_weight"):

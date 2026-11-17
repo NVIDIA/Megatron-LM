@@ -5,7 +5,6 @@ from unittest.mock import Mock, call, patch
 import pytest
 import torch
 
-from megatron.core.ops.norm.backends import SelectableNorm
 from megatron.core.transformer import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.wide_residual_config import WideResidualConfig
@@ -32,13 +31,11 @@ def _make_hybrid_config(**kwargs):
     return HybridModelConfig(**defaults)
 
 
-def test_liger_uses_the_default_hybrid_spec():
+def test_liger_rejects_modelopt_hybrid_specs():
     transformer = _make_transformer(
-        use_liger=True, normalization="RMSNorm", transformer_impl="transformer_engine"
+        rmsnorm_impl="liger", normalization="RMSNorm", transformer_impl="transformer_engine"
     )
-    spec = resolve_hybrid_stack_spec(_make_hybrid_config(transformer=transformer))
-    assert spec.submodules.moe_layer.submodules.pre_mlp_layernorm.func is SelectableNorm
-    with pytest.raises(ValueError, match="ModelOpt Hybrid specs"):
+    with pytest.raises(ValueError, match="rmsnorm_impl='liger' is not supported by ModelOpt"):
         resolve_hybrid_stack_spec(
             _make_hybrid_config(transformer=transformer, restore_modelopt_state=True)
         )

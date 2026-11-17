@@ -20,7 +20,6 @@ from megatron.core.transformer.spec_utils import import_module
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.global_vars import get_run_config
-from megatron.training.utils import warn_rank_0
 from megatron.training.yaml_arguments import core_transformer_config_from_yaml
 
 
@@ -32,11 +31,6 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
         else:
             config = core_transformer_config_from_args(args)
     if args.spec is not None:
-        if config.use_liger:
-            warn_rank_0(
-                "use_liger is ignored when a custom --spec is provided; the spec chooses "
-                "its own norms."
-            )
         transformer_layer_spec = import_module(args.spec)
     else:
         use_te = args.transformer_impl == "transformer_engine"
@@ -45,7 +39,7 @@ def gpt_builder(args, pre_process, post_process, vp_stage=None, config=None, pg_
             transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec(
                 config=config, vp_stage=vp_stage
             )
-        elif args.num_experts or config.use_liger:
+        elif args.num_experts:
             # Define the decoder block spec
             transformer_layer_spec = get_gpt_decoder_block_spec(
                 config,
@@ -160,5 +154,4 @@ def _get_transformer_layer_spec(use_te, config):
             use_kitchen=config.use_kitchen,
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
-            use_liger=config.use_liger,
         )

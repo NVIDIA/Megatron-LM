@@ -386,7 +386,7 @@ GOLDEN_CONFIG: Dict[str, Any] = {
     "use_inference_optimized_layers": False,
     "use_kitchen": False,
     "use_kitchen_attention": False,
-    "use_liger": False,
+    "rmsnorm_impl": "native",
     "use_mamba_mem_eff_path": True,
     "use_mup": False,
     "use_ring_exchange_p2p": False,

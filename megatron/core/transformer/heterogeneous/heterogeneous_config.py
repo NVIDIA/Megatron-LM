@@ -200,8 +200,8 @@ class HeterogeneousTransformerConfig(TransformerConfig):
 
     def __post_init__(self):
         super().__post_init__()
-        if self.use_liger:
-            raise ValueError("use_liger does not support heterogeneous layer specs.")
+        if self.rmsnorm_impl != "native":
+            raise ValueError("rmsnorm_impl='liger' does not support heterogeneous layer specs.")
 
         self.heterogeneous_block_specs = True
 

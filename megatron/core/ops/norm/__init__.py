@@ -13,6 +13,7 @@ A norm is built through a ``torch_norm.LayerNormBuilder``,
   RMSNorm) and ``L2Norm``.
 * ``fused_layer_norm`` -- Apex's fused LayerNorm, ``FusedLayerNorm``.
 * ``liger_norm`` -- optional Liger RMSNorm, ``LigerRMSNorm``.
+* ``backends`` -- ``select_rms_norm``, the RMSNorm kernel ``rmsnorm_impl`` selects.
 
 Transformer Engine's norms stay in ``megatron.core.extensions.transformer_engine``.
 Packages here do not re-export; import each name from the module that defines it.

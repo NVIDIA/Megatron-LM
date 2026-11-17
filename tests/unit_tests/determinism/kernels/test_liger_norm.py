@@ -15,6 +15,7 @@ from tests.unit_tests.determinism.kernels.harness import (
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Liger kernels need CUDA")
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("zero_centered", [False, True])
 @pytest.mark.parametrize("deterministic", [False, True])

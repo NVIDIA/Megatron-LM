@@ -56,13 +56,13 @@ def default_layer_spec(
 ) -> ModuleSpec:
     """Determine the most appropriate layer specification based on availability.
 
-    ``pp_rank`` selects this stage's layers for block specs (dense Liger and MoE); when
+    ``pp_rank`` selects this stage's layers for MoE block specs; when
     omitted, ``get_gpt_decoder_block_spec`` falls back to the global ``parallel_state``
     pipeline rank, which can disagree with a supplied ``pg_collection``.
     """
     transformer_cfg = config.transformer
-    if transformer_cfg.use_liger and config.restore_modelopt_state:
-        raise ValueError("use_liger is not supported by ModelOpt GPT specs.")
+    if transformer_cfg.rmsnorm_impl != "native" and config.restore_modelopt_state:
+        raise ValueError("rmsnorm_impl='liger' is not supported by ModelOpt GPT specs.")
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
     if (
         transformer_cfg.transformer_impl == "inference_optimized"
@@ -96,7 +96,7 @@ def default_layer_spec(
         )
     elif transformer_cfg.experimental_attention_variant is not None:
         return get_transformer_block_with_experimental_attention_variant_spec(config=transformer_cfg, vp_stage=vp_stage)
-    elif transformer_cfg.num_moe_experts is not None or transformer_cfg.use_liger:
+    elif transformer_cfg.num_moe_experts is not None:
         return get_gpt_decoder_block_spec(
             transformer_cfg,
             use_transformer_engine=use_te,
@@ -146,7 +146,6 @@ def _te_or_local_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSp
             use_kitchen=transformer_cfg.use_kitchen,
             use_kitchen_attention=transformer_cfg.use_kitchen_attention,
             kitchen_attention_backend=transformer_cfg.kitchen_attention_backend,
-            use_liger=transformer_cfg.use_liger,
         )
 
 

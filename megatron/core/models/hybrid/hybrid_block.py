@@ -32,7 +32,6 @@ from megatron.core.models.hybrid.shortcut_block import (
     ShortcutMoEBlock,
     group_layers_into_shortcut_blocks,
 )
-from megatron.core.ops.norm.backends import SelectableNorm
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.recompute import checkpointed_forward
@@ -417,9 +416,8 @@ class HybridStack(MegatronModule):
         )
 
         if self.post_process and self.post_layer_norm:
-            # Final layer norm before output; TENorm unless the config selects another RMSNorm.
-            self.final_norm = SelectableNorm(
-                native=TENorm,
+            # Final layer norm before output.
+            self.final_norm = TENorm(
                 config=self.config,
                 hidden_size=self.config.hidden_size,
                 eps=self.config.layernorm_epsilon,
