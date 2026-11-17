@@ -28,7 +28,7 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.multi_token_prediction import tie_word_embeddings_state_dict
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.utils import ensure_metadata_has_dp_cp_group, set_attention_backend
-from megatron.core.utils import get_pg_rank, make_tp_sharded_tensor_for_checkpoint
+from megatron.core.utils import get_pg_rank, get_pg_size, make_tp_sharded_tensor_for_checkpoint
 
 
 def _validate_supplied_collection(owner: str, pg_collection: ProcessGroupCollection) -> None:
@@ -79,8 +79,8 @@ class LanguageModule(MegatronModule):
             ``embd`` field, is deprecated: an omitted collection falls back to the global
             groups in ``megatron.core.parallel_state`` without these checks, and an omitted
             ``embd`` is treated as None. Both warn and become errors in Megatron Core 0.23.
-            With tied output weights or MTP across pipeline stages, a stage that holds the
-            word embeddings or a copy of them needs a usable ``embd`` group once distributed
+            With tied output weights or MTP across distributed pipeline ranks, a stage holding
+            the word embeddings or a copy of them needs a usable ``embd`` group once distributed
             is initialized; ``embd=None`` there also warns until 0.23 (T5 raises already).
     """
 
@@ -332,6 +332,10 @@ class LanguageModule(MegatronModule):
             or self.embd_group is not None
             or not torch.distributed.is_initialized()
         ):
+            return
+        if torch.distributed.get_world_size() < get_pg_size(self.pp_group):
+            # Checkpoint converters build all target stages in one process using fake groups
+            # larger than the executing world, and populate each tied copy themselves.
             return
         keeps_copy = (self.post_process and self.share_embeddings_and_output_weights) or getattr(
             self, 'mtp_process', False

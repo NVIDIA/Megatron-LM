@@ -188,6 +188,7 @@ def test_warns_when_shared_embedding_copies_have_no_embd_group(
 ):
     """A caller's collection without embd on a stage holding shared embeddings warns until 0.23."""
     mocker.patch('torch.distributed.is_initialized', return_value=initialized)
+    mocker.patch('torch.distributed.get_world_size', return_value=pp_size)
     pp_group = mocker.Mock()
     pp_group.rank.return_value = 0 if pre else pp_size - 1
     pp_group.size.return_value = pp_size

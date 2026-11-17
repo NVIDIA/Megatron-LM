@@ -1,6 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
+
 import pytest
+import torch
 
 from megatron.core import parallel_state, process_groups_config
 from megatron.core.models.common.language_module.language_module import LanguageModule
@@ -80,3 +83,44 @@ def test_fake_groups_satisfy_language_module(mocker, fake_groups, explicit_colle
     assert model.tp_group.size() == 4
     assert model.cp_group.size() == 1
     assert model.pp_group.size() == 2
+
+
+@pytest.mark.parametrize("pp_rank", [0, 1])
+def test_fake_pipeline_stages_do_not_warn_about_unsynchronized_embeddings(
+    mocker, fake_groups, pp_rank
+):
+    """The single-process saver fills both tied copies without embedding collectives."""
+    clear_nvte_env_vars()
+    mocker.patch("torch.distributed.is_initialized", return_value=True)
+    mocker.patch("torch.distributed.get_world_size", return_value=1)
+    mocker.patch.object(parallel_state, "_EMBEDDING_GROUP", None)
+    groups = ProcessGroupCollection.use_mpu_process_groups()
+    groups.pp.set_rank(pp_rank)
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        pipeline_model_parallel_size=2,
+        pipeline_dtype=torch.float32,
+    )
+    model = LanguageModule(config, pg_collection=groups)
+    model.pre_process = pp_rank == 0
+    model.post_process = pp_rank == 1
+    model.share_embeddings_and_output_weights = True
+    model.mtp_process = False
+    mocker.patch.object(
+        model, "shared_embedding_or_output_weight", return_value=torch.nn.Parameter(torch.ones(2))
+    )
+    all_reduce = mocker.patch("torch.distributed.all_reduce")
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        model.setup_embeddings_and_output_layer()
+
+    assert not [
+        warning
+        for warning in caught
+        if issubclass(warning.category, FutureWarning)
+        and "never synchronized" in str(warning.message)
+    ]
+    all_reduce.assert_not_called()
