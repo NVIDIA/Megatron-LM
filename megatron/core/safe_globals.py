@@ -139,7 +139,7 @@ class SafeDCPUnpickler(SafeUnpickler):
 
     _SAFE_CLASSES: frozenset = frozenset(
         {
-            **SAFE_OBJECTS,
+            *SAFE_OBJECTS,
             ("pathlib", "PosixPath"),
             ("torch.serialization", "_get_layout"),
             ("torch.distributed.checkpoint.filesystem", "_StorageInfo"),
