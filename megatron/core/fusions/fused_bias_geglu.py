@@ -432,6 +432,7 @@ def weighted_bias_quick_geglu_impl(
     reference. Bias addition and clamping do not commute.
     """
     ori_shape = input.shape
+    ori_dtype = input.dtype
     paged_stash_source = input
     assert len(ori_shape) in [2, 3]
     if clamp_value is not None:
@@ -460,5 +461,7 @@ def weighted_bias_quick_geglu_impl(
         )
     else:
         output = WeightedQuickGeGLUFunction.apply(input, weights, fp8_input_store, linear_offset)
+    # Adding a higher-precision bias above can promote the input; keep the caller's dtype.
+    output = output.to(ori_dtype)
 
     return output if len(ori_shape) == 2 else output.view(ori_shape[0], ori_shape[1], -1)

@@ -73,3 +73,30 @@ def test_bias_quick_geglu_matches_unfused_reference(bias_shape, clamp_value):
     torch.testing.assert_close(act_x.grad, ref_x.grad, **tols)
     torch.testing.assert_close(act_bias.grad, ref_bias.grad, **tols)
     torch.testing.assert_close(act_weights.grad, ref_weights.grad, **tols)
+
+
+@pytest.mark.internal
+@pytest.mark.parametrize("clamp_value", [None, 3.0])
+def test_fp32_bias_keeps_bf16_input_dtype(clamp_value):
+    """An FP32 bias promotes the biased input, but the output stays in the input dtype."""
+    torch.manual_seed(0)
+    tokens, hidden = 8, 16
+    x = (torch.randn(tokens, 2 * hidden, device=DEVICE) * 3.0).to(torch.bfloat16)
+    bias = torch.randn(2 * hidden, device=DEVICE) * 3.0
+    weights = torch.rand(tokens, 1, device=DEVICE, dtype=torch.float32)
+    grad_output = torch.randn(tokens, hidden, device=DEVICE).to(torch.bfloat16)
+
+    ref_x, ref_bias = (t.detach().clone().requires_grad_(True) for t in (x, bias))
+    expected = _reference(ref_x, ref_bias, weights, clamp_value)
+    expected.backward(grad_output)
+
+    act_x, act_bias = (t.detach().clone().requires_grad_(True) for t in (x, bias))
+    actual = weighted_bias_quick_geglu_impl(
+        act_x, act_bias, weights, False, LINEAR_OFFSET, clamp_value=clamp_value
+    )
+    actual.backward(grad_output)
+
+    assert actual.dtype == torch.bfloat16
+    assert act_x.grad.dtype == torch.bfloat16
+    assert act_bias.grad.dtype == torch.float32
+    torch.testing.assert_close(actual, expected)
