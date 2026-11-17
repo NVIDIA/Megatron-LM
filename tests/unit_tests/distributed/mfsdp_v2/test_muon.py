@@ -62,7 +62,9 @@ def _train(
 
 
 @pytest.mark.parametrize("dp_mode", ["fsdp", "hsdp", "hfsdp"])
-@pytest.mark.parametrize("num_groups_in_flight", [0, 2, 8])
+@pytest.mark.parametrize(
+    "num_groups_in_flight,use_side_stream", [(0, False), (2, True), (8, False)]
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("weight_decay_method", ["decoupled", "independent", "l2", "palm"])
 @pytest.mark.parametrize(
@@ -89,6 +91,7 @@ def test_muon_matches_reference(
     nesterov,
     kernel_options,
     num_groups_in_flight,
+    use_side_stream,
 ):
     """FSDP, HSDP, HFSDP, and unsharded Muon should produce identical loss curves.
 
@@ -152,5 +155,11 @@ def test_muon_matches_reference(
     # Every rank uses identical batches, so the reference needs no gradient reduction.
     inputs = torch.randn(5, 4, 8, device=device, dtype=dtype)
     reference_losses = _train(reference, (reference_optimizer, reference_other), inputs)
-    losses = _train(model, (optimizer, other_optimizer), inputs)
+    # Exercise the bounded pipeline from a non-default caller stream as well.
+    caller_stream = torch.cuda.current_stream(device)
+    stream = torch.cuda.Stream(device=device) if use_side_stream else caller_stream
+    stream.wait_stream(caller_stream)
+    with torch.cuda.stream(stream):
+        losses = _train(model, (optimizer, other_optimizer), inputs)
+    caller_stream.wait_stream(stream)
     torch.testing.assert_close(losses, reference_losses, atol=0, rtol=0)

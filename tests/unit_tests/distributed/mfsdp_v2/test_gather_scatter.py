@@ -8,7 +8,6 @@ computed inputs from a separate DBuffer, then scatter results into remote-owned 
 
 import pytest
 import torch
-import torch.distributed as dist
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import DBuffer, layout_builder
@@ -47,12 +46,6 @@ def _known_full_tensors(dbuffer: DBuffer) -> list[torch.Tensor]:
                 full.flatten()[offset : offset + shard_range.numel].view(local_view.shape)
             )
     return full_tensors
-
-
-def _wait(works: list[dist.Work]) -> None:
-    """Order the current stream after the posted transfers."""
-    for work in works:
-        work.wait()
 
 
 @pytest.mark.parametrize("subgroup", [False, True])
@@ -95,15 +88,15 @@ def test_gather_scatter_round_trip(subgroup, placement, distributed_setup):
 
     # Momentum/Nesterov-style computed inputs can use separate storage with the same layout.
     source = DBuffer.from_local(dbuffer.local_buffer + 2, mesh, [placement], layout)
-    _wait(gather(source, {}, tensor_to_owner={}))
-    _wait(scatter({}, dbuffer, tensor_to_owner={}))
+    gather(source, {}, tensor_to_owner={})
+    scatter({}, dbuffer, tensor_to_owner={})
     torch.testing.assert_close(dbuffer.local_buffer, original, atol=0, rtol=0)
 
     owned = {i for i, owner in tensor_to_owner.items() if owner == this_rank}
     destination = {
         i: torch.empty(full_tensors[i].shape, dtype=dbuffer.dtype, device=device) for i in owned
     }
-    _wait(gather(source, destination, tensor_to_owner=tensor_to_owner))
+    gather(source, destination, tensor_to_owner=tensor_to_owner)
     for i in owned:
         torch.testing.assert_close(destination[i], full_tensors[i] + 2, atol=0, rtol=0)
     assert set(destination) == owned
@@ -111,7 +104,7 @@ def test_gather_scatter_round_trip(subgroup, placement, distributed_setup):
 
     for tensor in destination.values():
         tensor.add_(1)
-    _wait(scatter(destination, dbuffer, tensor_to_owner=tensor_to_owner))
+    scatter(destination, dbuffer, tensor_to_owner=tensor_to_owner)
 
     expected_buffer = original.clone()
     for i in tensor_to_owner:
@@ -129,10 +122,12 @@ def test_gather_scatter_round_trip(subgroup, placement, distributed_setup):
 
 
 def test_gather_scatter_with_stream(distributed_setup):
-    """Gather and scatter on a separate stream into a scratch DBuffer with explicit waits."""
+    """Compute on gathered inputs and scatter on a side stream, then consume on the caller."""
     if distributed_setup.world_size < 2:
         pytest.skip("Needs at least two ranks.")
     device = distributed_setup.device
+    if device.type != "cuda":
+        pytest.skip("Requires CUDA streams.")
     mesh = init_device_mesh(device.type, (distributed_setup.world_size,))
     dbuffer = DBuffer.empty(mesh, [RowAtomic()], [(8, 4), (4, 4)], torch.float32, device)
     full_tensors = _known_full_tensors(dbuffer)
@@ -149,14 +144,16 @@ def test_gather_scatter_with_stream(distributed_setup):
     stream = torch.cuda.Stream(device=device)
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        _wait(gather(dbuffer, destination, tensor_to_owner=tensor_to_owner))
-        _wait(scatter(destination, scratch, tensor_to_owner=tensor_to_owner))
-    stream.synchronize()
+        gather(dbuffer, destination, tensor_to_owner=tensor_to_owner)
+        for tensor in destination.values():
+            tensor.mul_(2)
+        scatter(destination, scratch, tensor_to_owner=tensor_to_owner)
+    torch.cuda.current_stream(device).wait_stream(stream)
 
     for i in owned:
-        torch.testing.assert_close(destination[i], full_tensors[i], atol=0, rtol=0)
+        torch.testing.assert_close(destination[i], full_tensors[i] * 2, atol=0, rtol=0)
     for i in tensor_to_owner:
         local_view = dbuffer.get_tensor_view(i)
         result_view = scratch.get_tensor_view(i)
-        expected = torch.full_like(local_view, -1) if i in owned else local_view
+        expected = torch.full_like(local_view, -1) if i in owned else local_view * 2
         torch.testing.assert_close(result_view, expected, atol=0, rtol=0)

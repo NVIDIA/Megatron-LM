@@ -7,7 +7,6 @@ from dataclasses import dataclass, replace
 from typing import Any, cast
 
 import torch
-import torch.distributed as dist
 from torch.distributed.tensor import DTensor
 
 try:
@@ -39,13 +38,13 @@ class _FsdpGroupAssignment:
 
 @dataclass(frozen=True)
 class _GroupStep:
-    """One FSDP group's part of an optimizer step: its posted gather or scatter and the buffers.
+    """One FSDP group's part of an optimizer step: its transfer completion and the buffers.
 
     `sharded` is the DBuffer side of the transfer: the momentum inputs of a gather or the received
     updates of a scatter. `full_updates` holds the owners' full tensors on the other side.
     """
 
-    works: list[dist.Work]
+    ready: torch.cuda.Event
     fsdp_group: FsdpParameterGroup
     tensor_to_optimizer_group_index: dict[int, int]
     tensor_to_owner: dict[int, int]
@@ -54,8 +53,7 @@ class _GroupStep:
 
     def wait(self) -> None:
         """Order the current stream after the transfer; the host does not block."""
-        for work in self.works:
-            work.wait()
+        torch.cuda.current_stream(self.sharded.device).wait_event(self.ready)
 
 
 # Design choice: integrating Emerging Optimizers (EO) into FsdpMuon.
@@ -80,10 +78,10 @@ class FsdpMuon(Muon):
     """Muon for 2-D parameters with sharded optimizer buffers.
 
     Momentum remains sharded. Owner assignments balance orthogonalization across a
-    fixed set of buffers and are computed during initialization. Each step gathers,
-    orthogonalizes, and scatters each buffer on the caller's CUDA stream. Transfers are
-    asynchronous: the gathers of the next ``num_groups_in_flight`` buffers are posted before the
-    current one is orthogonalized, and a buffer's updates are applied after
+    fixed set of buffers and are computed during initialization. Momentum, orthogonalization,
+    and weight updates run on the caller's CUDA stream; gathers and scatters use a separate
+    communication stream. The gathers of the next ``num_groups_in_flight`` buffers are posted
+    before the current one is orthogonalized, and a buffer's updates are applied after
     ``num_groups_in_flight`` later buffers have been scattered, so each scatter overlaps their
     Newton-Schulz.
     Full matrices exist only on their assigned owners.
@@ -151,6 +149,11 @@ class FsdpMuon(Muon):
                 )
             )
         self._validate_parameter_groups()
+        self._communication_stream = (
+            torch.cuda.Stream(device=self._fsdp_group_assignments[0].fsdp_group.main_weight.device)
+            if self._fsdp_group_assignments
+            else None
+        )
 
     def _validate_parameter_groups(self) -> None:
         """Validate optimizer parameters and the FSDP buffers that contain them."""
@@ -218,7 +221,7 @@ class FsdpMuon(Muon):
             tensor_to_owner: The same active tensor indices mapped to global owner ranks.
 
         Returns:
-            The posted gather, holding the momentum inputs and the owners' full-tensor destinations.
+            The gather's completion event, momentum inputs, and owners' full-tensor destinations.
         """
         buffer: DBuffer = fsdp_group.main_weight
         momentum_inputs: DBuffer = self._compute_momentum_inputs(
@@ -230,9 +233,14 @@ class FsdpMuon(Muon):
             for i, owner in tensor_to_owner.items()
             if owner == this_rank
         }
-        works = gather(momentum_inputs, full_updates, tensor_to_owner=tensor_to_owner)
+        stream = self._communication_stream
+        assert stream is not None
+        stream.wait_stream(torch.cuda.current_stream(buffer.device))
+        with torch.cuda.stream(stream):
+            gather(momentum_inputs, full_updates, tensor_to_owner=tensor_to_owner)
+            ready = stream.record_event()
         return _GroupStep(
-            works=works,
+            ready=ready,
             fsdp_group=fsdp_group,
             tensor_to_optimizer_group_index=tensor_to_optimizer_group_index,
             tensor_to_owner=tensor_to_owner,
@@ -244,17 +252,22 @@ class FsdpMuon(Muon):
         """Post the scatter of a gathered group's orthogonalized updates.
 
         Returns:
-            The same group's step, now holding the scatter works and the buffer that receives
-            the updates of remote-owned tensors.
+            The same group's step, now holding the scatter's completion event and the buffer
+            that receives the updates of remote-owned tensors.
         """
         buffer: DBuffer = group_step.fsdp_group.main_weight
         local_updates: DBuffer = DBuffer(
             buffer.mesh, buffer.placements, buffer.layout, torch.float32, buffer.device
         )
-        works = scatter(
-            group_step.full_updates, local_updates, tensor_to_owner=group_step.tensor_to_owner
-        )
-        return replace(group_step, works=works, sharded=local_updates)
+        stream = self._communication_stream
+        assert stream is not None
+        stream.wait_stream(torch.cuda.current_stream(buffer.device))
+        with torch.cuda.stream(stream):
+            scatter(
+                group_step.full_updates, local_updates, tensor_to_owner=group_step.tensor_to_owner
+            )
+            ready = stream.record_event()
+        return replace(group_step, ready=ready, sharded=local_updates)
 
     def _compute_momentum_inputs(
         self, fsdp_group: FsdpParameterGroup, tensor_to_optimizer_group_index: dict[int, int]
