@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import copy
+import enum
 import functools
 import logging
 import math
@@ -53,6 +54,7 @@ from megatron.core.utils import ensure_params_ready, get_pg_size
 
 logger = logging.getLogger(__name__)
 _DSA_WEIGHTS_PROJ_TE_GEMM_FALLBACK_WARNED = False
+_DSA_CHECKPOINT_TOPK_REUSE_FALLBACK_WARNED = False
 _warned_mtp_index_sharing_fused_bypass = False
 # Kinds of prebuilt packed-CP layout mismatch already warned about (geometry fields
 # and/or device that differed), so each kind is reported once per process.
@@ -2601,6 +2603,20 @@ def _warn_dsa_weights_proj_te_gemm_fallback(error: RuntimeError) -> None:
     )
 
 
+def _warn_dsa_checkpoint_topk_reuse_fallback(layer_number: int, reason: str) -> None:
+    """Warn once when a checkpoint replay cannot reuse its first call's top-k selection."""
+    global _DSA_CHECKPOINT_TOPK_REUSE_FALLBACK_WARNED
+    if _DSA_CHECKPOINT_TOPK_REUSE_FALLBACK_WARNED:
+        return
+    _DSA_CHECKPOINT_TOPK_REUSE_FALLBACK_WARNED = True
+    # Logged on every rank: a fallback can be specific to one pipeline stage.
+    logger.warning(
+        "dsa_indexer_reuse_checkpoint_topk is enabled, but the checkpoint replay of DSA layer "
+        f"{layer_number} reran the dense indexer and top-k: {reason}. Further occurrences are "
+        "not logged."
+    )
+
+
 def _dsa_weights_proj_forward_gemm(
     x: torch.Tensor, weight: torch.Tensor, te_gemm_supported: Optional[bool]
 ) -> Tuple[torch.Tensor, Optional[bool]]:
@@ -2761,6 +2777,11 @@ def _validate_dsa_kpool_config(config: TransformerConfig) -> None:
             "dsa_indexer_mode='simplified' does not support KPool selection "
             "(dsa_indexer_kpool > 1): the simplified indexer has no pool compression, so the "
             f"pools would be silently ignored; got dsa_indexer_kpool={pool_size}."
+        )
+    if getattr(config, "dsa_indexer_reuse_checkpoint_topk", False):
+        raise ValueError(
+            "dsa_indexer_reuse_checkpoint_topk does not support KPool selection "
+            f"(dsa_indexer_kpool > 1), got dsa_indexer_kpool={pool_size}."
         )
     if (getattr(config, "dsa_indexer_loss_coeff", None) or 0.0) > 0:
         if not getattr(config, "dsa_indexer_use_sparse_loss", False):
@@ -3650,18 +3671,42 @@ class _DSAIndexSharingPayload:
     """Ordinary DSA index-sharing tensors carried across physical layers.
 
     Source/skip layers follow the configured layer-number schedule. The record lives on the
-    forward's carrier (:meth:`DSAttention._get_index_share_carrier`), so it lasts as long as
-    that carrier: one microbatch for ``PackedSeqParams``.
+    forward's carrier (:func:`get_index_share_carrier`), so it lasts as long as that carrier:
+    one microbatch for ``PackedSeqParams``. Entries a repeated MTP layer writes for itself are
+    keyed by ``(layer_number, prediction depth)``, so the depths do not overwrite each other.
+
+    ``topk_scores_by_layer`` holds the indexer scores aligned slot-for-slot with
+    ``topk_by_layer`` and ``topk_key_len_by_layer`` the key length they were selected
+    from. Both are written only by the no-grad first call of a checkpointed computing
+    layer under ``dsa_indexer_reuse_checkpoint_topk``, together with the indices, so the
+    replay can compute the sparse indexer loss without rerunning the dense indexer. Any
+    other publication of a layer's indices drops its score entries. Without the indexer
+    loss (a frozen indexer) that replay stores and needs no scores: it reuses the layer's
+    own ``topk_by_layer``, ``topk_length_by_layer`` and ``topk_rows_nonempty_by_layer``
+    entries.
 
     ``topk_rows_nonempty_by_layer`` holds the publishing call's host-side certificate that
     every row of its top-k selects at least one key (``can_prove_all_topk_rows_nonempty``).
     Every publication writes it, False included, so it never outlives the indices it
     describes; consumers treat a missing entry as False.
+
+    ``frozen_topk_key_len_by_layer`` holds the key length of a frozen indexer's published
+    indices. Every publication without the indexer loss writes it next to the indices, and
+    the frozen replay checks it before reusing them.
+
+    ``checkpoint_owner_by_layer`` names the checkpoint whose first call published a layer's
+    entries; any other publication drops it. A replay reuses only entries its own first call
+    published and otherwise recomputes them, so a later call that replaced them (the same layer
+    in another checkpoint, or another microbatch on a shared carrier) is never reused.
     """
 
     topk_by_layer: dict[int, torch.Tensor] = field(default_factory=dict)
     topk_length_by_layer: dict[int, torch.Tensor] = field(default_factory=dict)
+    topk_scores_by_layer: dict[int, torch.Tensor] = field(default_factory=dict)
+    topk_key_len_by_layer: dict[int, int] = field(default_factory=dict)
     topk_rows_nonempty_by_layer: dict[int, bool] = field(default_factory=dict)
+    frozen_topk_key_len_by_layer: dict[int, int] = field(default_factory=dict)
+    checkpoint_owner_by_layer: dict[int, object] = field(default_factory=dict)
 
 
 @dataclass
@@ -3687,8 +3732,86 @@ _INDEX_SHARE_TOPK_LENGTH_HOLDER_ATTR = "_dsa_index_share_topk_length_holder"
 _INDEX_SHARING_HOLDER_ATTRS = {
     "topk_by_layer": _INDEX_SHARE_TOPK_HOLDER_ATTR,
     "topk_length_by_layer": _INDEX_SHARE_TOPK_LENGTH_HOLDER_ATTR,
+    "topk_scores_by_layer": "_dsa_index_share_topk_scores_holder",
+    "topk_key_len_by_layer": "_dsa_index_share_topk_key_len_holder",
     "topk_rows_nonempty_by_layer": "_dsa_index_share_topk_rows_nonempty_holder",
+    "frozen_topk_key_len_by_layer": "_dsa_index_share_frozen_topk_key_len_holder",
+    "checkpoint_owner_by_layer": "_dsa_index_share_checkpoint_owner_holder",
 }
+
+
+class CheckpointPhase(enum.Enum):
+    """Which call of a checkpointed DSA region is running (:func:`dsa_checkpoint_phase_wrapper`).
+
+    ``FIRST_FORWARD`` marks a reentrant checkpoint's original call, which runs without grad,
+    when a backward replay is expected to follow: the wrapper was built with grad enabled and
+    an argument requires grad. ``REPLAY`` marks the backward-time recompute of that call.
+    Everything else stays ``NONE``.
+    """
+
+    NONE = "none"
+    FIRST_FORWARD = "first_forward"
+    REPLAY = "replay"
+
+
+@dataclass
+class _DSACheckpointCall:
+    """The running call of a checkpointed DSA region.
+
+    ``replayed_layers`` holds the layer keys a replay has already reached: the frozen-indexer
+    replay reuses each layer's first-call top-k once, so a checkpoint that runs a layer twice
+    is rejected instead of silently reusing the later run's selection.
+    """
+
+    phase: CheckpointPhase = CheckpointPhase.NONE
+    replayed_layers: set = field(default_factory=set)
+    owner: object = None
+
+
+_CURRENT_DSA_CHECKPOINT_CALL: ContextVar[Optional[_DSACheckpointCall]] = ContextVar(
+    "current_dsa_checkpoint_call", default=None
+)
+
+
+def current_dsa_checkpoint_phase() -> CheckpointPhase:
+    """Return the phase of the innermost checkpointed DSA region, ``NONE`` outside one."""
+    call = _CURRENT_DSA_CHECKPOINT_CALL.get()
+    return CheckpointPhase.NONE if call is None else call.phase
+
+
+def dsa_checkpoint_phase_wrapper(function):
+    """Mark a reentrant checkpoint function's original call and its backward replay.
+
+    A reentrant checkpoint runs its original call without grad, so a replay can follow only
+    when the wrapper is built with grad enabled (outside the checkpoint), the call itself runs
+    without grad, and an argument requires grad. Every later call is a replay.
+    """
+    replay_expected = torch.is_grad_enabled()
+    called = False
+    # Shared by the first call and its replay: names the entries the first call published.
+    owner = object()
+
+    @functools.wraps(function)
+    def wrapped(*args):
+        nonlocal called
+        if called:
+            phase = CheckpointPhase.REPLAY
+        elif (
+            replay_expected
+            and not torch.is_grad_enabled()
+            and any(isinstance(arg, torch.Tensor) and arg.requires_grad for arg in args)
+        ):
+            phase = CheckpointPhase.FIRST_FORWARD
+        else:
+            phase = CheckpointPhase.NONE
+        called = True
+        token = _CURRENT_DSA_CHECKPOINT_CALL.set(_DSACheckpointCall(phase, owner=owner))
+        try:
+            return function(*args)
+        finally:
+            _CURRENT_DSA_CHECKPOINT_CALL.reset(token)
+
+    return wrapped
 _MTP_SHARING_ATTR = "_dsa_mtp_repeated_sharing"
 
 
@@ -4908,8 +5031,85 @@ class DSAttention(MegatronModule):
             if self.index_share
             else None
         )
+        # Under activation recompute the checkpoint's first call runs without grad, so it
+        # selects top-k without the indexer loss, and the replay reruns the dense indexer
+        # and top-k only to recover the selected scores for that loss. With
+        # dsa_indexer_reuse_checkpoint_topk the first call also keeps those scores next to
+        # its published indices, and the replay computes the loss from them. A frozen
+        # indexer (no indexer loss) needs no scores: its replay reuses the top-k that the
+        # first call published and skips the indexer entirely.
+        indexer_loss_on = indexer_loss_coeff > 0
+        reuse_checkpoint_topk = bool(
+            self.config.dsa_indexer_reuse_checkpoint_topk
+            and index_payload is not None
+            and computes_topk
+            and self.training
+            and (sparse_indexer_loss if indexer_loss_on else not _is_kpool)
+            # KPool never reuses a checkpoint's top-k, frozen or trainable; the config
+            # rejects the combination, and this keeps a later-set flag from opening it.
+            and not _is_kpool
+            and use_fused_kernels
+            and not sequence_parallel_query_is_local
+        )
+        own_key = self.layer_number
+        if self.layer_number > self.config.num_layers:
+            from megatron.core.transformer.multi_token_prediction import mtp_repeated_depth
+
+            depth = mtp_repeated_depth(self.layer_number)
+            if depth is not None:
+                # One repeated MTP layer number runs every prediction depth.
+                own_key = (self.layer_number, depth)
+            elif getattr(self.config, "mtp_use_repeated_layer", False):
+                # Without a depth marker the depths would share one entry; recompute instead.
+                reuse_checkpoint_topk = False
+        checkpoint_call = _CURRENT_DSA_CHECKPOINT_CALL.get() if reuse_checkpoint_topk else None
+        checkpoint_phase = (
+            CheckpointPhase.NONE if checkpoint_call is None else checkpoint_call.phase
+        )
+        checkpoint_owner = None if checkpoint_call is None else checkpoint_call.owner
+        stash_checkpoint_topk_scores = (
+            checkpoint_phase is CheckpointPhase.FIRST_FORWARD
+            and not torch.is_grad_enabled()
+            and indexer_loss_on
+        )
+        replay_checkpoint_topk = checkpoint_phase is CheckpointPhase.REPLAY and use_indexer_loss
+        reuse_checkpoint_indices = False
+        if checkpoint_phase is CheckpointPhase.REPLAY and not indexer_loss_on:
+            # The carrier entry is the selection that the first call's output already used
+            # when this checkpoint's first call published it (the owner check below) and the
+            # checkpoint ran the layer once.
+            assert index_payload is not None
+            replayed_layers = _CURRENT_DSA_CHECKPOINT_CALL.get().replayed_layers
+            if own_key in replayed_layers:
+                raise RuntimeError(
+                    "DSA checkpoint replay ran layer_number="
+                    f"{self.layer_number} twice: dsa_indexer_reuse_checkpoint_topk keeps one "
+                    "first-call top-k per layer and checkpoint, so a checkpoint must not run "
+                    "a layer more than once."
+                )
+            replayed_layers.add(own_key)
+            stashed_indices = index_payload.topk_by_layer.get(own_key)
+            stashed_key_len = index_payload.frozen_topk_key_len_by_layer.get(own_key)
+            if stashed_indices is None:
+                _warn_dsa_checkpoint_topk_reuse_fallback(
+                    self.layer_number, "its first call published no top-k indices"
+                )
+            elif index_payload.checkpoint_owner_by_layer.get(own_key) is not checkpoint_owner:
+                _warn_dsa_checkpoint_topk_reuse_fallback(
+                    self.layer_number, "a later call replaced its first call's top-k"
+                )
+            elif stashed_key_len != skv or tuple(stashed_indices.shape[:2]) != (b, sq):
+                raise RuntimeError(
+                    "DSA checkpoint replay geometry differs from its first call: "
+                    f"layer_number={self.layer_number}, stored key length {stashed_key_len} "
+                    f"and rows {tuple(stashed_indices.shape[:2])}, replay key length {skv} "
+                    f"and rows {(b, sq)}."
+                )
+            else:
+                reuse_checkpoint_indices = True
         topk_indices = None
         topk_length = None
+        topk_scores = None
         q = k = weights = None
         # Pooled indexer keys of the trainable KPool path, in global pool order, and each
         # pool's first token.
@@ -4945,6 +5145,13 @@ class DSAttention(MegatronModule):
             topk_length = index_payload.topk_length_by_layer.get(self.source_layer)
             shared_topk_rows_nonempty = index_payload.topk_rows_nonempty_by_layer.get(
                 self.source_layer, False
+            )
+        elif reuse_checkpoint_indices:
+            assert index_payload is not None
+            topk_indices = index_payload.topk_by_layer[own_key]
+            topk_length = index_payload.topk_length_by_layer.get(own_key)
+            shared_topk_rows_nonempty = index_payload.topk_rows_nonempty_by_layer.get(
+                own_key, False
             )
         else:
             assert self.indexer is not None
@@ -5099,7 +5306,7 @@ class DSAttention(MegatronModule):
             return _normalize_dsattention_output_rank(output, x.ndim)
 
         fused_bounds = None
-        if use_fused_kernels and computes_topk:
+        if use_fused_kernels and computes_topk and topk_indices is None:
             assert q is not None
             fused_bounds = dsa_masking.build_fused_indexer_varlen_bounds(
                 sq=sq,
@@ -5209,7 +5416,52 @@ class DSAttention(MegatronModule):
             # ===================================
             # Attach indexer topk and loss
             # ===================================
-            if sparse_indexer_loss and fused_bounds is not None:
+            if replay_checkpoint_topk:
+                assert index_payload is not None
+                stashed_indices = index_payload.topk_by_layer.get(own_key)
+                stashed_length = index_payload.topk_length_by_layer.get(own_key)
+                stashed_scores = index_payload.topk_scores_by_layer.get(own_key)
+                stashed_key_len = index_payload.topk_key_len_by_layer.get(own_key)
+                reuse_failure = None
+                if stashed_indices is None or stashed_length is None or stashed_scores is None:
+                    reuse_failure = "its first call stored no top-k scores"
+                elif index_payload.checkpoint_owner_by_layer.get(own_key) is not checkpoint_owner:
+                    reuse_failure = "a later call replaced its first call's top-k"
+                else:
+                    if stashed_key_len != skv or tuple(stashed_indices.shape[:2]) != (b, sq):
+                        raise RuntimeError(
+                            "DSA checkpoint replay geometry differs from its first call: "
+                            f"layer_number={self.layer_number}, stored key length "
+                            f"{stashed_key_len} and rows {tuple(stashed_indices.shape[:2])}, "
+                            f"replay key length {skv} and rows {(b, sq)}."
+                        )
+                    stashed_loss = dsa_kernels.run_sparse_indexer_loss_from_topk(
+                        self.config,
+                        q,
+                        k,
+                        weights,
+                        topk_indices=stashed_indices,
+                        topk_length=stashed_length,
+                        topk_scores=stashed_scores,
+                        query=query.detach(),
+                        key=key.detach(),
+                        softmax_scale=self.softmax_scale,
+                        loss_coeff=indexer_loss_coeff,
+                        pg_collection=self.pg_collection,
+                        query_valid_rows=query_valid_rows,
+                        calculate_per_token_loss=self.config.calculate_per_token_loss,
+                    )
+                    if stashed_loss is None:
+                        reuse_failure = "the kernel backend declined the stored top-k"
+                    else:
+                        topk_indices = stashed_indices
+                        topk_length = stashed_length
+                        topk_scores = stashed_scores
+                        indexer_loss = stashed_loss
+                if reuse_failure is not None:
+                    _warn_dsa_checkpoint_topk_reuse_fallback(self.layer_number, reuse_failure)
+
+            if sparse_indexer_loss and fused_bounds is not None and topk_indices is None:
                 starts_i32, ends_i32 = fused_bounds
                 block_size = int(getattr(self, "fused_indexer_block_size", 8192))
                 fused_topk_with_loss = dsa_kernels.run_fused_qk_topk_with_loss(
@@ -5295,7 +5547,7 @@ class DSAttention(MegatronModule):
             elif fused_bounds is not None:
                 starts_i32, ends_i32 = fused_bounds
                 block_size = int(getattr(self, "fused_indexer_block_size", 8192))
-                fused_topk = dsa_kernels.run_fused_qk_topk(
+                fused_topk_args = (
                     self.config,
                     q,
                     k,
@@ -5303,6 +5555,8 @@ class DSAttention(MegatronModule):
                     self.index_topk,
                     starts_i32,
                     ends_i32,
+                )
+                fused_topk_kwargs = dict(
                     block_size=max(1, block_size),
                     use_relu=self.config.dsa_indexer_scoring_relu,
                     use_local_indexer_varlen=use_local_indexer_varlen,
@@ -5314,8 +5568,18 @@ class DSAttention(MegatronModule):
                     cp_size=cp_size,
                     varlen_is_plain_causal=varlen_is_plain_causal,
                 )
-                if fused_topk is not None:
-                    topk_indices, topk_length = fused_topk
+                if stash_checkpoint_topk_scores:
+                    fused_topk_with_scores = dsa_kernels.run_fused_qk_topk_with_scores(
+                        *fused_topk_args, query=query, key=key, **fused_topk_kwargs
+                    )
+                    if fused_topk_with_scores is not None:
+                        topk_indices, topk_length, topk_scores = fused_topk_with_scores
+                if topk_indices is None:
+                    fused_topk = dsa_kernels.run_fused_qk_topk(
+                        *fused_topk_args, **fused_topk_kwargs
+                    )
+                    if fused_topk is not None:
+                        topk_indices, topk_length = fused_topk
 
             if topk_indices is None:
                 with torch.no_grad():
@@ -5366,12 +5630,24 @@ class DSAttention(MegatronModule):
         # never describe newer indices.
         if publish_ordinary_topk:
             assert index_payload is not None and topk_indices is not None
-            index_payload.topk_by_layer[self.layer_number] = topk_indices
-            index_payload.topk_rows_nonempty_by_layer[self.layer_number] = all_topk_rows_nonempty
+            index_payload.topk_by_layer[own_key] = topk_indices
+            index_payload.topk_rows_nonempty_by_layer[own_key] = all_topk_rows_nonempty
             if topk_length is None:
-                index_payload.topk_length_by_layer.pop(self.layer_number, None)
+                index_payload.topk_length_by_layer.pop(own_key, None)
             else:
-                index_payload.topk_length_by_layer[self.layer_number] = topk_length
+                index_payload.topk_length_by_layer[own_key] = topk_length
+            if topk_scores is None:
+                index_payload.topk_scores_by_layer.pop(own_key, None)
+                index_payload.topk_key_len_by_layer.pop(own_key, None)
+            else:
+                index_payload.topk_scores_by_layer[own_key] = topk_scores
+                index_payload.topk_key_len_by_layer[own_key] = skv
+            if not indexer_loss_on:
+                index_payload.frozen_topk_key_len_by_layer[own_key] = skv
+            if checkpoint_phase is CheckpointPhase.FIRST_FORWARD:
+                index_payload.checkpoint_owner_by_layer[own_key] = checkpoint_owner
+            else:
+                index_payload.checkpoint_owner_by_layer.pop(own_key, None)
         if publish_mtp_topk:
             assert mtp_payload is not None and topk_indices is not None
             mtp_payload.topk_by_layer[self.layer_number] = topk_indices

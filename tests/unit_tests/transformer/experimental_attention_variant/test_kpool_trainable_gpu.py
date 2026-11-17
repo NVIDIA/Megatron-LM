@@ -144,7 +144,13 @@ _PROFILES = [
 ]
 _REFERENCE_PROFILE = {True: "key_dtype", False: "fp32"}
 # Token-level loss and top-k hooks that a KPool layer must never reach.
-_TOKEN_LEVEL_HOOKS = ("run_fused_dsa_attention", "run_fused_qk_topk", "run_fused_qk_topk_with_loss")
+_TOKEN_LEVEL_HOOKS = (
+    "run_fused_dsa_attention",
+    "run_fused_qk_topk",
+    "run_fused_qk_topk_with_scores",
+    "run_fused_qk_topk_with_loss",
+    "run_sparse_indexer_loss_from_topk",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -551,7 +557,7 @@ def _forbid_token_level_loss_hooks(monkeypatch):
     for name in _TOKEN_LEVEL_HOOKS:
         if hasattr(dsa_kernels, name):
             monkeypatch.setattr(dsa_kernels, name, forbidden(f"dsa_kernels.{name}"))
-    for name in ("run_fused_qk_topk_with_loss",):
+    for name in ("run_sparse_indexer_loss_from_topk", "run_fused_qk_topk_with_loss"):
         if hasattr(dsa_cudnn_kernels, name):
             monkeypatch.setattr(dsa_cudnn_kernels, name, forbidden(f"dsa_cudnn_kernels.{name}"))
 

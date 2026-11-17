@@ -44,6 +44,9 @@ from megatron.core.utils import init_method_normal
 from tests.unit_tests.transformer.experimental_attention_variant import (
     kpool_trainable_reference as ref,
 )
+from tests.unit_tests.transformer.experimental_attention_variant.test_mtp_dsa_cross_depth_sharing import (
+    _make_config as make_small_dsa_config,
+)
 
 POOL = 4
 TOPK = 16  # four selected pools per row
@@ -1786,6 +1789,22 @@ def test_frozen_kpool_configs_are_unchanged(overrides, coeff):
     assert (config.dsa_indexer_loss_coeff or 0.0) == 0.0
 
 
+def test_trainable_kpool_rejects_checkpoint_topk_reuse(monkeypatch):
+    # Config validation only; neither a CUDA device nor the kernel dependencies are needed.
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(core_utils, "_missing_cudnn_dsa_kernel_dependencies", lambda: [])
+    fields = dict(
+        dsa_kernel_backend="cudnn",
+        attention_backend=AttnBackend.auto,
+        dsa_indexer_kpool=POOL,
+        dsa_indexer_topk=8,
+        **_TRAINABLE,
+    )
+    make_small_dsa_config(**fields)  # control: accepted without the reuse
+    with pytest.raises(ValueError, match="dsa_indexer_reuse_checkpoint_topk"):
+        make_small_dsa_config(dsa_indexer_reuse_checkpoint_topk=True, **fields)
+
+
 @pytest.mark.parametrize("loss", ["frozen", "trainable"])
 def test_simplified_indexer_rejects_kpool(loss):
     fields = dict(
@@ -1819,6 +1838,7 @@ def _validator_config(**overrides):
         cuda_graph_impl="none",
         recompute_granularity=None,
         recompute_modules=["core_attn"],
+        dsa_indexer_reuse_checkpoint_topk=False,
         dsa_indexer_mode="standard",
     )
     values.update(overrides)
@@ -1843,6 +1863,11 @@ def test_validate_dsa_kpool_config_accepts_the_trainable_sparse_loss():
         pytest.param({"cuda_graph_impl": "full_iteration"}, "full_iteration", id="full-iteration"),
         pytest.param(_FULL_RECOMPUTE, _FULL_RECOMPUTE_MESSAGE, id="full-recompute"),
         pytest.param(_CORE_ATTN_RECOMPUTE, "core_attn", id="core-attn-recompute"),
+        pytest.param(
+            {"dsa_indexer_reuse_checkpoint_topk": True},
+            "dsa_indexer_reuse_checkpoint_topk",
+            id="checkpoint-topk-reuse",
+        ),
         pytest.param({"dsa_indexer_mode": "simplified"}, "simplified", id="simplified"),
     ],
 )

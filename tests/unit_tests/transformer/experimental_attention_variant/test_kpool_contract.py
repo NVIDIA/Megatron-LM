@@ -420,6 +420,8 @@ def test_kpool_allows_trainable_selector_with_sparse_loss():
         ),
         (0.0, dict(dsa_indexer_mode='simplified'), "dsa_indexer_mode='simplified'"),
         (0.01, dict(dsa_indexer_mode='simplified'), "dsa_indexer_mode='simplified'"),
+        (0.0, dict(dsa_indexer_reuse_checkpoint_topk=True), 'does not support KPool selection'),
+        (0.01, dict(dsa_indexer_reuse_checkpoint_topk=True), 'does not support KPool selection'),
     ],
 )
 def test_kpool_rejects_untrainable_combinations(loss_coeff, overrides, match):

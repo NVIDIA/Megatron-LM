@@ -1080,6 +1080,17 @@ class AbsorbedMLASelfAttention(Attention):
                 with mtp_repeated_depth_scope(layer_number, depth), bind_sharing_carrier():
                     return unscoped_forward(*inputs)
 
+        if getattr(self.core_attention, "index_share", False) and getattr(
+            self.config, "dsa_indexer_reuse_checkpoint_topk", False
+        ):
+            from megatron.core.transformer.experimental_attention_variant.dsa import (
+                dsa_checkpoint_phase_wrapper,
+            )
+
+            # DSA reuses its first call's top-k in this checkpoint's replay (the reuse requires
+            # IndexShare, so only a DSA core attention gets here).
+            custom_forward = dsa_checkpoint_phase_wrapper(custom_forward)
+
         hidden_states = tensor_parallel.checkpoint(
             custom_forward,
             False,
