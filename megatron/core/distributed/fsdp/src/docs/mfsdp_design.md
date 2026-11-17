@@ -267,7 +267,9 @@ teardown. See https://github.com/NVIDIA/Megatron-LM/pull/6230.
 
 ### FsdpContext
 
-Context-wide options are grouped in an immutable `RuntimePolicy`:
+`FsdpContext` shares communication streams and prefetch state across FSDP modules.
+`fully_shard_context` associates newly sharded modules with the context and finalizes
+its roots and prefetch orders on exit. Runtime options live in an immutable `RuntimePolicy`:
 
 ```python
 context = FsdpContext(
@@ -275,31 +277,28 @@ context = FsdpContext(
     runtime_policy=RuntimePolicy(
         use_symmetric_memory=True,
         overlap_allgather_reduction=False,
-        caller_managed_grad_sync=True,
     ),
 )
 with fully_shard_context(context):
     fully_shard(model, mesh=mesh, placements=placements)
 ```
 
-`device` and the construction-only `parameter_to_owner` map remain separate
-`FsdpContext` arguments. Runtime-policy flags default to `False`, except
-`overlap_allgather_reduction`, which defaults to `True`. When the caller manages
-gradient synchronization, call `context.finish_grad_sync()` after all backward
-work and before consuming gradients.
+For delayed weight gradients, keep both backward and `backward_dw()` inside the scope,
+then wait before the optimizer step:
 
-- Pass an `FsdpContext` to `fully_shard_context(context)` to share it with every
-  `FsdpModule` constructed in that scope. On exit, the scope finalizes the FSDP roots
-  and static forward and backward prefetch orders.
-- Per-device all-gather and reduce-scatter streams. Module compute runs on PyTorch’s
-  current stream.
-- Gradient finalization is enabled by default. Use
-  `with finalize_gradients(context, enabled=False):` around forward and backward
-  to defer DP-outer reduction and the automatic completion wait. Enable finalization
-  during the last backward call before the optimizer step. This launches deferred
-  outer reductions and enables the automatic wait for gradient reductions. The
-  scope itself does not launch reductions on entry or exit.
-- An optional PyTorch NCCL symmetric-memory pool for communication staging buffers.
+```python
+with context.finalize_gradients(mode=GradientFinalizationMode.REDUCE_OUTER):
+    loss = model(inputs).sum()
+    loss.backward()
+    model.backward_dw()
+context.finish_grad_sync()
+optimizer.step()
+```
+
+The MCore adapter starts in `REDUCE_OUTER` mode. Its `no_sync()` scopes temporarily
+select `SKIP_OUTER` for accumulation, and `finalize_model_grads()` waits after all
+backward work. Scopes restore the previous mode; `finish_grad_sync()` waits for
+submitted reductions without launching skipped ones.
 
 ### FsdpModule
 
