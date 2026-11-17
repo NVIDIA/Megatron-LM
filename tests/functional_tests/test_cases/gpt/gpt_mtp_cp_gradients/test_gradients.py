@@ -63,9 +63,9 @@ def _batches(mask_name):
 
 
 def _train(cp_size, per_token, depth, early_backward, initial_state=None):
-    parallel_state.initialize_model_parallel(context_parallel_size=cp_size)
+    pg_collection = parallel_state.initialize_model_parallel(context_parallel_size=cp_size)
     torch.manual_seed(6103)
-    model_parallel_cuda_manual_seed(6103)
+    model_parallel_cuda_manual_seed(6103, pg_collection=pg_collection)
     config = TransformerConfig(
         num_layers=2,
         hidden_size=128,
@@ -91,11 +91,14 @@ def _train(cp_size, per_token, depth, early_backward, initial_state=None):
         GPTModel(
             config=config,
             transformer_layer_spec=layer_spec,
-            mtp_block_spec=get_gpt_mtp_block_spec(config, layer_spec, use_transformer_engine=True),
+            mtp_block_spec=get_gpt_mtp_block_spec(
+                config, layer_spec, use_transformer_engine=True, pp_rank=pg_collection.pp.rank()
+            ),
             vocab_size=128,
             max_sequence_length=32,
             share_embeddings_and_output_weights=True,
             position_embedding_type="rope",
+            pg_collection=pg_collection,
         )
         .cuda()
         .bfloat16()
@@ -111,13 +114,14 @@ def _train(cp_size, per_token, depth, early_backward, initial_state=None):
         config,
         DistributedDataParallelConfig(grad_reduce_in_fp32=True, overlap_grad_reduce=False),
         model,
+        pg_collection=pg_collection,
     )
     config.finalize_model_grads_func = finalize_model_grads
     config.no_sync_func = model.no_sync
 
     def forward_step(iterator, wrapped_model):
         batch = get_batch_on_this_cp_rank(
-            next(iterator), dynamic_cp=False, cp_group=parallel_state.get_context_parallel_group()
+            next(iterator), dynamic_cp=False, cp_group=pg_collection.cp
         )
         mask = batch["loss_mask"]
         output = wrapped_model(
@@ -135,7 +139,7 @@ def _train(cp_size, per_token, depth, early_backward, initial_state=None):
                 return loss, count, {}
             # Legacy schedules multiply this mean by CP size before DDP
             # averages. Preserve a differentiable local numerator.
-            torch.distributed.all_reduce(count, group=parallel_state.get_context_parallel_group())
+            torch.distributed.all_reduce(count, group=pg_collection.cp)
             return loss / count.clamp(min=1), {}
 
         return output, loss_func
@@ -153,13 +157,14 @@ def _train(cp_size, per_token, depth, early_backward, initial_state=None):
         model.zero_grad_buffer()
         model.zero_grad(set_to_none=True)
         MTPLossLoggingHelper.tracker = {}
-        get_forward_backward_func()(
+        get_forward_backward_func(pp_size=pg_collection.pp.size())(
             forward_step_func=forward_step,
             data_iterator=iter(_batches(mask_name)),
             model=[model],
             num_microbatches=2,
             seq_length=32,
             micro_batch_size=1,
+            pg_collection=pg_collection,
         )
         gradients[mask_name] = {
             name: parameter.main_grad.detach().float().cpu().clone()

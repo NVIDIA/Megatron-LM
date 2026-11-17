@@ -201,7 +201,7 @@ def test_dsa_index_share_support_replays_across_forward_scopes(with_attention_ma
         attn_mask_type=AttnMaskType.causal,
         attention_type="self",
         softmax_scale=1.0,
-        pg_collection=SimpleNamespace(),
+        pg_collection=SimpleNamespace(tp=None, cp=None),
     )
     attention_mask = torch.empty(1, device="cuda") if with_attention_mask else None
     # Distinct candidate sets and lengths make cross-forward contamination visible.
