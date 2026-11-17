@@ -213,6 +213,10 @@ def run_fused_dsa_attention(
     The dispatcher only routes here for the cuDNN backend and ``dsa.py`` already gates on
     ``use_fused_dsa_kernels`` before calling, so this hook assumes it was selected (matching
     the TileLang backend) and only validates that the requested shapes/layout are supported.
+
+    ``pg_collection`` is the calling attention's collection. Its ``tp`` group, None when tensor
+    parallelism is off, sums the attention target across the tensor-parallel ranks. Omitting
+    the collection (the default) also runs without tensor parallelism.
     """
     _assert_supported_indexer_scoring(use_relu)
     if (
@@ -273,6 +277,9 @@ def run_fused_dsa_attention(
             "packed_max_seqlen_k": packed_max_seqlen_k,
             "packed_cp_size": cp_size,
         }
+    # Direct callers may omit the collection; that keeps the hook's default of no tensor
+    # parallelism and never consults the global grid.
+    tp_group = pg_collection.tp if pg_collection is not None else None
 
     output, indexer_loss = fused_indexer_sparse_attn(
         query.contiguous(),
@@ -295,7 +302,7 @@ def run_fused_dsa_attention(
         local_packed_cp_rank=local_packed_cp_rank,
         local_packed_cp_query_start=local_packed_cp_query_start,
         local_packed_cp_query_len=local_packed_cp_query_len,
-        tp_group=getattr(pg_collection, "tp", None),
+        tp_group=tp_group,
         **packed_thd_kwargs,
     )
 
@@ -1398,9 +1405,12 @@ def run_fused_qk_topk_with_loss(
     packed_seq_params: Optional["PackedSeqParams"] = None,
     cp_size: int = 1,
 ) -> Optional[Tuple[Tensor, Tensor, Tensor]]:
-    """Run cuDNN fused indexer and sparse indexer loss for split DSA."""
+    """Run cuDNN fused indexer and sparse indexer loss for split DSA.
+
+    ``pg_collection`` is the calling attention's collection. Its ``tp`` group, None when tensor
+    parallelism is off, sums the attention target across the tensor-parallel ranks.
+    """
     del block_size
-    tp_group = getattr(pg_collection, "tp", None)
     _assert_supported_indexer_scoring(use_relu)
     if loss_coeff <= 0:
         return None
@@ -1459,7 +1469,7 @@ def run_fused_qk_topk_with_loss(
         packed_max_seqlen_q,
         packed_max_seqlen_k,
         cp_size,
-        tp_group,
+        pg_collection.tp,
     )
 
 

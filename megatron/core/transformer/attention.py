@@ -338,9 +338,10 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             needs_dp = (
                 self.attention_type == "self" and self.config.test_mode and self.config.qk_layernorm
             )
-            pg_collection = ProcessGroupCollection.use_mpu_process_groups(
-                required_pgs=['tp', 'cp', 'hcp'] + (['dp', 'dp_gtp_remat'] if needs_dp else [])
-            )
+            required_pgs = ['tp', 'cp', 'hcp'] + (['dp', 'dp_gtp_remat'] if needs_dp else [])
+            # The Transformer Engine linears built below reduce FP8/FP4 amaxes over these groups.
+            required_pgs += ['tp_cp', 'tp_dp_cp']
+            pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
         else:
             groups = vars(pg_collection)
             for group_name in ('tp', 'cp'):
@@ -440,7 +441,9 @@ class Attention(MegatronModule, TwoStageAttentionLayer, ABC):
             is_expert=False,
             tp_comm_buffer_name='proj',
             tp_group=self.pg_collection.tp,
-            pg_collection=self.pg_collection,
+            # As for core attention: the fallback built before initialize_model_parallel() holds
+            # no group, and the linear then resolves its amax group at forward time.
+            pg_collection=self.pg_collection if self.tp_group is not None else None,
             name=(name + ".linear_proj") if name is not None else None,
         )
 
@@ -1935,7 +1938,8 @@ class SelfAttention(Attention):
             is_expert=False,
             tp_comm_buffer_name='qkv',
             tp_group=self.pg_collection.tp,
-            pg_collection=self.pg_collection,
+            # None for the fallback built before initialize_model_parallel(), as for linear_proj.
+            pg_collection=self.pg_collection if self.tp_group is not None else None,
             name=(name + ".linear_qkv") if name is not None else None,
         )
 
@@ -2011,10 +2015,18 @@ class SelfAttention(Attention):
         if not self.config.qk_layernorm:
             return
 
+        # __init__ has already checked that the DP group is there; a group removed since then
+        # must not reach torch.distributed, which reads None as WORLD.
+        dp_group = self._realtime_test_dp_group()
+        if self.tp_group is None or dp_group is None:
+            raise ValueError(
+                "SelfAttention with config.test_mode and qk_layernorm compares the Q/K layernorm "
+                "parameters across the tensor- and data-parallel groups; pg_collection must set "
+                "tp and dp_gtp_remat or dp"
+            )
+
         # check that all tensor parallel and data parallel ranks have the same
         # Q & K layernorm parameters.
-        # __init__ has already checked that the DP group is there.
-        dp_group = self._realtime_test_dp_group()
         rank = get_pg_rank(dp_group)
         inputs = torch.stack(
             [
@@ -2363,6 +2375,9 @@ class CrossAttention(Attention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
+            tp_group=self.pg_collection.tp,
+            # None for the fallback built before initialize_model_parallel(), as for linear_proj.
+            pg_collection=self.pg_collection if self.tp_group is not None else None,
             name=(name + ".linear_q") if name is not None else None,
         )
 
@@ -2375,6 +2390,9 @@ class CrossAttention(Attention):
             bias=self.config.add_bias_linear,
             skip_bias_add=False,
             is_expert=False,
+            tp_group=self.pg_collection.tp,
+            # None for the fallback built before initialize_model_parallel(), as for linear_proj.
+            pg_collection=self.pg_collection if self.tp_group is not None else None,
             name=(name + ".linear_kv") if name is not None else None,
         )
 

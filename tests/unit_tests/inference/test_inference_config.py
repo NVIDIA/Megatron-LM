@@ -144,9 +144,10 @@ class TestInferenceConfig:
             InferenceConfig().media_cache_coordinator_policy == MediaCacheCoordinatorPolicy.AFFINITY
         )
 
-    def test_resolve_pg_collection_does_not_store_the_global_groups(self, monkeypatch):
-        """The inference context and controller read ``pg_collection`` and treat None as unset."""
-        global_groups = ProcessGroupCollection(tp=object())
+    def test_resolve_pg_collection_stores_the_groups_it_resolves(self, monkeypatch):
+        """The context, wrapper, controller and engine of one config share the stored collection."""
+        names = ("tp", "pp", "dp", "mp", "ep", "cp", "expt_tp", "expt_dp", "tp_ep")
+        global_groups = ProcessGroupCollection(**{name: object() for name in names})
         monkeypatch.setattr(
             ProcessGroupCollection,
             "use_mpu_process_groups",
@@ -155,9 +156,9 @@ class TestInferenceConfig:
 
         config = InferenceConfig()
         assert config.resolve_pg_collection() is global_groups
-        assert config.pg_collection is None
+        assert config.pg_collection is global_groups
 
-        explicit_groups = ProcessGroupCollection(tp=object())
+        explicit_groups = ProcessGroupCollection(**{name: object() for name in names})
         config = InferenceConfig(pg_collection=explicit_groups)
         assert config.resolve_pg_collection() is explicit_groups
         assert config.pg_collection is explicit_groups

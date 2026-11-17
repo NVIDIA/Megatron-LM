@@ -428,7 +428,9 @@ class TensorParallelMuon(OrthogonalizedOptimizer):
         # TODO: Clean up code that determines if parameter is a MoE layer and which TP group to use
         is_expert = getattr(p, 'expert_tp', False)
         gtp_remat_group = (
-            resolve_gtp_remat_group(self.pg_collection, is_expert) if self.pg_collection else None
+            resolve_gtp_remat_group(self.pg_collection, is_expert, owner=type(self).__name__)
+            if self.pg_collection
+            else None
         )
 
         # Parameters with is_gtp_weight_remat=False are not sharded along the
