@@ -121,17 +121,6 @@ def cache_identity(
     if not bucket.startswith("tests/unit_tests/") or "\n" in bucket:
         raise ValueError("invalid unit-test bucket")
     paths = {root / path for path in COMPATIBILITY_FILES}
-    if bucket in {
-        "tests/unit_tests/inference/test_batch_invariant_fp8.py",
-        "tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py",
-        "tests/unit_tests/inference/test_disagg_transfer_pairwise.py",
-    }:
-        # These buckets depend on the runner's profiles and the selector's
-        # accumulation of those profiles into a complete baseline.
-        paths.update(
-            root / path
-            for path in ("tests/unit_tests/run_ci_test.sh", "tests/unit_tests/testmon_selector.py")
-        )
     paths.update(
         path for pattern in COMPATIBILITY_GLOBS for path in root.glob(pattern) if path.is_file()
     )

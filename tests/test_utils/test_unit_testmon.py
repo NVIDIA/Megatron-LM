@@ -36,7 +36,7 @@ def _function(source: str, name: str) -> str:
     return source.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
 
 
-def _invoke(project, cache, mode, phase="prod", rank=0, pytest_args=()):
+def _invoke(project, cache, mode, phase="prod", rank=0, pytest_args=(), append=False):
     return subprocess.run(
         [
             sys.executable,
@@ -47,6 +47,7 @@ def _invoke(project, cache, mode, phase="prod", rank=0, pytest_args=()):
             str(cache),
             "--phase",
             phase,
+            *(["--append"] if append else []),
             "--",
             "-q",
             "-c",
@@ -133,11 +134,52 @@ def test_successful_baseline_records_each_phase(project, cache):
         assert (cache / phase / "metadata.json").is_file()
 
 
-def test_failed_baseline_cannot_reuse_old_metadata(project, cache):
+@pytest.mark.parametrize("append", (False, True))
+def test_failed_baseline_cannot_reuse_old_metadata(project, cache, append):
     (project / "tests/test_app.py").write_text("def test_failure():\n    assert False\n")
-    result = _invoke(project, cache, "baseline")
+    result = _invoke(project, cache, "baseline", append=append)
     assert result.returncode == 1
     assert not (cache / "prod/metadata.json").exists()
+
+
+@pytest.mark.parametrize("changed", ("active", "unused"))
+def test_appended_profiles_select_changes_from_either_environment(project, tmp_path, changed):
+    (project / "tests/test_app.py").write_text(
+        "from app import active, unused\n\n"
+        "def test_active():\n    assert active(1) == 2\n\n"
+        "def test_unused():\n    assert unused(2) == 1\n"
+    )
+    cache = tmp_path / "profiles"
+    profiles = (("delayed", "active"), ("blockwise", "unused"))
+    for index, (profile, function) in enumerate(profiles):
+        result = _invoke(
+            project,
+            cache,
+            "baseline",
+            pytest_args=(f"--testmon-env={profile}", "-k", function),
+            append=index > 0,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    # A missing first environment selects its tests even without a source change.
+    for profile, function in profiles:
+        result = _invoke(
+            project, cache, "select", pytest_args=(f"--testmon-env={profile}", "-k", function)
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert (cache / ".testmon-work/prod/rank-0/selected-tests").read_text() == ""
+
+    dependency = project / "app.py"
+    source = dependency.read_text()
+    original = "value + 1" if changed == "active" else "value - 1"
+    dependency.write_text(source.replace(original, original[:-1] + "2"))
+    for profile, function in profiles:
+        result = _invoke(
+            project, cache, "select", pytest_args=(f"--testmon-env={profile}", "-k", function)
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        selected = (cache / ".testmon-work/prod/rank-0/selected-tests").read_text().splitlines()
+        assert selected == ([f"tests/test_app.py::test_{function}"] if function == changed else [])
 
 
 def test_empty_baseline_phase_is_recorded(project, tmp_path):
@@ -261,6 +303,7 @@ def test_changed_function_selects_and_runs_only_affected_cases_in_same_file(proj
                 "NUM_NODES=1",
                 "GPUS_PER_NODE=2",
                 "DISTRIBUTED_ARGS=()",
+                "UNIT_BUCKET_LAUNCHER=",
                 "IGNORE_ARGS=()",
                 "MARKER_ARG='not flaky'",
                 # Replace only uv/torchrun; run the actual coverage/pytest command locally.
@@ -269,6 +312,8 @@ def test_changed_function_selects_and_runs_only_affected_cases_in_same_file(proj
                 "    shift 5",
                 '    "$TEST_PYTHON" "$@"',
                 "}",
+                "run_unit_worker() {" + _function(runner, "run_unit_worker") + "\n}",
+                "run_unit_phase() {" + _function(runner, "run_unit_phase") + "\n}",
                 "merge_rank_selections() {" + _function(runner, "merge_rank_selections") + "\n}",
                 "run_selected_phase() {" + _function(runner, "run_selected_phase") + "\n}",
                 "merge_rank_selections prod",
@@ -639,12 +684,19 @@ def test_cpu_plan_execution(tmp_path, validation_status, selected_runs):
     runner = _source("tests/unit_tests/run_ci_test.sh")
     functions = "\n".join(
         name + "() {" + _function(runner, name) + "\n}"
-        for name in ("run_selected_phase", "write_testmon_summary", "run_enforced_tests")
+        for name in (
+            "run_unit_worker",
+            "run_unit_phase",
+            "run_selected_phase",
+            "write_testmon_summary",
+            "run_enforced_tests",
+        )
     )
     script = "\n".join(
         (
             "set -euo pipefail",
             "DISTRIBUTED_ARGS=() IGNORE_ARGS=()",
+            "UNIT_BUCKET_LAUNCHER=",
             "MARKER_ARG='not flaky_in_dev'",
             "UNIT_TEST_REPEAT=2 NUM_NODES=1 GPUS_PER_NODE=8 PLATFORM=h100",
             "BUCKET=tests/unit_tests/test_example.py",
