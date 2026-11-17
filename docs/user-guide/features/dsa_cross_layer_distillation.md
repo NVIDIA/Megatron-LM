@@ -21,15 +21,17 @@ layer has its own indexer. Ordinary owner-only supervision remains appropriate w
 quality is sufficient or the additional dependency/recompute constraints are
 undesirable. CLI is not required for ordinary DSA training.
 
-Reported training evaluations at sharing frequency 4 improved over CLI-disabled
-index-sharing DSA by the following score differences on a 0-100 scale:
+The [LongCat Sparse Attention cross-layer distillation ablation, Section 5.3.3
+and Fig. 7(c)](https://arxiv.org/html/2608.01662v2#S5.SS3.SSS3) reports:
 
-| GPQA | LongBench v2 | Graphwalks | MRCR-2N | MRCR-4N |
-| ---: | ---: | ---: | ---: | ---: |
-| +6.95 | +11.20 | +22.40 | +17.46 | +7.98 |
+| Configuration | Sharing group size | 128K retrieval accuracy |
+| --- | ---: | ---: |
+| Index sharing without cross-layer distillation | 2 | 70% |
+| Index sharing with cross-layer distillation | 2 | 96% |
 
-These experiments motivate the feature; they are separate from the focused tests
-of this upstream revision and do not establish gains for every model or workload.
+The 26-percentage-point improvement motivates supervision from reuse layers.
+These are published LongCat-Flash-Lite results, not measurements of this
+implementation or guarantees for other models and sharing frequencies.
 
 ## Objective and loss scaling
 
