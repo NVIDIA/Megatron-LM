@@ -675,6 +675,17 @@ class TransformerConfig(ModelParallelConfig):
     bias_dropout_fusion: bool = False  # TODO: this should be bias_dropout_add_fusion?
     """If True, uses bias dropout fusion."""
 
+    fuse_attn_residual_grad: bool = False
+    """Add the residual-branch gradient of the attention input inside the input-norm backward.
+
+    When the input layernorm is fused into the attention's first linear layer (MLA with
+    mla_down_proj_fusion, or a fused-norm linear_qkv) and Transformer Engine supports gradient
+    fan-in for that module, its RMSNorm backward adds the residual gradient
+    (``rmsnorm_bwd_add``) instead of autograd adding it with a separate kernel. Removes one
+    [tokens, hidden] elementwise add per layer in backward; rounds the sum once, so the
+    gradient is not bitwise identical to the default path. No effect otherwise.
+    """
+
     apply_rope_fusion: bool = False
     """If True, use fused RoPE kernel."""
 
@@ -907,6 +918,18 @@ class TransformerConfig(ModelParallelConfig):
     """Enable overlapping between shared expert computations and dispatcher communications.
     Without this, the shared experts execute before the router. 
     Only effective when moe-shared-expert-intermediate-size is set.
+    """
+
+    moe_fuse_input_grad: bool = False
+    """Sum the gradients of the MoE layer input in one buffer instead of with separate adds.
+
+    The MoE input feeds the token dispatch, the router gating GEMM and (without
+    moe_shared_expert_overlap) the shared-expert fc1. With this option the router gating
+    input-gradient GEMM, and the shared-expert fc1 dgrad GEMM when Transformer Engine supports
+    gradient fan-in (``supports_grad_fanin``), add their result into the running sum in the
+    GEMM epilogue. This removes up to two [tokens, hidden] elementwise adds per MoE layer in
+    backward. The sum is rounded once in the epilogue instead of once per add, so the input
+    gradient is not bitwise identical to the default path.
     """
 
     use_grouped_gemm_for_shared_expert: bool = False

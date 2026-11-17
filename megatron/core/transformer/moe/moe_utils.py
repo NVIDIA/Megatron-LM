@@ -1,5 +1,6 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import contextlib
 import functools
 import math
 from dataclasses import dataclass
@@ -29,6 +30,7 @@ from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
     is_batch_invariant_mode_enabled,
 )
 from megatron.core.transformer.enums import CudaGraphModule
+from megatron.core.transformer.grad_fanin import GradFanIn
 from megatron.core.transformer.moe.batch_invariant import (
     build_inverse_permutation_map as build_batch_invariant_inverse_permutation_map,
 )
@@ -1642,6 +1644,27 @@ def apply_biased_logits(logits, std, layer_number=None):
     return RandomSTEShared.apply(logits, std, layer_number)
 
 
+# Gradient fan-in of the MoE layer input that the router gating GEMM joins (see
+# ``router_input_grad_fanin``).
+_ROUTER_INPUT_GRAD_FANIN: Optional[GradFanIn] = None
+
+
+@contextlib.contextmanager
+def router_input_grad_fanin(fanin: Optional[GradFanIn]):
+    """Let the router gating GEMMs run in this block join ``fanin``.
+
+    A gating GEMM joins only if its input is the fan-in's source tensor. Its input-gradient
+    GEMM then accumulates into the fan-in's running sum (``accumulate=True``) when the router
+    dtype equals the input dtype, instead of autograd adding it with a separate kernel.
+    """
+    global _ROUTER_INPUT_GRAD_FANIN
+    prev, _ROUTER_INPUT_GRAD_FANIN = _ROUTER_INPUT_GRAD_FANIN, fanin
+    try:
+        yield
+    finally:
+        _ROUTER_INPUT_GRAD_FANIN = prev
+
+
 class RouterGatingLinearFunction(torch.autograd.Function):
     """
     Autograd function for router gating linear.
@@ -1654,6 +1677,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
         weight: torch.Tensor,
         bias: Optional[torch.Tensor],
         router_dtype: torch.dtype,
+        grad_fanin: Optional[GradFanIn] = None,
     ) -> torch.Tensor:
         """
         Forward pass of the RouterGatingLinearFunction function.
@@ -1663,11 +1687,13 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             weight (torch.Tensor): The weight tensor.
             bias (torch.Tensor): The bias tensor. Could be None.
             router_dtype (torch.dtype): The router dtype.
+            grad_fanin (GradFanIn, optional): Gradient fan-in of ``inp`` this GEMM has joined.
 
         Returns:
             torch.Tensor: The output tensor.
         """
         ctx.save_for_backward(inp, weight, bias)
+        ctx.grad_fanin = grad_fanin
         ctx.router_dtype = router_dtype
         ctx.input_dtype = inp.dtype
         ctx.weight_dtype = weight.dtype
@@ -1693,7 +1719,7 @@ class RouterGatingLinearFunction(torch.autograd.Function):
     @staticmethod
     def backward(
         ctx, grad_output: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], None]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], None, None]:
         """
         Backward pass of the RouterGatingLinearFunction function.
 
@@ -1701,23 +1727,51 @@ class RouterGatingLinearFunction(torch.autograd.Function):
             grad_output (torch.Tensor): The gradient output.
 
         Returns:
-            Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], None]:
-                The gradient input, gradient weight, gradient bias, and None.
+            Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], None, None]:
+                The gradient input, gradient weight, gradient bias, and None for the
+                non-tensor arguments. With a gradient fan-in, the gradient input is the
+                fan-in's sum for its last contribution and None otherwise.
         """
         inp, weight, bias = ctx.saved_tensors
+        grad_fanin, ctx.grad_fanin = ctx.grad_fanin, None
         inp_shape = inp.shape
         grad_shape = grad_output.shape
         inp = inp.view(-1, inp_shape[-1])
         grad_output = grad_output.view(-1, grad_shape[-1])
 
+        accumulated = False
         if te_general_gemm is not None and ctx.router_dtype != torch.float64:
-            grad_input = te_general_gemm(
-                weight.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NN", grad=True
-            )
+            acc = grad_fanin.accum_target() if grad_fanin is not None else None
+            if (
+                acc is not None
+                and ctx.router_dtype == ctx.input_dtype
+                and acc.dtype == ctx.input_dtype
+                and acc.is_contiguous()
+                and acc.numel() == inp.numel()
+            ):
+                # Add dx into the fan-in's running sum in the GEMM epilogue.
+                grad_input = te_general_gemm(
+                    weight.to(ctx.router_dtype),
+                    grad_output,
+                    ctx.router_dtype,
+                    layout="NN",
+                    out=acc.view(-1, inp_shape[-1]),
+                    grad=True,
+                    accumulate=True,
+                )[0]
+                accumulated = True
+            else:
+                grad_input = te_general_gemm(
+                    weight.to(ctx.router_dtype),
+                    grad_output,
+                    ctx.router_dtype,
+                    layout="NN",
+                    grad=True,
+                )[0]
             grad_weight = te_general_gemm(
                 inp.to(ctx.router_dtype), grad_output, ctx.router_dtype, layout="NT", grad=True
             )
-            grad_input = grad_input[0].to(ctx.input_dtype)
+            grad_input = grad_input.to(ctx.input_dtype)
             grad_weight = grad_weight[0].to(ctx.weight_dtype)
         else:
             grad_input = torch.mm(grad_output, weight.to(ctx.router_dtype)).to(ctx.input_dtype)
@@ -1725,7 +1779,9 @@ class RouterGatingLinearFunction(torch.autograd.Function):
 
         grad_bias = grad_output.sum(dim=0).to(ctx.weight_dtype) if bias is not None else None
         grad_input = grad_input.view(*inp_shape)
-        return grad_input, grad_weight, grad_bias, None
+        if grad_fanin is not None:
+            grad_input = grad_fanin.finish(grad_input, accumulated=accumulated)
+        return grad_input, grad_weight, grad_bias, None, None
 
 
 def router_gating_linear(
@@ -1745,7 +1801,17 @@ def router_gating_linear(
     Returns:
         torch.Tensor: The output tensor.
     """
-    return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype)
+    grad_fanin = _ROUTER_INPUT_GRAD_FANIN
+    if (
+        grad_fanin is not None
+        and torch.is_grad_enabled()
+        and inp.requires_grad
+        and grad_fanin.matches(inp)
+    ):
+        grad_fanin.add_consumer()
+    else:
+        grad_fanin = None
+    return RouterGatingLinearFunction.apply(inp, weight, bias, router_dtype, grad_fanin)
 
 
 def get_align_size_for_quantization(config: TransformerConfig) -> int:

@@ -31,6 +31,7 @@ from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.cuda_graphs import is_graph_capturing
 from megatron.core.transformer.enums import CudaGraphModule, InferenceCudaGraphScope, LayerType
+from megatron.core.transformer.grad_fanin import GradFanIn, attach_grad_fanin, grad_fanin_tap
 from megatron.core.transformer.identity_op import IdentityFuncOp, IdentityOp
 from megatron.core.transformer.mlp import MLP
 from megatron.core.transformer.module import GraphableMegatronModule, TwoStageAttentionLayer
@@ -1114,7 +1115,51 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
         if residual_connection is None and self.config.fp32_residual_connection:
             residual = residual.float()
+        if residual_connection is None:
+            self._maybe_attach_attn_residual_grad_fanin(residual)
         return input_layernorm_output, residual, connection_state
+
+    def _maybe_attach_attn_residual_grad_fanin(self, residual: Tensor) -> None:
+        """Set up the attention-input gradient fan-in (``config.fuse_attn_residual_grad``).
+
+        The attention input feeds the residual branch and, when the input layernorm is fused
+        into the attention's first linear layer, that layer directly. The linear layer joins
+        a gradient fan-in so its norm backward adds the residual gradient
+        (``rmsnorm_bwd_add``); the residual joins through a tap placed right before the
+        bias-dropout-add (``_apply_self_attn_bda_step``), so its gradient is reported before
+        the attention backward reaches the linear layer.
+        """
+        pending = self.__dict__.pop("_attn_residual_grad_fanin", None)
+        if pending is not None:
+            # Previous forward did not reach the base bias-dropout-add; detach its hook.
+            pending.__exit__(None, None, None)
+        if not (
+            self.config.fuse_attn_residual_grad
+            and self.training
+            and torch.is_grad_enabled()
+            and residual.requires_grad
+            and isinstance(self.input_layernorm, IdentityOp)
+            and not self._input_layernorm_checkpoint_active
+        ):
+            return
+        first_linear = getattr(self.self_attention, "linear_qkv_down_proj", None)
+        if first_linear is None:
+            first_linear = getattr(self.self_attention, "linear_qkv", None)
+        if not getattr(first_linear, "supports_grad_fanin", False):
+            return
+        attach = attach_grad_fanin(first_linear, GradFanIn(residual))
+        attach.__enter__()
+        self._attn_residual_grad_fanin = attach
+
+    def _maybe_tap_attn_residual_grad_fanin(self, residual: Tensor) -> Tensor:
+        """Route the residual-branch gradient through the attention-input fan-in, if any."""
+        attach = self.__dict__.pop("_attn_residual_grad_fanin", None)
+        if attach is None:
+            return residual
+        attach.__exit__(None, None, None)
+        if attach.joined and attach.fanin.matches(residual):
+            residual = grad_fanin_tap(residual, attach.fanin)
+        return residual
 
     def _apply_self_attn_bda_step(
         self,
@@ -1167,6 +1212,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     recompute_context=write_recompute_context,
                 )
         else:
+            residual = self._maybe_tap_attn_residual_grad_fanin(residual)
             with self.bias_dropout_add_exec_handler():
                 hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
                     attention_output_with_bias, residual, self.hidden_dropout
