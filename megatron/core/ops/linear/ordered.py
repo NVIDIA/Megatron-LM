@@ -31,6 +31,18 @@ try:
 except ImportError:
     HAVE_TE = False
 
+try:
+    from transformer_engine.pytorch.distributed_weight import (
+        finalize_weight_grads,
+        is_distributed_weight,
+        materialize_weight_for_backward,
+        materialize_weight_for_forward,
+    )
+
+    HAVE_DISTRIBUTED_WEIGHT = True
+except ImportError:
+    HAVE_DISTRIBUTED_WEIGHT = False
+
 
 def _training_buffer_key(group) -> str:
     return f"tp_ordered_training:{group.group_name}"
@@ -86,14 +98,15 @@ def _accumulate_wgrad(
     weight: torch.Tensor, grad_out2d: torch.Tensor, input2d: torch.Tensor, use_te_gemm: bool = False
 ):
     """Weight gradient with Megatron's main_grad accumulation (as in tensor_parallel.layers)."""
-    main_grad = getattr(weight, "main_grad", None)
+    distributed = HAVE_DISTRIBUTED_WEIGHT and is_distributed_weight(weight)
+    main_grad = weight.grad_buffer() if distributed else getattr(weight, "main_grad", None)
     if main_grad is None:
         if use_te_gemm:
             return te_cpp_extensions.general_gemm(
                 input2d, grad_out2d, layout="NT", out_dtype=weight.dtype, grad=True
             )[0]
         return grad_out2d.t().matmul(input2d)
-    if use_te_gemm:
+    if use_te_gemm or distributed:
         te_cpp_extensions.general_gemm(
             input2d,
             grad_out2d,
@@ -101,7 +114,7 @@ def _accumulate_wgrad(
             out=main_grad,
             out_dtype=main_grad.dtype,
             grad=True,
-            accumulate=True,
+            accumulate=not distributed,
         )
     elif HAVE_GRAD_ACCUM_FUSION and main_grad.dtype == torch.float32:
         fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(input2d, grad_out2d, main_grad)
@@ -109,6 +122,9 @@ def _accumulate_wgrad(
         fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp16(input2d, grad_out2d, main_grad)
     else:
         main_grad.add_(grad_out2d.t().matmul(input2d).to(main_grad.dtype))
+    if distributed:
+        # The full gradient is reduced and accumulated by the weight's owner.
+        return main_grad
     if not hasattr(weight, "grad_added_to_main_grad"):
         return None
     weight.grad_added_to_main_grad = True
@@ -134,6 +150,10 @@ class _TPShardRowLinear(torch.autograd.Function):
         ctx, x, weight, group, num_shards, sequence_parallel, wgrad_into_main_grad, use_te_gemm
     ):
         """Shard partials of x @ weight.T, reduced (SP: reduce-scattered) in shard order."""
+        ctx.save_for_backward(x, weight)
+        ctx.distributed_weight = HAVE_DISTRIBUTED_WEIGHT and is_distributed_weight(weight)
+        if ctx.distributed_weight:
+            weight = materialize_weight_for_forward(weight)[0]
         shape = (num_shards, *x.shape[:-1], weight.shape[0])
         scratch = {"tensor": None, "handle": None}
         key = _training_buffer_key(group)
@@ -170,7 +190,6 @@ class _TPShardRowLinear(torch.autograd.Function):
             out = ordered_reduce_scatter_shards(parts, group)
         else:
             out = ordered_all_reduce_shards(parts, group)
-        ctx.save_for_backward(x, weight)
         ctx.group = group
         ctx.sequence_parallel = sequence_parallel
         ctx.wgrad_into_main_grad = wgrad_into_main_grad
@@ -180,7 +199,13 @@ class _TPShardRowLinear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Stock row-parallel backward (all-gather under SP, full local-K GEMMs)."""
-        x, weight = ctx.saved_tensors
+        x, saved_weight = ctx.saved_tensors
+        # Materialize even without dgrad so GTP can prefetch the preceding weight.
+        weight = (
+            materialize_weight_for_backward(saved_weight)[0]
+            if ctx.distributed_weight
+            else saved_weight
+        )
         group = ctx.group
         world_size = group.size()
         if ctx.sequence_parallel and world_size > 1:
@@ -206,13 +231,15 @@ class _TPShardRowLinear(torch.autograd.Function):
         grad_weight = None
         if ctx.needs_input_grad[1]:
             if ctx.wgrad_into_main_grad:
-                grad_weight = _accumulate_wgrad(weight, g2, x2, use_te_gemm=ctx.use_te_gemm)
+                grad_weight = _accumulate_wgrad(saved_weight, g2, x2, use_te_gemm=ctx.use_te_gemm)
             elif ctx.use_te_gemm:
                 grad_weight = te_cpp_extensions.general_gemm(
                     x2, g2, layout="NT", out_dtype=weight.dtype, grad=True
                 )[0]
             else:
                 grad_weight = g2.t().matmul(x2)
+            if ctx.distributed_weight:
+                grad_weight = finalize_weight_grads(saved_weight, [grad_weight])[0]
         return grad_input, grad_weight, None, None, None, None, None
 
 

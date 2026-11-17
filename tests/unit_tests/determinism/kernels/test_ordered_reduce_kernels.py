@@ -69,6 +69,141 @@ class TestOrderedReduceKernels:
             what="ordered_fold",
         )
 
+    @_requires_tp(4)
+    @pytest.mark.parametrize(
+        "local_shards,sequence_parallel,fused_wgrad",
+        [
+            (2, False, False),
+            (2, True, False),
+            (2, False, True),
+            (2, True, True),
+            (1, False, False),
+            (1, True, True),
+        ],
+    )
+    def test_gtp_fixed_shard_linear_replays(
+        self, local_shards, sequence_parallel, fused_wgrad, monkeypatch
+    ):
+        """Real GTP weights: fixed-shard output, rematerialized dgrad and accumulated wgrad."""
+        from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+
+        if not HAVE_GTP:
+            pytest.skip("GTP requires TransformerEngine >= 2.19")
+
+        from megatron.core.extensions.transformer_engine import TERowParallelLinear
+        from megatron.core.process_groups_config import ProcessGroupCollection
+        from megatron.core.tensor_parallel import generalized_tensor_parallelism as gtp
+        from megatron.core.transformer.enums import AttnBackend
+        from megatron.core.transformer.transformer_config import TransformerConfig
+
+        Utils.initialize_model_parallel(2, 1, gtp_remat_size=2)
+        self._tp = 2
+        groups = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "gtp_remat"])
+        monkeypatch.setattr(gtp.GTP_CONFIG, "calculate_per_token_loss", True)
+        cfg = TransformerConfig(
+            num_layers=1,
+            hidden_size=256,
+            num_attention_heads=8,
+            tensor_model_parallel_size=2,
+            gtp_weight_remat_size=2,
+            sequence_parallel=sequence_parallel,
+            params_dtype=torch.bfloat16,
+            batch_invariant_mode=True,
+            batch_invariant_tp_shards=4,
+            gradient_accumulation_fusion=fused_wgrad,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            attention_dropout=0.0,
+        )
+        try:
+            layer = TERowParallelLinear(
+                512,
+                256,
+                config=cfg,
+                init_method=lambda w: None,
+                bias=False,
+                input_is_parallel=True,
+                skip_bias_add=True,
+                is_expert=False,
+                pg_collection=groups,
+            ).cuda()
+            seeded()
+            full_weight = torch.randn(256, 512, device="cuda", dtype=torch.bfloat16) * 0.02
+            tp_rank, gtp_rank = groups.tp.rank(), groups.gtp_remat.rank()
+            weight = full_weight[:, tp_rank * 256 : (tp_rank + 1) * 256].contiguous()
+            with torch.no_grad():
+                layer.weight.copy_(weight[gtp_rank * 128 : (gtp_rank + 1) * 128])
+            layer.weight.main_grad = torch.zeros_like(layer.weight, dtype=torch.float32)
+            gen = torch.Generator(device="cuda").manual_seed(51 + gtp_rank)
+            full_x = torch.randn(32, 1, 512, device="cuda", dtype=torch.bfloat16, generator=gen)
+            x = full_x[..., tp_rank * 256 : (tp_rank + 1) * 256].contiguous()
+            dy = torch.randn(32, 1, 256, device="cuda", dtype=torch.bfloat16, generator=gen)
+            local_dy = dy.chunk(2, dim=0)[tp_rank].contiguous() if sequence_parallel else dy
+            reference = orr.ordered_fold(
+                orl.row_parallel_shard_partials(full_x, full_weight, 2 * local_shards)
+            )
+            if sequence_parallel:
+                reference = reference.chunk(2, dim=0)[tp_rank].contiguous()
+            if local_shards == 1:
+                dx = orl.te_cpp_extensions.general_gemm(
+                    weight, dy.reshape(-1, 256), layout="NN", out_dtype=x.dtype, grad=True
+                )[0].view_as(x)
+            else:
+                dx = dy.reshape(-1, 256).matmul(weight).view_as(x)
+            if fused_wgrad:
+                dw = orl.te_cpp_extensions.general_gemm(
+                    x.reshape(-1, 256),
+                    dy.reshape(-1, 256),
+                    layout="NT",
+                    out_dtype=torch.float32,
+                    grad=True,
+                )[0]
+            else:
+                dw = dy.reshape(-1, 256).t().matmul(x.reshape(-1, 256))
+            torch.distributed.all_reduce(dw, group=groups.gtp_remat)
+            dw = dw[gtp_rank * 128 : (gtp_rank + 1) * 128].float()
+
+            def run(value):
+                layer.weight.main_grad.zero_()
+                outputs, inputs = [], []
+                for _ in range(2):
+                    leaf = value.detach().requires_grad_()
+                    if local_shards > 1:
+                        out, _ = layer(leaf)
+                    else:
+                        out = orl.tp_shard_row_linear(
+                            leaf,
+                            layer.weight,
+                            groups.tp,
+                            1,
+                            sequence_parallel,
+                            wgrad_into_main_grad=fused_wgrad,
+                            use_te_gemm=True,
+                        )
+                    out.backward(local_dy)
+                    outputs.append(out.detach())
+                    inputs.append(leaf.grad)
+                return outputs, inputs, layer.weight.main_grad.clone()
+
+            with set_batch_invariant_mode(True, backend="te_native"):
+                outputs, inputs, main_grad = run(x)
+                for out, grad in zip(outputs, inputs):
+                    assert torch.equal(out, reference)
+                    torch.testing.assert_close(grad, dx, rtol=0, atol=0)
+                torch.testing.assert_close(main_grad, dw * 2, rtol=0, atol=0)
+                assert_replays_bit_exact(
+                    run,
+                    (x,),
+                    backward=False,
+                    contention=True,
+                    what="GTP fixed-shard row linear forward/dgrad/wgrad",
+                )
+        finally:
+            torch.cuda.synchronize()
+            torch.distributed.barrier()
+            gtp.reset_gtp_state()
+            gtp._GTP_PARAMS.clear()
+
     @pytest.mark.parametrize("num_shards", [2, 4])
     def test_local_shard_partials_and_fold_replay(self, num_shards):
         seeded()

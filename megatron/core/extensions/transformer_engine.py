@@ -1490,11 +1490,7 @@ class TELinear(te.pytorch.Linear):
         # Set by a caller that runs the TP communication itself (shared-expert overlap): the
         # forward then returns this rank's partial and the caller reduces it.
         self.bi_tp_reduce_by_caller = False
-        self._bi_tp_direct_gemm = (
-            (gtp_remat_group is None or gtp_remat_group.size() == 1)
-            and not config.cpu_offloading
-            and not config.delay_wgrad_compute
-        )
+        self._bi_tp_direct_gemm = not config.cpu_offloading and not config.delay_wgrad_compute
         if self._bi_tp_forward is not _BITPForward.TE:
             input_size = divide(input_size, tp_size)
             te_parallel_mode = None
