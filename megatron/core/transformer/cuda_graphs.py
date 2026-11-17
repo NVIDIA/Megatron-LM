@@ -2548,6 +2548,8 @@ def _pair_hybrid_layers_enabled(config: TransformerConfig) -> bool:
                 getattr(config, "sequence_packing_scheduler", None) is not None,
             ),
             ("enable_mhc_connections", config.enable_mhc_connections),
+            # TransformerConfig rejects wide residual streams with TE CUDA graphs today; this
+            # keeps pairing off should that combination ever be allowed.
             ("wide_residual", config.wide_residual is not None),
             ("context_parallel_size > 1", config.context_parallel_size > 1),
         )

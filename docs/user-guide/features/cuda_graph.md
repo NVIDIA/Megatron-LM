@@ -150,7 +150,9 @@ follows it as one graph, which halves the graph launches per block:
   `--keep-mtp-in-bf16` in FP8 or FP4 training.
 - Pairing is skipped, with a warning, with `--overlap-moe-expert-parallel-comm`,
   `--delay-wgrad-compute`, `--fine-grained-activation-offloading`, `--sequence-packing-scheduler`,
-  `--enable-mhc-connections`, `--wide-residual` or `--context-parallel-size` greater than 1.
+  `--enable-mhc-connections` or `--context-parallel-size` greater than 1.
+- Wide residual streams (`--wide-residual`) do not support Transformer Engine CUDA graphs:
+  configuration validation rejects that combination, with or without pairing.
 - The flag has no effect with other `--cuda-graph-impl` values.
 
 ---
