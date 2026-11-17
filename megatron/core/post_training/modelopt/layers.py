@@ -86,6 +86,9 @@ class Norm:
         else:
             raise Exception("Only LayerNorm and RMSNorm are curently supported")
 
+        if config.normalization == "RMSNorm":
+            instance.weight.is_rmsnorm_weight = True
+
         def _state_dict_hook(self, state_dict, prefix, local_metadata):
             if "_extra_state" in state_dict:
                 state_dict.pop("_extra_state")

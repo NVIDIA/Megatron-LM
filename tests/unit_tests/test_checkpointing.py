@@ -19,6 +19,7 @@ from megatron.core.num_microbatches_calculator import (
     init_num_microbatches_calculator,
     unset_num_microbatches_calculator,
 )
+from megatron.core.rerun_state_machine import RerunMode, RerunState, RerunStateMachine
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -38,8 +39,8 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     set_checkpoint_version,
 )
-from megatron.training.config import ProfilingConfig
-from megatron.training.global_vars import set_args
+from megatron.training.config import InferenceConfigContainer, InferenceSetupConfig, ProfilingConfig
+from megatron.training.global_vars import get_run_config, set_args
 from megatron.training.state import TrainState
 from tests.unit_tests.dist_checkpointing import TempNamedDir
 from tests.unit_tests.test_utilities import Utils
@@ -437,6 +438,38 @@ def test_load_args_restores_gdp_num_householder_from_checkpoint(
     assert restored_args.gdp_num_householder == expected_num_householder
 
 
+def test_load_args_restores_quantile_balancing_from_checkpoint():
+    """QB mode and histogram shape are reconstructed before the router is built."""
+    checkpoint_args = SimpleNamespace(
+        moe_router_load_balancing_type="quantile_balancing",
+        moe_aux_loss_coeff=0.0,
+        moe_router_quantile_balancing_estimation_scope="global_batch",
+        moe_router_qb_num_bins=257,
+    )
+    args = SimpleNamespace(
+        load="checkpoint",
+        iteration=0,
+        moe_router_load_balancing_type="aux_loss",
+        moe_aux_loss_coeff=0.01,
+        moe_router_quantile_balancing_estimation_scope="micro_batch",
+        moe_router_qb_num_bins=64,
+        use_tokenizer_model_from_checkpoint_args=False,
+        use_mp_args_from_checkpoint_args=False,
+    )
+    state_dict = {"args": checkpoint_args, "iteration": 12}
+
+    with mock.patch(
+        "megatron.training.checkpointing._load_base_checkpoint",
+        return_value=(state_dict, "checkpoint", False, CheckpointType.LEGACY),
+    ):
+        restored_args, _ = load_args_from_checkpoint(args)
+
+    assert restored_args.moe_router_load_balancing_type == "quantile_balancing"
+    assert restored_args.moe_aux_loss_coeff == 0.0
+    assert restored_args.moe_router_quantile_balancing_estimation_scope == "global_batch"
+    assert restored_args.moe_router_qb_num_bins == 257
+
+
 @pytest.mark.parametrize(
     ("checkpoint_args", "configured_scale", "expected_scale"),
     [
@@ -531,6 +564,63 @@ def test_check_checkpoint_args_rejects_wide_residual_mismatch():
         check_checkpoint_args(checkpoint_args)
 
 
+@pytest.mark.parametrize(
+    "section,name,current,other",
+    [
+        ("train", "global_batch_size", 8, 16),
+        ("rng", "data_parallel_random_init", True, False),
+        ("tokenizer", "tokenizer_type", "GPT2BPETokenizer", "SentencePieceTokenizer"),
+    ],
+)
+@pytest.mark.parametrize(
+    "saved_source", ["legacy", "missing_section", "missing_field", "config", "config_only"]
+)
+def test_check_checkpoint_args_uses_config_owner(
+    monkeypatch, run_config, section, name, current, other, saved_source
+):
+    """Config precedence, old checkpoint fallback and skips share one comparison path."""
+    args = SimpleNamespace(
+        num_layers=2,
+        hidden_size=128,
+        num_attention_heads=4,
+        add_position_embedding=False,
+        vocab_file=None,
+        phase_transition_iterations=[100] if section == "train" else None,
+        use_dist_ckpt=True,
+        **{name: other},
+    )
+    owner = getattr(run_config, section)
+    if section == "tokenizer":
+        run_config.tokenizer.vocab_file = "vocab.json"
+        args.max_position_embeddings = 128
+        args.make_vocab_size_divisible_by = 128
+    assert hasattr(owner, name)
+    setattr(owner, name, current)
+    checkpoint_args = SimpleNamespace(**vars(args))
+    checkpoint_config = None
+    if saved_source != "legacy":
+        checkpoint_config = {} if saved_source == "missing_section" else {section: {}}
+    if saved_source in ("config", "config_only"):
+        saved_owner = checkpoint_config[section]
+        saved_owner[name] = current
+        if saved_source == "config_only":
+            delattr(checkpoint_args, name)
+    else:
+        saved_owner = vars(checkpoint_args)
+        saved_owner[name] = current
+    monkeypatch.setattr("megatron.training.checkpointing.get_args", lambda: args)
+    monkeypatch.setattr("megatron.training.checkpointing.get_checkpoint_version", lambda: 3.0)
+
+    check_checkpoint_args(checkpoint_args, checkpoint_config=checkpoint_config)
+    for saved_value in (other, None):
+        saved_owner[name] = saved_value
+        with pytest.raises(AssertionError, match=f"{name} value from checkpoint"):
+            check_checkpoint_args(checkpoint_args, checkpoint_config=checkpoint_config)
+        check_checkpoint_args(
+            checkpoint_args, checkpoint_config=checkpoint_config, skip_args={name}
+        )
+
+
 def create_checkpoint(load_path, ckpt_format):
     """Setup a dummy checkpoint directory."""
     iteration = 123
@@ -590,7 +680,6 @@ def create_ckpt_load_args(create_args):
     args.hidden_size = 2
     args.num_attention_heads = 1
     args.add_position_embedding = False
-    args.vocab_file = None
     args.tensor_model_parallel_size = 1
     args.pipeline_model_parallel_size = 1
     args.ckpt_assume_constant_structure = False
@@ -601,6 +690,9 @@ def create_ckpt_load_args(create_args):
     args.use_megatron_fsdp = False
     args.strict_fsdp_dtensor_load = True
     args.phase_transition_iterations = None
+
+    cfg = get_run_config()
+    cfg.tokenizer.vocab_file = None
 
     yield args
 
@@ -763,6 +855,8 @@ def test_load_checkpoint(
 ):
     """Test load_checkpoint."""
     args = create_ckpt_load_args
+    args.padded_vocab_size = None
+    run_config.tokenizer.padded_vocab_size = 128
     args.ckpt_format = ckpt_format
     args.use_distributed_optimizer = ckpt_format != "torch_dcp"
     args.use_dist_ckpt = ckpt_format != "torch"
@@ -812,7 +906,10 @@ def test_load_checkpoint(
         # With TP=PP=1, rank 0 writes the checkpoint. Other ranks can still call
         # torch.save internally while serializing RNG tensors for all_gather_object.
         if torch.distributed.get_rank() == 0:
-            assert serialized.call_args.args[0]["args"] is args
+            saved_args = serialized.call_args.args[0]["args"]
+            assert saved_args is not args
+            assert vars(saved_args) == {**vars(args), "padded_vocab_size": 128}
+        assert args.padded_vocab_size is None
         with open(ckpt_dir / f"iter_{iteration:07d}" / "run_config.yaml") as f:
             saved_config = yaml.safe_load(f)
         for field in fields(rng_config):
@@ -864,18 +961,18 @@ def test_load_checkpoint_stream_ckpt_dequant_refuses_optimizer(create_ckpt_load_
 
 @pytest.mark.parametrize("ckpt_format", ["torch"])
 def test_load_checkpoint_override_opt_param_scheduler(
-    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format
+    init_model_parallel, create_ckpt_load_args, tmp_path_dist_ckpt, ckpt_format, run_config
 ):
     """Test override_opt_param_scheduler behavior during checkpoint load."""
     args = create_ckpt_load_args
     args.ckpt_format = ckpt_format
     args.use_distributed_optimizer = False
     args.use_dist_ckpt = ckpt_format != "torch"
-    args.override_opt_param_scheduler = True
-    args.lr = 1.0
-    args.min_lr = 0.1
-    args.decoupled_lr = 0.5
-    args.decoupled_min_lr = 0.05
+    run_config.scheduler.override_opt_param_scheduler = True
+    run_config.optimizer.lr = 1.0
+    run_config.optimizer.min_lr = 0.1
+    run_config.optimizer.decoupled_lr = 0.5
+    run_config.optimizer.decoupled_min_lr = 0.05
     train_state = TrainState(consumed_train_samples=42)
 
     with (
@@ -933,10 +1030,10 @@ def test_load_checkpoint_override_opt_param_scheduler(
         )
         assert loaded_iter == iteration
         assert loaded_flops == num_floating_point_operations_so_far
-        assert new_optimizer.param_groups[0]["max_lr"] == args.lr
-        assert new_optimizer.param_groups[0]["min_lr"] == args.min_lr
-        assert new_optimizer.param_groups[1]["max_lr"] == args.decoupled_lr
-        assert new_optimizer.param_groups[1]["min_lr"] == args.decoupled_min_lr
+        assert new_optimizer.param_groups[0]["max_lr"] == run_config.optimizer.lr
+        assert new_optimizer.param_groups[0]["min_lr"] == run_config.optimizer.min_lr
+        assert new_optimizer.param_groups[1]["max_lr"] == run_config.optimizer.decoupled_lr
+        assert new_optimizer.param_groups[1]["min_lr"] == run_config.optimizer.decoupled_min_lr
         assert new_opt_param_scheduler.num_steps == train_state.consumed_train_samples == 42
         assert new_opt_param_scheduler.step_calls[-1] == 0
 
@@ -946,6 +1043,56 @@ def test_load_checkpoint_override_opt_param_scheduler(
         )
         assert loaded_iter_none == iteration
         assert loaded_flops_none == num_floating_point_operations_so_far
+
+
+@pytest.mark.parametrize("load_rerun_mode", [RerunMode.DISABLED, RerunMode.VALIDATE_RESULTS])
+def test_strict_load_idle_rerun_checkpoint(
+    init_model_parallel, tmp_path_dist_ckpt, create_ckpt_load_args, load_rerun_mode
+):
+    """Load an idle rerun shard without treating it as a pending rerun."""
+    args = create_ckpt_load_args
+    args.ckpt_format = "torch_dist"
+    args.use_dist_ckpt = True
+    args.use_distributed_optimizer = False
+    args.dist_ckpt_strictness = "raise_all"
+    args.no_save_rng = True
+    args.no_load_rng = True
+    args.no_save_optim = True
+    args.no_load_optim = True
+    args.fp16 = False
+    args.bf16 = False
+    args.save_tokenizer_assets = False
+    args.finetune = False
+    config = TransformerConfig(num_layers=1, kv_channels=1)
+    model = MockModel(config)
+    saved_machine = RerunStateMachine(mode=RerunMode.VALIDATE_RESULTS)
+
+    with TempNamedDir(tmp_path_dist_ckpt / "test_strict_idle_rerun", sync=True) as ckpt_dir:
+        args.save = ckpt_dir
+        args.load = ckpt_dir
+        set_args(args)
+        with mock.patch(
+            "megatron.training.checkpointing.get_rerun_state_machine", return_value=saved_machine
+        ):
+            save_checkpoint(123, [model], None, None, 456)
+
+        loaded_model = MockModel(config)
+        with torch.no_grad():
+            loaded_model.l.weight.zero_()
+        loaded_machine = RerunStateMachine(mode=load_rerun_mode)
+        with mock.patch(
+            "megatron.training.checkpointing.get_rerun_state_machine", return_value=loaded_machine
+        ):
+            iteration, flops = load_checkpoint(
+                [loaded_model], None, None, strict=True, restore_training_state=True
+            )
+
+        assert iteration == 123
+        assert flops == 456
+        torch.testing.assert_close(loaded_model.l.weight, model.l.weight, rtol=0, atol=0)
+        assert loaded_machine.state == RerunState.NOT_RUNNING_YET
+        assert loaded_machine.mode == load_rerun_mode
+        assert not loaded_machine.rerun_requested
 
 
 @pytest.mark.parametrize(
@@ -1033,7 +1180,7 @@ def test_dist_checkpoint_versioning(init_model_parallel, tmp_path_dist_ckpt, cre
 
 @pytest.mark.parametrize("ckpt_format", ["torch", "torch_dist"])
 @pytest.mark.parametrize("no_load_rng", [False, True])
-@pytest.mark.parametrize("load_mode", ["default", "inference", "resume", "override"])
+@pytest.mark.parametrize("load_mode", ["default", "inference", "resume", "override", "converter"])
 def test_checkpoint_load_without_microbatch_calculator(
     init_model_parallel,
     create_ckpt_load_args,
@@ -1041,6 +1188,8 @@ def test_checkpoint_load_without_microbatch_calculator(
     ckpt_format,
     no_load_rng,
     load_mode,
+    run_config,
+    monkeypatch,
 ):
     """Checkpoint loading restores data, not the training runtime calculator."""
     args = create_ckpt_load_args
@@ -1051,6 +1200,8 @@ def test_checkpoint_load_without_microbatch_calculator(
     args.data_parallel_size = args.world_size
     args.global_batch_size = args.world_size
     args.micro_batch_size = 1
+    run_config.train.global_batch_size = args.global_batch_size
+    run_config.train.micro_batch_size = 1
     args.fp16 = False
     args.bf16 = False
     args.hidden_size = 32
@@ -1099,7 +1250,7 @@ def test_checkpoint_load_without_microbatch_calculator(
         before_load_cuda_rng = torch.cuda.get_rng_state().clone()
         args.no_load_rng = no_load_rng
         # These training options must not influence an inference load.
-        args.override_ckpt_iteration = None if load_mode == "resume" else 7
+        args.override_ckpt_iteration = None if load_mode in ("resume", "converter") else 7
         is_inference = load_mode in ("default", "inference")
         args.phase_transition_iterations = [100] if is_inference else None
         args.no_load_optim = True
@@ -1109,6 +1260,14 @@ def test_checkpoint_load_without_microbatch_calculator(
             for name in ("global_batch_size", "micro_batch_size"):
                 delattr(args, name)
         unset_num_microbatches_calculator()
+        if is_inference or load_mode == "converter":
+            from megatron.training.argument_utils import inference_cfg_container_from_args
+
+            # Converters restore consumed-sample metadata without a training config.
+            monkeypatch.setattr(
+                "megatron.training.global_vars._GLOBAL_RUN_CONFIG",
+                inference_cfg_container_from_args(args, build_model_config=False),
+            )
         if is_inference:
             with mock.patch(
                 "megatron.training.checkpointing.get_rerun_state_machine",
@@ -1161,15 +1320,17 @@ def test_read_metadata_non_distributed(tmp_path, metadata_content, expected_iter
 
 
 def _make_metadata_args(
+    run_config,
     use_distributed_optimizer=False,
     use_layer_wise_distributed_optimizer=False,
     ckpt_format='torch_dist',
     dist_ckpt_optim_fully_reshardable=False,
     distrib_optim_fully_reshardable_mem_efficient=False,
 ):
+    # The metadata builder reads the optimizer flags from the run config, the rest from args.
+    run_config.optimizer.use_distributed_optimizer = use_distributed_optimizer
+    run_config.optimizer.use_layer_wise_distributed_optimizer = use_layer_wise_distributed_optimizer
     args = SimpleNamespace()
-    args.use_distributed_optimizer = use_distributed_optimizer
-    args.use_layer_wise_distributed_optimizer = use_layer_wise_distributed_optimizer
     args.ckpt_format = ckpt_format
     args.dist_ckpt_optim_fully_reshardable = dist_ckpt_optim_fully_reshardable
     args.distrib_optim_fully_reshardable_mem_efficient = (
@@ -1189,40 +1350,60 @@ class TestBuildShardedStateDictMetadata:
 
     DUMMY_GROUP = object()
 
-    def test_distributed_optimizer_sets_dp_reshardable_default(self):
-        args = _make_metadata_args(use_distributed_optimizer=True)
+    @pytest.mark.parametrize('ckpt_format', ['torch_dist', 'fsdp_dtensor'])
+    def test_inference_container_keeps_shared_metadata(self, monkeypatch, run_config, ckpt_format):
+        cfg = InferenceConfigContainer(
+            model=None, checkpoint=run_config.checkpoint, inference=InferenceSetupConfig()
+        )
+        monkeypatch.setattr('megatron.training.checkpointing.get_run_config', lambda: cfg)
+        args = SimpleNamespace(ckpt_format=ckpt_format)
+
+        metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
+
+        assert metadata == {
+            'singleton_local_shards': False,
+            'chained_optim_avoid_prefix': True,
+            'dp_cp_group': self.DUMMY_GROUP,
+        }
+
+    def test_distributed_optimizer_sets_dp_reshardable_default(self, run_config):
+        args = _make_metadata_args(run_config, use_distributed_optimizer=True)
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
 
-    def test_distributed_optimizer_fully_reshardable_flag(self):
+    def test_distributed_optimizer_fully_reshardable_flag(self, run_config):
         args = _make_metadata_args(
-            use_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
+            run_config, use_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
         )
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
         assert metadata['distrib_optim_fully_reshardable_mem_efficient'] is False
 
-    def test_distributed_optimizer_fsdp_dtensor(self):
-        args = _make_metadata_args(use_distributed_optimizer=True, ckpt_format='fsdp_dtensor')
+    def test_distributed_optimizer_fsdp_dtensor(self, run_config):
+        args = _make_metadata_args(
+            run_config, use_distributed_optimizer=True, ckpt_format='fsdp_dtensor'
+        )
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fsdp_dtensor'
 
-    def test_layer_wise_only_still_sets_sharding_type(self):
+    def test_layer_wise_only_still_sets_sharding_type(self, run_config):
         # Arg parser flips ``use_distributed_optimizer`` off when Muon is in
         # use, but the LayerWise + DistOpt split path still has a DistOpt
         # sub-optimizer for non-Muon params, so the metadata is required.
-        args = _make_metadata_args(use_layer_wise_distributed_optimizer=True)
+        args = _make_metadata_args(run_config, use_layer_wise_distributed_optimizer=True)
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'dp_reshardable'
 
-    def test_layer_wise_with_fully_reshardable(self):
+    def test_layer_wise_with_fully_reshardable(self, run_config):
         args = _make_metadata_args(
-            use_layer_wise_distributed_optimizer=True, dist_ckpt_optim_fully_reshardable=True
+            run_config,
+            use_layer_wise_distributed_optimizer=True,
+            dist_ckpt_optim_fully_reshardable=True,
         )
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert metadata['distrib_optim_sharding_type'] == 'fully_reshardable'
 
-    def test_no_distributed_optimizer_no_sharding_type(self):
-        args = _make_metadata_args()
+    def test_no_distributed_optimizer_no_sharding_type(self, run_config):
+        args = _make_metadata_args(run_config)
         metadata = _build_sharded_state_dict_metadata(args, dp_cp_group=self.DUMMY_GROUP)
         assert 'distrib_optim_sharding_type' not in metadata

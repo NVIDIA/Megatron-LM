@@ -225,7 +225,7 @@ class V41StateCodec:
         return TensorStatePayload.from_state(
             hidden,
             state,
-            self.schema(boundary),
+            self.schema(boundary).fields,
             boundary_id=f'v41:{boundary}',
             metadata=astuple(self.shape),
         )

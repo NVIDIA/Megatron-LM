@@ -74,14 +74,11 @@ class InferenceStateHandoffMixin:
 
     requires_recurrent_state_dummy_slot = True
 
-    def _complete_request(
-        self, request_entry: RequestEntry, finished_request: DynamicInferenceRequest | None = None
-    ) -> DynamicInferenceRequest:
+    def _finalize_request(self, request_entry: RequestEntry) -> DynamicInferenceRequest:
         """Attach merged RL history before the completion is consumed or sent."""
-        request = super()._complete_request(request_entry, finished_request)
+        request = super()._finalize_request(request_entry)
         if request.disaggregated_params:
             # The merged record includes evictions from all prefill checkpoints.
-            # No await intervenes before the completion future's consumers resume.
             request.disaggregated_params["kv_meta"]["request_metadata"] = asdict(
                 HandoffRequestMetadata.from_request(request)
             )
@@ -986,6 +983,7 @@ class InferenceStateHandoffMixin:
         allocated_blocks = [int(block) for block in allocated_blocks_tensor.tolist()]
         imported_blocks = allocated_blocks[:num_blocks_to_import]
         continuation_blocks = allocated_blocks[num_blocks_to_import:]
+        self.context._initialize_mha_value_pages(continuation_blocks)
         local_blocks = cached_blocks + imported_blocks
         owned_blocks_tensor = torch.tensor(
             local_blocks + continuation_blocks, dtype=torch.int32, device="cpu"
@@ -1097,10 +1095,9 @@ class InferenceStateHandoffMixin:
         Side: decode engine; pull and push transport paths.
         """
 
-        allocator = self.context.kv_block_allocator
         cached_blocks = []
         for block_hash in hashes[:num_blocks]:
-            block_id = allocator.kv_hash_to_block_id.get(block_hash)
+            block_id = self.context.prefix_cache_registry.kv_hash_to_block_id.get(block_hash)
             if block_id is None:
                 break
             cached_blocks.append(int(block_id))
@@ -1116,7 +1113,9 @@ class InferenceStateHandoffMixin:
         potential_matched_count = 0
         if cached_blocks:
             block_tensor = torch.tensor(cached_blocks, dtype=torch.int32, device="cpu")
-            potential_matched_count = int((allocator.block_ref_counts[block_tensor] == 0).sum())
+            potential_matched_count = int(
+                (allocator.pc_state.block_ref_counts[block_tensor] == 0).sum()
+            )
         # Model-parallel ranks process the same request and allocator operations
         # in lockstep, so capacity must remain mirrored without a per-request collective.
         return allocator.is_memory_available(
@@ -1360,12 +1359,9 @@ class InferenceStateHandoffMixin:
         self._set_finish_reason(request)
         request.generated_length = len(request.generated_tokens)
         request.status = Status.COMPLETED
-        request.add_event_finish()
-        self.finished_request_count += 1
-        finished_request = self._complete_request(request_entry)
+        self._complete_request(request_entry, reply_now=True)
 
         if self.use_coordinator and self.is_mp_coordinator:
-            self._send_requests_to_coordinator([finished_request])
             self._partial_emit_lengths.pop(request_id, None)
 
     def _release_pending_kv_import(self, pending: PendingKvImport) -> None:

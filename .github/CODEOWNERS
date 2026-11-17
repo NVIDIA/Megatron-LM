@@ -97,3 +97,10 @@ megatron/rl/ @NVIDIA/reinforcement-learning
 examples/rl/ @NVIDIA/reinforcement-learning
 tests/unit_tests/rl/ @NVIDIA/reinforcement-learning
 train_rl.py @NVIDIA/reinforcement-learning
+
+# Batch-invariant implementations.
+# Retain existing owners because the last matching CODEOWNERS rule wins.
+/megatron/core/transformer/custom_layers/batch_invariant_kernels.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/transformer @NVIDIA/batch-invariant
+/megatron/core/transformer/moe/batch_invariant.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/mixture-of-experts-adlr @NVIDIA/mixture-of-experts-devtech @NVIDIA/batch-invariant
+/megatron/core/inference/moe/batch_invariant.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/inference @NVIDIA/batch-invariant
+/megatron/core/ssm/ops/mamba2/batch_invariant_decode.py @NVIDIA/core-adlr @NVIDIA/core-nemo @NVIDIA/hybrid-model @NVIDIA/batch-invariant

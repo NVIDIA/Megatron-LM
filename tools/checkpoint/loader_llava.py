@@ -149,7 +149,7 @@ class MegatronCheckpointLoaderLLaVA(MegatronCheckpointLoaderBase):
         md.vision_dummy_head_count = self.args.vit_dummy_head_count
         md.vision_linear_bias = vision_config.add_bias_linear
         md.vision_qkv_bias = vision_config.add_qkv_bias
-        md.padded_vocab_size = self.margs.padded_vocab_size
+        md.padded_vocab_size = self.cfg.tokenizer.padded_vocab_size
         if hasattr(vision_config, 'normalization'):
             md.vision_norm_has_bias = vision_config.normalization == "LayerNorm"
         else:

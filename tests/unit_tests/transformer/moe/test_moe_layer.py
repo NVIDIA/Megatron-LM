@@ -1,8 +1,11 @@
 # Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
 
+from unittest.mock import Mock
+
 import pytest
 import torch
 
+import megatron.core.transformer.moe.moe_layer as moe_layer_module
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_decoder_block_spec,
     get_gpt_layer_local_submodules,
@@ -19,6 +22,76 @@ from tests.unit_tests.test_utilities import Utils
 
 
 class TestMoELayerInit:
+
+    @pytest.mark.skipif(
+        not is_te_min_version("1.7.0.dev0"),
+        reason="Expert with TE Linear is only supported in TE 1.7.0 and later.",
+    )
+    def test_megakernel_skips_native_token_dispatcher_construction(self, monkeypatch):
+        Utils.initialize_model_parallel(1, 1)
+        try:
+            config = TransformerConfig(
+                num_layers=1,
+                hidden_size=128,
+                num_attention_heads=4,
+                num_moe_experts=1,
+                moe_ffn_hidden_size=128,
+                moe_shared_expert_intermediate_size=128,
+                moe_router_topk=1,
+                moe_router_pre_softmax=True,
+                moe_grouped_gemm=True,
+                gated_linear_unit=True,
+                activation_func=torch.nn.functional.silu,
+                gradient_accumulation_fusion=True,
+                moe_megakernel_backend="mok",
+                add_bias_linear=False,
+                bf16=True,
+                use_cpu_initialization=True,
+            )
+            submodules = get_submodules(
+                get_gpt_layer_with_transformer_engine_submodules(
+                    num_experts=1, moe_grouped_gemm=True
+                ).mlp
+            )
+            backend = torch.nn.Identity()
+
+            def fail_if_constructed(*args, **kwargs):
+                del args, kwargs
+                pytest.fail("megakernel path must not construct a native token dispatcher")
+
+            monkeypatch.setattr(
+                moe_layer_module, "MoEAllGatherTokenDispatcher", fail_if_constructed
+            )
+            monkeypatch.setattr(
+                moe_layer_module, "build_megakernel_backend", lambda **kwargs: backend
+            )
+
+            layer = MoELayer(config, submodules)
+
+            assert layer.token_dispatcher is None
+            assert layer.megakernel_experts is backend
+
+            hidden = torch.zeros((3, 2, config.hidden_size), dtype=torch.bfloat16)
+            padding_mask = torch.tensor([[0, 0, 1], [0, 1, 1]])
+            input_ids = torch.arange(6).view(2, 3)
+            probs = torch.ones((6, 1))
+            routing_map = torch.ones((6, 1), dtype=torch.bool)
+            router_forward = Mock(return_value=(probs, routing_map))
+            backend_forward = Mock(return_value=hidden)
+            monkeypatch.setattr(layer.router, "forward", router_forward)
+            monkeypatch.setattr(backend, "forward", backend_forward)
+
+            output, bias = layer(hidden, padding_mask=padding_mask, input_ids=input_ids)
+
+            assert output is hidden and bias is None
+            router_forward.assert_called_once()
+            assert router_forward.call_args.args[0] is hidden
+            torch.testing.assert_close(router_forward.call_args.args[1], padding_mask.T.bool())
+            assert router_forward.call_args.kwargs["input_ids"] is input_ids
+            backend_forward.assert_called_once_with(hidden, probs, routing_map)
+        finally:
+            Utils.destroy_model_parallel()
+
     def setup_method(self, method):
         pass
 

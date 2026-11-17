@@ -12,7 +12,7 @@ from torch import nn
 from megatron.core.pipeline_parallel.pipeline_payload import TensorStatePayload
 from megatron.core.tensor_parallel import random as rng
 from megatron.core.transformer import stateful_module
-from megatron.core.transformer.state_boundary import TensorField, TensorSchema
+from megatron.core.transformer.state_boundary import TensorField
 from megatron.core.transformer.stateful_module import StatefulGraphs, StatefulModule
 
 
@@ -235,6 +235,89 @@ def test_graph_rejects_changed_profile_and_unused_differentiable_output():
     graphs.close()
 
 
+class _Ignores(nn.Module):
+    """Reads none of its state and publishes a floating statistic without gradients."""
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.linspace(0.1, 0.4, 8, device="cuda"))
+
+    def forward(self, hidden, state):
+        hidden = hidden * self.weight
+        return hidden, {"norm": hidden.square().sum(-1, keepdim=True)}
+
+
+@pytest.mark.usefixtures("te_rng_tracker")
+@pytest.mark.parametrize("backend", ["torch", "transformer_engine"])
+def test_graph_leaves_an_unread_input_without_gradient(backend):
+    if backend == "transformer_engine":
+        pytest.importorskip("transformer_engine.pytorch")
+    producer = _Branches()
+    region = StatefulModule(_Ignores(), _fields()[:1])
+    sample = torch.randn(4, 1, 8, device="cuda", requires_grad=True)
+    graphs = StatefulGraphs(region, sample, {"memory": sample * 2}, backend=backend)
+    try:
+        hidden, state = producer(sample, {})
+        hidden, _ = graphs.run(hidden, state)
+        hidden.sum().backward()
+        # As in eager execution: no gradient, rather than a zero that the optimizer applies.
+        assert producer.main.grad is not None and producer.side.grad is None
+        del hidden, state, _
+    finally:
+        graphs.close()
+
+
+@pytest.mark.usefixtures("te_rng_tracker")
+@pytest.mark.parametrize("backend", ["torch", "transformer_engine"])
+def test_graph_float_output_without_gradient_needs_no_backward(backend):
+    if backend == "transformer_engine":
+        pytest.importorskip("transformer_engine.pytorch")
+    norm = TensorField("norm", (4, 1, 1), torch.float32, "contiguous", False)
+    reference = StatefulModule(_Ignores(), output_fields=(norm,))
+    region = deepcopy(reference)
+    sample = torch.randn(4, 1, 8, device="cuda", requires_grad=True)
+    graphs = StatefulGraphs(region, sample, {}, backend=backend)
+    try:
+        for _ in range(2):  # The first backward must release the slot.
+            x = torch.randn_like(sample, requires_grad=True)
+            y = x.detach().clone().requires_grad_()
+            hidden, state = graphs.run(x, {})
+            expected, ref_state = reference.run(y, {})
+            torch.testing.assert_close(state["norm"], ref_state["norm"])
+            assert not state["norm"].requires_grad
+            hidden.sum().backward()
+            expected.sum().backward()
+            torch.testing.assert_close(x.grad, y.grad)
+        torch.testing.assert_close(region.module.weight.grad, reference.module.weight.grad)
+        del hidden, state, expected, ref_state
+    finally:
+        graphs.close()
+
+
+@pytest.mark.usefixtures("te_rng_tracker")
+@pytest.mark.parametrize("backend", ["torch", "transformer_engine"])
+def test_graph_slot_reuse_accumulates_parameter_gradients(backend):
+    """A .grad must not keep the static buffer that the slot's next backward rewrites."""
+    if backend == "transformer_engine":
+        pytest.importorskip("transformer_engine.pytorch")
+    reference = StatefulModule(_Branches(), output_fields=_fields())
+    region = deepcopy(reference)
+    sample = torch.randn(4, 1, 8, device="cuda", requires_grad=True)
+    graphs = StatefulGraphs(region, sample, {}, backend=backend)
+    try:
+        for _ in range(3):
+            x = torch.randn_like(sample, requires_grad=True)
+            hidden, state = graphs.run(x, {})
+            expected, ref_state = reference.run(x.detach().clone().requires_grad_(), {})
+            _loss(hidden, state, "used").backward()
+            _loss(expected, ref_state, "used").backward()
+        for p, q in zip(region.parameters(), reference.parameters()):
+            torch.testing.assert_close(p.grad, q.grad)
+        del hidden, state, expected, ref_state
+    finally:
+        graphs.close()
+
+
 def test_te_graph_rejects_legacy_rng_before_capture_and_recovers(te_rng_tracker):
     """A bad RNG profile must not poison later TE attention or graph captures."""
     from transformer_engine.pytorch import graph as te_graph
@@ -269,9 +352,8 @@ def test_schema_payload_roundtrip_preserves_aliases_and_optional_fields():
         TensorField("readonly", hidden.shape, hidden.dtype, "local", False),
         TensorField("absent", (1,), hidden.dtype, "local", True, False),
     )
-    schema = TensorSchema(fields)
     payload = TensorStatePayload.from_state(
-        hidden, {"shared": hidden, "readonly": hidden, "absent": None}, schema
+        hidden, {"shared": hidden, "readonly": hidden, "absent": None}, list(fields)
     )
     restored, state = payload.restore()
     assert restored is not hidden and restored.data_ptr() == hidden.data_ptr()
@@ -280,11 +362,13 @@ def test_schema_payload_roundtrip_preserves_aliases_and_optional_fields():
     assert not state["readonly"].requires_grad
     assert state["readonly"].data_ptr() == hidden.data_ptr()
     assert state["absent"] is None
-    assert schema == TensorSchema(fields)
+    assert payload.spec.fields[1:] == fields
     with pytest.raises(ValueError, match="Absent"):
-        schema.pack({"shared": hidden, "readonly": hidden, "absent": torch.ones(1)})
+        TensorStatePayload.from_state(
+            hidden, {"shared": hidden, "readonly": hidden, "absent": torch.ones(1)}, fields
+        )
     with pytest.raises(ValueError, match="duplicate"):
-        TensorSchema((fields[0], fields[0]))
+        StatefulModule(nn.Identity(), [fields[0], fields[0]])
 
 
 def test_last_consumer_retires_inputs_without_dropping_another_components_state():

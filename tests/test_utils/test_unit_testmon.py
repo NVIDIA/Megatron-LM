@@ -36,7 +36,7 @@ def _function(source: str, name: str) -> str:
     return source.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
 
 
-def _invoke(project, cache, mode, phase="prod", rank=0):
+def _invoke(project, cache, mode, phase="prod", rank=0, pytest_args=()):
     return subprocess.run(
         [
             sys.executable,
@@ -51,6 +51,7 @@ def _invoke(project, cache, mode, phase="prod", rank=0):
             "-q",
             "-c",
             str(project / "pytest.ini"),
+            *pytest_args,
             "tests",
         ],
         cwd=project,
@@ -409,7 +410,7 @@ def test_selected_test_failure_does_not_run_full_bucket(tmp_path):
     ("overrides", "expected"),
     [
         ({}, "true"),
-        ({"HAS_UNIT_TESTMON": "false"}, "false"),
+        ({"UNIT_TESTMON_REQUESTED": "false"}, "false"),
         ({"EVENT_NAME": "merge_group"}, "false"),
         ({"REF": "refs/heads/main"}, "false"),
         ({"LABELS_VALID": "false"}, "false"),
@@ -427,7 +428,9 @@ def test_pr_label_gate(overrides, expected):
     environment = {
         **os.environ,
         "LABELS_VALID": "true",
-        "HAS_UNIT_TESTMON": "true",
+        "UNIT_TESTMON_REQUESTED": "true",
+        "IS_CI_WORKLOAD": "false",
+        "IS_MERGE_GROUP": "false",
         "EVENT_NAME": "push",
         "REF": "refs/heads/pull-request/123",
         "HAS_RUN_TESTS": "false",
@@ -453,5 +456,222 @@ def test_mode_is_passed_as_container_environment():
     gb200_recipe = _source("tests/test_utils/recipes/gb200/unit-tests.yaml")
 
     assert '"UNIT_TESTMON_MODE": unit_testmon_mode' in launcher
-    assert '["full", "enforce", "baseline"]' in launcher
+    assert '["full", "enforce", "preselected", "baseline"]' in launcher
     assert "{unit_testmon_mode}" not in h100_recipe + gb200_recipe
+
+
+@pytest.fixture
+def cpu_baseline(project, tmp_path):
+    pytest.importorskip("yaml")
+    cache_module = sys.modules["testmon_cache"]
+    directory = project / "tests/unit_tests/example"
+    directory.mkdir(parents=True)
+    for path in (project / "tests").glob("test_*.py"):
+        path.rename(directory / path.name)
+    (directory / "test_app.py").write_text(
+        (directory / "test_app.py").read_text() + "\nimport pytest\n\n@pytest.mark.experimental\n"
+        "def test_experimental():\n    assert active(2) == 3\n"
+    )
+    (project / "pytest.ini").write_text("[pytest]\nmarkers = experimental: experimental test\n")
+    bucket, platform = "tests/unit_tests/example/**/*.py", "dgx_h100"
+    for filename in cache_module.COMPATIBILITY_FILES:
+        path = project / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n")
+    recipe = project / cache_module.PLATFORMS[platform]["recipe"]
+    recipe.parent.mkdir(parents=True)
+    recipe.write_text(json.dumps({"products": [{"test_case": [bucket]}]}))
+    (project / "tests/unit_tests/testmon_mandatory_tests.yaml").write_text(
+        "mappings:\n  - source_dirs: [unobserved]\n    test_buckets:\n"
+        f"      {platform}: [tests/unit_tests/example/test_other.py]\n"
+    )
+    cache_dir = tmp_path / "cpu-cache"
+    for phase in cache_module.PHASES:
+        marker = "not experimental" if phase == "prod" else "experimental"
+        result = _invoke(project, cache_dir, "baseline", phase, pytest_args=("-m", marker))
+        assert result.returncode == 0, result.stdout + result.stderr
+    identity = cache_module.cache_identity(project, bucket, platform)
+    cache_module.finalize(cache_dir, identity, "a" * 40, "123-1")
+    pr_files = project / "pr-files"
+    pr_files.mkdir()
+    (pr_files / "changed-files").write_text("")
+    (pr_files / "metadata.json").write_text(
+        json.dumps({"tested_sha": "b" * 40, "changed_paths": 0})
+    )
+    return {
+        "root": project,
+        "cache_dir": cache_dir,
+        "bucket": bucket,
+        "recipe_platform": platform,
+        "source_sha": "b" * 40,
+        "matched_key": identity["cache_prefix"] + "123-1",
+        "pr_files_dir": pr_files,
+    }
+
+
+@pytest.mark.parametrize(
+    ("change", "mode", "selected"),
+    [
+        ("unchanged", "selected", []),
+        ("dependency", "selected", ["test_app.py"]),
+        ("new-test", "selected", ["test_app.py", "test_new.py"]),
+        ("mandatory", "selected", ["test_other.py"]),
+        ("missing-cache", "full", []),
+        ("explicit-file", "selected", []),
+    ],
+)
+def test_cpu_selection(cpu_baseline, change, mode, selected):
+    arguments = cpu_baseline
+    project, directory = arguments["root"], arguments["cache_dir"]
+    if change == "unchanged":
+        manifest = directory / "manifest.json"
+        data = json.loads(manifest.read_text())
+        data["image_id"] = "sha256:" + "c" * 64
+        manifest.write_text(json.dumps(data))
+        for phase in ("prod", "experimental"):
+            metadata = directory / phase / "metadata.json"
+            data = json.loads(metadata.read_text())
+            data["runtime"].update(python="0.0.0", implementation="DifferentPython")
+            metadata.write_text(json.dumps(data))
+    elif change == "dependency":
+        # Selection must not execute this now-failing test.
+        (project / "app.py").write_text("def active(value):\n    return value + 2\n")
+    elif change == "new-test":
+        (project / "tests/unit_tests/example/test_new.py").write_text(
+            "def test_new():\n    assert False\n"
+        )
+        existing = project / "tests/unit_tests/example/test_app.py"
+        existing.write_text(existing.read_text() + "\ndef test_added():\n    assert False\n")
+    elif change == "mandatory":
+        (arguments["pr_files_dir"] / "changed-files").write_text("unobserved/source.py\n")
+        (arguments["pr_files_dir"] / "metadata.json").write_text(
+            json.dumps({"tested_sha": arguments["source_sha"], "changed_paths": 1})
+        )
+    elif change == "missing-cache":
+        arguments["cache_dir"] = directory.with_name("missing-cache")
+    elif change == "explicit-file":
+        arguments["bucket"] = "tests/unit_tests/example/test_app.py"
+        cache_module = sys.modules["testmon_cache"]
+        identity = cache_module.cache_identity(
+            project, arguments["bucket"], arguments["recipe_platform"]
+        )
+        cache_module.finalize(directory, identity, "a" * 40, "123-1")
+        arguments["matched_key"] = identity["cache_prefix"] + "123-1"
+    before = {phase: _snapshot(directory / phase) for phase in ("prod", "experimental")}
+    common = [
+        "--cache-dir",
+        str(arguments["cache_dir"]),
+        "--bucket",
+        arguments["bucket"],
+        "--platform",
+        arguments["recipe_platform"],
+        "--source-sha",
+        arguments["source_sha"],
+    ]
+    plan_path = project / "plan.json"
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(WRAPPER_PATH),
+            "select",
+            *common,
+            "--matched-key",
+            arguments["matched_key"],
+            "--pr-files-dir",
+            str(arguments["pr_files_dir"]),
+            "--output",
+            str(plan_path),
+        ],
+        cwd=project,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    plan = json.loads(plan_path.read_text())
+    assert plan["mode"] == mode, plan["reason"]
+    assert f"mode={mode}\n" in result.stdout
+    assert f"has_tests={str(mode != 'selected' or bool(selected)).lower()}\n" in result.stdout
+    if mode == "selected":
+        selected = [f"tests/unit_tests/example/{filename}" for filename in selected]
+        assert plan["phases"] == {phase: selected for phase in before}
+        assert plan["mandatory_files"] == (selected if change == "mandatory" else [])
+        result = subprocess.run(
+            [sys.executable, str(WRAPPER_PATH), "prepare", *common, "--plan", str(plan_path)],
+            cwd=project,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        for phase in before:
+            output = directory / ".testmon-work" / phase
+            assert (output / "selected-tests").read_text().splitlines() == selected
+            assert (output / "mandatory-tests").read_text().splitlines() == plan["mandatory_files"]
+    else:
+        assert plan["phases"] == {} and plan["reason"]
+    assert {phase: _snapshot(directory / phase) for phase in before} == before
+
+
+@pytest.mark.parametrize(
+    ("validation_status", "selected_runs"), [(0, 2), (1, 0)], ids=["valid-plan", "invalid-plan"]
+)
+def test_cpu_plan_execution(tmp_path, validation_status, selected_runs):
+    cache = tmp_path / "cache"
+    for phase, content in (
+        ("prod", "tests/unit_tests/test_example.py::test_one\n"),
+        ("experimental", ""),
+    ):
+        directory = cache / ".testmon-work" / phase
+        directory.mkdir(parents=True)
+        (directory / "selected-tests").write_text(content)
+        (directory / "mandatory-tests").write_text("")
+    (tmp_path / ".coverage.unit_tests").touch()
+    runner = _source("tests/unit_tests/run_ci_test.sh")
+    functions = "\n".join(
+        name + "() {" + _function(runner, name) + "\n}"
+        for name in ("run_selected_phase", "write_testmon_summary", "run_enforced_tests")
+    )
+    script = "\n".join(
+        (
+            "set -euo pipefail",
+            "DISTRIBUTED_ARGS=() IGNORE_ARGS=()",
+            "MARKER_ARG='not flaky_in_dev'",
+            "UNIT_TEST_REPEAT=2 NUM_NODES=1 GPUS_PER_NODE=8 PLATFORM=h100",
+            "BUCKET=tests/unit_tests/test_example.py",
+            "git() { echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa; }",
+            'run_full_tests() { echo full >> "$EVENTS"; }',
+            "run_testmon_phase() { echo 'unexpected GPU selection' >&2; return 99; }",
+            "coverage() { return 0; }",
+            "uv() {",
+            '  if [[ "$*" == *"testmon_selector.py prepare"* ]]; then return "$VALIDATION_STATUS"; fi',
+            '  echo "$*" >> "$EVENTS"',
+            "}",
+            functions,
+            "run_enforced_tests",
+        )
+    )
+    events = tmp_path / "events"
+    events.touch()
+    result = subprocess.run(
+        ["bash"],
+        input=script,
+        cwd=tmp_path,
+        env={
+            **os.environ,
+            "UNIT_TESTMON_MODE": "preselected",
+            "UNIT_TESTMON_CACHE_DIR": str(cache),
+            "EVENTS": str(events),
+            "VALIDATION_STATUS": str(validation_status),
+        },
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert result.returncode == validation_status, result.stdout + result.stderr
+    executed = events.read_text().splitlines()
+    assert "full" not in executed
+    assert sum("torch.distributed.run" in event for event in executed) == selected_runs
+    assert len(executed) == selected_runs
+    assert all("test_example.py::test_one" in event for event in executed)
+    assert "unexpected GPU selection" not in result.stderr

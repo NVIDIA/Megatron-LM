@@ -41,6 +41,7 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_pg_rank, get_pg_size
+from megatron.training.global_vars import get_run_config
 
 try:
     from megatron.core.extensions.transformer_engine import TERowParallelLinear
@@ -103,10 +104,11 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     return parser
 
 
-def _vocab_size(args: argparse.Namespace) -> int:
-    """Resolve the vocabulary size from stock args (``padded_vocab_size`` / ``vocab_size``)."""
+def _vocab_size() -> int:
+    """Resolve the vocabulary size from the tokenizer configuration."""
+    tokenizer_config = get_run_config().tokenizer
     for attr in ("padded_vocab_size", "vocab_size"):
-        value = getattr(args, attr, None)
+        value = getattr(tokenizer_config, attr, None)
         if value:
             return int(value)
     raise ValueError("vocab size unresolved: set --vocab-size / a tokenizer, or padded_vocab_size")
@@ -160,7 +162,7 @@ def nemotron_language_config(
     )
     config.sequence_parallel = tp_size > 1
     config.tensor_parallel_num_sequence_shards = tp_size * gtp_remat_num_sequence_shards
-    config.position_embedding_type = "none"
+    config.position_embedding_type = args.position_embedding_type
     return config
 
 
@@ -277,12 +279,15 @@ def language_model_spec(
         params={
             "config": config,
             "mamba_stack_spec": stack_spec,
-            "vocab_size": _vocab_size(args),
+            "vocab_size": _vocab_size(),
             "max_sequence_length": args.seq_length,
             "pre_process": pp_rank == 0,
             "post_process": pp_rank == pp_size - 1,
             "hybrid_layer_pattern": args.hybrid_layer_pattern,
-            "position_embedding_type": "none",
+            "position_embedding_type": args.position_embedding_type,
+            "rotary_base": args.rotary_base,
+            "rotary_percent": args.rotary_percent,
+            "seq_len_interpolation_factor": args.rotary_seq_len_interpolation_factor,
             "share_embeddings_and_output_weights": False,
             "scatter_embedding_sequence_parallel": False,
             "logit_dtype": args.logit_dtype,

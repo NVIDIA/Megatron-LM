@@ -3,19 +3,18 @@
 Cross-layer state lets one module produce tensors that later modules consume,
 while preserving all consumer gradients to the producer. The same declared
 tensor interface can cross a checkpoint, CUDA graph, or pipeline boundary.
-The implementation is adapted from the general state and transport contracts
-in [#7224](https://github.com/NVIDIA/Megatron-LM/pull/7224), by Hongxiao Bai.
-It contains no model-specific attention, compression, or routing rules.
+The feature contains no model-specific attention, compression, or routing rules.
 
 Packed (THD) batches cross pipeline boundaries through per-microbatch plans, whose
-shapes may vary. Packed CP layout conversion remains model-owned: the CP helpers'
-`thd_plans` argument is preliminary plumbing without end-to-end coverage.
+shapes may vary. The CP helpers convert dense sequence shards; packed CP layout
+conversion remains model-owned.
 
 ## Declare the inputs and outputs of a region
 
 `TensorField` declares a stable key, concrete shape, dtype, CP layout, gradient
-eligibility, and presence. `TensorSchema` orders those fields and packs/unpacks
-ordinary tensors. Integer fields cannot be differentiable. `present=False`
+eligibility, and presence. APIs take an ordered tuple (or list) of fields with
+unique keys, and pass the present ones as ordinary tensors in that order. Integer
+fields cannot be differentiable. `present=False`
 represents an absent field and differs from a present, zero-length tensor.
 The layout describes sequence sharding under context parallelism: `contiguous`
 and `zigzag` shard dimension zero, `replicated` is identical on every CP rank,
@@ -52,13 +51,23 @@ state = {"memory": torch.zeros_like(hidden)}
 hidden, state = region.run(hidden, state, recompute=True)
 ```
 
-Create fresh state at model entry for every microbatch. Region calls construct
-fresh mappings; modules must not retain activations or mutate shared tensors in
-place. Declared inputs omitted from the output schema are retired after their
-last consumer. Unrelated fields belonging to other components remain in the
-caller's state. Use namespaced keys when composing independent components.
+The model owns the state mapping between regions, and each region call returns a
+fresh mapping. Three rules keep that mapping correct under pipelining,
+recomputation and CUDA graphs:
 
-Schemas describe one shape/layout profile. A different profile can wrap the
+- Keep one mapping per microbatch, created at model entry. It cannot be a module
+  attribute, because 1F1B and VPP schedules keep several microbatches in flight.
+- Change it only through a region's declared outputs. A write inside a recomputed
+  region would run twice, and a CUDA graph replay does not run the Python code
+  that would make it. Modules must not retain activations or mutate shared
+  tensors in place.
+- Drop fields after their last use, or the mapping keeps them alive for the whole
+  forward. A region retires the declared inputs it does not list as outputs;
+  unrelated fields belonging to other components remain in the caller's state.
+
+Use namespaced keys when composing independent components.
+
+Field declarations describe one shape/layout profile. A different profile can wrap the
 same parameter-bearing module without copying weights. Keep parameter ownership
 with the model: registering a `StatefulModule` wrapper as a new child introduces
 its `module.` prefix into checkpoint keys, whereas an execution adapter referencing
@@ -86,9 +95,11 @@ parameter gather, pass `make_forward_pre_hook` so replays still run the
 parameter owners' gather hooks.
 
 Use independent slots for outstanding forwards; a slot cannot be reused until
-its backward completes. Forward-only and frozen invocations return independent
-copies, so another replay cannot overwrite outputs held by an asynchronous send.
-Replays on different streams wait for the previous invocation to finish copying.
+its backward completes. Parameter and state-input gradients never keep a slot's
+reusable buffers, so they accumulate correctly across replays. Forward-only and
+frozen invocations return independent copies, so another replay cannot overwrite
+outputs held by an asynchronous send. Replays on different streams wait for the
+previous invocation to finish copying.
 
 Input geometry, strides, dtypes, gradient profile, training mode and parameter
 storage must match capture. Input signatures and the training mode of every
@@ -107,9 +118,11 @@ buffers and registered buffers (e.g. router statistics), and suppress MCore DDP
 reductions during capture. CUDA graph creation must be serialized within a process.
 
 Every differentiable captured output must participate in one backward
-invocation. An unused output must be omitted from that capture profile; silently
-turning a missing gradient into a numeric zero would change optimizer and
-auxiliary-loss behavior. Full recomputation inside capture is rejected.
+invocation; outputs declared nondifferentiable need no gradient. An unused output
+must be omitted from that capture profile; silently turning a missing gradient
+into a numeric zero would change optimizer and auxiliary-loss behavior. For the
+same reason, an input the region does not read gets no gradient, as in eager
+execution. Full recomputation inside capture is rejected.
 
 For a skipped or failed iteration, first drain communication and stop scheduling
 work, then call `graphs.abort()` and discard its outputs. The slots can be reused;
@@ -121,11 +134,12 @@ and breaks the graphed-forward closure cycles.
 
 ## Context parallelism
 
-The helpers in `megatron.core.context_parallel.shared_state` accept an explicit
-CP process group:
+The helpers in `megatron.core.context_parallel.shared_state` take the state, its
+fields and an explicit CP process group. They return the converted state and its
+fields with their new shapes and layouts:
 
-- `redistribute_state` reuses the existing contiguous/zigzag conversion. Its
-  `thd_plans` argument (a `THDCPLayoutPlan` per field) is preliminary.
+- `redistribute_state` reuses the existing contiguous/zigzag conversion for dense
+  sequence shards.
 - `gather_state` gathers equal contiguous or zigzag sequence shards with one
   all-gather into a single buffer and a local reorder without host
   synchronization, so it also runs inside CUDA graph capture. Backward
@@ -137,9 +151,9 @@ CP process group:
   If TP ranks consume the gathered state identically (a TP-replicated consumer),
   pass `tp_replicated=True` so their duplicate contributions are averaged; the
   default sum is correct for TP-partitioned consumers such as split heads.
-- Fields marked `replicated`, `local`, or `strided` remain unchanged. Select the
-  fields to communicate through the schema; do not gather query-local state
-  simply because another field needs global visibility.
+- Fields marked `replicated`, `local`, or `strided` remain unchanged. Pass only
+  the fields to communicate; do not gather query-local state simply because
+  another field needs global visibility.
 
 Peers must agree on shapes and collective/backward participation, as required by
 the underlying distributed operations. The model owns compression groups, halo
@@ -149,13 +163,15 @@ ownership, packed positions, and TP/SP-specific layout rules.
 
 Stages opt into the existing ordinary or interleaved 1F1B scheduler by exposing
 `pipeline_payload_factory = TensorStatePayload`. A nonterminal stage returns
-`TensorStatePayload.from_state(hidden, state, output_schema, boundary_id=..., metadata=...)`.
-Its successor receives that object through the normal `set_input_tensor` hook
+`TensorStatePayload.from_state(hidden, state, fields, hidden_field=..., boundary_id=..., metadata=...)`.
+`hidden_field` declares the hidden activation's key, CP layout and gradient
+eligibility, and defaults to a differentiable `__hidden__` field with the
+`strided` layout. Its successor receives that object through the normal `set_input_tensor` hook
 and calls `payload.restore()` to obtain hidden and a fresh state mapping. The
 terminal stage uses the normal scalar-loss reduction interface.
 
 Every boundary message is described ahead of time by a `PipelinePayloadSpec`
-(hidden field first, then the state fields, host metadata and a boundary
+(the same hidden field first, then the state fields, host metadata and a boundary
 identity). Provide one incoming/outgoing spec per microbatch and virtual chunk
 through `PipelineDataIterator` and `PipelinePayloadPlan`; the optional
 `forward_step_func.prepare_pipeline_inputs` hook prepares iterators before
@@ -169,7 +185,7 @@ Gradient eligibility is static per microbatch. A field declared differentiable
 must receive a gradient from its consumers; a missing gradient is an error rather
 than a silent zero, because a zero would still run producer-side auxiliary-loss
 hooks. Declare a branch that is unused for a microbatch non-differentiable in
-that microbatch's plan. Empty fields carry no data.
+that microbatch's plan. Empty fields carry no data but follow the same rule.
 
 Typed transport carries mixed dtypes and empty/absent fields. All differentiable
 output roots of a stage participate in one autograd traversal; relay and
@@ -199,10 +215,12 @@ uv run python -m torch.distributed.run --standalone --nproc-per-node=2 \
   tests/unit_tests/pipeline_parallel/test_typed_pipeline.py
 
 uv run python -m torch.distributed.run --standalone --nproc-per-node=4 \
-  -m pytest tests/unit_tests/pipeline_parallel/test_shared_state_parallel.py
+  -m pytest tests/unit_tests/pipeline_parallel/test_shared_state_parallel.py \
+  tests/unit_tests/determinism/kernels/test_shared_tensor_state.py
 ```
 
 The four-rank cases compare CP2 x PP2/VPP against the same unpartitioned layer
 chain, including model gradients, with eager execution, recomputation, and both
-graph backends. Porting a particular model's state declarations and numerical
+graph backends. The determinism cases check that eager, checkpointed and graphed
+replays and the CP layout/gather gradients are bit-exact across runs. Porting a particular model's state declarations and numerical
 operations remains separate from this general feature.

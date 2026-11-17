@@ -55,7 +55,7 @@ class _LayerRegion(nn.Module):
                 mask = csa.thd_layout.valid_tokens.unsqueeze(0) if packed is not None else None
                 hidden = engram(hidden, values['hashes'], mask)
             hidden, _ = self.layer(
-                hidden_states=hidden,
+                hidden,
                 cross_layer_state=csa,
                 mhc_state=mhc,
                 packed_seq_params=packed,
@@ -211,7 +211,7 @@ class DeepSeekV41Adapter:
                     None if layout is None else layout.valid_tokens.unsqueeze(0),
                 )
             hidden_states, _ = layer(
-                hidden_states=hidden_states,
+                hidden_states,
                 cross_layer_state=csa,
                 mhc_state=context.mhc_state,
                 **kwargs,

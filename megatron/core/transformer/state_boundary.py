@@ -54,7 +54,11 @@ class TensorField:
 
 @dataclass(frozen=True)
 class TensorSchema:
-    """Stable field order; absent fields keep their slot in the mapping but not on the wire."""
+    """Validated form of an ordered field tuple, used inside the state boundaries.
+
+    Public APIs take and return the tuple itself. Absent fields keep their slot in
+    the mapping but not on the wire.
+    """
 
     fields: tuple[TensorField, ...]
 

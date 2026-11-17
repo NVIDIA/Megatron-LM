@@ -7,6 +7,7 @@ from typing import Any, Callable, Dict, Iterable
 
 import torch
 
+from megatron.core._batch_api_compat import deprecated_hybrid_cp_kwargs
 from megatron.core.packed_seq_params import PackedSeqParams
 
 from .layout import CPLayout, THDCPLayoutPlan, _build_thd_zigzag_metadata, build_thd_cp_layout_plan
@@ -66,6 +67,7 @@ def _get_batch_on_this_cp_rank_contiguous(
         "position_ids",
         "decoder_input",
         "mtp_input_mask",
+        "padding_mask",
     )
     if cp_size == 1:
         return batch
@@ -122,6 +124,7 @@ def _get_batch_on_this_cp_rank_padded_zigzag(
         "position_ids",
         "decoder_input",
         "mtp_input_mask",
+        "padding_mask",
     )
     for key in sequence_keys:
         sequence_tensor = batch.get(key)
@@ -147,7 +150,8 @@ def _get_batch_on_this_cp_rank_padded_zigzag(
             if tensor is not None:
                 local_tensor = tensor.index_select(1, valid_index)
                 padding_shape = (1, -1, *((1,) * (tensor.dim() - 2)))
-                batch[key] = local_tensor.masked_fill(padding.view(padding_shape), 0)
+                fill_value = True if key == "padding_mask" else 0
+                batch[key] = local_tensor.masked_fill(padding.view(padding_shape), fill_value)
     batch['cu_seqlens_padded'] = target_cu_seqlens_padded.unsqueeze(0)
     if batch.get('max_seqlen') is not None:
         max_seqlen = (target_cu_seqlens_padded[1:] - target_cu_seqlens_padded[:-1]).max()
@@ -162,6 +166,7 @@ def _build_packed_seq_params(
     tokens_per_sample: int | None,
     use_logical_qkv_seqlens: bool = False,
     pad_between_seqs: bool | None = None,
+    tp_cp_group: torch.distributed.ProcessGroup | None = None,
 ) -> PackedSeqParams | None:
     """Build packed sequence metadata for one physical CP layout."""
     cu_seqlens = batch.get('cu_seqlens')
@@ -191,19 +196,21 @@ def _build_packed_seq_params(
         max_seqlen_kv=max_seqlen,
         local_cp_size=int(local_cp_size.item()) if local_cp_size is not None else None,
         cp_group=batch.get('hybrid_cp_group'),
+        tp_cp_group=tp_cp_group,
         total_tokens=int(physical_cu_seqlens[-1].item()),
         tokens_per_sample=tokens_per_sample,
         pad_between_seqs=pad_between_seqs,
     )
 
 
+@deprecated_hybrid_cp_kwargs
 def get_batches_on_this_cp_rank(
     batch: Dict[str, Any],
     boundary_layout: CPLayout,
-    is_hybrid_cp: bool,
+    dynamic_cp: bool,
     cp_group: torch.distributed.ProcessGroup | None,
     additional_layouts: Iterable[CPLayout] = (),
-    hybrid_cp_group_func: Callable[[int], torch.distributed.ProcessGroup] | None = None,
+    dynamic_cp_group_func: Callable[[int], torch.distributed.ProcessGroup] | None = None,
     use_per_sequence_balancing: bool = False,
     sequence_parallel: bool = False,
     tp_group: torch.distributed.ProcessGroup | None = None,
@@ -216,26 +223,33 @@ def get_batches_on_this_cp_rank(
     may request additional physical views when different consumers need different layouts. The
     boundary view is always included and is the default returned by ``ContextParallelBatch``.
 
-    Packed non-hybrid CP batches need special handling when layout conversion requires a padded
-    zigzag view or the standard sharder would balance the flattened sample instead of each
-    sequence. The same rank ordering is used to build the zigzag batch tensors and their
+    Packed CP batches need special handling when layout conversion requires a padded zigzag
+    view, when the standard sharder would balance the flattened sample instead of each sequence,
+    or under dynamic CP, whose runtime group is resolved from ``local_cp_size``. The same rank
+    ordering is used to build the zigzag batch tensors and their
     ``PackedSeqParams``. When both layouts are requested, it also defines the
     activation-conversion plan. All other cases use the standard batch sharder.
 
     A ``None`` CP group represents a size-one CP domain and leaves sequence tensors unchanged.
     """
-    from megatron.core.utils import get_batch_on_this_cp_rank
+    from megatron.core.utils import _resolve_dynamic_cp_group_for_batch, get_batch_on_this_cp_rank
+
+    if dynamic_cp:
+        # Resolve once before selecting layouts. In particular, CP size and the
+        # TPxCP conversion plan must describe this microbatch's runtime group,
+        # including the real singleton group used for CP-off execution.
+        batch = dict(batch)
+        cp_group = _resolve_dynamic_cp_group_for_batch(batch, dynamic_cp_group_func)
 
     requested_layouts = set(additional_layouts)
     requested_layouts.add(boundary_layout)
     cp_size = 1 if cp_group is None else torch.distributed.get_world_size(cp_group)
 
     build_packed_zigzag_view = (
-        not is_hybrid_cp
-        and cp_size > 1
+        cp_size > 1
         and batch.get('cu_seqlens') is not None
         and "zigzag" in requested_layouts
-        and (use_per_sequence_balancing or "contiguous" in requested_layouts)
+        and (dynamic_cp or use_per_sequence_balancing or "contiguous" in requested_layouts)
     )
     build_thd_plan = build_packed_zigzag_view and "contiguous" in requested_layouts
 
@@ -260,7 +274,11 @@ def get_batches_on_this_cp_rank(
         }
         if build_thd_plan:
             batches_by_layout["contiguous"] = get_batch_on_this_cp_rank(
-                dict(batch), is_hybrid_cp=False, cp_group=cp_group, use_contiguous_cp=True
+                dict(batch),
+                dynamic_cp=dynamic_cp,
+                cp_group=cp_group,
+                dynamic_cp_group_func=dynamic_cp_group_func,
+                use_contiguous_cp=True,
             )
         packed_seq_params_by_layout = {
             layout: _build_packed_seq_params(
@@ -270,6 +288,7 @@ def get_batches_on_this_cp_rank(
                 tokens_per_sample,
                 use_logical_qkv_seqlens=layout == "zigzag",
                 pad_between_seqs=(zigzag_metadata.pad_between_seqs if layout == "zigzag" else None),
+                tp_cp_group=tp_cp_group if dynamic_cp else None,
             )
             for layout, layout_batch in batches_by_layout.items()
         }
@@ -305,16 +324,17 @@ def get_batches_on_this_cp_rank(
             "attention_mask",
             "decoder_input",
             "mtp_input_mask",
+            "padding_mask",
         )
     )
-    if has_sequence_data and (cp_size > 1 or is_hybrid_cp):
+    if has_sequence_data and (cp_size > 1 or dynamic_cp):
         # Copy the dictionary because the CP sharder replaces sequence-valued entries in place.
         batches_by_layout = {
             layout: get_batch_on_this_cp_rank(
                 dict(batch),
-                is_hybrid_cp=is_hybrid_cp,
+                dynamic_cp=dynamic_cp,
                 cp_group=cp_group,
-                hybrid_cp_group_func=hybrid_cp_group_func,
+                dynamic_cp_group_func=dynamic_cp_group_func,
                 use_per_sequence_balancing=use_per_sequence_balancing,
                 use_contiguous_cp=layout == "contiguous",
             )
@@ -328,7 +348,11 @@ def get_batches_on_this_cp_rank(
     # view rather than deriving one layout's metadata from the other.
     packed_seq_params_by_layout = {
         layout: _build_packed_seq_params(
-            batches_by_layout[layout], layout, cp_size, tokens_per_sample
+            batches_by_layout[layout],
+            layout,
+            cp_size,
+            tokens_per_sample,
+            tp_cp_group=tp_cp_group if dynamic_cp else None,
         )
         for layout in requested_layouts
     }

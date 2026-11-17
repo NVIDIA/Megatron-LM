@@ -677,7 +677,7 @@ class TestFP32LocalGradAccumulation:
         for grad in buf.extra_main_grads:
             grad.fill_(4.0)
 
-        buf.scale_gradients(0.5)
+        buf.scale_gradients(torch.tensor(0.5, device=buf.grad_data.device, dtype=torch.float32))
 
         assert torch.allclose(
             buf.grad_data, torch.tensor(1.0, dtype=buf.grad_data.dtype)

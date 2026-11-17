@@ -29,17 +29,17 @@ class VocabParallelCrossEntropy:
         return vocab_parallel_logits, logits_max
 
     @staticmethod
-    def calculate_predicted_logits(
+    def gather_predicted_logits(
         vocab_parallel_logits: torch.Tensor,
         target: torch.Tensor,
         logits_max: torch.Tensor,
         vocab_start_index: int,
         vocab_end_index: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Calculates predicted logits."""
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Read-only part of the forward: target mask, local target ids and
+        ``logits[target] - logits_max`` (zero for targets owned by other ranks).
 
-        # In-place subtraction reduces memory pressure.
-        vocab_parallel_logits -= logits_max.unsqueeze(dim=-1)
+        Does not modify ``vocab_parallel_logits``."""
 
         # Create a mask of valid vocab ids (1 means it needs to be masked).
         target_mask = (target < vocab_start_index) | (target >= vocab_end_index)
@@ -53,13 +53,41 @@ class VocabParallelCrossEntropy:
         logits_2d = vocab_parallel_logits.view(-1, partition_vocab_size)
         masked_target_1d = masked_target.view(-1)
         arange_1d = torch.arange(start=0, end=logits_2d.size()[0], device=logits_2d.device)
-        predicted_logits_1d = logits_2d[arange_1d, masked_target_1d]
+        predicted_logits_1d = logits_2d[arange_1d, masked_target_1d] - logits_max.view(-1)
         predicted_logits_1d = predicted_logits_1d.clone().contiguous()
         predicted_logits = predicted_logits_1d.view_as(target)
         predicted_logits[target_mask] = 0.0
 
+        return target_mask, masked_target_1d, predicted_logits
+
+    @staticmethod
+    def exp_logits_inplace(vocab_parallel_logits: torch.Tensor, logits_max: torch.Tensor) -> None:
+        """In place: ``vocab_parallel_logits <- exp(vocab_parallel_logits - logits_max)``.
+
+        Pointwise only. Kept separate from any reduction over the result so that, when
+        compiled, Inductor can keep the mutation in place (see fused_cross_entropy.py)."""
+
+        vocab_parallel_logits.sub_(logits_max.unsqueeze(dim=-1))
+        vocab_parallel_logits.exp_()
+
+    @staticmethod
+    def calculate_predicted_logits(
+        vocab_parallel_logits: torch.Tensor,
+        target: torch.Tensor,
+        logits_max: torch.Tensor,
+        vocab_start_index: int,
+        vocab_end_index: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Calculates predicted logits. ``vocab_parallel_logits`` is overwritten in place
+        with exp(logits - logits_max) and returned as ``exp_logits``."""
+
+        target_mask, masked_target_1d, predicted_logits = (
+            VocabParallelCrossEntropy.gather_predicted_logits(
+                vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
+            )
+        )
+        VocabParallelCrossEntropy.exp_logits_inplace(vocab_parallel_logits, logits_max)
         exp_logits = vocab_parallel_logits
-        torch.exp(vocab_parallel_logits, out=exp_logits)
         sum_exp_logits = exp_logits.sum(dim=-1)
 
         return target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits
@@ -98,6 +126,15 @@ class VocabParallelCrossEntropy:
         return grad_2d, arange_1d, softmax_update, grad_input
 
     @staticmethod
+    def scale_gradients_inplace(grad_input: torch.Tensor, grad_output: torch.Tensor) -> None:
+        """In place: ``grad_input <- grad_input * grad_output``.
+
+        Pointwise only. Kept separate from the target scatter so that, when compiled,
+        Inductor can keep the mutation in place (see fused_cross_entropy.py)."""
+
+        grad_input.mul_(grad_output.unsqueeze(dim=-1))
+
+    @staticmethod
     def calculate_gradients(
         grad_2d: torch.Tensor,
         arange_1d: torch.Tensor,
@@ -106,12 +143,13 @@ class VocabParallelCrossEntropy:
         grad_input: torch.Tensor,
         grad_output: torch.Tensor,
     ) -> torch.Tensor:
-        """Calculates gradients."""
+        """Calculates gradients in place in ``grad_input`` (``grad_2d`` is a view of it)."""
 
+        # Scatter over the [s * b] target entries.
         grad_2d[arange_1d, masked_target_1d] -= softmax_update
 
         # Finally elementwise multiplication with the output gradients.
-        grad_input.mul_(grad_output.unsqueeze(dim=-1))
+        VocabParallelCrossEntropy.scale_gradients_inplace(grad_input, grad_output)
 
         return grad_input
 

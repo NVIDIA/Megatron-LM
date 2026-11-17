@@ -22,7 +22,20 @@ def calculate_logits_max(vocab_parallel_logits: torch.Tensor) -> Tuple[torch.Ten
     return vocab_parallel_logits, logits_max
 
 
-@jit_fuser
+# NOTE on in-place semantics under torch.compile:
+# Inductor keeps an input mutation in place only when the mutated value is consumed by
+# pointwise ops alone. If the same graph also reduces over it (``exp_logits.sum``) or
+# scatters into it (``grad[idx] -= ...``), Inductor materializes the new value in a fresh
+# [s, b, v] buffer and copies it back into the input, i.e. a full logits-sized transient
+# allocation plus an extra read/write pass (4 GB and ~2x the time for an 8k x 128k fp32
+# head). The vocab-sized in-place steps of VocabParallelCrossEntropy are therefore compiled
+# on their own, and the gather / scatter / row-sum run outside those graphs.
+
+_gather_predicted_logits = jit_fuser(VocabParallelCrossEntropy.gather_predicted_logits)
+_exp_logits_inplace = jit_fuser(VocabParallelCrossEntropy.exp_logits_inplace)
+_scale_gradients_inplace = jit_fuser(VocabParallelCrossEntropy.scale_gradients_inplace)
+
+
 def calculate_predicted_logits(
     vocab_parallel_logits: torch.Tensor,
     target: torch.Tensor,
@@ -32,12 +45,16 @@ def calculate_predicted_logits(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Calculates the predicted logits for the tokens.
+
+    ``vocab_parallel_logits`` is overwritten in place with exp(logits - logits_max) and
+    returned as ``exp_logits``; no logits-sized temporary is allocated.
     """
-    target_mask, masked_target_1d, predicted_logits, sum_exp_logits, exp_logits = (
-        VocabParallelCrossEntropy.calculate_predicted_logits(
-            vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
-        )
+    target_mask, masked_target_1d, predicted_logits = _gather_predicted_logits(
+        vocab_parallel_logits, target, logits_max, vocab_start_index, vocab_end_index
     )
+    _exp_logits_inplace(vocab_parallel_logits, logits_max)
+    exp_logits = vocab_parallel_logits
+    sum_exp_logits = exp_logits.sum(dim=-1)
 
     predicted_logits_sum_exp_logits = torch.cat((predicted_logits, sum_exp_logits))
 
@@ -61,7 +78,6 @@ def calculate_cross_entropy_loss(
     return exp_logits, loss
 
 
-@jit_fuser
 def calculate_gradients(
     softmax: torch.Tensor,
     grad_output: torch.Tensor,
@@ -70,15 +86,18 @@ def calculate_gradients(
     logits_dtype: torch.dtype,
 ) -> torch.Tensor:
     """
-    Calculate the logits gradients scaled based on the CE loss
+    Calculate the logits gradients scaled based on the CE loss.
+
+    ``softmax`` is overwritten in place and returned as the gradient; no logits-sized
+    temporary is allocated.
     """
     grad_2d, arange_1d, softmax_update, grad_input = (
         VocabParallelCrossEntropy.prepare_gradient_calculation_operands(softmax, target_mask)
     )
 
-    grad_input = VocabParallelCrossEntropy.calculate_gradients(
-        grad_2d, arange_1d, masked_target_1d, softmax_update, grad_input, grad_output
-    )
+    # Eager scatter over the [s * b] target entries, then the compiled pointwise scaling.
+    grad_2d[arange_1d, masked_target_1d] -= softmax_update
+    _scale_gradients_inplace(grad_input, grad_output)
 
     # Emit the gradient in the dtype of the forward logits. If it differed, the autograd
     # engine would insert its own cast (a non-vectorized, un-fusable copy over the full

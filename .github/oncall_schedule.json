@@ -1,17 +1,5 @@
 [
     {
-        "user": "ilml",
-        "date": "2026-10-14"
-    },
-    {
-        "user": "janEbert",
-        "date": "2026-10-21"
-    },
-    {
-        "user": "maanug-nv",
-        "date": "2026-10-28"
-    },
-    {
         "user": "Phlip79",
         "date": "2026-11-04"
     },
@@ -46,5 +34,17 @@
     {
         "user": "ilml",
         "date": "2026-12-30"
+    },
+    {
+        "user": "janEbert",
+        "date": "2027-01-06"
+    },
+    {
+        "user": "maanug-nv",
+        "date": "2027-01-13"
+    },
+    {
+        "user": "Phlip79",
+        "date": "2027-01-20"
     }
 ]

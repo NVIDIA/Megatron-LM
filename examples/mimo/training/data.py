@@ -349,7 +349,7 @@ def _build_split_loaders(
     """Build split-local datasets with deterministic module/DP/split seeds."""
     cfg = get_run_config()
     base_seed = cfg.rng.seed + module_seed_offset + get_data_lane_rank(pg_collection)
-    common = _mock_loader_kwargs(args, encoder_name)
+    common = _mock_loader_kwargs(cfg, args, encoder_name)
     return tuple(
         _build_mock_vlm_dataloader(
             batch_size=batch_size,
@@ -361,7 +361,7 @@ def _build_split_loaders(
     )
 
 
-def _mock_loader_kwargs(args: argparse.Namespace, encoder_name: Optional[str]) -> dict:
+def _mock_loader_kwargs(cfg, args: argparse.Namespace, encoder_name: Optional[str]) -> dict:
     """Translate parsed training arguments to the reusable mock loader."""
     seq_len = args.seq_length
     dtype = getattr(args, "params_dtype", None)
@@ -386,7 +386,7 @@ def _mock_loader_kwargs(args: argparse.Namespace, encoder_name: Optional[str]) -
     return {
         "seq_len": seq_len,
         "image_seq_length": image_seq_length,
-        "vocab_size": args.vocab_size,
+        "vocab_size": cfg.tokenizer.vocab_size,
         "pad_token_id": getattr(args, "pad_token_id", 0),
         "image_token_id": args.image_token_id,
         "encoder_name": encoder_name,

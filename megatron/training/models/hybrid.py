@@ -60,6 +60,10 @@ class HybridModelConfig(ModelConfig):
     hybrid_override_pattern: str | None = None
     hybrid_layer_pattern: str | None = None
     seq_length: int = 8192
+    """Position-embedding capacity, passed to the model as max_sequence_length; the launcher
+    fills it from --max-position-embeddings. The training sequence length that core modules
+    size buffers from is TransformerConfig.max_seq_length_per_sample on ``transformer``.
+    """
     # HybridModel with no attention has no need for position embeddings, so none is default
     position_embedding_type: Literal["learned_absolute", "rope", "none"] = "none"
     rotary_percent: float = 1.0

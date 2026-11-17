@@ -68,7 +68,7 @@ def _shard_and_build_optimizer(
 
     Args:
         precision_aware: Keep the optimizer state in the lower ``exp_avg_dtype`` /
-            ``exp_avg_sq_dtype`` precision, as ``test_mcore_adapter.py`` trains MFSDP v2.
+            ``exp_avg_sq_dtype`` precision, as ``test_mcore_dense.py`` trains MFSDP v2.
     """
     model = FullyShardedDataParallel(
         config=config,
@@ -284,7 +284,7 @@ class TestOptimizerCheckpoint:
         With >=2 ranks this also covers checkpointing zero-sized local shards.
 
         ``precision_aware`` keeps the optimizer state in bf16 rather than fp32, which is how
-        ``test_mcore_adapter.py`` trains MFSDP v2. It changes the state tensors' dtype but not
+        ``test_mcore_dense.py`` trains MFSDP v2. It changes the state tensors' dtype but not
         their shape or their keys, so the same round trip has to hold.
         """
         config = _transformer_config()

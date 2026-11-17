@@ -232,8 +232,8 @@ class TorchSampling(Sampling):
             n: Number of rows to sample.
             context: The active DynamicInferenceContext.
             no_top_k, no_top_p: Batch-level dispatch flags (part of the shared kernel
-                contract); ignored here since the exact per-bucket sort already handles
-                any top-k / top-p combination.
+                contract). Used only to gate the all-greedy argmax shortcut; the exact
+                per-bucket sort otherwise handles any top-k / top-p combination.
             gather_indices: When set, sample from `logits[gather_indices[:n], :]`.
             token_to_request_index: When set, the loop dispatches per-token rather than
                 per-request (used by the speculative path).
@@ -246,11 +246,32 @@ class TorchSampling(Sampling):
         Returns:
             Sampled token IDs in `output`, or a newly allocated tensor when it is not provided.
         """
-        del eager, cache_key, no_top_k, no_top_p
+        del eager, cache_key
 
         # Group active requests into sampling buckets by (temperature, top_k, top_p).
         active_request_count = context.total_request_count - context.paused_request_count
         md = context.active_request_metadata
+
+        # With top-k=1 for every request, every row uses argmax regardless of
+        # temperature or its request mapping. Avoid building GPU bucket indices,
+        # torch.isin masks, and the scatter that otherwise serialize this eager
+        # sampling path once for the base logits and once per MTP depth.
+        if (
+            active_request_count > 0
+            and not no_top_k
+            and no_top_p
+            and bool((md["top_k"][:active_request_count] == 1).all())
+            and bool((md["top_p"][:active_request_count] == 0.0).all())
+        ):
+            selected_logits = (
+                logits[gather_indices[:n], :] if gather_indices is not None else logits[:n, :]
+            )
+            sampled = torch.argmax(selected_logits, dim=-1)
+            if output is None:
+                return sampled
+            output.copy_(sampled)
+            return output
+
         device = logits.device
         seed_metadata = md.get("seed")
         seeds = (

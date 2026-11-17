@@ -3,7 +3,7 @@
 """Explicit CP redistribution for shared tensor fields, independent of their meaning."""
 
 from dataclasses import replace
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 
 import torch
 import torch.distributed as dist
@@ -11,7 +11,6 @@ from torch import Tensor
 
 from megatron.core.context_parallel.layout import (
     CPLayout,
-    THDCPLayoutPlan,
     _get_layout_parallel_context,
     _local_segment_ids,
     convert_cp_layout,
@@ -22,43 +21,43 @@ from megatron.core.transformer.state_boundary import TensorField, TensorSchema
 
 def _map_sharded_fields(
     state: Mapping[str, Tensor | None],
-    schema: TensorSchema,
+    fields: Sequence[TensorField],
     convert: Callable[[TensorField, Tensor], tuple[Tensor, str]],
-) -> tuple[dict[str, Tensor | None], TensorSchema]:
+) -> tuple[dict[str, Tensor | None], tuple[TensorField, ...]]:
     """Convert present sequence-sharded fields; replicated/local/strided fields stay in place."""
+    schema = TensorSchema(tuple(fields))
     values = schema.unpack(schema.pack(state))
-    fields = []
+    converted = []
     for field in schema.fields:
         if field.present and field.layout in ("contiguous", "zigzag"):
             values[field.key], layout = convert(field, values[field.key])
             field = replace(field, shape=tuple(values[field.key].shape), layout=layout)
-        fields.append(field)
-    return {**state, **values}, TensorSchema(tuple(fields))
+        converted.append(field)
+    return {**state, **values}, tuple(converted)
 
 
 def redistribute_state(
     state: Mapping[str, Tensor | None],
-    schema: TensorSchema,
+    fields: Sequence[TensorField],
     target_layout: CPLayout,
     cp_group: dist.ProcessGroup,
     *,
     sequence_parallel: bool = False,
     tp_group: dist.ProcessGroup | None = None,
     tp_cp_group: dist.ProcessGroup | None = None,
-    thd_plans: Mapping[str, THDCPLayoutPlan] | None = None,
-) -> tuple[dict[str, Tensor | None], TensorSchema]:
+) -> tuple[dict[str, Tensor | None], tuple[TensorField, ...]]:
     """Reuse main's contiguous/zigzag exchange for every sharded field.
 
-    Sharded fields have sequence on dimension zero. Owners choose which fields
-    are sharded and provide packed layout metadata; this function does not infer
-    compression groups, halo ownership or logical token positions.
+    Sharded fields are dense sequences on dimension zero; converting packed (THD)
+    layouts stays with the model. Owners choose which fields are sharded; this
+    function does not infer compression groups, halo ownership or token positions.
+    Returns the state and its fields, now in ``target_layout``.
     """
     if target_layout not in ("contiguous", "zigzag"):
         raise ValueError("Shared state redistribution requires contiguous or zigzag layout")
     _get_layout_parallel_context(cp_group, sequence_parallel, tp_group, tp_cp_group)
 
     def convert(field, tensor):
-        plan = None if thd_plans is None else thd_plans.get(field.key)
         return (
             convert_cp_layout(
                 tensor,
@@ -68,24 +67,23 @@ def redistribute_state(
                 sequence_parallel=sequence_parallel,
                 tp_group=tp_group,
                 tp_cp_group=tp_cp_group,
-                thd_plan=plan,
             ),
             target_layout,
         )
 
-    return _map_sharded_fields(state, schema, convert)
+    return _map_sharded_fields(state, fields, convert)
 
 
 def gather_state(
     state: Mapping[str, Tensor | None],
-    schema: TensorSchema,
+    fields: Sequence[TensorField],
     cp_group: dist.ProcessGroup,
     *,
     sequence_parallel: bool = False,
     tp_group: dist.ProcessGroup | None = None,
     tp_cp_group: dist.ProcessGroup | None = None,
     tp_replicated: bool = False,
-) -> tuple[dict[str, Tensor | None], TensorSchema]:
+) -> tuple[dict[str, Tensor | None], tuple[TensorField, ...]]:
     """Gather equal CP/SP shards in sequence order; sum consumer gradients to each owner.
 
     One all-gather writes all shards, followed by a local reorder without host
@@ -93,7 +91,8 @@ def gather_state(
     reduce-scatters, which is correct when every rank contributes a distinct
     gradient (e.g. TP-partitioned heads). With sequence parallelism, set
     ``tp_replicated`` when TP ranks consume the gathered state identically, so
-    their duplicate contributions are averaged instead of summed.
+    their duplicate contributions are averaged instead of summed. Returns the state
+    and its fields, now replicated.
     """
     context = _get_layout_parallel_context(cp_group, sequence_parallel, tp_group, tp_cp_group)
     group = context.communication_group
@@ -131,4 +130,4 @@ def gather_state(
             tensor.register_hook(lambda grad: grad / context.tp_size)
         return tensor, "replicated"
 
-    return _map_sharded_fields(state, schema, convert)
+    return _map_sharded_fields(state, fields, convert)

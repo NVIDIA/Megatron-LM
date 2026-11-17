@@ -39,8 +39,10 @@ class TestDataLoaderResume:
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
 
-    def test_building_data_iterators_does_not_move_cpu_rng(self, monkeypatch):
+    def test_building_data_iterators_does_not_move_cpu_rng(self, monkeypatch, run_config):
         Utils.initialize_model_parallel(1, 1)
+        run_config.train.micro_batch_size = 1
+        run_config.train.global_batch_size = Utils.world_size
         monkeypatch.setattr(
             data_samplers,
             'get_args',
@@ -49,7 +51,7 @@ class TestDataLoaderResume:
                 micro_batch_size=1,
                 global_batch_size=Utils.world_size,
                 num_workers=0,
-                hybrid_context_parallel=False,
+                dynamic_context_parallel=False,
                 sequence_packing_scheduler=None,
                 use_varlen_dataset=False,
                 varlen_sbhd_validation=False,

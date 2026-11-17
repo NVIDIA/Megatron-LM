@@ -1,8 +1,9 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from megatron.core.fault_injector import FaultInjectorConfig
+from megatron.core.rerun_state_machine import RerunDiagnostic, RerunMode
 
 
 @dataclass(kw_only=True)
@@ -18,15 +19,38 @@ class RerunStateMachineConfig:
     )
     """Type of error to inject. """
 
-    rerun_mode: Literal["disabled", "validate_results", "report_stats"] = "validate_results"
+    rerun_mode: Literal["disabled", "validate_results", "report_determinism_stats"] = field(
+        default="validate_results",
+        metadata={
+            "argparse_meta": {
+                "choices": [
+                    "disabled",
+                    "validate_results",
+                    "report_determinism_stats",
+                    "report_stats",
+                ]
+            }
+        },
+    )
     """Use re-run engine to validate results (default) or to emit stats
-    on variability of computations due to non-deterministic algorithms."""
+    on variability of computations due to non-deterministic algorithms.
+    The CLI also accepts report_stats as an alias for report_determinism_stats."""
 
     check_for_nan_in_loss: bool = True
     """Check for NaN in the loss."""
 
     check_for_spiky_loss: bool = False
     """Check for spiky loss."""
+
+    result_rejected_tracker_filename: str | None = None
+    """Optional file recording rejected results and iterations to skip on restart."""
+
+    def validate(self) -> None:
+        """Check rerun settings without constructing or modifying runtime state."""
+        # Constructing an enum from a string checks that it is a supported value;
+        # otherwise, it raises ValueError.
+        RerunMode(self.rerun_mode)
+        RerunDiagnostic(self.error_injection_type)
 
 
 @dataclass(kw_only=True)

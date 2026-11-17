@@ -22,7 +22,7 @@ from megatron.core.pipeline_parallel.schedules import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import ModelType
-from megatron.core.transformer.state_boundary import TensorField, TensorSchema
+from megatron.core.transformer.state_boundary import TensorField
 from megatron.core.transformer.stateful_module import StatefulGraphs, StatefulModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -30,6 +30,8 @@ from tests.unit_tests.transformer.test_stateful_module import (  # pylint: disab
     te_rng_tracker,
 )
 
+# Each rank's hidden activation is its contiguous CP shard of the sequence.
+HIDDEN = TensorField("hidden", (8, 2), torch.float32, "contiguous", True)
 FIELDS = (
     TensorField("memory", (8, 2), torch.float32, "contiguous", True),
     TensorField("ids", (8,), torch.int64, "contiguous", False),
@@ -50,7 +52,7 @@ class _Region(nn.Module):
                 "ids": torch.arange(8, device=hidden.device) + self.cp.rank() * 8,
             }
             return memory + hidden.sin() * 0.1, state
-        gathered, _ = gather_state(state, TensorSchema(FIELDS), self.cp)
+        gathered, _ = gather_state(state, FIELDS, self.cp)
         selected = gathered["memory"].index_select(0, state["ids"])
         output = hidden * self.weight + (selected + gathered["memory"].mean(0)) * self.weight
         return output, state
@@ -97,7 +99,7 @@ class _Stage(nn.Module):
         if self.index == self.total - 1:
             return hidden.square().mean()
         return TensorStatePayload.from_state(
-            hidden, state, self.region.outputs, boundary_id=f"after:{self.index}"
+            hidden, state, FIELDS, hidden_field=HIDDEN, boundary_id=f"after:{self.index}"
         )
 
 
@@ -105,8 +107,7 @@ def _plan(stage, count):
     """Every boundary carries the hidden activation plus both shared fields."""
 
     def boundary(index):
-        hidden = TensorField("__hidden__", (8, 2), torch.float32, "strided", True)
-        return PipelinePayloadSpec((hidden, *FIELDS), boundary_id=f"after:{index}")
+        return PipelinePayloadSpec((HIDDEN, *FIELDS), boundary_id=f"after:{index}")
 
     first, last = stage.index == 0, stage.index == stage.total - 1
     return PipelinePayloadPlan(

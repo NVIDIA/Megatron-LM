@@ -32,9 +32,11 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection_transformer_layer import (
+    HyperConnectionTransformerLayer,
+)
 from megatron.core.transformer.module import convert_module_to_dtype_except_fp32_marked
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import HyperConnectionTransformerLayer
 from megatron.core.utils import get_batch_on_this_cp_rank
 from tests.unit_tests.test_utilities import Utils
 
@@ -412,8 +414,9 @@ def test_mhc_schedule_matches_pp1(
     monkeypatch,
 ):
     if cp_size == 1:
-        # FP32 schedule parity needs IEEE GEMMs on both sides, independent of
-        # TF32 kernel selection for the different PP partitions.
+        # FP32 schedule parity needs IEEE PyTorch GEMMs on both sides, independent
+        # of TF32 kernel selection for the different PP partitions. TE's own FP32
+        # GEMMs use TF32 compute regardless of these flags.
         monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
         monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
     if Utils.world_size % (2 * tp_size * cp_size) != 0:
