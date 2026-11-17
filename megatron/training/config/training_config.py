@@ -767,7 +767,7 @@ class CheckpointConfig:
     replication_factor: int = 2
     """Number of machines storing the replica of a given rank's data."""
 
-    verify_integrity: bool = False
+    verify_integrity: bool = True
     """Whether to hash checkpointing files during save and validate their integrity during load."""
 
     stream_ckpt_dequant: bool = False
