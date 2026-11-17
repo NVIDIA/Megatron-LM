@@ -24,10 +24,13 @@ import torch
 from megatron.core.extensions.transformer_engine import TENorm
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols as LayerSymbols
+from megatron.core.ssm.gdn_layer_config import GDNLayerConfig
 from megatron.core.ssm.mamba_layer import MambaLayer
+from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.module import MegatronModule, TwoStageAttentionLayer
+from megatron.core.transformer.moe.moe_layer_config import MoELayerConfig
 from megatron.core.transformer.moe.shared_experts import set_tensor_grad_fn_sequence_sr
 from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
@@ -37,14 +40,9 @@ from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.transformer.wide_residual import StreamwiseSigmoidWideResidualRead
 from megatron.core.typed_torch import apply_module
 
-# Layer symbols that may precede a shortcut MoE
-SUPPORTED_SHORTCUT_PREDECESSORS = frozenset(
-    {LayerSymbols.MAMBA, LayerSymbols.GDN}
-    | {
-        symbol
-        for symbol, layer_config in LayerSymbols.LAYER_CONFIG_MAP.items()
-        if layer_config in LayerSymbols.ATTENTION_LAYER_CONFIGS
-    }
+# Built-in config types that may precede a shortcut MoE.
+SUPPORTED_SHORTCUT_PREDECESSOR_CONFIGS = frozenset(
+    {MambaLayerConfig, GDNLayerConfig} | LayerSymbols.ATTENTION_LAYER_CONFIGS
 )
 
 
@@ -59,7 +57,7 @@ def _get_offloading_interface():
 
 def group_layers_into_shortcut_blocks(
     layers: torch.nn.ModuleList,
-    layer_type_list: Sequence[str],
+    layer_config_list: Sequence[TransformerConfig],
     config: TransformerConfig,
     pp_layer_offset: int = 0,
 ) -> torch.nn.ModuleList:
@@ -70,7 +68,7 @@ def group_layers_into_shortcut_blocks(
 
     Args:
         layers: Physical layers in execution order.
-        layer_type_list: Physical layer symbols in execution order.
+        layer_config_list: Physical layer configs in execution order.
         config: Transformer configuration controlling shortcut scheduling.
         pp_layer_offset: Global offset of this pipeline stage's first physical layer.
 
@@ -82,7 +80,7 @@ def group_layers_into_shortcut_blocks(
             pipeline-stage boundary.
     """
 
-    if pp_layer_offset > 0 and layer_type_list and layer_type_list[0] == LayerSymbols.MOE:
+    if pp_layer_offset > 0 and layer_config_list and type(layer_config_list[0]) is MoELayerConfig:
         raise ValueError(
             "Shortcut MoE pairs cannot cross pipeline-stage boundaries; this pipeline stage "
             f"begins with an MoE layer (global layer {pp_layer_offset + 1}). Move the stage "
@@ -94,7 +92,7 @@ def group_layers_into_shortcut_blocks(
     while physical_index < len(layers):
         next_is_moe = (
             physical_index + 1 < len(layers)
-            and layer_type_list[physical_index + 1] == LayerSymbols.MOE
+            and type(layer_config_list[physical_index + 1]) is MoELayerConfig
         )
         if not next_is_moe:
             grouped_layers.append(layers[physical_index])
@@ -102,8 +100,8 @@ def group_layers_into_shortcut_blocks(
             continue
 
         compute_layer = layers[physical_index]
-        paired_type = layer_type_list[physical_index]
-        if paired_type not in SUPPORTED_SHORTCUT_PREDECESSORS:
+        paired_type = type(layer_config_list[physical_index])
+        if paired_type not in SUPPORTED_SHORTCUT_PREDECESSOR_CONFIGS:
             raise ValueError(
                 "Shortcut MoE must be preceded by a Mamba, GDN, or supported attention layer"
             )
@@ -114,7 +112,7 @@ def group_layers_into_shortcut_blocks(
         )
         if not supports_two_stage:
             raise ValueError(
-                f"Shortcut attention layer {paired_type!r} does not support two-stage attention"
+                f"Shortcut layer {paired_type.__name__} does not support two-stage attention"
             )
         moe_layer = layers[physical_index + 1]
         grouped_layers.append(
