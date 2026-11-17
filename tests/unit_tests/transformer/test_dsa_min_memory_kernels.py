@@ -276,6 +276,18 @@ def test_triton_query_chunk_is_not_shrunk_by_long_key_length():
     assert _plan_execution(1, 524288, 524288, use_triton=False).query_chunk < _MAX_QUERY_CHUNK
 
 
+def _random_support(batch_size, query_len, topk, high, device):
+    """Random selected positions ending in the -1 suffix batch-invariant routing pads with."""
+    topk_indices = torch.randint(0, high, (batch_size, query_len, topk), device=device)
+    topk_indices[..., -5:] = -1
+    return topk_indices
+
+
+def _invalid_support(topk_indices, q_start):
+    query_positions = q_start + torch.arange(topk_indices.size(1), device=topk_indices.device)
+    return (topk_indices < 0) | (topk_indices > query_positions.view(1, -1, 1))
+
+
 @pytest.mark.skipif(not torch.cuda.is_available() or not HAVE_TRITON, reason="CUDA Triton only")
 def test_triton_simplified_selected_scores_matches_reference():
     torch.manual_seed(123)
@@ -290,7 +302,7 @@ def test_triton_simplified_selected_scores_matches_reference():
 
     q_index = torch.randn(query_len, batch_size, 1, head_dim, device=device, dtype=torch.bfloat16)
     key = torch.randn(sequence_length, batch_size, 1, head_dim, device=device, dtype=torch.bfloat16)
-    topk_indices = torch.randint(0, sequence_length, (batch_size, query_len, topk), device=device)
+    topk_indices = _random_support(batch_size, query_len, topk, sequence_length, device)
 
     actual = triton_simplified_selected_index_scores(
         q_index, key, topk_indices, score_scale, q_start
@@ -300,11 +312,10 @@ def test_triton_simplified_selected_scores_matches_reference():
 
     key_by_batch = key[:, :, 0, :].permute(1, 0, 2)
     batch_indices = torch.arange(batch_size, device=device).view(batch_size, 1, 1)
-    selected_key = key_by_batch[batch_indices, topk_indices]
+    selected_key = key_by_batch[batch_indices, topk_indices.clamp_min(0)]
     q_by_batch = q_index[:, :, 0, :].permute(1, 0, 2).float()
     expected = (q_by_batch.unsqueeze(2) * selected_key.float()).sum(dim=-1) * score_scale
-    query_positions = q_start + torch.arange(query_len, device=device)
-    invalid = topk_indices > query_positions.view(1, query_len, 1)
+    invalid = _invalid_support(topk_indices, q_start)
     expected = expected.masked_fill(invalid, float("-inf"))
 
     assert torch.equal(torch.isneginf(actual), invalid)
@@ -324,7 +335,7 @@ def test_triton_simplified_selected_scores_backward_matches_reference():
     score_scale = head_dim**-0.5
 
     key = torch.randn(sequence_length, batch_size, 1, head_dim, device=device, dtype=torch.bfloat16)
-    topk_indices = torch.randint(0, sequence_length, (batch_size, query_len, topk), device=device)
+    topk_indices = _random_support(batch_size, query_len, topk, sequence_length, device)
     grad_scores = torch.randn(batch_size, query_len, topk, device=device, dtype=torch.float32)
 
     actual = triton_simplified_selected_index_scores_backward(
@@ -333,12 +344,10 @@ def test_triton_simplified_selected_scores_backward_matches_reference():
     assert actual is not None
     assert actual.dtype == torch.float32
 
-    query_positions = q_start + torch.arange(query_len, device=device)
-    invalid = topk_indices > query_positions.view(1, query_len, 1)
-    masked_grad_scores = grad_scores.masked_fill(invalid, 0.0)
+    masked_grad_scores = grad_scores.masked_fill(_invalid_support(topk_indices, q_start), 0.0)
     key_by_batch = key[:, :, 0, :].permute(1, 0, 2)
     batch_indices = torch.arange(batch_size, device=device).view(batch_size, 1, 1)
-    selected_key = key_by_batch[batch_indices, topk_indices]
+    selected_key = key_by_batch[batch_indices, topk_indices.clamp_min(0)]
     expected = (masked_grad_scores.unsqueeze(-1) * selected_key.float()).sum(dim=2)
     expected = (expected * score_scale).permute(1, 0, 2).unsqueeze(2).contiguous()
 
@@ -356,9 +365,7 @@ def test_triton_simplified_selected_scores_backward_qk_matches_reference(dtype):
     score_scale = head_dim**-0.5
     q_index = torch.randn(query_len, batch_size, 1, head_dim, device=device, dtype=dtype)
     selected_k = torch.randn(batch_size, query_len, topk, head_dim, device=device, dtype=dtype)
-    topk_indices = torch.randint(
-        0, q_start + query_len + 5, (batch_size, query_len, topk), device=device
-    )
+    topk_indices = _random_support(batch_size, query_len, topk, q_start + query_len + 5, device)
     grad_scores = torch.randn(batch_size, query_len, topk, device=device)
 
     actual = triton_simplified_selected_index_scores_backward_qk(
@@ -367,9 +374,7 @@ def test_triton_simplified_selected_scores_backward_qk_matches_reference(dtype):
     assert actual is not None
     actual_q, actual_k = actual
 
-    query_positions = q_start + torch.arange(query_len, device=device)
-    invalid = topk_indices > query_positions.view(1, query_len, 1)
-    masked_grad = grad_scores.masked_fill(invalid, 0.0)
+    masked_grad = grad_scores.masked_fill(_invalid_support(topk_indices, q_start), 0.0)
     q = q_index[:, :, 0, :].permute(1, 0, 2).float()
     expected_q = torch.einsum("bqk,bqkd->bqd", masked_grad, selected_k.float()) * score_scale
     expected_q = expected_q.permute(1, 0, 2).unsqueeze(2)

@@ -228,6 +228,11 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         self.hybrid_stack_spec: ModuleSpec = hybrid_stack_spec
         self.vocab_size = vocab_size
         self.max_sequence_length = max_sequence_length
+        if (
+            self.config.batch_invariant_mode
+            and self.config.dsa_indexer_batch_invariant_max_sequence_length is None
+        ):
+            self.config.dsa_indexer_batch_invariant_max_sequence_length = max_sequence_length
         self.hybrid_layer_pattern = hybrid_layer_pattern
         self.hybrid_layer_config_list = hybrid_layer_config_list_snapshot
         self._has_custom_layers = any(

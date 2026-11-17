@@ -8,8 +8,9 @@ causal prefix, itself included), routed to the indexer's top-k of them. The same
 serve decode-only, prefill, and mixed steps, with launch sizes fixed by the padded batch, so
 every step type can run as a CUDA graph.
 
-Decode indexer scores use staged Gluon TMA loads and Blackwell tcgen05 MMA.
-Prefill indexer scores take blocks of consecutive rows of one request (``DSAMetadata``)
+Batch-invariant scores use staged Gluon TMA loads and Blackwell tcgen05 MMA with one fixed
+8-row tile for training, prefill and decode. Non-BI decode retains its original schedule.
+Non-BI prefill indexer scores take blocks of consecutive rows of one request (``DSAMetadata``)
 and stride over the request's paged keys up to the block's longest row, loading each key tile
 once for the whole block and scoring it on tensor cores.
 
@@ -62,11 +63,14 @@ ATTENTION_PROGRAMS_PER_SM = 1
 # programs to aim for per SM across a step.
 SCORE_BLOCK_T = 128
 SCORE_PROGRAMS_PER_SM = 8
+# Indexer dimension the Gluon score kernel's TMA tiles and MMA are laid out for.
+SCORE_INDEX_DIM = 128
+BI_SCORE_ROWS = 8
 
 
 if HAVE_GLUON:
 
-    @g.jit
+    @g.jit(do_not_specialize=["ROW_OFFSET", "OUT_ROWS"])
     def score_tcgen(
         Qdesc,
         Kdesc,
@@ -79,80 +83,149 @@ if HAVE_GLUON:
         PAGE: gl.constexpr,
         WORKERS: gl.constexpr,
         STAGES: gl.constexpr,
+        BlockStarts=None,
+        BlockRows=None,
+        ROW_OFFSET=0,
+        OUT_ROWS=0,
+        STRIDE_OUT: gl.constexpr = 0,
+        SCORE_ROWS: gl.constexpr = 8,
+        BATCH_INVARIANT: gl.constexpr = False,
+        SKIP_EMPTY_WORKERS: gl.constexpr = False,
     ):
         """Score a paged indexer row with staged TMA loads and tcgen05 MMA."""
-        row = gl.program_id(0)
-        worker = gl.program_id(1)
-        request = gl.load(Requests + row)
-        n = gl.minimum(gl.load(Lengths + row), WIDTH)
-        tiles = gl.cdiv(gl.cdiv(n, 128), WORKERS)
-        first = worker * tiles
-        count = gl.maximum(gl.minimum(tiles, gl.cdiv(n, 128) - first), 0)
-        qbuf = gl.allocate_shared_memory(Qdesc.dtype, Qdesc.block_type.shape, Qdesc.layout)
-        keys = gl.allocate_shared_memory(
-            Kdesc.dtype, [STAGES] + Kdesc.block_type.shape, Kdesc.layout
-        )
-        qbar = mbarrier.allocate_mbarrier()
-        done = mbarrier.allocate_mbarrier()
-        mbarrier.init(done, count=1)
-        bars = gl.allocate_shared_memory(gl.int64, [STAGES, 1], mbarrier.MBarrierLayout())
-        mbarrier.init(qbar, count=1)
-        for init_slot in gl.static_range(STAGES):
-            mbarrier.init(bars.index(init_slot), count=1)
-        mbarrier.expect(qbar, Qdesc.block_type.nbytes)
-        tma.async_load(Qdesc, [row, 0], qbar, qbuf)
-        for prefetch_slot in gl.static_range(STAGES):
-            start = (first + prefetch_slot) * 128
-            page = gl.load(
-                Table + request * stride_table + start // PAGE, mask=prefetch_slot < count, other=0
-            )
-            mbarrier.expect(
-                bars.index(prefetch_slot), Kdesc.block_type.nbytes, pred=prefetch_slot < count
-            )
-            tma.async_load(
-                Kdesc,
-                [page * PAGE + start % PAGE, 0],
-                bars.index(prefetch_slot),
-                keys.index(prefetch_slot),
-                pred=prefetch_slot < count,
-            )
-        mbarrier.wait(qbar, 0)
-        acc = allocate_tensor_memory(
-            gl.float32, [128, 8], TensorMemoryLayout([128, 8], col_stride=1)
-        )
-        for step in range(count):
-            i = step % STAGES
-            phase = step // STAGES % 2
-            mbarrier.wait(bars.index(i), phase)
-            tcgen05_mma(keys.index(i), qbuf.permute((1, 0)), acc, use_acc=False, mbarriers=[done])
-            mbarrier.wait(done, step % 2)
-            # Explicit completion protects both the TMEM read and reuse of the key slot.
-            values = acc.load()
-            layout: gl.constexpr = values.type.layout
-            rows = (first + step) * 128 + gl.arange(0, 128, layout=gl.SliceLayout(1, layout))
-            cols = gl.arange(0, 8, layout=gl.SliceLayout(0, layout))
-            gl.store(
-                Out + row * WIDTH + rows[:, None] + cols[None, :] * 0,
-                values,
-                mask=(rows[:, None] < n) & (cols[None, :] == 0),
-            )
-            next_step = step + STAGES
-            start = (first + next_step) * 128
-            page = gl.load(
-                Table + request * stride_table + start // PAGE, mask=next_step < count, other=0
-            )
-            mbarrier.expect(bars.index(i), Kdesc.block_type.nbytes, pred=next_step < count)
-            tma.async_load(
-                Kdesc,
-                [page * PAGE + start % PAGE, 0],
-                bars.index(i),
-                keys.index(i),
-                pred=next_step < count,
-            )
-        mbarrier.invalidate(done)
-        mbarrier.invalidate(qbar)
-        for free_slot in gl.static_range(STAGES):
-            mbarrier.invalidate(bars.index(free_slot))
+        block = gl.program_id(0)
+        request = gl.load(Requests + block)
+        if BATCH_INVARIANT:
+            first_row = gl.load(BlockStarts + block)
+            num_rows = gl.load(BlockRows + block)
+        else:
+            first_row = block
+            num_rows = 1
+        for row_start in range(0, num_rows, SCORE_ROWS):
+            row = first_row + row_start
+            valid_rows = gl.minimum(num_rows - row_start, SCORE_ROWS)
+            worker = gl.program_id(1)
+            if BATCH_INVARIANT:
+                offsets = gl.arange(0, SCORE_ROWS, layout=gl.BlockedLayout([1], [32], [4], [0]))
+                query_rows = row + offsets
+                active = (
+                    (offsets < valid_rows)
+                    & (query_rows >= ROW_OFFSET)
+                    & (query_rows < ROW_OFFSET + OUT_ROWS)
+                )
+                lengths = gl.load(Lengths + query_rows, mask=active, other=0)
+                n = gl.minimum(gl.max(lengths, 0), WIDTH)
+            else:
+                n = gl.minimum(gl.load(Lengths + row), WIDTH)
+            tiles = gl.cdiv(gl.cdiv(n, 128), WORKERS)
+            first = worker * tiles
+            count = gl.maximum(gl.minimum(tiles, gl.cdiv(n, 128) - first), 0)
+            if (not BATCH_INVARIANT and not SKIP_EMPTY_WORKERS) or count > 0:
+                qbuf = gl.allocate_shared_memory(Qdesc.dtype, Qdesc.block_type.shape, Qdesc.layout)
+                keys = gl.allocate_shared_memory(
+                    Kdesc.dtype, [STAGES] + Kdesc.block_type.shape, Kdesc.layout
+                )
+                qbar = mbarrier.allocate_mbarrier()
+                done = mbarrier.allocate_mbarrier()
+                mbarrier.init(done, count=1)
+                bars = gl.allocate_shared_memory(gl.int64, [STAGES, 1], mbarrier.MBarrierLayout())
+                mbarrier.init(qbar, count=1)
+                for init_slot in gl.static_range(STAGES):
+                    mbarrier.init(bars.index(init_slot), count=1)
+                mbarrier.expect(qbar, Qdesc.block_type.nbytes)
+                tma.async_load(Qdesc, [row, 0], qbar, qbuf)
+                for prefetch_slot in gl.static_range(STAGES):
+                    start = (first + prefetch_slot) * 128
+                    page = gl.load(
+                        Table + request * stride_table + start // PAGE,
+                        mask=prefetch_slot < count,
+                        other=0,
+                    )
+                    mbarrier.expect(
+                        bars.index(prefetch_slot),
+                        Kdesc.block_type.nbytes,
+                        pred=prefetch_slot < count,
+                    )
+                    tma.async_load(
+                        Kdesc,
+                        [page * PAGE + start % PAGE, 0],
+                        bars.index(prefetch_slot),
+                        keys.index(prefetch_slot),
+                        pred=prefetch_slot < count,
+                    )
+                mbarrier.wait(qbar, 0)
+                acc = allocate_tensor_memory(
+                    gl.float32,
+                    [128, SCORE_ROWS],
+                    TensorMemoryLayout([128, SCORE_ROWS], col_stride=1),
+                )
+                for step in range(count):
+                    i = step % STAGES
+                    phase = step // STAGES % 2
+                    mbarrier.wait(bars.index(i), phase)
+                    tcgen05_mma(
+                        keys.index(i), qbuf.permute((1, 0)), acc, use_acc=False, mbarriers=[done]
+                    )
+                    mbarrier.wait(done, step % 2)
+                    # Explicit completion protects both the TMEM read and reuse of the key slot.
+                    values = acc.load()
+                    layout: gl.constexpr = values.type.layout
+                    rows = (first + step) * 128 + gl.arange(
+                        0, 128, layout=gl.SliceLayout(1, layout)
+                    )
+                    cols = gl.arange(0, SCORE_ROWS, layout=gl.SliceLayout(0, layout))
+                    if BATCH_INVARIANT and valid_rows != 1:
+                        store_rows = row + cols
+                        row_valid = (
+                            (cols < valid_rows)
+                            & (store_rows >= ROW_OFFSET)
+                            & (store_rows < ROW_OFFSET + OUT_ROWS)
+                        )
+                        store_lengths = gl.minimum(
+                            gl.load(Lengths + store_rows, mask=row_valid, other=0), WIDTH
+                        )
+                        gl.store(
+                            Out + (store_rows[None, :] - ROW_OFFSET) * STRIDE_OUT + rows[:, None],
+                            values,
+                            mask=row_valid[None, :] & (rows[:, None] < store_lengths[None, :]),
+                        )
+                    elif BATCH_INVARIANT:
+                        gl.store(
+                            Out
+                            + (row - ROW_OFFSET) * STRIDE_OUT
+                            + rows[:, None]
+                            + cols[None, :] * 0,
+                            values,
+                            mask=(rows[:, None] < n) & (cols[None, :] == 0),
+                        )
+                    else:
+                        gl.store(
+                            Out
+                            + row * (STRIDE_OUT if STRIDE_OUT else WIDTH)
+                            + rows[:, None]
+                            + cols[None, :] * 0,
+                            values,
+                            mask=(rows[:, None] < n) & (cols[None, :] == 0),
+                        )
+                    next_step = step + STAGES
+                    start = (first + next_step) * 128
+                    page = gl.load(
+                        Table + request * stride_table + start // PAGE,
+                        mask=next_step < count,
+                        other=0,
+                    )
+                    mbarrier.expect(bars.index(i), Kdesc.block_type.nbytes, pred=next_step < count)
+                    tma.async_load(
+                        Kdesc,
+                        [page * PAGE + start % PAGE, 0],
+                        bars.index(i),
+                        keys.index(i),
+                        pred=next_step < count,
+                    )
+                mbarrier.invalidate(done)
+                mbarrier.invalidate(qbar)
+                for free_slot in gl.static_range(STAGES):
+                    mbarrier.invalidate(bars.index(free_slot))
 
 
 if HAVE_TRITON:
@@ -282,6 +355,7 @@ if HAVE_TRITON:
         VALUE_DIM_TILE: tl.constexpr,
         PAGE_SIZE: tl.constexpr,
         BLOCK: tl.constexpr,
+        SORTED_SUPPORT: tl.constexpr = False,
     ):
         row = tl.program_id(0)
         group = tl.program_id(1)
@@ -311,7 +385,14 @@ if HAVE_TRITON:
         running_sum = tl.zeros((HEAD_TILE,), tl.float32)
         acc = tl.zeros((HEAD_TILE, VALUE_DIM_TILE), tl.float32)
         first_slot = piece * slice_len
-        for start in range(0, slice_len, BLOCK):
+        # DeepSelect packs min(length, topk) valid indices before its -1 suffix.
+        # Keep the fixed partition, but omit tiles containing only that suffix.
+        active_slots = (
+            tl.minimum(slice_len, tl.maximum(length - first_slot, 0))
+            if SORTED_SUPPORT
+            else slice_len
+        )
+        for start in range(0, active_slots, BLOCK):
             slots = first_slot + start + tl.arange(0, BLOCK)
             # The last slice may be short when the slice count does not divide top-k.
             in_slice = (start + tl.arange(0, BLOCK) < slice_len) & (slots < topk)
@@ -411,6 +492,43 @@ if HAVE_TRITON:
             mask=value_dim_valid,
         )
 
+    @triton.jit
+    def _combine_fixed_kernel(
+        partial_out,
+        partial_max,
+        partial_sum,
+        output,
+        stride_o_req,
+        stride_o_head,
+        num_heads,
+        num_slices: tl.constexpr,
+        VALUE_DIM: tl.constexpr,
+        VALUE_DIM_TILE: tl.constexpr,
+    ):
+        row = tl.program_id(0)
+        head = tl.program_id(1)
+        pieces = tl.arange(0, triton.next_power_of_2(num_slices))
+        dims = tl.arange(0, VALUE_DIM_TILE)
+        partial = (row * num_slices + pieces).to(tl.int64) * num_heads + head
+        maxima = tl.load(partial_max + partial, mask=pieces < num_slices, other=float("-inf"))
+        sums = tl.load(partial_sum + partial, mask=pieces < num_slices, other=0.0)
+        maximum = tl.max(maxima, 0)
+        reference = tl.where(maximum == float("-inf"), 0.0, maximum)
+        weights = tl.exp2(maxima - reference)
+        denominator = tl.sum(sums * weights, 0)
+        values = tl.load(
+            partial_out + partial[:, None] * VALUE_DIM + dims[None, :],
+            mask=(pieces[:, None] < num_slices) & (dims[None, :] < VALUE_DIM),
+            other=0.0,
+        )
+        numerator = tl.sum(values * weights[:, None], 0)
+        result = numerator / tl.where(denominator > 0, denominator, 1.0)
+        tl.store(
+            output + row.to(tl.int64) * stride_o_req + head * stride_o_head + dims,
+            result.to(output.dtype.element_ty),
+            mask=dims < VALUE_DIM,
+        )
+
 
 @functools.cache
 def _num_sms(device_index: int) -> int:
@@ -441,6 +559,50 @@ def _require_int32_vector(name: str, tensor: torch.Tensor, length: Optional[int]
 def _require_block_table(block_table: torch.Tensor) -> None:
     if block_table.dtype != torch.int32 or block_table.dim() != 2 or block_table.stride(-1) != 1:
         raise TypeError("block_table must be int32 [requests,max_pages] with dense rows.")
+
+
+def _require_indexer_score_args(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    row_lengths: torch.Tensor,
+    block_starts: torch.Tensor,
+    block_rows: torch.Tensor,
+    block_requests: torch.Tensor,
+    out: torch.Tensor,
+    row_offset: int,
+) -> None:
+    if not HAVE_TRITON:
+        raise RuntimeError("Triton is required for the DSA indexer kernel.")
+    _require_cuda_on(
+        query.device,
+        (key_cache, block_table, row_lengths, block_starts, block_rows, block_requests, out),
+    )
+    if query.dtype != torch.bfloat16 or query.dim() != 2 or query.stride(-1) != 1:
+        raise TypeError("query must be BF16 [rows,index_dim] with dense rows.")
+    num_rows, index_dim = query.shape
+    if (
+        key_cache.dtype != torch.bfloat16
+        or key_cache.dim() != 3
+        or key_cache.size(2) != index_dim
+        or key_cache.stride(-1) != 1
+    ):
+        raise TypeError("key_cache must be BF16 [pages,page_size,index_dim] matching query.")
+    _require_block_table(block_table)
+    _require_int32_vector("row_lengths", row_lengths, num_rows)
+    num_blocks = block_starts.numel()
+    for name, tensor in (
+        ("block_starts", block_starts),
+        ("block_rows", block_rows),
+        ("block_requests", block_requests),
+    ):
+        _require_int32_vector(name, tensor, num_blocks)
+    if out.dtype != torch.float32 or out.dim() != 2 or out.stride(-1) != 1:
+        raise TypeError("out must be FP32 [out_rows,width] with dense rows.")
+    if row_offset < 0 or row_offset + out.size(0) > num_rows:
+        raise ValueError(
+            f"Score window [{row_offset}, {row_offset + out.size(0)}) exceeds {num_rows} rows."
+        )
 
 
 @torch.no_grad()
@@ -476,37 +638,19 @@ def dsa_gqa_indexer_scores(
             never written.
         row_offset: First row of the window ``out`` covers.
     """
-    if not HAVE_TRITON:
-        raise RuntimeError("Triton is required for the DSA indexer kernel.")
-    _require_cuda_on(
-        query.device,
-        (key_cache, block_table, row_lengths, block_starts, block_rows, block_requests, out),
+    _require_indexer_score_args(
+        query,
+        key_cache,
+        block_table,
+        row_lengths,
+        block_starts,
+        block_rows,
+        block_requests,
+        out,
+        row_offset,
     )
-    if query.dtype != torch.bfloat16 or query.dim() != 2 or query.stride(-1) != 1:
-        raise TypeError("query must be BF16 [rows,index_dim] with dense rows.")
     num_rows, index_dim = query.shape
-    if (
-        key_cache.dtype != torch.bfloat16
-        or key_cache.dim() != 3
-        or key_cache.size(2) != index_dim
-        or key_cache.stride(-1) != 1
-    ):
-        raise TypeError("key_cache must be BF16 [pages,page_size,index_dim] matching query.")
-    _require_block_table(block_table)
-    _require_int32_vector("row_lengths", row_lengths, num_rows)
     num_blocks = block_starts.numel()
-    for name, tensor in (
-        ("block_starts", block_starts),
-        ("block_rows", block_rows),
-        ("block_requests", block_requests),
-    ):
-        _require_int32_vector(name, tensor, num_blocks)
-    if out.dtype != torch.float32 or out.dim() != 2 or out.stride(-1) != 1:
-        raise TypeError("out must be FP32 [out_rows,width] with dense rows.")
-    if row_offset < 0 or row_offset + out.size(0) > num_rows:
-        raise ValueError(
-            f"Score window [{row_offset}, {row_offset + out.size(0)}) exceeds {num_rows} rows."
-        )
     width = out.size(1)
     if num_blocks == 0 or width == 0:
         return
@@ -553,8 +697,7 @@ def dsa_gqa_indexer_scores(
     )
 
 
-@torch.no_grad()
-def dsa_gqa_sparse_attention(
+def _require_sparse_attention_args(
     query: torch.Tensor,
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,
@@ -562,25 +705,8 @@ def dsa_gqa_sparse_attention(
     row_requests: torch.Tensor,
     row_lengths: torch.Tensor,
     topk_indices: torch.Tensor,
-    softmax_scale: float,
-    *,
     out: torch.Tensor,
 ) -> None:
-    """Attend each row's query heads to its selected paged keys and values.
-
-    Args:
-        query: BF16 ``[rows,query_heads,head_dim]``; the row stride may be pitched.
-        key_cache: Paged BF16 keys ``[num_pages,page_size,query_groups,head_dim]``.
-        value_cache: Paged BF16 values ``[num_pages,page_size,query_groups,value_head_dim]``.
-        block_table: Int32 physical-page table ``[requests,max_pages]``.
-        row_requests: Int32 ``[rows]`` block-table row of each row; -1 for padding rows.
-        row_lengths: Int32 ``[rows]`` valid key length of each row; 0 for padding rows.
-        topk_indices: Int32 logical key positions ``[rows,topk]``. Entries that are negative
-            or not below the row's length are skipped; rows may be pitched.
-        softmax_scale: Attention score scale.
-        out: Caller-owned BF16 output ``[rows,query_heads,value_head_dim]``. A row with no
-            valid selected key gets zeros.
-    """
     if not HAVE_TRITON:
         raise RuntimeError("Triton is required for the DSA sparse attention kernel.")
     _require_cuda_on(
@@ -595,8 +721,7 @@ def dsa_gqa_sparse_attention(
             raise TypeError(f"{name} must be BF16 [pages,page_size,groups,dim], last dim dense.")
     if key_cache.shape[:3] != value_cache.shape[:3] or key_cache.size(3) != head_dim:
         raise ValueError("Key/value cache geometry must agree and key head_dim must match query.")
-    num_pages, page_size, num_groups, _ = key_cache.shape
-    if num_query_heads % num_groups != 0:
+    if num_query_heads % key_cache.size(2) != 0:
         raise ValueError("Query heads must be divisible by the number of KV groups.")
     _require_block_table(block_table)
     _require_int32_vector("row_requests", row_requests, num_rows)
@@ -609,18 +734,58 @@ def dsa_gqa_sparse_attention(
         or topk_indices.stride(-1) != 1
     ):
         raise TypeError("topk_indices must be int32 [rows,topk] with dense rows.")
-    value_dim = value_cache.size(-1)
     if (
         out.dtype != torch.bfloat16
-        or out.shape != (num_rows, num_query_heads, value_dim)
+        or out.shape != (num_rows, num_query_heads, value_cache.size(-1))
         or out.stride(-1) != 1
     ):
         raise TypeError("out must be BF16 [rows,heads,value_head_dim] with dense rows.")
+
+
+@torch.no_grad()
+def _launch_sparse_attention(
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    row_requests: torch.Tensor,
+    row_lengths: torch.Tensor,
+    topk_indices: torch.Tensor,
+    softmax_scale: float,
+    *,
+    out: torch.Tensor,
+    slices: int,
+    sorted_support: bool,
+    combine_kernel,
+) -> None:
+    """Attend each row's query heads to its selected paged keys and values.
+
+    Callers validate the tensors with ``_require_sparse_attention_args`` first.
+
+    Args:
+        query: BF16 ``[rows,query_heads,head_dim]``; the row stride may be pitched.
+        key_cache: Paged BF16 keys ``[num_pages,page_size,query_groups,head_dim]``.
+        value_cache: Paged BF16 values ``[num_pages,page_size,query_groups,value_head_dim]``.
+        block_table: Int32 physical-page table ``[requests,max_pages]``.
+        row_requests: Int32 ``[rows]`` block-table row of each row; -1 for padding rows.
+        row_lengths: Int32 ``[rows]`` valid key length of each row; 0 for padding rows.
+        topk_indices: Int32 logical key positions ``[rows,topk]``. Entries that are negative
+            or not below the row's length are skipped; rows may be pitched.
+        softmax_scale: Attention score scale.
+        out: Caller-owned BF16 output ``[rows,query_heads,value_head_dim]``. A row with no
+            valid selected key gets zeros.
+        slices: Partial reductions each row's selected keys are split into.
+        sorted_support: Whether ``topk_indices`` rows are sorted with trailing -1 padding.
+        combine_kernel: Kernel merging the partial reductions, ``_combine_kernel`` or
+            ``_combine_fixed_kernel``.
+    """
+    num_rows, num_query_heads, head_dim = query.shape
     if num_rows == 0:
         return
+    num_pages, page_size, num_groups, _ = key_cache.shape
+    value_dim = value_cache.size(-1)
     topk = topk_indices.size(1)
     heads_per_group = num_query_heads // num_groups
-    slices = _num_slices(num_rows, num_groups, topk, _num_sms(query.device.index))
     slice_len = triton.cdiv(topk, slices)
     partial_rows = num_rows * slices * num_query_heads
     partial_out = torch.empty(partial_rows, value_dim, dtype=torch.float32, device=query.device)
@@ -661,10 +826,11 @@ def dsa_gqa_sparse_attention(
         VALUE_DIM_TILE=triton.next_power_of_2(value_dim),
         PAGE_SIZE=page_size,
         BLOCK=BLOCK_N,
+        SORTED_SUPPORT=sorted_support,
         num_warps=4,
         num_stages=2,
     )
-    _combine_kernel[(num_rows, num_query_heads)](
+    combine_kernel[(num_rows, num_query_heads)](
         partial_out,
         partial_max,
         partial_sum,
@@ -679,4 +845,4 @@ def dsa_gqa_sparse_attention(
     )
 
 
-__all__ = ["HAVE_TRITON", "SCORE_ROW_BLOCK", "dsa_gqa_indexer_scores", "dsa_gqa_sparse_attention"]
+__all__ = ["HAVE_TRITON", "SCORE_ROW_BLOCK", "dsa_gqa_indexer_scores"]

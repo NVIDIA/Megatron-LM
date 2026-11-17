@@ -872,6 +872,7 @@ def test_min_memory_backend_supports_no_grad_validation_forward(monkeypatch):
         core = SimpleNamespace(
             config=SimpleNamespace(
                 dsa_kernel_backend=backend,
+                batch_invariant_mode=False,
                 dsa_indexer_use_sparse_loss=True,
                 dsa_indexer_rotate_activation=True,
                 fp8=None,
@@ -920,6 +921,7 @@ def test_dense_warmup_no_grad_validation_uses_dense_core_attention():
     core = SimpleNamespace(
         config=SimpleNamespace(
             dsa_kernel_backend="min-memory-triton",
+            batch_invariant_mode=False,
             dsa_fwd_use_dense_attn=True,
             dsa_indexer_use_sparse_loss=False,
             dsa_indexer_rotate_activation=True,
@@ -1307,6 +1309,10 @@ class TestDSGQADynamicInference:
     @pytest.mark.parametrize("head_dim", [128, 256])
     def test_decode_logprobs_match_training(self, monkeypatch, backend, head_dim):
         """The same weights and token histories give close full-vocabulary logprobs."""
+        from megatron.core.tuning import policy as tuning_policy
+
+        # The non-BI baseline intentionally uses GVR2, which rejects deterministic routing.
+        monkeypatch.setattr(tuning_policy, "_deterministic_override", False)
         if torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
             pytest.skip("Native DSA decode requires Blackwell")
         pytest.importorskip("cutlass.cute")
@@ -1400,7 +1406,7 @@ class TestDSGQADynamicInference:
         decode_calls = []
         from megatron.core.transformer.experimental_attention_variant import dsa_gqa_inference
 
-        decode_target, decode_name = dsa_gqa_inference, "dsa_gqa_decode"
+        decode_target, decode_name = dsa_gqa_inference, "_sparse_attn_decode"
         original_decode = getattr(decode_target, decode_name)
 
         def capture_decode(*args, **kwargs):

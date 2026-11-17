@@ -487,6 +487,12 @@ class TransformerConfig(ModelParallelConfig):
     ``dsa_indexer_kpool > 1``.
     """
 
+    dsa_indexer_batch_invariant_max_sequence_length: Optional[int] = None
+    """
+    Maximum sequence length for batch-invariant DSA. If batch-invariant mode enabled but
+    this value is not set, it will inherit from hybrid model's max sequence length.
+    """
+
     ####################
     # Compressed sparse attention
     ####################
