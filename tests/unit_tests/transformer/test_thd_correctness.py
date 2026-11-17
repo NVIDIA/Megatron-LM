@@ -597,7 +597,7 @@ def test_thd_format(tc: TestCase):
     # --- SBHD forward/backward ---
     local_sbhd = shard_sbhd(full_sbhd, cp_rank, cp_size, tp_rank, tp_size, sp)
     input_sbhd = local_sbhd.detach().clone().requires_grad_(True)
-    out_sbhd, _ = layer(hidden_states=input_sbhd)
+    out_sbhd, _ = layer(input_sbhd)
     gathered_sbhd = gather_sbhd(out_sbhd, cp_size, tp_size, sp)
     gathered_sbhd.backward(grad_sbhd)
     sbhd_grads = {n: p.grad.clone() for n, p in layer.named_parameters()}
@@ -607,7 +607,7 @@ def test_thd_format(tc: TestCase):
     local_thd = shard_thd(seq_data, seqlens, cp_rank, cp_size, tp_rank, tp_size, sp, H, pad_to_max)
     packed_seq_params = make_packed_seq_params(seqlens, cp_size, tp_size, sp, pad_to_max)
     input_thd = local_thd.detach().clone().requires_grad_(True)
-    out_thd, _ = layer(hidden_states=input_thd, packed_seq_params=packed_seq_params)
+    out_thd, _ = layer(input_thd, packed_seq_params=packed_seq_params)
     gathered_thd = gather_thd(out_thd, seqlens, cp_size, tp_size, sp, H, pad_to_max)
     gathered_thd.backward(grad_thd)
     thd_grads = {n: p.grad.clone() for n, p in layer.named_parameters()}
