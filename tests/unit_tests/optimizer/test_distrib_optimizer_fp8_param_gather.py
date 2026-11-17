@@ -84,7 +84,10 @@ def _ddp_model(ddp_fp8_param_gather=False, use_distributed_optimizer=True, fp32_
         model.bias.data = model.bias.data.float().fill_(fp32_bias_value)
     model = DistributedDataParallel(
         TransformerConfig(num_attention_heads=1, num_layers=1),
-        DistributedDataParallelConfig(use_distributed_optimizer=use_distributed_optimizer),
+        # Keep gradient dtypes uniform for fused clipping with mixed BF16/FP32 parameters.
+        DistributedDataParallelConfig(
+            use_distributed_optimizer=use_distributed_optimizer, grad_reduce_in_fp32=True
+        ),
         model,
     )
     # Only the optimizer's view of the DDP config matters here; the params stay BF16.
@@ -110,8 +113,9 @@ def _train_step(model, optimizer):
     model.zero_grad_buffer()
     model(torch.randn(16, 128, dtype=torch.bfloat16, device="cuda")).square().mean().backward()
     model.finish_grad_sync()
-    update_successful, _, _ = optimizer.step()
+    update_successful, grad_norm, _ = optimizer.step()
     assert update_successful
+    assert torch.isfinite(torch.as_tensor(grad_norm)).all()
 
 
 def _master_params(optimizer):
