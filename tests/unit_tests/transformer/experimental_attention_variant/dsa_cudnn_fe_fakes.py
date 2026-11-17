@@ -1,0 +1,375 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+"""CPU stand-ins for the cuDNN frontend DSA indexer wrappers.
+
+The fakes reproduce the masking and buffer contracts that MCore depends on rather than
+the kernels' arithmetic order:
+
+* ``BottomRightDefaultDSA`` models the default of cuDNN frontend <= 1.25: no
+  ``q_causal_offsets`` means a bottom-right causal alignment, and the dense score buffer
+  is prefilled with ``-inf``. Unlike a released frontend <= 1.25, its wrapper also accepts
+  ``q_causal_offsets`` and honors explicit offsets.
+* ``Fe131DSA`` mirrors cuDNN frontend 1.31.0: no ``q_causal_offsets`` means a zero
+  (top-left) offset, the wrapper accepts ``precision='mxfp8'`` with packed E8M0 scales,
+  and the buffer is prefilled with ``-inf``.
+* ``Fe131CleanLogitsDSA`` adds the proposed ``clean_logits`` switch. With
+  ``clean_logits=False`` the buffer starts as ``poison`` (NaN by default) and only the
+  causal prefix ``[0, causal_len)`` of every covered row is written, as the FE 1.31
+  kernel does.
+
+``indexer_top_k_wrapper`` reads only ``[0, seq_len)`` of each row, matching the
+out-of-bounds-lane guard that cuDNN frontend 1.29 added to the varlen radix top-k.
+"""
+
+from __future__ import annotations
+
+import torch
+
+# Bound before any test patches ``Tensor.tolist`` to detect host syncs in MCore code.
+_TOLIST = torch.Tensor.tolist
+
+BOTTOM_RIGHT = "bottom_right"
+TOP_LEFT = "top_left"
+
+
+def _dense_scores(q: torch.Tensor, k: torch.Tensor, w: torch.Tensor, sm_scale: float):
+    """``sum_h relu(q_h . k) * w_h`` for ``q (..., sq, h, d)``, ``k (..., sk, d)``."""
+    logits = torch.einsum("...qhd,...kd->...qhk", q.float(), k.float()).relu()
+    return (logits * w.float().unsqueeze(-1)).sum(dim=-2) * sm_scale
+
+
+def _forward(
+    q,
+    k,
+    w,
+    *,
+    ratio,
+    sm_scale,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    max_seqlen_k,
+    q_causal_offsets,
+    default_offset,
+    fill_value,
+    calls,
+    record,
+):
+    calls.append(record)
+    if cu_seqlens_q is None:
+        b, sq = q.shape[:2]
+        sk = k.shape[1]
+        out = torch.full((b, sq, sk), fill_value, dtype=torch.float32)
+        scores = _dense_scores(q, k[:, :, 0, :], w, sm_scale)
+        rows = torch.arange(sq).view(1, sq, 1)
+        if q_causal_offsets is not None:
+            offsets = q_causal_offsets.to(torch.int64).view(b, 1, 1)
+        elif default_offset == BOTTOM_RIGHT:
+            offsets = torch.full((b, 1, 1), sk * ratio - sq, dtype=torch.int64)
+        else:
+            offsets = torch.zeros((b, 1, 1), dtype=torch.int64)
+        limit = ((offsets + rows + 1) // ratio).clamp(min=0, max=sk)
+        written = torch.arange(sk).view(1, 1, sk) < limit
+        return torch.where(written, scores, out)
+
+    total_q = q.shape[0]
+    out = torch.full((total_q, int(max_seqlen_k)), fill_value, dtype=torch.float32)
+    cu_q = _TOLIST(cu_seqlens_q)
+    cu_k = _TOLIST(cu_seqlens_k)
+    offsets = None if q_causal_offsets is None else _TOLIST(q_causal_offsets)
+    for seg in range(len(cu_q) - 1):
+        q_start, q_end = cu_q[seg], cu_q[seg + 1]
+        k_start, k_end = cu_k[seg], cu_k[seg + 1]
+        seg_q, seg_k = q_end - q_start, k_end - k_start
+        if seg_q <= 0 or seg_k <= 0:
+            continue
+        if q_causal_offsets is not None:
+            offset = offsets[seg]
+        elif default_offset == BOTTOM_RIGHT:
+            offset = seg_k * ratio - seg_q
+        else:
+            offset = 0
+        scores = _dense_scores(q[q_start:q_end], k[k_start:k_end, 0, :], w[q_start:q_end], sm_scale)
+        for i in range(seg_q):
+            causal_len = max(0, min((offset + i + 1) // ratio, seg_k))
+            out[q_start + i, :causal_len] = scores[i, :causal_len]
+    return out
+
+
+def trust_stand_in_top_k_for_any_k(monkeypatch):
+    """Hand a test's own stand-in top-k every row, as if the real kernel were right for every K.
+
+    Below ``_cudnn_topk_min_reliable_k`` the wrapper gives the kernel its short rows with
+    length 0 and selects them in PyTorch. Tests of the call plumbing and of the post-processing
+    of raw top-k output (lengths, chunks, ``return_val``, crafted raw ids) that run small K on
+    CPU stand-ins call this so the stand-in still sees and decides every row. The guard itself is covered by ``test_dsa_cudnn_topk_small_k.py`` and its GPU
+    counterpart.
+    """
+    from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_topk_min_reliable_k", lambda dtype: 1)
+
+
+def indexer_top_k_wrapper(input_values, seq_lens, top_k, next_n=1, return_val=True, **_unused):
+    """Row-local top-k that never reads past each row's ``seq_len``.
+
+    Below ``_cudnn_topk_min_reliable_k`` of the scores' dtype the real radix kernel returns
+    duplicate and out-of-row ids (it does not raise) on rows longer than ``top_k`` and at most
+    that many elements long; MCore must not hand it such a row, so this stand-in refuses them.
+    """
+    from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels
+
+    reliable_k = dsa_cudnn_kernels._cudnn_topk_min_reliable_k(input_values.dtype)
+    if top_k < reliable_k:
+        lengths = seq_lens.to(torch.int64)
+        exposed = (lengths > top_k) & (lengths <= reliable_k)
+        if bool(exposed.any()):
+            raise ValueError(
+                f"top_k={top_k} on {input_values.dtype} scores reached the cuDNN radix top-k "
+                f"with rows of {sorted(set(lengths[exposed].tolist()))} keys, which it gets wrong"
+            )
+    del next_n
+    n_rows, n_cols = input_values.shape
+    cols = torch.arange(n_cols).view(1, n_cols)
+    lens = seq_lens.to(torch.int64).view(n_rows, 1)
+    masked = torch.where(cols < lens, input_values, torch.full_like(input_values, float("-inf")))
+    values, indices = masked.topk(top_k, dim=-1)
+    slot = torch.arange(top_k).view(1, top_k)
+    valid = slot < lens
+    indices = torch.where(valid, indices, torch.full_like(indices, -1)).to(torch.int32)
+    values = torch.where(valid, values, torch.full_like(values, float("-inf")))
+    return {"indices": indices, "values": values if return_val else None}
+
+
+class BottomRightDefaultDSA:
+    """cuDNN frontend <= 1.25 default: bottom-right causal alignment, always prefilled.
+
+    The wrapper also accepts ``q_causal_offsets``, which released frontends <= 1.25 lack.
+    """
+
+    calls: list = []
+
+    @classmethod
+    def reset(cls):
+        cls.calls = []
+
+    @classmethod
+    def indexer_forward_wrapper(
+        cls,
+        q,
+        k,
+        w,
+        ratio=4,
+        qhead_per_kv_head=None,
+        m_block_size=128,
+        n_block_size=128,
+        q_stage=2,
+        kv_stage=4,
+        sm_scale=1.0,
+        stream=None,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen_q=None,
+        max_seqlen_k=None,
+        q_causal_offsets=None,
+    ):
+        scores = _forward(
+            q,
+            k,
+            w,
+            ratio=ratio,
+            sm_scale=sm_scale,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_k=max_seqlen_k,
+            q_causal_offsets=q_causal_offsets,
+            default_offset=BOTTOM_RIGHT,
+            fill_value=float("-inf"),
+            calls=cls.calls,
+            record={"q_causal_offsets": q_causal_offsets, "cu_seqlens_q": cu_seqlens_q},
+        )
+        return {"scores": scores}
+
+    indexer_top_k_wrapper = staticmethod(indexer_top_k_wrapper)
+
+
+class Fe131DSA:
+    """cuDNN frontend 1.31.0: top-left default offset, MXFP8 dense scorer, prefilled."""
+
+    calls: list = []
+    poison: float = float("nan")
+
+    @classmethod
+    def reset(cls):
+        cls.calls = []
+
+    @classmethod
+    def _run(cls, q, k, w, *, fill_value, kwargs):
+        precision = kwargs["precision"]
+        if precision == "mxfp8":
+            assert q.dtype == torch.float8_e4m3fn and k.dtype == torch.float8_e4m3fn
+            assert w.dtype == torch.bfloat16
+            assert kwargs["q_scale"] is not None and kwargs["k_scale"] is not None
+            assert kwargs["q_scale"].dtype == torch.float8_e8m0fnu
+            assert kwargs["k_scale"].dtype == torch.float8_e8m0fnu
+            if kwargs["cu_seqlens_q"] is not None:
+                assert kwargs["cu_seqlens_q_scale_padded"] is not None
+                assert kwargs["cu_seqlens_k_scale_padded"] is not None
+        else:
+            assert q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16
+            assert kwargs["q_scale"] is None and kwargs["k_scale"] is None
+        record = dict(kwargs)
+        record.update(q=q, k=k, w=w)
+        return _forward(
+            q,
+            k,
+            w,
+            ratio=kwargs["ratio"],
+            sm_scale=kwargs["sm_scale"],
+            cu_seqlens_q=kwargs["cu_seqlens_q"],
+            cu_seqlens_k=kwargs["cu_seqlens_k"],
+            max_seqlen_k=kwargs["max_seqlen_k"],
+            q_causal_offsets=kwargs["q_causal_offsets"],
+            default_offset=TOP_LEFT,
+            fill_value=fill_value,
+            calls=cls.calls,
+            record=record,
+        )
+
+    @classmethod
+    def indexer_forward_wrapper(
+        cls,
+        q,
+        k,
+        w,
+        ratio=4,
+        qhead_per_kv_head=None,
+        m_block_size=128,
+        n_block_size=128,
+        q_stage=2,
+        kv_stage=4,
+        sm_scale=1.0,
+        out=None,
+        stream=None,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen_q=None,
+        max_seqlen_k=None,
+        q_causal_offsets=None,
+        precision="bf16",
+        q_scale=None,
+        k_scale=None,
+        cu_seqlens_q_scale_padded=None,
+        cu_seqlens_k_scale_padded=None,
+        sf_vec_size=32,
+        return_lse=False,
+        lse_out=None,
+    ):
+        kwargs = dict(
+            ratio=ratio,
+            sm_scale=sm_scale,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            q_causal_offsets=q_causal_offsets,
+            precision=precision,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+            cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
+            sf_vec_size=sf_vec_size,
+            clean_logits=True,
+        )
+        return {"scores": cls._run(q, k, w, fill_value=float("-inf"), kwargs=kwargs)}
+
+    indexer_top_k_wrapper = staticmethod(indexer_top_k_wrapper)
+
+
+class Fe131CleanLogitsDSA(Fe131DSA):
+    """FE 1.31 plus the proposed ``clean_logits`` switch on the dense indexer forward."""
+
+    calls: list = []
+
+    @classmethod
+    def indexer_forward_wrapper(
+        cls,
+        q,
+        k,
+        w,
+        ratio=4,
+        qhead_per_kv_head=None,
+        m_block_size=128,
+        n_block_size=128,
+        q_stage=2,
+        kv_stage=4,
+        sm_scale=1.0,
+        out=None,
+        stream=None,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        max_seqlen_q=None,
+        max_seqlen_k=None,
+        q_causal_offsets=None,
+        precision="bf16",
+        q_scale=None,
+        k_scale=None,
+        cu_seqlens_q_scale_padded=None,
+        cu_seqlens_k_scale_padded=None,
+        sf_vec_size=32,
+        return_lse=False,
+        lse_out=None,
+        clean_logits: bool = True,
+    ):
+        kwargs = dict(
+            ratio=ratio,
+            sm_scale=sm_scale,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            q_causal_offsets=q_causal_offsets,
+            precision=precision,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            cu_seqlens_q_scale_padded=cu_seqlens_q_scale_padded,
+            cu_seqlens_k_scale_padded=cu_seqlens_k_scale_padded,
+            sf_vec_size=sf_vec_size,
+            clean_logits=clean_logits,
+        )
+        fill_value = float("-inf") if clean_logits else cls.poison
+        return {"scores": cls._run(q, k, w, fill_value=fill_value, kwargs=kwargs)}
+
+
+def packed_zigzag_layout(seq_lens, cp_size, cp_rank, max_num_seqs=None, device="cpu"):
+    """Local rows, key bounds and padded cu_seqlens of a zigzag-CP packed THD batch.
+
+    Returns ``(starts, ends, cu_seqlens, max_seqlen)``: ``starts``/``ends`` are global
+    packed key bounds of this CP rank's local query rows (front then back chunk of each
+    sequence), and ``cu_seqlens`` is the global packed boundary table, padded to
+    ``max_num_seqs + 1`` entries when given, as static CUDA-graph inputs are.
+    """
+    divisor = 2 * cp_size if cp_size > 1 else 1
+    assert all(length % divisor == 0 for length in seq_lens)
+    cu = [0]
+    for length in seq_lens:
+        cu.append(cu[-1] + length)
+    if max_num_seqs is not None:
+        cu += [cu[-1]] * (max_num_seqs + 1 - len(cu))
+    starts, ends = [], []
+    for seq, length in enumerate(seq_lens):
+        if cp_size == 1:
+            positions = list(range(length))
+        else:
+            half = length // divisor
+            positions = list(range(cp_rank * half, (cp_rank + 1) * half)) + list(
+                range((divisor - 1 - cp_rank) * half, (divisor - cp_rank) * half)
+            )
+        for position in positions:
+            starts.append(cu[seq])
+            ends.append(cu[seq] + position + 1)
+    return (
+        torch.tensor(starts, dtype=torch.int64, device=device),
+        torch.tensor(ends, dtype=torch.int64, device=device),
+        torch.tensor(cu, dtype=torch.int32, device=device),
+        max(seq_lens),
+    )

@@ -17,12 +17,41 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_masking,
 )
 from megatron.core.utils import accepts_parameter
+from tests.unit_tests.transformer.experimental_attention_variant import dsa_cudnn_fe_fakes as fakes
 from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_parity_utils import (
     assert_similarity as _assert_similarity,
 )
 from tests.unit_tests.transformer.experimental_attention_variant.dsa_native_parity_utils import (
     run_absorbed_mla_dsa_parity,
 )
+
+# Frontend version reported while a test-local fake replaces the cuDNN DSA namespace.
+_FAKE_NAMESPACE_FRONTEND_VERSION = (1, 21)
+
+
+@pytest.fixture(autouse=True)
+def _fake_dsa_namespaces_report_a_legacy_frontend(monkeypatch):
+    """Report a legacy cuDNN frontend version whenever a fake DSA namespace is installed.
+
+    The fakes in this file model the frontend <= 1.25 wrappers: no ``q_causal_offsets`` and
+    the bottom-right causal default. ``_cudnn_frontend_version`` reads the installed
+    ``cudnn`` package, so on a host with frontend >= 1.26 the version gates would otherwise
+    describe a different frontend than the namespace the code under test calls. The real
+    namespace keeps reporting the installed version.
+    """
+    installed_version = dsa_cudnn_kernels._cudnn_frontend_version
+    try:
+        from cudnn import DSA as real_namespace
+    except ImportError:
+        real_namespace = None
+
+    def frontend_version():
+        namespace = dsa_cudnn_kernels._cudnn_dsa
+        if namespace is not None and namespace is not real_namespace:
+            return _FAKE_NAMESPACE_FRONTEND_VERSION
+        return installed_version()
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_frontend_version", frontend_version)
 
 
 # Disabled in dev (flaky_in_dev) and LTS (flaky) CI: this real-kernel cuDNN/flash_mla
@@ -332,6 +361,7 @@ def test_cudnn_indexer_topk_varlen_uses_logical_query_positions(monkeypatch):
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     q = torch.ones((1, 2, 1, 1))
     k = torch.arange(8, dtype=torch.float32).view(1, 8, 1)
@@ -380,6 +410,7 @@ def test_cudnn_indexer_topk_score_chunks_preserve_global_query_offsets(monkeypat
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
     monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_score_chunk_rows", lambda b, sq, sk: 2)
 
     topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
@@ -417,6 +448,7 @@ def test_cudnn_indexer_topk_tie_break_prefers_lower_indices(monkeypatch):
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.zeros((1, 1, 1, 1)),
@@ -451,6 +483,7 @@ def test_cudnn_indexer_topk_repeated_varlen_ends_keep_distinct_query_rows(monkey
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.ones((1, 2, 1, 1)),
@@ -486,6 +519,7 @@ def test_cudnn_indexer_topk_nonlocal_varlen_ends_avoid_global_score_rows(monkeyp
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.ones((1, 2, 1, 1)),
@@ -522,6 +556,7 @@ def test_cudnn_indexer_topk_local_varlen_keeps_compact_query_rows(monkeypatch):
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.ones((1, 2, 1, 1)),
@@ -595,6 +630,7 @@ def test_cudnn_indexer_topk_multi_packed_cp_uses_segmented_thd(monkeypatch):
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     query_positions = torch.tensor([0, 1, 6, 7, 8, 9, 10, 11, 20, 21, 22, 23])
     starts = torch.tensor([0] * 4 + [8] * 8)
@@ -685,6 +721,7 @@ def test_cudnn_indexer_topk_multi_packed_cp1_uses_direct_thd(monkeypatch):
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     q = torch.ones((1, 8, 1, 1))
     k = torch.ones((1, 8, 1))
@@ -1120,6 +1157,7 @@ def test_cudnn_indexer_topk_incompatible_packed_boundaries_fall_back(monkeypatch
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
     monkeypatch.setattr(
         dsa_cudnn_kernels,
         "_indexer_topk_packed_thd",
@@ -1448,6 +1486,7 @@ def test_cudnn_split_topk_threads_multi_packed_cp_metadata(monkeypatch):
     torch.testing.assert_close(loss_on[18], packed_seq_params.cu_seqlens_q)
     torch.testing.assert_close(loss_on[19], packed_seq_params.cu_seqlens_kv)
     assert loss_on[20:23] == (16, 16, 2)
+    assert loss_on[-1] == dsa_cudnn_kernels.IndexerScorerOptions()
 
 
 def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch):
@@ -1476,6 +1515,7 @@ def test_cudnn_indexer_topk_single_packed_cp_uses_absolute_seq_lens(monkeypatch)
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.ones((1, 4, 1, 1)),
@@ -1623,6 +1663,7 @@ def test_cudnn_indexer_topk_indices_only_filters_masked_varlen_scores(monkeypatc
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.ones((1, 2, 1, 1)),
@@ -1666,6 +1707,7 @@ def test_cudnn_indexer_topk_indices_only_compacts_invalid_prefix_entries(monkeyp
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, _ = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.zeros((1, 1, 1, 1)),
@@ -1702,6 +1744,7 @@ def test_cudnn_indexer_topk_can_return_topk_scores(monkeypatch):
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.zeros((1, 1, 1, 1)),
@@ -1749,6 +1792,7 @@ def test_cudnn_indexer_topk_tie_break_does_not_bias_selected_scores(monkeypatch)
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.zeros((1, 1, 1, 1)),
@@ -1785,6 +1829,7 @@ def test_cudnn_indexer_topk_scores_reapply_varlen_bounds(monkeypatch):
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.zeros((1, 1, 1, 1)),
@@ -1844,6 +1889,7 @@ def test_cudnn_split_topk_hook_uses_indexer_topk(monkeypatch):
         packed_max_seqlen_k=None,
         packed_cp_size=1,
         varlen_is_plain_causal=False,
+        scorer_options=None,
     ):
         seen["q_shape"] = q_bshd.shape
         seen["k_shape"] = k_bsd.shape
@@ -1993,6 +2039,7 @@ def test_cudnn_split_topk_with_loss_returns_precomputed_indexer_grads(monkeypatc
         packed_max_seqlen_k=None,
         packed_cp_size=1,
         varlen_is_plain_causal=False,
+        scorer_options=None,
     ):
         seen["return_scores"] = return_scores
         seen["return_topk_scores"] = return_topk_scores
@@ -2190,6 +2237,7 @@ def test_cudnn_indexer_topk_scores_local_varlen_keeps_compact_query_rows(monkeyp
 
     monkeypatch.setattr(dsa_cudnn_kernels, "_ensure_dsa_namespace", lambda: None)
     monkeypatch.setattr(dsa_cudnn_kernels, "_cudnn_dsa", FakeDSA)
+    fakes.trust_stand_in_top_k_for_any_k(monkeypatch)
 
     topk_indices, topk_length, topk_scores = dsa_cudnn_kernels._indexer_topk_bshd(
         torch.ones((1, 1, 1, 1)),
@@ -2326,7 +2374,9 @@ def test_cudnn_sparse_loss_uses_selected_topk_scores(monkeypatch):
             loss_coeff,
             grad_loss,
             block_I,
+            topk_indices_global,
         ):
+            assert topk_indices_global is True
             seen["index_score"] = index_score
             return {
                 "d_index_q": torch.zeros_like(q_indexer),
@@ -2358,6 +2408,7 @@ def test_cudnn_sparse_loss_uses_selected_topk_scores(monkeypatch):
         packed_max_seqlen_k=None,
         packed_cp_size=1,
         varlen_is_plain_causal=False,
+        scorer_options=None,
     ):
         del (
             single_packed_thd_sequence,
@@ -2433,7 +2484,9 @@ def test_cudnn_sparse_loss_masks_invalid_query_rows_for_backward(monkeypatch):
             loss_coeff,
             grad_loss,
             block_I,
+            topk_indices_global,
         ):
+            assert topk_indices_global is True
             seen["attn_score"] = attn_score
             seen["index_score"] = index_score
             seen["topk_indices"] = topk_indices
@@ -2521,7 +2574,9 @@ def test_cudnn_sparse_loss_reduces_attention_target_across_tp(monkeypatch):
             loss_coeff,
             grad_loss,
             block_I,
+            topk_indices_global,
         ):
+            assert topk_indices_global is True
             del index_score, topk_indices, sm_scale, loss_coeff, grad_loss, block_I
             seen["attn_score"] = attn_score.detach().clone()
             return {
@@ -2589,7 +2644,9 @@ def test_cudnn_sparse_backward_uses_batch_major_topk_indices_for_batched_kv(monk
             loss_coeff,
             grad_loss,
             block_I,
+            topk_indices_global,
         ):
+            assert topk_indices_global is True
             seen["topk_indices"] = topk_indices
             seen["loss_coeff"] = loss_coeff
             seen["grad_loss"] = grad_loss
@@ -3234,7 +3291,9 @@ def test_cudnn_sparse_indexer_backward_chunks_sequence_and_preserves_scaling(mon
             loss_coeff,
             grad_loss,
             block_I,
+            topk_indices_global,
         ):
+            assert topk_indices_global is True
             del attn_score, index_score, topk_indices, sm_scale, grad_loss, block_I
             call_value = len(calls) + 1
             calls.append((q_indexer.size(1), loss_coeff))
@@ -3592,6 +3651,7 @@ def test_cudnn_full_fusion_accepts_varlen_when_indexer_loss_disabled(monkeypatch
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        scorer_options=None,
     ):
         seen["sparse_loss"] = sparse_loss
         seen["loss_coeff"] = loss_coeff
@@ -3682,6 +3742,7 @@ def test_cudnn_full_fusion_skips_varlen_dense_indexer_loss_under_no_grad(monkeyp
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        scorer_options=None,
     ):
         seen["loss_coeff"] = loss_coeff
         seen["sparse_loss"] = sparse_loss
@@ -3769,6 +3830,7 @@ def test_cudnn_full_fusion_accepts_local_varlen_for_sparse_indexer_loss(monkeypa
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        scorer_options=None,
     ):
         seen["sparse_loss"] = sparse_loss
         seen["loss_coeff"] = loss_coeff
@@ -3920,6 +3982,7 @@ def test_cudnn_full_fusion_strips_flagged_plain_causal_varlen(monkeypatch):
         local_packed_cp_query_start=0,
         local_packed_cp_query_len=None,
         tp_group=None,
+        scorer_options=None,
     ):
         seen["called"] = True
         seen["varlen_starts"] = varlen_starts
