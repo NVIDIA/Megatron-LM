@@ -26,6 +26,11 @@ from megatron.core.inference.quantization.mxfp8_quantize import (
     mxfp8_quantize_rows,
 )
 from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor, ensure_mxfp8_scale_dtype
+from megatron.core.transformer.moe.ep_invariant_combine import (
+    EPInvariantCombineArgs,
+    expert_tp_fold,
+    tree_combine_topk_forward,
+)
 
 from . import batch_invariant
 
@@ -128,6 +133,27 @@ def _quantize_mxfp8_used_rows(x: torch.Tensor, n_used: Optional[torch.Tensor]) -
     )
 
 
+def _rows_in_topk_order(
+    rows: torch.Tensor,
+    inverse_map: torch.Tensor,
+    routing_map: torch.Tensor,
+    local_expert_start: int,
+    num_local_experts: int,
+) -> torch.Tensor:
+    """Expert-grouped ``rows`` reordered per top-k slot: row t * topk + k is token t's slot k.
+
+    The permutation assigns rows within an expert with atomic counters, so the expert-grouped
+    order differs between ranks; this order depends only on the routing. Slots routed to other
+    ranks and tokens beyond the valid prefix (inverse map -1) get +0.0 rows.
+    """
+    lid = routing_map.to(torch.int64) - local_expert_start
+    local = (lid >= 0) & (lid < num_local_experts)
+    pos = inverse_map.to(torch.int64).gather(1, lid.clamp(0, num_local_experts - 1))
+    pos = torch.where(local, pos, -1).flatten()
+    picked = rows.index_select(0, pos.clamp(min=0))
+    return torch.where((pos >= 0).unsqueeze(1), picked, torch.zeros_like(picked))
+
+
 def mcore_fused_moe(
     hidden_states: torch.Tensor,
     probs: torch.Tensor,
@@ -141,6 +167,7 @@ def mcore_fused_moe(
     disable_fused_quant_kernels: bool = False,
     out: torch.Tensor = None,
     activation_clamp_scale: Optional[float] = None,
+    batch_invariant_kwargs: Optional[EPInvariantCombineArgs] = None,
 ) -> torch.Tensor:
     """Fused MoE: permute -> pad -> FC1 -> activation -> FC2 -> unpad -> unpermute.
 
@@ -170,6 +197,9 @@ def mcore_fused_moe(
         activation_clamp_scale: config.activation_func_tanh_clamp_scale. When set, the
             squared-ReLU pre-activation is soft-clamped with ``s * tanh(x / s)`` before the
             square, bounding the activation output by ``s ** 2``.
+        batch_invariant_kwargs: ``moe_ep_invariant_combine`` (batch-invariant mode) only;
+            when set, unpermute returns this rank's EP-invariant combine subtree partial
+            (see ``EPInvariantCombineArgs``).
 
     Returns:
         [max_tokens, hidden_size] BF16 output. Only the first valid_tokens rows are
@@ -296,9 +326,37 @@ def mcore_fused_moe(
             activation_out, n_used if batch_invariant_mode else None
         )
     fc2_output = mm_fn(activation_out, fc2_weight, offs)
+    expert_tp_group = (
+        batch_invariant_kwargs.expert_tp_group if batch_invariant_kwargs is not None else None
+    )
+    if expert_tp_group is not None and expert_tp_group.size() > 1:
+        # moe_ep_invariant_combine with expert TP: sum each (token, expert) row over expert TP,
+        # as training does, in a row order every expert-TP rank shares, then the subtree.
+        rows = _rows_in_topk_order(
+            fc2_output,
+            batch_invariant_inverse_map,
+            routing_map,
+            local_expert_start,
+            num_local_experts,
+        )
+        rows = expert_tp_fold(rows, expert_tp_group)
+        if out is None:
+            out = torch.empty(max_tokens, rows.shape[-1], dtype=torch.float32, device=rows.device)
+        if expert_tp_group.rank() != 0:
+            # Expert-TP rank 0 contributes this subtree; adding +0.0 for the others is exact.
+            return out.zero_()
+        return tree_combine_topk_forward(
+            rows,
+            routing_map,
+            local_expert_start,
+            num_local_experts,
+            batch_invariant_kwargs.leaves,
+            valid_tokens,
+            out,
+        )
 
     # --- Post-processing: unpermute ---
-    return unpermute_tokens(
+    output = unpermute_tokens(
         fc2_output,
         None if batch_invariant_mode else permuted_probs,
         permutation_map,
@@ -307,4 +365,8 @@ def mcore_fused_moe(
         valid_tokens,
         out=out,
         batch_invariant_inverse_map=batch_invariant_inverse_map,
+        ep_invariant_leaves=(
+            batch_invariant_kwargs.leaves if batch_invariant_kwargs is not None else None
+        ),
     )
+    return output
