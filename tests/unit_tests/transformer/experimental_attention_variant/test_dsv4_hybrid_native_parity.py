@@ -1058,7 +1058,7 @@ class TestDSv4HybridNativeParity:
         hidden_states_native = hidden_states.detach().clone().requires_grad_(True)
         grad = torch.randn_like(hidden_states)
 
-        real_out, _ = real_layer(hidden_states=hidden_states, attention_mask=None)
+        real_out, _ = real_layer(hidden_states, attention_mask=None)
         native_out, native_indexer_loss = native_layer(hidden_states_native, pg_collection)
         _assert_similarity(real_out.detach(), native_out.detach(), "mxfp8-indexer:out", eps=5e-3)
 
@@ -1173,7 +1173,7 @@ class TestDSv4HybridNativeParity:
             hidden_states_native = hidden_states.detach().clone().requires_grad_(True)
             grad = torch.randn_like(hidden_states)
 
-            real_out, _ = real_layer(hidden_states=hidden_states, attention_mask=None)
+            real_out, _ = real_layer(hidden_states, attention_mask=None)
             native_out, native_indexer_loss = native_layer(hidden_states_native, pg_collection)
             assert native_q_rms_norm_eps == [config.layernorm_epsilon]
 
@@ -1285,9 +1285,7 @@ class TestDSv4HybridNativeParity:
             grad = torch.randn_like(hidden_states)
 
             packed = _make_thd_packed_seq_params([seqlen])
-            real_out, _ = real_layer(
-                hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed
-            )
+            real_out, _ = real_layer(hidden_states, attention_mask=None, packed_seq_params=packed)
             native_out, native_indexer_loss = native_layer(hidden_states_native, pg_collection)
 
             _assert_similarity(
@@ -1399,9 +1397,7 @@ class TestDSv4HybridNativeParity:
 
         # ---- Real packed-sequence (THD) run ----------------------------------
         packed = _make_thd_packed_seq_params(seg_lens)
-        real_out, _ = real_layer(
-            hidden_states=hidden_states, attention_mask=None, packed_seq_params=packed
-        )
+        real_out, _ = real_layer(hidden_states, attention_mask=None, packed_seq_params=packed)
 
         # ---- Native oracle: each segment as an independent B=1 sequence ------
         # Slicing the single ``hidden_states_native`` leaf keeps every segment's
@@ -1530,7 +1526,7 @@ class TestDSv4HybridNativeParity:
         hidden_unpadded = hidden_states.detach().clone().requires_grad_(True)
         packed_unpadded = _make_thd_packed_seq_params(seg_lens)
         out_unpadded, _ = real_layer(
-            hidden_states=hidden_unpadded, attention_mask=None, packed_seq_params=packed_unpadded
+            hidden_unpadded, attention_mask=None, packed_seq_params=packed_unpadded
         )
         grad_unpadded = torch.randn_like(out_unpadded)
         out_unpadded.backward(grad_unpadded)
@@ -1604,7 +1600,7 @@ class TestDSv4HybridNativeParity:
         )
 
         out_padded, _ = real_layer(
-            hidden_states=hidden_padded, attention_mask=None, packed_seq_params=packed_padded
+            hidden_padded, attention_mask=None, packed_seq_params=packed_padded
         )
         # Build grad for padded buffer: scatter unpadded grad into real positions.
         grad_padded = torch.zeros_like(out_padded)

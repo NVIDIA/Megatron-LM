@@ -31,12 +31,9 @@ from megatron.core.distributed.data_parallel_base import _BaseDataParallel
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.distributed.fsdp.fsdp_unit_collector import FsdpUnitCollector
 from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import register_combined_1f1b_hooks
-from megatron.core.models.hybrid.shortcut_block import ShortcutMoEBlock
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.ssm.mamba_layer import MambaLayer
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
 from megatron.core.utils import log_single_rank
 
 __all__ = ["FullyShardedDataParallelV2"]
@@ -49,9 +46,9 @@ try:
         RuntimePolicy,
         SchedulePolicy,
         ShardLayout,
+        finalize_gradients,
         fully_shard,
         fully_shard_context,
-        microbatch,
     )
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.fully_shard import (
         current_fully_shard_context,
@@ -146,10 +143,12 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             module: Root model module to shard.
             fsdp_unit_modules: Module types to shard as child FSDP units. If
                 unspecified, transformer and Mamba layers, shortcut MoE blocks, and
-                TEGroupedMLP/SequentialMLP expert containers are used. An explicit list
-                replaces these defaults. Expert containers use the expert-DP mesh;
-                custom lists must include them when expert and dense sharding settings
-                differ.
+                mHC wrappers are used. An explicit list replaces these defaults.
+                Routed experts always receive independent units on the expert-DP mesh.
+                Parameterized mHC replay modules also receive independent units so
+                their hooks run during replay. Known layers own their remaining
+                submodules; configured types are matched during traversal of other
+                containers.
             disable_bucketing: Compatibility argument that must remain ``False`` for
                 MFSDP v2.
             device: Device used to construct the data-parallel mesh and, when this wrapper
@@ -169,6 +168,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             raise IMPORT_MEGATRON_FSDP_ERROR
         if pg_collection is None:
             raise ValueError("MFSDP v2 requires an explicit ProcessGroupCollection.")
+        ddp_config.finalize()
         FullyShardedDataParallelV2._validate_config(
             config, ddp_config, module, pg_collection, disable_bucketing
         )
@@ -182,15 +182,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # Importing experts at module load creates a cycle through pipeline schedules
         # and fsdp_dtensor_checkpoint, which then incorrectly marks MFSDP unavailable.
         from megatron.core.transformer.moe.experts import SequentialMLP, TEGroupedMLP
-
-        if fsdp_unit_modules is None:
-            fsdp_unit_modules = [
-                TransformerLayer,
-                MambaLayer,
-                ShortcutMoEBlock,
-                TEGroupedMLP,
-                SequentialMLP,
-            ]
 
         log_single_rank(
             logger, logging.INFO, "Setting up FullyShardedDataParallelV2 with config %s", ddp_config
@@ -281,7 +272,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                 )
             construction_context = nullcontext(active_context)
         with construction_context:
-            collector = FsdpUnitCollector(tuple(fsdp_unit_modules))
+            collector = FsdpUnitCollector(fsdp_unit_modules)
             for submodule in collector.collect(module):
                 is_expert = isinstance(submodule, (TEGroupedMLP, SequentialMLP))
                 if config.init_model_with_meta_device:
@@ -474,7 +465,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         MCore's schedules wrap every microbatch but the last in ``no_sync_func``.
         """
-        with microbatch(self.module.context, is_last=False):
+        with finalize_gradients(self.module.context, enabled=False):
             yield
 
     @torch.no_grad()

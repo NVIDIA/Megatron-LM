@@ -1776,7 +1776,7 @@ class MaskedTilingDynamicResolutionStrategy(ImageTilingStrategy):
         return f"MaskedTilingDynamicResolutionStrategy(vision_model_type={self._vision_model_type}, tile_size={self._tile_size}, use_thumbnail={self._use_thumbnail}, min_num_tiles={self._min_num_tiles}, max_num_tiles={self._max_num_tiles}, patch_size={self._patch_size}, pixel_shuffle={self._pixel_shuffle}, enable_tile_degradation={self._enable_tile_degradation}, video_frame_strategy={self._video_frame_strategy})"
 
 
-def create_image_tiling_strategy(args):
+def create_image_tiling_strategy(args, cfg):
     """
     Create an image tiling strategy based on the provided arguments.
 
@@ -1854,7 +1854,7 @@ def create_image_tiling_strategy(args):
                 pixel_shuffle=args.pixel_shuffle,
                 use_tile_tags=args.use_tile_tags,
                 max_num_tiles=args.max_num_tiles,
-                tokenizer_type=args.tokenizer_prompt_format,
+                tokenizer_type=cfg.tokenizer.tokenizer_prompt_format,
                 allow_non_spatial_embeddings=False if is_video else True,
             )
         )
@@ -1876,7 +1876,7 @@ def create_image_tiling_strategy(args):
                 pixel_shuffle=args.pixel_shuffle,
                 use_tile_tags=args.use_tile_tags,
                 max_num_tiles=args.max_num_tiles,
-                tokenizer_type=args.tokenizer_prompt_format,
+                tokenizer_type=cfg.tokenizer.tokenizer_prompt_format,
             )
             image_tiling_strategy = MaskedTilingDynamicResolutionStrategy(
                 vision_model_type=args.vision_model_type,
@@ -1911,7 +1911,7 @@ def create_image_tiling_strategy(args):
                 pixel_shuffle=args.pixel_shuffle,
                 use_tile_tags=args.use_tile_tags,
                 max_num_tiles=args.max_num_tiles,
-                tokenizer_type=args.tokenizer_prompt_format,
+                tokenizer_type=cfg.tokenizer.tokenizer_prompt_format,
             )
             image_tiling_strategy = MatchTilingDynamicResolutionStrategy(
                 vision_model_type=args.vision_model_type,
@@ -1964,7 +1964,7 @@ def create_image_tiling_strategy(args):
             pixel_shuffle=args.pixel_shuffle,
             use_tile_tags=args.use_tile_tags,
             max_num_tiles=args.max_num_tiles,
-            tokenizer_type=args.tokenizer_prompt_format,
+            tokenizer_type=cfg.tokenizer.tokenizer_prompt_format,
         )
         if use_tiling:
             image_strategy = ImageTilingStrategyV1(

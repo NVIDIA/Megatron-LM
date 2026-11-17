@@ -41,6 +41,8 @@ from megatron.core.transformer.mlp import MLP, MLPSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_pg_rank, get_pg_size
+from megatron.training.global_vars import get_run_config
+from megatron.training.vocab_utils import model_vocab_size
 
 try:
     from megatron.core.extensions.transformer_engine import TERowParallelLinear
@@ -103,15 +105,6 @@ def add_model_provider_args(parser: argparse.ArgumentParser) -> argparse.Argumen
     return parser
 
 
-def _vocab_size(args: argparse.Namespace) -> int:
-    """Resolve the vocabulary size from stock args (``padded_vocab_size`` / ``vocab_size``)."""
-    for attr in ("padded_vocab_size", "vocab_size"):
-        value = getattr(args, attr, None)
-        if value:
-            return int(value)
-    raise ValueError("vocab size unresolved: set --vocab-size / a tokenizer, or padded_vocab_size")
-
-
 def nemotron_projection_layer_spec() -> ModuleSpec:
     """Return the Nemotron VLM RADIO-to-language projector layer spec."""
     if TERowParallelLinear is None:
@@ -132,8 +125,8 @@ def nemotron_language_config(
     expt_tp_size: int,
     cp_size: int = 1,
 ) -> TransformerConfig:
-    """Nemotron6-MoE language config: stock from-args base + model-specific overrides."""
-    config = deepcopy(_base_config(args))
+    """Nemotron6-MoE language config with per-module topology overrides."""
+    config = deepcopy(_base_config())
     gtp_remat_num_sequence_shards = config.gtp_remat_num_sequence_shards
     # Code-only fields + hetero parallelism pins.
     config.variable_seq_lengths = True
@@ -145,15 +138,15 @@ def nemotron_language_config(
     config.tensor_parallel_num_weight_shards, config.gtp_weight_remat_size = (
         resolve_tensor_parallel_weight_shards(
             tp_size,
-            getattr(args, "tensor_parallel_num_weight_shards", None),
-            getattr(args, "gtp_weight_remat_size", 1),
+            config.tensor_parallel_num_weight_shards,
+            config.gtp_weight_remat_size,
         )
     )
     config.expert_tensor_parallel_num_weight_shards, config.expert_gtp_weight_remat_size = (
         resolve_tensor_parallel_weight_shards(
             expt_tp_size,
-            getattr(args, "expert_tensor_parallel_num_weight_shards", None),
-            getattr(args, "expert_gtp_weight_remat_size", 1),
+            config.expert_tensor_parallel_num_weight_shards,
+            config.expert_gtp_weight_remat_size,
             shards_field="expert_tensor_parallel_num_weight_shards",
             tp_field="expert_tensor_parallel_size",
         )
@@ -187,9 +180,10 @@ def nemotron_projection_config(
     base_config: TransformerConfig | None = None,
 ) -> TransformerConfig:
     """Vision-to-Nemotron projection config: stock from-args base + overrides."""
-    config = deepcopy(base_config if base_config is not None else _base_config(args))
+    config = deepcopy(base_config if base_config is not None else _base_config())
     config.num_layers = 1
-    config.hidden_size = int(args.hidden_size)
+    cfg = get_run_config()
+    config.hidden_size = cfg.model.transformer.hidden_size
     config.num_attention_heads = 1
     config.ffn_hidden_size = 4 * projection_input_size
     config.gated_linear_unit = False
@@ -263,6 +257,7 @@ def language_model_spec(
         ep_size = get_pg_size(pg_collection.ep)
         expt_tp_size = get_pg_size(pg_collection.expt_tp)
 
+    cfg = get_run_config()
     config = nemotron_language_config(
         args, tp_size, pp_size, ep_size, expt_tp_size, cp_size=cp_size
     )
@@ -277,18 +272,23 @@ def language_model_spec(
         params={
             "config": config,
             "mamba_stack_spec": stack_spec,
-            "vocab_size": _vocab_size(args),
+            "vocab_size": model_vocab_size(
+                cfg.model.vocab_size,
+                should_pad_vocab=cfg.model.should_pad_vocab,
+                make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
+                tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
+            ),
             "max_sequence_length": args.seq_length,
             "pre_process": pp_rank == 0,
             "post_process": pp_rank == pp_size - 1,
-            "hybrid_layer_pattern": args.hybrid_layer_pattern,
+            "hybrid_layer_pattern": cfg.model.hybrid_layer_pattern,
             "position_embedding_type": args.position_embedding_type,
             "rotary_base": args.rotary_base,
             "rotary_percent": args.rotary_percent,
             "seq_len_interpolation_factor": args.rotary_seq_len_interpolation_factor,
             "share_embeddings_and_output_weights": False,
             "scatter_embedding_sequence_parallel": False,
-            "logit_dtype": args.logit_dtype,
+            "logit_dtype": cfg.model.logit_dtype,
             "pg_collection": pg_collection,
         },
     )
@@ -391,7 +391,7 @@ def build_nemotron_communicator(
         )
     bridge_recv_shape_fns = None
     if getattr(args, "mimo_bridge_skip_shape_exchange", False):
-        bridge_hidden_size = int(args.hidden_size)
+        bridge_hidden_size = language_config.hidden_size
         if getattr(args, "mimo_run_input_projections_on_llm_ranks", False):
             vision_config = radio_vision_config(args, args.mimo_encoder_tp, 1)
             bridge_hidden_size = _vision_projection_input_size(args, vision_config)

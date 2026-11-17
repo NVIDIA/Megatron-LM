@@ -28,7 +28,7 @@ from megatron.core.models.bagel.transformer_mot_block import (
     get_mot_layer_spec,
 )
 from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.tensor_parallel.cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
 
 logger = logging.getLogger(__name__)
 

@@ -1316,10 +1316,22 @@ def test_sbhd_get_batch_returns_dataset_padding_mask(monkeypatch):
         pad_packed_seq_alignment=None,
         pipeline_model_parallel_layout=None,
         mtp_num_layers=0,
+        # Fields main's get_batch now reads from the normalized TransformerConfig.
+        sequence_packing_scheduler=None,
+        context_parallel_size=1,
+        dynamic_context_parallel=False,
+        pipeline_model_parallel_size=2,
     )
 
     monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
-    monkeypatch.setattr(pretrain_gpt, "core_transformer_config_from_args", lambda _: config)
+    # NOTE(nightly-sync 2026-11-12): main's d8ef5cca9 made get_batch read the normalized
+    # TransformerConfig from get_run_config() instead of core_transformer_config_from_args, so
+    # stub the run config, as test_get_batch.py does for the hybrid entrypoint.
+    monkeypatch.setattr(
+        pretrain_gpt,
+        "get_run_config",
+        lambda: SimpleNamespace(model=SimpleNamespace(transformer=config)),
+    )
     # Exercise an intermediate PP stage: it must not take the legacy early return.
     monkeypatch.setattr(pretrain_gpt, "is_first_or_last_pipeline_stage", lambda _: False)
     # Merged pretrain_gpt carries main's aliased import, so patch the alias.
@@ -1360,9 +1372,6 @@ def test_sbhd_dataset_is_built_on_intermediate_pipeline_stage(monkeypatch):
         use_varlen_dataset=True, varlen_sbhd_validation=True, sequence_packing_scheduler=None
     )
     monkeypatch.setattr(pretrain_gpt, "get_args", lambda: args)
-    monkeypatch.setattr(
-        pretrain_gpt, "core_transformer_config_from_args", lambda _: SimpleNamespace()
-    )
     monkeypatch.setattr(pretrain_gpt.mpu, "get_tensor_model_parallel_rank", lambda: 0)
     monkeypatch.setattr(pretrain_gpt, "is_first_or_last_pipeline_stage", lambda _: False)
     # Merged pretrain_gpt carries main's aliased import, so patch the alias. The restored
@@ -1370,13 +1379,26 @@ def test_sbhd_dataset_is_built_on_intermediate_pipeline_stage(monkeypatch):
     monkeypatch.setattr(pretrain_gpt, "mtp_on_this_rank_func", lambda *args, **kwargs: False)
     # NOTE(nightly-sync 2026-11-03): main (831aa66d4) moved is_dataset_built_on_rank into
     # megatron.training.datasets.providers, which pretrain_gpt re-exports. It reads the arguments
-    # and the transformer config at call time from global_vars and arguments, so patch those too.
-    from megatron.training import arguments as training_arguments
+    # and the transformer config at call time from global_vars, so patch those too.
     from megatron.training import global_vars
 
     monkeypatch.setattr(global_vars, "get_args", lambda: args)
+    # NOTE(nightly-sync 2026-11-12): main now reads the placement inputs from
+    # get_run_config().model.transformer instead of core_transformer_config_from_args (which
+    # pretrain_gpt no longer imports). Stub a placement that would otherwise keep the dataset
+    # off this intermediate stage, so only the varlen-SBHD disjunct can return True.
     monkeypatch.setattr(
-        training_arguments, "core_transformer_config_from_args", lambda _: SimpleNamespace()
+        global_vars,
+        "get_run_config",
+        lambda: SimpleNamespace(
+            model=SimpleNamespace(
+                transformer=SimpleNamespace(
+                    sequence_packing_scheduler=None,
+                    pipeline_model_parallel_layout=None,
+                    mtp_num_layers=0,
+                )
+            )
+        ),
     )
 
     assert pretrain_gpt.is_dataset_built_on_rank() is True
@@ -1515,7 +1537,19 @@ def _loader_args(*, use_varlen, sbhd, scheduler, mbs, dynamic_cp=False, gbs=None
     )
 
 
-def test_sbhd_validation_dataloader_uses_default_collate(run_config):
+@pytest.fixture
+def loader_model_config(run_config):
+    from megatron.core.transformer import TransformerConfig
+    from megatron.training.models import GPTModelConfig
+
+    run_config.model = GPTModelConfig(
+        transformer=TransformerConfig(num_layers=2, hidden_size=32, num_attention_heads=4),
+        seq_length=64,
+    )
+    return run_config.model.transformer
+
+
+def test_sbhd_validation_dataloader_uses_default_collate(run_config, loader_model_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
@@ -1549,13 +1583,14 @@ def test_sbhd_validation_dataloader_uses_default_collate(run_config):
         Utils.destroy_model_parallel()
 
 
-def test_thd_dataloader_uses_identity_collate(run_config):
+def test_thd_dataloader_uses_identity_collate(run_config, loader_model_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
     from tests.unit_tests.test_utilities import Utils
 
     Utils.initialize_model_parallel(1, 1)
+    loader_model_config.sequence_packing_scheduler = "dp_balanced"
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         mbs = 2
@@ -1580,13 +1615,17 @@ def test_thd_dataloader_uses_identity_collate(run_config):
         Utils.destroy_model_parallel()
 
 
-def test_dcp_dataloader_yields_microbatches_for_scheduler(run_config):
+def test_dcp_dataloader_yields_microbatches_for_scheduler(run_config, loader_model_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
     from tests.unit_tests.test_utilities import Utils
 
     Utils.initialize_model_parallel(1, 1)
+    # NOTE(nightly-sync 2026-11-12): main's d8ef5cca9 made the loader read the scheduler and
+    # dynamic-CP settings from the run's model config, so set them there as main's tests do.
+    loader_model_config.dynamic_context_parallel = True
+    loader_model_config.sequence_packing_scheduler = "default_dynamic_cp"
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         mbs = 2
@@ -1623,13 +1662,14 @@ def test_dcp_dataloader_yields_microbatches_for_scheduler(run_config):
         Utils.destroy_model_parallel()
 
 
-def test_packing_scheduler_dataloader_yields_microbatches(run_config):
+def test_packing_scheduler_dataloader_yields_microbatches(run_config, loader_model_config):
     from megatron.core import parallel_state
     from megatron.training.datasets.data_samplers import build_pretraining_data_loader
     from megatron.training.global_vars import destroy_global_vars, set_args
     from tests.unit_tests.test_utilities import Utils
 
     Utils.initialize_model_parallel(1, 1)
+    loader_model_config.sequence_packing_scheduler = "dp_balanced"
     try:
         tok = _FakeTokenizer(eod=0, pad=7)
         mbs = 2

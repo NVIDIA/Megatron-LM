@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from dataclasses import dataclass
 
@@ -27,6 +27,10 @@ class TrainState(Stateful):
     do_valid: bool = False
     do_test: bool = False
     release: bool = False
+    # Whether this run's primary checkpoint load applied finetune semantics (a fresh iteration
+    # and schedule): --finetune, the pretrained-checkpoint fallback or --freeze-all-layers.
+    # Written by load_checkpoint(record_finetune=True); not checkpointed.
+    effective_finetune: bool = False
 
     def state_dict(self) -> dict[str, torch.Tensor]:
         """Serializes the training state into a dictionary of tensors.
