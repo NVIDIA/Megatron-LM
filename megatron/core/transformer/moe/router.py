@@ -47,6 +47,23 @@ logger = logging.getLogger(__name__)
 _HYBRIDEP_INT16_EXPERT_LIMIT = 1 << 15
 
 
+def _sum_packed_moe_statistics(
+    scores: torch.Tensor, routing_map: torch.Tensor, sample_ids: torch.Tensor, num_samples: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reduce flat token statistics by sample with a fixed number of GPU launches.
+
+    Integer expert counts remain exact. Floating-point accumulation follows
+    PyTorch's deterministic-algorithm setting, as do the other torch router ops.
+    """
+    counts = torch.zeros(
+        (num_samples, routing_map.size(1)), dtype=torch.int64, device=routing_map.device
+    )
+    counts.index_add_(0, sample_ids, routing_map.to(torch.int64))
+    score_sums = scores.new_zeros((num_samples, scores.size(1)))
+    score_sums.index_add_(0, sample_ids, scores)
+    return counts, score_sums
+
+
 @dataclass(frozen=True)
 class _AuxLossGroupConfig:
     """Process groups used by local aux losses and their metrics."""
@@ -651,45 +668,112 @@ class TopKRouter(Router):
     ):
         """Apply the sequence-level auxiliary loss for the given scores and routing map.
 
-        To calculate the sequence-level aux loss, we reshape the batch_size dimension to
-        experts dimension. The resulted loss by switch_load_balancing_loss_func is equal
-        to the sum of aux loss for each sequence in the batch. And then we divide the aux
-        loss by the batch size to get averaged aux loss.
+        Packed inputs reduce scores and assignments into per-sample statistics while
+        keeping router activations flat. Rectangular inputs fold the batch dimension
+        into the expert dimension. Both paths average the per-sample losses.
         """
         seq_aux_loss_coeff = self.get_aux_loss_coeff("seq_aux_loss")
         if seq_aux_loss_coeff == 0:
             return probs
 
-        scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
-        routing_map = routing_map.reshape(seq_length, -1)
-
         aux_loss_groups = self._get_aux_loss_groups(packed_seq_params)
-        global_tokens_per_expert, local_num_tokens, total_num_tokens = (
-            get_tokens_per_expert_and_token_count(
-                routing_map=routing_map,
-                reduce_group=aux_loss_groups.loss_reduce_groups,
-                with_padding_mask=with_padding_mask,
-                topk=self.topk * bsz,
-            )
+        sample_lengths = (
+            packed_seq_params.moe_sample_lengths if packed_seq_params is not None else None
         )
-
-        # local_num_tokens is per-sequence (bsz is folded into the expert dim above) and floors
-        # uneven padding, so per-token-loss scaling uses the physical valid-token count instead.
-        num_valid_tokens = routing_map.sum() // self.topk if with_padding_mask else seq_length * bsz
-
-        aux_loss = (
-            switch_load_balancing_loss_func(
-                probs=scores_for_aux_loss,
-                tokens_per_expert=global_tokens_per_expert,
-                total_num_tokens=total_num_tokens,
+        if sample_lengths is not None:
+            assert bsz == 1, "Packed MoE sample metadata requires a flat [T, 1, H] input"
+            sample_ids = packed_seq_params.moe_sample_ids
+            if sample_ids is None:
+                # Build only this SP rank's mapping, once per batch. Its partition
+                # is fixed across MoE layers; no CP-sized tensor or per-layer slice
+                # is needed after the cache has been populated.
+                tp_size = self.tp_group.size() if self.config.sequence_parallel else 1
+                assert (
+                    sample_lengths and sum(sample_lengths) == seq_length * tp_size
+                ), "Packed sample lengths do not cover the MoE input"
+                local_start = (
+                    self.tp_group.rank() * seq_length if self.config.sequence_parallel else 0
+                )
+                # Host-known boundaries: shift into this rank's interval, clip,
+                # then difference. Keep setup work off the GPU and transfer only
+                # the small lengths vector before constructing the cached IDs.
+                offsets = torch.tensor(
+                    (0, *sample_lengths), dtype=torch.int64, device="cpu"
+                ).cumsum(0)
+                lengths = (offsets - local_start).clamp_(0, seq_length).diff()
+                lengths = lengths.to(device=scores_for_aux_loss.device)
+                sample_ids = torch.repeat_interleave(
+                    torch.arange(len(sample_lengths), device=lengths.device),
+                    lengths,
+                    output_size=seq_length,
+                )
+                packed_seq_params.moe_sample_ids = sample_ids
+            assert (
+                sample_ids.device == scores_for_aux_loss.device
+            ), "Cached MoE sample IDs must be on the router input device"
+            assert (
+                sample_ids.numel() == seq_length
+            ), "Cached MoE sample IDs must match the local token count"
+            # Aux-loss inputs already exclude padding through padding_mask.
+            # Only [samples, experts] statistics are formed; activations stay flat.
+            local_counts, score_sums = _sum_packed_moe_statistics(
+                scores_for_aux_loss, routing_map, sample_ids, len(sample_lengths)
+            )
+            global_counts, num_valid_tokens, total_num_tokens = (
+                get_tokens_per_expert_and_token_count(
+                    local_counts.reshape(1, -1),
+                    reduce_group=aux_loss_groups.loss_reduce_groups,
+                    topk=self.topk,
+                    with_padding_mask=True,
+                )
+            )
+            global_counts = global_counts.view_as(local_counts)
+            tokens_per_sample = (global_counts.sum(dim=1) // self.topk).to(score_sums.dtype)
+            # Keep score sums local; TP/CP ranks contribute separate terms to the loss.
+            normalizers = tokens_per_sample.clamp_min(1).square()[:, None]
+            # Fold per-sample normalization into the counts before calling the
+            # shared loss. A unit denominator avoids normalizing a second time.
+            aux_loss = switch_load_balancing_loss_func(
+                probs=score_sums.reshape(1, -1),
+                tokens_per_expert=(global_counts / normalizers).reshape(-1),
+                total_num_tokens=1,
                 topk=self.topk,
                 num_experts=self.config.num_moe_experts,
                 moe_aux_loss_coeff=seq_aux_loss_coeff,
                 fused=self.config.moe_router_aux_loss_fusion,
                 deterministic=self.config.deterministic_mode,
+            ) / len(sample_lengths)
+        else:
+            scores_for_aux_loss = scores_for_aux_loss.reshape(seq_length, -1)
+            routing_map = routing_map.reshape(seq_length, -1)
+            global_tokens_per_expert, local_num_tokens, total_num_tokens = (
+                get_tokens_per_expert_and_token_count(
+                    routing_map=routing_map,
+                    reduce_group=aux_loss_groups.loss_reduce_groups,
+                    with_padding_mask=with_padding_mask,
+                    topk=self.topk * bsz,
+                )
             )
-            / bsz
-        )
+
+            # local_num_tokens is per-sequence (bsz is folded into the expert dim above) and floors
+            # uneven padding, so per-token-loss scaling uses the physical valid-token count instead.
+            num_valid_tokens = (
+                routing_map.sum() // self.topk if with_padding_mask else seq_length * bsz
+            )
+
+            aux_loss = (
+                switch_load_balancing_loss_func(
+                    probs=scores_for_aux_loss,
+                    tokens_per_expert=global_tokens_per_expert,
+                    total_num_tokens=total_num_tokens,
+                    topk=self.topk,
+                    num_experts=self.config.num_moe_experts,
+                    moe_aux_loss_coeff=seq_aux_loss_coeff,
+                    fused=self.config.moe_router_aux_loss_fusion,
+                    deterministic=self.config.deterministic_mode,
+                )
+                / bsz
+            )
 
         probs = self.attach_and_log_load_balancing_loss(
             probs,
@@ -702,6 +786,7 @@ class TopKRouter(Router):
             valid_token_count=num_valid_tokens,
             aux_loss_logging_reduce_groups=aux_loss_groups.metric_pre_reduce_groups,
             aux_loss_scale_reduce_groups=aux_loss_groups.loss_reduce_groups,
+            aux_loss_scale_num_tokens=total_num_tokens if sample_lengths is not None else None,
         )
         return probs
 

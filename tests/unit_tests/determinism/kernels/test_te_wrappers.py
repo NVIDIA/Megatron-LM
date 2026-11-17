@@ -912,8 +912,10 @@ class TestTEWrappers:
             local_cp_size=1,
             tokens_per_sample=s,
             moe_sample_lengths=(s,),
+            moe_sample_ids=torch.zeros(s, dtype=torch.int64, device="cuda"),
         )
         assert "moe_sample_lengths" not in module.kept_packed_seq_params
+        assert "moe_sample_ids" not in module.kept_packed_seq_params
         assert module.cp_group is None
         reference = None
 

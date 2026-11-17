@@ -1914,13 +1914,16 @@ def test_aligned_zigzag_preserves_existing_padding_mask():
 
 
 @pytest.mark.parametrize(
-    "scheduler, expected_updates",
-    [(None, 1), ("dp_balanced", 0)],
-    ids=["unscheduled", "scheduled"],
+    "scheduler, expected_updates", [(None, 1), ("dp_balanced", 0)], ids=["unscheduled", "scheduled"]
 )
 def test_forward_step_updates_sequence_stats_only_without_scheduler(scheduler, expected_updates):
     initialize_test_environment(
-        tp_size=1, pp_size=1, cp_size=1, seq_length=8, micro_batch_size=1
+        tp_size=1,
+        pp_size=1,
+        cp_size=1,
+        seq_length=8,
+        micro_batch_size=1,
+        global_batch_size=Utils.world_size,
     )
     try:
         config = global_vars.get_run_config().model.transformer

@@ -38,6 +38,9 @@ class PackedSeqParams:
     # Physical sample lengths in the CP-local zigzag stream, before TP/SP slicing.
     # Unlike tokens_per_sample, these include per-document padding and may differ.
     moe_sample_lengths: tuple[int, ...] = None
+    # Lazily cached token-to-sample IDs for this rank's MoE input, after CP/SP.
+    # The local partition is fixed for this batch and reused across its MoE layers.
+    moe_sample_ids: Tensor | None = None
 
     def __post_init__(self):
         """Pre-compute seq_idx for Mamba mixer CUDA graph compatibility.

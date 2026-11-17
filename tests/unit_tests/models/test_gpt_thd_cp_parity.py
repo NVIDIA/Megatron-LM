@@ -198,7 +198,6 @@ def _run_pretrain_gpt_forward(
             mtp_num_layers=1 if mtp else None,
             pipeline_model_parallel_layout=None,
             sequence_parallel=False,
-            sequence_packing_scheduler=None,
             tensor_model_parallel_size=1,
             virtual_pipeline_model_parallel_size=None,
         )
@@ -266,12 +265,11 @@ def _run_pretrain_gpt_forward(
             assert mtp_metrics.call_count == 1
             local_loss, _, valid_tokens, *_ = mtp_metrics.call_args.args
             assert torch.isfinite(local_loss)
-            # CP ranks can own different valid-token counts after padding and rolling.
-            # Combine the actual MTP head losses using those counts, not a rank mean.
-            totals = torch.stack((local_loss * valid_tokens, valid_tokens)).float()
+            # MTP logging already uses global token normalization and scales by CP size.
+            totals = torch.stack((local_loss, valid_tokens)).float()
             dist.all_reduce(totals, group=parallel_state.get_context_parallel_group())
             assert totals[1].item() == sum(sequence_lengths) - len(sequence_lengths)
-            auxiliary_loss = (totals[0] / totals[1]).cpu()
+            auxiliary_loss = (totals[0] / cp_size).cpu()
         return global_losses, auxiliary_loss
     finally:
         Utils.destroy_model_parallel()
