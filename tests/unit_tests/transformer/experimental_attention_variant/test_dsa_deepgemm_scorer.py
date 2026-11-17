@@ -1625,14 +1625,17 @@ def test_config_accepts_deepgemm_with_mxfp8(monkeypatch, topk_backend):
     assert options.topk_backend == topk_backend
 
 
-def test_config_and_options_default_to_cudnn(monkeypatch):
+def test_config_is_unset_and_options_default_to_cudnn(monkeypatch):
     from megatron.core.transformer.transformer_config import TransformerConfig
 
-    assert TransformerConfig.__dataclass_fields__["dsa_indexer_scorer_backend"].default == "cudnn"
+    assert TransformerConfig.__dataclass_fields__["dsa_indexer_scorer_backend"].default is None
     assert dsa_cudnn_kernels.IndexerScorerOptions().scorer_backend == "cudnn"
     assert dsa_cudnn_kernels._scorer_options_from_config(None).scorer_backend == "cudnn"
     config = _make_config(monkeypatch, dsa_indexer_scorer_backend="cudnn")
     assert dsa_cudnn_kernels._scorer_options_from_config(config).scorer_backend == "cudnn"
+    # 'torch' is the PyTorch KPool scorer; the per-token options keep the cuDNN scorer.
+    kpool_torch = SimpleNamespace(dsa_indexer_scorer_backend="torch")
+    assert dsa_cudnn_kernels._scorer_options_from_config(kpool_torch).scorer_backend == "cudnn"
 
 
 @pytest.mark.parametrize(
@@ -1641,7 +1644,7 @@ def test_config_and_options_default_to_cudnn(monkeypatch):
         ({"dsa_indexer_precision": "bf16"}, "set dsa_indexer_precision='mxfp8'"),
         ({"dsa_kernel_backend": "none"}, "requires experimental_attention_variant='dsa' with"),
         ({"dsa_indexer_kpool": 4, "dsa_indexer_topk": 4}, "KPool selection .* bypasses it"),
-        ({"dsa_indexer_scorer_backend": "flashinfer"}, "must be 'cudnn' or 'deepgemm'"),
+        ({"dsa_indexer_scorer_backend": "flashinfer"}, "'torch', 'cudnn' or 'deepgemm'"),
         ({"attention_backend": AttnBackend.unfused}, "requires the fused DSA kernels"),
     ],
     ids=["bf16", "kernel-backend-none", "kpool", "unknown", "unfused"],

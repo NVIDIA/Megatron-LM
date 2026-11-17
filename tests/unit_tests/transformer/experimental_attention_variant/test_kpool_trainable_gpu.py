@@ -97,7 +97,7 @@ _GRAPH_ROWS, _GRAPH_TOPK = 4096, 2048
 # heads: about 4.3 GB per FP32 score tensor instead of 17 GB with sixteen.
 _RANK_128K_ROWS = 16384
 _RANK_128K_MIN_GPU_GIB = 64
-# The cuDNN-backend layer.
+# The cuDNN-backend layer: the geometry of test_kpool_cudnn_selection_gpu's layer test.
 _CUDNN_ROWS, _CUDNN_TOPK = 1024, 256
 
 # Absorbed NoPE MLA, as GLM-5.3-Flash's main attention, at a reduced width.
@@ -245,6 +245,7 @@ def _config(
     per_token=False,
     deterministic=False,
     kernel_backend="none",
+    scorer="torch",
     geometry=None,
     num_layers=4,
     mtp_num_layers=None,
@@ -279,6 +280,7 @@ def _config(
         dsa_indexer_loss_coeff=loss_coeff,
         dsa_indexer_use_sparse_loss=True,
         dsa_indexer_kpool=_POOL,
+        dsa_indexer_scorer_backend=scorer,
         dsa_indexer_kpool_key_dtype_compression=key_dtype_compression,
         dsa_indexer_hf_scoring=hf_scoring,
         dsa_indexer_scoring_relu=True,
@@ -1496,16 +1498,27 @@ def test_te_graph_capture_of_the_trainable_layer_replays_its_eager_step(record_p
         _assert_similar(parameter.grad, eager.param_grads[name], label=name, eps=1e-3)
 
 
-def test_cudnn_backend_trainable_layer_matches_the_reference(monkeypatch):
+@pytest.mark.parametrize("scorer", ["torch", "cudnn"])
+def test_cudnn_backend_trainable_layer_matches_the_reference(monkeypatch, scorer):
     """On the cuDNN DSA backend (FlashMLA sparse attention), the trainable layer still trains
     through the KPool loss alone and its loss matches the reference.
 
-    The real token-level hooks of that backend raise when reached.
+    The real token-level hooks of that backend raise when reached. With the cuDNN KPool
+    scorer, the layer's selector is the cuDNN pool top-k, and with cuDNN frontend >= 1.31 the
+    loss runs on the cuDNN frontend kernels instead of ``KPoolSparseIndexerLoss``
+    (``test_kpool_trainable_cudnn_gpu.py`` covers that path).
     """
     _require_cudnn_dsa()
+    cudnn_loss = scorer == "cudnn" and dsa_cudnn_kernels._cudnn_frontend_at_least(
+        dsa_cudnn_kernels._KPOOL_SPARSE_LOSS_MIN_FE_VERSION
+    )
     seen = _install_recorders(monkeypatch)
     config = _config(
-        loss_coeff=_COEFF, topk=_CUDNN_TOPK, kernel_backend="cudnn", geometry=_CUDNN_GEOMETRY
+        loss_coeff=_COEFF,
+        topk=_CUDNN_TOPK,
+        kernel_backend="cudnn",
+        scorer=scorer,
+        geometry=_CUDNN_GEOMETRY,
     )
     trainable = _build_layer(config, _single_rank_groups())
     _forbid_token_level_loss_hooks(monkeypatch)
@@ -1516,8 +1529,9 @@ def test_cudnn_backend_trainable_layer_matches_the_reference(monkeypatch):
     (record,) = _layer_losses(seen)
     (indexer_call,) = indexer_calls
     (call,) = seen.kpool
-    assert seen.loss_function_calls == 1
+    assert seen.loss_function_calls == (0 if cudnn_loss else 1)
     assert _is_trainable_call(call)
+    assert (call.kwargs.get("pool_topk_fn") is not None) == (scorer == "cudnn")
     _assert_indexer_trained(trainable, run)
     case = _reference_case(trainable, inputs, run, indexer_call)
     expected = _oracle(

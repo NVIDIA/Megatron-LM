@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from megatron.core.activations import squared_relu
+from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 
@@ -260,6 +261,71 @@ def test_dsa_kpool_cudnn_accepts_unquantized_fp32_weights_projection():
         dsa_indexer_weights_proj_use_quantization=False,
     )
     assert config.dsa_indexer_kpool == 4
+
+
+@pytest.fixture
+def no_dsa_kernel_dependency_check(monkeypatch):
+    """Skip the CUDA/library probe of ``dsa_kernel_backend`` so the config rules run on CPU."""
+    import megatron.core.transformer.transformer_config as config_module
+
+    monkeypatch.setattr(config_module, "_validate_dsa_kernel_backend_dependencies", lambda _: None)
+
+
+@pytest.mark.usefixtures("no_dsa_kernel_dependency_check")
+def test_dsa_scorer_backend_is_unset_by_default_and_kpool_accepts_torch_and_cudnn():
+    unset = _make_dsa_kpool_config(dsa_indexer_kpool=4, dsa_indexer_topk=8)
+    assert unset.dsa_indexer_scorer_backend is None
+    for backend in ("torch", "cudnn"):
+        config = _make_dsa_kpool_config(
+            dsa_indexer_kpool=4,
+            dsa_indexer_topk=8,
+            dsa_kernel_backend="cudnn",
+            dsa_indexer_scorer_backend=backend,
+        )
+        assert config.dsa_indexer_scorer_backend == backend
+    # Without KPool, 'cudnn' is the per-token cuDNN scorer.
+    per_token = _make_dsa_kpool_config(
+        dsa_indexer_kpool=1,
+        dsa_indexer_topk=8,
+        dsa_kernel_backend="cudnn",
+        dsa_indexer_scorer_backend="cudnn",
+    )
+    assert per_token.dsa_indexer_scorer_backend == "cudnn"
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        (dict(dsa_indexer_scorer_backend="triton"), "'torch', 'cudnn' or 'deepgemm'"),
+        (dict(dsa_indexer_scorer_backend="deepgemm"), "does not apply to KPool selection"),
+        (
+            dict(dsa_indexer_kpool=1, dsa_indexer_scorer_backend="torch"),
+            "applies only to KPool selection",
+        ),
+        (dict(dsa_kernel_backend="tilelang"), "needs dsa_kernel_backend='cudnn'"),
+        (dict(dsa_indexer_scoring_relu=False), "needs ReLU scoring"),
+        (dict(attention_backend=AttnBackend.unfused), "needs the fused DSA kernels"),
+        (dict(dsa_indexer_kpool_use_quantization=True), "does not support FP8 KPool"),
+        (
+            dict(
+                dsa_indexer_weights_proj_output_dtype="fp32",
+                dsa_indexer_weights_proj_use_quantization=False,
+            ),
+            "needs BF16 indexer head",
+        ),
+    ],
+)
+@pytest.mark.usefixtures("no_dsa_kernel_dependency_check")
+def test_dsa_scorer_backend_rejects_unsupported_kpool_configs(overrides, message):
+    settings = dict(
+        dsa_indexer_kpool=4,
+        dsa_indexer_topk=8,
+        dsa_kernel_backend="cudnn",
+        dsa_indexer_scorer_backend="cudnn",
+    )
+    settings.update(overrides)
+    with pytest.raises(ValueError, match=message):
+        _make_dsa_kpool_config(**settings)
 
 
 @pytest.mark.parametrize("loss_coeff", [None, 0.0, -1.0])

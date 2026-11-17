@@ -23,6 +23,7 @@ __all__ = [
     "get_cp_positions_from_layout",
     "get_packed_qk_cu_seqlens",
     "invert_permutation",
+    "nonpacked_query_position_runs",
     "normalize_cp_comm_type",
     "build_packed_allgather_cp_local_positions_from_host",
     "build_packed_allgather_cp_query_positions_and_key_reorder_from_host",
@@ -140,6 +141,129 @@ def ensure_sbhd(tensor: torch.Tensor, name: str) -> Tuple[torch.Tensor, bool]:
     if tensor.ndim == 3:
         return tensor.unsqueeze(1), True
     raise ValueError(f"{name} must be 3D ([t,h,d]) or 4D ([s,b,h,d]), got {tensor.ndim}D")
+
+
+def nonpacked_query_position_runs(
+    *, local_rows: int, full_rows: int, row_start: int, skv: int, cp_size: int, cp_rank: int
+) -> Tuple[Optional[Tuple[Tuple[int, int, int], ...]], str]:
+    """Host-side query positions of a causal non-packed DSA call, as runs of consecutive tokens.
+
+    Returns ``((row_start, row_end, position), ...)`` in row order: local query rows
+    ``[row_start, row_end)`` sit at global token positions ``position, position + 1, ...``.
+    This describes the same positions as :func:`get_cp_positions_from_layout` (and the causal
+    bounds ``build_dsattention_forward_mask`` builds from them) for the layouts whose positions
+    follow from host facts alone: no CP (row ``i`` at position ``i``) and allgather CP with the
+    uniform zigzag split. ``full_rows`` is the CP-local row count; ``row_start`` and
+    ``local_rows`` pick this rank's rows of it when TP sequence parallelism keeps queries
+    local. Other layouts return ``(None, reason)``. Callers must exclude query positions taken
+    from ``position_ids``, attention masks and packed sequences themselves.
+    """
+    if cp_size <= 1:
+        full_runs = [(0, full_rows, 0)]
+    else:
+        if skv != full_rows * cp_size:
+            return None, (
+                "allgather CP with non-uniform rank lengths takes its positions from an all-gather"
+            )
+        if skv % (2 * cp_size) != 0:
+            return None, "the sequence length is not divisible by 2 * cp_size (no zigzag split)"
+        chunk = skv // (2 * cp_size)
+        full_runs = [
+            (0, chunk, cp_rank * chunk),
+            (chunk, 2 * chunk, (2 * cp_size - cp_rank - 1) * chunk),
+        ]
+    window_start, window_end = row_start, row_start + local_rows
+    if window_start < 0 or window_end > full_rows:
+        return None, "the local query rows fall outside the CP-local sequence"
+    runs = []
+    for run_start, run_end, position in full_runs:
+        start, end = max(run_start, window_start), min(run_end, window_end)
+        if start < end:
+            runs.append((start - window_start, end - window_start, position + start - run_start))
+    return tuple(runs), ""
+
+
+def packed_kpool_query_runs(
+    *,
+    host_cu_seqlens_q: Optional[List[int]],
+    host_cu_seqlens_kv: Optional[List[int]],
+    local_rows: int,
+    full_rows: int,
+    row_start: int,
+    cp_size: int,
+    cp_rank: int,
+    pool_size: int,
+) -> Tuple[Optional[Tuple[Tuple[int, int, int, int, int], ...]], str]:
+    """Host-side KPool query runs of a causal packed-THD DSA call, one per document span.
+
+    Returns ``((row_start, row_end, position, key_start, key_count), ...)`` in row order, the
+    keyed runs of ``run_kpool_pool_topk``: local query rows ``[row_start, row_end)`` belong to
+    one document and sit at positions ``position, position + 1, ...`` counted from the
+    document's first token; that document's pooled keys are ``[key_start, key_start +
+    key_count)`` of the gathered pooled-key axis, which ``_kpool_compress_keys_per_seg`` lays
+    out document by document with ``(length // pool_size)`` complete pools each. The local
+    rows follow the packed zigzag CP layout (per document a front and a back span, as
+    :func:`_host_packed_cp_spans`), or the documents themselves without CP; these are the
+    positions the packed causal bounds of ``build_dsattention_forward_mask`` are built from.
+    ``full_rows``, ``row_start`` and ``local_rows`` window the CP-local rows for a TP
+    sequence-parallel local query, as in :func:`nonpacked_query_position_runs`.
+
+    Returns ``(None, reason)`` when the host boundaries are missing, differ between query
+    and key, or do not describe exactly ``full_rows`` CP-local rows.
+    """
+    if host_cu_seqlens_q is None or host_cu_seqlens_kv is None:
+        return None, "the packed THD boundaries are not on the host"
+    if list(host_cu_seqlens_q) != list(host_cu_seqlens_kv):
+        return None, "the packed THD query and key boundaries differ"
+    cu = [int(v) for v in host_cu_seqlens_q]
+    if len(cu) < 2 or cu[0] != 0 or any(b < a for a, b in zip(cu[:-1], cu[1:])):
+        return None, "the packed THD boundaries are not a non-decreasing list from 0"
+    full_runs = []
+    covered = 0
+    key_start = 0
+    for doc_start, doc_end in zip(cu[:-1], cu[1:]):
+        doc_len = doc_end - doc_start
+        if doc_len == 0:
+            continue
+        key_count = doc_len // pool_size
+        if cp_size <= 1:
+            spans = [(doc_start, doc_len)]
+        else:
+            if doc_len % (2 * cp_size) != 0:
+                return None, (
+                    "a packed THD document length is not divisible by 2 * cp_size "
+                    "(no zigzag split)"
+                )
+            half = doc_len // (2 * cp_size)
+            spans = [(doc_start + cp_rank * half, half), (doc_end - (cp_rank + 1) * half, half)]
+        for span_start, span_len in spans:
+            full_runs.append(
+                (covered, covered + span_len, span_start - doc_start, key_start, key_count)
+            )
+            covered += span_len
+        key_start += key_count
+    if covered != full_rows:
+        return None, (
+            f"the packed THD boundaries describe {covered} CP-local rows, not the {full_rows} "
+            "rows of this call"
+        )
+    window_start, window_end = row_start, row_start + local_rows
+    if window_start < 0 or window_end > full_rows:
+        return None, "the local query rows fall outside the CP-local sequence"
+    runs = []
+    for run_start, run_end, position, run_key_start, run_key_count in full_runs:
+        start, end = max(run_start, window_start), min(run_end, window_end)
+        if start < end:
+            runs.append(
+                (
+                    start - window_start,
+                    end - window_start,
+                    position + start - run_start,
+                    run_key_start,
+                    run_key_count,
+                )
+            )
+    return tuple(runs), ""
 
 
 def packed_kpool_pool_alignment_error(
