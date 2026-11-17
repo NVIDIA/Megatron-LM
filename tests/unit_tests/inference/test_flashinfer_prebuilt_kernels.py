@@ -2,6 +2,7 @@
 
 """`missing_flashinfer_prebuilt_kernels` against a stand-in for FlashInfer's loader state."""
 
+import hashlib
 import sys
 from types import ModuleType, SimpleNamespace
 from unittest import mock
@@ -12,6 +13,8 @@ from megatron.core.inference import utils as inference_utils
 
 CUBIN_DIR = "fmha/trtllm-gen/"
 CUBINS = ["include/flashInferMetaInfo.h", "fmhaSm100Kernel_a.cubin", "fmhaSm100Kernel_b.cubin"]
+# FlashInfer's manifest: each file's SHA-256 and path. FlashInfer pins the manifest's own hash.
+MANIFEST = "".join(f"{hashlib.sha256(name.encode()).hexdigest()} {name}\n" for name in CUBINS)
 
 
 def _compatible(binary_target, device):
@@ -30,20 +33,31 @@ def _flashinfer(cubin_dir, provider_architectures=("sm100a",), aot_modules=("fmh
         cuda_binary_target_compatibility_score=_compatible,
         get_aot_artifacts=lambda module: ("artifact",) if module in aot_modules else (),
     )
+    artifacts = ModuleType("flashinfer.artifacts")
+    artifacts.CheckSumHash = SimpleNamespace(
+        map_checksums={f"{CUBIN_DIR}checksums.txt": hashlib.sha256(MANIFEST.encode()).hexdigest()}
+    )
     flashinfer = ModuleType("flashinfer")
     flashinfer.__version__ = "0.7.2.post1"
     jit = ModuleType("flashinfer.jit")
     jit.env = env
     flashinfer.jit = jit
-    return {"flashinfer": flashinfer, "flashinfer.jit": jit, "flashinfer.jit.env": env}
+    flashinfer.artifacts = artifacts
+    return {
+        "flashinfer": flashinfer,
+        "flashinfer.artifacts": artifacts,
+        "flashinfer.jit": jit,
+        "flashinfer.jit.env": env,
+    }
 
 
-def _write_cubins(root, names):
+def _write_cubins(root, names, manifest=MANIFEST):
+    """FlashInfer's manifest and the listed files ``names``, each holding its own name."""
     directory = root / CUBIN_DIR
     (directory / "include").mkdir(parents=True)
-    (directory / "checksums.txt").write_text("".join(f"{'0' * 64} {name}\n" for name in CUBINS))
+    (directory / "checksums.txt").write_text(manifest)
     for name in names:
-        (directory / name).write_bytes(b"")
+        (directory / name).write_bytes(name.encode())
 
 
 def _missing(modules):
@@ -54,9 +68,9 @@ def _missing(modules):
 
 
 def test_complete_install_is_prebuilt(tmp_path):
-    """A provider for the device, the module and every listed cubin: nothing is missing. The
-    cubin directory is the one FlashInfer resolved: flashinfer-cubin, FLASHINFER_CUBIN_DIR or a
-    cache that `flashinfer download-cubin` filled."""
+    """A provider for the device, the module, the pinned manifest and every cubin it lists at
+    its SHA-256: nothing is missing. The cubin directory is the one FlashInfer resolved:
+    flashinfer-cubin, FLASHINFER_CUBIN_DIR or a cache that `flashinfer download-cubin` filled."""
     _write_cubins(tmp_path, CUBINS)
     assert _missing(_flashinfer(tmp_path)) is None
 
@@ -86,6 +100,32 @@ def test_missing_piece_is_named(tmp_path, provider_architectures, aot_modules, c
     modules = _flashinfer(tmp_path, provider_architectures, aot_modules)
     missing = _missing(modules)
     assert missing is not None and expected in missing
+
+
+def test_stale_cubin_is_named(tmp_path):
+    """A cubin whose SHA-256 is not the manifest's: FlashInfer's loader rejects it and downloads
+    a replacement, which fails offline, so the check names it."""
+    _write_cubins(tmp_path, CUBINS)
+    (tmp_path / CUBIN_DIR / CUBINS[1]).write_bytes(b"a cubin from another build")
+    missing = _missing(_flashinfer(tmp_path))
+    assert missing is not None and CUBINS[1] in missing and "SHA-256" in missing
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        pytest.param("", id="empty"),
+        # Every file it lists is present and matches, but FlashInfer pins the whole manifest.
+        pytest.param(MANIFEST.splitlines(keepends=True)[0], id="truncated"),
+        pytest.param("not a manifest\n", id="unparseable"),
+    ],
+)
+def test_manifest_flashinfer_does_not_pin_is_named(tmp_path, manifest):
+    """FlashInfer's loader takes checksums.txt only at the hash it pins and otherwise downloads
+    it, so the check names a manifest with any other content."""
+    _write_cubins(tmp_path, CUBINS, manifest)
+    missing = _missing(_flashinfer(tmp_path))
+    assert missing is not None and "checksums.txt" in missing and "pins" in missing
 
 
 def test_flashinfer_not_installed():

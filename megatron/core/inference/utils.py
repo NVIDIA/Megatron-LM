@@ -3,6 +3,7 @@
 import asyncio
 import contextlib
 import functools
+import hashlib
 import logging
 import multiprocessing
 import pathlib
@@ -327,7 +328,10 @@ def missing_flashinfer_prebuilt_kernels(
     - for each of ``cubin_dirs`` (FlashInfer artifact paths), its checksum manifest and every
       file it lists, in the cubin directory FlashInfer reads: flashinfer-cubin at FlashInfer's
       version, ``FLASHINFER_CUBIN_DIR``, or the cache that ``flashinfer download-cubin`` fills.
-      Without them, FlashInfer downloads cubins at its first call.
+      Each must have the SHA-256 FlashInfer checks: for the manifest, the one
+      ``flashinfer.artifacts`` pins; for each file, the one the manifest lists. Without them,
+      FlashInfer downloads cubins at its first call. The check runs once per process for each
+      set of arguments, so it hashes the files once.
 
     Args:
         aot_modules: FlashInfer modules the caller runs.
@@ -372,14 +376,31 @@ def _missing_flashinfer_prebuilt_kernels(
             return f"flashinfer-jit-cache has no prebuilt {module} module for {device}"
 
     for cubin_dir in cubin_dirs:
+        from flashinfer.artifacts import CheckSumHash
+
+        # FlashInfer's loader (flashinfer.jit.cubin_loader.get_artifact) takes a file from the
+        # cubin directory only if its SHA-256 matches, and otherwise downloads a replacement:
+        # the manifest must match the hash CheckSumHash pins, each file the hash the manifest lists.
         directory = pathlib.Path(jit_env.FLASHINFER_CUBIN_DIR) / cubin_dir
         try:
-            manifest = (directory / "checksums.txt").read_text().splitlines()
+            manifest = (directory / "checksums.txt").read_bytes()
         except OSError:
             return f"FlashInfer's cubins are not in {directory}"
-        for line in manifest:
-            if line.strip() and not (directory / line.split()[1]).is_file():
+        pinned = CheckSumHash.map_checksums.get(f"{cubin_dir.rstrip('/')}/checksums.txt")
+        if hashlib.sha256(manifest).hexdigest() != pinned:
+            return (
+                f"{directory / 'checksums.txt'} is not the manifest FlashInfer "
+                f"{flashinfer.__version__} pins"
+            )
+        # The pinned manifest is FlashInfer's own: one "<sha256> <path>" line per file.
+        for line in manifest.decode().splitlines():
+            sha256, name = line.split()
+            try:
+                data = (directory / name).read_bytes()
+            except OSError:
                 return f"FlashInfer's cubins in {directory} are incomplete"
+            if hashlib.sha256(data).hexdigest() != sha256:
+                return f"{directory / name} does not match its SHA-256 in FlashInfer's manifest"
     return None
 
 
