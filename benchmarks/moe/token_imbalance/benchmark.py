@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """MoE runtime token-imbalance benchmark (standard all-to-all baseline).
 
 Scope:

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """B1 trace v1: a persisted, checksummed logical routing workload.
 
 Design rules taken from the B1 contract:

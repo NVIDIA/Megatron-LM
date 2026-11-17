@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """B1 paired analysis: balanced-block baseline-vs-patch comparison per workload.
 
 Input layout (produced by run_b1_paired.sh):

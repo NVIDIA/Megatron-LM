@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """B1 backend adapter layer.
 
 A backend adapter carries exactly five things and nothing more (B1 contract, section 9):

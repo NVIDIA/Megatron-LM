@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """B1 instrumentation overhead: same workload and config, counters off vs on.
 
 Alternating order is used so a monotone drift does not land entirely on one side. With only

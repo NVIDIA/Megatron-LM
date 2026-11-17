@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Tabulates the benchmark's actual output: how a fixed logical workload changes step time,
 alongside the imbalance that is supposed to explain it.
 

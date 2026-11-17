@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """B1 summarizer: per-arm metrics and the baseline-vs-patch speed table.
 
 Reads the per-rank JSONL emitted by benchmark.py and never mixes runs that disagree on
