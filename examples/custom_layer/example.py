@@ -114,7 +114,7 @@ def main() -> None:
         # Materialize the global grid at bootstrap; pass it explicitly to the model.
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         torch.manual_seed(1234)
-        model_parallel_cuda_manual_seed(1234)
+        model_parallel_cuda_manual_seed(1234, pg_collection=pg_collection)
 
         model = build_model(pg_collection).cuda()
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
