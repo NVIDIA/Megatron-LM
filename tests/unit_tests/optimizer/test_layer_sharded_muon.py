@@ -478,6 +478,11 @@ _PARITY_CASES = {
     "uneven_homes": dict(rows=4, Q=8, N=3, momentum=0.95, nesterov=True, homes="uneven"),
     "no_homes_fallback": dict(rows=16, Q=24, N=3, momentum=0.95, nesterov=False, homes=None),
     "gtp_padding": dict(rows=4, Q=24, N=1, momentum=0.95, nesterov=False, homes="even", pad=3),
+    # A wide matrix on the fallback with distributed_reshard_wide: the fallback is the only
+    # path the argument reaches, and it runs duplicated mode, so nothing changes.
+    "no_homes_wide_reshard": dict(
+        rows=4, Q=64, N=2, momentum=0.95, nesterov=False, homes=None, reshard=True
+    ),
 }
 
 
@@ -486,8 +491,9 @@ def test_step_matches_duplicated_mode(case):
     """Two steps of LayerShardedMuon equal all_gather + NS + reshard bitwise.
 
     Cases: even home assignment, uneven assignment (idle ranks), no homes at all (the
-    TensorParallelMuon fallback), and GTP alignment padding (stripped before NS, scale on
-    the true dims, restored before the reverse exchange).
+    TensorParallelMuon fallback, also with ``distributed_reshard_wide`` on a wide matrix), and
+    GTP alignment padding (stripped before NS, scale on the true dims, restored before the
+    reverse exchange).
     """
     c = _PARITY_CASES[case]
     _require_multi_rank()
@@ -509,7 +515,14 @@ def test_step_matches_duplicated_mode(case):
         if pad:
             p.pad_length = pad
     extra = {"pg_collection": _pg_stub(gtp_remat=_world())} if c["homes"] is None else {}
-    opt = _muon(params, momentum=momentum, nesterov=nesterov, gtp_remat_group=_world(), **extra)
+    opt = _muon(
+        params,
+        momentum=momentum,
+        nesterov=nesterov,
+        gtp_remat_group=_world(),
+        distributed_reshard_wide=c.get("reshard", False),
+        **extra,
+    )
     if c["homes"] == "even":
         opt.set_param_ns_homes({id(p): (i % S, 0) for i, p in enumerate(params)})
     elif c["homes"] == "uneven":
