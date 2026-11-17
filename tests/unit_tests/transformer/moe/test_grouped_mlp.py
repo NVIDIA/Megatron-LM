@@ -13,6 +13,7 @@ import torch.nn.functional as F
 import megatron.core.extensions.transformer_engine as te_extension
 import megatron.core.transformer.moe.experts as experts_module
 from megatron.core.activations import squared_relu
+from megatron.core.enums import Fp8Recipe
 from megatron.core.extensions import transformer_engine as te_ext
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.fusions.fused_bias_geglu import quick_gelu
@@ -20,6 +21,7 @@ from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_local_submodules,
     get_gpt_layer_with_transformer_engine_submodules,
 )
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe.experts import TEGroupedMLP
@@ -29,6 +31,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from megatron.training.arguments import _add_network_size_args, parse_args
 from megatron.training.initialize import _set_random_seed
+from tests.unit_tests.amax_reduction_group_utils import global_amax_groups
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -571,6 +574,8 @@ def _make_precision_fused_forward_module(monkeypatch, *, fc2_bias=False):
     module._with_fused_impl = True
     module._use_grouped_tensor = True
     module._fused_ops = None
+    # A precision override opens its autocast with the amax group of this collection.
+    module.pg_collection = ProcessGroupCollection()
     for name in ("fc1", "fc2"):
         linear = torch.nn.Linear(4, 4, bias=False)
         linear.use_bias = fc2_bias and name == "fc2"
@@ -680,6 +685,33 @@ def test_fused_forward_rereads_precision_for_train_eval_and_recompute(monkeypatc
         module._fused_forward(*args)
         assert state.calls[0].enabled is enabled and state.enabled is enabled
     assert state.builds == 1 and module._with_fused_impl is True
+
+
+@pytest.mark.skipif(not te_extension.HAVE_TE, reason="requires Transformer Engine")
+def test_fused_forward_reduces_amaxes_over_its_collection(monkeypatch):
+    """A quantized override reduces amaxes over the expert's collection, not the global grid."""
+    module, _ = _make_precision_fused_forward_module(monkeypatch)
+    amax_group = object()
+    module.pg_collection = ProcessGroupCollection(tp_dp_cp=amax_group)
+    groups = []
+
+    @contextmanager
+    def autocast(*, enabled, fp8_group=None, **kwargs):
+        groups.append(fp8_group)
+        yield
+
+    monkeypatch.setattr(te_extension, "fp8_autocast", autocast)
+    for linear in (module.linear_fc1, module.linear_fc2):
+        linear.te_quant_params = te_extension.TEQuantizationParams(
+            training_recipe=te_extension.TEQuantizationRecipe(
+                fp8_quantization_recipe=Fp8Recipe.tensorwise
+            ),
+            evaluation_recipe=None,
+        )
+
+    module._fused_forward(torch.zeros(2, 4), torch.tensor([1, 1]), torch.ones(2))
+
+    assert groups == [amax_group]
 
 
 def test_apply_bias_returns_input_unchanged_when_bias_is_none():
@@ -1847,7 +1879,7 @@ class TestTEGroupedMLP:
             requires_grad=True,
         )
         probs = torch.rand(hidden.size(0), device="cuda", dtype=torch.float32, requires_grad=True)
-        with get_fp8_context(config):
+        with get_fp8_context(config, pg_collection=global_amax_groups()):
             output, _ = experts(hidden, tokens_per_expert, probs)
         output.backward(torch.randn_like(output))
 
