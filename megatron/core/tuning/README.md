@@ -126,6 +126,13 @@ kernels alike; every choice is logged for the agreement check. Kernels are
 keyed by their qualified name (`cudnn.linear_attention.cutile.kernels.gdn.<kernel>`)
 and the launch's shape key, which carries no device. The scope prefix is `cudnn`.
 A cudnn-frontend without the hooks keeps its timed picks, with one warning.
+The packaged `sm103` table carries one wildcard entry per cuTile GDN and KDA
+kernel, the majority winner of a GB300 record sweep over eight shapes, two
+dtypes and three repeats, so a pinned run on GB300 never falls back to the
+first candidate (the fallback costs up to 28% on the GDN forward output kernel
+at 4k tokens). `sm100` has no cuTile entries yet: record one on a B200 and
+merge it. A shape-keyed entry from a user table takes precedence over the
+wildcard.
 
 ## Modes and precedence
 

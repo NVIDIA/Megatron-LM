@@ -258,3 +258,50 @@ def test_cutile_gdn_pinned_pick_replays(isolated_policy, monkeypatch, tmp_path):
         if "cudnn.linear_attention.cutile." in entry and value.endswith(";pinned")
     }
     assert {entry.split("|")[1] for entry in pinned} == recorded
+
+
+def test_cutile_packaged_table_pins_gdn_and_kda(isolated_policy, monkeypatch):
+    """The packaged table pins every cuTile GDN and KDA launch on this architecture with no user table:
+    ``on_miss="error"`` would raise on the first miss."""
+    la_ops = pytest.importorskip("cudnn.linear_attention.ops")
+    common = pytest.importorskip("cudnn.linear_attention.cutile.kernels.common")
+    if not all(hasattr(common, name) for name in ("select_hints", "record_hint")):
+        pytest.skip("cudnn-frontend without the cuTile autotune hooks (NVIDIA/cudnn-frontend#1735)")
+    from megatron.core.tuning import selection
+
+    if selection.arch_tag() != "sm103":
+        pytest.skip("packaged cuTile entries exist for sm103 only")
+    for name in ("select_hints", "record_hint"):
+        monkeypatch.setattr(common, name, None)
+    interception.install(AutotunePolicy(mode="pinned", on_miss="error"))
+    seeded()
+    T, H, K, V = 2048, 16, 128, 128
+    cu_seqlens = torch.tensor([0, T], device="cuda", dtype=torch.int32)
+
+    def leaves(gate_shape, beta_shape):
+        q, k, v = (
+            torch.randn(T, H, d, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+            for d in (K, K, V)
+        )
+        g = (-torch.nn.functional.softplus(torch.randn(*gate_shape, device="cuda"))).requires_grad_(
+            True
+        )
+        beta = torch.rand(*beta_shape, device="cuda").requires_grad_(True)
+        return q, k, v, g, beta
+
+    for name, op, shapes in (
+        ("gdn_cutile", la_ops.gated_delta_net, ((T, H), (T, H))),
+        ("kda_cutile", la_ops.kimi_delta_attention, ((T, H, K), (T, H))),
+    ):
+        common.launch_hint_cache.clear()
+        q, k, v, g, beta = leaves(*shapes)
+        o, state = op(q, k, v, g, beta, cu_seqlens, output_final_state=True, plan_name=name)
+        (o.float().sum() + state.float().sum()).backward()
+        torch.cuda.synchronize()
+    pinned = {
+        entry.split("|")[1]
+        for entry, value in interception.choice_log().items()
+        if "cudnn.linear_attention.cutile." in entry and value.endswith(";pinned")
+    }
+    assert pinned, "no cuTile launch was pinned from the packaged table"
+    assert all(".kernels.gdn." in k or ".kernels.kda." in k for k in pinned), pinned

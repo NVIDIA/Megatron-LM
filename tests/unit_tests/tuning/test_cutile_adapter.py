@@ -160,3 +160,40 @@ def test_reinstalling_auto_clears_the_hooks(isolated_policy, fake_common):
     assert fake_common.select_hints is cutile.select
     interception.install(AutotunePolicy(mode="auto"))
     assert fake_common.select_hints is None and fake_common.record_hint is None
+
+
+CUTILE_KERNELS = (
+    "chunk_bwd_kernel_dqkwg",
+    "chunk_bwd_kernel_dv_local",
+    "chunk_fwd_kernel_o",
+    "chunk_gated_delta_rule_bwd_kernel_dhu_blockdim64",
+    "chunk_gated_delta_rule_fwd_kernel_h_blockdim64",
+    "chunk_gated_delta_rule_fwd_kkt_solve_kernel",
+    "prepare_wy_repr_bwd_kernel",
+    "recompute_w_u_fwd_kernel",
+    "chunk_gla_fwd_kernel_o",
+    "chunk_kda_fwd_kernel_inter_diag_compute_solve",
+    "chunk_kda_fwd_kernel_inter_solve_fused",
+    "recompute_w_u_fwd_kda_kernel",
+)
+
+
+def test_packaged_sm103_table_covers_every_cutile_kernel():
+    """A pinned run on GB300 must never fall back to the first candidate: the packaged table carries a
+    wildcard launch hint for every cuTile GDN and KDA kernel the adapter can see."""
+    loaded = table.load("sm103", ())
+    missing = []
+    for name in CUTILE_KERNELS:
+        module = (
+            "kda"
+            if name.endswith("kda_kernel") or "kda" in name or name == "chunk_gla_fwd_kernel_o"
+            else "gdn"
+        )
+        entries = loaded.kernels.get(f"cudnn.linear_attention.cutile.kernels.{module}.{name}") or {}
+        hint = entries.get("*")
+        if not hint:
+            missing.append(name)
+            continue
+        assert set(hint) == {"num_worker_warps", "occupancy"}, (name, hint)
+        assert all(isinstance(v, int) and v > 0 for v in hint.values()), (name, hint)
+    assert not missing, f"sm103 table has no wildcard cuTile entry for: {missing}"
