@@ -23,6 +23,7 @@ from megatron.core.datasets.data_schedule_utils import (
 )
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import RerunDataIterator
+from megatron.core.utils import flatten_batch_for_packed_sequences
 from megatron.training.global_vars import unset_global_variables
 from tests.unit_tests.test_utilities import Utils
 
@@ -468,6 +469,33 @@ def test_scheduler_reroute_rejects_inconsistent_sample_keys():
             dp_group=group,
             dp_cp_group=group,
         )
+
+
+@pytest.mark.parametrize("metadata_only", [False, True])
+def test_flatten_packed_batch_preserves_logical_and_physical_boundaries(metadata_only):
+    # The middle document in sample 0 and last document in sample 1 have no
+    # valid rows but do occupy storage. Repeated final entries are collation.
+    batch = {
+        "cu_seqlens": torch.tensor([[0, 3, 3, 5, 5], [0, 1, 4, 4, 4]], dtype=torch.int32),
+        "cu_seqlens_padded": torch.tensor([[0, 4, 6, 8, 8], [0, 2, 6, 8, 8]], dtype=torch.int32),
+        "max_seqlen": torch.tensor([4, 4], dtype=torch.int32),
+        "dataset_id": torch.tensor([7, 8]),
+    }
+    token_fields = ("tokens", "labels", "loss_mask", "position_ids")
+    for key in token_fields:
+        batch[key] = None if metadata_only else torch.arange(16).reshape(2, 8)
+    dataset_id = batch["dataset_id"]
+
+    result = flatten_batch_for_packed_sequences(batch)
+
+    assert result["cu_seqlens"].tolist() == [[0, 3, 3, 5, 6, 9, 9]]
+    assert result["cu_seqlens_padded"].tolist() == [[0, 4, 6, 8, 10, 14, 16]]
+    assert result["dataset_id"] is dataset_id
+    assert result["max_seqlen"].tolist() == [4]
+    assert "padding_mask" not in result
+    if not metadata_only:
+        for key in token_fields:
+            torch.testing.assert_close(result[key], torch.arange(16).reshape(1, 16))
 
 
 class MockVariableLengthSequencePackingDataIterator:

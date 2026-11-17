@@ -428,6 +428,30 @@ def _roll_tensor_packed_seq(
 
     rolled_tensor.index_copy_(sequence_dim, first_ends, first_received)
     rolled_tensor.index_copy_(sequence_dim, second_ends, second_received)
+    if packed_seq_params.cu_seqlens_q_padded is not None:
+        # A left shift stops at each document's logical tail, even when its physical padding
+        # holds nonzero token IDs or embeddings. Map local rows to in-document positions: this
+        # rank holds the front chunk at ``rank * chunk`` and the mirrored back chunk.
+        cp_rank = cp_group.rank()
+        positions = torch.arange(
+            tensor.size(sequence_dim), device=tensor.device, dtype=local_boundaries.dtype
+        )
+        document_ids = torch.searchsorted(local_boundaries[1:], positions, right=True)
+        trailing = positions >= local_boundaries[-1]
+        document_ids.clamp_max_(len(local_lengths) - 1)
+        offsets = positions - local_boundaries[:-1].index_select(0, document_ids)
+        chunk = local_lengths.index_select(0, document_ids) // 2
+        physical_lengths = torch.diff(physical_cu_seqlens).long().index_select(0, document_ids)
+        logical_lengths = (
+            torch.diff(cu_seqlens.to(device=tensor.device)).long().index_select(0, document_ids)
+        )
+        document_positions = torch.where(
+            offsets < chunk,
+            cp_rank * chunk + offsets,
+            physical_lengths - (cp_rank + 1) * chunk + offsets - chunk,
+        )
+        invalid = (document_positions >= logical_lengths - 1) & ~trailing
+        rolled_tensor.masked_fill_(invalid.view(mask_shape), 0)
     rolled_sum = rolled_tensor.sum() if return_sum else None
     return rolled_tensor, rolled_sum
 

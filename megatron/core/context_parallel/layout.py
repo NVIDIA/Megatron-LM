@@ -353,7 +353,11 @@ def _build_thd_cp_layout_plan_from_rank_order_indices(
 
 
 def _build_thd_zigzag_metadata(
-    cu_seqlens: torch.Tensor, cu_seqlens_padded: torch.Tensor | None, cp_size: int, tp_size: int
+    cu_seqlens: torch.Tensor,
+    cu_seqlens_padded: torch.Tensor | None,
+    cp_size: int,
+    tp_size: int,
+    local_token_alignment: int = 1,
 ) -> _THDZigzagMetadata:
     """Build padded dual-chunk metadata without Transformer Engine helpers."""
     if cu_seqlens.ndim != 1 or cu_seqlens.numel() < 2:
@@ -380,10 +384,17 @@ def _build_thd_zigzag_metadata(
         torch.div(source_lengths + alignment - 1, alignment, rounding_mode="floor") * alignment
     )
 
+    if local_token_alignment <= 0:
+        raise ValueError(
+            f"local_token_alignment must be a positive integer, got {local_token_alignment}"
+        )
+
     # CP attention needs two equal chunks per CP rank. Pad each sequence to that granularity,
-    # then add only enough padding to the last sequence to split the batch evenly over TP.
+    # then pad the last sequence so every logical TP x CP rank receives an aligned number of
+    # physical rows (for example, 32 rows for MXFP8).
     local_target_token_count = torch.div(target_lengths.sum(), cp_size, rounding_mode="floor")
-    tp_padding = torch.remainder(-local_target_token_count, tp_size)
+    rank_alignment = tp_size * local_token_alignment
+    tp_padding = torch.remainder(-local_target_token_count, rank_alignment)
     target_lengths = target_lengths.clone()
     target_lengths[-1] += tp_padding * cp_size
     target_cu_seqlens = torch.cat(

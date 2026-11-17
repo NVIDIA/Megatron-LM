@@ -2394,8 +2394,7 @@ def get_batch_on_this_tp_rank(
             if has_cu_seqlens or dynamic_cp:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
-                if cp_size > 1:
-                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+                _broadcast_cu_seqlens(batch.get('cu_seqlens_padded'))
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
             if dynamic_cp:
@@ -2410,8 +2409,7 @@ def get_batch_on_this_tp_rank(
             if has_cu_seqlens:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
-                if cp_size > 1:
-                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+                _broadcast_cu_seqlens(batch.get('cu_seqlens_padded'))
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
 
@@ -2424,8 +2422,7 @@ def get_batch_on_this_tp_rank(
             if has_cu_seqlens:
                 _broadcast_cu_seqlens(batch['cu_seqlens'])
                 _broadcast(batch['max_seqlen'])
-                if cp_size > 1:
-                    _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+                _broadcast_cu_seqlens(batch.get('cu_seqlens_padded'))
             if create_attention_mask_in_dataloader:
                 _broadcast(batch['attention_mask'])
 
@@ -2439,8 +2436,7 @@ def get_batch_on_this_tp_rank(
 
             _broadcast_cu_seqlens(batch['cu_seqlens'])
             _broadcast(batch['max_seqlen'])
-            if cp_size > 1:
-                _broadcast_cu_seqlens(batch['cu_seqlens_padded'])
+            _broadcast_cu_seqlens(batch.get('cu_seqlens_padded'))
 
     else:
         if dynamic_cp:
@@ -2515,8 +2511,7 @@ def get_batch_on_this_tp_rank(
             if has_cu_seqlens or dynamic_cp:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
-                if cp_size > 1:
-                    cu_seqlens_padded = _broadcast_cu_seqlens()
+                cu_seqlens_padded = _broadcast_cu_seqlens()
             if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
             if dynamic_cp:
@@ -2531,8 +2526,7 @@ def get_batch_on_this_tp_rank(
             if has_cu_seqlens:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
-                if cp_size > 1:
-                    cu_seqlens_padded = _broadcast_cu_seqlens()
+                cu_seqlens_padded = _broadcast_cu_seqlens()
             if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
 
@@ -2545,8 +2539,7 @@ def get_batch_on_this_tp_rank(
             if has_cu_seqlens:
                 cu_seqlens = _broadcast_cu_seqlens()
                 _broadcast(max_seqlen)
-                if cp_size > 1:
-                    cu_seqlens_padded = _broadcast_cu_seqlens()
+                cu_seqlens_padded = _broadcast_cu_seqlens()
             if create_attention_mask_in_dataloader:
                 _broadcast(attention_mask)
 
@@ -2559,8 +2552,7 @@ def get_batch_on_this_tp_rank(
 
             cu_seqlens = _broadcast_cu_seqlens()
             _broadcast(max_seqlen)
-            if cp_size > 1:
-                cu_seqlens_padded = _broadcast_cu_seqlens()
+            cu_seqlens_padded = _broadcast_cu_seqlens()
 
         batch = {
             'tokens': tokens,
@@ -2703,7 +2695,9 @@ def _get_batch_on_this_cp_rank_per_sequence_balancing(
     return batch
 
 
-def _merge_cu_seqlens_across_micro_batch(cu_seqlens: torch.Tensor, seq_length: int) -> torch.Tensor:
+def _merge_cu_seqlens_across_micro_batch(
+    cu_seqlens: torch.Tensor, seq_length: int, cu_seqlens_padded: Optional[torch.Tensor] = None
+) -> torch.Tensor:
     """Merge per-sample cu_seqlens into one 1-D tensor for THD attention.
 
     When micro_batch_size > 1, the dataloader produces cu_seqlens with shape
@@ -2722,32 +2716,39 @@ def _merge_cu_seqlens_across_micro_batch(cu_seqlens: torch.Tensor, seq_length: i
             right-padded with extra copies of ``seq_length``.
         seq_length: per-sample sequence length used to compute offsets and
             to detect padding.
+        cu_seqlens_padded: physical per-sample boundaries when ``cu_seqlens``
+            holds logical (real) document lengths. Each logical row then keeps
+            as many entries as its physical row, and samples are offset by the
+            preceding samples' real token counts, so the merged lengths stay
+            real while ``cu_seqlens_padded`` carries the storage offsets.
 
     Returns:
         1-D int32 tensor of merged cumulative sequence lengths.
     """
+    boundaries = cu_seqlens if cu_seqlens_padded is None else cu_seqlens_padded
 
-    def _strip_padding(row):
+    def _strip_padding(row, boundary_row):
         """Return the valid prefix of a padded cu_seqlens row.
 
         Valid entries run from 0 up to and including the first occurrence
-        of ``seq_length``.  Any trailing copies of ``seq_length`` (padding
+        of ``seq_length`` in the physical row.  Any trailing entries (padding
         inserted by the dataset for uniform collation) are dropped.
         """
-        hits = (row == seq_length).nonzero(as_tuple=True)[0]
+        hits = (boundary_row == seq_length).nonzero(as_tuple=True)[0]
         if hits.numel() > 0:
             return row[: hits[0].item() + 1]
         return row
 
     micro_batch_size = cu_seqlens.shape[0]
     if micro_batch_size == 1:
-        return _strip_padding(cu_seqlens[0])
+        return _strip_padding(cu_seqlens[0], boundaries[0])
 
-    parts = [_strip_padding(cu_seqlens[0])]
+    parts = [_strip_padding(cu_seqlens[0], boundaries[0])]
+    offset = parts[0][-1] if cu_seqlens_padded is not None else seq_length
     for i in range(1, micro_batch_size):
-        offset = i * seq_length
-        valid = _strip_padding(cu_seqlens[i])
+        valid = _strip_padding(cu_seqlens[i], boundaries[i])
         parts.append(valid[1:] + offset)
+        offset = offset + (valid[-1] if cu_seqlens_padded is not None else seq_length)
     return torch.cat(parts)
 
 
@@ -2781,9 +2782,13 @@ def flatten_batch_for_packed_sequences(batch: Dict[str, Any]) -> Dict[str, Any]:
             seq_length = batch[key].shape[1]
             break
     if seq_length is None:
-        seq_length = cu_seqlens[0, -1].item()
+        # Metadata-only pipeline stages: the physical boundaries end at the sample length.
+        physical = batch.get('cu_seqlens_padded')
+        seq_length = (physical if physical is not None else cu_seqlens)[0, -1].item()
 
-    batch['cu_seqlens'] = _merge_cu_seqlens_across_micro_batch(cu_seqlens, seq_length).unsqueeze(0)
+    batch['cu_seqlens'] = _merge_cu_seqlens_across_micro_batch(
+        cu_seqlens, seq_length, cu_seqlens_padded=batch.get('cu_seqlens_padded')
+    ).unsqueeze(0)
     if batch.get('cu_seqlens_padded') is not None:
         batch['cu_seqlens_padded'] = _merge_cu_seqlens_across_micro_batch(
             batch['cu_seqlens_padded'], seq_length

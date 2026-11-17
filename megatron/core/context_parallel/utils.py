@@ -214,6 +214,8 @@ def get_batches_on_this_cp_rank(
     tp_group: torch.distributed.ProcessGroup | None = None,
     tp_cp_group: torch.distributed.ProcessGroup | None = None,
     tokens_per_sample: int | None = None,
+    local_token_alignment: int = 1,
+    preserve_logical_seqlens: bool = False,
 ) -> ContextParallelBatch:
     """Partition a batch and prepare metadata for the requested CP layouts.
 
@@ -229,8 +231,19 @@ def get_batches_on_this_cp_rank(
     activation-conversion plan. All other cases use the standard batch sharder.
 
     A ``None`` CP group represents a size-one CP domain and leaves sequence tensors unchanged.
+
+    Producers describe document-suffix padding with logical cumulative lengths and separate
+    physical offsets. ``preserve_logical_seqlens`` keeps the logical lengths in
+    ``cu_seqlens_q``/``cu_seqlens_kv`` for every layout, as simplified sparse attention and MTP
+    need. ``local_token_alignment`` pads the padded zigzag view so every TP x CP rank receives a
+    multiple of that many rows (for example, 32 for MXFP8).
     """
     from megatron.core.utils import _resolve_dynamic_cp_group_for_batch, get_batch_on_this_cp_rank
+
+    if local_token_alignment <= 0:
+        raise ValueError(
+            f"local_token_alignment must be a positive integer, got {local_token_alignment}"
+        )
 
     if dynamic_cp:
         # Resolve once before selecting layouts. In particular, CP size and the
@@ -259,7 +272,11 @@ def get_batches_on_this_cp_rank(
             cu_seqlens_padded = cu_seqlens_padded.squeeze(0)
         tp_size = tp_group.size() if sequence_parallel else 1
         zigzag_metadata = _build_thd_zigzag_metadata(
-            cu_seqlens, cu_seqlens_padded, cp_size, tp_size
+            cu_seqlens,
+            cu_seqlens_padded,
+            cp_size,
+            tp_size,
+            local_token_alignment=local_token_alignment,
         )
 
         batches_by_layout = {
@@ -284,7 +301,7 @@ def get_batches_on_this_cp_rank(
                 layout,
                 cp_size,
                 tokens_per_sample,
-                use_logical_qkv_seqlens=layout == "zigzag",
+                use_logical_qkv_seqlens=layout == "zigzag" or preserve_logical_seqlens,
                 pad_between_seqs=(zigzag_metadata.pad_between_seqs if layout == "zigzag" else None),
                 tp_cp_group=tp_cp_group if dynamic_cp else None,
             )
@@ -350,6 +367,7 @@ def get_batches_on_this_cp_rank(
             layout,
             cp_size,
             tokens_per_sample,
+            use_logical_qkv_seqlens=preserve_logical_seqlens,
             tp_cp_group=tp_cp_group if dynamic_cp else None,
         )
         for layout in requested_layouts

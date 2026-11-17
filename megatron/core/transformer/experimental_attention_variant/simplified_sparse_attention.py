@@ -23,8 +23,10 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import accepts_parameter
 
+from . import dsa_layout
 from .simplified_sparse_attention_cudnn import (
     bind_cudnn_sparse_attention,
+    build_attention_layout,
     run_dense_teacher,
     run_sparse_attention,
 )
@@ -120,10 +122,11 @@ class SimplifiedSparseIndexer(MegatronModule):
 
 
 class SimplifiedSparseAttentionCore(MegatronModule):
-    """Causal top-k sparse attention and its indexer objective.
+    """Causal top-k sparse attention and its indexer objective, with local or CP-sharded queries.
 
     With ``ssa_train_indexer_only`` (phase 1), a frozen dense attention teacher replaces sparse
-    attention and the indexer learns from it over every causal key.
+    attention and the indexer learns from it over every causal key. Packed THD input attends
+    within each document; context parallelism all-gathers keys in global order.
     """
 
     def __init__(
@@ -138,7 +141,10 @@ class SimplifiedSparseAttentionCore(MegatronModule):
     ) -> None:
         super().__init__(config=config)
         self.tp_group = pg_collection.tp
-        if attention_type != "self" or attn_mask_type != AttnMaskType.causal:
+        if attention_type != "self" or attn_mask_type not in (
+            AttnMaskType.causal,
+            AttnMaskType.padding_causal,
+        ):
             raise ValueError("Simplified sparse attention requires causal self-attention.")
         if (
             config.num_attention_heads not in (16, 32, 96)
@@ -165,8 +171,19 @@ class SimplifiedSparseAttentionCore(MegatronModule):
                 "Simplified sparse attention does not expose logits for QK clipping or logit "
                 "logging."
             )
-        if pg_collection.tp.size() != 1 or pg_collection.cp.size() != 1:
-            raise NotImplementedError("Simplified sparse attention currently requires TP1 and CP1.")
+        if pg_collection.tp is not None and pg_collection.tp.size() != 1:
+            raise NotImplementedError("Simplified sparse attention currently requires TP1.")
+        self.cp_group = pg_collection.cp
+        if (
+            self.cp_group is not None
+            and self.cp_group.size() > 1
+            and cp_comm_type is not None
+            and dsa_layout.normalize_cp_comm_type(cp_comm_type) != "allgather"
+        ):
+            raise NotImplementedError(
+                "Simplified sparse attention context parallelism uses all-gather."
+            )
+        self._unpacked_layout = None
         if softmax_scale is not None and not math.isclose(
             softmax_scale, 256**-0.5, rel_tol=0.0, abs_tol=1e-12
         ):
@@ -174,6 +191,40 @@ class SimplifiedSparseAttentionCore(MegatronModule):
         self.layer_number = layer_number
         self.kernels = bind_cudnn_sparse_attention(dense_teacher=config.ssa_train_indexer_only)
         self.indexer = SimplifiedSparseIndexer(config, pg_collection)
+
+    def _attention_layout(self, query: torch.Tensor, packed_seq_params: Optional[PackedSeqParams]):
+        """Return the row layout, cached per packed microbatch or per SBHD shape.
+
+        Packed metadata belongs to one microbatch and is reused by its layers and by
+        recomputation, so the layout and its global real-token count are cached on it. SBHD
+        input only needs a cache keyed by shape and device.
+        """
+        owner = packed_seq_params if packed_seq_params is not None else self
+        cache_name = (
+            "_ssa_attention_layout" if packed_seq_params is not None else "_unpacked_layout"
+        )
+        metadata = ()
+        if packed_seq_params is not None:
+            tensors = (
+                packed_seq_params.cu_seqlens_q,
+                packed_seq_params.cu_seqlens_kv,
+                packed_seq_params.cu_seqlens_q_padded,
+                packed_seq_params.cu_seqlens_kv_padded,
+            )
+            metadata = tuple(
+                (
+                    (id(tensor), 0 if torch.is_inference(tensor) else tensor._version)
+                    if tensor is not None
+                    else None
+                )
+                for tensor in tensors
+            ) + (packed_seq_params.max_seqlen_q,)
+        cache_key = (query.shape[0], query.device, id(self.cp_group), metadata)
+        cached = getattr(owner, cache_name, None)
+        if cached is None or cached[0] != cache_key:
+            cached = (cache_key, build_attention_layout(query, packed_seq_params, self.cp_group))
+            setattr(owner, cache_name, cached)
+        return cached[1]
 
     def forward(
         self,
@@ -192,12 +243,9 @@ class SimplifiedSparseAttentionCore(MegatronModule):
             raise NotImplementedError(
                 "Simplified sparse attention does not support custom masks or bias."
             )
-        if attn_mask_type not in (None, AttnMaskType.causal):
+        if attn_mask_type not in (None, AttnMaskType.causal, AttnMaskType.padding_causal):
             raise NotImplementedError("Simplified sparse attention requires causal attention.")
-        if packed_seq_params is not None:
-            raise NotImplementedError(
-                "Simplified sparse attention currently requires unpadded SBHD."
-            )
+        layout = self._attention_layout(query, packed_seq_params)
 
         train_indexer = self.training and torch.is_grad_enabled()
         loss_coeff = self.config.dsa_indexer_loss_coeff if train_indexer else 0.0
@@ -213,6 +261,8 @@ class SimplifiedSparseAttentionCore(MegatronModule):
                 key_indexer,
                 loss_coeff=loss_coeff,
                 calculate_per_token_loss=self.config.calculate_per_token_loss,
+                layout=layout,
+                cp_group=self.cp_group,
             )
         else:
             output, indexer_loss = run_sparse_attention(
@@ -225,11 +275,13 @@ class SimplifiedSparseAttentionCore(MegatronModule):
                 topk=self.config.dsa_indexer_topk,
                 loss_coeff=loss_coeff,
                 calculate_per_token_loss=self.config.calculate_per_token_loss,
+                layout=layout,
+                cp_group=self.cp_group,
             )
         if train_indexer:
             logged_loss = indexer_loss.detach()
             if self.config.calculate_per_token_loss:
-                logged_loss = logged_loss / query.shape[0]
+                logged_loss = logged_loss / layout.num_real_tokens.squeeze()
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                 loss=logged_loss,
                 layer_number=self.layer_number,

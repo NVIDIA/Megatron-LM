@@ -615,6 +615,20 @@ def _sequence_parallel_tp_cp_group(
     return tp_cp_group
 
 
+def _preserves_logical_seqlens(config) -> bool:
+    """Simplified sparse attention keeps logical document ends beside physical offsets."""
+    return getattr(config, "experimental_attention_variant", None) == "ssa"
+
+
+def _local_token_alignment(config) -> int:
+    """Rows each CP rank's padded zigzag view must align to for the FP8 recipe."""
+    if not getattr(config, "fp8", None):
+        return 1
+    from megatron.core.fp8_utils import get_fp8_align_size
+
+    return get_fp8_align_size(config.fp8_recipe)
+
+
 def get_batch_on_this_rank_for_sequence_packing(
     data_iterator,
     vpp_size: Optional[int] = None,
@@ -627,6 +641,7 @@ def get_batch_on_this_rank_for_sequence_packing(
     dynamic_cp_group_func: Optional[Callable[..., torch.distributed.ProcessGroup]] = None,
     dynamic_tp_cp_group_func: Optional[Callable[..., torch.distributed.ProcessGroup]] = None,
     tp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
+    preserve_logical_seqlens: Optional[bool] = None,
 ):
     """
     Get a batch of data for sequence packing.
@@ -644,6 +659,9 @@ def get_batch_on_this_rank_for_sequence_packing(
             sequence parallelism. Defaults to ``pg_collection.tp_cp``.
         pg_collection (ProcessGroupCollection): Caller-owned parallel grid. Runtime groups
             default to its ``dynamic_cp`` and ``dynamic_tp_cp`` maps; callbacks may override them.
+        preserve_logical_seqlens (bool, optional): Keep logical document lengths in the
+            returned CP views' ``cu_seqlens_q``/``cu_seqlens_kv``, beside the physical offsets.
+            Defaults to True for simplified sparse attention.
     Returns:
         tuple of (tokens, labels, loss_mask, attention_mask, position_ids,
         packed_seq_params, padding_mask)
@@ -863,6 +881,12 @@ def get_batch_on_this_rank_for_sequence_packing(
                 tp_cp_group,
             ),
             tokens_per_sample=None,
+            local_token_alignment=_local_token_alignment(config),
+            preserve_logical_seqlens=(
+                _preserves_logical_seqlens(config)
+                if preserve_logical_seqlens is None
+                else preserve_logical_seqlens
+            ),
         )
 
         if getattr(config, "cuda_graph_thd_max_packed_sequences", None) is not None:

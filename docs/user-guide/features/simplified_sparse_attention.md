@@ -46,8 +46,9 @@ and `dsa_indexer_topk`, and phase 1 from a dense checkpoint keeps the requested 
 spec.
 
 `dsa_indexer_loss_coeff` scales both the auxiliary loss and its gradients and must
-be nonnegative. Mean-loss mode divides by the number of query tokens; per-token-loss
-mode leaves normalization to the training loop.
+be nonnegative. Mean-loss mode divides by the number of real query tokens across the
+context-parallel group; per-token-loss mode leaves normalization to the training loop.
+Storage padding contributes neither loss nor indexer gradients.
 
 Indexer gradients can be clipped separately from the backbone with
 `--ssa-separate-indexer-grad-clip`. The indexer then has its own L2 norm and
@@ -87,16 +88,38 @@ The current integration supports:
 
 | Property | Supported values |
 | --- | --- |
-| Layout | Unpadded SBHD, batch size 1 |
-| Parallel attention | Context parallel size 1, tensor model parallel size 1 |
+| Layout | SBHD with batch size 1, or packed THD |
+| Parallel attention | Context parallelism with zigzag token partitioning and all-gather communication; tensor model parallel size 1 |
 | Attention heads | 16, 32 or 96 query heads; one shared K/V head |
 | Attention head dimension | 256 |
 | Indexer | One learned Q/K head, dimension 128 |
 | Top-k | 512, 1024 or 2048 |
 | Kernel inputs | BF16 on SM100 or SM103 |
-| Mask | Causal self-attention without custom mask or bias |
+| Mask | Causal self-attention, per document for THD; no custom mask or bias |
 | QKV projection | Fused-norm `linear_qkv` (for example `TELayerNormColumnParallelLinear`) |
 
 Attention dropout, sliding-window attention, QK clipping, logit recording,
 decode caching and CUDA graph capture are not supported. Backward uses atomic
 accumulation, so deterministic mode is rejected.
+
+## Packed sequences and context parallelism
+
+Both training phases support context parallelism. Queries stay local, while keys,
+values and indexer keys are all-gathered into global sequence order. Backward
+reduce-scatters each rank's key, value and indexer-key gradients. Communication
+keeps the BF16 activation dtype.
+
+Packed inputs describe document boundaries through `PackedSeqParams`: logical
+lengths (`cu_seqlens_q`) mark real tokens, and physical offsets
+(`cu_seqlens_q_padded`) describe storage, with padding at each document's suffix.
+SSA derives local query validity from them and caches it once per microbatch.
+Producers must keep both; with SSA, the dataset, the sequence-packing scheduler and
+the CP batch builder do so. A language-model loss mask cannot supply validity, since
+image or prompt tokens can be valid attention inputs without a language-model target.
+
+Packed-batch preparation aligns documents for zigzag CP and, under FP8, pads each
+rank's rows to the recipe's alignment (for example, 32 for MXFP8). In phase 1, each
+local query chunk attends to its own document's causal key prefix in the dense
+teacher. In phase 2, sparse selection stays within the same document and causal
+prefix. MTP shifts stop at real document ends, and MIMO keeps logical document
+lengths separate from padded storage offsets.

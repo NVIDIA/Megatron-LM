@@ -43,6 +43,7 @@ class TestPartitionConfig:
         assert cfg.cp_group is None
         assert cfg.tp_group is None
         assert cfg.max_seq_len == 512
+        assert cfg.pad_packed_documents is False
 
     def test_from_mp_config_kv_format_thd(self):
         mp = TransformerConfig(num_layers=1, hidden_size=64, num_attention_heads=4)
@@ -539,3 +540,126 @@ class TestPartitionAdapterRealDistributed:
         torch.testing.assert_close(
             out_loss_mask, _expected_cp_zigzag_shard(loss_mask, cp_size, cp_rank)
         )
+
+
+@pytest.mark.parametrize('cp_size,cp_rank', [(1, 0), (2, 0), (2, 1)])
+@pytest.mark.parametrize('metadata_only', [False, True])
+@pytest.mark.parametrize('source_padding', [False, True])
+def test_packed_partition_aligns_documents_and_preserves_input_validity(
+    monkeypatch, cp_size, cp_rank, metadata_only, source_padding
+):
+    monkeypatch.setattr(torch.distributed, 'get_world_size', lambda group: cp_size)
+    monkeypatch.setattr(torch.distributed, 'get_rank', lambda group: cp_rank)
+    adapter = PartitionAdapter(
+        PartitionConfig(
+            seq_parallel=False,
+            use_cp=cp_size > 1,
+            tp_comm_overlap=False,
+            max_seq_len=12,
+            cp_group=MagicMock(size=lambda: cp_size),
+            pad_packed_documents=True,
+        )
+    )
+    tokens = torch.arange(1, 13).view(1, -1)
+    loss_mask = torch.ones(1, 12)
+    loss_mask[0, 1] = 0  # A real image row, independently excluded from LM loss.
+    padding = torch.zeros(1, 12, dtype=torch.bool)
+    if source_padding:
+        padding[0, [4, 10, 11]] = True
+    packed_batch = adapter.partition(
+        embeddings=None if metadata_only else tokens.T.unsqueeze(-1).float().expand(-1, -1, 3),
+        input_ids=None if metadata_only else tokens,
+        position_ids=None if metadata_only else tokens,
+        labels=None if metadata_only else tokens,
+        loss_mask=None if metadata_only else loss_mask,
+        mtp_input_mask=None,
+        cu_seqlens=torch.tensor([[0, 4, 9]] if source_padding else [[0, 5, 12]], dtype=torch.int32),
+        cu_seqlens_padded=torch.tensor([[0, 5, 12]], dtype=torch.int32),
+        max_seqlen=torch.tensor([7], dtype=torch.int32),
+    )
+    packed = packed_batch.get_packed_seq_params()
+    batch = packed_batch.get_batch()
+    rows = (
+        list(range(12))
+        if cp_size == 1
+        else [[0, 1, None, None, 5, 6, 11, None], [2, 3, 4, None, 7, 8, 9, 10]][cp_rank]
+    )
+    assert batch.get('padding_mask') is None
+    assert packed.cu_seqlens_q.tolist() == ([0, 4, 9] if source_padding else [0, 5, 12])
+    if cp_size > 1:
+        assert packed.cu_seqlens_q_padded.tolist() == [0, 8, 16]
+    assert packed.total_tokens == (12 if cp_size == 1 else 16)
+    assert packed.cu_seqlens_q is packed.cu_seqlens_kv
+    assert (batch['decoder_input'] is None) == metadata_only
+    if not metadata_only:
+        expected_tokens = torch.tensor(
+            [0 if row is None or (cp_size > 1 and padding[0, row]) else row + 1 for row in rows]
+        )
+        torch.testing.assert_close(batch['tokens'].reshape(-1), expected_tokens)
+        torch.testing.assert_close(batch['decoder_input'][:, 0, 0], expected_tokens.float())
+        if cp_rank == 0:
+            assert batch['tokens'][0, 1] == 2 and batch['loss_mask'][0, 1] == 0
+
+
+@pytest.mark.parametrize('alignment', [1, 32])
+def test_packed_partition_uses_precision_alignment(monkeypatch, alignment):
+    monkeypatch.setattr(torch.distributed, 'get_world_size', lambda group: 2)
+    monkeypatch.setattr(torch.distributed, 'get_rank', lambda group: 0)
+    adapter = PartitionAdapter(
+        PartitionConfig(
+            seq_parallel=False,
+            use_cp=True,
+            tp_comm_overlap=False,
+            max_seq_len=12,
+            cp_group=MagicMock(size=lambda: 2),
+            local_token_alignment=alignment,
+            pad_packed_documents=True,
+        )
+    )
+    result = adapter.partition(
+        embeddings=None,
+        input_ids=None,
+        position_ids=None,
+        labels=None,
+        loss_mask=None,
+        mtp_input_mask=None,
+        cu_seqlens=torch.tensor([[0, 5, 12]], dtype=torch.int32),
+        max_seqlen=torch.tensor([7], dtype=torch.int32),
+    )
+    packed = result.get_packed_seq_params()
+    assert result.get_batch().get('padding_mask') is None
+    assert packed.total_tokens == (16 if alignment == 1 else 64)
+    assert packed.cu_seqlens_q.tolist() == [0, 5, 12]
+    assert packed.cu_seqlens_q_padded.tolist() == ([0, 8, 16] if alignment == 1 else [0, 8, 64])
+
+
+@pytest.mark.parametrize('ssa', [False, True])
+def test_cp1_packed_multiaxis_positions_preserve_axes_and_padding(ssa):
+    adapter = PartitionAdapter(
+        PartitionConfig(
+            seq_parallel=False,
+            use_cp=False,
+            tp_comm_overlap=False,
+            max_seq_len=8,
+            pad_packed_documents=ssa,
+        )
+    )
+    positions = torch.arange(24).reshape(3, 1, 8)
+    embeddings = torch.arange(32).reshape(8, 1, 4).float()
+    result = adapter.partition(
+        embeddings=embeddings,
+        input_ids=None,
+        position_ids=positions,
+        labels=None,
+        loss_mask=None,
+        mtp_input_mask=None,
+        cu_seqlens=torch.tensor([[0, 3, 5]], dtype=torch.int32),
+        cu_seqlens_padded=torch.tensor([[0, 4, 8]], dtype=torch.int32),
+        max_seqlen=torch.tensor([4], dtype=torch.int32),
+    )
+    torch.testing.assert_close(result.get_batch()['position_ids'], positions)
+    torch.testing.assert_close(result.get_batch()['decoder_input'], embeddings)
+    assert result.get_batch().get('padding_mask') is None
+    packed = result.get_packed_seq_params()
+    assert packed.cu_seqlens_q.tolist() == ([0, 3, 5] if ssa else [0, 4, 8])
+    assert packed.cu_seqlens_q_padded.tolist() == [0, 4, 8]

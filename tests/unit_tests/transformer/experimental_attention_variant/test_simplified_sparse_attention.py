@@ -11,8 +11,10 @@ import pytest
 import torch
 
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core.transformer.experimental_attention_variant import (
+    dsa_layout,
     simplified_sparse_attention,
     simplified_sparse_attention_cudnn,
 )
@@ -462,6 +464,182 @@ def test_core_indexer_only_training_uses_the_dense_teacher(monkeypatch):
     with torch.no_grad():
         core.eval()(query, key, value, None, indexer_input=hidden)
     assert seen == [0.1, 0.0] and len(logged) == 1
+
+
+def test_core_allows_cp1_without_an_explicit_group(monkeypatch):
+    monkeypatch.setattr(simplified_sparse_attention, "TELinear", _Linear)
+    monkeypatch.setattr(
+        simplified_sparse_attention,
+        "get_fp8_disabled_context",
+        lambda *args, **kwargs: nullcontext(),
+    )
+    monkeypatch.setattr(
+        simplified_sparse_attention, "bind_cudnn_sparse_attention", _bind_mock_kernels
+    )
+    core = simplified_sparse_attention.SimplifiedSparseAttentionCore(
+        _config(hidden_size=16),
+        layer_number=1,
+        attn_mask_type=AttnMaskType.causal,
+        attention_type="self",
+        pg_collection=SimpleNamespace(tp=None, cp=None),
+    )
+    monkeypatch.setattr(simplified_sparse_attention, "run_sparse_attention", _fake_attention)
+    monkeypatch.setattr(
+        simplified_sparse_attention.DSAIndexerLossLoggingHelper,
+        "save_loss_to_tracker",
+        lambda **kw: None,
+    )
+    hidden = torch.randn(16, 1, 16, dtype=torch.bfloat16)
+    output = core(*_inputs()[:3], None, indexer_input=hidden)
+    assert output.shape == (16, 1, 4096)
+
+
+@pytest.mark.parametrize("cp_size", [2, 8, 64])
+@pytest.mark.parametrize(
+    "query_chunks,key_chunks",
+    [([1, 3], [1, 3]), ([0, 2, 0, 2, 0], [2, 0, 1, 1, 0]), ([1, 3], [2, 6]), ([0, 0], [0, 0])],
+)
+def test_complete_packed_cp_mapping_matches_generic(monkeypatch, cp_size, query_chunks, key_chunks):
+    """Direct mapping preserves empty documents, rectangular layouts and every owner."""
+    device = torch.device("cpu")
+    cu_q = torch.tensor([0] + query_chunks, dtype=torch.int32).cumsum(0) * (2 * cp_size)
+    cu_k = torch.tensor([0] + key_chunks, dtype=torch.int32).cumsum(0) * (2 * cp_size)
+    local_q, local_k = 2 * sum(query_chunks), 2 * sum(key_chunks)
+    build = dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder
+    gathered_keys = torch.cat(
+        [
+            dsa_layout.build_packed_allgather_cp_local_positions(
+                cu_k, cp_size, rank, device, local_k, cu_seqlens_cover_output=True
+            )
+            for rank in range(cp_size)
+        ]
+    )
+    for rank in range(cp_size):
+        sizes = dict(
+            local_output_size=local_q,
+            # SSA supplies only local_output_size for equal-sized Q/K.
+            key_local_output_size=None if local_q == local_k else local_k,
+            global_output_size=local_k * cp_size,
+        )
+        expected = build(cu_q, cu_k, cp_size, rank, device, **sizes)
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                dsa_layout,
+                "build_packed_allgather_cp_local_positions",
+                lambda *args, **kwargs: pytest.fail("Complete mapping used per-owner construction"),
+            )
+            actual = build(
+                cu_q,
+                cu_k,
+                cp_size,
+                rank,
+                device,
+                **sizes,
+                query_cu_seqlens_cover_output=True,
+                key_cu_seqlens_cover_output=True,
+            )
+        for result, reference in zip(actual, expected):
+            torch.testing.assert_close(result, reference, rtol=0, atol=0)
+            assert result.dtype == torch.int64 and result.is_contiguous()
+        torch.testing.assert_close(
+            gathered_keys.index_select(0, actual[1]), torch.arange(local_k * cp_size)
+        )
+
+
+def test_incomplete_packed_cp_mapping_keeps_padding_fallback(monkeypatch):
+    monkeypatch.setattr(
+        dsa_layout,
+        "_build_complete_packed_cp_positions_and_reorder",
+        lambda *args, **kwargs: pytest.fail("Incomplete metadata used complete mapping"),
+    )
+    cu = torch.tensor([0, 4, 12], dtype=torch.int32)
+    positions, reorder = dsa_layout.build_packed_allgather_cp_query_positions_and_key_reorder(
+        cu, cu, 2, 0, torch.device("cpu"), local_output_size=8, global_output_size=16
+    )
+    torch.testing.assert_close(positions, torch.tensor([0, 3, 4, 5, 10, 11, 12, 13]))
+    gathered = torch.tensor([0, 3, 4, 5, 10, 11, 12, 13, 1, 2, 6, 7, 8, 9, 20, 21])
+    torch.testing.assert_close(gathered[reorder], torch.tensor(list(range(14)) + [20, 21]))
+
+
+def test_packed_cp_layout_uses_changed_physical_boundaries_and_logical_lengths(monkeypatch):
+    group = SimpleNamespace(size=lambda: 2, rank=lambda: 1)
+    physical = torch.tensor([0, 4, 16], dtype=torch.int32)
+    logical = torch.tensor([0, 2, 10], dtype=torch.int32)
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=logical,
+        cu_seqlens_kv=logical,
+        cu_seqlens_q_padded=physical,
+        cu_seqlens_kv_padded=physical,
+        max_seqlen_q=12,
+    )
+    monkeypatch.setattr(torch.distributed, "all_reduce", lambda tensor, **kwargs: tensor.fill_(10))
+    query = torch.empty(8, 1, 1, 1)
+    for boundaries, starts, positions, valid in (
+        (
+            [0, 4, 16],
+            [0, 0, 4, 4, 4, 4, 4, 4],
+            [1, 2, 7, 8, 9, 10, 11, 12],
+            [True, False, True, True, True, True, True, False],
+        ),
+        (
+            [0, 8, 16],
+            [0, 0, 0, 0, 8, 8, 8, 8],
+            [2, 3, 4, 5, 10, 11, 12, 13],
+            [False, False, False, False, True, True, True, True],
+        ),
+    ):
+        physical.copy_(torch.tensor(boundaries, dtype=torch.int32))
+        layout = simplified_sparse_attention_cudnn.build_attention_layout(query, params, group)
+        torch.testing.assert_close(layout.key_starts, torch.tensor(starts, dtype=torch.int32))
+        torch.testing.assert_close(layout.key_ends, torch.tensor(positions, dtype=torch.int32) + 1)
+        torch.testing.assert_close(layout.query_valid, torch.tensor(valid))
+        torch.testing.assert_close(layout.num_real_tokens, torch.tensor([10.0]))
+
+
+def test_core_reuses_packed_layout_between_layers_and_invalidates_changed_lengths(monkeypatch):
+    cores = [_mock_core(monkeypatch, per_token=True, layer_number=i + 1) for i in range(2)]
+    # Layers in a model share the same process-group object.
+    cores[1].cp_group = cores[0].cp_group
+    logical = torch.tensor([0, 13], dtype=torch.int32)
+    physical = torch.tensor([0, 16], dtype=torch.int32)
+    params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=logical,
+        cu_seqlens_kv=logical,
+        cu_seqlens_q_padded=physical,
+        cu_seqlens_kv_padded=physical,
+        max_seqlen_q=16,
+        max_seqlen_kv=16,
+    )
+    build = simplified_sparse_attention.build_attention_layout
+    builds, logged = [], []
+
+    def record_build(*args):
+        result = build(*args)
+        builds.append(result)
+        return result
+
+    monkeypatch.setattr(simplified_sparse_attention, "build_attention_layout", record_build)
+    monkeypatch.setattr(simplified_sparse_attention, "run_sparse_attention", _fake_attention)
+    monkeypatch.setattr(
+        simplified_sparse_attention.DSAIndexerLossLoggingHelper,
+        "save_loss_to_tracker",
+        lambda **kw: logged.append(kw["loss"]),
+    )
+    hidden = torch.randn(16, 1, 16, dtype=torch.bfloat16)
+    inputs = _inputs()[:3]
+    for core in cores:
+        core(*inputs, None, packed_seq_params=params, indexer_input=hidden)
+    assert len(builds) == 1
+    assert builds[0].num_real_tokens.item() == 13
+    qi, ki = cores[0].indexer(hidden)
+    expected_log = (qi.float().square().sum() + ki.float().square().sum()) * 0.1 / 13
+    torch.testing.assert_close(logged[0], expected_log)
+    logical[1] = 12
+    cores[0](*inputs, None, packed_seq_params=params, indexer_input=hidden)
+    assert len(builds) == 2
+    assert builds[-1].num_real_tokens.item() == 12
 
 
 @pytest.mark.launch_on_gb200
