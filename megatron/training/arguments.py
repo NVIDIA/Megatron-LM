@@ -1540,8 +1540,30 @@ def validate_args(args, defaults={}):
 
     # Per-document CP padding can change the physical microbatch length even
     # without a packing scheduler. Pipeline peers must exchange the actual shape.
-    if args.context_parallel_size > 1 and (args.sft or args.dataloader_inter_document_masking):
+    if (
+        args.pipeline_model_parallel_size > 1
+        and args.context_parallel_size > 1
+        and (args.sft or args.dataloader_inter_document_masking)
+    ):
         args.variable_seq_lengths = True
+
+    if (
+        args.num_experts is not None
+        and args.context_parallel_size > 1
+        and args.dataloader_inter_document_masking
+    ):
+        if args.moe_router_load_balancing_type == "quantile_balancing":
+            raise ValueError(
+                "Quantile balancing does not support the padding masks required by "
+                "--dataloader-inter-document-masking with context parallelism."
+            )
+        if args.moe_token_dispatcher_type == "allgather":
+            raise ValueError(
+                "The allgather MoE token dispatcher does not support "
+                "--dataloader-inter-document-masking with context parallelism: "
+                "per-document padding can produce different token counts across "
+                "data-parallel ranks. Use the alltoall dispatcher instead."
+            )
 
     if args.sequence_packing_scheduler is not None:
         args.variable_seq_lengths = True

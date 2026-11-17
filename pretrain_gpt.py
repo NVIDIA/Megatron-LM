@@ -362,7 +362,8 @@ def forward_step(data_iterator, model: GPTModel, return_schedule_plan: bool = Fa
             padding_mask = padding_mask.chunk(config.tensor_model_parallel_size, dim=1)[
                 mpu.get_tensor_model_parallel_rank()
             ].contiguous()
-        if cu_seqlens is not None:
+        # Packing schedulers seed global iteration stats in train_step already.
+        if cu_seqlens is not None and config.sequence_packing_scheduler is None:
             update_seqlen_stats_from_cu_seqlens(cu_seqlens.squeeze(0))
 
         # Offline logits KD: record this microbatch's global (un-CP-sharded)

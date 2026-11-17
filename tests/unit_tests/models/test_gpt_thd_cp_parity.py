@@ -198,6 +198,7 @@ def _run_pretrain_gpt_forward(
             mtp_num_layers=1 if mtp else None,
             pipeline_model_parallel_layout=None,
             sequence_parallel=False,
+            sequence_packing_scheduler=None,
             tensor_model_parallel_size=1,
             virtual_pipeline_model_parallel_size=None,
         )

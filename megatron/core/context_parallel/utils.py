@@ -108,6 +108,7 @@ def _get_batch_on_this_cp_rank_padded_zigzag(
     cp_group: torch.distributed.ProcessGroup,
     rank_order_indices: torch.Tensor,
     target_cu_seqlens_padded: torch.Tensor,
+    pad_between_seqs: bool,
 ) -> Dict[str, Any]:
     """Build a packed zigzag shard padded for TE context-parallel attention."""
     cp_size = torch.distributed.get_world_size(cp_group)
@@ -143,7 +144,8 @@ def _get_batch_on_this_cp_rank_padded_zigzag(
             padding_shape = (1, -1, *((1,) * (tensor.dim() - 2)))
             fill_value = True if key == "padding_mask" else 0
             batch[key] = local_tensor.masked_fill(padding.view(padding_shape), fill_value)
-    if batch.get('padding_mask') is None:
+    # Preserve None for aligned inputs
+    if batch.get('padding_mask') is None and pad_between_seqs:
         batch['padding_mask'] = padding.unsqueeze(0)
     batch['cu_seqlens_padded'] = target_cu_seqlens_padded.unsqueeze(0)
     if batch.get('max_seqlen') is not None:
@@ -282,6 +284,7 @@ def get_batches_on_this_cp_rank(
                 cp_group=cp_group,
                 rank_order_indices=zigzag_metadata.rank_order_indices,
                 target_cu_seqlens_padded=zigzag_metadata.cu_seqlens_padded,
+                pad_between_seqs=zigzag_metadata.pad_between_seqs,
             )
         }
         if build_thd_plan:

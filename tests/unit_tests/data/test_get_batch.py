@@ -1863,6 +1863,87 @@ def test_padded_zigzag_constructs_padding_mask(metadata_only, cp_rank, expected_
     assert cp_batch.get_batch()["padding_mask"].dtype == torch.bool
 
 
+@pytest.mark.parametrize("metadata_only", [False, True], ids=["token-stage", "middle-stage"])
+def test_aligned_zigzag_keeps_padding_mask_none(metadata_only):
+    batch = {
+        "cu_seqlens": torch.tensor([[0, 4, 8]], dtype=torch.int32),
+        "max_seqlen": torch.tensor([4], dtype=torch.int32),
+    }
+    if not metadata_only:
+        batch["tokens"] = torch.arange(8).view(1, 8)
+
+    with (
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.get_rank", return_value=0),
+    ):
+        cp_batch = get_batches_on_this_cp_rank(
+            batch,
+            boundary_layout="zigzag",
+            dynamic_cp=False,
+            cp_group=MagicMock(),
+            use_per_sequence_balancing=True,
+        )
+
+    assert cp_batch.get_batch().get("padding_mask") is None
+    assert not cp_batch.get_packed_seq_params().pad_between_seqs
+    if not metadata_only:
+        torch.testing.assert_close(cp_batch.get_batch()["tokens"], torch.tensor([[0, 3, 4, 7]]))
+
+
+def test_aligned_zigzag_preserves_existing_padding_mask():
+    batch = {
+        "cu_seqlens": torch.tensor([[0, 4, 8]], dtype=torch.int32),
+        "max_seqlen": torch.tensor([4], dtype=torch.int32),
+        "padding_mask": torch.tensor([[False, False, False, True, False, False, False, True]]),
+    }
+    with (
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.distributed.get_rank", return_value=0),
+    ):
+        cp_batch = get_batches_on_this_cp_rank(
+            batch,
+            boundary_layout="zigzag",
+            dynamic_cp=False,
+            cp_group=MagicMock(),
+            use_per_sequence_balancing=True,
+        )
+
+    torch.testing.assert_close(
+        cp_batch.get_batch()["padding_mask"], torch.tensor([[False, True, False, True]])
+    )
+
+
+@pytest.mark.parametrize(
+    "scheduler, expected_updates",
+    [(None, 1), ("dp_balanced", 0)],
+    ids=["unscheduled", "scheduled"],
+)
+def test_forward_step_updates_sequence_stats_only_without_scheduler(scheduler, expected_updates):
+    initialize_test_environment(
+        tp_size=1, pp_size=1, cp_size=1, seq_length=8, micro_batch_size=1
+    )
+    try:
+        config = global_vars.get_run_config().model.transformer
+        config.sequence_packing_scheduler = scheduler
+        cp_batch = ContextParallelBatch.from_single_layout(
+            "zigzag", {"cu_seqlens": torch.tensor([[0, 3, 8]], dtype=torch.int32)}, None
+        )
+        model = MagicMock(vp_stage=None, pg_collection=object())
+        with (
+            patch.object(pretrain_gpt, "get_batch", return_value=cp_batch),
+            patch.object(pretrain_gpt, "update_seqlen_stats_from_cu_seqlens") as update_stats,
+        ):
+            pretrain_gpt.forward_step(None, model)
+
+        assert update_stats.call_count == expected_updates
+        if expected_updates:
+            torch.testing.assert_close(
+                update_stats.call_args.args[0], torch.tensor([0, 3, 8], dtype=torch.int32)
+            )
+    finally:
+        Utils.destroy_model_parallel()
+
+
 def test_padded_zigzag_keeps_original_sample_boundaries():
     # Three length-8 samples, each containing length-3 and length-5 documents.
     batch = {
