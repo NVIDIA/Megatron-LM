@@ -521,6 +521,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         # Batch-first shape of the padding_mask input reserved by the TE CUDA graph of this layer;
         # set in get_layer_static_inputs at capture, None when the graph has no such input.
         self._cuda_graph_padding_mask_shape: Optional[tuple[int, ...]] = None
+        # Link to the TE CUDA graph this layer shares with an adjacent Hybrid layer, set by
+        # TECudaGraphHelper with cuda_graph_pair_hybrid_layers; see _te_cuda_graph_replay_impl.
+        self._te_cuda_graph_pair_link = None
         if self.config.recompute_granularity == 'selective':
             assert self.config.recompute_modules is not None
             if "layernorm" in self.config.recompute_modules:
@@ -2129,24 +2132,36 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
 
     def _te_cuda_graph_replay_impl(self, args, kwargs, context):
         """Implementation of _te_cuda_graph_replay, separated for replay mode cleanup."""
-        # The graph only takes padding_mask when it was captured with that input; the eager MoE
-        # steps after the graph keep using the caller's mask from `kwargs`.
-        graph_kwargs = {
-            k: v for k, v in kwargs.items() if k not in ("padding_mask", "packed_seq_params")
-        }
         hidden_states = args[0]
-        graph_padding_mask = self._te_cuda_graph_padding_mask(
-            kwargs.get("padding_mask"), hidden_states.device
-        )
-        if graph_padding_mask is not None:
-            graph_kwargs["padding_mask"] = graph_padding_mask
-        cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **graph_kwargs))
+        pair_link = self._te_cuda_graph_pair_link
+        if pair_link is not None and pair_link.role == "partner":
+            # The mixer before this layer has replayed the graph that covers both layers.
+            cuda_graph_output = pair_link.pair.take_partner_outputs(hidden_states)
+        else:
+            # The graph only takes padding_mask when it was captured with that input; the eager
+            # MoE steps after the graph keep using the caller's mask from `kwargs`. A pair's mask
+            # input belongs to the router of its feed-forward layer.
+            graph_kwargs = {
+                k: v for k, v in kwargs.items() if k not in ("padding_mask", "packed_seq_params")
+            }
+            mask_layer = self if pair_link is None else pair_link.pair.partner
+            graph_padding_mask = mask_layer._te_cuda_graph_padding_mask(
+                kwargs.get("padding_mask"), hidden_states.device
+            )
+            if graph_padding_mask is not None:
+                graph_kwargs["padding_mask"] = graph_padding_mask
+            cuda_graph_output = list(super()._te_cuda_graph_replay(*args, **graph_kwargs))
 
         # Flush delayed offload groups from previous layers after graph replay.
         # The CPU is idle during the sync between graph replay and a2a comm,
         # so we use that time to execute the delayed offload operations.
         if self.config.delay_offload_until_cuda_graph:
             self.off_interface.flush_delayed_groups()
+
+        if pair_link is not None and pair_link.role == "mixer":
+            # The mixer's feed-forward branch is an identity, so its graph output is its layer
+            # output; the partner's graph outputs wait for the partner's call.
+            return pair_link.pair.stash_partner_outputs(cuda_graph_output), context
 
         if kwargs.get('context') is not None:
             context = cuda_graph_output.pop()

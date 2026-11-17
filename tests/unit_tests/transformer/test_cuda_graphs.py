@@ -2,14 +2,17 @@
 
 import gc
 import inspect
+import logging
 import os
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
-from transformer_engine.pytorch.fp8 import check_fp8_support
+from transformer_engine.pytorch.fp8 import check_fp8_support, check_mxfp8_support
 
 import megatron.core.transformer.cuda_graphs as cuda_graphs_module
+from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.enums import ModelType
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
@@ -23,13 +26,18 @@ from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.models.hybrid.hybrid_layer_allocation import validate_segment_layers
 from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
+from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     init_num_microbatches_calculator,
 )
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.pipeline_parallel.schedules import set_current_microbatch
+from megatron.core.pipeline_parallel.schedules import (
+    get_forward_backward_func,
+    set_current_microbatch,
+)
 from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.ssm.mlp_layer import MLPLayer
 from megatron.core.tensor_parallel.random import (
     HAVE_TE,
     CheckpointWithoutOutput,
@@ -42,6 +50,7 @@ from megatron.core.transformer.cuda_graphs import (
     _CudagraphGlobalRecord,
     _CudagraphReplayNode,
     _CudaGraphRunner,
+    _TECudaGraphLayerPair,
     create_cudagraphs,
     delete_cuda_graphs,
     is_graph_warmup,
@@ -55,10 +64,13 @@ from megatron.core.transformer.enums import (
 from megatron.core.transformer.mlp import MLPSubmodules
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.moe.fused_a2a import reset_hybrid_ep_buffer
+from megatron.core.transformer.moe.moe_logging import destroy_moe_metrics_tracker
+from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
 from megatron.core.transformer.spec_utils import ModuleSpec, get_submodules
 from megatron.core.transformer.transformer_block import TransformerBlock
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core.transformer.transformer_layer import MoETransformerLayer, TransformerLayer
+from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.core.utils import get_attr_wrapped_model, is_te_min_version
 from megatron.training import arguments as training_arguments
 from megatron.training.argument_utils import pretrain_cfg_container_from_args
@@ -78,6 +90,7 @@ from tests.unit_tests.test_utilities import (
 )
 
 fp8_available, _ = check_fp8_support()
+mxfp8_available, _ = check_mxfp8_support()
 
 
 def test_cuda_graph_runner_stream_pool_is_bounded(monkeypatch):
@@ -2240,6 +2253,670 @@ class TestPartialCudaGraph:
 
             nccl_ep_finalize()
         Utils.destroy_model_parallel()
+
+
+_PARTIAL_MOE_GRAPH_MODULES = [
+    CudaGraphModule.attn,
+    CudaGraphModule.moe_router,
+    CudaGraphModule.moe_preprocess,
+]
+
+
+def _hybrid_pair_forward_step(data_iterator, model):
+    """Forward step returning the LM loss averaged over the unpadded tokens."""
+    batch = next(data_iterator)
+    output = model(
+        input_ids=batch["input_ids"],
+        position_ids=batch["position_ids"],
+        attention_mask=None,
+        labels=batch["labels"],
+        padding_mask=batch["padding_mask"],
+    )
+
+    def loss_func(output_tensor):
+        loss = (output_tensor.float() * batch["loss_mask"]).sum() / batch["loss_mask"].sum()
+        return loss, {"loss": loss.detach().clone()}
+
+    return output, loss_func
+
+
+class TestHybridLayerPairCudaGraph:
+    """cuda_graph_pair_hybrid_layers graphs each Hybrid mixer with the MoE or MLP layer after it.
+
+    The GPU tests train one model twice in the same process, capturing TE graphs after an eager
+    iteration: first with per-layer graphs, then, after deleting them and restoring the initial
+    weights, with paired graphs. Deterministic kernels make the two runs comparable bit for bit.
+    Per-layer graphs leave Hybrid MTP blocks eager, and pairing graphs their layers, so models with
+    MTP also compare graphed with eager MTP layers.
+    """
+
+    seq_length = 128
+    micro_batch_size = 2
+    vocab_size = 256
+
+    def setup_method(self, method):
+        self.helpers = []
+        MTPLossLoggingHelper.reset_metrics_tracker()
+
+    def teardown_method(self, method):
+        for helper in self.helpers:
+            if helper.graphs_created():
+                helper.delete_cuda_graphs()
+        self.helpers = []
+        reset_hybrid_ep_buffer()
+        destroy_moe_metrics_tracker()
+        MTPLossLoggingHelper.reset_metrics_tracker()
+        destroy_num_microbatches_calculator()
+        Utils.destroy_model_parallel()
+        gc.collect()
+
+    @staticmethod
+    def _record_warnings(monkeypatch):
+        logged = []
+        monkeypatch.setattr(
+            cuda_graphs_module,
+            "log_single_rank",
+            lambda logger, level, msg, *args, **kwargs: logged.append((level, msg)),
+        )
+        return logged
+
+    @pytest.mark.parametrize(
+        "cuda_graph_impl,pair", [("transformer_engine", False), ("local", True), ("none", True)]
+    )
+    def test_pairing_needs_the_flag_and_te_graphs(self, monkeypatch, cuda_graph_impl, pair):
+        logged = self._record_warnings(monkeypatch)
+        config = _base_cuda_graph_config(
+            cuda_graph_impl=cuda_graph_impl, cuda_graph_pair_hybrid_layers=pair
+        )
+        assert not cuda_graphs_module._pair_hybrid_layers_enabled(config)
+        assert not logged
+
+    @pytest.mark.parametrize(
+        "feature,value",
+        [
+            ("overlap_moe_expert_parallel_comm", True),
+            ("delay_wgrad_compute", True),
+            ("fine_grained_activation_offloading", True),
+            ("sequence_packing_scheduler", "dp_balanced"),
+            ("enable_mhc_connections", True),
+            ("wide_residual", WideResidualConfig(num_streams=2)),
+            ("context_parallel_size", 2),
+        ],
+    )
+    def test_unsupported_feature_turns_pairing_off_with_a_warning(
+        self, monkeypatch, feature, value
+    ):
+        logged = self._record_warnings(monkeypatch)
+        config = _base_cuda_graph_config(
+            cuda_graph_impl="transformer_engine", cuda_graph_pair_hybrid_layers=True
+        )
+        assert cuda_graphs_module._pair_hybrid_layers_enabled(config)
+        # Set after construction: these features need more setup to validate, and the gate only
+        # reads the field.
+        setattr(config, feature, value)
+        assert not cuda_graphs_module._pair_hybrid_layers_enabled(config)
+        assert len(logged) == 1
+        level, msg = logged[0]
+        assert level == logging.WARNING and feature in msg
+
+    def _setup_parallel_state(self, monkeypatch, num_microbatches, **parallel_sizes):
+        """Initialize parallelism and return a counter of CUDA graph replays."""
+        # Required by deterministic_mode for TE attention.
+        monkeypatch.setenv("NVTE_ALLOW_NONDETERMINISTIC_ALGO", "0")
+        initialize_rng_tracker(use_te_rng_tracker=True, force_reset=True)
+        Utils.initialize_model_parallel(**parallel_sizes)
+        model_parallel_cuda_manual_seed(123)
+        # The MoE metrics tracker sizes its per-layer buffers at first use.
+        destroy_moe_metrics_tracker()
+        data_parallel_size = parallel_state.get_data_parallel_world_size()
+        destroy_num_microbatches_calculator()
+        init_num_microbatches_calculator(
+            rank=0,
+            global_batch_size=self.micro_batch_size * num_microbatches * data_parallel_size,
+            micro_batch_size=self.micro_batch_size,
+            data_parallel_size=data_parallel_size,
+        )
+        # A graphed callable replays one CUDA graph in forward and one in backward.
+        replays = [0]
+        replay = torch.cuda.CUDAGraph.replay
+
+        def counting_replay(graph):
+            replays[0] += 1
+            return replay(graph)
+
+        monkeypatch.setattr(torch.cuda.CUDAGraph, "replay", counting_replay)
+        return replays
+
+    def _config(self, pattern, cuda_graph_modules, **overrides):
+        config_kwargs = dict(
+            # Decoder layers only: HybridModel takes the MTP depths from the "/" sections.
+            num_layers=len(pattern.split("/")[0].replace("|", "")),
+            hidden_size=128,
+            num_attention_heads=4,
+            num_query_groups=2,
+            kv_channels=32,
+            ffn_hidden_size=256,
+            normalization="RMSNorm",
+            gated_linear_unit=True,
+            activation_func=torch.nn.functional.silu,
+            add_bias_linear=False,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+            pipeline_dtype=torch.bfloat16,
+            pipeline_model_parallel_size=parallel_state.get_pipeline_model_parallel_world_size(),
+            virtual_pipeline_model_parallel_size=(
+                parallel_state.get_virtual_pipeline_model_parallel_world_size()
+            ),
+            linear_conv_kernel_dim=4,
+            linear_key_head_dim=32,
+            linear_value_head_dim=32,
+            linear_num_key_heads=2,
+            linear_num_value_heads=4,
+            is_hybrid_model=True,
+            use_te_rng_tracker=True,
+            # Deterministic kernels make the paired and per-layer runs comparable bit for bit.
+            deterministic_mode=True,
+            gdn_kernel_backend="torch",
+            cuda_graph_impl="transformer_engine",
+            cuda_graph_modules=cuda_graph_modules,
+            cuda_graph_warmup_steps=1,
+        )
+        if "E" in pattern:
+            config_kwargs.update(
+                num_moe_experts=4,
+                moe_ffn_hidden_size=128,
+                moe_shared_expert_intermediate_size=128,
+                moe_router_topk=2,
+                moe_router_dtype="fp32",
+                moe_router_load_balancing_type="aux_loss",
+                moe_aux_loss_coeff=1e-2,
+                moe_grouped_gemm=True,
+                moe_permute_fusion=True,
+                moe_token_dispatcher_type="alltoall",
+            )
+        config_kwargs.update(overrides)
+        return TransformerConfig(**config_kwargs)
+
+    def _build_models(self, config, pattern):
+        """Build one DDP-wrapped HybridModel per virtual pipeline stage of this rank."""
+        vpp_size = parallel_state.get_virtual_pipeline_model_parallel_world_size()
+        models = []
+        for vp_stage in range(vpp_size) if vpp_size else [None]:
+            model = HybridModel(
+                config=config,
+                hybrid_stack_spec=hybrid_stack_spec,
+                vocab_size=self.vocab_size,
+                max_sequence_length=self.seq_length,
+                hybrid_layer_pattern=pattern,
+                pre_process=parallel_state.is_pipeline_first_stage(
+                    ignore_virtual=False, vp_stage=vp_stage
+                ),
+                post_process=parallel_state.is_pipeline_last_stage(
+                    ignore_virtual=False, vp_stage=vp_stage
+                ),
+                position_embedding_type="rope",
+                vp_stage=vp_stage,
+            ).cuda()
+            ddp_config = DistributedDataParallelConfig(grad_reduce_in_fp32=True)
+            models.append(DistributedDataParallel(config, ddp_config, model))
+        return models
+
+    def _batches(self, num_microbatches, padding):
+        generator = torch.Generator(device="cuda").manual_seed(7)
+        batches = []
+        for _ in range(num_microbatches):
+            tokens = torch.randint(
+                0,
+                self.vocab_size,
+                (self.micro_batch_size, self.seq_length + 1),
+                device="cuda",
+                generator=generator,
+            )
+            padding_mask = torch.zeros(
+                self.micro_batch_size, self.seq_length, dtype=torch.bool, device="cuda"
+            )
+            if padding:
+                padding_mask[-1, self.seq_length // 2 :] = True
+            batches.append(
+                {
+                    "input_ids": tokens[:, :-1].contiguous(),
+                    "labels": tokens[:, 1:].contiguous(),
+                    "position_ids": torch.arange(self.seq_length, device="cuda").repeat(
+                        self.micro_batch_size, 1
+                    ),
+                    "padding_mask": padding_mask if padding else None,
+                    "loss_mask": (~padding_mask).float(),
+                }
+            )
+        return batches
+
+    @staticmethod
+    def _named_parameters(models):
+        for chunk, model in enumerate(models):
+            for name, param in model.module.named_parameters():
+                yield f"{chunk}.{name}", param
+
+    def _forward_backward(self, models, batches, forward_only=False):
+        iterators = [iter(batches) for _ in models]
+        losses = get_forward_backward_func()(
+            forward_step_func=_hybrid_pair_forward_step,
+            data_iterator=iterators if len(iterators) > 1 else iterators[0],
+            model=models,
+            num_microbatches=len(batches),
+            seq_length=self.seq_length,
+            micro_batch_size=self.micro_batch_size,
+            forward_only=forward_only,
+        )
+        return [output["loss"] for output in losses]
+
+    def _train(self, models, config, batches, replays, pair):
+        """Run an eager iteration, capture TE graphs, then run two graphed iterations.
+
+        Each iteration ends with an SGD step. Returns the helper and, per iteration, the losses,
+        the MTP losses, the main_grad of every parameter and the number of graph replays.
+        """
+        config.cuda_graph_pair_hybrid_layers = pair
+        helper = TECudaGraphHelper(
+            model=models,
+            config=config,
+            seq_length=self.seq_length,
+            micro_batch_size=self.micro_batch_size,
+        )
+        self.helpers.append(helper)
+        record = {"loss": [], "mtp_loss": [], "grads": [], "replays": []}
+        for iteration in range(3):
+            if iteration == config.cuda_graph_warmup_steps:
+                helper.create_cudagraphs()
+                # TE wraps the __call__ of each captured class in an autocast while it captures. A
+                # wrapper left on a class would turn FP8/FP4 off in its layers that the capture did
+                # not graph on their own, such as paired feed-forward layers and eager MTP layers.
+                wrapped = [
+                    layer_class.__name__
+                    for layer_class in (
+                        TransformerLayer,
+                        MoETransformerLayer,
+                        MLPLayer,
+                        _TECudaGraphLayerPair,
+                    )
+                    if "__call__" in vars(layer_class)
+                ]
+                assert not wrapped, f"TE autocast wrappers left on {wrapped}"
+            for model in models:
+                model.zero_grad_buffer()
+            replays[0] = 0
+            record["loss"].append(self._forward_backward(models, batches))
+            record["replays"].append(replays[0])
+            # The MTP loss of each depth, summed over the microbatches (on the stage with MTP).
+            mtp_loss = MTPLossLoggingHelper.tracker.get("loss_values")
+            record["mtp_loss"].append(None if mtp_loss is None else mtp_loss.clone())
+            MTPLossLoggingHelper.clean_metrics_in_tracker()
+            record["grads"].append(
+                {name: param.main_grad.clone() for name, param in self._named_parameters(models)}
+            )
+            with torch.no_grad():
+                for _, param in self._named_parameters(models):
+                    param.add_(param.main_grad.to(param.dtype), alpha=-1e-2)
+        return helper, record
+
+    def _restore(self, models, params):
+        with torch.no_grad():
+            for name, param in self._named_parameters(models):
+                param.copy_(params[name])
+
+    @staticmethod
+    def _assert_bitwise_equal(paired, unpaired):
+        for iteration in range(len(unpaired["loss"])):
+            paired_losses, unpaired_losses = paired["loss"][iteration], unpaired["loss"][iteration]
+            assert len(paired_losses) == len(unpaired_losses)
+            for paired_loss, unpaired_loss in zip(paired_losses, unpaired_losses):
+                assert torch.equal(
+                    paired_loss, unpaired_loss
+                ), f"iteration {iteration}: loss {paired_loss.item()!r} != {unpaired_loss.item()!r}"
+            paired_mtp = paired["mtp_loss"][iteration]
+            unpaired_mtp = unpaired["mtp_loss"][iteration]
+            assert (paired_mtp is None) == (unpaired_mtp is None)
+            assert paired_mtp is None or torch.equal(
+                paired_mtp, unpaired_mtp
+            ), f"iteration {iteration}: MTP loss {paired_mtp.tolist()} != {unpaired_mtp.tolist()}"
+            paired_grads, unpaired_grads = paired["grads"][iteration], unpaired["grads"][iteration]
+            assert paired_grads.keys() == unpaired_grads.keys()
+            mismatched = [
+                name
+                for name, grad in paired_grads.items()
+                if not torch.equal(grad, unpaired_grads[name])
+            ]
+            assert not mismatched, f"iteration {iteration}: main_grad differs for {mismatched}"
+
+    def _eval_losses(self, models, batches, replays):
+        """Return the evaluation losses, checking that no CUDA graph replays."""
+        for model in models:
+            model.eval()
+        replays[0] = 0
+        with torch.no_grad():
+            losses = self._forward_backward(models, batches, forward_only=True)
+        assert replays[0] == 0
+        for model in models:
+            model.train()
+        return losses
+
+    def _assert_partner_needs_its_mixer(self, models, pair):
+        """A paired feed-forward layer replays only right after its mixer, on its output."""
+        hidden_states = torch.zeros(
+            self.seq_length,
+            self.micro_batch_size,
+            pair.mixer.config.hidden_size,
+            dtype=torch.bfloat16,
+            device="cuda",
+        )
+        rotary_pos_emb = models[0].module.rotary_pos_emb(self.seq_length)
+        with torch.no_grad():
+            with pytest.raises(RuntimeError, match="right after its mixer"):
+                pair.partner(hidden_states, attention_mask=None)
+            mixer_output, _ = pair.mixer(
+                hidden_states, attention_mask=None, rotary_pos_emb=rotary_pos_emb
+            )
+            with pytest.raises(RuntimeError, match="right after its mixer"):
+                pair.partner(mixer_output.clone(), attention_mask=None)
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
+    )
+    @pytest.mark.parametrize(
+        # expected_pairs: which callables of the paired run are pairs; None when all of them are.
+        "pattern,cuda_graph_modules,overrides,padding,expected_pairs",
+        [
+            pytest.param("GE*E", _PARTIAL_MOE_GRAPH_MODULES, {}, False, None, id="moe-router"),
+            pytest.param(
+                "*E*E", _PARTIAL_MOE_GRAPH_MODULES, {}, True, None, id="moe-router-padding"
+            ),
+            pytest.param(
+                "GE*E/*E", _PARTIAL_MOE_GRAPH_MODULES, {}, True, None, id="moe-router-mtp-padding"
+            ),
+            pytest.param(
+                "GE*E",
+                _PARTIAL_MOE_GRAPH_MODULES,
+                {"moe_token_dispatcher_type": "flex", "moe_flex_dispatcher_backend": "hybridep"},
+                True,
+                None,
+                id="moe-router-hybridep-padding",
+            ),
+            pytest.param(
+                "GE*E",
+                [CudaGraphModule.attn, CudaGraphModule.moe],
+                {"moe_expert_capacity_factor": 1.0, "moe_pad_expert_input_to_capacity": True},
+                False,
+                None,
+                id="moe-drop-and-pad",
+            ),
+            pytest.param(
+                "G-*-", [CudaGraphModule.attn, CudaGraphModule.mlp], {}, False, None, id="dense-mlp"
+            ),
+            pytest.param(
+                "GE*E/*E",
+                _PARTIAL_MOE_GRAPH_MODULES,
+                # MXFP8 needs GDN projection widths that are multiples of 32.
+                {"fp8": "e4m3", "fp8_recipe": "mxfp8", "linear_num_value_heads": 16},
+                False,
+                None,
+                id="moe-router-mtp-mxfp8",
+                marks=pytest.mark.launch_on_gb200,
+            ),
+            pytest.param(
+                "GE*EGE*E/*E",
+                _PARTIAL_MOE_GRAPH_MODULES,
+                {
+                    "fp8": "e4m3",
+                    "fp8_recipe": "mxfp8",
+                    "first_last_layers_bf16": True,
+                    "linear_num_value_heads": 16,
+                },
+                False,
+                # The BF16 first and last layers keep their own graphs, and so do their FP8
+                # neighbors, so one capture holds both pairs and single layers. The MTP layers,
+                # which run under the MTP block's FP8 setting, still pair.
+                [False, False, True, True, False, False, True],
+                id="moe-router-mtp-mxfp8-bf16-first-last-layers",
+                marks=pytest.mark.launch_on_gb200,
+            ),
+        ],
+    )
+    def test_paired_graphs_match_per_layer_graphs(
+        self, monkeypatch, pattern, cuda_graph_modules, overrides, padding, expected_pairs
+    ):
+        if overrides.get("moe_flex_dispatcher_backend") == "hybridep":
+            if not is_hybrid_ep_available():
+                pytest.skip("Hybrid EP is not available")
+            # Expert parallelism is 1: one rank per HybridEP NVLink domain.
+            monkeypatch.setenv("NUM_OF_HYBRID_EP_RANKS_PER_NVLINK_DOMAIN", "1")
+            monkeypatch.setenv("USE_MNNVL", "0")
+        if overrides.get("fp8_recipe") == "mxfp8" and not mxfp8_available:
+            pytest.skip("MXFP8 is not supported on this GPU")
+        replays = self._setup_parallel_state(monkeypatch, num_microbatches=1)
+        # As in training, keep autograd work off the default stream for TE graph capture.
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            config = self._config(pattern, cuda_graph_modules, **overrides)
+            models = self._build_models(config, pattern)
+            batches = self._batches(num_microbatches=1, padding=padding)
+            initial_params = {
+                name: param.detach().clone() for name, param in self._named_parameters(models)
+            }
+            parameter_names = list(initial_params)
+            state_dict_keys = list(models[0].state_dict())
+
+            unpaired_helper, unpaired = self._train(models, config, batches, replays, pair=False)
+            unpaired_eval_losses = self._eval_losses(models, batches, replays)
+            unpaired_helper.delete_cuda_graphs()
+
+            # Graph the same model again with pairing, from the same initial weights.
+            self._restore(models, initial_params)
+            paired_helper, paired = self._train(models, config, batches, replays, pair=True)
+
+            # Unless expected_pairs says otherwise, every mixer is paired with the layer after it:
+            # half the callables and replays. The layers of the MTP block, eager with per-layer
+            # graphs, form one more pair.
+            num_decoder_layers = len(pattern.split("/")[0])
+            num_layers = len(pattern.replace("/", ""))
+            if expected_pairs is None:
+                expected_pairs = [True] * (num_layers // 2)
+            paired_callables = paired_helper.flattened_callables
+            assert not any(
+                isinstance(c, _TECudaGraphLayerPair) for c in unpaired_helper.flattened_callables
+            )
+            assert len(unpaired_helper.flattened_callables) == num_decoder_layers
+            is_pair = [isinstance(c, _TECudaGraphLayerPair) for c in paired_callables]
+            assert is_pair == expected_pairs
+            assert sum(paired_helper.flattened_callables_is_mtp) == (
+                (num_layers - num_decoder_layers) // 2
+            )
+            # One forward and one backward replay per graphed callable.
+            assert unpaired["replays"] == [0, 2 * num_decoder_layers, 2 * num_decoder_layers]
+            assert paired["replays"] == [0, 2 * len(expected_pairs), 2 * len(expected_pairs)]
+            self._assert_bitwise_equal(paired, unpaired)
+            # The pairs are not part of the model.
+            assert [name for name, _ in self._named_parameters(models)] == parameter_names
+            assert list(models[0].state_dict()) == state_dict_keys
+            # Evaluation runs every layer eagerly.
+            paired_eval_losses = self._eval_losses(models, batches, replays)
+            assert torch.equal(torch.stack(paired_eval_losses), torch.stack(unpaired_eval_losses))
+
+            first_pair = next(c for c in paired_callables if isinstance(c, _TECudaGraphLayerPair))
+            self._assert_partner_needs_its_mixer(models, first_pair)
+            paired_helper.delete_cuda_graphs()
+            # A helper without pairing removes the links of the deleted pairs.
+            config.cuda_graph_pair_hybrid_layers = False
+            self.helpers.append(
+                TECudaGraphHelper(
+                    model=models,
+                    config=config,
+                    seq_length=self.seq_length,
+                    micro_batch_size=self.micro_batch_size,
+                )
+            )
+            decoder = get_attr_wrapped_model(models[0], "decoder")
+            mtp = getattr(models[0].module, "mtp", None)
+            mtp_layers = [
+                layer
+                for depth in getattr(mtp, "layers", ())
+                for layer in depth.mtp_model_layer.layers
+            ]
+            assert all(
+                layer._te_cuda_graph_pair_link is None for layer in [*decoder.layers, *mtp_layers]
+            )
+        torch.cuda.current_stream().wait_stream(stream)
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph UT support requires TransformerEngine version >= 2.10.0",
+    )
+    @pytest.mark.parametrize(
+        "vpp_size,pattern,expected_callables",
+        [
+            # Per pipeline rank: (per-layer, paired) graphed callables of each model chunk.
+            # Stage 0 holds "GE*" and stage 1 "EGE*E": pairs never cross the stage boundary.
+            pytest.param(None, "GE*|EGE*E", {0: ([3], [2]), 1: ([5], [3])}, id="pp2"),
+            # Stage 0 holds chunks "GE" and "EGE", stage 1 holds "*E*" and "*E".
+            pytest.param(
+                2, "GE|*E*|EGE|*E", {0: ([2, 3], [1, 2]), 1: ([3, 2], [2, 1])}, id="pp2-vpp2"
+            ),
+            # The last chunk also holds the MTP block "*E", which pairing graphs as one more pair.
+            pytest.param(
+                2, "GE|*E*|EGE|*E/*E", {0: ([2, 3], [1, 2]), 1: ([3, 2], [2, 2])}, id="pp2-vpp2-mtp"
+            ),
+        ],
+    )
+    def test_paired_graphs_match_per_layer_graphs_with_pipelining(
+        self, monkeypatch, vpp_size, pattern, expected_callables
+    ):
+        if Utils.world_size < 2 or Utils.world_size % 2:
+            pytest.skip("Pipeline parallelism of 2 needs an even number of ranks")
+        num_microbatches = 4
+        replays = self._setup_parallel_state(
+            monkeypatch,
+            num_microbatches,
+            pipeline_model_parallel_size=2,
+            virtual_pipeline_model_parallel_size=vpp_size,
+        )
+        unpaired_counts, paired_counts = expected_callables[
+            parallel_state.get_pipeline_model_parallel_rank()
+        ]
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            config = self._config(pattern, _PARTIAL_MOE_GRAPH_MODULES)
+            models = self._build_models(config, pattern)
+            batches = self._batches(num_microbatches, padding=False)
+            initial_params = {
+                name: param.detach().clone() for name, param in self._named_parameters(models)
+            }
+            unpaired_helper, unpaired = self._train(models, config, batches, replays, pair=False)
+            unpaired_helper.delete_cuda_graphs()
+            self._restore(models, initial_params)
+            paired_helper, paired = self._train(models, config, batches, replays, pair=True)
+
+            for helper, record, counts in (
+                (unpaired_helper, unpaired, unpaired_counts),
+                (paired_helper, paired, paired_counts),
+            ):
+                assert [len(callables) for callables in helper.callables_per_chunk] == counts
+                # One graph per callable and microbatch, each replayed in forward and backward.
+                assert record["replays"] == [0] + [2 * sum(counts) * num_microbatches] * 2
+            self._assert_bitwise_equal(paired, unpaired)
+            paired_helper.delete_cuda_graphs()
+        torch.cuda.current_stream().wait_stream(stream)
+
+    @pytest.mark.parametrize(
+        "pattern,overrides,expected_pairs,blocking_feature",
+        [
+            # The BF16 first and last layers split both decoder pairs, but every MTP layer runs
+            # under the MTP block's FP8 setting, so the MTP layers still pair.
+            pytest.param(
+                "GE*E/*E",
+                {
+                    "fp8": "e4m3",
+                    "fp8_recipe": "tensorwise",
+                    "first_last_layers_bf16": True,
+                    "num_layers_at_start_in_bf16": 1,
+                    "num_layers_at_end_in_bf16": 1,
+                    # FP8 needs GDN projection widths that are multiples of 16.
+                    "linear_num_value_heads": 16,
+                },
+                [False, False, False, False, True],
+                None,
+                id="fp8-bf16-first-last-layers",
+            ),
+            # TE graphs would capture the MTP layers in FP8.
+            pytest.param(
+                "GE*E/*E",
+                {
+                    "fp8": "e4m3",
+                    "fp8_recipe": "tensorwise",
+                    "keep_mtp_in_bf16": True,
+                    "linear_num_value_heads": 16,
+                },
+                [True, True],
+                "keep_mtp_in_bf16",
+                id="keep-mtp-in-bf16",
+            ),
+            # The MTP block runs once per depth, a graph holds the activations of one call.
+            pytest.param(
+                "GE*E/*E/*E",
+                {"mtp_use_repeated_layer": True},
+                [True, True],
+                "mtp_use_repeated_layer",
+                id="repeated-mtp-layer",
+            ),
+        ],
+    )
+    def test_which_hybrid_mtp_layers_are_graphed(
+        self, monkeypatch, pattern, overrides, expected_pairs, blocking_feature
+    ):
+        if "fp8" in overrides and not fp8_available:
+            pytest.skip("FP8 is not supported on this GPU")
+        self._setup_parallel_state(monkeypatch, num_microbatches=1)
+        config = self._config(
+            pattern, _PARTIAL_MOE_GRAPH_MODULES, cuda_graph_pair_hybrid_layers=True, **overrides
+        )
+        models = self._build_models(config, pattern)
+        logged = self._record_warnings(monkeypatch)
+        helper = TECudaGraphHelper(
+            model=models,
+            config=config,
+            seq_length=self.seq_length,
+            micro_batch_size=self.micro_batch_size,
+        )
+        self.helpers.append(helper)
+        callables = helper.flattened_callables
+        assert [isinstance(c, _TECudaGraphLayerPair) for c in callables] == expected_pairs
+        # The MTP block is graphed as one pair, or stays eager with a warning.
+        num_mtp_callables = 1 if blocking_feature is None else 0
+        assert helper.flattened_callables_is_mtp == (
+            [False] * (len(callables) - num_mtp_callables) + [True] * num_mtp_callables
+        )
+        if blocking_feature is None:
+            assert not logged
+        else:
+            assert len(logged) == 1 and blocking_feature in logged[0][1]
+
+    def test_set_current_microbatch_reaches_hybrid_mtp_layers_of_a_vlm(self):
+        """Graph replay selects the graph of each layer by its current_microbatch.
+
+        A VLM keeps its decoder and MTP block in its language model, and a Hybrid MTP block graphs
+        its layers one by one.
+        """
+        mtp_block = SimpleNamespace(layers=[SimpleNamespace(), SimpleNamespace()])
+        language_model = SimpleNamespace(
+            decoder=SimpleNamespace(layers=[SimpleNamespace()]),
+            mtp=SimpleNamespace(layers=[SimpleNamespace(mtp_model_layer=mtp_block)]),
+        )
+        vlm = SimpleNamespace(decoder=language_model.decoder, language_model=language_model)
+        set_current_microbatch(vlm, 3)
+        layers = [*language_model.decoder.layers, mtp_block, *mtp_block.layers]
+        assert [layer.current_microbatch for layer in layers] == [3] * len(layers)
 
 
 class _SimpleModule(MegatronModule):
