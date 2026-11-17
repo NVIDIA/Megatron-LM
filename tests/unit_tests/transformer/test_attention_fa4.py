@@ -13,7 +13,7 @@ the CI image installs the locked FA4 next to FA2 so that copy is the locked one.
 FA4 must also work with the Transformer Engine Megatron locks. TE before 2.21 passes FA4 the window
 (-1, 0) for causal masks, with -1 meaning unbounded; flash-attn-4 4.0.0b30 and later read -1 as a
 literal offset, so TE's FA4 backend returns zeros for causal attention. The lock keeps FA4 below
-4.0.0b30 until TE moves, and set_attention_backend refuses the pairing.
+4.0.0b30 until TE moves, and TEDotProductAttention refuses the pairing for causal layers.
 """
 
 import ast

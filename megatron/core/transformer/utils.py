@@ -15,7 +15,7 @@ from packaging.version import Version as PkgVersion
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedObject, ShardedStateDict, StateDict
 from megatron.core.jit import jit_fuser
-from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.utils import (
     get_pg_rank,
     get_te_version,
@@ -37,21 +37,34 @@ _TE_FA4_WINDOW_FIXED_VERSION = "2.21.0"
 _FA4_LITERAL_WINDOW_VERSION = "4.0.0b30"
 
 
-def _check_te_flash_attention_4_window(config: 'TransformerConfig') -> None:
-    """Refuse a Transformer Engine that would run causal attention on an FA4 it cannot drive.
+def check_te_flash_attention_4_window(
+    config: 'TransformerConfig', attn_mask_type: AttnMaskType, layer_number: int
+) -> None:
+    """Refuse a TE attention layer whose causal attention TE would run on an FA4 it cannot drive.
 
-    Runs once TE's attention-backend environment is set for the model. TE can select its
-    FlashAttention-4 backend when FlashAttention and its version 4 are enabled, on SM90 or newer.
+    TEDotProductAttention calls this as it is built, after set_attention_backend has set TE's
+    attention environment for the model. TE can select its FlashAttention-4 backend when
+    FlashAttention and its version 4 are enabled, on SM90 or newer. TE passes FlashAttention-4
+    the -1 left bound for a causal mask unless the layer has a sliding window with a bounded left
+    edge; other masks get (-1, -1), which FA4 reads as no window. A no_mask layer counts as
+    causal when config.window_size is set, because TEDotProductAttention._forward runs it as
+    causal_bottom_right for single-token decode.
     """
-    if config.transformer_impl == "local":
+    causal = "causal" in attn_mask_type.name or (
+        attn_mask_type == AttnMaskType.no_mask and config.window_size is not None
+    )
+    if not causal:
+        return
+    if (
+        is_layer_window_attention(config.window_size, config.window_attn_skip_freq, layer_number)
+        and config.window_size[0] >= 0
+    ):
         return
     if not int(os.getenv("NVTE_FLASH_ATTN", "1")) or not int(os.getenv("NVTE_FLASH_ATTN_V4", "1")):
         return
     if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9:
         return
-    from megatron.core.extensions.transformer_engine import HAVE_TE
-
-    if not HAVE_TE or get_te_version() >= PkgVersion(_TE_FA4_WINDOW_FIXED_VERSION):
+    if get_te_version() >= PkgVersion(_TE_FA4_WINDOW_FIXED_VERSION):
         return
     from megatron.core.transformer import attention
 
@@ -63,7 +76,8 @@ def _check_te_flash_attention_4_window(config: 'TransformerConfig') -> None:
         f"{fa4_version}: Transformer Engine before {_TE_FA4_WINDOW_FIXED_VERSION} passes "
         "FlashAttention-4 -1 for an unbounded window, which flash-attn-4 "
         f"{_FA4_LITERAL_WINDOW_VERSION} and later read as a literal offset, so causal attention "
-        "on its FlashAttention-4 backend would return zeros. Install flash-attn-4 "
+        f"on its FlashAttention-4 backend would return zeros (layer {layer_number}, "
+        f"{attn_mask_type.name} mask). Install flash-attn-4 "
         f">={attention._MIN_FA4_VERSION},<{_FA4_LITERAL_WINDOW_VERSION} (as Megatron's lock does) "
         f"or Transformer Engine >= {_TE_FA4_WINDOW_FIXED_VERSION}, or choose an attention backend "
         "that keeps Transformer Engine off FlashAttention-4 (attention_backend fused or unfused, "
@@ -123,8 +137,6 @@ def set_attention_backend(config: 'TransformerConfig') -> None:
                 int(version == config.flash_attention_version),
                 attention_backend,
             )
-
-    _check_te_flash_attention_4_window(config)
 
 
 def get_linear_layer(rows, columns, init_method, perform_initialization=True):
