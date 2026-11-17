@@ -671,7 +671,7 @@ class TestSequenceParallelMLALatentCache:
     tensor_parallel_size = 2
     prompt_len = 100
 
-    @pytest.fixture(scope='function', autouse=True)
+    @pytest.fixture(scope="function", autouse=True)
     def setup_and_teardown(self, linear_qkv_down_proj, kv_norm):
         Utils.initialize_model_parallel(self.tensor_parallel_size, 1)
         model_parallel_cuda_manual_seed(123)
