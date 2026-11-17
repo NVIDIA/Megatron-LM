@@ -24,9 +24,9 @@ class TestSamplingParams:
                 assert getattr(params, name) == value
 
     @pytest.mark.parametrize(
-        'given',
-        [{'temperature': 0.0}, {'temperature': 0.0, 'top_k': 20, 'top_p': 0.95}],
-        ids=['no-filters', 'model-card-filters'],
+        "given",
+        [{"temperature": 0.0}, {"temperature": 0.0, "top_k": 20, "top_p": 0.95}],
+        ids=["no-filters", "model-card-filters"],
     )
     def test_zero_temperature_is_greedy(self, given):
         # Greedy is top_k=1 (the lowest-index argmax) for every caller, not only the HTTP

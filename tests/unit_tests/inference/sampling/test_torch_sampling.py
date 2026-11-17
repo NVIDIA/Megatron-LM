@@ -115,7 +115,7 @@ def test_uniform_top_one_sampling_with_speculative_row_mapping():
 def test_temperature_scaling_runs_in_fp32(dtype):
     """The sampler scales fp32(logits) / T whatever the logits' dtype.
 
-    Logits reach the sampler in bf16 with CUDA graphs, PP > 1 or an unwrapped model. Divided in
+    Engine paths supply fp32 logits; direct callers can still pass bf16/fp16 logits. Divided in
     bf16, LM-head-like rows (max logit 15-30) at T = 0.7 move ~2% of the sampling mass.
     """
     generator = torch.Generator().manual_seed(0)
