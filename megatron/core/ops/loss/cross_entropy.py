@@ -5,6 +5,7 @@ from typing import Tuple
 import torch
 
 from megatron.core.parallel_state import get_tensor_model_parallel_group
+from megatron.core.process_groups_config import warn_global_process_group_fallback
 from megatron.core.tensor_parallel.utils import VocabUtility
 from megatron.core.utils import get_pg_rank, get_pg_size
 
@@ -159,6 +160,9 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         """Vocab parallel cross entropy forward function."""
 
         if tp_group is None:
+            warn_global_process_group_fallback(
+                "vocab_parallel_cross_entropy", "tp_group", deprecated_in="0.21", removed_in="0.23"
+            )
             tp_group = get_tensor_model_parallel_group()
 
         vocab_parallel_logits, logits_max = VocabParallelCrossEntropy.calculate_logits_max(
