@@ -8,4 +8,4 @@ auto-review:
 approval:
   enabled: true
   eligible_teams:
-    - automation
+    - ci
