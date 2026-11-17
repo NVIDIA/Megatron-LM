@@ -28,75 +28,9 @@ from megatron.core.transformer.experimental_attention_variant import (
     dsa_deepselect_topk,
 )
 from tests.unit_tests.transformer.experimental_attention_variant import dsa_cudnn_fe_fakes as fakes
-
-# CPU model of the cuDNN frontend radix top-k (frontend 1.31 signature): scores ranked by the
-# frontend's ordered radix key, random copies of the cutoff key, rows no longer than K return
-# ``0..len-1`` then ``-1``, and the output order shuffled (the kernel does not sort).
-_INT64_MAX = torch.iinfo(torch.int64).max
-
-
-def _radix_keys(scores: torch.Tensor, nan_mode: str) -> torch.Tensor:
-    """cuDNN ``to_ordered`` key for FP32 scores; smaller keys rank higher."""
-    bits = scores.contiguous().view(torch.int32).to(torch.int64) & 0xFFFFFFFF
-    keys = torch.where(bits >= 0x80000000, bits, (~bits) & 0x7FFFFFFF)
-    if nan_mode == "top":
-        # Another legal NaN placement: every NaN above every number (fp16 coarse bins).
-        keys = torch.where(torch.isnan(scores), torch.full_like(keys, -1), keys)
-    else:
-        assert nan_mode == "bits"
-    return keys
-
-
-class RadixTopK:
-    """CPU model of ``cudnn.DSA.indexer_top_k_wrapper`` (frontend 1.31 signature)."""
-
-    def __init__(self, seed: int = 0, nan_mode: str = "bits"):
-        self.generator = torch.Generator().manual_seed(seed)
-        self.nan_mode = nan_mode
-        self.calls = []
-
-    def indexer_top_k_wrapper(
-        self,
-        input_values,
-        seq_lens,
-        top_k,
-        next_n=1,
-        return_val=True,
-        num_copy_bits=256,
-        stream=None,
-        tie_break=0,
-    ):
-        assert next_n == 1 and tie_break in (0, 1)
-        self.calls.append(
-            {
-                "rows": input_values.size(0),
-                "tie_break": tie_break,
-                "val": return_val,
-                "offset_bytes": input_values.storage_offset() * input_values.element_size(),
-            }
-        )
-        n_rows, sk = input_values.shape
-        keys = _radix_keys(input_values, self.nan_mode)
-        if tie_break == 1:
-            tie_rank = torch.arange(sk, dtype=torch.int64).expand(n_rows, sk)
-        else:
-            tie_rank = torch.argsort(torch.rand((n_rows, sk), generator=self.generator), dim=1)
-        lengths = seq_lens.to(torch.int64).view(n_rows, 1)
-        columns = torch.arange(sk).view(1, sk)
-        composite = torch.where(columns < lengths, keys * sk + tie_rank, _INT64_MAX)
-        indices = torch.argsort(composite, dim=1)[:, :top_k].to(torch.int32)
-        shuffle = torch.argsort(torch.rand((n_rows, top_k), generator=self.generator), dim=1)
-        indices = torch.gather(indices, 1, shuffle)
-        trivial = lengths.view(n_rows) <= top_k
-        prefix = torch.arange(top_k, dtype=torch.int32).view(1, top_k)
-        prefix = torch.where(prefix < lengths, prefix, torch.full_like(prefix, -1))
-        indices = torch.where(trivial.view(n_rows, 1), prefix, indices)
-        values = None
-        if return_val:
-            values = torch.gather(input_values, 1, indices.clamp(min=0).to(torch.int64))
-            values = torch.where(indices >= 0, values, torch.full_like(values, float("-inf")))
-        return {"indices": indices, "values": values}
-
+from tests.unit_tests.transformer.experimental_attention_variant.test_dsa_cudnn_topk_deterministic import (  # noqa: E501
+    RadixTopK,
+)
 
 # Bound before tests patch the Tensor methods that synchronize with the host.
 _TOLIST = torch.Tensor.tolist
@@ -410,6 +344,7 @@ def _static(**overrides):
         topk_k=2048,
         dtype=torch.float32,
         device=torch.device("cpu"),
+        deterministic=False,
     )
     args.update(overrides)
     return dsa_deepselect_topk.static_fallback_reason(**args)
@@ -421,6 +356,7 @@ def test_static_eligibility_covers_every_requirement(deepselect, monkeypatch, pr
     assert _static() is None
     assert _static(width=2**23 - 1) is None
     assert _static(topk_k=4096) is None
+    assert "deterministic" in _static(deterministic=True)
     assert "top-k must be in" in _static(topk_k=4097)
     assert "top-k must be in" in _static(topk_k=0)
     assert "below 65536" in _static(width=65535)
@@ -584,11 +520,11 @@ def test_call_eligibility_checks_strides_and_lengths(deepselect):
     deepselect()
     buffer = torch.zeros((4, 512))
     lens = torch.full((4,), 100, dtype=torch.int32)
-    assert dsa_deepselect_topk.fallback_reason(buffer[:, :300], lens, 16) is None
-    assert "stride" in dsa_deepselect_topk.fallback_reason(buffer[:, ::2], lens, 16)
-    assert "stride" in dsa_deepselect_topk.fallback_reason(torch.zeros((4, 300)), lens, 16)
-    assert "one per row" in dsa_deepselect_topk.fallback_reason(buffer, lens[:3], 16)
-    assert "2-D" in dsa_deepselect_topk.fallback_reason(buffer.view(2, 2, 512), lens, 16)
+    assert dsa_deepselect_topk.fallback_reason(buffer[:, :300], lens, 16, False) is None
+    assert "stride" in dsa_deepselect_topk.fallback_reason(buffer[:, ::2], lens, 16, False)
+    assert "stride" in dsa_deepselect_topk.fallback_reason(torch.zeros((4, 300)), lens, 16, False)
+    assert "one per row" in dsa_deepselect_topk.fallback_reason(buffer, lens[:3], 16, False)
+    assert "2-D" in dsa_deepselect_topk.fallback_reason(buffer.view(2, 2, 512), lens, 16, False)
 
 
 def test_call_eligibility_checks_the_tma_start_address(deepselect, cudnn_topk):
@@ -598,7 +534,7 @@ def test_call_eligibility_checks_the_tma_start_address(deepselect, cudnn_topk):
     lens = torch.full((4,), 100, dtype=torch.int32)
     for offset, eligible in ((0, True), (4, True), (1, False), (2, False)):
         view = flat[offset : offset + 4 * 512].view(4, 512)
-        reason = dsa_deepselect_topk.fallback_reason(view, lens, 16)
+        reason = dsa_deepselect_topk.fallback_reason(view, lens, 16, False)
         assert (reason is None) is eligible, (offset, reason)
         if not eligible:
             assert reason == "score buffer must start at a 16-byte boundary"
@@ -662,13 +598,17 @@ def test_scratch_budget_never_chunks_deepselect(deepselect, cudnn_topk, monkeypa
 
 @pytest.mark.parametrize(
     "case",
-    ["narrow", "unaligned", "cudnn_backend", "no_pkg"],
+    ["deterministic_arg", "torch_deterministic", "narrow", "unaligned", "cudnn_backend", "no_pkg"],
 )
 def test_ineligible_calls_keep_the_cudnn_top_k(deepselect, cudnn_topk, monkeypatch, case):
     fake = deepselect()
     scores, seq_lens = _rows(3, n_rows=8, width=256)
     kwargs, backend = {}, "deepselect"
-    if case == "narrow":
+    if case == "deterministic_arg":
+        kwargs["deterministic"] = True
+    elif case == "torch_deterministic":
+        monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
+    elif case == "narrow":
         monkeypatch.setattr(dsa_deepselect_topk, "MIN_SCORE_WIDTH", _widths(257))
     elif case == "unaligned":
         scores, seq_lens = _rows(3, n_rows=8, width=200)
@@ -934,9 +874,11 @@ def test_backend_choice_is_logged_once_per_reason(deepselect, cudnn_topk, caplog
         for _ in range(3):
             _call(scores, seq_lens, 16, True)
             _call(narrow, narrow_lens, 8, True)
+            _call(scores, seq_lens, 16, True, deterministic=True)
     messages = [r.getMessage() for r in caplog.records]
     assert sum("uses DeepSelect" in m for m in messages) == 1
     assert sum("below 64" in m for m in messages) == 1
+    assert sum("deterministic mode" in m for m in messages) == 1
 
     caplog.clear()
     _no_build(monkeypatch, "no DeepSelect build: cannot import y")
@@ -1118,6 +1060,29 @@ def test_packed_thd_keeps_the_default_score_buffer_otherwise(
     _packed_topk(inputs, topk, dsa_cudnn_kernels.IndexerScorerOptions(topk_backend=backend))
 
     assert OutBindingFe131.outs == [None]
+
+
+def test_padded_buffer_is_not_requested_in_deterministic_mode(deepselect, out_frontend):
+    deepselect(input_align=256)
+    out_frontend()
+    kwargs = dsa_cudnn_kernels._deepselect_score_out_kwargs(
+        n_rows=8,
+        width=68,
+        topk_k=8,
+        device=torch.device("cpu"),
+        deterministic=True,
+        topk_backend="deepselect",
+    )
+    assert kwargs == {}
+    kwargs = dsa_cudnn_kernels._deepselect_score_out_kwargs(
+        n_rows=8,
+        width=68,
+        topk_k=8,
+        device=torch.device("cpu"),
+        deterministic=False,
+        topk_backend="deepselect",
+    )
+    assert kwargs["out"].shape == (8, 68) and kwargs["out"].stride() == (128, 1)
 
 
 # --------------------------------------------------------------------------------------- config
@@ -1423,9 +1388,9 @@ def test_bf16_call_eligibility_checks_the_byte_stride(deepselect):
     deepselect()
     lens = torch.full((4,), 100, dtype=torch.int32)
     padded = torch.zeros((4, 512), dtype=_BF16)
-    assert dsa_deepselect_topk.fallback_reason(padded[:, :300], lens, 16) is None
+    assert dsa_deepselect_topk.fallback_reason(padded[:, :300], lens, 16, False) is None
     assert "stride" in dsa_deepselect_topk.fallback_reason(
-        torch.zeros((4, 256), dtype=_BF16), lens, 16
+        torch.zeros((4, 256), dtype=_BF16), lens, 16, False
     )
 
 

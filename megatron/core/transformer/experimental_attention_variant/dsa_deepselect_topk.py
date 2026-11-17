@@ -48,12 +48,13 @@ none lay past a row's length; ``test_dsa_deepselect_topk_gpu.py`` checks BF16 ex
 well as at 128K and 1M. Correctness does not depend on these thresholds.
 
 :func:`deepselect_topk` keeps the cuDNN ``indexer_top_k_wrapper`` output contract of
-:func:`dsa_cudnn_kernels._indexer_top_k_wrapper_chunked`: int32
+:func:`dsa_cudnn_kernels._indexer_top_k_wrapper_chunked` in non-deterministic mode: int32
 ``[rows, K]`` indices in unspecified slot order, the selected scores in the scores' dtype (or
 ``None``), rows no longer than K gathered at the front of the row and padded with index ``-1``
 and value ``-inf``. Only the choice among equal scores at the cutoff may differ from cuDNN's, which
 is itself unspecified there. DeepSelect is deterministic run to run and does not depend on the
-other rows of the batch.
+other rows of the batch, but it does not keep the lowest-index ties, so deterministic mode
+never uses it.
 
 NaN: DeepSelect checks rows longer than K for NaN. Instead of trapping
 (``abort_when_nan_found=False``) it writes ``NAN_ROW_SENTINEL`` into slot 0 of such a row and
@@ -333,6 +334,7 @@ def static_fallback_reason(
     topk_k: int,
     dtype: torch.dtype,
     device: torch.device,
+    deterministic: bool,
 ) -> Optional[str]:
     """Why a top-k of this geometry cannot use DeepSelect, or ``None`` if it can.
 
@@ -341,6 +343,8 @@ def static_fallback_reason(
     double as the log-once key; :func:`log_topk_backend_once` also keys on the dtype, so FP32
     and BF16 calls log separately.
     """
+    if deterministic:
+        return "deterministic mode keeps the cuDNN tie_break=1 top-k"
     if not 0 < topk_k <= MAX_TOPK:
         return f"top-k must be in [1, {MAX_TOPK}]"
     if dtype not in SUPPORTED_DTYPES:
@@ -384,7 +388,9 @@ def static_fallback_reason(
     return None
 
 
-def fallback_reason(scores: Tensor, seq_lens: Tensor, topk_k: int) -> Optional[str]:
+def fallback_reason(
+    scores: Tensor, seq_lens: Tensor, topk_k: int, deterministic: bool
+) -> Optional[str]:
     """:func:`static_fallback_reason` plus the stride, address and length checks of a call."""
     if scores.ndim != 2:
         return "scores must be 2-D"
@@ -395,6 +401,7 @@ def fallback_reason(scores: Tensor, seq_lens: Tensor, topk_k: int) -> Optional[s
         topk_k=topk_k,
         dtype=scores.dtype,
         device=scores.device,
+        deterministic=deterministic,
     )
     if reason is not None:
         return reason

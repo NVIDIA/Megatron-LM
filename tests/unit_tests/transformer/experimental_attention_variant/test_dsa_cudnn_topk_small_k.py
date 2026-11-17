@@ -109,16 +109,17 @@ _SMALL_K = [
 
 @pytest.mark.parametrize("dtype, topk_k", _SMALL_K)
 @pytest.mark.parametrize("width", [5, 17, 130])
+@pytest.mark.parametrize("deterministic", [False, True], ids=["non_det", "det"])
 @pytest.mark.parametrize("return_topk_scores", [False, True], ids=["indices", "values"])
 def test_short_rows_skip_the_kernel_and_get_the_canonical_top_k(
-    kernel, monkeypatch, dtype, topk_k, width, return_topk_scores
+    kernel, monkeypatch, dtype, topk_k, width, deterministic, return_topk_scores
 ):
     if topk_k > width:
         pytest.skip("callers never ask for more than the row width")
     scores, seq_lens = _scores(width, dtype, seed=31 * width + topk_k)
     short = _short_rows(seq_lens, topk_k, dtype)
     assert bool(short.any())
-    kwargs = dict(return_topk_scores=return_topk_scores)
+    kwargs = dict(return_topk_scores=return_topk_scores, deterministic=deterministic)
 
     result = _run(scores, seq_lens, topk_k, **kwargs)
     (launched_k, launched_lens), *_ = kernel.launches
@@ -142,19 +143,21 @@ def test_short_rows_skip_the_kernel_and_get_the_canonical_top_k(
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
-def test_the_reliable_k_hands_the_kernel_every_row(kernel, dtype):
+@pytest.mark.parametrize("deterministic", [False, True], ids=["non_det", "det"])
+def test_the_reliable_k_hands_the_kernel_every_row(kernel, dtype, deterministic):
     scores, seq_lens = _scores(17, dtype, seed=7)
 
-    _run(scores, seq_lens, _MIN_K[dtype], return_topk_scores=False)
+    _run(scores, seq_lens, _MIN_K[dtype], return_topk_scores=False, deterministic=deterministic)
 
     assert [(k, lens.tolist()) for k, lens in kernel.launches] == [
         (_MIN_K[dtype], seq_lens.tolist())
     ]
 
 
-def test_short_rows_are_selected_across_kernel_row_chunks(kernel):
+@pytest.mark.parametrize("deterministic", [False, True], ids=["non_det", "det"])
+def test_short_rows_are_selected_across_kernel_row_chunks(kernel, deterministic):
     scores, seq_lens = _scores(130, torch.float32, seed=11)
-    kwargs = dict(return_topk_scores=True)
+    kwargs = dict(return_topk_scores=True, deterministic=deterministic)
     whole = _run(scores, seq_lens, 3, **kwargs)
     launches = len(kernel.launches)
 
@@ -166,8 +169,13 @@ def test_short_rows_are_selected_across_kernel_row_chunks(kernel):
     assert torch.equal(_bits(chunked["values"]), _bits(whole["values"]))
 
 
-def test_exact_small_topk_matches_the_reference():
+@pytest.mark.parametrize("budget_rows", [1, 3, 96])
+def test_exact_small_topk_matches_the_reference_in_row_chunks(monkeypatch, budget_rows):
     scores, seq_lens = _scores(130, torch.float32, seed=13)
+    bytes_per_row = 130 * (4 + 16) + 40 * 3
+    monkeypatch.setattr(
+        dsa_cudnn_kernels, "_DETERMINISTIC_TOPK_REPAIR_MAX_BYTES", budget_rows * bytes_per_row
+    )
 
     result = dsa_cudnn_kernels._exact_small_topk(
         scores, seq_lens, topk_k=3, return_topk_scores=True

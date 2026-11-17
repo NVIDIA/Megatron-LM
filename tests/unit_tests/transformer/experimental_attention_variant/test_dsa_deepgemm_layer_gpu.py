@@ -507,7 +507,7 @@ def test_checkpoint_replay_with_the_loss_reselects_or_reuses_the_same_keys(stash
         torch.manual_seed(1234)
         DSAIndexerLossAutoScaler.set_loss_scale(torch.ones((), device="cuda"))
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
-        config = reuse._make_config(tp=1, cp=1)
+        config = reuse._make_config(tp=1, cp=1, deterministic=False)
         _use_deepgemm(config)
         attention = reuse._make_attention(config, pg_collection)
         inputs = _alias_padded_cu_seqlens(reuse._make_inputs(config, tp_rank=0, cp_rank=0, cp=1))
@@ -555,7 +555,7 @@ def test_frozen_checkpoint_replay_reuses_the_first_call_indices(monkeypatch):
         model_parallel_cuda_manual_seed(1234)
         torch.manual_seed(1234)
         pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
-        config = reuse._make_config(tp=1, cp=1)
+        config = reuse._make_config(tp=1, cp=1, deterministic=False)
         config.dsa_indexer_loss_coeff = 0.0
         _use_deepgemm(config)
         attention = reuse._make_attention(config, pg_collection)
@@ -621,7 +621,7 @@ def test_deepgemm_layer_tracks_the_fe_mxfp8_scorer(layout, monkeypatch):
     layer_helpers._initialize_model_parallel(layout)
     try:
         _warm_up_this_rank(indexer_heads=32)
-        step, _scorer_spy = layer_helpers._build_step(layout, monkeypatch)
+        step, _scorer_spy = layer_helpers._build_step(layout, monkeypatch, deterministic=False)
         attention = step.args[0]
         if layout is _WIDE and dsa_deepselect_topk._load_provider() is not None:
             attention.config.dsa_indexer_topk_backend = "deepselect"
@@ -753,7 +753,7 @@ def test_graph_replay_with_the_prebuilt_layout_matches_eager(monkeypatch):
         failures.raise_on_any_rank("DeepGEMM warm-up")
         model_parallel_cuda_manual_seed(1234)
         torch.manual_seed(1234)
-        config = reuse._make_config(tp=1, cp=_GRAPH_CP)
+        config = reuse._make_config(tp=1, cp=_GRAPH_CP, deterministic=False)
         config.dsa_indexer_loss_coeff = 0.0  # frozen indexer: the replay needs the selection only
         _use_deepgemm(config)
         attention = reuse._make_attention(config, pg_collection)

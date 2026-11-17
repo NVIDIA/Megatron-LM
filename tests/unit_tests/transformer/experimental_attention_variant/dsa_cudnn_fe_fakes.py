@@ -114,8 +114,9 @@ def trust_stand_in_top_k_for_any_k(monkeypatch):
 
     Below ``_cudnn_topk_min_reliable_k`` the wrapper gives the kernel its short rows with
     length 0 and selects them in PyTorch. Tests of the call plumbing and of the post-processing
-    of raw top-k output (lengths, chunks, ``return_val``, crafted raw ids) that run small K on
-    CPU stand-ins call this so the stand-in still sees and decides every row. The guard itself is covered by ``test_dsa_cudnn_topk_small_k.py`` and its GPU
+    of raw top-k output (lengths, chunks, ``return_val``, crafted raw ids, deterministic repair)
+    that run small K on CPU stand-ins call this so the stand-in still sees and decides every
+    row. The guard itself is covered by ``test_dsa_cudnn_topk_small_k.py`` and its GPU
     counterpart.
     """
     from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_kernels

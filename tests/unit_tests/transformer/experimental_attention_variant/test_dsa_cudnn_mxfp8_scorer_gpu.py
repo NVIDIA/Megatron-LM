@@ -98,7 +98,7 @@ def _dense_reference(q, k, w):
         torch.backends.cuda.matmul.allow_tf32 = tf32
 
 
-def _score(q, k, w, layout, cp_size, cp_rank, topk, options):
+def _score(q, k, w, layout, cp_size, cp_rank, topk, options, deterministic=False):
     starts, ends, cu, max_seqlen = layout
     return dsa_cudnn_kernels._indexer_topk_bshd(
         q,
@@ -116,6 +116,7 @@ def _score(q, k, w, layout, cp_size, cp_rank, topk, options):
         packed_max_seqlen_k=max_seqlen,
         packed_cp_size=cp_size,
         local_packed_cp_rank=cp_rank,
+        deterministic=deterministic,
         scorer_options=options,
     )
 
@@ -221,6 +222,7 @@ def _sparse_loss(q, k, w, query, key, layout, cp_size, cp_rank, topk, precision)
     _starts, _ends, cu, max_seqlen = layout
     config = SimpleNamespace(
         kv_lora_rank=512,
+        deterministic_mode=False,
         dsa_indexer_precision=precision,
         dsa_indexer_skip_masked_score_fill=False,
     )
@@ -418,8 +420,7 @@ def test_mxfp8_loss_on_call_has_no_host_sync_and_replays_like_eager(heads, monke
     the eager call does, also after the inputs change in place. Like every cuDNN DSA kernel,
     the recompute compiles at its first eager call (one variant per top-k and head count), so
     the capture follows eager calls, as full-iteration graphs do after their warm-up steps.
-    The radix top-k fills its slots in an unspecified order, so each row is compared by key:
-    the selected indices sorted, with their scores."""
+    Deterministic top-k, so the slots compare bitwise."""
     _require_mxfp8()
     _require_recompute()
     # 128K CP32 rank 5: 4096 query rows over 131072 keys.
@@ -438,16 +439,9 @@ def test_mxfp8_loss_on_call_has_no_host_sync_and_replays_like_eager(heads, monke
     monkeypatch.setattr(dsa_cudnn_kernels, "_recompute_selected_indexer_log_probs", counting)
 
     def call():
-        return _score(*static, layout, 32, 5, _K, options)
-
-    def by_key(result):
-        indices, lengths, scores = result
-        key = torch.where(indices >= 0, indices, torch.iinfo(indices.dtype).max)
-        order = torch.sort(key, dim=-1).indices
-        return torch.gather(indices, -1, order), lengths, torch.gather(scores, -1, order)
+        return _score(*static, layout, 32, 5, _K, options, deterministic=True)
 
     def same(actual, expected):
-        actual, expected = by_key(actual), by_key(expected)
         assert torch.equal(actual[0], expected[0]) and torch.equal(actual[1], expected[1])
         torch.testing.assert_close(actual[2], expected[2], rtol=0, atol=1e-6)
 
@@ -540,3 +534,40 @@ def test_bshd_bottom_right_offsets_on_this_frontend():
     valid = torch.arange(sk, device="cuda").view(1, 1, sk) < limits
     torch.testing.assert_close(scores[valid], reference[valid], rtol=2e-2, atol=2e-2)
     assert torch.isneginf(scores[~valid]).all()
+
+
+@pytest.mark.parametrize("seq_lens, cp_size, cp_rank, max_num_seqs", LAYOUTS)
+def test_clean_logits_is_bitwise_identical(seq_lens, cp_size, cp_rank, max_num_seqs):
+    _cudnn_dsa_or_skip()
+    if not dsa_cudnn_kernels._supports_indexer_clean_logits():
+        pytest.skip("the installed cuDNN frontend has no clean_logits switch")
+    layout = fakes.packed_zigzag_layout(seq_lens, cp_size, cp_rank, max_num_seqs, device="cuda")
+    sq = layout[0].numel()
+    q, k, w = _inputs(sq, sq * cp_size, seed=17)
+    # Without deterministic mode the radix top-k writes its selection in an unspecified
+    # slot order, so even two prefilled runs differ slot by slot. Deterministic mode
+    # canonicalizes the selection, which makes a bitwise comparison meaningful.
+    filled = _score(
+        q,
+        k,
+        w,
+        layout,
+        cp_size,
+        cp_rank,
+        512,
+        dsa_cudnn_kernels.IndexerScorerOptions(),
+        deterministic=True,
+    )
+    skipped = _score(
+        q,
+        k,
+        w,
+        layout,
+        cp_size,
+        cp_rank,
+        512,
+        dsa_cudnn_kernels.IndexerScorerOptions(skip_masked_score_fill=True),
+        deterministic=True,
+    )
+    for expected, actual in zip(filled, skipped):
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)

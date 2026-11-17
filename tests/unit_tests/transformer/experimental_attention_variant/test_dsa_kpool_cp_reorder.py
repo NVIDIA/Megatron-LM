@@ -278,7 +278,7 @@ def _host_pos_emb_on_this_cp_rank(pos_emb, seq_dim, cp_group):
 
 
 def _real_kpool_config(
-    monkeypatch, scorer, cp_size, *, hf_scoring=False, **overrides
+    monkeypatch, scorer, cp_size, *, deterministic=False, hf_scoring=False, **overrides
 ):
     # The HF-scoring cases also keep the key dtype in the pooled keys (the other cases re-round
     # them to BF16), so a key the forward hands over in another dtype reaches the backend.
@@ -290,6 +290,7 @@ def _real_kpool_config(
         dsa_indexer_topk=REAL_TOPK,
         dsa_indexer_hf_scoring=hf_scoring,
         dsa_indexer_kpool_key_dtype_compression=hf_scoring,
+        deterministic_mode=deterministic,
         context_parallel_size=cp_size,
         cp_comm_type="allgather",
         **overrides,
@@ -359,6 +360,7 @@ def _real_kpool_layers(monkeypatch, cp_size, cp_rank, tp_group=None):
     # The backend's once-only log states: start clean, restored on teardown.
     monkeypatch.setattr(dsa_cudnn_kernels, "_KPOOL_DECLINES_LOGGED", set())
     monkeypatch.setattr(dsa_cudnn_kernels, "_KPOOL_FUSED_SELECTION_LOGGED", False)
+    monkeypatch.setattr(dsa_cudnn_kernels, "_DETERMINISTIC_TOPK_PATHS_LOGGED", set())
 
     seen = SimpleNamespace(kpool=[], dispatch=[], backend=[], torch_scorer=[])
     real_kpool = dsa_module.fused_qk_topk_kpool
@@ -375,8 +377,8 @@ def _real_kpool_layers(monkeypatch, cp_size, cp_rank, tp_group=None):
         seen.dispatch.append(result)
         return result
 
-    # The dispatch reads the backend's signature to decide whether to forward ``config``:
-    # functools.wraps keeps it. Binding the call fails on a keyword the
+    # The dispatch reads the backend's signature to decide whether to forward ``deterministic``
+    # and ``config``: functools.wraps keeps it. Binding the call fails on a keyword the
     # backend does not have and shows a keyword the dispatch dropped as its default.
     @functools.wraps(real_backend)
     def backend(*args, **kwargs):
@@ -445,19 +447,24 @@ def _describe(call):
 
 
 @pytest.mark.parametrize("hf_scoring", [False, True])
+@pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize(("cp_size", "cp_rank"), [(1, 0), (2, 1), (4, 0), (4, 2)])
 def test_cudnn_kpool_scorer_takes_the_real_forward_call(
-    monkeypatch, cp_size, cp_rank, hf_scoring
+    monkeypatch, cp_size, cp_rank, deterministic, hf_scoring
 ):
     """The real forward reaches the cuDNN KPool backend through the real dispatch.
 
     The backend takes the call for the tensors the forward and the real indexer produce,
-    with the layer's config, and the layer publishes the selection
+    with the layer's config and its deterministic flag, and the layer publishes the selection
     of the same layer with the ``'torch'`` scorer up to pools tying at the boundary.
     """
+    # Deterministic selection follows the config alone.
+    monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: False)
     run, seen = _real_kpool_layers(monkeypatch, cp_size, cp_rank)
     configs = {
-        scorer: _real_kpool_config(monkeypatch, scorer, cp_size, hf_scoring=hf_scoring)
+        scorer: _real_kpool_config(
+            monkeypatch, scorer, cp_size, deterministic=deterministic, hf_scoring=hf_scoring
+        )
         for scorer in ("torch", "cudnn")
     }
 
@@ -476,8 +483,9 @@ def test_cudnn_kpool_scorer_takes_the_real_forward_call(
     assert len(seen.torch_scorer) == 1, "the PyTorch scorer selected after the backend did"
     assert tuple(pools.shape) == (1, REAL_ROWS, REAL_TOPK // ks.POOL)
     assert fakes.Fe131DSA.calls, "the stand-in indexer kernel did not score"
-    # The dispatch forwards the layer's config.
+    # The dispatch forwards the layer's config and the deterministic flag of that config.
     assert call["config"] is configs["cudnn"]
+    assert call["deterministic"] is deterministic
     # The indexer's own projections, as production hands them over.
     assert call["q"].dtype == torch.bfloat16 and call["k_pooled"].dtype == torch.bfloat16
     assert call["weights"].dtype == (torch.float32 if hf_scoring else torch.bfloat16)
@@ -512,8 +520,9 @@ def test_cudnn_kpool_scorer_takes_the_real_forward_call(
         kpool_key_dtype_compression=kwargs["kpool_key_dtype_compression"],
     )
     assert differing <= REAL_ROWS // 16
-    # The slot order may differ (tied pools); the reference attention scatters the
-    # selection into a mask, so rows with the same pools must give bitwise-equal output.
+    # The slot order may differ (canonical order in deterministic mode, tied pools
+    # otherwise); the reference attention scatters the selection into a mask, so rows with
+    # the same pools must give bitwise-equal output.
     same = (reference.sort(dim=-1).values == candidate.sort(dim=-1).values).all(dim=-1)[0]
     assert int(same.sum()) == REAL_ROWS - differing
     assert torch.equal(reference_output[same], candidate_output[same])

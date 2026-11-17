@@ -11,13 +11,14 @@ columns past ``L``, in the next row or before the row's start (wrapped to 655xx 
 1.31, H100 and GB300). Below the guard the wrapper gives the kernel such rows with length 0 and
 selects them in PyTorch. On one SM90+ GPU with the installed frontend:
 
-* ``_indexer_top_k_wrapper_chunked`` below the guard selects a right top-k on every row: the
-  same scores as the canonical one (the ``min(K, selectable)`` best in-row scores, cutoff ties
-  by ascending index, ascending index order, ``-1`` / ``finfo.min`` padding) with distinct
-  in-row ids.
+* ``_indexer_top_k_wrapper_chunked`` below the guard selects a right top-k on every row: in
+  deterministic mode exactly the canonical one (the ``min(K, selectable)`` best in-row scores,
+  cutoff ties by ascending index, ascending index order, ``-1`` / ``finfo.min`` padding), and
+  otherwise the same scores as the canonical one with distinct in-row ids.
 * The raw kernel selects the right set for every ``top_k`` from the guard up, on rows that
   cover every (length, prologue) pair of short rows longer than ``top_k``, in its many-row and
-  few-row (at most 148 rows) compilations: what lets the guard stop there.
+  few-row (at most 148 rows) compilations and with ``tie_break=1``: what lets the guard stop
+  there.
 * The raw kernel's wrong rows below the guard are reported (``[topk-small-k]`` lines), not
   asserted, so the validation log records whether a frontend still has the defect.
 """
@@ -160,9 +161,10 @@ _BELOW_GUARD = [
 
 
 @pytest.mark.parametrize("dtype, topk_k, width", _BELOW_GUARD)
+@pytest.mark.parametrize("deterministic", [False, True], ids=["non_det", "det"])
 @pytest.mark.parametrize("few_rows", [False, True], ids=["many_rows", "few_rows"])
 def test_wrapper_selects_a_right_top_k_below_the_guard(
-    dtype, topk_k, width, few_rows
+    dtype, topk_k, width, deterministic, few_rows
 ):
     scores, seq_lens = _rows(
         width,
@@ -174,10 +176,14 @@ def test_wrapper_selects_a_right_top_k_below_the_guard(
     assert bool((seq_lens > topk_k).any())
 
     result = dsa_cudnn_kernels._indexer_top_k_wrapper_chunked(
-        scores, seq_lens, topk_k=topk_k, return_topk_scores=True
+        scores, seq_lens, topk_k=topk_k, return_topk_scores=True, deterministic=deterministic
     )
 
     _assert_a_right_top_k(result, scores, seq_lens, topk_k)
+    if deterministic:
+        expected_indices, expected_values = _canonical(scores, seq_lens, topk_k)
+        assert torch.equal(result["indices"], expected_indices)
+        assert torch.equal(result["values"], expected_values)
 
 
 _FROM_GUARD = [
@@ -192,13 +198,17 @@ _FROM_GUARD = [
 
 @pytest.mark.parametrize("dtype, topk_k, width", _FROM_GUARD)
 @pytest.mark.parametrize("masked", [False, True], ids=["tail_garbage", "tail_neg_inf"])
-@pytest.mark.parametrize("variant", ["many_rows", "few_rows"])
+@pytest.mark.parametrize("variant", ["many_rows", "few_rows", "tie_break"])
 def test_raw_kernel_is_exact_from_the_guard_up(dtype, topk_k, width, masked, variant):
     if not masked and not dsa_cudnn_kernels._cudnn_frontend_at_least(
         dsa_cudnn_kernels._TOPK_OOB_LANE_GUARD_FE_VERSION
     ):
         pytest.skip("frontends before 1.29 may read past a row's length")
     kwargs = {}
+    if variant == "tie_break":
+        if not dsa_cudnn_kernels._supports_lowest_index_topk_tie_break():
+            pytest.skip("this cuDNN frontend has no tie_break")
+        kwargs["tie_break"] = dsa_cudnn_kernels._TOPK_LOWEST_INDEX_TIE_BREAK
     scores, seq_lens = _rows(
         width,
         dtype,

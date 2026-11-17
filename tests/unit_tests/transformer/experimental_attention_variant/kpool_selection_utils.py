@@ -72,7 +72,7 @@ def select(x, *, topk, hf_scoring, pool_topk_fn=None):
     return tokens
 
 
-def cudnn_pool_topk_fn(query_runs, *, config=None, calls=None):
+def cudnn_pool_topk_fn(query_runs, *, deterministic=False, config=None, calls=None):
     """The pool selector DSAttention builds for ``dsa_indexer_kpool_scorer_backend='cudnn'``.
 
     ``calls``, when given, records per call whether the backend took it (not None).
@@ -87,6 +87,7 @@ def cudnn_pool_topk_fn(query_runs, *, config=None, calls=None):
             pool_size=pool_size,
             query_runs=query_runs,
             hf_scoring=hf_scoring,
+            deterministic=deterministic,
             config=config,
         )
         if calls is not None:
@@ -96,7 +97,9 @@ def cudnn_pool_topk_fn(query_runs, *, config=None, calls=None):
     return select_pools
 
 
-def cudnn_packed_pool_topk_fn(cu_seqlens, max_seqlen, *, config=None, calls=None, scores_out=None):
+def cudnn_packed_pool_topk_fn(
+    cu_seqlens, max_seqlen, *, deterministic=False, config=None, calls=None, scores_out=None
+):
     """The device-boundary pool selector DSAttention builds for packed THD without CP.
 
     ``calls`` records per call whether the backend took it; ``scores_out`` (a dict), when
@@ -112,6 +115,7 @@ def cudnn_packed_pool_topk_fn(cu_seqlens, max_seqlen, *, config=None, calls=None
             pool_size=pool_size,
             query_runs=None,
             hf_scoring=hf_scoring,
+            deterministic=deterministic,
             config=config,
             return_scores=scores_out is not None,
             packed_cu_seqlens=cu_seqlens,

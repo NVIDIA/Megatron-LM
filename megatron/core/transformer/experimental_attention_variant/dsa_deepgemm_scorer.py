@@ -325,12 +325,15 @@ def static_fallback_reason(
     q_dtype: torch.dtype,
     k_dtype: torch.dtype,
     w_dtype: torch.dtype,
+    deterministic: bool,
 ) -> Optional[str]:
     """Why a call of this geometry cannot use the DeepGEMM scorer, or ``None`` if it can.
 
     Reads no tensor value. The reason strings are stable per cause and double as the log-once
     key. The caller adds the JIT state (:func:`jit_problem`).
     """
+    if deterministic:
+        return "deterministic mode keeps the cuDNN MXFP8 scorer and the tie_break=1 top-k"
     problem = _device_problem(device)
     if problem is not None:
         return problem
@@ -364,6 +367,10 @@ def log_scorer_backend_once(reason: Optional[str]) -> None:
                 "dsa_deepgemm_scorer.warmup().",
                 JIT_CACHE_ENV,
             )
+    elif reason.startswith("deterministic"):
+        logger.info(
+            "dsa_indexer_scorer_backend='deepgemm' uses the cuDNN MXFP8 scorer: %s.", reason
+        )
     else:
         logger.warning(
             "dsa_indexer_scorer_backend='deepgemm' is unavailable, the cuDNN MXFP8 scorer runs: %s",

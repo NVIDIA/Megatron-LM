@@ -629,6 +629,7 @@ _FRESH_PROCESS_CAPTURES = {
                 q.view(1, 128, 32, 128),
                 k.view(1, 256, 1, 128),
                 w.view(1, 128, 32),
+                deterministic=False,
             )
         """,
 }
@@ -831,6 +832,7 @@ def _loss_and_grads(q, k, w, query, key, layout, scorer_options, topk_override=N
     starts, ends, cu, max_seqlen = layout
     config = SimpleNamespace(
         kv_lora_rank=512,
+        deterministic_mode=False,
         dsa_indexer_precision=scorer_options.precision,
         dsa_indexer_scorer_backend=scorer_options.scorer_backend,
         dsa_indexer_topk_backend=scorer_options.topk_backend,
