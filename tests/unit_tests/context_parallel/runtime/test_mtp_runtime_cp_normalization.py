@@ -38,7 +38,7 @@ def _config(num_layers=1, per_token=True):
 def test_normalization_uses_runtime_counts_without_changing_logging(
     monkeypatch, per_token, cp_size, runtime_metadata
 ):
-    """Reduce both counts, use the runtime group, and retain local logging counts."""
+    """Reduce both counts with the runtime group; retain local per-token logging counts."""
     static_group = SimpleNamespace(size=lambda: 1)
     runtime_group = SimpleNamespace(size=lambda: cp_size) if cp_size else None
     params = (
@@ -85,17 +85,21 @@ def test_normalization_uses_runtime_counts_without_changing_logging(
         metric_avg_group=object(),
     )
     (output.sum() * 0).backward()
-    assert len(reductions) == int(per_token and cp_size == 2)
+    assert len(reductions) == int(cp_size == 2)
+    main_tokens, mtp_tokens = (8, 7) if cp_size == 2 else (4, 3)
     if per_token:
-        main_tokens, mtp_tokens = (8, 7) if cp_size == 2 else (4, 3)
         torch.testing.assert_close(
             hidden.grad[4:, 0, 0] / main_tokens, torch.tensor([0.3 / mtp_tokens] * 3 + [0.0])
         )
         assert logged[0][0].item() == 3
         assert logged[0][1].item() == 3
     else:
-        torch.testing.assert_close(hidden.grad[4:, 0, 0], torch.tensor([0.1] * 3 + [0.0]))
-        assert logged[0][0].item() == 1
+        # Legacy DDP and logging average over CP, so each rank contributes CP/global_count.
+        cp_factor = cp_size or 1
+        torch.testing.assert_close(
+            hidden.grad[4:, 0, 0], torch.tensor([0.3 * cp_factor / mtp_tokens] * 3 + [0.0])
+        )
+        torch.testing.assert_close(logged[0][0], torch.tensor(3.0 * cp_factor / mtp_tokens))
         assert logged[0][1] is None
 
 
