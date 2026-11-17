@@ -110,8 +110,12 @@ def _ref_sequential_moe_swiglu(
     num_local_experts,
     local_expert_start,
     valid_tokens,
+    gate_activation=torch.nn.functional.silu,
 ):
-    """PyTorch reference for SwiGLU MoE: gate|up split -> SiLU(gate)*up -> FC2."""
+    """PyTorch reference for SwiGLU MoE: gate|up split -> SiLU(gate)*up -> FC2.
+
+    ``gate_activation`` replaces SiLU for other gated activations.
+    """
     vt = valid_tokens if isinstance(valid_tokens, int) else valid_tokens.item()
     max_tokens, topk = routing_map.shape
     hidden_size = hidden_states.shape[1]
@@ -126,7 +130,7 @@ def _ref_sequential_moe_swiglu(
                 h = hidden_states[t].float()
                 fc1_out = h @ fc1_weight[lid].float().T  # [2*ffn_hidden]
                 gate, up = fc1_out[:n_half], fc1_out[n_half:]
-                activated = torch.nn.functional.silu(gate) * up
+                activated = gate_activation(gate) * up
                 fc2_out = activated @ fc2_weight[lid].float().T
                 acc += probs[t, k].item() * fc2_out
         out[t] = acc
@@ -589,6 +593,68 @@ class TestVllmFusedMoe:
 
         assert result.shape == (max_tokens, hidden_size)
         torch.testing.assert_close(result, expected, atol=5e-2, rtol=5e-2)
+
+    def test_matches_reference_gated_squared_relu(self):
+        """Gated squared ReLU (relu(gate)^2 * up) reads both halves of the FC1 output."""
+        from megatron.core.inference.moe.fused_moe import ActivationType
+        from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
+
+        max_tokens, hidden_size, ffn_hidden, topk, num_experts = 32, 128, 128, 4, 8
+        hidden, probs, routing_map, fc1_weight, fc2_weight = _make_swiglu_inputs(
+            max_tokens, hidden_size, ffn_hidden, topk, num_experts
+        )
+        # O(1) activations, so that the up half visibly matters at BF16 precision.
+        fc1_weight, fc2_weight = fc1_weight * 10, fc2_weight * 10
+
+        result = vllm_fused_moe(
+            hidden,
+            probs,
+            fc1_weight,
+            fc2_weight,
+            ActivationType.GATED_SQUARED_RELU,
+            num_experts,
+            0,
+            _vt(max_tokens),
+            routing_map,
+        )
+        expected = _ref_sequential_moe_swiglu(
+            hidden,
+            probs,
+            fc1_weight,
+            fc2_weight,
+            routing_map,
+            num_experts,
+            0,
+            max_tokens,
+            gate_activation=lambda gate: torch.clamp(gate, min=0.0) ** 2,
+        )
+
+        assert result.shape == (max_tokens, hidden_size)
+        assert (result - expected).norm() / expected.norm() < 2e-2
+
+    def test_rejects_gemm_input_width_mismatch(self):
+        """FC2 must read its whole input: a gated FC1 output that reaches it un-reduced
+        (here through the non-gated activation) is rejected instead of half-read."""
+        from megatron.core.inference.moe.fused_moe import ActivationType
+        from megatron.core.inference.moe.vllm_fused_moe import vllm_fused_moe
+
+        max_tokens, hidden_size, ffn_hidden, topk, num_experts = 8, 64, 64, 2, 4
+        hidden, probs, routing_map, fc1_weight, fc2_weight = _make_swiglu_inputs(
+            max_tokens, hidden_size, ffn_hidden, topk, num_experts
+        )
+
+        with pytest.raises(ValueError, match="shape mismatch"):
+            vllm_fused_moe(
+                hidden,
+                probs,
+                fc1_weight,
+                fc2_weight,
+                ActivationType.SQUARED_RELU,
+                num_experts,
+                0,
+                _vt(max_tokens),
+                routing_map,
+            )
 
     @pytest.mark.parametrize(
         "local_start,num_local,num_experts", [(0, 4, 8), (4, 4, 8), (0, 2, 8), (6, 2, 8)]
