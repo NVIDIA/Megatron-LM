@@ -414,7 +414,7 @@ class OffloadTensorPool:
             return status
 
     def reset(self):
-        """Reset cached tensors; fixed storage reclaims only fully released epochs."""
+        """Reset cached tensors; fixed storage manages event-safe reuse itself."""
         if self._fixed_buffer is not None:
             # Manager resets must not discard outstanding backups or the events
             # protecting their H2D readers. The allocator advances epochs itself.
