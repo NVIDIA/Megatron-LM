@@ -1620,9 +1620,11 @@ class TELinear(te.pytorch.Linear):
         if self.use_bias:
             out, bias = out
         if self.config.sequence_parallel:
-            out = reduce_scatter_to_sequence_parallel_region(out, group=self._tp_group)
+            out = reduce_scatter_to_sequence_parallel_region(
+                out, group=self._tp_group, ordered=True
+            )
         else:
-            out = reduce_from_tensor_model_parallel_region(out, group=self._tp_group)
+            out = reduce_from_tensor_model_parallel_region(out, group=self._tp_group, ordered=True)
         return self._bi_finish_bias(out, bias)
 
     def _bi_finish_bias(self, out, bias):

@@ -335,7 +335,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
         ),
         kind="external-lib",
         notes="NCCL floating-point reductions pinned by NCCL_ALGO=Ring; covered by the TP/EP/FSDP cells of the model-level suite. "
-        "Under batch-invariant mode at TP >= 3 the forward reductions use ordered_reduce (replayed in test_ordered_reduce_kernels.py).",
+        "Under batch-invariant mode at TP >= 3 explicitly opted-in TP forward reductions use ordered_reduce (replayed in test_ordered_reduce_kernels.py).",
     ),
     KernelEntry(
         name="tensor_parallel_ordered_reduce",
@@ -938,12 +938,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/fp4_utils.py",
             "megatron/core/distributed/fsdp/src/megatron_fsdp/mixed_precision.py",
         ),
-        tests=(C + "test_fp8_determinism.py", K + "test_optimizer_kernels.py"),
+        tests=(
+            C + "test_fp8_determinism.py",
+            K + "test_optimizer_kernels.py",
+            K + "test_ordered_reduce_kernels.py",
+            K + "test_te_wrappers.py",
+        ),
         kind="dispatch",
         notes="TE cast_master_weights_to_fp8 / cast_to_fp8 (covered at model level by "
         "test_fp8_determinism.py), NVFP4 quantize_master_weights (needs TE>=2.7 + Blackwell, "
         "uncovered) and the apex multi_tensor_scale used by Megatron-FSDP mixed precision "
-        "(kernel replayed in test_optimizer_kernels.py).",
+        "(kernel replayed in test_optimizer_kernels.py). TP forward ordered-reduction dispatch "
+        "is replayed by test_ordered_reduce_kernels.py and the quantized TE row-linear tests.",
     ),
     KernelEntry(
         name="inference_mxfp8_quantization",

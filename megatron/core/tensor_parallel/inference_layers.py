@@ -581,7 +581,7 @@ class InferenceRowParallelLinear(TERowParallelLinear):
             x = _apply_linear(x, self.weight, self.config, out=symm_mem_buffer["tensor"])
             return symm_ordered_reduce_scatter(x, symm_mem_buffer["handle"])
         x = _apply_linear(x, self.weight, self.config)
-        return reduce_scatter_to_sequence_parallel_region(x, group=self.tp_group)
+        return reduce_scatter_to_sequence_parallel_region(x, group=self.tp_group, ordered=True)
 
     def _set_next_layer_norm_weights(self, weights: torch.Tensor):
         """
@@ -705,7 +705,9 @@ def inference_reduce_scatter_to_sequence_parallel_region(
                 return symm_ordered_reduce_scatter(
                     symm_mem_buffer["tensor"], symm_mem_buffer["handle"]
                 )
-        return reduce_scatter_to_sequence_parallel_region(x.contiguous(), group=tp_group)
+        return reduce_scatter_to_sequence_parallel_region(
+            x.contiguous(), group=tp_group, ordered=True
+        )
 
     # TP sequence-parallel RS: use NCCL in batch-invariant mode to match
     # training (TP <= 2 here). This does not affect MoE EP NVLS.

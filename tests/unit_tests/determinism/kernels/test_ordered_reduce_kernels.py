@@ -5,7 +5,7 @@
 Covers the Triton fold, the direct-buffer symmetric-memory pull kernels, the
 NCCL all-to-all fallback, the fixed-shard (``batch_invariant_tp_shards``) variants with one
 and several partials per rank, and the forward reductions in ``tensor_parallel/mappings.py``
-that route through them under batch-invariant mode. Multi-rank cases skip below their TP size.
+that explicitly opt into them under batch-invariant mode. Multi-rank cases skip below their TP size.
 """
 
 import pytest
@@ -220,7 +220,7 @@ class TestOrderedReduceKernels:
     @_requires_tp(4)
     @pytest.mark.parametrize("sequence_parallel", [False, True], ids=["all_reduce", "rs"])
     def test_mappings_ordered_forward_replays(self, sequence_parallel):
-        """mappings' forward reductions take the ordered path at TP >= 3 (backward is stock)."""
+        """Opted-in forward reductions are ordered at TP >= 3; backward remains stock."""
         group = self._init(4)
         seeded()
         x = _mixed_magnitudes((TOKENS, 2, HIDDEN), 2 + group.rank()).requires_grad_(True)
@@ -231,7 +231,7 @@ class TestOrderedReduceKernels:
         )
         with set_batch_invariant_mode(True):
             assert_replays_bit_exact(
-                lambda x: fn(x, group=group),
+                lambda x: fn(x, group=group, ordered=True),
                 (x,),
                 contention=True,
                 what=f"mappings.{fn.__name__} (ordered)",

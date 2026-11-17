@@ -2,6 +2,8 @@
 
 """Batch-invariant ordered TP reductions (megatron/core/ops/collectives/ordered_reduce.py)."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -14,9 +16,16 @@ from megatron.core.ops.collectives import ordered_reduce as orr
 from megatron.core.ops.linear import ordered as orl
 from megatron.core.tensor_parallel import mappings
 from megatron.core.tensor_parallel.inference_layers import InferenceRowParallelLinear
+from megatron.core.tensor_parallel.layers import RowParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.shared_experts import SharedExpertMLP, SharedExpertState
+from megatron.core.transformer.moe.token_dispatcher import (
+    MoEAllGatherTokenDispatcher,
+    MoEAlltoAllTokenDispatcher,
+)
+from megatron.core.transformer.moe.token_dispatcher_inference import NCCLAllGatherDispatcher
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import get_tensor_model_parallel_group_if_none, init_method_normal
 from tests.unit_tests.test_utilities import Utils
@@ -62,6 +71,10 @@ def _symm_buffer(group, nbytes):
         f"ordered_reduce_test:{nbytes}", process_group=group, size_mb=nbytes >> 20
     )
     return buf.symm_buffer, buf.symm_mem_hdl
+
+
+def _unexpected_ordered_reduce(*args, **kwargs):
+    pytest.fail("non-linear caller entered an ordered TP reduction")
 
 
 @requires_tp4
@@ -111,10 +124,14 @@ class TestOrderedReduce:
                     x = _partials((rows, hidden), torch.bfloat16, seed=rows + pos)
                     x[pos] = row[0]
                     # All-reduce (non-sequence-parallel row-parallel linear).
-                    ar = mappings.reduce_from_tensor_model_parallel_region(x.clone(), self.group)
+                    ar = mappings.reduce_from_tensor_model_parallel_region(
+                        x.clone(), self.group, ordered=True
+                    )
                     assert torch.equal(_bits(ar[pos]), _bits(expected))
                     # Reduce-scatter (sequence parallel); gather to find the row again.
-                    rs = mappings.reduce_scatter_to_sequence_parallel_region(x, self.group)
+                    rs = mappings.reduce_scatter_to_sequence_parallel_region(
+                        x, self.group, ordered=True
+                    )
                     full = mappings._gather_along_first_dim(rs, self.group)
                     assert torch.equal(_bits(full[pos]), _bits(expected))
 
@@ -122,11 +139,146 @@ class TestOrderedReduce:
         """Backward is unchanged: RS backward is an all-gather, AR backward the identity."""
         with set_batch_invariant_mode(True):
             x = _partials((8, 256), torch.float32, seed=3).requires_grad_()
-            mappings.reduce_scatter_to_sequence_parallel_region(x, self.group).sum().backward()
+            mappings.reduce_scatter_to_sequence_parallel_region(
+                x, self.group, ordered=True
+            ).sum().backward()
             assert torch.equal(x.grad, torch.ones_like(x))
             y = _partials((8, 256), torch.float32, seed=4).requires_grad_()
-            mappings.reduce_from_tensor_model_parallel_region(y, self.group).sum().backward()
+            mappings.reduce_from_tensor_model_parallel_region(
+                y, self.group, ordered=True
+            ).sum().backward()
             assert torch.equal(y.grad, torch.ones_like(y))
+
+    def test_shared_mappings_keep_stock_reductions(self, monkeypatch):
+        """Batch-invariant mode alone must not change a non-linear caller's collective."""
+        monkeypatch.setattr(mappings, "ordered_all_reduce", _unexpected_ordered_reduce)
+        monkeypatch.setattr(mappings, "ordered_reduce_scatter", _unexpected_ordered_reduce)
+        x = _partials((8, 256), torch.bfloat16, seed=81)
+        expected_ar = x.clone()
+        dist.all_reduce(expected_ar, group=self.group)
+        expected_rs = torch.empty_like(x[:2])
+        dist.reduce_scatter_tensor(expected_rs, x, group=self.group)
+        with set_batch_invariant_mode(True, backend="te_native"):
+            ar = mappings.reduce_from_tensor_model_parallel_region(x.clone(), self.group)
+            rs_input = x.detach().requires_grad_()
+            rs = mappings.reduce_scatter_to_sequence_parallel_region(rs_input, self.group)
+            rs.sum().backward()
+        assert torch.equal(_bits(ar), _bits(expected_ar))
+        assert torch.equal(_bits(rs), _bits(expected_rs))
+        assert torch.equal(rs_input.grad, torch.ones_like(x))
+
+    def test_moe_alltoall_uneven_expert_tp_combine(self, monkeypatch):
+        """Exercise the dispatcher's uneven TP4 combine, including its backward gather."""
+        monkeypatch.setattr(mappings, "ordered_reduce_scatter", _unexpected_ordered_reduce)
+        splits = [1, 2, 3, 2]
+        # Isolate communication from routing/permutation: one local expert needs no sort.
+        dispatcher = SimpleNamespace(
+            num_local_experts=1,
+            tp_size=TP,
+            tp_group=self.group,
+            output_splits_tp=torch.tensor(splits),
+            probs=torch.empty(0, dtype=torch.bfloat16, device="cuda"),
+        )
+        x = (torch.arange(64, device="cuda").reshape(8, 8) + self.group.rank()).bfloat16()
+        expected = x.float() * TP + sum(range(TP)) - self.group.rank() * TP
+        start = sum(splits[: self.group.rank()])
+        expected = expected[start : start + splits[self.group.rank()]].bfloat16()
+        x.requires_grad_()
+        with set_batch_invariant_mode(True, backend="te_native"):
+            out = MoEAlltoAllTokenDispatcher.combine_preprocess(dispatcher, x)
+            out.backward(torch.ones_like(out))
+        assert torch.equal(out, expected)
+        assert torch.equal(x.grad, torch.ones_like(x))
+
+    @pytest.mark.parametrize("inference", [False, True])
+    def test_moe_allgather_combine_keeps_stock_reduction(self, inference, monkeypatch):
+        """Training TPxEP and inference CUDA-graph combines never opt into TP ordering."""
+        monkeypatch.setattr(mappings, "ordered_reduce_scatter", _unexpected_ordered_reduce)
+        x = _partials((8, 256), torch.bfloat16, seed=82)
+        expected = torch.empty_like(x[:2])
+        dist.reduce_scatter_tensor(expected, x, group=self.group)
+        if inference:
+            dispatcher = object.__new__(NCCLAllGatherDispatcher)
+            dispatcher.ep_size = TP
+            dispatcher.tp_ep_group = self.group
+            monkeypatch.setattr(NCCLAllGatherDispatcher, "_use_allgather_v", False)
+            combine = dispatcher.token_combine
+        else:
+            dispatcher = SimpleNamespace(
+                tp_size=1, ep_size=TP, tp_ep_group=self.group, local_probs=x
+            )
+            combine = lambda x: MoEAllGatherTokenDispatcher.token_combine(dispatcher, x)
+        with set_batch_invariant_mode(True, backend="te_native"):
+            out = combine(x)
+            if inference:
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    combine(x)
+                torch.cuda.current_stream().wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    out = combine(x)
+                graph.replay()
+            else:
+                x.requires_grad_()
+                out = combine(x)
+                out.sum().backward()
+                assert torch.equal(x.grad, torch.ones_like(x))
+        assert torch.equal(_bits(out), _bits(expected))
+
+    @pytest.mark.parametrize("sequence_parallel", [False, True])
+    @pytest.mark.parametrize("caller_reduced", [False, True])
+    def test_row_linear_call_sites_opt_into_ordered_reduction(
+        self, sequence_parallel, caller_reduced
+    ):
+        model_parallel_cuda_manual_seed(123)
+        config = TransformerConfig(
+            num_layers=1,
+            hidden_size=512,
+            num_attention_heads=8,
+            tensor_model_parallel_size=TP,
+            sequence_parallel=sequence_parallel,
+            params_dtype=torch.bfloat16,
+            batch_invariant_mode=True,
+            batch_invariant_backend="te_native",
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=4,
+            hidden_dropout=0.0,
+            attention_dropout=0.0,
+        )
+        layer = RowParallelLinear(
+            512,
+            256,
+            config=config,
+            init_method=init_method_normal(0.02),
+            bias=False,
+            input_is_parallel=True,
+            skip_bias_add=False,
+            tp_group=self.group,
+        )
+        x = _partials((8, 1, 128), torch.bfloat16, seed=83)
+        with set_batch_invariant_mode(True, backend="te_native"):
+            partial = torch.nn.functional.linear(x, layer.weight)
+            expected = _left_fold(_all_partials(partial, self.group))
+            if caller_reduced:
+                # Shared-expert overlap defers its FC2 row reduction to this caller.
+                shared = SimpleNamespace(
+                    _overlap_state=SharedExpertState.FC2_FORWARD_DONE,
+                    stream=torch.cuda.current_stream(),
+                    config=SimpleNamespace(
+                        sequence_parallel=sequence_parallel, moe_shared_expert_overlap=True
+                    ),
+                    tp_group=self.group,
+                    cached_fc2_output=partial,
+                )
+                SharedExpertMLP.post_forward_comm(shared)
+                out = shared.cached_output
+            else:
+                out, _ = layer(x)
+        if sequence_parallel:
+            expected = expected.chunk(TP)[self.group.rank()]
+        assert torch.equal(_bits(out), _bits(expected))
 
     def test_symmetric_memory_paths_match_all_to_all(self, monkeypatch):
         """The inference (symmetric-memory pull) path gives the all-to-all path's bits."""
@@ -215,8 +367,10 @@ class TestOrderedReduceTP2Unchanged:
         dist.reduce_scatter_tensor(stock_rs, x, group=self.group)
         with set_batch_invariant_mode(True):
             assert not orr.use_ordered_tp_reduce(self.group, torch.bfloat16)
-            ar = mappings.reduce_from_tensor_model_parallel_region(x.clone(), self.group)
-            rs = mappings.reduce_scatter_to_sequence_parallel_region(x, self.group)
+            ar = mappings.reduce_from_tensor_model_parallel_region(
+                x.clone(), self.group, ordered=True
+            )
+            rs = mappings.reduce_scatter_to_sequence_parallel_region(x, self.group, ordered=True)
         assert torch.equal(_bits(ar), _bits(stock_ar))
         assert torch.equal(_bits(rs), _bits(stock_rs))
 
@@ -306,9 +460,9 @@ def _check_te_row_parallel_linear(sequence_parallel):
         actual_grads = torch.autograd.grad(actual, (x, layer.weight, layer.bias), dy)
         partial, bias = te.pytorch.Linear.forward(layer, x)
         reference = (
-            mappings.reduce_scatter_to_sequence_parallel_region(partial, group=group)
+            mappings.reduce_scatter_to_sequence_parallel_region(partial, group=group, ordered=True)
             if sequence_parallel
-            else mappings.reduce_from_tensor_model_parallel_region(partial, group)
+            else mappings.reduce_from_tensor_model_parallel_region(partial, group, ordered=True)
         ) + bias
         reference_grads = torch.autograd.grad(reference, (x, layer.weight, layer.bias), dy)
         for got, expected_grad in zip(actual_grads, reference_grads):
@@ -508,7 +662,7 @@ def test_direct_gemm_fused_main_grad_matches_te(backend):
                 xr = x.detach().clone().requires_grad_()
                 got = layer(x)[0]
                 want = mappings.reduce_scatter_to_sequence_parallel_region(
-                    reference(xr), group=group
+                    reference(xr), group=group, ordered=True
                 )
                 dy = _partials(got.shape, got.dtype, seed + 1)
                 got.backward(dy)

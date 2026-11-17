@@ -1040,7 +1040,7 @@ if HAVE_TE:
                 # Reduce-scatter after unpadding
                 if is_row_parallel_linear(module):
                     unpadded_output = reduce_scatter_to_sequence_parallel_region(
-                        unpadded_output, group=module.tp_group
+                        unpadded_output, group=module.tp_group, ordered=True
                     )
 
                 # Reset sequence parallelism flag on the module

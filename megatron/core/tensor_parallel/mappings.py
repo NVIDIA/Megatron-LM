@@ -109,7 +109,7 @@ def _gather_along_last_dim(input_, group):
     return output
 
 
-def _reduce_scatter_along_last_dim(input_, group, ordered=False):
+def _reduce_scatter_along_last_dim(input_, group):
     """Reduce-scatter tensors on the last dimension."""
 
     world_size = group.size()
@@ -120,9 +120,7 @@ def _reduce_scatter_along_last_dim(input_, group, ordered=False):
         input_, split_size_or_sections=input_.shape[-1] // world_size, dim=1
     )
     concat_tensor = torch.cat(split_tensors, dim=0)
-    output = _reduce_scatter_along_first_dim(concat_tensor, group=group, ordered=ordered).reshape(
-        target_shape
-    )
+    output = _reduce_scatter_along_first_dim(concat_tensor, group=group).reshape(target_shape)
     return output
 
 
@@ -178,9 +176,8 @@ def _reduce_scatter_along_first_dim(
             the input splits along the first dimension for each rank. If None,
             equal splitting is assumed. Default: None.
         ordered (bool): Use the batch-invariant rank-order sum when
-            `use_ordered_tp_reduce` selects it. Only the forward reductions pass True: the
-            backward of the all-gather regions calls this helper too, and gradients do not
-            need a fixed summation order.
+            `use_ordered_tp_reduce` selects it. Linear-layer callers opt in explicitly;
+            MoE combines and backward reductions keep their existing collectives.
     """
     assert group is not None, "group should not be None"
     world_size = group.size()
@@ -250,14 +247,16 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
     """All-reduce the input from the model parallel region."""
 
     @staticmethod
-    def symbolic(graph, input_, group):
+    def symbolic(graph, input_, group, ordered=False):
         """Symbolic function for tracing."""
+        if ordered and use_ordered_tp_reduce(group, input_.dtype):
+            return ordered_all_reduce(input_, group)
         return _reduce(input_, group)
 
     @staticmethod
-    def forward(ctx, input_, group):
+    def forward(ctx, input_, group, ordered=False):
         """Forward function."""
-        if use_ordered_tp_reduce(group, input_.dtype):
+        if ordered and use_ordered_tp_reduce(group, input_.dtype):
             # Batch-invariant mode at TP >= 3: fixed rank-order sum (backward is unchanged).
             return ordered_all_reduce(input_, group)
         return _reduce(input_, group)
@@ -265,7 +264,7 @@ class _ReduceFromModelParallelRegion(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         """Backward function."""
-        return grad_output, None
+        return grad_output, None, None
 
 
 class _ScatterToModelParallelRegion(torch.autograd.Function):
@@ -387,18 +386,22 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
     """Reduce scatter the input from the model parallel region."""
 
     @staticmethod
-    def symbolic(graph, input_, group, input_split_sizes=None, use_global_buffer=False):
+    def symbolic(
+        graph, input_, group, input_split_sizes=None, use_global_buffer=False, ordered=False
+    ):
         """Symbolic function for tracing."""
-        return _reduce_scatter_along_first_dim(input_, group, input_split_sizes, use_global_buffer)
+        return _reduce_scatter_along_first_dim(
+            input_, group, input_split_sizes, use_global_buffer, ordered=ordered
+        )
 
     @staticmethod
-    def forward(ctx, input_, group, input_split_sizes=None, use_global_buffer=False):
+    def forward(ctx, input_, group, input_split_sizes=None, use_global_buffer=False, ordered=False):
         """Forward function."""
         ctx.group = group
         ctx.input_split_sizes = input_split_sizes
         ctx.use_global_buffer = use_global_buffer
         return _reduce_scatter_along_first_dim(
-            input_, group, input_split_sizes, use_global_buffer, ordered=True
+            input_, group, input_split_sizes, use_global_buffer, ordered=ordered
         )
 
     @staticmethod
@@ -408,6 +411,7 @@ class _ReduceScatterToSequenceParallelRegion(torch.autograd.Function):
         use_global_buffer = ctx.use_global_buffer
         return (
             _gather_along_first_dim(grad_output, ctx.group, input_split_sizes, use_global_buffer),
+            None,
             None,
             None,
             None,
@@ -446,7 +450,7 @@ class _ReduceScatterToTensorParallelRegion(torch.autograd.Function):
     def forward(ctx, input_, group):
         """Forward function."""
         ctx.group = group
-        return _reduce_scatter_along_last_dim(input_, group, ordered=True)
+        return _reduce_scatter_along_last_dim(input_, group)
 
     @staticmethod
     def backward(ctx, grad_output):
@@ -528,10 +532,10 @@ def copy_to_tensor_model_parallel_region(input_, group=None):
     return _CopyToModelParallelRegion.apply(input_, group)
 
 
-def reduce_from_tensor_model_parallel_region(input_, group=None):
-    """Wrapper for autograd function: forward: all reduce, backward copy"""
+def reduce_from_tensor_model_parallel_region(input_, group=None, *, ordered=False):
+    """Forward all-reduce, backward copy; TP linears may opt into ordered sums."""
     group = get_tensor_model_parallel_group_if_none(group)
-    return _ReduceFromModelParallelRegion.apply(input_, group)
+    return _ReduceFromModelParallelRegion.apply(input_, group, ordered)
 
 
 def scatter_to_tensor_model_parallel_region(input_, group=None):
@@ -569,12 +573,12 @@ def gather_from_sequence_parallel_region(
 
 
 def reduce_scatter_to_sequence_parallel_region(
-    input_, group=None, input_split_sizes=None, use_global_buffer=False
+    input_, group=None, input_split_sizes=None, use_global_buffer=False, *, ordered=False
 ):
-    """Wrapper for autograd function: forward: RS, backward AG <fisrt dim>"""
+    """Forward RS, backward AG on the first dim; TP linears may opt into ordered sums."""
     group = get_tensor_model_parallel_group_if_none(group)
     return _ReduceScatterToSequenceParallelRegion.apply(
-        input_, group, input_split_sizes, use_global_buffer
+        input_, group, input_split_sizes, use_global_buffer, ordered
     )
 
 
