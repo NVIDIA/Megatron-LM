@@ -317,6 +317,28 @@ class LanguageModule(MegatronModule):
             return logits * self.config.mup_output_mult
         return logits
 
+    def _tie_local_output_weight(self) -> None:
+        """Register local shared weights on both consumers before FSDP wrapping."""
+        if not (
+            self.share_embeddings_and_output_weights
+            and hasattr(self, "embedding")
+            and hasattr(self, "output_layer")
+        ):
+            return
+        self.output_layer.weight = self.embedding.word_embeddings.weight
+
+        def save_hook(_module, state_dict, prefix, _metadata):
+            # Existing checkpoints store the local shared weight under the embedding only.
+            state_dict.pop(f"{prefix}output_layer.weight", None)
+
+        def load_hook(state_dict, prefix, *_args):
+            embedding_key = f"{prefix}embedding.word_embeddings.weight"
+            if embedding_key in state_dict:
+                state_dict[f"{prefix}output_layer.weight"] = state_dict[embedding_key]
+
+        self._register_state_dict_hook(save_hook)
+        self._register_load_state_dict_pre_hook(load_hook)
+
     def shared_embedding_or_output_weight(self) -> Tensor:
         """Gets the embedding weight or output logit weights when share embedding and output weights set to True
           or when use Multi-Token Prediction (MTP).
@@ -385,8 +407,6 @@ class LanguageModule(MegatronModule):
         )
 
         output_weight = None
-        if self.share_embeddings_and_output_weights:
-            output_weight = self.shared_embedding_or_output_weight()
 
         # Speculative decoding is inference-only, and inference consumes logits in fp32: emit
         # them so when the head can, upcast otherwise.
@@ -482,6 +502,7 @@ class LanguageModule(MegatronModule):
 
         if self.pre_process:
             # Output layer is equivalent to the embedding already
+            sharded_state_dict.pop(output_layer_weight_key, None)
             return
 
         # If use Multi-Token Prediction (MTP), we need maintain both embedding layer and output
@@ -490,7 +511,7 @@ class LanguageModule(MegatronModule):
         # any weight.
         if getattr(self, 'mtp_process', False):
             # No output layer
-            assert output_layer_weight_key not in sharded_state_dict, sharded_state_dict.keys()
+            sharded_state_dict.pop(output_layer_weight_key, None)
             return
 
         # Replace the default output layer with a one sharing the weights with the embedding

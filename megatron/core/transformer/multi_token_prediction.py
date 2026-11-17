@@ -1250,11 +1250,13 @@ def process_mtp_loss(
         )
         derived_labels_from_input_ids = True
 
+    head_kwargs = {}
     if config.mtp_detach_heads:
         if output_weight is not None:
             output_weight = output_weight.detach()
         else:
-            output_weight = output_layer.weight.detach()
+            # Resolve and detach inside forward, after the head's unshard pre-hook.
+            head_kwargs["detach_weight"] = True
 
     mtp_labels = labels.clone()
     if loss_mask is None:
@@ -1331,7 +1333,9 @@ def process_mtp_loss(
         ``correct``/``total`` are None when not training. All [s, b, v] allocations for
         one head lives here so ``mtp_loss_early_backward`` can run and release it as a unit.
         """
-        mtp_logits, _ = output_layer(head_hidden, weight=output_weight, runtime_gather_output=False)
+        mtp_logits, _ = output_layer(
+            head_hidden, weight=output_weight, runtime_gather_output=False, **head_kwargs
+        )
         if scale_logits_fn is not None:
             mtp_logits = scale_logits_fn(mtp_logits)
         if is_observing_tensor("mtp_logits"):

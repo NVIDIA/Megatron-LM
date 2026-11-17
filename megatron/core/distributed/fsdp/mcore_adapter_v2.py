@@ -104,6 +104,10 @@ def _materialize_meta_module(module: nn.Module, device: torch.device | None) -> 
         parameter = module.get_parameter(name)
         parameter.requires_grad_(requires_grad)
         copy_parameter_attributes(original_parameter, parameter)
+        if parameter is not original_parameter:
+            # Keep aliases in other modules attached to the materialized Parameter.
+            torch.utils.swap_tensors(original_parameter, parameter)
+            module._parameters[name] = original_parameter
 
 
 def _materialize_owned_meta_modules(module: nn.Module, device: torch.device | None) -> None:
