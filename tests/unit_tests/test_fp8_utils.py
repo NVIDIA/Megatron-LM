@@ -229,7 +229,7 @@ class _FakeSequenceParallelTELinear(nn.Module):
     """One rank of a TE linear with sequence parallelism and an identity GEMM. The other ranks
     contribute zeros to the reduce-scatter and copies of this rank's chunk to the all-gather."""
 
-    def __init__(self, parallel_mode, tp_size, rank):
+    def __init__(self, parallel_mode, tp_size, rank) -> None:
         super().__init__()
         self.parallel_mode, self.tp_size, self.rank = parallel_mode, tp_size, rank
         self.sequence_parallel = True
@@ -250,7 +250,7 @@ def _fake_fp8_padding(align):
         return [-(-m // align) * align for m in splits]
 
     class Padding:
-        def __init__(self, num_gemms):
+        def __init__(self, num_gemms) -> None:
             self.num_gemms = num_gemms
 
         def __call__(self, inp, splits):
