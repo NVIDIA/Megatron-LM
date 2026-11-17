@@ -972,14 +972,38 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="emerging_optimizer_update_dispatch",
         sources=("megatron/core/optimizer/emerging_optimizers.py",),
-        tests=(K + "test_optimizer_kernels.py",),
+        tests=(
+            K + "test_optimizer_kernels.py",
+            K + "test_sinkhorn_fused.py",
+            "tests/unit_tests/optimizer/test_sinkhorn_fused.py",
+        ),
         kind="dispatch",
         notes="TensorParallelMuon dispatches batched Newton-Schulz for complete query heads "
         "and single shared key heads. Replays cover FP32 and BF16 NS with spectral and "
         "actual per-head RMS scaling, including zero updates, under GEMM contention; "
         "V4.1 layout construction and update/resume parity are covered in test_csa2.py. "
         "Sinkhorn EMA/Nesterov and row/column L2 reductions replay embedding-shaped updates "
-        "with zero and near-zero rows under contention.",
+        "with zero and near-zero rows under contention, through EO's step and, with "
+        "MCORE_SINKHORN_FUSED, through Sinkhorn.step's dispatch to the fused kernels "
+        "(sinkhorn_fused); optimizer/test_sinkhorn_fused.py checks which parameters dispatch "
+        "and that the others run EO's step in their original order.",
+    ),
+    KernelEntry(
+        name="sinkhorn_fused_step",
+        sources=("megatron/core/optimizer/sinkhorn_fused.py",),
+        tests=(K + "test_sinkhorn_fused.py", "tests/unit_tests/optimizer/test_sinkhorn_fused.py"),
+        kind="triton",
+        notes="Opt-in (MCORE_SINKHORN_FUSED=1) Sinkhorn optimizer step: a momentum/row-norm "
+        "pass and K + 1 sweeps over contiguous row chunks, one program per chunk, each "
+        "writing its own row-norm or column partial sums (no atomics), which a multi-level "
+        "kernel cascade adds in a fixed order, then a one-program column-factor update whose "
+        "power-of-two rebalancing of the factors comes from a fixed-order sum of the column "
+        "sums; launch configurations depend on the shapes only (pipeline stages on shared "
+        "memory, which does not change the arithmetic). Replayed bit-exactly under contention "
+        "for a padded 64K x 256 shard and a 2048 x 5120 matrix; optimizer/test_sinkhorn_fused.py "
+        "checks bit-identical momentum and updates within a few ulps of EO's step, row-sharded "
+        "groups of 2 and 4 ranks, tall matrices with up to 25 normalization steps and "
+        "degenerate inputs.",
     ),
     # ---------------------------------------------------------------- Compressed sparse attention teacher LSE
     KernelEntry(

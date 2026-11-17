@@ -26,6 +26,7 @@ from megatron.core.utils import (
     log_single_rank,
 )
 
+from . import sinkhorn_fused
 from .optimizer_config import ParamKey, ParamPredicate
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,15 @@ except ImportError:
     OrthogonalizedOptimizer = object
     AdaptiveMuon = object
     Lion = None
+
+_NoOpWeightUpdateHook = None
+if HAVE_EMERGING_OPTIMIZERS:
+    try:
+        from emerging_optimizers.weight_update_hooks import (
+            NoOpWeightUpdateHook as _NoOpWeightUpdateHook,
+        )
+    except ImportError:  # Releases without weight-update hooks run none.
+        pass
 
 SOAP = None
 if HAVE_EMERGING_OPTIMIZERS:
@@ -238,6 +248,11 @@ _EMERGING_OPTIMIZERS: Dict[str, EmergingOptimizerEntry] = {}
 # ===========================================================================
 
 
+def _inherited(obj, name: str, owner: type) -> bool:
+    """Whether ``obj.<name>`` is ``owner``'s method, not overridden by a subclass or instance."""
+    return getattr(getattr(obj, name, None), "__func__", None) is getattr(owner, name, None)
+
+
 class Sinkhorn(OrthogonalizedOptimizer):
     """EMA/Nesterov SGD with EO's row/column balancing and no weight decay.
 
@@ -378,10 +393,104 @@ class Sinkhorn(OrthogonalizedOptimizer):
                         if active.item() and param.grad is None:
                             missing_grads.append(param)
                             param.grad = torch.zeros_like(param)
-            return super().step()
+            if not (sinkhorn_fused.SINKHORN_FUSED and sinkhorn_fused.HAVE_TRITON):
+                return super().step()
+            return self._step_with_fused_updates()
         finally:
             for param in missing_grads:
                 param.grad = None
+
+    def _step_with_fused_updates(self):
+        """EO's step loop with the eligible matrices updated by ``sinkhorn_fused``.
+
+        ``MCORE_SINKHORN_FUSED=1``: parameters keep their order, and every other one runs EO's
+        own step on a one-parameter view of its group, so the collectives of both kinds of
+        update line up across a row-shard group whatever each rank selects.
+        """
+        for group in self.param_groups:
+            self._init_group(group)
+            for param in group["params"]:
+                if param.grad is None:
+                    continue
+                if self._fused_update_supported(param, group):
+                    self._fused_update(param, group)
+                    continue
+                param_groups = self.param_groups
+                self.param_groups = [{**group, "params": [param]}]
+                try:
+                    super().step()
+                finally:
+                    self.param_groups = param_groups
+        return None
+
+    def _fused_update_supported(self, param, group) -> bool:
+        """Whether the fused kernels compute exactly EO's step body for this parameter.
+
+        EO's body adds weight decay, a pre-update function and a weight-update hook around
+        ``orthogonalize``; the fused path needs all three to be no-ops, Nesterov momentum,
+        this class's ``orthogonalize`` and plain-number settings. A whole matrix also needs
+        what ``sinkhorn_balance`` validates (otherwise the reference raises).
+        """
+        hook = getattr(self, "_weight_update_hook", None)
+        if (
+            param.ndim != 2
+            or not self.nesterov
+            or group["weight_decay"] != 0
+            or not (hook is None or type(hook) is _NoOpWeightUpdateHook)
+            or not _inherited(self, "_apply_weight_decay_inplace", OrthogonalizedOptimizer)
+            or not _inherited(self, "pre_weight_update_fn_inplace", OrthogonalizedOptimizer)
+            or not _inherited(self, "post_weight_update_fn_inplace", OrthogonalizedOptimizer)
+            or not _inherited(self, "orthogonalize", Sinkhorn)
+        ):
+            return False
+        names = ("lr", "momentum", "eps", "zero_row_threshold", "extra_scale_factor")
+        steps = group["num_normalization_steps"]
+        if type(steps) is not int or any(type(group[name]) not in (int, float) for name in names):
+            return False
+        rows, columns = param.shape
+        whole_matrix = get_pg_size(getattr(param, "row_shard_group", None)) <= 1 and (
+            getattr(param, "row_shard_local_rows", rows) == rows
+        )
+        if whole_matrix:
+            from emerging_optimizers.orthogonalized_optimizers.sinkhorn_utils import (
+                sinkhorn_balance,
+            )
+
+            eps, threshold = group["eps"], group["zero_row_threshold"]
+            if not (
+                self.scaled_orthogonalize_fn is sinkhorn_balance
+                and rows >= columns > 0
+                and steps >= 1
+                and steps % 2 == 1
+                and math.isfinite(eps)
+                and eps > 0
+                and math.isfinite(threshold)
+                and threshold >= 0
+            ):
+                return False
+        return sinkhorn_fused.fused_step_supported(
+            param, param.grad, self.state[param].get("momentum_buffer")
+        )
+
+    def _fused_update(self, param, group) -> None:
+        """EO's step body for one matrix, fused (see ``sinkhorn_fused``)."""
+        row_group = getattr(param, "row_shard_group", None)
+        distributed = get_pg_size(row_group) > 1
+        local_rows = getattr(param, "row_shard_local_rows", param.shape[0])
+        sinkhorn_fused.fused_sinkhorn_step(
+            param,
+            param.grad,
+            self.state[param]["momentum_buffer"],
+            lr=group["lr"],
+            momentum=group["momentum"],
+            eps=group["eps"],
+            num_normalization_steps=group["num_normalization_steps"],
+            zero_row_threshold=group["zero_row_threshold"],
+            extra_scale_factor=group["extra_scale_factor"],
+            local_rows=local_rows,
+            mean_rows=param.row_shard_global_rows if distributed else local_rows,
+            row_group=row_group if distributed else None,
+        )
 
     def orthogonalize(self, p: torch.Tensor, grad: torch.Tensor, **kwargs: Any) -> torch.Tensor:
         """Balance the Nesterov update to unit row RMS, then apply the paper's gamma."""

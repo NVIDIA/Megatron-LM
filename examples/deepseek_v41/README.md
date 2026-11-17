@@ -379,17 +379,18 @@ The optimizations below speed up the 16-GPU 64K proxy on GB300: 40 V/E blocks, h
 MoK experts, and transformer_engine CUDA graphs of the attention layers. A training step takes
 24.36 s (579 TFLOP/s per GPU) without them and 18.02 s (783 TFLOP/s per GPU) with all of them,
 including the run settings below and the opt-in `MCORE_CSA2_CUDNN_INDEXER_LOSS` and
-`MCORE_MHC_SP_CUTILE_PROJ_RMS`; the later Engram switches are not in these numbers.
+`MCORE_MHC_SP_CUTILE_PROJ_RMS`; the later Engram switches and `MCORE_SINKHORN_FUSED` are not in
+these numbers.
 
 Each switch is an environment variable, read once at import. Every optimization that keeps
 training results bit-identical is on by default, and its variable is a kill switch. The one
 exception is `MCORE_ROUTER_SAVE_FP32_INPUT`, which trades memory for time and stays opt-in. The
 debugging and profiling aids (`MCORE_CSA2_DEVICE_CHECKS`, `MCORE_ROUTER_CHECK_STATIC_TOKENS`,
 `MCORE_ENGRAM_HASH_CHECKS` and `MCORE_COMPONENT_NVTX`) are off by default. The cuDNN sparse indexer
-loss, the cuTile mHC projection and the fused Engram gate change numerics, so they are opt-in and
-off by default. The router switches (`MCORE_ROUTER_*`, `MCORE_AUX_LOSS_SCALE_0DIM` and
-`MCORE_RANDOM_STE_EMPTY_LIKE`) apply to every MoE model, with or without MoK; the `MCORE_MOK_*`
-switches apply to the MoK backend only.
+loss, the cuTile mHC projection, the fused Engram gate and the fused Sinkhorn step change numerics,
+so they are opt-in and off by default. The router switches (`MCORE_ROUTER_*`,
+`MCORE_AUX_LOSS_SCALE_0DIM` and `MCORE_RANDOM_STE_EMPTY_LIKE`) apply to every MoE model, with or
+without MoK; the `MCORE_MOK_*` switches apply to the MoK backend only.
 Boolean switches accept `1`, `true`, `yes` or `on` and `0`, `false`, `no` or `off` (any case);
 any other value, including an empty one, raises a `ValueError` naming the variable. Integer
 switches raise one for non-integer values too; `MCORE_CSA2_CANDIDATE_CHUNK_MIB` and
@@ -419,6 +420,7 @@ switches raise one for non-integer values too; `MCORE_CSA2_CANDIDATE_CHUNK_MIB` 
 | `MCORE_CSA2_CUDNN_INDEXER_LOSS` | off | `1` opts in | Computes the sparse indexer loss with cuDNN Frontend's DSA kernels instead of Triton, about 0.6 s per step faster at 64K. Inputs it does not support keep Triton, with one warning per reason; it needs an SM10x GPU, cuDNN Frontend's DSA wrappers, a BF16 H32/D128 indexer and at most 2048 Top-K slots, among other checks. | No: the score gradient is rounded to BF16, and dK accumulates with unordered FP32 adds (not reproducible run to run) |
 | `MCORE_MHC_SP_CUTILE_PROJ_RMS` | off | `1` opts in | Single-pass mHC computes its mapping projection and RMS with cuTile split-K kernels instead of Inductor and TF32 cuBLAS on an FP32 copy, where the backend policy selects cuTile and the residual qualifies (aligned, K = n * hidden >= 8192); other residuals warn and keep Inductor. | No: TF32 MMAs on the residual dtype and merged FP32 gradients |
 | `MCORE_ENGRAM_FUSED_GATE` | off | `1` opts in | Engram's context gate (the RMS-normalized key/hidden dot product, signed-square-root sigmoid gate and gated value add over the mHC streams) runs as one Triton forward kernel and three backward kernels instead of about 80 eager FP32 kernels, and keeps only its BF16 inputs and four FP32 values per token and stream for backward. With MXFP8 tables, the projection's padded output goes in whole, so backward makes no slice copy of its gradient. Deterministic run to run and capturable in CUDA graphs. Measured on the isolated gate at the proxy shape (4096 tokens, 4 streams of 5120, GB300): about 4.7 ms less GPU time and 680 MiB less activation memory per Engram layer and microbatch; not part of the step times above. Without Triton, or on the CPU, the eager gate runs. | No: its FP32 sums run in another order than the eager gate's (deterministic run to run) |
+| `MCORE_SINKHORN_FUSED` | off | `1` opts in | The Sinkhorn optimizer step of Engram tables and of the embedding and output matrices (Nesterov momentum, row masking, alternating row and column normalization, update) runs as K + 2 Triton passes over the FP32 gradient and momentum (K = 5 column/row pairs with the recipe's 11 normalization steps) instead of about 60 eager operations (about 40 for a whole matrix), most of them on full-size FP32 tensors: it keeps U = diag(a) G diag(b) as row and column factors (rebalanced by an exact power of two after every column step, so that they do not drift out of the FP32 range as the normalization steps add up), so it neither materializes the Nesterov value, the balanced update nor its square, and fuses the momentum and parameter updates into the first and last passes. It issues the same all-reduces as the reference, with the same shapes (a 0-dim FP32 sum, then K of the [1, C] column sums over the row-shard group), adds no host synchronization, and is deterministic run to run. Measured on GB300 for one 6.0M x 256 FP32 Engram shard: 14.7 ms instead of 88.2 ms per step (15.0 ms instead of 88.6 ms with four ranks all-reducing), and 78 MiB instead of 17.4 GiB of transient memory; 129,280 x 5,120 embedding: 7.3 ms instead of 30.4 ms. Not part of the step times above; on the 16-GPU proxy with the full-iteration CUDA graph, the static Engram lookup and `MCORE_ENGRAM_FUSED_GATE`, a step takes 16.05 s instead of 16.17 s and 17 GiB less device memory, which leaves room to drop the `--recompute-*` run settings below: 15.87 s per step. The first step also compiles its Triton kernels. Other parameters (not FP32 CUDA, weight decay, weight-update hooks or overridden update functions, rows wider than 8192) keep the reference step, in their original order. | No: momentum is bit-identical; the update agrees with the reference to a few ulps (products of factors instead of a chain of divisions, sums in another order), except in a row whose norm before balancing lies within a few ulps of the masking threshold, which either path may mask |
 | `MCORE_COMPONENT_NVTX` | off | `1` opts in | NVTX ranges per model component (`comp:<name>`) and layer (`layer:<n>`), forward and backward, also recorded during CUDA-graph capture. | Yes: host-only |
 
 "By test" means the equality was checked on GB300 rather than following from the code: re-run
@@ -450,5 +452,5 @@ reruns the same kernels on the same inputs, so values are expected to match. The
 also set `MCORE_CSA2_PAD_ROW_CAPACITY=32`: the proxy data has at most one padding row per
 microbatch. The MoK build and its schedule options are outside Megatron-LM's bit-identity tests:
 keep them fixed when comparing switch settings, and keep `MCORE_CSA2_CUDNN_INDEXER_LOSS`,
-`MCORE_MHC_SP_CUTILE_PROJ_RMS` and `MCORE_ENGRAM_FUSED_GATE` off when the comparison must be
-bit-identical.
+`MCORE_MHC_SP_CUTILE_PROJ_RMS`, `MCORE_ENGRAM_FUSED_GATE` and `MCORE_SINKHORN_FUSED` off when the
+comparison must be bit-identical.

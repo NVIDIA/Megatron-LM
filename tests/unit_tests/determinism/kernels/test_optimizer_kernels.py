@@ -185,10 +185,17 @@ def test_muon_per_head_replays(heads, rows, cols, precision, scale_mode):
     )
 
 
-def test_sinkhorn_step_replays():
-    """Replay EMA, row masking and row/column reductions on embedding-shaped matrices."""
+@pytest.mark.parametrize("fused", [False, True], ids=["eo", "fused"])
+def test_sinkhorn_step_replays(fused, monkeypatch):
+    """Replay EMA, row masking and row/column reductions on embedding-shaped matrices,
+    through EO's step and through the fused kernels (MCORE_SINKHORN_FUSED)."""
     pytest.importorskip('emerging_optimizers.orthogonalized_optimizers.sinkhorn_utils')
+    from megatron.core.optimizer import sinkhorn_fused
     from megatron.core.optimizer.emerging_optimizers import Sinkhorn
+
+    if fused and not sinkhorn_fused.HAVE_TRITON:
+        pytest.skip("requires Triton")
+    monkeypatch.setattr(sinkhorn_fused, "SINKHORN_FUSED", fused)
 
     seeded()
     weight = torch.randn(4097, 256, device='cuda', dtype=torch.float32)
