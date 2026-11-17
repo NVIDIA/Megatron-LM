@@ -7,6 +7,7 @@ import torch
 
 from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.inference.utils import InferenceMode
+from megatron.core.tensor_parallel import layers as tp_layers
 from megatron.core.tensor_parallel.layers import (
     ColumnParallelLinear,
     _wgrad_gemm,
@@ -544,3 +545,43 @@ class TestWgradGemmAccumulate:
         once = out.clone()
         _wgrad_gemm(out, grad_output, total_input)
         torch.testing.assert_close(out, once, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    not tp_layers._grad_accum_fusion_available, reason="needs fused_weight_gradient_mlp_cuda"
+)
+@pytest.mark.parametrize("zero_tensor_dummy_wgrad", [False, True])
+def test_weight_used_twice_gets_zero_tensor_dummy_wgrad(zero_tensor_dummy_wgrad):
+    """An output layer shared by the main and MTP heads: with gradient_accumulation_fusion both
+    uses accumulate into main_grad, and with ``zero_tensor_dummy_wgrad`` the dummy weight
+    gradients autograd sums are ZeroTensors. main_grad gets the same values either way."""
+    Utils.initialize_model_parallel(1, 1)
+    torch.manual_seed(1234)
+    weight = torch.randn(64, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    weight.main_grad = torch.zeros(weight.shape, device="cuda", dtype=torch.float32)
+    weight.grad_added_to_main_grad = False
+    if zero_tensor_dummy_wgrad:
+        weight.zero_tensor_dummy_wgrad = True
+    inputs = [torch.randn(8, 2, 32, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    grads = [torch.randn(8, 2, 64, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+
+    outputs = [
+        linear_with_grad_accumulation_and_async_allreduce(
+            x, weight, None, True, False, False, tp_group=None
+        )
+        for x in inputs
+    ]
+    torch.autograd.backward(outputs, grads)
+
+    expected = torch.zeros_like(weight.main_grad)
+    for x, g in zip(inputs, grads):
+        tp_layers.fused_weight_gradient_mlp_cuda.wgrad_gemm_accum_fp32(
+            x.view(-1, 32), g.view(-1, 64), expected
+        )
+    # The two backward calls may run in either order, so the fp32 sums may round differently.
+    torch.testing.assert_close(weight.main_grad, expected)
+    assert weight.grad_added_to_main_grad
+    assert torch._is_zerotensor(weight.grad) == zero_tensor_dummy_wgrad
+
+    Utils.destroy_model_parallel()
