@@ -516,11 +516,18 @@ class TransformerConfig(ModelParallelConfig):
     """Coefficient for the DSA indexer KL divergence loss.
     Set to 0 to disable indexer loss; in that mode the non-differentiable indexer projections are
     frozen and excluded from gradient/optimizer bookkeeping.
+    With KPool selection (``dsa_indexer_kpool > 1``), a positive coefficient trains the whole
+    KPool indexer, its pool gate and slot bias included, with a sparse pool-level KL over the
+    selected pools; it requires ``dsa_indexer_use_sparse_loss=True``. Unset or 0 keeps the KPool
+    selector frozen.
     """
 
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
-    top-k indices."""
+    top-k indices. KPool selection trains only with the sparse loss, computed over the selected
+    pools: the teacher is the main attention's probability mass of each selected pool (the
+    query-local tail counts in each head's normalizer, not in the target), summed over heads and
+    L1-normalized; the student is the selector's own pool score."""
 
     dsa_indexer_reuse_checkpoint_topk: bool = False
     """Whether a recomputed DSA layer reuses the top-k selected by its checkpoint's first call.
@@ -535,9 +542,10 @@ class TransformerConfig(ModelParallelConfig):
     sharing, and skips the indexer projections, the dense scoring and the top-k. Requires
     ``dsa_kernel_backend='cudnn'``, the fused DSA kernels and cross-layer top-k sharing
     (``dsa_indexer_topk_freq > 1``), plus the sparse indexer loss when the indexer loss is
-    on. Not supported with KPool selection (``dsa_indexer_kpool > 1``), nor for a frozen
-    indexer whose projections are quantized with ``fp8_recipe`` 'delayed' or 'custom' or
-    ``fp4_recipe`` 'custom'. Has no effect without full or ``core_attn`` recompute."""
+    on. Not supported with KPool selection (``dsa_indexer_kpool > 1``, frozen or trainable),
+    nor for a frozen indexer whose projections are quantized with ``fp8_recipe`` 'delayed' or
+    'custom' or ``fp4_recipe`` 'custom'. Has no effect without full or ``core_attn``
+    recompute."""
 
     dsa_indexer_skip_masked_score_fill: bool = True
     """Whether the cuDNN packed-THD DSA indexer scorer may skip its ``-inf`` score prefill.
@@ -582,8 +590,8 @@ class TransformerConfig(ModelParallelConfig):
     with NaN scores, so with the sparse indexer loss (selected scores kept) it ends with
     ``topk_length`` 0 and attends to no key, and without it attends to those first columns;
     cuDNN keeps top-k - 1 real keys there. Requires ``dsa_kernel_backend='cudnn'``. KPool
-    selection (``dsa_indexer_kpool > 1``) does not run this top-k, so the option has no
-    effect there."""
+    selection (``dsa_indexer_kpool > 1``) runs this top-k only with
+    ``dsa_indexer_kpool_scorer_backend='cudnn'`` (over pools instead of tokens)."""
 
     dsa_cudnn_topk_scratch_gib: float = 2.0
     """Per-launch scratch budget, in GiB, of the cuDNN radix top-k of the DSA indexer.
@@ -751,6 +759,16 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_scoring_relu: bool = True
     """Whether DSA indexer should apply ReLU to q@k scores before weighting."""
 
+    dsa_indexer_hf_scoring: bool = False
+    """Use the KPool scoring order of the Hugging Face reference indexer for
+    zai-org/GLM-5.3-Flash (transformers v5.16.1, Glm5NextTextIndexer): upcast projected
+    head weights before scaling, scale FP32 q@k before ReLU, and reduce heads with FP32
+    matmul. Compression rounding and score-input quantization remain independent options.
+    This is the arithmetic of the default PyTorch KPool scorer; with
+    ``dsa_indexer_kpool_scorer_backend='cudnn'`` the cuDNN kernel scores from the BF16
+    projection and drops the uniform scale, which selects the same pools up to ties.
+    """
+
     dsa_indexer_qk_proj_use_quantization: bool = True
     """Whether indexer query/key projections use the enclosing FP8/FP4 context.
     When disabled, these projections use the configured unquantized dtype (e.g. BF16).
@@ -827,12 +845,30 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_kpool: int = 1
     """Number of keys per softmax-weighted indexer pool; 1 keeps per-token selection.
-    When greater than one, ``dsa_indexer_topk`` must be divisible by this value.
+    When greater than one, ``dsa_indexer_topk`` must be divisible by this value. The KPool
+    selector is frozen unless ``dsa_indexer_loss_coeff > 0``, which trains it with the sparse
+    pool-level indexer loss (``dsa_indexer_use_sparse_loss=True``). A trainable KPool indexer
+    rejects FP8 KPool scoring, ``cuda_graph_impl='full_iteration'``, full recompute and
+    selective ``core_attn`` recompute; at runtime it rejects explicit attention masks,
+    CP-local lengths that are not a multiple of ``2 * dsa_indexer_kpool`` and, for packed THD
+    with context parallelism, packs whose padded documents are not multiples of
+    ``2 * cp_size * dsa_indexer_kpool`` or that lack the host boundaries of the prebuilt CP
+    routes. Not supported with ``dsa_indexer_mode='simplified'`` or
+    ``dsa_indexer_reuse_checkpoint_topk``.
     """
 
     dsa_indexer_kpool_use_quantization: bool = False
     """Quantize KPool scoring inputs to E4M3 with power-of-two scales after Hadamard
-    rotation. This does not change projection parameter or GEMM precision.
+    rotation. This does not change projection parameter or GEMM precision. Frozen KPool
+    selectors only: the E4M3 round trip has no training gradient.
+    """
+
+    dsa_indexer_kpool_key_dtype_compression: bool = False
+    """Cast pool probabilities to the key dtype before multiplication and reduction.
+    This matches the compression arithmetic of the Hugging Face reference indexer
+    (transformers v5.16.1, Glm5NextTextIndexer.get_pooled_states). False preserves
+    FP32 weighted reduction from the upstream KPool implementation. Score-input
+    quantization is independent of this compression precision choice.
     """
 
     dsa_indexer_kpool_always_select_tail: bool = True
@@ -840,6 +876,37 @@ class TransformerConfig(ModelParallelConfig):
     This widens the output to ``dsa_indexer_topk + dsa_indexer_kpool - 1``; unused slots are -1.
     Set to False for fixed-width pool-only selection. Only applies when
     ``dsa_indexer_kpool > 1``.
+    """
+
+    dsa_indexer_kpool_scorer_backend: Literal["torch", "cudnn"] = "torch"
+    """How the KPool selector (frozen or trainable) scores pools and picks its top-k inside
+    DSAttention. A trainable indexer's loss recomputes the scores of the selected pools in
+    PyTorch, whichever backend selected them.
+
+    ``'torch'`` scores every query row against every pooled key with PyTorch in FP32 and
+    query chunks, then masks and selects (the reference path).
+    ``'cudnn'`` scores the pooled keys with the cuDNN fused DSA indexer kernel at ratio
+    ``dsa_indexer_kpool``, whose causal rule (row at token position ``p`` sees pools
+    ``[0, (p + 1) // dsa_indexer_kpool)``) is KPool's, and selects with the indexer top-k
+    of ``dsa_indexer_topk_backend``. The kernel sums scores from the BF16 q, pooled keys and
+    head weights (with ``dsa_indexer_hf_scoring``, the BF16 projection; the HF uniform scale
+    does not change the selection), accumulating in another order than the FP32 PyTorch
+    scorer, so a row can swap pools whose scores tie at the selection boundary; the
+    selected pools come in the top-k kernel's order rather than by score. It needs
+    ``dsa_kernel_backend='cudnn'``, fused DSA kernels (``attention_backend`` not
+    ``unfused``), ReLU scoring, no FP8 KPool scoring and BF16 head weights (no
+    ``dsa_indexer_weights_proj_output_dtype='fp32'`` without HF scoring). It applies to
+    causal layouts without an attention mask whose query positions are known: non-packed
+    input without CP or with allgather CP in zigzag order (query positions not taken from
+    ``position_ids``, which DSAttention reads only under CP or for a TP sequence-parallel
+    local query), and packed THD, where each row is scored against its own document's pools:
+    without CP from the pack's device boundaries when the query rows are the whole pack (also
+    inside a CUDA graph capture), under CP from the host boundaries of the prebuilt CP routes
+    (outside a capture). Other calls keep ``'torch'``, logged once per reason, as do
+    off-pool-grid query chunks on a cuDNN frontend without ``q_causal_offsets`` (before
+    1.26).
+    On GB300 at the 1M CP64 rank shape (16,384 rows x 262,144 pools) one selection took
+    about 22 ms against 893 ms for ``'torch'``.
     """
 
     ####################
@@ -3211,7 +3278,8 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "dsa_indexer_weights_proj_output_dtype='fp32' is not supported by "
                 "dsa_kernel_backend='cudnn' for per-token DSA, which requires a BF16 indexer "
-                "weights tensor. KPool selection bypasses the cuDNN top-k path; use KPool or "
+                "weights tensor. The default KPool scorer (dsa_indexer_kpool > 1, "
+                "dsa_indexer_kpool_scorer_backend='torch') does not use it; use KPool or "
                 "dsa_kernel_backend='tilelang'/'none'."
             )
 
@@ -3527,8 +3595,8 @@ class TransformerConfig(ModelParallelConfig):
                         "dsa_indexer_use_sparse_loss=True, or dsa_indexer_loss_coeff=0 for a "
                         "frozen indexer."
                     )
-                # With the loss on, KPool is rejected below together with the indexer loss.
-                if not indexer_loss_on and self.dsa_indexer_kpool > 1:
+                # KPool never reuses a checkpoint's top-k, with the loss on or off.
+                if self.dsa_indexer_kpool > 1:
                     raise ValueError(
                         "dsa_indexer_reuse_checkpoint_topk does not support KPool selection "
                         f"(dsa_indexer_kpool > 1), got dsa_indexer_kpool={self.dsa_indexer_kpool}."
@@ -3582,6 +3650,15 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError(
                     f"dsa_indexer_kpool must be positive, got {self.dsa_indexer_kpool}."
                 )
+            if self.dsa_indexer_hf_scoring and (
+                self.dsa_indexer_kpool <= 1
+                or self.dsa_indexer_weights_proj_output_dtype != "bf16"
+                or not self.dsa_indexer_scoring_relu
+            ):
+                raise ValueError(
+                    "dsa_indexer_hf_scoring requires KPool > 1, BF16 projection output "
+                    "and ReLU scoring."
+                )
             if self.dsa_indexer_kpool > 1:
                 if self.dsa_indexer_topk is None:
                     raise ValueError(
@@ -3598,11 +3675,78 @@ class TransformerConfig(ModelParallelConfig):
                         " by dsa_indexer_kpool for pool selection; "
                         f"got topk={self.dsa_indexer_topk}, kpool={self.dsa_indexer_kpool}."
                     )
-            if self.dsa_indexer_kpool > 1 and (self.dsa_indexer_loss_coeff or 0.0) > 0:
+            if self.dsa_indexer_kpool > 1 and self.dsa_indexer_mode == "simplified":
+                # The simplified (GQA) indexer has no pool code; without this rule a KPool
+                # config with a frozen indexer would be accepted and KPool silently ignored.
                 raise ValueError(
-                    "DSA indexer loss is not supported with kpool selection; set "
-                    "dsa_indexer_loss_coeff=0 or dsa_indexer_kpool=1."
+                    "dsa_indexer_mode='simplified' does not support KPool selection "
+                    "(dsa_indexer_kpool > 1): the simplified indexer has no pool compression, "
+                    "so the pools would be silently ignored; got "
+                    f"dsa_indexer_kpool={self.dsa_indexer_kpool}."
                 )
+            if self.dsa_indexer_kpool > 1 and (self.dsa_indexer_loss_coeff or 0.0) > 0:
+                # A positive coefficient trains the KPool indexer with the sparse pool-level
+                # loss. The remaining trainable-KPool rules (full_iteration CUDA graphs and
+                # recompute that replays the selection) are checked once those options are
+                # final, below.
+                if not self.dsa_indexer_use_sparse_loss:
+                    raise ValueError(
+                        "DSA indexer loss is not supported with kpool selection unless it is "
+                        "the sparse pool-level loss: set dsa_indexer_use_sparse_loss=True to "
+                        "train the KPool indexer, dsa_indexer_loss_coeff=0 to keep it frozen, "
+                        "or dsa_indexer_kpool=1."
+                    )
+                if self.dsa_indexer_kpool_use_quantization:
+                    raise ValueError(
+                        "A trainable KPool indexer (dsa_indexer_kpool > 1 with "
+                        "dsa_indexer_loss_coeff > 0) does not support FP8 KPool scoring "
+                        "(dsa_indexer_kpool_use_quantization): its E4M3 round trip has no "
+                        "defined training gradient."
+                    )
+            if self.dsa_indexer_kpool_scorer_backend not in ("torch", "cudnn"):
+                raise ValueError(
+                    "dsa_indexer_kpool_scorer_backend must be 'torch' or 'cudnn', "
+                    f"got {self.dsa_indexer_kpool_scorer_backend!r}."
+                )
+            if self.dsa_indexer_kpool_scorer_backend == "cudnn":
+                if self.dsa_indexer_kpool <= 1:
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' applies only to KPool "
+                        f"selection (dsa_indexer_kpool > 1), got {self.dsa_indexer_kpool}."
+                    )
+                if self.dsa_kernel_backend != "cudnn":
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' needs "
+                        f"dsa_kernel_backend='cudnn', got {self.dsa_kernel_backend!r}."
+                    )
+                if not self.dsa_indexer_scoring_relu:
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' needs ReLU scoring "
+                        "(dsa_indexer_scoring_relu=True), as the cuDNN indexer kernel does."
+                    )
+                from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+                    use_fused_dsa_kernels,
+                )
+
+                if not use_fused_dsa_kernels(self):
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' needs the fused DSA kernels; "
+                        "attention_backend='unfused' disables them."
+                    )
+                if self.dsa_indexer_kpool_use_quantization:
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' scores BF16 inputs and does "
+                        "not support FP8 KPool scoring (dsa_indexer_kpool_use_quantization)."
+                    )
+                if (
+                    self.dsa_indexer_weights_proj_output_dtype == "fp32"
+                    and not self.dsa_indexer_hf_scoring
+                ):
+                    raise ValueError(
+                        "dsa_indexer_kpool_scorer_backend='cudnn' needs BF16 indexer head "
+                        "weights; dsa_indexer_weights_proj_output_dtype='fp32' would be rounded "
+                        "to BF16. Use dsa_indexer_weights_proj_output_dtype='bf16'."
+                    )
         elif self.experimental_attention_variant == "dsv4_hybrid":
             if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
                 raise ValueError(
@@ -4868,6 +5012,31 @@ class TransformerConfig(ModelParallelConfig):
                     "'layernorm'), or dsa_indexer_scorer_backend='cudnn'."
                 )
 
+        # A trainable KPool indexer under activation recompute, checked once the recompute
+        # options above are final. A checkpoint replay of the DSA layer selects its pools
+        # again, and the cuDNN top-k does not repeat its choice among tied scores (nor need
+        # the PyTorch top-k after any rounding change), so the replayed sparse attention and
+        # indexer loss could use other pools than the first call, whose output the forward
+        # used. KPool has no checkpoint top-k reuse, so reject the replaying recomputes.
+        if self.dsa_indexer_kpool > 1 and (self.dsa_indexer_loss_coeff or 0.0) > 0:
+            replay = None
+            if self.recompute_granularity == "full":
+                replay = "recompute_granularity='full'"
+            elif self.recompute_granularity == "selective" and "core_attn" in (
+                self.recompute_modules or []
+            ):
+                replay = "selective recompute of 'core_attn'"
+            if replay is not None:
+                raise ValueError(
+                    "A trainable KPool indexer (dsa_indexer_kpool > 1 with "
+                    f"dsa_indexer_loss_coeff > 0) does not support {replay}: the checkpoint "
+                    "replay would select the pools again, and the cuDNN top-k does not repeat "
+                    "its choice among tied scores, so the replayed sparse attention and "
+                    "indexer loss could use other pools than the first call, whose output the "
+                    "forward used. Use a recompute that does not replay core attention (e.g. "
+                    "selective 'mla_up_proj' or 'mhc')."
+                )
+
         # Validation for "mhc" in recompute_modules
         if self.recompute_granularity == "selective" and "mhc" in self.recompute_modules:
             if not self.enable_hyper_connections:
@@ -5954,6 +6123,17 @@ class TransformerConfig(ModelParallelConfig):
         assert not (
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
+
+        if (
+            self.cuda_graph_impl == "full_iteration"
+            and self.dsa_indexer_kpool > 1
+            and (self.dsa_indexer_loss_coeff or 0.0) > 0
+        ):
+            # The trainable KPool loss path has no full-iteration capture test yet.
+            raise ValueError(
+                "A trainable KPool indexer (dsa_indexer_kpool > 1 with dsa_indexer_loss_coeff "
+                "> 0) does not support cuda_graph_impl='full_iteration'."
+            )
 
         if (
             self.mlp_chunks_for_training > 1
