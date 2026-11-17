@@ -140,6 +140,9 @@ def test_failed_baseline_cannot_reuse_old_metadata(project, cache, append):
     result = _invoke(project, cache, "baseline", append=append)
     assert result.returncode == 1
     assert not (cache / "prod/metadata.json").exists()
+    selection = _invoke(project, cache, "select")
+    assert selection.returncode == 2
+    assert "metadata.json" in selection.stderr
 
 
 def test_appended_profiles_preserve_selection_for_each_environment(project, tmp_path):
@@ -181,10 +184,9 @@ def test_appended_profiles_preserve_selection_for_each_environment(project, tmp_
 
 
 def test_append_rejects_changed_runtime_before_modifying_database(project, cache):
-    metadata_path = cache / "prod/metadata.json"
-    metadata = json.loads(metadata_path.read_text())
-    metadata["runtime"]["python"] = "0.0.0"
-    metadata_path.write_text(json.dumps(metadata))
+    distribution = project / "torch-0.0.0.dist-info"
+    distribution.mkdir()
+    (distribution / "METADATA").write_text("Name: torch\nVersion: 0.0.0\n")
     before = _snapshot(cache / "prod")
     result = _invoke(project, cache, "baseline", append=True)
     assert result.returncode == 2

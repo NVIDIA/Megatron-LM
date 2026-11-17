@@ -9,7 +9,7 @@ usage() {
 
 # Get directory of this script
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-cd "$SCRIPT_PATH/../../"
+cd $SCRIPT_PATH/../../
 
 # Default values
 UNIT_TEST_REPEAT=1
@@ -112,7 +112,7 @@ else
     TEST_PATH="/opt/megatron-lm-legacy/"
 fi
 
-cd "$TEST_PATH"
+cd $TEST_PATH
 
 # These buckets need fixed world sizes and isolated precision processes, but
 # share the same Testmon baseline/selection lifecycle as every other bucket.
@@ -191,12 +191,12 @@ NUM_NODES=${NUM_NODES:-${SLURM_NNODES:-1}}
 GPUS_PER_NODE=${GPUS_PER_NODE:-8}
 NODE_RANK=${SLURM_NODEID:-${SLURM_NODEID:-0}}
 DISTRIBUTED_ARGS=(
-    --nproc_per_node "$GPUS_PER_NODE"
-    --nnodes "$NUM_NODES"
-    --master_addr "$MASTER_ADDR"
-    --master_port "$MASTER_PORT"
-    --node_rank "$NODE_RANK"
-    --log-dir "$LOG_DIR"
+    --nproc_per_node $GPUS_PER_NODE
+    --nnodes $NUM_NODES
+    --master_addr $MASTER_ADDR
+    --master_port $MASTER_PORT
+    --node_rank $NODE_RANK
+    --log-dir $LOG_DIR
     --tee "0:3"
     --redirects "3"
 )
