@@ -929,7 +929,10 @@ class TestFlashAttentionDeviceSelection:
     def _fresh_device_cache(self, monkeypatch):
         monkeypatch.delenv("FLASH_ATTENTION_ARCH", raising=False)
         _flash_attn_majors.cache_clear()
+        # Attention needs real tensor- and context-parallel groups; a single rank's suffice.
+        Utils.initialize_model_parallel(1, 1)
         yield
+        Utils.destroy_model_parallel()
         _flash_attn_majors.cache_clear()
 
     @staticmethod
@@ -948,7 +951,7 @@ class TestFlashAttentionDeviceSelection:
             submodules,
             layer_number=1,
             attn_mask_type=AttnMaskType.causal,
-            pg_collection=ProcessGroupCollection(tp=None, cp=None),
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"]),
         )
         attn.eval()
         attn.batch_invariant_mode = batch_invariant_mode
