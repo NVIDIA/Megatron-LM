@@ -1046,7 +1046,8 @@ class TestTensorReshardSpecs:
             ((2, 3), (5,)),
         ]
 
-    def test_strided_glu_shard_becomes_packed_component_specs(self):
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_strided_glu_shard_becomes_packed_component_specs(self, reverse):
         """A stride-2 TP shard ``[gate_i; up_i]`` is resharded as two components."""
         src_mesh = [0, 1]
         src = {
@@ -1065,18 +1066,68 @@ class TestTensorReshardSpecs:
         }
         dst_metadata = _meta(shape=(8, 8), owner_rank=2, tp_ranks=[2], dp_ranks=[2])
 
-        specs, error = _build_tensor_reshard_specs(
-            {2: {"weight": dst_metadata}}, src, my_global_rank=2
-        )
+        dst = {2: {"weight": dst_metadata}}
+        if reverse:
+            dst = {m.owner_rank: {"weight": m} for m in src["weight"]}
+            src = {"weight": [dst_metadata]}
+
+        specs, error = _build_tensor_reshard_specs(dst, src, my_global_rank=2)
 
         assert error is None
         assert [spec.global_shape for spec in specs] == [(8, 4), (8, 4)]
-        assert [spec.src_local_shape for spec in specs] == [(8, 2), (8, 2)]
-        assert [spec.dst_local_shape for spec in specs] == [(8, 4), (8, 4)]
+        src_size, dst_size = (4, 2) if reverse else (2, 4)
+        assert [spec.src_local_shape for spec in specs] == [(8, src_size)] * 2
+        assert [spec.dst_local_shape for spec in specs] == [(8, dst_size)] * 2
         assert [spec.part_index for spec in specs] == [0, 1]
         assert all(spec.part_count == 2 for spec in specs)
-        assert [spec.src_slice[1] for spec in specs] == [slice(0, 2), slice(2, 4)]
-        assert [spec.dst_slice[1] for spec in specs] == [slice(0, 4), slice(4, 8)]
+        assert [spec.src_slice[1] for spec in specs] == [
+            slice(0, src_size),
+            slice(src_size, 2 * src_size),
+        ]
+        assert [spec.dst_slice[1] for spec in specs] == [
+            slice(0, dst_size),
+            slice(dst_size, 2 * dst_size),
+        ]
+
+    @pytest.mark.parametrize("strided_ranks", [1, 2])
+    @pytest.mark.parametrize("reverse", [False, True])
+    def test_mixed_strided_plain_multi_rank_tp_is_rejected(self, strided_ranks, reverse):
+        strided_mesh = list(range(strided_ranks))
+        plain_mesh = [2, 3]
+        strided = [
+            _meta(
+                shape=(8 // strided_ranks,),
+                is_tp=True,
+                partition_dim=0,
+                partition_stride=2,
+                owner_rank=rank,
+                tp_ranks=strided_mesh,
+                dp_ranks=[rank],
+            )
+            for rank in strided_mesh
+        ]
+        plain = [
+            _meta(
+                shape=(4,),
+                is_tp=True,
+                partition_dim=0,
+                partition_stride=1,
+                owner_rank=rank,
+                tp_ranks=plain_mesh,
+                dp_ranks=[rank],
+            )
+            for rank in plain_mesh
+        ]
+        sources, destinations = (plain, strided) if reverse else (strided, plain)
+
+        specs, error = _build_tensor_reshard_specs(
+            {m.owner_rank: {"weight": m} for m in destinations},
+            {"weight": sources},
+            my_global_rank=0,
+        )
+
+        assert specs is None
+        assert error == "weight: mixed strided/plain TP layouts are unsupported"
 
     def test_strided_tp_to_strided_tp_keeps_component_layout(self):
         """GLU TP2 -> TP4: both sides are described as two packed components."""

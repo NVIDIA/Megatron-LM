@@ -464,11 +464,9 @@ def test_nccl_m2n_refits_selective_mxfp8_from_te(
     grouped_gemm_backend: str, monkeypatch: pytest.MonkeyPatch
 ):
     """Keep non-expert weights BF16 while refitting TE MXFP8 experts through M2N."""
+    # Only this optional quantized-source test needs TE's MXFP8 quantizer.
     import transformer_engine_torch as tex
     from transformer_engine.pytorch.tensor.mxfp8_tensor import MXFP8Quantizer
-
-    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-    from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
 
     Utils.initialize_distributed()
     if torch.cuda.get_device_properties(torch.cuda.current_device()).major < 10:
@@ -584,7 +582,6 @@ def test_nccl_m2n_refits_selective_mxfp8_from_te(
 )
 def test_nccl_m2n_quantizes_packed_parameters_to_mxfp8_one_at_a_time():
     """Receive packed BF16 shards and immediately quantize each full local parameter."""
-    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
 
     Utils.initialize_distributed()
     if torch.cuda.get_device_properties(torch.cuda.current_device()).major < 10:

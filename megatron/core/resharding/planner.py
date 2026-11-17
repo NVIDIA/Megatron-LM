@@ -826,6 +826,20 @@ def _build_tensor_reshard_specs(
         dst_metadata = dst_by_rank[dst_mesh[0]]
         selected_src = select_src_metadata_balanced(src_meta_list, dst_metadata, dst_mesh[0])
         src_mesh = _tensor_mesh(selected_src)
+        # A plain multi-rank shard is contiguous in the global tensor, not in
+        # each GLU component. Inferring packed sizes would silently reorder it.
+        src_stride = selected_src.partition_stride
+        dst_stride = dst_metadata.partition_stride
+        if (
+            selected_src.partition_sizes is None
+            and dst_metadata.partition_sizes is None
+            and src_stride != dst_stride
+            and (
+                (selected_src.is_tp and len(src_mesh) > 1 and src_stride == 1)
+                or (dst_metadata.is_tp and len(dst_mesh) > 1 and dst_stride == 1)
+            )
+        ):
+            return None, f"{resolved_name}: mixed strided/plain TP layouts are unsupported"
         src_by_rank = {r: _strided_as_packed(m) for r, m in src_groups[src_mesh].items()}
         dst_by_rank = {r: _strided_as_packed(m) for r, m in dst_by_rank.items()}
         dst_metadata = dst_by_rank[dst_mesh[0]]
