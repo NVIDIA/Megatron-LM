@@ -1339,6 +1339,20 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "compared bitwise with the eager composition; the full eager-parity grid lives in "
         "tests/unit_tests/fusions/test_fused_attention_output_gate.py.",
     ),
+    KernelEntry(
+        name="dsa_deepselect_topk",
+        sources=(
+            "megatron/core/transformer/experimental_attention_variant/dsa_deepselect_topk.py",
+        ),
+        tests=(
+            "tests/unit_tests/transformer/experimental_attention_variant/"
+            "test_dsa_deepselect_topk_gpu.py",
+        ),
+        kind="triton",
+        notes="Optional DeepSelect top-k backend (external DeepSelect build) and its NaN-row "
+        "repair kernel. The GPU tests repeat the selection bitwise, check batch independence "
+        "and replay it under a CUDA graph.",
+    ),
 )
 
 
