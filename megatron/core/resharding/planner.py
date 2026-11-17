@@ -851,6 +851,7 @@ def build_plan_from_rosters(
                     peer_slice=dst_slice,
                     task_id=task_id,
                     batch_id=batch_ids[dst_metadata.resolved_name or dst_metadata.name],
+                    dst_dtype=dst_metadata.dtype,
                 )
             )
 

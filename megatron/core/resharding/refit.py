@@ -550,11 +550,14 @@ def _harmonize_buffer_dtypes(plan, src_core, tgt_core, group=None):
             }
         # Transfer IDs already pair source and destination tensors, even when
         # their storage names or local pipeline indices differ.
-        local_src_dtypes = {
-            op.task_id: source_buffers[op.param_name]
-            for op in plan.send_ops
-            if op.param_name in source_buffers
-        }
+        local_src_dtypes = {}
+        for op in plan.send_ops:
+            if op.param_name in source_buffers:
+                local_src_dtypes[op.task_id] = source_buffers[op.param_name]
+                # Destinations are forced to this dtype on every refit below. Pin the
+                # wire dtype to it too: buffers such as the router expert_bias change
+                # dtype after planning (``_maintain_float32_expert_bias``).
+                op.dst_dtype = source_buffers[op.param_name]
         destination_buffers = (
             {name for name, _, _, _ in named_persistent_buffers(tgt_core)}
             if tgt_core is not None

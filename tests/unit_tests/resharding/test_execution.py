@@ -184,6 +184,38 @@ class TestExecuteReshard:
 
         assert torch.equal(dict(dst_module.named_parameters())["weight"].data, src_data[:4])
 
+    def test_send_casts_to_destination_dtype(self):
+        """An FP32 source reaches a BF16 destination as BF16 on the wire."""
+        src_data = torch.randn(4, 8, device="cuda")
+        src_module = _make_module_with_params({"weight": src_data.clone()})
+        dst_module = _make_module_with_params(
+            {"weight": torch.zeros(4, 8, dtype=torch.bfloat16, device="cuda")}
+        )
+
+        s = _full_slice(2)
+        send = _make_transfer_op("weight", 1, True, s, s, task_id=0)
+        send.dst_dtype = torch.bfloat16
+        plan = ReshardPlan(
+            send_ops=[send], recv_ops=[_make_transfer_op("weight", 0, False, s, s, task_id=0)]
+        )
+
+        class DtypeRecordingService(MockCopyService):
+            def __init__(self):
+                super().__init__()
+                self.sent_dtypes = []
+
+            def submit_send(self, src_tensor, dest_rank, task_id=None):
+                self.sent_dtypes.append(src_tensor.dtype)
+                super().submit_send(src_tensor, dest_rank, task_id=task_id)
+
+        service = DtypeRecordingService()
+        _run(plan, src_module, dst_module, service)
+
+        assert service.sent_dtypes == [torch.bfloat16]
+        assert torch.equal(
+            dict(dst_module.named_parameters())["weight"].data, src_data.to(torch.bfloat16)
+        )
+
 
 class TestExecutionBatches:
     """Test bounded, globally coordinated executor batches."""

@@ -41,6 +41,10 @@ class TransferOp:
     # transient receive buffers are released.
     batch_id: int = 0
 
+    # Destination dtype on send ops. Receivers write straight into destination
+    # storage, so a source held in another precision is cast before it is sent.
+    dst_dtype: torch.dtype | None = None
+
 
 @dataclass
 class ParameterMetadata:

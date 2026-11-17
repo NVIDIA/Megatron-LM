@@ -778,6 +778,14 @@ class TestBuildPlanFromRosters:
                 received[receive.my_slice].copy_(source_shards[receive.peer_rank][send.my_slice])
             torch.testing.assert_close(received, source_shards[rank - 2], rtol=0, atol=0)
 
+    def test_send_ops_carry_destination_dtype(self):
+        """A source kept in FP32 is sent in the destination's BF16."""
+        dst = _meta(owner_rank=1, tp_ranks=[1], dp_ranks=[1])
+        dst.dtype, dst.element_size = torch.bfloat16, 2
+        plans = _build_all([([_meta(owner_rank=0, tp_ranks=[0], dp_ranks=[0])], []), ([], [dst])])
+
+        assert [op.dst_dtype for op in plans[0].send_ops] == [torch.bfloat16]
+
     def test_gtp_schedule_matches_across_ranks(self):
         """Every GTP shard send has the matching deterministic receive."""
         src = [

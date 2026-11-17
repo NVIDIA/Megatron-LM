@@ -211,6 +211,8 @@ def _execute_batch(
                 torch.cuda.current_stream().wait_event(ev)
             sendable = get_sendable(op.param_name, src_param)
             src_view = sendable[op.my_slice]
+            if op.dst_dtype is not None and src_view.dtype != op.dst_dtype:
+                src_view = src_view.to(op.dst_dtype)
             if not src_view.is_contiguous():
                 src_view = src_view.contiguous()
             service.submit_send(src_view, op.peer_rank, task_id=op.task_id)
