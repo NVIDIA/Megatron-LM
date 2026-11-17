@@ -24,7 +24,7 @@ from megatron.core.transformer.transformer_config import TransformerConfig
     [
         {"bf16": False},
         {"fp8": "hybrid"},
-        {"moe_flex_dispatcher_backend": "hybridep"},
+        {"moe_flex_dispatcher_backend": "hybridep", "expert_tensor_parallel_size": 2},
         {"moe_flex_dispatcher_backend": "deepepv2"},
         {"moe_expert_capacity_factor": 1.0},
         {"moe_pad_expert_input_to_capacity": True},

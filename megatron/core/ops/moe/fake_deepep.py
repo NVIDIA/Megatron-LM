@@ -22,6 +22,10 @@ def fake_flex_memory_model(options):
     args = {key.replace("_", "-"): value for key, value in options.items()}
     if args.get("moe-token-dispatcher-type") != "flex":
         return None
+    if args.get("moe-flex-dispatcher-backend") == "hybridep":
+        from .fake_hybridep import fake_hybridep_memory_model
+
+        return fake_hybridep_memory_model(args)
     unsupported = []
     if args.get("moe-flex-dispatcher-backend", "deepep") != "deepep":
         unsupported.append("HybridEP")

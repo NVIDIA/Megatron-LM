@@ -7,6 +7,7 @@ import inspect
 from typing import Callable, Optional
 
 from megatron.core.ops.moe.fake_deepep import capture_event, get_fake_buffer, is_fake_process_group
+from megatron.core.ops.moe.fake_hybridep import FakeHybridEPBuffer, FakeHybridEPHandle
 from megatron.core.utils import internal_api
 
 try:
@@ -569,6 +570,9 @@ def init_hybrid_ep_buffer(
     '''
     assert not fp8_dispatch, "HybridEP dispatcher does not support fp8 dispatch now"
     global _hybrid_ep_buffer
+    if is_fake_process_group(group):
+        _hybrid_ep_buffer = FakeHybridEPBuffer(group, hidden_dim, num_tokens, num_local_experts)
+        return
     kwargs = {}
     if num_sms_dispatch_api is not None:
         kwargs['num_sms_dispatch_api'] = num_sms_dispatch_api
@@ -629,7 +633,9 @@ class HybridEPDispatch(torch.autograd.Function):
         '''
         Forward pass of fused dispatch of the HybridEP backend
         '''
-        if fused or num_blocks_permute is not None or num_blocks_unpermute is not None:
+        if not is_fake_process_group(group) and (
+            fused or num_blocks_permute is not None or num_blocks_unpermute is not None
+        ):
             import warnings
 
             if not _has_parameter(HybridEPBuffer.dispatch_with_permute, 'fuse_permute_dispatch'):
@@ -644,7 +650,19 @@ class HybridEPDispatch(torch.autograd.Function):
                 num_blocks_permute = None
                 num_blocks_unpermute = None
 
-        if _hybrid_ep_buffer is None:
+        if (
+            _hybrid_ep_buffer is None
+            or isinstance(_hybrid_ep_buffer, FakeHybridEPBuffer) != is_fake_process_group(group)
+            or (
+                is_fake_process_group(group)
+                and (
+                    _hybrid_ep_buffer.group is not group
+                    or _hybrid_ep_buffer.hidden_dim != x.shape[-1]
+                    or _hybrid_ep_buffer.num_local_experts != num_local_experts
+                    or _hybrid_ep_buffer.device != x.device
+                )
+            )
+        ):
             num_tokens, hidden_dim = x.shape[-2:]
             fp8_dispatch = False  # Currently, we do not support fp8 dispatch
             init_hybrid_ep_buffer(
@@ -707,7 +725,8 @@ class HybridEPDispatch(torch.autograd.Function):
         Backward pass of fused dispatch of the HybridEP backend
         '''
         handle = ctx.handle
-        combined_hidden, combined_probs = _hybrid_ep_buffer.combine_with_unpermute(
+        buffer = handle.owner if isinstance(handle, FakeHybridEPHandle) else _hybrid_ep_buffer
+        combined_hidden, combined_probs = buffer.combine_with_unpermute(
             hidden=grad_x,
             probs=grad_probs,
             handle=handle,
@@ -744,7 +763,8 @@ class HybridEPCombine(torch.autograd.Function):
         '''
         Forward pass of fused combine of the HybridEP backend
         '''
-        combined_hidden, _ = _hybrid_ep_buffer.combine_with_unpermute(
+        buffer = handle.owner if isinstance(handle, FakeHybridEPHandle) else _hybrid_ep_buffer
+        combined_hidden, _ = buffer.combine_with_unpermute(
             hidden=x,
             handle=handle,
             pad_multiple=pad_multiple,
@@ -762,7 +782,8 @@ class HybridEPCombine(torch.autograd.Function):
         Backward pass of fused combine of the HybridEP backend
         '''
         handle = ctx.handle
-        dispatched_hidden, _, _, _, _ = _hybrid_ep_buffer.dispatch_with_permute(
+        buffer = handle.owner if isinstance(handle, FakeHybridEPHandle) else _hybrid_ep_buffer
+        dispatched_hidden, _, _, _, _ = buffer.dispatch_with_permute(
             hidden=grad_x,
             scaling_factor=None,
             handle=handle,

@@ -1074,6 +1074,8 @@ class _HybridEPManager(_DispatchManager):
         self.num_experts = num_experts
         self.config = config
         self.router_topk = router_topk if router_topk is not None else config.moe_router_topk
+        if is_fake_process_group(group):
+            validate_fake_flex_config(config)
         self.permute_fusion = config.moe_permute_fusion
         self.capacity_factor = config.moe_expert_capacity_factor
         # Drop and pad the input to capacity.
@@ -1124,6 +1126,10 @@ class _HybridEPManager(_DispatchManager):
         padding_mask: Optional[torch.Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
+        if is_fake_process_group(self.group) and (
+            packed_seq_params is not None or (padding_mask is not None and bool(padding_mask.any()))
+        ):
+            raise ValueError("fake HybridEP does not model packed or masked input tokens")
         num_tokens = routing_map.shape[0]
         self._original_num_tokens = num_tokens
 

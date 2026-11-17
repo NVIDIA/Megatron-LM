@@ -924,17 +924,17 @@ If you use Megatron Core MoE in your research, please cite:
 }
 ```
 
-## Fake process groups with Flex/DeepEP
+## Fake process groups with Flex/DeepEP and HybridEP
 
 For a single-device memory probe, `--fake-process-group` supports the `flex`
-dispatcher with the `deepep` backend, BF16, and
+dispatcher with the `deepep` or `hybridep` backend, BF16, and
 `--moe-router-force-load-balancing`. No checkpoint or peer processes are required.
 Use the desired logical `WORLD_SIZE`, `RANK`, and model-parallel settings as with
 other FakePG probes. The selected rank constructs its own model shard and runs
 its normal pipeline schedule; probe the first and last logical rank separately
 when representative pipeline endpoints are needed.
 
-The fake backend executes the normal Flex preprocessing, expert computation,
+The fake DeepEP backend executes the normal Flex preprocessing, expert computation,
 permutation, and backward paths. Its received hidden-state shape is
 `[local_tokens * effective_topk, hidden_size]`, where the effective top-k includes
 expert tensor-parallel route replication. Every received row represents one
@@ -952,9 +952,30 @@ memory, exact RDMA metadata, and asynchronous communication lifetimes are not
 reproduced. The probe provides allocation evidence, not distributed timing or
 numerical training validation.
 
-HybridEP, DeepEP v2, quantization, capacity/drop/padding, and CUDA Graph capture
-are outside this initial fake Flex implementation. Unsupported combinations fail
-validation; real distributed training continues to use its selected backend.
+For `--moe-flex-dispatcher-backend hybridep`, the fake allocation model supports
+ETP1, equal source input sizes, and dropless routing. HybridEP bindings must be
+installed, but the native Buffer constructor is never called. Boolean routing
+maps and dense expert IDs use the same balanced expert-contiguous receive shape:
+`local_tokens * router_topk` rows, rounded up per local expert when BF16
+GroupedTensor/op-fuser alignment is enabled. Existing dispatch/combine autograd
+wrappers retain shape-only handles through backward; expert computation and its
+saved tensors remain real. Fused and unfused HybridEP permutation settings use
+this same synthetic allocation path.
+
+Unlike the DeepEP v1 model above, the HybridEP model **excludes** persistent
+transport buffers, scaling storage, native routing-handle arrays, workspace,
+and real asynchronous communication lifetimes. Its receipt explicitly reports
+`measurement_scope=model_state_and_activations; not total device capacity` and
+`capacity_guarantee=false`. Use it to compare model-state and activation memory;
+it cannot certify that a real HybridEP run will fit. Natural routing imbalance
+and remote input values are not reconstructed.
+
+DeepEP v2, quantization, capacity/drop/router padding, and CUDA Graph capture
+remain unsupported. HybridEP additionally rejects ETP greater than one, virtual
+expert balancing, uneven-input padding, packed sequences, and masked input rows.
+BF16 per-expert alignment is supported and is distinct from router capacity or
+quantization padding. Unsupported combinations fail validation; real distributed
+training continues to use its selected backend.
 
 For fixed-length, unpacked probes, non-source TP ranks initialize their existing
 receive buffers with synthetic token IDs, labels, loss masks, and positions.
