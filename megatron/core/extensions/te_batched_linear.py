@@ -62,6 +62,11 @@ if BatchedLinear is not None:
             """Preserve the requested unquantized initializer for the FP32 master."""
             initializer = self._init_method
             initial_value = None
+            cpu_weight = (
+                self.weight
+                if self._with_quantized_weight and self.weight.device.type == "cpu"
+                else None
+            )
 
             def initialize(weight):
                 nonlocal initial_value
@@ -74,6 +79,10 @@ if BatchedLinear is not None:
             self._init_method = initialize
             try:
                 super().reset_parameters()
+                if cpu_weight is not None:
+                    # TE quantization can read CPU storage asynchronously. Keep the
+                    # initializer alive until that read completes before releasing it.
+                    torch.cuda.current_stream(self.weight.device).synchronize()
             finally:
                 self._init_method = initializer
             self._flatten_weight()
