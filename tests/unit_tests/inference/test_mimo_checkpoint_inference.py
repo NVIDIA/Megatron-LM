@@ -197,8 +197,11 @@ def test_check_mimo_checkpoint_fully_loaded(monkeypatch, checkpoint_keys):
         vlm._check_mimo_checkpoint_fully_loaded(args, model)
 
 
-def test_mimo_vision_configs():
-    language_config = TransformerConfig(num_layers=1, hidden_size=32, num_attention_heads=4)
+@pytest.mark.parametrize("tp", [1, 2])
+def test_mimo_vision_configs(tp):
+    language_config = TransformerConfig(
+        num_layers=1, hidden_size=32, num_attention_heads=4, tensor_model_parallel_size=tp
+    )
     args = SimpleNamespace(
         vision_model_type='pixtral-vit-large',
         vision_num_layers=2,
@@ -217,6 +220,8 @@ def test_mimo_vision_configs():
 
     projection = vision_projection_config(args, language_config, config.add_bias_linear)
     assert (projection.hidden_size, projection.ffn_hidden_size) == (32, 32)
+    # The attention-free projection must build at any TP size the language model uses.
+    assert projection.tensor_model_parallel_size == tp
     assert projection.activation_func is _unfused_fast_gelu
     # Native mcore ViTs have no class tokens.
     assert get_num_image_embeddings(1540, 1540, 14, 'pixtral-vit-large', False, 1, False) == 110**2
