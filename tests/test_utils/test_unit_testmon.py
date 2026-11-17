@@ -36,7 +36,7 @@ def _function(source: str, name: str) -> str:
     return source.split(f"{name}() {{", 1)[1].split("\n}\n", 1)[0]
 
 
-def _invoke(project, cache, mode, phase="prod", rank=0, pytest_args=(), append=False):
+def _invoke(project, cache, mode, phase="prod", rank=0, pytest_args=()):
     return subprocess.run(
         [
             sys.executable,
@@ -47,7 +47,6 @@ def _invoke(project, cache, mode, phase="prod", rank=0, pytest_args=(), append=F
             str(cache),
             "--phase",
             phase,
-            *(["--append"] if append else []),
             "--",
             "-q",
             "-c",
@@ -134,72 +133,11 @@ def test_successful_baseline_records_each_phase(project, cache):
         assert (cache / phase / "metadata.json").is_file()
 
 
-@pytest.mark.parametrize("append", (False, True))
-def test_failed_baseline_cannot_reuse_old_metadata(project, cache, append):
+def test_failed_baseline_cannot_reuse_old_metadata(project, cache):
     (project / "tests/test_app.py").write_text("def test_failure():\n    assert False\n")
-    result = _invoke(project, cache, "baseline", append=append)
+    result = _invoke(project, cache, "baseline")
     assert result.returncode == 1
     assert not (cache / "prod/metadata.json").exists()
-    selection = _invoke(project, cache, "select")
-    assert selection.returncode == 2
-    assert "metadata.json" in selection.stderr
-
-
-def test_appended_profiles_preserve_selection_for_each_environment(project, tmp_path):
-    (project / "tests/test_other.py").write_text(
-        "from app import unused\n\ndef test_other():\n    assert unused(1) == 0\n"
-    )
-    cache = tmp_path / "profile-cache"
-    profiles = ("active", "other")
-    for index, profile in enumerate(profiles):
-        result = _invoke(
-            project,
-            cache,
-            "baseline",
-            pytest_args=(f"--testmon-env={profile}", "-k", profile),
-            append=index > 0,
-        )
-        assert result.returncode == 0, result.stdout + result.stderr
-    before = _snapshot(cache / "prod")
-    original = (project / "app.py").read_text()
-    for changed_profile, source in (
-        (None, original),
-        ("active", original.replace("value + 1", "value + 2")),
-        ("other", original.replace("value - 1", "value - 2")),
-    ):
-        # The changed tests would fail if executed; selection must only collect them.
-        (project / "app.py").write_text(source)
-        for profile in profiles:
-            result = _invoke(
-                project, cache, "select", pytest_args=(f"--testmon-env={profile}", "-k", profile)
-            )
-            assert result.returncode == 0, result.stdout + result.stderr
-            expected = []
-            if profile == changed_profile:
-                filename = "test_app.py" if profile == "active" else "test_other.py"
-                expected = [f"tests/{filename}::test_{profile}"]
-            selected = cache / ".testmon-work/prod/rank-0/selected-tests"
-            assert selected.read_text().splitlines() == expected
-            assert _snapshot(cache / "prod") == before
-
-
-def test_append_rejects_changed_runtime_before_modifying_database(project, cache):
-    distribution = project / "torch-0.0.0.dist-info"
-    distribution.mkdir()
-    (distribution / "METADATA").write_text("Name: torch\nVersion: 0.0.0\n")
-    before = _snapshot(cache / "prod")
-    result = _invoke(project, cache, "baseline", append=True)
-    assert result.returncode == 2
-    assert "Testmon runtime environment changed" in result.stderr
-    assert _snapshot(cache / "prod") == before
-
-
-def test_append_rejects_selection_mode(project, cache):
-    before = _snapshot(cache / "prod")
-    result = _invoke(project, cache, "select", append=True)
-    assert result.returncode == 2
-    assert "--append requires --mode baseline" in result.stderr
-    assert _snapshot(cache / "prod") == before
 
 
 def test_empty_baseline_phase_is_recorded(project, tmp_path):
