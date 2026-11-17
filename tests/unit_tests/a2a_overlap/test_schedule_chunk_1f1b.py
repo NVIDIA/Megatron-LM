@@ -512,7 +512,7 @@ class TestA2AOverlap:
         torch.cuda.empty_cache()
 
     @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
-    @pytest.mark.parametrize("mtp_layers", [0, 1])
+    @pytest.mark.parametrize("mtp_layers", [0, 1, 2])
     @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
     @pytest.mark.parametrize("fp8_flag", get_valid_fp8_flags())
     @pytest.mark.parametrize("layers", [[2, 1], [1, 2], [1, 1]])
@@ -533,6 +533,22 @@ class TestA2AOverlap:
             extra_kwargs["mtp_num_layers"] = mtp_layers
             extra_kwargs["mtp_loss_scaling_factor"] = 1.1
         run_two_chunk_parity(layers, extra_kwargs)
+
+    @pytest.mark.skipif(not is_te_min_version("1.9.0.dev0"), reason="Requires TE >= 1.9.0.dev0")
+    @pytest.mark.parametrize("dispatcher_type,flex_backend", get_valid_dispatcher_configs())
+    def test_1f1b_schedule_model_chunk_multi_mtp_multi_microbatch(
+        self, dispatcher_type, flex_backend
+    ):
+        """Two MTP depths over four microbatches.
+
+        Each non-last depth hands a detached copy of its output to the last depth's
+        torch.cat and adds the loss-side gradient back in its own backward. Rebuilding the
+        plans every round must not carry those copies, or their gradients, into the next
+        microbatch.
+        """
+        extra_kwargs = {"mtp_num_layers": 2, "mtp_loss_scaling_factor": 1.1}
+        apply_flex_backend_kwargs(extra_kwargs, dispatcher_type, flex_backend)
+        run_two_chunk_parity([2, 1], extra_kwargs, microbatches=4)
 
     def _run_full_recompute_parity(
         self,
