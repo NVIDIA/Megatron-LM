@@ -162,6 +162,8 @@ def model_provider(
                 use_transformer_engine=use_te,
                 normalization=language_config.normalization,
                 qk_l2_norm=language_config.qk_l2_norm,
+                vp_stage=vp_stage,
+                pp_rank=pg_collection.pp.rank() if pg_collection is not None else None,
             )
         else:
             language_transformer_layer_spec = get_layer_spec_te(

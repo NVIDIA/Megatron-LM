@@ -540,7 +540,7 @@ class LLaVAModel(MegatronModule):
                 vision_projection_layer_spec,
                 vision_projection_type,
                 vision_projection_input_size,
-                tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
             )
             # Ignore missing weights for the vision projection during checkpoint loading.
             # This should be disabled by default but can be enabled if your checkpoint contains
@@ -1175,7 +1175,7 @@ class LLaVAModel(MegatronModule):
 
         if self.sequence_parallel_lm and self.pre_process:
             combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
-                combined_embeddings
+                combined_embeddings, group=self.pg_collection.tp
             )  # [S/(CP*TP),B,H]
 
         return combined_embeddings, expanded_labels, expanded_loss_mask, packed_seq_params
