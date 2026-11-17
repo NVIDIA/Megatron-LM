@@ -110,11 +110,10 @@ def main() -> None:
     torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
     torch.distributed.init_process_group(backend="nccl")
     try:
-        parallel_state.initialize_model_parallel()
-        # Materialize the global grid at bootstrap; pass it explicitly to the model.
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        # Set up the global grid at bootstrap; pass the collection it returns to the model.
+        pg_collection = parallel_state.initialize_model_parallel()
         torch.manual_seed(1234)
-        model_parallel_cuda_manual_seed(1234)
+        model_parallel_cuda_manual_seed(1234, pg_collection=pg_collection)
 
         model = build_model(pg_collection).cuda()
         optimizer = torch.optim.SGD(model.parameters(), lr=0.1)

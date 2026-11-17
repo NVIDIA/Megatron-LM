@@ -665,7 +665,10 @@ class TestMuonOptimizerMultiRank:
 
         # Test creating the optimizer
         optimizer = get_megatron_optimizer(
-            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
+            config=optimizer_config,
+            model_chunks=[model],
+            use_gloo_process_groups=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         # Test basic properties
@@ -725,7 +728,11 @@ class TestMuonOptimizerMultiRank:
         )
 
         with pytest.raises(Exception, match='emerging optimizer with fp16 is not supported'):
-            get_megatron_optimizer(config=optimizer_config_fp16, model_chunks=[model])
+            get_megatron_optimizer(
+                config=optimizer_config_fp16,
+                model_chunks=[model],
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
 
         # Test 3: Invalid num_ns_steps should raise exception
         optimizer_config_invalid_ns = OptimizerConfig(
@@ -737,7 +744,11 @@ class TestMuonOptimizerMultiRank:
         )
 
         with pytest.raises(ValueError, match='num_ns_steps must be at least 1'):
-            get_megatron_optimizer(config=optimizer_config_invalid_ns, model_chunks=[model])
+            get_megatron_optimizer(
+                config=optimizer_config_invalid_ns,
+                model_chunks=[model],
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
 
     def test_get_megatron_optimizer_layer_wise(self):
         """Test get_megatron_optimizer with layer-wise distributed optimizer."""
@@ -761,7 +772,10 @@ class TestMuonOptimizerMultiRank:
 
         # use_layer_wise_distributed_optimizer=True triggers LayerWiseDistributedOptimizer
         optimizer = get_megatron_optimizer(
-            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
+            config=optimizer_config,
+            model_chunks=[model],
+            use_gloo_process_groups=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         # Verify it's a LayerWiseDistributedOptimizer
@@ -805,12 +819,18 @@ class TestMuonOptimizerMultiRank:
 
         with pytest.raises(ValueError, match="dist_ prefix"):
             get_megatron_muon_optimizer(
-                config=optimizer_config, model_chunks=[model], layer_wise_distributed_optimizer=True
+                config=optimizer_config,
+                model_chunks=[model],
+                layer_wise_distributed_optimizer=True,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
         optimizer_config.optimizer = 'dist_muon'
         optimizer = get_megatron_muon_optimizer(
-            config=optimizer_config, model_chunks=[model], layer_wise_distributed_optimizer=True
+            config=optimizer_config,
+            model_chunks=[model],
+            layer_wise_distributed_optimizer=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         # Verify it's a LayerWiseDistributedOptimizer
@@ -1257,7 +1277,10 @@ class TestMuonCoefficientTypeMultiRank:
         )
 
         optimizer = get_megatron_optimizer(
-            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
+            config=optimizer_config,
+            model_chunks=[model],
+            use_gloo_process_groups=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         assert optimizer is not None
@@ -1621,7 +1644,10 @@ class TestAdaptiveMuonOptimizerMultiRank:
         )
 
         optimizer = get_megatron_optimizer(
-            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
+            config=optimizer_config,
+            model_chunks=[model],
+            use_gloo_process_groups=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         assert optimizer is not None
@@ -1668,7 +1694,11 @@ class TestAdaptiveMuonOptimizerMultiRank:
         )
 
         with pytest.raises(Exception, match='emerging optimizer with fp16 is not supported'):
-            get_megatron_optimizer(config=optimizer_config_fp16, model_chunks=[model])
+            get_megatron_optimizer(
+                config=optimizer_config_fp16,
+                model_chunks=[model],
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
 
 
 @pytest.mark.skipif(
@@ -1928,7 +1958,10 @@ class TestSoapOptimizerMultiRank:
         )
 
         optimizer = get_megatron_optimizer(
-            config=optimizer_config, model_chunks=[model], use_gloo_process_groups=True
+            config=optimizer_config,
+            model_chunks=[model],
+            use_gloo_process_groups=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         assert optimizer is not None, "Optimizer should not be None"
@@ -1982,7 +2015,11 @@ class TestSoapOptimizerMultiRank:
         )
 
         with pytest.raises(Exception, match='emerging optimizer with fp16 is not supported'):
-            get_megatron_optimizer(config=optimizer_config_fp16, model_chunks=[model])
+            get_megatron_optimizer(
+                config=optimizer_config_fp16,
+                model_chunks=[model],
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
+            )
 
 
 # ===========================================================================

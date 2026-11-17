@@ -1092,6 +1092,9 @@ def test_intermediate_pipeline_batch_uses_config_layout(monkeypatch):
         mtp_num_layers=None,
         dynamic_context_parallel=False,
         linear_cp_layout="contiguous",
+        virtual_pipeline_model_parallel_size=None,
+        sequence_parallel=False,
+        tensor_model_parallel_size=1,
     )
     monkeypatch.setattr(pretrain_hybrid, "get_args", lambda: args)
     monkeypatch.setattr(
@@ -1099,13 +1102,17 @@ def test_intermediate_pipeline_batch_uses_config_layout(monkeypatch):
         "get_run_config",
         lambda: SimpleNamespace(model=SimpleNamespace(transformer=config)),
     )
-    monkeypatch.setattr(pretrain_hybrid.mpu, "get_tensor_model_parallel_rank", lambda: 0)
-    # Without a collection, get_batch reads the global pipeline group for MTP placement.
-    monkeypatch.setattr(pretrain_hybrid.mpu, "get_pipeline_model_parallel_group", lambda: None)
-    monkeypatch.setattr(pretrain_hybrid, "is_first_or_last_pipeline_stage", lambda stage: False)
+    # get_batch reads its ranks and stages from the collection; these stand-in groups need no
+    # parallel state.
+    monkeypatch.setattr(pretrain_hybrid, "get_pg_rank", lambda group: 0)
+    monkeypatch.setattr(
+        pretrain_hybrid, "is_first_or_last_pipeline_stage", lambda stage, **kwargs: False
+    )
     monkeypatch.setattr(pretrain_hybrid, "mtp_on_this_rank_func", lambda **kwargs: False)
 
-    batch = get_batch(None)
+    batch = get_batch(
+        None, pg_collection=ProcessGroupCollection(tp=object(), pp=object(), cp=object())
+    )
 
     assert set(batch.batches_by_layout) == {"contiguous"}
     assert all(value is None for value in batch.get_batch().values())
@@ -1235,24 +1242,31 @@ def test_unpacked_get_batch_places_mtp_by_the_callers_pipeline_group(
         pipeline_model_parallel_layout=None,
         mtp_num_layers=1,
         linear_cp_layout="zigzag",
+        sequence_parallel=False,
+        tensor_model_parallel_size=1,
     )
     global_pp_group = object()
-    global_grid = SimpleNamespace(
-        get_tensor_model_parallel_rank=lambda: 0,
-        get_pipeline_model_parallel_group=lambda: global_pp_group,
-    )
+    # Without a collection, get_batch builds one from the global grid.
+    global_grid = ProcessGroupCollection(tp=object(), pp=global_pp_group, cp=object())
     mtp_on_this_rank = MagicMock(return_value=False)
     monkeypatch.setattr(script, "get_args", lambda: args)
     monkeypatch.setattr(
         script, "get_run_config", lambda: SimpleNamespace(model=SimpleNamespace(transformer=config))
     )
-    monkeypatch.setattr(script, "mpu", global_grid)
+    monkeypatch.setattr(
+        ProcessGroupCollection, "use_mpu_process_groups", MagicMock(return_value=global_grid)
+    )
+    monkeypatch.setattr(script, "get_pg_rank", lambda group: 0)
     monkeypatch.setattr(script, "mtp_on_this_rank_func", mtp_on_this_rank)
     # An intermediate stage without MTP or cu_seqlens returns before reading any data.
-    monkeypatch.setattr(script, "is_first_or_last_pipeline_stage", lambda vp_stage: False)
+    monkeypatch.setattr(script, "is_first_or_last_pipeline_stage", lambda vp_stage, **kwargs: False)
 
     caller_pp_group = object()
-    pg_collection = ProcessGroupCollection(pp=caller_pp_group) if explicit_pg_collection else None
+    pg_collection = (
+        ProcessGroupCollection(tp=object(), pp=caller_pp_group, cp=object())
+        if explicit_pg_collection
+        else None
+    )
     batch = script.get_batch(None, pg_collection=pg_collection)
     # pretrain_hybrid wraps the empty batch in a ContextParallelBatch.
     values = list(batch.get_batch().values()) if script is pretrain_hybrid else batch
@@ -1779,7 +1793,9 @@ def test_packed_sequence_dataset_built_on_rank(
         sequence_packing_scheduler=sequence_packing_scheduler,
         pipeline_model_parallel_layout=None,
         mtp_num_layers=None,
+        virtual_pipeline_model_parallel_size=vp_size,
     )
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "pp"])
     vp_stages = [None] if vp_size is None else range(vp_size)
     # Both scripts use the shared predicate, which reads the run's model config.
     with (
@@ -1792,7 +1808,9 @@ def test_packed_sequence_dataset_built_on_rank(
     ):
         for vp_stage in vp_stages:
             built = script.is_dataset_built_on_rank(
-                vp_stage=vp_stage, is_packed_sequence=is_packed_sequence
+                vp_stage=vp_stage,
+                is_packed_sequence=is_packed_sequence,
+                pg_collection=pg_collection,
             )
             assert built == (tp_rank == 0), f"{tp_rank=} {pp_rank=} {vp_stage=}"
 

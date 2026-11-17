@@ -1,16 +1,19 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
 import os
+
 import torch
-from megatron.core import parallel_state
-from megatron.core import dist_checkpointing
-from megatron.core.export.model_type import ModelType
+
+from megatron.core import dist_checkpointing, parallel_state
 from megatron.core.export.data_type import DataType
 from megatron.core.export.export_config import ExportConfig
+from megatron.core.export.model_type import ModelType
 from megatron.core.export.trtllm.trtllm_helper import TRTLLMHelper
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-
+from megatron.core.utils import get_pg_rank, get_pg_size
 
 _SEQUENCE_LENGTH = 64
 
@@ -25,10 +28,12 @@ def initialize_distributed(tensor_model_parallel_size=1, pipeline_model_parallel
     torch.distributed.init_process_group(world_size=world_size, rank=rank)
 
     # Megatron core distributed training initialization
-    parallel_state.initialize_model_parallel(tensor_model_parallel_size, pipeline_model_parallel_size)
+    return parallel_state.initialize_model_parallel(
+        tensor_model_parallel_size, pipeline_model_parallel_size
+    )
 
-def model_provider():
-    """Build the model."""
+def model_provider(pg_collection):
+    """Build the model on the grid whose process groups are in pg_collection."""
 
     transformer_config = TransformerConfig(
         num_layers=2, 
@@ -43,6 +48,7 @@ def model_provider():
         transformer_layer_spec=get_gpt_layer_local_spec(), 
         vocab_size=100, 
         max_sequence_length=_SEQUENCE_LENGTH,
+        pg_collection=pg_collection,
     )
 
     return gpt_model
@@ -55,10 +61,23 @@ def load_distributed_checkpoint(checkpoint_path, gpt_model):
 
 if __name__ == "__main__":
     # Need to use TP1 PP1 for export on single device
-    initialize_distributed(tensor_model_parallel_size=1, pipeline_model_parallel_size=1)
-    model_parallel_cuda_manual_seed(123)
+    pg_collection = initialize_distributed(
+        tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+    )
+    # get_pg_rank and get_pg_size also accept the None that a grid without GTP weight
+    # rematerialization may hold in gtp_remat and expt_gtp_remat.
+    model_parallel_cuda_manual_seed(
+        123,
+        tp_rank=pg_collection.tp.rank(),
+        ep_rank=pg_collection.ep.rank(),
+        etp_rank=pg_collection.expt_tp.rank(),
+        gtp_remat_rank=get_pg_rank(pg_collection.gtp_remat),
+        egtp_remat_rank=get_pg_rank(pg_collection.expt_gtp_remat),
+        gtp_remat_world_size=get_pg_size(pg_collection.gtp_remat),
+        egtp_remat_world_size=get_pg_size(pg_collection.expt_gtp_remat),
+    )
 
-    gpt_model = model_provider()
+    gpt_model = model_provider(pg_collection)
 
     # Optionally you can also load a gpt model from ckpt_path using this code below
     # gpt_model = load_distributed_checkpoint(gpt_model=gpt_model, checkpoint_path=ckpt_path)
