@@ -141,6 +141,20 @@ def test_non_allreduce_param_uses_expert_tp_group_for_duplicate_filter():
     )
 
 
+def test_duplicate_filter_without_a_group_needs_the_global_grid():
+    """Without a group or a global grid the filter raises instead of keeping every replica."""
+    Utils.destroy_model_parallel()
+    dense_param = torch.empty(1)
+    expert_param = torch.empty(1)
+    expert_param.allreduce = False
+
+    for param in (dense_param, expert_param):
+        with pytest.raises(RuntimeError, match="tensor model parallel group is not initialized"):
+            param_is_not_tensor_parallel_duplicate(param)
+        # Groups taken from a collection need no grid: None marks an axis that is off.
+        assert param_is_not_tensor_parallel_duplicate(param, use_global_fallback=False)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 def test_expert_linear_parameters_use_expert_topology_metadata():
     Utils.initialize_model_parallel(tensor_model_parallel_size=2, expert_tensor_parallel_size=1)

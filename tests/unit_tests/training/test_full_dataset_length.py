@@ -1,11 +1,13 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
+import warnings
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
-from megatron.core import parallel_state
+from megatron.core import parallel_state, process_groups_config
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from megatron.training import training
 from megatron.training.training import _reduce_sum_across_data_parallel_group
 from megatron.training.utils import reduce_max_stat_across_model_parallel_group
@@ -34,8 +36,9 @@ def test_cp_deduplicated_dataloader_length_reaches_every_rank():
 
 @pytest.mark.parametrize("iteration", [None, 0, 100])
 @pytest.mark.parametrize("owns_data", [False, True])
+@pytest.mark.parametrize("pass_collection", [True, False])
 def test_length_probe_preserves_iteration_and_skips_restore(
-    monkeypatch, iteration, owns_data, run_config
+    monkeypatch, iteration, owns_data, pass_collection, run_config
 ):
     args = SimpleNamespace(
         train_iters=None, train_samples=None, deduplicate_dataloader_across_context_parallel=True
@@ -49,12 +52,53 @@ def test_length_probe_preserves_iteration_and_skips_restore(
     reduce_max = Mock(return_value=84)
     monkeypatch.setattr(training, "_reduce_sum_across_data_parallel_group", reduce_sum)
     monkeypatch.setattr(training, "reduce_max_stat_across_model_parallel_group", reduce_max)
+    # Omitting the collection reads the global grid, with a deprecation warning.
+    pg_collection = ProcessGroupCollection(mp=object())
+    global_pg_collection = ProcessGroupCollection(mp=object())
+    monkeypatch.setattr(
+        ProcessGroupCollection, "use_mpu_process_groups", Mock(return_value=global_pg_collection)
+    )
+    monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
 
-    assert training._get_train_full_dataset_sample_count(args, provider) == 84
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always", ProcessGroupFallbackWarning)
+        count = training._get_train_full_dataset_sample_count(
+            args, provider, pg_collection=pg_collection if pass_collection else None
+        )
+
+    assert count == 84
     assert vars(args) == before
     provider.assert_called_once_with(None, restore_dataloader_state=False)
-    reduce_sum.assert_called_once_with(42 if owns_data else None, with_context_parallel=True)
-    reduce_max.assert_called_once_with(84 if owns_data else None)
+    groups = pg_collection if pass_collection else global_pg_collection
+    reduce_sum.assert_called_once_with(
+        42 if owns_data else None, with_context_parallel=True, pg_collection=groups
+    )
+    reduce_max.assert_called_once_with(84 if owns_data else None, group=groups.mp)
+    fallbacks = [w for w in record if issubclass(w.category, ProcessGroupFallbackWarning)]
+    assert len(fallbacks) == (0 if pass_collection else 1)
+
+
+def test_length_probe_passes_the_collection_to_a_provider_that_takes_one(monkeypatch, run_config):
+    """The provider builds its probe loader on the ranks of the run's collection."""
+    args = SimpleNamespace(deduplicate_dataloader_across_context_parallel=False)
+    pg_collection = ProcessGroupCollection(mp=Mock())
+    calls = []
+
+    def provider(train_val_test_num_samples, *, restore_dataloader_state=True, pg_collection=None):
+        calls.append((train_val_test_num_samples, restore_dataloader_state, pg_collection))
+        return SimpleNamespace(_dataloader=range(42)), None, None
+
+    provider.supports_train_full_dataset = True
+    monkeypatch.setattr(training, "_reduce_sum_across_data_parallel_group", Mock(return_value=84))
+    reduce_max = Mock(return_value=84)
+    monkeypatch.setattr(training, "reduce_max_stat_across_model_parallel_group", reduce_max)
+
+    assert (
+        training._get_train_full_dataset_sample_count(args, provider, pg_collection=pg_collection)
+        == 84
+    )
+    assert calls == [(None, False, pg_collection)]
+    reduce_max.assert_called_once_with(84, group=pg_collection.mp)
 
 
 @pytest.mark.parametrize("field", ["train_iters", "train_samples"])

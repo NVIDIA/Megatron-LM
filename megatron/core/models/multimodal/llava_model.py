@@ -175,7 +175,12 @@ class LLaVAModel(MegatronModule):
         super().__init__(config=language_transformer_config)
 
         if has_config_logger_enabled(language_transformer_config):
-            log_config_to_disk(language_transformer_config, locals(), prefix=type(self).__name__)
+            log_config_to_disk(
+                language_transformer_config,
+                locals(),
+                prefix=type(self).__name__,
+                pg_collection=pg_collection,
+            )
 
         log_single_rank(
             logging.getLogger(__name__),
@@ -257,6 +262,7 @@ class LLaVAModel(MegatronModule):
 
         self.language_model = None
         self.sound_model = sound_model
+        self._give_tp_group_to(sound_model)
         self.sound_projection = sound_projection
         if self.add_decoder:
             if getattr(language_transformer_config, "language_model_type", "").startswith("hf://"):
@@ -265,6 +271,7 @@ class LLaVAModel(MegatronModule):
                 self.language_model = build_hf_model(
                     language_transformer_config, language_transformer_config.language_model_type
                 )
+                self._give_tp_group_to(self.language_model)
             elif is_hybrid_language_model:
                 self.language_model = HybridModel(
                     config=language_transformer_config,
@@ -501,6 +508,7 @@ class LLaVAModel(MegatronModule):
                 self.vision_model = build_hf_model(
                     vision_transformer_config, vision_transformer_config.vision_model_type
                 )
+                self._give_tp_group_to(self.vision_model)
             else:
                 raise ValueError(
                     "Vision model "
@@ -540,7 +548,7 @@ class LLaVAModel(MegatronModule):
                 vision_projection_layer_spec,
                 vision_projection_type,
                 vision_projection_input_size,
-                tp_group=self.pg_collection.tp,
+                pg_collection=self.pg_collection,
             )
             # Ignore missing weights for the vision projection during checkpoint loading.
             # This should be disabled by default but can be enabled if your checkpoint contains
@@ -587,6 +595,21 @@ class LLaVAModel(MegatronModule):
         if self.add_decoder:
             return self.language_model.shared_embedding_or_output_weight()
         return None
+
+    def _give_tp_group_to(self, module: Optional[torch.nn.Module]) -> None:
+        """Give a submodule that was built without process groups this model's TP group.
+
+        A HuggingFace wrapper or a sound model takes no process groups. Its weights are
+        replicated across this model's tensor-parallel group, which sets their checkpoint
+        replica ids. A submodule with a group or a collection of its own keeps it.
+        """
+        if (
+            isinstance(module, MegatronModule)
+            and not hasattr(module, 'tp_group')
+            and getattr(module, 'pg_collection', None) is None
+            and 'tp' in vars(self.pg_collection)
+        ):
+            module.tp_group = self.pg_collection.tp
 
     def sharded_state_dict(self, prefix: str = '', sharded_offsets: tuple = (), metadata=None):
         """Build a sharded state dict, optionally targeting an LLM-only checkpoint."""
@@ -1175,7 +1198,7 @@ class LLaVAModel(MegatronModule):
 
         if self.sequence_parallel_lm and self.pre_process:
             combined_embeddings = tensor_parallel.scatter_to_sequence_parallel_region(
-                combined_embeddings
+                combined_embeddings, group=self.pg_collection.tp
             )  # [S/(CP*TP),B,H]
 
         return combined_embeddings, expanded_labels, expanded_loss_mask, packed_seq_params

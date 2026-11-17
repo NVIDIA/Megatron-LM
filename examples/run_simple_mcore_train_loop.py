@@ -1,40 +1,44 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import os
-import torch
-from torch.optim import Adam
-from torch.utils.data import DataLoader
 from functools import partial
 from pathlib import Path
-from typing import Any, Callable, Dict, Tuple, Iterator
-from megatron.core import parallel_state
-from megatron.core import dist_checkpointing
-from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
-from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.models.gpt.gpt_model import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
-from megatron.core.datasets.utils import compile_helpers
-from megatron.core.datasets.blended_megatron_dataset_builder import (
-    BlendedMegatronDatasetBuilder,
-)
+from typing import Any, Callable, Dict, Iterator, Tuple
+
+import torch
+from torch.utils.data import DataLoader
+
+from megatron.core import dist_checkpointing, parallel_state
+from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDatasetConfig, MockGPTDataset
-from megatron.core.distributed import DistributedDataParallel
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.datasets.utils import compile_helpers
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_local_spec
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.core.optimizer import MegatronOptimizer, OptimizerConfig, get_megatron_optimizer
+from megatron.core.pipeline_parallel.schedules import get_forward_backward_func
+from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.tokenizers import MegatronTokenizer
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.utils import get_pg_rank, get_pg_size
 
 _SEQUENCE_LENGTH: int = 64
 
 def initialize_distributed(
     tensor_model_parallel_size: int = 1, pipeline_model_parallel_size: int = 1
-) -> None:
+) -> ProcessGroupCollection:
     """
     Set up torch.distributed and Megatron-Core model parallel groups.
 
     Args:
         tensor_model_parallel_size (int): Number of GPUs to use for tensor model parallelism.
         pipeline_model_parallel_size (int): Number of GPUs to use for pipeline model parallelism.
+
+    Returns:
+        ProcessGroupCollection: The process groups of the parallel grid built here. The rest
+            of this example passes them explicitly instead of reading the global grid.
     """
     parallel_state.destroy_model_parallel()
 
@@ -52,11 +56,15 @@ def initialize_distributed(
     parallel_state.initialize_model_parallel(
         tensor_model_parallel_size, pipeline_model_parallel_size
     )
+    return ProcessGroupCollection.use_mpu_process_groups()
 
 
-def model_provider() -> GPTModel:
+def model_provider(pg_collection: ProcessGroupCollection) -> GPTModel:
     """
     Construct a minimal GPT model for demonstration and testing purposes.
+
+    Args:
+        pg_collection (ProcessGroupCollection): Process groups of the grid the model runs on.
 
     Returns:
         GPTModel: A small GPT model instance with 2 layers.
@@ -74,6 +82,7 @@ def model_provider() -> GPTModel:
         transformer_layer_spec=get_gpt_layer_local_spec(),
         vocab_size=100,
         max_sequence_length=_SEQUENCE_LENGTH,
+        pg_collection=pg_collection,
     )
 
     return gpt_model
@@ -166,6 +175,78 @@ def forward_step_func(
     return output_tensor, partial(loss_func, loss_mask)
 
 
+def get_optimizer(
+    gpt_model: DistributedDataParallel, pg_collection: ProcessGroupCollection | None = None
+) -> MegatronOptimizer:
+    """
+    Build an Adam optimizer that steps on the gradients DDP accumulates.
+
+    Megatron-Core's DistributedDataParallel adds every gradient into ``param.main_grad`` and
+    sets ``param.grad`` to None, so a plain ``torch.optim.Adam`` would skip every parameter.
+    The Megatron optimizer reads ``main_grad`` instead.
+
+    Args:
+        gpt_model (DistributedDataParallel): The DDP-wrapped GPT model.
+        pg_collection (ProcessGroupCollection | None): The process groups the model runs on.
+
+    Returns:
+        MegatronOptimizer: An Adam optimizer over the model's parameters.
+    """
+    optimizer_config: OptimizerConfig = OptimizerConfig(optimizer="adam", lr=1e-3)
+    # Gloo groups serve only the distributed optimizer, which this example does not use.
+    return get_megatron_optimizer(
+        optimizer_config, [gpt_model], use_gloo_process_groups=False, pg_collection=pg_collection
+    )
+
+
+def train_step(
+    gpt_model: DistributedDataParallel,
+    optim: MegatronOptimizer,
+    forward_backward_func: Callable[..., Dict[str, Any]],
+    data_iterator: Iterator,
+    pg_collection: ProcessGroupCollection | None = None,
+) -> Dict[str, Any]:
+    """
+    Run one training iteration and update the model's weights.
+
+    Args:
+        gpt_model (DistributedDataParallel): The DDP-wrapped GPT model.
+        optim (MegatronOptimizer): The optimizer returned by get_optimizer().
+        forward_backward_func (Callable[..., Dict[str, Any]]): The schedule returned by
+            get_forward_backward_func().
+        data_iterator (Iterator): Iterator yielding training batches.
+        pg_collection (ProcessGroupCollection | None): The process groups the model runs on.
+
+    Returns:
+        Dict[str, Any]: The losses reduced over the microbatches.
+    """
+    # DDP keeps accumulating into param.main_grad until it is zeroed, and the last optimizer
+    # step left param.grad pointing at it. Clear both before the backward pass.
+    gpt_model.zero_grad_buffer()
+    optim.zero_grad()
+
+    losses_reduced: Dict[str, Any] = forward_backward_func(
+        forward_step_func=forward_step_func,
+        data_iterator=data_iterator,
+        model=gpt_model,
+        num_microbatches=1,
+        seq_length=_SEQUENCE_LENGTH,
+        micro_batch_size=8,
+        decoder_seq_length=_SEQUENCE_LENGTH,
+        forward_only=False,
+        pg_collection=pg_collection,
+    )
+
+    # Finalize model gradients: all-reduce across DP and TP groups.
+    # This synchronizes gradients for non-tensor-parallel parameters (e.g., LayerNorm)
+    # across tensor parallel ranks and all gradients across data parallel ranks.
+    finalize_model_grads([gpt_model], pg_collection=pg_collection)
+
+    optim.step()
+
+    return losses_reduced
+
+
 def save_distributed_checkpoint(
     checkpoint_path: str, gpt_model: torch.nn.Module
 ) -> None:
@@ -219,10 +300,23 @@ def load_distributed_checkpoint(
 
 
 if __name__ == "__main__":
-    initialize_distributed(tensor_model_parallel_size=2, pipeline_model_parallel_size=1)
-    model_parallel_cuda_manual_seed(123)
+    pg_collection: ProcessGroupCollection = initialize_distributed(
+        tensor_model_parallel_size=2, pipeline_model_parallel_size=1
+    )
+    # get_pg_rank and get_pg_size also accept the None that a grid without GTP weight
+    # rematerialization may hold in gtp_remat and expt_gtp_remat.
+    model_parallel_cuda_manual_seed(
+        123,
+        tp_rank=pg_collection.tp.rank(),
+        ep_rank=pg_collection.ep.rank(),
+        etp_rank=pg_collection.expt_tp.rank(),
+        gtp_remat_rank=get_pg_rank(pg_collection.gtp_remat),
+        egtp_remat_rank=get_pg_rank(pg_collection.expt_gtp_remat),
+        gtp_remat_world_size=get_pg_size(pg_collection.gtp_remat),
+        egtp_remat_world_size=get_pg_size(pg_collection.expt_gtp_remat),
+    )
 
-    gpt_model: GPTModel = model_provider()
+    gpt_model: GPTModel = model_provider(pg_collection)
     device: torch.device = torch.device("cuda")
     gpt_model.to(device)
 
@@ -238,35 +332,22 @@ if __name__ == "__main__":
         config=config,
         ddp_config=ddp_config,
         module=gpt_model,
+        pg_collection=pg_collection,
     )
 
-    optim: Adam = Adam(gpt_model.parameters())
+    optim: MegatronOptimizer = get_optimizer(gpt_model, pg_collection)
 
     train_iterator: Iterator = get_train_data_iterator()
 
-    forward_backward_func: Callable[..., Dict[str, Any]] = get_forward_backward_func()
+    forward_backward_func: Callable[..., Dict[str, Any]] = get_forward_backward_func(
+        pp_size=pg_collection.pp.size(), vp_size=None
+    )
 
     # Running the model for 5 iterations
     for iteration in range(5):
-        optim.zero_grad()
-
-        losses_reduced: Dict[str, Any] = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=train_iterator,
-            model=gpt_model,
-            num_microbatches=1,
-            seq_length=_SEQUENCE_LENGTH,
-            micro_batch_size=8,
-            decoder_seq_length=_SEQUENCE_LENGTH,
-            forward_only=False,
+        losses_reduced: Dict[str, Any] = train_step(
+            gpt_model, optim, forward_backward_func, train_iterator, pg_collection=pg_collection
         )
-
-        # Finalize model gradients: all-reduce across DP and TP groups.
-        # This synchronizes gradients for non-tensor-parallel parameters (e.g., LayerNorm)
-        # across tensor parallel ranks and all gradients across data parallel ranks.
-        finalize_model_grads([gpt_model])
-
-        optim.step()
 
         print(f"Iteration {iteration}: Losses reduced: {losses_reduced}")
 

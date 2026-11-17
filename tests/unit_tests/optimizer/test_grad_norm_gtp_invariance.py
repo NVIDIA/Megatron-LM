@@ -20,13 +20,23 @@ parameters tagged by hand. It does not verify that a real model tags its paramet
 correctly; that needs a check against the model's own parameter count at runtime.
 """
 
+import contextlib
+from unittest import mock
+
 import pytest
 import torch
 
-from megatron.core import parallel_state
-from megatron.core.optimizer import OptimizerConfig
+from megatron.core import parallel_state, process_groups_config
+from megatron.core.hyper_comm_grid import HyperCommGrid
+from megatron.core.optimizer import OptimizerConfig, _get_megatron_optimizer_based_on_param_groups
 from megatron.core.optimizer.clip_grads import get_grad_norm_fp32
-from megatron.core.optimizer.optimizer import MegatronOptimizer
+from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+from megatron.core.optimizer.optimizer import (
+    ChainedOptimizer,
+    MegatronOptimizer,
+    set_duplicate_filter_groups,
+)
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
 from tests.unit_tests.test_utilities import Utils
 
 # Row count of every logical weight. Must stay divisible by each GTP size under test.
@@ -294,3 +304,328 @@ class TestGradNormWithModuleLocalGTP:
         )
 
         assert len(optimizer.get_grads_for_grad_norm()) == 1
+
+
+class _GlobalGridRead(AssertionError):
+    """Raised by a patched accessor: the code under test read the global parallel grid."""
+
+
+# Every global accessor that the duplicate filters and their group resolution can reach. The
+# filters' fallbacks read the global grid through ``parallel_state``, not through names imported
+# into ``tensor_parallel.layers``.
+_GLOBAL_GRID_READS = (
+    (parallel_state, 'get_tensor_model_parallel_rank'),
+    (parallel_state, 'get_tensor_model_parallel_group'),
+    (parallel_state, 'get_expert_tensor_parallel_group'),
+    (parallel_state, 'get_gtp_weight_remat_rank'),
+    (parallel_state, 'get_gtp_weight_remat_group'),
+    (parallel_state, 'get_expert_gtp_weight_remat_rank'),
+    (parallel_state, 'get_expert_gtp_weight_remat_group'),
+)
+
+
+@contextlib.contextmanager
+def _forbid_global_grid_reads():
+    """Make every global accessor on the duplicate-filter path raise ``_GlobalGridRead``."""
+    with contextlib.ExitStack() as stack:
+        for module, name in _GLOBAL_GRID_READS:
+            stack.enter_context(
+                mock.patch.object(
+                    module, name, side_effect=_GlobalGridRead(f"{module.__name__}.{name}")
+                )
+            )
+        stack.enter_context(
+            mock.patch.object(
+                ProcessGroupCollection,
+                'use_mpu_process_groups',
+                side_effect=_GlobalGridRead('ProcessGroupCollection.use_mpu_process_groups'),
+            )
+        )
+        yield
+
+
+def _parameter_with_grad(grad, **attributes):
+    """A CUDA parameter carrying ``grad`` and the given parallelism attributes."""
+    parameter = torch.nn.Parameter(torch.zeros_like(grad).cuda())
+    parameter.grad = grad.detach().clone().cuda()
+    for name, value in attributes.items():
+        setattr(parameter, name, value)
+    return parameter
+
+
+def _build_optimizer_from_collection(parameters, pg_collection, grad_stats_group):
+    """Build the optimizer as get_megatron_optimizer does, from the module's own collection."""
+    return _get_megatron_optimizer_based_on_param_groups(
+        config=OptimizerConfig(optimizer='sgd', lr=1.0),
+        model_chunks=[torch.nn.Module()],
+        param_groups=[{'params': parameters, 'is_expert_parallel': False}],
+        model_parallel_group=grad_stats_group,
+        pg_collection=pg_collection,
+    )
+
+
+def _destroy_grid(grid):
+    """Destroy the process groups of ``grid``; call on every rank."""
+    # Every rank finishes its collectives before any communicator goes away.
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+    grid.destroy()
+
+
+def _norm_and_counted_elements(optimizer, parameters):
+    """Gradient norm, then the number of gradient elements the optimizer counts.
+
+    With every gradient zeroed, the zero count equals the number of elements that passed the
+    duplicate filters, summed over the grad-stats group.
+    """
+    grad_norm = float(optimizer.get_grad_norm())
+    for parameter in parameters:
+        parameter.grad.zero_()
+    return grad_norm, optimizer.count_zeros()
+
+
+class TestGradNormWithCollectionGroups:
+    """An optimizer built from a collection filters duplicates by that collection only.
+
+    The model here lives on its own grid next to a global grid with a different layout, as a
+    second model in the same job does. A ``None`` field in the collection marks an axis that is
+    off for this model; reading the global TP or GTP rank instead drops this model's
+    parameters on every rank that is not rank 0 of the global axis, which under-counts the
+    gradient norm and weakens clipping.
+    """
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize("chained", [False, True], ids=["single", "chained"])
+    @pytest.mark.parametrize("module_tp", ["singleton_group", "off"])
+    def test_axes_off_in_the_collection_ignore_the_global_axes(self, module_tp, chained):
+        world_size = Utils.world_size
+        if world_size % 4 != 0:
+            pytest.skip(f"world size {world_size} must be a multiple of 4 for global TP=2, GTP=2")
+
+        # The global grid pairs ranks along both TP and GTP.
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=2,
+            pipeline_model_parallel_size=world_size // 4,
+            gtp_remat_size=2,
+        )
+
+        # The module's own grid has one stage per rank, with tensor parallelism and GTP off.
+        grid = HyperCommGrid([1, world_size], ["tp", "pp"])
+        tp_group = grid.create_pg("tp")
+        grad_stats_group = grid.create_pg("pp")
+        pg_collection = ProcessGroupCollection(
+            tp=tp_group if module_tp == "singleton_group" else None,
+            gtp_remat=None,
+            expt_gtp_remat=None,
+        )
+
+        weight_grad, bias_grad = _logical_layer_grads(torch.distributed.get_rank())
+        parameters = [_parameter_with_grad(weight_grad), _parameter_with_grad(bias_grad)]
+
+        try:
+            with _forbid_global_grid_reads():
+                if chained:
+                    # One optimizer per parameter, as get_megatron_optimizer chains one per
+                    # parameter group. They share the grad-stats group, so the chain filters and
+                    # reduces their gradients together.
+                    optimizer = ChainedOptimizer(
+                        [
+                            _build_optimizer_from_collection(
+                                [parameter], pg_collection, grad_stats_group
+                            )
+                            for parameter in parameters
+                        ]
+                    )
+                else:
+                    optimizer = _build_optimizer_from_collection(
+                        parameters, pg_collection, grad_stats_group
+                    )
+                grad_norm, counted_elements = _norm_and_counted_elements(optimizer, parameters)
+        finally:
+            _destroy_grid(grid)
+
+        elements_per_layer = ROWS_PER_WEIGHT * COLUMNS_PER_WEIGHT + COLUMNS_PER_WEIGHT
+        assert counted_elements == world_size * elements_per_layer
+        assert grad_norm == pytest.approx(_single_process_norm(world_size), rel=1e-5)
+
+    @pytest.mark.parametrize("expert_tp", ["singleton_group", "off"])
+    def test_expert_params_follow_the_collection_expert_tp(self, expert_tp):
+        """Expert parameters are filtered over ``expt_tp``, never over the dense TP group."""
+        world_size = Utils.world_size
+        if world_size % 2 != 0:
+            pytest.skip(f"world size {world_size} must be even to form TP pairs")
+
+        # The global grid pairs neighbouring ranks along TP.
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+
+        # The module pairs ranks {r, r + world_size // 2} along TP instead, so a stray global TP
+        # read would pick the wrong partner. Its experts are not tensor-parallel (ETP=1), and
+        # every rank owns a different expert.
+        num_stages = world_size // 2
+        grid = HyperCommGrid([num_stages, 2, 1], ["pp", "tp", "etp"])
+        tp_group = grid.create_pg("tp")
+        singleton_group = grid.create_pg("etp")
+        grad_stats_group = grid.create_pg(["pp", "tp", "etp"])
+        pg_collection = ProcessGroupCollection(
+            tp=tp_group,
+            expt_tp=singleton_group if expert_tp == "singleton_group" else None,
+            gtp_remat=singleton_group,
+            expt_gtp_remat=singleton_group,
+        )
+
+        rank = torch.distributed.get_rank()
+        stage, tp_rank = rank % num_stages, rank // num_stages
+        rows_per_shard = ROWS_PER_WEIGHT // 2
+        weight_grad, bias_grad = _logical_layer_grads(stage)
+        expert_grad, _ = _logical_layer_grads(num_stages + rank)
+        parameters = [
+            _parameter_with_grad(
+                weight_grad[tp_rank * rows_per_shard : (tp_rank + 1) * rows_per_shard],
+                tensor_model_parallel=True,
+            ),
+            # Replicated across the module's TP pair.
+            _parameter_with_grad(bias_grad),
+            _parameter_with_grad(expert_grad, allreduce=False),
+        ]
+
+        try:
+            with _forbid_global_grid_reads():
+                optimizer = _build_optimizer_from_collection(
+                    parameters, pg_collection, grad_stats_group
+                )
+                grad_norm, counted_elements = _norm_and_counted_elements(optimizer, parameters)
+        finally:
+            _destroy_grid(grid)
+
+        dense_elements = ROWS_PER_WEIGHT * COLUMNS_PER_WEIGHT + COLUMNS_PER_WEIGHT
+        expert_elements = ROWS_PER_WEIGHT * COLUMNS_PER_WEIGHT
+        assert counted_elements == num_stages * dense_elements + world_size * expert_elements
+
+        squared_norm = _single_process_norm(num_stages) ** 2
+        for expert_rank in range(world_size):
+            expert_grad, _ = _logical_layer_grads(num_stages + expert_rank)
+            squared_norm += expert_grad.double().pow(2).sum().item()
+        assert grad_norm == pytest.approx(squared_norm**0.5, rel=1e-5)
+
+    @pytest.mark.parametrize("expert_tp", ["own_pairs", "unset"])
+    def test_replicated_expert_params_count_once_per_expert_tp_group(self, expert_tp):
+        """A replicated expert parameter is kept on rank 0 of ``expt_tp``, which defaults to ``tp``."""
+        world_size = Utils.world_size
+        if world_size % 4 != 0:
+            pytest.skip(f"world size {world_size} must be a multiple of 4 for TP=2 and ETP=2")
+
+        # The global grid has no tensor parallelism: a global TP read would keep every replica.
+        Utils.initialize_model_parallel()
+
+        # The module pairs neighbouring ranks along TP, and ranks {r, r + world_size // 2} along
+        # its expert TP axis.
+        grid = HyperCommGrid([2, world_size // 4, 2], ["tp", "pp", "etp"])
+        groups = {"tp": grid.create_pg("tp"), "gtp_remat": None, "expt_gtp_remat": None}
+        expert_tp_group = grid.create_pg("etp")
+        grad_stats_group = grid.create_pg(["tp", "pp", "etp"])
+        rank = torch.distributed.get_rank()
+        if expert_tp == "own_pairs":
+            groups["expt_tp"] = expert_tp_group
+            replica_set = rank % (world_size // 2)
+        else:
+            # The collection leaves expt_tp unset, so the experts replicate over the TP pairs.
+            replica_set = rank // 2
+
+        # One expert parameter per replica set, with the same gradient on both of its ranks.
+        expert_grad, _ = _logical_layer_grads(replica_set)
+        parameters = [_parameter_with_grad(expert_grad, allreduce=False)]
+
+        try:
+            with _forbid_global_grid_reads():
+                optimizer = _build_optimizer_from_collection(
+                    parameters, ProcessGroupCollection(**groups), grad_stats_group
+                )
+                grad_norm, counted_elements = _norm_and_counted_elements(optimizer, parameters)
+        finally:
+            _destroy_grid(grid)
+
+        num_replica_sets = world_size // 2
+        assert counted_elements == num_replica_sets * ROWS_PER_WEIGHT * COLUMNS_PER_WEIGHT
+        squared_norm = sum(
+            _logical_layer_grads(index)[0].double().pow(2).sum().item()
+            for index in range(num_replica_sets)
+        )
+        assert grad_norm == pytest.approx(squared_norm**0.5, rel=1e-5)
+
+    def test_collection_without_tp_warns_and_filters_by_the_global_grid(self, monkeypatch):
+        """An unset ``tp`` is deprecated: the filters still read the global TP rank, and warn."""
+        world_size = Utils.world_size
+        if world_size % 2 != 0:
+            pytest.skip(f"world size {world_size} must be even to form TP pairs")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        # This test observes the first fallback warning of every owner.
+        monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+        # One bias, replicated across each TP pair of the global grid.
+        _, bias_grad = _logical_layer_grads(0)
+        parameters = [_parameter_with_grad(bias_grad)]
+        with pytest.warns(ProcessGroupFallbackWarning) as record:
+            optimizer = _build_optimizer_from_collection(
+                parameters,
+                ProcessGroupCollection(gtp_remat=None, expt_gtp_remat=None),
+                parallel_state.get_model_parallel_group(),
+            )
+            grad_norm, counted_elements = _norm_and_counted_elements(optimizer, parameters)
+
+        owner = "get_megatron_optimizer was called without `pg_collection.tp`"
+        assert any(str(warning.message).startswith(owner) for warning in record)
+        # The grad-stats group is one TP pair, which counts its bias on TP rank 0 only.
+        assert counted_elements == COLUMNS_PER_WEIGHT
+        assert grad_norm == pytest.approx(bias_grad.double().norm().item(), rel=1e-5)
+
+    @pytest.mark.parametrize("tp_field", ["off", "unset"])
+    def test_layer_wise_zero_count_follows_the_collection(self, tp_field, monkeypatch):
+        """LayerWise counts zeros with the fallback choice that its collection gave it."""
+        world_size = Utils.world_size
+        if world_size % 2 != 0:
+            pytest.skip(f"world size {world_size} must be even to form TP pairs")
+        Utils.initialize_model_parallel(tensor_model_parallel_size=2)
+        monkeypatch.setattr(process_groups_config, "_warned_global_process_group_fallbacks", set())
+
+        # One zero gradient, replicated across each TP pair of the global grid.
+        _, bias_grad = _logical_layer_grads(0)
+        parameters = [_parameter_with_grad(torch.zeros_like(bias_grad))]
+        groups = {"gtp_remat": None, "expt_gtp_remat": None}
+        if tp_field == "off":
+            groups["tp"] = None
+        grad_stats_group = parallel_state.get_model_parallel_group()
+        # count_zeros reads only the attributes set here, so the optimizer needs no model.
+        optimizer = object.__new__(LayerWiseDistributedOptimizer)
+        optimizer.config = OptimizerConfig()
+        optimizer.grad_stats_parallel_group = grad_stats_group
+        optimizer.chained_optimizers = [
+            _ParametersOnlyOptimizer(parameters, grad_stats_group, None)
+        ]
+        expectation = (
+            pytest.warns(ProcessGroupFallbackWarning)
+            if tp_field == "unset"
+            else contextlib.nullcontext()
+        )
+        with expectation:
+            set_duplicate_filter_groups(optimizer, ProcessGroupCollection(**groups))
+            counted_elements = optimizer.count_zeros()
+
+        # With tensor parallelism off in the collection both ranks of the global TP pair count
+        # their gradient; an unset tp falls back to the global TP rank, which counts it once.
+        copies = 2 if tp_field == "off" else 1
+        assert counted_elements == copies * COLUMNS_PER_WEIGHT
+
+    def test_collection_without_tp_is_rejected_without_a_global_grid(self):
+        """Without a global grid to fall back to, an unset ``tp`` is an error."""
+        Utils.initialize_model_parallel()
+        Utils.destroy_model_parallel()
+        weight_grad, _ = _logical_layer_grads(0)
+
+        with pytest.raises(ValueError, match="must set tp"):
+            _build_optimizer_from_collection(
+                [_parameter_with_grad(weight_grad)],
+                ProcessGroupCollection(gtp_remat=None, expt_gtp_remat=None),
+                torch.distributed.group.WORLD,
+            )
