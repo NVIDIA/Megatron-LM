@@ -7,7 +7,7 @@ import sys
 
 import pytest
 import torch
-from transformer_engine.pytorch.fp8 import check_fp8_support
+from transformer_engine.pytorch.fp8 import FP8GlobalStateManager, check_fp8_support
 
 import megatron.core.transformer.cuda_graphs as cuda_graphs_module
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
@@ -2771,6 +2771,28 @@ class TestInferenceCudaGraphQuantizedWeightRefresh:
                     self._graph(module, inputs, recipe, key),
                     self._eager(module, inputs, recipe, key),
                 )
+        assert TestSkipFp8WeightUpdateTensor._read_skip_tensor().item() == 0.0
+
+    @pytest.mark.parametrize("fp8_recipe", ["tensorwise", "mxfp8"])
+    def test_external_te_flag_write_does_not_suppress_refresh(self, fp8_recipe):
+        """TE's own graph replay can change the shared flag between local replays."""
+        module, inputs, recipe = self._build(fp8_recipe, disable_parameter_transpose_cache=True)
+        for key in ("a", "b"):
+            self._graph(module, inputs, recipe, key)
+        before = self._graph(module, inputs, recipe, "b")
+        self._update_weight(module)
+
+        # Use TE's writer, bypassing Megatron, just as native TE graph replay does.
+        setter = getattr(FP8GlobalStateManager, "set_skip_fp8_weight_update_tensor", None)
+        with torch.inference_mode():
+            if setter is not None:
+                setter(True)
+            else:
+                TestSkipFp8WeightUpdateTensor._read_skip_tensor().fill_(True)
+
+        out = self._graph(module, inputs, recipe, "b")
+        assert not torch.equal(out, before)
+        assert torch.equal(out, self._eager(module, inputs, recipe, "b"))
         assert TestSkipFp8WeightUpdateTensor._read_skip_tensor().item() == 0.0
 
     @pytest.mark.parametrize("fp8_recipe", ["tensorwise", "mxfp8"])
