@@ -174,6 +174,7 @@ class _SafeDCPPickleModule(types.ModuleType):
 
     @staticmethod
     def load(file, **kwargs):
+        """ """
         return SafeDCPUnpickler(file, **kwargs).load()
 
 
