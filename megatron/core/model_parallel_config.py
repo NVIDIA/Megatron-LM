@@ -408,8 +408,10 @@ class ModelParallelConfig:
        Transformer Engine is used; if 'liger', Liger's vocab-parallel CE is used.
        Liger requires the optional ``liger_kernel.megatron.LigerMegatronCrossEntropy``
        export and always allocates an FP32 logits-sized buffer, so with FP32 logits it
-       needs one more such buffer than 'native'. Ignored when cross entropy loss fusion
-       is disabled. Defaults to 'native'.
+       needs one more such buffer than 'native'. It gives tokens labelled -100 zero loss
+       instead of their log-sum-exp (the loss mask removes them either way) and is rejected
+       with full-iteration CUDA graphs. Ignored when cross entropy loss fusion is disabled.
+       Defaults to 'native'.
     """
 
     tp_comm_overlap_disable_qkv: bool = False

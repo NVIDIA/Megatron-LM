@@ -25,6 +25,19 @@ def test_liger_is_imported_only_when_selected(monkeypatch):
         backends.select_cross_entropy(True, "liger")
 
 
+def test_liger_rejects_unverified_setups(monkeypatch):
+    pytest.importorskip(_LIBRARY)
+    from megatron.core.ops.loss.liger_cross_entropy import liger_cross_entropy
+
+    with pytest.raises(ValueError, match="full-iteration CUDA graphs"):
+        backends.select_cross_entropy(True, "liger", cuda_graph_impl="full_iteration")
+    with pytest.raises(ValueError, match="needs the tensor-parallel group"):
+        liger_cross_entropy(torch.zeros(2, 1, 4), torch.zeros(2, 1, dtype=torch.long), None)
+    monkeypatch.setattr(sys.modules["liger_kernel"], "__version__", "0.8.4", raising=False)
+    with pytest.raises(ImportError, match=r"liger_kernel.megatron>=0.8.5"):
+        backends.select_cross_entropy(True, "liger")
+
+
 @pytest.mark.parametrize("backend", ["local", "transformer_engine", "inference_optimized"])
 def test_provider_selects_liger_cross_entropy_independently(backend):
     pytest.importorskip(_LIBRARY)
@@ -36,17 +49,15 @@ def test_provider_selects_liger_cross_entropy_independently(backend):
     assert provider.vocab_parallel_cross_entropy() is liger_cross_entropy
 
 
-@pytest.fixture(scope="module", params=[None, 1, 2, 4], ids=["local", "tp1", "tp2", "tp4"])
+@pytest.fixture(scope="module", params=[1, 2, 4], ids=["tp1", "tp2", "tp4"])
 def ce_group(request):
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
-    size = request.param or 1
+    size = request.param
     if Utils.world_size < size or Utils.world_size % size:
         pytest.skip(f"needs a world size divisible by TP={size}")
     with Utils.interleaved_group(size) as group:
-        yield (None if request.param is None else group), group, Utils.rank % (
-            Utils.world_size // size
-        )
+        yield group, group, Utils.rank % (Utils.world_size // size)
 
 
 def _with_layout(tensor, layout):
@@ -101,7 +112,7 @@ def test_loss_and_gradients_match_references(
     original_reduce = torch.distributed.all_reduce
 
     def checked_reduce(tensor, *args, **kwargs):
-        assert group is not None and kwargs.get("group") is group
+        assert kwargs.get("group") is group
         return original_reduce(tensor, *args, **kwargs)
 
     with monkeypatch.context() as patch:

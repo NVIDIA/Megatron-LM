@@ -24,6 +24,11 @@ def liger_cross_entropy(
 ) -> torch.Tensor:
     """Return FP32 per-token loss without modifying logits.
 
-    The supplied group owns all vocabulary reductions; ``None`` means local vocabulary.
+    ``tp_group`` owns all vocabulary reductions and is required: with ``None`` Liger would
+    silently compute a local-vocabulary loss. Tokens labelled -100 get zero loss and
+    gradient, where the native cross entropy returns their log-sum-exp; Megatron's loss mask
+    removes those tokens either way, so the training loss is the same.
     """
+    if tp_group is None:
+        raise ValueError("Liger cross entropy needs the tensor-parallel group as tp_group.")
     return _cross_entropy()(logits, labels, tp_group=tp_group)
