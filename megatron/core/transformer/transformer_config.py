@@ -849,10 +849,12 @@ class TransformerConfig(ModelParallelConfig):
     """Use the kitchen extension for transformer quantization."""
 
     use_liger: bool = False
-    """Use Liger RMSNorm in local GPT specs, including the final and MTP norms.
+    """Use Liger RMSNorm for every standalone RMSNorm, including the final and MTP norms.
 
-    Requires `normalization="RMSNorm"` and `transformer_impl="local"`, and cannot be combined
-    with `use_kitchen`, an experimental attention variant or heterogeneous layers. Does not
+    Norms fused into a Transformer Engine linear stay Transformer Engine's. Requires
+    `normalization="RMSNorm"` and `transformer_impl` "local" or "transformer_engine", and cannot
+    be combined with `fused_residual_rmsnorm`, `use_kitchen`, an experimental attention variant
+    or heterogeneous layers. Does not
     change the cross-entropy implementation.
     """
 
@@ -1914,13 +1916,15 @@ class TransformerConfig(ModelParallelConfig):
         super().__post_init__()
         if self.use_liger and (
             self.normalization != "RMSNorm"
-            or self.transformer_impl != "local"
+            or self.transformer_impl not in ("local", "transformer_engine")
+            or self.fused_residual_rmsnorm
             or self.use_kitchen
             or self.experimental_attention_variant is not None
         ):
             raise ValueError(
-                "use_liger requires normalization='RMSNorm', transformer_impl='local', "
-                "use_kitchen=False and no experimental_attention_variant."
+                "use_liger requires normalization='RMSNorm', transformer_impl 'local' or "
+                "'transformer_engine', fused_residual_rmsnorm=False, use_kitchen=False and no "
+                "experimental_attention_variant."
             )
         self._validate_cp_layouts()
 

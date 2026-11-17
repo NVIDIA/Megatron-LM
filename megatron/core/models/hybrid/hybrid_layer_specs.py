@@ -17,6 +17,7 @@ from megatron.core.models.gpt.moe_module_specs import (
     get_moe_module_spec,
 )
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
+from megatron.core.ops.norm.backends import SelectableNorm
 from megatron.core.ssm.gated_delta_net import GatedDeltaNet, GatedDeltaNet2, GatedDeltaNetSubmodules
 from megatron.core.ssm.gated_delta_net.kda import KimiDeltaAttention, KimiDeltaAttentionSubmodules
 from megatron.core.ssm.gated_delta_product import (
@@ -98,6 +99,9 @@ _csa_indexer = partial(
     ),
 )
 _csa_qk_norm = TESpecProvider().layer_norm(for_qk=True)
+# Standalone pre-norms and the MTP norms: TENorm unless the config selects another RMSNorm
+# kernel (``select_rms_norm``). Norms fused into TE linears, out_norms and QK norms stay TE.
+_pre_norm = partial(SelectableNorm, native=TENorm)
 
 
 # MTP block spec - provides norms and projection only.
@@ -109,15 +113,15 @@ _hybrid_mtp_block_spec = ModuleSpec(
             ModuleSpec(
                 module=MultiTokenPredictionLayer,
                 submodules=MultiTokenPredictionLayerSubmodules(
-                    enorm=TENorm,
-                    hnorm=TENorm,
+                    enorm=_pre_norm,
+                    hnorm=_pre_norm,
                     # Hybrid MTP selects the combined projection normally and
                     # per-stream projections when mHC is enabled.
                     eh_proj=TEColumnParallelLinear,
                     e_proj=TEColumnParallelLinear,
                     h_proj=TEColumnParallelLinear,
                     mtp_model_layer=None,  # Built via pattern + hybrid_submodules
-                    layer_norm=TENorm,
+                    layer_norm=_pre_norm,
                 ),
             )
         ]
@@ -184,7 +188,7 @@ hybrid_stack_spec = ModuleSpec(
         kda_layer=ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                input_layernorm=TENorm,
+                input_layernorm=_pre_norm,
                 self_attention=ModuleSpec(
                     module=KimiDeltaAttention,
                     submodules=KimiDeltaAttentionSubmodules(
@@ -226,7 +230,7 @@ hybrid_stack_spec = ModuleSpec(
         dsa_layer=ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                input_layernorm=TENorm,
+                input_layernorm=_pre_norm,
                 self_attention=ModuleSpec(
                     module=AbsorbedMLASelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
@@ -261,7 +265,7 @@ hybrid_stack_spec = ModuleSpec(
         csa_layer=ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                input_layernorm=TENorm,
+                input_layernorm=_pre_norm,
                 self_attention=ModuleSpec(
                     module=DSv4HybridSelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
@@ -287,7 +291,7 @@ hybrid_stack_spec = ModuleSpec(
         csa_qk_layernorm_layer=ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                input_layernorm=TENorm,
+                input_layernorm=_pre_norm,
                 self_attention=ModuleSpec(
                     module=DSv4HybridSelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
@@ -313,7 +317,7 @@ hybrid_stack_spec = ModuleSpec(
         mla_layer=ModuleSpec(
             module=TransformerLayer,
             submodules=TransformerLayerSubmodules(
-                input_layernorm=TENorm,
+                input_layernorm=_pre_norm,
                 self_attention=ModuleSpec(
                     module=MLASelfAttention,
                     params={"attn_mask_type": AttnMaskType.causal},
@@ -376,7 +380,7 @@ hybrid_stack_spec = ModuleSpec(
         moe_layer=ModuleSpec(
             module=MoETransformerLayer,
             submodules=TransformerLayerSubmodules(
-                pre_mlp_layernorm=TENorm, mlp=moe, mlp_bda=get_bias_dropout_add
+                pre_mlp_layernorm=_pre_norm, mlp=moe, mlp_bda=get_bias_dropout_add
             ),
         ),
         mtp_block_spec=_hybrid_mtp_block_spec,

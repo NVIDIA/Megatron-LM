@@ -18,6 +18,7 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.models.backends import BackendSpecProvider
 from megatron.core.ops.loss.backends import CrossEntropyTarget, select_cross_entropy
+from megatron.core.ops.norm.backends import select_rms_norm
 from megatron.core.ops.norm.fused_layer_norm import FusedLayerNorm
 from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
@@ -47,11 +48,13 @@ class TESpecProvider(BackendSpecProvider):
         cross_entropy_loss_fusion: bool = False,
         cross_entropy_fusion_impl: str = "native",
         cuda_graph_impl: Optional[str] = None,
+        use_liger: bool = False,
     ) -> None:
         self._use_te_op_fuser = use_te_op_fuser
         self._cross_entropy_loss_fusion = cross_entropy_loss_fusion
         self._cross_entropy_fusion_impl = cross_entropy_fusion_impl
         self._cuda_graph_impl = cuda_graph_impl
+        self._use_liger = use_liger
 
     def linear(self) -> type:
         """Which linear module TE backend uses"""
@@ -83,7 +86,8 @@ class TESpecProvider(BackendSpecProvider):
             # we instead use the Apex implementation.
             return FusedLayerNorm
         # Keep returning a class so this path stays aligned with build_module's class handling.
-        return _TENormWithResidual if has_residual else TENorm
+        native = _TENormWithResidual if has_residual else TENorm
+        return select_rms_norm(native, use_liger=self._use_liger) if rms_norm else native
 
     def core_attention(self) -> type:
         """Which module to use for attention"""

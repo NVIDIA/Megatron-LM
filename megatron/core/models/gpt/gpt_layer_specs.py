@@ -172,6 +172,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
     kitchen_attention_backend: str = "sdpa",
     mla_down_proj_fusion: bool = False,
     use_grouped_gemm_for_dense_mlp: bool = False,
+    use_liger: bool = False,
 ) -> TransformerLayerSubmodules:
     """Use these submodules to use lower-level Transformer Engine modules (required for fp8
     training).
@@ -189,6 +190,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
         mla_down_proj_fusion (bool, optional): Enable fused q/kv down-projection and fused input
                                                layernorm when backend supports. Otherwise fall back
                                                to the unfused MLA.
+        use_liger (bool, optional): Use Liger for standalone RMSNorm slots. Defaults to False.
 
     Returns:
         TransformerLayerSubmodules: TE modules to construct a TransformerLayer
@@ -211,6 +213,7 @@ def get_gpt_layer_with_transformer_engine_submodules(
         use_kitchen=use_kitchen,
         use_kitchen_attention=use_kitchen_attention,
         kitchen_attention_backend=kitchen_attention_backend,
+        use_liger=use_liger,
     )
 
     mlp = get_mlp_module_spec_for_backend(
@@ -585,6 +588,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            use_liger=config.use_liger,
         )
         moe_layer_spec = get_gpt_layer_with_transformer_engine_spec(
             num_experts=config.num_moe_experts,
@@ -597,6 +601,7 @@ def get_gpt_decoder_layer_specs(
             use_kitchen_attention=config.use_kitchen_attention,
             kitchen_attention_backend=config.kitchen_attention_backend,
             mla_down_proj_fusion=getattr(config, "mla_down_proj_fusion", False),
+            use_liger=config.use_liger,
         )
     elif config.transformer_impl == "inference_optimized":
         dense_layer_spec = get_gpt_layer_with_inference_spec(

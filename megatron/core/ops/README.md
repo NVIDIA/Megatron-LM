@@ -257,9 +257,10 @@ below), not by an operation constructor. Say a library `foo` provides both.
 - **Normalization.** Write `norm/foo_norm.py` with a module built as a
   `LayerNormBuilder` (`config=`, `hidden_size=`, `eps=`) and satisfying
   `LayerNormInterface`. Use the parameter names the existing norms use (`weight`,
-  and `bias` for LayerNorm) so a checkpoint loads under either backend. The
-  provider that offers it returns it from `layer_norm(rms_norm=..., for_qk=...,
-  has_residual=...)`; providers stay in `models/` and `extensions/`.
+  and `bias` for LayerNorm) so a checkpoint loads under either backend. An RMSNorm
+  kernel gets a branch in `select_rms_norm` (`norm/backends.py`), keyed by an
+  existing config value; every provider's `layer_norm` and the `SelectableNorm`
+  slots of import-time specs (HybridModel's) ask it, so no spec changes.
 - **Tests:** parity against `cross_entropy.vocab_parallel_cross_entropy` or the
   Torch norm, including backward and TP > 1 for cross entropy; a missing library
   is an `ImportError` naming the backend when it is selected; the existing values
@@ -268,9 +269,11 @@ below), not by an operation constructor. Say a library `foo` provides both.
 ## Liger RMSNorm
 
 Install `pip install liger-kernel==0.8.5` (or a newer compatible release) and select
-`--transformer-impl local --normalization RMSNorm --use-liger`. The local GPT block spec
-(`get_gpt_decoder_block_spec`) then uses it for the layer, final and MTP norms; custom
-specs choose their own norms.
+`--normalization RMSNorm --use-liger` with `--transformer-impl local` or
+`transformer_engine`. GPT's block spec and HybridModel's default stack spec then use it for
+every standalone RMSNorm, including the final and MTP norms. Norms fused into a Transformer
+Engine linear, gated `out_norm`s and HybridModel's QK norms stay Transformer Engine's;
+custom specs choose their own norms.
 
 ## Dependency checks
 
@@ -320,8 +323,8 @@ directly. This is the pattern used by the new-operation recipe above.
 `BackendSpecProvider` in `megatron/core/models/backends.py` supplies the existing
 model-spec components, such as parallel linear layers, normalization, attention,
 and cross entropy. Its cross-entropy slot asks `loss/backends.py`'s
-`select_cross_entropy`, and its `layer_norm` slot returns a `norm` module or
-Transformer Engine's. It does not currently provide SSM or sparse-attention kernel
+`select_cross_entropy`, and its `layer_norm` slot asks `norm/backends.py`'s
+`select_rms_norm` for RMSNorm. It does not currently provide SSM or sparse-attention kernel
 slots. Keep operation-local kernel selection in the family until an extension
 to that provider interface and its callers is implemented together.
 

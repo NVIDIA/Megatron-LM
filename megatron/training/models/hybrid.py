@@ -126,11 +126,8 @@ def resolve_hybrid_stack_spec(model_config: HybridModelConfig) -> ModuleSpec:
     """Return the configured stack spec, or the default one for the transformer config."""
     if model_config.hybrid_stack_spec is not None:
         return model_config.hybrid_stack_spec
-    if model_config.transformer.use_liger:
-        raise ValueError(
-            "use_liger is not supported by default Hybrid specs. "
-            "Provide an explicit custom hybrid_stack_spec that owns its normalization."
-        )
+    if model_config.transformer.use_liger and model_config.restore_modelopt_state:
+        raise ValueError("use_liger is not supported by ModelOpt Hybrid specs.")
     use_wide_residual = model_config.transformer.wide_residual is not None
     if model_config.transformer.transformer_impl == "inference_optimized":
         return (

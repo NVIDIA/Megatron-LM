@@ -8,8 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.core.extensions.liger_kernel_spec_provider import LigerSpecProvider
-from megatron.core.models.backends import LocalSpecProvider, get_backend, get_backend_from_config
+from megatron.core.models.backends import get_backend
+from megatron.core.ops.norm.backends import SelectableNorm, select_rms_norm
 from megatron.core.ops.norm.liger_norm import LigerRMSNorm
 from megatron.core.ops.norm.torch_norm import WrappedTorchNorm
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
@@ -17,22 +17,43 @@ from megatron.core.transformer.heterogeneous.heterogeneous_config import (
 )
 from megatron.core.transformer.transformer_config import TransformerConfig
 
+IMPLS = ("local", "transformer_engine", "inference_optimized")
+
 
 def test_unselected_paths_do_not_import_liger(monkeypatch):
     for module in ("liger_kernel", "liger_kernel.megatron"):
         monkeypatch.setitem(sys.modules, module, None)  # any import attempt now fails
-    provider = get_backend_from_config(SimpleNamespace(transformer_impl="local", use_liger=True))
-    assert isinstance(provider, LigerSpecProvider)
-    assert provider.layer_norm() is LocalSpecProvider().layer_norm()
-    assert LocalSpecProvider().layer_norm(rms_norm=True) is WrappedTorchNorm
-    with pytest.raises(ImportError, match="Liger RMSNorm requires liger_kernel.megatron"):
-        provider.layer_norm(rms_norm=True)
+    assert select_rms_norm(WrappedTorchNorm) is WrappedTorchNorm
+    for impl in IMPLS:
+        get_backend(impl, use_liger=True).layer_norm()  # LayerNorm never asks for Liger
+        with pytest.raises(ImportError, match="Liger RMSNorm requires liger_kernel.megatron"):
+            get_backend(impl, use_liger=True).layer_norm(rms_norm=True)
 
 
-def test_get_backend_rejects_liger_on_non_local():
-    for impl in ("transformer_engine", "inference_optimized"):
-        with pytest.raises(ValueError, match="only supported by the local backend"):
-            get_backend(impl, use_liger=True)
+@pytest.mark.parametrize("impl", IMPLS)
+def test_every_provider_selects_liger_for_rms_norm(impl):
+    pytest.importorskip("liger_kernel.megatron")
+    for has_residual in (False, True):
+        liger = get_backend(impl, use_liger=True).layer_norm(
+            rms_norm=True, has_residual=has_residual
+        )
+        assert liger is LigerRMSNorm
+    assert get_backend(impl).layer_norm(rms_norm=True) is not LigerRMSNorm
+
+
+@pytest.mark.parametrize("use_liger", [False, True])
+def test_selectable_norm_builds_the_selected_kernel(use_liger):
+    pytest.importorskip("liger_kernel.megatron")
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=8,
+        num_attention_heads=1,
+        normalization="RMSNorm",
+        transformer_impl="local",
+        use_liger=use_liger,
+    )
+    norm = SelectableNorm(native=WrappedTorchNorm, config=config, hidden_size=8, eps=1e-6)
+    assert type(norm).__name__ == ("LigerMegatronRMSNorm" if use_liger else "RMSNorm")
 
 
 def test_config_rejects_unsupported_setups():
@@ -45,10 +66,11 @@ def test_config_rejects_unsupported_setups():
         use_liger=True,
     )
     TransformerConfig(**options)
+    TransformerConfig(**(options | {"transformer_impl": "transformer_engine"}))
     for invalid in (
         {"normalization": "LayerNorm"},
-        {"transformer_impl": "transformer_engine"},
         {"transformer_impl": "inference_optimized"},
+        {"fused_residual_rmsnorm": True},
         {"use_kitchen": True},
         {"experimental_attention_variant": "dsa"},
     ):
