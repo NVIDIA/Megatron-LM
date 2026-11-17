@@ -72,7 +72,7 @@ def cudnn_dsa_and_exact_reference():
         torch.set_float32_matmul_precision(previous)
 
 
-def _compare(seq, cp_size, cp_rank, *, batch, hf_scoring, config=None):
+def _compare(seq, cp_size, cp_rank, *, batch, hf_scoring, deterministic=False, config=None):
     x = ks.kpool_inputs(
         seq=seq,
         cp_size=cp_size,
@@ -87,6 +87,7 @@ def _compare(seq, cp_size, cp_rank, *, batch, hf_scoring, config=None):
     calls = []
     selector = ks.cudnn_pool_topk_fn(
         ks.query_runs(seq, cp_size, cp_rank),
+        deterministic=deterministic,
         config=config,
         calls=calls,
     )
@@ -272,10 +273,16 @@ def test_cudnn_kpool_device_selection_replays_in_a_cuda_graph_for_another_pack()
             buffer.copy_(value)
         graph.replay()
         expected_ids, expected_scores = select(*values)
-        # The same pools with the same scores per row (the top-k's slot order need not repeat
-        # between calls).
+        # The same pools with the same scores per row (outside deterministic mode the top-k's
+        # slot order need not repeat between calls).
         assert torch.equal(ids.sort(dim=-1).values, expected_ids.sort(dim=-1).values)
         assert torch.equal(scores.sort(dim=-1).values, expected_scores.sort(dim=-1).values)
+
+
+def test_cudnn_kpool_selection_deterministic_mode_repeats():
+    first = _compare(16384, 8, 3, batch=1, hf_scoring=True, deterministic=True)
+    second = _compare(16384, 8, 3, batch=1, hf_scoring=True, deterministic=True)
+    assert torch.equal(first, second)
 
 
 def test_cudnn_kpool_selection_with_deepselect_top_k(monkeypatch):
@@ -290,6 +297,7 @@ def test_cudnn_kpool_selection_with_deepselect_top_k(monkeypatch):
         topk_k=_TOPK // ks.POOL,
         dtype=torch.float32,
         device=torch.device("cuda"),
+        deterministic=False,
     )
     if reason is not None:
         pytest.skip(f"DeepSelect does not take this call here: {reason}")

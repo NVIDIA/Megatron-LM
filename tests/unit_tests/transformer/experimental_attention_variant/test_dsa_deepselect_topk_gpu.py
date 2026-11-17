@@ -94,12 +94,12 @@ def _topk(scores, seq_lens, backend, return_topk_scores=True, topk_k=_K):
 
 
 def _ran_deepselect(scores, seq_lens, topk_k=_K) -> bool:
-    return dsa_deepselect_topk.fallback_reason(scores, seq_lens, topk_k) is None
+    return dsa_deepselect_topk.fallback_reason(scores, seq_lens, topk_k, False) is None
 
 
 def _require_eligible(scores, seq_lens, topk_k=_K) -> None:
     """Skip widths below the loaded build's minimum (upstream deep_select starts at 512K)."""
-    reason = dsa_deepselect_topk.fallback_reason(scores, seq_lens, topk_k)
+    reason = dsa_deepselect_topk.fallback_reason(scores, seq_lens, topk_k, False)
     if reason is not None and reason.startswith("score width below"):
         pytest.skip(reason)
     assert reason is None, reason
@@ -806,6 +806,7 @@ def test_every_128k_cp32_and_1m_cp64_rank_width_is_eligible_for_bf16_scores():
             topk_k=_K,
             dtype=torch.bfloat16,
             device=torch.device("cuda"),
+            deterministic=False,
         )
         if provider.kind == "deep_select" and n_rows == 4096:
             assert reason is not None and reason.startswith("score width below")

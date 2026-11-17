@@ -5,11 +5,16 @@
 With the switch on, the cuDNN packed-THD indexer scorer is called with ``clean_logits=False``
 and leaves every score column at or past a row's causal limit unspecified. The unspecified
 columns are additionally poisoned (NaN, +inf) through a caller-owned score buffer, which is
-the worst case a reader past the limit could observe. The radix top-k writes its selection
-in an unspecified slot order and the sparse backward accumulates with atomics, so two
-prefilled runs already differ. Each row's top-k index set, sorted by key index, and the score
-of every selected key must still be exactly equal; the output, indexer loss and gradients
-must agree within a tolerance that the prefilled rerun itself has to meet.
+the worst case a reader past the limit could observe. Each layout runs in two modes:
+
+* deterministic mode: a full forward/backward of the layer must be bitwise identical to the
+  run with the ``-inf`` prefill: top-k indices, attention output, indexer loss and every
+  gradient.
+* production (non-deterministic) mode: the radix top-k writes its selection in an
+  unspecified slot order and the sparse backward accumulates with atomics, so two prefilled
+  runs already differ. Each row's top-k index set, sorted by key index, and the score of
+  every selected key must still be exactly equal; the output, indexer loss and gradients
+  must agree within a tolerance that the prefilled rerun itself has to meet.
 
 Layouts follow packed THD training: multi-sequence packs with a dummy tail sequence and
 fixed-capacity ``cu_seqlens`` (``thd_max_packed_sequences``), at CP1 and zigzag CP4, and
@@ -89,7 +94,7 @@ def _skip_unless_supported() -> None:
         pytest.skip("the installed cuDNN frontend has no indexer clean_logits switch")
 
 
-def _make_config(layout: _Layout) -> MLATransformerConfig:
+def _make_config(layout: _Layout, *, deterministic: bool) -> MLATransformerConfig:
     """64-head DSA attention geometry (512+64 latent, 32x128 indexer), small hidden."""
     config = MLATransformerConfig(
         multi_latent_attention=True,
@@ -135,6 +140,10 @@ def _make_config(layout: _Layout) -> MLATransformerConfig:
         use_cpu_initialization=False,
         perform_initialization=True,
     )
+    # Set after validation: deterministic mode otherwise asserts launcher-level settings.
+    # Bitwise comparisons need the deterministic sparse backward and top-k tie-breaking;
+    # production runs leave it off.
+    config.deterministic_mode = deterministic
     return config
 
 
@@ -318,6 +327,23 @@ def _bitwise_equal(value: torch.Tensor, reference: torch.Tensor) -> bool:
     return torch.equal(value.reshape(-1).view(torch.uint8), reference.reshape(-1).view(torch.uint8))
 
 
+def _assert_bitwise_equal(actual: dict, expected: dict, label: str) -> None:
+    assert actual.keys() == expected.keys(), f"{label}: {sorted(actual)} != {sorted(expected)}"
+    for name, reference in expected.items():
+        value = actual[name]
+        assert value.dtype == reference.dtype and value.shape == reference.shape, (
+            f"{label} {name}: {value.dtype}{tuple(value.shape)} != "
+            f"{reference.dtype}{tuple(reference.shape)}"
+        )
+        if not _bitwise_equal(value, reference):
+            diff = (value.double() - reference.double()).abs()
+            pytest.fail(
+                f"{label}: {name} differs bitwise in "
+                f"{int((value != reference).sum())}/{value.numel()} elements "
+                f"(max |diff| {diff.nan_to_num(nan=float('inf')).max().item():.3e})"
+            )
+
+
 def _is_topk_indices(name: str) -> bool:
     return name.startswith("topk.") and name.endswith(".0")
 
@@ -325,9 +351,9 @@ def _is_topk_indices(name: str) -> bool:
 def _sort_topk_by_key(result: dict) -> dict:
     """Sort each row's top-k selection by key index and carry the selected scores along.
 
-    The cuDNN radix top-k writes its selection in an unspecified slot order. The selected
-    set, its length and the score of every selected key are still reproducible. Invalid
-    slots (``-1``) sort last.
+    Without deterministic mode the cuDNN radix top-k writes its selection in an
+    unspecified slot order. The selected set, its length and the score of every selected
+    key are still reproducible. Invalid slots (``-1``) sort last.
     """
     canonical = dict(result)
     for name, indices in result.items():
@@ -424,7 +450,7 @@ def _initialize_model_parallel(layout: _Layout) -> None:
     )
 
 
-def _build_step(layout: _Layout, monkeypatch):
+def _build_step(layout: _Layout, monkeypatch, *, deterministic: bool):
     """Build the layer and inputs for ``layout``; returns the step function and scorer spy.
 
     The model parallel state must already be initialized for ``layout``.
@@ -440,7 +466,7 @@ def _build_step(layout: _Layout, monkeypatch):
         )
     cp_group = pg_collection.cp
     assert cp_group.size() == layout.realized_cp
-    config = _make_config(layout)
+    config = _make_config(layout, deterministic=deterministic)
     attention = _make_attention(config, pg_collection)
     packed_seq_params = _packed_seq_params(layout, cp_group, cp_group.rank())
     inputs = _make_inputs(config, layout, torch.distributed.get_rank())
@@ -477,12 +503,36 @@ _POISONS = (None, float("nan"), float("inf"))
 
 
 @pytest.mark.parametrize("layout", _LAYOUTS)
-def test_skip_masked_score_fill_matches_in_production_mode(layout, monkeypatch):
-    """Exact sorted top-k, values within run-to-run noise."""
+def test_skip_masked_score_fill_is_bitwise_identical(layout, monkeypatch):
     _skip_unless_supported()
     _initialize_model_parallel(layout)
     try:
-        step, spy = _build_step(layout, monkeypatch)
+        step, spy = _build_step(layout, monkeypatch, deterministic=True)
+        filled = step(skip_fill=False)
+        assert spy.clean_logits_calls and all(spy.clean_logits_calls)
+        assert any(name.startswith("topk.") for name in filled), "no top-k was selected"
+        # The comparison is only meaningful if the reference itself is reproducible.
+        _assert_bitwise_equal(step(skip_fill=False), filled, "prefill rerun")
+
+        for poison in _POISONS:
+            skipped = _run_skipped(step, spy, poison)
+            _assert_bitwise_equal(skipped, filled, f"skip fill, poison={poison}")
+        print(
+            f"[skip-score-fill] layout={layout} rank={torch.distributed.get_rank()} "
+            f"scorer_calls={len(spy.clean_logits_calls)} compared={len(filled)} tensors"
+        )
+    finally:
+        DSAIndexerLossLoggingHelper.clean_loss_in_tracker()
+        Utils.destroy_model_parallel()
+
+
+@pytest.mark.parametrize("layout", _LAYOUTS)
+def test_skip_masked_score_fill_matches_in_production_mode(layout, monkeypatch):
+    """Without deterministic mode: exact sorted top-k, values within run-to-run noise."""
+    _skip_unless_supported()
+    _initialize_model_parallel(layout)
+    try:
+        step, spy = _build_step(layout, monkeypatch, deterministic=False)
         raw_filled = step(skip_fill=False)
         assert spy.clean_logits_calls and all(spy.clean_logits_calls)
         assert any(name.startswith("topk.") for name in raw_filled), "no top-k was selected"

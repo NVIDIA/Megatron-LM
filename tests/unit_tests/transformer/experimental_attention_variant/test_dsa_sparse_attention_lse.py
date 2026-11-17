@@ -298,17 +298,21 @@ def test_hook_default_call_keeps_old_kwargs_and_return_lse_is_forwarded(monkeypa
 
     assert _call_hook(all_topk_rows_nonempty=True) is output
     assert len(calls[0][0]) == 6
-    assert calls[0][1] == {"all_topk_rows_nonempty": True}
+    assert calls[0][1] == {"all_topk_rows_nonempty": True, "deterministic": False}
 
     assert _call_hook(all_topk_rows_nonempty=True, return_lse=True) == (output, lse)
-    assert calls[1][1] == {"all_topk_rows_nonempty": True, "return_lse": True}
+    assert calls[1][1] == {
+        "all_topk_rows_nonempty": True,
+        "deterministic": False,
+        "return_lse": True,
+    }
 
 
 def test_hook_return_lse_reaches_the_cudnn_backend_signature():
     """The cuDNN backend hook declares ``return_lse``, so the hook offers it."""
     accepted = core_utils.filter_kwargs_for_callable(
         dsa_cudnn_kernels.run_fused_absorbed_sparse_attention,
-        {"all_topk_rows_nonempty": True, "return_lse": True},
+        {"all_topk_rows_nonempty": True, "deterministic": False, "return_lse": True},
     )
     assert accepted["return_lse"] is True
 
@@ -651,3 +655,114 @@ def test_run_sparse_indexer_backward_passes_sm_scale_to_every_chunk(
     torch.testing.assert_close(scaled[1], torch.full_like(x.weights, 0.5), rtol=0, atol=0)
     # dK sums the chunks' stand-in values.
     torch.testing.assert_close(scaled[2], torch.full_like(x.k, 1.0), rtol=0, atol=0)
+
+
+def _autograd_indexer_grads(x, *, sm_scale, loss_coeff, grad_loss):
+    """dW and dK of ``grad_loss * loss_coeff * sum_rows CE(target, softmax(I)) / (B * S_q)``."""
+    batch, sq, _heads, dim = x.q.shape
+    skv = x.k.size(1)
+    weights = x.weights.detach().clone().requires_grad_(True)
+    k = x.k.detach().clone().requires_grad_(True)
+    safe = x.local.clamp_min(0).long()
+    selected = torch.gather(
+        k.unsqueeze(1).expand(batch, sq, skv, dim),
+        2,
+        safe.unsqueeze(-1).expand(batch, sq, safe.size(-1), dim),
+    )
+    dots = torch.einsum("bqhd,bqtd->bqht", x.q, selected) * sm_scale
+    logits = (torch.relu(dots) * weights.unsqueeze(-1)).sum(dim=2)
+    log_predict = torch.log_softmax(logits.masked_fill(~x.valid, float("-inf")), dim=-1)
+    log_predict = log_predict.masked_fill(~x.valid, 0.0)
+    loss = -(x.target * log_predict).sum() * loss_coeff / (batch * sq) * grad_loss
+    grad_w, grad_k = torch.autograd.grad(loss, (weights, k))
+    predict = log_predict.exp().masked_fill(~x.valid, 0.0)
+    return predict.detach(), grad_w, grad_k
+
+
+def test_deterministic_indexer_grads_follow_sm_scale():
+    """Explicit default is bitwise the default; half the scale halves dW and dK exactly."""
+    x = _indexer_backward_inputs()
+    loss_coeff, grad_loss = 0.7, torch.tensor(1.25)
+
+    def grads(**kwargs):
+        return dsa_cudnn_kernels._deterministic_sparse_indexer_grads_wk(
+            x.q,
+            x.weights,
+            x.k,
+            x.target.clone(),
+            x.predict.clone(),
+            x.global_ids,
+            loss_coeff=loss_coeff,
+            grad_loss=grad_loss,
+            compute_grad_w=True,
+            **kwargs,
+        )
+
+    default_w, default_k = grads()
+    explicit_w, explicit_k = grads(sm_scale=dsa_cudnn_kernels._INDEXER_SOFTMAX_SCALE)
+    half_w, half_k = grads(sm_scale=0.5 * dsa_cudnn_kernels._INDEXER_SOFTMAX_SCALE)
+
+    assert torch.equal(explicit_w, default_w) and torch.equal(explicit_k, default_k)
+    # With the scores held fixed, every term carries one factor of sm_scale; halving it is
+    # exact in floating point.
+    assert torch.equal(half_w, default_w * 0.5) and torch.equal(half_k, default_k * 0.5)
+    assert not torch.equal(half_k, default_k)
+
+
+@pytest.mark.parametrize("sm_scale", [1.0, 0.5, 1.0 / 64.0])
+def test_deterministic_indexer_grads_match_autograd_at_sm_scale(sm_scale):
+    """The replacement's dW and dK are the KL gradients of ``sum_h w_h relu(s q_h . k)``."""
+    x = _indexer_backward_inputs()
+    loss_coeff, grad_loss = 0.7, torch.tensor(1.25)
+    predict, reference_w, reference_k = _autograd_indexer_grads(
+        x, sm_scale=sm_scale, loss_coeff=loss_coeff, grad_loss=grad_loss
+    )
+
+    grad_w, grad_k = dsa_cudnn_kernels._deterministic_sparse_indexer_grads_wk(
+        x.q,
+        x.weights,
+        x.k,
+        x.target.clone(),
+        predict.contiguous(),
+        x.global_ids,
+        loss_coeff=loss_coeff,
+        grad_loss=grad_loss,
+        compute_grad_w=True,
+        sm_scale=sm_scale,
+    )
+
+    torch.testing.assert_close(grad_w, reference_w, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(grad_k, reference_k, rtol=2e-5, atol=2e-6)
+
+
+def test_run_sparse_indexer_backward_deterministic_uses_sm_scale(
+    recording_indexer_backward, monkeypatch
+):
+    """Deterministic mode recomputes dK (and SM90 dW) with the requested scale."""
+    monkeypatch.setattr(
+        dsa_cudnn_kernels, "_requires_native_deterministic_indexer_grad_w", lambda *_: True
+    )
+    x = _indexer_backward_inputs()
+    loss_coeff, grad_loss = 0.7, torch.tensor(1.25)
+    predict, reference_w, reference_k = _autograd_indexer_grads(
+        x, sm_scale=0.5, loss_coeff=loss_coeff, grad_loss=grad_loss
+    )
+
+    grad_q, grad_w, grad_k = dsa_cudnn_kernels._run_sparse_indexer_backward(
+        x.q,
+        x.weights,
+        x.k,
+        x.target.clone(),
+        predict.contiguous(),
+        x.global_ids,
+        loss_coeff=loss_coeff,
+        grad_loss=grad_loss,
+        block_i=128,
+        deterministic=True,
+        sm_scale=0.5,
+    )
+
+    assert [call["sm_scale"] for call in recording_indexer_backward.calls] == [0.5]
+    torch.testing.assert_close(grad_q, torch.full_like(x.q, 0.5), rtol=0, atol=0)
+    torch.testing.assert_close(grad_w, reference_w, rtol=2e-5, atol=2e-6)
+    torch.testing.assert_close(grad_k, reference_k, rtol=2e-5, atol=2e-6)

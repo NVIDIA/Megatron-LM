@@ -2,8 +2,8 @@
 
 """CPU tests of the trainable KPool indexer loss on cuDNN frontend kernels (phase 2).
 
-With TP size 1, ``dsa_kernel_backend='cudnn'``, the cuDNN KPool scorer, HF scoring, an
-accepted forward and cuDNN frontend >= 1.31, a trainable KPool layer
+With TP size 1, no deterministic mode, ``dsa_kernel_backend='cudnn'``, the cuDNN KPool
+scorer, HF scoring, an accepted forward and cuDNN frontend >= 1.31, a trainable KPool layer
 computes its sparse pool-level KL after the sparse attention: the teacher from FE score
 recompute fed the attention's own LSE, the student from the cuDNN selector's pool scores, the
 gradients from the FE sparse indexer backward on the pooled keys. Everywhere else the PyTorch
@@ -17,7 +17,8 @@ stand-in of the fused sparse attention returns its LSE. Checked here:
 - ``run_kpool_attention_token_target`` with ``_kpool_pool_target_from_token_target``: the
   oracle teacher, from the selector's own layout padded to 128 without ``topk_length``;
 - ``KPoolSparseIndexerLossFromScoresFunc``: loss and gradients of the phase-1 Function, for
-  both scorings, every row-count convention and the chunked backward; rows and slots outside the loss get exactly zero gradient;
+  both scorings, every row-count convention, deterministic accumulation and the chunked
+  backward; rows and slots outside the loss get exactly zero gradient;
 - the cuDNN frontend >= 1.31 gate and the other decline reasons;
 - a real ``DSAttention`` (PyTorch stand-ins for Transformer Engine): the dispatch matrix of
   scorer x scoring x layout x TP against the oracle (``kpool_trainable_reference.py``), with
@@ -206,7 +207,7 @@ def test_dispatch_hook_offers_return_scores_only_when_asked(monkeypatch):
         seen.append(return_scores)
         return (ids, torch.ones(ids.shape)) if return_scores else ids
 
-    config = SimpleNamespace(dsa_kernel_backend="cudnn")
+    config = SimpleNamespace(dsa_kernel_backend="cudnn", deterministic_mode=False)
     args = (config, None, None, None, 3, POOL, ((0, 2, 0),), True)
     monkeypatch.setattr(dsa_kernels, "_resolve_fused_hook", lambda _config, _name: legacy_hook)
     assert dsa_kernels.run_kpool_pool_topk(*args) is ids
@@ -313,10 +314,11 @@ def _leaves(case):
 
 
 @pytest.mark.parametrize("chunked", [False, True], ids=["one-launch", "row-chunks"])
+@pytest.mark.parametrize("deterministic", [False, True], ids=["atomics", "deterministic"])
 @pytest.mark.parametrize("row_count_kind", ["rows", "valid-rows", "per-token"])
 @pytest.mark.parametrize("hf_scoring", [True, False], ids=["hf", "legacy"])
 def test_cudnn_loss_matches_the_pytorch_loss(
-    frontend, monkeypatch, hf_scoring, row_count_kind, chunked
+    frontend, monkeypatch, hf_scoring, row_count_kind, deterministic, chunked
 ):
     """Same student scores, teacher and rows: the phase-1 loss and, to BF16, its gradients.
 
@@ -329,6 +331,16 @@ def test_cudnn_loss_matches_the_pytorch_loss(
     if chunked:
         monkeypatch.setattr(dsa_cudnn_kernels, "_CUDA_GRID_Y_MAX", 7)
         monkeypatch.setattr(dsa_cudnn_kernels, "_SPARSE_INDEXER_BACKWARD_CHUNK_ROWS", 8)
+    # The fake's dK equals the atomic-free one, so values cannot tell the two apart: count
+    # the atomic-free replacement's calls instead.
+    atomic_free_calls = []
+    real_atomic_free = dsa_cudnn_kernels._deterministic_sparse_indexer_grads_wk
+
+    def atomic_free(*args, **kwargs):
+        atomic_free_calls.append(kwargs.get("sm_scale"))
+        return real_atomic_free(*args, **kwargs)
+
+    monkeypatch.setattr(dsa_cudnn_kernels, "_deterministic_sparse_indexer_grads_wk", atomic_free)
     case = _loss_case(11, hf_scoring=hf_scoring)
     batch = case.q.size(1)
     row_count = {
@@ -358,6 +370,7 @@ def test_cudnn_loss_matches_the_pytorch_loss(
         row_count,
         coeff,
         hf_scoring,
+        deterministic=deterministic,
     )
     assert loss.dtype == torch.float32 and loss.ndim == 0
     torch.testing.assert_close(loss, expected, rtol=1e-5, atol=1e-8)
@@ -372,6 +385,13 @@ def test_cudnn_loss_matches_the_pytorch_loss(
     for call in dsa_ns.backward_calls:
         assert call["heads"] == 64 and call["topk"] == 128
         assert call["sm_scale"] == pytest.approx(expected_scale, rel=1e-12)
+    # The pooled-key gradient comes from the atomic-free replacement exactly when asked, at
+    # the FE backward's score scale.
+    if deterministic:
+        assert atomic_free_calls, "deterministic: the atomic-free dK replacement did not run"
+        assert all(s == pytest.approx(expected_scale, rel=1e-12) for s in atomic_free_calls)
+    else:
+        assert atomic_free_calls == []
     # Rows outside the loss get exactly zero query and head-weight gradients.
     outside = ~case.row_mask
     assert torch.all(leaves[0].grad.permute(1, 0, 2, 3)[outside] == 0)
@@ -498,7 +518,7 @@ def test_decline_reason_names_a_layout_the_fused_attention_declines(frontend):
 def test_dispatch_hooks_of_a_backend_without_the_cudnn_loss(monkeypatch):
     """No hook: the decline names the backend; the loss hooks raise instead of declining."""
     monkeypatch.setattr(dsa_kernels, "_resolve_fused_hook", lambda _config, _name: None)
-    config = SimpleNamespace(dsa_kernel_backend="tilelang")
+    config = SimpleNamespace(dsa_kernel_backend="tilelang", deterministic_mode=False)
     reason = dsa_kernels.kpool_sparse_indexer_loss_decline_reason(config, None, None)
     assert "'tilelang' has no fused KPool indexer loss" in reason
     with pytest.raises(RuntimeError, match="run_kpool_attention_token_target"):
@@ -559,6 +579,7 @@ def _fused_sparse_attention(
     v_channels,
     topk_length=None,
     all_topk_rows_nonempty=False,
+    deterministic=False,
     return_lse=False,
 ):
     """PyTorch stand-in of the cuDNN backend's fused absorbed sparse attention (FlashMLA)."""
@@ -980,6 +1001,38 @@ def test_frontend_older_than_1_31_runs_the_pytorch_loss(frontend, cpu_layer, cap
     assert not cpu_layer.attention[-1].return_lse
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any(_PYTORCH_PATH in m and "older than 1.31" in m for m in warnings), warnings
+    _check_against_the_oracle(
+        attention, inputs, run, calls[0], cpu_layer, cu_seqlens=None, eps=1e-3
+    )
+
+
+@pytest.mark.parametrize("how", ["deterministic_mode", "torch_deterministic_algorithms"])
+def test_deterministic_mode_runs_the_pytorch_loss(frontend, cpu_layer, caplog, how):
+    """Deterministic DSA (either switch) keeps phase 1, whose pooled-key gradient is free of
+    atomics at a cost set by the selected pools, and says why; it still trains to the oracle."""
+    frontend()
+    config = _layer_config(scorer="cudnn", hf_scoring=True)
+    if how == "deterministic_mode":
+        config.deterministic_mode = True
+    attention = _build_layer(config)
+    calls = _spy_indexer(attention)
+    inputs = _layer_inputs(config, batch=2, seed=37)
+    previous = (
+        torch.are_deterministic_algorithms_enabled(),
+        torch.is_deterministic_algorithms_warn_only_enabled(),
+    )
+    if how == "torch_deterministic_algorithms":
+        torch.use_deterministic_algorithms(True, warn_only=True)
+    try:
+        with caplog.at_level(logging.WARNING, logger=_DSA_LOGGER):
+            run = _run_layer(attention, inputs)
+    finally:
+        torch.use_deterministic_algorithms(previous[0], warn_only=previous[1])
+    assert (cpu_layer.cudnn, cpu_layer.pytorch) == (0, 1)
+    assert not cpu_layer.attention[-1].return_lse
+    assert cpu_layer.student == []
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(_PYTORCH_PATH in m and "deterministic mode" in m for m in warnings), warnings
     _check_against_the_oracle(
         attention, inputs, run, calls[0], cpu_layer, cu_seqlens=None, eps=1e-3
     )

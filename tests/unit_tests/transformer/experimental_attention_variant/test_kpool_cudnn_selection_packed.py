@@ -464,6 +464,7 @@ def test_kernel_dispatch_declines_device_boundaries_for_a_hook_without_them(monk
     monkeypatch.setattr(dsa_kernels, "_resolve_fused_hook", lambda config, name: old_hook)
     monkeypatch.setattr(dsa_kernels, "_log_declined_hook", lambda *args: None)
     config = SimpleNamespace(dsa_kernel_backend="cudnn")
+    monkeypatch.setattr(dsa_kernels, "_deterministic_dsa_requested", lambda config: False)
     result = dsa_kernels.run_kpool_pool_topk(
         config,
         None,

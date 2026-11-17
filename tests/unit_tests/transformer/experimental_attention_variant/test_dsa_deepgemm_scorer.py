@@ -427,6 +427,7 @@ def test_device_rule(monkeypatch, sm, message):
 
 def _fallback_case(dg, monkeypatch, case):
     heads, dim, w_dtype = HEADS, HEAD_DIM, torch.bfloat16
+    deterministic = False
     if case == "sm100":
         monkeypatch.setattr(
             dsa_deepgemm_scorer,
@@ -439,6 +440,10 @@ def _fallback_case(dg, monkeypatch, case):
             "_IMPORT_STATE",
             {"provider": None, "error": "cannot import deep_gemm: ImportError: x"},
         )
+    elif case == "torch-deterministic":
+        monkeypatch.setattr(torch, "are_deterministic_algorithms_enabled", lambda: True)
+    elif case == "deterministic-arg":
+        deterministic = True
     elif case == "jit-failure":
 
         def broken(*_args, **_kwargs):
@@ -447,7 +452,7 @@ def _fallback_case(dg, monkeypatch, case):
         monkeypatch.setattr(dg.dg, "fp8_fp4_mqa_logits", broken)
     else:
         raise AssertionError(case)
-    return heads, dim, w_dtype
+    return heads, dim, w_dtype, deterministic
 
 
 @pytest.mark.parametrize(
@@ -455,6 +460,8 @@ def _fallback_case(dg, monkeypatch, case):
     [
         ("sm100", logging.WARNING, "not validated on SM 10.0"),
         ("no-build", logging.WARNING, "cannot import deep_gemm"),
+        ("torch-deterministic", logging.INFO, "deterministic mode"),
+        ("deterministic-arg", logging.INFO, "deterministic mode"),
         ("jit-failure", logging.WARNING, "JIT warm-up failed: RuntimeError: nvcc not found"),
     ],
 )
@@ -462,7 +469,7 @@ def test_environment_fallbacks_run_the_cudnn_mxfp8_scorer_and_log_once(
     dg, monkeypatch, caplog, case, level, reason
 ):
     q, k, w, layout = _case((256, 128), 1, 0, seed=3)
-    _fallback_case(dg, monkeypatch, case)
+    _, _, _, deterministic = _fallback_case(dg, monkeypatch, case)
     starts, ends, cu, max_seqlen = layout
     with caplog.at_level(logging.INFO, logger=dsa_deepgemm_scorer.__name__):
         for _ in range(3):
@@ -480,6 +487,7 @@ def test_environment_fallbacks_run_the_cudnn_mxfp8_scorer_and_log_once(
                 packed_cu_seqlens_k=cu,
                 packed_max_seqlen_q=max_seqlen,
                 packed_max_seqlen_k=max_seqlen,
+                deterministic=deterministic,
                 scorer_options=DEEPGEMM,
             )
     assert len(DeepGemmFe.calls) == 3
@@ -1643,11 +1651,12 @@ def test_config_is_unset_and_options_default_to_cudnn(monkeypatch):
     [
         ({"dsa_indexer_precision": "bf16"}, "set dsa_indexer_precision='mxfp8'"),
         ({"dsa_kernel_backend": "none"}, "requires experimental_attention_variant='dsa' with"),
+        ({"deterministic_mode": True}, "does not support deterministic_mode"),
         ({"dsa_indexer_kpool": 4, "dsa_indexer_topk": 4}, "KPool selection .* bypasses it"),
         ({"dsa_indexer_scorer_backend": "flashinfer"}, "'torch', 'cudnn' or 'deepgemm'"),
         ({"attention_backend": AttnBackend.unfused}, "requires the fused DSA kernels"),
     ],
-    ids=["bf16", "kernel-backend-none", "kpool", "unknown", "unfused"],
+    ids=["bf16", "kernel-backend-none", "deterministic", "kpool", "unknown", "unfused"],
 )
 def test_config_rejects_what_deepgemm_cannot_honour(monkeypatch, overrides, message):
     with pytest.raises(ValueError, match=message):

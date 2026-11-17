@@ -148,8 +148,8 @@ class _DeepSelectSpy:
         real_topk = dsa_deepselect_topk.deepselect_topk
 
         @functools.wraps(real_reason)
-        def fallback_reason(scores, seq_lens, topk_k):
-            reason = real_reason(scores, seq_lens, topk_k)
+        def fallback_reason(scores, seq_lens, topk_k, deterministic):
+            reason = real_reason(scores, seq_lens, topk_k, deterministic)
             self.reasons.append(reason)
             return reason
 
@@ -364,13 +364,14 @@ def test_deepselect_layer_matches_cudnn_in_production_mode(layout, monkeypatch):
             topk_k=_TOPK,
             dtype=torch.float32,
             device=torch.device("cuda", torch.cuda.current_device()),
+            deterministic=False,
         )
         assert reason is None, f"layout is not DeepSelect-eligible on CP rank {cp_rank}: {reason}"
 
         # Installed first, so the step's recording wrapper logs what the layer receives.
         permuter = _SlotPermuter(dsa_cudnn_kernels._indexer_topk_bshd)
         monkeypatch.setattr(dsa_cudnn_kernels, "_indexer_topk_bshd", permuter)
-        step, scorer_spy = _build_step(layout, monkeypatch)
+        step, scorer_spy = _build_step(layout, monkeypatch, deterministic=False)
         attention = step.args[0]
         deepselect_spy = _DeepSelectSpy(monkeypatch)
         run = functools.partial(_run, step, attention, scorer_spy, deepselect_spy, layout)

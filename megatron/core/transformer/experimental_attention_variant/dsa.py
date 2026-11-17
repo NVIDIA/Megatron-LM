@@ -4766,15 +4766,28 @@ class DSAttention(MegatronModule):
         None when it can, as far as host facts decide before selection; the cuDNN KPool
         scorer must then still accept the forward and return its pool scores. The cuDNN path
         needs TP size 1 (TP ranks use TP rank 0's selection, which another rank's top-k values
-        do not belong to), ``dsa_kernel_backend='cudnn'``, the cuDNN KPool scorer (its top-k
-        values are the student), HF scoring, the fused absorbed-MLA sparse attention (its LSE
-        feeds the teacher) and cuDNN frontend >= 1.31 (the backend checks the last two).
+        do not belong to), no deterministic mode, ``dsa_kernel_backend='cudnn'``, the cuDNN
+        KPool scorer (its top-k values are the student), HF scoring, the fused absorbed-MLA
+        sparse attention (its LSE feeds the teacher) and cuDNN frontend >= 1.31 (the backend
+        checks the last two).
+
+        Deterministic mode keeps the PyTorch loss: its pooled-key gradient is free of atomics
+        at a cost that grows with the selected pools, whereas the cuDNN path's atomic-free
+        replacement (``_deterministic_sparse_indexer_grads_wk``) sweeps every pooled key in
+        each query-row chunk, and its fixed per-key buffers shrink the chunks to one row at
+        1M tokens (262,144 pooled keys).
         """
         config = self.config
         if tp_size > 1:
             return (
                 f"tensor parallelism (TP size {tp_size}): every TP rank attends TP rank 0's "
                 "selection, which another rank's cuDNN top-k values do not belong to"
+            )
+        if dsa_kernels._deterministic_dsa_requested(config):
+            return (
+                "deterministic mode: the cuDNN path's atomic-free pooled-key gradient sweeps "
+                "every pooled key in each query-row chunk (one row per chunk at 1M tokens), "
+                "while the PyTorch loss accumulates it over the selected pools only"
             )
         if config.dsa_kernel_backend != "cudnn":
             return f"dsa_kernel_backend is {config.dsa_kernel_backend!r}, not 'cudnn'"

@@ -587,8 +587,8 @@ class TransformerConfig(ModelParallelConfig):
     multiple of 1024 bytes, row width to below 2**23 and from 65536 for FP32 ``ds_tune``
     (81920 for calls of more than 4096 rows), 16384 for BF16 ``ds_tune`` or 524288 for
     ``deep_select``, a compiled config for the score dtype and top-k <= 4096 and top-k a
-    multiple of 8, of 16 for BF16); every other call keeps the cuDNN top-k, and the choice is
-    logged once per reason and score dtype.
+    multiple of 8, of 16 for BF16); every other call, and deterministic mode, keeps the cuDNN
+    top-k, and the choice is logged once per reason and score dtype.
     BF16 scores (``ds_tune`` config ``h_t256_o2_b2_2k_d3``: 4.20 against 6.08 ms for FP32 at
     1M, 0.337 against 0.469 ms at 128K) have their own width threshold: on GB300 ``ds_tune``
     BF16 was 1.70-2.69x faster than cuDNN's BF16 radix top-k at every measured width
@@ -672,13 +672,14 @@ class TransformerConfig(ModelParallelConfig):
     first call), SM 10.3, cuDNN frontend >= 1.29 (the radix top-k out-of-bounds lane guard,
     since DeepGEMM leaves the logits past each row's length unwritten), 32 or 64 indexer
     heads of dim 128, BF16 weights and Transformer Engine MXFP8. Without them, on SM 10.0
-    (not validated yet) or when DeepGEMM's JIT warm-up fails (not a CUDA out-of-memory error,
-    which propagates), a call falls back to the cuDNN MXFP8 scorer, logged once per reason:
-    check for the "DSA indexer scorer uses DeepGEMM" line. A fallback scores in FP32, so its
-    score buffer is twice DeepGEMM's BF16 one (64 against 32 GiB per 1M CP64 rank-0 call);
-    memory budgeted for DeepGEMM may not hold it. Requires ``dsa_indexer_precision='mxfp8'``
-    (and with it every MXFP8 requirement). Kernels JIT-compile at the first eager call per
-    device and head count: set ``DG_JIT_CACHE_DIR`` to a persistent
+    (not validated yet), under ``torch.use_deterministic_algorithms`` or when DeepGEMM's JIT
+    warm-up fails (not a CUDA out-of-memory error, which propagates), a call falls back to
+    the cuDNN MXFP8 scorer, logged once per reason: check for the "DSA indexer scorer uses
+    DeepGEMM" line. A fallback scores in FP32, so its score buffer is twice DeepGEMM's BF16
+    one (64 against 32 GiB per 1M CP64 rank-0 call); memory budgeted for DeepGEMM may not
+    hold it. Requires ``dsa_indexer_precision='mxfp8'`` (and with it every MXFP8
+    requirement) and is not available with ``deterministic_mode``. Kernels JIT-compile at the
+    first eager call per device and head count: set ``DG_JIT_CACHE_DIR`` to a persistent
     directory shared by all ranks and run at least one eager step before CUDA graph capture
     (capturing a cold kernel raises). A process runs DeepGEMM on one device, the first that
     calls it (its JIT keeps one kernel handle per process); a call on another device falls
@@ -3626,6 +3627,13 @@ class TransformerConfig(ModelParallelConfig):
                         "dsa_indexer_scorer_backend='deepgemm' is the MXFP8 selection scorer; "
                         "set dsa_indexer_precision='mxfp8', got "
                         f"{self.dsa_indexer_precision!r}."
+                    )
+                if self.deterministic_mode:
+                    raise ValueError(
+                        "dsa_indexer_scorer_backend='deepgemm' does not support "
+                        "deterministic_mode: BF16 logits and DeepSelect do not keep the "
+                        "lowest-index ties of the deterministic top-k; use "
+                        "dsa_indexer_scorer_backend='cudnn'."
                     )
             if self.dsa_indexer_skip_topk_offset < 0:
                 raise ValueError(

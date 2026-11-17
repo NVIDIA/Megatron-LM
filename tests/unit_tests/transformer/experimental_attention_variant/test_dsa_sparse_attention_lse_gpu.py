@@ -8,11 +8,10 @@ backward and sparse indexer backward):
 - the LSE that ``run_fused_absorbed_sparse_attention(return_lse=True)`` returns equals a
   PyTorch FP32 ``logsumexp`` over each row's attended keys, in the natural log, laid out
   ``[sq, b, np]``, with ``+inf`` on a row that attends no key;
-- asking for the LSE changes nothing else: the output and the LSE are bitwise those of
-  ``return_lse=False``, and the query and key gradients agree within the spread of two
-  default launches (the backward accumulates with atomics);
-- the sparse indexer backward with ``sm_scale`` passed equal to its default matches the
-  default call within the same spread, and half the scale halves dQ, dW and dK, as the
+- asking for the LSE changes nothing else: the output, the LSE and, with the deterministic
+  backward, the query and key gradients are bitwise those of ``return_lse=False``;
+- the sparse indexer backward with ``sm_scale`` passed equal to its default is bitwise the
+  default call (deterministic mode), and half the scale halves dQ, dW and dK, as the
   gradient of ``sum_h w_h relu(s q_h . k)`` predicts.
 
 Launch from the Megatron-LM root, e.g.::
@@ -31,7 +30,8 @@ from megatron.core.transformer.experimental_attention_variant import dsa_cudnn_k
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
 
 # Absorbed MLA rows: 512 latent channels plus 64 RoPE channels. FlashMLA pads the 16 heads to
-# its head block in forward (so the LSE it hands back is a column slice).
+# its head block in forward (so the LSE it hands back is a column slice), and the deterministic
+# backward takes 16 heads directly.
 _ATT_HEADS, _ATT_DIM, _LATENT = 16, 576, 512
 _ATT_ROWS, _ATT_BATCH, _ATT_KEYS, _ATT_WIDTH = 128, 2, 256, 64
 _ATT_SCALE = _ATT_DIM**-0.5
@@ -112,7 +112,7 @@ def _reference_lse(query, key, ids):
     return lse.masked_fill(torch.isneginf(lse), float("inf"))
 
 
-def _run_attention(query, key, ids, grad_output, *, return_lse):
+def _run_attention(query, key, ids, grad_output, *, deterministic, return_lse):
     query = query.detach().clone().requires_grad_(True)
     key = key.detach().clone().requires_grad_(True)
     result = dsa_cudnn_kernels.run_fused_absorbed_sparse_attention(
@@ -121,6 +121,7 @@ def _run_attention(query, key, ids, grad_output, *, return_lse):
         topk_indices=ids,
         softmax_scale=_ATT_SCALE,
         v_channels=_LATENT,
+        deterministic=deterministic,
         return_lse=return_lse,
     )
     assert result is not None, "the fused sparse attention declined the test case"
@@ -134,7 +135,9 @@ def test_returned_lse_matches_reference_logsumexp():
     _require_flash_mla()
     query, key, ids, grad_output = _attention_case()
 
-    _output, lse, _dq, _dkv = _run_attention(query, key, ids, grad_output, return_lse=True)
+    _output, lse, _dq, _dkv = _run_attention(
+        query, key, ids, grad_output, deterministic=False, return_lse=True
+    )
     reference = _reference_lse(query, key, ids)
 
     assert lse.dtype == torch.float32
@@ -146,25 +149,40 @@ def test_returned_lse_matches_reference_logsumexp():
     torch.testing.assert_close(lse[~empty], reference[~empty], rtol=1e-4, atol=1e-3)
 
 
-def test_return_lse_leaves_output_and_gradients_unchanged():
+@pytest.mark.parametrize("deterministic", [True, False], ids=["deterministic", "atomic"])
+def test_return_lse_leaves_output_and_gradients_unchanged(deterministic):
     _require_flash_mla()
     query, key, ids, grad_output = _attention_case(seed=20261112)
+    if deterministic and not dsa_cudnn_kernels._supports_deterministic_sparse_attention_backward(
+        query
+    ):
+        pytest.skip("installed cuDNN DSA has no deterministic sparse-attention backward")
 
-    default = _run_attention(query, key, ids, grad_output, return_lse=False)
-    with_lse = _run_attention(query, key, ids, grad_output, return_lse=True)
+    default = _run_attention(
+        query, key, ids, grad_output, deterministic=deterministic, return_lse=False
+    )
+    with_lse = _run_attention(
+        query, key, ids, grad_output, deterministic=deterministic, return_lse=True
+    )
 
-    # The forward is deterministic.
+    # The forward is deterministic in both modes.
     assert torch.equal(with_lse[0], default[0])
-    # The atomic backward may reorder its sums between any two launches; compare to the
-    # spread of two default launches.
-    repeat = _run_attention(query, key, ids, grad_output, return_lse=False)
-    for index in (2, 3):
-        spread = (repeat[index].float() - default[index].float()).abs().max()
-        difference = (with_lse[index].float() - default[index].float()).abs().max()
-        scale = default[index].float().abs().max()
-        assert difference <= max(2 * spread, 1e-2 * scale), (index, difference, spread)
+    if deterministic:
+        assert torch.equal(with_lse[2], default[2])
+        assert torch.equal(with_lse[3], default[3])
+    else:
+        # The atomic backward may reorder its sums between any two launches; compare to the
+        # spread of two default launches.
+        repeat = _run_attention(query, key, ids, grad_output, deterministic=False, return_lse=False)
+        for index in (2, 3):
+            spread = (repeat[index].float() - default[index].float()).abs().max()
+            difference = (with_lse[index].float() - default[index].float()).abs().max()
+            scale = default[index].float().abs().max()
+            assert difference <= max(2 * spread, 1e-2 * scale), (index, difference, spread)
     # A second LSE run returns the same LSE bit for bit.
-    again = _run_attention(query, key, ids, grad_output, return_lse=True)
+    again = _run_attention(
+        query, key, ids, grad_output, deterministic=deterministic, return_lse=True
+    )
     assert torch.equal(again[1], with_lse[1])
 
 
@@ -203,7 +221,7 @@ def _indexer_case(seed=20261113):
     )
 
 
-def _indexer_backward(case, **kwargs):
+def _indexer_backward(case, *, deterministic, **kwargs):
     # The cuDNN score-gradient stage overwrites both score operands, so pass copies.
     grads = dsa_cudnn_kernels._run_sparse_indexer_backward(
         case["q"],
@@ -215,6 +233,7 @@ def _indexer_backward(case, **kwargs):
         loss_coeff=1.0,
         grad_loss=torch.ones((), dtype=torch.float32, device="cuda"),
         block_i=128,
+        deterministic=deterministic,
         **kwargs,
     )
     torch.cuda.synchronize()
@@ -254,21 +273,26 @@ def _relative_error(candidate, reference):
     return ((candidate - reference).norm() / reference.norm()).item()
 
 
-def test_indexer_backward_sm_scale_default_and_half():
+@pytest.mark.parametrize("deterministic", [True, False], ids=["deterministic", "atomic"])
+def test_indexer_backward_sm_scale_default_and_half(deterministic):
     case = _indexer_case()
     default_scale = dsa_cudnn_kernels._INDEXER_SOFTMAX_SCALE
 
-    default = _indexer_backward(case)
-    explicit = _indexer_backward(case, sm_scale=default_scale)
-    half = _indexer_backward(case, sm_scale=0.5 * default_scale)
+    default = _indexer_backward(case, deterministic=deterministic)
+    explicit = _indexer_backward(case, deterministic=deterministic, sm_scale=default_scale)
+    half = _indexer_backward(case, deterministic=deterministic, sm_scale=0.5 * default_scale)
 
     names = ("d_index_q", "d_weights", "d_index_k")
-    # dK accumulates with atomics: bound by the spread of two default launches.
-    repeat = _indexer_backward(case)
-    for name, grad_a, grad_b, grad_r in zip(names, explicit, default, repeat):
-        spread = (grad_r.float() - grad_b.float()).abs().max()
-        difference = (grad_a.float() - grad_b.float()).abs().max()
-        assert difference <= max(2 * spread, 1e-2 * grad_b.float().abs().max()), name
+    if deterministic:
+        for name, grad_a, grad_b in zip(names, explicit, default):
+            assert torch.equal(grad_a, grad_b), name
+    else:
+        # dK accumulates with atomics: bound by the spread of two default launches.
+        repeat = _indexer_backward(case, deterministic=False)
+        for name, grad_a, grad_b, grad_r in zip(names, explicit, default, repeat):
+            spread = (grad_r.float() - grad_b.float()).abs().max()
+            difference = (grad_a.float() - grad_b.float()).abs().max()
+            assert difference <= max(2 * spread, 1e-2 * grad_b.float().abs().max()), name
 
     for name, grad_half, grad_default in zip(names, half, default):
         assert not torch.equal(grad_half, grad_default), name
