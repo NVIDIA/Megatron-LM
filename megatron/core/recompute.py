@@ -7,6 +7,7 @@ from torch import Tensor
 from megatron.core.context_parallel import ContextParallelLayoutState, CPLayout
 from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
+from megatron.core.models.hybrid.layers import utils as hybrid_layer_utils
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.ssm.mamba_layer_config import MambaLayerConfig
 from megatron.core.tensor_observation import observe_layer_residuals
@@ -45,7 +46,8 @@ def checkpointed_forward(
             global indices when checking extract_layer_indices.
         cp_layout_state (ContextParallelLayoutState, optional): CP layout state for this forward.
         packed_sequence_cp_metadata (optional): Packed-sequence CP metadata for Mamba layers.
-        input_ids (Tensor, optional): Token IDs forwarded to hash-routed MoE layers.
+        input_ids (Tensor, optional): Boundary-layout token IDs for hash-routed MoE
+            and custom layers.
 
     Returns:
         If extract_layer_indices is empty: hidden_states tensor
@@ -140,10 +142,31 @@ def checkpointed_forward(
                 )
                 inner_layer = getattr(layer, "inner_layer", layer)
                 router = getattr(getattr(inner_layer, "mlp", None), "router", None)
-                if input_ids is not None and getattr(router, "is_hash_layer", False):
-                    layer_kwargs["input_ids"] = input_ids
+                is_custom_layer = (
+                    hybrid_layer_utils.get_custom_layer_type(getattr(layer, "config", None))
+                    is not None
+                )
+                layer_input_ids = input_ids
+                if is_custom_layer and cp_layout_state is not None:
+                    layer_input_ids = cp_layout_state.get_layer_input_ids(index, input_ids)
+                if input_ids is not None and (
+                    is_custom_layer or getattr(router, "is_hash_layer", False)
+                ):
+                    layer_kwargs["input_ids"] = layer_input_ids
                 with inner_quantization_context:
-                    if isinstance(layer, TransformerLayer):
+                    if is_custom_layer and not getattr(
+                        layer, "supports_hybrid_recompute_kwargs", False
+                    ):
+                        hidden_states = hybrid_layer_utils.invoke_custom_layer(
+                            layer,
+                            hidden_states,
+                            attention_mask=attention_mask,
+                            rotary_pos_emb=rotary_pos_emb,
+                            packed_seq_params=layer_packed_seq_params,
+                            padding_mask=layer_padding_mask,
+                            input_ids=layer_input_ids,
+                        )
+                    elif isinstance(layer, TransformerLayer):
                         hidden_states, context = layer(hidden_states, **layer_kwargs)
                     elif getattr(layer, "supports_hybrid_recompute_kwargs", False):
                         # HyperConnectionHybridLayer accepts the routing metadata
