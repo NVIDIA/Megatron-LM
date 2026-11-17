@@ -892,9 +892,7 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
         training,
         "get_run_config",
         lambda: SimpleNamespace(
-            model=SimpleNamespace(transformer=transformer),
-            data=DataConfig(),
-            train=train,
+            model=SimpleNamespace(transformer=transformer), data=DataConfig(), train=train
         ),
     )
     training.dummy_train_step(None)
@@ -1247,6 +1245,7 @@ def test_get_batch_ignores_the_poisoned_data_arguments(monkeypatch, entry_point)
     monkeypatch.setattr(script.mpu, "get_tensor_model_parallel_rank", lambda: 1)  # no iterator
     monkeypatch.setattr(script.mpu, "get_tensor_model_parallel_src_rank", lambda: 0)
     monkeypatch.setattr(script.mpu, "get_tensor_model_parallel_group", lambda: None)
+    monkeypatch.setattr(script.mpu, "get_pipeline_model_parallel_group", lambda: None)
     monkeypatch.setattr(script.mpu, "is_pipeline_first_stage", lambda: True)
     monkeypatch.setattr(script.mpu, "is_pipeline_last_stage", lambda: True)
     monkeypatch.setattr(script, "get_context_parallel_group", lambda: None)

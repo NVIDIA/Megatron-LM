@@ -26,7 +26,10 @@ from megatron.core.ops.mtp_kl_loss import vocab_parallel_kl_div, vocab_parallel_
 from megatron.core.ops.norm.torch_norm import LayerNormBuilder
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group, resolve_tp_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
 from megatron.core.tensor_parallel import (
     gather_from_sequence_parallel_region,
@@ -964,14 +967,17 @@ def mtp_on_this_rank(
         - If no custom layout is provided, assumes all MTP layers (if any) are placed on the last
           pipeline stage. The function returns True only on the last pipeline stage.
     """
+    if layout is None and mtp_num_layers is None:
+        # No MTP layers anywhere, so the pipeline rank is not needed.
+        return False
     mtp_on_this_rank = False
-    if pp_group is not None:
-        pp_rank = get_pg_rank(pp_group)
-        pp_size = get_pg_size(pp_group)
-    else:
-        # Compatibility fallback for callers that have not migrated to an explicit PP group.
+    if pp_group is None:
+        warn_global_process_group_fallback("mtp_on_this_rank", "pp_group")
         pp_rank = parallel_state.get_pipeline_model_parallel_rank()
         pp_size = None
+    else:
+        pp_rank = get_pg_rank(pp_group)
+        pp_size = get_pg_size(pp_group)
     if vp_size is None and layout is not None:
         vp_size = layout.virtual_pipeline_model_parallel_size
     elif vp_size is None and not ignore_virtual:
@@ -993,7 +999,6 @@ def mtp_on_this_rank(
         # without custom PP layout, we only support put all of MTP layers on the last pipeline stage
         if mtp_num_layers is not None:
             if pp_size is None:
-                # Compatibility fallback for callers without explicit pipeline metadata.
                 pp_size = parallel_state.get_pipeline_model_parallel_world_size()
             mtp_on_this_rank = pp_rank == pp_size - 1
             if mtp_on_this_rank and not ignore_virtual and vp_size not in (None, 1):
@@ -1272,6 +1277,7 @@ def process_mtp_loss(
     # when calculate_per_token_loss is enabled. This ensures MTP gradients are
     # correctly scaled relative to the main loss gradients in finalize_model_grads.
     original_num_tokens = loss_mask.sum()
+    cp_size = cp_group.size() if cp_group is not None else 1
     # Preserve CE-only behavior for config-like callers predating KD options.
     ce_enabled = getattr(config, "mtp_ce_loss_weight", 1.0) > 0
     kd_enabled = is_training and getattr(config, "mtp_kl_loss_weight", 0.0) > 0
@@ -1463,6 +1469,20 @@ def process_mtp_loss(
             mtp_layer_number, head_input, mtp_labels, layer_loss_mask
         )
 
+        # CP ranks own disjoint parts of the same examples. Use their combined
+        # counts so moving a target across a CP boundary cannot change its weight,
+        # including when a rank has no LM targets but receives a rolled MTP target.
+        if cp_size > 1:
+            token_counts = torch.stack((original_num_tokens, num_tokens))
+            torch.distributed.all_reduce(
+                token_counts, op=torch.distributed.ReduceOp.SUM, group=cp_group
+            )
+            normalization_original_tokens, normalization_tokens = token_counts.unbind()
+        else:
+            normalization_original_tokens = original_num_tokens
+            normalization_tokens = num_tokens
+        safe_normalization_tokens = normalization_tokens.clamp(min=1)
+
         if is_training:
             # Logging only: detach so nothing here keeps this head's graph alive.
             combined_sum = getattr(config, "mtp_ce_loss_weight", 1.0) * ce_sum if ce_enabled else 0
@@ -1471,9 +1491,13 @@ def process_mtp_loss(
             mtp_loss_for_log = combined_sum
             ce_loss_for_log = ce_sum if ce_enabled else None
             if not config.calculate_per_token_loss:
-                mtp_loss_for_log = mtp_loss_for_log / num_tokens.clamp(min=1)
+                mtp_loss_for_log = (
+                    mtp_loss_for_log * (normalization_tokens > 0).to(mtp_loss.dtype) * cp_size
+                ) / safe_normalization_tokens
                 if ce_loss_for_log is not None:
-                    ce_loss_for_log = ce_loss_for_log / num_tokens.clamp(min=1)
+                    ce_loss_for_log = (
+                        ce_loss_for_log * (normalization_tokens > 0).to(mtp_loss.dtype) * cp_size
+                    ) / safe_normalization_tokens
 
             if metric_avg_group is None:
                 # Compatibility fallback for callers that have not migrated to explicit groups.
@@ -1504,25 +1528,19 @@ def process_mtp_loss(
             mtp_loss_normalized = mtp_loss_scale * mtp_loss
         elif config.calculate_per_token_loss:
             # finalize_model_grads divides by the global main-loss token count.
-            # Use one main/MTP token ratio for this logical microbatch, independent
-            # of its CP partition. Rolling and masking can leave different ratios
-            # (or no valid tokens) on individual ranks. Keep the local counts above
-            # unchanged for logging, which reduces them separately over DP+CP.
-            normalization_tokens = torch.stack((original_num_tokens, num_tokens))
-            if cp_group is not None and cp_group.size() > 1:
-                torch.distributed.all_reduce(
-                    normalization_tokens, op=torch.distributed.ReduceOp.SUM, group=cp_group
-                )
-            main_num_tokens, mtp_num_tokens = normalization_tokens.unbind()
-            # Clamp only after the collective; empty ranks must participate too.
+            # Use the CP-wide main/MTP ratio for this logical microbatch. Keep
+            # local counts unchanged for logging, which sums them over DP+CP.
             # This preserves CP partition invariance, not a global MTP-token mean
             # across different DP microbatches with different main/MTP ratios.
             mtp_loss_normalized = (
-                mtp_loss_scale * mtp_loss * (main_num_tokens / mtp_num_tokens.clamp(min=1))
+                mtp_loss_scale
+                * mtp_loss
+                * (normalization_original_tokens / safe_normalization_tokens)
             )
         else:
-            safe_num_tokens = num_tokens.clamp(min=1)
-            mtp_loss_normalized = mtp_loss_scale * mtp_loss / safe_num_tokens
+            # The legacy path averages parameter gradients over DP and CP.
+            # Compensate the CP average when using a CP-wide denominator.
+            mtp_loss_normalized = mtp_loss_scale * cp_size * mtp_loss / safe_normalization_tokens
 
         if early_backward:
             # Same upstream gradient MTPLossAutoScaler.backward would supply, applied now. This
@@ -2654,20 +2672,28 @@ class MultiTokenPredictionBlock(MegatronModule):
         # This enables MTP to work with CP > 1 by providing the CP process group
         # to the roll_tensor function for proper boundary communication
         if pg_collection is None:
-            # Use default MPU process groups if not provided
-            required_pgs = ['cp', 'tp', 'pp'] + (['dp', 'gtp_remat'] if self.config.mtp_hsm else [])
+            warn_global_process_group_fallback(type(self).__name__)
+            # hcp feeds TEDotProductAttention's a2a+p2p path in the MTP layers.
+            required_pgs = ['cp', 'hcp', 'tp', 'pp'] + (
+                ['dp', 'gtp_remat'] if self.config.mtp_hsm else []
+            )
+            if self.config.test_mode and self.config.qk_layernorm:
+                # SelfAttention.run_realtime_tests in the MTP layers compares the Q/K layernorm
+                # parameters across the data-parallel group.
+                required_pgs += [g for g in ('dp', 'dp_gtp_remat') if g not in required_pgs]
             pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=required_pgs)
-        else:
-            # Ensure the provided process groups include TP, CP, and PP.
-            for group_name in ('tp', 'cp', 'pp'):
-                assert (
-                    getattr(pg_collection, group_name, None) is not None
-                ), f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
-            if self.config.mtp_hsm:
-                for group_name in ('dp', 'gtp_remat'):
-                    assert (
-                        getattr(pg_collection, group_name, None) is not None
-                    ), f"MultiTokenPredictionBlock with HSM requires a {group_name} process group"
+        # Ensure the provided process groups include TP, CP, and PP.
+        for group_name in ('tp', 'cp', 'pp'):
+            if vars(pg_collection).get(group_name) is None:
+                raise ValueError(
+                    f"MultiTokenPredictionBlock pg_collection must have {group_name} process group"
+                )
+        if self.config.mtp_hsm:
+            for group_name in ('dp', 'gtp_remat'):
+                if vars(pg_collection).get(group_name) is None:
+                    raise ValueError(
+                        f"MultiTokenPredictionBlock with HSM requires a {group_name} process group"
+                    )
 
         self._build_layers(pg_collection)
         assert len(self.layers) > 0, "MultiTokenPredictionBlock must have at least one layer."
