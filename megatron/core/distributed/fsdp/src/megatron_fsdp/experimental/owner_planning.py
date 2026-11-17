@@ -19,10 +19,15 @@ from .range import intersect_ranges
 
 @dataclasses.dataclass(frozen=True, order=True)
 class _BufferKey:
-    """Identifies a buffer identically on every rank that holds it."""
+    """Identify a logical buffer across all replicas using its full mesh and input order.
 
-    shard_group: tuple[int, ...]  # The global ranks that together hold one copy of the buffer.
-    position: int  # The buffer's index among its shard group's buffers, same on all those ranks.
+    Store the mesh topology as plain tuples so keys can be gathered and sorted without
+    serializing DeviceMesh process-group state or process-local cached hashes.
+    """
+
+    mesh_shape: tuple[int, ...]
+    mesh_ranks: tuple[int, ...]
+    position: int  # Index among buffers on this mesh topology, identical across its ranks.
 
 
 @dataclasses.dataclass(frozen=True)
@@ -41,7 +46,8 @@ def assign_owner_work(buffers: Iterable[DBuffer]) -> list[dict[int, int]]:
     Account for single-candidate tensors across all buffers first, then assign the remaining
     tensors in descending cost order across buffers. Each tensor goes to its least-loaded
     holder. Equal-cost tensors follow buffer key and tensor index; equal-load holders
-    follow buffer offset order. Buffers on one mesh must be identical across its ranks.
+    follow buffer offset order. Buffers on the same mesh topology must be listed in the same
+    order across its ranks, including buffers with different placements.
 
     The plan is global: every rank all-gathers the tensors of all ranks, including the experts
     of other EP ranks, and runs the same assignment, so load balances across meshes. Every rank
@@ -71,13 +77,19 @@ def assign_owner_work(buffers: Iterable[DBuffer]) -> list[dict[int, int]]:
     assignments: list[dict[int, int]] = [{} for _ in buffers]
     # Gathered items name buffers by key; map this rank's keys back to its buffer indices.
     buffer_indices: dict[_BufferKey, int] = {}
+    positions_by_mesh: dict[tuple[tuple[int, ...], tuple[int, ...]], int] = {}
+    shard_ranks_by_buffer: list[list[int]] = []
     work_items: list[_OwnerWork] = []
     for buffer_index, buffer in enumerate(buffers):
         mesh = buffer.mesh
-        ranks = tuple(get_shard_ranks(buffer))
-        buffer_key = _BufferKey(ranks, sum(key.shard_group == ranks for key in buffer_indices))
+        mesh_topology = (tuple(mesh.shape), tuple(mesh.mesh.flatten().tolist()))
+        position = positions_by_mesh.get(mesh_topology, 0)
+        positions_by_mesh[mesh_topology] = position + 1
+        buffer_key = _BufferKey(*mesh_topology, position)
         buffer_indices[buffer_key] = buffer_index
-        # One holder reports each buffer, rotating over its shard ranks to spread the metadata.
+        ranks = get_shard_ranks(buffer)
+        shard_ranks_by_buffer.append(ranks)
+        # One holder reports each replica, rotating over its shard ranks to spread the metadata.
         if ranks[buffer_key.position % len(ranks)] != dist.get_rank():
             continue
         layout = buffer.layout
@@ -115,6 +127,8 @@ def assign_owner_work(buffers: Iterable[DBuffer]) -> list[dict[int, int]]:
             )
         owner = min(item.candidates, key=lambda rank: running_cost[rank])
         if item.buffer_key in buffer_indices:
-            assignments[buffer_indices[item.buffer_key]][item.tensor_index] = owner
+            index = buffer_indices[item.buffer_key]
+            if owner in shard_ranks_by_buffer[index]:
+                assignments[index][item.tensor_index] = owner
         running_cost[owner] += item.cost
     return assignments

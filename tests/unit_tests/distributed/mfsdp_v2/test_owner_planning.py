@@ -89,6 +89,36 @@ def test_assign_owner_work_uses_buffer_placements(distributed_setup):
     assert assign_owner_work([buffer]) == [{0: mesh.get_rank()}]
 
 
+def test_assign_owner_work_keeps_replica_assignments_separate(distributed_setup):
+    """Logical mesh keys share metadata without overwriting another replica's owners.
+
+    Include ranks with empty tensor shards: they still need the owner mapping even though
+    they are not candidates for that tensor.
+    """
+    if distributed_setup.world_size < 4 or distributed_setup.world_size % 4:
+        pytest.skip("Requires a multiple of four ranks for replicated two-rank shard groups.")
+    device = distributed_setup.device
+    mesh = init_device_mesh(
+        device.type,
+        (distributed_setup.world_size // 4, 2, 2),
+        mesh_dim_names=("replica", "outer", "inner"),
+    )["outer", "inner"]
+    ranks = mesh.mesh.flatten().tolist()
+    placements = [
+        [Replicate(), RowAtomic()],
+        [Replicate(), Replicate()],
+        [RowAtomic(), RowAtomic()],
+    ]
+    buffers = [
+        DBuffer(mesh, placement, _layout([(2, 2)], [0], 4 * shards, shards), torch.float32, device)
+        for placement, shards in zip(placements, [2, 1, 4], strict=True)
+    ]
+    coordinate = mesh.get_coordinate()
+    replica_owner = ranks[coordinate[0] * 2]
+    expected = [{0: replica_owner}, {0: mesh.get_rank()}, {0: ranks[0]}]
+    assert assign_owner_work(buffers) == expected
+
+
 @pytest.mark.parametrize("ranks", [[0, 1], [1, 3]])
 @pytest.mark.parametrize(
     "first_shape, first_size, second_shape, second_size, expected",
