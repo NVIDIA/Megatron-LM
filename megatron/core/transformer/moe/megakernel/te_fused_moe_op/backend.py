@@ -19,6 +19,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
 from megatron.core.transformer.moe.megakernel.route_adapter import routing_map_to_indices
+from megatron.core.utils import is_te_min_version
 
 if TYPE_CHECKING:
     from megatron.core.transformer.transformer_config import TransformerConfig
@@ -37,23 +38,10 @@ class TEFusedMoEOp(MegakernelBackend):
         num_local_experts: int,
     ) -> None:
         super().__init__()
-        try:
-            from transformer_engine.pytorch import ep, ops
-
-            required = (ops.MoeDispatch, ops.MoeCombine, ep.EpConfig, ep.EpBuffer)
-        except (ImportError, AttributeError) as exc:
+        if not is_te_min_version("2.21.0"):
             raise ImportError(
-                "moe_megakernel_backend='te' requires TE with NCCL EP, MoeDispatch, "
-                "MoeCombine, and operation-fuser channel support"
-            ) from exc
-        del required
-        from megatron.core.transformer.moe.experts import TEGroupedMLP
-
-        if (
-            not isinstance(routed_experts, TEGroupedMLP)
-            or not routed_experts._is_fused_impl_supported()
-        ):
-            raise ValueError("The TE MoE backend requires op-fuser-compatible TEGroupedMLP experts")
+                "moe_megakernel_backend='te' requires Transformer Engine 2.21.0 or newer"
+            )
         if ep_group.size() < 2:
             raise ValueError("The TE MoE backend requires at least two expert-parallel ranks")
         self.config = config

@@ -409,7 +409,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
     ),
     KernelEntry(
         name="te_fused_moe_op",
-        sources=("megatron/core/transformer/moe/megakernel/te.py",),
+        sources=("megatron/core/transformer/moe/megakernel/te_fused_moe_op/backend.py",),
         tests=(K + "test_te_fused_moe_op.py",),
         kind="dispatch",
         notes="Authoritative route conversion and probability-gradient replay. Distributed "

@@ -2,7 +2,7 @@
 
 import torch
 
-from megatron.core.transformer.moe.megakernel.te import routing_map_to_indices
+from megatron.core.transformer.moe.megakernel.te_fused_moe_op.backend import routing_map_to_indices
 from tests.unit_tests.determinism.kernels.harness import assert_replays_bit_exact, seeded
 
 

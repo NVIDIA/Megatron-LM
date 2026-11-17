@@ -30,7 +30,7 @@ def build_megakernel_backend(
     """
     backend = config.moe_megakernel_backend
     if backend == "te":
-        from megatron.core.transformer.moe.megakernel.te import TEFusedMoEOp
+        from megatron.core.transformer.moe.megakernel.te_fused_moe_op.backend import TEFusedMoEOp
 
         return TEFusedMoEOp(
             config=config,

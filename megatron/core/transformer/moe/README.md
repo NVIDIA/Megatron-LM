@@ -637,7 +637,7 @@ MCore's routing and parameter ownership.
 --moe-megakernel-backend-config '{"max_tokens_per_rank": 4096}'
 ```
 
-Use a TE build providing `EpConfig`, `EpBuffer`, `MoeDispatch`, `MoeCombine`, and
+Use Transformer Engine 2.21.0 or newer, providing `EpConfig`, `EpBuffer`, `MoeDispatch`, `MoeCombine`, and
 operation-fuser channels, built with NCCL EP support. `use_transformer_engine_op_fuser`
 is not required; `moe_token_dispatcher_type` and `moe_flex_dispatcher_backend` do not
 choose this backend's transport. TP and expert TP must both be one, and EP must be at least two.
