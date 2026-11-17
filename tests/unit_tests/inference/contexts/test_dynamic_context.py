@@ -2806,6 +2806,9 @@ class TestDynamicContext:
                 buffer_size_gb=0.1,
                 block_size_tokens=16,
                 max_tokens=1024,
+                # One KV plane leaves room for about 1600 blocks; keep the request count, which
+                # would follow the block count, within max_tokens.
+                max_requests=128,
                 unified_memory_level=0,
                 layer_type_list=layer_type_list,
             ),
