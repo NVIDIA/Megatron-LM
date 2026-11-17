@@ -1,17 +1,22 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Tests for batch-invariant MoE grouped GEMM."""
+
+import sys
+import types
+
 import pytest
 import torch
 import torch.nn.functional as F
 
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.custom_layers import batch_invariant_kernels as bik
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
-    HAVE_DEEPGEMM_BF16,
     _bf16_grouped_gemm_contiguous,
     _m_splits_to_m_indices,
     _offs_to_m_indices,
     set_batch_invariant_mode,
 )
+from tests.unit_tests.test_utilities import is_lts_ci_image
 
 
 def _hopper_or_newer() -> bool:
@@ -22,9 +27,9 @@ def _hopper_or_newer() -> bool:
 
 
 pytestmark = [
+    # DeepGEMM ships only in the dev CI image; there these tests fail without it.
     pytest.mark.skipif(
-        not HAVE_DEEPGEMM_BF16,
-        reason="DeepGEMM with bf16 grouped bindings is required for MoE batch-invariant tests.",
+        is_lts_ci_image(), reason="DeepGEMM, which these tests need, is not in the LTS image."
     ),
     pytest.mark.skipif(
         not _hopper_or_newer(), reason="DeepGEMM bf16 grouped kernels require Hopper (sm_90+)."
@@ -146,7 +151,7 @@ def _moe_env():
         Utils.destroy_model_parallel()
 
 
-def _build_moe_layer(hidden_size=64, ffn=128, num_experts=4, topk=1):
+def _build_moe_layer(hidden_size=64, ffn=128, num_experts=4, topk=1, **overrides):
     from megatron.core.models.gpt.gpt_layer_specs import (
         get_gpt_layer_with_transformer_engine_submodules,
     )
@@ -174,6 +179,7 @@ def _build_moe_layer(hidden_size=64, ffn=128, num_experts=4, topk=1):
         flash_attention_version=4,
         attention_dropout=0.0,
         batch_invariant_mode=True,
+        **overrides,
     )
     submodules = get_submodules(
         get_gpt_layer_with_transformer_engine_submodules(
@@ -206,11 +212,13 @@ def test_tegroupedmlp_batch_invariant_split(_moe_env):
     )
 
 
-def test_tegroupedmlp_per_token_invariance_across_batch_sizes(_moe_env):
+@pytest.mark.parametrize("grouped_tensor", [False, True])
+def test_tegroupedmlp_per_token_invariance_across_batch_sizes(_moe_env, grouped_tensor):
     """The strongest batch-invariance check: a fixed set of "target" tokens must
     produce the *exact same output* regardless of what other tokens surround
-    them in the batch. This is what RL log-prob parity needs."""
-    layer, cfg = _build_moe_layer()
+    them in the batch. This is what RL log-prob parity needs. With grouped
+    tensors the experts take TE's GroupedTensor path."""
+    layer, cfg = _build_moe_layer(moe_use_grouped_tensor=grouped_tensor)
     torch.manual_seed(1)
 
     # 8 target tokens whose outputs we lock in by running them alone.
@@ -253,3 +261,342 @@ def test_tegroupedmlp_invariance_under_permutation(_moe_env):
         f"MoE output not invariant to batch permutation; max abs diff: "
         f"{(y_ref.float() - y_unperm.float()).abs().max().item()}"
     )
+
+
+def _forbid_te_grouped_gemms(monkeypatch):
+    """Make every TE cuBLASLt grouped GEMM raise, so a bypass fails the test."""
+    import transformer_engine_torch as tex
+
+    def forbidden(name):
+        def raise_(*args, **kwargs):
+            raise AssertionError(f"{name} ran TE's grouped GEMM under batch-invariant mode")
+
+        return raise_
+
+    for name in (
+        "te_general_grouped_gemm",
+        "te_general_grouped_gemm_for_grouped_tensor",
+        "te_general_grouped_gemm_for_discrete_in",
+        "te_general_grouped_gemm_for_discrete_out",
+    ):
+        if hasattr(tex, name):
+            monkeypatch.setattr(tex, name, forbidden(name))
+
+
+def _count_deepgemm_grouped_gemms(monkeypatch):
+    calls = {"m_grouped": 0, "k_grouped": 0}
+    for key, name in (
+        ("m_grouped", "m_grouped_bf16_gemm_nt_contiguous"),
+        ("k_grouped", "k_grouped_bf16_gemm_tn_contiguous"),
+    ):
+
+        def counted(*args, _key=key, _fn=getattr(bik.deep_gemm, name), **kwargs):
+            calls[_key] += 1
+            return _fn(*args, **kwargs)
+
+        monkeypatch.setattr(bik.deep_gemm, name, counted)
+    return calls
+
+
+def _param_data(param) -> torch.Tensor:
+    """A parameter's (or gradient's) values, unwrapping a TE GroupedTensor."""
+    data = getattr(param, "rowwise_data", None)
+    return param.data if data is None else data
+
+
+def _legacy_expert_outputs(x, dy, weights, splits):
+    """Forward, dgrad and fp32 wgrad of the legacy (host split sizes) grouped kernels."""
+    m_indices = _m_splits_to_m_indices(splits, x.device, x.shape[0])
+    out = _bf16_grouped_gemm_contiguous(x, weights, m_indices, splits)
+    dx = _bf16_grouped_gemm_contiguous(dy, weights.transpose(1, 2).contiguous(), m_indices, splits)
+    dw = bik._bf16_grouped_gemm_wgrad_contiguous(dy, x, splits)
+    return out, dx, dw
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize(
+    "counts, trailing",
+    [([37, 0, 300, 5, 128], 0), ([0, 0, 1, 0, 0], 0), ([256] * 5, 0), ([37, 0, 300, 5, 128], 50)],
+)
+def test_grouped_gemm_device_counts_matches_host_counts(counts, trailing):
+    """Reading the group sizes on the device gives the host-count kernels' bits, and rows past
+    the groups' total (a caller's capacity buffer) are neither computed nor written."""
+    torch.manual_seed(0)
+    E, K, N, total = len(counts), 256, 192, sum(counts)
+    x = torch.randn(total + trailing, K, device="cuda", dtype=torch.bfloat16)
+    dy = torch.randn(total + trailing, N, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(E, N, K, device="cuda", dtype=torch.bfloat16)
+    m_indices = _m_splits_to_m_indices(counts, x.device, total)
+    expected = _bf16_grouped_gemm_contiguous(x[:total], w, m_indices, counts)
+    out = torch.full((total + trailing, N), 7.0, device="cuda", dtype=torch.bfloat16)
+    device_counts = torch.tensor(counts, device="cuda", dtype=torch.int64)
+    groups, valid = bik._bf16_grouped_gemm_device_counts(x, w, device_counts, out=out)
+    assert torch.equal(out[:total], expected)
+    assert torch.all(out[total:] == 7.0)
+    assert torch.equal(groups[:total].to(torch.int32), m_indices)
+    assert valid.sum().item() == total and bool(valid[:total].all())
+    # On Blackwell this takes DeepGEMM's device psum layout; on Hopper the host path.
+    dw = bik._bf16_grouped_gemm_wgrad_device_counts(dy, x, device_counts)
+    assert dw.dtype == torch.float32
+    assert torch.equal(dw, bik._bf16_grouped_gemm_wgrad_contiguous(dy[:total], x[:total], counts))
+
+
+_GROUPED_LINEAR_VARIANTS = {
+    "aligned": dict(splits=[256, 512, 0, 256]),
+    "unaligned": dict(splits=[37, 0, 300, 5]),
+    "single-weight": dict(splits=[37, 0, 300, 5], moe_single_grouped_weight=True),
+    "bias": dict(splits=[37, 0, 300, 5], bias=True),
+    "single-weight-and-bias": dict(
+        splits=[37, 0, 300, 5],
+        bias=True,
+        moe_single_grouped_weight=True,
+        moe_single_grouped_bias=True,
+    ),
+    "fp32-main-grad": dict(splits=[37, 0, 300, 5], gradient_accumulation_fusion=True),
+    "single-weight-fp32-main-grad": dict(
+        splits=[37, 0, 300, 5], moe_single_grouped_weight=True, gradient_accumulation_fusion=True
+    ),
+}
+
+
+@pytest.mark.launch_on_gb200
+@pytest.mark.parametrize("variant", list(_GROUPED_LINEAR_VARIANTS))
+@pytest.mark.parametrize("backend", ["deepgemm", "triton"])
+def test_te_grouped_linear_grouped_tensor_path_matches_legacy_kernels(
+    _moe_env, monkeypatch, backend, variant
+):
+    """TE GroupedLinear's GroupedTensor path (moe_use_grouped_tensor=True) runs DeepGEMM's
+    grouped GEMMs, never TE's, with the legacy kernels' bits in forward, dgrad and wgrad:
+    discrete or single grouped weights, discrete or single grouped biases, and wgrad
+    accumulated in fp32 into main_grad."""
+    from transformer_engine.pytorch.module.grouped_linear import (
+        is_module_grouped_tensor_path_supported,
+    )
+    from transformer_engine.pytorch.tensor import GroupedTensorStorage
+
+    from megatron.core.extensions.transformer_engine import (
+        _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR,
+        TEGroupedLinear,
+    )
+    from megatron.core.transformer.enums import AttnBackend
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.core.utils import init_method_normal
+
+    # The dev image's TE and cuBLASLt take the GroupedTensor path on this GPU; without it
+    # this test would check TE's legacy path.
+    assert _TE_GROUPED_LINEAR_SUPPORTS_GROUPED_TENSOR
+    assert is_module_grouped_tensor_path_supported(None, torch.bfloat16)
+
+    options = dict(_GROUPED_LINEAR_VARIANTS[variant])
+    splits = options.pop("splits")
+    bias = options.pop("bias", False)
+    fused_wgrad = options.get("gradient_accumulation_fusion", False)
+    single = options.get("moe_single_grouped_weight", False)
+    single_bias = options.get("moe_single_grouped_bias", False)
+    if single:
+        # TE ignores single_grouped_weight/bias (falling back to per-expert parameters,
+        # with a warning) unless this variable is set.
+        monkeypatch.setenv("NVTE_GROUPED_LINEAR_SINGLE_PARAM", "1")
+    E, k, n, total = len(splits), 512, 256, sum(splits)
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=k,
+        ffn_hidden_size=n,
+        moe_ffn_hidden_size=n,
+        num_attention_heads=4,
+        num_moe_experts=E,
+        moe_router_topk=2,
+        moe_grouped_gemm=True,
+        moe_token_dispatcher_type="alltoall",
+        moe_use_grouped_tensor=True,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+        add_bias_linear=bias,
+        hidden_dropout=0.0,
+        attention_dropout=0.0,
+        attention_backend=AttnBackend.flash,
+        flash_attention_version=3,
+        batch_invariant_mode=True,
+        batch_invariant_backend=backend,
+        **options,
+    )
+    module = TEGroupedLinear(
+        E,
+        k,
+        n,
+        parallel_mode=None,
+        config=config,
+        init_method=init_method_normal(0.02),
+        bias=bias,
+        skip_bias_add=False,
+        is_expert=True,
+    ).cuda()
+    # The module holds the parameter layout the variant names.
+    assert module.single_grouped_weight == single
+    assert module.single_grouped_bias == single_bias
+    if single:
+        assert isinstance(module.weight, GroupedTensorStorage)
+        assert all(getattr(module, f"weight{i}") is None for i in range(E))
+        weight_params = [module.weight]
+    else:
+        weight_params = [getattr(module, f"weight{i}") for i in range(E)]
+    if single_bias:
+        assert isinstance(module.bias, GroupedTensorStorage)
+        assert all(getattr(module, f"bias{i}") is None for i in range(E))
+    torch.manual_seed(3)
+    if bias:
+        bias_values = (torch.randn(E, n, device="cuda") * 0.1).to(torch.bfloat16)
+        with torch.no_grad():
+            if single_bias:
+                _param_data(module.bias).view(E, n).copy_(bias_values)
+            else:
+                for i in range(E):
+                    getattr(module, f"bias{i}").copy_(bias_values[i])
+    if fused_wgrad:
+        # Accumulate (not overwrite) into a pre-filled fp32 main_grad.
+        module.is_first_microbatch = False
+        for param in weight_params:
+            param.main_grad = torch.randn(param.shape, device="cuda", dtype=torch.float32)
+        base = torch.cat([param.main_grad.reshape(-1) for param in weight_params])
+        base = base.view(E, n, k).clone()
+    weights = torch.cat([_param_data(param).reshape(-1) for param in weight_params]).view(E, n, k)
+    x = torch.randn(total, k, device="cuda", dtype=torch.bfloat16)
+    dy = torch.randn(total, n, device="cuda", dtype=torch.bfloat16)
+    expected_out, expected_dx, expected_dw = _legacy_expert_outputs(x, dy, weights, splits)
+    if bias:
+        groups = _m_splits_to_m_indices(splits, x.device, total).long()
+        expected_out = expected_out + bias_values[groups]
+    _forbid_te_grouped_gemms(monkeypatch)
+    calls = _count_deepgemm_grouped_gemms(monkeypatch)
+    # Record which GroupedTensor operands the adapter unpacks.
+    roles = []
+
+    def grouped_tensor_data(t, role, *args, _orig=bik._grouped_tensor_data, **kwargs):
+        roles.append(role)
+        return _orig(t, role, *args, **kwargs)
+
+    monkeypatch.setattr(bik, "_grouped_tensor_data", grouped_tensor_data)
+    x_i = x.clone().requires_grad_(True)
+    with set_batch_invariant_mode(True, backend=backend):
+        out, _ = module(x_i, torch.tensor(splits, device="cuda", dtype=torch.int64))
+        out.backward(dy)
+    assert calls["m_grouped"] >= 2 and calls["k_grouped"] >= 1, calls
+    # A single grouped weight reaches the adapter as a GroupedTensor in forward and dgrad,
+    # and its gradient (or fp32 main_grad) as a GroupedTensor in wgrad; discrete weights
+    # and their gradients reach it as lists.
+    if single:
+        assert roles.count("weight") == 2 and roles.count("weight gradient") == 1, roles
+    else:
+        assert "weight" not in roles and "weight gradient" not in roles, roles
+    assert torch.equal(out, expected_out)
+    assert torch.equal(x_i.grad, expected_dx)
+    if fused_wgrad:
+        main_grad = torch.cat([param.main_grad.reshape(-1) for param in weight_params])
+        assert torch.equal(main_grad.view(E, n, k), base + expected_dw)
+    else:
+        grads = torch.cat([_param_data(param.grad).reshape(-1) for param in weight_params])
+        assert torch.equal(grads.view(E, n, k), expected_dw.to(torch.bfloat16))
+    reference = torch.cat(
+        [rows.double() @ weights[i].double().t() for i, rows in enumerate(torch.split(x, splits))]
+    )
+    if bias:
+        reference = reference + bias_values.double()[groups]
+    torch.testing.assert_close(out.double(), reference, atol=0.05, rtol=0.02)
+
+
+@pytest.mark.parametrize("bias", ["none", "bias", "scaled-bias"])
+@pytest.mark.parametrize("backend", ["deepgemm", "triton"])
+def test_te_op_fuser_grouped_linear_runs_batch_invariant_grouped_gemm(
+    _moe_env, monkeypatch, backend, bias
+):
+    """The op fuser's GroupedLinear (use_transformer_engine_op_fuser experts) runs DeepGEMM's
+    grouped GEMMs, never TE's, with the legacy kernels' bits in forward, dgrad and wgrad,
+    including its grouped bias and per-token scaled bias."""
+    import transformer_engine.pytorch.ops as te_ops
+    from transformer_engine.pytorch.ops.basic.grouped_linear import (
+        is_op_fuser_grouped_tensor_path_supported,
+    )
+
+    # BF16 takes the op fuser's GroupedTensor path in the dev image.
+    assert is_op_fuser_grouped_tensor_path_supported(None, torch.bfloat16)
+    splits = [256, 512, 0, 256]
+    E, k, n, total = len(splits), 512, 256, sum(splits)
+    op = te_ops.GroupedLinear(
+        E,
+        k,
+        n,
+        bias=bias != "none",
+        scale_bias=bias == "scaled-bias",
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    torch.manual_seed(4)
+    bias_values = (torch.randn(E, n, device="cuda") * 0.1).to(torch.bfloat16)
+    if bias != "none":
+        with torch.no_grad():
+            for i in range(E):
+                getattr(op, f"bias{i}").copy_(bias_values[i])
+    scales = torch.rand(total, device="cuda", dtype=torch.float32)
+    x = torch.randn(total, k, device="cuda", dtype=torch.bfloat16)
+    dy = torch.randn(total, n, device="cuda", dtype=torch.bfloat16)
+    weights = torch.stack([getattr(op, f"weight{i}").detach() for i in range(E)])
+    expected_out, expected_dx, expected_dw = _legacy_expert_outputs(x, dy, weights, splits)
+    groups = _m_splits_to_m_indices(splits, x.device, total).long()
+    if bias == "bias":
+        expected_out = expected_out + bias_values[groups]
+    elif bias == "scaled-bias":
+        expected_out = expected_out.add_(bias_values[groups] * scales.unsqueeze(-1))
+    _forbid_te_grouped_gemms(monkeypatch)
+    calls = _count_deepgemm_grouped_gemms(monkeypatch)
+    x_i = x.clone().requires_grad_(True)
+    extra = (scales,) if bias == "scaled-bias" else ()
+    with set_batch_invariant_mode(True, backend=backend):
+        out = op(x_i, torch.tensor(splits, device="cuda", dtype=torch.int64), *extra)
+        out.backward(dy)
+    assert calls["m_grouped"] >= 2 and calls["k_grouped"] >= 1, calls
+    assert torch.equal(out, expected_out)
+    assert torch.equal(x_i.grad, expected_dx)
+    for i in range(E):
+        assert torch.equal(
+            getattr(op, f"weight{i}").grad, expected_dw[i].to(torch.bfloat16)
+        ), f"weight{i} gradient"
+
+
+def test_batch_invariant_mode_rebinds_every_te_grouped_gemm(_moe_env, monkeypatch):
+    """Enabling the mode replaces TE's grouped GEMMs in every loaded TE module that binds them,
+    under any name (including the op fuser's fused grouped MLP), and disabling restores them."""
+    import transformer_engine.pytorch.cpp_extensions.gemm as te_gemm
+    import transformer_engine.pytorch.ops.fused.grouped_mlp as te_grouped_mlp
+
+    originals = (te_gemm.general_grouped_gemm, te_gemm.general_grouped_gemm_for_grouped_tensor)
+    patched = (bik._te_general_grouped_gemm_patched, bik._te_grouped_tensor_gemm_patched)
+    # A TE module that a fixed list of sites would not know about.
+    probe = types.ModuleType("transformer_engine._batch_invariant_probe")
+    probe.grouped, probe.grouped_tensor = originals
+    monkeypatch.setitem(sys.modules, probe.__name__, probe)
+    with set_batch_invariant_mode(True, backend="deepgemm"):
+        assert te_grouped_mlp.general_grouped_gemm_for_grouped_tensor is patched[1]
+        assert (probe.grouped, probe.grouped_tensor) == patched
+        assert not bik._te_bindings_of(originals)
+    assert (probe.grouped, probe.grouped_tensor) == originals
+    assert te_grouped_mlp.general_grouped_gemm_for_grouped_tensor is originals[1]
+    assert not bik._te_bindings_of(patched)
+
+
+def test_unreplaceable_te_grouped_gemm_binding_fails_closed(_moe_env, monkeypatch):
+    """A TE module whose grouped GEMM binding cannot be replaced makes the patch raise."""
+    import transformer_engine.pytorch.cpp_extensions.gemm as te_gemm
+
+    class _Frozen(types.ModuleType):
+        def __setattr__(self, name, value):
+            pass  # silently keeps its binding
+
+    probe = _Frozen("transformer_engine._batch_invariant_frozen_probe")
+    probe.__dict__["grouped"] = te_gemm.general_grouped_gemm
+    monkeypatch.setitem(sys.modules, probe.__name__, probe)
+    try:
+        with pytest.raises(RuntimeError, match="_batch_invariant_frozen_probe.grouped"):
+            bik._te_patch_general_grouped_gemm()
+    finally:
+        bik._te_unpatch_general_grouped_gemm()
+    assert te_gemm.general_grouped_gemm is not bik._te_general_grouped_gemm_patched
