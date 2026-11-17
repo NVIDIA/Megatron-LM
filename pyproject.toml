@@ -13,6 +13,8 @@ include = [
     "megatron.core.*",
     "megatron.training",
     "megatron.training.*",
+    "megatron.bridge",
+    "megatron.bridge.*",
 ]
 
 [tool.setuptools.package-data]
@@ -71,6 +73,17 @@ Download = "https://github.com/NVIDIA/Megatron-LM/releases"
 Homepage = "https://github.com/NVIDIA/Megatron-LM"
 
 [project.optional-dependencies]
+bridge = [
+    "accelerate",
+    "einops",
+    "omegaconf>=2.3.0",
+    "pydantic>=2,<2.14",
+    "pyyaml>=6.0.2",
+    "rich",
+    "safetensors>=0.4.5",
+    "transformers>=5.15,<5.21",
+]
+
 training = [
     "flask-restful",
     "sentencepiece",

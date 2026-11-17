@@ -2703,6 +2703,16 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+bridge = [
+    { name = "accelerate" },
+    { name = "einops" },
+    { name = "omegaconf" },
+    { name = "pydantic" },
+    { name = "pyyaml" },
+    { name = "rich" },
+    { name = "safetensors" },
+    { name = "transformers" },
+]
 dev = [
     { name = "av" },
     { name = "datasets" },
@@ -2839,11 +2849,13 @@ testmon = [
 
 [package.metadata]
 requires-dist = [
+    { name = "accelerate", marker = "extra == 'bridge'" },
     { name = "accelerate", marker = "extra == 'mlm'" },
     { name = "accelerate", marker = "extra == 'training'" },
     { name = "av", marker = "extra == 'dev'" },
     { name = "causal-conv1d", marker = "extra == 'ssm'", specifier = "~=1.5" },
     { name = "datasets", marker = "extra == 'dev'" },
+    { name = "einops", marker = "extra == 'bridge'" },
     { name = "einops", marker = "extra == 'dev'", specifier = "~=0.8" },
     { name = "emerging-optimizers", marker = "extra == 'dev'", git = "https://github.com/NVIDIA-NeMo/Emerging-Optimizers.git?rev=v0.3.0" },
     { name = "fast-hadamard-transform", marker = "extra == 'dev'", git = "https://github.com/Dao-AILab/fast-hadamard-transform.git?rev=f134af63deb2df17e1171a9ec1ea4a7d8604d5ca" },
@@ -2878,6 +2890,7 @@ requires-dist = [
     { name = "nvidia-cudnn-frontend", extras = ["cutedsl"], marker = "extra == 'dev'", specifier = "==1.32.0" },
     { name = "nvidia-modelopt", extras = ["torch"], marker = "sys_platform != 'darwin' and extra == 'dev'", specifier = ">=0.47" },
     { name = "nvidia-resiliency-ext", marker = "extra == 'dev'", specifier = "==0.7.0" },
+    { name = "omegaconf", marker = "extra == 'bridge'", specifier = ">=2.3.0" },
     { name = "omegaconf", marker = "extra == 'mlm'" },
     { name = "omegaconf", marker = "extra == 'training'" },
     { name = "onnxscript", marker = "extra == 'dev'" },
@@ -2887,9 +2900,13 @@ requires-dist = [
     { name = "orjson", marker = "extra == 'inference'" },
     { name = "packaging", specifier = ">=24.2" },
     { name = "pillow", marker = "extra == 'dev'", specifier = ">=13.0.0" },
+    { name = "pydantic", marker = "extra == 'bridge'", specifier = ">=2,<2.14" },
+    { name = "pyyaml", marker = "extra == 'bridge'", specifier = ">=6.0.2" },
     { name = "pyzmq", marker = "extra == 'inference'" },
     { name = "quart", marker = "extra == 'dev'" },
     { name = "quart", marker = "extra == 'inference'" },
+    { name = "rich", marker = "extra == 'bridge'" },
+    { name = "safetensors", marker = "extra == 'bridge'", specifier = ">=0.4.5" },
     { name = "sentencepiece", marker = "extra == 'mlm'" },
     { name = "sentencepiece", marker = "extra == 'training'" },
     { name = "tensorstore", marker = "extra == 'dev'", specifier = "~=0.1,!=0.1.46,!=0.1.72" },
@@ -2899,6 +2916,7 @@ requires-dist = [
     { name = "torch-memory-saver", marker = "extra == 'inference'", git = "https://github.com/fzyzcjy/torch_memory_saver.git?rev=9bc9a442e6d108c7b7903def199896a005143aaf" },
     { name = "tqdm", marker = "extra == 'dev'" },
     { name = "transformer-engine", extras = ["core-cu13", "pytorch"], marker = "extra == 'te'", git = "https://github.com/NVIDIA/TransformerEngine.git?rev=44f31bbeaf99bd30a67b928000d4b980026debd2" },
+    { name = "transformers", marker = "extra == 'bridge'", specifier = ">=5.15,<5.21" },
     { name = "transformers", marker = "extra == 'mlm'" },
     { name = "transformers", marker = "extra == 'training'" },
     { name = "wandb", marker = "extra == 'mlm'" },
@@ -2906,7 +2924,7 @@ requires-dist = [
     { name = "wget", marker = "extra == 'dev'" },
     { name = "zstandard", marker = "extra == 'dev'" },
 ]
-provides-extras = ["training", "mlm", "dev", "inference", "otel", "lts", "te", "ssm"]
+provides-extras = ["bridge", "training", "mlm", "dev", "inference", "otel", "lts", "te", "ssm"]
 
 [package.metadata.requires-dev]
 build = [
@@ -6198,15 +6216,14 @@ name = "torch"
 version = "2.14.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "cuda-bindings", marker = "python_full_version < '3.15' and sys_platform == 'linux'" },
-    { name = "filelock", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "fsspec", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "jinja2", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "networkx", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "setuptools", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
-    { name = "sympy", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "filelock", marker = "sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "fsspec", marker = "sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "jinja2", marker = "sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "networkx", marker = "sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "setuptools", marker = "sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'" },
+    { name = "sympy", marker = "sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'" },
     { name = "triton", marker = "sys_platform == 'never'" },
-    { name = "typing-extensions", marker = "sys_platform != 'emscripten' and sys_platform != 'win32'" },
+    { name = "typing-extensions", marker = "sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'" },
 ]
 
 [[package]]
