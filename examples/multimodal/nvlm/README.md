@@ -21,7 +21,7 @@ Please use `examples/multimodal/Dockerfile`.
 ## Dataset preparation
 
 Please refer to Tables 4 and 6 in the [NVLM paper](https://arxiv.org/pdf/2409.11402) for full list of pretrain and SFT datasets.
-Please refer to https://nvidia.github.io/Megatron-Energon/data_prep.html on preparing datasets in the Megatron Energon format.
+Please refer to https://nvidia.github.io/Megatron-Energon/basic/data_prep.html on preparing datasets in the Megatron Energon format.
 
 ## Model conversion
 
