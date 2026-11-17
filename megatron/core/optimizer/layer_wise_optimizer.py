@@ -755,10 +755,9 @@ class LayerWiseDistributedOptimizer(ChainedOptimizer):
         # place) or the compact layout's variable-size gather staged in grad_data. False: the
         # optimizer calls allgather_params() after its step, with temporary buffers.
         if self.param_layout == 'padded':
-            self.layerwise_param_sync_via_bucket_group = self.ddp_config.param_sync_via_bucket_group
+            self.layerwise_param_sync_via_bucket_group = True
         else:
-            # A compact chunk's model-level use_distributed_optimizer belongs to the sibling
-            # DistributedOptimizer; DDP builds the LayerWise buffers with a config without it.
+            # Compact layouts use bucket-group parameter sync for overlap or grad-buffer reuse.
             self.layerwise_param_sync_via_bucket_group = (
                 self.overlap_param_gather or sync_config.reuse_grad_buf_for_mxfp8_param_ag
             )

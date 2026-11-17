@@ -504,7 +504,8 @@ class TestLayerWiseOptimizer:
                     buffer.params[0], 'is_managed_by_layer_wise_optimizer', False
                 )
                 # LayerWise buffers are unsharded and unpadded; only DistOpt has a param buffer.
-                assert buffer.ddp_config.use_distributed_optimizer != is_layer_wise
+                assert buffer.ddp_config is model.ddp_config
+                assert (buffer.num_optimizer_shards is None) == is_layer_wise
                 assert (buffer.param_data is None) == is_layer_wise
             for bucket_group in model.bucket_groups + model.expert_parallel_bucket_groups:
                 owners = {
@@ -515,7 +516,7 @@ class TestLayerWiseOptimizer:
                 assert len(owners) == 1, "A bucket group mixes LayerWise and DistOpt buckets"
                 if owners.pop():
                     # Without overlap the optimizer gathers the LayerWise params after its step.
-                    assert bucket_group.ddp_config.param_sync_via_bucket_group == overlap
+                    assert bucket_group.param_sync_via_bucket_group == overlap
         _assert_trains_like_reference(model, optimizer, steps=3)
 
     def test_all_reduce_training_replays_bit_exact(self):

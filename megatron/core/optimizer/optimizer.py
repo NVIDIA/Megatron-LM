@@ -406,7 +406,7 @@ class MegatronOptimizer(ABC):
 
         Called by :meth:`ChainedOptimizer.quantize_and_sync_model_params_from_main_params`
         after every member has staged its params. DDP skips the bucket groups of such params
-        (see ``DistributedDataParallelConfig.param_sync_via_bucket_group``).
+        (see ``_ParamAndGradBucketGroup.param_sync_via_bucket_group``).
         """
         return
 

@@ -422,9 +422,8 @@ class OptimizerConfig:
     use_layer_wise_distributed_optimizer: bool = False
     """Use :class:`LayerWiseDistributedOptimizer` for emerging optimizers (e.g. Muon).
     An emerging optimizer with ``use_distributed_optimizer=True`` resolves to this flag (see
-    :func:`resolve_layer_wise_distributed_optimizer`); :meth:`finalize_optimizer_config` then
-    sets it and resets ``use_distributed_optimizer`` to False so that the standard
-    distributed-optimizer path is not triggered."""
+    :func:`resolve_layer_wise_distributed_optimizer`). Finalization preserves the requested
+    ``use_distributed_optimizer`` value; the factory selects the wrapper by optimizer name."""
 
     second_order_optimizer_grad_collective: str = "reduce-scatter"
     """Data-parallel gradient collective for the parameters that a second-order optimizer with
@@ -680,9 +679,7 @@ class OptimizerConfig:
             )
 
         if self.overlap_param_gather:
-            # finalize_optimizer_config() may already have turned use_distributed_optimizer into
-            # use_layer_wise_distributed_optimizer (muon / dist_muon), which shares the same
-            # param-gather overlap, so accept either form.
+            # Explicit LayerWise selection and deprecated dist_* aliases also support overlap.
             assert (
                 self.use_distributed_optimizer
                 or self.uses_layer_wise_distributed_optimizer()
@@ -782,9 +779,8 @@ class OptimizerConfig:
         if self.use_precision_aware_optimizer and not is_te_min_version("2.1.0"):
             self.store_param_remainders = False
 
-        # Canonical optimizer intent: e.g. muon + use_distributed_optimizer (or the deprecated
-        # dist_muon) becomes muon + use_layer_wise_distributed_optimizer. The layer-wise
-        # optimizer, not the standard DistributedOptimizer, then owns the sharding.
+        # Resolve the optimizer name and LayerWise wrapper while preserving the requested
+        # distributed-optimizer setting. The factory routes emerging optimizers separately.
         self.optimizer, self.use_layer_wise_distributed_optimizer = (
             resolve_layer_wise_distributed_optimizer(
                 self.optimizer,
@@ -792,8 +788,6 @@ class OptimizerConfig:
                 self.use_layer_wise_distributed_optimizer,
             )
         )
-        if self.use_layer_wise_distributed_optimizer:
-            self.use_distributed_optimizer = False
 
 
 # Backward-compatible aliases (deprecated; use OptimizerConfig directly).

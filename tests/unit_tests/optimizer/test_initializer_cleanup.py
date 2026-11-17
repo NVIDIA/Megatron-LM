@@ -149,7 +149,6 @@ def test_layer_wise_muon_clears_non_owned_initializers(expert):
             num_distributed_optimizer_instances=1,
             overlap_param_gather=False,
             reuse_grad_buf_for_mxfp8_param_ag=False,
-            param_sync_via_bucket_group=False,
         )
         model.weights = torch.nn.ParameterList(
             [_parameter(device='cuda') for _ in range(2 * torch.distributed.get_world_size())]

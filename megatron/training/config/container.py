@@ -679,8 +679,6 @@ class PretrainConfigContainer(ConfigContainerBase):
         ) = batch_sizes
         self.optimizer = optimizer
         self.optimizer.finalize_optimizer_config()
-        if self.optimizer.use_layer_wise_distributed_optimizer:
-            self.ddp.use_distributed_optimizer = False
         # NaNs signal overflow to FP16 dynamic loss scaling; fake groups cannot
         # perform numerical validation. Loss and gradient checks otherwise remain independent.
         fp16 = transformer.fp16 if transformer is not None else self.optimizer.fp16
