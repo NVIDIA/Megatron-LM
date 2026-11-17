@@ -317,6 +317,7 @@ class InferenceStateHandoffMixin:
             # a missing graph; existing captured graphs remain usable.
             self.cuda_graph_all_prefills = False
         self._kv_transfer_role = role
+        self.context.kv_transfer_enabled = True
         self._require_handoff_claim = require_handoff_claim
         backend_cls = construct_kv_transfer_backend_class(self.context.config.kv_transport_backend)
 

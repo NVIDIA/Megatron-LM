@@ -330,6 +330,45 @@ class TestLayerWiseOptimizer:
         assert not torch.equal(model.module.scalar.weight, initial_weight)
         _assert_replicas_equal(model)
 
+    @pytest.mark.parametrize('use_gloo_process_groups', [False, True])
+    def test_scalar_distributed_optimizer_uses_collection_gloo_group(self, use_gloo_process_groups):
+        """The DistOpt for non-Muon params gets the collection's Gloo group when Gloo is on."""
+        from megatron.training.training import wrap_model_chunks_with_ddp
+
+        model = wrap_model_chunks_with_ddp(
+            [SimpleModel().bfloat16().cuda()],
+            TransformerConfig(num_attention_heads=1, num_layers=1),
+            DistributedDataParallelConfig(),
+            use_layer_wise_distributed_optimizer=True,
+        )[0]
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+        # Fresh groups over every rank (the dp_cp and expt_dp ranks here), distinct from the
+        # parallel_state Gloo groups, so the identity check shows where the group came from.
+        pg_collection.intra_dp_cp_gloo = torch.distributed.new_group(backend="gloo")
+        pg_collection.intra_expt_dp_gloo = torch.distributed.new_group(backend="gloo")
+        optimizer_config = OptimizerConfig(
+            optimizer='muon',
+            lr=0.01,
+            bf16=True,
+            muon_tp_mode="duplicated",
+            use_layer_wise_distributed_optimizer=True,
+        )
+
+        optimizer = get_megatron_optimizer(
+            optimizer_config,
+            [model],
+            pg_collection=pg_collection,
+            use_gloo_process_groups=use_gloo_process_groups,
+        )
+
+        (scalar_optimizer,) = [
+            sub_optimizer
+            for sub_optimizer in optimizer.chained_optimizers
+            if isinstance(sub_optimizer, DistributedOptimizer)
+        ]
+        expected_gloo_group = pg_collection.intra_dp_cp_gloo if use_gloo_process_groups else None
+        assert scalar_optimizer.data_parallel_group_gloo is expected_gloo_group
+
     def test_get_grad_norm(self):
         """The grad norm matches the non-distributed reference."""
         model, optimizer, _ = _create()
