@@ -450,8 +450,12 @@ class GraphableMegatronModule(MegatronModule):
             else:
                 # Do CUDA Graphs replay.
                 cuda_graph_func = self._te_cuda_graph_replay
-            return cuda_graph_func(*args, **kwargs)
+            return self._call_cuda_graph(cuda_graph_func, *args, **kwargs)
         return super().__call__(*args, **kwargs)
+
+    def _call_cuda_graph(self, graph_func, *args, **kwargs):
+        """Dispatch a graph; wrappers may preserve their module-hook lifecycle here."""
+        return graph_func(*args, **kwargs)
 
 
 def conversion_helper(val, conversion):
