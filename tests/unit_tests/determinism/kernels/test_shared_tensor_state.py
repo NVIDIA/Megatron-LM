@@ -6,7 +6,7 @@ from torch import nn
 
 from megatron.core.context_parallel.shared_state import gather_state, redistribute_state
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.state_boundary import TensorField, TensorSchema
+from megatron.core.transformer.state_boundary import TensorField
 from megatron.core.transformer.stateful_module import StatefulGraphs, StatefulModule
 from tests.unit_tests.determinism.kernels.harness import (
     assert_module_replays_bit_exact,
@@ -111,14 +111,14 @@ def test_shared_cp_state_replays_forward_and_gradients(operation, sequence_paral
         sequence_parallel=sequence_parallel, tp_group=groups.tp, tp_cp_group=groups.tp_cp
     )
     seeded(1234 + Utils.rank)
-    schema = TensorSchema((TensorField("memory", (16, 4), torch.float32, "contiguous", True),))
+    fields = (TensorField("memory", (16, 4), torch.float32, "contiguous", True),)
 
     def run(value):
         if operation == "gather":
-            result, _ = gather_state({"memory": value}, schema, group, **options)
+            result, _ = gather_state({"memory": value}, fields, group, **options)
         else:
             result, layout = redistribute_state(
-                {"memory": value}, schema, "zigzag", group, **options
+                {"memory": value}, fields, "zigzag", group, **options
             )
             if operation == "zigzag_gather":
                 result, _ = gather_state(result, layout, group, **options)

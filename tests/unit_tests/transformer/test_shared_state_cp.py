@@ -10,7 +10,7 @@ from torch import nn
 
 from megatron.core.context_parallel.shared_state import gather_state, redistribute_state
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.transformer.state_boundary import TensorField, TensorSchema
+from megatron.core.transformer.state_boundary import TensorField
 from megatron.core.transformer.stateful_module import StatefulGraphs, StatefulModule
 from tests.unit_tests.test_utilities import Utils
 from tests.unit_tests.transformer.test_stateful_module import (  # pylint: disable=unused-import
@@ -34,21 +34,20 @@ def _state(group):
     ids = torch.arange(group.rank() * 8, (group.rank() + 1) * 8, device="cuda")
     constant = torch.ones((), device="cuda")
     state = {"shared": shared, "ids": ids, "constant": constant}
-    schema = TensorSchema(
-        (
-            TensorField("shared", (8, 2), shared.dtype, "contiguous", True),
-            TensorField("ids", (8,), ids.dtype, "contiguous", False),
-            TensorField("constant", (), constant.dtype, "replicated", False),
-        )
+    fields = (
+        TensorField("shared", (8, 2), shared.dtype, "contiguous", True),
+        TensorField("ids", (8,), ids.dtype, "contiguous", False),
+        TensorField("constant", (), constant.dtype, "replicated", False),
     )
-    return state, schema
+    return state, fields
 
 
 def test_layout_roundtrip_preserves_shared_state_and_owner_gradients(cp):
-    state, schema = _state(cp)
-    shuffled, layout = redistribute_state(state, schema, "zigzag", cp)
+    state, fields = _state(cp)
+    shuffled, layout = redistribute_state(state, list(fields), "zigzag", cp)
+    assert [f.layout for f in layout] == ["zigzag", "zigzag", "replicated"]
     restored, original = redistribute_state(shuffled, layout, "contiguous", cp)
-    assert original == schema
+    assert original == fields
     for key in state:
         torch.testing.assert_close(restored[key], state[key], rtol=0, atol=0)
     assert restored["constant"] is state["constant"]
@@ -57,21 +56,21 @@ def test_layout_roundtrip_preserves_shared_state_and_owner_gradients(cp):
 
 
 def test_gather_adds_all_consumer_gradients_and_preserves_integer_state(cp):
-    state, schema = _state(cp)
-    gathered, global_schema = gather_state(state, schema, cp)
+    state, fields = _state(cp)
+    gathered, global_fields = gather_state(state, fields, cp)
     torch.testing.assert_close(
         gathered["shared"], torch.arange(32, device="cuda").float().reshape(16, 2)
     )
     torch.testing.assert_close(gathered["ids"], torch.arange(16, device="cuda"))
-    assert global_schema.fields[0].shape == (16, 2)
-    assert global_schema.fields[0].layout == "replicated"
+    assert global_fields[0].shape == (16, 2)
+    assert global_fields[0].layout == "replicated"
     (gathered["shared"].sum() * (cp.rank() + 1)).backward()
     torch.testing.assert_close(state["shared"].grad, torch.full_like(state["shared"], 3))
 
 
 def test_gather_then_local_slice_does_not_double_reduce(cp):
-    state, schema = _state(cp)
-    gathered, _ = gather_state(state, schema, cp)
+    state, fields = _state(cp)
+    gathered, _ = gather_state(state, fields, cp)
     local = gathered["shared"].narrow(0, cp.rank() * 8, 8)
     local.square().sum().backward()
     torch.testing.assert_close(state["shared"].grad, 2 * state["shared"])
@@ -82,10 +81,10 @@ class _CrossRankRegion(nn.Module):
         super().__init__()
         self.group = group
         self.weight = nn.Parameter(torch.tensor(0.25, device="cuda"))
-        self.schema = TensorSchema((TensorField("shared", (8, 2), torch.float32, layout, True),))
+        self.fields = (TensorField("shared", (8, 2), torch.float32, layout, True),)
 
     def forward(self, hidden, state):
-        gathered, _ = gather_state(state, self.schema, self.group)
+        gathered, _ = gather_state(state, self.fields, self.group)
         return hidden + gathered["shared"].sum(0) * self.weight, {}
 
 
@@ -95,9 +94,9 @@ class _CrossRankRegion(nn.Module):
 def test_cp_collective_region_matches_eager_in_recompute_and_graphs(cp, mode, layout):
     """Zigzag reordering inside capture requires a gather without host synchronization."""
     module = _CrossRankRegion(cp, layout)
-    actual = StatefulModule(module, module.schema.fields)
+    actual = StatefulModule(module, module.fields)
     # Copy the parameters, retaining the same explicit process group.
-    expected = StatefulModule(_CrossRankRegion(cp, layout), actual.inputs.fields)
+    expected = StatefulModule(_CrossRankRegion(cp, layout), module.fields)
     expected.load_state_dict(actual.state_dict())
     state, _ = _state(cp)
     x = torch.randn(8, 2, device="cuda", requires_grad=True)
@@ -133,21 +132,19 @@ def test_tp_sp_cp_gather_orders_tokens_and_sums_owner_gradients(layout):
         whole = torch.arange(64, device="cuda").float().reshape(32, 2)
         value = whole[logical_rank * 8 : (logical_rank + 1) * 8].clone().requires_grad_()
         ids = torch.arange(logical_rank * 8, (logical_rank + 1) * 8, device="cuda")
-        schema = TensorSchema(
-            (
-                TensorField("value", (8, 2), torch.float32, "contiguous", True),
-                TensorField("ids", (8,), torch.int64, "contiguous", False),
-            )
+        fields = (
+            TensorField("value", (8, 2), torch.float32, "contiguous", True),
+            TensorField("ids", (8,), torch.int64, "contiguous", False),
         )
         state = {"value": value, "ids": ids}
         if layout == "zigzag":
-            state, schema = redistribute_state(state, schema, "zigzag", groups.cp, **options)
+            state, fields = redistribute_state(state, fields, "zigzag", groups.cp, **options)
             segment = groups.cp.rank() if groups.tp.rank() == 0 else 3 - groups.cp.rank()
             torch.testing.assert_close(state["value"], whole[segment * 8 : (segment + 1) * 8])
-            restored, _ = redistribute_state(state, schema, "contiguous", groups.cp, **options)
+            restored, _ = redistribute_state(state, fields, "contiguous", groups.cp, **options)
             torch.testing.assert_close(restored["value"], value)
-        gathered, _ = gather_state(state, schema, groups.cp, **options)
-        replicated, _ = gather_state(state, schema, groups.cp, tp_replicated=True, **options)
+        gathered, _ = gather_state(state, fields, groups.cp, **options)
+        replicated, _ = gather_state(state, fields, groups.cp, tp_replicated=True, **options)
         torch.testing.assert_close(gathered["value"], whole)
         torch.testing.assert_close(gathered["ids"], torch.arange(32, device="cuda"))
         # Distinct consumers sum (1+2+3+4) * 2v; TP-replicated duplicates are averaged.
@@ -155,8 +152,8 @@ def test_tp_sp_cp_gather_orders_tokens_and_sums_owner_gradients(layout):
         (loss * (logical_rank + 1)).backward()
         torch.testing.assert_close(value.grad, 30 * value)
         for function, args in (
-            (gather_state, (state, schema, groups.cp)),
-            (redistribute_state, (state, schema, layout, groups.cp)),
+            (gather_state, (state, fields, groups.cp)),
+            (redistribute_state, (state, fields, layout, groups.cp)),
         ):
             with pytest.raises(ValueError, match="tp_group is required"):
                 function(*args, sequence_parallel=True)
@@ -167,14 +164,14 @@ def test_tp_sp_cp_gather_orders_tokens_and_sums_owner_gradients(layout):
 
 
 def test_zigzag_gather_needs_only_one_collective_per_field(cp, monkeypatch):
-    state, schema = _state(cp)
-    state, schema = redistribute_state(state, schema, "zigzag", cp)
+    state, fields = _state(cp)
+    state, fields = redistribute_state(state, fields, "zigzag", cp)
 
     def unexpected_exchange(*args, **kwargs):
         pytest.fail("Zigzag gather must not perform a preliminary all-to-all")
 
     monkeypatch.setattr(torch.distributed, "all_to_all_single", unexpected_exchange)
-    gathered, _ = gather_state(state, schema, cp)
+    gathered, _ = gather_state(state, fields, cp)
     torch.testing.assert_close(
         gathered["shared"], torch.arange(32, device="cuda").float().reshape(16, 2)
     )

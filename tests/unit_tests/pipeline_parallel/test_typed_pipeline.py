@@ -29,7 +29,7 @@ from megatron.core.pipeline_parallel.typed_p2p_communication import TypedP2PComm
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexerLossAutoScaler
-from megatron.core.transformer.state_boundary import TensorField, TensorSchema
+from megatron.core.transformer.state_boundary import TensorField
 from megatron.core.transformer.transformer_config import TransformerConfig
 
 _CONFIG = SimpleNamespace(timers=None, grad_scale_func=None, deallocate_pipeline_outputs=True)
@@ -81,11 +81,12 @@ def test_release_shrinks_owned_roots_and_keeps_saved_values():
     x = torch.tensor([1.0, 2.0, 3.0, 4.0], requires_grad=True)
     saved = x.sigmoid()  # sigmoid saves this very output for its own backward
     expected = saved.detach().clone()
-    schema = TensorSchema(
-        (_field("saved", (2, 2), torch.float32, True), _field("empty", (0,), torch.float32, True))
+    fields = (
+        _field("saved", (2, 2), torch.float32, True),
+        _field("empty", (0,), torch.float32, True),
     )
     payload = TensorStatePayload.from_state(
-        x * 2, {"saved": saved.view(2, 2), "empty": x[:0]}, schema
+        x * 2, {"saved": saved.view(2, 2), "empty": x[:0]}, fields
     )
     payload.release_output()
     payload.release_output()  # The schedule may retire the same output more than once.
@@ -108,6 +109,23 @@ def test_terminal_payload_backward_scales_loss_once():
     )
     torch.testing.assert_close(grads[0], torch.tensor([12.0, 15.0]))
     torch.testing.assert_close(grads[1], torch.tensor([6.0, 9.0]))
+
+
+def test_payload_uses_the_hidden_field_its_caller_declares():
+    hidden = torch.randn(4, 2, requires_grad=True)
+    field = _field("tokens", (4, 2), torch.float32, True, "contiguous")
+    payload = TensorStatePayload.from_state(hidden, {}, (), hidden_field=field)
+    assert payload.spec.fields == (field,)
+    assert payload.restore()[0].data_ptr() == hidden.data_ptr()
+    frozen = _field("tokens", (4, 2), torch.float32, False, "contiguous")
+    detached = TensorStatePayload.from_state(hidden, {}, (), hidden_field=frozen)
+    assert not detached.tensors[0].requires_grad
+    with pytest.raises(ValueError, match="tokens has incompatible"):
+        TensorStatePayload.from_state(
+            hidden, {}, (), hidden_field=_field("tokens", (2, 4), torch.float32, True)
+        )
+    with pytest.raises(ValueError, match="hidden.*must be present"):
+        PipelinePayloadSpec((_field("tokens", (4, 2), torch.float32, True, present=False),))
 
 
 def test_spec_is_generic_and_fingerprints_every_qualification():
@@ -136,9 +154,13 @@ def test_spec_is_generic_and_fingerprints_every_qualification():
             "differentiable": False,
             "present": False,
         }[change]
-        replaced = TensorField(**{**vars(fields[0]), change: value})
+        # The hidden slot must be present, so presence changes a state field instead.
+        index = 2 if change == "present" else 0
+        replaced = TensorField(**{**vars(fields[index]), change: value})
         variants.append(
-            PipelinePayloadSpec((replaced, *fields[1:]), spec.metadata, spec.boundary_id)
+            PipelinePayloadSpec(
+                (*fields[:index], replaced, *fields[index + 1 :]), spec.metadata, spec.boundary_id
+            )
         )
     assert len({spec.fingerprint, *(v.fingerprint for v in variants)}) == len(variants) + 1
     for bad in [((), ()), (fields, (1.5,)), ((object(),), ())]:
@@ -155,7 +177,7 @@ def test_missing_and_zero_gradients_differ_for_auxiliary_losses(monkeypatch, act
     auxiliary = torch.nn.Parameter(torch.tensor(3.0))
     hidden = DSAIndexerLossAutoScaler.apply(x.square(), auxiliary.square())
     payload = TensorStatePayload.from_state(
-        hidden, {"kv": x * weight}, TensorSchema((_field("kv", (3,), torch.float32, True),))
+        hidden, {"kv": x * weight}, (_field("kv", (3,), torch.float32, True),)
     )
     payload.release_output()
     grads = (
@@ -170,10 +192,8 @@ def test_missing_and_zero_gradients_differ_for_auxiliary_losses(monkeypatch, act
 def test_same_tensor_in_several_fields_accumulates_each_contribution():
     x = torch.ones(3, requires_grad=True)
     shared = x.square()
-    schema = TensorSchema(
-        (_field("a", (3,), torch.float32, True), _field("b", (3,), torch.float32, True))
-    )
-    payload = TensorStatePayload.from_state(shared, {"a": shared, "b": shared}, schema)
+    fields = [_field("a", (3,), torch.float32, True), _field("b", (3,), torch.float32, True)]
+    payload = TensorStatePayload.from_state(shared, {"a": shared, "b": shared}, fields)
     payload.release_output()
     backward_pipeline_payload(
         None, payload, (torch.ones(3), torch.full((3,), 2.0), torch.full((3,), 3.0))
@@ -194,8 +214,8 @@ def test_owned_release_preserves_saved_aliases_and_joint_gradients(view, empty):
         hidden, expected_hidden = hidden.t(), expected_hidden.t()
     if empty:
         hidden, expected_hidden = hidden[:0], expected_hidden[:0]
-    schema = TensorSchema((_field("shared", hidden.shape, hidden.dtype, True),))
-    payload = TensorStatePayload.from_state(hidden, {"shared": hidden}, schema)
+    fields = (_field("shared", hidden.shape, hidden.dtype, True),)
+    payload = TensorStatePayload.from_state(hidden, {"shared": hidden}, fields)
     wire = payload.tensors[0].detach().contiguous()
     snapshot = hidden.detach().clone()
     payload.release_output()
@@ -213,7 +233,7 @@ def test_owned_release_does_not_retain_an_unaliased_output_storage():
     leaf = torch.ones(4096, requires_grad=True)
     hidden = leaf * 2
     reference = weakref.ref(hidden)
-    payload = TensorStatePayload.from_state(hidden, {}, TensorSchema(()))
+    payload = TensorStatePayload.from_state(hidden, {}, ())
     del hidden
     gc.collect()
     assert reference() is None
@@ -229,7 +249,7 @@ def test_release_drops_readonly_outputs_after_the_wire_owns_them():
     ids = torch.arange(4)
     reference = weakref.ref(ids)
     payload = TensorStatePayload.from_state(
-        leaf * 2, {"ids": ids}, TensorSchema((_field("ids", (4,), torch.int64, False),))
+        leaf * 2, {"ids": ids}, (_field("ids", (4,), torch.int64, False),)
     )
     wire = payload.tensors[1].detach()
     del ids
@@ -417,7 +437,8 @@ def test_planned_exchange_posts_only_tensor_data(fake_transport, release):
     source = TensorStatePayload.from_state(
         hidden,
         {"empty": torch.empty(0, dtype=torch.bfloat16), "ids": torch.arange(2)},
-        TensorSchema(_TRANSFER_SPEC.fields[1:]),
+        _TRANSFER_SPEC.fields[1:],
+        hidden_field=_TRANSFER_SPEC.fields[0],
         boundary_id=_TRANSFER_SPEC.boundary_id,
         metadata=_TRANSFER_SPEC.metadata,
     )
@@ -552,7 +573,8 @@ class _Stage(torch.nn.Module):
         payload = TensorStatePayload.from_state(
             hidden,
             state,
-            TensorSchema(spec.fields[1:]),
+            spec.fields[1:],
+            hidden_field=spec.fields[0],
             boundary_id=spec.boundary_id,
             metadata=spec.metadata,
         )

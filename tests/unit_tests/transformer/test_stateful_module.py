@@ -12,7 +12,7 @@ from torch import nn
 from megatron.core.pipeline_parallel.pipeline_payload import TensorStatePayload
 from megatron.core.tensor_parallel import random as rng
 from megatron.core.transformer import stateful_module
-from megatron.core.transformer.state_boundary import TensorField, TensorSchema
+from megatron.core.transformer.state_boundary import TensorField
 from megatron.core.transformer.stateful_module import StatefulGraphs, StatefulModule
 
 
@@ -352,9 +352,8 @@ def test_schema_payload_roundtrip_preserves_aliases_and_optional_fields():
         TensorField("readonly", hidden.shape, hidden.dtype, "local", False),
         TensorField("absent", (1,), hidden.dtype, "local", True, False),
     )
-    schema = TensorSchema(fields)
     payload = TensorStatePayload.from_state(
-        hidden, {"shared": hidden, "readonly": hidden, "absent": None}, schema
+        hidden, {"shared": hidden, "readonly": hidden, "absent": None}, list(fields)
     )
     restored, state = payload.restore()
     assert restored is not hidden and restored.data_ptr() == hidden.data_ptr()
@@ -363,11 +362,13 @@ def test_schema_payload_roundtrip_preserves_aliases_and_optional_fields():
     assert not state["readonly"].requires_grad
     assert state["readonly"].data_ptr() == hidden.data_ptr()
     assert state["absent"] is None
-    assert schema == TensorSchema(fields)
+    assert payload.spec.fields[1:] == fields
     with pytest.raises(ValueError, match="Absent"):
-        schema.pack({"shared": hidden, "readonly": hidden, "absent": torch.ones(1)})
+        TensorStatePayload.from_state(
+            hidden, {"shared": hidden, "readonly": hidden, "absent": torch.ones(1)}, fields
+        )
     with pytest.raises(ValueError, match="duplicate"):
-        TensorSchema((fields[0], fields[0]))
+        StatefulModule(nn.Identity(), [fields[0], fields[0]])
 
 
 def test_last_consumer_retires_inputs_without_dropping_another_components_state():

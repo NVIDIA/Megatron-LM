@@ -11,7 +11,7 @@ same tensor signature. The module never retains a forward's state mapping.
 import gc
 from contextlib import contextmanager
 from functools import partial
-from typing import Callable, Mapping
+from typing import Callable, Mapping, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -34,13 +34,14 @@ class StatefulModule(nn.Module):
     def __init__(
         self,
         module: nn.Module,
-        input_fields: tuple[TensorField, ...] = (),
-        output_fields: tuple[TensorField, ...] = (),
+        input_fields: Sequence[TensorField] = (),
+        output_fields: Sequence[TensorField] = (),
     ) -> None:
         super().__init__()
         self.module = module
         self.training = module.training
-        self.inputs, self.outputs = TensorSchema(input_fields), TensorSchema(output_fields)
+        self.inputs = TensorSchema(tuple(input_fields))
+        self.outputs = TensorSchema(tuple(output_fields))
 
     def forward(self, hidden: Tensor, *values: Tensor) -> tuple[Tensor, ...]:
         """Run from explicit tensors, rebuilding state on checkpoint replay/capture."""

@@ -6,7 +6,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from functools import cached_property
 from hashlib import sha256
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import torch
 
@@ -21,10 +21,11 @@ PipelineGradients = tuple[torch.Tensor | None, ...]
 class PipelinePayloadSpec:
     """Host-only description of one boundary message, prepared before the microbatch runs.
 
-    ``fields`` start with the hidden activation and include absent slots. Gradient
-    eligibility is static per microbatch: a differentiable field must receive a
-    gradient from its consumer, so a branch that is unused for a microbatch is
-    declared non-differentiable in that microbatch's plan.
+    ``fields`` start with the hidden activation, which is always present, followed
+    by the state fields, including absent slots. Gradient eligibility is static per
+    microbatch: a differentiable field must receive a gradient from its consumer, so
+    a branch that is unused for a microbatch is declared non-differentiable in that
+    microbatch's plan.
     """
 
     fields: tuple[TensorField, ...]
@@ -38,6 +39,8 @@ class PipelinePayloadSpec:
             raise ValueError("Pipeline payload metadata must be a tuple of host integers")
         if not self.fields or not all(isinstance(f, TensorField) for f in self.fields):
             raise ValueError("Pipeline payload fields must be TensorFields, hidden first")
+        if not self.fields[0].present:
+            raise ValueError("A pipeline payload's first (hidden) field must be present")
         self.schema
 
     @cached_property
@@ -120,17 +123,36 @@ class TensorStatePayload:
     _roots: tuple[torch.Tensor | None, ...] | None = field(default=None, init=False, repr=False)
 
     @classmethod
-    def from_state(cls, hidden, state, schema: TensorSchema, *, boundary_id="state", metadata=()):
-        """Publish explicit producer edges; never detach or copy shared tensors."""
-        hidden_field = TensorField("__hidden__", tuple(hidden.shape), hidden.dtype, "strided", True)
-        spec = PipelinePayloadSpec((hidden_field, *schema.fields), tuple(metadata), boundary_id)
+    def from_state(
+        cls,
+        hidden: torch.Tensor,
+        state: Mapping[str, torch.Tensor | None],
+        fields: Sequence[TensorField],
+        *,
+        hidden_field: TensorField | None = None,
+        boundary_id: str = "state",
+        metadata: Sequence[int] = (),
+    ) -> "TensorStatePayload":
+        """Publish explicit producer edges; never copy shared tensors or detach eligible ones.
+
+        ``hidden_field`` declares the hidden activation's key, layout and gradient
+        eligibility, and must match the boundary's plan. By default it is a
+        differentiable ``__hidden__`` field without sequence semantics ("strided").
+        """
+        if hidden_field is None:
+            hidden_field = TensorField(
+                "__hidden__", tuple(hidden.shape), hidden.dtype, "strided", True
+            )
+        spec = PipelinePayloadSpec((hidden_field, *fields), tuple(metadata), boundary_id)
+        # The spec's schema validates hidden like any field and detaches it if ineligible.
+        values = spec.schema.pack({**state, hidden_field.key: hidden})
         tensors = tuple(
             (
                 make_viewless_tensor(tensor.view_as(tensor), requires_grad=True, keep_graph=True)
                 if f.differentiable and tensor.requires_grad
                 else tensor
             )
-            for f, tensor in zip(spec.schema.packed_fields, (hidden, *schema.pack(state)))
+            for f, tensor in zip(spec.schema.packed_fields, values)
         )
         return cls(tensors, spec, True)
 
@@ -143,8 +165,6 @@ class TensorStatePayload:
     def restore(self):
         """Return the hidden tensor and a fresh state mapping after the receive completes."""
         self.spec.schema.validate(self.tensors)
-        if self.spec.fields[0].key != "__hidden__":
-            raise ValueError("Tensor state payload must start with its declared hidden field")
         if any(t.device != self.tensors[0].device for t in self.tensors):
             raise ValueError("Tensor state payload fields must share a device")
         return self.tensors[0], TensorSchema(self.spec.fields[1:]).unpack(self.tensors[1:])
