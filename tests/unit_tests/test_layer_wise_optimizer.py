@@ -330,13 +330,18 @@ class TestLayerWiseOptimizer:
         assert not torch.equal(model.module.scalar.weight, initial_weight)
         _assert_replicas_equal(model)
 
-    @pytest.mark.parametrize('use_gloo_process_groups', [False, True])
-    def test_scalar_distributed_optimizer_uses_collection_gloo_group(self, use_gloo_process_groups):
-        """The DistOpt for non-Muon params gets the collection's Gloo group when Gloo is on."""
+    @pytest.mark.parametrize(
+        ('use_gloo_process_groups', 'missing_expert_gloo'),
+        [(False, False), (True, False), (True, True)],
+    )
+    def test_scalar_distributed_optimizer_uses_collection_gloo_group(
+        self, use_gloo_process_groups, missing_expert_gloo
+    ):
+        """Dense and expert scalar DistOpts use their own Gloo mirrors when requested."""
         from megatron.training.training import wrap_model_chunks_with_ddp
 
         model = wrap_model_chunks_with_ddp(
-            [SimpleModel().bfloat16().cuda()],
+            [ExpertModel().bfloat16().cuda()],
             TransformerConfig(num_attention_heads=1, num_layers=1),
             DistributedDataParallelConfig(),
             use_layer_wise_distributed_optimizer=True,
@@ -345,7 +350,9 @@ class TestLayerWiseOptimizer:
         # Fresh groups over every rank (the dp_cp and expt_dp ranks here), distinct from the
         # parallel_state Gloo groups, so the identity check shows where the group came from.
         pg_collection.intra_dp_cp_gloo = torch.distributed.new_group(backend="gloo")
-        pg_collection.intra_expt_dp_gloo = torch.distributed.new_group(backend="gloo")
+        pg_collection.intra_expt_dp_gloo = (
+            None if missing_expert_gloo else torch.distributed.new_group(backend="gloo")
+        )
         optimizer_config = OptimizerConfig(
             optimizer='muon',
             lr=0.01,
@@ -354,6 +361,16 @@ class TestLayerWiseOptimizer:
             use_layer_wise_distributed_optimizer=True,
         )
 
+        if missing_expert_gloo:
+            with pytest.raises(ValueError, match="requires pg_collection.intra_expt_dp_gloo"):
+                get_megatron_optimizer(
+                    optimizer_config,
+                    [model],
+                    pg_collection=pg_collection,
+                    use_gloo_process_groups=use_gloo_process_groups,
+                )
+            return
+
         optimizer = get_megatron_optimizer(
             optimizer_config,
             [model],
@@ -361,13 +378,19 @@ class TestLayerWiseOptimizer:
             use_gloo_process_groups=use_gloo_process_groups,
         )
 
-        (scalar_optimizer,) = [
+        dense_optimizer, expert_optimizer = [
             sub_optimizer
             for sub_optimizer in optimizer.chained_optimizers
             if isinstance(sub_optimizer, DistributedOptimizer)
         ]
-        expected_gloo_group = pg_collection.intra_dp_cp_gloo if use_gloo_process_groups else None
-        assert scalar_optimizer.data_parallel_group_gloo is expected_gloo_group
+        assert dense_optimizer.data_parallel_group is pg_collection.dp_cp
+        assert expert_optimizer.data_parallel_group is pg_collection.expt_dp
+        assert dense_optimizer.data_parallel_group_gloo is (
+            pg_collection.intra_dp_cp_gloo if use_gloo_process_groups else None
+        )
+        assert expert_optimizer.data_parallel_group_gloo is (
+            pg_collection.intra_expt_dp_gloo if use_gloo_process_groups else None
+        )
 
     def test_get_grad_norm(self):
         """The grad norm matches the non-distributed reference."""

@@ -1058,13 +1058,25 @@ def _get_megatron_emerging_optimizer(
                 # Route non-emerging params (adam/lion) through a real DistributedOptimizer
                 # (byte-level sharding) instead of stuffing them inside LayerWise. Expert
                 # params shard over the expert data-parallel group, as in the standard
-                # (non-layer-wise) optimizer path. Gloo groups are off on this path.
+                # (non-layer-wise) optimizer path, including its Gloo checkpoint groups.
                 mp_group_name, dp_group_name = (
                     ('expt_tp_pp_with_egtp_remat_group', 'intra_expt_dp_group')
                     if is_expert
                     else ('mp_group', 'intra_dp_cp_group')
                 )
                 distopt_model_parallel_group = distopt_process_groups[mp_group_name]
+                distopt_data_parallel_group_gloo = distopt_process_groups[f'{dp_group_name}_gloo']
+                if (
+                    is_expert
+                    and use_gloo_process_groups
+                    and distopt_data_parallel_group_gloo is None
+                    and not ProcessGroupCollection.is_gtp_remat_active(distopt_process_groups)
+                ):
+                    raise ValueError(
+                        "use_gloo_process_groups=True requires pg_collection.intra_expt_dp_gloo "
+                        "for the expert parameters. Build the job with Gloo process groups or "
+                        "pass use_gloo_process_groups=False."
+                    )
                 fallback_config.use_distributed_optimizer = True
                 result = _get_megatron_optimizer_based_on_param_groups(
                     config=fallback_config,
@@ -1073,6 +1085,7 @@ def _get_megatron_emerging_optimizer(
                     per_model_buffers=distopt_per_model_buffers[is_expert],
                     model_parallel_group=distopt_model_parallel_group,
                     data_parallel_group=distopt_process_groups[dp_group_name],
+                    data_parallel_group_gloo=distopt_data_parallel_group_gloo,
                     data_parallel_group_idx=get_pg_rank(distopt_model_parallel_group),
                     intra_dist_opt_group=distopt_process_groups['intra_dist_opt_group'],
                     pg_collection=pg_collection,
