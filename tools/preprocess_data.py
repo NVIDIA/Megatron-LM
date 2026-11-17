@@ -323,7 +323,7 @@ def main():
                 f"Removing num_workers ({num_workers}) from workers list "
                 f"because it's not divisible by num_partitions ({args.partitions})"
             )
-    workers[:] = [num_workers for num_workers in workers if num_workers % args.partitions == 0]
+    workers = [w for w in workers if w % args.partitions == 0]
     assert workers, "Please, provide valid number of workers which is divisible by number of partitions."
     if args.find_optimal_num_workers:
         args.log_interval = 1000

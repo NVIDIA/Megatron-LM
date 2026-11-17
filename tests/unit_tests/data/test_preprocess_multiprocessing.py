@@ -8,31 +8,54 @@ import os
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from megatron.core.datasets.indexed_dataset import IndexedDataset
-from tools import preprocess_data
 
 
-def test_worker_sweep_rejects_consecutive_invalid_counts(monkeypatch):
-    """Reject an invalid sweep before starting partition processing."""
-    args = SimpleNamespace(
-        find_optimal_num_workers=True,
-        workers_to_check=[1, 3],
-        partitions=4,
-        split_sentences=False,
-        input="unused.jsonl",
-    )
-    monkeypatch.setattr(preprocess_data, "get_args", lambda: args)
-
-    def unexpected_input_lookup(_):
-        pytest.fail("Invalid worker counts reached input discovery")
-
-    monkeypatch.setattr(preprocess_data.glob, "glob", unexpected_input_lookup)
-    with pytest.raises(AssertionError, match="valid number of workers"):
-        preprocess_data.main()
+def test_worker_sweep_rejects_consecutive_invalid_counts(tmp_path):
+    """An all-invalid sweep must fail before any partition is processed."""
+    root = Path(__file__).resolve().parents[3]
+    command = [
+        sys.executable,
+        '-m',
+        'tools.preprocess_data',
+        '--input',
+        str(tmp_path / 'unused.jsonl'),
+        '--output-prefix',
+        str(tmp_path / 'tokens'),
+        '--tokenizer-type',
+        'NullTokenizer',
+        '--vocab-size',
+        '32',
+        '--append-eod',
+        '--workers',
+        '4',
+        '--partitions',
+        '4',
+        '--find-optimal-num-workers',
+        '--workers-to-check',
+        '1',
+        '3',
+    ]
+    env = dict(os.environ)
+    env['PYTHONPATH'] = os.pathsep.join(filter(None, [str(root), env.get('PYTHONPATH')]))
+    try:
+        result = subprocess.run(
+            command, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120
+        )
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout or ''
+        if isinstance(output, bytes):
+            output = output.decode(errors='replace')
+        raise AssertionError(
+            'Invalid worker count reached partition processing instead of being rejected: '
+            + output[-500:]
+        ) from exc
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert 'Please, provide valid number of workers' in result.stderr
+    assert 'Processing data with 3 workers.' not in result.stdout
 
 
 @pytest.mark.parametrize('start_method', multiprocessing.get_all_start_methods())
