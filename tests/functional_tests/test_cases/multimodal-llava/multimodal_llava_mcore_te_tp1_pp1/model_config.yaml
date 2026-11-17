@@ -50,5 +50,6 @@ MODEL_ARGS:
   --patch-dim: 14
   --mock-data: true
   --log-memory-to-tensorboard: true
+  --strict-process-group-fallbacks: true
 TEST_TYPE: regular
 LAUNCHER: ft_launcher

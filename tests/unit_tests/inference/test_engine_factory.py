@@ -2,6 +2,7 @@
 
 """Tests for the framework-facing dynamic inference engine factory."""
 
+import warnings
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -17,6 +18,8 @@ from megatron.core.inference.disaggregation.engine import (
 )
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import Status
+from megatron.core.process_groups_config import ProcessGroupCollection, ProcessGroupFallbackWarning
+from tests.unit_tests.test_utilities import forbid_global_process_groups
 
 
 class _DynamicEngine:
@@ -100,6 +103,17 @@ def mock_pipeline(monkeypatch):
     return context, wrapper_cls, controller, configure
 
 
+def _model():
+    """A stand-in model whose collection sets every group that inference reads.
+
+    No process group is created: the groups that inference runs collectives on are stand-in
+    objects, and the groups whose axis may be off are None.
+    """
+    groups = dict.fromkeys(("ep", "cp", "expt_tp", "expt_dp", "tp_ep"))
+    groups.update({name: object() for name in ("tp", "pp", "dp", "mp")})
+    return SimpleNamespace(config=MagicMock(), pg_collection=ProcessGroupCollection(**groups))
+
+
 @pytest.mark.parametrize("disaggregated", [False, True])
 def test_builds_and_configures_engine(mock_pipeline, disaggregated):
     context, wrapper_cls, controller, configure = mock_pipeline
@@ -107,7 +121,8 @@ def test_builds_and_configures_engine(mock_pipeline, disaggregated):
         disaggregation_shards="tp=1,role=prefill+tp=1,role=decode" if disaggregated else None,
         enable_prefix_caching=True,
     )
-    model = SimpleNamespace(config=MagicMock())
+    # The factory resolves the process groups of a config without a collection from the model.
+    model = _model()
 
     engine = factory_module.build_dynamic_inference_engine(
         model=model,
@@ -125,6 +140,35 @@ def test_builds_and_configures_engine(mock_pipeline, disaggregated):
         configure.assert_called_once_with(engine)
     else:
         configure.assert_not_called()
+
+
+def test_config_without_collection_takes_the_collection_of_the_model(mock_pipeline, monkeypatch):
+    """The context is built before the wrapper and does not hold the model, so the factory
+    resolves the process groups with the model first. The context then finds the model's
+    collection, not the warned fallback to the global grid."""
+    context, wrapper_cls, _, _ = mock_pipeline
+    collections_at_context_build = []
+
+    def build_context(model_config, inference_config):
+        collections_at_context_build.append(inference_config.pg_collection)
+        return context
+
+    monkeypatch.setattr(factory_module, "DynamicInferenceContext", build_context)
+    config = InferenceConfig()
+    model = _model()
+
+    with forbid_global_process_groups(), warnings.catch_warnings():
+        warnings.simplefilter("error", ProcessGroupFallbackWarning)
+        factory_module.build_dynamic_inference_engine(
+            model=model,
+            tokenizer="tokenizer",
+            inference_config=config,
+            inference_wrapper_cls=wrapper_cls,
+        )
+
+    assert len(collections_at_context_build) == 1
+    assert collections_at_context_build[0] is model.pg_collection
+    assert config.pg_collection is model.pg_collection
 
 
 def test_disaggregation_rejects_incompatible_engine_override(mock_pipeline):

@@ -94,9 +94,13 @@ def initialize_real_model(
     config_cls = MLATransformerConfig if is_mla else TransformerConfig
     transformer_config = config_cls(**default_config_kwargs)
 
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     if is_moe:
         layer_spec = get_gpt_decoder_block_spec(
-            transformer_config, use_transformer_engine=True, vp_stage=vp_stage
+            transformer_config,
+            use_transformer_engine=True,
+            vp_stage=vp_stage,
+            pp_rank=pg_collection.pp.rank(),
         )
     else:
         layer_spec = get_gpt_layer_with_transformer_engine_spec(multi_latent_attention=is_mla)
@@ -108,6 +112,7 @@ def initialize_real_model(
         pre_process=pre_process,
         post_process=post_process,
         vp_stage=vp_stage,
+        pg_collection=pg_collection,
     )
 
     return this_model
