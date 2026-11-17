@@ -25,7 +25,10 @@ from megatron.core.models.vision.clip_vit_model import CLIPViTModel, get_num_ima
 from megatron.core.models.vision.multimodal_projector import MultimodalProjector
 from megatron.core.models.vision.radio import RADIOViTModel
 from megatron.core.packed_seq_params import PackedSeqParams
-from megatron.core.process_groups_config import ProcessGroupCollection
+from megatron.core.process_groups_config import (
+    ProcessGroupCollection,
+    warn_global_process_group_fallback,
+)
 from megatron.core.transformer import MegatronModule
 from megatron.core.transformer.attention import SelfAttentionSubmodules
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -181,6 +184,9 @@ class LLaVAModel(MegatronModule):
         )
 
         if pg_collection is None:
+            # A vision encoder and a language model may run on independent parallel grids, so the
+            # global grid is only a compatibility default.
+            warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         is_hybrid_language_model = language_transformer_config.is_hybrid_model
 
@@ -1383,6 +1389,7 @@ class LLaVAModel(MegatronModule):
                     vision_images,
                     imgs_sizes,
                     vision_packed_seq_params,
+                    cp_group=self.pg_collection.cp,
                     patch_dim=self.vision_model.patch_dim,
                     dummy_image_size=dummy_image_size,
                     fp8_enabled=self._vision_fp8,
@@ -1398,7 +1405,9 @@ class LLaVAModel(MegatronModule):
                 if local_num_frames is not None:
                     num_frames = local_num_frames.tolist()
             elif self.context_parallel_lm > 1 and imgs_sizes is None and images.shape[0] >= 2:
-                vision_images, static_vision_cp_pad = split_to_context_parallel_ranks(images)
+                vision_images, static_vision_cp_pad = split_to_context_parallel_ranks(
+                    images, cp_group=self.pg_collection.cp
+                )
 
             use_temporal = self.temporal_patch_dim > 1 and imgs_sizes is not None
             if use_temporal:
@@ -1620,15 +1629,21 @@ class LLaVAModel(MegatronModule):
 
             if dynamic_vision_cp:
                 image_embeddings = gather_from_context_parallel_ranks_dynamic_res(
-                    image_embeddings, num_padded_vision_ranks
+                    image_embeddings,
+                    cp_group=self.pg_collection.cp,
+                    num_padded_imgs=num_padded_vision_ranks,
                 )
                 if use_temporal:
                     imgs_sizes = gather_from_context_parallel_ranks_dynamic_res(
-                        imgs_sizes, num_padded_vision_ranks
+                        imgs_sizes,
+                        cp_group=self.pg_collection.cp,
+                        num_padded_imgs=num_padded_vision_ranks,
                     )
                     if tubelet_token_counts is not None:
                         tubelet_token_counts = gather_from_context_parallel_ranks_dynamic_res(
-                            tubelet_token_counts.unsqueeze(-1), num_padded_vision_ranks
+                            tubelet_token_counts.unsqueeze(-1),
+                            cp_group=self.pg_collection.cp,
+                            num_padded_imgs=num_padded_vision_ranks,
                         ).squeeze(-1)
                         media_token_counts = _align_temporal_token_counts_to_placeholders(
                             tubelet_token_counts,
@@ -1669,7 +1684,7 @@ class LLaVAModel(MegatronModule):
                 )
             elif static_vision_cp_pad is not None:
                 image_embeddings = gather_from_context_parallel_ranks(
-                    image_embeddings, static_vision_cp_pad
+                    image_embeddings, static_vision_cp_pad, cp_group=self.pg_collection.cp
                 )
 
             # Apply tile tagging if enabled and an image token is present.

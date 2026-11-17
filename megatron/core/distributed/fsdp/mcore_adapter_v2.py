@@ -17,6 +17,7 @@
 import contextlib
 import logging
 from contextlib import nullcontext
+from dataclasses import replace
 from typing import List, NamedTuple, Optional, Tuple, Type
 
 import torch
@@ -42,11 +43,11 @@ try:
     from megatron.core.distributed.fsdp.src.megatron_fsdp import MixedPrecisionPolicy
     from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
         FsdpContext,
+        GradientFinalizationMode,
         Placements,
         RuntimePolicy,
         SchedulePolicy,
         ShardLayout,
-        finalize_gradients,
         fully_shard,
         fully_shard_context,
     )
@@ -270,7 +271,6 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         )
         common_fully_shard_kwargs = dict(
             mixed_precision_policy=self.mp_policy,
-            schedule_policy=schedule_policy,
             shard_layout=(
                 ShardLayout.PADDED
                 if ddp_config.megatron_fsdp_padded_shards
@@ -285,19 +285,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             construction_context = fully_shard_context(
                 FsdpContext(
                     device=device,
+                    gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
                     runtime_policy=RuntimePolicy(
                         use_symmetric_memory=ddp_config.nccl_ub,
-                        caller_managed_grad_sync=True,
                         overlap_outer_communication=ddp_config.overlap_outer_communication,
                     ),
                 )
             )
         else:
-            if not active_context.caller_managed_grad_sync:
-                raise ValueError(
-                    "MCore MFSDP v2 requires shared contexts to be constructed with "
-                    "RuntimePolicy(caller_managed_grad_sync=True)."
-                )
             construction_context = nullcontext(active_context)
         with construction_context:
             collector = FsdpUnitCollector(fsdp_unit_modules)
@@ -310,6 +305,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
                     mesh=expert_dp_mesh if is_expert else dp_mesh,
                     placements=expert_placements if is_expert else dense_placements,
                     grad_scale=expert_grad_scale if is_expert else dense_grad_scale,
+                    schedule_policy=replace(
+                        schedule_policy,
+                        unshard_all_planes_in_backward=collector.is_partially_recomputed(submodule),
+                    ),
                     **common_fully_shard_kwargs,
                 )
 
@@ -494,7 +493,7 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
 
         MCore's schedules wrap every microbatch but the last in ``no_sync_func``.
         """
-        with finalize_gradients(self.module.context, enabled=False):
+        with self.module.context.finalize_gradients(mode=GradientFinalizationMode.SKIP_OUTER):
             yield
 
     @torch.no_grad()
