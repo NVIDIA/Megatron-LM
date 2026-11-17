@@ -27,6 +27,7 @@ from megatron.core.models.hybrid.hybrid_model import HybridModel
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnMaskType
+from megatron.core.transformer.experimental_attention_variant import dsa_layer_specs
 from megatron.core.transformer.experimental_attention_variant.dsa import fused_qk_topk_naive
 from megatron.core.transformer.experimental_attention_variant.dsa_gqa import (
     DSGQACoreAttention,
@@ -213,6 +214,40 @@ def test_dsa_stack_spec_preserves_dense_attention(derived, upstream):
     assert (
         core_attention.submodules.dense_core_attention
         is upstream_attention.submodules.core_attention
+    )
+
+
+@pytest.mark.parametrize("training_spec", ["dsa_stack_spec", "gdp_dsa_stack_spec"])
+@pytest.mark.parametrize("wide_residual", [False, True])
+def test_inference_optimized_resolves_dsa_inference_stack(training_spec, wide_residual):
+    """inference_optimized serving finds a DSA inference stack for each DSA training spec.
+
+    Without one, the lookup returns None and the server falls back to a stack with Mamba
+    mixers and plain attention, silently leaving the checkpoint's GDP and indexer weights
+    unloaded.
+    """
+    from megatron.training.argument_utils import _hybrid_inference_stack_spec
+
+    spec = _hybrid_inference_stack_spec(
+        [dsa_layer_specs.__name__, training_spec], wide_residual=wide_residual
+    )
+    assert spec is not None
+    expected = training_spec.removesuffix("_stack_spec") + "_inference_stack_spec"
+    if wide_residual:
+        expected = "wide_residual_" + expected
+    assert spec is getattr(dsa_layer_specs, expected)
+    layer_selections = [spec.submodules]
+    if wide_residual:
+        # MTP reuses the unwrapped layer selection; it must keep the indexer the checkpoint holds.
+        layer_selections.append(spec.submodules.mtp_stack_submodules)
+    for submodules in layer_selections:
+        self_attention = submodules.attention_layer.submodules.self_attention
+        assert self_attention.module is DSGroupedSelfAttention
+        assert self_attention.submodules.core_attention.module is DSGQACoreAttention
+    training_mixer = getattr(dsa_layer_specs, training_spec).submodules.mamba_layer
+    assert (
+        spec.submodules.mamba_layer.submodules.mixer.module
+        is training_mixer.submodules.mixer.module
     )
 
 
