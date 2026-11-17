@@ -665,7 +665,9 @@ def _expert_family(resolved_name: str) -> str:
     """``...experts.linear_fc1.weight17`` -> ``...experts.linear_fc1.weight``."""
     head, _, tail = resolved_name.rpartition('.')
     m = _EXPERT_PARAM_RE.match(tail)
-    return f"{head}.{m.group(1)}" if m else resolved_name
+    if m is None:
+        return resolved_name
+    return f"{head}.{m.group(1)}" if head else m.group(1)
 
 
 def _is_stackable_expert(metadata: ParameterMetadata) -> bool:

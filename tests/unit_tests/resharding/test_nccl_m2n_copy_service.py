@@ -3,6 +3,7 @@
 """Tests for the native NCCL M2N ReFIT copy service."""
 
 import importlib.util
+import math
 import os
 from dataclasses import replace
 from types import SimpleNamespace
@@ -12,8 +13,12 @@ import torch
 import torch.distributed as dist
 from packaging.version import Version
 
+from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
+from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
+from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
 from megatron.core.resharding.copy_services.nccl_m2n_copy_service import (
     NCCLM2NCopyService,
+    _adjacent_stack_view,
     _default_split_comm,
     _has_nccl_cuda_backend,
     _M2NChannel,
@@ -22,8 +27,14 @@ from megatron.core.resharding.copy_services.nccl_m2n_copy_service import (
     _validate_nccl_version,
     _validate_role_roster,
 )
+from megatron.core.resharding.planner import _build_tensor_reshard_specs, index_metadata_rosters
 from megatron.core.resharding.transforms import MXFP8ReshardTransform
-from megatron.core.resharding.utils import ReshardPlan, TensorReshardSpec
+from megatron.core.resharding.utils import (
+    ParameterMetadata,
+    ReshardPlan,
+    TensorReshardSpec,
+    assign_ep_resolved_name_inplace,
+)
 from tests.unit_tests.test_utilities import Utils
 
 
@@ -693,11 +704,9 @@ def test_nccl_m2n_quantizes_packed_parameters_to_mxfp8_one_at_a_time():
     assert status.item() == 1
 
 
-def _expert_meta(name, owner, ep_ranks, local_idx, num_experts, shape=(6, 4)):
-    from megatron.core.resharding.utils import ParameterMetadata, assign_ep_resolved_name_inplace
-
+def _expert_meta(prefix, owner, ep_ranks, local_idx, num_experts, shape=(6, 4)):
     meta = ParameterMetadata(
-        name=f"decoder.layers.0.mlp.experts.linear_fc1.weight{local_idx}",
+        name=f"{prefix}weight{local_idx}",
         shape=shape,
         dtype=torch.bfloat16,
         element_size=2,
@@ -712,26 +721,29 @@ def _expert_meta(name, owner, ep_ranks, local_idx, num_experts, shape=(6, 4)):
     return meta
 
 
-def _expert_rosters(src_ep=(0, 1), dst_ep=(2, 3, 4, 5), num_experts=8, shape=(6, 4)):
-    from megatron.core.resharding.planner import index_metadata_rosters
-
+def _expert_rosters(
+    src_ep=(0, 1),
+    dst_ep=(2, 3, 4, 5),
+    num_experts=8,
+    shape=(6, 4),
+    prefix="decoder.layers.0.mlp.experts.linear_fc1.",
+):
     world = max(src_ep + dst_ep) + 1
     pairs = [([], []) for _ in range(world)]
     for ep, side in ((src_ep, 0), (dst_ep, 1)):
         k = num_experts // len(ep)
         for owner in ep:
             pairs[owner][side].extend(
-                _expert_meta(None, owner, ep, i, num_experts, shape) for i in range(k)
+                _expert_meta(prefix, owner, ep, i, num_experts, shape) for i in range(k)
             )
     return index_metadata_rosters(pairs)
 
 
 @pytest.mark.parametrize("stack", ["1", "0"])
-def test_expert_family_becomes_one_ep_sharded_spec(monkeypatch, stack):
-    from megatron.core.resharding.planner import _build_tensor_reshard_specs
-
+@pytest.mark.parametrize("prefix", ["decoder.layers.0.mlp.experts.linear_fc1.", ""])
+def test_expert_family_becomes_one_ep_sharded_spec(monkeypatch, stack, prefix):
     monkeypatch.setenv("MEGATRON_NCCL_M2N_STACK_EXPERTS", stack)
-    dst_by_rank, src_by_name = _expert_rosters()
+    dst_by_rank, src_by_name = _expert_rosters(prefix=prefix)
     for rank in range(6):
         specs, error = _build_tensor_reshard_specs(dst_by_rank, src_by_name, rank)
         assert error is None
@@ -740,19 +752,17 @@ def test_expert_family_becomes_one_ep_sharded_spec(monkeypatch, stack):
             continue
         assert len(specs) == 1
         (spec,) = specs
-        assert spec.resolved_name == "decoder.layers.0.mlp.experts.linear_fc1.weight[experts]"
+        assert spec.resolved_name == f"{prefix}weight[experts]"
         assert (spec.src_ranks, spec.dst_ranks) == ((0, 1), (2, 3, 4, 5))
         assert spec.global_shape == (8, 6, 4)
         assert (spec.src_local_shape, spec.dst_local_shape) == ((4, 6, 4), (2, 6, 4))
         assert (spec.src_shard_dim, spec.dst_shard_dim) == (0, 0)
-        local = [f"decoder.layers.0.mlp.experts.linear_fc1.weight{i}" for i in range(4)]
+        local = [f"{prefix}weight{i}" for i in range(4)]
         assert spec.src_stack_names == (tuple(local) if rank < 2 else None)
         assert spec.dst_stack_names == (tuple(local[:2]) if rank >= 2 else None)
 
 
 def test_expert_stacking_falls_back_when_an_expert_is_missing(monkeypatch):
-    from megatron.core.resharding.planner import _build_tensor_reshard_specs
-
     monkeypatch.setenv("MEGATRON_NCCL_M2N_STACK_EXPERTS", "1")
     dst_by_rank, src_by_name = _expert_rosters()
     # Remove one source replica of expert 5: the family must keep per-expert specs.
@@ -762,11 +772,6 @@ def test_expert_stacking_falls_back_when_an_expert_is_missing(monkeypatch):
 
 
 def test_adjacent_stack_view_and_staging_scatter():
-    from megatron.core.resharding.copy_services.nccl_m2n_copy_service import (
-        NCCLM2NCopyService,
-        _adjacent_stack_view,
-    )
-
     base = torch.arange(24, dtype=torch.float32)
     adjacent = [base[0:6].view(2, 3), base[6:12].view(2, 3)]
     view = _adjacent_stack_view(adjacent)
@@ -808,7 +813,6 @@ def test_adjacent_stack_view_and_staging_scatter():
 
 def test_stacked_experts_feed_receiver_side_transform():
     """Transformed experts go through prepare_recv/finalize_recv; the rest are copied."""
-    from megatron.core.resharding.copy_services.nccl_m2n_copy_service import _adjacent_stack_view
 
     class _RecordingTransform:
         def __init__(self, names):
@@ -860,19 +864,17 @@ def test_stacked_experts_feed_receiver_side_transform():
     not _has_nccl_m2n_python_package(),
     reason="install NVIDIA/nccl-extensions and NCCL4Py to run the M2N integration test",
 )
+@pytest.mark.parametrize("source_count", [1, 2])
+@pytest.mark.usefixtures("nccl_m2n_host_proxy")
+@pytest.mark.launch_on_gb200
 def test_nccl_m2n_stacked_experts_match_per_expert_and_nccl_with_mxfp8(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, source_count: int
 ):
     """Planner-built expert stacks, per-expert M2N and NCCL send/recv agree bitwise.
 
     Half of the destination experts go through the receiver-side MXFP8 transform and
     half stay BF16, so the stacked path exercises both writebacks in one call.
     """
-    from megatron.core.inference.quantization.mxfp8_tensor import MXFP8Tensor
-    from megatron.core.inference.quantization.utils import resolve_mxfp8_backend
-    from megatron.core.resharding.copy_services.nccl_copy_service import NCCLCopyService
-    from megatron.core.resharding.planner import _build_tensor_reshard_specs
-
     Utils.initialize_distributed()
     if torch.cuda.get_device_properties(torch.cuda.current_device()).major < 10:
         pytest.skip("MXFP8 integration requires a Blackwell GPU")
@@ -882,12 +884,11 @@ def test_nccl_m2n_stacked_experts_match_per_expert_and_nccl_with_mxfp8(
 
     monkeypatch.setenv("NCCL_RESHARD_COPY_ALGORITHM", "PACK")
     rank = dist.get_rank()
-    mesh_size = world_size // 2
-    src_ep = tuple(range(mesh_size))
-    dst_ep = tuple(range(mesh_size, world_size))
+    src_ep = tuple(range(source_count))
+    dst_ep = tuple(range(source_count, world_size))
     is_source = rank in src_ep
-    experts_per_rank = 2
-    num_experts = mesh_size * experts_per_rank
+    num_experts = math.lcm(len(src_ep), len(dst_ep)) * 2
+    experts_per_rank = num_experts // len(src_ep if is_source else dst_ep)
     shape = (64, 128)
     dst_by_rank, src_by_name = _expert_rosters(src_ep, dst_ep, num_experts, shape)
     local_rank = (src_ep if is_source else dst_ep).index(rank)
@@ -939,15 +940,18 @@ def test_nccl_m2n_stacked_experts_match_per_expert_and_nccl_with_mxfp8(
     tensors, buffers, transform = destination_state() if not is_source else ({}, {}, None)
     service = NCCLCopyService()
     pending = []
-    for name in local_names:
-        if is_source:
-            service.submit_send(source[name], dst_ep[local_rank])
-        else:
+    for expert in range(num_experts):
+        source_owner = src_ep[expert // (num_experts // len(src_ep))]
+        destination_owner = dst_ep[expert // (num_experts // len(dst_ep))]
+        name = local_names[expert % experts_per_rank]
+        if rank == source_owner:
+            service.submit_send(source[name], destination_owner)
+        elif rank == destination_owner:
             full_slice = (slice(None), slice(None))
             target = (
                 transform.prepare_recv(name, full_slice)[0] if name in converted else tensors[name]
             )
-            service.submit_recv(target, src_ep[local_rank])
+            service.submit_recv(target, source_owner)
             pending.append((name, full_slice, target))
     service.run()
     torch.cuda.synchronize()
@@ -972,6 +976,89 @@ def test_nccl_m2n_stacked_experts_match_per_expert_and_nccl_with_mxfp8(
                     local_ok &= not tensors[name].any().item()
                 else:
                     local_ok &= torch.equal(tensors[name], expected_bf16)
+    status = torch.tensor(int(local_ok), dtype=torch.int32, device="cuda")
+    dist.all_reduce(status, op=dist.ReduceOp.MIN)
+    assert status.item() == 1
+
+
+@pytest.mark.skipif(
+    not _has_nccl_m2n_python_package(),
+    reason="install NVIDIA/nccl-extensions and NCCL4Py to run the M2N integration test",
+)
+@pytest.mark.parametrize("source_count", [1, 3])
+@pytest.mark.usefixtures("nccl_m2n_host_proxy")
+@pytest.mark.launch_on_gb200
+def test_nccl_m2n_refits_planner_built_strided_glu(
+    source_count: int, monkeypatch: pytest.MonkeyPatch
+):
+    """Packed GLU components survive TP expansion/contraction and a repeated refit."""
+    Utils.initialize_distributed()
+    world = dist.get_world_size()
+    if world < 4:
+        pytest.skip("requires at least four ranks")
+    monkeypatch.setenv("NCCL_RESHARD_COPY_ALGORITHM", "PACK")
+    source_ranks = tuple(range(source_count))
+    destination_ranks = tuple(range(source_count, world))
+    rank = dist.get_rank()
+    is_source = rank in source_ranks
+    component_rows = math.lcm(len(source_ranks), len(destination_ranks)) * 4
+    full = torch.arange(component_rows * 2 * 16, device="cuda", dtype=torch.float32).view(-1, 16)
+    src_metadata = []
+    dst_metadata = {}
+    for ranks, source_side in ((source_ranks, True), (destination_ranks, False)):
+        for owner in ranks:
+            metadata = ParameterMetadata(
+                name="linear_fc1.weight",
+                resolved_name="linear_fc1.weight",
+                shape=(2 * component_rows // len(ranks), 16),
+                dtype=torch.float32,
+                element_size=4,
+                is_tp=True,
+                partition_dim=0,
+                partition_stride=2,
+                owner_rank=owner,
+                tensor_parallel_group_ranks=list(ranks),
+                data_parallel_group_ranks=[owner],
+            )
+            if source_side:
+                src_metadata.append(metadata)
+            else:
+                dst_metadata[owner] = {metadata.resolved_name: metadata}
+    specs, error = _build_tensor_reshard_specs(
+        dst_metadata, {"linear_fc1.weight": src_metadata}, rank
+    )
+    assert error is None
+    assert len(specs) == 2
+    plan = ReshardPlan([], [], tensor_reshard_specs=specs)
+
+    def shard(value: torch.Tensor, ranks: tuple[int, ...]) -> torch.Tensor:
+        local_rank = ranks.index(rank)
+        rows = component_rows // len(ranks)
+        return torch.cat(
+            [
+                component[local_rank * rows : (local_rank + 1) * rows]
+                for component in value.chunk(2, dim=0)
+            ]
+        )
+
+    local = shard(full, source_ranks if is_source else destination_ranks)
+    source = {"linear_fc1.weight": local} if is_source else {}
+    destination = {} if is_source else {"linear_fc1.weight": torch.empty_like(local)}
+    service = NCCLM2NCopyService()
+    service.set_model_roles(is_source=is_source, is_destination=not is_source)
+    local_ok = True
+    try:
+        for offset in (0, 1000):
+            if is_source:
+                local.copy_(shard(full + offset, source_ranks))
+            assert service.execute_plan(plan, source, destination)
+            torch.cuda.synchronize()
+            if not is_source:
+                local_ok &= torch.equal(
+                    destination["linear_fc1.weight"], shard(full + offset, destination_ranks)
+                )
+    finally:
+        service.close()
     status = torch.tensor(int(local_ok), dtype=torch.int32, device="cuda")
     dist.all_reduce(status, op=dist.ReduceOp.MIN)
     assert status.item() == 1

@@ -687,6 +687,18 @@ KERNELS: Tuple[KernelEntry, ...] = (
         training_path=False,
         exempt_reason="Byte copy for refit; needs NVSHMEM and a multi-GPU RL environment.",
     ),
+    KernelEntry(
+        name="nccl_m2n_expert_refit",
+        sources=("megatron/core/resharding/copy_services/nccl_m2n_copy_service.py",),
+        tests=(
+            K + "test_refit_expert_staging.py",
+            "tests/unit_tests/resharding/test_nccl_m2n_copy_service.py",
+        ),
+        kind="external-lib",
+        training_path=False,
+        notes="Expert stack views, staging, and foreach writeback replay bit-exactly under "
+        "contention. Native M2N/MXFP8 parity runs in the dedicated GB200 integration bucket.",
+    ),
     # ---------------------------------------------------------------- external-library dispatch sites
     # Modules that choose between / call external GPU kernels. Covered by the replay tests of
     # the kernels they call (and by module-level tests where they exist); ``notes`` say which.
