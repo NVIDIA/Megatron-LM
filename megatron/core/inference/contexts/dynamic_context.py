@@ -456,22 +456,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 inference_config.block_size_tokens == 64
             ), "Flash MLA requires a block size of 64. Set --inference-dynamic-batching-block-size 64 to fix this assert"
 
-        # A pinned FlashAttention-2 must be able to read the paged KV cache of the layers that run
-        # it: a plain transformer's, or a hybrid's attention and MLA layers (DSA layers and other
-        # attention variants use their own kernels). Attention checks again where FA2 runs, which
-        # also covers automatic selection.
-        hybrid_layer_types = (
-            inference_config.mamba_inference_state_config.layer_type_list
-            if inference_config.mamba_inference_state_config is not None
-            else None
-        )
-        if hybrid_layer_types is not None:
-            runs_flash_attention = bool(
-                {Symbols.ATTENTION, Symbols.MLA}.intersection(hybrid_layer_types)
-            )
-        else:
-            runs_flash_attention = model_config.experimental_attention_variant is None
-        if model_config.flash_attention_version == 2 and runs_flash_attention:
+        # A pinned FlashAttention-2 must be able to read the paged KV cache. A plain transformer's
+        # attention runs this config's pin (attention variants use their own kernels), so its cache
+        # is checked here. A hybrid's layers run their own configs' pins, which a
+        # hybrid_layer_config_list sets apart from this root config, so Attention checks each layer
+        # where FA2 runs, as it does for automatic selection.
+        if (
+            model_config.flash_attention_version == 2
+            and model_config.experimental_attention_variant is None
+            and not model_config.is_hybrid_model
+            and inference_config.mamba_inference_state_config is None
+        ):
             from megatron.core.transformer.attention import check_flash_attn_2_paged_kv
 
             if self.cache_mla_latent:

@@ -1045,3 +1045,28 @@ class TestFlashAttentionDeviceSelection:
         ):
             self._run(attn, is_decode_only)
         fa2.assert_called_once()
+
+    @pytest.mark.parametrize("is_decode_only", [False, True], ids=["prefill", "decode"])
+    @pytest.mark.parametrize("flash_attention_version", [2, 4], ids=["fa2", "fa4"])
+    def test_layer_pin_decides_paged_kv_check(self, flash_attention_version, is_decode_only):
+        """Each layer runs the FlashAttention its own config pins, so 64-token blocks fail before
+        FA2 runs for a layer pinned to FA2 and run on FA4 for one pinned to FA4. A hybrid's layer
+        configs can pin apart from its root config, so this is where its pins are checked."""
+        attn = self._attention(flash_attention_version=flash_attention_version)
+        fa4 = mock.Mock(return_value=(torch.zeros(2, 4, 8), torch.zeros(4, 2)))
+        fa2_prefill, fa2_decode = mock.Mock(), mock.Mock()
+        with (
+            self._on_device((9, 0)),
+            mock.patch("megatron.core.transformer.attention.HAVE_FA4", True),
+            mock.patch("megatron.core.transformer.attention.flash_attn4_varlen_func", fa4),
+            mock.patch("megatron.core.transformer.attention.flash_attn_varlen_func", fa2_prefill),
+            mock.patch("megatron.core.transformer.attention.flash_attn_with_kvcache", fa2_decode),
+        ):
+            if flash_attention_version == 2:
+                with pytest.raises(ValueError, match="blocks hold 64 tokens"):
+                    self._run(attn, is_decode_only, block_size=64)
+            else:
+                self._run(attn, is_decode_only, block_size=64)
+        fa2_prefill.assert_not_called()
+        fa2_decode.assert_not_called()
+        assert fa4.call_count == (1 if flash_attention_version == 4 else 0)

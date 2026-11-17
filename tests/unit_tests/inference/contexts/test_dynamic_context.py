@@ -357,7 +357,11 @@ class TestDynamicContext:
 
     @staticmethod
     def _flash_attention_context(
-        mla, flash_attention_version, block_size_tokens, hybrid_layer_types=None
+        mla,
+        flash_attention_version,
+        block_size_tokens,
+        hybrid_layer_types=None,
+        is_hybrid_model=False,
     ):
         common = dict(
             num_layers=2,
@@ -365,6 +369,7 @@ class TestDynamicContext:
             num_attention_heads=8,
             params_dtype=torch.bfloat16,
             flash_attention_version=flash_attention_version,
+            is_hybrid_model=is_hybrid_model,
         )
         if mla:
             # Unabsorbed MLA prefill attends with 96-wide query/key and 64-wide value heads.
@@ -414,23 +419,25 @@ class TestDynamicContext:
             self._flash_attention_context(mla, 2, block_size_tokens)
 
     @pytest.mark.parametrize(
-        "hybrid_layer_types, runs_flash_attention",
+        "hybrid_layer_types, is_hybrid_model",
         [
-            pytest.param([Symbols.MAMBA, Symbols.ATTENTION], True, id="attention"),
-            pytest.param([Symbols.MAMBA, Symbols.DS_ATTENTION], False, id="dsa-only"),
+            pytest.param([Symbols.MAMBA, Symbols.ATTENTION], False, id="mamba-attention"),
+            pytest.param([Symbols.MAMBA, Symbols.DS_ATTENTION], False, id="mamba-dsa"),
+            # A config-list HybridModel marks its root config hybrid, recurrent layers or not.
+            pytest.param(None, True, id="attention-only"),
         ],
     )
-    def test_pinned_flash_attention_2_checks_only_layers_that_run_it(
-        self, hybrid_layer_types, runs_flash_attention
+    def test_pinned_flash_attention_2_leaves_hybrid_layers_to_attention(
+        self, hybrid_layer_types, is_hybrid_model
     ):
-        """A hybrid's DSA layers read the paged KV cache with their own kernels, so a pinned FA2
-        limits the cache only when the hybrid has attention layers that run FlashAttention."""
-        if runs_flash_attention:
-            with pytest.raises(ValueError, match="blocks hold 64 tokens"):
-                self._flash_attention_context(False, 2, 64, hybrid_layer_types)
-        else:
-            context = self._flash_attention_context(False, 2, 64, hybrid_layer_types)
-            assert context.block_size_tokens == 64
+        """A hybrid's layers run their own configs' FlashAttention pins, which a
+        hybrid_layer_config_list sets apart from the root config: FA4 attention layers can sit
+        under a root pinned to FA2. The root's pin does not limit a hybrid's cache; Attention
+        checks each layer's pin where FA2 runs."""
+        context = self._flash_attention_context(
+            False, 2, 64, hybrid_layer_types, is_hybrid_model=is_hybrid_model
+        )
+        assert context.block_size_tokens == 64
 
     @pytest.mark.parametrize(
         "mla, flash_attention_version, block_size_tokens",
