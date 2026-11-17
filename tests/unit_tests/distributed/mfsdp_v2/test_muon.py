@@ -95,8 +95,8 @@ def test_muon_matches_reference(
 ):
     """FSDP, HSDP, HFSDP, and unsharded Muon should produce identical loss curves.
 
-    Each linear layer is its own FSDP group, so several groups' communication is in flight at once;
-    with 8, all four Muon groups are.
+    Each linear layer is its own FSDP group. Two streams exercise round-robin reuse across
+    the four Muon groups; eight caps the pool at four streams, one per group.
     """
     world_size = distributed_setup.world_size
     if dp_mode == "fsdp":

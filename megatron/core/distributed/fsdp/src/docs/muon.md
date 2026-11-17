@@ -98,15 +98,22 @@ moves only remote fragments. In the example, `P0`, `P3`, and `P4` require
 no optimizer-step network traffic. Persistent ownership stays unchanged;
 full inputs and updates exist temporarily on compute owners.
 
-Gathers and scatters order their calling stream after their transfers. Muon runs
-them on a separate communication stream and records completion events, so
-communication overlaps Newton–Schulz on the caller's stream. Before a group is
-orthogonalized, the gathers of the next `num_groups_in_flight` groups are posted,
-and a group's updates are applied once
-`num_groups_in_flight` later groups have been scattered, so each scatter overlaps
-their Newton–Schulz. Each group in flight holds its momentum inputs, full tensors,
-and received updates, so `num_groups_in_flight` trades memory for overlap; zero
-gives the non-overlapped order.
+Gathers and scatters order their calling stream after their transfers. This trial
+assigns each FSDP group to a stream in a round-robin pool. Momentum, gather,
+Newton–Schulz, scatter, and the local weight update run in sequence on that stream.
+Completion events order each gather, Newton–Schulz, and scatter after the same
+stage of the previous active group. All streams wait for the caller's inputs,
+and the caller waits for every stream before continuing.
+
+In this trial, `num_groups_in_flight` controls the pool's stream count rather than
+gather lookahead; zero runs serially on the caller's stream. This simplifies the
+host schedule but changes P2P posting order to gather/scatter for each group.
+Batched P2P shares an internal NCCL stream, so a scatter waiting for Newton–Schulz
+can hold up the next group's gather. The extra group streams therefore do not
+guarantee communication/compute overlap. Pending NCCL work can also delay allocator
+reuse, so stream count alone does not guarantee a bound on temporary memory.
+Two-GPU FSDP matches the unsharded reference. HSDP/HFSDP correctness, overlap, and
+peak memory still need validation.
 
 A simpler alternative in [issue #5533](https://github.com/NVIDIA/Megatron-LM/issues/5533)
 all-gathers boundary-matrix inputs and duplicates orthogonalization. The
