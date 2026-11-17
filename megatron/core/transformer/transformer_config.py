@@ -4305,30 +4305,32 @@ class TransformerConfig(ModelParallelConfig):
                         "MOK does not support per-layer CUDA Graph scopes containing "
                         "moe_preprocess"
                     )
-                # The router can run in the layer's graph: with the moe_router scope the graph
-                # returns its outputs and the megakernel runs eagerly after it, as the native
-                # dispatcher does. With the moe scope, or with empty modules (whole-layer capture
-                # here, not full_iteration), the graph covers the router and the megakernel, and
-                # its output is the layer output: MOK has static shapes and no host
-                # synchronization after warm-up. Only the TE implementation refreshes MOK's weight
-                # views eagerly before each replay (TransformerLayer._before_te_cuda_graph_replay).
-                megakernel_in_graph = (
-                    not self.cuda_graph_modules or CudaGraphModule.moe in self.cuda_graph_modules
-                )
+                if CudaGraphModule.moe_router in self.cuda_graph_modules:
+                    # That graph would end between the router and the megakernel. The graph of a
+                    # MOK layer contains both or neither.
+                    raise ValueError(
+                        "MOK does not support the moe_router CUDA Graph scope; capture the MoE "
+                        "layer with the moe scope or whole-layer capture (empty "
+                        "cuda_graph_modules) and cuda_graph_impl='transformer_engine', or leave "
+                        "the MoE layer out of the CUDA Graph"
+                    )
+                # With the moe scope, or with empty modules (whole-layer capture here, not
+                # full_iteration), the graph covers the router and the megakernel, and its output
+                # is the layer output: MOK has static shapes and no host synchronization after
+                # warm-up. Only the TE implementation refreshes MOK's weight views eagerly before
+                # each replay (TransformerLayer._before_te_cuda_graph_replay).
                 if not self.cuda_graph_modules:
                     graph_scope = "whole-layer CUDA Graph capture (empty cuda_graph_modules)"
                 elif CudaGraphModule.moe in self.cuda_graph_modules:
                     graph_scope = "the moe CUDA Graph scope"
-                elif CudaGraphModule.moe_router in self.cuda_graph_modules:
-                    graph_scope = "the moe_router CUDA Graph scope"
                 else:
                     graph_scope = None
-                if graph_scope is not None and self.cuda_graph_impl != "transformer_engine":
-                    raise ValueError(
-                        f"MOK supports {graph_scope} only with "
-                        "cuda_graph_impl='transformer_engine'"
-                    )
-                if megakernel_in_graph:
+                if graph_scope is not None:
+                    if self.cuda_graph_impl != "transformer_engine":
+                        raise ValueError(
+                            f"MOK supports {graph_scope} only with "
+                            "cuda_graph_impl='transformer_engine'"
+                        )
                     if self.pipeline_model_parallel_size > 1:
                         # Validated only without pipeline parallelism, where each microbatch's
                         # backward runs before the next microbatch replays the layer's graph.

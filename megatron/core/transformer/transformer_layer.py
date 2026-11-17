@@ -1927,18 +1927,40 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         self._cuda_graph_padding_mask_shape = None
         if self._moe_router_in_cuda_graph():
             mask_shape = self._padding_mask_shape_seen
+            # TE runs the graphed callable eagerly on these static inputs (warmup) before it
+            # captures it. The all-ones hidden states give every token the same router logits, so
+            # every token of every EP rank picks the same top-k experts. A megakernel inside the
+            # graph sizes its per-expert schedule for real routing (MOK's
+            # schedule_capacity_multiplier) and can trap on that skew, so its static mask marks
+            # every token as padding and the warmup routes none. Replay copies the real mask into
+            # this buffer. Native MoE layers keep the all-False mask.
+            megakernel_in_graph = self._cuda_graph_megakernel() is not None
+            if (
+                megakernel_in_graph
+                and mask_shape is None
+                and not self.config.moe_router_force_load_balancing
+            ):
+                # Without a mask input, nothing keeps the warmup's routes off that skew, except
+                # forced load balancing, a benchmark-only mode that replaces the router logits with
+                # random ones. TECudaGraphHelper builds the static inputs of every layer before it
+                # calls TE's make_graphed_callables, so this raises before any warmup forward.
+                raise RuntimeError(
+                    "This layer's TE CUDA graph contains the MoE megakernel, but no padding_mask "
+                    "reached the layer during the eager cuda_graph_warmup_steps. Without a "
+                    "padding_mask graph input, TE's capture warmup would route every token of its "
+                    "all-ones static input to the same experts, which can exceed the megakernel's "
+                    "static schedule capacity (MOK traps on the device). Pass a padding_mask model "
+                    "input (an all-False mask is enough) in at least one eager warmup step "
+                    "(cuda_graph_warmup_steps > 0), or leave the MoE layer out of the CUDA graph "
+                    "(for example cuda_graph_modules=['attn']). Benchmarks that set "
+                    "moe_router_force_load_balancing, which replaces the router logits with "
+                    "random ones, are exempt."
+                )
             if mask_shape is not None:
                 self._cuda_graph_padding_mask_shape = tuple(mask_shape)
-                # TE runs the graphed callable eagerly on these static inputs (warmup) before it
-                # captures it. The all-ones hidden states give every token the same router logits,
-                # so every token of every EP rank picks the same top-k experts. A megakernel inside
-                # the graph sizes its per-expert schedule for real routing (MOK's
-                # schedule_capacity_multiplier) and can trap on that skew, so its static mask marks
-                # every token as padding and the warmup routes none. Replay copies the real mask
-                # into this buffer. Native MoE layers keep the all-False mask.
                 static_inputs["padding_mask"] = torch.full(
                     mask_shape,
-                    self._cuda_graph_megakernel() is not None,
+                    megakernel_in_graph,
                     dtype=torch.bool,
                     device=torch.cuda.current_device(),
                 )
@@ -1956,8 +1978,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         """Return the MoE megakernel backend that this layer's TE CUDA graph runs, else None.
 
         The graph contains the megakernel when its scope covers the whole MoE (``moe``, or every
-        module when ``cuda_graph_modules`` is empty). With ``moe_router`` the graph ends after the
-        router and the megakernel runs eagerly after the replay.
+        module when ``cuda_graph_modules`` is empty). Otherwise the whole MoE layer runs eagerly:
+        TransformerConfig rejects the ``moe_router`` and ``moe_preprocess`` scopes for MOK, whose
+        graphs would end between the router and the megakernel.
         """
         if not self.is_moe_layer or (
             self.config.cuda_graph_modules
@@ -2032,11 +2055,9 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             submodules += [self.pre_mlp_layernorm, self.mlp]
         elif self.is_moe_layer and CudaGraphModule.moe_router in self.config.cuda_graph_modules:
             submodules += [self.pre_mlp_layernorm, self.mlp.router]
-            # A megakernel backend computes the shared expert itself, outside the graph.
             if (
                 self.config.moe_shared_expert_intermediate_size is not None
                 and not self.config.moe_shared_expert_overlap
-                and self.config.moe_megakernel_backend is None
             ):
                 submodules += [self.mlp.shared_experts]
         return submodules
@@ -2217,10 +2238,8 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             if (
                 self.config.moe_shared_expert_intermediate_size is not None
                 and not self.config.moe_shared_expert_overlap
-                and self.config.moe_megakernel_backend is None
             ):
                 # The shared expert output is the last second element in the CUDA graph output.
-                # A megakernel backend computes the shared expert itself, so its graph has none.
                 shared_expert_output = cuda_graph_output.pop()
 
             if CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules:

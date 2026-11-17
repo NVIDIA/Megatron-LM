@@ -142,16 +142,22 @@ def test_mok_rejects_key_incompatible_configurations(overrides, error):
 
 @pytest.mark.parametrize("cuda_graph_impl", ["local", "transformer_engine"])
 @pytest.mark.parametrize(
-    "cuda_graph_modules",
+    "cuda_graph_modules, error",
     [
-        [CudaGraphModule.moe_preprocess],
-        [CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess],
+        ([CudaGraphModule.moe_preprocess], "moe_preprocess"),
+        ([CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess], "moe_preprocess"),
+        # The graph would end between the router and the megakernel.
+        (
+            [CudaGraphModule.attn, CudaGraphModule.moe_router],
+            "does not support the moe_router CUDA Graph scope",
+        ),
     ],
+    ids=["moe_preprocess", "moe_router_moe_preprocess", "attn_moe_router"],
 )
-def test_mok_rejects_per_layer_cuda_graph_covering_moe_preprocess(
-    cuda_graph_impl, cuda_graph_modules
+def test_mok_rejects_per_layer_cuda_graph_ending_inside_moe(
+    cuda_graph_impl, cuda_graph_modules, error
 ):
-    with pytest.raises(ValueError, match="moe_preprocess"):
+    with pytest.raises(ValueError, match=error):
         _mok_transformer_config(
             cuda_graph_impl=cuda_graph_impl, cuda_graph_modules=cuda_graph_modules
         )
@@ -213,18 +219,6 @@ def test_mok_rejects_moe_cuda_graph_with_pipeline_parallelism(cuda_graph_modules
         )
 
 
-def test_mok_accepts_moe_router_cuda_graph_with_pipeline_parallelism():
-    # MOK runs eagerly after the router graph, so each call keeps its own saved state.
-    config = _mok_transformer_config(
-        cuda_graph_impl="transformer_engine",
-        cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe_router],
-        pipeline_model_parallel_size=2,
-        pipeline_dtype=torch.bfloat16,
-    )
-
-    assert config.pipeline_model_parallel_size == 2
-
-
 @_MEGAKERNEL_GRAPH_MODULES
 def test_mok_moe_cuda_graph_requires_te_that_does_not_clone_param_grads(
     monkeypatch, cuda_graph_modules
@@ -247,22 +241,6 @@ def test_native_moe_cuda_graph_still_requires_drop_padding():
             moe_megakernel_backend=None,
             cuda_graph_impl="transformer_engine",
             cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe],
-        )
-
-
-def test_mok_accepts_transformer_engine_moe_router_cuda_graph():
-    cuda_graph_modules = [CudaGraphModule.attn, CudaGraphModule.moe_router]
-    config = _mok_transformer_config(
-        cuda_graph_impl="transformer_engine", cuda_graph_modules=cuda_graph_modules
-    )
-
-    assert config.cuda_graph_modules == cuda_graph_modules
-
-
-def test_mok_rejects_local_moe_router_cuda_graph():
-    with pytest.raises(ValueError, match="only with cuda_graph_impl='transformer_engine'"):
-        _mok_transformer_config(
-            cuda_graph_impl="local", cuda_graph_modules=[CudaGraphModule.moe_router]
         )
 
 

@@ -535,8 +535,8 @@ _MEGAKERNEL_GRAPH_SCOPES = pytest.mark.parametrize(
         (True, True, [CudaGraphModule.moe], True),
         # An empty scope graphs the whole layer.
         (True, True, [], True),
-        # The megakernel runs eagerly after a router-only graph and refreshes itself.
-        (True, True, [CudaGraphModule.attn, CudaGraphModule.moe_router], False),
+        # Outside the graph, the megakernel runs eagerly and refreshes itself.
+        (True, True, [CudaGraphModule.attn], False),
         (True, False, [CudaGraphModule.attn, CudaGraphModule.moe], False),
         (False, False, [CudaGraphModule.attn, CudaGraphModule.mlp], False),
     ],
@@ -1117,10 +1117,7 @@ def _mock_backend(monkeypatch, *, single_grouped=False, gated=True, mxfp8=False,
         ({"cuda_graph_impl": "none", "cuda_graph_modules": []}, False),
         ({"cuda_graph_impl": "full_iteration", "cuda_graph_modules": []}, False),
         (
-            {
-                "cuda_graph_impl": "transformer_engine",
-                "cuda_graph_modules": [CudaGraphModule.attn, CudaGraphModule.moe_router],
-            },
+            {"cuda_graph_impl": "transformer_engine", "cuda_graph_modules": [CudaGraphModule.attn]},
             False,
         ),
         (

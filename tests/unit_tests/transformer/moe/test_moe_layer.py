@@ -230,7 +230,7 @@ class TestMoELayerInit:
         not is_te_min_version("1.7.0.dev0"),
         reason="Expert with TE Linear is only supported in TE 1.7.0 and later.",
     )
-    @pytest.mark.parametrize("path", ["eager", "recompute", "moe_router_graph_replay"])
+    @pytest.mark.parametrize("path", ["eager", "recompute"])
     def test_megakernel_receives_no_padding_routes(self, monkeypatch, path):
         Utils.initialize_model_parallel(1, 1)
         model_parallel_cuda_manual_seed(123)
@@ -238,10 +238,6 @@ class TestMoELayerInit:
             config_overrides = {
                 "eager": {},
                 "recompute": {"recompute_granularity": "selective", "recompute_modules": ["moe"]},
-                "moe_router_graph_replay": {
-                    "cuda_graph_impl": "transformer_engine",
-                    "cuda_graph_modules": [CudaGraphModule.attn, CudaGraphModule.moe_router],
-                },
             }[path]
             backend = _RecordingMegakernel()
             layer = _megakernel_moe_layer(monkeypatch, backend, **config_overrides)
@@ -252,23 +248,13 @@ class TestMoELayerInit:
             routing_map = torch.tensor([[True, False], [False, True]] * 3)
             router_forward = Mock(return_value=(probs, routing_map))
             monkeypatch.setattr(layer.router, "forward", router_forward)
-            if path == "moe_router_graph_replay":
-                # Replay hands the layer the router outputs captured in its graph, unmasked.
-                layer.cudagraph_tensor_store.set(
-                    hidden_states=hidden, probs=probs, routing_map=routing_map
-                )
 
             output, bias = layer(hidden, padding_mask=padding_mask)
             output.sum().backward()
-            layer.cudagraph_tensor_store.clear()
 
             assert bias is None
-            # Recompute reruns the router and the megakernel in backward; replay skips the router.
-            router_calls, backend_calls = {
-                "eager": (1, 1),
-                "recompute": (2, 2),
-                "moe_router_graph_replay": (0, 1),
-            }[path]
+            # Recompute reruns the router and the megakernel in backward.
+            router_calls, backend_calls = {"eager": (1, 1), "recompute": (2, 2)}[path]
             assert router_forward.call_count == router_calls
             assert len(backend.routes) == backend_calls
             # Tokens flatten sequence-first, so the padded tokens are rows 3, 4 and 5.
@@ -276,39 +262,6 @@ class TestMoELayerInit:
             for backend_probs, backend_routing_map in backend.routes:
                 torch.testing.assert_close(backend_probs, probs * valid)
                 torch.testing.assert_close(backend_routing_map, routing_map & valid)
-        finally:
-            Utils.destroy_model_parallel()
-
-    @pytest.mark.skipif(
-        not is_te_min_version("1.7.0.dev0"),
-        reason="Expert with TE Linear is only supported in TE 1.7.0 and later.",
-    )
-    def test_megakernel_moe_router_graph_capture_outputs_unmasked_routes(self, monkeypatch):
-        Utils.initialize_model_parallel(1, 1)
-        try:
-            backend = _RecordingMegakernel()
-            layer = _megakernel_moe_layer(
-                monkeypatch,
-                backend,
-                cuda_graph_impl="transformer_engine",
-                cuda_graph_modules=[CudaGraphModule.attn, CudaGraphModule.moe_router],
-            )
-            hidden = torch.zeros((3, 2, 128), dtype=torch.bfloat16)
-            padding_mask = torch.tensor([[False, False, True], [False, True, True]])
-            probs = torch.rand((6, 2))
-            routing_map = torch.tensor([[True, False], [False, True]] * 3)
-            monkeypatch.setattr(layer.router, "forward", Mock(return_value=(probs, routing_map)))
-
-            _set_capture_start()
-            try:
-                graph_outputs = layer(hidden, padding_mask=padding_mask)
-            finally:
-                _set_capture_end()
-
-            # The graph ends after the router, so the mask is applied at replay, not captured.
-            assert graph_outputs[0] is hidden
-            assert graph_outputs[1] is probs and graph_outputs[2] is routing_map
-            assert backend.routes == []
         finally:
             Utils.destroy_model_parallel()
 
@@ -416,6 +369,70 @@ class TestMoELayerInit:
         not is_te_min_version("2.19.0"),
         reason="The megakernel moe CUDA graph scope requires TE 2.19 and later.",
     )
+    @_MEGAKERNEL_GRAPH_MODULES
+    @pytest.mark.parametrize(
+        "warmup_padding_mask, force_load_balancing",
+        [(False, False), (True, False), (False, True)],
+        ids=["no_mask", "all_false_mask", "forced_load_balancing"],
+    )
+    def test_graphed_megakernel_capture_requires_a_warmup_padding_mask(
+        self, monkeypatch, cuda_graph_modules, warmup_padding_mask, force_load_balancing
+    ):
+        """Without a padding_mask in the eager warmup steps, the graph gets no mask input, and TE's
+        warmup of the capture would route every token of the all-ones static input to the same
+        expert, beyond a megakernel's static capacity (MOK traps). The static inputs, built before
+        that warmup, raise instead, unless forced load balancing spreads the routes."""
+        Utils.initialize_model_parallel(1, 1)
+        torch.manual_seed(123)
+        model_parallel_cuda_manual_seed(123)
+        try:
+            seq_length, micro_batch_size, num_experts = 8, 2, 4
+            # Three times the balanced top-1 load: real routing fits, a single-expert batch not.
+            backend = _CapacityCheckingMegakernel(
+                capacity=3 * seq_length * micro_batch_size // num_experts
+            )
+            layer = _moe_transformer_layer(
+                monkeypatch,
+                backend,
+                num_experts,
+                cuda_graph_impl="transformer_engine",
+                cuda_graph_modules=cuda_graph_modules,
+                moe_router_force_load_balancing=force_load_balancing,
+            )
+            hidden = torch.randn((seq_length, micro_batch_size, 128), dtype=torch.bfloat16).cuda()
+            padding_mask = None
+            if warmup_padding_mask:
+                padding_mask = torch.zeros((micro_batch_size, seq_length), dtype=torch.bool).cuda()
+
+            # Eager cuda_graph_warmup_steps, with or without a mask.
+            layer(hidden, padding_mask=padding_mask)
+
+            if not warmup_padding_mask and not force_load_balancing:
+                with pytest.raises(RuntimeError, match="no padding_mask reached the layer"):
+                    layer.get_layer_static_inputs(seq_length, micro_batch_size)
+            else:
+                static_inputs = layer.get_layer_static_inputs(seq_length, micro_batch_size)
+                # An all-False mask is enough: the static mask marks every token as padding.
+                if warmup_padding_mask:
+                    assert bool(static_inputs["padding_mask"].all())
+                else:
+                    assert "padding_mask" not in static_inputs
+                # TE's warmup of the capture stays within the backend's capacity.
+                _set_capture_start()
+                try:
+                    layer(static_inputs.pop("hidden_states"), **static_inputs)
+                finally:
+                    _set_capture_end()
+                if force_load_balancing:
+                    # Random router logits spread the identical tokens over the experts.
+                    assert int(backend.routing_maps[-1].any(dim=0).sum()) > 1
+        finally:
+            Utils.destroy_model_parallel()
+
+    @pytest.mark.skipif(
+        not is_te_min_version("2.19.0"),
+        reason="The megakernel moe CUDA graph scope requires TE 2.19 and later.",
+    )
     @pytest.mark.parametrize(
         "megakernel, cuda_graph_modules, config_overrides, all_padding",
         [
@@ -423,8 +440,6 @@ class TestMoELayerInit:
             (True, [CudaGraphModule.moe], {}, True),
             # Whole-layer capture graphs the megakernel as well.
             (True, [], {}, True),
-            # A router-only graph ends before the megakernel, which runs eagerly on the real mask.
-            (True, [CudaGraphModule.attn, CudaGraphModule.moe_router], {}, False),
             # Native MoE layers keep the all-False static mask.
             (False, [CudaGraphModule.attn, CudaGraphModule.moe_router], {}, False),
             (

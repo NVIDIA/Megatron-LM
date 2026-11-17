@@ -836,8 +836,7 @@ class MoELayer(BaseMoELayer):
                     replay_topk_idx=replay_topk_idx,
                 )
                 # Like dropless HybridEP, the megakernel gives padding tokens no routes and skips
-                # them. It masks after route(), so this also covers the unmasked router outputs
-                # that a moe_router CUDA graph replay returns.
+                # them.
                 return apply_module(self.megakernel_experts)(
                     hidden_states, probs, routing_map, padding_mask
                 )
@@ -847,22 +846,7 @@ class MoELayer(BaseMoELayer):
                     megakernel_forward, self.config, self.tp_group, hidden_states, padding_mask
                 )
             else:
-                try:
-                    output = megakernel_forward(hidden_states, padding_mask)
-                except MoECudaGraphPartialCaptureSignal as e:
-                    # Capturing cuda_graph_modules=[..., "moe_router"]: the layer's CUDA graph
-                    # ends after the router and returns its outputs, and the megakernel runs
-                    # eagerly after each replay, not in TE's capture warm-up. MOK has static
-                    # shapes and no host synchronization after warm-up, so the moe scope and
-                    # whole-layer capture put it in the graph as well. TransformerConfig rejects
-                    # those two for MOK with pipeline parallelism and with Transformer Engine
-                    # older than 2.19. Unless moe_router_force_load_balancing is set, they also
-                    # need a padding_mask input during the eager cuda_graph_warmup_steps, or the
-                    # capture warm-up can exceed MOK's schedule capacity (see
-                    # TransformerLayer.get_layer_static_inputs). This router-only graph keeps the
-                    # router captured without these requirements. The shared expert runs inside
-                    # the megakernel, so it adds no graph output.
-                    return e.get_early_return_outputs(hidden_states, None)
+                output = megakernel_forward(hidden_states, padding_mask)
             return output, None
 
         # MoE forward: route -> dispatch -> compute -> combine

@@ -653,7 +653,7 @@ target is unsupported.
 | Parallelism | TP=1, expert TP=1, EP in {1, 4, 8, 16, 32, 64}; each EP group must fit within one NVLink domain supporting PyTorch symmetric memory and multicast |
 | Shapes | Hidden and expert intermediate sizes divisible by 256; at least 512 local tokens per rank, divisible by 256; identical token, hidden, and top-k shapes across EP ranks |
 | Recomputation | Whole-MoE activation recompute |
-| CUDA Graph | Full-iteration capture; per-layer Transformer Engine capture with the `moe_router` scope, or with the `moe` scope or whole-layer capture (empty `cuda_graph_modules`), which also capture the megakernel (Transformer Engine 2.19 or later and `pipeline_model_parallel_size=1`; not with `moe` in `recompute_modules`). Unless `moe_router_force_load_balancing` is set, a graph that captures the megakernel needs a `padding_mask` model input during the eager `cuda_graph_warmup_steps`: without one, the capture warm-up routes every token to the same experts and can exceed MOK's schedule capacity (a device-side trap) |
+| CUDA Graph | Full-iteration capture; per-layer Transformer Engine capture with the `moe` scope or whole-layer capture (empty `cuda_graph_modules`), whose graph contains the router and the megakernel (Transformer Engine 2.19 or later and `pipeline_model_parallel_size=1`; not with `moe` in `recompute_modules`). The capture requires a `padding_mask` model input in at least one eager warm-up step (`cuda_graph_warmup_steps` > 0; an all-False mask is enough) and raises an error without one, because the capture warm-up would route every token to the same experts and can exceed MOK's schedule capacity (a device-side trap). Runs whose batches carry no `padding_mask` must keep the MoE layer out of the graph (for example `cuda_graph_modules=[attn]`). Only `moe_router_force_load_balancing` (benchmark-only random routing) is exempt |
 | Checkpointing | Save/resume with unchanged backend, weight layout, and parallel configuration |
 
 Wgrad GEMMs accumulate in FP32. The destination `main_grad` dtype selects the reduction-store
@@ -677,16 +677,21 @@ rest of the layer. The layer refreshes MOK's weight views eagerly before each re
 scope was validated only without pipeline parallelism, where each microbatch's backward runs before
 the next microbatch replays the layer's graph, so both require `pipeline_model_parallel_size=1`.
 Pipeline schedules keep several microbatches in flight, and per-layer MOK replay has not been
-validated there. With the `moe_router` scope, the graph ends after the router and MOK runs eagerly
-after each replay, not in the capture warm-up. That scope is therefore also accepted with pipeline
-parallelism and with Transformer Engine older than 2.19, and its warm-up cannot exceed MOK's
-schedule capacity, with or without a `padding_mask` input.
+validated there. Transformer Engine's capture warm-up runs the layer on static inputs whose
+all-ones hidden states route every token to the same experts. The layer's static `padding_mask`
+input marks every token as padding, so the warm-up routes none, and each replay copies the batch's
+mask into it. The layer reserves that input only if a `padding_mask` reached it during the eager
+warm-up steps (`cuda_graph_warmup_steps` > 0). Otherwise the capture raises an error before the
+warm-up, unless `moe_router_force_load_balancing` (benchmark-only random routing) is set, so a run
+whose batches carry no `padding_mask` must keep the MoE layer out of the graph, for example with
+`cuda_graph_modules=[attn]`. Graphs that end between the router and MOK are not supported: capture
+the whole MoE layer, or leave it out of the graph.
 
 The current backend requires grouped experts and fused gradient accumulation. It does not support
 linear biases, applying router probabilities to expert inputs, MCore EP 1F1B overlap or delayed
 wgrad, native shared-expert overlap, shared-expert-only
 recompute, latent MoE, GTP weight rematerialization, shortcut MoE, inference-optimized layers,
-the `moe_preprocess` CUDA Graph scope, MCore expert-input
+the `moe_router` and `moe_preprocess` CUDA Graph scopes, MCore expert-input
 capacity padding, FC1 GLU-interleaved weights, or checkpoint conversion between physical weight
 layouts.
 
