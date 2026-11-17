@@ -357,7 +357,7 @@ class LocalSymmetricPeers:
     signals; call it before every launch.
     """
 
-    def __init__(self, world_size: int, numel: int, dtype: torch.dtype, rank: int = 0):
+    def __init__(self, world_size: int, numel: int, dtype: torch.dtype, rank: int = 0) -> None:
         from megatron.core.inference.communication.torch_symm_triton.kernel_config import (
             SYMM_MEM_KERNEL_CONFIG,
         )

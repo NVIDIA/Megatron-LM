@@ -219,10 +219,14 @@ class _PendingReduction:
     """Work-like handle of a rank-ordered reduction whose all-to-all is in flight.
 
     wait() makes the current stream wait for the all-to-all (no host sync) and then launches
-    the rest of the reduction, so the result is ready, in stream order, when it returns.
+    the rest of the reduction, so the result is ready, in stream order, when it returns. For an
+    all-reduce that rest includes the all-gather, so, unlike NCCL's own work, the handles of a
+    group must be waited in the same order on every rank. Every caller (Megatron's and TE's
+    linear backward) waits its one handle later in the same backward, after the
+    weight-gradient GEMM that overlaps the all-to-all.
     """
 
-    def __init__(self, work: dist.Work, finish, keep_alive):
+    def __init__(self, work: dist.Work, finish, keep_alive) -> None:
         self._work = work
         self._finish = finish
         # Inputs the all-to-all still reads.
