@@ -332,8 +332,10 @@ run_large_tests() {
     # unit-tests.yaml, which never runs large tests.
     mapfile -t files < <(grep -rlE --include='test_*.py' 'mark\.large\b' "$target" | LC_ALL=C sort)
     if (( ${#files[@]} == 0 )); then
-        echo "No test file under $target is marked large." >&2
-        return 1
+        # Nothing in this bucket needs the large lane; a marked file whose cases
+        # all fail to collect still fails below.
+        echo "No test file under $target is marked large; nothing to run."
+        return 0
     fi
     rc=0
     uv run --no-sync python -m pytest --collect-only -q -p no:cacheprovider -m "$MARKER_ARG" \

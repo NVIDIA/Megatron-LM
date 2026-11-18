@@ -90,3 +90,27 @@ def test_every_large_test_file_is_in_a_large_bucket():
         ):
             unowned.append(relative)
     assert not unowned, f"Add a bucket to unit-tests-large.yaml for {unowned}"
+
+
+def test_large_launch_passes_a_bucket_without_large_tests(tmp_path):
+    """A bucket with no file marked large has nothing to run, which is not a failure."""
+    runner = (ROOT / "tests/unit_tests/run_ci_test.sh").read_text()
+    start = runner.index("\nrun_large_tests() {\n")
+    function = runner[start : runner.index("\n}\n", start) + 3]
+    bucket = tmp_path / "bucket"
+    bucket.mkdir()
+    (bucket / "test_small.py").write_text("def test_small():\n    pass\n")
+    result = subprocess.run(
+        ["bash", "-e", "-u", "-o", "pipefail"],
+        input=function + "\nrun_large_tests\n",
+        env={
+            "PATH": os.environ["PATH"],
+            "BUCKET": f"{bucket}/**/*.py",
+            "LOG_DIR": str(tmp_path / "logs"),
+            "MARKER_ARG": "large",
+        },
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert "nothing to run" in result.stdout
