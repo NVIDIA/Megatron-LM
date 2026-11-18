@@ -248,10 +248,10 @@ KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
         name="v41_engram_embedding",
         sources=("megatron/core/models/engram/distributed_embedding.py",),
-        tests=("tests/unit_tests/models/test_v41_engram.py",),
+        tests=(K + "test_tensor_parallel_kernels.py", "tests/unit_tests/models/test_v41_engram.py"),
         kind="torch-op",
-        notes="Sorted repeated-row accumulation in deterministic mode; real Gloo EP lookup "
-        "and gradient parity, including uneven shards. NCCL GPU replay remains to be qualified.",
+        notes="CUDA replay of sorted repeated-row BF16 gradients with FP32 accumulation. "
+        "Gloo covers multi-rank lookup, uneven shards and gradient parity.",
     ),
     KernelEntry(
         name="fused_embedding_wgrad",

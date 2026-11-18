@@ -4,6 +4,7 @@
 
 import tempfile
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import torch
 import torch.distributed as dist
@@ -11,7 +12,7 @@ import torch.multiprocessing as mp
 
 from megatron.core.models.deepseek_v41.config import EngramConfig
 from megatron.core.models.deepseek_v41.engram import Engram, EngramHasher
-from megatron.core.models.deepseek_v41.engram_hash import EngramLayout
+from megatron.core.models.deepseek_v41.engram_hash import EngramLayout, build_compressed_token_map
 from megatron.core.models.engram.distributed_embedding import EPShardedMultiTableEmbedding
 from megatron.core.optimizer import OptimizerConfig, get_standard_config_overrides
 from megatron.core.optimizer.emerging_optimizers import _is_muon_excluded
@@ -44,6 +45,18 @@ def _config():
         hidden_size=4,
         layernorm_epsilon=1e-6,
     )
+
+
+def test_tokenizer_compression_preserves_whitespace_and_partial_bytes():
+    decoded = [" The", "the", "THE", "Café", "cafe", " ", "\t", "", "\ufffd", "\ufffd"]
+    tokenizer = MagicMock()
+    tokenizer.__len__.return_value = len(decoded)
+    tokenizer.backend_tokenizer.decode.side_effect = lambda ids, *, skip_special_tokens: decoded[
+        ids[0]
+    ]
+    tokenizer.backend_tokenizer.id_to_token.side_effect = {8: "<0x80>", 9: "<0x81>"}.__getitem__
+
+    assert build_compressed_token_map(tokenizer) == ([0, 0, 0, 1, 1, 2, 2, 3, 4, 5], 6)
 
 
 def test_hash_resets_and_memory_gradients():
@@ -81,7 +94,7 @@ def test_hash_resets_and_memory_gradients():
 
 
 def _distributed_worker(rank, path):
-    dist.init_process_group('gloo', init_method='file://' + path, rank=rank, world_size=2)
+    dist.init_process_group("gloo", init_method="file://" + path, rank=rank, world_size=2)
     group = dist.group.WORLD
     torch.manual_seed(123)
     before = torch.random.get_rng_state()
@@ -102,7 +115,7 @@ def _distributed_worker(rank, path):
         torch.testing.assert_close(
             table.weight.grad, counts[table.row_start : table.row_end, None].expand_as(table.weight)
         )
-        shard = table.sharded_state_dict()['weight']
+        shard = table.sharded_state_dict()["weight"]
         assert shard.global_shape == tuple(full[i].shape)
     hasher = _hasher()
     # Check both normal halo exchange and tiny shards spanning multiple neighbors.
@@ -118,4 +131,4 @@ def _distributed_worker(rank, path):
 
 def test_two_rank_lookup_gradients_and_cp_hash_history():
     with tempfile.TemporaryDirectory() as directory:
-        mp.spawn(_distributed_worker, args=(directory + '/rendezvous',), nprocs=2, join=True)
+        mp.spawn(_distributed_worker, args=(directory + "/rendezvous",), nprocs=2, join=True)

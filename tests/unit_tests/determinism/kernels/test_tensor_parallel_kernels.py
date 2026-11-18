@@ -24,6 +24,7 @@ from megatron.core import parallel_state
 from megatron.core.extensions.transformer_engine import te_general_gemm
 from megatron.core.fusions.fused_embedding_wgrad import accumulate_embedding_wgrad
 from megatron.core.fusions.fused_softmax import FusedScaleMaskSoftmax
+from megatron.core.models.engram.distributed_embedding import EPShardedMultiTableEmbedding
 from megatron.core.ops.loss.cross_entropy import (
     VocabParallelCrossEntropy,
     vocab_parallel_cross_entropy,
@@ -95,6 +96,25 @@ class TestTensorParallelLayers:
                 replays=4,
                 what=f"VocabParallelEmbedding[det={deterministic_branch}]",
             )
+
+    def test_engram_repeated_row_gradients_replay_bit_exact(self):
+        """Many repeated lookups accumulate in FP32 before the one BF16 table-gradient cast."""
+        seeded()
+        rows, width = 16, 32
+        module = EPShardedMultiTableEmbedding(
+            _config(), (rows,), width, init_method_normal(0.02), ep_group=None
+        )
+        ids = torch.randint(rows, (8192, 1), device="cuda")
+        # Dyadic values make the FP32 sum exact regardless of the CPU reference reduction order.
+        upstream = torch.randint(-8, 17, (8192, 1, width), device="cuda").to(torch.bfloat16) / 16
+        assert_module_replays_bit_exact(
+            module, (ids,), grad_output=upstream, replays=3, contention=True, what="Engram lookup"
+        )
+        expected = torch.zeros(rows, width)
+        expected.index_add_(0, ids.cpu().flatten(), upstream[:, 0].float().cpu())
+        torch.testing.assert_close(
+            module.tables[0].weight.grad.cpu(), expected.bfloat16(), rtol=0, atol=0
+        )
 
     def test_vocab_parallel_embedding_wgrad_fusion_replays(self):
         """gradient_accumulation_fusion: 64 distinct ids over 4096 positions accumulate into
