@@ -225,9 +225,16 @@ case "$ASYNC_SCHED" in
         ;;
 esac
 
+# On Grace (aarch64), the engine checks that each rank is bound to its GPU's NUMA node.
+NUMA_ARGS=()
+if [[ "$(uname -m)" == "aarch64" ]]; then
+    NUMA_ARGS=(--numa-binding node)
+fi
+
 (
     cd "$ROOT_DIR"
     uv run --no-sync python -m torch.distributed.run \
+        "${NUMA_ARGS[@]}" \
         --nproc-per-node "$WORLD_SIZE" \
         --master_addr "$MASTER_ADDR" \
         --master_port "$MASTER_PORT" \
