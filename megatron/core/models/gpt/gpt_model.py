@@ -137,6 +137,10 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             )
         super().__init__(config=config, pg_collection=pg_collection)
         # MTP depth is model-wide; non-MTP pipeline stages still freeze their backbone.
+        if self.config.mtp_kl_loss_weight > 0 and (
+            self.config.mtp_num_layers is None or self.config.mtp_num_layers <= 0
+        ):
+            raise ValueError("MTP KL loss requires positive mtp_num_layers")
         if self.config.freeze_base_model_for_mtp and (
             self.config.mtp_num_layers is None or self.config.mtp_num_layers < 1
         ):
@@ -246,6 +250,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     self.config, "yarn_correction_range_round_to_int"
                 ),
                 use_cpu_initialization=self.config.use_cpu_initialization,
+                cp_group=self.cp_group,
             )
         elif self.position_embedding_type == 'mrope' and not self.config.multi_latent_attention:
             self.rotary_pos_emb = MultimodalRotaryEmbedding(
@@ -254,6 +259,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                 rotary_interleaved=self.config.rotary_interleaved,
                 seq_len_interpolation_factor=seq_len_interpolation_factor,
                 rotary_base=rotary_base,
+                cp_group=self.cp_group,
             )
             self.mrope_section = self.config.mrope_section
             assert (

@@ -367,10 +367,6 @@ def _ep_invariant_moe_config(**overrides):
 
 
 def test_config_accepts_expert_tensor_parallel_inference():
-    from megatron.core.transformer.custom_layers.batch_invariant_kernels import HAVE_DEEPGEMM_BF16
-
-    if not HAVE_DEEPGEMM_BF16:
-        pytest.skip("Building a batch-invariant MoE config requires DeepGEMM bf16 kernels.")
     _ep_invariant_moe_config(
         transformer_impl="inference_optimized",
         normalization="RMSNorm",
