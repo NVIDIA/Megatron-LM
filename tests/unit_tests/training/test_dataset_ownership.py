@@ -767,9 +767,10 @@ def test_a_packing_scheduler_needs_per_token_loss(container_factory):
     cfg.validate()
 
 
-def test_varlen_datasets_and_the_packing_scheduler(container_factory):
+def test_varlen_datasets_and_the_packing_scheduler(container_factory, monkeypatch):
     """A packed varlen dataset needs a scheduler (the CLI selects one; a Python container names
-    it); SBHD validation excludes one."""
+    it); SBHD validation excludes one and emits fixed-width rows."""
+    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 2)
     _, cfg = container_factory(["--seq-length", "64"])
     plain = GPTDatasetConfig(
         sequence_length=64,
@@ -784,7 +785,7 @@ def test_varlen_datasets_and_the_packing_scheduler(container_factory):
     cfg.model = _layout()
     with pytest.raises(ValueError, match="needs model.transformer.sequence_packing_scheduler"):
         cfg.validate()
-    cfg.model = _layout(sequence_packing_scheduler="dp_balanced")
+    cfg.model = _layout(sequence_packing_scheduler="dp_balanced", max_seq_length_per_sample=128)
     cfg.validate()
     sbhd = GPTDatasetConfig(
         sequence_length=64,
@@ -797,10 +798,22 @@ def test_varlen_datasets_and_the_packing_scheduler(container_factory):
         eod_mask_loss=False,
     )
     cfg.data = DataConfig(dataset=sbhd, dataset_type=VarlenDataset, dataloader=cfg.data.dataloader)
+    cfg.model = _layout(sequence_packing_scheduler="dp_balanced")
     with pytest.raises(ValueError, match="does not use a packing scheduler"):
         cfg.validate()
-    cfg.model = _layout()
-    cfg.validate()
+    for width in (128, 32):
+        cfg.model = _layout(pipeline_model_parallel_size=2, max_seq_length_per_sample=width)
+        before = cfg.to_dict()
+        with pytest.raises(ValueError, match="must equal"):
+            cfg.validate()
+        assert cfg.to_dict() == before
+    for width in (64, None):
+        cfg.model = _layout(pipeline_model_parallel_size=2, max_seq_length_per_sample=width)
+        before = cfg.to_dict()
+        cfg.validate()
+        assert cfg.to_dict() == before
+    cfg.finalize()
+    assert cfg.model.transformer.max_seq_length_per_sample == 64
 
 
 def test_sample_length_is_a_multiple_of_twice_the_cp_size(container_factory):

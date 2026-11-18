@@ -219,7 +219,7 @@ def test_loader_options_are_generated_from_the_dataloader_config():
         "num_workers": "Dataloader number of workers.",
         "data_sharding": "Shard the dataset per data-parallel rank",
         "pin_memory": "Pin host memory in the torch DataLoader",
-        "persistent_workers": "Keep the DataLoader workers alive between passes",
+        "persistent_workers": "Keep DataLoader workers alive between epochs.",
     }
     assert {f.name for f in fields(DataloaderConfig)} == set(helps) | {"drop_last"}
     for dest, prefix in helps.items():
