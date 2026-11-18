@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -23,7 +24,6 @@ from megatron.core.transformer.hyper_connection import (
     HyperConnectionResidualConnection,
 )
 from megatron.core.transformer.identity_op import IdentityOp
-from megatron.core.transformer.module import GraphableMegatronModule
 from megatron.core.transformer.residual_connection import (
     ResidualBranchOutput,
     ResidualConnection,
@@ -33,6 +33,9 @@ from megatron.core.transformer.residual_recompute import ResidualStreamRecompute
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.transformer.transformer_layer import TransformerLayer, TransformerLayerSubmodules
+from megatron.core.transformer.transformer_layer_mixins import (
+    TECudaGraphHyperConnectionTransformerLayerMixin,
+)
 from megatron.core.typed_torch import apply_module
 from megatron.core.utils import (
     deprecate_inference_params,
@@ -45,12 +48,18 @@ if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCCheckpointManager
 
 
-class HyperConnectionTransformerLayer(TransformerLayer):
+class HyperConnectionTransformerLayer(
+    TECudaGraphHyperConnectionTransformerLayerMixin, TransformerLayer
+):
     """A transformer layer with Manifold-Constrained Hyper-Connections (mHC).
 
-    Extends TransformerLayer by adding hyper connection modules around self-attention
-    and MLP. The n-stream hidden states are aggregated before each sub-layer and
-    expanded back afterwards using learned mappings (H_pre, H_post, H_res).
+    Extends TransformerLayer by adding hyper connection modules around each active
+    self-attention or MLP branch. The n-stream hidden states are aggregated before each
+    branch and expanded back afterwards using learned mappings (H_pre, H_post, H_res).
+
+    Replay uses the shared residual-stream recompute contract, accepting
+    ``ResidualStreamRecomputeContext`` via ``residual_stream_recompute_context``.
+    The deprecated ``mhc_recompute_manager`` keyword is still converted to a context.
 
     Cross-attention hyper connection is not supported.
     """
@@ -68,7 +77,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         pp_layer_offset: Optional[int] = None,
         is_mtp_layer: bool = False,
         name: str | None = None,
-    ):
+    ) -> None:
         super().__init__(
             config=config,
             submodules=submodules,
@@ -87,40 +96,61 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 "hyper connections. Use IdentityOp for cross_attention_hyper_connection."
             )
 
-        assert submodules.self_attention_hyper_connection is not IdentityOp, (
-            "HyperConnectionTransformerLayer requires self_attention_hyper_connection. "
-            "Use TransformerLayer instead if hyper connections are not needed."
-        )
-        assert submodules.mlp_hyper_connection is not IdentityOp, (
-            "HyperConnectionTransformerLayer requires mlp_hyper_connection. "
-            "Use TransformerLayer instead if hyper connections are not needed."
-        )
+        has_attention, has_mlp = self._validate_residual_branch_layout()
+        if not has_attention and not has_mlp:
+            raise ValueError("HyperConnectionTransformerLayer requires an attention or MLP branch.")
 
-        self.self_attention_hyper_connection = build_module(
-            submodules.self_attention_hyper_connection,
-            config=self.config,
-            layer_number=self.layer_number,
-        )
+        for active, owner_spec, stage in (
+            (has_attention, submodules.self_attention_hyper_connection, "self-attention"),
+            (has_mlp, submodules.mlp_hyper_connection, "MLP"),
+        ):
+            if active and owner_spec is IdentityOp:
+                raise ValueError(f"The active {stage} branch requires a hyper connection module.")
+            if not active and owner_spec is not IdentityOp:
+                raise ValueError(
+                    f"The inactive {stage} branch requires an identity hyper connection."
+                )
 
-        self.mlp_hyper_connection = build_module(
-            submodules.mlp_hyper_connection, config=self.config, layer_number=self.layer_number
-        )
+        self.self_attention_hyper_connection = None
+        self.residual_read_self_attn = None
+        self.residual_write_self_attn = None
+        if has_attention:
+            self.self_attention_hyper_connection = build_module(
+                submodules.self_attention_hyper_connection,
+                config=self.config,
+                layer_number=self.layer_number,
+            )
+            self.residual_read_self_attn = HyperConnectionResidualConnection(
+                self.config, operation="read", use_input_residual=True
+            )
+            self.residual_write_self_attn = HyperConnectionResidualConnection(
+                self.config, operation="write"
+            )
 
-        self.residual_read_self_attn = HyperConnectionResidualConnection(
-            self.config, operation="read", use_input_residual=True
-        )
-        self.residual_write_self_attn = HyperConnectionResidualConnection(
-            self.config, operation="write"
-        )
-        self.residual_read_mlp = HyperConnectionResidualConnection(
-            self.config, operation="read", use_input_residual=True
-        )
-        self.residual_write_mlp = HyperConnectionResidualConnection(self.config, operation="write")
+        self.mlp_hyper_connection = None
+        self.residual_read_mlp = None
+        self.residual_write_mlp = None
+        if has_mlp:
+            self.mlp_hyper_connection = build_module(
+                submodules.mlp_hyper_connection, config=self.config, layer_number=self.layer_number
+            )
+            self.residual_read_mlp = HyperConnectionResidualConnection(
+                self.config, operation="read", use_input_residual=True
+            )
+            self.residual_write_mlp = HyperConnectionResidualConnection(
+                self.config, operation="write"
+            )
 
         # mHC has always bypassed this legacy hook, which cannot carry residual state.
         self._legacy_forward_post_mlp = None
 
-        self._mhc_recompute_manager = None
+        # Replay state for the current public call only (set and cleared in __call__). Deferred
+        # local CUDA-graph capture bypasses __call__ after the block was finalized, so it sees
+        # None and runs mHC eagerly, like TE capture.
+        self._mhc_recompute_context: ResidualStreamRecomputeContext | None = None
+        # The mHC split and EP-overlap replay paths read the manager rather than the context.
+        # __call__ keeps it in sync; schedule-driven callers that bypass __call__ install it.
+        self._mhc_recompute_manager: Optional[MHCCheckpointManager] = None
         self._validate_mhc_recompute_attn_cuda_graph_split()
         if self.config.cuda_graph_impl == "local":
             if self.is_moe_layer and {
@@ -185,41 +215,71 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             )
 
     def __call__(self, *args, **kwargs):
-        # TODO(kwangjuna): Unify this entry point with WR's recompute manager
-        # in the follow-up layer PR.
-        if kwargs.get("residual_stream_recompute_context") is not None:
-            raise ValueError(
-                "mHC does not accept residual_stream_recompute_context; use mhc_recompute_manager."
+        # Remove the context from kwargs because CUDA graphs cannot accept its live manager.
+        # The residual and norm hooks read it from the layer while this call runs.
+        context = kwargs.pop("residual_stream_recompute_context", None)
+        legacy_manager = kwargs.pop("mhc_recompute_manager", None)
+        if legacy_manager is not None:
+            # Deprecated entry point: snapshot the manager's mutable block-end flag.
+            if context is not None:
+                raise ValueError(
+                    "Pass residual_stream_recompute_context or the deprecated "
+                    "mhc_recompute_manager, not both."
+                )
+            warnings.warn(
+                "HyperConnectionTransformerLayer's mhc_recompute_manager keyword is deprecated "
+                "and will be removed in a future release. Pass "
+                "residual_stream_recompute_context=ResidualStreamRecomputeContext(manager, "
+                "is_block_end) instead.",
+                DeprecationWarning,
+                stacklevel=2,
             )
-        # Pull the manager off kwargs before super().__call__ hands them to the
-        # CUDA-graph machinery (which can't handle a CheckpointWithoutOutputManager).
-        # forward() reads the value back from self.
-        self._mhc_recompute_manager = kwargs.pop("mhc_recompute_manager", None)
-        return super().__call__(*args, **kwargs)
+            context = ResidualStreamRecomputeContext(
+                legacy_manager, is_block_end=legacy_manager.is_last_layer_in_recompute_block
+            )
+        self._mhc_recompute_context = context
+        self._mhc_recompute_manager = context.manager if context is not None else None
+        try:
+            return super().__call__(*args, **kwargs)
+        finally:
+            self._mhc_recompute_context = None
+            self._mhc_recompute_manager = None
+
+    def _residual_recompute_context(
+        self, *, is_mlp: bool = False
+    ) -> ResidualStreamRecomputeContext | None:
+        """Only the last configured residual write preserves the layer's block-end flag."""
+        context = self._mhc_recompute_context
+        if context is None and self._mhc_recompute_manager is not None:
+            # Schedule-driven callers install the manager directly and bypass __call__.
+            manager = self._mhc_recompute_manager
+            context = ResidualStreamRecomputeContext(
+                manager, is_block_end=getattr(manager, "is_last_layer_in_recompute_block", False)
+            )
+        if context is None or self._is_last_residual_write(is_mlp=is_mlp):
+            return context
+        return ResidualStreamRecomputeContext(context.manager, is_block_end=False)
+
+    def supports_two_stage_attention(self) -> bool:
+        """mHC layers run only through ``__call__``, where their replay state enters.
+
+        The split two-stage entry points bypass it, so attention-only mHC layers must not
+        advertise them (for example, to Shortcut MoE grouping).
+        """
+        return False
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):
-        """Override to produce n-stream hidden_states of shape [s, b, n*C].
+        """Use hidden-size graph inputs for the attention-only mHC split.
 
-        CUDA graph capture creates static buffers whose shapes are determined by
-        this method. The base class returns [s, b, C], but mHC layers operate on
-        n-stream hidden states of shape [s, b, n*C].
+        The mixin produces n-stream hidden_states of shape [s, b, n*C]. The split's captured
+        callable begins at the attention consumer, after the eager mHC producer has reduced
+        the n streams to one hidden-size tensor, so it keeps the base layer's static inputs.
         """
-        static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
         if self._uses_mhc_recompute_attn_cuda_graph_split():
-            # The captured callable begins at the attention consumer, after the
-            # eager mHC producer has reduced n streams to one hidden-size tensor.
-            return static_inputs
-
-        hs = static_inputs["hidden_states"]
-        n = self.config.num_residual_streams
-        static_inputs["hidden_states"] = torch.ones(
-            (hs.shape[0], hs.shape[1], n * self.config.hidden_size),
-            dtype=hs.dtype,
-            requires_grad=hs.requires_grad,
-            device=hs.device,
-        )
-
-        return static_inputs
+            return super(
+                TECudaGraphHyperConnectionTransformerLayerMixin, self
+            ).get_layer_static_inputs(seq_length, micro_batch_size)
+        return super().get_layer_static_inputs(seq_length, micro_batch_size)
 
     def create_mcore_cudagraph_manager(self, config):
         """Create only CUDA graph managers compatible with this mHC layer."""
@@ -231,21 +291,25 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         if self.is_moe_layer:
             # Whole-layer and MLP-scope graphs would capture dynamic MoE dispatch. Mixed
             # models may still request MLP graphs globally, so leave only this MoE layer eager.
-            if not config.cuda_graph_modules or (
-                CudaGraphModule.mlp in config.cuda_graph_modules
-                and CudaGraphModule.attn not in config.cuda_graph_modules
+            # An MLP-only MoE layer has no attention branch for an attn scope to graph, and
+            # the base MLP branch would reject it.
+            if (
+                not config.cuda_graph_modules
+                or (
+                    CudaGraphModule.mlp in config.cuda_graph_modules
+                    and CudaGraphModule.attn not in config.cuda_graph_modules
+                )
+                or isinstance(self.self_attention, IdentityOp)
             ):
                 return
 
         super().create_mcore_cudagraph_manager(config)
 
     def _get_submodules_under_cudagraphs(self):
-        """Override to include hyper connection modules.
+        """Add the mHC split and MoE-scope hooks to the mixin's hyper connection modules.
 
-        The base TransformerLayer._get_submodules_under_cudagraphs does not include
-        self_attention_hyper_connection / mlp_hyper_connection. Their learnable
-        parameters (mapping_proj, alpha_*, bias) need manual pre-forward hooks
-        during CUDA graph replay so that parameter all-gathers are triggered.
+        Hyper connection parameters (mapping_proj, alpha_*, bias) need manual pre-forward
+        hooks during CUDA graph replay so that parameter all-gathers are triggered.
         """
         if self._uses_mhc_recompute_attn_cuda_graph_split():
             # mHC pre/post run eagerly and therefore receive ordinary hooks.
@@ -254,9 +318,16 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             return [self.input_layernorm, self.self_attention]
 
         submodules = super()._get_submodules_under_cudagraphs()
-
-        if not self.config.cuda_graph_modules:
-            return submodules
+        # The moe and moe_router graphs also capture the MLP hyper connection.
+        if (
+            self.is_moe_layer
+            and self.mlp_hyper_connection is not None
+            and {CudaGraphModule.moe, CudaGraphModule.moe_router}.intersection(
+                self.config.cuda_graph_modules
+            )
+        ):
+            submodules.append(self.mlp_hyper_connection)
+        return submodules
 
         if CudaGraphModule.attn in self.config.cuda_graph_modules:
             submodules.append(self.self_attention_hyper_connection)
@@ -347,13 +418,13 @@ class HyperConnectionTransformerLayer(TransformerLayer):
 
         This GPT layer is itself the top-level TE graph callable. HybridStack instead wraps
         plain ``TransformerLayer`` instances in ``HyperConnectionHybridLayer``, so no outer
-        wrapper calls this subclass's ``_te_cuda_graph_capture_impl``. If that topology changes,
+        wrapper calls this subclass's ``_te_cuda_graph_capture_forward``. If that topology changes,
         this subclass must override the implementation entry point as well.
         """
         if not self._uses_mhc_recompute_attn_cuda_graph_split():
             return super()._te_cuda_graph_capture(*args, **kwargs)
 
-        self._reconstruct_packed_seq_params_from_kwargs(kwargs)
+        self._reconstruct_packed_graph_inputs(kwargs)
         return self._forward_mhc_attention_cuda_graph_consumer(*args, **kwargs)
 
     def _forward_mhc_attention_post_cuda_graph(
@@ -690,14 +761,18 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         assert (
             kwargs.get("inference_context") is None
         ), "mHC attention-only TE CUDA Graphs do not support inference_context"
-        if self.config.delay_offload_until_cuda_graph:
-            self.off_interface.enter_replay()
+        off_interface = self.get_offload_interface()
+        delay_offload_until_cuda_graph = (
+            off_interface is not None and self.config.delay_offload_until_cuda_graph
+        )
+        if delay_offload_until_cuda_graph:
+            off_interface.enter_replay()
         try:
             return self._te_cuda_graph_replay_impl(args, kwargs, None)
         finally:
             self._te_cuda_graph_route_replay_state = None
-            if self.config.delay_offload_until_cuda_graph:
-                self.off_interface.exit_replay()
+            if delay_offload_until_cuda_graph:
+                off_interface.exit_replay()
 
     def _replay_mhc_attention_consumer(self, args, kwargs, context):
         """Eager mHC aggregate -> captured attention replay -> eager post-BDA.
@@ -769,18 +844,17 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         )
         nvtx_range_pop(suffix="self_attention_hyper_connection")
 
-        cuda_graph_output = GraphableMegatronModule._te_cuda_graph_replay(
-            self, aggregated, **graph_kwargs
-        )
+        cuda_graph_output = self._te_cuda_graph_replay_graph(aggregated, **graph_kwargs)
 
         # Flush delayed offload groups from previous layers after graph replay, as
-        # TransformerLayer._te_cuda_graph_replay_impl does. The split returns out of
+        # TECudaGraphMixin._te_cuda_graph_replay does. The split returns out of
         # that method before reaching its flush and exit_replay() only clears the
         # _in_replay flag, so without this the queued groups never run and reset()
         # drops them at the end of the iteration. This is the shared head of both
         # split variants, so one call covers them.
-        if self.config.delay_offload_until_cuda_graph:
-            self.off_interface.flush_delayed_groups()
+        off_interface = self.get_offload_interface()
+        if off_interface is not None and self.config.delay_offload_until_cuda_graph:
+            off_interface.flush_delayed_groups()
 
         if isinstance(cuda_graph_output, torch.Tensor):
             cuda_graph_output = (cuda_graph_output,)
@@ -890,37 +964,39 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         return (residual, local_tokens, probs, shared_expert_output, mlp_h_res, mlp_hc_h_post)
 
     def _te_cuda_graph_replay_impl(self, args, kwargs, context):
-        """Implementation of _te_cuda_graph_replay with hyper connection support.
+        """Replay the attention-only mHC split between eager mHC pre/post operations.
 
         The caller owns the delay_offload_until_cuda_graph lifecycle
-        (enter_replay/exit_replay), including on the attention-only split path.
+        (enter_replay/exit_replay). Other scopes replay through the mixin's prepare/finish
+        steps, with this layer's mHC continuation in ``_te_cuda_graph_finish_replay``.
+        """
+        if not self._uses_mhc_recompute_attn_cuda_graph_split():
+            raise RuntimeError(
+                "_te_cuda_graph_replay_impl replays only the mHC attention-only graph split."
+            )
+        if self.config.overlap_moe_expert_parallel_comm:
+            return self._te_cuda_graph_replay_mhc_attention_split_overlap(args, kwargs, context)
+        return self._te_cuda_graph_replay_mhc_attention_split(args, kwargs, context)
+
+    def _te_cuda_graph_finish_replay(
+        self,
+        cuda_graph_output,
+        *,
+        context: Optional[Tensor] = None,
+        graph_has_context: bool = False,
+        padding_mask: Optional[Tensor] = None,
+        input_ids: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """Finish the eager layer stages after replay, with hyper connection support.
 
         During MoE partial CUDA graph capture, the graph outputs include HC state
         (mlp_hc_h_post, mlp_h_res) in addition to the base class outputs. This method
         extracts the HC state and uses it for post-processing after resuming the MoE forward.
+        TECudaGraphMixin._te_cuda_graph_replay has already flushed delayed offload groups.
         """
-        if self._uses_mhc_recompute_attn_cuda_graph_split():
-            if self.config.overlap_moe_expert_parallel_comm:
-                return self._te_cuda_graph_replay_mhc_attention_split_overlap(args, kwargs, context)
-            return self._te_cuda_graph_replay_mhc_attention_split(args, kwargs, context)
-
-        # Read, do not pop: on THD, padding_mask IS a capture-time kwarg
-        # (get_layer_static_inputs adds it whenever _is_thd_cuda_graph()), and
-        # TE's replay raises TypeError for any captured kwarg that is missing.
-        # On SBHD it is simply not in the graph's kwargs_keys, and TE reads only
-        # the keys it captured -- extra kwargs are ignored, so leaving it in
-        # kwargs is safe on both layouts. The routing tail below consumes it.
-        padding_mask = kwargs.get("padding_mask", None)
-
-        cuda_graph_output = list(
-            GraphableMegatronModule._te_cuda_graph_replay(self, *args, **kwargs)
-        )
-
-        # Flush delayed offload groups from previous layers after graph replay.
-        if self.config.delay_offload_until_cuda_graph:
-            self.off_interface.flush_delayed_groups()
-
-        if kwargs.get('context') is not None:
+        cuda_graph_output = list(cuda_graph_output)
+        if graph_has_context:
             context = cuda_graph_output.pop()
 
         if (
@@ -938,62 +1014,12 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             mlp_h_res = cuda_graph_output.pop()
             mlp_hc_h_post = cuda_graph_output.pop()
 
-            shared_expert_output, routing_map = None, None
-            if (
-                self.config.moe_shared_expert_intermediate_size is not None
-                and not self.config.moe_shared_expert_overlap
-            ):
-                shared_expert_output = cuda_graph_output.pop()
-
-            if CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules:
-                (hidden_states, probs), attr_outputs = (
-                    cuda_graph_output[:2],
-                    cuda_graph_output[2:],
-                )
-                valid_cudagraph_attrs = self.mlp.token_dispatcher.valid_cudagraph_attrs
-                assert len(attr_outputs) == len(
-                    valid_cudagraph_attrs
-                ), f"attr_outputs: {len(attr_outputs)} != {len(valid_cudagraph_attrs)}"
-                for i, attr_name in enumerate(valid_cudagraph_attrs):
-                    self.mlp.token_dispatcher.set_cudagraph_attr(attr_name, attr_outputs[i])
-            else:
-                assert len(cuda_graph_output) == 3, (
-                    "CUDA graph output should be [hidden_states, probs, routing_map], "
-                    f"but got {len(cuda_graph_output)} elements"
-                )
-                hidden_states, probs, routing_map = cuda_graph_output
-
-            # Resume the MoELayer forward pass from the end of the CUDA graph scope.
-            nvtx_range_push(suffix="mlp")
-            self.mlp.cudagraph_tensor_store.set(
-                hidden_states=hidden_states,
-                probs=probs,
-                routing_map=routing_map,
-                shared_expert_output=shared_expert_output,
+            mlp_output_with_bias = self.mlp._te_cuda_graph_resume(
+                cuda_graph_output, padding_mask, packed_seq_params=packed_seq_params
             )
-            # If EP overlap is enabled, remaining of mlp will be called as fine_grained_callables
-            # and should be skipped here.
             if self.config.overlap_moe_expert_parallel_comm:
-                probs, routing_map = self.mlp.route(hidden_states, padding_mask=padding_mask)
-                hidden_states, probs = self.mlp.preprocess(
-                    hidden_states,
-                    probs,
-                    routing_map,
-                    padding_mask,
-                    packed_seq_params=kwargs.get("packed_seq_params"),
-                )
-                nvtx_range_pop(suffix="mlp")
-                return (
-                    residual,
-                    hidden_states,
-                    probs,
-                    shared_expert_output,
-                    mlp_h_res,
-                    mlp_hc_h_post,
-                )
-            mlp_output_with_bias = self.mlp(hidden_states)
-            self.mlp.cudagraph_tensor_store.clear()
-            nvtx_range_pop(suffix="mlp")
+                # The EP-overlap schedule owns the remaining MoE work and the mHC tail.
+                return (residual, *mlp_output_with_bias, mlp_h_res, mlp_hc_h_post)
 
             # HC post-processing with fused h_res, h_post and BDA.
             recompute_pre_mlp_layernorm = self.recompute_pre_mlp_layernorm
@@ -1057,7 +1083,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                     probs,
                     routing_map,
                     padding_mask,
-                    packed_seq_params=kwargs.get("packed_seq_params"),
+                    packed_seq_params=packed_seq_params,
                 )
                 return (
                     residual,
@@ -1071,12 +1097,12 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             # Same threading as the dense split tail: the whole-attention capture
             # keeps the MLP-side mHC group eager, so it registers against the
             # manager __call__ stashed on the layer, and the router needs the
-            # padding_mask read above.
+            # replay padding_mask.
             output = self._forward_mlp(
                 *cuda_graph_output,
                 padding_mask=padding_mask,
-                input_ids=kwargs.get("input_ids", None),
-                packed_seq_params=kwargs.get("packed_seq_params", None),
+                input_ids=input_ids,
+                packed_seq_params=packed_seq_params,
                 mhc_recompute_manager=getattr(self, '_mhc_recompute_manager', None),
             )
         return output, context
@@ -1113,18 +1139,6 @@ class HyperConnectionTransformerLayer(TransformerLayer):
             hidden_states, mhc_recompute_manager=self._mhc_recompute_manager
         )
 
-    def _residual_recompute_context(
-        self, *, is_mlp: bool = False
-    ) -> ResidualStreamRecomputeContext | None:
-        """Share the block manager; only the final MLP write ends a replay block."""
-        manager = self._mhc_recompute_manager
-        if manager is None:
-            return None
-        return ResidualStreamRecomputeContext(
-            manager,
-            is_block_end=is_mlp and getattr(manager, "is_last_layer_in_recompute_block", False),
-        )
-
     def _read_residual_connection(
         self,
         connection: ResidualConnection,
@@ -1136,10 +1150,11 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         """Read through the current owner, preserving its activation dtype."""
         if recompute_context is not None:
             raise ValueError(
-                "mHC does not accept residual_stream_recompute_context; use mhc_recompute_manager."
+                "Pass the mHC recompute context through the layer call, not the base schedule."
             )
         owner = self.mlp_hyper_connection if is_mlp else self.self_attention_hyper_connection
-        # This operation context must not select WR's norm/offload policy in the base.
+        # Pass replay state to the adapter while preserving the shared schedule's
+        # existing mHC norm and offload behavior.
         return apply_module(connection)(
             hidden_states,
             execution_context=HyperConnectionExecutionContext(owner),
@@ -1158,7 +1173,7 @@ class HyperConnectionTransformerLayer(TransformerLayer):
         """Write through the current owner within the base BDA gradient scope."""
         if recompute_context is not None:
             raise ValueError(
-                "mHC does not accept residual_stream_recompute_context; use mhc_recompute_manager."
+                "Pass the mHC recompute context through the layer call, not the base schedule."
             )
         owner = self.mlp_hyper_connection if is_mlp else self.self_attention_hyper_connection
         return apply_module(connection)(
@@ -1170,12 +1185,4 @@ class HyperConnectionTransformerLayer(TransformerLayer):
                 owner, self.config.bias_dropout_fusion
             ),
             recompute_context=self._residual_recompute_context(is_mlp=is_mlp),
-        )
-
-    def supports_two_stage_attention(self) -> bool:
-        """Expose the incoming split interface on its supported mHC configurations."""
-        return (
-            not self.config.fp32_residual_connection
-            and not self._uses_mhc_recompute_attn_cuda_graph_split()
-            and super().supports_two_stage_attention()
         )

@@ -194,6 +194,23 @@ def test_contiguous_context_parallel_rejects_bshd_inputs():
         )
 
 
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, None),
+        (False, None),
+        (True, ["ag", "rs"]),
+        ([], ["ag", "rs"]),
+        (["rs", "ag", "rs"], ["ag", "rs"]),
+    ],
+)
+def test_gtp_nccl_ub_is_normalized(value, expected):
+    config = ModelParallelConfig(gtp_remat_nccl_ub=value, gtp_expert_remat_nccl_ub=value)
+
+    assert config.gtp_remat_nccl_ub == expected
+    assert config.gtp_expert_remat_nccl_ub == expected
+
+
 def test_dynamic_cp_selects_default_scheduler_and_variable_lengths():
     config = ModelParallelConfig(dynamic_context_parallel=True, max_seqlen_per_dp_cp_rank=4096)
 

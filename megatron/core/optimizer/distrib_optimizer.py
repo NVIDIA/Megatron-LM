@@ -46,6 +46,7 @@ from ..dist_checkpointing.mapping import (
     ShardedObject,
     ShardedStateDict,
     ShardedTensorFactory,
+    get_checkpoint_parameter_id,
 )
 from ..dist_checkpointing.utils import extract_sharded_tensors_and_factories
 from ..distributed.param_and_grad_buffer import (
@@ -2177,7 +2178,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             model_sharded_state_dict
         )
         for sh_base in nested_values(model_sharded_state_dict):
-            param_to_sharded_metadata[sh_base.data] = sh_base
+            param_to_sharded_metadata[get_checkpoint_parameter_id(sh_base.data)] = sh_base
 
         prefix = 'optimizer.state'
         model_space_state = {}
@@ -2212,7 +2213,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
                     bucket_id,
                 ) in buffer.param_index_map.items():
                     try:
-                        sharded_metadata = param_to_sharded_metadata[model_param]
+                        sharded_metadata = param_to_sharded_metadata[id(model_param)]
                     except KeyError as e:
                         raise ValueError(
                             f"Model param {model_param} not in model_sharded_state_dict."
@@ -2455,7 +2456,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             model_sharded_state_dict
         )
         for sh_base in nested_values(model_sharded_state_dict):
-            param_to_sharded_metadata[sh_base.data] = sh_base
+            param_to_sharded_metadata[get_checkpoint_parameter_id(sh_base.data)] = sh_base
 
         prefix = 'optimizer.state'
         state = {}
@@ -2470,7 +2471,7 @@ class DistributedOptimizer(MixedPrecisionOptimizer):
             # Match optimizer parameter with model ShardedTensor (or
             # ShardedTensorFactory).
             try:
-                sharded_metadata = param_to_sharded_metadata[model_param]
+                sharded_metadata = param_to_sharded_metadata[id(model_param)]
             except KeyError as e:
                 raise ValueError(
                     f"Model param {model_param} not in model_sharded_state_dict"

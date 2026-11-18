@@ -82,13 +82,13 @@ class TestHybridMHCAttentionGraphSplit:
         assert inputs["attention_mask"] is mask
 
     def test_mlp_wrapper_stays_eager(self, hybrid_split_wrapper):
-        from megatron.core.transformer.cuda_graphs import _layer_is_graphable
+        from megatron.core.transformer.cuda_graphs import _te_cuda_graph_layer_is_graphable
 
         wrapper = hybrid_split_wrapper
         wrapper.inner_layer.self_attention = IdentityOp()
         wrapper.inner_layer.mlp = torch.nn.Linear(4, 4)
         assert not wrapper._uses_mhc_recompute_attn_cuda_graph_split()
-        assert not _layer_is_graphable(wrapper, wrapper.config)
+        assert not _te_cuda_graph_layer_is_graphable(wrapper, wrapper.config)
 
     @pytest.mark.parametrize("mla_recompute", [False, True])
     def test_split_keeps_static_input_liveness_validation(
@@ -336,6 +336,8 @@ def packed_split_layer(hybrid_split_wrapper, request, monkeypatch):
         layer._forward_mlp = Mock(return_value=residual)
     layer.config = config
     layer.off_interface = Mock()
+    # Graph replay owns the TE graph offload lifecycle through get_offload_interface().
+    layer.get_offload_interface = lambda: layer.off_interface
     return layer, producer, attention
 
 
@@ -524,6 +526,7 @@ class TestMHCAttentionGraphSplitTHD:
         layer.config = hybrid_split_wrapper.config
         layer.config.delay_offload_until_cuda_graph = True
         layer.off_interface = Mock()
+        layer.get_offload_interface = lambda: layer.off_interface
         packed = _cpu_packed_metadata()
 
         def replay_impl(args, kwargs, context):

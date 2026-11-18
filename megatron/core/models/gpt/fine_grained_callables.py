@@ -9,6 +9,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import tensor_parallel
+from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
 from megatron.core.fusions.fused_moe_residual_add import (
     can_use_fused_moe_residual_add,
@@ -20,7 +21,7 @@ from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
 )
 from megatron.core.pipeline_parallel.utils import ScheduleNode, StageDispatchBwdGrad, make_viewless
 from megatron.core.transformer.enums import CudaGraphModule
-from megatron.core.transformer.module import GraphableMegatronModule, float16_to_fp32
+from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.transformer.moe.moe_layer import MoELayer
 from megatron.core.transformer.multi_token_prediction import (
     MultiTokenPredictionLayer,
@@ -507,69 +508,6 @@ class TransformerLayerNode(ScheduleNode):
         self.submodule = None
 
 
-class _BackwardDWWrapper:
-    """Wrapper for managing backward weight gradient computation of attn module.
-
-    This class handles the execution of weight gradient computations for transformer layers,
-    coordinating between CUDA graphed and non-graphed components. It is used when
-    overlap_moe_expert_parallel_comm and delay_wgrad_compute are enabled to manage
-    the delayed weight gradient computation in MoE models.
-
-    The wrapper stores references to the attention and shared expert backward weight gradient
-    callables, and determines which components should be executed based on whether CUDA graphs
-    are being replayed and which scopes are covered by the graphs.
-    """
-
-    def __init__(self, layer):
-        assert isinstance(
-            layer, GraphableMegatronModule
-        ), "cuda graphed ep overlap only supports GraphableMegatronModule."
-        assert isinstance(
-            layer, TransformerLayer
-        ), "cuda graphed ep overlap only supports TransformerLayer for now."
-        self.layer = layer
-        self.graphed_backward_dw_callable = None
-        self.attn_dw_callable = layer.self_attention.backward_dw
-        self.submodules = [layer.self_attention]
-        if layer.is_moe_layer:
-            self.shared_expert_dw_callable = partial(
-                layer.mlp.backward_dw, routed_experts=False, shared_experts=True
-            )
-            if layer.mlp.use_shared_expert:
-                self.submodules.append(layer.mlp.shared_experts)
-        else:
-            self.shared_expert_dw_callable = None
-        self.cuda_graph_modules = layer.config.cuda_graph_modules
-
-    def backward_dw(self):
-        """Execute weight gradients, skipping CUDA graphed components during replay."""
-        is_replay = hasattr(self.layer, 'cuda_graphs') and self.layer.cuda_graphs
-        if self.shared_expert_dw_callable is not None and (
-            not is_replay or CudaGraphModule.moe_router not in self.cuda_graph_modules
-        ):
-            self.shared_expert_dw_callable()
-        if not is_replay or CudaGraphModule.attn not in self.cuda_graph_modules:
-            self.attn_dw_callable()
-        if is_replay and self.graphed_backward_dw_callable is not None:
-            self.graphed_backward_dw_callable()
-        self.layer = None
-
-    def set_graphed_backward_dw_callable(self, graphed_backward_dw_callable):
-        """Store the CUDA graphed backward weight gradient callable."""
-        self.graphed_backward_dw_callable = graphed_backward_dw_callable
-
-    def parameters(self):
-        """Returns an iterator over module parameters.
-
-        This method mimics the behavior of torch.nn.Module.parameters() by yielding
-        all parameters from the submodules managed by this wrapper. It is used to
-        collect parameters that require gradient computation during the backward pass.
-        """
-        for module in self.submodules:
-            for param in module.parameters():
-                yield param
-
-
 def build_transformer_layer_callables(layer: TransformerLayer):
     """Create callables for transformer layer nodes.
 
@@ -633,9 +571,10 @@ def build_transformer_layer_callables(layer: TransformerLayer):
             mhc_recompute_manager.is_last_layer_in_recompute_block = is_last_in_mhc_recompute_group
 
         using_cuda_graph_replay = (
-            isinstance(layer, GraphableMegatronModule)
-            and hasattr(layer, 'cuda_graphs')
-            and layer.cuda_graphs
+            getattr(layer.config, 'cuda_graph_impl', None) == "transformer_engine"
+            and isinstance(layer, TECudaGraphMixin)
+            and hasattr(layer, 'te_cuda_graphs')
+            and layer.te_cuda_graphs
         )
         if using_cuda_graph_replay:
             layer.set_te_cuda_graph_backward_dw_wrapper()
@@ -870,8 +809,11 @@ def build_transformer_layer_callables(layer: TransformerLayer):
         if fuse_residual_add and not should_fuse_residual_add:
             output = output + shared_expert_output
 
-        if hasattr(layer, 'cuda_graphs') and layer.cuda_graphs:
-            layer.mlp.cudagraph_tensor_store.clear()
+        if (
+            getattr(layer.config, 'cuda_graph_impl', None) == "transformer_engine"
+            and layer.te_cuda_graphs
+        ):
+            layer.mlp.te_cuda_graph_tensor_store.clear()
 
         if shared_expert_output is not None:
             shared_expert_output.record_stream(torch.cuda.current_stream())
