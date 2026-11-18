@@ -360,11 +360,14 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         if not hasattr(pg_collection, 'dp_cp'):
             raise ValueError("MFSDP v2 requires an explicit dp_cp process group.")
 
-        if "residual_stream" in (config.recompute_modules or []):
-            # Stack-managed replay can run before the owning layer gathers its weights.
+        if (
+            "residual_stream" in (config.recompute_modules or [])
+            and config.residual_stream_recompute_num_layers != 1
+        ):
+            # Larger blocks (including None) still replay outside the FSDP owner.
             raise ValueError(
-                "MFSDP v2 does not support residual_stream recomputation (#7777). "
-                "Remove it from recompute_modules and clear residual_stream_recompute_num_layers."
+                "MFSDP v2 residual_stream recomputation requires "
+                "residual_stream_recompute_num_layers=1."
             )
 
         if config.mtp_detach_heads:

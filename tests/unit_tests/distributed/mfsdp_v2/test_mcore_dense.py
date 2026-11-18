@@ -65,6 +65,32 @@ def process_group_collection(distributed_setup):
     destroy_model_parallel()
 
 
+@pytest.mark.parametrize("block_size", [None, 2])
+def test_rejects_cross_layer_residual_recompute(process_group_collection, block_size):
+    """Only layer-owned residual replay is supported by MFSDP v2."""
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=16,
+        num_attention_heads=4,
+        wide_residual=WideResidualConfig(num_streams=3),
+        recompute_granularity="selective",
+        recompute_modules=["residual_stream"],
+        residual_stream_recompute_num_layers=block_size,
+    )
+    with pytest.raises(ValueError, match="residual_stream_recompute_num_layers=1"):
+        FullyShardedDataParallel(
+            config=config,
+            ddp_config=DistributedDataParallelConfig(
+                use_megatron_fsdp=True,
+                megatron_fsdp_version=2,
+                use_distributed_optimizer=False,
+                data_parallel_sharding_strategy="optim_grads_params",
+            ),
+            module=torch.nn.Linear(16, 16, device="cuda"),
+            pg_collection=process_group_collection,
+        )
+
+
 def test_residual_recompute_matches_eager_training(process_group_collection, distributed_setup):
     """Per-layer residual replay must use weights gathered by the owning FSDP unit."""
     if distributed_setup.world_size < 2:
