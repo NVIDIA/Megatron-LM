@@ -14,7 +14,7 @@ import uuid
 import warnings
 from dataclasses import dataclass
 from enum import Enum
-from functools import partial
+from functools import lru_cache, partial
 from typing import Any, Optional
 
 _MEDIA_FETCH_TIMEOUT_S = 5.0
@@ -422,7 +422,9 @@ def _extract_multimodal_from_messages(
     return rewritten, image_bytes_list, video_bytes_list, media_slots
 
 
-def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None):
+def _sanitize_messages_for_template(
+    messages, media_slots=(), prompt_config=None, template_takes_content_parts=False
+):
     """Prepare messages so tokenizer chat templates can safely consume them.
 
     This lowers structured media content according to the model prompt contract
@@ -437,6 +439,10 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
 
     Another example:
     - arguments: "[1,2,3]" -> arguments: {}
+
+    List content of a message without media follows the template, as vLLM's default ("auto")
+    content format does: a template that iterates over a message's content parts receives
+    them as text parts, and any other template receives the text parts joined with newlines.
     """
     if not isinstance(messages, list):
         return messages
@@ -453,8 +459,8 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
             continue
         msg_copy = dict(message)
         content = msg_copy.get("content")
-        # OpenAI-style multimodal/text content may arrive as a list of blocks.
-        # HF/Jinja chat templates used by this server expect plain strings.
+        # OpenAI-style multimodal/text content may arrive as a list of blocks. A message with media
+        # is lowered to one string with its media sentinels; see the docstring for the rest.
         if isinstance(content, list):
             text_chunks = []
             for chunk in content:
@@ -470,9 +476,14 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
                 media_chunks = [chunk for chunk in text_chunks if chunk in media_sentinels]
                 non_media_chunks = [chunk for chunk in text_chunks if chunk not in media_sentinels]
                 text_chunks = media_chunks + non_media_chunks
-            separator = ""
             message_modalities = media_modalities_by_message.get(message_index, set())
-            if message_modalities:
+            if not message_modalities:
+                text_chunks = [chunk for chunk in text_chunks if chunk]
+                if template_takes_content_parts:
+                    msg_copy["content"] = [{"type": "text", "text": chunk} for chunk in text_chunks]
+                else:
+                    msg_copy["content"] = "\n".join(text_chunks)
+            else:
                 if prompt_config is None:
                     raise ValueError("Media content normalization requires a prompt config.")
                 separators = {
@@ -484,13 +495,23 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
                         "Media types in one message must use the same content-part separator."
                     )
                 separator = separators.pop()
-            msg_copy["content"] = separator.join(chunk for chunk in text_chunks if chunk)
+                msg_copy["content"] = separator.join(chunk for chunk in text_chunks if chunk)
         elif isinstance(content, dict):
             msg_copy["content"] = str(content.get("text", ""))
         elif content is None:
             msg_copy["content"] = ""
         elif not isinstance(content, str):
             msg_copy["content"] = str(content)
+
+        # vLLM returns an assistant turn's reasoning as `reasoning` (`reasoning_content` is its
+        # older name), and clients send the turn back as they received it. Chat templates read
+        # `reasoning_content`, so accept either; an explicit `reasoning_content` wins.
+        if (
+            msg_copy.get("role") == "assistant"
+            and msg_copy.get("reasoning_content") is None
+            and isinstance(msg_copy.get("reasoning"), str)
+        ):
+            msg_copy["reasoning_content"] = msg_copy["reasoning"]
 
         tool_calls = msg_copy.get("tool_calls")
         if isinstance(tool_calls, list):
@@ -864,6 +885,14 @@ def apply_parsers(
     return message_text, meta
 
 
+def _strips_content_with_tool_calls(parsers):
+    """Whether a configured tool parser strips the content of a turn with tool calls."""
+    return any(
+        getattr(PARSER_MAPPING.get(name), "strip_content_with_tool_calls", False)
+        for name in parsers or ()
+    )
+
+
 def _chat_tokenizer(tokenizer):
     """Prefer the underlying HF tokenizer for chat-template work."""
     hf_tokenizer = getattr(getattr(tokenizer, "_tokenizer", None), "tokenizer", None)
@@ -876,6 +905,102 @@ def _has_chat_template(tokenizer, chat_template_kwargs):
         getattr(tokenizer, "chat_template", None) is not None
         or chat_template_kwargs.get("chat_template") is not None
     )
+
+
+def _reads_content(node, aliases):
+    """True for a Jinja expression reading a message's `content`, e.g. `message.content`,
+    `message['content']` or a variable known to hold it, optionally through filters such as
+    `| default('')` or `| selectattr(...)`."""
+    from jinja2 import nodes
+
+    while isinstance(node, nodes.Filter) and node.node is not None:
+        node = node.node
+    if isinstance(node, nodes.Getattr):
+        return node.attr == "content"
+    if isinstance(node, nodes.Getitem):
+        return isinstance(node.arg, nodes.Const) and node.arg.value == "content"
+    return isinstance(node, nodes.Name) and node.name in aliases
+
+
+def _chat_template_environment(template: str):
+    """The Jinja environment transformers renders `template` with, so templates using its
+    extensions (e.g. `{% generation %}`) parse here too. Falls back to a plain environment with
+    loop controls if transformers' (private) compile helper is unavailable; parsing never
+    executes the template, so no sandbox is needed."""
+    try:
+        from transformers.utils.chat_template_utils import _compile_jinja_template
+
+        return _compile_jinja_template(template).environment
+    except Exception:
+        from jinja2 import Environment
+
+        return Environment(extensions=["jinja2.ext.loopcontrols"])
+
+
+@lru_cache(maxsize=16)
+def _template_takes_content_parts(template: Optional[str]) -> bool:
+    """Whether a chat template iterates over a message's content parts.
+
+    Checks the template's syntax tree, without rendering it, for a `for` loop over a message's
+    content: directly, through a variable assigned from it (`{% set c = m['content'] %}`), or
+    through a macro parameter it is passed to (`render(m.content)`). Such a template handles
+    list content itself; any other template expects a string. A template that fails to parse
+    is treated as expecting a string. Cached per template.
+
+    This matches vLLM's `auto` chat-template content format (`_detect_content_format`):
+    https://github.com/vllm-project/vllm/blob/ced6857afa0ea7b2e3f0846a62e1394e90f15607/vllm/renderers/hf.py#L473-L502
+
+    A render probe (rendering a sentinel text part and checking the output) would be shorter
+    but brittle: a string template that interpolates `{{ message.content }}` prints the list's
+    repr, sentinel included; templates may raise on list content or on probe messages that
+    miss roles or fields they require; and rendering depends on per-request kwargs and tools.
+    """
+    if not template:
+        return False
+    try:
+        from jinja2 import nodes
+
+        tree = _chat_template_environment(template).parse(template)
+    except Exception:
+        logger.warning(
+            "Could not parse the chat template to detect its content format; "
+            "text content parts will be joined with newlines."
+        )
+        return False
+    macros = {macro.name: [arg.name for arg in macro.args] for macro in tree.find_all(nodes.Macro)}
+    # Names that may hold a message's content, grown until no new name is found. Scopes are not
+    # tracked, which errs toward treating the template as taking content parts.
+    aliases = set()
+    while True:
+        found = {
+            node.target.name
+            for node in tree.find_all(nodes.Assign)
+            if isinstance(node.target, nodes.Name) and _reads_content(node.node, aliases)
+        }
+        for call in tree.find_all(nodes.Call):
+            params = macros.get(getattr(call.node, "name", None), ())
+            found.update(
+                param for param, arg in zip(params, call.args) if _reads_content(arg, aliases)
+            )
+        if found <= aliases:
+            break
+        aliases |= found
+    return any(_reads_content(loop.iter, aliases) for loop in tree.find_all(nodes.For))
+
+
+def _chat_template_source(tokenizer, chat_template_kwargs, tools):
+    """The Jinja source the renderer will use: the server-configured template if any, else the
+    tokenizer's (resolving named templates as `apply_chat_template` does)."""
+    template = chat_template_kwargs.get("chat_template")
+    get_chat_template = getattr(tokenizer, "get_chat_template", None)
+    if get_chat_template is not None:
+        try:
+            return get_chat_template(template, tools=tools)
+        except Exception:
+            pass
+    if template is None:
+        template = getattr(tokenizer, "chat_template", None)
+    return template if isinstance(template, str) else None
 
 
 class _TemplateRenderer:
@@ -1227,6 +1352,10 @@ def format_chat_response(batch_results, sampling_params, tokenizer, options, *, 
             # absent final content from an empty assistant message and otherwise
             # continue the episode after a reasoning-only completion.
             content = None
+        elif normalized_tool_calls and _strips_content_with_tool_calls(parsers):
+            # Match vLLM's tool parsers: a tool-call turn's content is stripped, and absent
+            # when only whitespace remains.
+            content = (message_text or "").strip() or None
         else:
             content = message_text if message_text is not None else ""
 
@@ -1234,6 +1363,9 @@ def format_chat_response(batch_results, sampling_params, tokenizer, options, *, 
         if normalized_tool_calls:
             message["tool_calls"] = normalized_tool_calls
         if "reasoning" in metadata:
+            # `reasoning` is vLLM's field; `reasoning_content` is its older name, kept for
+            # existing clients.
+            message["reasoning"] = metadata["reasoning"]
             message["reasoning_content"] = metadata["reasoning"]
         if options.return_tokenized_data and not payload_offloaded:
             # Wire contract matches vLLM: prompt_token_ids are model-input tokens
@@ -1374,8 +1506,16 @@ try:
             multi_modal_data = {"image": image_bytes_list}
         elif video_bytes_list:
             multi_modal_data = {"video": video_bytes_list}
-        template_messages = _sanitize_messages_for_template(messages, media_slots, prompt_config)
         template_tools = _sanitize_tools_for_template(options.tools)
+        chat_tok = _chat_tokenizer(tokenizer)
+        template_messages = _sanitize_messages_for_template(
+            messages,
+            media_slots,
+            prompt_config,
+            template_takes_content_parts=_template_takes_content_parts(
+                _chat_template_source(chat_tok, options.chat_template_kwargs, template_tools)
+            ),
+        )
 
         try:
             prefix_source = _resolve_prefix_source(
@@ -1387,7 +1527,6 @@ try:
         # Capability checks read the shared tokenizer; rendering runs on the executor's private
         # copy, since HF tokenizers are not thread-safe. Callers that build the app config directly
         # register no copy, so the shared tokenizer is the fallback.
-        chat_tok = _chat_tokenizer(tokenizer)
         renderer = _TemplateRenderer(
             current_app.config.get('tokenize_executor'),
             _chat_tokenizer(current_app.config.get('tokenizer_copy', tokenizer)),

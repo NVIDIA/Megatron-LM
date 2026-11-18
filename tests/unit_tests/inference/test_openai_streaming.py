@@ -282,6 +282,13 @@ async def test_openai_stream_preserves_chat_top_logprobs_with_parser():
     assert records[-1] == "data: [DONE]\n\n"
 
 
+def test_streaming_chat_parser_emits_reasoning_under_both_field_names():
+    parser = StreamingChatParser(lambda text, finished=False: ("", {"reasoning": text}))
+
+    assert parser.parse("thin") == [{"reasoning": "thin", "reasoning_content": "thin"}]
+    assert parser.parse("thinking") == [{"reasoning": "king", "reasoning_content": "king"}]
+
+
 def test_streaming_chat_parser_emits_structured_stable_tool_call_deltas():
     tools = [
         {
