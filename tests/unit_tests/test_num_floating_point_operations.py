@@ -24,6 +24,7 @@ from megatron.core.models.hybrid.hybrid_layer_specs import gdp_stack_spec
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.experimental_attention_variant.dsa import DSAIndexer, DSAttention
 from megatron.core.transformer.transformer_config import MLATransformerConfig
+from megatron.training.logging.dsa_flops import dsa_indexer_flops
 from megatron.training.models import GPTModelConfig, HybridModelConfig
 from megatron.training.training import (
     consume_seqlen_stats_in_iteration,
@@ -2804,39 +2805,57 @@ class TestDSAFlopsHelpers:
     @pytest.mark.parametrize("loss_coeff", [0.0, 0.01])
     @pytest.mark.parametrize("sparse_loss", [False, True])
     def test_indexer_training_terms(self, pattern, num_indexer_layers, loss_coeff, sparse_loss):
-        """Model-wide counting handles pipeline positions, index sharing, and MTP.
+        """Both models have six DSA layers but different indexer counts.
 
         Standard decoder layer 1 and MTP layer 1 compute an index. The hybrid
         main pattern computes at positions 1 and 5, plus position 1 in each MTP depth.
         Pipeline separators must not affect that numbering.
         """
-        args, cfg = _make_hybrid_dsa_args(loss_coeff, sparse_loss)
+        args, _ = _make_hybrid_dsa_args(loss_coeff, sparse_loss)
         args.hybrid_layer_pattern = pattern
-        args.experimental_attention_variant = "dsa" if pattern is None else None
         args.num_layers = 4 if pattern is None else 8
         args.mtp_num_layers = 2
         args.dsa_indexer_topk_freq = 4
         args.dsa_indexer_skip_topk_offset = 1
         total_tokens = 2 * args.seq_length
         sum_sq = 2 * args.seq_length**2
-        actual = num_floating_point_operations(args, 2, sequence_length=args.seq_length)
-        if pattern is None:
-            expected = _dsa_golden_flops(
-                args, cfg, total_tokens, sum_sq, num_indexer_layers=num_indexer_layers
-            )
-        else:
-            # Removing only DSA positions leaves the MLPs and output heads unchanged.
-            args.hybrid_layer_pattern = pattern.replace("D", "")
-            actual -= num_floating_point_operations(args, 2, sequence_length=args.seq_length)
-            token_term, core_term = _dsa_golden_layer_terms(
-                args, total_tokens, sum_sq, num_dsa_layers=6, num_indexer_layers=num_indexer_layers
-            )
-            expected = total_tokens * token_term + sum_sq * core_term
-        assert actual == pytest.approx(expected, rel=1e-15)
+        token_term, core_term = _dsa_golden_layer_terms(
+            args, total_tokens, sum_sq, num_dsa_layers=0, num_indexer_layers=num_indexer_layers
+        )
+        assert dsa_indexer_flops(
+            total_tokens=total_tokens,
+            seqlen_squared_sum=sum_sq,
+            hidden_size=args.hidden_size,
+            q_lora_rank=args.q_lora_rank,
+            dsa_indexer_n_heads=args.dsa_indexer_n_heads,
+            dsa_indexer_head_dim=args.dsa_indexer_head_dim,
+            dsa_indexer_topk=args.dsa_indexer_topk,
+            num_dsa_layers=6,
+            dsa_indexer_loss_coeff=loss_coeff,
+            dsa_indexer_use_sparse_loss=sparse_loss,
+            dsa_indexer_skip_topk_offset=args.dsa_indexer_skip_topk_offset,
+            dsa_indexer_topk_freq=args.dsa_indexer_topk_freq,
+            hybrid_layer_pattern=pattern,
+            mtp_num_layers=args.mtp_num_layers,
+        ) == (total_tokens * token_term + sum_sq * core_term)
 
     def test_no_dsa_layers(self):
-        """Non-DSA models need no indexer configuration or estimates."""
-        args, _ = _make_hybrid_dsa_args()
+        """Zero indexers cost nothing; non-DSA models need no indexer configuration."""
+        assert (
+            dsa_indexer_flops(
+                total_tokens=512,
+                seqlen_squared_sum=131072,
+                hidden_size=512,
+                q_lora_rank=128,
+                dsa_indexer_n_heads=4,
+                dsa_indexer_head_dim=32,
+                dsa_indexer_topk=16,
+                num_dsa_layers=0,
+            )
+            == 0
+        )
+
+        args, cfg = _make_hybrid_dsa_args()
         args.hybrid_layer_pattern = "--"
         expected = num_floating_point_operations(args, 2, sequence_length=args.seq_length)
         for name in list(vars(args.transformer)):

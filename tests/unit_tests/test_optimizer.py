@@ -2081,7 +2081,10 @@ def test_emerging_optimizer_expert_grad_norm_covers_egtp_remat_shards():
         + model.experts.weight.numel() * sum(i**2 for i in range(1, num_expert_shards + 1))
     ) ** 0.5
 
-    assert optimizer.get_grad_norm() == pytest.approx(expected_grad_norm, rel=1e-6)
+    grad_norm = optimizer.get_grad_norm()
+    # Dev's ChainedOptimizer keeps the norm on device so the step stays graph-capturable.
+    grad_norm_value = grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm
+    assert grad_norm_value == pytest.approx(expected_grad_norm, rel=1e-6)
 
 
 def _chain_member(param_groups):

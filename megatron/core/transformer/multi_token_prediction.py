@@ -2707,6 +2707,9 @@ def process_mtp_loss(
                     )
                 else:
                     ce_loss = compute_language_model_loss(mtp_labels, ce_logits)
+                # Drop the alias now. Under early backward it would otherwise keep this head's
+                # [s, b, v] logits (or their KD clone) alive while the next head projects.
+                del ce_logits
             if kd_enabled:
                 kd_loss = (
                     vocab_parallel_kl_div(

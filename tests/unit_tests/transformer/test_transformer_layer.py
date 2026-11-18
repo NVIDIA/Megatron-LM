@@ -313,27 +313,37 @@ class TestParallelTransformerLayer:
 
     def test_set_offload_modules_requires_concrete_attention_branch(self, monkeypatch):
         """The stored capture flag must not survive on an attention-free split layer."""
-        import megatron.core.transformer.transformer_layer as transformer_layer_module
+        import megatron.core.transformer.transformer_layer_mixins as transformer_layer_mixins_module
         from megatron.core.transformer.identity_op import IdentityOp
 
         layer = self.parallel_transformer_layer
         layer.config.fine_grained_activation_offloading = True
         layer.config.offload_modules = ['core_attn']
+        layer.config.cuda_graph_impl = "transformer_engine"
         layer.config.cuda_graph_modules = [CudaGraphModule.attn]
         layer.config.cuda_graph_warmup_steps = 1
         layer.is_moe_layer = False
-        monkeypatch.setattr(transformer_layer_module, 'is_torch_min_version', lambda _version: True)
-        monkeypatch.setattr(transformer_layer_module, 'is_te_min_version', lambda _version: True)
+        # TE graph registration owns the offload-in-graph flag and its version gates. Keep the
+        # shared offload stream/event out of this flag check.
+        monkeypatch.setattr(
+            transformer_layer_mixins_module, 'is_torch_min_version', lambda _version: True
+        )
+        monkeypatch.setattr(
+            transformer_layer_mixins_module, 'is_te_min_version', lambda _version: True
+        )
+        monkeypatch.setattr(layer, 'get_offload_interface', lambda: None)
 
         # A normal GPT attention layer owns the configured core-attention boundary.
         assert not isinstance(layer.self_attention, IdentityOp)
         layer._set_offload_modules()
+        layer.register_te_cuda_graph()
         assert layer.offload_module_in_cuda_graph
 
         # A split Hybrid MoE tail shares the config but has no attention body.
         layer.self_attention = IdentityOp()
         layer.cross_attention = IdentityOp()
         layer._set_offload_modules()
+        layer.register_te_cuda_graph()
         assert not layer.offload_module_in_cuda_graph
 
     def test_split_branch_norms_join_mhc_recompute_manager(self, monkeypatch):
@@ -554,7 +564,7 @@ class TestParallelTransformerLayer:
 
         warning_messages = []
         monkeypatch.setattr(
-            "megatron.core.transformer.transformer_layer.log_single_rank",
+            "megatron.core.transformer.transformer_layer_mixins.log_single_rank",
             lambda _logger, _level, message: warning_messages.append(message),
         )
 

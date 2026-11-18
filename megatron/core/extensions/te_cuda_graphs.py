@@ -590,8 +590,12 @@ def set_te_cuda_graph_current_microbatch(model, microbatch_id):
                 assert hasattr(
                     layer, 'mtp_model_layer'
                 ), f"MTP layer {layer} must have 'mtp_model_layer' attribute"
-                if layer.mtp_model_layer.config.cuda_graph_impl == "transformer_engine":
-                    layer.mtp_model_layer.te_cuda_graph_current_microbatch = microbatch_id
+                mtp_model_layer = layer.mtp_model_layer
+                # Hybrid MTP captures TE graphs on the stack's inner layers, and their
+                # backend can differ from the stack's own.
+                for graph_layer in (mtp_model_layer, *getattr(mtp_model_layer, "layers", ())):
+                    if graph_layer.config.cuda_graph_impl == "transformer_engine":
+                        graph_layer.te_cuda_graph_current_microbatch = microbatch_id
 
     # Also set current_microbatch on vision encoder layers so that
     # _te_cuda_graph_replay selects the correct graph index. Without this,

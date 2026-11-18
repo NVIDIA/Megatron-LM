@@ -202,6 +202,7 @@ def test_hybrid_padding_mask_sp_scatter_uses_model_tp_group(monkeypatch, input_p
             freeze_base_model_for_mtp=False,
         ),
         hybrid_layer_config_list=None,
+        _has_custom_layers=False,
         pre_process=input_path != "pipeline",
         post_process=False,
         embedding=FakeEmbedding(),
@@ -1369,6 +1370,9 @@ class TestStaticInputs:
         layer.config.context_parallel_size = 2
         layer.config.sequence_packing_scheduler = "dp_balanced" if packed else None
         layer.config.cuda_graph_impl = "transformer_engine"
+        # The layer was built without TE CUDA graphs; initialize the graph state that
+        # construction with cuda_graph_impl="transformer_engine" would have registered.
+        layer.register_te_cuda_graph()
         layer.config.moe_num_hash_layers = 1
         layer.is_moe_layer = True
         layer.mlp.router = torch.nn.Identity()
@@ -2202,7 +2206,7 @@ class TestGraphDynamicRouteMetadataArena:
                 if hasattr(graph, "reset"):
                     graph.reset()
             for layer in graph_layers:
-                layer.cuda_graphs.clear()
+                layer.te_cuda_graphs.clear()
             block.clear_te_cuda_graph_route_metadata_arenas()
 
 

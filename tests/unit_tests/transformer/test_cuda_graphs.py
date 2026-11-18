@@ -2377,7 +2377,7 @@ class TestHybridTECudaGraphDiscovery:
 
         class Tail:
             @staticmethod
-            def _resume_partial_moe_cuda_graph(_outputs):
+            def _resume_partial_moe_cuda_graph(_outputs, padding_mask=None):
                 calls.append('eager_tail')
                 if tail_raises:
                     raise RuntimeError('eager tail failed')
@@ -2395,7 +2395,7 @@ class TestHybridTECudaGraphDiscovery:
             calls.append('graph_replay')
             return (torch.ones(2, 1, 4),)
 
-        monkeypatch.setattr(GraphableMegatronModule, '_te_cuda_graph_replay', graph_replay)
+        monkeypatch.setattr(HyperConnectionHybridLayer, '_te_cuda_graph_replay_graph', graph_replay)
 
         if tail_raises:
             with pytest.raises(RuntimeError, match='eager tail failed'):
@@ -2682,8 +2682,10 @@ class TestTECudaGraphHelper:
         monkeypatch.setattr(
             paged_stash_module, "paged_stash_te_graph_capture", record_capture_context
         )
+        # create_cudagraphs() imports make_graphed_callables from TE at call time,
+        # so patch the TE module attribute rather than a cuda_graphs global.
         monkeypatch.setattr(
-            cuda_graphs_module, "make_graphed_callables", lambda *args, **kwargs: ()
+            "transformer_engine.pytorch.graph.make_graphed_callables", lambda *args, **kwargs: ()
         )
 
         helper.create_cudagraphs()

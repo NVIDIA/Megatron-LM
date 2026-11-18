@@ -599,6 +599,20 @@ class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
             cuda_graph_outputs.append(context)
         return tuple(cuda_graph_outputs)
 
+    def _te_cuda_graph_capture_impl(self, *args, **kwargs):
+        """Capture this layer's graph-safe body without offload boundary events.
+
+        The public capture entry owns the graph boundary. Outer graphable wrappers
+        may call this implementation when they capture the TransformerLayer body as
+        part of a larger callable, avoiding nested events in the middle of that graph.
+        ``packed_seq_params`` must already be reconstructed by the boundary owner.
+        """
+        assert 'cu_seqlens_q' not in kwargs, (
+            "TransformerLayer CUDA graph capture body received raw THD sequence tensors. "
+            "The outer capture boundary must reconstruct PackedSeqParams first."
+        )
+        return self._te_cuda_graph_capture_forward(*args, **kwargs)
+
     def _te_cuda_graph_prepare_replay(self, hidden_states: Tensor, *args, **kwargs):
         """Run the eager prefix and bind this call's graph and continuation inputs."""
         if args:

@@ -141,6 +141,11 @@ class HyperConnectionTransformerLayer(
                 self.config, operation="write"
             )
 
+        # The shared TransformerLayer schedule carries each read's input as its residual.
+        # The dedicated two-stage forward reads through the same adapters but carries the
+        # owner's residual view, as its split CUDA Graph replay does, so eager and replayed
+        # stages share the same BroadcastTensorFused residual gradient.
+
         # mHC has always bypassed this legacy hook, which cannot carry residual state.
         self._legacy_forward_post_mlp = None
 
@@ -260,6 +265,19 @@ class HyperConnectionTransformerLayer(
             return context
         return ResidualStreamRecomputeContext(context.manager, is_block_end=False)
 
+    @property
+    def _is_single_stage(self) -> bool:
+        """Whether only one of the attention and MLP stages has a hyper connection."""
+        return self.self_attention_hyper_connection is None or self.mlp_hyper_connection is None
+
+    def _uses_residual_adapters(self, mhc_recompute_manager) -> bool:
+        """Whether a two-stage eager stage routes through the residual read/write adapters.
+
+        The adapters derive replay state from the manager installed for this layer call.
+        Schedule-driven callers that pass a different manager keep the direct owner calls.
+        """
+        return mhc_recompute_manager is getattr(self, "_mhc_recompute_manager", None)
+
     def supports_two_stage_attention(self) -> bool:
         """mHC layers run only through ``__call__``, where their replay state enters.
 
@@ -329,22 +347,16 @@ class HyperConnectionTransformerLayer(
             submodules.append(self.mlp_hyper_connection)
         return submodules
 
-        if CudaGraphModule.attn in self.config.cuda_graph_modules:
-            submodules.append(self.self_attention_hyper_connection)
-        if (not self.is_moe_layer and CudaGraphModule.mlp in self.config.cuda_graph_modules) or (
-            self.is_moe_layer
-            and (
-                CudaGraphModule.moe in self.config.cuda_graph_modules
-                or CudaGraphModule.moe_router in self.config.cuda_graph_modules
-            )
-        ):
-            submodules.append(self.mlp_hyper_connection)
-        return submodules
-
     def forward(self, *args, **kwargs):
         """Forward pass with MHC recompute manager support."""
         kwargs.pop("dynamic_inference_decode_only", None)
         kwargs.pop("_called_from_hybrid_mhc_wrapper", None)
+
+        if self._is_single_stage:
+            # A single-stage layer has no fused attention+MLP mHC path. Run the inherited
+            # forward: its residual read/write hooks apply the active stage's hyper
+            # connection and leave the inactive identity stage untouched.
+            return super().forward(*args, _called_from_hybrid_mhc_wrapper=True, **kwargs)
 
         mhc_recompute_manager = getattr(self, '_mhc_recompute_manager', None)
 
@@ -418,7 +430,7 @@ class HyperConnectionTransformerLayer(
 
         This GPT layer is itself the top-level TE graph callable. HybridStack instead wraps
         plain ``TransformerLayer`` instances in ``HyperConnectionHybridLayer``, so no outer
-        wrapper calls this subclass's ``_te_cuda_graph_capture_forward``. If that topology changes,
+        wrapper calls this subclass's ``_te_cuda_graph_capture_impl``. If that topology changes,
         this subclass must override the implementation entry point as well.
         """
         if not self._uses_mhc_recompute_attn_cuda_graph_split():
@@ -495,13 +507,43 @@ class HyperConnectionTransformerLayer(
     ):
         """Forward attention with hyper connection pre/post processing on self-attention."""
         inference_context = deprecate_inference_params(inference_context, inference_params)
+        if self._is_single_stage:
+            # The inherited forward dispatches here; keep it on the inherited schedule.
+            return super()._forward_attention(
+                hidden_states,
+                attention_mask=attention_mask,
+                context=context,
+                context_mask=context_mask,
+                rotary_pos_emb=rotary_pos_emb,
+                rotary_pos_cos=rotary_pos_cos,
+                rotary_pos_sin=rotary_pos_sin,
+                rotary_pos_cos_sin=rotary_pos_cos_sin,
+                attention_bias=attention_bias,
+                inference_context=inference_context,
+                packed_seq_params=packed_seq_params,
+                sequence_len_offset=sequence_len_offset,
+                padding_mask=padding_mask,
+                input_ids=input_ids,
+            )
 
         nvtx_range_push(suffix="self_attention_hyper_connection")
-        hidden_states, self_attn_h_res, self_attn_hc_h_post, residual = (
-            self.self_attention_hyper_connection(
-                hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
+        use_residual_adapters = self._uses_residual_adapters(mhc_recompute_manager)
+        if use_residual_adapters:
+            hidden_states, (residual, self_attn_h_res, self_attn_hc_h_post) = (
+                self._read_residual_connection(
+                    self.residual_read_self_attn,
+                    hidden_states,
+                    is_mlp=False,
+                    recompute_context=None,
+                    owner_residual_view=True,
+                )
             )
-        )
+        else:
+            hidden_states, self_attn_h_res, self_attn_hc_h_post, residual = (
+                self.self_attention_hyper_connection(
+                    hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
+                )
+            )
         nvtx_range_pop(suffix="self_attention_hyper_connection")
 
         # Optional Input Layer norm
@@ -548,16 +590,25 @@ class HyperConnectionTransformerLayer(
 
         nvtx_range_push(suffix="self_attention_fused_h_res_h_post_bda")
         with self.bias_dropout_add_exec_handler():
-            hidden_states = self.self_attention_hyper_connection.fused_h_res_h_post_bda(
-                self_attn_h_res,
-                residual,
-                self_attn_hc_h_post,
-                attention_output_with_bias,
-                self.hidden_dropout,
-                self.training,
-                self.config.bias_dropout_fusion,
-                mhc_recompute_manager,
-            )
+            if use_residual_adapters:
+                hidden_states = self._write_residual_connection(
+                    self.residual_write_self_attn,
+                    attention_output_with_bias,
+                    (residual, self_attn_h_res, self_attn_hc_h_post),
+                    is_mlp=False,
+                    recompute_context=None,
+                )
+            else:
+                hidden_states = self.self_attention_hyper_connection.fused_h_res_h_post_bda(
+                    self_attn_h_res,
+                    residual,
+                    self_attn_hc_h_post,
+                    attention_output_with_bias,
+                    self.hidden_dropout,
+                    self.training,
+                    self.config.bias_dropout_fusion,
+                    mhc_recompute_manager,
+                )
         nvtx_range_pop(suffix="self_attention_fused_h_res_h_post_bda")
 
         hidden_states = attn_norm_manager.group_offload(hidden_states)
@@ -593,16 +644,42 @@ class HyperConnectionTransformerLayer(
         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
     ):
         """Forward MLP with hyper connection pre/post processing."""
-        is_last_in_recompute_block = bool(
-            mhc_recompute_manager is not None
-            and getattr(mhc_recompute_manager, "is_last_layer_in_recompute_block", False)
-        )
+        if self._is_single_stage:
+            # The inherited forward dispatches here; keep it on the inherited schedule.
+            return super()._forward_mlp(
+                hidden_states,
+                inference_context,
+                padding_mask=padding_mask,
+                packed_seq_params=packed_seq_params,
+                input_ids=input_ids,
+            )
+        recompute_context = getattr(self, "_mhc_recompute_context", None)
+        if recompute_context is not None and recompute_context.manager is mhc_recompute_manager:
+            # TransformerBlock carries the block-end flag on the residual-stream recompute
+            # context and no longer sets it on the shared manager.
+            is_last_in_recompute_block = recompute_context.is_block_end
+        else:
+            # Schedule-driven callers bypass __call__ and set the manager's flag directly.
+            is_last_in_recompute_block = bool(
+                mhc_recompute_manager is not None
+                and getattr(mhc_recompute_manager, "is_last_layer_in_recompute_block", False)
+            )
         mhc_mlp_bda_manager = None if is_last_in_recompute_block else mhc_recompute_manager
 
         nvtx_range_push(suffix="mlp_hyper_connection")
-        hidden_states, mlp_h_res, mlp_hc_h_post, residual = self.mlp_hyper_connection(
-            hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
-        )
+        use_residual_adapters = self._uses_residual_adapters(mhc_recompute_manager)
+        if use_residual_adapters:
+            hidden_states, (residual, mlp_h_res, mlp_hc_h_post) = self._read_residual_connection(
+                self.residual_read_mlp,
+                hidden_states,
+                is_mlp=True,
+                recompute_context=None,
+                owner_residual_view=True,
+            )
+        else:
+            hidden_states, mlp_h_res, mlp_hc_h_post, residual = self.mlp_hyper_connection(
+                hidden_states, mhc_recompute_manager=mhc_recompute_manager, return_residual=True
+            )
         nvtx_range_pop(suffix="mlp_hyper_connection")
         # mHC aggregation upcasts the single-stream MLP input to fp32 for numerical
         # stability of the mixing weights, and that fp32 propagates through the residual
@@ -668,7 +745,12 @@ class HyperConnectionTransformerLayer(
             return list(mlp_output_with_bias) + [mlp_hc_h_post, mlp_h_res, residual]
 
         return self._forward_post_mlp_with_fused_hyper_connection(
-            mlp_output_with_bias, mlp_h_res, residual, mlp_hc_h_post, mhc_mlp_bda_manager
+            mlp_output_with_bias,
+            mlp_h_res,
+            residual,
+            mlp_hc_h_post,
+            mhc_mlp_bda_manager,
+            use_residual_adapter=use_residual_adapters,
         )
 
     def _forward_mhc_mlp_post_core(
@@ -715,6 +797,8 @@ class HyperConnectionTransformerLayer(
         residual,
         mlp_hc_h_post,
         mhc_mlp_bda_recompute_manager: Optional['MHCCheckpointManager'] = None,
+        *,
+        use_residual_adapter: bool = False,
     ):
         """
         Perform operations after the MLP computation with fused hyper connection kernel.
@@ -727,6 +811,8 @@ class HyperConnectionTransformerLayer(
             residual (Tensor): [s, b, n*C] - original residual (n-stream hidden states).
             mlp_hc_h_post (Tensor): [s, b, n] - expansion weights from hyper connection.
             mhc_recompute_manager: Optional MHCCheckpointManager for checkpoint management.
+            use_residual_adapter (bool): Write through ``residual_write_mlp`` so the shared
+                residual-stream replay contract observes this stage.
 
         Returns:
             output (Tensor): Transformed hidden states of shape [s, b, h].
@@ -738,9 +824,25 @@ class HyperConnectionTransformerLayer(
                 mlp_output_with_bias[0]
             )
 
-        hidden_states = self._forward_mhc_mlp_post_core(
-            mlp_output_with_bias, mlp_h_res, residual, mlp_hc_h_post, mhc_mlp_bda_recompute_manager
-        )
+        if use_residual_adapter:
+            nvtx_range_push(suffix="mlp_fused_h_res_h_post_bda")
+            with self.bias_dropout_add_exec_handler():
+                hidden_states = self._write_residual_connection(
+                    self.residual_write_mlp,
+                    mlp_output_with_bias,
+                    (residual, mlp_h_res, mlp_hc_h_post),
+                    is_mlp=True,
+                    recompute_context=None,
+                )
+            nvtx_range_pop(suffix="mlp_fused_h_res_h_post_bda")
+        else:
+            hidden_states = self._forward_mhc_mlp_post_core(
+                mlp_output_with_bias,
+                mlp_h_res,
+                residual,
+                mlp_hc_h_post,
+                mhc_mlp_bda_recompute_manager,
+            )
 
         hidden_states = self.mlp_norm_manager.group_offload(hidden_states)
 
@@ -1146,6 +1248,7 @@ class HyperConnectionTransformerLayer(
         *,
         is_mlp: bool,
         recompute_context: ResidualStreamRecomputeContext | None,
+        owner_residual_view: bool = False,
     ) -> tuple[Tensor, ResidualConnectionState]:
         """Read through the current owner, preserving its activation dtype."""
         if recompute_context is not None:
@@ -1157,7 +1260,9 @@ class HyperConnectionTransformerLayer(
         # existing mHC norm and offload behavior.
         return apply_module(connection)(
             hidden_states,
-            execution_context=HyperConnectionExecutionContext(owner),
+            execution_context=HyperConnectionExecutionContext(
+                owner, owner_residual_view=owner_residual_view
+            ),
             recompute_context=self._residual_recompute_context(is_mlp=is_mlp),
         )
 

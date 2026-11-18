@@ -1151,6 +1151,7 @@ _TE_NATIVE_WORKSPACE_BYTES = 1024
 
 # Originals saved by _enable_te_native_workspace_starvation for restoration.
 _TE_WORKSPACE_SIZE_FN_ORIG = None
+_TE_WORKSPACE_FN_ORIG = None
 _TE_GROUPED_WORKSPACE_FN_ORIG = None
 _TE_NATIVE_ENV_ORIG: dict = {}
 
@@ -1197,12 +1198,15 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
     - Transformer Engine's own workspace: TE (<= 2.15 verified) hardcodes 32MiB in
       get_cublas_workspace_size_bytes() and ignores CUBLASLT_WORKSPACE_SIZE, so the
       env pin alone never engages for TE-launched GEMMs — patch the size fn and
-      clear its lru_cache.
+      serve starved workspaces from a separate cache. TE's own cache is left intact:
+      TE allocates its full workspaces once per process, and clearing that cache would
+      make TE re-allocate them lazily inside whichever cached segment is free at the
+      next GEMM, pinning that segment for the rest of the process.
     """
     import logging
     import os
 
-    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG
+    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG
     logger = logging.getLogger(__name__)
 
     # CUBLASLT_WORKSPACE_SIZE must be pinned (not setdefault): a preset value
@@ -1235,8 +1239,12 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
         ):
             _TE_WORKSPACE_SIZE_FN_ORIG = _te_gemm_mod.get_cublas_workspace_size_bytes
             _te_gemm_mod.get_cublas_workspace_size_bytes = lambda: workspace_bytes
-            if hasattr(getattr(_te_gemm_mod, "get_cublas_workspace", None), "cache_clear"):
-                _te_gemm_mod.get_cublas_workspace.cache_clear()
+            workspace_fn = getattr(_te_gemm_mod, "get_cublas_workspace", None)
+            if hasattr(workspace_fn, "__wrapped__"):
+                _TE_WORKSPACE_FN_ORIG = workspace_fn
+                _te_gemm_mod.get_cublas_workspace = lru_cache(maxsize=None)(
+                    workspace_fn.__wrapped__
+                )
         # Only device-metadata grouped GEMM needs the full workspace. Gate that
         # exception at dispatch, including BF16 modules in a mixed recipe; dense
         # and legacy grouped GEMMs retain their restricted workspace.
@@ -1244,8 +1252,6 @@ def _enable_te_native_workspace_starvation(workspace_bytes: int = _TE_NATIVE_WOR
             _te_gemm_mod, "_get_grouped_cublas_workspace"
         ):
             _TE_GROUPED_WORKSPACE_FN_ORIG = _te_gemm_mod._get_grouped_cublas_workspace
-            if hasattr(_TE_GROUPED_WORKSPACE_FN_ORIG, "cache_clear"):
-                _TE_GROUPED_WORKSPACE_FN_ORIG.cache_clear()
             _get_te_native_grouped_workspace.cache_clear()
             _te_gemm_mod._get_grouped_cublas_workspace = _get_te_native_grouped_workspace
     except ImportError:
@@ -1256,15 +1262,13 @@ def _disable_te_native_workspace_starvation():
     """Restore the TE workspace function and env pinned by the te_native backend."""
     import os
 
-    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG
+    global _TE_GROUPED_WORKSPACE_FN_ORIG, _TE_WORKSPACE_FN_ORIG, _TE_WORKSPACE_SIZE_FN_ORIG
     if _TE_GROUPED_WORKSPACE_FN_ORIG is not None:
         _get_te_native_grouped_workspace.cache_clear()
         try:
             import transformer_engine.pytorch.cpp_extensions.gemm as _te_gemm_mod
 
             _te_gemm_mod._get_grouped_cublas_workspace = _TE_GROUPED_WORKSPACE_FN_ORIG
-            if hasattr(_TE_GROUPED_WORKSPACE_FN_ORIG, "cache_clear"):
-                _TE_GROUPED_WORKSPACE_FN_ORIG.cache_clear()
         except ImportError:
             pass
         _TE_GROUPED_WORKSPACE_FN_ORIG = None
@@ -1273,11 +1277,13 @@ def _disable_te_native_workspace_starvation():
             import transformer_engine.pytorch.cpp_extensions.gemm as _te_gemm_mod
 
             _te_gemm_mod.get_cublas_workspace_size_bytes = _TE_WORKSPACE_SIZE_FN_ORIG
-            if hasattr(getattr(_te_gemm_mod, "get_cublas_workspace", None), "cache_clear"):
-                _te_gemm_mod.get_cublas_workspace.cache_clear()
+            if _TE_WORKSPACE_FN_ORIG is not None:
+                # Drop the starved cache; TE's full workspaces were never released.
+                _te_gemm_mod.get_cublas_workspace = _TE_WORKSPACE_FN_ORIG
         except ImportError:
             pass
         _TE_WORKSPACE_SIZE_FN_ORIG = None
+        _TE_WORKSPACE_FN_ORIG = None
     for var, prev in _TE_NATIVE_ENV_ORIG.items():
         if prev is None:
             os.environ.pop(var, None)

@@ -132,13 +132,13 @@ def add_multimodal_extra_args(parser):
         "--lr-data-range-start",
         type=float,
         default=0,
-        help="Start of the learning rate range as percentage (0-100) of the full training schedule. 0%% means start from the beginning of the training schedule. E.g. setting to 10, means start at 10% of the training schedule (the dataloader still starts from the beginning of the dataset, but assume that corresponds to 10% of the training schedule).",
+        help="Start of the learning rate range as percentage (0-100) of the full training schedule. 0%% means start from the beginning of the training schedule. E.g. setting to 10, means start at 10%% of the training schedule (the dataloader still starts from the beginning of the dataset, but assume that corresponds to 10%% of the training schedule).",
     )
     group.add_argument(
         "--lr-data-range-end",
         type=float,
         default=100,
-        help="End of the learning rate range as percentage (0-100) of the full training schedule. 100%% means the end of the training schedule. E.g. setting to 90, means end at 90% of the training schedule (the dataloader still ends at the end of the dataset, but assume that corresponds to 90% of the training schedule).",
+        help="End of the learning rate range as percentage (0-100) of the full training schedule. 100%% means the end of the training schedule. E.g. setting to 90, means end at 90%% of the training schedule (the dataloader still ends at the end of the dataset, but assume that corresponds to 90%% of the training schedule).",
     )
     group.add_argument(
         "--num-frames",

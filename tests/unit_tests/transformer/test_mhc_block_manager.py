@@ -616,11 +616,11 @@ def test_block_forward_transports_fresh_contexts_and_finalizes_each_boundary_onc
         events.append("finalize")
         finalized.append((manager, hidden_states))
 
-    monkeypatch.setattr(
-        CheckpointWithoutOutputManager,
-        "discard_all_outputs_and_register_unified_recompute",
-        finalize,
-    )
+    # Dev's block plans MHCCheckpointManager instances, which override the base method.
+    for manager_type in (CheckpointWithoutOutputManager, MHCCheckpointManager):
+        monkeypatch.setattr(
+            manager_type, "discard_all_outputs_and_register_unified_recompute", finalize
+        )
     monkeypatch.setattr(
         "megatron.core.transformer.transformer_block.observe_layer_residuals",
         lambda *args: events.append("observe"),

@@ -382,7 +382,7 @@ class HyperConnectionHybridLayer(TECudaGraphMixin, GraphableMegatronModule):
 
     def _get_active_te_cuda_graph_group_tail(self) -> Optional['HyperConnectionHybridLayer']:
         """Return the grouped tail only while this layer is replaying training graphs."""
-        if self.training and getattr(self, 'cuda_graphs', None):
+        if self.training and getattr(self, 'te_cuda_graphs', None):
             return self._get_te_cuda_graph_group_tail()
         return None
 
@@ -431,9 +431,10 @@ class HyperConnectionHybridLayer(TECudaGraphMixin, GraphableMegatronModule):
         offload_in_graph = self.offload_module_in_cuda_graph
         off_interface = self.get_offload_interface()
         if offload_in_graph:
-            assert (
-                off_interface is not None
-            ), "offload_module_in_cuda_graph requires fine-grained activation offloading."
+            assert off_interface is not None, (
+                "offload_module_in_cuda_graph requires a TransformerLayer-backed "
+                "Hybrid wrapper with an offload interface."
+            )
             if args:
                 hidden_states = off_interface.backward_record(args[0])
                 args = (hidden_states,) + args[1:]
@@ -473,7 +474,7 @@ class HyperConnectionHybridLayer(TECudaGraphMixin, GraphableMegatronModule):
             inner_kwargs = dict(kwargs)
             inner_kwargs.pop("hidden_states", None)
             inner_out = list(
-                self.inner_layer._te_cuda_graph_capture_forward(aggregated, **inner_kwargs)
+                self.inner_layer._te_cuda_graph_capture_impl(aggregated, **inner_kwargs)
             )
             # inner_out = router/preprocess intermediates ending in the inner residual;
             # append the mHC state AND the n-stream `residual` returned by the (graphed)

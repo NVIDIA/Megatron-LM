@@ -603,7 +603,9 @@ def test_standard_rope_fused_unfused_parity(attention_type, qkv_format, cp_size,
             layer_number=0,
             attn_mask_type=AttnMaskType.causal,
             cp_comm_type="all_gather" if cp_size > 1 else None,
-            pg_collection=ProcessGroupCollection(tp=None, cp=cp_group),
+            pg_collection=ProcessGroupCollection(
+                tp=parallel_state.get_tensor_model_parallel_group(), cp=cp_group
+            ),
         ).cuda()
         for config, module_spec in zip(configs, submodules)
     ]

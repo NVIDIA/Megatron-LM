@@ -133,6 +133,7 @@ def _case(depth, packed, device, cp_group, layout="zigzag", early_backward=False
         cross_entropy_loss_fusion=False,
         attention_cp_layout=layout,
         mtp_loss_early_backward=early_backward,
+        mtp_loss_type="cross_entropy",
     )
     boundaries = ([0, 4, 12, 16] if layout == "contiguous" else [0, 8, 16]) if packed else [0, 16]
     params = (
@@ -275,8 +276,8 @@ def test_mtp_cp_logged_loss_uses_global_count(cp_group, device, monkeypatch, per
             cp_group,
             training=True,
         )
-        MTPLossLoggingHelper.reduce_metrics_in_tracker()
-        actual = MTPLossLoggingHelper.tracker["loss_values"][0]
+        MTPLossLoggingHelper.reduce_loss_in_tracker()
+        actual = MTPLossLoggingHelper.tracker["values"][0]
         losses = F.cross_entropy(
             F.linear(hidden[1, :-1], weight).permute(1, 2, 0), labels[:, 1:], reduction="none"
         )
@@ -284,8 +285,5 @@ def test_mtp_cp_logged_loss_uses_global_count(cp_group, device, monkeypatch, per
         # The actual logging accumulator stores float32, even for this float64 head.
         torch.testing.assert_close(actual, ce_weight * expected.float(), atol=1e-6, rtol=1e-6)
         torch.testing.assert_close(
-            MTPLossLoggingHelper.tracker["ce_loss_values"][0],
-            expected.float(),
-            atol=1e-6,
-            rtol=1e-6,
+            MTPLossLoggingHelper.tracker["ce_values"][0], expected.float(), atol=1e-6, rtol=1e-6
         )

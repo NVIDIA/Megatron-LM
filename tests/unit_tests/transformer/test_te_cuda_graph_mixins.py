@@ -192,3 +192,42 @@ def test_te_cuda_graph_mixin_hooks(monkeypatch, failure):
             output.backward()
             torch.testing.assert_close(x.grad, torch.tensor(3.0))
             assert events == order
+
+
+@pytest.mark.parametrize("root_backend", ["transformer_engine", "local"])
+def test_te_cuda_graph_microbatch_reaches_hybrid_mtp_inner_layers(monkeypatch, root_backend):
+    """Hybrid MTP graphs are captured on the stack's inner layers, which replay their own slot."""
+    te_inner = _Module(_config())
+    local_inner = _Module(_config("local"))
+    # The stack's own backend does not gate its inner layers: an eager/local stack can hold TE
+    # layers.
+    mtp_stack = SimpleNamespace(config=_config(root_backend), layers=[te_inner, local_inner])
+    model = SimpleNamespace(
+        config=_config(),
+        decoder=SimpleNamespace(layers=[]),
+        mtp=SimpleNamespace(layers=[SimpleNamespace(mtp_model_layer=mtp_stack)]),
+    )
+    monkeypatch.setattr(cuda_graphs, "_IS_GRAPH_CAPTURING", False)
+    te_inner.register_te_cuda_graph()
+    events = []
+
+    def graph(index):
+        def replay(hidden_states, offset, is_first_microbatch):
+            events.append((index, is_first_microbatch))
+            return hidden_states + index + offset
+
+        return replay
+
+    te_inner.te_cuda_graphs = [graph(0), graph(1)]
+    x = torch.tensor(3.0)
+    offset = torch.tensor(2.0)
+    for microbatch in (0, 1, 2):
+        set_te_cuda_graph_current_microbatch(model, microbatch)
+        events.clear()
+        torch.testing.assert_close(te_inner(x, offset), x + microbatch % 2 + offset)
+        assert events == [(microbatch % 2, microbatch == 0)]
+    assert not hasattr(local_inner, "te_cuda_graph_current_microbatch")
+    if root_backend == "transformer_engine":
+        assert mtp_stack.te_cuda_graph_current_microbatch == 2
+    else:
+        assert not hasattr(mtp_stack, "te_cuda_graph_current_microbatch")

@@ -1061,10 +1061,15 @@ class HyperConnectionModule(MegatronModule):
 
 @dataclass(frozen=True)
 class HyperConnectionExecutionContext:
-    """Current mHC parameter owner and BDA fusion setting for one residual operation."""
+    """Current mHC parameter owner and BDA fusion setting for one residual operation.
+
+    ``owner_residual_view`` makes an input-residual read carry the owner's residual view
+    for this call only, for callers whose other execution path already carries that view.
+    """
 
     owner: HyperConnectionModule
     bias_dropout_fusion: bool = False
+    owner_residual_view: bool = False
 
 
 class HyperConnectionResidualConnection(ResidualConnection):
@@ -1123,7 +1128,7 @@ class HyperConnectionResidualConnection(ResidualConnection):
     ) -> tuple[Tensor, ResidualConnectionState]:
         """Share owner invocation and state packing without choosing a replay policy."""
 
-        if self.use_input_residual:
+        if self.use_input_residual and not execution_context.owner_residual_view:
             # Preserve the dedicated Transformer's residual path and three-output owner hooks.
             residual = hidden_states
             branch_input, h_res, h_post = apply_module(execution_context.owner)(

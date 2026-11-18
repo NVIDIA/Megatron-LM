@@ -2013,10 +2013,15 @@ def validate_args(args, defaults={}):
         # Other optimizers (e.g. Muon) with the distributed optimizer take the layer-wise path,
         # which builds a separate DistributedOptimizer for their non-matrix parameters unless
         # --no-use-layer-wise-param-layout is set. Its memory-efficient fully reshardable save
-        # gathers over Gloo as well.
+        # gathers over Gloo as well. The optimizer resolution above has already moved such
+        # runs from use_distributed_optimizer to use_layer_wise_distributed_optimizer.
         if (
             args.optimizer not in ('sgd', 'adam')
-            and (args.use_distributed_optimizer or args.optimizer == 'dist_muon')
+            and (
+                args.use_distributed_optimizer
+                or getattr(args, 'use_layer_wise_distributed_optimizer', False)
+                or args.optimizer == 'dist_muon'
+            )
             and getattr(args, 'use_layer_wise_param_layout', True)
             and args.dist_ckpt_optim_fully_reshardable
         ):

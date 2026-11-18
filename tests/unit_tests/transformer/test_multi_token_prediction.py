@@ -4,6 +4,7 @@ import itertools
 import os
 import sys
 import types
+import weakref
 
 import pytest
 import torch
@@ -1894,6 +1895,43 @@ class TestMultiTokenPredictionLayer:
         result.sum().backward()
         # The injected head gradients reach the MTP head inputs through the main backward.
         assert torch.count_nonzero(hidden_states.grad[seq_len:]) > 0
+
+    def test_process_mtp_loss_early_backward_releases_logits_before_next_head(self):
+        """With early backward and unfused CE, no reference to an earlier head's logits may
+        survive into the next head's vocabulary projection."""
+        config = TransformerConfig(
+            mtp_num_layers=3,
+            num_layers=2,
+            hidden_size=8,
+            num_attention_heads=2,
+            use_cpu_initialization=True,
+            mtp_loss_early_backward=True,
+        )
+        seq_len = 4
+        hidden_states = torch.randn(4 * seq_len, 1, config.hidden_size, requires_grad=True)
+        output_weight = torch.nn.Parameter(torch.randn(16, config.hidden_size))
+        logits_refs = []
+        live_previous_logits = []
+
+        def output_layer(hidden, weight=None, runtime_gather_output=None):
+            live_previous_logits.append(sum(ref() is not None for ref in logits_refs))
+            logits = torch.matmul(hidden, weight.t())
+            logits_refs.append(weakref.ref(logits))
+            return logits, None
+
+        process_mtp_loss(
+            hidden_states=hidden_states,
+            labels=torch.arange(seq_len).unsqueeze(0),
+            loss_mask=torch.ones(1, seq_len),
+            output_layer=output_layer,
+            output_weight=output_weight,
+            is_training=False,
+            compute_language_model_loss=lambda labels, logits: logits.square()
+            .sum(dim=-1)
+            .transpose(0, 1),
+            config=config,
+        )
+        assert live_previous_logits == [0, 0, 0]
 
     def test_process_mtp_loss_early_backward_is_skipped_without_grad(self):
         """Under no_grad there is no graph to back-propagate; the plain path must be taken."""
