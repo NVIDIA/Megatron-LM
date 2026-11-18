@@ -15,6 +15,7 @@ from megatron.core.distributed import DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallel
 from megatron.core.distributed.fsdp.src.megatron_fsdp.mixed_precision import HAVE_TE_MXFP8TENSOR
+from megatron.core.distributed.fsdp.src.megatron_fsdp.utils import find_megatron_fsdp
 from megatron.core.fp8_utils import HAVE_TE
 from megatron.core.full_cuda_graph import FullCudaGraphWrapper, StaticBufferLoader
 from megatron.core.hyper_comm_grid import HyperCommGrid
@@ -1978,11 +1979,11 @@ class TestMegatronFsdpOverlapSchedule:
     @pytest.mark.parametrize("outer_dp_sharding_strategy", ["no_shard", "optim"])
     def test_dp_outer_reduces_once_per_step(self, outer_dp_sharding_strategy):
         """
-        HSDP reduces each bucket over DP-Outer once per optimization step.
+        HSDP counts each gradient once in its DP-Outer reduction.
 
         The 1F1B overlap schedule runs the model and the MTP layer in separate backward
-        passes, so it reduces the embedding bucket twice in the last microbatch. The in-place
-        DP-Outer reduction must still run only once.
+        passes, so it reduces the embedding bucket twice in the last microbatch. The second
+        DP-Outer reduction must not reduce the first one's result again.
         """
         self._check_matches_standard_schedule(
             num_optimizer_instances=2, outer_dp_sharding_strategy=outer_dp_sharding_strategy
@@ -1995,3 +1996,310 @@ class TestMegatronFsdpOverlapSchedule:
     def test_gradient_bucket_freed_on_communication_stream(self):
         """A gradient bucket freed on the communication stream is not reused before reduction."""
         self._check_matches_standard_schedule()
+
+
+class TestMegatronFsdpRepeatedDpOuterReduce:
+    """HSDP when the last microbatch reduces its buckets more than once.
+
+    Every microbatch runs several forward and backward passes, as the 1F1B overlap schedule
+    does for the MTP layer that shares the word embedding, and Megatron-FSDP reduces every
+    bucket in every backward pass. So the last microbatch reduces every bucket over DP-Outer
+    more than once.
+
+    Weights and inputs are -1, 0 or 1 and each head's output weights are a signed one-hot,
+    which keeps every partial sum of the gradients exact in bfloat16 on up to 10 ranks. The
+    gradients are compared to a single-GPU reference without tolerance.
+    """
+
+    NUM_OPTIMIZER_INSTANCES = 2
+    NUM_PASSES = 3
+    NUM_HEADS = 2
+    HIDDEN_SIZE = 4
+    BATCH_SIZE = 1
+
+    class SharedTrunkModel(torch.nn.Module):
+        def __init__(self, hidden_size, num_heads):
+            super().__init__()
+            self.trunk = torch.nn.Linear(hidden_size, hidden_size, bias=False)
+            self.heads = torch.nn.ModuleList(
+                [torch.nn.Linear(hidden_size, hidden_size, bias=False) for _ in range(num_heads)]
+            )
+
+        def forward(self, x):
+            hidden = self.trunk(x)
+            return [head(hidden) for head in self.heads]
+
+    @classmethod
+    def setup_class(cls):
+        # Gradients are only sharded over DP-Shard when it has more than one rank.
+        if Utils.world_size % (2 * cls.NUM_OPTIMIZER_INSTANCES) != 0:
+            pytest.skip(f"Requires a world size divisible by {2 * cls.NUM_OPTIMIZER_INSTANCES}.")
+        Utils.initialize_model_parallel(
+            num_distributed_optimizer_instances=cls.NUM_OPTIMIZER_INSTANCES
+        )
+
+    @classmethod
+    def teardown_class(cls):
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    @classmethod
+    def _models(cls, **ddp_kwargs):
+        """Build a reference model and a Megatron-FSDP copy of it, with integer weights."""
+        model = cls.SharedTrunkModel(cls.HIDDEN_SIZE, cls.NUM_HEADS)
+        generator = torch.Generator().manual_seed(0)
+        with torch.no_grad():
+            for param in model.parameters():
+                param.copy_(torch.randint(-1, 2, param.shape, generator=generator))
+        ref_model = copy.deepcopy(model).cuda()
+        ddp_config = dict(
+            data_parallel_sharding_strategy="optim_grads",
+            overlap_grad_reduce=True,
+            overlap_param_gather=True,
+            use_megatron_fsdp=True,
+            num_distributed_optimizer_instances=cls.NUM_OPTIMIZER_INSTANCES,
+        )
+        ddp_config.update(ddp_kwargs)
+        fsdp_model = FullyShardedDataParallel(
+            config=TransformerConfig(num_attention_heads=1, num_layers=1, context_parallel_size=1),
+            ddp_config=DistributedDataParallelConfig(**ddp_config),
+            module=model.cuda(),
+            fsdp_unit_modules=[torch.nn.Linear],
+        )
+        return ref_model, fsdp_model
+
+    @classmethod
+    def _batches(cls, num_steps, num_microbatches):
+        """The batches of every pass, generated alike on every rank.
+
+        Indexed by [step, rank, microbatch, pass]. Each batch holds an input at index 0 and the
+        output weights of each head after it, along dimension 1.
+        """
+        generator = torch.Generator().manual_seed(1)
+        shape = (num_steps, Utils.world_size, num_microbatches, cls.NUM_PASSES, cls.BATCH_SIZE)
+        inputs = torch.randint(-1, 2, (*shape, 1, cls.HIDDEN_SIZE), generator=generator)
+        hot = torch.randint(0, cls.HIDDEN_SIZE, (*shape, cls.NUM_HEADS), generator=generator)
+        sign = torch.randint(0, 2, hot.shape, generator=generator) * 2 - 1
+        output_weights = torch.nn.functional.one_hot(hot, cls.HIDDEN_SIZE) * sign.unsqueeze(-1)
+        return torch.cat([inputs, output_weights], dim=-2).float().cuda()
+
+    @staticmethod
+    def _loss(model, batch):
+        inputs, output_weights = batch[:, 0], batch[:, 1:]
+        return (torch.stack(model(inputs), dim=1) * output_weights).sum()
+
+    @classmethod
+    def _run_backward_passes(cls, fsdp_model, step_batches):
+        """Run this rank's passes, reducing over DP-Outer in the last microbatch."""
+        megatron_fsdp = find_megatron_fsdp(fsdp_model)
+        rank_batches = step_batches[torch.distributed.get_rank()]
+        for microbatch_id, microbatch in enumerate(rank_batches):
+            megatron_fsdp.is_last_microbatch = microbatch_id == len(rank_batches) - 1
+            for batch in microbatch:
+                cls._loss(fsdp_model, batch).backward()
+
+    @classmethod
+    def _run_step(cls, fsdp_model, step_batches):
+        cls._run_backward_passes(fsdp_model, step_batches)
+        fsdp_model.finish_grad_sync()
+
+    @staticmethod
+    def _main_grads(fsdp_model):
+        """Assemble each parameter's main gradient from the shards held across DP."""
+        buffer = fsdp_model.param_and_grad_buffer
+        grads = {}
+        for group in buffer.parameter_groups:
+            main_grad_buffer = group.main_grad_buffer
+            assert main_grad_buffer.is_data_distributed
+            for item_id, param in enumerate(group.params):
+                grad = torch.zeros(
+                    main_grad_buffer.item_index_map[item_id].size, dtype=torch.float32
+                ).cuda()
+                start, end = main_grad_buffer.locate_item_shard_in_global_item(item_id)
+                grad[start:end] = main_grad_buffer.get_item(item_id, only_shard=True)
+                # Every rank of the main gradient's group holds a distinct shard of it.
+                torch.distributed.all_reduce(grad, group=main_grad_buffer.data_parallel_group)
+                grads[buffer.param_to_name[param]] = grad
+        return grads
+
+    @classmethod
+    def _assert_grads_match_reference(cls, fsdp_model, ref_model, step_batches):
+        """Compare the main gradients to those of every rank's passes, averaged over DP."""
+        ref_model.zero_grad()
+        for rank_batches in step_batches:
+            for microbatch in rank_batches:
+                for batch in microbatch:
+                    cls._loss(ref_model, batch).backward()
+        grads = cls._main_grads(fsdp_model)
+        for name, param in ref_model.named_parameters():
+            assert_close(
+                grads[name],
+                param.grad.flatten() / Utils.world_size,
+                rtol=0,
+                atol=0,
+                msg=lambda msg: f"Gradient mismatch for {name}: {msg}",
+            )
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Megatron-FSDP requires torch >= 2.4.0"
+    )
+    @pytest.mark.parametrize(
+        "ddp_kwargs",
+        [
+            pytest.param({}, id="default"),
+            pytest.param(dict(megatron_fsdp_grad_comm_dtype=torch.bfloat16), id="bf16_comm"),
+            pytest.param(dict(average_in_collective=True), id="average_in_collective"),
+        ],
+    )
+    @pytest.mark.parametrize("num_microbatches", [1, 2])
+    @pytest.mark.parametrize("sharding_strategy", ["optim_grads", "optim_grads_params"])
+    @pytest.mark.parametrize("outer_dp_sharding_strategy", ["no_shard", "optim"])
+    def test_every_pass_counted_once(
+        self, outer_dp_sharding_strategy, sharding_strategy, num_microbatches, ddp_kwargs
+    ):
+        """
+        Each pass of the last microbatch adds its gradient to the main gradient exactly once.
+
+        The first DP-Outer reduction of a bucket reduces its accumulated gradient in place,
+        and a later one must reduce only its own gradient. A second step checks that zeroing
+        the gradients starts over, so the accumulated gradient is reduced again.
+        """
+        num_steps = 2
+        ref_model, fsdp_model = self._models(
+            data_parallel_sharding_strategy=sharding_strategy,
+            outer_dp_sharding_strategy=outer_dp_sharding_strategy,
+            **ddp_kwargs,
+        )
+        batches = self._batches(num_steps, num_microbatches)
+        for step in range(num_steps):
+            fsdp_model.zero_grad_buffer()
+            self._run_step(fsdp_model, batches[step])
+            self._assert_grads_match_reference(fsdp_model, ref_model, batches[step])
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Megatron-FSDP requires torch >= 2.4.0"
+    )
+    @pytest.mark.parametrize("outer_dp_sharding_strategy", ["no_shard", "optim"])
+    def test_model_auto_sync_counts_every_pass_once(self, outer_dp_sharding_strategy):
+        """
+        Automatic synchronization reduces over DP-Outer after every pass of every microbatch.
+
+        Only the first of those reductions since the gradients were zeroed may reduce the
+        accumulated gradient in place.
+        """
+        num_steps = 2
+        ref_model, fsdp_model = self._models(outer_dp_sharding_strategy=outer_dp_sharding_strategy)
+        find_megatron_fsdp(fsdp_model).set_model_auto_sync(True)
+        batches = self._batches(num_steps, num_microbatches=2)
+        for step in range(num_steps):
+            fsdp_model.zero_grad_buffer()
+            self._run_backward_passes(fsdp_model, batches[step])
+            self._assert_grads_match_reference(fsdp_model, ref_model, batches[step])
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Megatron-FSDP requires torch >= 2.4.0"
+    )
+    @pytest.mark.parametrize("outer_dp_sharding_strategy", ["no_shard", "optim"])
+    def test_dp_outer_reductions_overlap_backward(self, monkeypatch, outer_dp_sharding_strategy):
+        """
+        Every DP-Outer reduction is issued in the backward pass that produced its gradient.
+
+        Issued there, it overlaps with the rest of the backward pass, while finish_grad_sync()
+        only waits for it.
+        """
+        _, fsdp_model = self._models(outer_dp_sharding_strategy=outer_dp_sharding_strategy)
+        outer_fsdp_group = fsdp_model.megatron_fsdp_dist_index.get_outer_fsdp_group()
+        phase = "backward"
+        dp_outer_collective_phases = []
+
+        def record_dp_outer_collective(collective):
+            def wrapper(*args, **kwargs):
+                if kwargs.get("group") is outer_fsdp_group:
+                    dp_outer_collective_phases.append(phase)
+                return collective(*args, **kwargs)
+
+            return wrapper
+
+        for name in ("all_reduce", "reduce_scatter_tensor"):
+            collective = getattr(torch.distributed, name)
+            monkeypatch.setattr(torch.distributed, name, record_dp_outer_collective(collective))
+        self._run_backward_passes(fsdp_model, self._batches(num_steps=1, num_microbatches=2)[0])
+        phase = "finish_grad_sync"
+        fsdp_model.finish_grad_sync()
+        monkeypatch.undo()
+
+        assert dp_outer_collective_phases, "No DP-Outer reduction was issued."
+        assert set(dp_outer_collective_phases) == {"backward"}, (
+            f"{dp_outer_collective_phases.count('finish_grad_sync')} DP-Outer reductions "
+            "were deferred to finish_grad_sync()."
+        )
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Megatron-FSDP requires torch >= 2.4.0"
+    )
+    @pytest.mark.parametrize("outer_dp_sharding_strategy", ["no_shard", "optim"])
+    def test_cuda_graph_replays_every_pass_once(self, outer_dp_sharding_strategy):
+        """
+        A CUDA graph of a step replays its repeated DP-Outer reductions correctly.
+
+        The graph captures which reductions of a bucket reduce in place and which only add
+        their own gradient, so it holds for every replay as long as each replay follows a
+        zeroing of the gradients, as it does in training.
+        """
+        num_steps = 4
+        ref_model, fsdp_model = self._models(
+            outer_dp_sharding_strategy=outer_dp_sharding_strategy,
+            megatron_fsdp_cuda_graph_mode=True,
+        )
+        batches = self._batches(num_steps, num_microbatches=2)
+        static_batches = torch.zeros_like(batches[0])
+        graph = torch.cuda.CUDAGraph()
+        stream = torch.cuda.Stream()
+        override_stale_capture_stream = hasattr(
+            torch.autograd.graph, "set_override_stale_capture_stream"
+        )
+        try:
+            for step in range(num_steps):
+                static_batches.copy_(batches[step])
+                fsdp_model.zero_grad_buffer()
+                if step == 0:
+                    # Warm up on the capture stream, as FullCudaGraphWrapper does.
+                    stream.wait_stream(torch.cuda.current_stream())
+                    with torch.cuda.stream(stream):
+                        self._run_step(fsdp_model, static_batches)
+                    torch.cuda.current_stream().wait_stream(stream)
+                else:
+                    if step == 1:
+                        if override_stale_capture_stream:
+                            torch.autograd.graph.set_override_stale_capture_stream(True)
+                        torch.cuda.synchronize()
+                        with torch.cuda.graph(
+                            graph, stream=stream, capture_error_mode="thread_local"
+                        ):
+                            self._run_step(fsdp_model, static_batches)
+                    graph.replay()
+                self._assert_grads_match_reference(fsdp_model, ref_model, batches[step])
+        finally:
+            if override_stale_capture_stream:
+                torch.autograd.graph.set_override_stale_capture_stream(False)
+            torch.cuda.synchronize()
+            del graph
+
+    @pytest.mark.skipif(
+        not is_torch_min_version("2.4.0"), reason="Megatron-FSDP requires torch >= 2.4.0"
+    )
+    @pytest.mark.parametrize("sharding_strategy", ["no_shard", "optim"])
+    def test_repeated_reduction_of_unsharded_gradients_raises(self, sharding_strategy):
+        """
+        A bucket whose gradients DP-Shard does not shard cannot be reduced again in a step.
+
+        Its DP-Shard gradient buffer accumulates and reduces in place, so a later reduction
+        would reduce the reduced gradient again, already on DP-Shard.
+        """
+        _, fsdp_model = self._models(data_parallel_sharding_strategy=sharding_strategy)
+        with pytest.raises(NotImplementedError, match="reduced more than once"):
+            self._run_step(fsdp_model, self._batches(num_steps=1, num_microbatches=1)[0])
+        torch.cuda.synchronize()
