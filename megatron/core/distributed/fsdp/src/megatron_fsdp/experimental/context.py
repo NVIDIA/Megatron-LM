@@ -304,6 +304,24 @@ class FsdpContext:
         if self.outer_reduction_stream is not self.inner_reduction_stream:
             self.current_stream().wait_stream(self.outer_reduction_stream)
 
+    def prepare_for_cuda_graph_capture(self) -> None:
+        """Require completed eager recording and a clean synchronization boundary."""
+        self.ensure_finalized()
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError("Prepare the FSDP context before entering CUDA graph capture.")
+        if self._post_autograd_hook_registered or self._delayed_post_backward_callbacks:
+            raise RuntimeError("FSDP capture requires a clean gradient synchronization boundary.")
+        if self.training and self.prefetch_order is PrefetchOrder.RECORDED:
+            view = self.execution_order_view
+            if self.is_recording_execution_order or view is None or view.position:
+                raise RuntimeError("FSDP capture requires a complete execution window.")
+        if any(
+            group._unshard_events
+            for module in self._module_names
+            for group in module.parameter_groups
+        ):
+            raise RuntimeError("FSDP capture requires all gathered weights to be released.")
+
     def pre_backward(self) -> None:
         """Fork the reduce-scatter stream into any active CUDA-graph capture.
 
