@@ -53,8 +53,7 @@ from megatron.training import (
     print_rank_0,
     set_startup_timestamps,
 )
-from megatron.training.argument_utils import (  # noqa: F401  (core_gpt_dataset_config_from_args: legacy shape, importable from here)
-    core_gpt_dataset_config_from_args,
+from megatron.training.argument_utils import (
     gpt_config_from_args,
     gpt_data_config_from_args,
     pretrain_cfg_container_from_args,

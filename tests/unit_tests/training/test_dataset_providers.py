@@ -352,7 +352,8 @@ def test_entry_points_build_the_dataset_config_pretrain_gpt_built(
     if (entry_point, case) in REJECTED:
         with pytest.raises(ValueError, match=REJECTED[(entry_point, case)]):
             args, _, _ = _prepare(monkeypatch, extra, overrides, entry_point)
-            module.core_gpt_dataset_config_from_args(args)
+            if entry_point == "prepare_cache":
+                module.core_gpt_dataset_config_from_args(args)
         return
     args, cfg, tokenizer = _prepare(monkeypatch, extra, overrides, entry_point)
     expected = legacy.legacy_gpt_dataset_config(args)
@@ -394,9 +395,6 @@ def test_entry_points_build_the_dataset_config_pretrain_gpt_built(
         assert dataset_class is expected_class
     if entry_point != "hybrid_flex":  # its rank predicate has no packed-sequence parameter
         assert packed is expected_packed
-    wrapper = module.core_gpt_dataset_config_from_args(args)
-    assert isinstance(wrapper, type(actual)) and wrapper.tokenizer is not None
-    assert _signature(wrapper, names) == _signature(expected, names)
 
 
 @pytest.mark.parametrize(("entry_point", "case"), sorted(LEGACY_CLASS_CHANGES))
@@ -682,20 +680,3 @@ def test_rank_rule_gates_on_tensor_parallel_rank():
         assert rule(None, False, sequence_packing_scheduler="dp_balanced", **layout) is expected
     finally:
         Utils.destroy_model_parallel()
-
-
-def test_legacy_wrapper_is_the_shared_helper(monkeypatch, corpus):
-    """pretrain_gpt and pretrain_hybrid expose argument_utils.core_gpt_dataset_config_from_args
-    itself; the cache tool wraps it (the class pinned to GPTDataset) and hybrid-flex builds the
-    same standalone section through its own factory (the varlen check). The helper takes the seed
-    from the arguments, validates, and binds the tokenizer it is given."""
-    shared = argument_utils.core_gpt_dataset_config_from_args
-    assert _entry_point("gpt").core_gpt_dataset_config_from_args is shared
-    assert _entry_point("hybrid").core_gpt_dataset_config_from_args is shared
-    args, cfg, _ = _prepare(monkeypatch, *corpus["blend"])
-    cfg.rng.seed = 77  # not the dataset's seed: that is --seed
-    own = SimpleNamespace(vocab_size=2048)
-    config = shared(args, tokenizer=own)
-    assert config.tokenizer is own and config.random_seed == args.seed
-    with pytest.raises(ValueError, match="GPTDataset needs a data source"):
-        shared(_validated(["--mock-data"], {}), dataset_type=GPTDataset)

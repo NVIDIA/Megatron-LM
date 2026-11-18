@@ -318,43 +318,6 @@ def test_file_backed_sources_are_resolved_by_the_factory(files):
     data.validate()
 
 
-def test_standalone_config_takes_the_container_written_fields_from_args():
-    args = _validated(
-        [
-            "--mock-data",
-            "--seed",
-            "99",
-            "--full-validation",
-            "--sequence-parallel",
-            "--tensor-model-parallel-size",
-            "1",
-        ]
-    )
-    standalone = gpt_data_config_from_args(args, standalone=True).dataset
-    assert standalone.random_seed == 99 and standalone.full_validation is True
-    assert standalone.multiple_validation_sets is False
-    assert standalone.data_parallel_size == args.data_parallel_size
-    assert standalone.context_parallel_size == args.context_parallel_size
-    assert standalone.sequence_parallel_size == args.tensor_model_parallel_size * int(
-        args.sequence_parallel
-    )
-    assert standalone.dynamic_context_parallel is False
-    owned = gpt_data_config_from_args(args).dataset
-    assert _written_fields(owned) == CORE_DEFAULTS
-    assert owned.random_seed == 99  # the seed is the section's own setting
-    assert set(argument_utils._container_written_fields_from_args(args)) == (
-        set(CONTAINER_WRITTEN_FIELDS) - {"packed_sequence_length"}
-    )
-    sft_args = _validated(["--mock-data", "--sft", "--max-seq-length-per-sample", "64"])
-    standalone_sft = gpt_data_config_from_args(sft_args, standalone=True).dataset
-    assert standalone_sft.data_parallel_size == sft_args.data_parallel_size
-    assert standalone_sft.context_parallel_size == sft_args.context_parallel_size
-    assert standalone_sft.sequence_parallel_size == 0
-    assert standalone_sft.dynamic_context_parallel is False
-    assert standalone_sft.sequence_length == 32
-    assert standalone_sft.packed_sequence_length == 64
-
-
 def test_conflicting_dataset_families_are_rejected():
     with pytest.raises(ValueError, match="mutually exclusive"):
         requested_dataset_family(Namespace(sft=True, use_varlen_dataset=True))
