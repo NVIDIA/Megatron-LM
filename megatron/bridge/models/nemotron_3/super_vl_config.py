@@ -52,7 +52,7 @@ class Nemotron35SuperVLModelConfig(BridgeHybridModelConfig):
     """Super VL language decoder, RADIO encoder and projection configuration."""
 
     builder: ClassVar[str] = (
-        "megatron.bridge.models.nemotron_super_vl.builder.Nemotron35SuperVLModelBuilder"
+        "megatron.bridge.models.nemotron_3.super_vl_builder.Nemotron35SuperVLModelBuilder"
     )
 
     image_token_index: int = 0

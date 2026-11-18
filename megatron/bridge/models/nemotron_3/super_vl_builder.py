@@ -21,8 +21,8 @@ import copy
 from typing import Any
 
 from megatron.bridge.models.hybrid.hybrid_builder import BridgeHybridModelBuilder
-from megatron.bridge.models.nemotron_super_vl.config import Nemotron35SuperVLModelConfig
-from megatron.bridge.models.nemotron_super_vl.modeling_super_vl import Nemotron35SuperVLModel
+from megatron.bridge.models.nemotron_3.modeling_super_vl import Nemotron35SuperVLModel
+from megatron.bridge.models.nemotron_3.super_vl_config import Nemotron35SuperVLModelConfig
 from megatron.core.activations import fast_gelu, squared_relu
 from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
 from megatron.core.models.vision.vit_layer_specs import get_vit_layer_with_transformer_engine_spec

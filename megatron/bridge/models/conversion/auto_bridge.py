@@ -308,7 +308,7 @@ def _resolve_pretrained_wrapper_cls(
     """
     architectures = getattr(config, "architectures", None) or []
     if "NemotronH_Omni_Reasoning_V3" in architectures:
-        from megatron.bridge.models.nemotron_super_vl.hf_pretrained import Nemotron35VLPretrained
+        from megatron.bridge.models.nemotron_3.super_vl_hf_pretrained import Nemotron35VLPretrained
 
         return Nemotron35VLPretrained
     if any(arch.endswith("ForTokenClassification") for arch in architectures):
@@ -2418,7 +2418,7 @@ class AutoBridge(Generic[MegatronModelT]):
                         f"          # Return a MegatronMappingRegistry with weight mappings\n"
                         f"          ...\n\n"
                         f"For reference implementations, see:\n"
-                        f"  • megatron/bridge/models/nemotronh/nemotron_h_bridge.py\n"
+                        f"  • megatron/bridge/models/nemotron_3/nemotron_3_bridge.py\n"
                         f"  • megatron/bridge/models/qwen/qwen35_bridge.py"
                     ) from None
 

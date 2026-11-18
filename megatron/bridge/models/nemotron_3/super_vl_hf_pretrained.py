@@ -67,9 +67,7 @@ class Nemotron35VLPretrained(PreTrainedCausalLM):
             version.base_version in _PROCESSOR_ADAPTER_RELEASES
             and getattr(self.config, "audio_config", None) is None
         ):
-            from megatron.bridge.models.nemotron_super_vl.processing_super_vl import (
-                Nemotron35VLProcessor,
-            )
+            from megatron.bridge.models.nemotron_3.processing_super_vl import Nemotron35VLProcessor
 
             processor_cls = Nemotron35VLProcessor
         return processor_cls.from_pretrained(

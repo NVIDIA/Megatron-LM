@@ -34,9 +34,9 @@ from megatron.bridge.models.conversion.param_mapping import (
 )
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.hf_pretrained.state import SafeTensorsStateSource, StateDict
-from megatron.bridge.models.nemotron_super_vl.config import Nemotron35SuperVLModelConfig
-from megatron.bridge.models.nemotron_super_vl.modeling_super_vl import Nemotron35SuperVLModel
-from megatron.bridge.models.nemotronh.nemotron_h_bridge import NemotronHBridge
+from megatron.bridge.models.nemotron_3.modeling_super_vl import Nemotron35SuperVLModel
+from megatron.bridge.models.nemotron_3.nemotron_3_bridge import Nemotron3Bridge
+from megatron.bridge.models.nemotron_3.super_vl_config import Nemotron35SuperVLModelConfig
 from megatron.core.activations import squared_relu
 from megatron.core.transformer.enums import AttnBackend
 
@@ -78,7 +78,7 @@ from .configuration_radio import RADIOConfig as _RADIOConfig
         ("hybrid_override_pattern", "hybrid_layer_pattern"),
         # HF public Omni config uses layer_norm_epsilon instead of rms_norm_eps.
         ("layer_norm_epsilon", "layernorm_epsilon"),
-        # Mamba-specific (same as NemotronHBridge)
+        # Mamba-specific (same as Nemotron3Bridge)
         ("mamba_head_dim", "mamba_head_dim"),
         ("mamba_num_heads", "mamba_num_heads"),
         ("n_groups", "mamba_num_groups"),
@@ -122,7 +122,7 @@ from .configuration_radio import RADIOConfig as _RADIOConfig
         llm_config = self._hf_language_config(hf_config)
         config_kwargs = super().hf_config_to_model_config_kwargs(llm_config)
 
-        hybrid_pattern = NemotronHBridge._hf_hybrid_pattern(llm_config)
+        hybrid_pattern = Nemotron3Bridge._hf_hybrid_pattern(llm_config)
         if hybrid_pattern is None:
             raise ValueError(
                 "Nemotron Omni requires hybrid_override_pattern or layers_block_type in llm_config."
@@ -146,7 +146,7 @@ from .configuration_radio import RADIOConfig as _RADIOConfig
             # to a square grid covering the longest image dimension, then crop to
             # the requested aspect ratio.
             radio_interpolate_only_cpe=False,
-            **NemotronHBridge._hf_mtp_settings(llm_config),
+            **Nemotron3Bridge._hf_mtp_settings(llm_config),
         )
 
         if hasattr(hf_config, "projector_hidden_size"):
@@ -247,7 +247,7 @@ from .configuration_radio import RADIOConfig as _RADIOConfig
         mappings = []
 
         # Reuse the media mappings, removing LLaVA's wrapper namespace.
-        # Language mappings come from NemotronHBridge so MTP and supported MoE
+        # Language mappings come from Nemotron3Bridge so MTP and supported MoE
         # layouts remain one source of truth.
         for mapping in self._llava_mapping_registry().mappings:
             if mapping.megatron_param.startswith("llava_model.language_model."):
@@ -259,7 +259,7 @@ from .configuration_radio import RADIOConfig as _RADIOConfig
         hf_config = getattr(self, "hf_config", None)
         llm_config = self._hf_language_config(hf_config)
 
-        language_bridge = NemotronHBridge()
+        language_bridge = Nemotron3Bridge()
         language_bridge.hf_config = llm_config
         for mapping in language_bridge.mapping_registry().mappings:
             is_mtp = mapping.megatron_param.startswith("mtp.")
@@ -537,7 +537,7 @@ class Nemotron35SuperVLBridge(_SuperVLMappingBase):
     @classmethod
     def _validate_shared_mtp_config(cls, llm_config) -> None:
         """Validate the serialized shared block before choosing training depths."""
-        blocks, pattern = NemotronHBridge._hf_mtp_config(llm_config)
+        blocks, pattern = Nemotron3Bridge._hf_mtp_config(llm_config)
         if blocks != cls._HF_SHARED_MTP_BLOCKS:
             raise ValueError(
                 f"Nemotron 3.5 Super VL requires exactly one serialized shared MTP block; got {blocks}."

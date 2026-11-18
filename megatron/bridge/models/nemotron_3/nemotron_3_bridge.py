@@ -240,7 +240,7 @@ class _MTPFlatteningQKVMapping(MegatronParamMapping[Dict[str, torch.Tensor]]):
 @MegatronModelBridge.register_bridge(
     source="NemotronHForCausalLM", target=HybridModel, model_type="nemotron_h"
 )
-class NemotronHBridge(MegatronModelBridge):
+class Nemotron3Bridge(MegatronModelBridge):
     """
     Megatron Bridge for Nemotron-H Causal LM.
 

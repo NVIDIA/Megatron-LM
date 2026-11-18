@@ -11,6 +11,10 @@ checkpoints. Other Bridge model families are not registered by this package.
 Super VL can also import/export its text-only projection with `--text-only`;
 Qwen VL does not support that projection.
 
+Nemotron text and Super VL implementations live together under
+`megatron.bridge.models.nemotron_3`. The text conversion class is `Nemotron3Bridge`;
+HF architecture/config identifiers retain their original names for compatibility.
+
 Native I/O supports builder-backed `torch_dist` model weights and MLM
 `run_config.yaml` metadata. It does not convert optimizer state, training progress,
 legacy args/provider checkpoints, PEFT adapters, or ModelOpt checkpoint transforms.
@@ -71,6 +75,17 @@ parallelism overrides. GTP checkpoints reject incompatible native topology
 changes; export to HF first, then import with the desired topology.
 
 ## Python API
+
+For a single-GPU HF → Megatron model → HF round-trip example:
+
+```bash
+PYTHONPATH=. uv run --no-sync python examples/bridge/conversion/hf_megatron_roundtrip.py \
+  --hf-model-id /models/qwen-checkpoint --output-dir /exports
+```
+
+Choose a supported model that fits on one GPU. The example prints per-weight
+comparisons (mismatches are displayed, not asserted) and saves to a new directory;
+it does not save an intermediate native checkpoint or run training.
 
 ```python
 from megatron.bridge import AutoBridge

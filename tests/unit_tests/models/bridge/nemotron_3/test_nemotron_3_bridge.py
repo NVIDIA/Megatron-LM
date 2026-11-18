@@ -30,8 +30,8 @@ from megatron.bridge.models.conversion.param_mapping import AutoMapping, QKVMapp
 from megatron.bridge.models.conversion.quant_mapping import AmaxFanoutMapping, AmaxMapping
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.hybrid import BridgeHybridModelConfig
-from megatron.bridge.models.nemotronh.nemotron_h_bridge import (
-    NemotronHBridge,
+from megatron.bridge.models.nemotron_3.nemotron_3_bridge import (
+    Nemotron3Bridge,
     _MTPFlatteningMapping,
     _MTPFlatteningQKVMapping,
     _replace_wildcards,
@@ -39,8 +39,8 @@ from megatron.bridge.models.nemotronh.nemotron_h_bridge import (
 from megatron.core.activations import squared_relu
 
 
-class TestNemotronHBridge:
-    """Test cases for NemotronHBridge class."""
+class TestNemotron3Bridge:
+    """Test cases for Nemotron3Bridge class."""
 
     @pytest.fixture
     def active_nemotronh_config_dict(self):
@@ -118,12 +118,12 @@ class TestNemotronHBridge:
         return mock_pretrained
 
     def test_bridge_registration(self):
-        """Test that NemotronHBridge is properly registered."""
-        assert issubclass(NemotronHBridge, MegatronModelBridge)
+        """Test that Nemotron3Bridge is properly registered."""
+        assert issubclass(Nemotron3Bridge, MegatronModelBridge)
 
     def test_model_config_basic(self, mock_pretrained_nemotronh, mock_nemotronh_config):
         """Test basic config conversion."""
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
 
         # Convert the HF config
         result = bridge.hf_config_to_model_config(mock_pretrained_nemotronh.config)
@@ -142,7 +142,7 @@ class TestNemotronHBridge:
 
     def test_model_config_vocabulary(self, mock_pretrained_nemotronh, mock_nemotronh_config):
         """Test vocabulary size mapping."""
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
 
         result = bridge.hf_config_to_model_config(mock_pretrained_nemotronh.config)
 
@@ -154,7 +154,7 @@ class TestNemotronHBridge:
 
     def test_model_config_attention_config(self, mock_pretrained_nemotronh, mock_nemotronh_config):
         """Test attention configuration mapping."""
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
 
         result = bridge.hf_config_to_model_config(mock_pretrained_nemotronh.config)
 
@@ -164,7 +164,7 @@ class TestNemotronHBridge:
 
     def test_model_config_mamba_config(self, mock_pretrained_nemotronh, mock_nemotronh_config):
         """Test Mamba-specific configuration mapping."""
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
 
         result = bridge.hf_config_to_model_config(mock_pretrained_nemotronh.config)
         result.finalize()
@@ -179,7 +179,7 @@ class TestNemotronHBridge:
 
     def test_model_config_mlp_config(self, mock_pretrained_nemotronh, mock_nemotronh_config):
         """Test MLP configuration mapping."""
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
 
         result = bridge.hf_config_to_model_config(mock_pretrained_nemotronh.config)
 
@@ -189,7 +189,7 @@ class TestNemotronHBridge:
 
     def test_model_config_normalization(self, mock_pretrained_nemotronh, mock_nemotronh_config):
         """Test normalization configuration."""
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
 
         result = bridge.hf_config_to_model_config(mock_pretrained_nemotronh.config)
 
@@ -203,7 +203,7 @@ class TestNemotronHBridge:
         mock_nemotronh_config.torch_dtype = "bfloat16"
         mock_pretrained.config = mock_nemotronh_config
 
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         result = bridge.hf_config_to_model_config(mock_pretrained.config)
 
         # The provider should respect the model's dtype
@@ -213,7 +213,7 @@ class TestNemotronHBridge:
 
     def test_mapping_registry_implementation(self, mock_pretrained_nemotronh):
         """Test that mapping_registry returns a proper MegatronMappingRegistry."""
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
 
         # Get the mapping registry
         mapping_registry = bridge.mapping_registry()
@@ -229,7 +229,7 @@ class TestNemotronHBridge:
         "hf_embedding_key", ["backbone.embedding.weight", "backbone.embeddings.weight"]
     )
     def test_embedding_mapping_preserves_checkpoint_key(self, hf_embedding_key: str) -> None:
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         bridge.hf_pretrained = SimpleNamespace(
             state=SimpleNamespace(
                 source=SimpleNamespace(get_all_keys=lambda: [hf_embedding_key, "lm_head.weight"])
@@ -247,7 +247,7 @@ class TestNemotronHBridge:
 
     @pytest.mark.unit
     def test_config_only_embedding_mapping_keeps_legacy_name(self) -> None:
-        registry = NemotronHBridge().mapping_registry()
+        registry = Nemotron3Bridge().mapping_registry()
 
         assert (
             registry.megatron_to_hf_lookup("embedding.word_embeddings.weight").hf_param
@@ -256,7 +256,7 @@ class TestNemotronHBridge:
 
     @pytest.mark.unit
     def test_missing_embedding_remains_a_conversion_error(self) -> None:
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         bridge.hf_pretrained = SimpleNamespace(
             state=SimpleNamespace(source=SimpleNamespace(get_all_keys=lambda: ["lm_head.weight"]))
         )
@@ -268,7 +268,7 @@ class TestNemotronHBridge:
 
     def test_mapping_registry_contains_mamba_conv1d_compat_mappings(self):
         """Test that Mamba conv mappings support old and new Megatron-Core names."""
-        registry = NemotronHBridge().mapping_registry()
+        registry = Nemotron3Bridge().mapping_registry()
 
         new_weight = registry.megatron_to_hf_lookup("decoder.layers.0.mixer.conv1d_weight")
         new_bias = registry.megatron_to_hf_lookup("decoder.layers.0.mixer.conv1d_bias")
@@ -287,7 +287,7 @@ class TestNemotronHBridge:
 
     def test_model_config_fixed_settings(self, mock_pretrained_nemotronh):
         """Test fixed settings that should always be set regardless of config."""
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
 
         result = bridge.hf_config_to_model_config(mock_pretrained_nemotronh.config)
 
@@ -317,7 +317,7 @@ class TestNemotronHBridge:
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = cfg
 
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         result = bridge.hf_config_to_model_config(mock_pretrained.config)
 
         # Check MoE configuration mappings
@@ -350,7 +350,7 @@ class TestNemotronHBridge:
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = cfg
 
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         result = bridge.hf_config_to_model_config(mock_pretrained.config)
 
         # When n_routed_experts is 0, num_moe_experts should be 0 or None
@@ -378,7 +378,7 @@ class TestNemotronHBridge:
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = cfg
 
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         result = bridge.hf_config_to_model_config(mock_pretrained.config)
 
         # Check Super-specific MoE configuration
@@ -402,7 +402,7 @@ class TestNemotronHBridge:
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = cfg
 
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         result = bridge.hf_config_to_model_config(mock_pretrained.config)
 
         # Check MTP configuration mappings
@@ -430,7 +430,7 @@ class TestNemotronHBridge:
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = SimpleNamespace(**config_dict)
 
-        result = NemotronHBridge().hf_config_to_model_config(mock_pretrained.config)
+        result = Nemotron3Bridge().hf_config_to_model_config(mock_pretrained.config)
 
         assert result.mtp_num_layers == 0
         assert result.mtp_hybrid_override_pattern is None
@@ -446,7 +446,7 @@ class TestNemotronHBridge:
         )
 
         with pytest.raises(ValueError, match="mtp_hybrid_override_pattern"):
-            NemotronHBridge().hf_config_to_model_config(mock_pretrained.config)
+            Nemotron3Bridge().hf_config_to_model_config(mock_pretrained.config)
 
     def test_model_config_no_moe_when_attribute_missing(self, active_nemotronh_config_dict):
         """Test that MoE configs are not added when n_routed_experts attribute is missing."""
@@ -461,7 +461,7 @@ class TestNemotronHBridge:
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = cfg
 
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         result = bridge.hf_config_to_model_config(mock_pretrained.config)
 
         # Should work without MoE configs - provider should still be created
@@ -470,7 +470,7 @@ class TestNemotronHBridge:
 
     def test_mapping_registry_contains_moe_mappings(self):
         """Test that mapping_registry contains MoE parameter mappings."""
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         mapping_registry = bridge.mapping_registry()
 
         # Get all megatron params from mappings
@@ -495,7 +495,7 @@ class TestNemotronHBridge:
 
     def test_mapping_registry_contains_latent_proj_mappings(self):
         """Test that mapping_registry contains latent projection mappings for Super model."""
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         mapping_registry = bridge.mapping_registry()
 
         # Get all megatron params from mappings
@@ -509,7 +509,7 @@ class TestNemotronHBridge:
 
     def test_mapping_registry_moe_hf_params(self):
         """Test that MoE mappings have correct HF parameter names."""
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         mapping_registry = bridge.mapping_registry()
 
         # Create a lookup dict of megatron -> hf params
@@ -547,7 +547,7 @@ class TestNemotronHBridge:
 
     def test_mapping_registry_latent_proj_hf_params(self):
         """Test that latent projection mappings have correct HF parameter names."""
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         mapping_registry = bridge.mapping_registry()
 
         # Create a lookup dict of megatron -> hf params
@@ -568,28 +568,28 @@ class TestNemotronHBridge:
         )
 
 
-class TestNemotronHBridgeTokenizerKwargs:
+class TestNemotron3BridgeTokenizerKwargs:
     """Test get_hf_tokenizer_kwargs method."""
 
     def test_tokenizer_kwargs_returns_dict(self):
         """Test get_hf_tokenizer_kwargs returns a dict."""
-        kwargs = NemotronHBridge.get_hf_tokenizer_kwargs()
+        kwargs = Nemotron3Bridge.get_hf_tokenizer_kwargs()
         assert isinstance(kwargs, dict)
 
     def test_tokenizer_kwargs_use_fast(self):
         """Test get_hf_tokenizer_kwargs returns use_fast=True."""
-        kwargs = NemotronHBridge.get_hf_tokenizer_kwargs()
+        kwargs = Nemotron3Bridge.get_hf_tokenizer_kwargs()
         assert kwargs.get("use_fast") is True
 
 
-class TestNemotronHBridgeMegatronToHFConfig:
+class TestNemotron3BridgeMegatronToHFConfig:
     """Test Megatron provider config export for Nemotron-H."""
 
     def test_megatron_to_hf_config_splits_unified_mtp_pattern(self):
         """Export HF hybrid_override_pattern without Megatron's unified MTP separator."""
         provider = SimpleNamespace(hybrid_layer_pattern="ME|ME/*E", mtp_num_layers=1)
 
-        hf_cfg = NemotronHBridge.megatron_to_hf_config(provider)
+        hf_cfg = Nemotron3Bridge.megatron_to_hf_config(provider)
 
         assert hf_cfg["hybrid_override_pattern"] == "MEME"
         assert hf_cfg["mtp_hybrid_override_pattern"] == "*E"
@@ -599,7 +599,7 @@ class TestNemotronHBridgeMegatronToHFConfig:
         """Collapse repeated unified MTP blocks to the HF MTP block pattern field."""
         provider = SimpleNamespace(hybrid_layer_pattern="MEME/*E/*E", mtp_num_layers=2)
 
-        hf_cfg = NemotronHBridge.megatron_to_hf_config(provider)
+        hf_cfg = Nemotron3Bridge.megatron_to_hf_config(provider)
 
         assert hf_cfg["hybrid_override_pattern"] == "MEME"
         assert hf_cfg["mtp_hybrid_override_pattern"] == "*E"
@@ -618,7 +618,7 @@ class TestNemotronHBridgeMegatronToHFConfig:
             mtp_use_repeated_layer=mtp_use_repeated_layer,
         )
 
-        hf_cfg = NemotronHBridge.megatron_to_hf_config(provider)
+        hf_cfg = Nemotron3Bridge.megatron_to_hf_config(provider)
 
         assert hf_cfg["hybrid_override_pattern"] == "MEME"
         assert hf_cfg["mtp_hybrid_override_pattern"] == "*E"
@@ -634,12 +634,12 @@ class TestNemotronHBridgeMegatronToHFConfig:
             mtp_use_repeated_layer=repeated,
             hf_model_text_only=text_only,
         )
-        config = NemotronHBridge.megatron_to_hf_config(provider)
+        config = Nemotron3Bridge.megatron_to_hf_config(provider)
         physical_blocks = 1 if depth and repeated else depth
         assert config["num_nextn_predict_layers"] == physical_blocks
         # Reimport preserves stored blocks; the training recipe selects repetitions.
         config["mtp_use_repeated_layer"] = repeated
-        reimported = NemotronHBridge._hf_mtp_settings(SimpleNamespace(**config))
+        reimported = Nemotron3Bridge._hf_mtp_settings(SimpleNamespace(**config))
         assert reimported["mtp_num_layers"] == physical_blocks
         assert reimported["mtp_use_repeated_layer"] is bool(depth and repeated)
 
@@ -649,7 +649,7 @@ class TestNemotronHBridgeMegatronToHFConfig:
             hybrid_layer_pattern="MEME", mtp_num_layers=0, mtp_use_repeated_layer=False
         )
 
-        hf_cfg = NemotronHBridge.megatron_to_hf_config(provider)
+        hf_cfg = Nemotron3Bridge.megatron_to_hf_config(provider)
 
         assert hf_cfg["num_nextn_predict_layers"] == 0
 
@@ -660,7 +660,7 @@ class TestNemotronHBridgeMegatronToHFConfig:
         with pytest.raises(
             ValueError, match="Unknown layer type characters in hybrid_override_pattern"
         ):
-            NemotronHBridge.megatron_to_hf_config(provider)
+            Nemotron3Bridge.megatron_to_hf_config(provider)
 
     def test_megatron_to_hf_config_rejects_unknown_mtp_pattern_characters(self):
         """Validate MTP block patterns split from Megatron's unified pattern."""
@@ -669,7 +669,7 @@ class TestNemotronHBridgeMegatronToHFConfig:
         with pytest.raises(
             ValueError, match="Unknown layer type characters in mtp_hybrid_override_pattern"
         ):
-            NemotronHBridge.megatron_to_hf_config(provider)
+            Nemotron3Bridge.megatron_to_hf_config(provider)
 
     def test_megatron_to_hf_config_rejects_mismatched_mtp_patterns(self):
         """Unified MTP blocks must be identical when exported to a single HF MTP pattern."""
@@ -678,7 +678,7 @@ class TestNemotronHBridgeMegatronToHFConfig:
         with pytest.raises(
             ValueError, match="All MTP patterns in hybrid_override_pattern must be identical"
         ):
-            NemotronHBridge.megatron_to_hf_config(provider)
+            Nemotron3Bridge.megatron_to_hf_config(provider)
 
 
 class TestAutoBridgeIntegration:
@@ -1113,8 +1113,8 @@ class TestMTPFlatteningQKVMapping:
             m.megatron_to_hf(torch.tensor([1.0]), torch.nn.Linear(1, 1))
 
 
-class TestNemotronHBridgeMTPIntegration:
-    """Test NemotronHBridge methods related to MTP layer handling."""
+class TestNemotron3BridgeMTPIntegration:
+    """Test Nemotron3Bridge methods related to MTP layer handling."""
 
     def test_list_based_transformers_layer_schema_is_normalized(self):
         hf_config = SimpleNamespace(
@@ -1123,14 +1123,14 @@ class TestNemotronHBridgeMTPIntegration:
             mtp_layers_block_type=["attention", "moe"],
         )
 
-        assert NemotronHBridge._hf_hybrid_pattern(hf_config) == "ME*-"
-        assert NemotronHBridge._hf_mtp_config(hf_config) == (1, "*E")
+        assert Nemotron3Bridge._hf_hybrid_pattern(hf_config) == "ME*-"
+        assert Nemotron3Bridge._hf_mtp_config(hf_config) == (1, "*E")
 
     def test_list_based_transformers_layer_schema_rejects_unknown_types(self):
         hf_config = SimpleNamespace(layers_block_type=["mamba", "unknown"])
 
         with pytest.raises(ValueError, match="Unknown layers_block_type entry at index 1"):
-            NemotronHBridge._hf_hybrid_pattern(hf_config)
+            Nemotron3Bridge._hf_hybrid_pattern(hf_config)
 
     @pytest.mark.parametrize(
         ("hf_config", "expected_mtp_mappings"),
@@ -1142,7 +1142,7 @@ class TestNemotronHBridgeMTPIntegration:
     )
     def test_mapping_registry_uses_hf_config(self, hf_config, expected_mtp_mappings):
         """Registry construction follows the HF config stored on the bridge."""
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         bridge.hf_config = SimpleNamespace(**hf_config)
 
         registry = bridge.mapping_registry()
@@ -1154,7 +1154,7 @@ class TestNemotronHBridgeMTPIntegration:
 
     def test_mapping_registry_with_mtp(self):
         """Test mapping_registry includes MTP flattening mappings when mtp is configured."""
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         bridge.hf_config = SimpleNamespace(
             num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*E"
         )
@@ -1183,7 +1183,7 @@ class TestNemotronHBridgeMTPIntegration:
 
     def test_mapping_registry_resolves_representative_mtp_params(self):
         """Verify current MTP mappings resolve to concrete HF parameter names."""
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         bridge.hf_config = SimpleNamespace(
             num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*E"
         )
@@ -1203,7 +1203,7 @@ class TestNemotronHBridgeMTPIntegration:
         assert qkv_mapping.hf_param["q"] == "mtp.layers.3.mixer.q_proj.weight"
 
     def test_quantized_mtp_amax_mappings_preserve_flattened_layer_indices(self):
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         bridge.hf_config = SimpleNamespace(
             num_nextn_predict_layers=1, mtp_hybrid_override_pattern="*E*M-"
         )
@@ -1250,7 +1250,7 @@ class TestNemotronHBridgeMTPIntegration:
 
     def test_mapping_registry_resolves_final_norm_aliases(self):
         """Export trunk final norm for both HybridModel and TransformerBlock key names."""
-        registry = NemotronHBridge().mapping_registry()
+        registry = Nemotron3Bridge().mapping_registry()
 
         final_norm_mapping = registry.megatron_to_hf_lookup("decoder.final_norm.weight")
         final_layernorm_mapping = registry.megatron_to_hf_lookup("decoder.final_layernorm.weight")
@@ -1260,7 +1260,7 @@ class TestNemotronHBridgeMTPIntegration:
 
     def test_mapping_registry_without_mtp_skips_mtp_mappings(self):
         """A non-MTP model builds its normal registry without MTP mappings."""
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         bridge.hf_config = SimpleNamespace(num_nextn_predict_layers=0)
 
         registry = bridge.mapping_registry()
@@ -1388,10 +1388,10 @@ class TestNemotronHBuilderConfig:
     """Builder-backed ModelConfig path for Nemotron-H."""
 
     def test_conversion_uses_builder_config(self):
-        assert NemotronHBridge.MODEL_CONFIG_CLASS is BridgeHybridModelConfig
+        assert Nemotron3Bridge.MODEL_CONFIG_CLASS is BridgeHybridModelConfig
 
     def test_hf_config_to_model_config_uses_direct_mapping(self):
-        bridge = NemotronHBridge()
+        bridge = Nemotron3Bridge()
         model_config = bridge.hf_config_to_model_config(_builder_hf_config("moe_mtp_latent"))
 
         assert isinstance(model_config, BridgeHybridModelConfig)
@@ -1418,7 +1418,7 @@ class TestNemotronHBuilderConfig:
     @pytest.mark.parametrize("variant", [*_BUILDER_CONFIG_VARIANTS, "native"])
     def test_model_config_roundtrip(self, variant):
         hf_config = _native_hf_config() if variant == "native" else _builder_hf_config(variant)
-        model_config = NemotronHBridge().hf_config_to_model_config(hf_config)
+        model_config = Nemotron3Bridge().hf_config_to_model_config(hf_config)
         restored = BridgeHybridModelConfig.from_dict(model_config.as_dict())
 
         assert isinstance(restored, BridgeHybridModelConfig)
@@ -1435,10 +1435,10 @@ class TestNemotronHBuilderConfig:
 
     @pytest.mark.parametrize("variant", ["moe_mtp_latent", "mtp_not_repeated", "chunk256_fp16"])
     def test_model_config_exports_hf_architecture(self, variant):
-        model_config = NemotronHBridge().hf_config_to_model_config(_builder_hf_config(variant))
+        model_config = Nemotron3Bridge().hf_config_to_model_config(_builder_hf_config(variant))
         model_config.finalize()
 
-        hf_config = NemotronHBridge.megatron_to_hf_config(model_config)
+        hf_config = Nemotron3Bridge.megatron_to_hf_config(model_config)
 
         assert (
             hf_config["hybrid_override_pattern"] == _BUILDER_BASE_CONFIG["hybrid_override_pattern"]
@@ -1446,7 +1446,7 @@ class TestNemotronHBuilderConfig:
         assert hf_config["chunk_size"] == model_config.mamba_chunk_size
 
     def test_unified_pattern_follows_recipe_mtp_depth(self):
-        model_config = NemotronHBridge().hf_config_to_model_config(
+        model_config = Nemotron3Bridge().hf_config_to_model_config(
             _builder_hf_config("moe_mtp_latent")
         )
         # Recipes train two prediction depths with the checkpoint's single shared MTP block.

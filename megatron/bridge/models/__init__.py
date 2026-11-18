@@ -14,7 +14,7 @@ from megatron.bridge.models.conversion.param_mapping import (
     ReplicatedMapping,
     RowParallelMapping,
 )
-from megatron.bridge.models.nemotron_super_vl.bridge import Nemotron35SuperVLBridge
-from megatron.bridge.models.nemotronh.nemotron_h_bridge import NemotronHBridge
+from megatron.bridge.models.nemotron_3.nemotron_3_bridge import Nemotron3Bridge
+from megatron.bridge.models.nemotron_3.super_vl_bridge import Nemotron35SuperVLBridge
 from megatron.bridge.models.qwen.qwen35_bridge import Qwen35Bridge, Qwen35MoEBridge
 from megatron.bridge.models.qwen_vl.qwen35_vl_bridge import Qwen35VLBridge, Qwen35VLMoEBridge
