@@ -1,5 +1,6 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import warnings
+from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
 import torch
@@ -18,6 +19,51 @@ from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
     dynamic_media_replacement_counts,
 )
 from megatron.core.utils import get_attr_wrapped_model
+
+
+def _embedding_sequence_parallel_shards(module, num_tokens: int) -> int:
+    """Number of sequence-parallel shards to reduce-scatter a step's embeddings into, or 1.
+
+    The language model's embedding is built without sequence-parallel scattering so media
+    embeddings can be merged into the full sequence first. When the language model runs with
+    sequence parallelism (and no context parallelism) each rank only consumes its own shard, so
+    the vocab-parallel embedding can be reduce-scattered into it directly instead of being
+    all-reduced over the full sequence and split afterwards.
+    """
+    # Models other than LLaVAModel may implement forward_lm_only without these attributes.
+    if (
+        not getattr(module, "sequence_parallel_lm", False)
+        or getattr(module, "context_parallel_lm", 1) > 1
+    ):
+        return 1
+    embedding = module.language_model.embedding
+    tp_size = embedding.tp_group.size()
+    if (
+        tp_size == 1
+        or embedding.add_position_embedding
+        or embedding.num_tokentypes > 0
+        or num_tokens % tp_size
+    ):
+        return 1
+    return tp_size
+
+
+@contextmanager
+def _reduce_scatter_embeddings(embedding):
+    """Make `embedding` reduce-scatter its output to sequence-parallel shards, as it does when
+    built to scatter embeddings to sequence-parallel ranks."""
+    saved = (
+        embedding.reduce_scatter_embeddings,
+        embedding.word_embeddings.reduce_scatter_embeddings,
+    )
+    embedding.reduce_scatter_embeddings = True
+    embedding.word_embeddings.reduce_scatter_embeddings = True
+    try:
+        yield
+    finally:
+        embedding.reduce_scatter_embeddings, embedding.word_embeddings.reduce_scatter_embeddings = (
+            saved
+        )
 
 
 # pylint: disable=line-too-long
@@ -464,16 +510,33 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             else:
                 input_ids_text[input_ids_text == -1] = 0
 
-            # Get language embeddings: [seq_len, b, h_language]
-            language_embeddings = module.language_model.embedding(
-                input_ids=input_ids_text, position_ids=position_ids
-            )
+            num_shards = _embedding_sequence_parallel_shards(module, tokens.shape[1])
+            if num_shards > 1:
+                # This rank's sequence-parallel shard, [seq_len / tp, b, h_language], already in
+                # the language model's input layout. The [b, seq_len / tp, h] view lets media
+                # embeddings be merged in place below.
+                embedding = module.language_model.embedding
+                with _reduce_scatter_embeddings(embedding):
+                    sharded_embeddings = embedding(
+                        input_ids=input_ids_text, position_ids=position_ids
+                    )
+                final_embedding = sharded_embeddings.transpose(0, 1)
+                if image_token_mask is not None:
+                    shard_len = sharded_embeddings.shape[0]
+                    shard_start = shard_len * embedding.tp_group.rank()
+                    image_token_mask = image_token_mask[:, shard_start : shard_start + shard_len]
+            else:
+                sharded_embeddings = None
+                # Get language embeddings: [seq_len, b, h_language]
+                language_embeddings = module.language_model.embedding(
+                    input_ids=input_ids_text, position_ids=position_ids
+                )
 
-            # Transpose to [b, seq_len, h_language]
-            language_embeddings = language_embeddings.transpose(1, 0).contiguous()
+                # Transpose to [b, seq_len, h_language]
+                language_embeddings = language_embeddings.transpose(1, 0).contiguous()
+                final_embedding = language_embeddings.clone()
 
-            embed_dim = language_embeddings.shape[-1]
-            final_embedding = language_embeddings.clone()
+            embed_dim = final_embedding.shape[-1]
 
             # Inject vision embeddings into the decoder input.
             if image_token_mask is not None and image_embeddings is not None:
@@ -508,9 +571,12 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                     final_embedding[image_positions] = image_embeddings_flat[image_indices]
 
             # LLaVAModel.forward_lm_only handles the batch->sequence transpose
-            # (and SP/CP sharding when configured).
+            # (and SP/CP sharding when configured) unless the shard was built above.
+            if sharded_embeddings is not None:
+                final_embedding = sharded_embeddings
         else:
             final_embedding = None
+            sharded_embeddings = None
 
         # Fall through to a clear error rather than an AttributeError if the
         # wrapped model doesn't implement forward_lm_only. LLaVAModel does
@@ -524,12 +590,16 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                 "wrapped model to enable dynamic-batching decode."
             )
 
+        sharded_kwargs = (
+            {"sequence_parallel_sharded": True} if sharded_embeddings is not None else {}
+        )
         output = module.forward_lm_only(
             combined_embeddings=final_embedding,
             attention_mask=attention_mask,
             labels=None,
             inference_context=self.inference_context,
             runtime_gather_output=True,
+            **sharded_kwargs,
         )
 
         return output
