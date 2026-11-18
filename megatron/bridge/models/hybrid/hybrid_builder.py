@@ -121,7 +121,7 @@ def use_local_core_attention(stack_spec: ModuleSpec) -> ModuleSpec:
 
 
 class BridgeHybridModelBuilder(HybridModelBuilder):
-    """Hybrid builder that resolves the stack spec the way ``HybridModelProvider`` does.
+    """Hybrid builder supporting stack-spec factories and model-specific settings.
 
     The configured stack spec may be a ``ModuleSpec`` or a factory that takes no
     arguments or the model config. When it is unset, Bridge's default selection

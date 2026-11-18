@@ -32,7 +32,6 @@ from megatron.bridge.models.conversion.param_mapping import (
     RowParallelMapping,
 )
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
-from megatron.bridge.models.hybrid.hybrid_provider import HybridModelProvider
 from megatron.bridge.models.hybrid.model_config import BridgeHybridModelConfig
 from megatron.core.activations import squared_relu
 from megatron.core.models.hybrid.hybrid_model import HybridModel
@@ -239,10 +238,7 @@ class _MTPFlatteningQKVMapping(MegatronParamMapping[Dict[str, torch.Tensor]]):
 
 
 @MegatronModelBridge.register_bridge(
-    source="NemotronHForCausalLM",
-    target=HybridModel,
-    provider=HybridModelProvider,
-    model_type="nemotron_h",
+    source="NemotronHForCausalLM", target=HybridModel, model_type="nemotron_h"
 )
 class NemotronHBridge(MegatronModelBridge):
     """
@@ -259,7 +255,6 @@ class NemotronHBridge(MegatronModelBridge):
     """
 
     MODEL_CONFIG_CLASS = BridgeHybridModelConfig
-    USE_MODEL_CONFIG_FOR_CONVERSION = True
 
     def text_only_pretrained(self, hf_pretrained: PreTrainedCausalLM) -> PreTrainedCausalLM:
         """Return the already-text-only checkpoint without changing its config or weights."""
@@ -358,20 +353,6 @@ class NemotronHBridge(MegatronModelBridge):
             settings["mtp_loss_scaling_factor"] = getattr(hf_config, "mtp_loss_scaling_factor", 0.3)
         return settings
 
-    @staticmethod
-    def _keep_mtp_spec_in_bf16(hf_config, mtp_num_layers: int) -> bool:
-        """Return the provider-only ``keep_mtp_spec_in_bf16`` flag, which nothing reads."""
-        return bool(mtp_num_layers and getattr(hf_config, "keep_mtp_spec_in_bf16", True))
-
-    @classmethod
-    def _configure_mtp_provider(cls, provider: HybridModelProvider, hf_config) -> None:
-        """Apply shared Nemotron-H MTP settings to a text or multimodal provider."""
-        for name, value in cls._hf_mtp_settings(hf_config).items():
-            setattr(provider, name, value)
-        provider.keep_mtp_spec_in_bf16 = cls._keep_mtp_spec_in_bf16(
-            hf_config, provider.mtp_num_layers
-        )
-
     def hf_config_to_model_config_kwargs(self, hf_config: PretrainedConfig) -> dict[str, Any]:
         """Convert a Hugging Face Nemotron-H config to builder config kwargs."""
         config_kwargs = super().hf_config_to_model_config_kwargs(hf_config)
@@ -394,14 +375,14 @@ class NemotronHBridge(MegatronModelBridge):
             moe_token_dispatcher_type="alltoall",
             moe_permute_fusion=True,
             moe_shared_expert_overlap=getattr(hf_config, "moe_shared_expert_overlap", True),
-            # HybridModelProvider defaults that differ from the builder config's.
+            # Nemotron-H defaults that differ from the base builder config's.
             normalization="RMSNorm",
             apply_rope_fusion=True,
             attention_backend=AttnBackend.flash,
             bias_dropout_fusion=True,
             **self._hf_mtp_settings(hf_config),
         )
-        # HybridModelProvider defaults for fields that some Hugging Face configs omit.
+        # Nemotron-H defaults for fields that some Hugging Face configs omit.
         for name, default in (
             ("add_bias_linear", False),
             ("hidden_dropout", 0.0),
@@ -423,14 +404,6 @@ class NemotronHBridge(MegatronModelBridge):
         if hasattr(hf_config, "moe_latent_size"):
             config_kwargs["moe_latent_size"] = hf_config.moe_latent_size
         return config_kwargs
-
-    def hf_config_to_provider_kwargs(self, hf_config: PretrainedConfig) -> dict[str, Any]:
-        """Adapt the canonical builder mapping to the deprecated provider path."""
-        provider_kwargs = self.hf_config_to_model_config_kwargs(hf_config)
-        provider_kwargs["keep_mtp_spec_in_bf16"] = self._keep_mtp_spec_in_bf16(
-            hf_config, provider_kwargs["mtp_num_layers"]
-        )
-        return provider_kwargs
 
     @classmethod
     def get_hf_tokenizer_kwargs(cls) -> dict:

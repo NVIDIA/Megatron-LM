@@ -24,8 +24,6 @@ can be enabled based on the current environment and dependencies.
 import logging
 import os
 
-from megatron.core.transformer.transformer_config import TransformerConfig
-
 logger = logging.getLogger(__name__)
 
 # Control whether to log warnings when fusions are disabled
@@ -68,38 +66,3 @@ def can_enable_gradient_accumulation_fusion() -> bool:
                 "Fusion disabled."
             )
         return False
-
-
-def validate_rope_fusion_compatibility(config: TransformerConfig) -> bool:
-    """Validate if RoPE fusion is compatible with the current model configuration.
-
-    Args:
-        config: The TransformerConfig instance to validate.
-
-    Returns:
-        bool: True if RoPE fusion is compatible, False otherwise.
-    """
-    if not config.apply_rope_fusion:
-        return True
-
-    # Check if position embedding type is RoPE (similar to arguments.py logic)
-    position_embedding_type = getattr(config, "position_embedding_type", "learned_absolute")
-    if position_embedding_type != "rope":
-        if LOG_FUSION_DISABLE:
-            logger.warning(
-                f"apply_rope_fusion is only compatible with RoPE position embeddings. "
-                f"Current position_embedding_type: {position_embedding_type}. "
-                f"Consider disabling apply_rope_fusion."
-            )
-        return False
-
-    # Check for multi_latent_attention incompatibility
-    if getattr(config, "multi_latent_attention", False):
-        if LOG_FUSION_DISABLE:
-            logger.warning(
-                "apply_rope_fusion for multi-latent attention only supports training. "
-                "It is experimental and may change in future versions."
-            )
-        return True
-
-    return True

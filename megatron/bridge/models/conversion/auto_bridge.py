@@ -17,7 +17,6 @@
 
 from __future__ import annotations
 
-import dataclasses
 import inspect
 import json
 import logging
@@ -55,7 +54,6 @@ if TYPE_CHECKING:
 
 from safetensors.torch import save_file
 from transformers.configuration_utils import PretrainedConfig
-from typing_extensions import Unpack
 
 from megatron.bridge.models.conversion import model_bridge
 from megatron.bridge.models.conversion.model_bridge import (
@@ -64,8 +62,8 @@ from megatron.bridge.models.conversion.model_bridge import (
     MegatronWeightTuple,
     WeightConversionTask,
 )
+from megatron.bridge.models.conversion.model_builder import build_distributed_models
 from megatron.bridge.models.conversion.utils import get_causal_lm_class_name_via_auto_map
-from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.hf_pretrained.causal_lm import (
     PreTrainedCausalLM,
     _ConfigOnlyPretrainedShim,
@@ -77,12 +75,6 @@ from megatron.bridge.models.hf_pretrained.state import (
     _existing_safetensors_files,
 )
 from megatron.bridge.models.hf_pretrained.token_classification import PreTrainedTokenClassification
-from megatron.bridge.models.model_provider import (
-    GetModelKwargs,
-    ModelParallelKwargs,
-    ModelProviderMixin,
-    build_distributed_models,
-)
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.transformer_config import MLATransformerConfig, TransformerConfig
 from megatron.training.models.base import ModelConfig
@@ -91,7 +83,6 @@ from megatron.training.utils.common_utils import get_local_rank_preinit
 logger = logging.getLogger(__name__)
 
 MegatronModelT = TypeVar("MegatronModelT", bound=MegatronModule)
-DataclassT = TypeVar("DataclassT")
 
 # Supported HuggingFace architecture suffixes for causal generation models, plus a
 # small allowlist of non-causal architectures (e.g. masked/encoder-only LMs) that are
@@ -451,8 +442,7 @@ class AutoBridge(Generic[MegatronModelT]):
     Example:
         >>> # Load and convert a model to Megatron format
         >>> bridge = AutoBridge.from_hf_pretrained("meta-llama/Meta-Llama-3-8B")
-        >>> provider = bridge.to_megatron_provider()
-        >>> megatron_model = provider.provide_distributed_model(wrap_with_ddp=False)
+        >>> megatron_model = bridge.get_model(wrap_with_ddp=False)
 
         >>> # Export a Megatron model back to HuggingFace format
         >>> bridge.save_hf_pretrained(megatron_model, "./exported_model")
@@ -669,8 +659,7 @@ class AutoBridge(Generic[MegatronModelT]):
             >>> bridge = AutoBridge.from_hf_config(config)
             >>>
             >>> # Create Megatron model with random initialization
-            >>> provider = bridge.to_megatron_provider(load_weights=False)
-            >>> model = provider.provide_distributed_model(wrap_with_ddp=False)
+            >>> model = bridge.get_model(load_weights=False, wrap_with_ddp=False)
 
             >>> # Or use for architecture exploration
             >>> transformer_config = bridge.transformer_config
@@ -1673,11 +1662,7 @@ class AutoBridge(Generic[MegatronModelT]):
         )
 
     def load_megatron_model(
-        self,
-        path: str | Path,
-        *,
-        mp_overrides: ModelParallelKwargs | None = None,
-        **kwargs: Unpack[GetModelKwargs],
+        self, path: str | Path, *, mp_overrides: dict[str, Any] | None = None, **kwargs: Any
     ) -> list[MegatronModelT]:
         """
         Load a Megatron model from a native Megatron checkpoint.
@@ -1776,18 +1761,12 @@ class AutoBridge(Generic[MegatronModelT]):
             else temporary_distributed_context(backend="gloo")
         )
         with model_context:
-            # Prefer the native ModelConfig/ModelBuilder path for migrated model
-            # families while preserving the provider path for legacy bridges.
-            if bridge._model_bridge.USE_MODEL_CONFIG_FOR_CONVERSION:
-                model_config = bridge.get_model_config()
-                model_config.transformer.use_cpu_initialization = True
-                megatron_model = bridge.get_model(
-                    model_config, wrap_with_ddp=False, mixed_precision_wrapper=None
-                )
-            else:
-                megatron_model = bridge.to_megatron_model(
-                    wrap_with_ddp=False, use_cpu_initialization=True
-                )
+            # Build through the model's native ModelConfig/ModelBuilder.
+            model_config = bridge.get_model_config()
+            model_config.transformer.use_cpu_initialization = True
+            megatron_model = bridge.get_model(
+                model_config, wrap_with_ddp=False, mixed_precision_wrapper=None
+            )
 
             # Save as Megatron checkpoint
             hf_tokenizer_kwargs = {}
@@ -1884,11 +1863,6 @@ class AutoBridge(Generic[MegatronModelT]):
     def get_model_config(self) -> ModelConfig:
         """Convert the Hugging Face architecture to a builder-backed config.
 
-        Builder-backed config support is being rolled out incrementally by
-        model family. This API is available only for families that have
-        migrated to a compatible ``ModelConfig``. Continue to use
-        :meth:`to_megatron_provider` for families that have not yet migrated.
-
         This method performs configuration conversion only. It does not load
         weights, initialize distributed state, finalize the config, or build a
         model.
@@ -1965,11 +1939,6 @@ class AutoBridge(Generic[MegatronModelT]):
     ) -> list[MegatronModelT]:
         """Build a Megatron model through its configured ``ModelBuilder``.
 
-        Like :meth:`get_model_config`, this builder-backed API is being rolled
-        out incrementally and supports only migrated model families. Continue
-        to use :meth:`to_megatron_model` for families that have not yet
-        migrated.
-
         Args:
             model_config: Optional config with user overrides already applied.
                 When omitted, :meth:`get_model_config` supplies the defaults.
@@ -1981,8 +1950,7 @@ class AutoBridge(Generic[MegatronModelT]):
             **kwargs: Arguments for ``ModelBuilder.build_distributed_models``.
                 Its ``mixed_precision_wrapper`` (``Float16Module`` when omitted,
                 ``None`` to skip wrapping) keeps router expert biases and
-                parameters named in ``_keep_in_float32_parameter_names`` in FP32,
-                as :meth:`to_megatron_model` does.
+                parameters named in ``_keep_in_float32_parameter_names`` in FP32.
 
         Returns:
             Distributed model stages created by the configured builder.
@@ -2106,111 +2074,6 @@ class AutoBridge(Generic[MegatronModelT]):
 
         return ProcessGroupCollection.use_mpu_process_groups()
 
-    def to_megatron_model(
-        self,
-        load_weights: bool = True,
-        hf_path: str | Path | None = None,
-        **kwargs: Unpack[GetModelKwargs],
-    ) -> list[MegatronModelT]:
-        provider = self.to_megatron_provider(load_weights, hf_path)
-
-        # Finalize the provider before creating models
-        if hasattr(provider, "finalize"):
-            provider.finalize()
-
-        return provider.provide_distributed_model(**kwargs)
-
-    def to_megatron_provider(
-        self, load_weights: bool = True, hf_path: str | Path | None = None
-    ) -> GPTModelProvider:
-        """
-        Convert to a Megatron model provider.
-
-        This method creates a GPTModelProvider configured to match the HuggingFace
-        model's architecture. The provider can then be used to instantiate
-        Megatron models for training or inference.
-
-        Args:
-            load_weights: Whether to configure the provider to load weights
-                from HuggingFace format. If False, creates model with random
-                initialization.
-            hf_path: Optional path to load weights from. If None, uses weights
-                from the bridge's hf_pretrained instance. Useful for loading
-                weights from a different checkpoint.
-
-        Returns:
-            GPTModelProvider: A configured model provider ready to create
-                Megatron models
-
-        Example:
-            >>> # Create provider and model with loaded weights
-            >>> bridge = AutoBridge.from_hf_pretrained("meta-llama/Meta-Llama-3-8B")
-            >>> provider = bridge.to_megatron_provider()
-            >>> model = provider.get_model()
-
-            >>> # Create provider without loading weights (for training from scratch)
-            >>> provider = bridge.to_megatron_provider(load_weights=False)
-            >>> model = provider.get_model()  # Random initialization
-
-            >>> # Load weights from a different checkpoint
-            >>> bridge = AutoBridge.from_hf_config(config)  # Config only
-            >>> provider = bridge.to_megatron_provider(hf_path="./finetuned_model")
-            >>> model = provider.get_model()  # Loads finetuned weights
-
-        See Also:
-            GPTModelProvider: The provider class for creating models
-            load_weights: Method to load weights into existing models
-        """
-        provider_input = self._provider_bridge_input
-        provider: ModelProviderMixin = self._model_bridge.provider_bridge(provider_input)
-        if self.text_only:
-            provider.hf_model_text_only = True
-
-        if load_weights:
-            if hf_path is None and not isinstance(self.hf_pretrained, _PRETRAINED_WRAPPER_TYPES):
-                raise ValueError(
-                    "AutoBridge.from_hf_config() does not include weights. "
-                    "Pass load_weights=False for random initialization or provide hf_path to load weights."
-                )
-            # Skip weights initialization since we are going to load weights
-            provider.perform_initialization = False
-            if hf_path is None:
-                provider.register_pre_wrap_hook(
-                    partial(self._model_bridge.load_weights_hf_to_megatron, self.hf_pretrained)
-                )
-            else:
-                # Load from specified path
-                trust_remote_code = getattr(self.hf_pretrained, "trust_remote_code", False)
-                if self.text_only:
-                    pre_trained = self._text_only_pretrained_from_path(hf_path)
-                else:
-                    wrapper_cls = self._pretrained_wrapper_cls
-                    pre_trained = wrapper_cls.from_pretrained(
-                        hf_path, trust_remote_code=trust_remote_code
-                    )
-                provider.register_pre_wrap_hook(
-                    partial(self._model_bridge.load_weights_hf_to_megatron, pre_trained)
-                )
-
-        hf_identifier: str | None = None
-        if hf_path is not None:
-            hf_identifier = str(hf_path)
-        else:
-            hf_name_or_path = getattr(self.hf_pretrained, "model_name_or_path", None)
-            if hf_name_or_path is None and isinstance(self.hf_pretrained, PretrainedConfig):
-                hf_name_or_path = getattr(self.hf_pretrained, "name_or_path", None)
-            if hf_name_or_path:
-                hf_identifier = str(hf_name_or_path)
-
-        if hf_identifier:
-            setattr(provider, "hf_model_id", hf_identifier)
-        if hf_path is None and self.hf_model_revision:
-            setattr(provider, "hf_model_revision", self.hf_model_revision)
-        elif self.text_only and load_weights and hf_path is not None:
-            provider.hf_model_revision = pre_trained.init_kwargs.get("revision")
-
-        return provider
-
     @staticmethod
     def get_hf_model_id_from_checkpoint(path: str | Path) -> str | None:
         """Get the HuggingFace model identifier stored in a checkpoint.
@@ -2263,7 +2126,7 @@ class AutoBridge(Generic[MegatronModelT]):
 
         Example:
             >>> bridge = AutoBridge.from_hf_pretrained("meta-llama/Llama-3.2-1B")
-            >>> megatron_model = bridge.to_megatron_model(load_weights=False, wrap_with_ddp=False)
+            >>> megatron_model = bridge.get_model(load_weights=False, wrap_with_ddp=False)
             >>> tasks = bridge.get_conversion_tasks(megatron_model)
             >>>
             >>> for task in tasks:
@@ -2321,10 +2184,7 @@ class AutoBridge(Generic[MegatronModelT]):
     ) -> Iterable[MegatronWeightTuple]:
         """Stream HF-to-Megatron conversions from the configured or external state."""
         return self._model_bridge.stream_weights_hf_to_megatron(
-            self._provider_bridge_input,
-            megatron_model,
-            conversion_tasks,
-            hf_state_dict=hf_state_dict,
+            self._hf_conversion_input, megatron_model, conversion_tasks, hf_state_dict=hf_state_dict
         )
 
     def finalize_hf_import(self, megatron_model: MegatronModelT | list[MegatronModelT]) -> None:
@@ -2333,23 +2193,16 @@ class AutoBridge(Generic[MegatronModelT]):
 
     @property
     def transformer_config(self) -> TransformerConfig:
-        _model_provider = self.to_megatron_provider(load_weights=False)
-
-        # Finalize the provider before extracting config
-        if hasattr(_model_provider, "finalize"):
-            _model_provider.finalize()
-
-        return self._create_config_from_provider(_model_provider, TransformerConfig)
+        model_config = self.get_model_config()
+        model_config.finalize()
+        return model_config.transformer
 
     @property
     def mla_transformer_config(self) -> MLATransformerConfig:
-        _model_provider = self.to_megatron_provider(load_weights=False)
-
-        # Finalize the provider before extracting config
-        if hasattr(_model_provider, "finalize"):
-            _model_provider.finalize()
-
-        return self._create_config_from_provider(_model_provider, MLATransformerConfig)
+        config = self.transformer_config
+        if not isinstance(config, MLATransformerConfig):
+            raise TypeError("The selected model does not use an MLA transformer config.")
+        return config
 
     @property
     def _model_bridge(self) -> "MegatronModelBridge":
@@ -2410,7 +2263,7 @@ class AutoBridge(Generic[MegatronModelT]):
         return _resolve_pretrained_wrapper_cls(self.hf_pretrained)
 
     @property
-    def _provider_bridge_input(
+    def _hf_conversion_input(
         self,
     ) -> (
         PreTrainedCausalLM
@@ -2552,7 +2405,7 @@ class AutoBridge(Generic[MegatronModelT]):
                         + "\n".join(f"  • {model}" for model in supported_models)
                         + f"\n\nTo add support for {architecture}, you need to:\n"
                         f"1. Create a new bridge class that inherits from MegatronModelBridge\n"
-                        f"2. Implement the required methods (provider_bridge, mapping_registry)\n"
+                        f"2. Set MODEL_CONFIG_CLASS and implement mapping_registry\n"
                         f"3. Register it with @MegatronModelBridge.register_bridge decorator\n\n"
                         f"Example implementation:\n"
                         f"  from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge\n"
@@ -2560,15 +2413,13 @@ class AutoBridge(Generic[MegatronModelT]):
                         f"  from megatron.core.models.gpt import GPTModel\n\n"
                         f"  @MegatronModelBridge.register_bridge(source={architecture}, target=GPTModel)\n"
                         f"  class Megatron{architecture.replace('ForCausalLM', '')}Bridge(MegatronModelBridge):\n"
-                        f"      def provider_bridge(self, hf_pretrained):\n"
-                        f"          # Return a ModelProvider instance\n"
-                        f"          ...\n\n"
+                        f"      MODEL_CONFIG_CLASS = MyModelConfig\n\n"
                         f"      def mapping_registry(self):\n"
                         f"          # Return a MegatronMappingRegistry with weight mappings\n"
                         f"          ...\n\n"
                         f"For reference implementations, see:\n"
-                        f"  • src/megatron/bridge/models/llama/llama_bridge.py\n"
-                        f"  • src/megatron/bridge/models/qwen/qwen_2_causal_bridge.py"
+                        f"  • megatron/bridge/models/nemotronh/nemotron_h_bridge.py\n"
+                        f"  • megatron/bridge/models/qwen/qwen35_bridge.py"
                     ) from None
 
     def _get_model_instance(self, model: list[MegatronModelT]) -> MegatronModelT:
@@ -2576,15 +2427,6 @@ class AutoBridge(Generic[MegatronModelT]):
         while hasattr(model_instance, "module"):
             model_instance = model_instance.module
         return model_instance
-
-    def _create_config_from_provider(
-        self, source_obj: Any, target_dataclass: Type[DataclassT]
-    ) -> DataclassT:
-        kwargs = {}
-        for field in dataclasses.fields(target_dataclass):
-            if hasattr(source_obj, field.name):
-                kwargs[field.name] = getattr(source_obj, field.name)
-        return target_dataclass(**kwargs)
 
     @cached_property
     def _config_only_pretrained(self) -> PreTrainedCausalLM:

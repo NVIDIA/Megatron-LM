@@ -20,7 +20,7 @@ Unit tests for Qwen3.5 bridge functionality.
 
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -192,7 +192,7 @@ class TestQwen35DenseBridge:
         assert not result.mtp_num_layers
 
     def test_model_config_dtype_handling(self, qwen3_5_27b_config_dict):
-        """Test dtype handling in provider_bridge."""
+        """Test dtype handling in builder config conversion."""
         config = Qwen3_5TextConfig(**qwen3_5_27b_config_dict)
         for key, value in qwen3_5_27b_config_dict.items():
             setattr(config, key, value)
@@ -217,7 +217,7 @@ class TestQwen35DenseBridge:
         assert result.params_dtype == torch.float16
 
     def test_model_config_tie_word_embeddings_true(self, mock_qwen3_5_config):
-        """Test provider_bridge with tie_word_embeddings=True."""
+        """Test builder config conversion with tie_word_embeddings=True."""
         mock_qwen3_5_config.tie_word_embeddings = True
 
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
@@ -229,7 +229,7 @@ class TestQwen35DenseBridge:
         assert result.share_embeddings_and_output_weights is True
 
     def test_model_config_tie_word_embeddings_false(self, mock_qwen3_5_config):
-        """Test provider_bridge with tie_word_embeddings=False."""
+        """Test builder config conversion with tie_word_embeddings=False."""
         mock_qwen3_5_config.tie_word_embeddings = False
 
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
@@ -241,7 +241,7 @@ class TestQwen35DenseBridge:
         assert result.share_embeddings_and_output_weights is False
 
     def test_model_config_27b_config(self, qwen3_5_27b_config_dict):
-        """Test provider_bridge with Qwen3.5-27B dense configuration."""
+        """Test builder config conversion with Qwen3.5-27B dense configuration."""
         config = Qwen3_5TextConfig(**qwen3_5_27b_config_dict)
         for key, value in qwen3_5_27b_config_dict.items():
             setattr(config, key, value)
@@ -588,7 +588,7 @@ class TestQwen35MoEBridge:
         assert not result.mtp_num_layers
 
     def test_model_config_dtype_handling(self, qwen3_5_397b_a17b_config_dict):
-        """Test dtype handling in provider_bridge."""
+        """Test dtype handling in builder config conversion."""
         config = Qwen3_5MoeTextConfig(**qwen3_5_397b_a17b_config_dict)
         for key, value in qwen3_5_397b_a17b_config_dict.items():
             setattr(config, key, value)
@@ -613,7 +613,7 @@ class TestQwen35MoEBridge:
         assert result.params_dtype == torch.float16
 
     def test_model_config_tie_word_embeddings_true(self, mock_qwen3_5_moe_config):
-        """Test provider_bridge with tie_word_embeddings=True."""
+        """Test builder config conversion with tie_word_embeddings=True."""
         mock_qwen3_5_moe_config.tie_word_embeddings = True
 
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
@@ -625,7 +625,7 @@ class TestQwen35MoEBridge:
         assert result.share_embeddings_and_output_weights is True
 
     def test_model_config_tie_word_embeddings_false(self, mock_qwen3_5_moe_config):
-        """Test provider_bridge with tie_word_embeddings=False."""
+        """Test builder config conversion with tie_word_embeddings=False."""
         mock_qwen3_5_moe_config.tie_word_embeddings = False
 
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
@@ -637,7 +637,7 @@ class TestQwen35MoEBridge:
         assert result.share_embeddings_and_output_weights is False
 
     def test_model_config_397b_a17b_config(self, qwen3_5_397b_a17b_config_dict):
-        """Test provider_bridge with Qwen3.5-397B-A17B MoE configuration."""
+        """Test builder config conversion with Qwen3.5-397B-A17B MoE configuration."""
         config = Qwen3_5MoeTextConfig(**qwen3_5_397b_a17b_config_dict)
         for key, value in qwen3_5_397b_a17b_config_dict.items():
             setattr(config, key, value)
@@ -1000,19 +1000,8 @@ class TestQwen35BuilderConfig:
     """Builder-backed ModelConfig path for the Qwen3.5 text bridges."""
 
     @pytest.mark.parametrize("bridge_class", [Qwen35Bridge, Qwen35MoEBridge])
-    def test_removed_provider_path_directs_callers_to_builder(self, bridge_class):
-        pretrained = Mock(spec=PreTrainedCausalLM)
-        pretrained.config = _qwen35_text_config()
-        with (
-            pytest.warns(FutureWarning),
-            pytest.raises(NotImplementedError, match="get_model_config"),
-        ):
-            bridge_class().provider_bridge(pretrained)
-
-    @pytest.mark.parametrize("bridge_class", [Qwen35Bridge, Qwen35MoEBridge])
     def test_conversion_uses_builder_config(self, bridge_class):
         assert bridge_class.MODEL_CONFIG_CLASS is Qwen35HybridModelConfig
-        assert bridge_class.USE_MODEL_CONFIG_FOR_CONVERSION is True
 
     @pytest.mark.parametrize(
         ("bridge_class", "config"),
@@ -1021,17 +1010,7 @@ class TestQwen35BuilderConfig:
     )
     def test_hf_config_to_model_config_uses_direct_mapping(self, bridge_class, config):
         bridge = bridge_class()
-        with (
-            patch.object(
-                bridge, "provider_bridge", side_effect=AssertionError("provider path used")
-            ),
-            patch.object(
-                bridge,
-                "hf_config_to_provider_kwargs",
-                side_effect=AssertionError("provider kwargs used"),
-            ),
-        ):
-            model_config = bridge.hf_config_to_model_config(config)
+        model_config = bridge.hf_config_to_model_config(config)
 
         assert isinstance(model_config, BridgeHybridModelConfig)
         assert model_config.num_layers == 16

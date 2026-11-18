@@ -57,7 +57,6 @@ class _SuperVLMappingBase(MegatronModelBridge):
     """Bridge for the canonical expanded-sequence Nemotron-3 Omni model."""
 
     MODEL_CONFIG_CLASS = Nemotron35SuperVLModelConfig
-    USE_MODEL_CONFIG_FOR_CONVERSION = True
 
     _HF_DYNAMIC_MODULE_IMPORTS = """
 

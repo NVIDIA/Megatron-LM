@@ -512,9 +512,8 @@ class Nemotron35SuperVLModel(MegatronModule):
                 f"{actual_features} projected features. Nemotron35SuperVLModel requires the processor "
                 "to emit one placeholder for every projected media token before collator-owned packing. "
                 "A single placeholder for multiple features usually means this batch was prepared "
-                "for the legacy LLaVAModel collapse/expand path. Use expanded processor output, or "
-                "load the checkpoint through the explicit NemotronOmniLlavaModelProvider/"
-                "NemotronOmniLlavaBridge compatibility path."
+                "for the legacy LLaVAModel collapse/expand path. Use expanded processor output "
+                "for this model."
             )
 
         # With batch size one, transpose can remain contiguous and

@@ -37,9 +37,6 @@ from megatron.bridge.models.conversion.param_mapping import (
 
 
 class _Bridge(MegatronModelBridge):
-    def provider_bridge(self, hf_pretrained):
-        return None
-
     def mapping_registry(self):
         return MegatronMappingRegistry()
 

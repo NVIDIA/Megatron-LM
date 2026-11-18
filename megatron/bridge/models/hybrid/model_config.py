@@ -55,7 +55,6 @@ class BridgeHybridModelConfig(ModelConfigOverrideMixin, HybridModelConfig, Model
     specialized transformer config, such as an MLA config, through
     ``transformer_config_class``.
 
-    It keeps the construction contract of ``HybridModelProvider``.
     ``validate()`` checks the settings without changing them, and
     ``finalize()`` runs it before appending ``mtp_hybrid_override_pattern`` to
     ``hybrid_layer_pattern`` once per MTP depth and deriving ``num_layers`` from
@@ -221,8 +220,6 @@ class BridgeHybridMLAModelConfig(MLAModelConfigMixin, BridgeHybridModelConfig):
     stores and serializes ``rotary_base`` and ``rotary_percent``, because MLA
     attention applies RoPE from them; on this config they are constructor
     arguments and views of the nested values (see ``MLAModelConfigMixin``).
-    Hybrid MLA families such as DeepSeek-V4 and GLM-5 subclass it, as their
-    providers combine ``HybridModelProvider`` with an MLA config.
     """
 
 

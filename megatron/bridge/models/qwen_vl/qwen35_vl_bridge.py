@@ -210,7 +210,6 @@ class Qwen35VLMoEBridge(MegatronModelBridge):
     """
 
     MODEL_CONFIG_CLASS = Qwen35VLModelConfig
-    USE_MODEL_CONFIG_FOR_CONVERSION = True
     mimo_source_prefixes = {"language": "language_model.", "images": "vision_model."}
 
     def hf_config_to_model_config_kwargs(self, hf_config: PretrainedConfig) -> dict[str, Any]:
@@ -323,7 +322,6 @@ class Qwen35VLBridge(MegatronModelBridge):
     """
 
     MODEL_CONFIG_CLASS = Qwen35VLModelConfig
-    USE_MODEL_CONFIG_FOR_CONVERSION = True
     mimo_source_prefixes = {"language": "language_model.", "images": "vision_model."}
 
     def hf_config_to_model_config_kwargs(self, hf_config: PretrainedConfig) -> dict[str, Any]:

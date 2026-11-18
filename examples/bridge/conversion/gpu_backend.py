@@ -26,10 +26,8 @@ from rich.console import Console
 from utils import (
     _configure_distributed_env,
     _configure_model_config,
-    _configure_model_provider,
     _hf_tokenizer_kwargs,
     _maybe_generate_pipeline_layout,
-    _uses_model_builder,
     parse_dtype,
     prepare_output_directory,
     resolve_hf_model_revision,
@@ -38,8 +36,8 @@ from utils import (
 
 from megatron.bridge import AutoBridge
 from megatron.bridge.models.decorators import torchrun_main
-from megatron.bridge.models.gpt_provider import GPTModelProvider
 from megatron.bridge.models.hf_pretrained.utils import is_safe_repo
+from megatron.training.models.base import ModelConfig
 from megatron.training.utils.common_utils import print_rank_0
 
 _IGNORE_PRECISION_PARAMS = (
@@ -115,11 +113,11 @@ def _rebalance_pipeline_layout(saved_layout: list[list[str]], pp: int) -> list[l
 
 
 def _maybe_restore_pipeline_layout(
-    bridge: AutoBridge, model_provider: GPTModelProvider, megatron_path: str, pp: int
+    bridge: AutoBridge, model_config: ModelConfig, megatron_path: str, pp: int
 ) -> None:
     """Restore a serialized pipeline layout or regenerate it for export.
 
-    The provider adopts the checkpoint's MTP layer count because export builds the model from the
+    The config adopts the checkpoint's MTP layer count because export builds the model from the
     checkpoint config, so a restored or regenerated layout must place the MTP layers that model has.
     """
     checkpoint_path = Path(megatron_path)
@@ -141,13 +139,13 @@ def _maybe_restore_pipeline_layout(
     if config_path.exists():
         with config_path.open() as config_file:
             config = yaml.safe_load(config_file) or {}
-        model_config = config.get("model", {})
+        saved_model_config = config.get("model", {})
         # Builder-backed model configs serialize the Megatron-Core fields under ``transformer``.
-        model_config = {**(model_config.get("transformer") or {}), **model_config}
-        if "mtp_num_layers" in model_config:
-            model_provider.mtp_num_layers = model_config["mtp_num_layers"]
-        saved_layout = model_config.get("pipeline_model_parallel_layout")
-        saved_pp = model_config.get("pipeline_model_parallel_size")
+        saved_model_config = {**(saved_model_config.get("transformer") or {}), **saved_model_config}
+        if "mtp_num_layers" in saved_model_config:
+            model_config.mtp_num_layers = saved_model_config["mtp_num_layers"]
+        saved_layout = saved_model_config.get("pipeline_model_parallel_layout")
+        saved_pp = saved_model_config.get("pipeline_model_parallel_size")
         is_valid_layout = isinstance(saved_layout, list) and all(
             isinstance(stage, list) for stage in saved_layout
         )
@@ -155,11 +153,11 @@ def _maybe_restore_pipeline_layout(
             saved_pp is None and len(saved_layout or []) % pp == 0
         )
         if is_valid_layout and is_same_topology and len(saved_layout) % pp == 0:
-            model_provider.pipeline_model_parallel_layout = saved_layout
+            model_config.pipeline_model_parallel_layout = saved_layout
             # Hybrid models take their stage boundaries from the '|' segments saved with this layout.
-            saved_pattern = model_config.get("hybrid_layer_pattern")
+            saved_pattern = saved_model_config.get("hybrid_layer_pattern")
             if isinstance(saved_pattern, str) and "|" in saved_pattern:
-                model_provider.hybrid_layer_pattern = saved_pattern
+                model_config.hybrid_layer_pattern = saved_pattern
             print_rank_0(
                 f"Read pipeline layout from checkpoint ({len(saved_layout)} PP/VPP stages)"
             )
@@ -168,12 +166,12 @@ def _maybe_restore_pipeline_layout(
             print_rank_0(
                 f"Rebalancing checkpoint pipeline layout from PP={saved_pp or 'unknown'} to requested PP={pp}"
             )
-            if not _maybe_generate_pipeline_layout(bridge, model_provider, pp):
-                model_provider.pipeline_model_parallel_layout = _rebalance_pipeline_layout(
+            if not _maybe_generate_pipeline_layout(bridge, model_config, pp):
+                model_config.pipeline_model_parallel_layout = _rebalance_pipeline_layout(
                     saved_layout, pp
                 )
             return
-    _maybe_generate_pipeline_layout(bridge, model_provider, pp)
+    _maybe_generate_pipeline_layout(bridge, model_config, pp)
 
 
 def _roundtrip_weights_match(
@@ -310,20 +308,12 @@ def import_checkpoint(
         torch_dtype=dtype,
         **revision_kwargs,
     )
-    if _uses_model_builder(bridge):
-        model_config = bridge.get_model_config()
-        _configure_model_config(model_config, tp=tp, pp=pp, ep=ep, etp=etp, dtype=dtype)
-        _maybe_generate_pipeline_layout(bridge, model_config, pp)
-        megatron_model = bridge.get_model(
-            model_config, wrap_with_ddp=False, mixed_precision_wrapper=None
-        )
-    else:
-        model_provider = bridge.to_megatron_provider(load_weights=True)
-        _configure_model_provider(model_provider, tp=tp, pp=pp, ep=ep, etp=etp, dtype=dtype)
-        _maybe_generate_pipeline_layout(bridge, model_provider, pp)
-        model_provider.finalize()
-        model_provider.initialize_model_parallel(seed=0, create_gloo_process_groups=False)
-        megatron_model = model_provider.provide_distributed_model(wrap_with_ddp=False)
+    model_config = bridge.get_model_config()
+    _configure_model_config(model_config, tp=tp, pp=pp, ep=ep, etp=etp, dtype=dtype)
+    _maybe_generate_pipeline_layout(bridge, model_config, pp)
+    megatron_model = bridge.get_model(
+        model_config, wrap_with_ddp=False, mixed_precision_wrapper=None
+    )
 
     bridge.save_megatron_model(
         megatron_model,
@@ -412,26 +402,15 @@ def export_checkpoint(
     # Preserve the reference wrapper's streaming state source and shard map while
     # exporting the checkpoint-derived architecture and vocabulary configuration.
     bridge.hf_pretrained.config = checkpoint_config_bridge.hf_pretrained
-    if _uses_model_builder(bridge):
-        model_config = bridge.get_model_config()
-        _configure_model_config(
-            model_config, tp=tp, pp=pp, ep=ep, etp=etp, dtype=dtype, use_cpu=use_cpu
-        )
-        _maybe_restore_pipeline_layout(bridge, model_config, megatron_path, pp)
-        resolved_pipeline_layout = model_config.pipeline_model_parallel_layout
-        model_config.finalize()
-        resolved_hybrid_layer_pattern = getattr(model_config, "hybrid_layer_pattern", None)
-        bridge._get_or_initialize_pg_collection(model_config.transformer)
-    else:
-        model_provider = bridge.to_megatron_provider(load_weights=False)
-        _configure_model_provider(
-            model_provider, tp=tp, pp=pp, ep=ep, etp=etp, dtype=dtype, use_cpu=use_cpu
-        )
-        _maybe_restore_pipeline_layout(bridge, model_provider, megatron_path, pp)
-        resolved_pipeline_layout = model_provider.pipeline_model_parallel_layout
-        model_provider.finalize()
-        resolved_hybrid_layer_pattern = getattr(model_provider, "hybrid_layer_pattern", None)
-        model_provider.initialize_model_parallel(seed=0, create_gloo_process_groups=False)
+    model_config = bridge.get_model_config()
+    _configure_model_config(
+        model_config, tp=tp, pp=pp, ep=ep, etp=etp, dtype=dtype, use_cpu=use_cpu
+    )
+    _maybe_restore_pipeline_layout(bridge, model_config, megatron_path, pp)
+    resolved_pipeline_layout = model_config.pipeline_model_parallel_layout
+    model_config.finalize()
+    resolved_hybrid_layer_pattern = getattr(model_config, "hybrid_layer_pattern", None)
+    bridge._get_or_initialize_pg_collection(model_config.transformer)
 
     model_parallel_overrides: dict[str, object] = {
         "tensor_model_parallel_size": tp,
@@ -502,19 +481,11 @@ def roundtrip_checkpoint(
         torch_dtype=dtype,
     )
 
-    if _uses_model_builder(bridge):
-        model_config = bridge.get_model_config()
-        _configure_model_config(model_config, tp=tp, pp=pp, ep=ep, etp=etp, dtype=dtype)
-        _maybe_generate_pipeline_layout(bridge, model_config, pp)
-        megatron_model = bridge.get_model(
-            model_config, wrap_with_ddp=False, mixed_precision_wrapper=None
-        )
-    else:
-        model_provider = bridge.to_megatron_provider(load_weights=True)
-        _configure_model_provider(model_provider, tp=tp, pp=pp, ep=ep, etp=etp, dtype=dtype)
-        _maybe_generate_pipeline_layout(bridge, model_provider, pp)
-        model_provider.finalize()
-        model_provider.initialize_model_parallel(seed=0, create_gloo_process_groups=False)
-        megatron_model = model_provider.provide_distributed_model(wrap_with_ddp=False)
+    model_config = bridge.get_model_config()
+    _configure_model_config(model_config, tp=tp, pp=pp, ep=ep, etp=etp, dtype=dtype)
+    _maybe_generate_pipeline_layout(bridge, model_config, pp)
+    megatron_model = bridge.get_model(
+        model_config, wrap_with_ddp=False, mixed_precision_wrapper=None
+    )
     _verify_roundtrip_weights(bridge, megatron_model)
     print_rank_0("GPU round-trip validation complete")

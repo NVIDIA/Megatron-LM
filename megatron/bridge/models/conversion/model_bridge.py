@@ -23,7 +23,6 @@ import itertools
 import logging
 import math
 import re
-import warnings
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
 from typing import (
@@ -84,7 +83,6 @@ from megatron.bridge.models.conversion.utils import (
 )
 from megatron.bridge.models.decorators.dispatch import dispatch
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
-from megatron.bridge.models.model_provider import ModelProviderMixin
 from megatron.bridge.models.transformer_config import TransformerConfig as BridgeTransformerConfig
 from megatron.bridge.utils import fusions
 from megatron.bridge.utils.activation_map import ACTIVATION_FUNC_MAP
@@ -100,7 +98,6 @@ logger = logging.getLogger(__name__)
 
 MappingT = TypeVar("MappingT", bound=MegatronParamMapping)
 HFPreTrained = TypeVar("HFPreTrained")
-ModelProviderTarget = TypeVar("ModelProviderTarget", bound=ModelProviderMixin)
 MegatronModel = TypeVar("MegatronModel", bound=MegatronModule)
 _BridgeImplClass = TypeVar("_BridgeImplClass", bound="MegatronModelBridge")
 
@@ -475,9 +472,7 @@ def _megatron_local_name_to_global(
     return param_name
 
 
-class MegatronModelBridge(
-    MegatronQuantizationBridge, Generic[HFPreTrained, ModelProviderTarget, MegatronModel]
-):
+class MegatronModelBridge(MegatronQuantizationBridge, Generic[HFPreTrained, MegatronModel]):
     """
     High-level orchestrator for HuggingFace ↔ Megatron model conversions.
 
@@ -507,16 +502,16 @@ class MegatronModelBridge(
             class MegatronCausalLlamaBridge(MegatronModelBridge):
                 pass
 
-    2. Implement provider_bridge to create Megatron configurations:
+    2. Select a ModelConfig and map the Hugging Face architecture into it:
 
         .. code-block:: python
 
-            def provider_bridge(self, hf_pretrained) -> GPTModelProvider:
-                return GPTModelProvider(
-                    num_layers=hf_pretrained.config.num_hidden_layers,
-                    hidden_size=hf_pretrained.config.hidden_size,
-                    ...
-                )
+            MODEL_CONFIG_CLASS = MyModelConfig
+
+            def hf_config_to_model_config_kwargs(self, hf_config):
+                config_kwargs = super().hf_config_to_model_config_kwargs(hf_config)
+                config_kwargs.update(num_layers=hf_config.num_hidden_layers)
+                return config_kwargs
 
     3. Implement mapping_registry to define weight mappings:
 
@@ -537,12 +532,11 @@ class MegatronModelBridge(
             # The bridge is typically not instantiated directly
             # Instead, use AutoBridge or AutoBridge which handle this
             bridge = AutoBridge.from_hf_pretrained("meta-llama/Meta-Llama-3-8B")
-            provider = bridge.to_megatron_provider()
+            model_config = bridge.get_model_config()
 
     Note:
         This class uses generic type parameters to ensure type safety:
         - HFPreTrained: The HuggingFace model type
-        - ModelProviderTarget: The Megatron model provider type
         - MegatronModel: The Megatron model type
     """
 
@@ -551,23 +545,8 @@ class MegatronModelBridge(
     # Set to False only when this bridge cannot produce a standalone Hugging Face checkpoint.
     SUPPORTS_HF_PRETRAINED_EXPORT: ClassVar[bool] = True
 
-    # None selects GPTModelProvider. Pass provider=... to @register_bridge only for a specialized
-    # provider, such as one implementing MLA.
-    PROVIDER_CLASS = None
-
-    # Builder-backed construction is rolling out incrementally by model family, so it is opt-in.
-    # None means the family has not migrated: get_model_config() raises and the provider path
-    # stays the supported one. A family that has mapped its Hugging Face config for the builder
-    # path sets this to BridgeGPTModelConfig, or to a specialized config when the standard GPT
-    # model config cannot represent the model. Subclasses of a migrated bridge inherit the
-    # opt-in. The selected model config owns its nested transformer config class.
+    # The selected model config owns its nested transformer config and builder class.
     MODEL_CONFIG_CLASS: ClassVar[type[ModelConfig] | None] = None
-
-    # Conversion still uses the provider-backed construction path unless a model family has
-    # explicitly migrated its conversion lifecycle to ModelBuilder. Keeping this separate
-    # from MODEL_CONFIG_CLASS lets a family expose get_model_config() without silently
-    # changing how its checkpoints are constructed. Requires MODEL_CONFIG_CLASS to be set.
-    USE_MODEL_CONFIG_FOR_CONVERSION: ClassVar[bool] = False
 
     # Source modules intentionally absent from every target of this bridge.
     # Strict export still requires all other source tensors. Prefixes must name
@@ -658,7 +637,7 @@ class MegatronModelBridge(
     ]
 
     # YARN rope scaling field mapping for GPT models: (hf_rope_scaling_key, megatron_yarn_param)
-    # These are only applied when rope_scaling.type == "yarn" and provider is GPTModelProvider
+    # These are only applied to non-MLA model configs when rope_scaling.type == "yarn".
     # Uses yarn_ prefix (e.g., yarn_mscale, yarn_rotary_scaling_factor)
     YARN_ROPE_SCALING_MAPPING = [
         ("factor", "yarn_rotary_scaling_factor"),
@@ -764,17 +743,12 @@ class MegatronModelBridge(
 
         # Handle rope scaling: extract params from rope_scaling dict
         # HF configs use either "type" or "rope_type" key for the scaling type
-        from megatron.bridge.models.mla_provider import MLAModelProvider
-
-        # MLA rope fields belong to an MLA provider or to a model config that nests an MLA transformer config.
+        # MLA rope fields belong to the nested MLA transformer config.
         model_transformer_config_class = getattr(
             self.MODEL_CONFIG_CLASS, "transformer_config_class", None
         )
-        is_mla = (
-            self.PROVIDER_CLASS is not None and issubclass(self.PROVIDER_CLASS, MLAModelProvider)
-        ) or (
-            isinstance(model_transformer_config_class, type)
-            and issubclass(model_transformer_config_class, MLATransformerConfig)
+        is_mla = isinstance(model_transformer_config_class, type) and issubclass(
+            model_transformer_config_class, MLATransformerConfig
         )
         rope_scaling = getattr(hf_config, "rope_scaling", None)
 
@@ -795,7 +769,7 @@ class MegatronModelBridge(
                 if mla_params:
                     provider_kwargs["_mla_rope_params"] = mla_params
             else:
-                # GPT models: use yarn_ prefixed field names (dataclass fields on GPTModelProvider)
+                # Non-MLA models use yarn_ prefixed transformer-config fields.
                 provider_kwargs["position_embedding_type"] = "yarn"
                 for hf_key, megatron_key in self.YARN_ROPE_SCALING_MAPPING:
                     value = rope_scaling.get(hf_key)
@@ -843,22 +817,17 @@ class MegatronModelBridge(
 
         return provider_kwargs
 
-    def hf_config_to_provider_kwargs(self, hf_config: PretrainedConfig) -> dict[str, Any]:
-        """Return kwargs for the legacy provider compatibility path."""
-        return self._hf_config_to_megatron_kwargs(hf_config)
-
     def hf_config_to_model_config_kwargs(self, hf_config: PretrainedConfig) -> dict[str, Any]:
         """Return flat kwargs for a builder-backed model config.
 
         Model-family bridges should call ``super()`` and add their architecture
-        defaults here. This path intentionally does not call the provider-era
-        override hook.
+        defaults here.
         """
         config_kwargs = self._hf_config_to_megatron_kwargs(hf_config)
         mla_rope_params = config_kwargs.pop("_mla_rope_params", None)
         if mla_rope_params is not None:
             # MLA transformer configs declare the rotary scaling fields, and MLA attention applies
-            # RoPE itself, so the model keeps "rope", as provider_bridge() sets for MLA providers.
+            # RoPE itself, so the model keeps "rope".
             config_kwargs.update(mla_rope_params)
             config_kwargs["position_embedding_type"] = "rope"
         config_kwargs.update(
@@ -931,8 +900,7 @@ class MegatronModelBridge(
         if model_config_class is None:
             raise ModelConfigNotSupportedError(
                 f"ModelConfig conversion is not implemented for {type(self).__name__}. "
-                "This model family has not migrated to builder-backed configs "
-                "(MODEL_CONFIG_CLASS is None); use AutoBridge.to_megatron_provider() instead."
+                "The bridge must define MODEL_CONFIG_CLASS."
             )
 
         config_kwargs = self.hf_config_to_model_config_kwargs(hf_config)
@@ -966,80 +934,6 @@ class MegatronModelBridge(
         and return a config registered with the corresponding text bridge.
         """
         raise ValueError(f"{type(self).__name__} does not support text_only=True.")
-
-    def provider_bridge(self, hf_pretrained: HFPreTrained) -> ModelProviderTarget:
-        """Create a Megatron model provider from HuggingFace configuration.
-
-        Default implementation that:
-        1. Converts HF config to provider kwargs using CONFIG_MAPPING
-        2. Creates and returns a GPTModelProvider
-
-        Subclasses should override this to add model-specific configuration
-        by calling super().provider_bridge() then setting properties directly
-        on the returned provider (e.g., provider.normalization = "RMSNorm").
-
-        Args:
-            hf_pretrained (HFPreTrained): HuggingFace model or configuration
-                containing the source model's architecture details.
-
-        Returns:
-            ModelProviderTarget: A configured model provider instance
-        """
-        from megatron.bridge.models.gpt_provider import GPTModelProvider
-        from megatron.bridge.models.mla_provider import MLAModelProvider
-
-        if self.MODEL_CONFIG_CLASS is not None:
-            warnings.warn(
-                f"{type(self).__name__}.provider_bridge() and AutoBridge.to_megatron_provider() "
-                "are deprecated for builder-backed models. Use AutoBridge.get_model_config() "
-                "for training recipes or AutoBridge.get_model() to construct a model. "
-                "Legacy provider support will be removed in a future release.",
-                FutureWarning,
-                stacklevel=2,
-            )
-
-        hf_config = hf_pretrained.config
-
-        # Build base provider kwargs using CONFIG_MAPPING
-        provider_kwargs = self.hf_config_to_provider_kwargs(hf_config)
-
-        mla_rope_params = provider_kwargs.pop("_mla_rope_params", None)
-
-        # Use specified provider class, defaulting to GPTModelProvider
-        provider_class = (
-            self.PROVIDER_CLASS if self.PROVIDER_CLASS is not None else GPTModelProvider
-        )
-        is_mla_provider = issubclass(provider_class, MLAModelProvider)
-        # Filter kwargs to only fields the provider dataclass accepts, so that MLA-only None
-        # values (q_lora_rank, kv_lora_rank, …) are silently dropped for non-MLA providers
-        # while still being passed through for MLA providers that declare them as fields.
-        valid_fields = provider_class.__dataclass_fields__
-        provider = provider_class(**{k: v for k, v in provider_kwargs.items() if k in valid_fields})
-
-        # Determine position_embedding_type from HF rope_scaling.
-        # For GPT providers: rope_type=="yarn" → "yarn"; otherwise the type the bridge's
-        # kwargs select (e.g. "none" for Nemotron-H), and "rope" when they select none.
-        # For MLA providers: always "rope" — YaRN scaling parameters are applied
-        # separately via mla_rope_params (rotary_scaling_factor, mscale, etc.) and
-        # position_embedding_type="yarn" is not a valid MLA config value.
-        hf_rope_scaling = getattr(hf_config, "rope_scaling", None)
-        rope_type = None
-        if hf_rope_scaling:
-            rope_type = hf_rope_scaling.get("type") or hf_rope_scaling.get("rope_type")
-        position_embedding_type = provider_kwargs.get("position_embedding_type")
-        if is_mla_provider:
-            provider.position_embedding_type = "rope"
-        elif rope_type == "yarn" or position_embedding_type == "yarn":
-            provider.position_embedding_type = "yarn"
-        else:
-            provider.position_embedding_type = position_embedding_type or "rope"
-
-        # Apply MLA rope params via setattr (for MLA models like DeepSeek, Kimi)
-        if mla_rope_params:
-            for key, value in mla_rope_params.items():
-                setattr(provider, key, value)
-
-        return provider
 
     @classmethod
     def megatron_to_hf_config(cls, provider) -> dict:
@@ -2343,11 +2237,6 @@ class MegatronModelBridge(
             base //= 2
         return base
 
-    def _get_provider_from_model(self, model: MegatronModule) -> ModelProviderTarget:
-        """Extract provider/config from model."""
-        model = unwrap_model(model)
-        return model.config
-
     def _share_embeddings_and_output_weights(self, model: MegatronModule) -> bool:
         """Return whether the model ties its input embeddings and output layer.
 
@@ -2951,68 +2840,15 @@ class MegatronModelBridge(
         *,
         source: Type[PreTrainedModel] | str,
         target: Type[MegatronModel],
-        provider: Type[ModelProviderTarget] | None = None,
         model_type: str | None = None,
     ) -> Callable[[_BridgeImplClass], _BridgeImplClass]:
-        """Class decorator for registering bridge implementations.
+        """Class decorator registering an HF architecture and its Megatron model type.
 
-        This decorator registers a MegatronModelBridge subclass with the dispatch
-        system, enabling automatic routing of conversions based on the source
-        HuggingFace model type and target Megatron model type.
-
-        Args:
-            source (Type[PreTrainedModel] | str): HuggingFace PreTrainedModel class
-                (e.g., LlamaForCausalLM) or the class name as a string. Using a
-                string allows registering bridges for architectures that are only
-                available via auto_map.
-            target (Type[MegatronModel]): Megatron model class (e.g., GPTModel).
-            provider (Type[ModelProviderTarget], optional): Provider class to use
-                for this model (e.g., DeepSeekModelProvider for MLA models).
-                Defaults to GPTModelProvider if not specified.
-            model_type (str, optional): HuggingFace model_type string (e.g., "llama").
-                Used for megatron_to_hf_config conversion.
-
-        Returns:
-            Callable[[_BridgeImplClass], _BridgeImplClass]: Decorator function
-                that registers the bridge implementation.
-
-        Example:
-            .. code-block:: python
-
-                @MegatronModelBridge.register_bridge(
-                    source=LlamaForCausalLM, target=GPTModel, model_type="llama"
-                )
-                class MegatronCausalLlamaBridge(MegatronModelBridge):
-                    def provider_bridge(self, hf_pretrained):
-                        # Implementation
-                        pass
-
-                    def mapping_registry(self):
-                        # Implementation
-                        pass
-
-            String-based registration with custom provider:
-
-            .. code-block:: python
-
-                @MegatronModelBridge.register_bridge(
-                    source="DeepseekV3ForCausalLM",
-                    target=GPTModel,
-                    provider=DeepSeekModelProvider,
-                    model_type="deepseek_v3",
-                )
-                class MegatronDeepseekV3Bridge(MegatronModelBridge):
-                    ...
-
-        Note:
-            The decorated class is registered with multiple dispatchers to handle
-            different conversion scenarios. The registration is automatic when the
-            class is defined.
+        The bridge class supplies MODEL_CONFIG_CLASS and weight mappings.
+        Source may be an HF class or a class-name string for remote-code models.
         """
 
-        return create_bridge_decorator(
-            source=source, target=target, provider=provider, model_type=model_type
-        )
+        return create_bridge_decorator(source=source, target=target, model_type=model_type)
 
 
 # Core dispatch functions
@@ -3143,21 +2979,9 @@ def create_bridge_decorator(
     *,
     source: Type["PreTrainedModel"] | str,
     target: Type["MegatronModule"],
-    provider: Type["ModelProviderMixin"] | None = None,
     model_type: str | None = None,
 ) -> Callable[[Type["MegatronModelBridge"]], Type["MegatronModelBridge"]]:
-    """Create a decorator for registering bridge implementations.
-
-    Args:
-        source: HuggingFace PreTrainedModel class or the class name as a string
-            (useful for auto_map architectures)
-        target: Megatron model class
-        provider: Provider class to use for this model (e.g., DeepSeekModelProvider)
-        model_type: HuggingFace model_type string (e.g., "llama", "deepseek_v3")
-
-    Returns:
-        Decorator function that registers the bridge implementation
-    """
+    """Register a model bridge and record its HF architecture and model type."""
 
     def decorator(bridge_class: Type["MegatronModelBridge"]) -> Type["MegatronModelBridge"]:
         # Store source name for HF config generation
@@ -3165,9 +2989,6 @@ def create_bridge_decorator(
         # Store model_type for HF config generation
         if model_type is not None:
             bridge_class.MODEL_TYPE = model_type
-        # Set the provider class on the bridge
-        if provider is not None:
-            bridge_class.PROVIDER_CLASS = provider
         register_bridge_implementation(source=source, target=target, bridge_class=bridge_class)
         return bridge_class
 

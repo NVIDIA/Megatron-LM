@@ -30,7 +30,6 @@ from megatron.bridge.models.conversion.param_mapping import AutoMapping, QKVMapp
 from megatron.bridge.models.conversion.quant_mapping import AmaxFanoutMapping, AmaxMapping
 from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
 from megatron.bridge.models.hybrid import BridgeHybridModelConfig
-from megatron.bridge.models.hybrid.hybrid_provider import HybridModelProvider
 from megatron.bridge.models.nemotronh.nemotron_h_bridge import (
     NemotronHBridge,
     _MTPFlatteningMapping,
@@ -122,16 +121,16 @@ class TestNemotronHBridge:
         """Test that NemotronHBridge is properly registered."""
         assert issubclass(NemotronHBridge, MegatronModelBridge)
 
-    def test_provider_bridge_basic(self, mock_pretrained_nemotronh, mock_nemotronh_config):
-        """Test basic provider_bridge functionality."""
+    def test_model_config_basic(self, mock_pretrained_nemotronh, mock_nemotronh_config):
+        """Test basic config conversion."""
         bridge = NemotronHBridge()
 
-        # Call provider_bridge
-        result = bridge.provider_bridge(mock_pretrained_nemotronh)
+        # Convert the HF config
+        result = bridge.hf_config_to_model_config(mock_pretrained_nemotronh.config)
         result.finalize()
 
-        # Check that it returns a HybridModelProvider instance
-        assert isinstance(result, HybridModelProvider)
+        # Check that it returns a BridgeHybridModelConfig instance
+        assert isinstance(result, BridgeHybridModelConfig)
 
         # Check basic configuration mapping
         assert result.num_layers == mock_nemotronh_config.num_hidden_layers
@@ -141,11 +140,11 @@ class TestNemotronHBridge:
         assert result.num_attention_heads == mock_nemotronh_config.num_attention_heads
         assert result.seq_length == mock_nemotronh_config.max_position_embeddings
 
-    def test_provider_bridge_vocabulary(self, mock_pretrained_nemotronh, mock_nemotronh_config):
+    def test_model_config_vocabulary(self, mock_pretrained_nemotronh, mock_nemotronh_config):
         """Test vocabulary size mapping."""
         bridge = NemotronHBridge()
 
-        result = bridge.provider_bridge(mock_pretrained_nemotronh)
+        result = bridge.hf_config_to_model_config(mock_pretrained_nemotronh.config)
 
         # Check vocabulary configuration
         assert result.vocab_size == mock_nemotronh_config.vocab_size
@@ -153,23 +152,21 @@ class TestNemotronHBridge:
             result.share_embeddings_and_output_weights == mock_nemotronh_config.tie_word_embeddings
         )
 
-    def test_provider_bridge_attention_config(
-        self, mock_pretrained_nemotronh, mock_nemotronh_config
-    ):
+    def test_model_config_attention_config(self, mock_pretrained_nemotronh, mock_nemotronh_config):
         """Test attention configuration mapping."""
         bridge = NemotronHBridge()
 
-        result = bridge.provider_bridge(mock_pretrained_nemotronh)
+        result = bridge.hf_config_to_model_config(mock_pretrained_nemotronh.config)
 
         # Check attention configuration
         assert result.num_attention_heads == mock_nemotronh_config.num_attention_heads
         assert result.num_query_groups == mock_nemotronh_config.num_key_value_heads
 
-    def test_provider_bridge_mamba_config(self, mock_pretrained_nemotronh, mock_nemotronh_config):
+    def test_model_config_mamba_config(self, mock_pretrained_nemotronh, mock_nemotronh_config):
         """Test Mamba-specific configuration mapping."""
         bridge = NemotronHBridge()
 
-        result = bridge.provider_bridge(mock_pretrained_nemotronh)
+        result = bridge.hf_config_to_model_config(mock_pretrained_nemotronh.config)
         result.finalize()
 
         # Check Mamba-specific configuration
@@ -180,34 +177,34 @@ class TestNemotronHBridge:
         assert result.mamba_chunk_size == mock_nemotronh_config.chunk_size
         assert result.hybrid_layer_pattern == mock_nemotronh_config.hybrid_override_pattern
 
-    def test_provider_bridge_mlp_config(self, mock_pretrained_nemotronh, mock_nemotronh_config):
+    def test_model_config_mlp_config(self, mock_pretrained_nemotronh, mock_nemotronh_config):
         """Test MLP configuration mapping."""
         bridge = NemotronHBridge()
 
-        result = bridge.provider_bridge(mock_pretrained_nemotronh)
+        result = bridge.hf_config_to_model_config(mock_pretrained_nemotronh.config)
 
         # Check MLP configuration
         assert result.ffn_hidden_size == mock_nemotronh_config.intermediate_size
         assert result.gated_linear_unit == False  # Mamba doesn't use gated linear units
 
-    def test_provider_bridge_normalization(self, mock_pretrained_nemotronh, mock_nemotronh_config):
+    def test_model_config_normalization(self, mock_pretrained_nemotronh, mock_nemotronh_config):
         """Test normalization configuration."""
         bridge = NemotronHBridge()
 
-        result = bridge.provider_bridge(mock_pretrained_nemotronh)
+        result = bridge.hf_config_to_model_config(mock_pretrained_nemotronh.config)
 
         # Check normalization settings
         assert result.layernorm_epsilon == mock_nemotronh_config.layer_norm_epsilon
 
-    def test_provider_bridge_dtype_handling(self, mock_nemotronh_config):
-        """Test dtype handling in provider_bridge."""
+    def test_model_config_dtype_handling(self, mock_nemotronh_config):
+        """Test dtype handling in config conversion."""
         # Create model with specific dtype
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_nemotronh_config.torch_dtype = "bfloat16"
         mock_pretrained.config = mock_nemotronh_config
 
         bridge = NemotronHBridge()
-        result = bridge.provider_bridge(mock_pretrained)
+        result = bridge.hf_config_to_model_config(mock_pretrained.config)
 
         # The provider should respect the model's dtype
         assert result.params_dtype == torch.bfloat16
@@ -288,18 +285,18 @@ class TestNemotronHBridge:
         assert reverse_weight.megatron_param == "decoder.layers.0.mixer.conv1d_weight"
         assert reverse_bias.megatron_param == "decoder.layers.0.mixer.conv1d_bias"
 
-    def test_provider_bridge_fixed_settings(self, mock_pretrained_nemotronh):
+    def test_model_config_fixed_settings(self, mock_pretrained_nemotronh):
         """Test fixed settings that should always be set regardless of config."""
         bridge = NemotronHBridge()
 
-        result = bridge.provider_bridge(mock_pretrained_nemotronh)
+        result = bridge.hf_config_to_model_config(mock_pretrained_nemotronh.config)
 
         # These should always be set to these values for Mamba
         assert result.position_embedding_type == "none"  # Mamba doesn't use position embeddings
         assert result.rotary_percent == 1.0
         assert result.rotary_base == 10000
 
-    def test_provider_bridge_moe_config(self, active_nemotronh_config_dict):
+    def test_model_config_moe_config(self, active_nemotronh_config_dict):
         """Test MoE configuration mapping when n_routed_experts > 0."""
         # Add MoE-specific configurations to the base config
         moe_config_dict = {
@@ -321,7 +318,7 @@ class TestNemotronHBridge:
         mock_pretrained.config = cfg
 
         bridge = NemotronHBridge()
-        result = bridge.provider_bridge(mock_pretrained)
+        result = bridge.hf_config_to_model_config(mock_pretrained.config)
 
         # Check MoE configuration mappings
         assert result.num_moe_experts == cfg.n_routed_experts
@@ -332,7 +329,7 @@ class TestNemotronHBridge:
         assert result.moe_router_group_topk == cfg.topk_group
         assert result.moe_router_topk_scaling_factor == cfg.routed_scaling_factor
 
-    def test_provider_bridge_no_moe_when_n_routed_experts_zero(self, active_nemotronh_config_dict):
+    def test_model_config_no_moe_when_n_routed_experts_zero(self, active_nemotronh_config_dict):
         """Test that MoE configs are not added when n_routed_experts is 0."""
         # Add MoE config with n_routed_experts = 0
         moe_config_dict = {
@@ -354,12 +351,12 @@ class TestNemotronHBridge:
         mock_pretrained.config = cfg
 
         bridge = NemotronHBridge()
-        result = bridge.provider_bridge(mock_pretrained)
+        result = bridge.hf_config_to_model_config(mock_pretrained.config)
 
         # When n_routed_experts is 0, num_moe_experts should be 0 or None
         assert result.num_moe_experts in (0, None)
 
-    def test_provider_bridge_moe_latent_size(self, active_nemotronh_config_dict):
+    def test_model_config_moe_latent_size(self, active_nemotronh_config_dict):
         """Test moe_latent_size mapping for Super model."""
         moe_config_dict = {
             **active_nemotronh_config_dict,
@@ -382,13 +379,13 @@ class TestNemotronHBridge:
         mock_pretrained.config = cfg
 
         bridge = NemotronHBridge()
-        result = bridge.provider_bridge(mock_pretrained)
+        result = bridge.hf_config_to_model_config(mock_pretrained.config)
 
         # Check Super-specific MoE configuration
         assert result.moe_latent_size == 1024
         assert result.moe_shared_expert_overlap is False
 
-    def test_provider_bridge_mtp_config(self, active_nemotronh_config_dict):
+    def test_model_config_mtp_config(self, active_nemotronh_config_dict):
         """Test MTP configuration mapping for Super model."""
         mtp_config_dict = {
             **active_nemotronh_config_dict,
@@ -406,17 +403,16 @@ class TestNemotronHBridge:
         mock_pretrained.config = cfg
 
         bridge = NemotronHBridge()
-        result = bridge.provider_bridge(mock_pretrained)
+        result = bridge.hf_config_to_model_config(mock_pretrained.config)
 
         # Check MTP configuration mappings
         assert result.mtp_num_layers == 2
         assert result.mtp_hybrid_override_pattern == "*E"
         assert result.mtp_use_repeated_layer is True
-        assert result.keep_mtp_spec_in_bf16 is True
         assert result.mtp_loss_scaling_factor == 0.3
 
     @pytest.mark.parametrize("num_nextn_predict_layers", [None, 0])
-    def test_provider_bridge_disables_mtp_naturally(
+    def test_model_config_disables_mtp_naturally(
         self, active_nemotronh_config_dict, num_nextn_predict_layers
     ):
         """HF configs without enabled MTP produce a normal non-MTP provider."""
@@ -434,14 +430,13 @@ class TestNemotronHBridge:
         mock_pretrained = Mock(spec=PreTrainedCausalLM)
         mock_pretrained.config = SimpleNamespace(**config_dict)
 
-        result = NemotronHBridge().provider_bridge(mock_pretrained)
+        result = NemotronHBridge().hf_config_to_model_config(mock_pretrained.config)
 
         assert result.mtp_num_layers == 0
         assert result.mtp_hybrid_override_pattern is None
         assert result.mtp_use_repeated_layer is False
-        assert result.keep_mtp_spec_in_bf16 is False
 
-    def test_provider_bridge_rejects_incomplete_mtp_config(self, active_nemotronh_config_dict):
+    def test_model_config_rejects_incomplete_mtp_config(self, active_nemotronh_config_dict):
         """An enabled HF MTP config must describe its hybrid block."""
         from types import SimpleNamespace
 
@@ -451,9 +446,9 @@ class TestNemotronHBridge:
         )
 
         with pytest.raises(ValueError, match="mtp_hybrid_override_pattern"):
-            NemotronHBridge().provider_bridge(mock_pretrained)
+            NemotronHBridge().hf_config_to_model_config(mock_pretrained.config)
 
-    def test_provider_bridge_no_moe_when_attribute_missing(self, active_nemotronh_config_dict):
+    def test_model_config_no_moe_when_attribute_missing(self, active_nemotronh_config_dict):
         """Test that MoE configs are not added when n_routed_experts attribute is missing."""
         from types import SimpleNamespace
 
@@ -467,10 +462,10 @@ class TestNemotronHBridge:
         mock_pretrained.config = cfg
 
         bridge = NemotronHBridge()
-        result = bridge.provider_bridge(mock_pretrained)
+        result = bridge.hf_config_to_model_config(mock_pretrained.config)
 
         # Should work without MoE configs - provider should still be created
-        assert isinstance(result, HybridModelProvider)
+        assert isinstance(result, BridgeHybridModelConfig)
         assert not hasattr(result, "num_moe_experts") or result.num_moe_experts is None
 
     def test_mapping_registry_contains_moe_mappings(self):
@@ -642,12 +637,11 @@ class TestNemotronHBridgeMegatronToHFConfig:
         config = NemotronHBridge.megatron_to_hf_config(provider)
         physical_blocks = 1 if depth and repeated else depth
         assert config["num_nextn_predict_layers"] == physical_blocks
-        reimported = SimpleNamespace()
         # Reimport preserves stored blocks; the training recipe selects repetitions.
         config["mtp_use_repeated_layer"] = repeated
-        NemotronHBridge._configure_mtp_provider(reimported, SimpleNamespace(**config))
-        assert reimported.mtp_num_layers == physical_blocks
-        assert reimported.mtp_use_repeated_layer is bool(depth and repeated)
+        reimported = NemotronHBridge._hf_mtp_settings(SimpleNamespace(**config))
+        assert reimported["mtp_num_layers"] == physical_blocks
+        assert reimported["mtp_use_repeated_layer"] is bool(depth and repeated)
 
     def test_megatron_to_hf_config_disables_mtp_with_zero_physical_layers(self):
         """Export zero physical MTP layers when MTP is disabled."""
@@ -1393,26 +1387,12 @@ def _builder_field_names(model_config) -> set[str]:
 class TestNemotronHBuilderConfig:
     """Builder-backed ModelConfig path for Nemotron-H."""
 
-    def test_provider_bridge_is_inherited_compatibility_only(self):
-        assert "provider_bridge" not in NemotronHBridge.__dict__
-
     def test_conversion_uses_builder_config(self):
         assert NemotronHBridge.MODEL_CONFIG_CLASS is BridgeHybridModelConfig
-        assert NemotronHBridge.USE_MODEL_CONFIG_FOR_CONVERSION is True
 
     def test_hf_config_to_model_config_uses_direct_mapping(self):
         bridge = NemotronHBridge()
-        with (
-            patch.object(
-                bridge, "provider_bridge", side_effect=AssertionError("provider path used")
-            ),
-            patch.object(
-                bridge,
-                "hf_config_to_provider_kwargs",
-                side_effect=AssertionError("provider kwargs used"),
-            ),
-        ):
-            model_config = bridge.hf_config_to_model_config(_builder_hf_config("moe_mtp_latent"))
+        model_config = bridge.hf_config_to_model_config(_builder_hf_config("moe_mtp_latent"))
 
         assert isinstance(model_config, BridgeHybridModelConfig)
         assert model_config.hybrid_layer_pattern == _BUILDER_BASE_CONFIG["hybrid_override_pattern"]
@@ -1436,51 +1416,30 @@ class TestNemotronHBuilderConfig:
         assert model_config.hybrid_stack_spec is None
 
     @pytest.mark.parametrize("variant", [*_BUILDER_CONFIG_VARIANTS, "native"])
-    def test_model_config_matches_provider(self, variant):
-        bridge = NemotronHBridge()
+    def test_model_config_roundtrip(self, variant):
+        hf_config = _native_hf_config() if variant == "native" else _builder_hf_config(variant)
+        model_config = NemotronHBridge().hf_config_to_model_config(hf_config)
+        restored = BridgeHybridModelConfig.from_dict(model_config.as_dict())
 
-        def hf_config():
-            return _native_hf_config() if variant == "native" else _builder_hf_config(variant)
+        assert isinstance(restored, BridgeHybridModelConfig)
+        for name in sorted(_builder_field_names(model_config) - {"transformer"}):
+            assert getattr(restored, name) == getattr(model_config, name), name
 
-        mock_pretrained = Mock(spec=PreTrainedCausalLM)
-        mock_pretrained.config = hf_config()
-        with pytest.warns(FutureWarning, match=r"deprecated.*get_model_config.*get_model"):
-            provider = bridge.provider_bridge(mock_pretrained)
-        model_config = bridge.hf_config_to_model_config(hf_config())
-
-        shared = {f.name for f in dataclasses.fields(provider)} & _builder_field_names(model_config)
-        assert len(shared) > 300
-        for name in sorted(shared - {"transformer"}):
-            assert getattr(model_config, name) == getattr(provider, name), name
-        assert provider.position_embedding_type == "none"
-        assert provider.keep_mtp_spec_in_bf16 is bool(
-            provider.mtp_num_layers
-            and getattr(mock_pretrained.config, "keep_mtp_spec_in_bf16", True)
-        )
-
-        # Both paths combine the MTP block with the decoder pattern the same way.
-        provider.finalize()
         model_config.finalize()
-        for name in sorted(shared - {"transformer"}):
-            provider_value, model_value = getattr(provider, name), getattr(model_config, name)
-            if callable(provider_value) and not isinstance(provider_value, type):
+        restored.finalize()
+        for name in sorted(_builder_field_names(model_config) - {"transformer"}):
+            expected = getattr(model_config, name)
+            if callable(expected) and not isinstance(expected, type):
                 continue
-            assert model_value == provider_value, name
+            assert getattr(restored, name) == expected, name
 
     @pytest.mark.parametrize("variant", ["moe_mtp_latent", "mtp_not_repeated", "chunk256_fp16"])
-    def test_megatron_to_hf_config_from_model_config_matches_provider(self, variant):
-        bridge = NemotronHBridge()
-        mock_pretrained = Mock(spec=PreTrainedCausalLM)
-        mock_pretrained.config = _builder_hf_config(variant)
-        with pytest.warns(FutureWarning):
-            provider = bridge.provider_bridge(mock_pretrained)
-        model_config = bridge.hf_config_to_model_config(_builder_hf_config(variant))
-        provider.finalize()
+    def test_model_config_exports_hf_architecture(self, variant):
+        model_config = NemotronHBridge().hf_config_to_model_config(_builder_hf_config(variant))
         model_config.finalize()
 
         hf_config = NemotronHBridge.megatron_to_hf_config(model_config)
 
-        assert hf_config == NemotronHBridge.megatron_to_hf_config(provider)
         assert (
             hf_config["hybrid_override_pattern"] == _BUILDER_BASE_CONFIG["hybrid_override_pattern"]
         )

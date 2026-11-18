@@ -82,7 +82,9 @@ models = bridge.get_model(model_config, load_weights=True, wrap_with_ddp=False)
 ```
 
 These configs use MLM model builders and can be inspected and serialized without
-constructing a model. This port does not provide Bridge recipes, data pipelines,
+constructing a model. Model construction uses only the config/builder APIs above;
+the older model-provider classes and APIs are not included.
+This port does not provide Bridge recipes, data pipelines,
 PEFT training, or a unified end-to-end training entrypoint.
 
 ## Tests

@@ -15,7 +15,7 @@
 # Source license: Apache-2.0.
 
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -562,29 +562,14 @@ class TestQwen35VLBridgeModelConfig:
         assert exported["layer_types"] == hf_config.text_config.layer_types
 
     @pytest.mark.parametrize("bridge_class", [Qwen35VLBridge, Qwen35VLMoEBridge])
-    def test_provider_bridge_is_inherited_compatibility_only(self, bridge_class):
-        assert "provider_bridge" not in bridge_class.__dict__
-
-    @pytest.mark.parametrize("bridge_class", [Qwen35VLBridge, Qwen35VLMoEBridge])
     def test_conversion_uses_builder_config(self, bridge_class):
         assert bridge_class.MODEL_CONFIG_CLASS is Qwen35VLModelConfig
-        assert bridge_class.USE_MODEL_CONFIG_FOR_CONVERSION is True
 
     @pytest.mark.parametrize(("bridge_class", "moe"), _BRIDGE_CASES, ids=_BRIDGE_IDS)
     def test_hf_config_to_model_config_uses_direct_mapping(self, bridge_class, moe):
         hf_config = _qwen35_vl_config(moe=moe)
         bridge = bridge_class()
-        with (
-            patch.object(
-                bridge, "provider_bridge", side_effect=AssertionError("provider path used")
-            ),
-            patch.object(
-                bridge,
-                "hf_config_to_provider_kwargs",
-                side_effect=AssertionError("provider kwargs used"),
-            ),
-        ):
-            model_config = bridge.hf_config_to_model_config(hf_config)
+        model_config = bridge.hf_config_to_model_config(hf_config)
 
         assert isinstance(model_config, Qwen35VLModelConfig)
         assert isinstance(model_config.transformer, Qwen35VLTransformerConfig)

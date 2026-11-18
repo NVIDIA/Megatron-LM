@@ -25,10 +25,8 @@ import torch
 from utils import (
     _configure_distributed_env,
     _configure_model_config,
-    _configure_model_provider,
     _hf_tokenizer_kwargs,
     _maybe_generate_pipeline_layout,
-    _uses_model_builder,
     parse_dtype,
     prepare_output_directory,
     resolve_hf_model_revision,
@@ -142,24 +140,14 @@ def import_checkpoint(
                 torch_dtype=dtype,
                 **revision_kwargs,
             )
-            if _uses_model_builder(bridge):
-                model_config = bridge.get_model_config()
-                _configure_model_config(
-                    model_config, tp=tp, pp=pp, ep=ep, etp=etp, dtype=dtype, use_cpu=True
-                )
-                _maybe_generate_pipeline_layout(bridge, model_config, pp)
-                megatron_model = bridge.get_model(
-                    model_config, wrap_with_ddp=False, mixed_precision_wrapper=None
-                )
-            else:
-                model_provider = bridge.to_megatron_provider(load_weights=True)
-                _configure_model_provider(
-                    model_provider, tp=tp, pp=pp, ep=ep, etp=etp, dtype=dtype, use_cpu=True
-                )
-                _maybe_generate_pipeline_layout(bridge, model_provider, pp)
-                model_provider.finalize()
-                model_provider.initialize_model_parallel(seed=0, create_gloo_process_groups=False)
-                megatron_model = model_provider.provide_distributed_model(wrap_with_ddp=False)
+            model_config = bridge.get_model_config()
+            _configure_model_config(
+                model_config, tp=tp, pp=pp, ep=ep, etp=etp, dtype=dtype, use_cpu=True
+            )
+            _maybe_generate_pipeline_layout(bridge, model_config, pp)
+            megatron_model = bridge.get_model(
+                model_config, wrap_with_ddp=False, mixed_precision_wrapper=None
+            )
 
             bridge.save_megatron_model(
                 megatron_model,

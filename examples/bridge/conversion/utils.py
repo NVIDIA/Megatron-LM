@@ -28,7 +28,7 @@ import torch
 
 if TYPE_CHECKING:
     from megatron.bridge import AutoBridge
-    from megatron.bridge.models.gpt_provider import GPTModelProvider
+    from megatron.training.models.base import ModelConfig
 
 
 DTYPE_MAP = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}
@@ -39,10 +39,7 @@ def _configure_distributed_env() -> None:
     if os.environ.get("WORLD_SIZE") is not None or os.environ.get("SLURM_NTASKS") is None:
         return
 
-    from megatron.bridge.utils.slurm import (
-        resolve_slurm_master_addr,
-        resolve_slurm_master_port,
-    )
+    from megatron.bridge.utils.slurm import resolve_slurm_master_addr, resolve_slurm_master_port
 
     os.environ["RANK"] = os.environ["SLURM_PROCID"]
     os.environ["WORLD_SIZE"] = os.environ["SLURM_NTASKS"]
@@ -202,44 +199,22 @@ def prepare_output_directory(
     return output_path
 
 
-def _uses_model_builder(bridge: AutoBridge) -> bool:
-    """Return whether the selected bridge supports native builder construction."""
-    return getattr(bridge._model_bridge, "USE_MODEL_CONFIG_FOR_CONVERSION", False)
-
-
-def _configure_model_provider(
-    model_provider: GPTModelProvider,
-    *,
-    tp: int,
-    pp: int,
-    ep: int,
-    etp: int,
-    dtype: torch.dtype,
-    use_cpu: bool = False,
-) -> None:
-    """Apply distributed parallelism and dtype settings to a model provider."""
-    model_provider.tensor_model_parallel_size = tp
-    model_provider.pipeline_model_parallel_size = pp
-    model_provider.expert_model_parallel_size = ep
-    model_provider.expert_tensor_parallel_size = etp
-    model_provider.pipeline_dtype = dtype
-    model_provider.params_dtype = dtype
-    if use_cpu:
-        model_provider.use_cpu_initialization = True
-
-
 def _configure_model_config(
     model_config, *, tp: int, pp: int, ep: int, etp: int, dtype: torch.dtype, use_cpu: bool = False
 ) -> None:
     """Apply distributed parallelism and dtype settings to a builder config."""
-    _configure_model_provider(
-        model_config.transformer, tp=tp, pp=pp, ep=ep, etp=etp, dtype=dtype, use_cpu=use_cpu
-    )
+    transformer = model_config.transformer
+    transformer.tensor_model_parallel_size = tp
+    transformer.pipeline_model_parallel_size = pp
+    transformer.expert_model_parallel_size = ep
+    transformer.expert_tensor_parallel_size = etp
+    transformer.pipeline_dtype = dtype
+    transformer.params_dtype = dtype
+    if use_cpu:
+        transformer.use_cpu_initialization = True
 
 
-def _maybe_generate_pipeline_layout(
-    bridge: AutoBridge, model_provider: GPTModelProvider, pp: int
-) -> bool:
+def _maybe_generate_pipeline_layout(bridge: AutoBridge, model_config: ModelConfig, pp: int) -> bool:
     """Generate a bridge-specific pipeline layout when the model requires one.
 
     A bridge returns ``None`` when the default pipeline split already applies. A bridge whose
@@ -249,11 +224,11 @@ def _maybe_generate_pipeline_layout(
     if pp <= 1:
         return False
     if hasattr(bridge._model_bridge, "configure_pipeline_layout"):
-        bridge._model_bridge.configure_pipeline_layout(model_provider)
+        bridge._model_bridge.configure_pipeline_layout(model_config)
         from megatron.training.utils.common_utils import print_rank_0
 
         stage_sizes = [
-            stage.count("decoder") for stage in model_provider.pipeline_model_parallel_layout or []
+            stage.count("decoder") for stage in model_config.pipeline_model_parallel_layout or []
         ]
         print_rank_0(
             f"Configured pipeline layout for PP={pp} ({stage_sizes} decoder layers per stage)"
@@ -263,12 +238,12 @@ def _maybe_generate_pipeline_layout(
         return False
     num_layers = bridge.hf_pretrained.config.num_hidden_layers
     # The layout must match the model being built, which may omit the checkpoint's MTP layers.
-    model_config = getattr(model_provider, "transformer", model_provider)
-    mtp_layers = getattr(model_config, "mtp_num_layers", None) or 0
+    transformer = model_config.transformer
+    mtp_layers = getattr(transformer, "mtp_num_layers", None) or 0
     layout = bridge._model_bridge.generate_pipeline_layout(num_layers, pp, mtp_layers)
     if layout is None:
         return False
-    model_provider.pipeline_model_parallel_layout = layout
+    model_config.pipeline_model_parallel_layout = layout
     from megatron.training.utils.common_utils import print_rank_0
 
     print_rank_0(
