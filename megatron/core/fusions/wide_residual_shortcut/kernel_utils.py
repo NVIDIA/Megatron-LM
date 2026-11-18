@@ -115,10 +115,8 @@ def _coefficient(table, INDEX: gl.constexpr):
 
 
 @g.jit
-def _emit_mxfp8(y, data, scale, coordinates, rows=None, AXIS: gl.constexpr = 1):
-    """Store MXFP8 data and TE-swizzled E8M0 scales of 32-value blocks along ``AXIS``.
-
-    ``rows`` zeroes padded-row scales.
+def _e8m0_scale(amax):
+    """TE's E8M0 exponent of each block amax and the FP32 reciprocal scale it encodes.
 
     Inline PTX: Gluon has no E8M0 conversion. ``cvt.rp.satfinite.ue8m0x2.f32`` produces the
     scale exponent (rounded toward +inf, finite values saturated to 254, NaN kept as 255) in one
@@ -128,7 +126,7 @@ def _emit_mxfp8(y, data, scale, coordinates, rows=None, AXIS: gl.constexpr = 1):
         gl.inline_asm_elementwise(
             "cvt.rp.satfinite.ue8m0x2.f32 $0, 0.0, $1;",
             "=h,f",
-            [gl.max(gl.abs(y), AXIS) * (1.0 / 448.0)],
+            [amax * (1.0 / 448.0)],
             dtype=gl.uint16,
             is_pure=True,
             pack=1,
@@ -138,10 +136,27 @@ def _emit_mxfp8(y, data, scale, coordinates, rows=None, AXIS: gl.constexpr = 1):
     # TE's E8M0 exponent; 254 has a subnormal reciprocal and 255 preserves NaN encoding.
     bits = gl.where(exponent == 254, 0x00400000, (254 - exponent) << 23)
     bits = gl.where(exponent == 255, 0x7FFFFFFF, bits)
-    outer, inner, width = coordinates
+    return exponent, bits
+
+
+@g.jit
+def _swizzled_scale_index(outer, inner, width):
+    """Offset of the E8M0 scale of 32-value block ``inner`` of row ``outer`` in TE's GEMM-ready
+    layout (128 x 4 scale tiles, ``width`` values per row)."""
     # Left-associated, so constant per-thread offsets fold into store immediates.
     index = ((outer // 128) * gl.cdiv(width, 128) + inner // 4) * 512 + (outer % 32) * 16
-    index = index + (outer % 128 // 32) * 4 + inner % 4
+    return index + (outer % 128 // 32) * 4 + inner % 4
+
+
+@g.jit
+def _emit_mxfp8(y, data, scale, coordinates, rows=None, AXIS: gl.constexpr = 1):
+    """Store MXFP8 data and TE-swizzled E8M0 scales of 32-value blocks along ``AXIS``.
+
+    ``rows`` zeroes padded-row scales.
+    """
+    exponent, bits = _e8m0_scale(gl.max(gl.abs(y), AXIS))
+    outer, inner, width = coordinates
+    index = _swizzled_scale_index(outer, inner, width)
     scale_pointer, scale_mask = scale
     data_pointer, data_mask = data
     if rows is not None:
@@ -209,6 +224,36 @@ def _mul2(a, b):
 # forward's FP32 rounding exactly, but the compiler still contracts a plain ``*`` / ``+`` into an
 # FMA even with enable_fp_fusion=False (measured: replay no longer bit-identical), and
 # libdevice.mul_rn flushes subnormals under reflect-FTZ.
+
+
+@g.jit
+def _add2(a, b):
+    """Two independent RN FP32 sums as one packed f32x2 instruction (never fused)."""
+    return gl.inline_asm_elementwise(
+        """
+        {
+            .reg .b64 a,b,r;
+            mov.b64 a,{$2,$3};
+            mov.b64 b,{$4,$5};
+            add.rn.f32x2 r,a,b;
+            mov.b64 {$0,$1},r;
+        }
+        """,
+        "=f,=f,f,f,f,f",
+        [a, b],
+        dtype=gl.float32,
+        is_pure=True,
+        pack=2,
+    )
+
+
+@g.jit
+def _round_bf16(x):
+    """FP32 -> BF16, round to nearest even, two values per ``cvt.rn.bf16x2.f32`` (the scalar
+    conversion runs on the quarter-rate conversion pipe)."""
+    return gl.inline_asm_elementwise(
+        "cvt.rn.bf16x2.f32 $0, $2, $1;", "=r,f,f", [x], dtype=gl.bfloat16, is_pure=True, pack=2
+    )
 
 
 @g.jit
