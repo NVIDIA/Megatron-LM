@@ -3089,7 +3089,7 @@ def load_checkpoint(
             run_tp_pp, ckpt_tp_pp
         )
 
-        load_dp_rng_states = _checkpoint_has_per_dp_rng_states(cfg)
+        load_dp_rng_states = _checkpoint_has_per_dp_rng_states(cfg.checkpoint)
 
         # Determine if RNG state will be loaded
         # world_size must match too: the rng shard key includes dp_cp, so a DP rescale leaves this
@@ -3763,17 +3763,6 @@ def load_checkpoint(
                 else:
                     rng_state_list = state_dict['rng_state']
                     rng_state = _select_rng_state(rng_state_list, load_dp_rng_states, dp_cp_gtp_remat, dp_cp_group)
-
-                # access rng_state for data parallel rank
-                if cfg.rng.data_parallel_random_init:
-                    dp_rank = (
-                        get_pg_rank(dp_group)
-                        if dp_group is not None
-                        else mpu.get_data_parallel_rank()
-                    )
-                    rng_state = rng_state[dp_rank]
-                else:
-                    rng_state = rng_state[0]
                 random.setstate(rng_state['random_rng_state'])
                 np.random.set_state(rng_state['np_rng_state'])
                 torch.set_rng_state(rng_state['torch_rng_state'])
