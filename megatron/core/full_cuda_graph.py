@@ -241,11 +241,18 @@ class FullCudaGraphWrapper:
     cuda_graph = {'training': None, 'validation': None}
     result = {'training': None, 'validation': None}
 
-    def __init__(self, forward_backward_func, cuda_graph_warmup_steps=1, use_single_mempool=False):
+    def __init__(
+        self,
+        forward_backward_func,
+        cuda_graph_warmup_steps=1,
+        use_single_mempool=False,
+        control_group=None,
+    ):
         self.forward_backward_func = forward_backward_func
         self.static_loader = StaticBufferLoader()
         self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
         self.use_single_mempool = use_single_mempool
+        self.control_group = control_group
 
     def data_read(self, data_iterator, model, training, num_microbatches):
         """Read all microbatch inputs from Dataloader and copy to static buffers."""
@@ -280,6 +287,35 @@ class FullCudaGraphWrapper:
                     data_list.append(None)
         return data_list
 
+    def _prepare_fsdp_capture(self, model):
+        """Agree on FSDP readiness before entering graph capture."""
+        error = None
+        try:
+            contexts = {}
+            chunks = model if isinstance(model, (list, tuple)) else (model,)
+            for chunk in chunks:
+                modules = getattr(chunk, 'modules', None)
+                for module in modules() if callable(modules) else (chunk,):
+                    context = getattr(module, '_context', None)
+                    if callable(getattr(context, 'prepare_for_cuda_graph_capture', None)):
+                        contexts[id(context)] = context
+            for context in contexts.values():
+                context.prepare_for_cuda_graph_capture()
+        except Exception as exc:
+            error = exc
+        if self.control_group is not None:
+            # Stages without FSDP contexts must not enter collectives after a peer fails.
+            status = torch.tensor([int(error is not None)], dtype=torch.int64, device='cuda')
+            torch.distributed.all_reduce(
+                status, op=torch.distributed.ReduceOp.MAX, group=self.control_group
+            )
+            if status.item():
+                if error is not None:
+                    raise error
+                raise RuntimeError('FSDP graph preparation failed on another rank')
+        elif error is not None:
+            raise error
+
     def __call__(self, *args, **kwargs):
         assert len(args) == 0, 'forward_backward_func does not accept positional args'
         assert all(
@@ -305,6 +341,7 @@ class FullCudaGraphWrapper:
         training_str = 'training' if training else 'validation'
         curr_iteration = self.curr_iter(training_str)
         if curr_iteration == self.cuda_graph_warmup_steps:
+            self._prepare_fsdp_capture(model)
             logger.info(f'Capture CUDA graph for {training_str}!!!')
             if hasattr(torch.autograd.graph, 'set_override_stale_capture_stream'):
                 torch.autograd.graph.set_override_stale_capture_stream(True)

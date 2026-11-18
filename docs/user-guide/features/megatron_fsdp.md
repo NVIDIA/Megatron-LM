@@ -651,3 +651,10 @@ recording state and training cursors. Changing the schedule requires a new
 context. Recorded execution requires ordinary hooks; combined EP-overlap
 scheduling is unsupported. Recording and byte sampling must finish before
 CUDA Graph capture; capture executes the replay operations.
+
+Before full-iteration CUDA Graph capture, `FullCudaGraphWrapper` prepares each
+FSDP context once and coordinates failures through its explicit `control_group`.
+Standalone capture callers should call `context.prepare_for_cuda_graph_capture()`
+outside capture, after `post_backward()` and `finish_grad_sync()` complete and
+all gathered weights are released. Evaluation preserves the training recording
+state. Captured replay performs no preparation checks or status collective.
