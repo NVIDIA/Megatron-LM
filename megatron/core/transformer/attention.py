@@ -2011,10 +2011,18 @@ class SelfAttention(Attention):
         if not self.config.qk_layernorm:
             return
 
+        # __init__ has already checked that the DP group is there; a group removed since then
+        # must not reach torch.distributed, which reads None as WORLD.
+        dp_group = self._realtime_test_dp_group()
+        if self.tp_group is None or dp_group is None:
+            raise ValueError(
+                "SelfAttention with config.test_mode and qk_layernorm compares the Q/K layernorm "
+                "parameters across the tensor- and data-parallel groups; pg_collection must set "
+                "tp and dp_gtp_remat or dp"
+            )
+
         # check that all tensor parallel and data parallel ranks have the same
         # Q & K layernorm parameters.
-        # __init__ has already checked that the DP group is there.
-        dp_group = self._realtime_test_dp_group()
         rank = get_pg_rank(dp_group)
         inputs = torch.stack(
             [
