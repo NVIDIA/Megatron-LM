@@ -2,7 +2,10 @@
 
 """Construction helpers for dynamic inference engines."""
 
+import logging
 from typing import Any
+
+import torch.distributed as dist
 
 from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
@@ -17,9 +20,12 @@ from megatron.core.inference.model_inference_wrappers.abstract_model_inference_w
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.shards_spec import resolve_inference_shard
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def build_dynamic_inference_engine(
@@ -63,6 +69,21 @@ def build_dynamic_inference_engine(
         engine_cls = DisaggDynamicInferenceEngine if disaggregated else DynamicInferenceEngine
     elif disaggregated and not issubclass(engine_cls, DisaggDynamicInferenceEngine):
         raise ValueError("disaggregation_shards requires a DisaggDynamicInferenceEngine subclass")
+
+    if disaggregated and inference_config.prefix_caching_mamba_gb:
+        # A shared launch passes one config to every shard. Prefill engines reuse
+        # cached recurrent state across turns, but a decode engine imports the final
+        # recurrent state into live slots and rejects a prefix-cache state buffer.
+        role = resolve_inference_shard(
+            inference_config.disaggregation_shards, dist.get_world_size(), dist.get_rank()
+        ).spec.role
+        if role == "decode":
+            logger.info(
+                "decode shard: ignoring prefix_caching_mamba_gb=%s; imported recurrent "
+                "state is written to live slots",
+                inference_config.prefix_caching_mamba_gb,
+            )
+            inference_config.prefix_caching_mamba_gb = None
 
     inference_config.reserve_recurrent_state_dummy_slot = (
         engine_cls.requires_recurrent_state_dummy_slot

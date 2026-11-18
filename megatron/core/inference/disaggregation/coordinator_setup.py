@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Literal, Sequence
 
+import torch
 import torch.distributed as dist
 
 from megatron.core.inference.shards_spec import (
@@ -59,6 +60,19 @@ def validate_disaggregation_shards(
     return specs
 
 
+def transfer_rank_pairs(specs: Sequence[InferenceShardSpec]) -> list[tuple[int, int]]:
+    """Every (prefill global rank, decode global rank) pair, in a fixed global order.
+
+    Shards own contiguous rank windows in spec order.
+    """
+    prefill, decode, offset = [], [], 0
+    for spec in specs:
+        ranks = list(range(offset, offset + spec.world_size))
+        (prefill if spec.role == PREFILL else decode).extend(ranks)
+        offset += spec.world_size
+    return [(src, dst) for src in prefill for dst in decode]
+
+
 def configure_prebuilt_disagg_engine(engine: Any) -> None:
     """Configure an engine for coordinator-native disaggregation."""
     shards = engine.context.config.disaggregation_shards
@@ -91,6 +105,15 @@ def configure_prebuilt_disagg_engine(engine: Any) -> None:
             f"inference shard {assignment.index} parallelism mismatch: "
             f"process groups {built}, expected {expected_built}; "
             f"model config {configured}, expected {expected_configured}"
+        )
+
+    if engine.context.config.kv_transport_backend == "nccl":
+        # World-collective: dedicated per-pair groups keep transfers to different peers
+        # from serializing on one communicator stream (see transfer_backends/nccl.py).
+        from megatron.core.inference.disaggregation.transfer_backends.nccl import setup_peer_groups
+
+        setup_peer_groups(
+            transfer_rank_pairs(specs), torch.device("cuda", torch.cuda.current_device())
         )
 
     # Each shard replica needs a distinct coordinator identity.
