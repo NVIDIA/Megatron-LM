@@ -57,3 +57,29 @@ def test_missing_modelopt_plugin_uses_stock_hybrid_builder(monkeypatch, request)
     assert build_stock.call_args.kwargs["hybrid_stack_spec"] is stock_spec
     assert build_stock.call_args.kwargs["vocab_size"] == 128
     build_modelopt.assert_not_called()
+
+
+def test_modelopt_stage_binds_the_tokenizer_vocab_size():
+    """The stage config is translated after tokenizer init, so it takes the run's vocab size."""
+    module = importlib.import_module("megatron.elastification.pretrain_hybrid_flex")
+    built = object()
+    builder = Mock()
+    builder.build_model.return_value = built
+    model_config = SimpleNamespace(
+        vocab_size=None, pre_wrap_hooks=[], get_builder_cls=lambda: lambda config: builder
+    )
+    run_config = SimpleNamespace(
+        tokenizer=SimpleNamespace(padded_vocab_size=128), checkpoint=None, distillation=None
+    )
+
+    with (
+        patch.object(module, "get_run_config", return_value=run_config),
+        patch.object(module, "hybrid_config_from_args"),
+        patch.object(module, "apply_modelopt_model_config", return_value=model_config, create=True),
+        patch.object(module, "modelopt_setup_hooks", return_value=[], create=True),
+        patch.object(module, "distillation_hooks", return_value=[], create=True) as kd_hooks,
+    ):
+        assert module._build_modelopt_stage(Namespace(), True, True, None, object()) is built
+
+    assert model_config.vocab_size == 128
+    kd_hooks.assert_called_once_with(model_config, None)

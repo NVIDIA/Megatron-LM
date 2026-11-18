@@ -107,3 +107,17 @@ def test_ambiguous_aliases_fail_instead_of_picking_a_mapping():
 def test_no_maps_do_not_read_checkpoint_metadata():
     read = remap(model_with_maps({}), {"weight": tensor(FUSED)}, {LEGACY})
     read.assert_not_called()
+
+
+def test_metadata_is_read_with_the_load_strategy():
+    strategy = object()
+    with patch.object(
+        layer_key_aliases, "load_tensors_metadata", return_value=dict.fromkeys({FUSED})
+    ) as read:
+        layer_key_aliases.remap_sharded_state_dict_for_load(
+            [model_with_maps(KEYS_MAP)],
+            {"weight": tensor(FUSED)},
+            "/selected/iter_5",
+            sharded_strategy=strategy,
+        )
+    read.assert_called_once_with("/selected/iter_5", strategy)

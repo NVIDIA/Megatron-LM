@@ -2161,6 +2161,7 @@ def _load_non_persistent_base_checkpoint(
     expt_dp_group=None,
     checkpoint_group=None,
     gtp_pad_for_alignment=None,
+    layer_key_alias_models=None,
     *,
     checkpoint: CheckpointConfig,
 ):
@@ -2185,6 +2186,7 @@ def _load_non_persistent_base_checkpoint(
             expt_dp_group=expt_dp_group,
             checkpoint_group=checkpoint_group,
             gtp_pad_for_alignment=gtp_pad_for_alignment,
+            layer_key_alias_models=layer_key_alias_models,
             checkpoint=checkpoint,
         )
     elif checkpoint.non_persistent_ckpt_type == 'local':
@@ -2228,12 +2230,15 @@ def _load_global_dist_base_checkpoint(
     expt_dp_group=None,
     checkpoint_group=None,
     gtp_pad_for_alignment=None,
+    layer_key_alias_models=None,
     *,
     checkpoint: CheckpointConfig,
 ):
     """Load the base state_dict from the given directory containing the global distributed checkpoint.
 
     ``checkpoint`` is the load policy; ``args`` is still read for the precision recipe (GTP padding).
+    ``layer_key_alias_models`` are the models whose layer-spec key aliases the load request
+    may resolve (see ``remap_sharded_state_dict_for_load``).
     """
     if rank0:
         checkpoint_name = find_checkpoint_rank_0(load_dir, iteration, release)
@@ -2283,6 +2288,15 @@ def _load_global_dist_base_checkpoint(
         )
     if checkpointing_context is not None:
         checkpointing_context['load_strategy'] = load_strategy
+
+    if layer_key_alias_models is not None:
+        # Uses the load strategy, so this metadata read shares the load's metadata cache.
+        remap_sharded_state_dict_for_load(
+            layer_key_alias_models,
+            sharded_state_dict,
+            checkpoint_name,
+            sharded_strategy=load_strategy,
+        )
 
     # Computed fresh, not from GTP_CONFIG (only set when GTP is active): a non-GTP run may still
     # load a checkpoint saved with GTP padding and needs this to recognize it as padding.
@@ -2336,6 +2350,7 @@ def _load_base_checkpoint(
     gpt_compat_layer_maps=None,
     gtp_pad_for_alignment=None,
     use_megatron_fsdp=False,
+    layer_key_alias_models=None,
     *,
     checkpoint: Optional[CheckpointConfig] = None,
     finetune: Optional[bool] = None,
@@ -2383,6 +2398,7 @@ def _load_base_checkpoint(
                 expt_dp_group=expt_dp_group,
                 checkpoint_group=checkpoint_group,
                 gtp_pad_for_alignment=gtp_pad_for_alignment,
+                layer_key_alias_models=layer_key_alias_models,
                 checkpoint=checkpoint,
             )
         else:
@@ -2440,6 +2456,7 @@ def _load_base_checkpoint(
             expt_dp_group=expt_dp_group,
             checkpoint_group=checkpoint_group,
             gtp_pad_for_alignment=gtp_pad_for_alignment,
+            layer_key_alias_models=layer_key_alias_models,
             checkpoint=checkpoint,
         )
     elif ckpt_format == 'torch':
@@ -3336,12 +3353,10 @@ def load_checkpoint(
                 if model_key in load_kwargs['sharded_state_dict']:
                     model_sharded_state_dict_modifier(load_kwargs['sharded_state_dict'][model_key])
 
-        # Resolve legacy layer-spec names against the checkpoint actually selected by the
-        # loader. Include optimizer tensors, whose storage keys can contain model keys.
+        # Resolve legacy layer-spec names when the load strategy exists, against the checkpoint
+        # it selects. Include optimizer tensors, whose storage keys can contain model keys.
         if ckpt_type == CheckpointType.GLOBAL:
-            remap_sharded_state_dict_for_load(
-                model, load_kwargs['sharded_state_dict'], checkpoint_name
-            )
+            load_kwargs['layer_key_alias_models'] = model
     elif load_format == 'torch_dcp':
         model_sd = model[0].state_dict()
         if tp_group is None and pp_group is None:

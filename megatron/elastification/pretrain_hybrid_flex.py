@@ -93,12 +93,15 @@ def count_parameters_in_layer(model, layer_name):
 
 def _build_modelopt_stage(args, pre_process, post_process, vp_stage, pg_collection):
     """Build one model stage with the stock builder for the ModelOpt config, running its pre-wrap hooks."""
+    run_config = get_run_config()
     model_config = apply_modelopt_model_config(hybrid_config_from_args(args), args)
+    # This config is translated after tokenizer initialization bound the run's vocabulary.
+    if model_config.vocab_size is None:
+        model_config.vocab_size = run_config.tokenizer.padded_vocab_size
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
     builder = model_config.get_builder_cls()(model_config)
     models = [builder.build_model(pg_collection, pre_process, post_process, vp_stage)]
-    run_config = get_run_config()
     # Same order as setup_model_and_optimizer: ModelOpt setup, own hooks, KD conversion last.
     pre_wrap_hook = compose_hooks(
         [

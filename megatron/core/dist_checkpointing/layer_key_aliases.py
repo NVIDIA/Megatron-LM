@@ -20,13 +20,16 @@ from megatron.core.utils import log_single_rank
 logger = logging.getLogger(__name__)
 
 
-def remap_sharded_state_dict_for_load(models, state_dict, checkpoint_dir):
+def remap_sharded_state_dict_for_load(models, state_dict, checkpoint_dir, sharded_strategy=None):
     """Resolve layer-spec key aliases in a distributed checkpoint's load request.
 
     Prefer the requested checkpoint key. If it is absent, try the corresponding runtime
     module name from the layer specs. Only the load template is changed; the models and
     their canonical save mappings stay untouched. Apply this after other load modifiers
     to the complete template, including model-keyed optimizer state.
+
+    ``sharded_strategy`` reads the checkpoint metadata; pass the strategy of the load that
+    follows so that both share its metadata cache. Defaults to the default load strategy.
     """
     aliases = {
         (runtime, canonical)
@@ -39,7 +42,7 @@ def remap_sharded_state_dict_for_load(models, state_dict, checkpoint_dir):
     }
     if not aliases:
         return
-    checkpoint_keys = load_tensors_metadata(checkpoint_dir).keys()
+    checkpoint_keys = load_tensors_metadata(checkpoint_dir, sharded_strategy).keys()
     resolved = []
 
     def remap(value):
