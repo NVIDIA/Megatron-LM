@@ -9,14 +9,7 @@
 
 # Generating Docs Locally
 
-To generate docs locally, use the following commands:
-
-```
-cd docs
-SKIP_PUBLIC_DOCS_FEATURES=true uv run --only-group docs sphinx-autobuild . _build/html --port 8080 --host 127.0.0.1
-```
-
-Docs will be generated at [http://localhost:8080/](http://localhost:8080/).
-
-**Recommended:** set the environment variable `SKIP_AUTODOC=true` when generating docs 
-to skip the generation of `apidocs`.
+The published documentation is built with Fern. To preview your changes, refer to
+[Preview Locally](../documentation.md#preview-locally) and
+[Share a Preview](../documentation.md#share-a-preview) in
+[Documentation Development](../documentation.md). 

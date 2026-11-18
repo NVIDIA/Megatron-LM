@@ -1,5 +1,5 @@
-# Navigation for Megatron Core, derived from the Sphinx toctrees in index.md.
-# Paths are relative to this file (docs/). Pages that Sphinx marked `orphan: true`
+# Navigation for Megatron Core, derived from the toctrees in index.md.
+# Paths are relative to this file (docs/). Pages marked `orphan: true`
 # are kept under a hidden section so links to them resolve.
 navigation:
   - page: "Megatron Core User Guide"
