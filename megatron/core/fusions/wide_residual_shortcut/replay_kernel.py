@@ -12,7 +12,18 @@ from triton.experimental import gluon as g
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language import BlockedLayout
 
-from .kernel_utils import _emit_mxfp8, _forward_value, _mul_rn, allocate_operand, operand_buffers
+from .kernel_utils import (
+    _add2,
+    _e8m0_scale,
+    _fma2,
+    _forward_value,
+    _mul2,
+    _mul_rn,
+    _round_bf16,
+    _swizzled_scale_index,
+    allocate_operand,
+    operand_buffers,
+)
 
 
 @g.jit
@@ -57,6 +68,35 @@ def _bwd_wr_recompute(
 
 
 @g.jit
+def _tile_value(previous, update, write, retain, lane, stream: gl.constexpr, RETAIN: gl.constexpr):
+    """``_forward_value`` on a tile, with the stream's contraction rule resolved at compile time
+    (stream 0 always fuses, stream 1 for tile rows below 12, the others never) and packed f32x2
+    arithmetic. ``lane`` is the row within its 32-row block. Bit-identical to ``_forward_value``."""
+    retained = _mul2(retain, previous) if RETAIN else previous
+    if stream == 0:
+        return _fma2(write, update, retained)
+    separate = _add2(_mul2(write, update), retained)
+    if stream == 1:
+        return gl.where(lane < 12, _fma2(write, update, retained), separate)
+    return separate
+
+
+@g.jit
+def _emit_columns(y, data, scales, index, mask, EVEN: gl.constexpr):
+    """Columnwise MXFP8 of a (32, C) FP32 tile that is one 32-row block: E8M0 scale per column
+    (at ``index``, TE's swizzled scale offset of each column). Padded rows are zero in ``y``;
+    tiles cover whole 128 x 128 scale tiles, so padded scales are written too."""
+    exponent, bits = _e8m0_scale(gl.max(gl.abs(y), 0))
+    q = _mul2(y, gl.expand_dims(bits.to(gl.float32, bitcast=True), 0))
+    q = q.to(gl.float8e4nv).to(gl.uint8, bitcast=True)
+    if EVEN:
+        gl.store(data, q)
+    else:
+        gl.store(data, q, mask)
+    gl.store(scales + index, exponent.to(gl.uint8))
+
+
+@g.jit
 def _bwd_wr_recompute_mxfp8quant(
     checkpoint,
     updates,
@@ -72,60 +112,83 @@ def _bwd_wr_recompute_mxfp8quant(
     S: gl.constexpr,
     RETENTION: gl.constexpr,
     TERMINAL: gl.constexpr,
-    EMIT: gl.constexpr,
+    READERS: gl.constexpr,
+    FIRST: gl.constexpr,
+    VEC: gl.constexpr,
+    THREADS_N: gl.constexpr,
+    WARPS: gl.constexpr,
 ):
-    """Replay transitions on 32x32 tiles, emitting the columns of every reader EMIT[tape] names
-    (``rstd``/``gamma``/``data``/``scales`` are per tape, per reader)."""
-    BLOCK_COLS: gl.constexpr = 32
-    L: gl.constexpr = gl.BlockedLayout([1, 4], [4, 8], [4, 1], [1, 0])
-    rowtile = gl.program_id(0) // (gl.cdiv(H, 128) * (128 // BLOCK_COLS))
-    coltile = gl.program_id(0) % (gl.cdiv(H, 128) * (128 // BLOCK_COLS))
-    rr = rowtile * 32 + gl.arange(0, 32, layout=gl.constexpr(gl.SliceLayout(1, L)))
+    """Replay transitions on 32-row tiles, emitting the columns of every reader in READERS[j]
+    after transition j. ``rstd``, ``gamma``, ``data`` and ``scales`` hold one entry per emitted
+    column operand, in transition order; FIRST[j] is transition j's first."""
+    BLOCK_COLS: gl.constexpr = VEC * THREADS_N
+    # Training shapes cover whole 128 x 128 scale tiles: no masks.
+    EVEN: gl.constexpr = (M % 128 == 0) and (H % 128 == 0)
+    L: gl.constexpr = gl.BlockedLayout([1, VEC], [32 // THREADS_N, THREADS_N], [WARPS, 1], [1, 0])
+    columns: gl.constexpr = gl.cdiv(H, 128) * (128 // BLOCK_COLS)
+    rowtile = gl.program_id(0) // columns
+    coltile = gl.program_id(0) % columns
+    lane = gl.arange(0, 32, layout=gl.constexpr(gl.SliceLayout(1, L)))
+    rr = rowtile * 32 + lane
     cc = coltile * BLOCK_COLS + gl.arange(0, BLOCK_COLS, layout=gl.constexpr(gl.SliceLayout(0, L)))
     mask = (rr[:, None] < M) & (cc[None, :] < H)
+    rows = lane[:, None]
     values = ()
     for s in gl.static_range(S):
-        values += (
-            gl.load(checkpoint + rr[:, None] * (S * H) + s * H + cc[None, :], mask, 0).to(
-                gl.float32
-            ),
-        )
-    for j in gl.static_range(len(updates)):
-        u = gl.load(updates[j] + rr[:, None] * H + cc[None, :], mask, 0).to(gl.float32)
-        for reader in gl.static_range(len(EMIT[j])):
-            if EMIT[j][reader]:
-                x = gl.full((32, BLOCK_COLS), 0, gl.float32, L)
-                q = 0.0
-                for s in gl.static_range(S):
-                    w = gl.load(cs[j] + s)
-                    t = gl.load(cs[j] + S + s) if RETENTION[j] else 1.0
-                    beta = gl.load(cs[j] + (2 + reader) * S + s)
-                    # Explicit rn multiply prevents contraction into neighboring recurrence.
-                    alpha = _mul_rn(beta, t)
-                    x = gl.fma(alpha, values[s], x)
-                    q = gl.fma(beta, w, q)
-                x = gl.fma(q, u, x)
-                r = gl.load(rstd[j][reader] + rr, rr < M, 0)
-                weight = gl.load(gamma[j][reader] + cc, cc < H, 0).to(gl.float32)
-                z = _mul_rn(x, r[:, None])
-                y = gl.where(mask, _mul_rn(z, weight[None, :]), 0.0)
-                # Columnwise blocks run down the rows; padded scales are overwritten too.
-                _emit_mxfp8(
-                    y,
-                    (data[j][reader] + rr[:, None] * H + cc[None, :], mask),
-                    (scales[j][reader], None),
-                    (cc, rowtile, M),
-                    AXIS=0,
-                )
+        ptr = checkpoint + rr[:, None] * (S * H) + s * H + cc[None, :]
+        values += ((gl.load(ptr) if EVEN else gl.load(ptr, mask, 0)).to(gl.float32),)
+    N: gl.constexpr = len(updates)
+    # Per-thread offsets every transition shares: [M, H] tiles (updates, column data), the
+    # residual's first stream, and each column's swizzled scale.
+    offsets = rr[:, None] * H + cc[None, :]
+    residual_offsets = rr[:, None] * (S * H) + cc[None, :]
+    scale_index = _swizzled_scale_index(cc, rowtile, M)
+    u_next = gl.load(updates[0] + offsets) if EVEN else gl.load(updates[0] + offsets, mask, 0)
+    for j in gl.static_range(N):
+        u = u_next.to(gl.float32)
+        if j + 1 < N:  # the next update's load overlaps this transition's stores
+            uptr = updates[j + 1] + offsets
+            u_next = gl.load(uptr) if EVEN else gl.load(uptr, mask, 0)
+        writes, retains = (), ()
+        for s in gl.static_range(S):
+            writes += (gl.load(cs[j] + s),)
+            retains += (gl.load(cs[j] + S + s) if RETENTION[j] else 1.0,)
+        for e in gl.static_range(len(READERS[j])):
+            x = None
+            q = 0.0
+            for s in gl.static_range(S):
+                beta = gl.load(cs[j] + (2 + READERS[j][e]) * S + s)
+                # Explicit rn multiply prevents contraction into neighboring recurrence.
+                alpha = _mul_rn(beta, retains[s])
+                x = _mul2(alpha, values[s]) if x is None else _fma2(alpha, values[s], x)
+                q = gl.fma(beta, writes[s], q)
+            x = _fma2(q, u, x)
+            if EVEN:
+                r = gl.load(rstd[FIRST[j] + e] + rr)
+                weight = gl.load(gamma[FIRST[j] + e] + cc).to(gl.float32)
+            else:
+                r = gl.load(rstd[FIRST[j] + e] + rr, rr < M, 0)
+                weight = gl.load(gamma[FIRST[j] + e] + cc, cc < H, 0).to(gl.float32)
+            y = _mul2(_mul2(x, r[:, None]), weight[None, :])
+            if not EVEN:
+                y = gl.where(mask, y, 0.0)
+            _emit_columns(
+                y, data[FIRST[j] + e] + offsets, scales[FIRST[j] + e], scale_index, mask, EVEN
+            )
         if j < len(updates) - 1 or TERMINAL:
             next_values = ()
             for s in gl.static_range(S):
-                w = gl.load(cs[j] + s)
-                t = gl.load(cs[j] + S + s) if RETENTION[j] else 1.0
-                value = _forward_value(values[s], u, w, t, rr[:, None], s)
+                value = _tile_value(values[s], u, writes[s], retains[s], rows, s, RETENTION[j])
                 target = outputs[j] if j < len(updates) - 1 else terminal
-                value = value.to(target.dtype.element_ty)
-                gl.store(target + rr[:, None] * (S * H) + s * H + cc[None, :], value, mask)
+                if target.dtype.element_ty == gl.bfloat16:
+                    value = _round_bf16(value)
+                else:
+                    value = value.to(target.dtype.element_ty)
+                tptr = target + s * H + residual_offsets
+                if EVEN:
+                    gl.store(tptr, value)
+                else:
+                    gl.store(tptr, value, mask)
                 next_values += (value.to(gl.float32),)
             values = next_values
 
@@ -169,32 +232,43 @@ def _column_inputs(checkpoint, tapes, requested, columns):
     return columns, data, scales
 
 
+# Column replay schedules per residual dtype: (VEC columns per thread, THREADS lanes across a
+# 32-row tile, WARPS warps down it, MAXNREG registers), from an 8K-token Nano/Super/Ultra sweep.
+_MX_SCHEDULES = {torch.float32: (4, 8, 2, 128), torch.bfloat16: (4, 8, 4, 80)}
+
+
 def _launch_columns(checkpoint, tapes, outputs, data, scales, requested, terminal):
     m, h = tapes[0].update.shape
-    _bwd_wr_recompute_mxfp8quant[(triton.cdiv(m, 128) * 4 * triton.cdiv(h, 128) * 4,)](
+    readers = tuple(tuple(r for r, need in enumerate(needs) if need) for needs in requested)
+    first, flat = [], []  # per tape its first emitted operand; (tape, reader) per operand
+    for tape, (index, emitted) in zip(tapes, enumerate(readers)):
+        first.append(len(flat))
+        flat.extend((index, r) for r in emitted)
+    vector, threads, warps, maxnreg = _MX_SCHEDULES[checkpoint.dtype]
+    block = vector * threads
+    tiles = triton.cdiv(m, 128) * 4 * triton.cdiv(h, 128) * (128 // block)
+    _bwd_wr_recompute_mxfp8quant[(tiles,)](
         checkpoint,
         tuple(t.update for t in tapes),
         tuple(t.coefficients for t in tapes),
-        tuple(
-            tuple(t.rstd[r] if need else None for r, need in enumerate(needs))
-            for t, needs in zip(tapes, requested)
-        ),
-        tuple(
-            tuple(t.gammas[r] if need else None for r, need in enumerate(needs))
-            for t, needs in zip(tapes, requested)
-        ),
+        tuple(tapes[t].rstd[r] for t, r in flat),
+        tuple(tapes[t].gammas[r] for t, r in flat),
         outputs,
-        data,
-        scales,
+        tuple(data[t][r] for t, r in flat),
+        tuple(scales[t][r] for t, r in flat),
         terminal,
         m,
         h,
         tapes[0].num_streams,
         tuple(t.has_retention for t in tapes),
         terminal is not None,
-        requested,
-        maxnreg=64,
-        num_warps=4,
+        readers,
+        tuple(first),
+        vector,
+        threads,
+        warps,
+        maxnreg=maxnreg,
+        num_warps=warps,
     )
 
 
