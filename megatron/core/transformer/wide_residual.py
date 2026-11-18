@@ -520,10 +520,10 @@ class WriteReadNorm(nn.Module):
     A fused layer spec selects this as the layer's read connection (with an identity input norm);
     its predecessor's DeferredWrite always hands its write here, and the tensor this read is called
     with is only that write's unwritten input residual. Every module consuming the read is linked
-    to it (``link_consumer``), which fixes the read's format: MXFP8 if every consumer quantizes
-    it, BF16 if none does, else both, a (BF16, MXFP8) pair. A SeamInput (a fused shortcut block's
-    two-reader kernel already applied the write) passes through. Returns
-    ``(branch_input, (residual,))`` like a residual-connection read.
+    to it (``link_consumer``): each consumer takes it as MXFP8 if it quantizes it, else BF16, and
+    a read with two consumers is returned as one tensor per consumer, in link order. A SeamInput
+    (a fused shortcut block's two-reader kernel already applied the write) passes through.
+    Returns ``(branch_input, (residual,))`` like a residual-connection read.
     """
 
     def __init__(
@@ -581,14 +581,20 @@ class WriteReadNorm(nn.Module):
         return tuple(module for module, quantizes in self.consumers if quantizes)
 
     @property
-    def format(self) -> str:
-        """The seam kernel's output format for this read (fixed once its consumers are linked)."""
+    def consumer_formats(self) -> tuple:
+        """Each linked consumer's format, in link order: the seam returns one output per
+        consumer (one or two), whose gradients its backward kernel sums."""
         if not self.consumers:
             raise RuntimeError("a fused read has no linked consumer")
-        quantized = len(self.mxfp8_linears)
-        if quantized == 0:
-            return "bf16"
-        return "mxfp8" if quantized == len(self.consumers) else "both"
+        if len(self.consumers) > 2:
+            raise RuntimeError("a fused read feeds at most two linked consumers")
+        return tuple("mxfp8" if quantizes else "bf16" for _, quantizes in self.consumers)
+
+    @property
+    def format(self) -> str:
+        """The seam kernel's output format for this read (fixed once its consumers are linked)."""
+        formats = set(self.consumer_formats)
+        return formats.pop() if len(formats) == 1 else "both"
 
     def hand(self, item) -> None:
         """Hand ``item`` (PendingWideResidualWrites or SeamInput) to this empty read."""
@@ -630,9 +636,9 @@ class WriteReadNorm(nn.Module):
     def apply_write(self, pending, shortcut: WriteReadNorm | None = None):
         """Write ``pending`` and return ``(residual, branch_input)`` (plus ``shortcut``'s
         normalized input, for a shortcut block's second reader) from one fused kernel. Each read
-        is emitted in its linked format (a "both" read as a (BF16, MXFP8) pair), and the write is
-        recorded into this seam's replay interval, which the output residual carries on to the
-        next seam."""
+        is emitted in its consumers' formats (one output per consumer), and the write is recorded
+        into this seam's replay interval, which the output residual carries on to the next
+        seam."""
         replay = self._replay_interval(pending)
         reads = (self,) if shortcut is None else (self, shortcut)
         # Inference builds no autograd graph (and uses the inference MXFP8 eligibility) even with
@@ -641,7 +647,7 @@ class WriteReadNorm(nn.Module):
             if any(read.mxfp8_linears for read in reads):
                 check_mxfp8_call(pending.routed)  # never falls back to BF16
             options = dict(
-                outputs=tuple(read.format for read in reads),
+                outputs=tuple(read.consumer_formats for read in reads),
                 mxfp8_consumers=tuple(read.mxfp8_linears for read in reads),
                 num_streams=self.num_streams,
                 epsilon=self.eps,
