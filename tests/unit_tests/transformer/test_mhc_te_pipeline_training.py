@@ -39,7 +39,7 @@ from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.cuda_graphs import (
     TECudaGraphHelper,
     _get_mtp_te_layers,
-    _layer_is_graphable,
+    _te_cuda_graph_layer_is_graphable,
 )
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import Float16Module
@@ -130,7 +130,9 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph, recompute_rebu
         for model in models:
             module = _unwrap(model)
             decoder_layers = [
-                layer for layer in module.decoder.layers if _layer_is_graphable(layer, config)
+                layer
+                for layer in module.decoder.layers
+                if _te_cuda_graph_layer_is_graphable(layer, config)
             ]
             expected_layers.extend(decoder_layers)
             expected_mtp.extend([False] * len(decoder_layers))
@@ -138,7 +140,7 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph, recompute_rebu
                 nested_layers = [
                     layer
                     for layer in _get_mtp_te_layers(depth.mtp_model_layer)
-                    if _layer_is_graphable(layer, config)
+                    if _te_cuda_graph_layer_is_graphable(layer, config)
                 ]
                 expected_layers.extend(nested_layers)
                 expected_mtp.extend([True] * len(nested_layers))
@@ -151,21 +153,21 @@ def _run_te_pipeline_training(models, groups, pp_size, use_graph, recompute_rebu
         # hooks. Its actual gradient accumulation/reduction hooks remain active.
         assert all(not model.use_forward_hook for model in models)
         for layer in expected_layers:
-            assert len(layer.cuda_graphs) == graph_helper.num_microbatches
-            original_graphs = list(layer.cuda_graphs)
+            assert len(layer.te_cuda_graphs) == graph_helper.num_microbatches
+            original_graphs = list(layer.te_cuda_graphs)
             counted_graphs = []
             for graph_index, graph in enumerate(original_graphs):
 
                 def counted(*args, _layer=layer, _index=graph_index, _graph=graph, **kwargs):
-                    microbatch = _layer.current_microbatch
-                    assert _index == microbatch % len(_layer.cuda_graphs)
+                    microbatch = _layer.te_cuda_graph_current_microbatch
+                    assert _index == microbatch % len(_layer.te_cuda_graphs)
                     replay_calls[(iteration, id(_layer))] += 1
                     replay_microbatches.setdefault((iteration, id(_layer)), []).append(microbatch)
                     return _graph(*args, **kwargs)
 
                 counted.reset = graph.reset
                 counted_graphs.append(counted)
-            layer.cuda_graphs = counted_graphs
+            layer.te_cuda_graphs = counted_graphs
         return graph_helper
 
     history = []

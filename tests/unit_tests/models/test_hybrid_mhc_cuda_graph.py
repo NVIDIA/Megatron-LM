@@ -17,6 +17,7 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
+from megatron.core.extensions.te_cuda_graphs import set_te_cuda_graph_current_microbatch
 from megatron.core.fusions import fused_mhc_kernels
 from megatron.core.models.gpt.gpt_layer_specs import get_gpt_layer_with_transformer_engine_spec
 from megatron.core.models.gpt.gpt_model import GPTModel
@@ -39,9 +40,8 @@ from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.cuda_graphs import (
     TECudaGraphHelper,
     _get_mtp_te_layers,
-    _layer_is_graphable,
-    convert_schedule_table_to_order,
-    set_current_microbatch,
+    _te_cuda_graph_layer_is_graphable,
+    convert_te_cuda_graph_schedule_table_to_order,
 )
 from megatron.core.transformer.enums import AttnBackend, CudaGraphModule
 from megatron.core.transformer.hyper_connection import HyperConnectionModule
@@ -359,7 +359,7 @@ class TestMHCTEGraphs:
         layers = list(model.decoder.layers)
         for mtp in getattr(getattr(model, "mtp", None), "layers", []):
             layers.extend(_get_mtp_te_layers(mtp.mtp_model_layer))
-        graphable = [layer for layer in layers if _layer_is_graphable(layer, config)]
+        graphable = [layer for layer in layers if _te_cuda_graph_layer_is_graphable(layer, config)]
         assert graphable
         for layer in layers:
             if isinstance(layer, HyperConnectionHybridLayer):
@@ -395,10 +395,11 @@ class TestMHCTEGraphs:
         model = _model("hybrid_gdn", config, ProcessGroupCollection.use_mpu_process_groups())
         gdn_wrapper = model.decoder.layers[0]
         assert gdn_wrapper._is_attention_graph_split()
-        assert _layer_is_graphable(gdn_wrapper, config)
+        assert _te_cuda_graph_layer_is_graphable(gdn_wrapper, config)
         # GDN reads packed offsets on the host, so packed THD batches keep it eager.
-        config.sequence_packing_scheduler = "dp_balanced"
-        assert not _layer_is_graphable(gdn_wrapper, config)
+        # HybridStack gives each layer its own config copy, which the scope check reads.
+        gdn_wrapper.inner_layer.config.sequence_packing_scheduler = "dp_balanced"
+        assert not _te_cuda_graph_layer_is_graphable(gdn_wrapper, config)
 
     def test_attention_graph_split_rejects_compound_hybrid_layer(self):
         Utils.initialize_model_parallel(1, 1)
@@ -507,7 +508,7 @@ class TestMHCTEGraphs:
         expected = list(graphed.decoder.layers)
         for mtp in getattr(getattr(graphed, "mtp", None), "layers", []):
             expected.extend(_get_mtp_te_layers(mtp.mtp_model_layer))
-        expected = [layer for layer in expected if _layer_is_graphable(layer, config)]
+        expected = [layer for layer in expected if _te_cuda_graph_layer_is_graphable(layer, config)]
         assert self.helper.flattened_callables == expected and expected
         if "mtp" in kind:
             # Two MTP depths of two layers each; only attention layers are graphed in the split.
@@ -523,7 +524,7 @@ class TestMHCTEGraphs:
             set() if attention_graph_split else expected_backend_calls
         ), backend_calls
         print(f"mHC fused={fused}; captured backend calls: {dict(backend_calls['capture'])}")
-        assert all(layer.cuda_graphs for layer in expected)
+        assert all(layer.te_cuda_graphs for layer in expected)
         assert set(graphed.state_dict()) == initial_keys
 
         hooks = Counter()
@@ -559,18 +560,18 @@ class TestMHCTEGraphs:
 
         replay_calls = Counter()
         for layer in expected:
-            graphs = layer.cuda_graphs
+            graphs = layer.te_cuda_graphs
 
             def counted(*args, _layer=layer, _graph=graphs[0], **kwargs):
                 replay_calls[id(_layer)] += 1
                 return _graph(*args, **kwargs)
 
             counted.reset = graphs[0].reset
-            layer.cuda_graphs = [counted]
+            layer.te_cuda_graphs = [counted]
 
         for index, value in enumerate(inputs):
-            set_current_microbatch(graphed, index)
-            assert all(layer.current_microbatch == index for layer in expected)
+            set_te_cuda_graph_current_microbatch(graphed, index)
+            assert all(layer.te_cuda_graph_current_microbatch == index for layer in expected)
             expected_output, expected_input_grad, expected_grads = step(reference, value)
             backend_calls["eager"].clear()
             rebuilds.clear()
@@ -729,7 +730,7 @@ class _CustomTransformerLayer(TransformerLayer):
     def __init__(self, config, moe) -> None:
         MegatronModule.__init__(self, config)
         self.layer_number = 1
-        self.cuda_graphs = []
+        self.te_cuda_graphs = []
         self.is_moe_layer = moe
         self.self_attention = IdentityOp() if moe else torch.nn.Identity()
         self.cross_attention = IdentityOp()
@@ -743,7 +744,7 @@ class _CustomTransformerLayer(TransformerLayer):
     def _forward_self_attention_output_with_bias(self, *_args, **_kwargs):
         raise AssertionError("The custom forward must not be bypassed.")
 
-    def _te_cuda_graph_capture(self, *_args, **_kwargs):
+    def _te_cuda_graph_capture_forward(self, *_args, **_kwargs):
         raise AssertionError("The custom forward must not be bypassed.")
 
 
@@ -771,7 +772,7 @@ def test_mhc_te_graphs_keep_custom_transformer_layers_eager(graphs):
         wrapper = HyperConnectionHybridLayer(config, inner).cuda()
         assert not wrapper._is_attention_graph_split()
         assert not wrapper._is_partial_moe_graph()
-        assert not _layer_is_graphable(wrapper, config)
+        assert not _te_cuda_graph_layer_is_graphable(wrapper, config)
 
         hidden = torch.randn(
             4,
@@ -903,7 +904,7 @@ def test_attention_graph_split_scheduler_thd_replay(kind, chunks, monkeypatch):
                 assert callables == [
                     layer
                     for layer in model.module.decoder.layers
-                    if _layer_is_graphable(layer, config)
+                    if _te_cuda_graph_layer_is_graphable(layer, config)
                 ]
                 assert len(callables) == 1
             rotary = models[0].module.rotary_pos_emb(32, packed_seq=True)
@@ -986,24 +987,26 @@ def test_attention_graph_split_scheduler_thd_replay(kind, chunks, monkeypatch):
             replays = []
             graphed_layers = [layer for layers in helper.callables_per_chunk for layer in layers]
             for layer in graphed_layers:
-                assert len(layer.cuda_graphs) == 4
+                assert len(layer.te_cuda_graphs) == 4
                 counted_graphs = []
-                for graph_index, graph in enumerate(layer.cuda_graphs):
+                for graph_index, graph in enumerate(layer.te_cuda_graphs):
 
                     def counted(*args, _layer=layer, _index=graph_index, _graph=graph, **kwargs):
-                        assert _index == _layer.current_microbatch % len(_layer.cuda_graphs)
-                        replays.append((id(_layer), _layer.current_microbatch))
+                        assert _index == _layer.te_cuda_graph_current_microbatch % len(
+                            _layer.te_cuda_graphs
+                        )
+                        replays.append((id(_layer), _layer.te_cuda_graph_current_microbatch))
                         return _graph(*args, **kwargs)
 
                     counted.reset = graph.reset
                     counted_graphs.append(counted)
-                layer.cuda_graphs = counted_graphs
+                layer.te_cuda_graphs = counted_graphs
             bda_managers = _record_bda_managers(monkeypatch)
             for count in (4, 2, 4):
                 _, _, warmup, _ = get_pp_rank_microbatches(
                     count, chunks, 2, p2p_communicator=helper.p2p_communicator
                 )
-                order = convert_schedule_table_to_order(
+                order = convert_te_cuda_graph_schedule_table_to_order(
                     warmup, chunks, get_schedule_table(count, chunks, 2)
                 )
                 forwards, backwards, pending = [0] * chunks, [0] * chunks, {}
@@ -1015,7 +1018,7 @@ def test_attention_graph_split_scheduler_thd_replay(kind, chunks, monkeypatch):
                     if entry > 0:
                         mb = forwards[chunk]
                         forwards[chunk] += 1
-                        set_current_microbatch(models[chunk], mb)
+                        set_te_cuda_graph_current_microbatch(models[chunk], mb)
                         hidden = inputs[chunk, mb].clone().requires_grad_(True)
                         output = run_decoder(chunk, mb, hidden)
                         torch.testing.assert_close(
