@@ -646,19 +646,22 @@ class MegatronLLMEngine(LLMEngine):
         try:
             # The deadline covers only this request's own exchanges: requests to
             # the same source run concurrently instead of queueing on a lock.
+            # Admission spans the handshake and the request, so another request's
+            # timeout cannot close the channel between them.
             async with asyncio.timeout(_RELEASE_TIMEOUT):
-                current = await channel.instance_id()
-                if current != instance_id:
-                    # ZMQ reconnects across coordinator replacement, but the
-                    # replacement only knows this socket after a new CONNECT.
-                    current = await channel.instance_id(refresh=True)
-                if current != instance_id:
-                    if owner is not None:
-                        raise RuntimeError("Cannot claim a handoff from a replaced source")
-                    # The old coordinator/engine incarnation is gone. Never
-                    # release a recycled request ID in its replacement.
-                    return
-                reply = await channel.request(command, tuple(expected))
+                with channel.admit():
+                    current = await channel.instance_id()
+                    if current != instance_id:
+                        # ZMQ reconnects across coordinator replacement, but the
+                        # replacement only knows this socket after a new CONNECT.
+                        current = await channel.instance_id(refresh=True)
+                    if current != instance_id:
+                        if owner is not None:
+                            raise RuntimeError("Cannot claim a handoff from a replaced source")
+                        # The old coordinator/engine incarnation is gone. Never
+                        # release a recycled request ID in its replacement.
+                        return
+                    reply = await channel.request(command, tuple(expected))
         except (TimeoutError, zmq.ZMQError, ConnectionError):
             # Requests already waiting keep their own deadlines. New requests get
             # a fresh socket, which registers with whichever coordinator answers.

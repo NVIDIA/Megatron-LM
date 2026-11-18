@@ -608,6 +608,42 @@ async def test_concurrent_claims_to_one_source_overlap_and_match_acks_out_of_ord
 
 
 @pytest.mark.asyncio
+async def test_claim_sharing_a_timed_out_handshake_finishes_on_the_retired_channel():
+    context = zmq.asyncio.Context()
+    router = context.socket(zmq.ROUTER)
+    address = f"tcp://127.0.0.1:{router.bind_to_random_port('tcp://127.0.0.1')}"
+    engine = MegatronLLMEngine(_config("decode"))
+    try:
+        with patch("megatron.inference.integrations.dynamo.llm_engine._RELEASE_TIMEOUT", 0.5):
+            first = asyncio.create_task(
+                engine._remote_handoff_command(address, 1, "source", owner="decode")
+            )
+            identity, payload = await router.recv_multipart()
+            assert msgpack.unpackb(payload) == [Headers.CONNECT.value]
+            await asyncio.sleep(0.25)
+            # Joins the first claim's handshake with a later deadline.
+            second = asyncio.create_task(
+                engine._remote_handoff_command(address, 2, "source", owner="decode")
+            )
+            with pytest.raises(TimeoutError):
+                await first
+            assert not engine._handoff_channels
+            await router.send_multipart(
+                [identity, msgpack.packb([Headers.CONNECT_ACK.value, "source"])]
+            )
+            claim = msgpack.unpackb((await asyncio.wait_for(router.recv_multipart(), 1))[1])
+            assert claim[:2] == [Headers.CLAIM_KV.value, 2]
+            ack = [Headers.CLAIM_KV_ACK.value, 2, "source", HandoffClaimStatus.ACCEPTED.value]
+            await router.send_multipart([identity, msgpack.packb(ack)])
+            assert await asyncio.wait_for(second, 1) is None
+            assert all(channel.closed for channel in engine._retired_handoff_channels)
+    finally:
+        await engine.cleanup()
+        router.close(linger=0)
+        context.term()
+
+
+@pytest.mark.asyncio
 async def test_release_requires_acceptance_and_discards_timed_out_socket():
     engine = MegatronLLMEngine(_config("decode"))
     socket = _ScriptedSocket(_connect_ack("instance"))

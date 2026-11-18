@@ -7,7 +7,8 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Iterator
 
 import msgpack
 import zmq
@@ -38,6 +39,9 @@ class HandoffChannel:
     arrival order, so requests that share a key are resolved FIFO. A request
     that stops waiting stays queued, so a late reply resolves it rather than a
     newer request with the same key.
+
+    Callers hold :meth:`admit` across all of their exchanges, so retiring the
+    channel cannot close it between one caller's handshake and its request.
     """
 
     def __init__(self, context: zmq.asyncio.Context, address: str) -> None:
@@ -59,24 +63,35 @@ class HandoffChannel:
         """Whether the socket has been closed."""
         return self._closed
 
+    @contextmanager
+    def admit(self) -> Iterator[None]:
+        """Keep the channel open for one caller's exchanges.
+
+        Only admission checks retirement: a caller admitted before the channel
+        retired finishes its handshake and request on it.
+        """
+        if self._retired:
+            raise HandoffChannelClosed(f"Handoff control channel to {self.address} is retired")
+        self._active += 1
+        try:
+            yield
+        finally:
+            self._active -= 1
+            self._close_if_drained()
+
     async def instance_id(self, *, refresh: bool = False) -> str:
         """Register with the coordinator and return its instance ID.
 
         A replacement coordinator does not know this socket until CONNECT is
         resent, so callers refresh when they expect a different instance.
-        Concurrent callers share one handshake.
+        Concurrent callers share one handshake. Call within :meth:`admit`.
         """
         if self._instance_id is not None and not refresh:
             return self._instance_id
         if self._handshake is None or self._handshake.done():
             self._handshake = asyncio.create_task(self._connect())
             self._handshake.add_done_callback(lambda task: task.cancelled() or task.exception())
-        self._active += 1
-        try:
-            return await asyncio.shield(self._handshake)
-        finally:
-            self._active -= 1
-            self._close_if_drained()
+        return await asyncio.shield(self._handshake)
 
     async def _connect(self) -> str:
         reply = await self._exchange([Headers.CONNECT.value], (Headers.CONNECT_ACK.value,))
@@ -86,15 +101,11 @@ class HandoffChannel:
         return reply[1]
 
     async def request(self, message: list, reply_key: tuple) -> list:
-        """Send one message and wait, without a deadline, for its reply."""
-        if self._retired:
-            raise HandoffChannelClosed(f"Handoff control channel to {self.address} is retired")
-        self._active += 1
-        try:
-            return await self._exchange(message, reply_key)
-        finally:
-            self._active -= 1
-            self._close_if_drained()
+        """Send one message and wait, without a deadline, for its reply.
+
+        Call within :meth:`admit`.
+        """
+        return await self._exchange(message, reply_key)
 
     async def _exchange(self, message: list, reply_key: tuple) -> list:
         future = asyncio.get_running_loop().create_future()
