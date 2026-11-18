@@ -11,7 +11,9 @@ from megatron.core.transformer.transformer_config import TransformerConfig
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("fused", [False, True])
-def test_previous_mix_controls_input_and_receives_gradients(dtype, fused):
+def test_previous_mix_controls_input_and_receives_gradients(dtype, fused, monkeypatch):
+    # The reference matmul and the fused stream reduction must both use IEEE FP32.
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
     config = TransformerConfig(
         num_layers=2,
         hidden_size=16,
@@ -39,9 +41,10 @@ def test_previous_mix_controls_input_and_receives_gradients(dtype, fused):
     torch.testing.assert_close(output, reference.flatten(-2).to(dtype))
     # Direct activation-dtype stores must preserve FP32 coefficient gradients.
     leaves = (x, previous, module.mapping_proj.weight, bias)
-    actual_grads = torch.autograd.grad(output.float().square().mean(), leaves, retain_graph=True)
+    upstream = torch.randn_like(output) / output.numel()
+    actual_grads = torch.autograd.grad(output, leaves, upstream, retain_graph=True)
     reference_grads = torch.autograd.grad(
-        reference.flatten(-2).to(dtype).float().square().mean(), leaves, retain_graph=True
+        reference.flatten(-2).to(dtype), leaves, upstream, retain_graph=True
     )
     for actual, expected in zip(actual_grads, reference_grads):
         torch.testing.assert_close(actual, expected, atol=2e-3, rtol=2e-2)

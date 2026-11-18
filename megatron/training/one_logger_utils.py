@@ -1,6 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 import time, os
 
+from megatron.core._rank_utils import safe_get_world_size
+
 from .global_vars import get_one_logger, get_args
 from megatron.training.global_vars import get_run_config
 
@@ -32,6 +34,7 @@ def on_train_start(iteration, consumed_train_samples, train_samples, seq_length,
         log_throughput (bool): log throughput or not
         num_floating_point_operations_so_far (int): flops so far
     """
+    cfg = get_run_config()
     args = get_args()
     one_logger = get_one_logger()
 
@@ -54,7 +57,7 @@ def on_train_start(iteration, consumed_train_samples, train_samples, seq_length,
             one_logger.store_set('save_checkpoint_sync_time_total', 0.0)
 
             # Derive train_samples from iters for iteration-based training
-            train_samples_target = train_samples or train_iters * args.global_batch_size
+            train_samples_target = train_samples or train_iters * cfg.train.global_batch_size
 
             train_tokens_target = seq_length * train_samples_target
             e2e_metrics = {
@@ -281,14 +284,14 @@ def on_pretrain_start():
 
             one_logger.log_metrics({
                 'train_iterations_warmup': 5,
-                'data_parallel_size' : args.data_parallel_size,
-                'context_parallel_size': args.context_parallel_size,
-                'global_batch_size': args.global_batch_size,
-                'micro_batch_size': args.micro_batch_size,
-                'pipeline_model_parallel_size': args.pipeline_model_parallel_size,
-                'tensor_model_parallel_size': args.tensor_model_parallel_size,
-                'expert_model_parallel_size' : args.expert_model_parallel_size,
-                'world_size': args.world_size,
+                'data_parallel_size' : cfg.get_data_parallel_size(),
+                'context_parallel_size': cfg.model.transformer.context_parallel_size,
+                'global_batch_size': cfg.train.global_batch_size,
+                'micro_batch_size': cfg.train.micro_batch_size,
+                'pipeline_model_parallel_size': cfg.model.transformer.pipeline_model_parallel_size,
+                'tensor_model_parallel_size': cfg.model.transformer.tensor_model_parallel_size,
+                'expert_model_parallel_size' : cfg.model.transformer.expert_model_parallel_size,
+                'world_size': safe_get_world_size(),
                 'model_seq_length': args.seq_length,
                 'app_tag_run_name': app_tag_run_name,
                 'app_tag_run_version': app_tag_run_version,

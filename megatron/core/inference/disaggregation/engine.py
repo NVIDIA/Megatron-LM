@@ -25,11 +25,13 @@ class StateHandoffDynamicInferenceEngine(InferenceStateHandoffMixin, DynamicInfe
     install the coordinator-native registration protocol below.
     """
 
-    def _serialize_finished_request(self, request: DynamicInferenceRequest) -> dict:
+    def _record_and_serialize_finished_request(
+        self, request: DynamicInferenceRequest
+    ) -> dict | None:
         """A prefill handoff is intermediate, not a ledger/stager completion."""
         if request.disaggregated_params:
             return request.serialize()
-        return super()._serialize_finished_request(request)
+        return super()._record_and_serialize_finished_request(request)
 
     def _send_requests_to_coordinator(self, requests: list[DynamicInferenceRequest]) -> None:
         """Register external handoffs before publishing their source descriptors."""
@@ -58,7 +60,9 @@ class DisaggDynamicInferenceEngine(StateHandoffDynamicInferenceEngine):
     control planes should use :class:`StateHandoffDynamicInferenceEngine`.
     """
 
-    def _serialize_finished_request(self, request: DynamicInferenceRequest) -> dict:
+    def _record_and_serialize_finished_request(
+        self, request: DynamicInferenceRequest
+    ) -> dict | None:
         """Send handoff metadata and canonical tokens on the internal decode hop."""
         if self._is_disaggregated_role("prefill") and request.disaggregated_params:
             return {
@@ -69,7 +73,7 @@ class DisaggDynamicInferenceEngine(StateHandoffDynamicInferenceEngine):
                 "prompt_frame": msgpack.packb(request.prompt_tokens.tolist(), use_bin_type=True),
                 "offload_frame": msgpack.packb(request.offload_params, use_bin_type=True),
             }
-        return super()._serialize_finished_request(request)
+        return super()._record_and_serialize_finished_request(request)
 
     @internal_api
     def set_disaggregation_config(

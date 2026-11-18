@@ -47,9 +47,13 @@ class TestCommunicationWithCustomPPGroup:
 
         local_tensor = torch.randn(self.size, dtype=self.dtype, device=device)
 
+        # Only the last stage supplies the tensor. A non-last stage that passes one receives
+        # into it, so both calls would return that same object and the comparison could not fail.
+        is_last_stage = parallel_state.is_pipeline_last_stage(ignore_virtual=True)
+
         # Broadcast using global state
         tensor_received_global = broadcast_from_last_pipeline_stage(
-            size=self.size, dtype=self.dtype, tensor=local_tensor
+            size=self.size, dtype=self.dtype, tensor=local_tensor if is_last_stage else None
         )
 
         # Initialize torch.distributed if not already initialized
@@ -59,10 +63,23 @@ class TestCommunicationWithCustomPPGroup:
         # Note: HyperCommGrid uses minor-to-major order (tp, pp), which is reverse of device mesh
         grid = HyperCommGrid([tp_size, pp_size], ["tp", "pp"])
         pp_group = grid.create_pg("pp")
+        is_last_stage_custom = pp_group.rank() == pp_group.size() - 1
 
         # Broadcast using custom pp_group
         tensor_received_custom = broadcast_from_last_pipeline_stage(
-            size=self.size, dtype=self.dtype, tensor=local_tensor, pp_group=pp_group
+            size=self.size,
+            dtype=self.dtype,
+            tensor=local_tensor if is_last_stage_custom else None,
+            pp_group=pp_group,
+        )
+
+        # A non-last stage may pass its own receive buffer: the broadcast fills and returns it.
+        receive_buffer = torch.zeros(self.size, dtype=self.dtype, device=device)
+        tensor_received_in_place = broadcast_from_last_pipeline_stage(
+            size=self.size,
+            dtype=self.dtype,
+            tensor=local_tensor if is_last_stage_custom else receive_buffer,
+            pp_group=pp_group,
         )
 
         # Synchronize before test
@@ -70,6 +87,9 @@ class TestCommunicationWithCustomPPGroup:
         assert torch.allclose(
             tensor_received_global, tensor_received_custom
         ), "broadcast_from_last_pipeline_stage should be the same with or without custom pp_group"
+        if not is_last_stage_custom:
+            assert tensor_received_in_place is receive_buffer
+        assert torch.equal(tensor_received_in_place, tensor_received_custom)
 
         grid.destroy()
 
