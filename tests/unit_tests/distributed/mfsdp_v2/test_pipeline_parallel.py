@@ -19,6 +19,7 @@ import torch
 import torch.nn as nn
 
 from megatron.core.distributed import DistributedDataParallelConfig, FullyShardedDataParallel
+from megatron.core.distributed.finalize_model_grads import finalize_model_grads
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV2
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
     GradientFinalizationMode,
@@ -41,9 +42,13 @@ from tests.unit_tests.test_utilities import Utils
 class _VirtualPipelineChunk(nn.Module):
     """One virtual-pipeline stage: a tiny dense block with its own parameters."""
 
-    def __init__(self, dim: int = 16) -> None:
+    def __init__(self, config: TransformerConfig) -> None:
         super().__init__()
-        self.fc = nn.Linear(dim, dim, bias=False)
+        # finalize_model_grads reads the model config and embedding-sharing contract.
+        self.config = config
+        self.pre_process = False
+        self.share_embeddings_and_output_weights = False
+        self.fc = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.fc(x)
@@ -78,7 +83,6 @@ class TestMfsdpV2PipelineSharedContext:
         device = distributed_setup.device
 
         # The ambient context is shared for both ordinary PP and VPP wrapping.
-        chunks = [_VirtualPipelineChunk().to(device=device, dtype=torch.bfloat16) for _ in range(2)]
         config = TransformerConfig(
             num_layers=4,
             hidden_size=16,
@@ -90,6 +94,9 @@ class TestMfsdpV2PipelineSharedContext:
             virtual_pipeline_model_parallel_size=2,
         )
 
+        chunks = [
+            _VirtualPipelineChunk(config).to(device=device, dtype=torch.bfloat16) for _ in range(2)
+        ]
         wrapped_chunks = wrap_model_chunks_with_ddp(
             chunks,
             config,
@@ -134,8 +141,9 @@ class TestMfsdpV2PipelineSharedContext:
                         outputs = [chunk(inputs) for chunk in wrapped_chunks]
                         for output in reversed(outputs):
                             output.float().sum().backward()
-                context.post_backward()
-                context.finish_grad_sync()
+                # Exercise production schedule completion so a missing context.post_backward()
+                # in finalize_model_grads cannot be hidden by calling it directly in the test.
+                finalize_model_grads(wrapped_chunks, pg_collection=self.pg_collection)
                 assert not context.is_recording_execution_order
                 assert list(context.execution_order) == expected
                 assert context.execution_order.position == 0
