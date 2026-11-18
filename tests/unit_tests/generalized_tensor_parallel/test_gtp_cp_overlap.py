@@ -6,6 +6,9 @@ Run with torchrun on both four and eight GPUs to cover all TP/CP/GTP layouts.
 The reference uses ordinary CP and replicated weights, with identical tokens.
 """
 
+import os
+import socket
+
 import pytest
 import torch
 import torch.distributed as dist
@@ -57,11 +60,15 @@ def _enable_cp_attention(set_env, monkeypatch):
 
 
 class _Model(torch.nn.Module):
-    def __init__(self, config: TransformerConfig, pg: ProcessGroupCollection) -> None:
+    def __init__(
+        self, config: TransformerConfig, pg: ProcessGroupCollection, num_moe_experts=None
+    ) -> None:
         super().__init__()
         self.config = config
         self.share_embeddings_and_output_weights = False
-        spec = get_gpt_layer_with_transformer_engine_spec()
+        spec = get_gpt_layer_with_transformer_engine_spec(
+            num_experts=num_moe_experts, moe_grouped_gemm=num_moe_experts is not None
+        )
         self.layer = spec.module(config, spec.submodules, layer_number=1, pg_collection=pg)
 
     def forward(self, x):
@@ -71,7 +78,17 @@ class _Model(torch.nn.Module):
         return self.layer.sharded_state_dict(prefix + "layer.", sharded_offsets, metadata)
 
 
-def _build(tp, cp, weight, distopt, per_token, initial=None, num_sequence_shards=1):
+def _build(
+    tp,
+    cp,
+    weight,
+    distopt,
+    per_token,
+    initial=None,
+    num_sequence_shards=1,
+    num_optimizer_instances=1,
+    num_moe_experts=None,
+):
     ps.destroy_model_parallel()
     reset_gtp_state()
     total_cp = cp * num_sequence_shards
@@ -80,10 +97,27 @@ def _build(tp, cp, weight, distopt, per_token, initial=None, num_sequence_shards
         context_parallel_size=total_cp,
         gtp_remat_size=weight,
         gtp_remat_num_sequence_shards=num_sequence_shards,
+        num_distributed_optimizer_instances=num_optimizer_instances,
+        expert_model_parallel_size=2 if num_moe_experts is not None else 1,
+        expert_gtp_remat_size=2 if num_moe_experts is not None else 1,
     )
     pg = ProcessGroupCollection.use_mpu_process_groups()
     model_parallel_cuda_manual_seed(42)
     update_gtp_config(pad_for_alignment=0, calculate_per_token_loss=per_token)
+    moe_config = (
+        dict(
+            num_moe_experts=num_moe_experts,
+            moe_router_topk=2,
+            moe_ffn_hidden_size=256,
+            moe_grouped_gemm=True,
+            moe_token_dispatcher_type="alltoall",
+            moe_aux_loss_coeff=0.0,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_num_weight_shards=2,
+        )
+        if num_moe_experts is not None
+        else {}
+    )
     config = TransformerConfig(
         num_layers=1,
         hidden_size=256,
@@ -103,23 +137,38 @@ def _build(tp, cp, weight, distopt, per_token, initial=None, num_sequence_shards
         add_bias_linear=True,
         gradient_accumulation_fusion=False,
         calculate_per_token_loss=per_token,
+        **moe_config,
     )
     assert pg.cp.size() == config.context_parallel_size
     assert pg.gtp_remat.size() == weight
     assert config.gtp_remat_num_sequence_shards == num_sequence_shards
-    model = _Model(config, pg).cuda()
+    model = _Model(config, pg, num_moe_experts).cuda()
     if initial is not None:
         with torch.no_grad():
             for name, param in model.named_parameters():
                 value = initial[name]
                 if isinstance(param, GTPShardedParam):
-                    value = value.chunk(weight, dim=0)[pg.gtp_remat.rank()]
+                    if value.shape != param.shape:
+                        value = value.chunk(weight, dim=0)[pg.gtp_remat.rank()]
                 param.copy_(value)
+    if num_moe_experts is not None:
+        for param in model.parameters():
+            is_sharded = isinstance(param, GTPShardedParam)
+            if not getattr(param, "allreduce", True):
+                group = ps.get_expert_data_parallel_group(with_gtp_remat=not is_sharded)
+            else:
+                group = ps.get_data_parallel_group(
+                    with_context_parallel=True, with_gtp_remat=not is_sharded
+                )
+            dist.broadcast(param.data, src=dist.get_process_group_ranks(group)[0], group=group)
     saved = {n: p.detach().clone() for n, p in model.named_parameters()}
     ddp = DistributedDataParallel(
         config,
         DistributedDataParallelConfig(
-            use_distributed_optimizer=distopt, overlap_grad_reduce=False, grad_reduce_in_fp32=True
+            use_distributed_optimizer=distopt,
+            overlap_grad_reduce=False,
+            grad_reduce_in_fp32=True,
+            num_distributed_optimizer_instances=num_optimizer_instances,
         ),
         model,
         pg_collection=pg,
@@ -137,6 +186,10 @@ def _build(tp, cp, weight, distopt, per_token, initial=None, num_sequence_shards
         pg_collection=pg,
         use_gloo_process_groups=False,
     )
+    if num_moe_experts is not None:
+        from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
+
+        classify_gtp_remat_chains([ddp])
     return ddp, optimizer, pg, saved
 
 
@@ -172,6 +225,38 @@ def _step(model, optimizer, pg, step):
         float(norm),
         gradients,
         {n: p.detach().clone() for n, p in model.module.named_parameters()},
+    )
+
+
+def _assert_two_node_site_locality(pg):
+    """Treat each four-GPU node as a site when requested by the test launcher."""
+    if os.environ.get("GTP_TEST_TWO_SITE_SIMULATION") != "1":
+        return
+    assert os.environ.get("NCCL_NET") == "Socket"
+    hosts = [None] * dist.get_world_size()
+    dist.all_gather_object(hosts, socket.gethostname())
+    assert len(hosts) == 8 and len(set(hosts)) == 2, hosts
+    assert len(set(hosts[:4])) == len(set(hosts[4:])) == 1, hosts
+    assert hosts[0] != hosts[4], hosts
+    my_host = hosts[dist.get_rank()]
+    for name in (
+        "tp",
+        "cp",
+        "gtp_remat",
+        "ep",
+        "expt_gtp_remat",
+        "mp",
+        "tp_ep_pp_with_egtp_remat",
+        "intra_dp_cp",
+        "intra_expt_dp",
+        "intra_dist_opt",
+    ):
+        ranks = dist.get_process_group_ranks(getattr(pg, name))
+        assert {hosts[rank] for rank in ranks} == {my_host}, (name, ranks, hosts)
+    inter_ranks = dist.get_process_group_ranks(pg.inter_dist_opt)
+    assert len(inter_ranks) == 2 and {hosts[rank] for rank in inter_ranks} == set(hosts), (
+        inter_ranks,
+        hosts,
     )
 
 
@@ -233,6 +318,85 @@ def test_attention_gradients_and_adam_updates(
                 torch.testing.assert_close(weights[name], target, rtol=0.03, atol=2e-3)
                 if grad_target is not None:
                     torch.testing.assert_close(grads[name], grad_target, rtol=0.03, atol=2e-3)
+    finally:
+        ps.destroy_model_parallel()
+        reset_gtp_state()
+
+
+def test_sequence_sharding_two_optimizer_instances():
+    """Two DistOpt instances preserve updates when GTP peers split a sequence."""
+    if dist.get_world_size() != 8:
+        pytest.skip("Requires eight ranks")
+    try:
+        reference, optimizer, pg, initial = _build(1, 1, 2, True, False, num_sequence_shards=2)
+        expected = [_step(reference, optimizer, pg, step) for step in range(2)]
+
+        model, optimizer, pg, _ = _build(
+            1, 1, 2, True, False, initial=initial, num_sequence_shards=2, num_optimizer_instances=2
+        )
+        assert pg.cp.size() == 2
+        assert (
+            ps.get_data_parallel_group(
+                with_context_parallel=True, with_gtp_remat=False, partial_data_parallel=True
+            ).size()
+            == 2
+        )
+        for step, (expected_norm, _, expected_weights) in enumerate(expected):
+            norm, _, weights = _step(model, optimizer, pg, step)
+            torch.testing.assert_close(norm, expected_norm, rtol=1e-4, atol=1e-5)
+            for name, expected_weight in expected_weights.items():
+                torch.testing.assert_close(
+                    weights[name], expected_weight, rtol=1e-4, atol=1e-4, msg=name
+                )
+    finally:
+        ps.destroy_model_parallel()
+        reset_gtp_state()
+
+
+def test_moe_sequence_sharding_two_optimizer_instances():
+    """Two DistOpt instances preserve dense and expert updates with GTP sequence CP."""
+    if dist.get_world_size() != 8:
+        pytest.skip("Requires eight ranks")
+    try:
+        reference, optimizer, pg, initial = _build(
+            1, 1, 2, True, False, num_sequence_shards=2, num_moe_experts=4
+        )
+        expert_names = [
+            name
+            for name, param in reference.module.named_parameters()
+            if not getattr(param, "allreduce", True)
+        ]
+        assert expert_names
+        assert any(
+            isinstance(dict(reference.module.named_parameters())[name], GTPShardedParam)
+            for name in expert_names
+        )
+        expected = [_step(reference, optimizer, pg, step) for step in range(2)]
+        assert any(
+            not torch.equal(expected[-1][2][name], initial[name]) for name in expert_names
+        ), "Expert weights did not change"
+
+        model, optimizer, pg, _ = _build(
+            1,
+            1,
+            2,
+            True,
+            False,
+            initial=initial,
+            num_sequence_shards=2,
+            num_optimizer_instances=2,
+            num_moe_experts=4,
+        )
+        assert pg.cp.size() == 2
+        assert pg.expt_gtp_remat.size() == 2
+        _assert_two_node_site_locality(pg)
+        for step, (expected_norm, _, expected_weights) in enumerate(expected):
+            norm, _, weights = _step(model, optimizer, pg, step)
+            torch.testing.assert_close(norm, expected_norm, rtol=1e-4, atol=1e-5)
+            for name, expected_weight in expected_weights.items():
+                torch.testing.assert_close(
+                    weights[name], expected_weight, rtol=1e-4, atol=1e-4, msg=name
+                )
     finally:
         ps.destroy_model_parallel()
         reset_gtp_state()
