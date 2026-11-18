@@ -9,6 +9,10 @@ on:
         description: JSON-encoded recipe bucket list
         type: string
         required: true
+      scope:
+        description: Recipe scope of the buckets
+        type: string
+        default: unit-tests
       platform:
         type: string
         default: dgx_h100
@@ -174,6 +178,7 @@ jobs:
         with:
           script: ""
           test_case: ${{ matrix.bucket }}
+          unit_test_scope: ${{ inputs.scope }}
           tag: latest
           timeout: ${{ matrix.timeout || 30 }}
           is_unit_test: "true"
