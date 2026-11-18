@@ -46,30 +46,53 @@ See ModelOpt's example (https://github.com/NVIDIA/Model-Optimizer/tree/main/spec
 for more details. The final output is stored as `jsonlines` in an OpenAI chat completion format.
 
 
-### Stream Teacher Features to EAGLE3 (experimental)
+### Stream teacher features to EAGLE3 (experimental)
 
-Use a [ModelOpt vLLM hidden-state server](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/speculative_decoding#training-draft-model-with-streaming-base-model)
-and a checkpoint prepared using `convert_speculative.py --algorithm eagle3 --export-offline-model`.
-Use the same target weights and tokenizer for serving and checkpoint conversion. For each zero-based
-auxiliary layer in the EAGLE checkpoint, capture its ID plus one in the server, in ascending order.
-Use auxiliary layers below the target's final layer and append the target layer count to capture its
-pre-normalization residual for the teacher output head. Use BF16 on both sides. The server must allow
-one generation token beyond the trainer's sequence length, and the capture slot must hold the prompt.
+Use a [ModelOpt vLLM teacher server](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/speculative_decoding#megatron-eagle3-teacher-features)
+and an offline EAGLE3 GPTModel checkpoint prepared with
+`convert_speculative.py --algorithm eagle3 --export-offline-model`. The checkpoint and server
+must use the same teacher weights and tokenizer. Install a ModelOpt build with
+`MegatronEagleVllmStreamingDataset` and NIXL in the trainer environment.
+
+The following one-step Qwen3-0.6B smoke test assumes the server is already running on a separate
+GPU at port 18876 under the name `qwen3-teacher`. Set `TEACHER_MODEL` to the local teacher
+tokenizer directory and `OFFLINE_EAGLE_CKPT` to the converted checkpoint directory.
 
 ```sh
-torchrun --nproc-per-node=1 examples/post_training/modelopt/finetune.py \
-    --bf16 --export-offline-model --load "$OFFLINE_EAGLE_CKPT" \
-    --eagle-streaming-server-urls http://localhost:8765 \
-    --eagle-streaming-model "$SERVED_MODEL_ID" \
-    --eagle-streaming-train-data "$TRAIN_JSONL" \
-    --eval-iters 0 ${MLM_EXTRA_ARGS}
+cat > train.jsonl <<'JSONL'
+{"conversation_id":"smoke","messages":[{"role":"user","content":"What is speculative decoding?"},{"role":"assistant","content":"A drafter proposes tokens and a teacher verifies them."}],"chat_template_kwargs":{"enable_thinking":false}}
+JSONL
+
+torchrun --standalone --nproc-per-node=1 examples/post_training/modelopt/finetune.py \
+    --num-layers 28 --hidden-size 1024 --ffn-hidden-size 3072 \
+    --num-attention-heads 16 --group-query-attention --num-query-groups 8 --kv-channels 128 \
+    --normalization RMSNorm --norm-epsilon 1e-6 --position-embedding-type rope \
+    --rotary-base 1000000 --swiglu --disable-bias-linear --make-vocab-size-divisible-by 1187 \
+    --seq-length 256 --max-position-embeddings 1024 --bf16 \
+    --tokenizer-type HuggingFaceTokenizer --tokenizer-model "$TEACHER_MODEL" \
+    --export-offline-model --export-model-type GPTModel --ckpt-format torch_dist \
+    --load "$OFFLINE_EAGLE_CKPT" --finetune --no-load-optim --no-load-rng \
+    --save eagle-smoke --save-interval 1 --no-save-optim --no-save-rng \
+    --micro-batch-size 1 --global-batch-size 1 --train-iters 1 --lr 1e-4 --lr-decay-style constant \
+    --no-gradient-accumulation-fusion --no-masked-softmax-fusion --no-bias-swiglu-fusion \
+    --mock-data --dataloader-type single --num-workers 0 --eval-iters 0 --log-interval 1 \
+    --eagle-streaming-server-urls http://127.0.0.1:18876 \
+    --eagle-streaming-model qwen3-teacher --eagle-streaming-train-data train.jsonl
 ```
 
-Use a ModelOpt build that provides `MegatronEagleVllmStreamingDataset` and install NIXL in the
-trainer environment. Use micro-batch size 1, CP=PP=1, and one conversation per sample. Each JSONL
-row needs `conversation_id` or `uuid` and `messages` or `conversations` in the ModelOpt streaming
-format. Optional validation and test corpora use `--eagle-streaming-valid-data` and
-`--eagle-streaming-test-data`. To supervise only assistant tokens, use
+For a checkpoint with zero-based auxiliary layer IDs `[1, 13, 24]`, configure captures
+`[2, 14, 25, 28]`. The server counts completed layers. Keep auxiliary captures in checkpoint
+order and append the final layer as a distinct pre-norm capture. The adapter emits `S+1` token IDs
+and an unshifted loss mask, plus `S` BF16 rows for each feature tensor. Megatron shifts the IDs
+and mask once to build next-token training batches and passes the final residual to ModelOpt with
+`base_hidden_prenorm=True` so ModelOpt applies the saved teacher final norm before the LM head.
+
+Use BF16, micro-batch size 1, CP=PP=1, and one conversation per sample. The trainer reads the
+JSONL through the streaming flags. Here `--mock-data` satisfies Megatron's generic data-source
+validation. The capture slot must hold the full prompt and the server must allow one extra
+generation token. For same-host UCX, set `NIXL_BACKENDS=UCX` and `UCX_TLS=tcp,sm,self,cuda_copy`
+on both processes. Supply `--eagle-streaming-valid-data` when using nonzero `--eval-iters`.
+Optional test data uses `--eagle-streaming-test-data`. To supervise only assistant tokens, use
 `--eagle-streaming-answer-only-loss` with a compatible chat template.
 
 ### Quantization-Aware Training (QAT)
