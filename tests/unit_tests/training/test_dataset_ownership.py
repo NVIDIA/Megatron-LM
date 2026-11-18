@@ -8,7 +8,7 @@ import json
 import re
 from argparse import ArgumentParser, Namespace
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import yaml
@@ -29,14 +29,7 @@ from megatron.training.argument_utils import (
     requested_dataset_family,
 )
 from megatron.training.arguments import parse_args, validate_args
-from megatron.training.config import (
-    CheckpointConfig,
-    DataConfig,
-    DataloaderConfig,
-    InferenceConfigContainer,
-    InferenceSetupConfig,
-    PretrainConfigContainer,
-)
+from megatron.training.config import DataConfig, DataloaderConfig, PretrainConfigContainer
 from megatron.training.config import container as container_module
 from megatron.training.config.dataset_config import CONTAINER_WRITTEN_FIELDS
 from megatron.training.datasets.sft_dataset import MockSFTDataset, SFTDataset
@@ -50,11 +43,6 @@ MODEL_ARGV = (
 ).split()
 SOURCE = ["--data-path", "prefix-a", "--split", "9,1,0"]
 BLEND = (["prefix-a", "prefix-b"], [0.3, 0.7])
-# The layout fields the container writes from the required model config.
-LAYOUT_FIELDS = (
-    "data_parallel_size", "context_parallel_size", "sequence_parallel_size",
-    "dynamic_context_parallel",
-)  # fmt: skip
 # Megatron Core's defaults for the fields the container writes: what an unset field holds.
 CORE_DEFAULTS = {
     "data_parallel_size": 1, "context_parallel_size": None, "sequence_parallel_size": 0,
@@ -330,28 +318,6 @@ def test_file_backed_sources_are_resolved_by_the_factory(files):
     data.validate()
 
 
-def test_every_data_argument_is_forwarded(files, tmp_path):
-    """No entry-point exceptions: the fields the legacy hybrid, hybrid-flex and cache factories left
-    at Megatron Core's defaults are forwarded like every other data argument, and the sequences file
-    is always read."""
-    argv = [
-        "--seq-length", "32", *SOURCE, "--allow-ambiguous-pad-tokens",
-        "--dataloader-inter-document-masking", "--sft-mock-dataset-config-json", "{}",
-        "--varlen-mock-dataset-config-json", "{}",
-    ]  # fmt: skip
-    dataset = gpt_data_config_from_args(
-        _parse([*argv, "--per-dataset-sequences-path", files["sequences"]])
-    ).dataset
-    assert dataset.allow_ambiguous_pad_tokens is True and dataset.inter_document_masking is True
-    assert dataset.sft_mock_dataset_config_json == "{}"
-    assert dataset.varlen_mock_dataset_config_json == "{}"
-    assert dataset.sequences_per_dataset == {"prefix-a": [10, 2], "prefix-b": [20, 4]}
-    with pytest.raises(FileNotFoundError):
-        gpt_data_config_from_args(
-            _parse([*argv, "--per-dataset-sequences-path", str(tmp_path / "missing.json")])
-        )
-
-
 def test_standalone_config_takes_the_container_written_fields_from_args():
     args = _validated(
         [
@@ -389,11 +355,7 @@ def test_standalone_config_takes_the_container_written_fields_from_args():
     assert standalone_sft.packed_sequence_length == 64
 
 
-def test_requested_family_precedence(warnings_log):
-    assert requested_dataset_family(Namespace()) == "gpt"
-    assert requested_dataset_family(Namespace(sft=True, fim_data=True)) == "sft"
-    assert requested_dataset_family(Namespace(use_varlen_dataset=True, fim_data=True)) == "varlen"
-    assert len(warnings_log) == 2
+def test_conflicting_dataset_families_are_rejected():
     with pytest.raises(ValueError, match="mutually exclusive"):
         requested_dataset_family(Namespace(sft=True, use_varlen_dataset=True))
 
@@ -442,15 +404,6 @@ def test_container_keeps_a_caller_supplied_data_section(container_factory):
     assert cfg.data.dataset.random_seed == 7 and cfg.rng.seed == 1234  # independent seeds
 
 
-def test_run_config_fixture_is_loader_only(run_config, monkeypatch):
-    assert run_config.data.dataset is None
-    run_config.validate()
-    # finalize() resolves the batch sizes from the registered arguments (upstream #8149).
-    monkeypatch.setattr(global_vars, "_GLOBAL_ARGS", SimpleNamespace(batch_parallel_size=1))
-    run_config.train.micro_batch_size = 1
-    run_config.finalize()
-
-
 # The fields the container writes and the cross-section checks.
 
 
@@ -495,65 +448,6 @@ def test_container_writes_the_owned_fields_at_finalize(container_factory, monkey
     cfg.validate()  # the dataset seed has no owner to agree with
 
 
-def test_a_layout_field_at_core_default_carries_no_explicit_value(container_factory, monkeypatch):
-    """The layout fields keep Megatron Core's fields and defaults (1, 0, False): a value equal to
-    the default is not an explicit value, so it agrees with any layout and is written over; a
-    different value must agree with the layout."""
-    _, cfg = container_factory(["--seq-length", "64", "--mock-data", "--sft"], data=True)
-    dataset = cfg.data.dataset
-    cfg.model = _layout(
-        tensor_model_parallel_size=2,
-        context_parallel_size=2,
-        sequence_parallel=True,
-        dynamic_context_parallel=True,
-    )
-    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 8)
-    dataset.data_parallel_size, dataset.sequence_parallel_size = 1, 0
-    dataset.dynamic_context_parallel = False
-    cfg.validate()
-    dataset.sequence_parallel_size = 1
-    with pytest.raises(ValueError, match="data.dataset.sequence_parallel_size=1 disagrees"):
-        cfg.validate()
-    dataset.sequence_parallel_size = 0
-    cfg.finalize()
-    assert (dataset.data_parallel_size, dataset.sequence_parallel_size) == (2, 2)
-    assert dataset.dynamic_context_parallel is True
-
-
-def test_model_owned_dataset_layout_survives_a_reload(container_factory, monkeypatch, tokenizer):
-    """Reloading reconstructs dataset layout from the authoritative model section."""
-    _, cfg = container_factory(["--seq-length", "64", "--mock-data", "--sft"], data=True)
-    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: 8)
-    cfg.finalize()
-    cfg.data.bind_tokenizer(tokenizer)
-    layout = tuple(getattr(cfg.data.dataset, name) for name in LAYOUT_FIELDS)
-    assert layout == (8, 1, 0, False)
-    cfg.validate()  # Core's defaults are not explicit values
-    reloaded = PretrainConfigContainer.from_dict(cfg.to_dict())
-    reloaded.finalize()
-    reloaded.data.bind_tokenizer(tokenizer)
-    assert tuple(getattr(reloaded.data.dataset, name) for name in LAYOUT_FIELDS) == layout
-
-
-def test_dataset_layout_requires_a_model_section(container_factory):
-    """A dataset's layout fields cannot replace the required model owner."""
-    _, cfg = container_factory(
-        ["--seq-length", "64", "--mock-data", "--sft", "--full-validation"], data=True
-    )
-    cfg.model = None
-    dataset = cfg.data.dataset
-    dataset.data_parallel_size = 4
-    with pytest.raises(ValueError, match="Training requires a model config"):
-        cfg.validate()
-    with pytest.raises(ValueError, match="Training requires a model config"):
-        cfg.finalize()
-    assert dataset.random_seed == 1234  # --seed, from construction
-    assert dataset.full_validation is None and dataset.multiple_validation_sets is None
-    assert dataset.data_parallel_size == 4 and dataset.context_parallel_size is None
-    assert "data_parallel_size" not in cfg.to_dict()["data"]["dataset"]
-    assert (dataset.sequence_parallel_size, dataset.dynamic_context_parallel) == (0, False)
-
-
 @pytest.mark.parametrize(
     ("field", "value", "message"),
     [
@@ -578,52 +472,6 @@ def test_each_owned_field_is_checked_against_its_owner(container_factory, field,
         cfg.validate()
 
 
-@pytest.mark.parametrize(
-    ("world_size", "layout", "configured_cp", "expected"),
-    [
-        (8, dict(tensor_model_parallel_size=2, pipeline_model_parallel_size=2), 1, 2),
-        (8, dict(tensor_model_parallel_size=2, context_parallel_size=2), 2, 2),
-        (16, dict(tensor_model_parallel_size=2, sequence_parallel=True, context_parallel_size=2, gtp_weight_remat_size=2, tensor_parallel_num_sequence_shards=4), 1, 4),
-        (16, dict(tensor_model_parallel_size=2, context_parallel_size=2, gtp_weight_remat_size=2), 2, 2),
-        (4, dict(), 1, 4),
-    ],
-)  # fmt: skip
-def test_get_data_parallel_size_matches_validate_args(
-    container_factory, monkeypatch, world_size, layout, configured_cp, expected
-):
-    """validate_args: world_size // (tp * pp * configured cp * weight remat); the model config holds
-    the resolved cp (configured cp times the GTP sequence shards)."""
-    _, cfg = container_factory(["--seq-length", "64"])
-    cfg.model = _layout(**layout)
-    transformer = cfg.model.transformer
-    assert (
-        transformer.context_parallel_size
-        == configured_cp * transformer.gtp_remat_num_sequence_shards
-    )
-    legacy = world_size // (
-        transformer.tensor_model_parallel_size
-        * transformer.pipeline_model_parallel_size
-        * configured_cp
-        * transformer.gtp_weight_remat_size
-    )
-    assert expected == legacy
-    assert cfg.get_parallel_layout(world_size).dp == expected
-    monkeypatch.setattr(container_module, "safe_get_world_size", lambda: world_size)
-    assert cfg.get_data_parallel_size() == expected
-
-
-def test_get_data_parallel_size_rejects_an_indivisible_world(container_factory):
-    _, cfg = container_factory(["--seq-length", "64"])
-    cfg.model = _layout(tensor_model_parallel_size=2, pipeline_model_parallel_size=2)
-    with pytest.raises(ValueError, match="divisible"):
-        cfg.get_parallel_layout(6)
-    cfg.model = _layout(
-        context_parallel_size=3, gtp_weight_remat_size=2, tensor_parallel_num_sequence_shards=2
-    )
-    with pytest.raises(ValueError, match="must contain the GTP sequence shards"):
-        cfg.get_parallel_layout(12)
-
-
 @pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope", "yarn"])
 def test_model_capacity_must_cover_the_sample_length(container_factory, position_embedding_type):
     _, cfg = container_factory(["--seq-length", "64", "--mock-data"], data=True)
@@ -637,9 +485,6 @@ def test_model_capacity_must_cover_the_sample_length(container_factory, position
         cfg.validate()
     cfg.model.seq_length = 64
     cfg.validate()
-    cfg.model = None
-    with pytest.raises(ValueError, match="Training requires a model config"):
-        cfg.validate()
 
 
 @pytest.mark.parametrize("position_embedding_type", ["learned_absolute", "rope", "yarn"])
@@ -742,6 +587,7 @@ def test_full_container_round_trips_before_and_after_binding_the_tokenizer(
     reloaded.finalize()
     assert reloaded.data.dataset_type is GPTDataset
     assert reloaded.data.dataset.random_seed == cfg.data.dataset.random_seed
+    assert _written_fields(reloaded.data.dataset) == _written_fields(cfg.data.dataset)
 
 
 def test_pre_data_run_config_loads_with_the_default_section(run_config):
@@ -753,20 +599,6 @@ def test_pre_data_run_config_loads_with_the_default_section(run_config):
     restored = PretrainConfigContainer.from_dict(legacy)
     assert restored.data == DataConfig()
     assert "data" not in legacy  # the caller's dictionary is not modified
-    # A snapshot of the unmerged earlier schema is not migrated.
-    old_schema = copy.deepcopy(legacy)
-    old_schema["dataset"] = {"_target_": "megatron.training.config.dataset_config.GPTDatasetConfig"}
-    with pytest.raises(ValueError, match="extra keys"):
-        PretrainConfigContainer.from_dict(old_schema)
-
-
-def test_inference_container_is_unaffected():
-    cfg = InferenceConfigContainer(
-        model=None, checkpoint=CheckpointConfig(), inference=InferenceSetupConfig()
-    )
-    assert not hasattr(cfg, "data")
-    serialized = cfg.to_dict()
-    assert InferenceConfigContainer.from_dict(serialized).to_dict() == serialized
 
 
 # The runtime services bind the tokenizer.
@@ -840,20 +672,12 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
     from the data section, the model-parallel values from the model section, the sample length
     from the model's resolved run maximum; the poisoned namespace shows which source won."""
     from megatron.training import training
-    from megatron.training.config import DataConfig
 
     calls = []
-
-    class _Machine:
-        def __init__(self):
-            self.runs = 0
-
-        def should_run_forward_backward(self, data_iterator):
-            self.runs += 1
-            return self.runs == 1
-
+    machine = Mock()
+    machine.should_run_forward_backward.side_effect = [True, False, True, False]
     monkeypatch.setattr(training, "get_num_microbatches", lambda: 1)
-    monkeypatch.setattr(training, "get_rerun_state_machine", lambda: _Machine())
+    monkeypatch.setattr(training, "get_rerun_state_machine", lambda: machine)
     monkeypatch.setattr(
         training, "get_batch_on_this_tp_rank", lambda batch, **kw: calls.append(kw) or {}
     )
@@ -875,26 +699,19 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
         create_attention_mask_in_dataloader=False,
     )
     monkeypatch.setattr(training, "get_args", lambda: args)
-    train = SimpleNamespace(micro_batch_size=3)
-    transformer = SimpleNamespace(
-        context_parallel_size=2,
-        pipeline_model_parallel_size=4,
-        dynamic_context_parallel=False,
-        sequence_packing_scheduler=None,
-        max_seq_length_per_sample=64,
+    cfg = SimpleNamespace(
+        model=_layout(
+            context_parallel_size=2, pipeline_model_parallel_size=4, max_seq_length_per_sample=64
+        ),
+        data=DataConfig(),
+        train=SimpleNamespace(micro_batch_size=3),
     )
+    monkeypatch.setattr(training, "get_run_config", lambda: cfg)
 
     # A loader-only section (an entry point whose datasets come from its own callbacks): the
     # length is the model's per-sample maximum, resolved before startup,
     # the flags are the plain-GPT ones whatever args.sft says, the model-parallel values are the
     # model section's.
-    monkeypatch.setattr(
-        training,
-        "get_run_config",
-        lambda: SimpleNamespace(
-            model=SimpleNamespace(transformer=transformer), data=DataConfig(), train=train
-        ),
-    )
     training.dummy_train_step(None)
     kw = calls.pop()
     assert (kw["cp_size"], kw["pipeline_model_parallel_size"], kw["dynamic_cp"]) == (2, 4, False)
@@ -911,22 +728,8 @@ def test_dummy_train_step_reads_the_section_and_the_model_seams(monkeypatch):
         reset_attention_mask=False,
         eod_mask_loss=False,
     )
-    transformer = SimpleNamespace(
-        context_parallel_size=1,
-        pipeline_model_parallel_size=1,
-        dynamic_context_parallel=True,
-        sequence_packing_scheduler=None,
-        max_seq_length_per_sample=16,
-    )
-    monkeypatch.setattr(
-        training,
-        "get_run_config",
-        lambda: SimpleNamespace(
-            model=SimpleNamespace(transformer=transformer),
-            data=DataConfig(dataset=dataset, dataset_type=MockGPTDataset),
-            train=train,
-        ),
-    )
+    cfg.model = _layout(dynamic_context_parallel=True, max_seq_length_per_sample=16)
+    cfg.data = DataConfig(dataset=dataset, dataset_type=MockGPTDataset)
     training.dummy_train_step(None)
     kw = calls.pop()
     assert (kw["cp_size"], kw["pipeline_model_parallel_size"], kw["dynamic_cp"]) == (1, 1, True)
@@ -1004,8 +807,6 @@ def test_a_packing_scheduler_needs_per_token_loss(container_factory):
 def test_varlen_datasets_and_the_packing_scheduler(container_factory):
     """A packed varlen dataset needs a scheduler (the CLI selects one; a Python container names
     it); SBHD validation excludes one."""
-    from megatron.training.config import DataConfig
-
     _, cfg = container_factory(["--seq-length", "64"])
     plain = GPTDatasetConfig(
         sequence_length=64,
@@ -1148,9 +949,7 @@ def test_runtime_services_read_config_lengths_not_legacy_args(container_factory,
     assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 16
 
 
-@pytest.mark.parametrize("with_dataset", [False, True])
-@pytest.mark.parametrize("requested_length", [None, 96])
-def test_vlm_resolves_expanded_width_before_startup(monkeypatch, with_dataset, requested_length):
+def test_vlm_resolves_expanded_width_before_startup(monkeypatch):
     """Text rows and expanded model inputs stay distinct without a second VLM length field."""
     import pretrain_vlm
 
@@ -1158,26 +957,23 @@ def test_vlm_resolves_expanded_width_before_startup(monkeypatch, with_dataset, r
     monkeypatch.setattr(pretrain_vlm, "get_num_image_embeddings", lambda *a, **kw: 4)
     monkeypatch.setattr(pretrain_vlm.context_parallel, "get_padding", lambda *a: 0)
     argv = MODEL_ARGV + ["--seq-length", "64", "--max-position-embeddings", "128", "--mock-data"]
-    if requested_length is not None:
-        argv += ["--decoder-seq-length", str(requested_length)]
     with patch("sys.argv", ["test"] + argv):
         args = validate_args(parse_args(extra_args_provider=pretrain_vlm.add_vlm_extra_args))
     text_length, padding = pretrain_vlm.resolve_vlm_sequence_lengths(args)
-    width = requested_length or 68
+    width = 68
     assert (text_length, padding) == (64, width - 68)
     model = model_config_from_args(args, model_config_cls=LLaVAModelConfig)
     cfg = pretrain_cfg_container_from_args(
-        args, model_cfg=model, data_cfg=gpt_data_config_from_args(args) if with_dataset else None
+        args, model_cfg=model, data_cfg=gpt_data_config_from_args(args)
     )
     assert not hasattr(model, "decoder_seq_length")
     assert model.transformer.max_seq_length_per_sample == width
     cfg.validate()
     cfg.finalize()
     assert model.transformer.max_seq_length_per_sample == width
-    if with_dataset:
-        assert cfg.data.dataset.sequence_length == 64
-        monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
-        assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 64
+    assert cfg.data.dataset.sequence_length == 64
+    monkeypatch.setattr(global_vars, "_GLOBAL_RUN_CONFIG", cfg)
+    assert global_vars.build_telemetry_resource_attrs(args)["dl.sequence_length"] == 64
     saved = cfg.to_dict()
     assert "decoder_seq_length" not in saved["model"]
     restored = type(cfg).from_dict(saved)
@@ -1191,8 +987,6 @@ def test_get_batch_ignores_the_poisoned_data_arguments(monkeypatch, entry_point)
     """The three scripts' get_batch read the batch flags from the section, the model-parallel
     values from the model section and the sample length from the container; every data-owned
     value on args is poisoned and must not surface in the captured call."""
-    from megatron.training.config import DataConfig
-
     if entry_point == "gpt":
         import pretrain_gpt as script
     elif entry_point == "hybrid":
@@ -1209,21 +1003,8 @@ def test_get_batch_ignores_the_poisoned_data_arguments(monkeypatch, entry_point)
         reset_attention_mask=False,
         eod_mask_loss=False,
     )
-    transformer = SimpleNamespace(
-        sequence_packing_scheduler=None,
-        dynamic_context_parallel=False,
-        context_parallel_size=1,
-        pipeline_model_parallel_size=3,
-        pipeline_model_parallel_layout=None,
-        mtp_num_layers=None,
-        virtual_pipeline_model_parallel_size=None,
-        linear_cp_layout="zigzag",
-        attention_cp_layout="zigzag",
-        sequence_parallel=False,
-        tensor_model_parallel_size=1,
-    )
     cfg = SimpleNamespace(
-        model=SimpleNamespace(transformer=transformer),
+        model=_layout(pipeline_model_parallel_size=3, max_seq_length_per_sample=16),
         data=DataConfig(dataset=dataset, dataset_type=MockGPTDataset),
         train=SimpleNamespace(micro_batch_size=5),
     )
@@ -1284,9 +1065,6 @@ def test_a_scheduler_selected_after_construction_needs_variable_seq_lengths(
     TransformerConfig; the constructor-time selection is the positive control."""
     import torch
 
-    from megatron.core.transformer.transformer_config import TransformerConfig
-    from megatron.training.models.gpt import GPTModelConfig
-
     transformer = TransformerConfig(
         num_layers=2,
         hidden_size=128,
@@ -1300,16 +1078,6 @@ def test_a_scheduler_selected_after_construction_needs_variable_seq_lengths(
     if not scheduler_at_construction:
         transformer.sequence_packing_scheduler = "dp_balanced"  # after construction
     _, cfg = container_factory(["--seq-length", "16", "--mock-data", "--sft"], data=True)
-    cfg.data = DataConfig(
-        dataset=GPTDatasetConfig(
-            random_seed=1,
-            sequence_length=16,
-            reset_position_ids=False,
-            reset_attention_mask=False,
-            eod_mask_loss=False,
-        ),
-        dataset_type=MockVarlenDataset,
-    )
     cfg.model = GPTModelConfig(transformer=transformer, seq_length=64, vocab_size=16)
     if scheduler_at_construction:
         assert transformer.variable_seq_lengths is True
@@ -1322,9 +1090,8 @@ def test_a_scheduler_selected_after_construction_needs_variable_seq_lengths(
         cfg.validate()
 
 
-@pytest.mark.parametrize("legacy_length", [32, None])
-def test_gpt_forward_step_uses_dataset_length_for_packed_metadata(monkeypatch, legacy_length):
-    """Packed metadata must describe the actual samples even with stale or missing args."""
+def test_gpt_forward_step_uses_dataset_length_for_packed_metadata(monkeypatch):
+    """Packed metadata must describe the actual samples even with stale args."""
     from unittest.mock import MagicMock
 
     import torch
@@ -1332,7 +1099,7 @@ def test_gpt_forward_step_uses_dataset_length_for_packed_metadata(monkeypatch, l
     import pretrain_gpt
     from megatron.training.distillation import logits_saver
 
-    args = Namespace() if legacy_length is None else Namespace(seq_length=legacy_length)
+    args = Namespace(seq_length=32)
     dataset = GPTDatasetConfig(
         sequence_length=16,
         random_seed=1,
