@@ -298,11 +298,7 @@ class TaskEncoder(DefaultTaskEncoder[OCRSample, OCRSample, ImageTaskBatchPacked,
         )
 
     def _verify_no_temporal_compression(self):
-        """
-        This TaskEncoder is not updated to support these features, but we still construct it during
-        training setup even when using MultiModalTaskEncoder, enen though we don't use it. So we
-        have to check this during runtime.
-        """
+        """Reject temporal compression when this legacy TaskEncoder is used."""
         # For tiling only, need a fixed number of embeddings for num_image_embeddings_per_tile
         # We don't pass in `is_video` to calculate `self.num_image_embeddings_per_tile`,
         # so we currently require no temporal compression because we can't verify the number of frames

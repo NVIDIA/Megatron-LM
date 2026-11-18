@@ -196,9 +196,9 @@ def get_batch(data_iterator, image_token_index, img_seq_len):
             (cu_lengths_padded if cu_lengths_padded is not None else cu_lengths)[-1].item()
         )
 
-        # The shared throughput accumulator otherwise uses args.seq_length,
-        # which is the vision length in multimodal training rather than the
-        # packed decoder work. PP>1 does not yet have all-rank participation.
+        # Feed real packed lengths to the shared throughput accumulator; otherwise it
+        # estimates from the configured execution width. PP>1 does not yet have
+        # all-rank participation.
         if pp_size == 1:
             update_seqlen_stats_from_cu_seqlens(cu_lengths)
 

@@ -153,7 +153,7 @@ def get_batch(
     ):
         return [None for _ in BATCH_KEYS]
 
-    # The sample length: the dataset's (the model's per-sample maximum for a loader-only section).
+    # The dataset's row width (the derived pack width for SFT).
     seq_length = get_dataset_input_length(cfg.data.dataset)
     batch = {}
     if tp_rank == 0:

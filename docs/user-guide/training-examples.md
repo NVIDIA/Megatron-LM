@@ -128,10 +128,8 @@ legacy `sequence_length` value. Container deserialization upgrades saved SFT sec
 all fields. Unknown fields still fail strict loading. Varlen callers and CLI flag
 names are unchanged.
 
-`LLaVAModelConfig.decoder_seq_length` is removed. Python callers and saved
-configurations using this field require updating; strict deserialization rejects
-the removed LLaVA field. For LLaVA, move the resolved text + image + padding width
-to `model.transformer.max_seq_length_per_sample` before startup.
+For LLaVA, set the resolved text + image + padding width in
+`model.transformer.max_seq_length_per_sample` before startup.
 
 The `--decoder-seq-length` CLI flag remains accepted: VLM entrypoints translate
 it into their execution width, while T5 retains an independent decoder width.
