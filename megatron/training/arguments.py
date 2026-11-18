@@ -3012,6 +3012,24 @@ def _add_distributed_args(parser):
                        'separate DistributedOptimizer with byte-level sharding, which is faster '
                        'and uses less padding but produces different bf16 reduction ordering '
                        'and so will not match legacy-path loss curves bit-for-bit.')
+    group.add_argument('--layerwise-element-granular-dense', action='store_true',
+                       help='LayerWise distributed optimizer (Muon) with its param layout: give '
+                       'the dense LayerWise DDP buffer an element-granular layout with '
+                       '--layerwise-dense-num-buckets buckets and no padding beyond alignment, '
+                       'while every param keeps its LayerWise owner. After each bucket\'s '
+                       'reduce-scatter the reduced slice pieces are sent to their owners (stage A); '
+                       'before each bucket\'s param all-gather the owners send the updated pieces '
+                       'back (stage A^-1). Optimizer state and math are unchanged. Expert buffers '
+                       'keep the shard-aligned layout.')
+    group.add_argument('--layerwise-dense-num-buckets', type=int, default=10,
+                       help='Number of buckets of the element-granular dense LayerWise buffer '
+                       '(--layerwise-element-granular-dense); its bucket size is the dense '
+                       'buffer size divided by this.')
+    group.add_argument('--layerwise-owner-exchange', type=str, default='a2a',
+                       choices=['a2a', 'p2p'],
+                       help='Transport of the slice <-> owner exchange of '
+                       '--layerwise-element-granular-dense: a2a = one all_to_all_single with '
+                       'split sizes per bucket; p2p = one batch of sends and receives per bucket.')
     group.add_argument('--use-nccl-ub', action='store_true', dest='nccl_ub',
                        help='Use the userbuffer registration for DP/FSDP communication buffers.'
                        'This option will reduce GPU SM usage for the DP/FSDP communication,'

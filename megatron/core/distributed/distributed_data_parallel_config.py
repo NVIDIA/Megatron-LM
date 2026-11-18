@@ -86,6 +86,32 @@ class DistributedDataParallelConfig:
        over the wire (using an all-to-all to keep total communication overhead in line
        with the standard ring implementation) but performs accumulation locally in FP32."""
 
+    layerwise_element_granular_dense: bool = False
+    """LayerWiseDistributedOptimizer with its param layout only. If true, the dense
+       LayerWise-managed buffer gets an element-granular (DistOpt-style) layout -- buckets of
+       `layerwise_dense_num_buckets`, no whole-param-per-shard constraint, so no padding beyond
+       alignment -- while every param keeps the owner the shard-aligned layout gives it. After
+       each bucket's reduce-scatter the reduced pieces of a rank's slice are sent to their
+       owners (stage A); before each bucket's param all-gather the owners send the updated
+       pieces back to the slice holders (stage A^-1). Expert buffers keep the shard-aligned
+       layout."""
+
+    layerwise_dense_num_buckets: Optional[int] = 10
+    """Number of buckets of the element-granular dense LayerWise buffer
+       (`layerwise_element_granular_dense`): bucket size = ceil(buffer numel / this). None
+       means one bucket. Without bucketing (overlap_grad_reduce=False) the buffer is one
+       bucket regardless."""
+
+    layerwise_owner_exchange: str = "a2a"
+    """Transport of the slice <-> owner exchange of an element-granular LayerWise buffer
+       (`layerwise_element_granular_dense`). "a2a": one `all_to_all_single` with split sizes
+       per bucket on the buffer's data-parallel group; the gradient pieces arrive in a
+       scratch tensor and are copied into the owner's range, and the param pieces arrive in
+       a scratch tensor that the param all-gather reads. "p2p": one batch of sends and
+       receives (`batch_isend_irecv`) per bucket on views of the buffer, without a copy.
+       With `nccl_ub` only "p2p" is supported: the scratch tensors of "a2a" are not registered
+       with NCCL."""
+
     param_name_patterns_for_fp32_local_accumulation: Tuple[str, ...] = ()
     """List of param_name patterns (in Python's fnmatch format) to match against to do
        local gradient accumulation in FP32. The special pattern 'all' matches every
@@ -424,6 +450,17 @@ class DistributedDataParallelConfig:
             if not self._bucket_size_resolved:
                 assert self.bucket_size is None, "Cannot specify both num_buckets and bucket_size"
             assert self.num_buckets > 0, "num_buckets must be greater than 0"
+
+        if self.layerwise_dense_num_buckets is not None:
+            assert (
+                self.layerwise_dense_num_buckets > 0
+            ), "layerwise_dense_num_buckets must be greater than 0"
+
+        if self.layerwise_owner_exchange not in ("a2a", "p2p"):
+            raise ValueError(
+                f"layerwise_owner_exchange must be 'a2a' or 'p2p', "
+                f"got {self.layerwise_owner_exchange!r}"
+            )
 
     def resolve_bucket_size(self, *, num_parameters: int, data_parallel_size: int) -> None:
         """Resolve buckets in place after model construction and process-group setup.

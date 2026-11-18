@@ -250,6 +250,110 @@ class TestLayerWiseOptimizer:
 
                 check_equal(plain_sd_A, plain_sd_B)
 
+    @staticmethod
+    def _layerwise_buffers(optimizer):
+        """The LayerWise optimizer chained in ``optimizer`` and the DDP buffers it manages."""
+        layerwise = next(
+            child
+            for child in optimizer.chained_optimizers
+            if isinstance(child, LayerWiseDistributedOptimizer)
+        )
+        buffers = [
+            buffer
+            for chunk in layerwise.model_chunks
+            for buffer in chunk.buffers + chunk.expert_parallel_buffers
+            if getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
+        ]
+        return layerwise, buffers
+
+    @pytest.mark.parametrize('tp, transport', [(1, 'a2a'), (2, 'p2p')])
+    def test_element_granular_dense_checkpoint_is_interchangeable(
+        self, tmp_path_dist_ckpt, tp, transport
+    ):
+        """layerwise_element_granular_dense keeps every LayerWise owner, and with it every
+        rank's optimizer state: both layouts write the same LayerWise checkpoint (FP32 masters
+        and Muon state), and each loads the other's."""
+        Utils.initialize_model_parallel(tp, 1)
+        common = dict(
+            tp=tp,
+            pp=1,
+            bf16=True,
+            dist_opt=True,
+            initialize_fn=initialize_gpt_model,
+            optimizer='muon',
+            use_param_layout=True,
+            ddp_num_buckets=2,
+        )
+        element_granular = dict(
+            layerwise_element_granular_dense=True, layerwise_owner_exchange=transport
+        )
+        # The Adam-managed params sit in a sibling DistributedOptimizer, whose default
+        # checkpoint format the sharded save does not support.
+        metadata = {'distrib_optim_sharding_type': 'dp_reshardable'}
+
+        def build(seed, **layout):
+            model, optimizer = setup_model_and_optimizer(seed=seed, **common, **layout)
+            layerwise, buffers = self._layerwise_buffers(optimizer)
+            assert any(b.param_to_owner_shard is not None for b in buffers) == bool(layout)
+            return model, optimizer, layerwise, buffers
+
+        def save_layerwise(model, layerwise, ckpt_dir):
+            save(layerwise.sharded_state_dict(model[0].sharded_state_dict()), ckpt_dir)
+
+        def cross_load(source_dir, target_dir, **layout):
+            """Load a whole-optimizer checkpoint into a differently seeded optimizer of the
+            other layout, and save that optimizer's LayerWise checkpoint."""
+            model, optimizer, layerwise, _ = build(3, **layout)
+            model_sharded_sd = model[0].sharded_state_dict()
+            state_dict = load(
+                optimizer.sharded_state_dict(model_sharded_sd, metadata=metadata, is_loading=True),
+                source_dir,
+            )
+            optimizer.load_state_dict(state_dict)
+            save_layerwise(model, layerwise, target_dir)
+
+        with (
+            TempNamedDir(tmp_path_dist_ckpt / 'eg_dense', sync=True) as dir_eg,
+            TempNamedDir(tmp_path_dist_ckpt / 'shard_aligned', sync=True) as dir_ref,
+            TempNamedDir(tmp_path_dist_ckpt / 'lw_eg', sync=True) as dir_lw_eg,
+            TempNamedDir(tmp_path_dist_ckpt / 'lw_ref', sync=True) as dir_lw_ref,
+            TempNamedDir(tmp_path_dist_ckpt / 'lw_eg_into_ref', sync=True) as dir_lw_eg_ref,
+            TempNamedDir(tmp_path_dist_ckpt / 'lw_ref_into_eg', sync=True) as dir_lw_ref_eg,
+        ):
+            saves = ((element_granular, dir_eg, dir_lw_eg), ({}, dir_ref, dir_lw_ref))
+            for layout, ckpt_dir, lw_dir in saves:
+                model, optimizer, layerwise, buffers = build(2, **layout)
+                if layout:
+                    # The layout must do something here, or the test is vacuous: some rank
+                    # holds a piece of a param that another rank owns.
+                    moved = sum(
+                        end - start
+                        for buffer in buffers
+                        if buffer.param_to_owner_shard is not None
+                        for bucket in buffer.buckets
+                        for start, end, _ in bucket.owner_exchange_plan.to_owners
+                    )
+                    moved = torch.tensor([moved], device='cuda')
+                    torch.distributed.all_reduce(moved)
+                    assert moved.item() > 0, "no param crosses a slice boundary in this model"
+                save(
+                    optimizer.sharded_state_dict(model[0].sharded_state_dict(), metadata=metadata),
+                    ckpt_dir,
+                )
+                save_layerwise(model, layerwise, lw_dir)
+            # Written element-granular and read shard-aligned, then the other way.
+            cross_load(dir_eg, dir_lw_eg_ref)
+            cross_load(dir_ref, dir_lw_ref_eg, **element_granular)
+
+            Utils.destroy_model_parallel()
+            Utils.initialize_model_parallel(1, 1)
+            from megatron.core.dist_checkpointing import load_plain_tensors
+
+            plain = load_plain_tensors(dir_lw_eg)
+            assert any(torch.is_tensor(value) for value in nested_values(plain))
+            for other_dir in (dir_lw_ref, dir_lw_eg_ref, dir_lw_ref_eg):
+                check_equal(plain, load_plain_tensors(other_dir))
+
     @pytest.mark.parametrize('tp', [1, 2, 4])
     @pytest.mark.parametrize('pp', [1, 2, 4])
     def test_layer_wise_optimizer_grad_norm(self, tp, pp):
