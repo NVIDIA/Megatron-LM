@@ -54,18 +54,13 @@ spec:
     fi
 
 
-    if [[ "$BUCKET" == "tests/unit_tests/inference/test_batch_invariant_fp8.py" ]]; then
-        bash "$TEST_PATH/tests/test_utils/run_batch_invariant_fp8.sh" \
-          gb200 "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "{assets_dir}/logs/1/"
-    else
-        bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
-          --tag $TAG \
-          --environment $ENVIRONMENT \
-          --bucket $BUCKET \
-          --platform gb200 \
-          --unit-test-repeat $UNIT_TEST_REPEAT \
-          --log-dir {assets_dir}/logs/1/
-    fi
+    bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
+      --tag $TAG \
+      --environment $ENVIRONMENT \
+      --bucket $BUCKET \
+      --platform gb200 \
+      --unit-test-repeat $UNIT_TEST_REPEAT \
+      --log-dir {assets_dir}/logs/1/
 
     ls -al
 
