@@ -1,4 +1,6 @@
-# Run PR builds and tests unless every changed path matches one of these
-# repository-root Git globs. Changes to this list take effect after merge.
+# Skip PR builds and tests when every changed path matches a pattern below.
+# Patterns match entire repository-root paths, case-sensitively (Python fnmatchcase).
+# Wildcards match across directory separators. Use one pattern per line.
+# Changes to this list take effect after merge.
 examples/bridge/**
 megatron/bridge/**

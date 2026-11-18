@@ -1,0 +1,106 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Collect PR changed files
+description: Validate the file list for a tested PR merge and determine its build and test scope.
+inputs:
+  pr-info:
+    description: PR metadata returned by get-pr-info.
+    required: true
+  tested-sha:
+    description: PR merge commit selected for validation.
+    required: true
+  pr-token:
+    description: Token with permission to read PRs.
+    default: ${{ github.token }}
+outputs:
+  ready:
+    description: Whether the complete changed-file manifest is ready for the tested commit.
+    value: ${{ steps.files.outputs.ready }}
+  skip_builds_and_tests:
+    description: Whether all changed paths match the target branch's CI skip list.
+    value: ${{ steps.scope.outputs.skip_builds_and_tests || 'false' }}
+runs:
+  using: composite
+  steps:
+    - name: Get changed files for the tested merge commit
+      id: files
+      shell: bash -e -u -o pipefail {0}
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ inputs.pr-token }}
+        PR_NUMBER: ${{ fromJSON(inputs.pr-info || '{}').number }}
+        PR_CHANGED_FILES: ${{ fromJSON(inputs.pr-info || '{}').changed_files }}
+        PR_MERGE_SHA: ${{ fromJSON(inputs.pr-info || '{}').merge_commit_sha }}
+        TESTED_SHA: ${{ inputs.tested-sha }}
+      run: |
+        PR_FILES_DIR="$RUNNER_TEMP/unit-test-pr-files"
+        PR_FILES_RESPONSE="$RUNNER_TEMP/unit-test-pr-files-response.json"
+        # Fetch once for all buckets. Missing or stale PR data leaves no
+        # artifact ID, so consumers fall back to the full unit-test bucket.
+        if mkdir -p "$PR_FILES_DIR" \
+          && [[ "$TESTED_SHA" =~ ^[0-9a-f]{40}$ \
+                && "$PR_MERGE_SHA" == "$TESTED_SHA" \
+                && "$PR_NUMBER" =~ ^[1-9][0-9]*$ \
+                && "$PR_CHANGED_FILES" =~ ^[0-9]+$ \
+                && "$PR_CHANGED_FILES" -le 3000 ]] \
+          && gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/files?per_page=100" \
+            > "$PR_FILES_RESPONSE" \
+          && CHANGED_FILES=$(jq -se '
+            def valid_path: type == "string" and length > 0 and (test("[\r\n]") | not);
+            if length > 0 and all(.[]; type == "array") then add
+            else error("Expected PR file pages") end
+            | if all(.[]; (.filename | valid_path)
+                and (if .status == "renamed" or has("previous_filename")
+                     then (.previous_filename | valid_path) else true end))
+              then length else error("Invalid PR file record") end
+            ' "$PR_FILES_RESPONSE") \
+          && [[ "$CHANGED_FILES" == "$PR_CHANGED_FILES" ]] \
+          && jq -sr '[.[][] | .filename, (.previous_filename // empty)] | unique[]' \
+            "$PR_FILES_RESPONSE" > "$PR_FILES_DIR/changed-files" \
+          && CHANGED_PATHS=$(wc -l < "$PR_FILES_DIR/changed-files" | tr -d ' ') \
+          && CURRENT_PR_SHA=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '.merge_commit_sha') \
+          && [[ "$CURRENT_PR_SHA" == "$TESTED_SHA" ]] \
+          && jq -n --arg tested_sha "$TESTED_SHA" --argjson changed_files "$CHANGED_FILES" \
+            --argjson changed_paths "$CHANGED_PATHS" \
+            '{tested_sha: $tested_sha, changed_files: $changed_files, changed_paths: $changed_paths}' \
+            > "$PR_FILES_DIR/metadata.json"; then
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::notice::PR changed-file list unavailable or incomplete for the tested commit; unit-test buckets will run in full."
+        fi
+
+    - name: Match changed paths against the target branch's skip list
+      id: scope
+      if: >-
+        steps.files.outputs.ready == 'true' && github.event_name == 'push' &&
+        startsWith(github.ref, 'refs/heads/pull-request/') &&
+        fromJSON(inputs.pr-info || '{}').head.sha == github.sha
+      shell: bash -e -u -o pipefail {0}
+      continue-on-error: true
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TARGET_SHA: ${{ fromJSON(inputs.pr-info || '{}').base.sha }}
+      run: |
+        paths="$RUNNER_TEMP/unit-test-pr-files/changed-files"
+        policy="$RUNNER_TEMP/pr-ci-skip-paths.txt"
+        [[ -s "$paths" && "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || exit 0
+        if ! gh api -H 'Accept: application/vnd.github.raw+json' \
+          "repos/$GITHUB_REPOSITORY/contents/.github/workflows/config/pr-ci-skip-paths.txt?ref=$TARGET_SHA" > "$policy"; then
+          echo "::notice::PR CI skip list unavailable. Running normal CI."
+          exit 0
+        fi
+        python3 - "$paths" "$policy" >> "$GITHUB_OUTPUT" <<'PYTHON'
+        import sys
+        from fnmatch import fnmatchcase
+        from pathlib import Path
+
+        # Other Unicode line separators are valid filename characters.
+        paths = Path(sys.argv[1]).read_text(encoding="utf-8").removesuffix("\n").split("\n")
+        patterns = [
+            line for line in Path(sys.argv[2]).read_text(encoding="utf-8").split("\n")
+            if line and not line.startswith("#")
+        ]
+        if all(any(fnmatchcase(path, pattern) for pattern in patterns) for path in paths):
+            print("skip_builds_and_tests=true")
+        PYTHON

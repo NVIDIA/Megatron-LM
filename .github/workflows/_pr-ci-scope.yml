@@ -16,35 +16,28 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      skip_builds_and_tests: ${{ steps.diff.outputs.skip_builds_and_tests || 'false' }}
+      skip_builds_and_tests: ${{ steps.diff.outcome == 'success' && steps.diff.outputs.skip_builds_and_tests || 'false' }}
     steps:
-      # Keep the job successful with its default output on all other events so
-      # workflows depending on it continue through their normal job graph.
-      - name: Resolve the PR target
-        id: target
+      # Other events keep the default output so their usual jobs can proceed.
+      - name: Get PR info
+        id: get-pr-info
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/pull-request/')
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          [[ "$GITHUB_REF_NAME" =~ ^pull-request/([0-9]+)$ ]] || exit 0
-          target=$(gh api "repos/$GITHUB_REPOSITORY/pulls/${BASH_REMATCH[1]}" \
-            --jq 'select(.head.sha == env.GITHUB_SHA) | .base.sha') || exit 0
-          if [[ "$target" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "sha=$target" >> "$GITHUB_OUTPUT"
-          fi
+        continue-on-error: true
+        uses: nv-gha-runners/get-pr-info@090577647b8ddc4e06e809e264f7881650ecdccf # main
 
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         id: checkout
-        if: steps.target.outputs.sha != ''
+        if: steps.get-pr-info.outcome == 'success' && steps.get-pr-info.outputs.pr-info != ''
         continue-on-error: true
         with:
-          sparse-checkout: .github/scripts
+          sparse-checkout: .github/actions/pr-changed-files
+          persist-credentials: false
 
-      - name: Compare the complete trees
+      - name: Determine PR CI scope
         id: diff
         if: steps.checkout.outcome == 'success'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TARGET_SHA: ${{ steps.target.outputs.sha }}
-        run: bash .github/scripts/report_pr_ci_scope.sh "$TARGET_SHA"
+        continue-on-error: true
+        uses: ./.github/actions/pr-changed-files
+        with:
+          pr-info: ${{ steps.get-pr-info.outputs.pr-info }}
+          tested-sha: ${{ fromJSON(steps.get-pr-info.outputs.pr-info).merge_commit_sha }}
