@@ -19,11 +19,8 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_inference_submodules,
-    get_gpt_layer_with_transformer_engine_spec,
     get_gpt_layer_with_transformer_engine_submodules,
-    get_gpt_mtp_block_spec,
 )
-from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
@@ -846,58 +843,6 @@ class TestSequenceParallelMLALatentCache:
         )
         assert key.shape == context.memory_buffer.shape[1:]
         assert value is None
-
-    def test_forward_without_context_up_projects_whole_latents(self):
-        """A forward without an inference context, as in an MTP draft step, keeps every token's
-        whole latent on each rank and up-projects it for this rank's heads, without gathering
-        the latents across ranks."""
-        config = self.attention.config
-        heads = self.attention.num_attention_heads_per_partition
-        tp_group = self.attention.pg_collection.tp
-        num_tokens = 16
-        generator = torch.Generator(device="cuda").manual_seed(3)
-        hidden_states = torch.randn(
-            num_tokens, 1, config.hidden_size, device="cuda", generator=generator
-        ).to(torch.bfloat16)
-        # The forward would absorb first; absorbing here lets the test hook the KV norm.
-        self.attention.prepare_for_absorption()
-        normalized_latents = []
-        hook = self.attention.kv_layernorm.register_forward_hook(
-            lambda module, args, output: normalized_latents.append(output)
-        )
-        with (
-            mock.patch.object(
-                self.attention, "_run_core_attention", side_effect=_AttentionKernelReached
-            ) as run_core_attention,
-            pytest.raises(_AttentionKernelReached),
-            torch.no_grad(),
-        ):
-            self.attention(
-                hidden_states.chunk(tp_group.size())[tp_group.rank()], attention_mask=None
-            )
-        hook.remove()
-        query, key, value = run_core_attention.call_args.args[:3]
-        # Without a fused KV norm, kv_layernorm passes through a strided view of the
-        # down-projection output.
-        latents = normalized_latents[0].contiguous()
-
-        # Collectives first, so that a failed check cannot leave a rank waiting in one.
-        latents_by_rank = [torch.empty_like(latents) for _ in range(tp_group.size())]
-        torch.distributed.all_gather(latents_by_rank, latents, group=tp_group)
-        assert len(normalized_latents) == 1
-        assert latents.shape == (num_tokens, 1, config.kv_lora_rank)
-        for rank_latents in latents_by_rank:
-            assert torch.equal(rank_latents, latents)
-
-        assert query.shape == (num_tokens, 1, heads, self.attention.q_head_dim)
-        assert key.shape == (num_tokens, 1, heads, self.attention.q_head_dim)
-        up_proj_weight = self.attention.linear_kv_up_proj_linear.weight.detach()
-        kv = (latents @ up_proj_weight.t()).view(
-            num_tokens, 1, heads, config.qk_head_dim + config.v_head_dim
-        )
-        k_no_pe, expected_value = kv.split([config.qk_head_dim, config.v_head_dim], dim=-1)
-        torch.testing.assert_close(key[..., : config.qk_head_dim], k_no_pe)
-        torch.testing.assert_close(value, expected_value)
 
 
 @pytest.mark.parametrize("linear_qkv_down_proj", linear_qkv_down_proj_options)
@@ -1937,127 +1882,6 @@ class TestMLAUpProjectionInput:
         hook.remove()
         assert copy.call_count == 0
         assert len(received) == 1 and not received[0].is_contiguous()
-
-
-# The cached-latent layer up-projects its latents with a torch GEMM (up_project_whole_latents),
-# while the layer without cached latents runs Transformer Engine's, which computes FP32 GEMMs in
-# TF32.
-_FP32_RTOL = _FP32_ATOL = 1e-3
-
-
-class TestMLACachedLatentsWithoutInferenceContext:
-    """With cache_mla_latents, which dynamic-batching MLA requires, a forward that has no
-    inference context runs the unabsorbed attention. The MTP draft step runs such a forward."""
-
-    @pytest.fixture(scope='function', autouse=True)
-    def setup_and_teardown(self):
-        Utils.initialize_model_parallel(1, 1)
-        model_parallel_cuda_manual_seed(123)
-        yield
-        Utils.destroy_model_parallel()
-
-    @staticmethod
-    def _config(cache_mla_latents, **overrides):
-        settings = dict(
-            num_layers=1,
-            hidden_size=256,
-            num_attention_heads=4,
-            q_lora_rank=64,
-            kv_lora_rank=64,
-            qk_head_dim=128,
-            v_head_dim=128,
-            qk_pos_emb_head_dim=64,
-            rotary_base=10000,
-            original_max_position_embeddings=32,
-            # The KV norm is fused into linear_kv_up_proj, which absorption splits.
-            qk_layernorm=True,
-            add_bias_linear=False,
-            hidden_dropout=0.0,
-            attention_dropout=0.0,
-            # prepare_for_absorption builds TE modules mid-forward on the init device.
-            use_cpu_initialization=False,
-            cache_mla_latents=cache_mla_latents,
-        )
-        settings.update(overrides)
-        return MLATransformerConfig(**settings)
-
-    @pytest.mark.parametrize("rope_type", ("rope", "yarn"))
-    def test_forward_matches_layer_without_cached_latents(self, rope_type):
-        submodules = get_gpt_layer_with_transformer_engine_submodules(
-            multi_latent_attention=True, qk_layernorm=True
-        ).self_attention.submodules
-        reference, cached = (
-            MLASelfAttention(
-                self._config(cache_mla_latents, rope_type=rope_type),
-                submodules,
-                layer_number=1,
-                attn_mask_type=AttnMaskType.causal,
-            )
-            .cuda()
-            .eval()
-            for cache_mla_latents in (False, True)
-        )
-        cached.load_state_dict(reference.state_dict())
-        # As in a draft step: one token per request, along the sequence dimension.
-        hidden_states = torch.randn(8, 1, reference.config.hidden_size, device="cuda")
-
-        with torch.inference_mode():
-            expected, _ = reference(hidden_states, attention_mask=None)
-            # The first forward absorbs the KV up-projection, the second runs absorbed.
-            for _ in range(2):
-                output, _ = cached(hidden_states, attention_mask=None)
-                torch.testing.assert_close(output, expected, rtol=_FP32_RTOL, atol=_FP32_ATOL)
-        assert not hasattr(cached, "linear_kv_up_proj")
-
-    @pytest.mark.parametrize("mtp_use_repeated_layer", (False, True), ids=("per-depth", "repeated"))
-    def test_mtp_draft_step(self, mtp_use_repeated_layer):
-        """compute_mtp_single_step at every draft depth gives the logits of the same model without
-        cached latents, for a head with one MTP layer per depth and for a repeated head, which
-        applies its one layer at every depth. MLA heads have no MTP draft KV plane, so both
-        draft without an inference context."""
-        num_depths = 2
-        models = []
-        for cache_mla_latents in (False, True):
-            config = self._config(
-                cache_mla_latents,
-                num_layers=2,
-                mtp_num_layers=1 if mtp_use_repeated_layer else num_depths,
-                mtp_use_repeated_layer=mtp_use_repeated_layer,
-            )
-            layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                multi_latent_attention=True, qk_layernorm=True
-            )
-            model = GPTModel(
-                config=config,
-                transformer_layer_spec=layer_spec,
-                vocab_size=128,
-                max_sequence_length=64,
-                mtp_block_spec=get_gpt_mtp_block_spec(
-                    config, layer_spec, use_transformer_engine=True
-                ),
-                position_embedding_type="rope",
-            )
-            models.append(model.cuda().eval())
-        reference, cached = models
-        cached.load_state_dict(reference.state_dict())
-
-        num_requests = 4
-        expected_hidden = hidden = torch.randn(num_requests, 1, config.hidden_size, device="cuda")
-        token_ids = torch.randint(0, 128, (1, num_requests), device="cuda")
-        position_ids = torch.arange(num_requests, device="cuda").unsqueeze(0)
-        for depth in range(num_depths):
-            # As the MTP controller drafts: each depth continues from the previous one's hidden
-            # states.
-            mtp_depth = None if mtp_use_repeated_layer else depth
-            expected_hidden, expected = reference.compute_mtp_single_step(
-                expected_hidden, token_ids, position_ids, depth=mtp_depth
-            )
-            hidden, logits = cached.compute_mtp_single_step(
-                hidden, token_ids, position_ids, depth=mtp_depth
-            )
-            torch.testing.assert_close(logits, expected, rtol=_FP32_RTOL, atol=_FP32_ATOL)
-            attention = cached.mtp.layers[mtp_depth or 0].mtp_model_layer.self_attention
-            assert not hasattr(attention, "linear_kv_up_proj")
 
 
 @pytest.mark.parametrize("rope_type", ('yarn', 'rope'))

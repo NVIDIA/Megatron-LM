@@ -49,7 +49,10 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.models.hybrid.hybrid_block import HybridStack, HybridStackSubmodules
 from megatron.core.models.hybrid.hybrid_model import HybridModel
-from megatron.core.tensor_parallel.mappings import scatter_to_sequence_parallel_region
+from megatron.core.tensor_parallel.mappings import (
+    gather_from_sequence_parallel_region,
+    scatter_to_sequence_parallel_region,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from megatron.core.transformer.attention import HAVE_FA3, HAVE_FA4, HAVE_FMLA
@@ -1915,17 +1918,16 @@ class TestMLAMTPCudaGraphInference:
     """MTP speculative decoding of an MLA model in the dynamic engine, at TP=2 with sequence
     parallelism and with CUDA graphs.
 
-    Dynamic-batching MLA caches latents, and MLA heads have no MTP draft KV plane (it assumes
-    keys without RoPE). Every draft depth therefore runs the MLA layer without an inference
-    context: the engine captures that forward in the MTP CUDA graphs and replays it after each
-    verification step. Covers a head with one MTP layer per depth (as DeepSeek-V3 checkpoints
-    have) and a repeated head.
+    Dynamic-batching MLA attends over its latent cache, so an MLA head drafts on the MTP draft KV
+    plane: each draft appends its latent there and attends over the request's draft history,
+    applying MLA's RoPE at the draft's position. A head whose one MLA layer drafts every depth
+    gets the plane, whether repeated or of a single layer (as DeepSeek-V3 checkpoints have); a
+    head with a layer per depth gets none, and the controller rejects it.
     """
 
     TP_SIZE = 2
     VOCAB_SIZE = 128
     MAX_SEQ_LEN = 256
-    NUM_SPECULATIVE_TOKENS = 2
     NUM_TOKENS_TO_GENERATE = 8
     PROMPT_LENGTHS = (70, 7, 45, 130)
     MAX_STEPS = 200
@@ -1948,7 +1950,17 @@ class TestMLAMTPCudaGraphInference:
         InferenceMode.unset_active()  # the engine activates it
         delete_cuda_graphs()
 
-    def _build_engine(self, mtp_use_repeated_layer):
+    @staticmethod
+    def _skip_without_mla_kernels():
+        if not (HAVE_FA4 or HAVE_FA3):
+            # FlashAttention-2's varlen kernel needs equal query/key and value head dims.
+            pytest.skip("MLA prefill with cached latents needs FlashAttention-3 or -4")
+        if not _flash_mla_decode_runs():
+            pytest.skip("MLA decode needs FlashMLA with kernels for this GPU")
+
+    def _build_model(
+        self, *, mtp_num_layers=1, mtp_use_repeated_layer=True, cache_mla_latents=True
+    ):
         # The model sets the NVTE attention variables from its config; drop any set before.
         clear_nvte_env_vars()
         model_parallel_cuda_manual_seed(123, inference_rng_tracker=True, force_reset_rng=True)
@@ -1965,9 +1977,10 @@ class TestMLAMTPCudaGraphInference:
             v_head_dim=128,
             qk_layernorm=True,
             rope_type="rope",
-            cache_mla_latents=True,
-            # Transformer Engine picks the backend of the draft step's attention. Dynamic prefill
-            # runs the newest FlashAttention installed (no flash_attention_version pinned).
+            cache_mla_latents=cache_mla_latents,
+            # Transformer Engine picks the backend of attention without an inference context.
+            # Dynamic prefill runs the newest FlashAttention installed (no flash_attention_version
+            # pinned).
             attention_backend=AttnBackend.auto,
             normalization="RMSNorm",
             activation_func=F.silu,
@@ -1981,14 +1994,14 @@ class TestMLAMTPCudaGraphInference:
             params_dtype=torch.bfloat16,
             hidden_dropout=0.0,
             attention_dropout=0.0,
-            mtp_num_layers=1 if mtp_use_repeated_layer else self.NUM_SPECULATIVE_TOKENS,
+            mtp_num_layers=mtp_num_layers,
             mtp_use_repeated_layer=mtp_use_repeated_layer,
             cuda_graph_impl="local",
         )
         layer_spec = get_gpt_layer_with_inference_spec(
             qk_layernorm=True, multi_latent_attention=True
         )
-        model = GPTModel(
+        return GPTModel(
             config=config,
             transformer_layer_spec=layer_spec,
             vocab_size=self.VOCAB_SIZE,
@@ -2003,13 +2016,15 @@ class TestMLAMTPCudaGraphInference:
             # MLA applies its own RoPE; GPTModel then builds none.
             position_embedding_type="rope",
         ).eval()
+
+    def _build_engine(self, model, num_speculative_tokens=2):
         context = DynamicInferenceContext(
-            model_config=config,
+            model_config=model.config,
             inference_config=InferenceConfig(
                 max_sequence_length=self.MAX_SEQ_LEN,
                 buffer_size_gb=0.1,
                 materialize_only_last_token_logits=False,
-                num_speculative_tokens=self.NUM_SPECULATIVE_TOKENS,
+                num_speculative_tokens=num_speculative_tokens,
                 block_size_tokens=64,  # required with cached MLA latents
                 max_requests=16,
                 max_tokens=512,
@@ -2023,19 +2038,33 @@ class TestMLAMTPCudaGraphInference:
         ctrl = TextGenerationController(inference_wrapped_model=wrapped, tokenizer=mock_tokenizer)
         return DynamicInferenceEngine(ctrl, context)
 
-    @pytest.mark.parametrize("mtp_use_repeated_layer", [False, True], ids=["per-depth", "repeated"])
+    def _run_to_completion(self, engine):
+        finished = {}
+        for _ in range(self.MAX_STEPS):
+            if not engine.has_unfinished_requests():
+                return finished
+            for request in engine.step_modern()["finished_requests"]:
+                finished[request.request_id] = request
+        pytest.fail(f"the engine did not finish within {self.MAX_STEPS} steps")
+
+    @pytest.mark.parametrize(
+        "mtp_use_repeated_layer,num_speculative_tokens",
+        [(True, 2), (False, 1)],
+        ids=["repeated", "single-layer"],
+    )
     @torch.inference_mode()
-    def test_greedy_generation_with_mtp_cuda_graphs(self, mtp_use_repeated_layer):
-        """The engine captures the MTP CUDA graphs and completes greedy requests, drafting at
-        every decode step."""
-        if not (HAVE_FA4 or HAVE_FA3):
-            # FlashAttention-2's varlen kernel needs equal query/key and value head dims.
-            pytest.skip("MLA prefill with cached latents needs FlashAttention-3 or -4")
-        if not _flash_mla_decode_runs():
-            pytest.skip("MLA decode needs FlashMLA with kernels for this GPU")
-        engine = self._build_engine(mtp_use_repeated_layer)
-        assert not engine.context.enable_mtp_kv_cache
-        assert engine.controller.num_mtp_depths == self.NUM_SPECULATIVE_TOKENS
+    def test_greedy_generation_with_mtp_cuda_graphs(
+        self, mtp_use_repeated_layer, num_speculative_tokens
+    ):
+        """The engine captures the MTP CUDA graphs and completes greedy requests, drafting on the
+        draft KV plane at every decode step."""
+        self._skip_without_mla_kernels()
+        engine = self._build_engine(
+            self._build_model(mtp_use_repeated_layer=mtp_use_repeated_layer),
+            num_speculative_tokens=num_speculative_tokens,
+        )
+        assert engine.context.enable_mtp_kv_cache
+        assert engine.controller.num_mtp_depths == num_speculative_tokens
 
         # The same prompts on every rank.
         generator = torch.Generator().manual_seed(1234)
@@ -2047,14 +2076,7 @@ class TestMLAMTPCudaGraphInference:
                     num_tokens_to_generate=self.NUM_TOKENS_TO_GENERATE, termination_id=-1, top_k=1
                 ),
             )
-        finished = {}
-        for _ in range(self.MAX_STEPS):
-            if not engine.has_unfinished_requests():
-                break
-            for request in engine.step_modern()["finished_requests"]:
-                finished[request.request_id] = request
-        else:
-            pytest.fail(f"the engine did not finish within {self.MAX_STEPS} steps")
+        finished = self._run_to_completion(engine)
 
         assert sorted(finished) == list(range(len(self.PROMPT_LENGTHS)))
         for request in finished.values():
@@ -2063,4 +2085,90 @@ class TestMLAMTPCudaGraphInference:
         assert int(engine._spec_tokens_proposed_per_pos.sum()) > 0
         TestMTPCudaGraphInference._assert_mtp_cuda_graphs_were_replayed(
             engine.controller.inference_wrapped_model.model, expect_replayed=True
+        )
+
+    @torch.inference_mode()
+    def test_head_with_a_layer_per_depth_is_rejected(self):
+        """Each depth's own MLA layer would need a plane of its own, so such a head gets none,
+        and an MLA head cannot draft without one."""
+        model = self._build_model(mtp_num_layers=2, mtp_use_repeated_layer=False)
+        with pytest.raises(ValueError, match="MLA MTP heads need the MTP draft KV cache"):
+            self._build_engine(model, num_speculative_tokens=2)
+
+    @torch.inference_mode()
+    def test_first_draft_matches_mtp_forward_over_the_whole_sequence(self):
+        """A request's first draft, made on the draft KV plane in the step that prefills it, has
+        the logits of the MTP head run as in training over the whole sequence, at the last prompt
+        position: the draft attends over the draft KV of every earlier position, with MLA's RoPE
+        at their positions.
+
+        The reference model holds the same weights without cached latents and runs with no
+        inference context: the decoder over the prompt, then the MTP layer over each position's
+        hidden state and the token after it. Both run in bf16, so they differ by rounding; the
+        same forward over only the last positions differs by far more.
+        """
+        self._skip_without_mla_kernels()
+        # Spans two 64-token KV blocks, and splits evenly across the sequence-parallel ranks.
+        prompt_length = 70
+        reference = self._build_model(cache_mla_latents=False)
+        model = self._build_model()
+        # Before the engine's first forward absorbs the KV up-projection.
+        model.load_state_dict(reference.state_dict())
+        engine = self._build_engine(model)
+        assert engine.context.enable_mtp_kv_cache
+
+        compute_mtp_single_step = model.compute_mtp_single_step
+        draft_steps = []
+
+        def record_draft_step(**kwargs):
+            # The token and position buffers are rewritten at the next depth.
+            inputs = (kwargs["next_token_ids"][0, 0].clone(), kwargs["position_ids"][0, 0].clone())
+            hidden_states, logits = compute_mtp_single_step(**kwargs)
+            draft_steps.append((*inputs, logits[0, 0].clone()))
+            return hidden_states, logits
+
+        # The same prompt on every rank.
+        generator = torch.Generator().manual_seed(1234)
+        prompt = torch.randint(0, self.VOCAB_SIZE, (prompt_length,), generator=generator).cuda()
+        with mock.patch.object(model, "compute_mtp_single_step", side_effect=record_draft_step):
+            engine.add_request(
+                0, prompt, SamplingParams(num_tokens_to_generate=2, termination_id=-1, top_k=1)
+            )
+            self._run_to_completion(engine)
+
+        # The prefill step's first draft: depth 0 of the only request, which writes and queries
+        # the draft KV of the last prompt position, paired with the token sampled after it.
+        base_token, base_position, draft_logits = draft_steps[0]
+        assert int(base_position) == prompt_length
+
+        InferenceMode.unset_active()  # the reference runs as training does
+        tp_group = reference.pg_collection.tp
+        tokens = torch.cat([prompt, base_token.view(1)])
+        positions = torch.arange(prompt_length + 1, device=prompt.device)
+        hidden_states = reference.decoder(
+            hidden_states=reference.embedding(
+                input_ids=tokens[None, :-1], position_ids=positions[None, :-1]
+            ),
+            attention_mask=None,
+        )
+        hidden_states = gather_from_sequence_parallel_region(hidden_states, group=tp_group)
+
+        def reference_logits(first_position):
+            """The MTP head's logits at the last prompt position, over the positions from
+            `first_position` on."""
+            _, logits = reference.compute_mtp_single_step(
+                hidden_states=scatter_to_sequence_parallel_region(
+                    hidden_states[first_position:], group=tp_group
+                ),
+                next_token_ids=tokens[None, first_position + 1 :],
+                position_ids=positions[None, first_position + 1 :],
+                eager=True,
+            )
+            return logits[-1, 0]
+
+        tolerances = dict(rtol=5e-2, atol=5e-2)
+        torch.testing.assert_close(draft_logits, reference_logits(0), **tolerances)
+        # A draft that attended over only the last positions would not pass the check above.
+        assert not torch.allclose(
+            draft_logits, reference_logits(prompt_length - self.TP_SIZE), **tolerances
         )

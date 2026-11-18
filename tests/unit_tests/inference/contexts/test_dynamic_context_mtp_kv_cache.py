@@ -146,9 +146,13 @@ class TestMtpKvCacheGating:
             {"mtp_layer_type_list": [Symbols.MAMBA, Symbols.MLP]},
             {"mtp_layer_type_list": [Symbols.ATTENTION, Symbols.ATTENTION]},
             {"mtp_layer_type_list": [Symbols.MAMBA]},
-            # MLA applies RoPE to its keys, which the draft plane does not support.
-            {"multi_latent_attention": True},
-            {"multi_latent_attention": True, "mtp_layer_type_list": [Symbols.MLA, Symbols.MLP]},
+            # MLA heads of more than one layer drafting their own depth.
+            {"multi_latent_attention": True, "mtp_use_repeated_layer": False, "mtp_num_layers": 2},
+            # DSA keeps indexer keys, which the plane does not hold.
+            {
+                "multi_latent_attention": True,
+                "mtp_layer_type_list": [Symbols.DS_ATTENTION, Symbols.MLP],
+            },
         ],
         ids=[
             "no-drafts",
@@ -157,8 +161,8 @@ class TestMtpKvCacheGating:
             "recurrent-mlp",
             "two-attentions",
             "recurrent",
-            "mla",
-            "hybrid-mla",
+            "mla-per-depth",
+            "hybrid-dsa",
         ],
     )
     def test_unsupported_config_has_no_draft_kv_plane(self, kwargs):
@@ -167,6 +171,42 @@ class TestMtpKvCacheGating:
         assert context.enable_mtp_kv_cache is False
         assert context.mtp_kv_layer_slot is None
         assert context.num_attention_layers == NUM_LAYERS
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {},
+            # A non-repeated head of one layer, as DeepSeek-V3 checkpoints have.
+            {"mtp_use_repeated_layer": False},
+            {"mtp_layer_type_list": [Symbols.MLA, Symbols.MLP]},
+        ],
+        ids=["mla", "mla-single-layer", "hybrid-mla"],
+    )
+    def test_mla_head_of_one_layer_gets_a_draft_kv_plane(self, kwargs):
+        """MLA applies its RoPE at the token positions the plane's write maps publish, so an MLA
+        head drafts on the plane; it has no way to draft without one."""
+        context = _make_context(multi_latent_attention=True, **kwargs)
+        assert context.enable_mtp_kv_cache is True
+        assert context.mtp_kv_layer_slot == NUM_LAYERS
+        assert context.num_attention_layers == NUM_LAYERS + 1
+
+    @pytest.mark.parametrize("variant", ["dsa", "dsv4_hybrid"])
+    def test_mla_attention_variant_has_no_draft_kv_plane(self, variant):
+        """The attention variants built on MLA keep caches beyond its latents, which the plane
+        does not route, so a non-hybrid head of one gets no plane."""
+        model_config = types.SimpleNamespace(
+            mtp_num_layers=1,
+            mtp_use_repeated_layer=True,
+            multi_latent_attention=True,
+            experimental_attention_variant=variant,
+        )
+        assert not DynamicInferenceContext.should_enable_mtp_kv_cache(
+            model_config, mtp_layer_type_list=None, num_speculative_tokens=2
+        )
+        model_config.experimental_attention_variant = None
+        assert DynamicInferenceContext.should_enable_mtp_kv_cache(
+            model_config, mtp_layer_type_list=None, num_speculative_tokens=2
+        )
 
     def test_enabled_for_hybrid_main_decoder_with_attention_mtp_head(self):
         """The gate is on the MTP head, not the main decoder: a hybrid backbone is fine."""

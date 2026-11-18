@@ -40,33 +40,41 @@ class MTPContextMixin:
         Returns:
             (bool): True when the draft KV plane should be reserved.
         """
-        # The draft plane reserves exactly one attention slot, so the head must be one layer.
-        # `mtp_use_repeated_layer` is what guarantees that: it builds a single layer and applies
-        # it at every depth, where the non-repeated path builds `mtp_num_layers` of them.
-        if not (
-            num_speculative_tokens > 0
-            and getattr(model_config, "mtp_num_layers", None)
-            and getattr(model_config, "mtp_use_repeated_layer", False)
-        ):
+        if not (num_speculative_tokens > 0 and getattr(model_config, "mtp_num_layers", None)):
             return False
 
-        # The draft plane assumes keys without RoPE, and MLA always applies its own RoPE to the
-        # keys' positional part. An MLA head drafts without the plane, as a per-depth head does.
-        if getattr(model_config, "multi_latent_attention", False):
+        # The draft plane reserves exactly one attention slot, so one MTP layer must draft every
+        # depth. `mtp_use_repeated_layer` guarantees that: it builds a single layer and applies it
+        # at every depth, where the non-repeated path builds `mtp_num_layers` of them. A
+        # non-repeated head of one layer drafts a single depth, so it fits too. MLA heads of that
+        # shape take the plane, since MLA cannot draft without one (`TextGenerationController`
+        # rejects MLA heads that get none); other heads of that shape draft without it.
+        multi_latent_attention = getattr(model_config, "multi_latent_attention", False)
+        if not (
+            getattr(model_config, "mtp_use_repeated_layer", False)
+            or (multi_latent_attention and model_config.mtp_num_layers == 1)
+        ):
             return False
 
         if mtp_layer_type_list is None:
             # Non-hybrid model -- `HybridModel` builds a head only when the pattern has an MTP
             # section, so a hybrid head always exposes one. That layer is cloned from the last
-            # decoder layer spec, so it is attention by construction.
-            return True
+            # decoder layer spec, so it is attention by construction. With MLA the plane holds
+            # only the latent cache, so a head with an experimental attention variant (such as
+            # DSA, which also caches indexer keys) gets none.
+            return not (
+                multi_latent_attention
+                and getattr(model_config, "experimental_attention_variant", None) is not None
+            )
 
         # The reserved slot holds one layer's KV, so a head with a second attention layer would
         # have both depths read and write the same plane.
         attention_symbols = (Symbols.ATTENTION, Symbols.DS_ATTENTION, Symbols.MLA)
         num_attention = sum(t in attention_symbols for t in mtp_layer_type_list)
         has_recurrent = any(t in (Symbols.MAMBA, Symbols.GDN) for t in mtp_layer_type_list)
-        return num_attention == 1 and not has_recurrent
+        # With MLA, that layer must be plain MLA (not DSA), for the same reason.
+        is_plain_attention = not multi_latent_attention or Symbols.MLA in mtp_layer_type_list
+        return num_attention == 1 and not has_recurrent and is_plain_attention
 
     def _mtp_initialize_kv_cache(
         self, model_config, mtp_layer_type_list: Optional[List[str]]
@@ -267,7 +275,10 @@ class MTPContextMixin:
     # The draft attention reuses this context's KV `memory_buffer` (slot `mtp_kv_layer_slot`)
     # and main's block table. Each draft depth is a decode-style forward: one token per active
     # request, written at its own draft position and attending over its own history
-    # (write-then-attend). RoPE is assumed absent.
+    # (write-then-attend). The draft forwards give attention no rotary embeddings: a head without
+    # MLA runs without RoPE (`TextGenerationController` requires position_embedding_type='none'),
+    # and MLA applies its own RoPE at the token positions the write maps publish, which are the
+    # draft write positions.
     #
     # There is NO persistent per-request draft length. Depth 0's write position is DERIVED each
     # step as `base_position - 1` (roll-by-one). Because the main KV offsets it comes from are

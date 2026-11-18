@@ -326,11 +326,20 @@ class TextGenerationController(MTPControllerMixin):
         # Use padded vocab size because tokenizer vocab size might pad to nearest power of 2.
         self.vocab_size = self._language_model.vocab_size
 
-        if getattr(self.inference_wrapped_model.inference_context, "enable_mtp_kv_cache", False):
-            if self._language_model.position_embedding_type != "none":
+        inference_context = self.inference_wrapped_model.inference_context
+        multi_latent_attention = getattr(
+            self._language_model.config, "multi_latent_attention", False
+        )
+        enable_mtp_kv_cache = getattr(inference_context, "enable_mtp_kv_cache", False)
+        if enable_mtp_kv_cache:
+            # The draft forwards give attention no rotary embeddings, and the commit pass gives the
+            # embedding zero positions. MLA applies its own RoPE from the context's token
+            # positions, and the model builds no other position embedding for it under 'rope'.
+            position_embedding_types = ("none", "rope") if multi_latent_attention else ("none",)
+            if self._language_model.position_embedding_type not in position_embedding_types:
                 raise ValueError(
-                    "MTP KV caching requires position_embedding_type='none'; positional "
-                    "embeddings are not supported."
+                    "MTP KV caching requires position_embedding_type='none' (or 'rope' with MLA, "
+                    "which applies its own RoPE); positional embeddings are not supported."
                 )
 
         # Build and seed sampling RNG. Optionally offset by DP rank so each rank gets a
@@ -360,6 +369,22 @@ class TextGenerationController(MTPControllerMixin):
                 self.num_mtp_depths = min(
                     self.num_speculative_tokens, self.model_config.mtp_num_layers
                 )
+
+        # Dynamic-batching MLA attends over its latent cache, so an MLA head drafts only on the
+        # draft KV plane; without one, a draft would attend over none of the request's history.
+        if (
+            self.num_mtp_depths > 0
+            and multi_latent_attention
+            and inference_context.is_dynamic_batching()
+            and not enable_mtp_kv_cache
+        ):
+            raise ValueError(
+                "MLA MTP heads need the MTP draft KV cache (one plain MLA layer drafting every "
+                "depth: mtp_use_repeated_layer=True or mtp_num_layers=1, and in a hybrid head no "
+                "other attention or recurrent layer). This head gets none: mtp_num_layers="
+                f"{self.model_config.mtp_num_layers}, mtp_use_repeated_layer="
+                f"{self.model_config.mtp_use_repeated_layer}."
+            )
 
         if (
             self.model_config.cuda_graph_impl == "local"
