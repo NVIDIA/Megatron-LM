@@ -114,22 +114,46 @@ fi
 
 cd $TEST_PATH
 
-# Load bucket-specific launch behavior before discovery and distributed setup.
-UNIT_BUCKET_LAUNCHER=
+# These buckets need fixed world sizes and isolated precision processes, but
+# share the same Testmon baseline/selection lifecycle as every other bucket.
+UNIT_PROFILES=()
+UNIT_PYTEST_ARGS=()
+UNIT_RESULTS_DIR=
 case "$BUCKET" in
 tests/unit_tests/inference/test_batch_invariant_fp8.py)
-    UNIT_BUCKET_LAUNCHER=tests/test_utils/run_batch_invariant_fp8.sh
+    GPUS_PER_NODE=1
+    export CUBLASLT_WORKSPACE_SIZE=0
+    case "$PLATFORM" in
+        h100) UNIT_PROFILES=(delayed blockwise) ;;
+        gb200) UNIT_PROFILES=(mxfp8) ;;
+        *) echo "Unsupported FP8 platform: $PLATFORM" >&2; exit 1 ;;
+    esac
     ;;
-tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py|tests/unit_tests/inference/test_disagg_transfer_pairwise.py)
-    UNIT_BUCKET_LAUNCHER=tests/test_utils/run_disagg_pairwise.sh
+tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py)
+    GPUS_PER_NODE=4
+    UNIT_PROFILES=(default)
+    UNIT_PYTEST_ARGS=(--experimental)
+    if ! uv run --no-sync python -c 'from nixl import _api'; then
+        if [[ "$UNIT_TESTMON_MODE" == full ]]; then
+            echo "NIXL is unavailable; skipping $BUCKET"
+            exit 0
+        fi
+        echo "NIXL must be importable to record or select this Testmon bucket." >&2
+        exit 1
+    fi
+    ;;
+tests/unit_tests/inference/test_disagg_transfer_pairwise.py)
+    GPUS_PER_NODE=6
+    UNIT_PROFILES=(default)
+    UNIT_PYTEST_ARGS=(--experimental)
     ;;
 esac
-if [[ -n "$UNIT_BUCKET_LAUNCHER" ]]; then
-    source "$UNIT_BUCKET_LAUNCHER"
-    [[ "$UNIT_TEST_REPEAT" =~ ^[1-9][0-9]*$ ]]
-    unit_bucket_setup
-    LOG_DIR="$(cd "$LOG_DIR" && pwd)"
+if (( ${#UNIT_PROFILES[@]} )); then
+    UNIT_RESULTS_DIR="$(cd "$LOG_DIR" && pwd)/unit-results"
+    rm -rf -- "$UNIT_RESULTS_DIR"
+    mkdir -p "$UNIT_RESULTS_DIR"
     UNIT_LAUNCH=0
+    UNIT_RESULTS_MODE="$UNIT_TESTMON_MODE"
 fi
 
 MARKER=()
@@ -192,99 +216,105 @@ run_test_cmd() {
     return "$rc"
 }
 
-# Build worker arguments before adding a bucket's torchrun launch settings.
-run_unit_worker() {
-    local mode="$1" phase="$2" profile="$3" append="$4"
-    shift 4
-    local -a worker command
-    if [[ "$mode" == baseline || "$mode" == select ]]; then
-        worker=(tests/unit_tests/testmon_selector.py --mode "$mode"
-            --cache-dir "$UNIT_TESTMON_CACHE_DIR" --phase "$phase")
-        [[ "$append" != true ]] || worker+=(--append)
-        worker+=(-- "$@")
-    elif [[ "$phase" == prod ]]; then
-        worker=(-m coverage run --data-file=.coverage.unit_tests --source=megatron/core
-            -m pytest "$@")
-    else
-        worker=(-m pytest "$@")
-    fi
-
-    command=(uv run --no-sync python -m torch.distributed.run)
-    if [[ -z "$profile" ]]; then
-        "${command[@]}" "${DISTRIBUTED_ARGS[@]}" "${worker[@]}"
-        return $?
-    fi
-
-    UNIT_LAUNCH=$((UNIT_LAUNCH + 1))
-    local launch_dir="$LOG_DIR/$profile/$phase-$UNIT_LAUNCH"
-    mkdir -p "$launch_dir" || return
-    command+=(--standalone --nnodes=1 --nproc-per-node="$GPUS_PER_NODE" --max-restarts=0
-        --log-dir "$launch_dir" --redirects=3 --tee=3)
+# Keep profile data in Testmon's native environments within each phase database.
+# Appending the second profile preserves the first; CPU selection already reads
+# all environments. Each torchrun still gets a fresh interpreter and rank logs.
+run_profiled_command() {
+    local phase="$1" mode="$2"
+    shift 2
+    local -a command=("$@") profile_args wrapper_args
+    local profile selection output rank_dir rc first=true
+    local launcher_length=$((6 + ${#DISTRIBUTED_ARGS[@]}))
+    for profile in "${UNIT_PROFILES[@]}"; do
+        profile_args=("${UNIT_PYTEST_ARGS[@]}")
+        wrapper_args=()
+        if [[ "$profile" != default ]]; then
+            selection="$profile"
+            [[ "$profile" != delayed ]] || selection='not mxfp8 and not blockwise'
+            profile_args+=(-k "$selection")
+            if [[ "$mode" == baseline || "$mode" == select ]]; then
+                profile_args+=("--testmon-env=$profile")
+            fi
+        fi
+        if [[ "$mode" == baseline && "$first" == false ]]; then
+            wrapper_args=(--append)
+        fi
+        first=false
+        if [[ "$mode" == select ]]; then
+            "${command[@]}" "${profile_args[@]}" || return $?
+            for output in "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$phase"/rank-*/selected-tests; do
+                mv -- "$output" "$output.$profile" || return
+            done
+        else
+            UNIT_LAUNCH=$((UNIT_LAUNCH + 1))
+            export UNIT_TEST_JUNIT_DIR="$UNIT_RESULTS_DIR/$profile/$phase-$UNIT_LAUNCH"
+            mkdir -p "$UNIT_TEST_JUNIT_DIR"
+            # Expand RANK inside the worker, including when it runs the Testmon wrapper.
+            rc=0
+            "${command[@]:0:launcher_length}" --no-python bash -c \
+                'exec uv run --no-sync python "$@" --junitxml="$UNIT_TEST_JUNIT_DIR/rank-$RANK.xml"' bash \
+                "${command[@]:launcher_length:1}" "${wrapper_args[@]}" \
+                "${command[@]:launcher_length+1}" "${profile_args[@]}" || rc=$?
+            [[ "$rc" -eq 0 || "$rc" -eq 5 ]] || return "$rc"
+        fi
+    done
     if [[ "$mode" == select ]]; then
-        "${command[@]}" "${worker[@]}"
-        return $?
+        for rank_dir in "$UNIT_TESTMON_CACHE_DIR/.testmon-work/$phase"/rank-*; do
+            cat "$rank_dir"/selected-tests.* | LC_ALL=C sort -u > "$rank_dir/selected-tests" || return
+        done
     fi
-
-    export UNIT_TEST_JUNIT_DIR="$launch_dir/results"
-    rm -rf -- "$UNIT_TEST_JUNIT_DIR" || return
-    mkdir -p "$UNIT_TEST_JUNIT_DIR" || return
-    local rc=0
-    # Expand RANK in each worker and retain argv boundaries through the shell.
-    "${command[@]}" --no-python bash -c \
-        'exec uv run --no-sync python "$@" --junitxml="$UNIT_TEST_JUNIT_DIR/rank-$RANK.xml"' \
-        bash "${worker[@]}" || rc=$?
-    [[ "$rc" -eq 0 || "$rc" -eq 5 ]] || return "$rc"
-    validate_unit_results "$mode" "$phase"
 }
 
-validate_unit_results() {
-    uv run --no-sync python - "$UNIT_TEST_JUNIT_DIR" "$GPUS_PER_NODE" "$1" "$2" <<'PYTHON'
+validate_profile_results() {
+    uv run --no-sync python - "$UNIT_RESULTS_DIR" "$GPUS_PER_NODE" "$UNIT_RESULTS_MODE" "${UNIT_PROFILES[@]}" <<'PY'
 import sys
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-root, ranks, mode, phase = sys.argv[1:]
-for rank in range(int(ranks)):
-    report = Path(root) / f"rank-{rank}.xml"
-    assert report.is_file(), f"Rank {rank} is missing its report: {report}"
-    cases = ET.parse(report).findall(".//testcase")
-    if mode in ("full", "baseline") and phase == "prod":
-        assert cases, f"Rank {rank} executed no tests: {report}"
-    assert all(case.find(tag) is None for case in cases for tag in ("skipped", "failure", "error")), (
-        f"Rank {rank} has skipped or failed tests: {report}"
-    )
-PYTHON
-}
-
-run_unit_phase() {
-    local mode="$1" phase="$2"
-    shift 2
-    if [[ -n "$UNIT_BUCKET_LAUNCHER" ]]; then
-        local rc=0
-        unit_bucket_run "$mode" "$phase" "$@" || rc=$?
-        if [[ "$mode" == baseline && "$rc" -ne 0 ]]; then
-            rm -f -- "$UNIT_TESTMON_CACHE_DIR/$phase/metadata.json"
-        fi
-        return "$rc"
-    else
-        run_unit_worker "$mode" "$phase" "" false "$@"
-    fi
+root, ranks, mode, *profiles = sys.argv[1:]
+for profile in profiles:
+    launches = list((Path(root) / profile).iterdir()) if (Path(root) / profile).exists() else []
+    if mode in ("full", "baseline"):
+        assert launches, f"{profile}: executed no tests"
+    for launch in launches:
+        for rank in range(int(ranks)):
+            report = launch / f"rank-{rank}.xml"
+            assert report.is_file(), f"{profile}: rank {rank} is missing its report in {launch.name}"
+            cases = ET.parse(report).findall(".//testcase")
+            if mode in ("full", "baseline") and launch.name.startswith("prod-"):
+                assert cases, f"{profile}: rank {rank} executed no tests in {launch.name}"
+            assert all(case.find(tag) is None for case in cases for tag in ("skipped", "failure", "error")), (
+                f"{profile}: rank {rank} has skipped or failed tests in {launch.name}"
+            )
+PY
 }
 
 # Keep this path identical to exhaustive CI. The installed Testmon plugin is
 # inactive unless one of the selective paths below passes --testmon.
 run_full_tests() {
-    local target
+    UNIT_RESULTS_MODE=full
+    local phase target
+    local -a command
     target=$(echo "$BUCKET" | sed 's|/\*\*/\*\.py$||')
     for i in $(seq $UNIT_TEST_REPEAT); do
-        echo "Running prod test suite."
-        run_test_cmd run_unit_phase full prod \
-            -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target"
-        if [[ "$TAG" == latest ]]; then
-            run_test_cmd run_unit_phase full experimental \
-                -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" "$target"
-        fi
+        for phase in prod experimental; do
+            [[ "$phase" != experimental || "$TAG" == latest ]] || continue
+            command=(uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}")
+            if [[ "$phase" == prod ]]; then
+                command+=(-m coverage run --data-file=.coverage.unit_tests --source=megatron/core
+                    -m pytest -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" "$target")
+            else
+                command+=(-m pytest -vs --experimental "${IGNORE_ARGS[@]}"
+                    -m "experimental and ${MARKER_ARG}" "$target")
+            fi
+            if (( ${#UNIT_PROFILES[@]} )); then
+                run_profiled_command "$phase" full "${command[@]}"
+            else
+                run_test_cmd "${command[@]}"
+            fi
+        done
     done
+
     coverage combine -q
 }
 
@@ -316,7 +346,19 @@ run_testmon_phase() {
         uv pip install --python /opt/venv/bin/python --no-deps "pytest-testmon==2.2.0" || return
         UNIT_TESTMON_INSTALLED=true
     fi
-    run_unit_phase "$mode" "$phase" "$@"
+    local -a command=(uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}")
+    command+=(
+        tests/unit_tests/testmon_selector.py
+        --mode "$mode"
+        --cache-dir "$UNIT_TESTMON_CACHE_DIR"
+        --phase "$phase"
+        -- "$@"
+    )
+    if [[ -n "${UNIT_RESULTS_DIR:-}" ]]; then
+        run_profiled_command "$phase" "$mode" "${command[@]}"
+    else
+        "${command[@]}"
+    fi
 }
 
 run_baseline_tests() {
@@ -367,6 +409,7 @@ run_selected_phase() {
     local phase="$1"
     local selection_file="$UNIT_TESTMON_CACHE_DIR/.testmon-work/$phase/selected-tests"
     local -a selected_tests=()
+    local -a command=(uv run --no-sync python -m torch.distributed.run "${DISTRIBUTED_ARGS[@]}")
 
     while IFS= read -r nodeid; do
         [[ -n "$nodeid" ]] && selected_tests+=("$nodeid")
@@ -376,16 +419,34 @@ run_selected_phase() {
         return 0
     fi
 
-    # Mandatory files can contain no tests for this phase.
-    local rc=0
-    if [[ "$phase" == prod ]]; then
-        run_unit_phase selected "$phase" \
-            -vs "${IGNORE_ARGS[@]}" -m "not experimental and ${MARKER_ARG}" \
-            "${selected_tests[@]}" || rc=$?
+    if [[ "$phase" == "prod" ]]; then
+        command+=(
+            -m coverage run
+            --data-file=.coverage.unit_tests
+            --source=megatron/core
+            -m pytest
+            -vs
+            "${IGNORE_ARGS[@]}"
+            -m "not experimental and ${MARKER_ARG}"
+            "${selected_tests[@]}"
+        )
     else
-        run_unit_phase selected "$phase" \
-            -vs --experimental "${IGNORE_ARGS[@]}" -m "experimental and ${MARKER_ARG}" \
-            "${selected_tests[@]}" || rc=$?
+        command+=(
+            -m pytest
+            -vs
+            --experimental
+            "${IGNORE_ARGS[@]}"
+            -m "experimental and ${MARKER_ARG}"
+            "${selected_tests[@]}"
+        )
+    fi
+    # Mandatory files are passed whole, so a phase's marker filter can
+    # legitimately deselect everything in them (pytest exit 5).
+    local rc=0
+    if [[ -n "${UNIT_RESULTS_DIR:-}" ]]; then
+        run_profiled_command "$phase" selected "${command[@]}" || rc=$?
+    else
+        "${command[@]}" || rc=$?
     fi
     if [[ "$rc" -eq 5 ]]; then
         echo "No $phase tests collected from the selection (pytest exit 5) — treating as pass."
@@ -456,3 +517,7 @@ enforce|preselected)
     run_enforced_tests
     ;;
 esac
+
+if (( ${#UNIT_PROFILES[@]} )); then
+    validate_profile_results
+fi
