@@ -12,7 +12,7 @@
 CUDA Graphs reduce kernel-launch overhead by recording GPU operations once and replaying the recording on subsequent iterations. Megatron-LM provides three CUDA graph implementations controlled by `--cuda-graph-impl`.
 
 For implementation background and design details, see NVIDIA's
-[Transformer Engine and Megatron-LM CUDA Graph Support](https://docs.nvidia.com/dl-cuda-graph/torch-cuda-graph/te-megatron-cuda-graphs.html).
+[Transformer Engine and Megatron-LM CUDA Graph Support](https://docs.nvidia.com/dl-cuda-graph/latest/torch-cuda-graph/te-megatron-cuda-graphs.html).
 That article is a useful conceptual reference, but some examples there still use older flags such as
 `--enable-cuda-graph` or `--cuda-graph-scope full_iteration`; in this repository, prefer
 `--cuda-graph-impl local|transformer_engine|full_iteration` as documented below.
@@ -98,6 +98,21 @@ wired into custom training loops. The trade-off is that it requires more manual 
 
 Megatron-LM's stock training loop already wires these calls in `megatron/training/training.py`,
 but custom training scripts must do the same work themselves.
+
+For scheduler-produced THD batches, use `--use-varlen-dataset`,
+`--sequence-packing-scheduler dp_balanced`, `--cuda-graph-modules attn`,
+`--pad-packed-seq-alignment max`, and an explicit `--cuda-graph-thd-max-packed-sequences`. The metadata capacity includes one
+reserved dummy document for token padding. `--max-seqlen-per-dp-cp-rank` sets the
+fixed local token capacity; the source global batch size and micro-batch size 1
+must stay fixed. PP/VPP automatically keeps graph inputs alive until their
+corresponding backward even when packing reduces the number of microbatches.
+Source-batch ramp-up is unsupported: `--step-batch-size-schedule`
+is rejected for this path, and the deprecated `--rampup-batch-size` is ignored by
+the microbatch calculator. Increasing the source batch would require recapturing
+the graphs with a new capacity. Dynamic CP, EP communication overlap, delayed
+wgrad, and paged stash are outside this path. mHC wrappers and attention graph
+splitting require their separate graph integrations; these packing options do
+not enable mHC capture by themselves.
 
 ### Usage
 
@@ -202,7 +217,7 @@ graphs to be used on MoE models as well:
   `--cuda-graph-impl local`. Use `--inference-cuda-graph-scope layer|block` with
   `local`; all other implementations must set `--inference-cuda-graph-scope none`,
   meaning inference runs in eager mode.
-- Background reference: [Transformer Engine and Megatron-LM CUDA Graph Support](https://docs.nvidia.com/dl-cuda-graph/torch-cuda-graph/te-megatron-cuda-graphs.html),
+- Background reference: [Transformer Engine and Megatron-LM CUDA Graph Support](https://docs.nvidia.com/dl-cuda-graph/latest/torch-cuda-graph/te-megatron-cuda-graphs.html),
   which also covers PyTorch CUDA Graph best practices and lessons learned.
 
 ---

@@ -27,6 +27,10 @@ class TestBaseEmbedding:
 
     def test_constructor(self):
         assert isinstance(self.base_embedding, LanguageModelEmbedding)
+        assert self.base_embedding.word_embeddings.weight.is_word_embedding_parameter is True
+        assert not getattr(
+            self.base_embedding.position_embeddings.weight, "is_word_embedding_parameter", False
+        )
         num_weights = sum([p.numel() for p in self.base_embedding.parameters()])
         assert num_weights == 1248
 

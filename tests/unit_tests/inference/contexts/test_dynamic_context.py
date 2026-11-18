@@ -12,7 +12,11 @@ import torch
 
 from megatron.core import parallel_state
 from megatron.core.inference.batch_dimensions_utils import InferenceBatchDimensions
-from megatron.core.inference.config import InferenceConfig, MambaInferenceStateConfig
+from megatron.core.inference.config import (
+    InferenceConfig,
+    KVCacheManagementMode,
+    MambaInferenceStateConfig,
+)
 from megatron.core.inference.contexts import zero_padding_rows_kernel
 from megatron.core.inference.contexts.dynamic_context import (
     DynamicInferenceContext,
@@ -25,6 +29,8 @@ from megatron.core.inference.sampling.torch_sampling import TorchSampling
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.enums import AttnBackend
+from megatron.core.transformer.moe.token_dispatcher_inference import NVLSAllGatherVDispatcher
 from megatron.core.transformer.transformer_block import get_num_layers_to_build
 from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.inference.paged_attention_test_utils import reference_paged_attention
@@ -271,8 +277,10 @@ class TestDynamicContext:
         enable_chunked_prefill: bool = False,
         max_requests: int = None,
         expert_model_parallel_size: int = 1,
+        expert_tensor_parallel_size: int = None,
         reserve_recurrent_state_dummy_slot: bool = False,
         mamba_memory_ratio: float = None,
+        kv_cache_management_mode: KVCacheManagementMode = KVCacheManagementMode.PERSIST,
     ):
         if is_hybrid_model:
             if layer_type_list is None:
@@ -296,6 +304,7 @@ class TestDynamicContext:
                 kv_channels=kv_channels,
                 num_attention_heads=num_attention_heads,
                 expert_model_parallel_size=expert_model_parallel_size,
+                expert_tensor_parallel_size=expert_tensor_parallel_size,
                 num_moe_experts=2 if expert_model_parallel_size > 1 else None,
             ),
             inference_config=InferenceConfig(
@@ -317,6 +326,7 @@ class TestDynamicContext:
                 max_requests=max_requests,
                 reserve_recurrent_state_dummy_slot=reserve_recurrent_state_dummy_slot,
                 mamba_memory_ratio=mamba_memory_ratio,
+                kv_cache_management_mode=kv_cache_management_mode,
             ),
         )
         return dynamic_context
@@ -567,6 +577,102 @@ class TestDynamicContext:
 
     @pytest.mark.internal
     @rounder_override(64)
+    @pytest.mark.parametrize(
+        "max_tokens,tp_size,batch_invariant,match",
+        [(1060, 8, False, "divisible"), (12, 1, True, "batch-invariant")],
+    )
+    def test_rejects_incompatible_token_capacity(self, max_tokens, tp_size, batch_invariant, match):
+        model_config = TransformerConfig(
+            num_layers=2,
+            hidden_size=128,
+            num_attention_heads=8,
+            tensor_model_parallel_size=tp_size,
+            params_dtype=torch.bfloat16,
+            batch_invariant_mode=batch_invariant,
+            attention_backend=AttnBackend.flash,
+            flash_attention_version=3,
+            attention_dropout=0.0,
+        )
+        inference_config = InferenceConfig(max_tokens=max_tokens, max_requests=8)
+        with pytest.raises(ValueError, match=match):
+            DynamicInferenceContext(model_config, inference_config)
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize("max_tokens,mixed", [(12, False), (1064, False), (1064, True)])
+    def test_eager_prefill_padding_fits_token_capacity(self, max_tokens, mixed):
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.bfloat16,
+            num_layers=2,
+            kv_channels=16,
+            num_attention_heads=8,
+            max_sequence_length=2048,
+            buffer_size_gb=0.01,
+            block_size_tokens=128,
+            max_tokens=max_tokens,
+            max_requests=4,
+        )
+        if mixed:
+            ctx.add_request(
+                DynamicInferenceRequest(
+                    request_id=0,
+                    prompt_tokens=torch.tensor([7]),
+                    sampling_params=SamplingParams(num_tokens_to_generate=4),
+                )
+            )
+            ctx.initialize_attention_state()
+            ctx.update_requests(
+                active_requests_mask=torch.ones(1, dtype=torch.int32, device="cuda"),
+                new_tokens=torch.tensor([9], device="cuda"),
+            )
+        prompt_length = max_tokens - 1 - int(mixed)
+        prompt = torch.arange(prompt_length)
+        ctx.add_request(
+            DynamicInferenceRequest(
+                request_id=1,
+                prompt_tokens=prompt,
+                sampling_params=SamplingParams(num_tokens_to_generate=4),
+            )
+        )
+        ctx.initialize_attention_state()
+        inputs, positions = ctx.current_input_and_position_ids()
+
+        assert not ctx.using_cuda_graph_this_step()
+        assert ctx.max_tokens == max_tokens
+        assert ctx.active_token_count == max_tokens - 1
+        assert ctx.padded_active_token_count == max_tokens
+        assert inputs.shape == positions.shape == (1, max_tokens)
+        assert ctx.num_decode_requests == int(mixed)
+        assert ctx.num_prefill_requests == 1
+        assert torch.equal(inputs[0, int(mixed) : max_tokens - 1].cpu(), prompt)
+        assert inputs[0, -1].item() == 0
+
+    @pytest.mark.internal
+    @rounder_override(64)
+    def test_graph_prefill_padding_keeps_selected_dimensions(self):
+        ctx = self._get_dynamic_context(
+            params_dtype=torch.bfloat16,
+            num_layers=2,
+            kv_channels=16,
+            num_attention_heads=8,
+            max_sequence_length=2048,
+            buffer_size_gb=0.01,
+            block_size_tokens=128,
+            max_tokens=1064,
+            max_requests=4,
+            num_cuda_graphs=4,
+        )
+        graph = next(
+            dims for dims in ctx.cuda_graph_batch_dimensions_list if dims.prefill_req_count > 0
+        )
+        ctx.initialize_attention_state(construct_graph_dimensions=graph)
+        inputs, positions = ctx.current_input_and_position_ids()
+        assert ctx.using_cuda_graph_this_step()
+        assert ctx.padded_batch_dimensions == graph
+        assert inputs.shape == positions.shape == (1, graph.token_count)
+
+    @pytest.mark.internal
+    @rounder_override(64)
     def test_current_input_and_position_ids_view_cache(self):
         dynamic_context = self._get_dynamic_context(
             params_dtype=torch.float32,
@@ -743,6 +849,37 @@ class TestDynamicContext:
         expected[dynamic_context.padding_slice] = 0.0
         dynamic_context.zero_padding_tokens(activations)
         assert torch.equal(activations, expected)
+
+    @pytest.mark.internal
+    def test_nvls_routing_mask_reads_the_token_count_after_a_recompute_resume(self, monkeypatch):
+        """A RECOMPUTE resume rebuilds gpu_view; the NVLS dispatcher must read the new one."""
+        monkeypatch.setattr(NVLSAllGatherVDispatcher, "_real_token_count_tensor", None)
+        dynamic_context = self._get_dynamic_context(
+            params_dtype=torch.bfloat16,
+            num_layers=2,
+            kv_channels=64,
+            num_attention_heads=8,
+            max_sequence_length=256,
+            buffer_size_gb=0.05,
+            block_size_tokens=256,
+            max_tokens=None,
+            max_requests=16,
+            kv_cache_management_mode=KVCacheManagementMode.RECOMPUTE,
+        )
+        # The dispatcher itself needs an EP group; binding its mask only needs this flag.
+        dynamic_context._nvls_dispatcher = True
+        dynamic_context.deallocate_inference_state_buffers()
+        dynamic_context.reinitialize_inference_state_buffers()
+
+        dynamic_context.add_request(
+            DynamicInferenceRequest(
+                request_id=0,
+                prompt_tokens=torch.arange(5, device="cuda"),
+                sampling_params=SamplingParams(num_tokens_to_generate=2, termination_id=-1),
+            )
+        )
+        dynamic_context.initialize_attention_state()
+        assert NVLSAllGatherVDispatcher._real_token_count_tensor.item() == 5
 
     @pytest.mark.internal
     @rounder_override(8)
@@ -1444,6 +1581,7 @@ class TestDynamicContext:
             last_block_offsets=last_offsets,
         )
         original_tokens = ctx.token_to_input_ids[:active_request_count].clone()
+        ctx.memory_buffer[1].fill_(5)
 
         ctx.prepare_requests()
 
@@ -1464,6 +1602,9 @@ class TestDynamicContext:
         if last_offsets and last_offsets[0] == ctx.block_size_tokens - 1:
             assert ctx.request_kv_block_counts[0] == 2
             assert ctx.token_to_block_idx[0] == ctx.request_last_kv_block_id[0]
+            new_value_page = ctx.memory_buffer[1, :, ctx.request_last_kv_block_id[0].item()]
+            assert torch.count_nonzero(new_value_page) == 0
+            assert torch.count_nonzero(ctx.memory_buffer[1] != 5) == new_value_page.numel()
 
     @pytest.mark.internal
     @rounder_override(8)
@@ -1487,6 +1628,37 @@ class TestDynamicContext:
         )
         ctx.kv_block_allocator.get_allocatable_count = mock.Mock(return_value=allocatable_count)
 
+        assert ctx.can_prepare_requests() is expected
+
+    @pytest.mark.internal
+    @rounder_override(8)
+    @pytest.mark.parametrize(
+        ("active_length", "expected"),
+        [pytest.param(31, True, id="last-position-fits"), pytest.param(32, False, id="overflow")],
+    )
+    def test_async_sched_can_prepare_requests_respects_sequence_capacity(
+        self, active_length, expected
+    ):
+        """Overlap never prepares beyond the physical speculative capacity."""
+        ctx = self._get_async_sched_context(num_speculative_tokens=2)
+        self._setup_async_sched_decode_rows(ctx, active_request_count=1)
+        tokens_per_request = ctx.num_speculative_tokens + 1
+        ctx.request_query_lengths[0] = tokens_per_request
+        ctx.request_kv_length_offsets[0] = active_length - tokens_per_request
+        ctx.request_last_kv_block_offset[0] = (active_length - 1) % ctx.block_size_tokens
+        ctx.request_output_lengths[0] = ctx.max_sequence_length
+        ctx.active_token_count = tokens_per_request
+        ctx.kv_block_allocator.get_allocatable_count = mock.Mock(return_value=1)
+
+        assert ctx.get_active_sequence_lengths().item() == active_length
+        assert ctx.max_sequence_length_for_model == ctx.max_sequence_length + 2
+        assert (
+            ctx.graph_attn_metadata["mha_metadata"].max_seqlen == ctx.max_sequence_length_for_model
+        )
+        assert (
+            ctx.non_graph_attn_metadata["mha_metadata"].max_seqlen
+            == ctx.max_sequence_length_for_model
+        )
         assert ctx.can_prepare_requests() is expected
 
     @pytest.mark.internal
@@ -2882,6 +3054,25 @@ class TestDynamicContext:
         assert metadata.mamba_state_free_slot_count == 0
 
     @pytest.mark.internal
+    @rounder_override(64)
+    @pytest.mark.parametrize(
+        "expert_model_parallel_size, expert_tensor_parallel_size, expected",
+        [(1, 1, False), (2, 1, True), (1, 2, True)],
+    )
+    def test_hybrid_dummy_slot_reserved_when_tp_ep_group_has_peers(
+        self, expert_model_parallel_size, expert_tensor_parallel_size, expected
+    ):
+        # The work consensus runs over the tp_ep group (ETP x EP), so TP > 1 with EP = 1
+        # can also run a dummy forward and needs the reserved recurrent-state slot.
+        ctx = self._get_hybrid_ep_context(
+            num_cuda_graphs=16,
+            expert_model_parallel_size=expert_model_parallel_size,
+            expert_tensor_parallel_size=expert_tensor_parallel_size,
+            reserve_recurrent_state_dummy_slot=True,
+        )
+        assert ctx.reserve_recurrent_state_dummy_slot is expected
+
+    @pytest.mark.internal
     @rounder_override(1)
     def test_hybrid_ep_dummy_requires_positive_request_capacity(self):
         with pytest.raises(ValueError, match="leaves no request capacity"):
@@ -3626,7 +3817,7 @@ class TestDynamicContext:
 
         # Ref counts on the shared full blocks should be 2.
         for bid in first_full_blocks:
-            assert ctx.kv_block_allocator.block_ref_counts[bid].item() == 2
+            assert ctx.kv_block_allocator.pc_state.block_ref_counts[bid].item() == 2
 
         # Second request should skip the 3 full cached blocks (96 tokens),
         # leaving only the trailing tokens as the query.
@@ -3726,17 +3917,17 @@ class TestDynamicContext:
 
         # Verify initial ref counts are 2.
         for bid in shared_blocks:
-            assert ctx.kv_block_allocator.block_ref_counts[bid].item() == 2
+            assert ctx.kv_block_allocator.pc_state.block_ref_counts[bid].item() == 2
 
         # Release one request. Ref counts should decrement to 1.
         ctx.release_memory_blocks_from_request_indexes(torch.tensor([0]))
         for bid in shared_blocks:
-            assert ctx.kv_block_allocator.block_ref_counts[bid].item() == 1
+            assert ctx.kv_block_allocator.pc_state.block_ref_counts[bid].item() == 1
 
         # Blocks should still be discoverable via hash map.
         for bid in shared_blocks:
-            h = ctx.kv_block_allocator.block_hashes[bid].item()
-            assert h in ctx.kv_block_allocator.kv_hash_to_block_id
+            h = ctx.kv_block_allocator.pc_state.block_hashes[bid].item()
+            assert h in ctx.kv_block_allocator.registry.kv_hash_to_block_id
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -3812,8 +4003,8 @@ class TestDynamicContext:
         assert new_block != shared_b1
 
         # Shared blocks should remain intact with ref count 2.
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b0].item() == 2
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b1].item() == 2
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[shared_b0].item() == 2
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[shared_b1].item() == 2
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -4183,7 +4374,7 @@ class TestDynamicContext:
             [block_a, block_b, block_c, block_d], dtype=torch.int32, device='cpu'
         )
         ctx.request_to_kv_block_ids[3, 0] = block_d
-        ctx.kv_block_allocator.block_ref_counts[blocks] = torch.tensor(
+        ctx.kv_block_allocator.pc_state.block_ref_counts[blocks] = torch.tensor(
             [1, 2, 2, 2], dtype=torch.int32, device='cpu'
         )
 
@@ -4235,8 +4426,8 @@ class TestDynamicContext:
         shared_b1 = ctx.request_to_kv_block_ids[0, 1].item()
 
         # Both blocks should be safely shared with ref count 2
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b0].item() == 2
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b1].item() == 2
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[shared_b0].item() == 2
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[shared_b1].item() == 2
 
         # Evicting only the right-most sharer releases no physical blocks. Both
         # requests must be selected before either shared block reaches ref-zero.
@@ -4267,8 +4458,8 @@ class TestDynamicContext:
         assert evicted_ids[0].item() == 1
 
         # req2 remains active, so the shared blocks should drop to a ref count of 1
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b0].item() == 1
-        assert ctx.kv_block_allocator.block_ref_counts[shared_b1].item() == 1
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[shared_b0].item() == 1
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[shared_b1].item() == 1
 
     @pytest.mark.internal
     @rounder_override(64)
@@ -4473,8 +4664,8 @@ class TestDynamicContext:
         assert ctx.request_kv_block_counts[1].item() == 4
 
         # Verify block references updated appropriately
-        assert ctx.kv_block_allocator.block_ref_counts[req1_blocks[2]].item() == 2
-        assert ctx.kv_block_allocator.block_ref_counts[req1_blocks[3]].item() == 2
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[req1_blocks[2]].item() == 2
+        assert ctx.kv_block_allocator.pc_state.block_ref_counts[req1_blocks[3]].item() == 2
 
     # ------------------------------------------------------------------ #
     #  Tests for active_logit_idxs / last_token_logits / pad_active_slices

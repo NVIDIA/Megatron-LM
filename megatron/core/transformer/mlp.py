@@ -171,6 +171,24 @@ class MLP(MegatronModule):
      s: sequence length
     """
 
+    @classmethod
+    def estimate_flops(
+        cls,
+        config: TransformerConfig,
+        *,
+        total_real_tokens_in_batch: float,
+        seqlen_squared_sum_in_batch: float,
+    ) -> float:
+        """Estimate forward projection FLOPs for a dense MLP."""
+        projections = 3 if config.gated_linear_unit else 2
+        return (
+            2
+            * projections
+            * total_real_tokens_in_batch
+            * config.hidden_size
+            * config.ffn_hidden_size
+        )
+
     def __init__(
         self,
         config: TransformerConfig,
@@ -486,6 +504,15 @@ def apply_swiglu_sharded_factory(
         is_dp_sharded = dp_size > 1
     else:
         is_dp_sharded = False
+
+    source_param = getattr(original_sh_ten.data, "_gtp_dequant_src", original_sh_ten.data)
+    gtp_size = getattr(source_param, "gtp_remat_size", 1)
+    if gtp_size > 1 and not is_dp_sharded:
+        from megatron.core.tensor_parallel.gtp_ckpt_util import make_gtp_swiglu_sharded_factory
+
+        return make_gtp_swiglu_sharded_factory(
+            original_sh_ten, sharded_offsets, singleton_local_shards, gtp_size
+        )
 
     @torch.no_grad()
     def sh_ten_build_fn(

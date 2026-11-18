@@ -355,6 +355,13 @@ class QuantizedDBuffer:
         for plane in self.planes_for(rowwise=True, columnwise=not rowwise_only):
             plane.release_storage()
 
+    def can_redistribute_locally(self, placements: Iterable[Placement]) -> bool:
+        """Whether every plane can preserve its values through a local view.
+
+        All planes use the same mesh partition, so the rowwise-data check suffices.
+        """
+        return self.rowwise_data.can_redistribute_locally(placements)
+
     def view(self, placements: Iterable[Placement]) -> "QuantizedDBuffer":
         """Return a storage-sharing view of every physical plane."""
         placements = tuple(placements)
@@ -365,6 +372,12 @@ class QuantizedDBuffer:
             self.columnwise_data.view(placements),
             self.rowwise_scale.view(placements),
             self.columnwise_scale.view(_block_atomic_to_flat(placements)),
+        )
+
+    def is_alias_of(self, other: "QuantizedDBuffer") -> bool:
+        """Whether every corresponding plane shares backing storage."""
+        return all(
+            plane.is_alias_of(other_plane) for plane, other_plane in zip(self.planes, other.planes)
         )
 
     def redistribute(

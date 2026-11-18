@@ -168,7 +168,7 @@ class TestWideResidualMTPAndMIMO:
         assert isinstance(mtp_stack.layers[1], TransformerLayer)
         assert not isinstance(mtp_stack.layers[1], WideResidualTransformerLayer)
         for operation in ("read", "write"):
-            assert mtp_stack.layers[1]._get_mlp_residual_connection(operation=operation) is None
+            assert mtp_stack.layers[1]._get_residual_connection_for_mlp(operation=operation) is None
         assert model.mtp.layers[0].eh_proj.weight.grad is not None
         assert model.embedding.word_embeddings.weight.grad is not None
         assert loss.shape == input_ids.shape
