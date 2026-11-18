@@ -55,6 +55,7 @@ jobs:
     outputs:
       is_external_contributor: ${{ github.event.pull_request.user.type == 'User' }}
       is_maintainer: ${{ steps.check-membership.outputs.is_maintainer }}
+      skip_builds_and_tests: ${{ steps.pr-ci-scope.outputs.skip_builds_and_tests || 'false' }}
       selected_runner: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-gpu-x8' || needs.ephemeral-runner-routing.outputs.runner_label_base }}
       selected_runner_gb200: ${{ steps.check-membership.outputs.is_maintainer == 'true' && 'nvidia-ci-aws-use2-gpu-x4' || 'ubuntu-latest' }}
     permissions:
@@ -179,17 +180,18 @@ jobs:
             echo "is_maintainer=false" | tee -a $GITHUB_OUTPUT
           fi
 
-  pr-ci-scope:
-    if: github.repository == 'NVIDIA/Megatron-LM'
-    permissions:
-      contents: read
-      pull-requests: read
-    uses: ./.github/workflows/_pr-ci-scope.yml
+      - name: Determine PR CI scope
+        id: pr-ci-scope
+        if: steps.get-pr-info.outcome == 'success' && fromJSON(steps.get-pr-info.outputs.pr-info || '{}').head.sha == github.sha
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          TARGET_SHA: ${{ fromJSON(steps.get-pr-info.outputs.pr-info || '{}').base.sha }}
+        run: bash .github/scripts/report_pr_ci_scope.sh "$TARGET_SHA"
 
   # Skipping preflight also suppresses its downstream test overrides on exempt PRs.
   pre-flight:
-    needs: [is-not-external-contributor, pr-ci-scope]
-    if: github.repository == 'NVIDIA/Megatron-LM' && needs.pr-ci-scope.outputs.skip_builds_and_tests != 'true'
+    needs: [is-not-external-contributor]
+    if: github.repository == 'NVIDIA/Megatron-LM' && needs.is-not-external-contributor.outputs.skip_builds_and_tests != 'true'
     uses: NVIDIA-NeMo/FW-CI-templates/.github/workflows/_cicd_preflight.yml@037094bcc9138c72bc125418e6e3653f9e1c4160 # v1.11.0
     with:
       workflow_ref: 037094bcc9138c72bc125418e6e3653f9e1c4160 # pragma: allowlist secret
@@ -1416,8 +1418,9 @@ jobs:
           sha: ${{ needs.configure.outputs.sha }}
 
   Nemo_CICD_Test:
+    outputs:
+      skip_builds_and_tests: ${{ steps.result.outputs.skip_builds_and_tests }}
     needs:
-      - pr-ci-scope
       - pre-flight
       - configure
       - is-not-external-contributor
@@ -1448,7 +1451,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_RUN_ID: ${{ github.run_id }}
-          SKIP_BUILDS_AND_TESTS: ${{ needs.pr-ci-scope.outputs.skip_builds_and_tests == 'true' && needs.is-not-external-contributor.result == 'success' }}
+          SKIP_BUILDS_AND_TESTS: ${{ needs.is-not-external-contributor.outputs.skip_builds_and_tests == 'true' && needs.is-not-external-contributor.result == 'success' }}
           DOCS_ONLY: ${{ needs.pre-flight.outputs.docs_only }}
           IS_DEPLOYMENT: ${{ needs.pre-flight.outputs.is_deployment_workflow }}
           IS_MAINTAINER: ${{ needs.is-not-external-contributor.outputs.is_maintainer }}
@@ -1463,6 +1466,7 @@ jobs:
           GB200_RESULT: ${{ needs.cicd-integration-tests-latest-gb200.result }}
         run: |
           if [ "$SKIP_BUILDS_AND_TESTS" == "true" ]; then
+            echo "skip_builds_and_tests=true" >> "$GITHUB_OUTPUT"
             echo "All changed paths match the PR CI skip list. Build and test jobs skipped."
             exit 0
           fi
@@ -1552,10 +1556,10 @@ jobs:
 
   Coverage_Fake:
     runs-on: ubuntu-latest
-    needs: [Nemo_CICD_Test, pre-flight, pr-ci-scope]
+    needs: [Nemo_CICD_Test, pre-flight]
     if: |
       (
-        (needs.pr-ci-scope.outputs.skip_builds_and_tests == 'true' && needs.Nemo_CICD_Test.result == 'success')
+        (needs.Nemo_CICD_Test.outputs.skip_builds_and_tests == 'true' && needs.Nemo_CICD_Test.result == 'success')
         || ((needs.pre-flight.outputs.docs_only == 'true' || needs.pre-flight.outputs.is_deployment_workflow == 'true')
             && needs.pre-flight.outputs.is_ci_workload == 'false')
       )
@@ -1586,11 +1590,11 @@ jobs:
 
   Coverage:
     runs-on: ubuntu-latest
-    needs: [Nemo_CICD_Test, pre-flight, pr-ci-scope, configure, cicd-parse-unit-tests, cicd-parse-unit-tests-gb200]
+    needs: [Nemo_CICD_Test, pre-flight, configure, cicd-parse-unit-tests, cicd-parse-unit-tests-gb200]
     if: |
       !cancelled()
       && needs.Nemo_CICD_Test.result == 'success'
-      && needs.pr-ci-scope.outputs.skip_builds_and_tests != 'true'
+      && needs.Nemo_CICD_Test.outputs.skip_builds_and_tests != 'true'
       && needs.pre-flight.outputs.docs_only != 'true'
       && needs.pre-flight.outputs.is_deployment_workflow != 'true'
       && github.repository == 'NVIDIA/Megatron-LM'
