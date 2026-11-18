@@ -451,13 +451,17 @@ class ModelParallelConfig:
     exposed (not overlapped with other computation).
     """
 
-    ep_overlap_pp_bwd_wait_on_comm_stream: bool = False
+    ep_overlap_pp_bwd_recv_wait_on_comm_stream: bool = False
     """With EP overlap and pipeline parallelism, wait for the backward pipeline receive on the
     communication stream instead of the computation stream.
     The received output gradient only gates the backward chunk, whose first layer op (combine
     backward) runs on the communication stream. Waiting for it on the computation stream also
-    holds back the forward layer that is paired with that backward layer, so a late receive
-    from the next pipeline stage stalls both. With this flag only the backward chunk waits.
+    holds back the computation of the paired forward layer, so a late receive from the next
+    pipeline stage stalls both. With this flag the paired forward layer's pre-dispatch
+    computation (attention and routing) no longer waits for the receive. Work queued on the
+    communication stream after the receive wait still waits for it, including the paired
+    forward dispatch, which is queued after combine backward. Only where the receive is
+    waited for changes, so results are bitwise identical with and without the flag.
     """
 
     ###################
