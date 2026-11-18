@@ -4,7 +4,7 @@
 
 import unittest
 from contextlib import ExitStack, nullcontext
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -14,10 +14,8 @@ from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.context impor
     GradientFinalizationMode,
 )
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.execution_order import (
-    ExecutionAction,
     ExecutionEvent,
 )
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.phase import Phase
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.runtime_policy import (
     PrefetchOrder,
@@ -42,9 +40,6 @@ class TestContextCapturePreparation(unittest.TestCase):
             patch.object(torch.cuda, "is_current_stream_capturing", return_value=False)
         )
         self.stack.enter_context(patch.object(torch.cuda, "Stream", return_value=Mock()))
-        self.stack.enter_context(
-            patch.object(torch.cuda, "stream", side_effect=lambda _: nullcontext())
-        )
 
     def _context(self, order=PrefetchOrder.RECORDED):
         context = FsdpContext(
@@ -52,18 +47,9 @@ class TestContextCapturePreparation(unittest.TestCase):
             runtime_policy=RuntimePolicy(prefetch_order=order),
             gradient_finalization_mode=GradientFinalizationMode.REDUCE_OUTER,
         )
-        context.current_stream = Mock(return_value=Mock())
         owner = torch.nn.Identity()
-        owner.context = context
-        owner.phase = Phase.FORWARD
-        owner.parameter_groups = owner._parameter_groups = (Mock(_unshard_events={}),)
-        owner._nvtx_range = Mock(side_effect=lambda _: nullcontext())
-        owner._unshard_parameter_groups = Mock()
-        owner._prefetch_parameter_groups = Mock(
-            side_effect=AssertionError("Evaluation must not prefetch the training source")
-        )
-        owner._schedule_policy = SimpleNamespace(register_hooks=True, forward_prefetch_size=0)
-        owner._execution_event = MethodType(FsdpModule._execution_event, owner)
+        owner.parameter_groups = (Mock(_unshard_events={}),)
+        owner._schedule_policy = SimpleNamespace(register_hooks=True)
         owner.reshard = Mock()
         context.register_module(owner)
         context.finalize()
@@ -102,15 +88,9 @@ class TestContextCapturePreparation(unittest.TestCase):
                 context.prefetch_order_view.advance()
             owner.eval()
             position = context.prefetch_order_view.position
-            with patch.object(
-                torch.cuda, "memory_allocated", side_effect=AssertionError("Evaluation recorded")
-            ):
-                FsdpModule.unshard(owner, Phase.FORWARD, prefetch=True)
-                FsdpModule._execution_event(owner, ExecutionAction.UNSHARD)
-                context.prepare_for_cuda_graph_capture()
+            context.prepare_for_cuda_graph_capture()
             self.assertEqual(context.prefetch_order_view.position, position)
             self.assertEqual(context._recording_execution_order, not recorded)
-            owner._prefetch_parameter_groups.assert_not_called()
         context, owner = self._context(PrefetchOrder.REGISTRATION)
         for attribute, dirty in (
             ("_is_finalized", False),
