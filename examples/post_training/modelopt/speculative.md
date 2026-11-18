@@ -46,6 +46,32 @@ See ModelOpt's example (https://github.com/NVIDIA/Model-Optimizer/tree/main/spec
 for more details. The final output is stored as `jsonlines` in an OpenAI chat completion format.
 
 
+### Stream Teacher Features to EAGLE3 (experimental)
+
+Use a [ModelOpt vLLM hidden-state server](https://github.com/NVIDIA/Model-Optimizer/tree/main/examples/speculative_decoding#training-draft-model-with-streaming-base-model)
+and a checkpoint prepared using `convert_speculative.py --algorithm eagle3 --export-offline-model`.
+Use the same target weights and tokenizer for serving and checkpoint conversion. For each zero-based
+auxiliary layer in the EAGLE checkpoint, capture its ID plus one in the server, in ascending order.
+Use auxiliary layers below the target's final layer and append the target layer count to capture its
+pre-normalization residual for the teacher output head. Use BF16 on both sides. The server must allow
+one generation token beyond the trainer's sequence length, and the capture slot must hold the prompt.
+
+```sh
+torchrun --nproc-per-node=1 examples/post_training/modelopt/finetune.py \
+    --bf16 --export-offline-model --load "$OFFLINE_EAGLE_CKPT" \
+    --eagle-streaming-server-urls http://localhost:8765 \
+    --eagle-streaming-model "$SERVED_MODEL_ID" \
+    --eagle-streaming-train-data "$TRAIN_JSONL" \
+    --eval-iters 0 ${MLM_EXTRA_ARGS}
+```
+
+Use a ModelOpt build that provides `MegatronEagleVllmStreamingDataset` and install NIXL in the
+trainer environment. Use micro-batch size 1, CP=PP=1, and one conversation per sample. Each JSONL
+row needs `conversation_id` or `uuid` and `messages` or `conversations` in the ModelOpt streaming
+format. Optional validation and test corpora use `--eagle-streaming-valid-data` and
+`--eagle-streaming-test-data`. To supervise only assistant tokens, use
+`--eagle-streaming-answer-only-loss` with a compatible chat template.
+
 ### Quantization-Aware Training (QAT)
 
 For quantize-aware training (QAT), the process is `bf16 training`, `fake quantization`, `qat`.
