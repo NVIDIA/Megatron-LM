@@ -121,15 +121,15 @@ class MuonExcludedMatrixModel(nn.Module):
 
 
 class ExpertOnlyModel(nn.Module):
-    """Model whose parameters are all expert-parallel (``allreduce=False``).
-
-    It has no dense parameter, so no dp_cp rank owns one, rank 0 included.
-    """
+    """Model whose parameters are all expert-parallel."""
 
     def __init__(self):
         super().__init__()
         self.experts = nn.ModuleList([nn.Linear(10, 8), nn.Linear(8, 5)])
         for param in self.parameters():
+            # ``allreduce = False`` marks a parameter as expert-parallel: the optimizer puts it
+            # in the expert list instead of the dense one. With every parameter marked, the
+            # model has no dense parameter, so no dp_cp rank owns one, rank 0 included.
             param.allreduce = False
 
     def forward(self, x):
