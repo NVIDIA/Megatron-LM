@@ -316,6 +316,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
         logical_window_width: int,
         kv_reconstruction_parts: Tuple[Tensor, Tensor, Tensor] | None,
         out_rope: Optional[OutputRopeParams] = None,
+        compact_indexer_predict: Tensor | None = None,
     ) -> Tuple[Tensor, Tensor]:
         """Run packed attention with positive indexer loss and deferred CP reductions."""
         if loss_coeff <= 0:
@@ -370,9 +371,21 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             q_bshd, k_bsd, w_bsh, topk_bst = _thd_to_fake_bshd(
                 q_indexer, k_indexer, weights_scaled, indexer_topk_idxs_for_loss
             )
-            predict = _DSA.sparse_indexer_score_recompute_wrapper(
-                q_bshd, k_bsd, w_bsh, topk_bst, qhead_per_kv_head=idx_nh, topk_indices_global=True
-            )["predict"].squeeze(0)
+            if compact_indexer_predict is not None:
+                if compact_indexer_predict.shape != indexer_topk_idxs_for_loss.shape:
+                    raise ValueError("Compact indexer softmax must match the selected key slots")
+                predict = compact_indexer_predict
+                if q_padding_mask is not None:
+                    predict = predict.masked_fill(q_padding_mask.unsqueeze(-1), 0)
+            else:
+                predict = _DSA.sparse_indexer_score_recompute_wrapper(
+                    q_bshd,
+                    k_bsd,
+                    w_bsh,
+                    topk_bst,
+                    qhead_per_kv_head=idx_nh,
+                    topk_indices_global=True,
+                )["predict"].squeeze(0)
             target = _compute_attn_target(
                 query.detach(),
                 compressed_kv.detach(),
@@ -690,6 +703,7 @@ class FusedCSAIndexerSparseAttnFromTopkFunc(torch.autograd.Function):
             None,
             grad_local_k_indexer,
             grad_local_compressed_kv,
+            None,
             None,
             None,
             None,

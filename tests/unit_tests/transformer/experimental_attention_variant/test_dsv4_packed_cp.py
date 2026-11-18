@@ -231,7 +231,7 @@ def _compare_results(actual, expected, label, failures, rows=None):
     ],
 )
 def test_packed_cp_matches_full_attention_and_gradients(
-    cp_size, ratio, sparse, coeff, recompute, rope_fusion
+    cp_size, ratio, sparse, coeff, recompute, rope_fusion, indexer_precision="bf16"
 ):
     if Utils.world_size < cp_size:
         pytest.skip(f"requires {cp_size} ranks")
@@ -266,6 +266,7 @@ def test_packed_cp_matches_full_attention_and_gradients(
             dsa_indexer_head_dim=128,
             dsa_indexer_topk=512,
             dsa_indexer_loss_coeff=coeff,
+            dsa_indexer_precision=indexer_precision,
             dsa_indexer_use_sparse_loss=sparse,
             dsa_kernel_backend="cudnn",
             context_parallel_size=cp_size,
@@ -308,7 +309,7 @@ def test_packed_cp_matches_full_attention_and_gradients(
                     assert torch.count_nonzero(value) == 0, name
 
         # Check the preceding stages once per configuration, not again for CP4.
-        if cp_size == 2:
+        if cp_size == 2 and indexer_precision == "bf16":
             state = model.state_dict()
 
             def run_control(config, *, packed_params=packed, documents=None):
@@ -392,3 +393,17 @@ def test_packed_output_rope_backward_contract(monkeypatch, rotate):
     torch.testing.assert_close(query.grad, expected * 2)
     torch.testing.assert_close(output, saved)
     assert torch.equal(upstream, torch.ones_like(upstream))
+
+
+@pytest.mark.launch_on_gb200
+def test_packed_cp_mxfp8_indexer_attention_and_gradients():
+    """Compact Top-K and its sparse-loss prediction must preserve CP2/CP1 gradients."""
+    test_packed_cp_matches_full_attention_and_gradients(
+        cp_size=2,
+        ratio=4,
+        sparse=True,
+        coeff=0.2,
+        recompute=True,
+        rope_fusion=True,
+        indexer_precision="mxfp8",
+    )

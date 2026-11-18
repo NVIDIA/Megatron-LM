@@ -961,6 +961,7 @@ def indexer_topk(
     ratio: int = 4,
     indexer_softmax_scale: float = 1.0,
     deterministic: bool = False,
+    compact_indexer=None,
 ) -> Tuple[Tensor, Tensor]:
     """Score + top-K selection for inference (no KL loss, no backward).
 
@@ -989,9 +990,12 @@ def indexer_topk(
     q_bshd, k_bsd, _w_bsh_raw, w_bsh_scaled = _sbhd_to_bshd_indexer_inputs(
         q_indexer, k_indexer, weights, indexer_softmax_scale
     )
-    topk_indices, topk_length, _ = _indexer_topk_bshd(
-        q_bshd, k_bsd, w_bsh_scaled, topk, ratio, deterministic=deterministic
-    )
+    if compact_indexer is not None:
+        topk_indices, topk_length, _, _ = compact_indexer(q_bshd, k_bsd, w_bsh_scaled, topk, ratio)
+    else:
+        topk_indices, topk_length, _ = _indexer_topk_bshd(
+            q_bshd, k_bsd, w_bsh_scaled, topk, ratio, deterministic=deterministic
+        )
     return topk_indices, topk_length
 
 
@@ -1252,6 +1256,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         calculate_per_token_loss: bool,
         deterministic: bool,
         out_rope: Optional[OutputRopeParams] = None,
+        compact_indexer=None,
     ) -> Tuple[Tensor, Tensor]:
         """Fused forward: indexer scoring, sparse attention, KL loss, and indexer backward."""
         _ensure_dsa_namespace()
@@ -1270,9 +1275,25 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
         )
 
         # ---- 2. Indexer scoring + top-K (with scores retained). -------------
-        topk_indices_cmp, _, indexer_scores = _indexer_topk_bshd(
-            q_idx_bshd, k_idx_bsd, w_bsh_scaled, indexer_topk, ratio, deterministic=deterministic
-        )
+        compact_predict = None
+        if compact_indexer is not None:
+            topk_indices_cmp, _, indexer_scores, compact_predict = compact_indexer(
+                q_idx_bshd,
+                k_idx_bsd,
+                w_bsh_scaled,
+                indexer_topk,
+                ratio,
+                return_softmax=loss_coeff > 0 and sparse_loss,
+            )
+        else:
+            topk_indices_cmp, _, indexer_scores = _indexer_topk_bshd(
+                q_idx_bshd,
+                k_idx_bsd,
+                w_bsh_scaled,
+                indexer_topk,
+                ratio,
+                deterministic=deterministic,
+            )
 
         # ---- 3. Combine indices (indexer first, then window). --------------
         compress_topk_idxs = torch.where(topk_indices_cmp >= 0, topk_indices_cmp + kv_offset, -1)
@@ -1320,13 +1341,16 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             )
 
             if sparse_loss:
-                # Derive predict: gather topk scores from indexer_scores → softmax.
-                safe_indices = topk_indices_cmp.clamp(min=0).long()
-                gathered_scores = torch.gather(indexer_scores, dim=2, index=safe_indices)
-                gathered_scores = torch.where(
-                    topk_indices_cmp >= 0, gathered_scores, torch.finfo(torch.float32).min
-                )
-                predict = torch.softmax(gathered_scores, dim=-1)  # (b, sq, topk) fp32
+                if compact_predict is not None:
+                    predict = compact_predict
+                else:
+                    # Derive predict: gather topk scores from indexer_scores → softmax.
+                    safe_indices = topk_indices_cmp.clamp(min=0).long()
+                    gathered_scores = torch.gather(indexer_scores, dim=2, index=safe_indices)
+                    gathered_scores = torch.where(
+                        topk_indices_cmp >= 0, gathered_scores, torch.finfo(torch.float32).min
+                    )
+                    predict = torch.softmax(gathered_scores, dim=-1)  # (b, sq, topk) fp32
 
                 target = _compute_attn_target(
                     q_attn_bshd,
@@ -1342,8 +1366,18 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
                 )
             else:
                 # Dense: use full indexer_scores directly + logsumexp.
-                index_score = indexer_scores  # (b, sq, n_comp) fp32
-                index_lse = torch.logsumexp(indexer_scores, dim=-1)  # (b, sq) fp32
+                if indexer_scores is None:
+                    index_score, index_lse = _compute_dense_indexer_score(
+                        q_idx_bshd,
+                        k_idx_bsd.unsqueeze(2),
+                        w_bsh,
+                        q_idx_bshd.shape[2],
+                        indexer_softmax_scale,
+                        ratio,
+                    )
+                else:
+                    index_score = indexer_scores  # (b, sq, n_comp) fp32
+                    index_lse = torch.logsumexp(indexer_scores, dim=-1)  # (b, sq) fp32
 
                 dense_teacher_lse = _compute_full_csa_teacher_lse(
                     q_attn_bshd,
@@ -1536,6 +1570,7 @@ class FusedCSAIndexerSparseAttnFunc(torch.autograd.Function):
             None,
             None,
             None,
+            None,
         )[: ctx.num_forward_inputs]
 
 
@@ -1557,6 +1592,7 @@ def fused_csa_indexer_sparse_attn(
     calculate_per_token_loss: bool = False,
     deterministic: bool = False,
     out_rope: Optional[OutputRopeParams] = None,
+    compact_indexer=None,
 ) -> Tuple[Tensor, Tensor]:
     """Path B (training): fused indexer (+KL loss) + sparse attention.
 
@@ -1615,6 +1651,7 @@ def fused_csa_indexer_sparse_attn(
         calculate_per_token_loss,
         deterministic,
         out_rope,
+        compact_indexer,
     )
 
 

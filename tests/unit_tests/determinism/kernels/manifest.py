@@ -109,6 +109,17 @@ R = "tests/unit_tests/context_parallel/runtime/"
 
 KERNELS: Tuple[KernelEntry, ...] = (
     KernelEntry(
+        name="csa_compact_mxfp8_indexer",
+        sources=(
+            "megatron/core/ops/attention/csa/indexer_quantization.py",
+            "megatron/core/ops/attention/csa/compact_indexer.py",
+        ),
+        tests=(K + "test_csa_compact_indexer.py",),
+        kind="triton",
+        notes="TE MXFP8 data, E8M0 packing and compact cuDNN Top-K replay with canonical "
+        "slot order; packed CP offsets, dynamic graph metadata and shared scratch lifetime.",
+    ),
+    KernelEntry(
         name="mtp_kl_loss",
         sources=("megatron/core/ops/mtp_kl_loss.py",),
         tests=(K + "test_mtp_kl_loss.py",),
@@ -1047,6 +1058,7 @@ KERNELS: Tuple[KernelEntry, ...] = (
             "megatron/core/transformer/experimental_attention_variant/csa_utils/fused_sparse_attention.py",
         ),
         tests=(
+            K + "test_csa_compact_indexer.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_csa_deterministic_indexer.py",
             "tests/unit_tests/transformer/experimental_attention_variant/test_csa_fused_sparse_attention.py",
         ),

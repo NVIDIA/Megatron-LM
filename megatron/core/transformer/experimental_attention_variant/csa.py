@@ -11,6 +11,7 @@ import torch.nn as nn
 from megatron.core.fp8_utils import get_fp8_disabled_context
 from megatron.core.fusions.fused_mla_yarn_rope_apply import fused_mla_rope_inplace
 from megatron.core.models.common.embeddings import RotaryEmbedding, apply_rotary_pos_emb
+from megatron.core.ops.attention.csa.backends import select_compact_indexer
 from megatron.core.ops.attention.csa.output_rope import OutputRopeParams
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
@@ -45,6 +46,7 @@ from .csa_utils.packed_sparse_attention import (
     defer_reduce_scatter_wait,
     get_flash_mla_topk_alignment,
 )
+from .dsv4_layer_config import get_compact_indexer_workspace_registry
 
 #: Bit-exact determinism status for the eager CSA operations introduced here.
 #: The operations use CUDA reductions and indexed accumulation, but bit-exact
@@ -1025,6 +1027,20 @@ class CompressedSparseAttention(MegatronModule):
         self.softmax_scale = softmax_scale
         self.use_fused_kernels = use_fused_dsa_kernels(config)
 
+        self.compact_indexer = None
+        if compress_ratio == 4 and not config.csa_dense_mode and submodules.indexer is not None:
+            workspaces = (
+                get_compact_indexer_workspace_registry(config)
+                if config.dsa_compact_indexer_workspace_sharing
+                else {}
+            )
+            self.compact_indexer = select_compact_indexer(
+                config.dsa_indexer_precision,
+                workspaces=workspaces,
+                cuda_graphs=config.cuda_graph_impl != "none",
+                deterministic=config.deterministic_mode,
+            )
+
         # Learnable attention sink per head, kept in reference-checkpoint FP32.
         self.attn_sink = mark_keep_in_fp32(
             nn.Parameter(torch.zeros(self.num_attention_heads, dtype=torch.float32))
@@ -1127,6 +1143,7 @@ class CompressedSparseAttention(MegatronModule):
                 calculate_per_token_loss=self.config.calculate_per_token_loss,
                 deterministic=self.config.deterministic_mode,
                 out_rope=out_rope,
+                compact_indexer=self.compact_indexer,
             )
             nvtx_range_pop("sparse_attn_kernel")
 
@@ -1149,6 +1166,7 @@ class CompressedSparseAttention(MegatronModule):
                 self.compress_ratio,
                 indexer_softmax_scale=self.indexer.softmax_scale,
                 deterministic=self.config.deterministic_mode,
+                compact_indexer=self.compact_indexer,
             )
             compressed_indices = torch.where(
                 compressed_indices >= 0, compressed_indices + compressed_offset, -1
@@ -1459,6 +1477,7 @@ class CompressedSparseAttention(MegatronModule):
             and "mla_up_proj" in (self.config.recompute_modules or [])
         )
         sparse_indexer_loss = self.config.dsa_indexer_use_sparse_loss
+        compact_indexer_predict = None
         local_k_indexer_grad_edge = None
         indexer_k_rs_state = None
         local_compressed_kv_grad_edge = None
@@ -1587,18 +1606,41 @@ class CompressedSparseAttention(MegatronModule):
                 k_indexer_seq_major = torch.index_select(
                     k_indexer_rank_major, 0, seq_to_rank_row.clamp_min(0)
                 )
-                compressed_topk, indexer_layout = cp_utils.compute_cp_indexer_topk(
-                    q_indexer_cp,
-                    weights_indexer_cp,
-                    k_indexer_seq_major,
-                    cu_seqlens,
-                    cu_seqlens_compressed,
-                    global_start,
-                    ratio,
-                    indexer.index_topk,
-                    indexer.softmax_scale,
-                    max_seqlen_q=max_seqlen_q,
-                )
+                if self.compact_indexer is not None:
+                    indexer_layout = cp_utils.build_cp_indexer_layout(
+                        cu_seqlens,
+                        cu_seqlens_compressed,
+                        global_start,
+                        l_local,
+                        k_indexer_seq_major.shape[0],
+                    )
+                    compressed_topk, _, compact_indexer_predict = self.compact_indexer.packed(
+                        q_indexer_cp,
+                        k_indexer_seq_major,
+                        weights_indexer_cp,
+                        indexer.index_topk,
+                        ratio,
+                        cu_seqlens_compressed=cu_seqlens_compressed,
+                        indexer_layout=indexer_layout,
+                        max_seqlen_q=max_seqlen_q,
+                        indexer_softmax_scale=indexer.softmax_scale,
+                        return_softmax=(
+                            training_with_grad and sparse_indexer_loss and indexer_loss_coeff > 0
+                        ),
+                    )
+                else:
+                    compressed_topk, indexer_layout = cp_utils.compute_cp_indexer_topk(
+                        q_indexer_cp,
+                        weights_indexer_cp,
+                        k_indexer_seq_major,
+                        cu_seqlens,
+                        cu_seqlens_compressed,
+                        global_start,
+                        ratio,
+                        indexer.index_topk,
+                        indexer.softmax_scale,
+                        max_seqlen_q=max_seqlen_q,
+                    )
                 nvtx_range_pop("dsv4_cp_indexer_topk")
 
                 nvtx_range_push("dsv4_cp_attention_kv_all_gather_wait")
@@ -1707,6 +1749,7 @@ class CompressedSparseAttention(MegatronModule):
                 self.window_size,
                 kv_reconstruction_parts,
                 out_rope,
+                compact_indexer_predict,
             )
             DSAIndexerLossLoggingHelper.save_loss_to_tracker(
                 loss=indexer_loss,

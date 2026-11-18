@@ -407,6 +407,16 @@ class TransformerConfig(ModelParallelConfig):
     frozen and excluded from gradient/optimizer bookkeeping.
     """
 
+    dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
+    """CSA indexer scoring precision; MXFP8 uses compact cuDNN forward + Top-K.
+    Projection parameters and indexer backward remain BF16, independent of model FP8.
+    """
+
+    dsa_compact_indexer_workspace_sharing: bool = True
+    """Share compact indexer capture scratch across serial layers of the same model.
+    Results are allocated per dispatch; autograd never saves this shared scratch.
+    """
+
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
     top-k indices."""
@@ -2188,6 +2198,13 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_loss_coeff=0 or dsa_indexer_kpool=1."
                 )
         elif self.experimental_attention_variant == "dsv4_hybrid":
+            if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
+                raise ValueError("dsa_indexer_precision must be 'bf16' or 'mxfp8'")
+            if self.dsa_indexer_precision == "mxfp8":
+                if self.dsa_kernel_backend != "cudnn":
+                    raise ValueError("MXFP8 CSA indexer requires dsa_kernel_backend='cudnn'")
+                if self.dsa_indexer_n_heads != 64 or self.dsa_indexer_head_dim != 128:
+                    raise ValueError("MXFP8 CSA indexer requires 64 indexer heads and head_dim=128")
             assert self.multi_latent_attention, "DSv4 Hybrid requires multi_latent_attention."
             assert self.csa_compress_ratios is not None, "csa_compress_ratios must be set"
             mtp_layers = self.mtp_num_layers or 0
