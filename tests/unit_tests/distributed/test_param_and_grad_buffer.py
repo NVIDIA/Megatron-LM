@@ -989,6 +989,83 @@ def test_optimizer_shards_cover_every_param(num_distributed_optimizer_instances:
     Utils.destroy_model_parallel()
 
 
+@pytest.mark.parametrize("bucket_size", [None, 9000])
+@pytest.mark.parametrize("num_distributed_optimizer_instances", [1, 2])
+def test_grad_shard_range_matches_optimizer(
+    bucket_size: Optional[int], num_distributed_optimizer_instances: int
+):
+    """``get_grad_shard_range`` is the part of each param that the distributed optimizer of this
+    rank owns, and the union over the buffer's data-parallel group is the whole param."""
+    Utils.initialize_model_parallel(
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances
+    )
+
+    _, param_and_grad_buffer, _ = get_model_and_buffers(
+        input_dim=100,
+        output_dim=100,
+        num_layers=3,
+        bias=True,
+        shared_embedding=False,
+        bucket_size=bucket_size,
+        use_distributed_optimizer=True,
+        overlap_grad_reduce=False,
+        average_in_collective=False,
+        num_distributed_optimizer_instances=num_distributed_optimizer_instances,
+    )
+
+    owned = {}
+    for bucket_index in range(len(param_and_grad_buffer.buckets)):
+        param_map = DistributedOptimizer._build_model_gbuf_range(
+            param_and_grad_buffer, bucket_index
+        )["param_map"]
+        for param, param_ranges in param_map.items():
+            owned[param] = (param_ranges["param"].start, param_ranges["param"].end)
+
+    group = param_and_grad_buffer.data_parallel_group
+    for param in param_and_grad_buffer.params:
+        assert param_and_grad_buffer.get_grad_shard_range(param) == owned.get(param, (0, 0))
+        assert param_and_grad_buffer.get_grad_shard_range_union(param, param.main_grad, group) == (
+            0,
+            param.numel(),
+        )
+        # The union is cached: a second call needs no collective.
+        with mock.patch.object(torch.distributed, "all_gather") as all_gather:
+            assert param_and_grad_buffer.get_grad_shard_range_union(
+                param, param.main_grad, group
+            ) == (0, param.numel())
+            all_gather.assert_not_called()
+
+    # A param that is not in the buffer has no shard range.
+    assert param_and_grad_buffer.get_grad_shard_range(torch.nn.Parameter(torch.zeros(4))) is None
+
+    Utils.destroy_model_parallel()
+
+
+def test_grad_shard_range_without_distributed_optimizer():
+    """Without a distributed optimizer the buffer is not sharded, so there is no shard range."""
+    Utils.initialize_model_parallel()
+
+    _, param_and_grad_buffer, _ = get_model_and_buffers(
+        input_dim=100,
+        output_dim=100,
+        num_layers=2,
+        bias=True,
+        shared_embedding=False,
+        bucket_size=None,
+        use_distributed_optimizer=False,
+        overlap_grad_reduce=False,
+        average_in_collective=False,
+    )
+    group = param_and_grad_buffer.data_parallel_group
+    for param in param_and_grad_buffer.params:
+        assert param_and_grad_buffer.get_grad_shard_range(param) is None
+        assert (
+            param_and_grad_buffer.get_grad_shard_range_union(param, param.main_grad, group) is None
+        )
+
+    Utils.destroy_model_parallel()
+
+
 @pytest.mark.parametrize("use_distributed_optimizer", [False, True])
 def test_expert_parallel_params_get_separate_buffers(use_distributed_optimizer: bool):
     """Verify that expert-parallel params (allreduce=False) land in separate buffers

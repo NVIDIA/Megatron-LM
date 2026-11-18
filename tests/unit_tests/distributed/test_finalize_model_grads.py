@@ -8,10 +8,11 @@ import torch
 import torch.distributed as dist
 
 from megatron.core import parallel_state
-from megatron.core.distributed import DistributedDataParallelConfig
+from megatron.core.distributed import DistributedDataParallel, DistributedDataParallelConfig
 from megatron.core.distributed.finalize_model_grads import (
     _allreduce_non_tensor_model_parallel_grads,
     _allreduce_word_embedding_grads,
+    _grad_buffer_of_param,
     _update_router_expert_bias,
     _update_router_qb_beta,
     finalize_model_grads,
@@ -321,6 +322,162 @@ class TestAllReduceLNGrads:
         embd_group = parallel_state.get_embedding_group()
 
         _allreduce_word_embedding_grads([self.model], self.transformer_config, embd_group, pp_group)
+
+
+class TestShardedEmbeddingGradAllReduce:
+    """``shard_embedding_grad_allreduce`` gives the distributed optimizer the same embedding
+    gradient as reducing the whole tied-embedding gradient across pipeline stages."""
+
+    pp_size = 2
+    vocab_size = 1000
+
+    def setup_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _build(self, *, shard, use_distributed_optimizer, bucket_size):
+        config = TransformerConfig(
+            num_layers=2,
+            hidden_size=16,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            pipeline_model_parallel_size=self.pp_size,
+            pipeline_dtype=torch.float32,
+        )
+        module = GPTModel(
+            config=config,
+            transformer_layer_spec=get_gpt_layer_with_transformer_engine_spec(),
+            vocab_size=self.vocab_size,
+            max_sequence_length=4,
+            pre_process=parallel_state.is_pipeline_first_stage(),
+            post_process=parallel_state.is_pipeline_last_stage(),
+            share_embeddings_and_output_weights=True,
+        ).cuda()
+        ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=use_distributed_optimizer,
+            bucket_size=bucket_size,
+            shard_embedding_grad_allreduce=shard,
+        )
+        model = DistributedDataParallel(config, ddp_config=ddp_config, module=module)
+        # Rank- and parameter-dependent gradients, identical for every model built here.
+        generator = torch.Generator(device="cuda").manual_seed(1234 + dist.get_rank())
+        for param in model.module.parameters():
+            param.main_grad.copy_(
+                torch.randn(param.shape, generator=generator, device="cuda", dtype=torch.float32)
+            )
+        return config, model
+
+    def _reduce(self, config, model, force_all_reduce=False):
+        model.finish_grad_sync(force_all_reduce=force_all_reduce)
+        _allreduce_word_embedding_grads(
+            [model],
+            config,
+            parallel_state.get_embedding_group(),
+            parallel_state.get_pipeline_model_parallel_group(),
+            force_all_reduce=force_all_reduce,
+        )
+        return model.module.shared_embedding_or_output_weight()
+
+    def _skip_unless_dp(self):
+        if Utils.world_size < 2 * self.pp_size or Utils.world_size % self.pp_size != 0:
+            pytest.skip(f"needs data parallelism with PP={self.pp_size}")
+
+    @pytest.mark.parametrize("bucket_size", [None, 4000])
+    def test_shards_match_full_allreduce(self, bucket_size):
+        self._skip_unless_dp()
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=self.pp_size)
+        model_parallel_cuda_manual_seed(123)
+
+        config, ref_model = self._build(
+            shard=False, use_distributed_optimizer=True, bucket_size=bucket_size
+        )
+        ref_weight = self._reduce(config, ref_model)
+        _, model = self._build(shard=True, use_distributed_optimizer=True, bucket_size=bucket_size)
+        weight = self._reduce(config, model)
+
+        buffer = _grad_buffer_of_param(model, weight)
+        lo, hi = buffer.get_grad_shard_range(weight)
+        torch.testing.assert_close(
+            weight.main_grad.view(-1)[lo:hi], ref_weight.main_grad.view(-1)[lo:hi], rtol=0, atol=0
+        )
+        # Every other parameter's shard is untouched by the option.
+        for p, ref_p in zip(model.module.parameters(), ref_model.module.parameters()):
+            p_lo, p_hi = _grad_buffer_of_param(model, p).get_grad_shard_range(p)
+            torch.testing.assert_close(
+                p.main_grad.view(-1)[p_lo:p_hi], ref_p.main_grad.view(-1)[p_lo:p_hi], rtol=0, atol=0
+            )
+
+        # The reduced range covers both stages' shards and is a fraction of the gradient.
+        reduced = buffer.get_grad_shard_range_union(
+            weight, weight.main_grad, parallel_state.get_embedding_group()
+        )
+        assert reduced is not None
+        if hi > lo:
+            assert reduced[0] <= lo and hi <= reduced[1]
+        assert reduced[1] - reduced[0] < weight.numel()
+
+        # A second step reuses the cached range and still matches.
+        for m in (model, ref_model):
+            m.zero_grad_buffer()
+            generator = torch.Generator(device="cuda").manual_seed(99 + dist.get_rank())
+            for param in m.module.parameters():
+                param.main_grad.copy_(
+                    torch.randn(
+                        param.shape, generator=generator, device="cuda", dtype=torch.float32
+                    )
+                )
+        ref_weight = self._reduce(config, ref_model)
+        weight = self._reduce(config, model)
+        torch.testing.assert_close(
+            weight.main_grad.view(-1)[lo:hi], ref_weight.main_grad.view(-1)[lo:hi], rtol=0, atol=0
+        )
+
+    @pytest.mark.parametrize(
+        ("use_distributed_optimizer", "force_all_reduce"), [(False, False), (True, True)]
+    )
+    def test_full_allreduce_fallback(self, use_distributed_optimizer, force_all_reduce):
+        """Without a reduce-scatter grad sync the whole gradient is still reduced."""
+        self._skip_unless_dp()
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=self.pp_size)
+        model_parallel_cuda_manual_seed(123)
+
+        config, ref_model = self._build(
+            shard=False, use_distributed_optimizer=use_distributed_optimizer, bucket_size=None
+        )
+        ref_weight = self._reduce(config, ref_model, force_all_reduce=force_all_reduce)
+        _, model = self._build(
+            shard=True, use_distributed_optimizer=use_distributed_optimizer, bucket_size=None
+        )
+        weight = self._reduce(config, model, force_all_reduce=force_all_reduce)
+        torch.testing.assert_close(weight.main_grad, ref_weight.main_grad, rtol=0, atol=0)
+
+    def test_full_allreduce_without_ddp_grad_buffer(self):
+        """A model chunk without DDP grad buffers (as with Megatron-FSDP or torch FSDP2) has no
+        distributed-optimizer shard layout, so the whole gradient is reduced."""
+        self._skip_unless_dp()
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=self.pp_size)
+        model_parallel_cuda_manual_seed(123)
+
+        config, ddp_model = self._build(
+            shard=True, use_distributed_optimizer=True, bucket_size=None
+        )
+        module = ddp_model.module
+        module.ddp_config = ddp_model.ddp_config
+        weight = module.shared_embedding_or_output_weight()
+        assert _grad_buffer_of_param(module, weight) is None
+        weight.main_grad = torch.full_like(
+            weight, float(parallel_state.get_pipeline_model_parallel_rank() + 1)
+        )
+        _allreduce_word_embedding_grads(
+            [module],
+            config,
+            parallel_state.get_embedding_group(),
+            parallel_state.get_pipeline_model_parallel_group(),
+        )
+        expected = float(sum(range(1, self.pp_size + 1)))
+        torch.testing.assert_close(weight.main_grad, torch.full_like(weight, expected))
 
 
 class _TPGradSumModel(torch.nn.Module):

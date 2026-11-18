@@ -51,6 +51,16 @@ class DistributedDataParallelConfig:
        enabled. Defaults to 1, which means DistOpt is across entire DP domain.
     """
 
+    shard_embedding_grad_allreduce: bool = False
+    """If true, the all-reduce of tied embedding (and position-embedding) gradients across
+       pipeline stages only covers the part of the gradient inside the embedding group's
+       distributed-optimizer shards, instead of the whole gradient. After the DP reduce-scatter
+       nothing else reads the rest of the gradient, so the optimizer sees the same values while
+       the all-reduce moves about 1/DP of the bytes. Only takes effect with
+       use_distributed_optimizer=True; otherwise (and when gradient reduction is forced to an
+       all-reduce) the whole gradient is reduced.
+    """
+
     check_for_nan_in_grad: bool = False
     """
     If true, check for NaNs and Infs in gradients _before_ communication collective.
