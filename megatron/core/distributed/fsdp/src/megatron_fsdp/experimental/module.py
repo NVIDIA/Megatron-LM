@@ -409,14 +409,15 @@ class FsdpModule:
             )
         else:
             groups_to_release = self._parameter_groups
-        if groups_to_release:
-            allgather_stream = self.context.allgather_stream
-            allgather_stream.wait_stream(self.context.current_stream())
-            # Release on the all-gather stream where unsharded storage was allocated,
-            # so no record_stream() call is required for the storage.
-            with torch.cuda.stream(allgather_stream):
-                for group in groups_to_release:
-                    group.release_unsharded_storage(rowwise_only=rowwise_only)
+        if not groups_to_release:
+            return
+        allgather_stream = self.context.allgather_stream
+        allgather_stream.wait_stream(self.context.current_stream())
+        # Release on the all-gather stream where unsharded storage was allocated,
+        # so no record_stream() call is required for the storage.
+        with torch.cuda.stream(allgather_stream):
+            for group in groups_to_release:
+                group.release_unsharded_storage(rowwise_only=rowwise_only)
 
     def pre_backward(self) -> None:
         """Prepare full parameters and prefetch the next FsdpModule in backward order."""
