@@ -215,10 +215,12 @@ class FsdpContext:
             for root in reversed(list(self._roots)):
                 _collect_backward_order(root, registered_modules, self.execution_order)
 
-        if self.prefetch_order is PrefetchOrder.RECORDED and any(
-            not module._schedule_policy.register_hooks for module in self._module_names
+        if (
+            self.prefetch_order is PrefetchOrder.RECORDED
+            and self.autograd_completes_execution
+            and any(not module._schedule_policy.register_hooks for module in self._module_names)
         ):
-            raise ValueError("Recorded FSDP execution requires ordinary module hooks.")
+            raise ValueError("Recorded execution with custom hooks requires explicit completion.")
 
         self._registered_modules.clear()
         self.parameter_to_owner = None

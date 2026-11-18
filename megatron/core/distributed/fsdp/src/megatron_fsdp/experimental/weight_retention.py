@@ -21,6 +21,7 @@ import torch
 import torch.distributed as dist
 
 from .execution_order import ExecutionAction
+from .phase import Phase
 
 
 def build_retain_mask(execution_order, agreement_group, *, device):
@@ -92,12 +93,16 @@ def build_retain_mask(execution_order, agreement_group, *, device):
         elif event.module in next_uses:
             reuse_ends[index] = next_uses[event.module]
 
-    # Simulate normal demand + one successor before admitting any retained gaps.
+    # Simulate demand and any configured successor before admitting retained gaps.
     live, usage, limits = set(), [], []
     for index, event in enumerate(records):
         if event.action is ExecutionAction.UNSHARD:
             live.add(event.module)
-            if (successor := successors[index]) is not None:
+            sizes_by_phase = policies[event.module]
+            prefetch = (event.phase is Phase.FORWARD and sizes_by_phase[0] is None) or (
+                event.phase is Phase.BACKWARD and sizes_by_phase[1] is None
+            )
+            if prefetch and (successor := successors[index]) is not None:
                 live.add(successor)
         elif not event.rowwise_only:
             live.discard(event.module)

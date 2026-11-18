@@ -117,6 +117,20 @@ class TestWeightRetention(unittest.TestCase):
                     last = next(event for event in reversed(before) if event.module is owner)
                     self.assertNotIn(last.event_id, mask)
 
+    def test_demand_only_schedule_uses_both_slots_for_retention(self):
+        u, r = ExecutionAction.UNSHARD, ExecutionAction.RESHARD
+        owners = [torch.nn.Identity() for _ in range(3)]
+        for owner in owners:
+            owner._schedule_policy = SimpleNamespace(
+                forward_prefetch_size=0, backward_prefetch_size=0
+            )
+        source = ExecutionOrder(
+            ExecutionEvent(owner, None, action, unsharded_bytes=10)
+            for owner in owners * 2
+            for action in (u, r)
+        )
+        self.assertEqual(dict(self._build(source, object())), {1: True, 5: True})
+
     def test_trace_agreement_errors_and_masks_keep_weak_ownership(self):
         u, r = ExecutionAction.UNSHARD, ExecutionAction.RESHARD
         owner, group = torch.nn.Identity(), object()

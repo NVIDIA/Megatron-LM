@@ -1,6 +1,9 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.runtime_policy import (
+    PrefetchOrder,
+)
 
 
 def _make_unshard_forward_hook(owner: FsdpModule):
@@ -8,8 +11,9 @@ def _make_unshard_forward_hook(owner: FsdpModule):
     forward."""
 
     def hook(submodule, _args, _kwargs):
-        if owner.is_root():
-            context = owner.context
+        context = owner.context
+        # A chunk with no root-owned weights can enter through a child.
+        if owner.is_root() or context.prefetch_order is PrefetchOrder.RECORDED:
             context.allgather_stream.wait_stream(context.current_stream())
         owner.unshard()
 
@@ -21,8 +25,9 @@ def _make_unshard_backward_hook(owner: FsdpModule):
     backward."""
 
     def hook(submodule, _grad_output):
-        if owner.is_root():
-            owner.context.pre_backward()
+        context = owner.context
+        if owner.is_root() or context.prefetch_order is PrefetchOrder.RECORDED:
+            context.pre_backward()
         owner.unshard()
 
     return hook
@@ -33,10 +38,11 @@ def _module_post_backward_hook(module: FsdpModule) -> None:
     module.post_accumulate_grad()
 
 
-def reshard_fsdp_module(module: FsdpModule) -> None:
-    """Reshard the FSDP module after fine-grained computation."""
-    assert isinstance(module, FsdpModule), "Expected an FsdpModule."
-    module.reshard()
+def reshard_fsdp_modules(module: FsdpModule) -> None:
+    """Reshard the layer and its independently sharded children."""
+    units = [unit for unit in module.modules() if isinstance(unit, FsdpModule)]
+    for unit in reversed(units):
+        unit.reshard()
 
 
 def register_combined_1f1b_hooks(module: FsdpModule) -> None:

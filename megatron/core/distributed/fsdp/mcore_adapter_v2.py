@@ -267,11 +267,9 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         # without symmetric memory: it uses ncclCommRegister rather than the more performant
         # ncclCommWindowRegister:
         # https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/bufferreg.html#window-registration
-        prefetch_size = (
-            None
-            if ddp_config.megatron_fsdp_weight_retention
-            else ddp_config.suggested_communication_unit_size
-        )
+        prefetch_size = ddp_config.suggested_communication_unit_size
+        if ddp_config.megatron_fsdp_weight_retention:
+            prefetch_size = 0 if config.overlap_moe_expert_parallel_comm else None
         schedule_policy = SchedulePolicy(
             forward_prefetch_size=prefetch_size,
             backward_prefetch_size=prefetch_size,
@@ -349,9 +347,10 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
         config: TransformerConfig, ddp_config: DistributedDataParallelConfig
     ) -> "PrefetchOrder":
         """Record ordinary pipeline schedules and weight-retention iterations."""
+        if ddp_config.megatron_fsdp_weight_retention:
+            return PrefetchOrder.RECORDED
         if not config.overlap_moe_expert_parallel_comm and (
-            ddp_config.megatron_fsdp_weight_retention
-            or config.pipeline_model_parallel_size > 1
+            config.pipeline_model_parallel_size > 1
             or config.virtual_pipeline_model_parallel_size is not None
         ):
             return PrefetchOrder.RECORDED
@@ -395,11 +394,8 @@ class FullyShardedDataParallelV2(_BaseDataParallel):
             ValueError: If a required process group is missing or the model,
                 topology, or data-parallel configuration uses an unsupported feature.
         """
-        if ddp_config.megatron_fsdp_weight_retention:
-            if config.overlap_moe_expert_parallel_comm:
-                raise ValueError("MFSDP v2 weight retention requires ordinary module hooks.")
-            if ddp_config.nccl_ub:
-                raise ValueError("MFSDP v2 weight retention does not support nccl_ub.")
+        if ddp_config.megatron_fsdp_weight_retention and ddp_config.nccl_ub:
+            raise ValueError("MFSDP v2 weight retention does not support nccl_ub.")
         if config.moe_virtual_expert_load_balance:
             raise ValueError(
                 "MoonEP is not yet integrated with Megatron-FSDP v2. Supporting it requires "

@@ -6,7 +6,7 @@ import torch
 from torch import Tensor
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.module import FsdpModule
-from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import reshard_fsdp_module
+from megatron.core.models.common.combined_1f1b_mfsdp_scheduler import reshard_fsdp_modules
 from megatron.core.pipeline_parallel.utils import (
     AbstractSchedulePlan,
     NoopScheduleNode,
@@ -663,16 +663,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
                 # Forward resharding follows the schedule. Backward resharding and
                 # reduction are triggered by each FsdpModule's gradient countdown.
                 #
-                # One hook per layer plan pins the reshard boundary to "one transformer
-                # layer == one FSDP unit": the plan registers it on its own layer module
-                # (TransformerLayer / HybridStack / MTP layer) and fires it on that layer's
-                # last forward node, so the layer's all-gathered parameters are released at
-                # the layer boundary. That only holds while the FSDP unit is the layer
-                # itself -- the granularity `set_fsdp_reshard_hooks` asserts and the MFSDP
-                # v2 adapter forms for EP overlap (``fsdp_unit_modules``). A sub-layer unit
-                # would need a hook per unit; a coarser one would need this hoisted to the
-                # enclosing plan.
-                layer_plan.set_fsdp_reshard_hooks(reshard_fsdp_module, lambda _: None)
+                # Release the layer and its independently sharded experts at this boundary.
+                layer_plan.set_fsdp_reshard_hooks(reshard_fsdp_modules, lambda _: None)
 
         # Split into segments; pre_process and post_process keep their graphs.
         self._build_recompute_segments(model.config)

@@ -47,9 +47,8 @@ class RuntimePolicy:
 
     Schedules call post_backward() once after all microbatch backwards and delayed
     weight gradients. Subsequent schedules must repeat the complete U/R trace,
-    including its interleaving, consistently across data-parallel ranks. Recording
-    requires ordinary module hooks; combined EP-overlap scheduling is unsupported.
-    Discard the context if recording fails.
+    including its interleaving, consistently across data-parallel ranks. Custom
+    hooks must use explicit completion. Discard the context if recording fails.
     """
 
     autograd_completes_execution: bool = True

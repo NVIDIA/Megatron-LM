@@ -233,7 +233,7 @@ The first eager iteration records the complete schedule. Before the next iterati
 or CUDA graph capture, M-LM builds a release mask from that trace.
 
 Compute, single-successor prefetch and retained weights share the standard
-window of two gathered FSDP owners. The planner keeps prefetch enabled and retains
+window of two gathered FSDP owners. The planner preserves configured prefetch and retains
 an owner only when its complete release-to-next-use interval fits that window.
 For nested root/layer/expert execution, it preserves the normal prefetch schedule's
 larger owner-slot envelope instead of adding retention buffers. Replicated weights
@@ -244,11 +244,10 @@ is needed. This is a module-slot policy, not a bound on allocated bytes when own
 have different sizes. Every iteration releases gathered weights before optimizer
 updates. Recording and planning happen once, before CUDA graph capture.
 
-Retention defaults to off and requires a fixed module/microbatch schedule with
-ordinary hooks. Enabled M-LM wrappers use single-successor prefetch; standalone
-callers must use prefetch sizes of `None` (one successor) or `0` (disabled).
-MoE EP overlap and NCCL user buffers are currently unsupported. Gradient
-accumulation and reduction modes are unchanged.
+Retention defaults to off and requires a fixed module/microbatch schedule.
+M-LM uses single-successor prefetch with ordinary hooks and demand gathers with
+MoE EP overlap. Standalone callers must use prefetch sizes of `None` (one
+successor) or `0` (disabled). NCCL user buffers are unsupported.
 
 ### 🔁 Checkpoint Conversion
 
@@ -673,6 +672,6 @@ missing, extra or reordered calls. The full cursor does not wrap until successfu
 `post_backward()` completion. Prefetch uses an independent filtered `UNSHARD`
 view; speculative gathers do not consume logical events. Evaluation preserves
 recording state and training cursors. Changing the schedule requires a new
-context. Recorded execution requires ordinary hooks; combined EP-overlap
-scheduling is unsupported. Recording and byte sampling must finish before
+context. The combined EP-overlap schedule uses explicit completion and records its
+demand gathers and layer releases. Recording and byte sampling must finish before
 CUDA Graph capture; capture executes the replay operations.
