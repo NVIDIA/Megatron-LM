@@ -1,6 +1,7 @@
 # Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
 
 """Shared utilities for modelopt post-training scripts."""
+
 import os
 import sys
 from typing import Any
@@ -39,16 +40,40 @@ def get_eos_token_id(hf_tokenizer=None):
     if hf_tokenizer is None:
         hf_tokenizer = get_hf_tokenizer()
 
-    if hf_tokenizer.eos_token == "<|eot_id|>":
-        return 128001
-    if hf_tokenizer.eos_token == "<|eot|>":
-        return 200001
-    if hf_tokenizer.eos_token == "<|im_end|>":
-        return 151643
-    if hf_tokenizer.eos_token == "<|return|>":
-        return 199999
+    tokenizer_size = None
+    try:
+        tokenizer_size = len(hf_tokenizer)
+    except TypeError:
+        tokenizer_size = getattr(hf_tokenizer, "vocab_size", None)
 
-    return hf_tokenizer.eos_token_id
+    def _valid_token_id(token_id):
+        return (
+            token_id is not None
+            and token_id >= 0
+            and (tokenizer_size is None or token_id < tokenizer_size)
+        )
+
+    known_chat_eos_ids = {
+        "<|eot_id|>": 128001,
+        "<|eot|>": 200001,
+        "<|im_end|>": 151643,
+        "<|return|>": 199999,
+    }
+    if hf_tokenizer.eos_token in known_chat_eos_ids:
+        converted_id = hf_tokenizer.convert_tokens_to_ids(hf_tokenizer.eos_token)
+        if _valid_token_id(converted_id):
+            return converted_id
+        mapped_id = known_chat_eos_ids[hf_tokenizer.eos_token]
+        if _valid_token_id(mapped_id):
+            return mapped_id
+
+    if _valid_token_id(hf_tokenizer.eos_token_id):
+        return hf_tokenizer.eos_token_id
+    raise ValueError(
+        "Tokenizer EOS token id {} is outside the tokenizer vocabulary.".format(
+            hf_tokenizer.eos_token_id
+        )
+    )
 
 
 def build_lm_batch(
@@ -63,7 +88,7 @@ def build_lm_batch(
     eod_mask_loss: bool = False,
     pad_mask_loss: bool = False,
     cp_group: torch.distributed.ProcessGroup | None = None,
-    is_hybrid_cp: bool = False,
+    dynamic_cp: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Build causal-LM training tensors from packed or padded ``input_ids``.
 
@@ -85,7 +110,7 @@ def build_lm_batch(
         eod_mask_loss: Passed through to ``get_ltor_masks_and_position_ids``.
         pad_mask_loss: Passed through to ``get_ltor_masks_and_position_ids``.
         cp_group: When set, slice the batch for context parallelism.
-        is_hybrid_cp: Passed through to ``get_batch_on_this_cp_rank``.
+        dynamic_cp: Passed through to ``get_batch_on_this_cp_rank``.
 
     Returns:
         Dict with ``tokens``, ``labels``, ``loss_mask``, ``attention_mask``, and
@@ -124,7 +149,7 @@ def build_lm_batch(
     }
 
     if cp_group is not None:
-        batch = get_batch_on_this_cp_rank(batch, is_hybrid_cp=is_hybrid_cp, cp_group=cp_group)
+        batch = get_batch_on_this_cp_rank(batch, dynamic_cp=dynamic_cp, cp_group=cp_group)
 
     return batch
 
@@ -139,7 +164,7 @@ def build_lm_batch_from_input_ids(
     eod_mask_loss: bool = False,
     pad_mask_loss: bool = False,
     cp_group: torch.distributed.ProcessGroup | None = None,
-    is_hybrid_cp: bool = False,
+    dynamic_cp: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Build an LM batch dict from a dataloader batch containing ``input_ids``.
 
@@ -165,5 +190,5 @@ def build_lm_batch_from_input_ids(
         eod_mask_loss=eod_mask_loss,
         pad_mask_loss=pad_mask_loss,
         cp_group=cp_group,
-        is_hybrid_cp=is_hybrid_cp,
+        dynamic_cp=dynamic_cp,
     )

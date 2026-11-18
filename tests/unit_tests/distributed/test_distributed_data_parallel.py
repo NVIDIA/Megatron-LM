@@ -27,6 +27,29 @@ class TestModel(torch.nn.Module):
         return x
 
 
+@pytest.mark.parametrize("fp8_param_gather", [False, True])
+def test_invalid_buffer_reuse_is_rejected_before_ddp_setup(fp8_param_gather):
+    kwargs = dict(
+        reuse_grad_buf_for_mxfp8_param_ag=True,
+        fp8_param_gather=fp8_param_gather,
+        grad_buffer_offload=fp8_param_gather,
+    )
+    error = ValueError if fp8_param_gather else AssertionError
+    match = "Gradient-buffer offload" if fp8_param_gather else "Reuse grad buffer"
+    ddp_config = DistributedDataParallelConfig(**kwargs)
+    ddp_config.finalize()
+    model_config = TransformerConfig(num_layers=1, hidden_size=8, num_attention_heads=1)
+    with pytest.raises(error, match=match):
+        DistributedDataParallel(model_config, ddp_config, TestModel(8, 8))
+
+    # Standalone callers can also edit the config after construction.
+    ddp_config = DistributedDataParallelConfig()
+    for name, value in kwargs.items():
+        setattr(ddp_config, name, value)
+    with pytest.raises(error, match=match):
+        DistributedDataParallel(model_config, ddp_config, TestModel(8, 8))
+
+
 class TestDistributedDataParallel:
     @classmethod
     def setup_class(cls):
@@ -41,7 +64,8 @@ class TestDistributedDataParallel:
         reason="Device mesh feature requires PyTorch 2.3 or later",
     )
     @pytest.mark.parametrize("dp_size", [2, 8])  # Test with 2 or 8 GPUs
-    def test_ddp_with_dp_process_groups(self, dp_size):
+    @pytest.mark.parametrize("bucket_policy", ["size", "automatic", "count", "no-overlap"])
+    def test_ddp_with_dp_process_groups(self, dp_size, bucket_policy):
         """Test that DDP works correctly with dp pgs from parallel state and user defined pgs."""
 
         # Skip test if we don't have enough GPUs
@@ -54,7 +78,16 @@ class TestDistributedDataParallel:
         output_dim = 17
 
         # Setup DDP config
-        ddp_config = DistributedDataParallelConfig(overlap_grad_reduce=True, bucket_size=10000)
+        ddp_config = DistributedDataParallelConfig(
+            overlap_grad_reduce=bucket_policy != "no-overlap",
+            bucket_size=10000 if bucket_policy == "size" else None,
+            num_buckets=2 if bucket_policy in ("count", "no-overlap") else None,
+        )
+        expected_bucket_size = (
+            10000 if bucket_policy == "size" else max(40000000, 1000000 * dp_size)
+        )
+        if bucket_policy == "no-overlap":
+            expected_bucket_size = None
 
         # Create two identical models
         model1 = TestModel(input_dim=input_dim, output_dim=output_dim).cuda()
@@ -72,6 +105,12 @@ class TestDistributedDataParallel:
         ddp_model1 = DistributedDataParallel(
             transformer_config, ddp_config=ddp_config, module=model1
         )
+        ddp_config.validate()
+        assert ddp_config.bucket_size == expected_bucket_size
+        if bucket_policy != "size":
+            assert ddp_config._bucket_size_resolved
+        assert ddp_config.expert_data_parallel_sharding_strategy == "no_shard"
+        assert ddp_config.expert_outer_dp_sharding_strategy == "no_shard"
 
         # Initialize torch.distributed if not already initialized
         if not torch.distributed.is_initialized():
@@ -93,6 +132,8 @@ class TestDistributedDataParallel:
         ddp_model2 = DistributedDataParallel(
             transformer_config, ddp_config=ddp_config, module=model2, pg_collection=pg_collection
         )
+        ddp_config.validate()
+        assert ddp_config.bucket_size == expected_bucket_size
 
         # Create identical inputs with integer values
         batch_size = 2
@@ -116,3 +157,83 @@ class TestDistributedDataParallel:
         for p1, p2 in zip(ddp_model1.parameters(), ddp_model2.parameters()):
             if hasattr(p1, 'main_grad') and hasattr(p2, 'main_grad'):
                 testing.assert_close(p1.main_grad, p2.main_grad, rtol=0, atol=0)
+
+
+class TestExpertGradientScalingFactorGTPRemat:
+    """Regression coverage for expert_gradient_scaling_factor's GTP_remat/EGTP_remat
+    correction, folded directly into DDP's one-time prescale computation (Case 2,
+    average_in_collective=False -- the only case reachable when GTP_remat is active).
+
+    dp_cp_group.size() is deliberately shrunk by gtp_weight_remat_size (see the comment in
+    DistributedDataParallel.__init__); the egtp/gtp correction is what keeps expert params on
+    the same 1/dp_size target as dense params despite that shrink. Applied unconditionally,
+    for any gtp vs egtp relationship -- both gtp>egtp and gtp<egtp need it.
+    """
+
+    def teardown_method(self, method):
+        Utils.destroy_model_parallel()
+
+    def _scaling_factors(self, gtp, egtp):
+        Utils.initialize_model_parallel(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_model_parallel_size=1,
+            gtp_remat_size=gtp,
+            expert_gtp_remat_size=egtp,
+        )
+
+        class _TinyModel(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.dense = torch.nn.Linear(4, 4, bias=False)
+                self.expert = torch.nn.Linear(4, 4, bias=False)
+                self.expert.weight.allreduce = False
+
+        # gtp_weight_remat_size / expert_gtp_weight_remat_size are DERIVED fields (resolved in
+        # ModelParallelConfig.__post_init__ from the user-facing tensor_parallel_num_weight_shards
+        # / expert_tensor_parallel_num_weight_shards knobs) -- passing them directly is a no-op;
+        # this is also how production configs set them (core_transformer_config_from_args copies
+        # the user-facing knob from CLI args), so exercising the same path here is intentional,
+        # not just a workaround.
+        config = TransformerConfig(
+            num_attention_heads=1,
+            num_layers=1,
+            hidden_size=4,
+            tensor_parallel_num_weight_shards=gtp,
+            expert_tensor_parallel_num_weight_shards=egtp,
+        )
+        ddp_config = DistributedDataParallelConfig(
+            use_distributed_optimizer=False, overlap_grad_reduce=False
+        )
+        ddp_model = DistributedDataParallel(config, ddp_config, _TinyModel().cuda())
+        assert len(ddp_model.expert_parallel_buffers) == 1
+        assert len(ddp_model.buffers) == 1
+        return (
+            ddp_model.buffers[0].gradient_scaling_factor,
+            ddp_model.expert_parallel_buffers[0].gradient_scaling_factor,
+            ddp_model.dp_cp_group.size(),
+        )
+
+    @pytest.mark.parametrize(
+        "gtp,egtp,expected_correction",
+        [
+            (2, 1, 0.5),  # gtp > egtp: dense-only GTP, replicated experts
+            (4, 1, 0.25),  # gtp > egtp: wider gap
+            (4, 2, 0.5),  # gtp > egtp: both axes active, still gtp != egtp
+            (2, 2, 1.0),  # matched (gtp == egtp): correction collapses to 1.0
+            (1, 1, 1.0),  # GTP_remat inactive entirely
+            (1, 2, 2.0),  # gtp < egtp: EGTP-sharded experts, GTP_remat inactive
+            (2, 4, 2.0),  # gtp < egtp: wider gap
+        ],
+    )
+    def test_expert_scaling_factor_gets_the_egtp_over_gtp_correction(
+        self, gtp, egtp, expected_correction
+    ):
+        if torch.cuda.device_count() < 4:
+            pytest.skip("Requires 4 CUDA devices")
+        dense_factor, expert_factor, dp_cp_size = self._scaling_factors(gtp, egtp)
+        assert dense_factor == 1.0 / dp_cp_size
+        assert expert_factor == (1.0 / dp_cp_size) * expected_correction, (
+            f"gtp={gtp} egtp={egtp}: expert_gradient_scaling_factor={expert_factor} != "
+            f"(1/dp_cp_group.size()={1.0/dp_cp_size}) * (egtp/gtp={expected_correction})"
+        )

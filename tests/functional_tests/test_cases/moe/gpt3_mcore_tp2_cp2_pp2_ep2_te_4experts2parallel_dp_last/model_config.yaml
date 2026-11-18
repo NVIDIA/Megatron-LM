@@ -43,6 +43,8 @@ MODEL_ARGS:
   --expert-model-parallel-size: 2
   --sequence-parallel: true
   --num-experts: 4
+  --moe-token-dispatcher-type: allgather
+  --no-moe-grouped-gemm: true
   --moe-router-load-balancing-type: sinkhorn
   --moe-router-topk: 1
   --deterministic-mode: true
@@ -60,3 +62,4 @@ MODEL_ARGS:
   --async-save: true
   --use-persistent-ckpt-worker: true
 TEST_TYPE: regular
+LAUNCHER: ft_launcher

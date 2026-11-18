@@ -14,17 +14,28 @@
 
 """Experimental Megatron-FSDP implementation."""
 
+from .checkpoint import load_checkpoint, save_checkpoint
+from .context import FsdpContext, PrefetchOrder
 from .dbuffer import DBuffer
-from .fully_shard import fully_shard, microbatch
-from .placement import Flat, Partial, Placement, Placements, Replicate
+from .fully_shard import Placements, finalize_gradients, fully_shard, fully_shard_context
+from .optimizer import fully_shard_optimizer, init_optimizer_state
+from .placement import ShardLayout
+from .runtime_policy import RuntimePolicy
+from .schedule_policy import SchedulePolicy
 
 __all__ = [
     "DBuffer",
-    "Flat",
-    "Partial",
-    "Placement",
+    "FsdpContext",
     "Placements",
-    "Replicate",
+    "PrefetchOrder",
+    "RuntimePolicy",
+    "SchedulePolicy",
+    "ShardLayout",
+    "finalize_gradients",
     "fully_shard",
-    "microbatch",
+    "fully_shard_context",
+    "fully_shard_optimizer",
+    "init_optimizer_state",
+    "load_checkpoint",
+    "save_checkpoint",
 ]

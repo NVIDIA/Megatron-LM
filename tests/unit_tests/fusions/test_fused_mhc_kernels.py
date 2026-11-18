@@ -217,6 +217,21 @@ class TestFusedSinkhorn:
 class TestNativeHAggregate:
     """Tests for native_h_aggregate."""
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+    @pytest.mark.parametrize("grad_enabled", [False, True])
+    def test_caller_owned_forward_matches_allocating_path(self, dtype, grad_enabled):
+        """A fixed graph input must receive the same aggregate without intermediate rounding."""
+        torch.manual_seed(1234)
+        x = torch.randn(8, 1, 2, 64, device=DEVICE, dtype=dtype, requires_grad=True)
+        h_pre = torch.randn(8, 1, 2, device=DEVICE, dtype=dtype, requires_grad=True)
+        out = torch.full((8, 1, 64), float("nan"), device=DEVICE, dtype=dtype)
+        pointer = out.data_ptr()
+        with torch.set_grad_enabled(grad_enabled):
+            expected = native_h_aggregate(x, h_pre)
+            actual = native_h_aggregate_into(x, h_pre, out)
+        assert actual.data_ptr() == pointer
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
     @pytest.mark.parametrize("s,b,n,C", [(2, 4, 4, 1024), (1, 1, 2, 256)])
     def test_fwd_bwd_vs_torch_reference(self, s, b, n, C):
         _info()
@@ -641,6 +656,7 @@ class TestTritonHPostBDABwdE2EDebug:
         h_pre = h[..., :n].sigmoid()
         h_post_val = h[..., n : 2 * n].sigmoid() * 2
         h_res = fused_sinkhorn(h[..., 2 * n :].view(s, b, n, n), sinkhorn_iters, eps)
+        h_pre, h_post_val, h_res = h_pre.to(DTYPE), h_post_val.to(DTYPE), h_res.to(DTYPE)
         _ = fused_h_aggregate(hs.view(s, b, n, C), h_pre)
         output = fused_h_post_bda(
             h_res, hs.view(s, b, n, C), h_post_val, layer_out_data, layer_bias_data
@@ -679,6 +695,67 @@ class TestTritonHPostBDABwdE2EDebug:
 
 
 class TestTritonSinkhorn:
+    @_require_triton
+    @pytest.mark.parametrize("hc", [4, 8])
+    @pytest.mark.parametrize("num_warps", [1, 2, 4, 8])
+    def test_bwd_reads_scratch_after_all_warps_store(self, monkeypatch, hc, num_warps):
+        """Backward must not read Sinkhorn scratch before every warp has stored it.
+
+        Deterministic algorithms fill uninitialized scratch with NaN, so a read that races
+        ahead of another warp's store shows up as nonfinite input gradients. Without the
+        CTA barrier, HC8 fails this way at two or more warps.
+        """
+        import triton
+
+        from megatron.core.fusions import fused_mhc_kernels as kernels
+
+        generator = torch.Generator().manual_seed(193)
+        data = (torch.rand((3, 1, hc, hc), generator=generator) * 0.2 - 0.1).cuda()
+        grad_out = (torch.rand((3, 1, hc, hc), generator=generator) * 0.2 - 0.1).cuda()
+        reference_input = data.cpu().double().requires_grad_()
+        reference_output = _ref_sinkhorn(reference_input, 5)
+        reference_output.backward(grad_out.cpu().double())
+
+        def run():
+            inp = data.clone().requires_grad_()
+            out = kernels.triton_fused_sinkhorn(inp, 5)
+            out.backward(grad_out)
+            return out.detach(), inp.grad
+
+        was_deterministic = torch.are_deterministic_algorithms_enabled()
+        was_warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+        was_fill_uninitialized = torch.utils.deterministic.fill_uninitialized_memory
+        try:
+            torch.use_deterministic_algorithms(True)
+            torch.utils.deterministic.fill_uninitialized_memory = True
+            with monkeypatch.context() as patch:
+                # A single candidate launches at this warp count without benchmarking.
+                config = triton.Config({}, num_warps=num_warps)
+                for tuner in (
+                    kernels._triton_sinkhorn_fwd_kernel,
+                    kernels._triton_sinkhorn_bwd_kernel,
+                ):
+                    for name in ("best_config", "configs_timings", "bench_time", "nargs"):
+                        patch.setattr(tuner, name, getattr(tuner, name, None), raising=False)
+                    patch.setattr(tuner, "configs", [config])
+                    patch.setattr(tuner, "cache", {})
+                    patch.setattr(tuner, "cache_results", False, raising=False)
+                results = [run(), run()]
+        finally:
+            torch.use_deterministic_algorithms(was_deterministic, warn_only=was_warn_only)
+            torch.utils.deterministic.fill_uninitialized_memory = was_fill_uninitialized
+
+        for name, first, second, reference in zip(
+            ("output", "input gradient"), *results, (reference_output, reference_input.grad)
+        ):
+            assert torch.isfinite(first).all() and torch.isfinite(second).all(), name
+            assert torch.equal(
+                first.contiguous().view(torch.uint8), second.contiguous().view(torch.uint8)
+            ), name
+            torch.testing.assert_close(
+                first.cpu().double(), reference, atol=2e-6, rtol=2e-5, msg=name
+            )
+
     @_require_triton
     @pytest.mark.parametrize("s,b,n,iters", [(2, 4, 4, 5), (1, 1, 2, 10), (8, 4, 4, 20)])
     def test_fwd_bwd_vs_reference(self, s, b, n, iters):
@@ -748,9 +825,10 @@ class TestNativeProjRms:
 
         xr = x_data.clone().requires_grad_(True)
         wr = w_data.clone().requires_grad_(True)
-        proj_r, r_r = _ref_proj_rms(xr, wr, eps)
+        proj_r, r_r = _ref_proj_rms(xr.float(), wr.float(), eps)
         (proj_r * grad_proj + r_r * grad_r).sum().backward()
 
+        assert proj_f.dtype == r_f.dtype == torch.float32
         torch.testing.assert_close(proj_f, proj_r, atol=FWD_ATOL, rtol=FWD_RTOL)
         torch.testing.assert_close(r_f, r_r, atol=FWD_ATOL, rtol=FWD_RTOL)
         torch.testing.assert_close(
@@ -915,6 +993,7 @@ class TestEndToEndNative:
             h_post = h[..., n : 2 * n].sigmoid() * 2
             h_res_logits = h[..., 2 * n :]
             h_res = _ref_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
+            h_pre, h_post, h_res = h_pre.to(DTYPE), h_post.to(DTYPE), h_res.to(DTYPE)
 
             aggregated = _ref_h_aggregate(hs.view(s, b, n, C), h_pre)
 
@@ -943,7 +1022,6 @@ class TestEndToEndNative:
 class TestEndToEndFused:
     """Full mHC pipeline using the public fused API."""
 
-    @pytest.mark.flaky_in_dev
     @_require_cutile
     def test_full_pipeline_fwd_bwd(self):
         from megatron.core.fusions.fused_mhc_kernels import (
@@ -976,6 +1054,8 @@ class TestEndToEndFused:
             h_post = h[..., n : 2 * n].sigmoid() * 2
             h_res_logits = h[..., 2 * n :]
             h_res = fused_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
+            # Match HyperConnectionModule's activation-dtype mappings for fused mixing.
+            h_pre, h_post, h_res = h_pre.to(DTYPE), h_post.to(DTYPE), h_res.to(DTYPE)
 
             aggregated = fused_h_aggregate(hs.view(s, b, n, C), h_pre)
 
@@ -1001,6 +1081,7 @@ class TestEndToEndFused:
             h_post = h[..., n : 2 * n].sigmoid() * 2
             h_res_logits = h[..., 2 * n :]
             h_res = _ref_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
+            h_pre, h_post, h_res = h_pre.to(DTYPE), h_post.to(DTYPE), h_res.to(DTYPE)
 
             aggregated = _ref_h_aggregate(hs.view(s, b, n, C), h_pre)
 
@@ -1015,8 +1096,11 @@ class TestEndToEndFused:
         proj_f, r_f, out_f, agg_f, grad_f = _run_fused()
         proj_r, r_r, out_r, agg_r, grad_r = _run_ref()
 
-        torch.testing.assert_close(proj_f, proj_r, atol=FWD_ATOL, rtol=FWD_RTOL)
-        torch.testing.assert_close(r_f, r_r, atol=FWD_ATOL, rtol=FWD_RTOL)
+        proj_32, r_32 = _ref_proj_rms(hs_data.reshape(s * b, n * C).float(), w_data.float(), eps)
+        assert proj_f.dtype == r_f.dtype == torch.float32
+        assert out_f.dtype == agg_f.dtype == DTYPE
+        torch.testing.assert_close(proj_f, proj_32.view(s, b, -1), atol=FWD_ATOL, rtol=FWD_RTOL)
+        torch.testing.assert_close(r_f, r_32.view(s, b, 1), atol=FWD_ATOL, rtol=FWD_RTOL)
         torch.testing.assert_close(agg_f, agg_r, atol=FWD_ATOL, rtol=FWD_RTOL)
         torch.testing.assert_close(
             out_f, out_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="h_post_bda output mismatch"
@@ -1312,6 +1396,7 @@ class TestEndToEndFusedBroadcast:
             h_post = h[..., n : 2 * n].sigmoid() * 2
             h_res_logits = h[..., 2 * n :]
             h_res = fused_sinkhorn(h_res_logits.view(s, b, n, n), sinkhorn_iters, eps)
+            h_pre, h_post, h_res = h_pre.to(DTYPE), h_post.to(DTYPE), h_res.to(DTYPE)
 
             aggregated = fused_h_aggregate(hs_agg.view(s, b, n, C), h_pre)
 
@@ -1351,6 +1436,7 @@ class TestEndToEndFusedBroadcast:
         out_f, agg_f, grad_f = _run_fused_broadcast()
         out_r, agg_r, grad_r = _run_ref()
 
+        assert out_f.dtype == agg_f.dtype == DTYPE
         torch.testing.assert_close(
             agg_f, agg_r, atol=FWD_ATOL, rtol=FWD_RTOL, msg="aggregated mismatch (fused broadcast)"
         )
@@ -1586,12 +1672,7 @@ class TestFusedProjRmsComputeHKeepFp32:
         )
 
     def test_public_entry_point_native_branch(self, monkeypatch):
-        """The public op must also run natively — this is the forced-native path.
-
-        MHC_FORCE_BACKEND=native and an auto run on a cuTile-less container both
-        land here, and the module always calls the public op when
-        use_fused_mhc=True, so this branch is what a real training job hits.
-        """
+        """The public op must honor the explicit native backend policy."""
         from megatron.core.fusions import fused_mhc_kernels as fused_mod
 
         _info()
@@ -1604,7 +1685,9 @@ class TestFusedProjRmsComputeHKeepFp32:
         one = torch.full((1,), 0.1, device=DEVICE, dtype=torch.float32)
         bias = torch.zeros(N, device=DEVICE, dtype=torch.float32)
 
-        outs = fused_mod.fused_proj_rms_compute_h(x, w, one, one, one, bias, n, 1e-6)
+        outs = fused_mod.fused_proj_rms_compute_h(
+            x, w, one, one, one, bias, n, 1e-6, backend="native"
+        )
         for t in outs:
             assert torch.isfinite(t).all()
 
@@ -1647,3 +1730,140 @@ class TestCutileHAggregateBackwardReduction:
         assert torch.equal(c_gx, t_gx)
         # A bf16 product before the fp32 accumulate showed up here as ~2.5x.
         assert rel(c_gh, ref_gh) <= rel(t_gh, ref_gh) * 1.1
+
+
+def test_all_mhc_backends_declare_determinism():
+    """Every concrete backend declares a valid bit-exact determinism status."""
+    from megatron.core.fusions.fused_mhc_kernels import MHC_BACKEND_DETERMINISM
+
+    valid_statuses = {"deterministic", "nondeterministic", "unknown"}
+    assert set(MHC_BACKEND_DETERMINISM) == {"native", "triton", "cutile"}
+    assert set(MHC_BACKEND_DETERMINISM.values()) <= valid_statuses
+
+
+class TestExplicitBackendDispatch:
+    """Configuration-driven dispatch must be strict and stable through backward."""
+
+    def test_backend_logging_is_once_per_policy(self, monkeypatch):
+        from megatron.core.fusions import fused_mhc_kernels as fused_mod
+
+        log_calls = []
+        warning_calls = []
+        monkeypatch.setattr(fused_mod, "_BACKEND_INFO_LOGGED", set())
+        monkeypatch.setattr(
+            fused_mod,
+            "_mhc_backend_status",
+            lambda backend: (f"policy={backend}; all native", True),
+        )
+        monkeypatch.setattr(fused_mod, "safe_get_rank", lambda: 0)
+        monkeypatch.setattr(fused_mod, "log_single_rank", lambda *args: log_calls.append(args))
+        monkeypatch.setattr(
+            fused_mod.warnings,
+            "warn",
+            lambda message, *args, **kwargs: warning_calls.append(message),
+        )
+
+        for backend in ("native", "native", "auto", "auto"):
+            fused_mod.log_fused_mhc_backend_once(backend)
+
+        assert len(log_calls) == 2
+        assert [call[1] for call in log_calls] == [
+            fused_mod.logging.INFO,
+            fused_mod.logging.WARNING,
+        ]
+        assert len(warning_calls) == 1
+        assert "falling back to native torch" in str(warning_calls[0])
+
+    @pytest.mark.parametrize("backend", ["triton", "cutile"])
+    def test_unavailable_explicit_backend_fails(self, monkeypatch, backend):
+        from megatron.core.fusions import fused_mhc_kernels as fused_mod
+
+        if backend == "triton":
+            monkeypatch.setattr(fused_mod, "is_triton_available", lambda: False)
+        else:
+            monkeypatch.setattr(fused_mod, "is_cutile_available", lambda: False)
+
+        logits = _rand(1, 1, 2, 2)
+        with pytest.raises(RuntimeError, match=backend):
+            fused_mod.fused_sinkhorn(logits, 2, backend=backend)
+
+    def test_h_aggregate_forward_backward_share_backend_policy(self, monkeypatch):
+        from megatron.core.fusions import fused_mhc_kernels as fused_mod
+
+        seen = []
+
+        def get_triton_forward(backend):
+            seen.append(("forward", backend))
+            return fused_mod.native_h_aggregate
+
+        def use_cutile(backend):
+            seen.append(("backward", backend))
+            return False
+
+        monkeypatch.setattr(fused_mod, "is_triton_available", lambda: True)
+        monkeypatch.setattr(fused_mod, "_get_triton_h_aggregate_fwd", get_triton_forward)
+        monkeypatch.setattr(fused_mod, "_backend_uses_cutile", use_cutile)
+
+        x = _rand(2, 2, 2, 8).requires_grad_(True)
+        h_pre = _rand(2, 2, 2).requires_grad_(True)
+        fused_mod.fused_h_aggregate(x, h_pre, backend="triton").sum().backward()
+
+        assert ("forward", "triton") in seen
+        assert ("backward", "triton") in seen
+        assert x.grad is not None
+        assert h_pre.grad is not None
+
+    def test_h_aggregate_auto_mixes_triton_forward_and_cutile_backward(self, monkeypatch):
+        from megatron.core.fusions import fused_mhc_kernels as fused_mod
+
+        seen = []
+
+        def get_triton_forward(backend):
+            seen.append(("forward", backend, "triton"))
+            return fused_mod.native_h_aggregate
+
+        def cutile_backward(grad_output, x, h_pre):
+            seen.append(("backward", "auto", "cutile"))
+            return fused_mod._torch_h_aggregate_bwd(grad_output, x, h_pre)
+
+        monkeypatch.setattr(fused_mod, "is_triton_available", lambda: True)
+        monkeypatch.setattr(fused_mod, "is_cutile_available", lambda: True)
+        monkeypatch.setattr(fused_mod, "_get_triton_h_aggregate_fwd", get_triton_forward)
+        monkeypatch.setattr(fused_mod, "_cutile_h_aggregate_bwd", cutile_backward, raising=False)
+
+        x = _rand(2, 2, 2, 8).requires_grad_(True)
+        h_pre = _rand(2, 2, 2).requires_grad_(True)
+        fused_mod.fused_h_aggregate(x, h_pre, backend="auto").sum().backward()
+
+        assert seen == [("forward", "auto", "triton"), ("backward", "auto", "cutile")]
+        assert x.grad is not None
+        assert h_pre.grad is not None
+
+    def test_h_post_bda_forward_backward_share_backend_policy(self, monkeypatch):
+        from megatron.core.fusions import fused_mhc_kernels as fused_mod
+
+        seen = []
+
+        def get_triton_forward(backend):
+            seen.append(("forward", backend))
+            return fused_mod.native_h_post_bda
+
+        def get_triton_backward(backend):
+            seen.append(("backward", backend))
+            return fused_mod._torch_h_post_bda_bwd
+
+        monkeypatch.setattr(fused_mod, "is_triton_available", lambda: True)
+        monkeypatch.setattr(fused_mod, "_get_triton_h_post_bda_fwd", get_triton_forward)
+        monkeypatch.setattr(fused_mod, "_get_triton_h_post_bda_bwd", get_triton_backward)
+
+        h_res = _rand(2, 2, 2, 2).requires_grad_(True)
+        residual = _rand(2, 2, 2, 8).requires_grad_(True)
+        h_post = _rand(2, 2, 2).requires_grad_(True)
+        x = _rand(2, 2, 8).requires_grad_(True)
+        bias = _rand(8).requires_grad_(True)
+        fused_mod.fused_h_post_bda(
+            h_res, residual, h_post, x, bias, backend="triton"
+        ).sum().backward()
+
+        assert seen == [("forward", "triton"), ("backward", "triton")]
+        assert all(tensor.grad is not None for tensor in (h_res, residual, h_post, x, bias))

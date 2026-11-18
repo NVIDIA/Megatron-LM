@@ -7,6 +7,8 @@ import torch
 
 from .utils import is_torch_min_version
 
+VALID_SHARDING_STRATEGIES = ("no_shard", "optim", "optim_grads", "optim_grads_params")
+
 
 @dataclass
 class DistributedDataParallelConfig:
@@ -44,8 +46,19 @@ class DistributedDataParallelConfig:
     """Sharding strategy for FSDP. Valid values are 'no_shard', 'optim',
       'optim_grads', 'optim_grads_params'."""
 
+    expert_data_parallel_sharding_strategy: Optional[str] = None
+    """Sharding strategy applied to expert (MoE) parameters on DP-Shard. Valid values are
+      'no_shard', 'optim', 'optim_grads', 'optim_grads_params'. When set,
+      `data_parallel_sharding_strategy` only applies to non-expert parameters, which allows
+      trading DP-Shard communication against memory separately for the two parameter classes
+      (e.g. 'optim' on non-experts and 'optim_grads_params' on experts). Expert parameters are
+      already sharded over a narrower DP group than non-expert parameters when expert
+      parallelism is enabled, so the two classes have very different traffic-per-byte.
+      None is replaced with `data_parallel_sharding_strategy` during initialization."""
+
     gradient_reduce_div_fusion: bool = True
-    """If true, perform gradient reduce and division fusion."""
+    """If true, perform gradient reduce and division fusion. Requires a single gradient
+    communication dtype per coalesced bucket group when enabled."""
 
     suggested_communication_unit_size: int = None
     """Specifies the number of elements to communicate at once during
@@ -204,10 +217,38 @@ class DistributedDataParallelConfig:
     FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
     """
 
+    megatron_fsdp_padded_shards: bool = True
+    """Megatron-FSDP v2 only. If true (default), pad each parameter group so every rank
+    gets an equal shard. If false, pack the group without padding and split it into
+    generally unequal per-rank shards at row boundaries (32-row block boundaries for
+    MXFP8), which saves the padding memory and communication but is incompatible with
+    nccl_ub (symmetric memory).
+    """
+
+    hfsdp_param_gather_overlap: bool = False
+    """If true, pipeline HFSDP parameter gathers across the DP-Outer and DP-Inner
+    communication domains. DP-Inner retains its size-based prefetch policy, while
+    DP-Outer is prefetched one additional FSDP unit beyond the DP-Inner frontier.
+    Only effective with ``outer_dp_sharding_strategy='optim'``.
+    """
+
     def __post_init__(self):
         import os
 
         """Check the validity of the config."""
+        if self.expert_data_parallel_sharding_strategy is None:
+            self.expert_data_parallel_sharding_strategy = self.data_parallel_sharding_strategy
+        for field_name in [
+            "data_parallel_sharding_strategy",
+            "expert_data_parallel_sharding_strategy",
+        ]:
+            strategy = getattr(self, field_name)
+            if strategy not in VALID_SHARDING_STRATEGIES:
+                raise ValueError(
+                    f"[Megatron-FSDP] Invalid {field_name}: {strategy}. "
+                    f"Valid values are {VALID_SHARDING_STRATEGIES}."
+                )
+
         if self.megatron_fsdp_prefetch_recompute_forward_weights:
             assert self.data_parallel_sharding_strategy == "optim_grads_params", (
                 "megatron_fsdp_prefetch_recompute_forward_weights is only supported with "

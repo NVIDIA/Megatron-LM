@@ -96,6 +96,14 @@ def add_modelopt_args(parser):
         default="train",
         help="HF dataset split used for finetuning.",
     )
+    group.add_argument(
+        "--finetune-data-files",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Optional explicit files from an HF dataset repository used for finetuning. "
+        "Listing files avoids preparing unrelated splits of large datasets.",
+    )
 
     # MTP / base train-target selection for QAD and MTP QAT.
     group.add_argument(
@@ -115,6 +123,15 @@ def add_modelopt_args(parser):
         default=False,
         help='Deprecated alias for --qad-train-target mtp: freeze all base model '
         'parameters and only train MTP heads.',
+    )
+
+    # Scale-learning QAD (LSQ): the checkpoint is assumed to already have LSQ enabled
+    group.add_argument(
+        '--lsq-scale-lr',
+        type=float,
+        default=None,
+        help='Optional separate learning rate for LSQ scale (amax) parameters. If unset, they '
+        'use the base learning rate.',
     )
 
     # Special model architecture option

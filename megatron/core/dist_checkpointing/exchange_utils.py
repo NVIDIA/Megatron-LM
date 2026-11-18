@@ -2,7 +2,10 @@
 
 """Utilities for exchanging data between ranks."""
 
+import hashlib
 import logging
+import os
+import pickle
 from collections import defaultdict
 from functools import reduce
 from itertools import zip_longest
@@ -11,10 +14,12 @@ from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple, TypeVar, c
 import numpy as np
 import torch
 
+from megatron.core._rank_utils import safe_get_rank
+
 from .core import CheckpointingException
 from .dict_utils import nested_values
 from .mapping import ShardedStateDict, ShardedTensor, is_main_replica
-from .utils import _sharded_tensor_shard_id, _ShardId, debug_time
+from .utils import _quantized_storage_tensors, _sharded_tensor_shard_id, _ShardId, debug_time
 
 # TODO: remove TE references once the TE bug is fixed
 # Check if Transformer Engine has Float8Tensor class
@@ -170,39 +175,50 @@ def distribute_shards_to_ranks(
     return shard_to_saving_rank
 
 
-def determine_main_replica_uniform_distribution(
-    sharded_state_dict: ShardedStateDict,
-    parallelization_group: torch.distributed.ProcessGroup,
-    ignore_groups: bool = False,
-) -> Optional[ShardDistribution]:
-    """Computes the save distribution.
+# Prefix of the per-parallelization-group cache files written/read by the
+# PG-collective caching feature (see `determine_main_replica_uniform_distribution`).
+PG_DIST_CACHE_FILE_PREFIX = "pg_dist"
 
-    Should be used in conjunction with `distribute_main_replicas_with_precomputed_distribution`
-    which applies the computed save distribution.
+# Process-global in-memory cache of the per-group distributions, keyed by the
+# resolved cache file path (which uniquely identifies a (cache dir, group) pair,
+# because the file name is derived from the group's ordered global ranks).
+# Each entry holds the full {ignore_groups: ShardDistribution} map, so a single
+# entry serves both the save and load variants. This memoization makes
+# `determine_main_replica_uniform_distribution` idempotent within a job:
+#   * CREATE runs the gather + write at most once per group (subsequent calls,
+#     e.g. later saves or the second `replicate_local_replicas` call, hit memory
+#     and skip the collective and the file write), and
+#   * READ opens each group's file at most once per job.
+# It is checked *before* the collective so every rank of a group hits or misses
+# in lockstep, preserving collective symmetry.
+_PG_DIST_CACHE: Dict[str, Dict[bool, "ShardDistribution"]] = {}
 
-    We rely on the fact that the assignment algorithm is deterministic on all ranks,
-    so there is no extra communication needed after metadata exchange.
+
+def _gather_shards_metadata(
+    sharded_state_dict: ShardedStateDict, parallelization_group: torch.distributed.ProcessGroup
+) -> List[List[ShardedTensor]]:
+    """Runs the single expensive collective behind the load/save distribution.
+
+    Every rank in the group contributes the metadata (no tensor data) of the
+    ``ShardedTensor``s it holds; the result is the list of every rank's shard
+    metadata, identical on all ranks of the group. This is the
+    ``all_gather_object`` that the caching feature exists to eliminate on
+    subsequent jobs.
+
+    Decision: data is stripped with ``without_data()`` before the gather. Only
+    the metadata (key, offsets, shape, dtype, replica_id) drives the
+    distribution algorithm, and gathering it keeps the pickled payload tiny.
 
     Args:
-        sharded_state_dict (ShardedStateDict): state dict to compute the distribution of
-        parallelization_group (ProcessGroup): distribution will be computed
-            within this process group
-        ignore_groups (bool, optional): whether the distribution defines groups.
-            This option is primarily used during loading, as it ensures that all replicas,
-            including non-main ones, are loaded by this parallelization group
-            Defaults to False.
+        sharded_state_dict (ShardedStateDict): state dict whose local shards
+            are advertised to the group.
+        parallelization_group (ProcessGroup): group to gather within.
 
-    Returns (ShardDistribution, optional): distribution that can be used to apply the
-        parallelization. Returns None if the process_group is trivial (1 rank)
-
+    Returns:
+        List[List[ShardedTensor]]: per-rank lists of data-less ShardedTensors.
     """
     from ..utils import get_pg_size
 
-    if parallelization_group is None:
-        parallelization_group = torch.distributed.group.WORLD
-    group_size = get_pg_size(group=parallelization_group)
-    if group_size <= 1:
-        return
     local_shards = list(
         sh_base
         for sh_base in nested_values(sharded_state_dict)
@@ -210,11 +226,38 @@ def determine_main_replica_uniform_distribution(
     )
     local_shards_no_data = [ten.without_data() for ten in local_shards]
 
-    all_shards = [None] * get_pg_size(group=parallelization_group)
+    all_shards: List[Optional[List[ShardedTensor]]] = [None] * get_pg_size(
+        group=parallelization_group
+    )
     torch.distributed.all_gather_object(
         all_shards, local_shards_no_data, group=parallelization_group
     )
+    return cast(List[List[ShardedTensor]], all_shards)
 
+
+def _build_shard_distribution(
+    all_shards: List[List[ShardedTensor]], ignore_groups: bool
+) -> ShardDistribution:
+    """Computes a ShardDistribution from already-gathered shard metadata.
+
+    This is the pure, deterministic post-gather logic of
+    ``determine_main_replica_uniform_distribution`` factored out so that:
+      * it can be run twice (for both ``ignore_groups`` variants) from a single
+        gather when creating the cache, and
+      * it has no dependence on the local rank, which is what makes the result
+        identical on every rank of the group and therefore safe to persist and
+        reload across jobs.
+
+    Args:
+        all_shards (List[List[ShardedTensor]]): gathered per-rank shard metadata
+            (output of ``_gather_shards_metadata``).
+        ignore_groups (bool): if True (load mode) include shards whose main
+            replica lives outside this group; if False (save mode) restrict to
+            shards with a main replica in this group.
+
+    Returns:
+        ShardDistribution: the computed distribution.
+    """
     shard_to_ranks = defaultdict(list)
     shard_to_size = {}
     shard_to_metadata = {}
@@ -251,6 +294,199 @@ def determine_main_replica_uniform_distribution(
     return ShardDistribution(
         shard_to_saving_rank, shards_in_this_group, shard_to_metadata, shard_to_ranks
     )
+
+
+def _pg_dist_cache_file_path(
+    cache_path: str, parallelization_group: torch.distributed.ProcessGroup
+) -> str:
+    """Returns the cache file path holding the distributions for a given group.
+
+    The file is keyed by a SHA-256 digest of the group's ordered global ranks.
+    Decision rationale:
+      * The distribution depends on the group's exact membership and rank order,
+        so the key must identify both. ``min(global ranks)`` alone is not
+        unique: distinct groups can share a minimum rank (for example a
+        data-parallel group over ranks [0, 1, 2, 3] and an expert-data-parallel
+        group over [0, 2]), and they would then read or overwrite each other's
+        distributions.
+      * It is computed from purely local metadata
+        (``get_process_group_ranks``), so the filename is derivable without any
+        collective — essential for the zero-communication read path.
+      * Every member of a group maps to the same file (one file per group rather
+        than one per rank): far fewer files at scale and a single read per rank,
+        with duplicate reads absorbed by the FS page cache.
+
+    Cache files written under the earlier ``pg_dist_<min rank>.pkl`` naming are
+    not read; regenerate them with ``--ckpt-pg-tensors-cache-create``.
+
+    Args:
+        cache_path (str): directory holding the cache files.
+        parallelization_group (ProcessGroup): the group to key on.
+
+    Returns:
+        str: absolute-or-relative path of the group's cache file.
+    """
+    ranks = torch.distributed.get_process_group_ranks(parallelization_group)
+    group_key = hashlib.sha256(",".join(map(str, ranks)).encode("ascii")).hexdigest()
+    return os.path.join(cache_path, f"{PG_DIST_CACHE_FILE_PREFIX}_{group_key}.pkl")
+
+
+def _load_pg_dist_cache(cache_file: str) -> Dict[bool, ShardDistribution]:
+    """Reads both pre-computed ShardDistributions for a group from disk.
+
+    Returns the full ``{ignore_groups: ShardDistribution}`` map (not just one
+    variant) so the caller can memoize both in the process-global cache and serve
+    later save/load calls without re-opening the file.
+
+    Performs no existence/validity checks by design (see the feature docs): the
+    user opts into the cache only when they guarantee the config and world size
+    match the run that created it, trading safety for the lowest possible
+    latency.
+
+    Args:
+        cache_file (str): resolved path of the group's cache file.
+
+    Returns:
+        Dict[bool, ShardDistribution]: the {ignore_groups: distribution} map.
+    """
+    with open(cache_file, "rb") as f:
+        return pickle.load(f)
+
+
+def _create_pg_dist_cache(
+    all_shards: List[List[ShardedTensor]],
+    cache_path: str,
+    parallelization_group: torch.distributed.ProcessGroup,
+) -> Dict[bool, ShardDistribution]:
+    """Builds both distribution variants and persists them for the group.
+
+    Both the save (``ignore_groups=False``) and load (``ignore_groups=True``)
+    distributions are derived from the *same* gathered metadata, so a single
+    collective suffices to populate a cache usable by every later load and save
+    — even if the creating job only ever loads (e.g. ``exit_after_loading_ckpt``).
+
+    Only the group's writer rank (global rank == ``min`` of the group) writes,
+    keeping create-time IO to one file per group. The write is atomic
+    (temp file + ``os.replace``) so a concurrent/interrupted create can never
+    leave a torn file that a reader would later trust blindly.
+
+    Args:
+        all_shards (List[List[ShardedTensor]]): gathered shard metadata.
+        cache_path (str): directory to write the cache file into.
+        parallelization_group (ProcessGroup): group being cached.
+
+    Returns:
+        Dict[bool, ShardDistribution]: the {ignore_groups: distribution} map,
+            so the caller can return the variant it needs without recomputing.
+    """
+    both: Dict[bool, ShardDistribution] = {
+        ignore_groups: _build_shard_distribution(all_shards, ignore_groups)
+        for ignore_groups in (False, True)
+    }
+    ranks = torch.distributed.get_process_group_ranks(parallelization_group)
+    if torch.distributed.get_rank() == min(ranks):
+        os.makedirs(cache_path, exist_ok=True)
+        path = _pg_dist_cache_file_path(cache_path, parallelization_group)
+        tmp_path = f"{path}.tmp.{torch.distributed.get_rank()}"
+        with open(tmp_path, "wb") as f:
+            pickle.dump(both, f)
+        os.replace(tmp_path, path)
+    return both
+
+
+def determine_main_replica_uniform_distribution(
+    sharded_state_dict: ShardedStateDict,
+    parallelization_group: torch.distributed.ProcessGroup,
+    ignore_groups: bool = False,
+    pg_cache_path: Optional[str] = None,
+    pg_cache_create: bool = False,
+) -> Optional[ShardDistribution]:
+    """Computes (or loads from cache) the load/save shard distribution.
+
+    Should be used in conjunction with `distribute_main_replicas_with_precomputed_distribution`
+    which applies the computed save distribution.
+
+    We rely on the fact that the assignment algorithm is deterministic on all ranks,
+    so there is no extra communication needed after metadata exchange.
+
+    PG-collective caching:
+    The metadata exchange (`all_gather_object`) is by far the dominant cost of
+    this function at scale. Its result is a pure deterministic function of the
+    sharded state dict structure and the parallel layout, so for a fixed config
+    and world size it is identical across jobs and can be cached on disk:
+
+      * ``pg_cache_path`` set, ``pg_cache_create=False`` (READ): skip the
+        collective entirely and load the pre-computed distribution for this
+        group and mode from disk.
+      * ``pg_cache_path`` set, ``pg_cache_create=True`` (CREATE): run the
+        collective once, build *both* the save and load distributions from the
+        single gather, persist them, and return the requested one.
+      * both unset (default): the original behaviour, unchanged.
+
+    Results are additionally memoized in a process-global cache (``_PG_DIST_CACHE``)
+    keyed by the group's cache file, so within a single job each group is created
+    (gather + write) or read (file open) at most once — later calls (subsequent
+    saves, the second ``replicate_local_replicas`` pass, or the save wrapper
+    reusing the load wrapper's entry) are served from memory.
+
+    No existence/validity checks are performed on the cache by design — the user
+    opts in only when guaranteeing a matching config and world size.
+
+    Args:
+        sharded_state_dict (ShardedStateDict): state dict to compute the distribution of
+        parallelization_group (ProcessGroup): distribution will be computed
+            within this process group
+        ignore_groups (bool, optional): whether the distribution defines groups.
+            This option is primarily used during loading, as it ensures that all replicas,
+            including non-main ones, are loaded by this parallelization group
+            Defaults to False.
+        pg_cache_path (str, optional): directory of the PG-distribution cache.
+            When set, enables the caching feature. Defaults to None (disabled).
+        pg_cache_create (bool, optional): when True (and ``pg_cache_path`` set),
+            compute the distribution normally and write the cache; when False
+            (and ``pg_cache_path`` set), read the cache and skip the collective.
+            Defaults to False.
+
+    Returns (ShardDistribution, optional): distribution that can be used to apply the
+        parallelization. Returns None if the process_group is trivial (1 rank)
+
+    """
+    from ..utils import get_pg_size
+
+    if parallelization_group is None:
+        parallelization_group = torch.distributed.group.WORLD
+    group_size = get_pg_size(group=parallelization_group)
+    if group_size <= 1:
+        return
+
+    if pg_cache_path is not None:
+        # The resolved file path uniquely identifies this (cache dir, group) and
+        # keys the process-global memo. Checking it *first* makes both READ and
+        # CREATE idempotent within a job: a second call for the same group (a
+        # later save, the second `replicate_local_replicas` call, or the save
+        # wrapper reusing what the load wrapper already cached) returns from
+        # memory with no collective and no file IO. The check is identical on all
+        # ranks of the group, so it never desynchronizes the collective below.
+        cache_file = _pg_dist_cache_file_path(pg_cache_path, parallelization_group)
+        if cache_file in _PG_DIST_CACHE:
+            return _PG_DIST_CACHE[cache_file][bool(ignore_groups)]
+
+        # READ path: no collective; open the file once, then memoize both variants.
+        if not pg_cache_create:
+            both = _load_pg_dist_cache(cache_file)
+            _PG_DIST_CACHE[cache_file] = both
+            return both[bool(ignore_groups)]
+
+        # CREATE path: gather once, build & persist both variants, then memoize
+        # so no subsequent call for this group gathers or writes again.
+        all_shards = _gather_shards_metadata(sharded_state_dict, parallelization_group)
+        both = _create_pg_dist_cache(all_shards, pg_cache_path, parallelization_group)
+        _PG_DIST_CACHE[cache_file] = both
+        return both[bool(ignore_groups)]
+
+    # Default path: unchanged behaviour.
+    all_shards = _gather_shards_metadata(sharded_state_dict, parallelization_group)
+    return _build_shard_distribution(all_shards, ignore_groups)
 
 
 @torch.no_grad()
@@ -401,8 +637,6 @@ def exchange_loaded_tensors_gather_object(
             previously loaded tensors (from `loaded_tensors` input)
 
     """
-    from ..utils import log_single_rank
-
     all_loaded_tensors_list = [None] * torch.distributed.get_world_size(group=parallelization_group)
     torch.distributed.all_gather_object(
         all_loaded_tensors_list, loaded_tensors, group=parallelization_group
@@ -413,18 +647,18 @@ def exchange_loaded_tensors_gather_object(
     # Error checks
     if len(all_loaded_tensors) != sum(map(len, all_loaded_tensors_list)):
         err_msg = "Duplicate shard ids loaded by different ranks"
-        log_single_rank(
-            logger,
-            logging.ERROR,
-            f"{err_msg}. Shards ids by rank:" f" {[lt.keys() for lt in all_loaded_tensors_list]}",
-        )
+        if logger.isEnabledFor(logging.ERROR) and safe_get_rank() == 0:
+            shard_ids_by_rank = [
+                rank_loaded_tensors.keys() for rank_loaded_tensors in all_loaded_tensors_list
+            ]
+            logger.error("%s. Shards ids by rank: %s", err_msg, shard_ids_by_rank)
         raise CheckpointingException(err_msg)
 
     return all_loaded_tensors
 
 
 def exchange_loaded_objects_gather_object(
-    loaded_objects: Dict[_ShardId, Any]
+    loaded_objects: Dict[_ShardId, Any],
 ) -> Dict[_ShardId, Any]:
     """Exchange the objects loaded by different ranks with a simple all_gather_object call.
 
@@ -436,8 +670,6 @@ def exchange_loaded_objects_gather_object(
         Dict[_ShardId, Any]: dictionary mapping shard ids to objects needed by this rank to
          load a given state dict.
     """
-    from ..utils import log_single_rank
-
     all_loaded_objects_list = [None] * torch.distributed.get_world_size()
     torch.distributed.all_gather_object(all_loaded_objects_list, loaded_objects, group=None)
     all_loaded_objects_list = cast(List[Dict[_ShardId, Any]], all_loaded_objects_list)
@@ -446,11 +678,11 @@ def exchange_loaded_objects_gather_object(
     # Error checks
     if len(all_loaded_objects) != sum(map(len, all_loaded_objects_list)):
         err_msg = "Duplicate shard ids loaded by different ranks"
-        log_single_rank(
-            logger,
-            logging.ERROR,
-            f"{err_msg}. Shards ids by rank:" f" {[lt.keys() for lt in all_loaded_objects_list]}",
-        )
+        if logger.isEnabledFor(logging.ERROR) and safe_get_rank() == 0:
+            shard_ids_by_rank = [
+                rank_loaded_objects.keys() for rank_loaded_objects in all_loaded_objects_list
+            ]
+            logger.error("%s. Shards ids by rank: %s", err_msg, shard_ids_by_rank)
         raise CheckpointingException(err_msg)
 
     return all_loaded_objects
@@ -542,12 +774,147 @@ def exchange_loaded_tensors_broadcast(
     return all_loaded_tensors
 
 
+_QUANTIZED_STORAGE_PART_ALIGNMENT = 16
+
+
+def _aligned_nbytes(nbytes: int) -> int:
+    return -(-nbytes // _QUANTIZED_STORAGE_PART_ALIGNMENT) * _QUANTIZED_STORAGE_PART_ALIGNMENT
+
+
+def _quantized_storage_nbytes(tensor: torch.Tensor) -> int:
+    """Size of the packed quantized storage of a TE quantized tensor (see `_pack_...`)."""
+    return sum(
+        _aligned_nbytes(part.numel() * part.element_size())
+        for part in _quantized_storage_tensors(tensor)
+    )
+
+
+def _pack_quantized_storage(tensor: torch.Tensor) -> torch.Tensor:
+    """Packs the raw storage of a TE quantized tensor (codes and scales) into one byte buffer.
+
+    Exchanging the raw storage instead of the dequantized values keeps the loading rank's
+    encoding bit for bit on the receivers (re-quantizing dequantized values can pick different
+    block scales) and halves the exchanged bytes. Parts are 16-byte aligned so that every part
+    can be viewed in place with its own dtype.
+    """
+    buf = torch.empty(_quantized_storage_nbytes(tensor), dtype=torch.uint8, device=tensor.device)
+    offset = 0
+    for part in _quantized_storage_tensors(tensor):
+        nbytes = part.numel() * part.element_size()
+        buf[offset : offset + nbytes].view(part.dtype).view(part.shape).copy_(part)
+        offset += _aligned_nbytes(nbytes)
+    return buf
+
+
+def _unpack_quantized_storage(buf: torch.Tensor, tensor: torch.Tensor) -> None:
+    """Inverse of `_pack_quantized_storage`, writing into the storage of `tensor`."""
+    offset = 0
+    for part in _quantized_storage_tensors(tensor):
+        nbytes = part.numel() * part.element_size()
+        part.copy_(buf[offset : offset + nbytes].view(part.dtype).view(part.shape))
+        offset += _aligned_nbytes(nbytes)
+    if offset != buf.numel():
+        raise CheckpointingException(
+            f'Packed quantized storage ({buf.numel()} bytes) does not match the destination'
+            f' ({offset} bytes)'
+        )
+
+
+def exchange_loaded_tensors_broadcast_quantized(
+    loaded_tensors: Dict[_ShardId, torch.Tensor],
+    unloaded_shards: Dict[_ShardId, ShardedTensor],
+    shard_distribution: ShardDistribution,
+    parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> Dict[_ShardId, torch.Tensor]:
+    """`exchange_loaded_tensors_broadcast` for state dicts with quantized destinations.
+
+    Used by the streaming dequantize load, which loads quantized destinations in place on the
+    loading rank. Such tensors are broadcast as their packed raw storage (see
+    `_pack_quantized_storage`) and unpacked straight into the receivers' destinations, so that
+    every rank ends up with the loading rank's encoding and no high-precision copy is created.
+    Other tensors are exchanged as by `exchange_loaded_tensors_broadcast`.
+
+    Args: see `exchange_loaded_tensors_broadcast`.
+    """
+    from ..fp8_utils import is_float8tensor  # Avoid circular import
+
+    main_rank_for_shard, _, shard_to_metadata, all_ranks_for_shard = shard_distribution
+    local_rank = torch.distributed.get_rank(group=parallelization_group)
+
+    # Ranks that do not need a shard still take part in its broadcast and must know the size of
+    # its packed storage, which only the loading rank knows: gather the sizes once up front.
+    local_nbytes = {
+        shard_id: _quantized_storage_nbytes(tensor)
+        for shard_id, tensor in loaded_tensors.items()
+        if is_float8tensor(tensor)
+    }
+    all_nbytes = [None] * torch.distributed.get_world_size(group=parallelization_group)
+    torch.distributed.all_gather_object(all_nbytes, local_nbytes, group=parallelization_group)
+    quantized_nbytes = {k: v for rank_nbytes in all_nbytes for k, v in rank_nbytes.items()}
+
+    if not quantized_nbytes:
+        return exchange_loaded_tensors_broadcast(
+            loaded_tensors, unloaded_shards, shard_distribution, parallelization_group
+        )
+
+    plain_loaded_tensors = {k: v for k, v in loaded_tensors.items() if k not in quantized_nbytes}
+    plain_distribution = ShardDistribution(
+        {k: v for k, v in main_rank_for_shard.items() if k not in quantized_nbytes},
+        shard_distribution.shards_in_this_group,
+        shard_to_metadata,
+        all_ranks_for_shard,
+    )
+    all_loaded_tensors = exchange_loaded_tensors_broadcast(
+        plain_loaded_tensors, unloaded_shards, plain_distribution, parallelization_group
+    )
+
+    for shard_id, rank in main_rank_for_shard.items():
+        if shard_id not in quantized_nbytes:
+            continue
+        nbytes = quantized_nbytes[shard_id]
+        if rank == local_rank:
+            all_loaded_tensors[shard_id] = loaded_tensors[shard_id]
+        if len(all_ranks_for_shard[shard_id]) == 1:
+            # Only the loading rank needs this tensor, no exchange needed.
+            continue
+        if rank == local_rank:
+            quantized = loaded_tensors[shard_id]
+            buf = _pack_quantized_storage(quantized)
+        else:
+            quantized = unloaded_shards[shard_id].data if shard_id in unloaded_shards else None
+            if quantized is not None and (
+                not is_float8tensor(quantized) or _quantized_storage_nbytes(quantized) != nbytes
+            ):
+                raise CheckpointingException(
+                    f'Shard {shard_id} was loaded as a quantized tensor on rank {rank} but its'
+                    f' destination on rank {local_rank} does not have the same quantized storage'
+                )
+            buf = torch.empty(nbytes, dtype=torch.uint8, device='cuda')
+        global_src_rank = (
+            rank
+            if parallelization_group is None
+            else torch.distributed.get_global_rank(parallelization_group, rank)
+        )
+        torch.distributed.broadcast(buf, src=global_src_rank, group=parallelization_group)
+        if rank != local_rank and quantized is not None:
+            with torch.no_grad():
+                _unpack_quantized_storage(buf, quantized)
+            # Hand back a view rather than the destination object itself: `load_state_dict`
+            # copies the loaded tensor into the param, and TE's generic quantized `copy_`
+            # cannot copy a tensor onto itself (it detaches the source storage first).
+            all_loaded_tensors[shard_id] = quantized.view(quantized.shape)
+        del buf
+
+    return all_loaded_tensors
+
+
 def exchange_by_distribution(
     loaded_tensors: Dict[_ShardId, torch.Tensor],
     unloaded_shards: Dict[_ShardId, ShardedTensor],
     shard_distribution: ShardDistribution,
     parallelization_group: Optional[torch.distributed.ProcessGroup] = None,
     exchange_algo="broadcast",
+    exchange_quantized_storage: bool = False,
 ) -> Dict[_ShardId, torch.Tensor]:
     """Exchange tensors loaded by different ranks using the specified exchange_algo.
 
@@ -561,6 +928,10 @@ def exchange_by_distribution(
             distribution. Tensors will be exchanged within this group
         exchange_algo (str): The algorithm used for performing exchanges.
             Defaults to 'broadcast'.
+        exchange_quantized_storage (bool): with the 'broadcast' algorithm, exchange quantized
+            tensors as their raw storage and unpack them into the receivers' quantized
+            destinations (streaming dequantize load), see
+            `exchange_loaded_tensors_broadcast_quantized`.
 
     Returns:
         Dict[_ShardId, torch.Tensor]: dictionary mapping shard ids to tensors
@@ -574,7 +945,11 @@ def exchange_by_distribution(
     elif exchange_algo == "gather_rounds":
         exchange_fn = exchange_loaded_tensors_gather_rounds
     elif exchange_algo == "broadcast":
-        exchange_fn = exchange_loaded_tensors_broadcast
+        exchange_fn = (
+            exchange_loaded_tensors_broadcast_quantized
+            if exchange_quantized_storage
+            else exchange_loaded_tensors_broadcast
+        )
     else:
         raise NotImplementedError(f"Unrecognized gather algorithm: {exchange_algo}")
     return exchange_fn(loaded_tensors, unloaded_shards, shard_distribution, parallelization_group)

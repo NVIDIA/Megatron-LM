@@ -9,6 +9,9 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 
+from megatron.core.tensor_parallel.layers import (
+    linear_with_grad_accumulation_and_async_allreduce,
+)
 from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.utils import ensure_divisible
 
@@ -32,14 +35,11 @@ if TYPE_CHECKING:
 # readiness) — this vanilla path is a drop-in substitute only when kernel
 # parity with the reference backend is required.
 # ---------------------------------------------------------------------------
+# (torch.matmul kernel, NOT TE).
 
 
 class _VanillaColParallelMatmul(torch.autograd.Function):
-    """forward: output = matmul(input, weight.t()) — replicated input, sharded output.
-    backward: grad_input = grad_output @ weight (+ all-reduce across TP);
-              grad_weight = grad_output.T @ input.
-    Mirrors MC `LinearWithGradAccumulationAndAsyncCommunication`.
-    """
+    """forward: output = matmul(input, weight.t()) — replicated input, sharded output."""
 
     @staticmethod
     def forward(ctx, input_, weight, tp_group):
@@ -61,17 +61,7 @@ class _VanillaColParallelMatmul(torch.autograd.Function):
 
 
 class _VanillaColParallelMatmulSP(torch.autograd.Function):
-    """SP-aware column-parallel matmul matching MC's
-    `ColumnParallelLinear(sequence_parallel=True)` kernel bit-for-bit.
-
-    forward:
-      - all-gather input along dim-0 from [S/tp, B, H] → [S, B, H]
-      - matmul(gathered, weight.t()) → [S, B, V/tp]
-    backward:
-      - grad_input_full = grad_output @ weight  → [S, B, H]
-      - reduce-scatter dim-0 → [S/tp, B, H]
-      - grad_weight = grad_output^T @ gathered_input
-    """
+    """SP-aware column-parallel matmul matching MC's `ColumnParallelLinear(sequence_parallel=True)` kernel bit-for-bit."""
 
     @staticmethod
     def forward(ctx, input_, weight, tp_group):
@@ -108,17 +98,7 @@ class _VanillaColParallelMatmulSP(torch.autograd.Function):
 
 
 class _VanillaColLinear(nn.Module):
-    """Drop-in for `te.Linear(parallel_mode='column')` using torch.matmul.
-
-    Shape: `self.weight` is (out_features_per_tp, in_features). Exposes
-    `.weight` at the same attribute path as TE Linear for checkpoint-loader
-    compatibility.
-
-    When `sp=True`, input is assumed SP-sharded on dim-0; forward gathers
-    before matmul and backward reduce-scatters grad_input — matching MC's
-    `ColumnParallelLinear(sequence_parallel=True)` bit-for-bit. When
-    `sp=False`, input is assumed replicated and grad_input is all-reduced.
-    """
+    """Drop-in for `te.Linear(parallel_mode='column')` using torch.matmul."""
 
     def __init__(self, in_features: int, out_features: int, ps: ParallelState, *, sp: bool = False):
         super().__init__()
@@ -133,6 +113,18 @@ class _VanillaColLinear(nn.Module):
         nn.init.xavier_uniform_(self.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Once the distributed optimizer has allocated ``main_grad``, Core's own
+        # linear can accumulate the weight gradient straight into it.
+        if getattr(self.weight, "main_grad", None) is not None:
+            return linear_with_grad_accumulation_and_async_allreduce(
+                input=x,
+                weight=self.weight,
+                bias=None,
+                gradient_accumulation_fusion=True,
+                allreduce_dgrad=not self.sp and self.tp_size > 1,
+                sequence_parallel=self.sp and self.tp_size > 1,
+                tp_group=self.tp_group,
+            )
         if self.sp:
             return _VanillaColParallelMatmulSP.apply(x, self.weight, self.tp_group)
         return _VanillaColParallelMatmul.apply(x, self.weight, self.tp_group)
@@ -257,21 +249,74 @@ class RowParallelLinear(nn.Module):
 
 
 def pad_vocab_for_tp(vocab_size: int, tp_size: int) -> int:
-    """Round vocab up to be divisible by `lcm(128, tp_size)`.
-
-    Matches MC's `_vocab_size_with_padding(..., make_vocab_size_divisible_by=128)`:
-    pad to 128-multiple for GEMM alignment, and also require tp-divisibility.
-    For typical `tp_size ∈ {1,2,4,...,128}`, `lcm = 128` so a vocab already
-    divisible by 128 (e.g. Qwen3-MoE's 151936) stays unchanged — which is
-    what MC's `output_layer` sees. Using `128 * tp_size` instead would
-    over-pad (e.g. 151936 -> 152064
-    at tp=2), introducing 128 extra logits into the vocab-parallel cross-
-    entropy log-sum-exp and driving a ~3e-4 loss drift.
-    """
+    """Round vocab up to be divisible by `lcm(128, tp_size)`."""
     import math
 
     divisor = math.lcm(128, tp_size)
     return ((vocab_size + divisor - 1) // divisor) * divisor
+
+
+def _dummy_wgrad(weight: torch.Tensor) -> torch.Tensor:
+    """One shared placeholder gradient per shape, as Core's ``get_dummy_wgrad`` does."""
+    try:
+        from transformer_engine.pytorch.module.base import get_dummy_wgrad
+
+        return get_dummy_wgrad(list(weight.shape), weight.dtype)
+    except Exception:
+        key = (weight.shape, weight.dtype, weight.device)
+        buf = _DUMMY_WGRADS.get(key)
+        if buf is None:
+            buf = torch.empty(weight.shape, dtype=weight.dtype, device=weight.device)
+            _DUMMY_WGRADS[key] = buf
+        return buf
+
+
+_DUMMY_WGRADS: dict = {}
+
+
+class _EmbeddingAccumulatingIntoMainGrad(torch.autograd.Function):
+    """Embedding lookup whose backward writes straight into ``main_grad``."""
+
+    @staticmethod
+    def forward(ctx, weight, local_ids):
+        ctx.save_for_backward(weight, local_ids)
+        return weight[local_ids]
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        weight, local_ids = ctx.saved_tensors
+        main_grad = getattr(weight, "main_grad", None)
+        if main_grad is None or main_grad.dtype != torch.float32:
+            grad = torch.zeros_like(weight)
+            grad.index_add_(
+                0,
+                local_ids.reshape(-1),
+                grad_output.reshape(-1, grad_output.shape[-1]).to(weight.dtype),
+            )
+            return grad, None
+        main_grad.index_add_(
+            0, local_ids.reshape(-1), grad_output.reshape(-1, grad_output.shape[-1]).float()
+        )
+        weight.grad_added_to_main_grad = True
+        # DDP asserts a gradient is present whenever overlap_grad_reduce is on,
+        # so returning None here trades one copy for a crash.
+        return _dummy_wgrad(weight), None
+
+
+class AccumulatingLinear(nn.Linear):
+    """``nn.Linear`` whose weight gradient lands in ``main_grad`` directly."""
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if getattr(self.weight, "main_grad", None) is None:
+            return super().forward(x)
+        return linear_with_grad_accumulation_and_async_allreduce(
+            input=x,
+            weight=self.weight,
+            bias=self.bias,
+            gradient_accumulation_fusion=True,
+            allreduce_dgrad=False,
+            sequence_parallel=False,
+        )
 
 
 class VocabParallelEmbedding(nn.Module):
@@ -298,7 +343,7 @@ class VocabParallelEmbedding(nn.Module):
         if self.deterministic:
             out = self.embedding.weight[local_ids]
         else:
-            out = self.embedding(local_ids)
+            out = _EmbeddingAccumulatingIntoMainGrad.apply(self.embedding.weight, local_ids)
         out = out * mask.unsqueeze(-1)
         if self.tp_size > 1:
             out = _ReduceFromTP.apply(out, self.tp_group)
@@ -306,14 +351,7 @@ class VocabParallelEmbedding(nn.Module):
 
 
 class _ColForLMHead(nn.Module):
-    """Thin wrapper exposing `.linear` (with `.weight`) for checkpoint-loader
-    compat, switchable between TE and vanilla torch.matmul kernel.
-
-    `sp=True` threads to the underlying linear: vanilla uses the SP-aware
-    matmul (gather-in / reduce-scatter-on-bwd); TE uses `sequence_parallel=True`
-    on `te.Linear`. Both match MC's `output_layer(sequence_parallel=True)`
-    semantics so the upstream final_layernorm can run on SP-sharded input.
-    """
+    """Thin wrapper exposing `.linear` (with `.weight`) for checkpoint-loader compat, switchable between TE and vanilla torch.matmul kernel."""
 
     def __init__(
         self,
@@ -342,12 +380,7 @@ class _ColForLMHead(nn.Module):
 
 
 class VocabParallelOutput(nn.Module):
-    """Output projection split across TP on the vocab dimension (column parallel).
-
-    Default backend is `"vanilla"` (torch.matmul) to match the reference backend's
-    `tensor_parallel.ColumnParallelLinear` bit-for-bit. Pass `backend="te"`
-    to use TE's `te.Linear` kernel (e.g. for FP8 inference paths).
-    """
+    """Output projection split across TP on the vocab dimension (column parallel)."""
 
     def __init__(
         self, vocab_size: int, hidden_size: int, ps: ParallelState, *, backend: str = "vanilla"

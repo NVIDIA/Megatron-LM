@@ -127,25 +127,7 @@ You can combine formats to optimize both flexibility and performance:
 
 The framework supports asynchronous checkpoint saving to improve training performance by offloading I/O operations. 
 
-We are transitioning to a new async saving implementation based on the **NVRx (NVIDIA Resiliency Extension)** package. The legacy async strategy (referred to as **mcore**) is being deprecated.
-
-### Migration to NVRx
-
-- The **NVRx-based async strategy** will become the **default** in mcore v0.17.
-- The existing **mcore async strategy** is **deprecated** and will be removed in future versions.
-- A deprecation warning is emitted when using the mcore strategy.
-
-### Selecting Async Strategy
-
-`--async-strategy` flag is introduced to control the async strategy. To use legacy async strategy (**mcore**), set:
-
-```bash
---async-strategy mcore
-```
-
-### NVRx Dependency
-
-To use the NVRx-based async strategy, you must install the `nvidia-resiliency-ext` package.
+To use the async strategy, you must install the `nvidia-resiliency-ext` package.
 
 ```bash
 git clone https://github.com/NVIDIA/nvidia-resiliency-ext
@@ -155,15 +137,13 @@ pip install .
 
 > NOTE
 
-- If `nvidia-resiliency-ext` is not installed, the NVRx async strategy will not be available.
-- The `mcore` strategy will remain temporarily to ensure a smooth transition but will be removed in future releases.
-- It is strongly recommended to migrate to the NVRx strategy as soon as possible.
+- If `nvidia-resiliency-ext` is not installed, the async strategy will not be available.
 
 ### Async Saving for `fsdp_dtensor` and `torch_dcp` checkpoints
 
 Starting from mcore v0.17, asynchronous checkpoint saving is supported for `fsdp_dtensor` and `torch_dcp` formats.
 
-Note that async saving for these formats requires the `nvidia-resiliency-ext` package. As a result, the only supported `async_strategy` in this context is `nvrx`.
+Note that async saving for these formats requires the `nvidia-resiliency-ext` package.
 
 ## Subpackages
 

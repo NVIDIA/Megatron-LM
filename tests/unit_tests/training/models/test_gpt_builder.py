@@ -1,18 +1,21 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 
 import inspect
+import sys
 from unittest.mock import Mock, call, patch
 
 import pytest
 import torch
 
-from megatron.core.transformer import ModuleSpec
+from megatron.core.transformer import MLATransformerConfig, ModuleSpec
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.heterogeneous.heterogeneous_config import (
     HeterogeneousTransformerConfig,
 )
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
 from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.training.argument_utils import gpt_config_from_args
+from megatron.training.arguments import parse_args, validate_args
 from megatron.training.models.gpt import (
     GPTModelBuilder,
     GPTModelConfig,
@@ -264,6 +267,7 @@ class TestGPTModelConfigInitialization:
         assert config.should_pad_vocab is False
         assert config.seq_length == 1024
         assert config.fp16_lm_cross_entropy is False
+        assert config.logit_dtype is None
         assert config.parallel_output is True
         assert config.share_embeddings_and_output_weights is False
         assert config.position_embedding_type == "learned_absolute"
@@ -282,6 +286,7 @@ class TestGPTModelConfigInitialization:
             transformer=_make_transformer(),
             seq_length=4096,
             fp16_lm_cross_entropy=True,
+            logit_dtype=torch.float32,
             parallel_output=False,
             share_embeddings_and_output_weights=True,
             position_embedding_type="rope",
@@ -290,6 +295,7 @@ class TestGPTModelConfigInitialization:
         )
         assert config.seq_length == 4096
         assert config.fp16_lm_cross_entropy is True
+        assert config.logit_dtype == torch.float32
         assert config.parallel_output is False
         assert config.share_embeddings_and_output_weights is True
         assert config.position_embedding_type == "rope"
@@ -366,6 +372,24 @@ class TestGPTModelConfigSetAttr:
         self.config.hidden_size = 2048
         assert "hidden_size" not in self.config.__dict__
 
+    def test_rotary_fields_reach_an_mla_transformer_config(self):
+        """rotary_base / rotary_percent exist on both GPTModelConfig and MLATransformerConfig;
+        MLA builds its rotary embeddings from the inner config, so the proxy must forward them."""
+        mla = MLATransformerConfig(
+            num_layers=2,
+            hidden_size=12,
+            num_attention_heads=4,
+            use_cpu_initialization=True,
+            q_lora_rank=32,
+            kv_lora_rank=32,
+            qk_head_dim=128,
+            v_head_dim=128,
+            qk_pos_emb_head_dim=64,
+        )
+        GPTModelConfig(transformer=mla, vocab_size=32000, rotary_base=500000, rotary_percent=0.5)
+        assert mla.rotary_base == 500000
+        assert mla.rotary_percent == 0.5
+
 
 class TestGPTModelConfigFinalize:
     """Tests for GPTModelConfig.finalize() — validation logic."""
@@ -383,12 +407,13 @@ class TestGPTModelConfigFinalize:
         assert not hasattr(config.transformer, "finalize")
         config.finalize()
 
-    def test_raises_when_cudagraph_without_te_rng_tracker(self):
+    def test_model_finalization_does_not_validate_runtime_rng_policy(self):
         config = _make_gpt_config()
         config.transformer.cuda_graph_impl = "local"
         config.transformer.use_te_rng_tracker = False
-        with pytest.raises(AssertionError, match="RNG tracker"):
-            config.finalize()
+        # The run container propagates RNGConfig before finalizing the model.
+        config.finalize()
+        assert not config.transformer.use_te_rng_tracker
 
     def test_no_error_when_cudagraph_with_te_rng_tracker(self):
         config = _make_gpt_config()
@@ -662,11 +687,11 @@ class TestGPTModelBuilderBuildModel:
         mock_mtp = patches[-1]
         mtp_spec = ModuleSpec(module=object)
         mock_mtp.return_value = mtp_spec
+        self.pg.pp.rank.return_value = 1
 
         self.builder.build_model(self.pg, pre_process=True, post_process=True, vp_stage=1)
 
-        # mtp_block_spec is called with (config, transformer_layer_spec, vp_stage=vp_stage)
-        mock_mtp.assert_called_once_with(self.config, self._default_spec, vp_stage=1)
+        mock_mtp.assert_called_once_with(self.config, self._default_spec, vp_stage=1, pp_rank=1)
         assert mock_model.call_args.kwargs["mtp_block_spec"] is mtp_spec
 
     @patch("megatron.training.models.gpt.mtp_block_spec", return_value=None)
@@ -681,6 +706,7 @@ class TestGPTModelBuilderBuildModel:
             vocab_size=32000,
             seq_length=4096,
             fp16_lm_cross_entropy=True,
+            logit_dtype=torch.float32,
             parallel_output=False,
             share_embeddings_and_output_weights=True,
             position_embedding_type="rope",
@@ -702,6 +728,7 @@ class TestGPTModelBuilderBuildModel:
         assert kw["vocab_size"] == 32000
         assert kw["max_sequence_length"] == 4096
         assert kw["fp16_lm_cross_entropy"] is True
+        assert kw["logit_dtype"] == torch.float32
         assert kw["parallel_output"] is False
         assert kw["share_embeddings_and_output_weights"] is True
         assert kw["position_embedding_type"] == "rope"
@@ -847,17 +874,22 @@ class TestMtpBlockSpec:
         result = mtp_block_spec(config, spec)
         assert result is None
 
+    @pytest.mark.parametrize("attention_variant", [None, "gdn", "gdn2", "dsa", "dsv4_hybrid"])
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
-    def test_uses_resolved_block_layer_spec(self, mock_get_mtp):
+    def test_reuses_last_resolved_decoder_layer_spec(self, mock_get_mtp, attention_variant):
         config = self._make_config(mtp_num_layers=1)
-        decoder_layer = ModuleSpec(module=object)
-        spec = TransformerBlockSubmodules(layer_specs=[decoder_layer])
+        config.transformer.experimental_attention_variant = attention_variant
+        layer_specs = [ModuleSpec(module=object), ModuleSpec(module=object)]
+        spec = TransformerBlockSubmodules(layer_specs=layer_specs)
         mock_get_mtp.return_value = Mock(spec=ModuleSpec)
 
-        mtp_block_spec(config, spec)
+        result = mtp_block_spec(config, spec, vp_stage=3, pp_rank=7)
 
-        passed_spec = mock_get_mtp.call_args.args[1]
-        assert passed_spec is decoder_layer
+        mock_get_mtp.assert_called_once_with(
+            config.transformer, layer_specs[-1], use_transformer_engine=True, vp_stage=3, pp_rank=7
+        )
+        assert mock_get_mtp.call_args.args[1] is layer_specs[-1]
+        assert result is mock_get_mtp.return_value
 
     @patch("megatron.training.models.gpt._te_or_local_layer_spec")
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
@@ -870,11 +902,12 @@ class TestMtpBlockSpec:
         mock_te_or_local.return_value = fallback_spec
         mock_get_mtp.return_value = Mock(spec=ModuleSpec)
 
-        mtp_block_spec(config, spec, vp_stage=4)
+        mtp_block_spec(config, spec, vp_stage=4, pp_rank=7)
 
         mock_te_or_local.assert_called_once_with(config, 4)
         passed_spec = mock_get_mtp.call_args.args[1]
         assert passed_spec is fallback_spec
+        assert mock_get_mtp.call_args.kwargs["pp_rank"] == 7
 
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
     def test_passes_vp_stage_and_use_te_to_get_gpt_mtp_block_spec(self, mock_get_mtp):
@@ -882,11 +915,14 @@ class TestMtpBlockSpec:
         spec = ModuleSpec(module=object)
         mock_get_mtp.return_value = Mock(spec=ModuleSpec)
 
-        mtp_block_spec(config, spec, vp_stage=3)
+        result = mtp_block_spec(config, spec, vp_stage=3, pp_rank=7)
 
+        assert result is mock_get_mtp.return_value
+        assert mock_get_mtp.call_args.args[1] is spec
         call_kwargs = mock_get_mtp.call_args.kwargs
         assert call_kwargs["use_transformer_engine"] is True
         assert call_kwargs["vp_stage"] == 3
+        assert call_kwargs["pp_rank"] == 7
 
     @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
     def test_use_transformer_engine_false_when_impl_not_te(self, mock_get_mtp):
@@ -896,7 +932,21 @@ class TestMtpBlockSpec:
 
         mtp_block_spec(config, spec)
 
+        assert mock_get_mtp.call_args.args[1] is spec
         assert mock_get_mtp.call_args.kwargs["use_transformer_engine"] is False
+
+    @patch("megatron.core.models.gpt.gpt_layer_specs.get_gpt_mtp_block_spec")
+    def test_uses_explicit_spec_when_layer_specs_nonempty(self, mock_get_mtp):
+        config = self._make_config(mtp_num_layers=1)
+        decoder_specs = [ModuleSpec(module=object), ModuleSpec(module=object)]
+        spec = TransformerBlockSubmodules(layer_specs=decoder_specs)
+        mock_get_mtp.return_value = Mock(spec=ModuleSpec)
+
+        mtp_block_spec(config, spec)
+
+        # Use the final resolved decoder spec, preserving caller-selected variants.
+        passed_spec = mock_get_mtp.call_args.args[1]
+        assert passed_spec is decoder_specs[-1]
 
 
 @pytest.mark.parametrize(
@@ -929,3 +979,49 @@ def test_mtp_block_spec_reuses_experimental_decoder_layer(mock_get_mtp):
     mtp_block_spec(config, decoder_block)
 
     assert mock_get_mtp.call_args.args[1] is decoder_layer
+
+
+# =============================================================================
+# Section 5 — gpt_config_from_args
+# =============================================================================
+
+
+class TestGPTConfigFromArgs:
+    """Tests for argument propagation through ``gpt_config_from_args``."""
+
+    def _make_args(self, **overrides):
+        sys.argv = ['test_gpt_builder.py']
+        args = parse_args()
+        args.num_layers = 2
+        args.hidden_size = 128
+        args.num_attention_heads = 8
+        args.micro_batch_size = 1
+        args.seq_length = 128
+        args.max_position_embeddings = 131072
+        args.padded_vocab_size = 32000
+        args.position_embedding_type = 'rope'
+        args.apply_rope_fusion = False
+        for name, value in overrides.items():
+            setattr(args, name, value)
+        validate_args(args)
+        return args
+
+    def test_forwards_rope_scaling_factor_from_args(self):
+        """--rope-scaling-factor must reach the model config instead of the default."""
+        args = self._make_args(use_rope_scaling=True, rope_scaling_factor=32.0)
+
+        config = gpt_config_from_args(args)
+
+        assert config.rope_scaling is True
+        assert config.rope_scaling_factor == 32.0
+
+    def test_seq_length_and_max_position_embeddings_land_on_different_fields(self):
+        """--seq-length is the per-sample training length that core modules (NCCL EP) size
+        buffers from; --max-position-embeddings is the position-embedding capacity on the
+        model config. They must not be conflated."""
+        args = self._make_args(seq_length=128, max_position_embeddings=131072)
+
+        config = gpt_config_from_args(args)
+
+        assert config.transformer.max_seq_length_per_sample == 128
+        assert config.seq_length == 131072

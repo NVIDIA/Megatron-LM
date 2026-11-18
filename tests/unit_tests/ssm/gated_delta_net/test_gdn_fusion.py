@@ -116,6 +116,7 @@ class TestFusedPreGatedDeltaRule:
             linear_attention_freq=[1],
             transformer_impl="transformer_engine",
             deterministic_mode=deterministic_mode,
+            gdn_kernel_backend="torch" if deterministic_mode else "fla",
             gdn_pre_gated_delta_rule_fusion=gdn_pre_gated_delta_rule_fusion,
         )
         gdn_submodules = get_experimental_attention_variant_module_spec(
@@ -355,7 +356,9 @@ class TestFusedPreGatedDeltaRule:
             unfused_outputs,
             atol=1e-3,
             rtol=1e-3,
-            output_tolerances={"g": (1e-3, 3e-3)},
+            # Fused and unfused L2 reductions can round Q/K to adjacent BF16
+            # values. One ULP can be as large as 2**-7 relative to the value.
+            output_tolerances={"query": (1e-3, 8e-3), "key": (1e-3, 8e-3), "g": (1e-3, 3e-3)},
         )
 
     def test_fused_and_unfused_beta_use_fp32_sigmoid(self):

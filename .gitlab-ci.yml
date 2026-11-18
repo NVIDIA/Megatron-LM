@@ -8,7 +8,6 @@
   FUNCTIONAL_TEST_SCOPE: mr-slim
   FUNCTIONAL_TEST_REPEAT: 1
   FUNCTIONAL_TEST_TIME_LIMIT: 2700
-  CLUSTER_A100: ""
   CLUSTER_H100: ""
   PUBLISH: "no"
 
@@ -48,7 +47,6 @@ workflow:
         FUNCTIONAL_TEST_REPEAT: 5
         FUNCTIONAL_TEST_RECORD_CHECKPOINTS: "no"
         FUNCTIONAL_TEST_TIME_LIMIT: 3600
-        CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
       auto_cancel:
@@ -62,7 +60,6 @@ workflow:
         UNIT_TEST_TIMEOUT: 30
         INTEGRATION_TEST: "no"
         FUNCTIONAL_TEST: "no"
-        CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
 
@@ -82,7 +79,6 @@ workflow:
         FUNCTIONAL_TEST_SCOPE: mr-slim
         FUNCTIONAL_TEST_REPEAT: 1
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
-        CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
 
@@ -98,7 +94,6 @@ workflow:
         FUNCTIONAL_TEST_REPEAT: 5
         FUNCTIONAL_TEST_RECORD_CHECKPOINTS: "no"
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
-        CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
 
@@ -114,7 +109,6 @@ workflow:
         FUNCTIONAL_TEST_REPEAT: 1
         FUNCTIONAL_TEST_RECORD_CHECKPOINTS: "no"
         FUNCTIONAL_TEST_TIME_LIMIT: 9000
-        CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
 
@@ -129,7 +123,6 @@ workflow:
         FUNCTIONAL_TEST_SCOPE: mr
         FUNCTIONAL_TEST_REPEAT: 1
         FUNCTIONAL_TEST_TIME_LIMIT: 2700
-        CLUSTER_A100: ""
         CLUSTER_H100: ""
         PUBLISH: "no"
 
@@ -154,6 +147,7 @@ stages:
   - integration_tests
   - functional_tests
   - publish
+  - triage
 
 default:
   interruptible: true
@@ -230,12 +224,6 @@ variables:
     options:
       - "yes"
       - "no"
-  CLUSTER_A100:
-    value: "dgxa100_dracooci"
-    options:
-      - "dgxa100_dracooci"
-      - "dgxa100_dracooci-ord"
-    description: "Cluster for A100 workloads"
   CLUSTER_H100:
     value: "dgxh100_coreweave"
     options:
@@ -247,6 +235,11 @@ variables:
     options:
       - "dgxgb200_oci-hsg"
     description: "Cluster for H100 workloads"
+  CLUSTER_GB300:
+    value: "dgxgb300_oci-jhb"
+    options:
+      - "dgxgb300_oci-jhb"
+    description: "Cluster for GB300 workloads"
   PUBLISH:
     value: "no"
     options:
@@ -268,7 +261,21 @@ variables:
       - "upgrade-dependencies"
     description: Type of publish (freeze or final release)
 
+  RUN_LINEAR_STATUS:
+    value: "True"
+    options:
+      - "True"
+      - "False"
+    description: Reconcile functional-test failures against Linear
+  RUN_LINEAR_WRITE:
+    value: "True"
+    options:
+      - "True"
+      - "False"
+    description: Apply proposed Linear issue opens, updates, and closes
+
   # CI wide variables
+  CERNO_CONFIG: .gitlab/cerno.yml
   CI_MCORE_LTS_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci_lts
   CI_MCORE_DEV_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/mcore_ci_dev
   CI_NEMO_IMAGE: ${GITLAB_ENDPOINT}:5005/adlr/megatron-lm/nemo_ci
@@ -282,3 +289,4 @@ include:
   - .gitlab/stages/03.integration-tests.yml
   - .gitlab/stages/04.functional-tests.yml
   - .gitlab/stages/05.publish.yml
+  - .gitlab/stages/06.triage.yml

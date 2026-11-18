@@ -22,6 +22,7 @@ import copy
 import json
 import math
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Dict, Optional
 from unittest.mock import patch
@@ -197,9 +198,10 @@ def _build_mamba_model(
     post_process: bool = True,
 ) -> HybridModel:
     """Build a HybridModel with the given hybrid layer pattern."""
-    layer_type_list = validate_segment_layers(layer_pattern)
     mamba_config = copy.deepcopy(config)
-    mamba_config.num_layers = len(layer_type_list)
+    mamba_config.num_layers = len(layer_pattern)
+    layer_config_list = validate_segment_layers(layer_pattern, mamba_config)
+    assert len(layer_config_list) == mamba_config.num_layers
     assert mamba_config.num_layers == _NUM_GPT_LAYERS * 2
     model = HybridModel(
         config=mamba_config,
@@ -665,12 +667,14 @@ class TestDSAHybridMHCProxy:
         Utils.destroy_model_parallel()
 
     def _enable_mhc(self, config: MLATransformerConfig) -> MLATransformerConfig:
-        config.enable_hyper_connections = True
-        config.num_residual_streams = 4
-        config.mhc_sinkhorn_iterations = 5
-        config.mhc_init_gating_factor = 0.01
-        config.hidden_dropout = 0.0
-        return config
+        return replace(
+            config,
+            enable_mhc_connections=True,
+            num_residual_streams=4,
+            mhc_sinkhorn_iterations=5,
+            mhc_init_gating_factor=0.01,
+            hidden_dropout=0.0,
+        )
 
     def _assert_mhc_model_forward(self, config: MLATransformerConfig, pattern: str) -> None:
         Utils.initialize_model_parallel(1, 1)
@@ -693,3 +697,13 @@ class TestDSAHybridMHCProxy:
         """DeepSeek-V3-style DSA + MoE split pattern runs with mHC."""
         config = _make_dsa_moe_config(num_layers=_NUM_GPT_LAYERS, tp=1, pp=1)
         self._assert_mhc_model_forward(config, _MOE_MAMBA_PATTERN)
+
+
+def test_mhc_proxy_config_normalizes_enablement():
+    original = _make_dsa_config(num_layers=_NUM_GPT_LAYERS)
+    config = TestDSAHybridMHCProxy()._enable_mhc(original)
+    assert not original.enable_mhc_connections
+    assert not original.enable_hyper_connections
+    assert config.enable_mhc_connections
+    assert config.enable_hyper_connections
+    assert config.mhc_num_residual_streams == config.num_residual_streams == 4

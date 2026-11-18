@@ -42,3 +42,4 @@ MODEL_ARGS:
   --ckpt-format: torch
   --attention-backend: unfused
 TEST_TYPE: regular
+LAUNCHER: ft_launcher

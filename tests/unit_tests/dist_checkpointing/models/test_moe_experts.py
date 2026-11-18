@@ -1,4 +1,4 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
 
 import pytest
@@ -29,6 +29,7 @@ from megatron.core.transformer.spec_utils import get_submodules
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import is_te_min_version
 from tests.unit_tests.dist_checkpointing import TempNamedDir
+from tests.unit_tests.dist_checkpointing.models.common import common_test_pg_distribution_cache_e2e
 from tests.unit_tests.test_utilities import Utils
 
 fp8_available, reason_for_no_fp8 = check_fp8_support()
@@ -53,7 +54,14 @@ def enable_te_cutedsl_fused_grouped_mlp():
             os.environ['NVTE_CUTEDSL_FUSED_GROUPED_MLP'] = previous
 
 
-def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False, **config_kwargs):
+def initialize_expert_layer(
+    seed,
+    glu=True,
+    expert_type='sequential',
+    fp8=False,
+    use_te_activation_func=False,
+    **config_kwargs,
+):
     torch.manual_seed(seed)
     model_parallel_cuda_manual_seed(seed)
     pg_collection = get_default_pg_collection()
@@ -70,12 +78,15 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
         gated_linear_unit=glu,
         fp8="hybrid" if fp8 else None,
         add_bias_linear=False,
+        use_te_activation_func=use_te_activation_func,
     )
     default_config_kwargs.update(**config_kwargs)
     transformer_config = TransformerConfig(**default_config_kwargs)
     if expert_type == 'te_grouped':
         layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
-            num_experts=num_moe_experts, moe_grouped_gemm=True
+            num_experts=num_moe_experts,
+            moe_grouped_gemm=True,
+            use_te_activation_func=use_te_activation_func,
         )
         mlp_submodules = get_submodules(layer_submodules.mlp)
         assert isinstance(mlp_submodules, MoESubmodules)
@@ -97,7 +108,9 @@ def initialize_expert_layer(seed, glu=True, expert_type='sequential', fp8=False,
         )
     elif expert_type == 'te_sequential':
         layer_submodules = get_gpt_layer_with_transformer_engine_submodules(
-            num_experts=num_moe_experts, moe_grouped_gemm=False
+            num_experts=num_moe_experts,
+            moe_grouped_gemm=False,
+            use_te_activation_func=use_te_activation_func,
         )
         mlp_submodules = get_submodules(layer_submodules.mlp)
         assert isinstance(mlp_submodules, MoESubmodules)
@@ -131,6 +144,91 @@ class TestExpertLayerReconfiguration:
 
     def teardown_method(self, method):
         Utils.destroy_model_parallel()
+
+    @pytest.mark.parametrize('save_load_process_group', ['dp', 'ep_dp'])
+    @pytest.mark.parametrize(('tp', 'pp', 'ep'), [(1, 1, 1), (1, 1, 2), (1, 2, 2), (2, 1, 2)])
+    @pytest.mark.parametrize('expert_type', expert_type)
+    def test_pg_distribution_cache_e2e(
+        self, tmp_path_dist_ckpt, tp, pp, ep, expert_type, save_load_process_group
+    ):
+        """MoE experts must round-trip identically through the PG-distribution cache.
+
+        Experts are the case the cache targets: they dominate the shard count and can
+        be distributed over either parallelization group that
+        --ckpt-fully-parallel-{save,load}-process-group selects, so both 'dp' and
+        'ep_dp' are covered here, across tensor, pipeline and expert parallelism.
+        """
+        Utils.initialize_model_parallel(tp, pp, expert_model_parallel_size=ep)
+        if save_load_process_group == 'ep_dp':
+            parallelization_group = parallel_state.get_expert_data_parallel_group()
+        else:
+            parallelization_group = parallel_state.get_data_parallel_group(
+                with_context_parallel=True
+            )
+        common_test_pg_distribution_cache_e2e(
+            lambda seed: initialize_expert_layer(seed, expert_type=expert_type),
+            tmp_path_dist_ckpt,
+            parallelization_group,
+            sharded_state_dict_fn=lambda model: model.sharded_state_dict(
+                prefix=f'{parallel_state.get_pipeline_model_parallel_rank()}.'
+            ),
+        )
+
+    @pytest.mark.internal
+    @pytest.mark.parametrize("expert_gtp_remat_size", [1, 2])
+    @pytest.mark.skipif(
+        not is_te_min_version("1.13.0"),
+        reason="TE activation operators require Transformer Engine 1.13 or later.",
+    )
+    def test_grouped_te_activation_extra_state_tracks_expert_dp_replica(
+        self, tmp_path_dist_ckpt, expert_gtp_remat_size
+    ):
+        """Grouped TE state must identify replicas across joint ETP-EP, expert-DP and EGTP-remat.
+
+        With ``expert_gtp_remat_size=1`` the expert-DP and ``expt_dp_gtp_remat`` groups coincide,
+        so only the remat size 2 case catches a DP coordinate taken from the replicate group: the
+        rematerialization peers would then share main-replica ids.
+        """
+        Utils.initialize_model_parallel(
+            2,
+            1,
+            expert_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+            expert_gtp_remat_size=expert_gtp_remat_size,
+            order="tp-ep-dp-pp",
+        )
+        model = initialize_expert_layer(1, expert_type="te_grouped", use_te_activation_func=True)
+        sharded_state_dict = model.sharded_state_dict()
+
+        activation_extra_states = {
+            key: value
+            for key, value in sharded_state_dict.items()
+            if key.endswith("activation_func._extra_state")
+        }
+        assert len(activation_extra_states) == 1
+        activation_extra_state = next(iter(activation_extra_states.values()))
+        assert activation_extra_state.replica_id == (
+            0,
+            parallel_state.get_expert_tensor_and_model_parallel_rank(),
+            parallel_state.get_expert_data_parallel_rank(),
+        )
+        # Every rank holds a distinct replica id and exactly one rank the main replica.
+        all_replica_ids = [None] * torch.distributed.get_world_size()
+        torch.distributed.all_gather_object(all_replica_ids, activation_extra_state.replica_id)
+        assert len(set(all_replica_ids)) == len(all_replica_ids), all_replica_ids
+        assert sum(replica_id == (0, 0, 0) for replica_id in all_replica_ids) == 1, all_replica_ids
+
+        # The default MoE process-group collection carries no ``expt_gtp_remat`` group, so with
+        # rematerialization peers the grouped linear weights are not GTP-sharded. Save the whole
+        # model where that is well defined and only the activation entries otherwise.
+        state_to_save = (
+            sharded_state_dict if expert_gtp_remat_size == 1 else activation_extra_states
+        )
+        with TempNamedDir(
+            tmp_path_dist_ckpt / "test_grouped_te_activation_extra_state_tracks_expert_dp_replica",
+            sync=True,
+        ) as ckpt_dir:
+            save(state_to_save, ckpt_dir, validate_access_integrity=True)
 
     @pytest.mark.internal
     @pytest.mark.parametrize(
@@ -346,6 +444,7 @@ class TestExpertLayerReconfiguration:
     def test_sequential_grouped_mlp_extra_state(
         self,
         tmp_path_dist_ckpt,
+        monkeypatch,
         src_tp_pp_exp,
         dest_tp_pp_exp,
         src_module,
@@ -393,6 +492,8 @@ class TestExpertLayerReconfiguration:
                 ckpt_dir_A,
                 load_strategy,
             )
+            # This checkpoint was created by the test and is therefore trusted.
+            monkeypatch.setenv("NVTE_ALLOW_UNSAFE_PICKLE_EXTRA_STATE", "1")
             model_A.load_state_dict(
                 {k.removeprefix(layer_prefix): v for k, v in state_dict.items()}
             )

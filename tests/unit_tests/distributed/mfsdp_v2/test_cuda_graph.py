@@ -4,17 +4,26 @@
 
 import logging
 
+import pytest
 import torch
+import torch.distributed as dist
 from torch import nn
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import Partial, Replicate, Shard
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
-    Flat,
+    FsdpContext,
     Placements,
+    RuntimePolicy,
     fully_shard,
+    fully_shard_context,
 )
 
 logger = logging.getLogger(__name__)
+
+# Sized so NCCL selects its symmetric-memory (ncclSymk*) kernels over ring for the
+# sharded Linear collectives; see test_symmetric_memory.py for the rationale.
+_HIDDEN = 1024
 
 
 class NestedModel(nn.Module):
@@ -33,27 +42,57 @@ class NestedModel(nn.Module):
         return x
 
 
-def _flat_placements() -> Placements:
-    return Placements(dp_axes=[0], parameter=[Flat()], gradient=[Flat()], optimizer=[Flat()])
+def _default_placements() -> Placements:
+    return Placements(dp_axes=[0], parameter=[Shard(0)], gradient=[Shard(0)], optimizer=[Shard(0)])
 
 
-def test_captures_full_iteration(distributed_setup):
-    """A full training iteration should be CUDA-graphable."""
+# CUDA graph capture without symmetric memory is supported and runs by default. The symmetric
+# memory case tracks https://github.com/NVIDIA/Megatron-LM/issues/6154: its MemPool is separate
+# from CUDA graph's private pool, so allocation addresses and lifetimes are not yet guaranteed
+# across capture and replay. Mark only that case flaky until the required PyTorch allocator and
+# buffer-registration support is available.
+@pytest.mark.parametrize(
+    "use_symmetric_memory",
+    [
+        pytest.param(False, id="default"),
+        pytest.param(
+            True, id="symmetric_memory", marks=[pytest.mark.flaky, pytest.mark.flaky_in_dev]
+        ),
+    ],
+)
+def test_captures_full_iteration(distributed_setup, use_symmetric_memory):
+    """A full training iteration should be CUDA-graphable, with and without symmetric memory.
+
+    With ``use_symmetric_memory=True`` the FSDP collective path changes: unshard allocates the
+    all-gather buffer from a symmetric-memory ``MemPool`` and calls
+    ``symm_mem.rendezvous()``, and the backward reduce-scatter does the same for the
+    partial-gradient buffer. Both allocation-from-pool and rendezvous are normally
+    illegal inside CUDA-graph capture, so this confirms the warmup establishes reusable,
+    already-rendezvoused buffers that capture and replay cleanly -- reproducing the
+    non-symmetric-memory loss trajectory exactly.
+    """
     world_size = distributed_setup.world_size
     device = distributed_setup.device
+    if use_symmetric_memory and world_size < 2:
+        pytest.skip("Symmetric memory requires at least 2 ranks.")
 
     mesh = init_device_mesh(device.type, (world_size,))
     torch.manual_seed(1234)
-    dim = 8
+    dim = _HIDDEN
     model = NestedModel(dim=dim, num_children=2).to(device)
 
     static_input = torch.eye(dim, device=device)
     static_target = torch.zeros_like(static_input)
 
-    placements = _flat_placements()
-    for layer in model.layers:
-        fully_shard(layer, mesh=mesh, placements=placements)
-    fully_shard(model, mesh=mesh, placements=placements)
+    placements = _default_placements()
+    with fully_shard_context(
+        FsdpContext(
+            device=device, runtime_policy=RuntimePolicy(use_symmetric_memory=use_symmetric_memory)
+        )
+    ):
+        for layer in model.layers:
+            fully_shard(layer, mesh=mesh, placements=placements)
+        fully_shard(model, mesh=mesh, placements=placements)
 
     optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
 
@@ -64,6 +103,11 @@ def test_captures_full_iteration(distributed_setup):
         loss.backward()
         optimizer.step()
         return loss.detach()
+
+    if use_symmetric_memory:
+        # NCCL symmetric-memory window registration can fail when a rendezvous is the
+        # first collective on a communicator, so establish it before capture.
+        dist.barrier(group=mesh.get_group(0), device_ids=[device.index])
 
     capture_stream = torch.cuda.Stream()
     capture_stream.wait_stream(torch.cuda.current_stream())
@@ -99,3 +143,66 @@ def test_captures_full_iteration(distributed_setup):
         f"first={loss_values[0]:.6f}, "
         f"last={loss_values[-1]:.6f}, trace={loss_values}"
     )
+
+
+def test_local_accumulation_captures_full_iteration(distributed_setup):
+    """Graph replay matches eager training with singleton-inner accumulation and outer overlap."""
+    device = distributed_setup.device
+    if distributed_setup.world_size < 2:
+        pytest.skip("Requires a nontrivial outer data-parallel axis.")
+    mesh = init_device_mesh(device.type, (distributed_setup.world_size, 1))
+    placements = Placements(
+        [0, 1], [Replicate(), Shard(0)], [Partial("avg"), Shard(0)], [Replicate(), Shard(0)]
+    )
+    torch.manual_seed(1234)
+    model = NestedModel(dim=16, num_children=2).to(device)
+    reference_model = NestedModel(dim=16, num_children=2).to(device)
+    reference_model.load_state_dict(model.state_dict())
+    for candidate in (model, reference_model):
+        with fully_shard_context(
+            FsdpContext(
+                device=device, runtime_policy=RuntimePolicy(overlap_outer_communication=True)
+            )
+        ):
+            for layer in candidate.layers:
+                fully_shard(layer, mesh=mesh, placements=placements)
+            fully_shard(candidate, mesh=mesh, placements=placements)
+
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.25, foreach=False)
+    reference_optimizer = torch.optim.SGD(reference_model.parameters(), lr=0.25, foreach=False)
+    static_input = torch.eye(16, device=device)
+    static_target = torch.zeros_like(static_input)
+
+    def train_iteration(model, optimizer) -> torch.Tensor:
+        optimizer.zero_grad(set_to_none=False)
+        loss = torch.nn.functional.mse_loss(model(static_input), static_target)
+        loss.backward()
+        optimizer.step()
+        return loss.detach()
+
+    capture_stream = torch.cuda.Stream()
+    capture_stream.wait_stream(torch.cuda.current_stream())
+    # Warm up on the capture stream to establish reusable gradient storage.
+    with torch.cuda.stream(capture_stream):
+        for _ in range(3):
+            train_iteration(model, optimizer)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=capture_stream):
+        static_loss = train_iteration(model, optimizer)
+    torch.cuda.current_stream().wait_stream(capture_stream)
+
+    # Capture records kernels without executing them; only warmup advanced the model.
+    for _ in range(3):
+        train_iteration(reference_model, reference_optimizer)
+
+    losses = []
+    reference_losses = []
+    for _ in range(5):
+        graph.replay()
+        # Preserve each replay's loss before the next replay overwrites it.
+        losses.append(static_loss.clone())
+        reference_losses.append(train_iteration(reference_model, reference_optimizer))
+    torch.testing.assert_close(torch.stack(losses), torch.stack(reference_losses))
+    for parameter, reference_parameter in zip(model.parameters(), reference_model.parameters()):
+        torch.testing.assert_close(parameter.to_local(), reference_parameter.to_local())

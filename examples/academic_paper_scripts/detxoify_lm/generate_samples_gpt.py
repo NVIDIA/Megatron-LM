@@ -3,6 +3,7 @@
 
 
 """Sample Generate GPT"""
+
 import json
 import os
 import sys
@@ -23,8 +24,10 @@ from megatron.core.models.gpt.gpt_layer_specs import (
 from megatron.core.transformer.spec_utils import import_module
 from megatron.inference.text_generation import generate_and_post_process
 from megatron.training import get_args, get_model, get_tokenizer, print_rank_0
+from megatron.training.argument_utils import inference_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
+from megatron.training.global_vars import get_run_config, set_run_config
 from megatron.training.initialize import initialize_megatron
 
 
@@ -40,6 +43,7 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
         GPTModel: The returned model
     """
     args = get_args()
+    cfg_container = get_run_config()
 
     print_rank_0('building GPT model ...')
     config = core_transformer_config_from_args(args)
@@ -65,11 +69,12 @@ def model_provider(pre_process=True, post_process=True) -> GPTModel:
     model = GPTModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
-        vocab_size=args.padded_vocab_size,
+        vocab_size=cfg_container.tokenizer.padded_vocab_size,
         max_sequence_length=args.max_position_embeddings,
         pre_process=pre_process,
         post_process=post_process,
         fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        logit_dtype=getattr(args, 'logit_dtype', None),
         parallel_output=False,
         share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
         position_embedding_type=args.position_embedding_type,
@@ -244,15 +249,12 @@ def generate_and_write_samples_conditional(model):
 def main():
     """Main program."""
 
-    parse_and_validate_args(
-        extra_args_provider=add_text_generate_args,
-        args_defaults={
-            'tokenizer_type': 'GPT2BPETokenizer',
-            'no_load_rng': True,
-            'no_load_optim': True,
-            'seq_length': 2048,
-        },
-    )
+    args = parse_and_validate_args(extra_args_provider=add_text_generate_args,
+                            args_defaults={'tokenizer_type': 'GPT2BPETokenizer',
+                                           'no_load_rng': True,
+                                           'no_load_optim': True,
+                                           'seq_length': 2048})
+    set_run_config(inference_cfg_container_from_args(args))
     initialize_megatron()
 
     # Set up model and load checkpoint

@@ -9,7 +9,6 @@ import time
 _TRAIN_START_TIME = time.time()  # The earliest we can measure the start time.
 
 # Standard library.
-import argparse
 import copy
 import dataclasses
 import functools
@@ -20,6 +19,7 @@ import math
 import os
 import sys
 from collections import defaultdict
+from collections.abc import Callable
 from contextlib import nullcontext
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -40,8 +40,8 @@ logging.basicConfig(handlers=[CustomHandler()], level=logging.INFO)
 # measurement (kept for backwards compatibility).
 _LEGACY_TRAIN_START_TIME = time.time()  # NOTE(asolergi-nv): Legacy timestamp
 
-# First-party.
-from megatron.core import mpu, nccl_allocator, tensor_parallel
+from megatron.core import mpu, tensor_parallel
+from megatron.core._rank_utils import safe_get_rank, safe_get_world_size
 from megatron.core.datasets.data_schedule import wrap_data_iterator
 from megatron.core.distributed import DistributedDataParallel as DDP
 from megatron.core.distributed import (
@@ -50,18 +50,24 @@ from megatron.core.distributed import (
     finalize_model_grads,
 )
 from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
-    FullyShardedDataParallel as megatron_FSDP,
+    FullyShardedDataParallel,
+    FullyShardedDataParallelV1,
+    FullyShardedDataParallelV2,
+)
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import (
+    FsdpContext,
+    RuntimePolicy,
+    fully_shard_context,
 )
 from megatron.core.enums import ModelType
 from megatron.core.fp8_utils import correct_amax_history_if_needed
-from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_shared_capture_stream
 from megatron.core.inference.symmetric_memory import SymmetricMemoryManager
-from megatron.core.inference.unified_memory import create_unified_mempool
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     is_gated_delta_net_variant,
     is_linear_attention_variant,
 )
-from megatron.core.msc_utils import MultiStorageClientFeature, open_file
+from megatron.core.msc_utils import maybe_msc
 from megatron.core.num_microbatches_calculator import (
     destroy_num_microbatches_calculator,
     get_current_global_batch_size,
@@ -99,6 +105,7 @@ from megatron.core.parallel_state import (
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
 from megatron.core.pipeline_parallel.utils import (
+    get_pp_last_rank,
     is_pp_first_stage,
     is_pp_last_stage,
     is_vp_first_stage,
@@ -114,11 +121,12 @@ from megatron.core.rerun_state_machine import (
     destroy_rerun_state_machine,
     get_rerun_state_machine,
 )
-from megatron.core.resharding.refit import swap_model_weights
 from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
-from megatron.core.transformer.experimental_attention_variant.dsa import (
+from megatron.core.transformer.experimental_attention_variant.dsa import is_dsa_skip_topk_layer
+from megatron.core.transformer.experimental_attention_variant.dsa_logging import (
     DSAIndexerLossLoggingHelper,
-    is_dsa_skip_topk_layer,
+    initialize_dsa_metric_tracker,
+    resolve_dsa_metric_pg_collection,
 )
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.moe import upcycling_utils
@@ -126,6 +134,7 @@ from megatron.core.transformer.moe.moe_logging import get_moe_metrics_tracker
 from megatron.core.transformer.moe.paged_stash import PagedStashRunner
 from megatron.core.transformer.moe.router_trace import get_moe_router_tracer, init_moe_router_tracer
 from megatron.core.transformer.multi_token_prediction import MTPLossLoggingHelper
+from megatron.core.tuning import maybe_verify_choices
 from megatron.core.utils import (
     StragglerDetector,
     check_param_hashes_across_dp_replicas,
@@ -138,6 +147,12 @@ from megatron.core.utils import (
     get_pg_size,
     unwrap_model,
 )
+from megatron.training.callbacks import (
+    Callback,
+    CallbackContext,
+    CallbackManager,
+    normalize_callbacks,
+)
 from megatron.training.checkpointing import (
     checkpoint_exists,
     get_loaded_iteration,
@@ -145,7 +160,7 @@ from megatron.training.checkpointing import (
     save_checkpoint,
     save_grads,
 )
-from megatron.training.config import FaultInjectorConfig
+from megatron.training.config import TrainingConfig, ValidationConfig
 from megatron.training.config.container import PretrainConfigContainer
 from megatron.training.datasets.data_samplers import build_pretraining_data_loader
 from megatron.training.initialize import (
@@ -153,7 +168,17 @@ from megatron.training.initialize import (
     set_jit_fusion_options,
     write_args_to_tensorboard,
 )
-from megatron.training.utils import is_hybrid_model
+from megatron.training.kernel_warmup import warmup_training_kernels
+from megatron.training.logging.dsa_flops import _dsa_indexer_flops as _dsa_kpool_indexer_flops
+from megatron.training.logging.dsa_flops import _dsa_kpool_attention_scale
+
+# Retain the training.py import path used by existing multimodal callers.
+from megatron.training.logging.packed_sequence_stats import (
+    consume_packed_sequence_stats_in_iteration,
+    update_packed_sequence_stats,
+)
+from megatron.training.models import ModelConfig
+from megatron.training.utils import is_gtp_remat_active, is_hybrid_model
 
 # Local.
 from . import ft_integration, one_logger_utils
@@ -172,10 +197,12 @@ from .global_vars import (
     get_args,
     get_energy_monitor,
     get_one_logger,
+    get_run_config,
     get_signal_handler,
+    get_telemetry,
     get_tensorboard_writer,
     get_timers,
-    get_tokenizer,
+    get_train_state,
     get_wandb_writer,
 )
 from .theoretical_memory_usage import report_theoretical_memory
@@ -190,24 +217,12 @@ from .utils import (
     reduce_max_stat_across_model_parallel_group,
     report_memory,
     to_empty_if_meta_device,
-    update_use_dist_ckpt,
 )
+
+_TensorMetricObserverCallback = Callable[..., None]
 
 # Optional dependencies. Each is guarded so the module imports cleanly when the
 # dependency is unavailable; the ``has_*``/``HAVE_*`` flags gate later usage.
-try:
-    from megatron.rl import rl_utils
-    from megatron.rl.rl_profiling import (
-        RL_LOGGABLE_TIMER_NAMES,
-        initialize_rl_profiler,
-        log_iteration_profile,
-        shutdown_rl_profiler,
-    )
-
-    has_rl_utils = True
-except ImportError:
-    has_rl_utils = False
-
 try:
     from modelopt.torch.distill.plugins.megatron import get_tensor_shapes_adjust_fn_for_distillation
 
@@ -224,17 +239,12 @@ try:
 except ImportError:
     HAVE_FSDP2 = False
 
-try:
-    from torch_memory_saver import torch_memory_saver
-
-    torch_memory_saver.hook_mode = "torch"
-    HAVE_TORCH_MEMORY_SAVER = True
-except ImportError:
-    HAVE_TORCH_MEMORY_SAVER = False
-
 # Module-level globals.
 # Startup timestamps for tracking program initialization phases.
 _STARTUP_TIMESTAMPS = {
+    'slurm_job_start_time': None,  # Set by Slurm itself (SLURM_JOB_START_TIME env var)
+    'launch_script_start': None,  # Set by the sbatch script, its own first line
+    'launch_script_presrun': None,  # Set by the sbatch script, right before srun
     'program_start': None,  # Set by entry script before imports
     'main_entry': None,  # Set by entry script at start of __main__
     'pretrain_entry': None,  # Set at top of pretrain()
@@ -256,15 +266,58 @@ stimer = StragglerDetector()
 # first time an update lands this iteration and is the gate that decides
 # whether ``consume_*`` issues a collective at all -- unpacked BSHD runs
 # never call ``update_*`` so the flag stays ``False`` and no collective fires.
+# Right-padded SBHD validation (``--varlen-sbhd-validation``) feeds its real
+# per-sample lengths through ``update_seqlen_stats_from_padding_mask`` so the
+# padding tail is not reported as useful work either.
 _seqlen_stats_in_iteration: Optional[torch.Tensor] = None
 _seqlen_stats_active: bool = False
+_seqlen_stats_are_global: bool = False
+
+# Per-iteration vision-work stats, accumulated from the actual ``grid_thw``
+# tensors consumed by multimodal forward steps:
+#   index 0 -> total input patches, ``sum_i(T_i * H_i * W_i)``
+#   index 1 -> bidirectional attention work, ``sum_i(T_i * (H_i * W_i) ** 2)``
+#   index 2 -> total output tokens after spatial patch merging
+#   index 3 -> "this rank saw runtime grid data" flag (0.0 / 1.0)
+#   index 4 -> count of malformed grid rows seen (see ``update_*``)
+#
+# Slots 3 and 4 ride along in the same tensor so the whole protocol costs one
+# all-reduce and one host sync per iteration. Slot 3 is summed and tested
+# ``> 0``: it distinguishes "some rank reported vision work" from "every
+# microbatch this iteration was text-only" (legitimately all-zero stats) and
+# from "nothing was ever reported".
+#
+# As with language packed-sequence stats, every model-parallel rank sees the
+# same grids while data-parallel ranks see different samples. ``consume_*``
+# therefore all-reduces once and removes TP/CP/PP replication. Unlike the
+# language decoder, the vision encoder itself is NOT partitioned by context
+# parallelism -- it runs before ``_cp_split_for_forward`` and is forced onto a
+# size-1 attention group, so every CP rank redundantly computes the entire
+# vision forward. Dividing by ``cp_size`` here is still correct for a MODEL
+# FLOPs metric (redundant compute is not useful work), it just means vision
+# and language replicate across CP for different reasons -- the vision
+# encoder isn't actually doing 1/cp_size of the work per rank the way the
+# decoder is.
+_VISION_FLOPS_STATS_SLOTS = 5
+_VISION_FLOPS_PATCHES_SLOT = 0
+_VISION_FLOPS_ATTN_SLOT = 1
+_VISION_FLOPS_MERGED_SLOT = 2
+_VISION_FLOPS_REPORTED_SLOT = 3
+_VISION_FLOPS_INVALID_SLOT = 4
+_vision_flops_stats_in_iteration: Optional[torch.Tensor] = None
 
 # Only report memory for first 3 checkpoint saves.
 num_checkpoints_memory_reported = 0
 MAX_NUM_CHECKPOINTS_MEMORY_REPORTED = 3
 
 
-def set_startup_timestamps(program_start=None, main_entry=None):
+def set_startup_timestamps(
+    program_start=None,
+    main_entry=None,
+    launch_script_start=None,
+    launch_script_presrun=None,
+    slurm_job_start_time=None,
+):
     """Set startup timestamps from the entry script.
 
     Call this after imports but before calling pretrain() to register
@@ -273,6 +326,18 @@ def set_startup_timestamps(program_start=None, main_entry=None):
     Args:
         program_start: Timestamp captured at very start of program, before any imports.
         main_entry: Timestamp captured right after entering __main__ block.
+        launch_script_start: Timestamp captured at the very top of the sbatch launch
+            script, before any of its own setup work (mkdir, checkpoint symlinking,
+            etc). Optional -- only meaningful if the launch script actually passes
+            it through an env var; entry points that don't have no way to know this.
+        launch_script_presrun: Timestamp captured by the launch script right before
+            it invokes srun. The gap to program_start is container/scheduler
+            overhead the launch script itself can't observe from inside Python.
+        slurm_job_start_time: Slurm's own record of when the job was granted its
+            allocation and started (SLURM_JOB_START_TIME env var, set by Slurm for
+            every process in the job -- no cooperation from the launch script
+            needed). Can be earlier than launch_script_start if there's
+            prolog/scheduling overhead before the launch script's first line runs.
     """
     global _TRAIN_START_TIME, _STARTUP_TIMESTAMPS
     if program_start is not None:
@@ -280,6 +345,394 @@ def set_startup_timestamps(program_start=None, main_entry=None):
         _STARTUP_TIMESTAMPS['program_start'] = program_start
     if main_entry is not None:
         _STARTUP_TIMESTAMPS['main_entry'] = main_entry
+    if launch_script_start is not None:
+        _STARTUP_TIMESTAMPS['launch_script_start'] = launch_script_start
+    if launch_script_presrun is not None:
+        _STARTUP_TIMESTAMPS['launch_script_presrun'] = launch_script_presrun
+    if slurm_job_start_time is not None:
+        _STARTUP_TIMESTAMPS['slurm_job_start_time'] = slurm_job_start_time
+
+
+# OTel: module-level helpers imported once at startup.
+try:
+    from nemo.lens.helpers import managed_span as _otel_managed_span
+    from nemo.lens.helpers import safe_set_span_attributes as _otel_safe_set_attrs
+    from nemo.lens.helpers import trace_fn as _otel_trace_fn
+    from nemo.lens.state import is_span_group_enabled as _otel_sg_enabled
+except ImportError:
+    from megatron.core.telemetry.fallbacks import is_span_group_enabled as _otel_sg_enabled
+    from megatron.core.telemetry.fallbacks import managed_span as _otel_managed_span
+    from megatron.core.telemetry.fallbacks import safe_set_span_attributes as _otel_safe_set_attrs
+    from megatron.core.telemetry.fallbacks import trace_fn as _otel_trace_fn
+
+
+# OTel: module-level state for the job-level spans -- module level rather than
+# closures local to pretrain(), because train()'s own early-exit path (a few
+# thousand lines away, a different function) needs to reach the same
+# end-spans-then-shutdown sequence. Closures defined inside pretrain() aren't
+# callable from there; these are.
+#
+# Structure (audit section L: NO run-long umbrellas). An incarnation emits a set of
+# SEGMENTED traces rather than one tree, because a run-long root span is dead weight
+# (its children live in their own traces anyway) and is LOST outright when a fault kill
+# arrives before it can be ended and exported. There is deliberately no in-process
+# 'workload' / 'megatron.pretrain' span: the authoritative run envelope is the
+# reckoner's out-of-band slurm.job (from sacct), and every span here carries run
+# identity (run_uuid / slurm.sluid / nvrx.cycle) on its RESOURCE attributes, which is
+# what actually stitches the traces back together.
+#
+#   trace A: pre_startup            (top-level, fully backdated, CYCLE 0 / non-NVRx only:
+#                                    SLURM_JOB_START_TIME -> launch_script_start, i.e. the
+#                                    queue tail / prolog before our first line. Ends exactly
+#                                    where the agent's nvrx.cold_start begins, so the two
+#                                    tile instead of overlapping -- audit section K.)
+#   trace B: megatron.startup       (own trace, fresh trace_id via an empty Context())
+#            |- megatron.startup.launch_script   (backdated; plain-srun path only)
+#            |- megatron.startup.container_load  (backdated; plain-srun path only)
+#            |- megatron.startup.imports / .arg_parse / .inprocess_setup /
+#            |  .in_job_setup / .initialize_megatron / .jit_fusion_options (backdated)
+#            `- whatever runs live before train()'s loop (weight-hash check, sniff test,
+#               cuda-graph setup) -- they attach to the current context
+#   trace C_n: megatron.train       (one per checkpoint interval, each its own trace --
+#              see _reroot_otel_interval; C_0 Links back to trace B, C_n Links to C_n-1)
+#
+# The launch_script/container_load children are only emitted when this process actually
+# owns that window (the launch script passed presrun through AND we're not under NVRx,
+# where nvrx.cold_start covers it -- see pretrain_hybrid.py). When they are emitted the
+# startup trace is anchored at launch_script_start so they tile inside it; otherwise it
+# is anchored at program_start.
+_otel_startup_span = None
+_otel_startup_span_ctx = None  # kept after the span ends, for the first interval's Link
+_otel_ctx_module = None
+_otel_startup_ctx_token = None
+_otel_shutdown_done = False
+# Trace segmentation: the steady-state loop is emitted as a series of megatron.train
+# spans -- one per checkpoint interval -- instead of one run-long umbrella. Each is a
+# compact [N iterations + checkpoint (+eval/sniff)] unit in its own trace, so it stays
+# short and survives a fault-kill (it .end()s at the next boundary; a single umbrella
+# only ends at loop exit, which a SIGKILL'd cycle never reaches). _otel_interval_span
+# is the current block's root (a fresh trace_id, Linked back to the prior block -- and,
+# for the first block, to this incarnation's megatron.startup trace);
+# _otel_trace_interval_step is a dedicated per-loop counter (not
+# `iteration`, which carries the resume offset) driving the save_interval-boundary
+# re-root. Iterations/checkpoint/eval/sniff nest under it via _otel_managed_span.
+_otel_interval_span = None
+_otel_interval_ctx_token = None
+_otel_trace_interval_step = 0
+# Set once the atexit hook + SIGTERM handler have been installed, so a second
+# pretrain() call in the same process can't stack duplicate registrations.
+_otel_exit_hooks_installed = False
+
+
+def _otel_telemetry_active():
+    """True only when telemetry is initialized AND actually exporting.
+
+    Gates the process-global side effects (the atexit hook, the SIGTERM handler) that
+    exist purely to flush telemetry. With telemetry off there is nothing to flush, and
+    installing them anyway would change the process's signal semantics -- a Python-level
+    SIGTERM handler makes syscalls EINTR-restartable-through-Python and inserts us into
+    the torchelastic/ft_launcher handler chain -- for a run that asked for none of it.
+
+    Returns False both when nemo-lens is absent (get_telemetry() is None) and when it is
+    present but disabled (the handle exists but is not exporting).
+    """
+    handle = get_telemetry()
+    return handle is not None and bool(getattr(handle, 'is_exporting', False))
+
+
+def _start_otel_job_spans(model_type, program_start):
+    """Emit pre_startup and open this incarnation's megatron.startup trace.
+
+    See the module comment above for the full picture. There are no run-long
+    umbrella spans any more (audit section L): 'workload' and 'megatron.pretrain'
+    used to wrap everything, but their children live in their own segmented traces,
+    the goodput denominator is the reckoner's out-of-band slurm.job, and a run-long
+    span is exactly the thing a fault SIGKILL destroys before it can be exported.
+    So this function now does just two things:
+
+      1. pre_startup -- fully backdated, top-level (emitted before any context is
+         attached, so it roots its own trace). Only when the SLURM->launch-script gap
+         is real; pretrain_hybrid.py suppresses it on NVRx restart cohorts.
+      2. megatron.startup -- opened in an EMPTY Context() so it becomes the ROOT of a
+         fresh trace instead of inheriting whatever is ambient, the same technique
+         _reroot_otel_interval uses for the per-interval blocks. It uses the explicit
+         span API (start_span + context.attach) rather than managed_span because it
+         must stay open past the end of this function -- it closes in train(), just
+         before the loop (see _end_otel_startup_span).
+
+    Its backdated children (launch_script/container_load/imports/arg_parse/...) are
+    already fully elapsed by the time we get here -- no tracer existed during imports
+    and arg parsing, telemetry isn't initialized until parse_and_validate_args()
+    returns -- so they are created-and-closed with explicit timestamps rather than
+    being live spans; see _backdated_otel_span.
+    """
+    global _otel_startup_span, _otel_startup_span_ctx, _otel_ctx_module
+    global _otel_startup_ctx_token
+
+    if not _otel_sg_enabled('job'):
+        return
+
+    from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+    from opentelemetry import context as _otel_ctx
+    from opentelemetry import trace as _otel_trace
+    from opentelemetry.context import Context as _OtelContext
+
+    _otel_ctx_module = _otel_ctx
+    _otel_tracer = get_telemetry().tracer
+
+    launch_script_start = _STARTUP_TIMESTAMPS.get('launch_script_start')
+    launch_script_presrun = _STARTUP_TIMESTAMPS.get('launch_script_presrun')
+    slurm_job_start_time = _STARTUP_TIMESTAMPS.get('slurm_job_start_time')
+    _program_start_ns = int(program_start * 1e9) if program_start is not None else None
+
+    # pre_startup: the gap between Slurm marking the job started and our own launch
+    # script's first line actually running -- queue tail / prolog scripts / node setup.
+    # Kept as a COARSE fallback for when the out-of-band SLURM reckoner isn't available
+    # (that reconstructs this authoritatively from sacct). Emitted here, before anything
+    # is attached to the context, so it is a top-level span in its own trace.
+    #
+    # It ends at launch_script_start, which on cycle 0 is the sbatch script's first line
+    # -- the exact instant the NVRx agent starts nvrx.cold_start -- so pre_startup and
+    # cold_start TILE. (They used to overlap by the whole cold-start window because
+    # pretrain_hybrid.py overrode launch_script_start with the worker-spawn stamp on
+    # every cohort including cycle 0; that override is now restart-only. Audit sect. K.)
+    # On restart cohorts pretrain_hybrid.py drops slurm_job_start_time entirely, so the
+    # guard below skips pre_startup: the agent's restart tree owns that window instead.
+    if (
+        launch_script_start is not None
+        and slurm_job_start_time is not None
+        and slurm_job_start_time < launch_script_start
+    ):
+        _backdated_otel_span('pre_startup', slurm_job_start_time, launch_script_start)
+
+    # Do we own the pre-Python launch window (launch script start -> interpreter up)?
+    # Only on the plain-srun path: the launch script has to have passed its pre-srun
+    # stamp through, AND we must not be under NVRx (where the agent's nvrx.cold_start /
+    # restart-cycle spans already describe that window -- pretrain_hybrid.py signals
+    # this by dropping presrun on every NVRx cohort). When we do own it, fold it into
+    # the startup trace: anchor the trace at launch_script_start so launch_script and
+    # container_load tile inside it ahead of imports. Otherwise the startup trace starts
+    # at program_start, as before, and neither child is emitted.
+    _fold_launch_phases = (
+        launch_script_start is not None
+        and launch_script_presrun is not None
+        and program_start is not None
+        and launch_script_start <= launch_script_presrun <= program_start
+    )
+    _startup_start_ns = int(launch_script_start * 1e9) if _fold_launch_phases else _program_start_ns
+
+    # Empty Context() -> no parent -> megatron.startup roots its OWN trace.
+    _otel_startup_span = _otel_tracer.start_span(
+        "megatron.startup", context=_OtelContext(), start_time=_startup_start_ns
+    )
+    _otel_mark_goodput(_otel_startup_span)
+    # model_type used to ride on megatron.pretrain; keep it on the startup root now that
+    # the umbrella is gone, so it is still queryable per incarnation.
+    _otel_set_attrs(_otel_startup_span, {'megatron.model_type': str(model_type)})
+    try:
+        _otel_startup_span_ctx = _otel_startup_span.get_span_context()
+    except Exception:  # noqa: BLE001 -- telemetry must never break training
+        _otel_startup_span_ctx = None
+    _otel_startup_ctx_token = _otel_ctx.attach(_otel_trace.set_span_in_context(_otel_startup_span))
+
+    if _fold_launch_phases:
+        _backdated_otel_span(
+            'megatron.startup.launch_script', launch_script_start, launch_script_presrun
+        )
+        _backdated_otel_span(
+            'megatron.startup.container_load', launch_script_presrun, program_start
+        )
+
+
+def _otel_mark_goodput(span):
+    """Mark a manually created span as a goodput boundary.
+
+    The job/startup structural spans are created via the explicit start_span API
+    (they must outlive the function that opens them), so they cannot pass
+    attributes through a managed_span call and are stamped by hand instead.
+    Absent this attribute a span is profiling-only, which is the default for
+    everything except the resiliency-accounting boundaries.
+    """
+    try:
+        span.set_attribute('is_goodput_span', True)
+    except Exception:  # noqa: BLE001 -- telemetry must never break training
+        pass
+
+
+def _backdated_otel_span(name, start, end):
+    """Record an already-elapsed phase as a closed span with explicit timestamps."""
+    if not _otel_sg_enabled('job') or start is None or end is None:
+        return
+    _otel_tracer = get_telemetry().tracer
+    _s = _otel_tracer.start_span(name, start_time=int(start * 1e9))
+    _otel_mark_goodput(_s)
+    _s.end(end_time=int(end * 1e9))
+
+
+def _end_otel_startup_span():
+    """End the megatron.startup trace root and detach its token.
+
+    This closes (and therefore exports) the whole startup trace. Safe to call more
+    than once -- the None check makes it idempotent, since it may run once explicitly
+    inside train() (after the preamble, before the loop) and again later via
+    _end_otel_job_spans() if that first call never happened (early crash).
+
+    _otel_startup_span_ctx is deliberately NOT cleared: the first interval block Links
+    back to the startup trace, and by then the span itself is gone.
+    """
+    global _otel_startup_span
+    if _otel_startup_span is not None:
+        try:
+            if _otel_ctx_module is not None and _otel_startup_ctx_token is not None:
+                _otel_ctx_module.detach(_otel_startup_ctx_token)
+        except Exception:  # noqa: BLE001 -- telemetry must never break training
+            pass
+        try:
+            _otel_startup_span.end()
+        except Exception:  # noqa: BLE001
+            pass
+        _otel_startup_span = None
+
+
+def _start_otel_train_span():
+    """Prepare the steady-state training loop's tracing.
+
+    The loop is emitted as one megatron.train span per checkpoint interval rather
+    than a single umbrella span; see the trace-segmentation note at the top of this
+    module for why. This just resets the per-interval counter; the first loop pass
+    opens the first megatron.train interval.
+
+    Called after _end_otel_startup_span() (so the startup trace is closed and detached;
+    the interval blocks root their own traces regardless, and the first one Links back
+    to the startup trace via the span context kept in _otel_startup_span_ctx).
+    """
+    global _otel_trace_interval_step
+    if not _otel_sg_enabled('job'):
+        return
+    _otel_trace_interval_step = 0  # restart the per-interval trace counter for this loop
+
+
+def _reroot_otel_interval():
+    """Close the current interval span and open the next as a new megatron.train
+    span in a new trace (empty context -> fresh trace_id). See the trace-segmentation
+    note at the top of this module for why the loop is segmented this way.
+
+    Each interval is Linked to the prior interval (a chain), and the FIRST interval of
+    this incarnation is Linked to its megatron.startup trace instead -- so a backend can
+    walk startup -> block -> block -> ... even though they are all separate traces. There
+    is no run-long span to link to any more (audit section L); run identity
+    (run_uuid/sluid/nvrx.cycle) rides the resource attrs on every span, which is the
+    primary correlation key. Iterations/checkpoint/eval/sniff nest under the block
+    because they use _otel_managed_span, which attaches to the current context."""
+    global _otel_interval_span, _otel_interval_ctx_token
+    if get_telemetry() is None or not _otel_sg_enabled('job'):
+        return
+    from opentelemetry import context as _octx
+    from opentelemetry import trace as _otr
+    from opentelemetry.context import Context
+    from opentelemetry.trace import Link
+
+    prev = _otel_interval_span
+    links = []
+    try:
+        if prev is not None:
+            links.append(Link(prev.get_span_context()))
+        elif _otel_startup_span_ctx is not None:
+            # First block of this incarnation -> chain it to the startup trace.
+            links.append(Link(_otel_startup_span_ctx))
+    except Exception:  # noqa: BLE001
+        links = []
+    # Close the prior interval (detach its context, end the span) before opening the next.
+    if prev is not None:
+        try:
+            if _otel_interval_ctx_token is not None:
+                _octx.detach(_otel_interval_ctx_token)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            prev.end()
+        except Exception:  # noqa: BLE001
+            pass
+        _otel_interval_span = None
+        _otel_interval_ctx_token = None
+    try:
+        sp = get_telemetry().tracer.start_span('megatron.train', context=Context(), links=links)
+        _otel_mark_goodput(sp)
+        _otel_interval_span = sp
+        _otel_interval_ctx_token = _octx.attach(_otr.set_span_in_context(sp))
+    except Exception:  # noqa: BLE001
+        _otel_interval_span = None
+        _otel_interval_ctx_token = None
+
+
+def _maybe_reroot_otel_interval():
+    """Called once at the top of each training-loop pass. Re-roots the trace at each
+    checkpoint-frequency boundary using a dedicated counter (so groups are clean
+    save_interval-sized chunks regardless of the resume offset in `iteration`).
+    save_interval<=0 (no checkpointing) -> never re-roots (single trace, as before)."""
+    global _otel_trace_interval_step
+    freq = get_run_config().checkpoint.save_interval or 0
+    if freq > 0 and (_otel_trace_interval_step % freq == 0):
+        _reroot_otel_interval()
+    _otel_trace_interval_step += 1
+
+
+def _end_otel_interval_span():
+    """Close the final interval root (loop exit / teardown). Idempotent."""
+    global _otel_interval_span, _otel_interval_ctx_token
+    if _otel_interval_span is not None:
+        try:
+            from opentelemetry import context as _octx
+
+            if _otel_interval_ctx_token is not None:
+                _octx.detach(_otel_interval_ctx_token)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            _otel_interval_span.end()
+        except Exception:  # noqa: BLE001
+            pass
+        _otel_interval_span = None
+        _otel_interval_ctx_token = None
+
+
+def _end_otel_train_span():
+    """Close the final megatron.train interval span. Idempotent -- called on
+    train()'s normal return and via _end_otel_job_spans() on the sys.exit() path
+    (before the telemetry shutdown, so the last block survives)."""
+    _end_otel_interval_span()
+
+
+def _end_otel_job_spans():
+    """Close whatever is still open (the current interval block, and startup if a
+    crash/early-exit skipped its normal end point), then flush+shutdown telemetry.
+
+    Since the run-long umbrellas are gone (audit section L) this is a short list --
+    which is the point: there is no longer a long-lived span that a fault SIGKILL can
+    destroy in the window between "training died" and "exporter flushed".
+
+    This is the single place that does all of this, and every exit path --
+    pretrain()'s own normal completion, train()'s early-exit
+    (--exit-interval/duration/signal, which calls sys.exit() directly from inside
+    train(), never returning control to the rest of pretrain()), the uncaught-exception
+    path, the hard-terminate SIGTERM handler, and the atexit fallback -- must call this
+    same function rather than reimplementing the sequence. Ending the spans before
+    shutdown() matters: shutdown() flushes and tears down the provider, so anything
+    ended afterward has nowhere left to export into. Safe to call more than once (e.g.
+    once from train()'s early exit, again via atexit) -- span-ending is idempotent via
+    the None checks in the two helpers, and the shutdown() call is separately guarded
+    so it only actually fires once.
+    """
+    global _otel_shutdown_done
+
+    _end_otel_train_span()  # end innermost first (train() sys.exit() path)
+    _end_otel_startup_span()
+
+    if not _otel_shutdown_done:
+        _otel_handle = get_telemetry()
+        if _otel_handle is not None:
+            _otel_handle.shutdown()
+        _otel_shutdown_done = True
 
 
 def destroy_global_state():
@@ -319,7 +772,11 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     the all-reduce; BSHD callers that never invoke this function leave the
     flag at ``False`` and pay zero collective cost.
     """
-    global _seqlen_stats_in_iteration, _seqlen_stats_active
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
+    # Packing has already supplied the complete global batch, including all
+    # microbatches. Forward calls on PP/VPP stages must not count it again.
+    if _seqlen_stats_are_global:
+        return
     if cu_seqlens is None or cu_seqlens.numel() < 2:
         return
     # Pin the accumulator to the current CUDA device when available so the
@@ -338,6 +795,69 @@ def update_seqlen_stats_from_cu_seqlens(cu_seqlens):
     _seqlen_stats_in_iteration[0] += seqlens.sum()
     _seqlen_stats_in_iteration[1] += (seqlens * seqlens).sum()
     _seqlen_stats_active = True
+    _seqlen_stats_are_global = False
+
+
+def set_seqlen_stats_in_iteration(total_real_tokens, seqlen_squared_sum):
+    """Seed per-iteration THD FLOPs stats that were already computed globally."""
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
+    if total_real_tokens is None or seqlen_squared_sum is None:
+        return
+    if _seqlen_stats_in_iteration is None:
+        device = (
+            torch.device(f'cuda:{torch.cuda.current_device()}')
+            if torch.cuda.is_available()
+            else 'cpu'
+        )
+        _seqlen_stats_in_iteration = torch.zeros(2, dtype=torch.float64, device=device)
+    _seqlen_stats_in_iteration[0] = float(total_real_tokens)
+    _seqlen_stats_in_iteration[1] = float(seqlen_squared_sum)
+    _seqlen_stats_active = True
+    _seqlen_stats_are_global = True
+
+
+def reset_seqlen_stats_in_iteration():
+    """Discard any per-iteration sequence statistics accumulated so far.
+
+    The producers run inside ``get_batch`` / ``forward_step``, so they also fire during
+    evaluation forwards and in every forward/backward attempt the rerun state machine
+    repeats for one logical iteration, while :func:`consume_seqlen_stats_in_iteration`
+    drains the accumulator only once per training iteration. ``train_step`` calls this at
+    the start of every attempt and ``evaluate`` on entry and exit, so a training
+    iteration's FLOPs only ever see the micro-batches of its own, final attempt. The
+    tensor stays allocated.
+    """
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
+    if _seqlen_stats_in_iteration is not None:
+        _seqlen_stats_in_iteration.zero_()
+    _seqlen_stats_active = False
+    _seqlen_stats_are_global = False
+
+
+def update_seqlen_stats_from_padding_mask(padding_mask):
+    """Add ``sum(L_i)`` and ``sum(L_i ** 2)`` from one right-padded SBHD micro-batch.
+
+    Args:
+        padding_mask: ``[micro_batch_size, seq_length]`` boolean tensor with
+            ``True`` at padded positions (the layout emitted by
+            ``VarlenDataset`` under ``--varlen-sbhd-validation``). The real
+            length of sample ``i`` is its number of ``False`` entries.
+
+    Padded SBHD validation runs every sample through the model at full
+    ``seq_length``, but only the real tokens are useful work, so the reported
+    FLOPs would otherwise count the padding tail (about 80% of the tokens for
+    ~14K-token documents in a 64K window). Feeding the real lengths here makes
+    the SBHD reference report the same useful-work FLOPs as its packed THD
+    counterpart. Pass the CP-unsliced mask, and call this once per pipeline
+    rank and micro-batch, like the packed-sequence callers of
+    :func:`update_seqlen_stats_from_cu_seqlens`.
+    """
+    if padding_mask is None:
+        return
+    real_lens = (~padding_mask).sum(dim=1).to(torch.int32)
+    cu_seqlens = torch.zeros(real_lens.numel() + 1, dtype=torch.int32, device=real_lens.device)
+    cu_seqlens[1:] = torch.cumsum(real_lens, dim=0)
+    update_seqlen_stats_from_cu_seqlens(cu_seqlens)
 
 
 def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float]]:
@@ -365,13 +885,15 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     replicated across TP/CP/PP); the world all-reduce therefore overcounts by a
     factor of ``TP * CP * PP``, which we divide out.
     """
-    global _seqlen_stats_in_iteration, _seqlen_stats_active
+    global _seqlen_stats_in_iteration, _seqlen_stats_active, _seqlen_stats_are_global
     if not _seqlen_stats_active:
         # BSHD path: never allocated the tensor; tell the caller to use the
         # closed-form defaults.
         return None, None
     t = _seqlen_stats_in_iteration
-    if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
+    if _seqlen_stats_are_global:
+        dedup = 1
+    elif torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
         torch.distributed.all_reduce(t)
         tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
         cp_size = max(mpu.get_context_parallel_world_size(), 1)
@@ -387,6 +909,7 @@ def consume_seqlen_stats_in_iteration() -> Tuple[Optional[float], Optional[float
     # iterations reuse it without reallocating.
     t.zero_()
     _seqlen_stats_active = False
+    _seqlen_stats_are_global = False
     return total_real_tokens / dedup, seqlen_squared_sum / dedup
 
 
@@ -422,8 +945,44 @@ def _dsa_sparse_core_scale(total_real_tokens, seqlen_squared_sum, dsa_indexer_to
     return attended / (mean_seqlen / 2)
 
 
+def _logit_flops_per_token(hidden_size, vocab_size, mtp_num_layers=0, mtp_detach_heads=False):
+    """Return training FLOPs per token for the final and MTP logit projections.
+
+    The final language-model head always participates in forward, dgrad, and
+    wgrad. MTP draft heads do the same by default, but ``mtp_detach_heads``
+    detaches their shared output weight and therefore removes only wgrad; the
+    draft hidden states still require dgrad for the MTP layer parameters.
+    """
+    fma_expansion_factor = 2
+    forward_backward_expansion_factor = 3
+    mtp_forward_backward_expansion_factor = (
+        2 if mtp_detach_heads else forward_backward_expansion_factor
+    )
+    return (
+        fma_expansion_factor
+        * hidden_size
+        * vocab_size
+        * (
+            forward_backward_expansion_factor
+            + mtp_num_layers * mtp_forward_backward_expansion_factor
+        )
+    )
+
+
 def _dsa_indexer_flops(
-    *, hidden_size, q_lora_rank, n_heads, head_dim, num_indexer_layers, indexer_loss_coeff
+    *,
+    hidden_size,
+    q_lora_rank,
+    n_heads,
+    head_dim,
+    num_indexer_layers,
+    dsa_indexer_loss_enabled: bool,
+    dsa_indexer_use_sparse_loss=False,
+    sparse_core_scale=1.0,
+    total_tokens=0,
+    seqlen_squared_sum=0,
+    dsa_indexer_topk=None,
+    dsa_indexer_kpool=1,
 ):
     """DSA lightning-indexer FLOPs coefficients, fwd/bwd expansion included.
 
@@ -436,9 +995,10 @@ def _dsa_indexer_flops(
     only the model's defining GEMMs enter the estimate, not auxiliary-loss or
     sorting work.
 
-    Only ``num_indexer_layers`` layers pay: with cross-layer index sharing
-    (``dsa_indexer_topk_freq``) the layers in between reuse the most recent
-    top-k (see ``is_dsa_skip_topk_layer``).
+    Only ``num_indexer_layers`` indexer executions pay: with cross-layer index
+    sharing (``dsa_indexer_topk_freq``) the layers in between reuse the most
+    recent top-k (see ``is_dsa_skip_topk_layer``). Repeated MTP may execute the
+    same physical indexer multiple times.
 
     The indexer does NOT get the global fwd+bwd factor of 3. It is trained
     only by its own KL loss, so ``DSAttention.forward`` runs it under
@@ -450,17 +1010,53 @@ def _dsa_indexer_flops(
       * loss on  -> the projections (wq_b / wk / weights_proj) read a detached
         input, so autograd skips their dgrad and they pay fwd + wgrad = 2x.
         The scoring GEMM has two activation operands that both need gradients
-        to reach those weights, so it pays fwd + dq + dk = 3x.
+        to reach those weights, so it pays fwd + dq + dk. Forward scoring is
+        always dense (top-k selection needs every score). How much of the
+        backward is dense depends on the loss variant:
+
+          - dense KL (``dsa_indexer_use_sparse_loss=False``, the default):
+            every causal (query, key) pair carries a gradient, so
+            dq + dk are dense too and the scoring pays 3x.
+          - sparse KL (``dsa_indexer_use_sparse_loss=True``): the KL is
+            taken over the selected top-k keys only, so the score gradient is
+            zero outside them and dq + dk span just the top-k pairs. The
+            scoring pays ``1 + 2 * sparse_core_scale``, with
+            ``sparse_core_scale`` the same top-k / dense pair ratio that
+            ``_dsa_sparse_core_scale`` applies to core attention. The fused
+            cuDNN backend (``_compute_sparse_indexer_loss_and_grads``)
+            executes exactly this sparse backward; the reference PyTorch path
+            multiplies a dense zero-padded gradient instead, which is an
+            implementation detail and, like the dense-masked reference
+            attention, does not enter the model FLOPs count.
 
     Whether the indexer is trained is part of the training procedure rather
-    than the kernel schedule, so it belongs in this model-FLOPs count. (With
-    ``dsa_indexer_use_sparse_loss`` the scoring backward only covers the top-k
-    entries, which the 3x does not model; it defaults to False.)
+    than the kernel schedule, so it belongs in this model-FLOPs count.
+    The caller derives ``dsa_indexer_loss_enabled`` from the configured loss
+    coefficient; its magnitude affects gradients but not the FLOPs count.
 
     Returns ``(token_linear, core)`` INCLUDING the fwd/bwd and FMA factors.
     Multiply ``token_linear`` by the real token count and ``core`` by
     ``sum_i(L_i ** 2)``.
+
+    With KPool (``dsa_indexer_kpool > 1``) the indexer is forward only and
+    scores complete key pools plus a per-token gate; that case delegates to the
+    shared counter in ``megatron.training.logging.dsa_flops``, which needs the
+    batch statistics ``total_tokens`` and ``seqlen_squared_sum``.
     """
+    if dsa_indexer_kpool > 1:
+        return _dsa_kpool_indexer_flops(
+            total_tokens=total_tokens,
+            seqlen_squared_sum=seqlen_squared_sum,
+            hidden_size=hidden_size,
+            q_lora_rank=q_lora_rank,
+            n_heads=n_heads,
+            head_dim=head_dim,
+            num_indexer_layers=num_indexer_layers,
+            dsa_indexer_loss_enabled=dsa_indexer_loss_enabled,
+            dsa_indexer_use_sparse_loss=dsa_indexer_use_sparse_loss,
+            dsa_indexer_topk=dsa_indexer_topk,
+            dsa_indexer_kpool=dsa_indexer_kpool,
+        )
     if num_indexer_layers <= 0:
         return 0, 0
     if q_lora_rank is None:
@@ -475,27 +1071,223 @@ def _dsa_indexer_flops(
     # Scoring each query against every past token under a causal mask (/2).
     core = num_indexer_layers * index_dim / 2
     fma_expansion_factor = 2
-    loss_enabled = (indexer_loss_coeff or 0.0) > 0
+    if not dsa_indexer_loss_enabled:
+        token_expansion, core_expansion = 1, 1
+    else:
+        # Projections: fwd + wgrad (input is detached, no dgrad).
+        token_expansion = 2
+        # Scoring: dense fwd + dq + dk, where dq/dk cover only the top-k pairs
+        # under the sparse KL loss (see docstring).
+        core_expansion = 1 + 2 * (sparse_core_scale if dsa_indexer_use_sparse_loss else 1.0)
     return (
-        (2 if loss_enabled else 1) * fma_expansion_factor * token_linear,
-        (3 if loss_enabled else 1) * fma_expansion_factor * core,
+        token_expansion * fma_expansion_factor * token_linear,
+        core_expansion * fma_expansion_factor * core,
     )
 
 
-def _num_dsa_indexer_layers(num_layers, skip_topk_offset, topk_freq):
-    """Count layers that compute their own DSA index (the rest reuse one).
+def _standard_layer_numbers_for_execution(
+    num_decoder_layers, *, mtp_num_layers=0, mtp_use_repeated_layer=False
+):
+    """Return standard-model layer numbers in their runtime execution order.
 
-    On the standard-model path every layer is a DSA attention layer (MTP
-    layers included -- ``DSAttention.__init__`` numbers them
-    ``layer_number + config.num_layers``, which is exactly how the caller
-    extends ``num_layers``), so the predicate runs over the whole
-    ``1..num_layers`` range.
+    Decoder layers use global numbers ``1..N``. Independent MTP layers use
+    ``N+1..N+D``, while repeated MTP builds only layer ``N+1`` and executes it
+    ``D`` times.
     """
+    layer_numbers = list(range(1, num_decoder_layers + 1))
+    mtp_num_layers = mtp_num_layers or 0
+    if mtp_use_repeated_layer and mtp_num_layers > 0:
+        layer_numbers.extend([num_decoder_layers + 1] * mtp_num_layers)
+    else:
+        layer_numbers.extend(range(num_decoder_layers + 1, num_decoder_layers + mtp_num_layers + 1))
+    return layer_numbers
+
+
+def _num_dsa_indexer_layers(
+    num_decoder_layers,
+    skip_topk_offset,
+    topk_freq,
+    *,
+    mtp_num_layers=0,
+    mtp_use_repeated_layer=False,
+):
+    """Count DSA indexer executions on the standard-model path.
+
+    Cross-layer top-k sharing is tied to the physical layer number, so repeated
+    MTP either executes its one indexer ``D`` times or reuses top-k ``D`` times.
+    """
+
+    def computes_index(layer_number):
+        return not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
+
     return sum(
-        1
-        for layer_number in range(1, num_layers + 1)
-        if not is_dsa_skip_topk_layer(layer_number, skip_topk_offset or 0, topk_freq or 1)
+        computes_index(layer_number)
+        for layer_number in _standard_layer_numbers_for_execution(
+            num_decoder_layers,
+            mtp_num_layers=mtp_num_layers,
+            mtp_use_repeated_layer=mtp_use_repeated_layer,
+        )
     )
+
+
+def _vision_flops_stats_tensor(reference: torch.Tensor | None = None) -> torch.Tensor:
+    """Return the per-iteration vision stats buffer, allocating it on first use."""
+    global _vision_flops_stats_in_iteration
+    if _vision_flops_stats_in_iteration is None:
+        if torch.cuda.is_available():
+            device = torch.device(f'cuda:{torch.cuda.current_device()}')
+        elif reference is not None:
+            device = reference.device
+        else:
+            device = torch.device("cpu")
+        _vision_flops_stats_in_iteration = torch.zeros(
+            _VISION_FLOPS_STATS_SLOTS, dtype=torch.float64, device=device
+        )
+    return _vision_flops_stats_in_iteration
+
+
+def update_vision_model_flops_stats(grid_thw: torch.Tensor | None, spatial_merge_size: int) -> None:
+    """Accumulate vision-token shape statistics for one microbatch.
+
+    Args:
+        grid_thw: ``[num_images_or_videos, 3]`` tensor containing the
+            post-patch-embedding ``(T, H, W)`` grid for each vision input.
+            ``None`` records an explicit text-only microbatch.
+        spatial_merge_size: Spatial patch-merger factor used by the vision
+            encoder.
+
+    Must be called by every rank on every microbatch whenever
+    ``args.count_vision_model_flops`` is set -- including for text-only or
+    empty microbatches, for which ``grid_thw=None`` records an explicit zero.
+    ``consume_vision_model_flops_stats`` decides whether to enter its
+    collective from that config flag alone, so a rank that silently skipped
+    the update would not desync the job, but it would drop its share of the
+    global batch from the reported FLOPs.
+
+    The update stays on device and records the three sufficient statistics
+    needed by the Qwen3.5-VL FLOPs formula. Each temporal frame is a separate
+    bidirectional-attention sequence, matching the encoder's packed THD
+    ``cu_seqlens`` construction. Malformed grid values are accumulated into a
+    device-side counter rather than checked eagerly, so production CUDA grids
+    are validated with the same strictness as CPU ones at no extra host sync;
+    ``consume_*`` raises on the reduced counter.
+    """
+    if spatial_merge_size is None or spatial_merge_size <= 0:
+        raise ValueError(f"vision spatial_merge_size must be positive, got {spatial_merge_size}")
+    stats = _vision_flops_stats_tensor(grid_thw)
+    if grid_thw is None or grid_thw.numel() == 0:
+        # An explicit text-only (or vision-free) microbatch still counts as a
+        # report: the iteration's vision work is genuinely zero, which is a
+        # different statement from "no runtime grids were ever available".
+        stats[_VISION_FLOPS_REPORTED_SLOT] += 1.0
+        return
+    if grid_thw.ndim != 2 or grid_thw.shape[1] != 3:
+        raise ValueError(
+            "vision grid_thw must have shape [num_images_or_videos, 3], "
+            f"got {tuple(grid_thw.shape)}"
+        )
+
+    grid = grid_thw.to(device=stats.device, dtype=torch.float64)
+    temporal, height, width = grid.unbind(dim=1)
+    # Device-side validation: non-positive extents, or an H/W that the patch
+    # merger's ``view(-1, merge_dim)`` reshape could not consume. Counted, not
+    # raised, to keep this path free of a device-to-host sync.
+    not_positive = (grid <= 0).any(dim=1)
+    not_mergeable = (torch.remainder(grid[:, 1:], spatial_merge_size) != 0).any(dim=1)
+    invalid = not_positive | not_mergeable
+    stats[_VISION_FLOPS_INVALID_SLOT] += invalid.to(torch.float64).sum()
+
+    patches_per_frame = height * width
+    merged_height = torch.div(height, spatial_merge_size, rounding_mode='floor')
+    merged_width = torch.div(width, spatial_merge_size, rounding_mode='floor')
+    stats[_VISION_FLOPS_PATCHES_SLOT] += (temporal * patches_per_frame).sum()
+    stats[_VISION_FLOPS_ATTN_SLOT] += (temporal * patches_per_frame * patches_per_frame).sum()
+    stats[_VISION_FLOPS_MERGED_SLOT] += (temporal * merged_height * merged_width).sum()
+    stats[_VISION_FLOPS_REPORTED_SLOT] += 1.0
+
+
+def consume_vision_model_flops_stats(
+    count_vision_model_flops: bool,
+) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+    """Read, reset, and globally reduce per-iteration vision shape stats.
+
+    Args:
+        count_vision_model_flops: ``args.count_vision_model_flops`` -- a
+            config value identical on every rank. Whether to enter the
+            distributed all-reduce is decided by THIS value alone, never by
+            whether ``update_vision_model_flops_stats`` happened to be called
+            locally this iteration: a rank whose data iterator ran dry (or
+            whose model wrapper lacks a ``.training`` attribute) must still
+            enter the same collective its peers enter, or the job desyncs.
+            Ranks with nothing to report contribute a zero tensor, and the
+            "did anyone report" flag is reduced inside the same collective.
+
+    Returns:
+        ``(total_patches, attention_seqlen_squared_sum, merged_tokens)`` for
+        the global batch. Returns ``(None, None, None)`` when vision FLOPs
+        counting is disabled, or when it is enabled but no rank supplied any
+        runtime grid this iteration.
+
+    Raises:
+        ValueError: if any rank accumulated a malformed ``grid_thw`` row.
+    """
+    if not count_vision_model_flops:
+        return None, None, None
+
+    stats = _vision_flops_stats_tensor()
+    if torch.distributed.is_initialized() and mpu.model_parallel_is_initialized():
+        # Unconditional when the feature is on, so collective participation is
+        # a global invariant rather than a function of local activity.
+        torch.distributed.all_reduce(stats)
+        tp_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
+        cp_size = max(mpu.get_context_parallel_world_size(), 1)
+        pp_size = max(mpu.get_pipeline_model_parallel_world_size(), 1)
+        dedup = tp_size * cp_size * pp_size
+    else:
+        # No model-parallel state -> single-rank path (standalone unit tests;
+        # production always initializes mpu).
+        dedup = 1
+
+    # Single host sync drains every slot at once.
+    total_patches, attention_seqlen_squared_sum, merged_tokens, num_reported, num_invalid = (
+        stats.tolist()
+    )
+    # Reset for the next iteration, keeping the tensor allocated.
+    stats.zero_()
+
+    if num_invalid > 0:
+        raise ValueError(
+            f"{int(num_invalid)} vision grid_thw row(s) this iteration had a non-positive "
+            "extent, or a height/width not divisible by vision_spatial_merge_size"
+        )
+    if num_reported == 0:
+        return None, None, None
+    return (total_patches / dedup, attention_seqlen_squared_sum / dedup, merged_tokens / dedup)
+
+
+def _num_hybrid_dsa_indexer_layers(hybrid_layer_pattern, num_layers, skip_topk_offset, topk_freq):
+    """Count DSA indexer executions at actual main and nested-MTP layer numbers."""
+    from megatron.core.models.hybrid.hybrid_layer_allocation import Symbols, parse_hybrid_pattern
+
+    parsed = parse_hybrid_pattern(hybrid_layer_pattern)
+    main_pattern = (parsed.main_pattern or "").replace(Symbols.PIPE, "")
+
+    def is_indexer(layer_type, layer_number):
+        return layer_type == Symbols.DS_ATTENTION and not is_dsa_skip_topk_layer(
+            layer_number, skip_topk_offset or 0, topk_freq or 1
+        )
+
+    count = sum(
+        is_indexer(layer_type, layer_number)
+        for layer_number, layer_type in enumerate(main_pattern, start=1)
+    )
+    if parsed.mtp_pattern is not None:
+        indexers_per_mtp_depth = sum(
+            is_indexer(layer_type, num_layers + inner_layer_number)
+            for inner_layer_number, layer_type in enumerate(parsed.mtp_pattern, start=1)
+        )
+        count += indexers_per_mtp_depth * parsed.mtp_num_depths
+    return count
 
 
 def _dsv4_hybrid_self_attention_flops(
@@ -514,6 +1306,7 @@ def _dsv4_hybrid_self_attention_flops(
     dsa_indexer_n_heads,
     dsa_indexer_head_dim,
     dsa_indexer_topk,
+    csa_dense_mode=False,
 ):
     """Per-iteration DSv4-hybrid self-attention FLOPs coefficients.
 
@@ -530,6 +1323,11 @@ def _dsv4_hybrid_self_attention_flops(
       * ``r==4``   (CSA):    window + learned-topk over compressed KV
         (compressor + indexer).
       * ``r==128`` (HCA):    window + all compressed KV (compressor only).
+
+    ``csa_dense_mode`` makes ``r==4`` layers attend to every compressed key
+    (an ``L^2`` term) with no indexer. ``seq_length`` caps the learned top-k;
+    the hybrid path passes the token-weighted mean real sequence length when DSv4
+    is detected from the layer pattern alone.
 
     Returns ``(token_linear, core)`` WITHOUT the fwd+bwd (x3) or FMA (x2)
     expansion factors -- the caller applies those. Multiply ``token_linear`` by
@@ -568,7 +1366,13 @@ def _dsv4_hybrid_self_attention_flops(
     )
 
     # ---- r=4 layers: sparse attention + indexer ----
-    if n_layers_r4 > 0:
+    if n_layers_r4 > 0 and csa_dense_mode:
+        # Dense CSA: window (token-linear) + all ~L/4 compressed keys (L^2), no indexer.
+        sparse_attn_r4 = n_layers_r4 * num_attention_heads * csa_window_size * v_head_dim * 2
+        sparse_attn_r4_core = n_layers_r4 * num_attention_heads * v_head_dim / 4
+        indexer_token_term = 0
+        indexer_scoring_core = 0
+    elif n_layers_r4 > 0:
         assert (
             dsa_indexer_n_heads is not None
         ), "dsa_indexer_n_heads must be set for dsv4_hybrid with ratio==4 layers."
@@ -591,8 +1395,10 @@ def _dsv4_hybrid_self_attention_flops(
         )
         # Indexer L^2: scoring each query against ~L/4 compressed positions.
         indexer_scoring_core = n_layers_r4 * dsa_indexer_n_heads * dsa_indexer_head_dim / 4
+        sparse_attn_r4_core = 0
     else:
         sparse_attn_r4 = 0
+        sparse_attn_r4_core = 0
         indexer_token_term = 0
         indexer_scoring_core = 0
 
@@ -604,17 +1410,234 @@ def _dsv4_hybrid_self_attention_flops(
         + main_compressor_term
         + indexer_token_term
     )
-    core = sparse_attn_r128_core + indexer_scoring_core
+    core = sparse_attn_r128_core + sparse_attn_r4_core + indexer_scoring_core
     return token_linear, core
 
 
+_vision_flops_missing_runtime_stats_warned: bool = False
+
+
+def validate_vision_flops_metadata(args) -> None:
+    """Validate ``count_vision_model_flops`` metadata and precompute derived scalars.
+
+    Call this once, at model-construction time, right after a model
+    registry's ``vision_flops_fn`` sets ``args.count_vision_model_flops`` and
+    the ``vision_*`` fields (see
+    ``examples/multimodal_dev/pretrain_multimodal.py:model_provider``, which
+    calls this centrally right after ``vision_flops_fn`` -- individual
+    ``vision_flops_fn`` implementations, e.g.
+    ``examples/multimodal_dev/models/qwen35_vl/factory.py:set_vision_flops_metadata``,
+    do not need to call it themselves).
+    Doing this eagerly means a misconfigured variant or missing/invalid field
+    raises before the dataloader and optimizer are built, instead of at
+    iteration 1 inside the training loop. It also means
+    ``_num_multimodal_extra_floating_point_operations`` -- which runs every
+    iteration, from both the train loop and ``training_log``'s throughput
+    computation -- only has to do arithmetic on the precomputed scalars set
+    here, not re-validate config that cannot change after model construction.
+    """
+    if not getattr(args, "count_vision_model_flops", False):
+        return
+
+    vision_flops_variant = getattr(args, "vision_flops_variant", None)
+    if vision_flops_variant != "qwen35_vl":
+        raise ValueError(f"Unsupported vision FLOPs variant: {vision_flops_variant!r}")
+
+    required_fields = (
+        "vision_num_layers",
+        "vision_hidden_size",
+        "vision_ffn_hidden_size",
+        "vision_num_attention_heads",
+        "vision_patch_size",
+        "vision_temporal_patch_size",
+        "vision_spatial_merge_size",
+        "vision_in_channels",
+        "vision_out_hidden_size",
+    )
+    missing_fields = [field for field in required_fields if getattr(args, field, None) is None]
+    if missing_fields:
+        raise ValueError("Missing Qwen3.5-VL vision FLOPs metadata: " + ", ".join(missing_fields))
+
+    hidden_size = args.vision_hidden_size
+    num_attention_heads = args.vision_num_attention_heads
+    spatial_merge_size = args.vision_spatial_merge_size
+    positive_fields = {
+        "vision_num_layers": args.vision_num_layers,
+        "vision_hidden_size": hidden_size,
+        "vision_ffn_hidden_size": args.vision_ffn_hidden_size,
+        "vision_num_attention_heads": num_attention_heads,
+        "vision_patch_size": args.vision_patch_size,
+        "vision_temporal_patch_size": args.vision_temporal_patch_size,
+        "vision_spatial_merge_size": spatial_merge_size,
+        "vision_in_channels": args.vision_in_channels,
+        "vision_out_hidden_size": args.vision_out_hidden_size,
+    }
+    invalid_fields = [f"{field}={value}" for field, value in positive_fields.items() if value <= 0]
+    if invalid_fields:
+        raise ValueError(
+            "Qwen3.5-VL vision FLOPs metadata must be positive: " + ", ".join(invalid_fields)
+        )
+
+    kv_channels = getattr(args, "vision_kv_channels", None)
+    if kv_channels is None:
+        if hidden_size % num_attention_heads != 0:
+            raise ValueError(
+                "vision_hidden_size must be divisible by vision_num_attention_heads "
+                "when vision_kv_channels is unset"
+            )
+        kv_channels = hidden_size // num_attention_heads
+    elif kv_channels <= 0:
+        raise ValueError(f"vision_kv_channels must be positive, got {kv_channels}")
+
+    # Derived scalars fixed at model-construction time; the per-iteration
+    # path below reads these directly instead of recomputing them.
+    args.vision_projection_size = kv_channels * num_attention_heads
+    args.vision_patch_dim = (
+        args.vision_in_channels
+        * args.vision_temporal_patch_size
+        * args.vision_patch_size
+        * args.vision_patch_size
+    )
+    args.vision_merge_dim = hidden_size * spatial_merge_size**2
+
+
+def _num_multimodal_extra_floating_point_operations(
+    args,
+    vision_total_tokens_in_batch=None,
+    vision_seqlen_squared_sum_in_batch=None,
+    vision_merged_tokens_in_batch=None,
+):
+    """Estimate training FLOPs outside the language decoder stack.
+
+    This follows the existing decoder convention: count the dominant
+    projections and attention matrix multiplications, including forward,
+    weight-gradient, and data-gradient work, while omitting comparatively
+    small elementwise operations such as normalization, GELU, RoPE, and
+    residual additions.
+
+    Metadata validation and derived-scalar precomputation happen once, at
+    model-construction time, in ``validate_vision_flops_metadata`` -- see
+    there. This function assumes that already ran successfully whenever
+    ``count_vision_model_flops`` is set.
+
+    The vision terms are driven exclusively by the runtime ``grid_thw``
+    statistics the forward step reported. When an entry point does not report
+    them, the vision contribution is omitted (and a one-time warning is
+    logged) rather than synthesised from nominal architecture metadata: a
+    fabricated-but-plausible number would silently feed MFU comparisons and
+    perf regression tracking.
+    """
+    if not getattr(args, "count_vision_model_flops", False):
+        return 0
+
+    global _vision_flops_missing_runtime_stats_warned
+
+    projection_size = getattr(args, "vision_projection_size", None)
+    if projection_size is None:
+        # The derived scalars are only ever set by validate_vision_flops_metadata.
+        # An entry point that sets count_vision_model_flops itself, without
+        # routing through that validator, would otherwise fail here with a bare
+        # AttributeError at the first training iteration.
+        raise ValueError(
+            "count_vision_model_flops is set but the vision FLOPs metadata was never "
+            "validated. Call megatron.training.training.validate_vision_flops_metadata(args) "
+            "at model-construction time (see "
+            "examples/multimodal_dev/pretrain_multimodal.py:model_provider)."
+        )
+    hidden_size = args.vision_hidden_size
+    ffn_hidden_size = args.vision_ffn_hidden_size
+    patch_dim = args.vision_patch_dim
+    merge_dim = args.vision_merge_dim
+
+    vision_stats = (
+        vision_total_tokens_in_batch,
+        vision_seqlen_squared_sum_in_batch,
+        vision_merged_tokens_in_batch,
+    )
+    if any(value is not None for value in vision_stats) and not all(
+        value is not None for value in vision_stats
+    ):
+        raise ValueError(
+            "vision_total_tokens_in_batch, vision_seqlen_squared_sum_in_batch, "
+            "and vision_merged_tokens_in_batch must be provided together"
+        )
+    if all(value is not None for value in vision_stats) and any(
+        value < 0 for value in vision_stats
+    ):
+        raise ValueError(
+            "runtime vision FLOPs statistics must be non-negative, " f"got {vision_stats}"
+        )
+
+    if vision_total_tokens_in_batch is None:
+        if not _vision_flops_missing_runtime_stats_warned:
+            print_rank_0(
+                "[vision FLOPs] count_vision_model_flops is enabled but no runtime "
+                "image_grid_thw was reported, so vision-encoder work is EXCLUDED from "
+                "the reported FLOPs/TFLOP-per-s. Entry points must call "
+                "megatron.training.training.update_vision_model_flops_stats() from "
+                "their forward step (see examples/multimodal_dev/forward_step.py). "
+                "Logged once."
+            )
+            _vision_flops_missing_runtime_stats_warned = True
+        return 0
+
+    # Every weight-bearing matmul runs once in forward and twice in backward.
+    forward_backward_expansion_factor = 3
+    fma_expansion_factor = 2
+    training_matmul_factor = forward_backward_expansion_factor * fma_expansion_factor
+
+    # NOTE: uses the same forward+weight-grad+data-grad factor as the other
+    # terms even though pixel_values is a leaf input with no data-gradient
+    # (factor 4 would be exact here, not 6). Deliberate ~0.4% over-count for
+    # formula uniformity across terms; not worth a separate constant.
+    patch_embed_flops = (
+        training_matmul_factor * vision_total_tokens_in_batch * patch_dim * hidden_size
+    )
+
+    # Per layer: dense QKV + output projections, a two-linear GELU MLP, and
+    # bidirectional QK^T / attention-value matmuls over each temporal frame.
+    vision_projection_flops = (
+        training_matmul_factor
+        * vision_total_tokens_in_batch
+        * (
+            hidden_size * (3 * projection_size)
+            + projection_size * hidden_size
+            + hidden_size * ffn_hidden_size
+            + ffn_hidden_size * hidden_size
+        )
+    )
+    vision_core_attention_flops = (
+        forward_backward_expansion_factor * 4 * vision_seqlen_squared_sum_in_batch * projection_size
+    )
+    vision_transformer_flops = args.vision_num_layers * (
+        vision_projection_flops + vision_core_attention_flops
+    )
+
+    patch_merger_flops = (
+        training_matmul_factor
+        * vision_merged_tokens_in_batch
+        * (merge_dim * merge_dim + merge_dim * args.vision_out_hidden_size)
+    )
+    return patch_embed_flops + vision_transformer_flops + patch_merger_flops
+
+
 def num_floating_point_operations(
-    args, batch_size, seqlen_squared_sum_in_batch=None, total_real_tokens_in_batch=None
+    model_config,
+    batch_size,
+    *,
+    sequence_length,
+    seqlen_squared_sum_in_batch=None,
+    total_real_tokens_in_batch=None,
+    vision_total_tokens_in_batch=None,
+    vision_seqlen_squared_sum_in_batch=None,
+    vision_merged_tokens_in_batch=None,
+    vision_args=None,
 ):
     """Compute the number of floating-point operations for one global batch.
 
     Args:
-        args: Megatron args (provides hidden size, num layers, seq length, ...).
+        model_config: Model configuration containing the resolved TransformerConfig.
+        sequence_length: Actual data/decoder length, distinct from position capacity.
         batch_size: Global batch size (samples per iteration). Only used to
             compute the default token counts for the BSHD path -- with THD
             both ``total_real_tokens_in_batch`` and ``seqlen_squared_sum_in_batch``
@@ -622,26 +1645,54 @@ def num_floating_point_operations(
         seqlen_squared_sum_in_batch: ``sum_i(L_i ** 2)`` across all REAL
             (unpadded) sub-sequences in the global batch. Drives the
             core-attention L^2 FLOPs. For BSHD this equals
-            ``batch_size * args.seq_length ** 2`` (the default when ``None``).
+            ``batch_size * llm_seq_length ** 2`` (the default when ``None``).
             For THD it is the actual ragged sum and is strictly less than the
             BSHD value, reflecting per-chunk causal masking AND the fact that
             padding tokens do not contribute to attention scores.
         total_real_tokens_in_batch: ``sum_i(L_i)``, the TOTAL REAL (unpadded)
             token count across the global batch. Drives all token-linear FLOPs
             (QKV+output projections, MLP, MoE, MTP norms/projs, logits). For
-            BSHD this equals ``batch_size * args.seq_length`` (the default when
+            BSHD this equals ``batch_size * llm_seq_length`` (the default when
             ``None``). For THD it equals the real token count -- strictly less
-            than ``batch_size * args.seq_length`` whenever the dataloader added
+            than ``batch_size * llm_seq_length`` whenever the dataloader added
             CP-alignment padding or end-of-sequence padding, so neither kind of
             padding shows up in the reported FLOPs.
+        vision_total_tokens_in_batch: Total pre-merger vision patch tokens
+            from the actual ``grid_thw`` values in the global batch.
+        vision_seqlen_squared_sum_in_batch: ``sum_i(T_i * (H_i * W_i)^2)``
+            for bidirectional vision attention, where each temporal frame is
+            one packed attention sequence.
+        vision_merged_tokens_in_batch: Total vision tokens after spatial patch
+            merging. The three vision statistics must be supplied together.
+            When omitted, the vision-encoder contribution is excluded from the
+            result (with a one-time warning) rather than estimated from
+            nominal architecture metadata.
+        vision_args: Namespace carrying the vision-encoder FLOPs metadata that
+            ``validate_vision_flops_metadata`` validated (``count_vision_model_flops``
+            and the ``vision_*`` fields). ``None`` excludes the vision encoder.
     """
+    from megatron.core.activations import situlu
+    from megatron.training.vocab_utils import model_vocab_size
+
+    transformer_cfg = model_config.transformer
+    llm_seq_length = sequence_length
+    group_query_attention = transformer_cfg.num_query_groups != transformer_cfg.num_attention_heads
+    swiglu = transformer_cfg.gated_linear_unit and transformer_cfg.activation_func is torch.nn.functional.silu
+    situ_glu = transformer_cfg.gated_linear_unit and transformer_cfg.activation_func is situlu
+    vocab_size = model_vocab_size(
+        model_config.vocab_size,
+        should_pad_vocab=model_config.should_pad_vocab,
+        make_vocab_size_divisible_by=model_config.make_vocab_size_divisible_by,
+        tensor_model_parallel_size=transformer_cfg.tensor_model_parallel_size,
+    )
+
     # Defaults: BSHD layout assumption (full causal mask, every sample length =
-    # seq_length, no padding). For BSHD ``total_real_tokens = batch * s`` and
+    # llm_seq_length, no padding). For BSHD ``total_real_tokens = batch * s`` and
     # ``seqlen_squared_sum = batch * s^2`` recover the original closed-form.
     if seqlen_squared_sum_in_batch is None:
-        seqlen_squared_sum_in_batch = batch_size * args.seq_length * args.seq_length
+        seqlen_squared_sum_in_batch = batch_size * llm_seq_length * llm_seq_length
     if total_real_tokens_in_batch is None:
-        total_real_tokens_in_batch = batch_size * args.seq_length
+        total_real_tokens_in_batch = batch_size * llm_seq_length
 
     def mlp_layer_flops(total_tokens, hidden_size, expansion=4.0, swiglu=False):
         """Calculate FLOPs for an MLP layer."""
@@ -800,6 +1851,38 @@ def num_floating_point_operations(
             + (2 * total_tokens * d_in * hidden_size)  # out_proj
         )
 
+    def gated_delta_product_layer_flops(
+        total_tokens,
+        hidden_size,
+        num_householder,
+        state_dim=128,
+        head_dim=64,
+        num_groups=8,
+        num_heads=None,
+        conv_kernel_dim=4,
+    ):
+        """Calculate FLOPs for a Gated Delta Product (GDP) layer."""
+        if num_heads is None:
+            d_inner = 2 * hidden_size
+            num_heads = d_inner // head_dim
+        else:
+            d_inner = num_heads * head_dim
+        in_proj_dim = (
+            d_inner * (1 + num_householder)
+            + num_groups * state_dim * (1 + num_householder)
+            + num_heads * (1 + num_householder)
+        )
+        conv_dim = d_inner * num_householder + num_groups * state_dim * (1 + num_householder)
+        non_core_flops = (
+            2
+            * total_tokens
+            * (hidden_size * in_proj_dim + conv_kernel_dim * conv_dim + d_inner * hidden_size)
+        )
+        # Best-case recurrent GDP core estimate. The FLA chunk kernel may do additional
+        # score/solve/WY work, but this keeps the implementation-agnostic lower bound explicit.
+        core_flops = (4 * num_householder + 3) * total_tokens * d_inner * state_dim
+        return non_core_flops + core_flops
+
     def gdn_layer_flops(
         total_tokens,
         hidden_size,
@@ -808,16 +1891,23 @@ def num_floating_point_operations(
         num_qk_heads=16,
         num_v_heads=32,
         conv_kernel_dim=4,
+        use_gdn2=False,
     ):
         """Calculate FLOPs for a Gated Delta Net (GDN) layer."""
         qk_dim = qk_head_dim * num_qk_heads
         v_dim = v_head_dim * num_v_heads
+        if use_gdn2:
+            # GDN2 in_proj: hidden_size -> (4*qk_dim + 3*v_dim) for q, k, v, z, f, b, w
+            in_proj_dim = 4 * qk_dim + 3 * v_dim
+        else:
+            # GDN in_proj: hidden_size -> (2*qk_dim + 2*v_dim + 2*num_v_heads)
+            in_proj_dim = 2 * qk_dim + 2 * v_dim + 2 * num_v_heads
         return (
             2
             * total_tokens
             * (
-                # in_proj: hidden_size -> (2*qk_dim + 2*v_dim + 2*num_v_heads)
-                hidden_size * (2 * qk_dim + 2 * v_dim + 2 * num_v_heads)
+                # in_proj
+                hidden_size * in_proj_dim
                 # conv1d
                 + conv_kernel_dim * (2 * qk_dim + v_dim)
                 # gated delta rule: KK^T, VK^T, S(a(I-bKK^T)), and SQ
@@ -835,27 +1925,100 @@ def num_floating_point_operations(
         num_qk_heads=16,
         num_v_heads=16,
         conv_kernel_dim=4,
+        f_lora_rank=None,
+        gate_lora_rank=None,
     ):
-        """Calculate FLOPs for a direct-projection Kimi Delta Attention layer."""
+        """Calculate projection FLOPs for a Kimi Delta Attention layer."""
         if num_qk_heads != num_v_heads or qk_head_dim != v_head_dim:
             raise ValueError(
                 "KDA FLOPs require the equal K/V head layout enforced by KimiDeltaAttention."
             )
         qk_dim = qk_head_dim * num_qk_heads
         v_dim = v_head_dim * num_v_heads
-        in_proj_dim = 3 * qk_dim + 2 * v_dim
+        f_projection_flops = hidden_size * qk_dim
+        if f_lora_rank is not None:
+            if f_lora_rank <= 0:
+                raise ValueError(
+                    f"KDA F-decay projection rank must be positive, got {f_lora_rank=}."
+                )
+            f_projection_flops = hidden_size * f_lora_rank + f_lora_rank * qk_dim
+        gate_projection_flops = hidden_size * v_dim
+        if gate_lora_rank is not None:
+            if gate_lora_rank <= 0:
+                raise ValueError(
+                    f"KDA output-gate projection rank must be positive, got {gate_lora_rank=}."
+                )
+            gate_projection_flops = hidden_size * gate_lora_rank + gate_lora_rank * v_dim
+        projection_flops = (
+            hidden_size * (2 * qk_dim + v_dim + num_qk_heads)
+            + f_projection_flops
+            + gate_projection_flops
+            + hidden_size * v_dim
+        )
         non_core_flops = (
-            2
-            * total_tokens
-            * (
-                hidden_size * (in_proj_dim + num_qk_heads)
-                + conv_kernel_dim * (2 * qk_dim + v_dim)
-                + hidden_size * v_dim
-            )
+            2 * total_tokens * (projection_flops + conv_kernel_dim * (2 * qk_dim + v_dim))
         )
         state_update_flops = num_v_heads * (qk_head_dim**2 + 3 * qk_head_dim * v_head_dim)
         core_flops = 2 * total_tokens * state_update_flops
         return non_core_flops + core_flops
+
+    def attention_residual_flops(
+        total_tokens,
+        hidden_size,
+        num_layers,
+        block_layers,
+        transformer_layer_layout=False,
+        mtp_num_layers=0,
+        mtp_num_sublayers=2,
+    ):
+        """Calculate forward-equivalent FLOPs for Attention Residual aggregations.
+
+        The FLOPs estimator follows the same convention as core attention: it
+        counts the two hidden-width contractions for every depth
+        source (query-key scoring and weighted value accumulation), with the
+        FMA factor baked in. RMSNorm and depth softmax are omitted by convention,
+        like the softmax in ``attn_layer_flops``. This is a nominal model-FLOPs
+        estimate, independent of backend fusion or the single-source identity
+        shortcut. The caller adds the global forward/backward factor.
+
+        ``block_layers`` counts Transformer layers in the standard GPT layout,
+        where each layer has attention and MLP aggregations. In the hybrid
+        layout it counts pattern entries, each of which has one aggregation.
+        ``num_layers`` counts only the trunk. Each MTP depth has
+        ``mtp_num_sublayers`` aggregations plus its own output aggregation.
+        """
+        if not isinstance(block_layers, int) or isinstance(block_layers, bool) or block_layers < 1:
+            raise ValueError(
+                "Attention Residual FLOPs require attn_res_block_layers to be a "
+                f"positive integer, got {block_layers!r}."
+            )
+
+        total_source_arity = 0
+        for layer_number in range(1, num_layers + 1):
+            completed_sources = (layer_number - 1) // block_layers + 1
+            is_block_start = (layer_number - 1) % block_layers == 0
+
+            # A block-start aggregation consumes completed block sources only;
+            # all other aggregations also consume the running partial block.
+            total_source_arity += completed_sources + (not is_block_start)
+            if transformer_layer_layout:
+                # The MLP aggregation always follows the attention output, so a
+                # non-empty running partial block is present at every layer.
+                total_source_arity += completed_sources + 1
+
+        # The trunk output aggregates every completed source and its trailing
+        # partial block before the final norm.
+        final_source_arity = (num_layers - 1) // block_layers + 2
+        total_source_arity += final_source_arity
+
+        # Every MTP aggregation sees the fixed trunk history plus that depth's
+        # fresh partial. MTP entries never open new residual blocks, even when
+        # their count exceeds block_layers. GPT has two sublayers per depth;
+        # hybrid MTP has one per nested pattern entry. Both add an output head.
+        total_source_arity += mtp_num_layers * (mtp_num_sublayers + 1) * (final_source_arity + 1)
+
+        # Two contractions per source, each counted as one multiply-add.
+        return 4 * total_tokens * hidden_size * total_source_arity
 
     def hybrid_flops(
         total_tokens,
@@ -867,6 +2030,7 @@ def num_floating_point_operations(
         num_mamba_layers,
         num_mlp_layers,
         num_moe_layers,
+        gdp_num_householder,
         num_gdn_layers=0,
         mamba_state_dim=128,
         mamba_head_dim=64,
@@ -882,18 +2046,24 @@ def num_floating_point_operations(
         moe_ffn_hidden_size=2048,
         shared_expert_ffn_hidden_size=2048,
         num_experts_routed_to=1,
+        use_gated_delta_product=False,
         gdn_qk_head_dim=128,
         gdn_v_head_dim=128,
         gdn_num_qk_heads=16,
         gdn_num_v_heads=32,
         gdn_conv_kernel_dim=4,
+        gdn_use_gdn2=False,
         kda_qk_head_dim=128,
         kda_v_head_dim=128,
         kda_num_qk_heads=16,
         kda_num_v_heads=16,
         kda_conv_kernel_dim=4,
+        kda_f_lora_rank=None,
+        kda_gate_lora_rank=None,
         vocab_size=256000,
         mtp_num_layers=0,
+        mtp_loss_type="cross_entropy",
+        mtp_detach_heads=False,
         q_lora_rank=None,
         kv_lora_rank=0,
         qk_head_dim=0,
@@ -908,10 +2078,14 @@ def num_floating_point_operations(
         o_groups=None,
         o_lora_rank=None,
         csa_window_size=None,
+        csa_dense_mode=False,
         seq_length=None,
         dsa_indexer_n_heads=None,
         dsa_indexer_head_dim=None,
         dsa_indexer_topk=None,
+        enable_attention_residuals=False,
+        attn_res_block_layers=None,
+        hybrid_layer_pattern=None,
     ):
         """Calculate total FLOPs for the hybrid model."""
         # Self-attention (already summed over all attention layers, fwd-equivalent
@@ -927,6 +2101,7 @@ def num_floating_point_operations(
                 o_groups=o_groups,
                 o_lora_rank=o_lora_rank,
                 csa_window_size=csa_window_size,
+                csa_dense_mode=csa_dense_mode,
                 seq_length=seq_length,
                 n_layers_r0=dsv4_n_layers_r0,
                 n_layers_r4=dsv4_n_layers_r4,
@@ -978,14 +2153,38 @@ def num_floating_point_operations(
                 kda_num_qk_heads,
                 kda_num_v_heads,
                 kda_conv_kernel_dim,
+                kda_f_lora_rank,
+                kda_gate_lora_rank,
             )
 
-        flops_fwd = (
-            attn_flops_total
-            + kda_flops_total
-            + num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size, mlp_expansion, swiglu)
-            + num_mamba_layers
-            * mamba_layer_flops(
+        attn_res_flops_total = 0
+        if enable_attention_residuals:
+            from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern
+
+            # The per-type counts above include MTP entries. Only trunk entries
+            # grow the depth history, so preserve the pattern's trunk/MTP split.
+            parsed_pattern = parse_hybrid_pattern(hybrid_layer_pattern)
+            attn_res_flops_total = attention_residual_flops(
+                total_tokens=total_tokens,
+                hidden_size=hidden_size,
+                num_layers=len((parsed_pattern.main_pattern or "").replace("|", "")),
+                block_layers=attn_res_block_layers,
+                mtp_num_layers=parsed_pattern.mtp_num_depths,
+                mtp_num_sublayers=len(parsed_pattern.mtp_pattern or ""),
+            )
+
+        mamba_flops = (
+            gated_delta_product_layer_flops(
+                total_tokens,
+                hidden_size,
+                gdp_num_householder,
+                mamba_state_dim,
+                mamba_head_dim,
+                mamba_num_groups,
+                mamba_num_heads,
+            )
+            if use_gated_delta_product
+            else mamba_layer_flops(
                 total_tokens,
                 hidden_size,
                 mamba_state_dim,
@@ -993,6 +2192,13 @@ def num_floating_point_operations(
                 mamba_num_groups,
                 mamba_num_heads,
             )
+        )
+        flops_fwd = (
+            attn_flops_total
+            + kda_flops_total
+            + attn_res_flops_total
+            + num_mlp_layers * mlp_layer_flops(total_tokens, hidden_size, mlp_expansion, swiglu)
+            + num_mamba_layers * mamba_flops
             + num_moe_layers
             * moe_layer_flops(
                 total_tokens,
@@ -1012,66 +2218,79 @@ def num_floating_point_operations(
                 gdn_num_qk_heads,
                 gdn_num_v_heads,
                 gdn_conv_kernel_dim,
+                gdn_use_gdn2,
             )
             +
             # MTP norms (eh_norm + final_norm) and eh projection (2 * h^2).
             2 * mtp_num_layers * (3 * hidden_size + 2 * hidden_size * hidden_size) * total_tokens
-            + 2 * total_tokens * hidden_size * vocab_size * (1 + mtp_num_layers)
         )
-        return flops_fwd * 3
+        logit_flops = total_tokens * _logit_flops_per_token(
+            hidden_size,
+            vocab_size,
+            mtp_num_layers=mtp_num_layers,
+            mtp_detach_heads=mtp_detach_heads,
+        )
+        # E2E TV projects the frozen backbone once to produce target logits.
+        # This projection has no backward pass because the target distribution
+        # is detached. Softmax/overlap elementwise work is omitted consistently
+        # with the existing cross-entropy FLOPs convention.
+        e2e_tv_target_projection_flops = (
+            2 * total_tokens * hidden_size * vocab_size if mtp_loss_type == "e2e_tv" else 0
+        )
+        return flops_fwd * 3 + logit_flops + e2e_tv_target_projection_flops
 
     def transformer_flops():
         """Calculate FLOPs for a standard Transformer model."""
         # TODO(helenn/dnarayanan): Refactor this to reuse the helper methods.
         # Group Query Attention.
-        if not args.group_query_attention:
-            args.num_query_groups = args.num_attention_heads
+        if not group_query_attention:
+            transformer_cfg.num_query_groups = transformer_cfg.num_attention_heads
         # MoE.
-        if args.num_experts is None:
+        if transformer_cfg.num_moe_experts is None:
             # Every Transformer MLP is dense.
-            num_dense_layers = args.num_layers
+            num_dense_layers = transformer_cfg.num_layers
             num_moe_layers = 0
             num_experts_routed_to = 0
             last_layer_is_moe = 0
         else:
             # Calculate number of dense and MoE Transformer MLPs.
-            if isinstance(args.moe_layer_freq, int):
+            if isinstance(transformer_cfg.moe_layer_freq, int):
                 moe_layer_pattern = [
-                    1 if (i % args.moe_layer_freq == 0) else 0 for i in range(args.num_layers)
+                    1 if (i % transformer_cfg.moe_layer_freq == 0) else 0 for i in range(transformer_cfg.num_layers)
                 ]
-            elif isinstance(args.moe_layer_freq, list):
-                moe_layer_pattern = args.moe_layer_freq
+            elif isinstance(transformer_cfg.moe_layer_freq, list):
+                moe_layer_pattern = transformer_cfg.moe_layer_freq
             else:
                 raise RuntimeError("Illegal --moe-layer-freq argument provided!")
-            assert len(moe_layer_pattern) == args.num_layers, (
+            assert len(moe_layer_pattern) == transformer_cfg.num_layers, (
                 f"Invalid length of moe_layer_pattern: {len(moe_layer_pattern)}, "
-                f"expected {args.num_layers}, "
-                f"current moe layer pattern: {args.moe_layer_freq}"
+                f"expected {transformer_cfg.num_layers}, "
+                f"current moe layer pattern: {transformer_cfg.moe_layer_freq}"
             )
             num_moe_layers = sum(moe_layer_pattern)  # Number of 1s in `moe_layer_pattern`.
-            num_dense_layers = args.num_layers - num_moe_layers
-            num_experts_routed_to = args.moe_router_topk
+            num_dense_layers = transformer_cfg.num_layers - num_moe_layers
+            num_experts_routed_to = transformer_cfg.moe_router_topk
             last_layer_is_moe = moe_layer_pattern[-1]
 
-        if args.mtp_num_layers is not None:
-            mtp_num_layers = args.mtp_num_layers
+        if transformer_cfg.mtp_num_layers is not None:
+            mtp_num_layers = transformer_cfg.mtp_num_layers
             num_moe_layers += last_layer_is_moe * mtp_num_layers
             num_dense_layers += (1 - last_layer_is_moe) * mtp_num_layers
-            num_layers = args.num_layers + mtp_num_layers
+            num_layers = transformer_cfg.num_layers + mtp_num_layers
         else:
             mtp_num_layers = 0
-            num_layers = args.num_layers
+            num_layers = transformer_cfg.num_layers
 
         moe_ffn_hidden_size = (
-            args.moe_ffn_hidden_size
-            if args.moe_ffn_hidden_size is not None
-            else args.ffn_hidden_size
+            transformer_cfg.moe_ffn_hidden_size
+            if transformer_cfg.moe_ffn_hidden_size is not None
+            else transformer_cfg.ffn_hidden_size
         )
-        moe_latent_size = args.moe_latent_size
+        moe_latent_size = transformer_cfg.moe_latent_size
         shared_expert_ffn_hidden_size = (
             0
-            if args.moe_shared_expert_intermediate_size is None
-            else args.moe_shared_expert_intermediate_size
+            if transformer_cfg.moe_shared_expert_intermediate_size is None
+            else transformer_cfg.moe_shared_expert_intermediate_size
         )
 
         # - 3x: Each GEMM in the model needs to be performed 3 times (forward pass,
@@ -1081,17 +2300,17 @@ def num_floating_point_operations(
         fma_expansion_factor = 2
         # - 3x (gated GLU): h->2*ffn_h GEMM and ffn_h->h GEMM are stacked.
         # - 2x (non-gated): h->ffn_h GEMM and ffn_h->h GEMM are stacked.
-        ffn_expansion_factor = 3 if (args.swiglu or getattr(args, "situ_glu", False)) else 2
+        ffn_expansion_factor = 3 if (swiglu or situ_glu) else 2
 
         # self_attn is split into a token-linear part (projections, multiplied by
-        # ``batch_size * args.seq_length`` like all other token-linear work) and a
+        # ``batch_size * llm_seq_length`` like all other token-linear work) and a
         # core-attention part (``QK^T`` and ``softmax(QK^T) V``) whose compute scales
         # with ``sum_i(L_i ** 2)`` instead of ``batch * seq^2``. With unpacked BSHD the
         # two are equal, so the BSHD result is unchanged. With THD/packed sequences
         # ``seqlen_squared_sum_in_batch`` is strictly smaller, reflecting the per-chunk
         # causal mask of packed attention.
-        if args.multi_latent_attention:
-            assert not args.group_query_attention
+        if transformer_cfg.multi_latent_attention:
+            assert not group_query_attention
             '''
             Basic arithmetic
             let B is batch size, s is seq_len, h is embedding dim,
@@ -1105,7 +2324,7 @@ def num_floating_point_operations(
             https://arxiv.org/abs/2305.10403
             https://arxiv.org/abs/2205.05198
             '''
-            if args.experimental_attention_variant == "dsv4_hybrid":
+            if transformer_cfg.experimental_attention_variant == "dsv4_hybrid":
                 ## DSv4 hybrid: the MLA projections AND the sparse attention that
                 ## replaces full core attention are both computed together by
                 ## ``_dsv4_hybrid_self_attention_flops`` in the dsv4_hybrid branch
@@ -1115,27 +2334,27 @@ def num_floating_point_operations(
                 standard_self_attn_core_term = 0
             else:
                 ## MLA
-                if args.q_lora_rank is None:
+                if transformer_cfg.q_lora_rank is None:
                     q_term = (
-                        args.hidden_size
-                        * args.num_attention_heads
-                        * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+                        transformer_cfg.hidden_size
+                        * transformer_cfg.num_attention_heads
+                        * (transformer_cfg.qk_head_dim + transformer_cfg.qk_pos_emb_head_dim)
                     )
                 else:
-                    q_term = args.q_lora_rank * (
-                        args.hidden_size
-                        + args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim)
+                    q_term = transformer_cfg.q_lora_rank * (
+                        transformer_cfg.hidden_size
+                        + transformer_cfg.num_attention_heads * (transformer_cfg.qk_head_dim + transformer_cfg.qk_pos_emb_head_dim)
                         + 1
                     )
                 gate_projection_size = 0
-                if args.attention_output_gate:
+                if transformer_cfg.attention_output_gate:
                     gate_granularity = getattr(
-                        args, "gated_attention_proj_granularity", "elementwise"
+                        transformer_cfg, "gated_attention_proj_granularity", "elementwise"
                     )
                     if gate_granularity == "elementwise":
-                        gate_projection_size = args.num_attention_heads * args.v_head_dim
+                        gate_projection_size = transformer_cfg.num_attention_heads * transformer_cfg.v_head_dim
                     elif gate_granularity == "headwise":
-                        gate_projection_size = args.num_attention_heads
+                        gate_projection_size = transformer_cfg.num_attention_heads
                     else:
                         raise ValueError(
                             "gated_attention_proj_granularity must be either 'elementwise' or "
@@ -1149,17 +2368,17 @@ def num_floating_point_operations(
                         ## q lora + rope + q norm
                         q_term
                         ## kv lora + rope + kv norm
-                        + args.kv_lora_rank
+                        + transformer_cfg.kv_lora_rank
                         * (
-                            args.hidden_size
-                            + args.num_attention_heads * (args.qk_head_dim + args.v_head_dim)
+                            transformer_cfg.hidden_size
+                            + transformer_cfg.num_attention_heads * (transformer_cfg.qk_head_dim + transformer_cfg.v_head_dim)
                             + 1
                         )
-                        + args.hidden_size * args.qk_pos_emb_head_dim
+                        + transformer_cfg.hidden_size * transformer_cfg.qk_pos_emb_head_dim
                         ## o proj
-                        + (args.num_attention_heads * args.v_head_dim) * args.hidden_size
+                        + (transformer_cfg.num_attention_heads * transformer_cfg.v_head_dim) * transformer_cfg.hidden_size
                         ## output gate proj
-                        + gate_projection_size * args.hidden_size
+                        + gate_projection_size * transformer_cfg.hidden_size
                     )
                 )
                 # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``. The
@@ -1168,24 +2387,24 @@ def num_floating_point_operations(
                     forward_backward_expansion_factor
                     * fma_expansion_factor
                     * (
-                        args.num_attention_heads * (args.qk_head_dim + args.qk_pos_emb_head_dim) / 2
-                        + args.num_attention_heads * args.v_head_dim / 2
+                        transformer_cfg.num_attention_heads * (transformer_cfg.qk_head_dim + transformer_cfg.qk_pos_emb_head_dim) / 2
+                        + transformer_cfg.num_attention_heads * transformer_cfg.v_head_dim / 2
                     )
                 )
 
         else:
             ## MHA or GQA
-            query_projection_size = args.kv_channels * args.num_attention_heads
-            key_projection_size = args.kv_channels * args.num_query_groups
-            value_projection_size = args.kv_channels * args.num_query_groups
-            gate_projection_size = query_projection_size if args.attention_output_gate else 0
+            query_projection_size = transformer_cfg.kv_channels * transformer_cfg.num_attention_heads
+            key_projection_size = transformer_cfg.kv_channels * transformer_cfg.num_query_groups
+            value_projection_size = transformer_cfg.kv_channels * transformer_cfg.num_query_groups
+            gate_projection_size = query_projection_size if transformer_cfg.attention_output_gate else 0
             # Token-linear part of self-attention (QKV projection + output projection).
             standard_self_attn_term = (
                 forward_backward_expansion_factor
                 * fma_expansion_factor
                 * (
                     ## qkv proj
-                    args.hidden_size
+                    transformer_cfg.hidden_size
                     * (
                         query_projection_size
                         + key_projection_size
@@ -1193,7 +2412,7 @@ def num_floating_point_operations(
                         + gate_projection_size
                     )
                     ## out proj
-                    + query_projection_size * args.hidden_size
+                    + query_projection_size * transformer_cfg.hidden_size
                 )
             )
             # Core-attention (L^2) part: ``QK^T`` and ``(softmax(QK^T)) V``.
@@ -1209,74 +2428,84 @@ def num_floating_point_operations(
         dsv4_hybrid_extra_core_term = 0
         dsa_extra_term = 0
         dsa_extra_core_term = 0
-        if is_linear_attention_variant(args.experimental_attention_variant):
-            # Calculate number of dense and MoE Transformer MLPs.
-            if isinstance(args.linear_attention_freq, int):
+        if is_linear_attention_variant(transformer_cfg.experimental_attention_variant):
+            # The attention pattern describes only the main decoder layers.
+            if isinstance(transformer_cfg.linear_attention_freq, int):
                 linear_attention_pattern = [
                     # [1,1,...,1,0,1,1,...,1,0,...]
-                    0 if ((i + 1) % args.linear_attention_freq == 0) else 1
-                    for i in range(num_layers)
+                    0 if ((i + 1) % transformer_cfg.linear_attention_freq == 0) else 1
+                    for i in range(transformer_cfg.num_layers)
                 ]
-            elif isinstance(args.linear_attention_freq, list):
-                linear_attention_pattern = args.linear_attention_freq
-                assert len(linear_attention_pattern) == num_layers, (
+            elif isinstance(transformer_cfg.linear_attention_freq, list):
+                linear_attention_pattern = transformer_cfg.linear_attention_freq
+                assert len(linear_attention_pattern) == transformer_cfg.num_layers, (
                     f"Invalid length of linear_attention_pattern: {len(linear_attention_pattern)}, "
-                    f"expected {num_layers}, "
-                    f"current linear attention pattern: {args.linear_attention_freq}"
+                    f"expected {transformer_cfg.num_layers}, "
+                    f"current linear attention pattern: {transformer_cfg.linear_attention_freq}"
                 )
-            elif args.linear_attention_freq is None:
+            elif transformer_cfg.linear_attention_freq is None:
                 # This should be caught by config validation, but raise here as a safety check
                 raise ValueError(
-                    f"Linear attention type {args.experimental_attention_variant} is specified "
+                    f"Linear attention type {transformer_cfg.experimental_attention_variant} is specified "
                     "but linear_attention_freq is None. "
                     "Please set linear_attention_freq to specify the LA/SDPA layer pattern."
                 )
             else:
                 raise ValueError(
-                    f"Invalid linear_attention_freq: {type(args.linear_attention_freq)},"
-                    f" {args.linear_attention_freq}"
+                    f"Invalid linear_attention_freq: {type(transformer_cfg.linear_attention_freq)},"
+                    f" {transformer_cfg.linear_attention_freq}"
                 )
-            num_linear_attention_layers = sum(linear_attention_pattern)
+            # MTP repeats the last decoder layer's attention type, not the pattern.
+            num_linear_attention_layers = (
+                sum(linear_attention_pattern) + linear_attention_pattern[-1] * mtp_num_layers
+            )
             num_standard_attention_layers = num_layers - num_linear_attention_layers
 
-            if args.experimental_attention_variant == "kda":
+            if transformer_cfg.experimental_attention_variant == "kda":
                 linear_self_attn_term = forward_backward_expansion_factor * kda_layer_flops(
                     total_tokens=1,
-                    hidden_size=args.hidden_size,
-                    qk_head_dim=args.linear_key_head_dim,
-                    v_head_dim=args.linear_value_head_dim,
-                    num_qk_heads=args.linear_num_key_heads,
-                    num_v_heads=args.linear_num_value_heads,
-                    conv_kernel_dim=args.linear_conv_kernel_dim,
+                    hidden_size=transformer_cfg.hidden_size,
+                    f_lora_rank=getattr(transformer_cfg, "kda_f_lora_rank", None),
+                    gate_lora_rank=getattr(transformer_cfg, "kda_gate_lora_rank", None),
+                    qk_head_dim=transformer_cfg.linear_key_head_dim,
+                    v_head_dim=transformer_cfg.linear_value_head_dim,
+                    num_qk_heads=transformer_cfg.linear_num_key_heads,
+                    num_v_heads=transformer_cfg.linear_num_value_heads,
+                    conv_kernel_dim=transformer_cfg.linear_conv_kernel_dim,
                 )
-            elif is_gated_delta_net_variant(args.experimental_attention_variant):
+            elif is_gated_delta_net_variant(transformer_cfg.experimental_attention_variant):
                 # Calculate the FLOPs for the gated delta net attention.
-                qk_head_dim = args.linear_key_head_dim
-                v_head_dim = args.linear_value_head_dim
-                num_qk_heads = args.linear_num_key_heads
-                num_v_heads = args.linear_num_value_heads
+                qk_head_dim = transformer_cfg.linear_key_head_dim
+                v_head_dim = transformer_cfg.linear_value_head_dim
+                num_qk_heads = transformer_cfg.linear_num_key_heads
+                num_v_heads = transformer_cfg.linear_num_value_heads
                 qk_dim = qk_head_dim * num_qk_heads
                 v_dim = v_head_dim * num_v_heads
+                if transformer_cfg.experimental_attention_variant == "gdn2":
+                    # GDN2 in_proj: q, k, v, z, f, b, w
+                    in_proj_dim = 4 * qk_dim + 3 * v_dim
+                else:
+                    in_proj_dim = 2 * qk_dim + 2 * v_dim + 2 * num_v_heads
                 linear_self_attn_term = (
                     forward_backward_expansion_factor
                     * fma_expansion_factor
                     * (
                         ## in proj
-                        args.hidden_size * (2 * qk_dim + 2 * v_dim + 2 * num_v_heads)
+                        transformer_cfg.hidden_size * in_proj_dim
                         ## conv1d
-                        + args.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
+                        + transformer_cfg.linear_conv_kernel_dim * (2 * qk_dim + v_dim)
                         ## gated delta rule
                         + num_v_heads * (v_head_dim**2) * 4  # KK^T, VK^T, S(a(I-bKK^T)), and SQ
                         ## out proj
-                        + args.hidden_size * v_dim
+                        + transformer_cfg.hidden_size * v_dim
                     )
                 )
             else:
                 raise ValueError(
                     "Invalid experimental_attention_variant: "
-                    f"{args.experimental_attention_variant}"
+                    f"{transformer_cfg.experimental_attention_variant}"
                 )
-        elif args.experimental_attention_variant == "dsv4_hybrid":
+        elif transformer_cfg.experimental_attention_variant == "dsv4_hybrid":
             # DSv4 hybrid: MLA projections + sparse attention (window /
             # compressed-KV), main compressor, and learned indexer (DSA) are all
             # computed by the shared ``_dsv4_hybrid_self_attention_flops`` helper.
@@ -1285,29 +2514,37 @@ def num_floating_point_operations(
             linear_self_attn_term = 0
             num_standard_attention_layers = num_layers
 
-            compress_ratios = args.csa_compress_ratios
+            compress_ratios = transformer_cfg.csa_compress_ratios
             assert compress_ratios is not None, "csa_compress_ratios must be set for dsv4_hybrid"
             assert len(compress_ratios) == num_layers, (
                 f"Invalid length of csa_compress_ratios: {len(compress_ratios)}, "
                 f"expected num_layers + mtp_num_layers ({num_layers})."
             )
+            compress_ratios = [
+                compress_ratios[layer_number - 1]
+                for layer_number in _standard_layer_numbers_for_execution(
+                    transformer_cfg.num_layers,
+                    mtp_num_layers=mtp_num_layers,
+                    mtp_use_repeated_layer=getattr(transformer_cfg, "mtp_use_repeated_layer", False),
+                )
+            ]
             # ratio == 0: window-only; ratio == 4: window + topk compressed KV
             # (compressor + indexer); ratio == 128: window + all compressed KV.
             dsv4_token_term, dsv4_core_term = _dsv4_hybrid_self_attention_flops(
-                hidden_size=args.hidden_size,
-                num_attention_heads=args.num_attention_heads,
-                v_head_dim=args.v_head_dim,
-                q_lora_rank=args.q_lora_rank,
-                o_groups=args.o_groups,
-                o_lora_rank=args.o_lora_rank,
-                csa_window_size=args.csa_window_size,
-                seq_length=args.seq_length,
+                hidden_size=transformer_cfg.hidden_size,
+                num_attention_heads=transformer_cfg.num_attention_heads,
+                v_head_dim=transformer_cfg.v_head_dim,
+                q_lora_rank=transformer_cfg.q_lora_rank,
+                o_groups=transformer_cfg.o_groups,
+                o_lora_rank=transformer_cfg.o_lora_rank,
+                csa_window_size=transformer_cfg.csa_window_size,
+                seq_length=llm_seq_length,
                 n_layers_r0=sum(1 for r in compress_ratios if r == 0),
                 n_layers_r4=sum(1 for r in compress_ratios if r == 4),
                 n_layers_r128=sum(1 for r in compress_ratios if r == 128),
-                dsa_indexer_n_heads=args.dsa_indexer_n_heads,
-                dsa_indexer_head_dim=args.dsa_indexer_head_dim,
-                dsa_indexer_topk=args.dsa_indexer_topk,
+                dsa_indexer_n_heads=transformer_cfg.dsa_indexer_n_heads,
+                dsa_indexer_head_dim=transformer_cfg.dsa_indexer_head_dim,
+                dsa_indexer_topk=transformer_cfg.dsa_indexer_topk,
             )
             dsv4_hybrid_extra_term = (
                 forward_backward_expansion_factor * fma_expansion_factor * dsv4_token_term
@@ -1315,7 +2552,7 @@ def num_floating_point_operations(
             dsv4_hybrid_extra_core_term = (
                 forward_backward_expansion_factor * fma_expansion_factor * dsv4_core_term
             )
-        elif args.experimental_attention_variant == "dsa":
+        elif transformer_cfg.experimental_attention_variant == "dsa":
             # DSA (e.g. GLM-5.2). The MLA projections are unchanged -- absorption
             # relocates the same W_UK/W_UV GEMMs (per-token K/V up-projection
             # becomes per-token q-side and output-side absorption of identical
@@ -1339,26 +2576,50 @@ def num_floating_point_operations(
             linear_self_attn_term = 0
             num_standard_attention_layers = num_layers
 
+            dsa_sparse_core_scale = _dsa_sparse_core_scale(
+                total_real_tokens_in_batch, seqlen_squared_sum_in_batch, transformer_cfg.dsa_indexer_topk
+            )
+            dsa_indexer_kpool = getattr(transformer_cfg, "dsa_indexer_kpool", 1) or 1
+            if dsa_indexer_kpool > 1:
+                # KPool attends to the selected complete pools, expanded to their
+                # original tokens, plus (optionally) the incomplete tail pool.
+                dsa_attention_core_scale = _dsa_kpool_attention_scale(
+                    total_real_tokens_in_batch,
+                    seqlen_squared_sum_in_batch,
+                    transformer_cfg.dsa_indexer_topk,
+                    dsa_indexer_kpool,
+                    getattr(transformer_cfg, "dsa_indexer_kpool_always_select_tail", True),
+                )
+            else:
+                dsa_attention_core_scale = dsa_sparse_core_scale
             standard_self_attn_core_term = (
                 forward_backward_expansion_factor
                 * fma_expansion_factor
                 * (
-                    args.num_attention_heads * (args.kv_lora_rank + args.qk_pos_emb_head_dim) / 2
-                    + args.num_attention_heads * args.kv_lora_rank / 2
+                    transformer_cfg.num_attention_heads * (transformer_cfg.kv_lora_rank + transformer_cfg.qk_pos_emb_head_dim) / 2
+                    + transformer_cfg.num_attention_heads * transformer_cfg.kv_lora_rank / 2
                 )
-                * _dsa_sparse_core_scale(
-                    total_real_tokens_in_batch, seqlen_squared_sum_in_batch, args.dsa_indexer_topk
-                )
+                * dsa_attention_core_scale
             )
             dsa_extra_term, dsa_extra_core_term = _dsa_indexer_flops(
-                hidden_size=args.hidden_size,
-                q_lora_rank=args.q_lora_rank,
-                n_heads=args.dsa_indexer_n_heads,
-                head_dim=args.dsa_indexer_head_dim,
+                hidden_size=transformer_cfg.hidden_size,
+                q_lora_rank=transformer_cfg.q_lora_rank,
+                n_heads=transformer_cfg.dsa_indexer_n_heads,
+                head_dim=transformer_cfg.dsa_indexer_head_dim,
                 num_indexer_layers=_num_dsa_indexer_layers(
-                    num_layers, args.dsa_indexer_skip_topk_offset, args.dsa_indexer_topk_freq
+                    transformer_cfg.num_layers,
+                    transformer_cfg.dsa_indexer_skip_topk_offset,
+                    transformer_cfg.dsa_indexer_topk_freq,
+                    mtp_num_layers=mtp_num_layers,
+                    mtp_use_repeated_layer=getattr(transformer_cfg, "mtp_use_repeated_layer", False),
                 ),
-                indexer_loss_coeff=args.dsa_indexer_loss_coeff,
+                dsa_indexer_loss_enabled=(transformer_cfg.dsa_indexer_loss_coeff or 0.0) > 0,
+                dsa_indexer_use_sparse_loss=getattr(transformer_cfg, "dsa_indexer_use_sparse_loss", False),
+                sparse_core_scale=dsa_sparse_core_scale,
+                total_tokens=total_real_tokens_in_batch,
+                seqlen_squared_sum=seqlen_squared_sum_in_batch,
+                dsa_indexer_topk=transformer_cfg.dsa_indexer_topk,
+                dsa_indexer_kpool=dsa_indexer_kpool,
             )
         else:
             num_linear_attention_layers = 0
@@ -1383,6 +2644,17 @@ def num_floating_point_operations(
             + dsa_extra_core_term
         )
 
+        attention_residual_term = 0
+        if getattr(transformer_cfg, "enable_attention_residuals", False):
+            attention_residual_term = forward_backward_expansion_factor * attention_residual_flops(
+                total_tokens=1,
+                hidden_size=transformer_cfg.hidden_size,
+                num_layers=transformer_cfg.num_layers,
+                block_layers=transformer_cfg.attn_res_block_layers,
+                transformer_layer_layout=True,
+                mtp_num_layers=mtp_num_layers,
+            )
+
         # Token-linear FLOPs scale with the real (unpadded) token count.
         # For BSHD this falls back to ``batch_size * seq_length`` (no padding).
         total_floating_point_operations = (
@@ -1391,10 +2663,10 @@ def num_floating_point_operations(
                 # MLP
                 forward_backward_expansion_factor
                 * fma_expansion_factor
-                * args.hidden_size
+                * transformer_cfg.hidden_size
                 * (
                     # dense layer (deepseek v2, v3 style)
-                    (args.ffn_hidden_size * ffn_expansion_factor) * num_dense_layers
+                    (transformer_cfg.ffn_hidden_size * ffn_expansion_factor) * num_dense_layers
                     # routed experts
                     + (
                         (moe_ffn_hidden_size * num_experts_routed_to * ffn_expansion_factor)
@@ -1405,7 +2677,7 @@ def num_floating_point_operations(
                                 * num_experts_routed_to
                                 * ffn_expansion_factor
                                 * moe_latent_size
-                                / args.hidden_size
+                                / transformer_cfg.hidden_size
                             )  # Routed experts run on moe_latent_size.
                             + 2 * moe_latent_size  # Up proj and down proj.
                         )
@@ -1416,22 +2688,30 @@ def num_floating_point_operations(
                 )
                 # Self Attention (token-linear part).
                 + self_attn_term
+                # Attention Residual depth scoring and value aggregation.
+                + attention_residual_term
                 # MTP norms and proj
                 + forward_backward_expansion_factor
                 * fma_expansion_factor
                 * mtp_num_layers
                 * (
                     # MTP eh norm + final nrom
-                    3 * args.hidden_size
+                    3 * transformer_cfg.hidden_size
                     # MTH eh proj
-                    + 2 * args.hidden_size * args.hidden_size
+                    + 2 * transformer_cfg.hidden_size * transformer_cfg.hidden_size
                 )
                 # Logit.
-                + forward_backward_expansion_factor
-                * fma_expansion_factor
-                * args.hidden_size
-                * args.padded_vocab_size
-                * (mtp_num_layers + 1)  # MTP + final logit
+                + _logit_flops_per_token(
+                    transformer_cfg.hidden_size,
+                    vocab_size,
+                    mtp_num_layers=mtp_num_layers,
+                    mtp_detach_heads=getattr(transformer_cfg, "mtp_detach_heads", False),
+                )
+                # E2E TV target distribution: one frozen forward-only output projection.
+                + fma_expansion_factor
+                * transformer_cfg.hidden_size
+                * vocab_size
+                * int(getattr(transformer_cfg, "mtp_loss_type", "cross_entropy") == "e2e_tv")
             )
             # Self Attention (core L^2 part). For BSHD the default
             # ``seqlen_squared_sum_in_batch = batch_size * seq_length^2`` recovers the
@@ -1441,26 +2721,59 @@ def num_floating_point_operations(
         )
         return total_floating_point_operations
 
+    def _uses_gated_delta_product_spec():
+        """Return whether the hybrid stack uses GatedDeltaProductMixer.
+
+        Used to select the gated-delta-product FLOPs calculation.
+        """
+        from megatron.core.ssm.gated_delta_product import GatedDeltaProductMixer
+
+        spec = getattr(model_config, "hybrid_stack_spec", None)
+        layer = getattr(getattr(spec, "submodules", None), "mamba_layer", None)
+        mixer = getattr(getattr(layer, "submodules", None), "mixer", None)
+        return getattr(mixer, "module", None) is GatedDeltaProductMixer
+
     # Main entrypoint for FLOPs calculation.
-    if is_hybrid_model(args):
+    if is_hybrid_model(model_config):
         from megatron.core.models.hybrid.hybrid_layer_allocation import (
             Symbols,
             get_hybrid_layer_counts,
+            parse_hybrid_pattern,
         )
 
-        layer_counts = get_hybrid_layer_counts(args.hybrid_layer_pattern)
+        layer_counts = get_hybrid_layer_counts(model_config.hybrid_layer_pattern)
         num_mamba_layers = layer_counts[Symbols.MAMBA]
         num_gdn_layers = layer_counts[Symbols.GDN]
         num_kda_layers = layer_counts[Symbols.KDA]
         num_mlp_layers = layer_counts[Symbols.MLP]
         num_moe_layers = layer_counts[Symbols.MOE]
 
+        # Prefer the canonical DSv4 output-projection names. validate_args mirrors them
+        # onto the legacy o_groups / o_lora_rank aliases, but not every caller runs it.
+        dsv4_o_groups = getattr(transformer_cfg, "output_projection_groups", None)
+        if dsv4_o_groups is None:
+            dsv4_o_groups = getattr(transformer_cfg, "o_groups", None)
+        dsv4_o_lora_rank = getattr(transformer_cfg, "output_projection_lora_rank", None)
+        if dsv4_o_lora_rank is None:
+            dsv4_o_lora_rank = getattr(transformer_cfg, "o_lora_rank", None)
+
+        # The static C/H/W specs select DSv4 even when the CLI variant is inferred
+        # only on the layer config (argument_utils writes it into the config kwargs,
+        # never back onto ``args``), so key off the layer pattern as well. Pattern-only
+        # detection also needs the DSv4 output-projection dims; callers that leave them
+        # unset (for example, args built without validate_args) keep the dense-MLA
+        # estimate for C/H/W layers instead of failing inside the DSv4 attention helper.
+        has_dsv4_layers = any(layer_counts[symbol] for symbol in Symbols.DSV4_COMPRESS_RATIO_MAP)
+        is_dsv4_hybrid = transformer_cfg.experimental_attention_variant == "dsv4_hybrid" or (
+            has_dsv4_layers and dsv4_o_groups is not None and dsv4_o_lora_rank is not None
+        )
+
         # DSv4 D/C/H/W layers are MLA variants, but their
         # sparse attention FLOPs are handled by the DSv4 branch.
         dsv4_mla_symbols = Symbols.MLA_ATTENTION - {Symbols.MLA}
         dsv4_mla_layers = sum(layer_counts[symbol] for symbol in dsv4_mla_symbols)
         num_mla_layers = layer_counts[Symbols.MLA]
-        if args.experimental_attention_variant == "dsv4_hybrid":
+        if is_dsv4_hybrid:
             num_attn_layers = layer_counts[Symbols.ATTENTION] + dsv4_mla_layers
         else:
             num_attn_layers = layer_counts[Symbols.ATTENTION]
@@ -1469,7 +2782,7 @@ def num_floating_point_operations(
         dsv4_n_layers_r0 = layer_counts[Symbols.WINDOW]
         dsv4_n_layers_r4 = layer_counts[Symbols.CSA]
         dsv4_n_layers_r128 = layer_counts[Symbols.HCA]
-        if args.experimental_attention_variant == "dsv4_hybrid":
+        if is_dsv4_hybrid:
             assert num_mla_layers == 0, "dsv4_hybrid does not support dense + MLA layers"
             assert num_attn_layers == (dsv4_n_layers_r0 + dsv4_n_layers_r4 + dsv4_n_layers_r128), (
                 "dsv4_hybrid expects all attention layers to be Window/CSA/HCA; "
@@ -1482,14 +2795,13 @@ def num_floating_point_operations(
         # 'D' pattern here would silently fall through to the dense full-MLA
         # estimate below -- overcounting core attention at long context and
         # dropping the indexer entirely -- so fail loud instead. Key off the
-        # layer pattern itself, not just ``args.experimental_attention_variant``:
+        # layer pattern itself, not just ``transformer_cfg.experimental_attention_variant``:
         # on the hybrid path a 'D' pattern sets the variant only in the config
         # kwargs (``arguments.py``/``argument_utils.py`` write it into
         # ``kw_args``, never back onto ``args``), so the attribute alone misses
         # exactly the runs this guard exists for.
         assert (
-            args.experimental_attention_variant != "dsa"
-            and layer_counts[Symbols.DS_ATTENTION] == 0
+            transformer_cfg.experimental_attention_variant != "dsa" and layer_counts[Symbols.DS_ATTENTION] == 0
         ), (
             "num_floating_point_operations does not support DSA "
             "('D' layers / experimental_attention_variant='dsa') on the "
@@ -1497,14 +2809,29 @@ def num_floating_point_operations(
             "without a layer pattern."
         )
 
-        mtp_num_layers = args.mtp_num_layers
+        mtp_num_layers = transformer_cfg.mtp_num_layers
         if mtp_num_layers is None:
             mtp_num_layers = 0
+        if is_dsv4_hybrid:
+            # The pattern owns the DSv4 MTP depth; transformer_cfg.mtp_num_layers may be unset.
+            mtp_num_layers = parse_hybrid_pattern(model_config.hybrid_layer_pattern).mtp_num_depths
+        # CSA top-k saturation depends on the real sequence length. An explicit dsv4_hybrid
+        # variant keeps the standard-model estimate, which caps top-k with llm_seq_length,
+        # so the two paths stay bit-identical. DSv4 detected from the static C/H/W pattern
+        # alone uses the token-weighted mean real length because packed statistics keep no
+        # per-document lengths (llm_seq_length for BSHD).
+        if transformer_cfg.experimental_attention_variant == "dsv4_hybrid":
+            dsv4_seq_length = llm_seq_length
+        elif total_real_tokens_in_batch:
+            dsv4_seq_length = seqlen_squared_sum_in_batch / total_real_tokens_in_batch
+        else:
+            dsv4_seq_length = llm_seq_length
 
-        return hybrid_flops(
+        # Compute hybrid decoder FLOPs.
+        total_floating_point_operations = hybrid_flops(
             total_tokens=total_real_tokens_in_batch,
             seqlen_squared_sum=seqlen_squared_sum_in_batch,
-            hidden_size=args.hidden_size,
+            hidden_size=transformer_cfg.hidden_size,
             num_attn_layers=num_attn_layers,
             num_mla_layers=num_mla_layers,
             num_kda_layers=num_kda_layers,
@@ -1512,64 +2839,89 @@ def num_floating_point_operations(
             num_mlp_layers=num_mlp_layers,
             num_moe_layers=num_moe_layers,
             num_gdn_layers=num_gdn_layers,
-            mamba_state_dim=args.mamba_state_dim,
-            mamba_head_dim=args.mamba_head_dim,
-            mamba_num_groups=args.mamba_num_groups,
-            mamba_num_heads=args.mamba_num_heads,
-            num_attn_heads=args.num_attention_heads,
-            gqa=args.group_query_attention,
-            gqa_groups=args.num_query_groups,
-            kv_channels=args.kv_channels,
-            mlp_expansion=args.ffn_hidden_size / args.hidden_size,
-            swiglu=(args.swiglu or getattr(args, "situ_glu", False)),
-            moe_latent_size=args.moe_latent_size,
+            mamba_state_dim=transformer_cfg.mamba_state_dim,
+            mamba_head_dim=transformer_cfg.mamba_head_dim,
+            mamba_num_groups=transformer_cfg.mamba_num_groups,
+            mamba_num_heads=transformer_cfg.mamba_num_heads,
+            gdp_num_householder=transformer_cfg.gdp_num_householder,
+            num_attn_heads=transformer_cfg.num_attention_heads,
+            gqa=group_query_attention,
+            gqa_groups=transformer_cfg.num_query_groups,
+            kv_channels=transformer_cfg.kv_channels,
+            mlp_expansion=transformer_cfg.ffn_hidden_size / transformer_cfg.hidden_size,
+            swiglu=(swiglu or situ_glu),
+            use_gated_delta_product=_uses_gated_delta_product_spec(),
+            moe_latent_size=transformer_cfg.moe_latent_size,
             moe_ffn_hidden_size=(
-                args.moe_ffn_hidden_size
-                if args.moe_ffn_hidden_size is not None
-                else args.ffn_hidden_size
+                transformer_cfg.moe_ffn_hidden_size
+                if transformer_cfg.moe_ffn_hidden_size is not None
+                else transformer_cfg.ffn_hidden_size
             ),
             shared_expert_ffn_hidden_size=(
                 0
-                if args.moe_shared_expert_intermediate_size is None
-                else args.moe_shared_expert_intermediate_size
+                if transformer_cfg.moe_shared_expert_intermediate_size is None
+                else transformer_cfg.moe_shared_expert_intermediate_size
             ),
-            num_experts_routed_to=args.moe_router_topk,
-            gdn_qk_head_dim=args.linear_key_head_dim or 128,
-            gdn_v_head_dim=args.linear_value_head_dim or 128,
-            gdn_num_qk_heads=args.linear_num_key_heads or 16,
-            gdn_num_v_heads=args.linear_num_value_heads or 32,
-            gdn_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
-            kda_qk_head_dim=args.linear_key_head_dim or 128,
-            kda_v_head_dim=args.linear_value_head_dim or 128,
-            kda_num_qk_heads=args.linear_num_key_heads or 16,
-            kda_num_v_heads=args.linear_num_value_heads or 16,
-            kda_conv_kernel_dim=args.linear_conv_kernel_dim or 4,
-            vocab_size=args.padded_vocab_size,
+            num_experts_routed_to=transformer_cfg.moe_router_topk,
+            gdn_qk_head_dim=transformer_cfg.linear_key_head_dim or 128,
+            gdn_v_head_dim=transformer_cfg.linear_value_head_dim or 128,
+            gdn_num_qk_heads=transformer_cfg.linear_num_key_heads or 16,
+            gdn_num_v_heads=transformer_cfg.linear_num_value_heads or 32,
+            gdn_conv_kernel_dim=transformer_cfg.linear_conv_kernel_dim or 4,
+            kda_qk_head_dim=transformer_cfg.linear_key_head_dim or 128,
+            kda_v_head_dim=transformer_cfg.linear_value_head_dim or 128,
+            kda_num_qk_heads=transformer_cfg.linear_num_key_heads or 16,
+            kda_num_v_heads=transformer_cfg.linear_num_value_heads or 16,
+            kda_conv_kernel_dim=transformer_cfg.linear_conv_kernel_dim or 4,
+            gdn_use_gdn2=(transformer_cfg.experimental_attention_variant == "gdn2"),
+            kda_f_lora_rank=getattr(transformer_cfg, "kda_f_lora_rank", None),
+            kda_gate_lora_rank=getattr(transformer_cfg, "kda_gate_lora_rank", None),
+            vocab_size=vocab_size,
             mtp_num_layers=mtp_num_layers,
-            q_lora_rank=args.q_lora_rank,
-            kv_lora_rank=args.kv_lora_rank,
-            qk_head_dim=args.qk_head_dim,
-            qk_pos_emb_head_dim=args.qk_pos_emb_head_dim,
-            v_head_dim=args.v_head_dim,
-            attention_output_gate=getattr(args, "attention_output_gate", False),
+            mtp_loss_type=getattr(transformer_cfg, "mtp_loss_type", "cross_entropy"),
+            mtp_detach_heads=getattr(transformer_cfg, "mtp_detach_heads", False),
+            # MLA fields exist only on MLATransformerConfig; the defaults match the
+            # --q-lora-rank/--qk-head-dim/--qk-pos-emb-head-dim/--v-head-dim CLI defaults.
+            q_lora_rank=getattr(transformer_cfg, "q_lora_rank", None),
+            kv_lora_rank=getattr(transformer_cfg, "kv_lora_rank", 0),
+            qk_head_dim=getattr(transformer_cfg, "qk_head_dim", 128),
+            qk_pos_emb_head_dim=getattr(transformer_cfg, "qk_pos_emb_head_dim", 64),
+            v_head_dim=getattr(transformer_cfg, "v_head_dim", 128),
+            attention_output_gate=getattr(transformer_cfg, "attention_output_gate", False),
             gated_attention_proj_granularity=getattr(
-                args, "gated_attention_proj_granularity", "elementwise"
+                transformer_cfg, "gated_attention_proj_granularity", "elementwise"
             ),
-            experimental_attention_variant=args.experimental_attention_variant,
+            experimental_attention_variant=(
+                "dsv4_hybrid" if is_dsv4_hybrid else transformer_cfg.experimental_attention_variant
+            ),
             dsv4_n_layers_r0=dsv4_n_layers_r0,
             dsv4_n_layers_r4=dsv4_n_layers_r4,
             dsv4_n_layers_r128=dsv4_n_layers_r128,
-            o_groups=getattr(args, "o_groups", None),
-            o_lora_rank=getattr(args, "o_lora_rank", None),
-            csa_window_size=getattr(args, "csa_window_size", None),
-            seq_length=args.seq_length,
-            dsa_indexer_n_heads=getattr(args, "dsa_indexer_n_heads", None),
-            dsa_indexer_head_dim=getattr(args, "dsa_indexer_head_dim", None),
-            dsa_indexer_topk=getattr(args, "dsa_indexer_topk", None),
+            o_groups=dsv4_o_groups,
+            o_lora_rank=dsv4_o_lora_rank,
+            csa_window_size=getattr(transformer_cfg, "csa_window_size", None),
+            csa_dense_mode=getattr(transformer_cfg, "csa_dense_mode", False),
+            seq_length=dsv4_seq_length,
+            dsa_indexer_n_heads=getattr(transformer_cfg, "dsa_indexer_n_heads", None),
+            dsa_indexer_head_dim=getattr(transformer_cfg, "dsa_indexer_head_dim", None),
+            dsa_indexer_topk=getattr(transformer_cfg, "dsa_indexer_topk", None),
+            enable_attention_residuals=getattr(transformer_cfg, "enable_attention_residuals", False),
+            attn_res_block_layers=getattr(transformer_cfg, "attn_res_block_layers", None),
+            hybrid_layer_pattern=model_config.hybrid_layer_pattern,
         )
     else:
         # Compute standard Transformer model FLOPs.
-        return transformer_flops()
+        total_floating_point_operations = transformer_flops()
+
+    return int(
+        total_floating_point_operations
+        + _num_multimodal_extra_floating_point_operations(
+            vision_args,
+            vision_total_tokens_in_batch=vision_total_tokens_in_batch,
+            vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
+            vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
+        )
+    )
 
 
 def get_start_time_from_progress_log():
@@ -1577,9 +2929,21 @@ def get_start_time_from_progress_log():
     Gets start time of earliest job with same world size. Also returns the number
     of floating-point operations completed in last saved checkpoint.
     """
-    args = get_args()
-    assert args.save is not None
-    progress_log_filename = os.path.join(args.save, "progress.txt")
+    return _get_start_time_from_progress_log(get_run_config().checkpoint.save, safe_get_world_size())
+
+
+# The start time will not change across multiple calls, so we can cache it.
+@functools.cache
+def _get_start_time_from_progress_log(save_dir: str, world_size: int):
+    """
+    Gets start time of earliest job in the specified save directory with the
+    specified world size. Also returns the number of floating-point operations
+    completed in last saved checkpoint.
+
+    Implementation function cached on save_dir and world_size arguments.
+    """
+    assert save_dir is not None
+    progress_log_filename = os.path.join(save_dir, "progress.txt")
 
     # start_time is time when job with same world size started.
     # start_num_floating_point_operations is the number of floating-point operations
@@ -1594,7 +2958,7 @@ def get_start_time_from_progress_log():
     def _get_field(string, type):
         return type(string.split(': ')[1])
 
-    with open_file(progress_log_filename, 'r') as f:
+    with maybe_msc.open(progress_log_filename, 'r') as f:
         for line in f:
             line = line.strip()
             line_tokens = line.split('\t')
@@ -1615,7 +2979,7 @@ def get_start_time_from_progress_log():
                         latest_num_floating_point_operations_uncommitted
                     )
                     latest_num_floating_point_operations_uncommitted = None
-            if world_size_in_line != args.world_size:
+            if world_size_in_line != world_size:
                 # Re-start search if we see a different world size.
                 start_time = None
                 start_num_floating_point_operations = None
@@ -1663,6 +3027,7 @@ def preprocess_common_state_dict(common_state_dict):
             if "param_groups" not in inner_optimizer:
                 return
             param_groups = inner_optimizer["param_groups"]
+
             # Treat missing and explicit None identifier values as equivalent.
             # Wrap each component so None never compares directly with floats or strings.
             def key_fn(pg):
@@ -1670,6 +3035,7 @@ def preprocess_common_state_dict(common_state_dict):
                     (value is not None, value)
                     for value in (pg.get(key) for key in param_group_identifier_keys)
                 ]
+
             param_groups.sort(key=key_fn)
             inner_optimizer["param_groups"] = param_groups
 
@@ -1684,6 +3050,43 @@ def preprocess_common_state_dict(common_state_dict):
                     reorder_inner_param_groups(optimizer_state_dict[i])
 
     return preprocessed_common_state_dict
+
+
+def _get_train_full_dataset_sample_count(args, dataset_provider):
+    """Measure the training horizon without restoring a temporary dataloader.
+
+    Opt-in providers must accept ``restore_dataloader_state=False`` and expose
+    the finite loader through ``_dataloader`` on ranks that own training data.
+    Actual restoration happens after model setup resolves the checkpoint iteration.
+    """
+    cfg = get_run_config()
+    if not getattr(dataset_provider, 'supports_train_full_dataset', False):
+        raise ValueError(
+            "--train-full-dataset requires a dataset provider that declares "
+            "supports_train_full_dataset"
+        )
+    if cfg.train.train_iters is not None or cfg.train.train_samples is not None:
+        raise ValueError(
+            "--train-full-dataset cannot be combined with --train-iters or --train-samples"
+        )
+
+    train_data_iterator, _, _ = dataset_provider(None, restore_dataloader_state=False)
+    local_num_samples = (
+        len(train_data_iterator._dataloader)
+        if hasattr(train_data_iterator, '_dataloader')
+        else None
+    )
+    total_num_samples = reduce_max_stat_across_model_parallel_group(
+        _reduce_sum_across_data_parallel_group(
+            local_num_samples,
+            with_context_parallel=getattr(
+                args, 'deduplicate_dataloader_across_context_parallel', False
+            ),
+        )
+    )
+    if total_num_samples is None:
+        raise ValueError("--train-full-dataset resolved to an empty training dataset")
+    return int(total_num_samples)
 
 
 def pretrain(
@@ -1701,6 +3104,14 @@ def pretrain(
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     skip_model_parallel_init=False,
+    callbacks: list[Callback] | CallbackManager | None = None,
+    tensor_metric_observer: _TensorMetricObserverCallback | None = None,
+    *,
+    build_tokenizer: bool = True,
+    next_train_iterator: Optional[Callable[[int, Any], Any]] = None,
+    run_eval: Optional[Callable[..., None]] = None,
+    run_train_loop_without_updates: bool = False,
+    suppress_microbatch_rampup_handling: bool = False,
 ):
     """Main training program.
 
@@ -1713,6 +3124,9 @@ def pretrain(
     Args:
         train_valid_test_dataset_provider: a function that takes the size of
             train/valid/test dataset and returns `train, valid, test` datasets.
+            May be None when a caller-provided `next_train_iterator` supplies the training data;
+            validation and test data are then absent too (a caller-supplied `run_eval` may still
+            evaluate), and --train-full-dataset (which samples the provider) raises.
         model_provider: a function that returns a vanilla version of the
             model. By vanilla we mean a simple model on cpu with no fp16 or ddp.
         model_type: an enum that specifies the type of model being trained.
@@ -1743,10 +3157,29 @@ def pretrain(
             torch.distributed.init_process_group
         inprocess_call_wrapper: an optional instance of inprocess.CallWrapper,
             it is automatically injected when in-process restart is in use
+        tensor_metric_observer: Optional callback invoked immediately before each optimizer step.
+            Observers exposing `observe_forward_backward` also receive a context around the
+            forward-backward execution. The callback runs on every rank and owns tensor selection,
+            metric execution, and sinks. It overrides any observer selected by
+            `cfg_container.logger.tensor_metrics`.
+        build_tokenizer: whether startup builds the shared tokenizer. Disable for
+            workloads that provide their own tokenization, such as heterogeneous MiMo.
+        next_train_iterator: the loop's data hook (see `train`); defaults to the provider-built
+            iterators. A caller-provided hook replaces only the training dataloader; the
+            validation/test dataloaders (and the default run_eval over them) are still built
+            when a dataset provider is given.
+        run_eval: the loop's evaluation hook (see `train`); defaults to evaluate_and_print_results.
+        run_train_loop_without_updates: iterate the training loop without optimizer updates.
+        suppress_microbatch_rampup_handling: skip the automatic checkpoint on mid-loop
+            microbatch changes (for data sources that reconfigure microbatches every iteration).
     """
     # Capture timestamp right at top of pretrain, before initialize_megatron
     global _STARTUP_TIMESTAMPS
     _STARTUP_TIMESTAMPS['pretrain_entry'] = time.time()
+
+    cfg_container.validate()
+
+    callback_manager = normalize_callbacks(callbacks)
 
     if inprocess_call_wrapper is not None:
         iteration = inprocess_call_wrapper.iteration
@@ -1754,9 +3187,18 @@ def pretrain(
 
     timestamp_after_inprocess_setup = time.time()
 
+    # Finalize the registered configuration before anything reads it: fault tolerance captures
+    # the checkpoint policy (save directory, async mode) and must see the derived values.
+    # initialize_megatron() re-enters the idempotent finalize later.
+    cfg_container.finalize()
+
     # Early fault tolerance setup - must be done before initialize_megatron
     # to enable monitoring of the initialization process
-    ft_integration.setup()
+    ft_integration.setup(
+        cfg_container.fault_tolerance,
+        checkpoint_dir=cfg_container.checkpoint.save,
+        async_save=cfg_container.checkpoint.async_save,
+    )
     timestamp_after_in_job_setup = time.time()
 
     # Multimodal MiMo seeds each module's RNG in its builder; a plain collection seeds stock here.
@@ -1764,6 +3206,8 @@ def pretrain(
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(
+        training=True,
+        build_tokenizer=build_tokenizer,
         get_embedding_ranks=get_embedding_ranks,
         get_position_embedding_ranks=get_position_embedding_ranks,
         store=store,
@@ -1778,18 +3222,72 @@ def pretrain(
 
     timestamp_after_initialize_megatron = time.time()
 
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use cfg_container; remaining settings still use legacy args.
     args = get_args()
+    train_state = get_train_state()
     timers = get_timers()
 
-    if args.fine_grained_activation_offloading:
+    if tensor_metric_observer is None and cfg_container.logger.tensor_metrics:
+        from .tensor_metrics.observer import build_tensor_metric_observer
+
+        tensor_metric_observer = build_tensor_metric_observer(cfg_container.logger.tensor_metrics)
+
+    # OTel span setup (_start_otel_job_spans) is deferred until after
+    # kernel warmup below, where program_start/main_entry/pretrain_entry
+    # and the other startup timestamps are all available -- see the block right
+    # after those are extracted from _STARTUP_TIMESTAMPS.
+
+    if cfg_container.model.transformer.fine_grained_activation_offloading:
         from megatron.core.pipeline_parallel.utils import set_ideal_affinity_for_current_gpu
 
-        set_ideal_affinity_for_current_gpu()
+        try:
+            set_ideal_affinity_for_current_gpu()
+        except Exception as exc:  # pylint: disable=broad-except
+            # The NUMA-affinity hint speeds up the offload copies but is not required for
+            # correctness. It fails per rank, e.g. when the job's cgroup (SLURM cpus-per-task)
+            # holds no CPU of this GPU's socket, so the pinned buffers land on the remote socket
+            # and the D2H/H2D copies run at the cross-socket bandwidth. Warn from every rank.
+            allowed = len(os.sched_getaffinity(0))
+            print(
+                f"[rank {torch.distributed.get_rank()}] WARNING: could not set the GPU-local CPU "
+                f"affinity for fine-grained offloading ({exc}); the process may use {allowed} "
+                f"CPU(s) that are not on this GPU's socket, which slows the offload copies.",
+                flush=True,
+            )
 
     if cfg_container.logger.log_progress:
-        append_to_progress_log(args.save, "Starting job")
+        append_to_progress_log(cfg_container.checkpoint.save, "Starting job")
 
-    set_jit_fusion_options(tp_size=args.tensor_model_parallel_size)
+    set_jit_fusion_options(
+        cfg_container.model.transformer,
+        sequence_length=args.seq_length,
+        micro_batch_size=cfg_container.train.micro_batch_size,
+        tp_size=cfg_container.model.transformer.tensor_model_parallel_size,
+    )
+
+    # MIMO hands a per-module collection, which holds one ProcessGroupCollection
+    # per module and has no tp of its own. The cross-entropy warmup is vocab
+    # parallel, so it belongs to the language model's tensor-parallel group;
+    # a rank carrying only encoders warms its own module's shapes instead.
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        warmup_pg_collection = (
+            pg_collection.get_language_model_collection()
+            if pg_collection.has_language_model()
+            else next(iter(pg_collection))
+        )
+        warmup_tp_group = warmup_pg_collection.tp
+    elif pg_collection is not None:
+        warmup_tp_group = pg_collection.tp
+    else:
+        warmup_tp_group = mpu.get_tensor_model_parallel_group()
+    warmup_training_kernels(
+        cfg_container.model,
+        warmup_tp_group,
+        seq_length=args.seq_length,
+        micro_batch_size=cfg_container.train.micro_batch_size,
+    )
+    print_rank_0("Finished training-kernel warmup.")
 
     timestamp_after_set_jit_fusion_options = time.time()
 
@@ -1799,6 +3297,104 @@ def pretrain(
     program_start = _STARTUP_TIMESTAMPS.get('program_start')
     main_entry = _STARTUP_TIMESTAMPS.get('main_entry')
     pretrain_entry = _STARTUP_TIMESTAMPS.get('pretrain_entry')
+
+    # OTel: emit the backdated pre_startup span and open this incarnation's
+    # megatron.startup trace (its own trace_id -- there are no run-long umbrella spans;
+    # see _start_otel_job_spans()'s docstring and the module comment above it for the
+    # full picture and why these use the explicit span API and backdating instead of
+    # managed_span). The megatron.startup.* spans below then nest inside that trace.
+    # The per-interval megatron.train blocks are separate traces again, chained by
+    # Links -- see _end_otel_startup_span(), called right before train()'s loop.
+    _start_otel_job_spans(model_type, program_start)
+
+    _backdated_otel_span('megatron.startup.imports', program_start, main_entry)
+    _backdated_otel_span('megatron.startup.arg_parse', main_entry, pretrain_entry)
+    _backdated_otel_span(
+        'megatron.startup.inprocess_setup', pretrain_entry, timestamp_after_inprocess_setup
+    )
+    _backdated_otel_span(
+        'megatron.startup.in_job_setup',
+        timestamp_after_inprocess_setup,
+        timestamp_after_in_job_setup,
+    )
+    _backdated_otel_span(
+        'megatron.startup.initialize_megatron',
+        timestamp_after_in_job_setup,
+        timestamp_after_initialize_megatron,
+    )
+    _backdated_otel_span(
+        'megatron.startup.jit_fusion_options',
+        timestamp_after_initialize_megatron,
+        timestamp_after_set_jit_fusion_options,
+    )
+
+    # Both hooks below exist ONLY to flush telemetry, and both are process-global side
+    # effects, so they are installed only when telemetry is actually active. With it off
+    # there is nothing to flush and Megatron must behave exactly as it does upstream --
+    # in particular it must NOT grow a Python-level SIGTERM handler it never had, which
+    # would change EINTR behaviour and splice us into the ft_launcher/torchelastic
+    # handler chain. _otel_exit_hooks_installed keeps the installation itself idempotent.
+    global _otel_exit_hooks_installed
+    if _otel_telemetry_active() and not _otel_exit_hooks_installed:
+        _otel_exit_hooks_installed = True
+
+        # An atexit fallback in case pretrain() exits via unhandled exception --
+        # ensures both spans still get ended and telemetry flushed. Idempotent, so
+        # this doesn't double-flush if _end_otel_job_spans() already ran normally.
+        import atexit
+
+        atexit.register(_end_otel_job_spans)
+
+        # atexit does NOT run on SIGTERM (CPython terminates without unwinding), and the
+        # ft_launcher tears down ranks with SIGTERM-then-SIGKILL on a fault/restart -- so
+        # without a SIGTERM handler, megatron.train (and the open span tree) leaks as a
+        # never-exported span in exactly the faulted runs we care about.
+        import signal as _signal
+
+        _otel_prev_sigterm = _signal.getsignal(_signal.SIGTERM)
+        # with --exit-signal-handler, SIGTERM means "finish the current iteration, save a final
+        # checkpoint, then exit" (DistributedSignalHandler drain -> should_exit). We must not end
+        # spans / shut down the provider in that case -- that truncates megatron.train and drops the
+        # final-iteration + final-checkpoint spans; the normal should_exit path runs
+        # _end_otel_job_spans. There we only bounded-flush so nothing already-ended is lost if
+        # SIGKILL beats the drain.
+        # For an immediate/hard terminate (SIG_DFL / ft hard kill) we end + export the tree now.
+        _otel_graceful_drain = cfg_container.train.exit_signal_handler
+        _otel_sigterm_fired = [False]  # re-entry guard so a 2nd SIGTERM can't re-enter shutdown()
+
+        def _otel_force_flush():
+            try:
+                from opentelemetry import trace as _ot
+
+                _prov = _ot.get_tracer_provider()
+                if hasattr(_prov, 'force_flush'):
+                    _prov.force_flush()
+            except Exception:
+                pass
+
+        def _otel_sigterm_handler(signum, frame):
+            if not _otel_sigterm_fired[0]:
+                _otel_sigterm_fired[0] = True
+                try:
+                    if _otel_graceful_drain:
+                        _otel_force_flush()  # graceful drain: flush only, keep provider alive
+                    else:
+                        _end_otel_job_spans()  # hard terminate: end + export the tree now
+                except Exception:
+                    pass
+            # chain to whatever handler was already installed (ft/torchelastic drain, or default)
+            if callable(_otel_prev_sigterm):
+                _otel_prev_sigterm(signum, frame)
+            elif _otel_prev_sigterm == _signal.SIG_DFL:
+                _signal.signal(_signal.SIGTERM, _signal.SIG_DFL)
+                os.kill(os.getpid(), signum)
+            # SIG_IGN: previous handler ignored SIGTERM -> nothing more to do.
+
+        try:
+            _signal.signal(_signal.SIGTERM, _otel_sigterm_handler)
+        except (ValueError, OSError):
+            # Not the main thread / platform unsupported -> atexit remains the fallback.
+            pass
 
     # Initialize program_start_global with a fallback value in case set_startup_timestamps() wasn't called
     program_start_global = _TRAIN_START_TIME
@@ -1916,161 +3512,133 @@ def pretrain(
     else:
         checkpointing_context = {}
 
+    callback_manager.callback_context.train_state = train_state
+    callback_manager.callback_context.checkpointing_context = checkpointing_context
+    callback_manager.trigger("on_setup_start")
+
+    if args.train_full_dataset:
+        # The scheduler must know the training horizon before model and optimizer setup.
+        cfg_container.train.train_samples = _get_train_full_dataset_sample_count(
+            args, train_valid_test_dataset_provider
+        )
+
     # Model, optimizer, and learning rate.
     timers('model-and-optimizer-setup', log_level=0).start(barrier=True)
-    model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
-        model_type,
-        model_provider_func=model_provider,
-        checkpointing_context=checkpointing_context,
-        cfg_container=cfg_container,
-        # TODO (@maanug): temporary until initialize.py builds a pgcollection as bridge does.
-        pg_collection=(
-            pg_collection
-            if pg_collection is not None
-            else ProcessGroupCollection.use_mpu_process_groups()
-        ),
-    )
-
+    with _otel_managed_span('model_init', 'megatron.startup.model_init', is_goodput_span=True):
+        model, optimizer, opt_param_scheduler = setup_model_and_optimizer(
+            model_type,
+            model_provider_func=model_provider,
+            checkpointing_context=checkpointing_context,
+            cfg_container=cfg_container,
+            # TODO (@maanug): temporary until initialize.py builds a pgcollection as bridge does.
+            pg_collection=(
+                pg_collection
+                if pg_collection is not None
+                else ProcessGroupCollection.use_mpu_process_groups()
+            ),
+            run_train_loop_without_updates=run_train_loop_without_updates,
+        )
     timers('model-and-optimizer-setup').stop()
     print_datetime('after model, optimizer, and learning rate ' 'scheduler are built')
     model_cfg = get_model_config(model[0])
 
-    # Build a separate inference model for RL if requested.
-    inference_model = None
-    if args.perform_rl_step:
-        # RL inference doesn't support CP; when training uses CP>1, always build a
-        # separate CP=1 inference model (CP ranks become extra DP replicas, dp*=cp).
-        force_cp1_inference_model = args.context_parallel_size > 1
-        if (
-            args.rl_inference_tensor_model_parallel_size is not None
-            or args.rl_inference_pipeline_model_parallel_size is not None
-            or args.rl_inference_expert_model_parallel_size is not None
-            or args.rl_inference_expert_tensor_model_parallel_size is not None
-            or force_cp1_inference_model
-        ):
-            from megatron.core.inference.shards import build_inference_pg_collection
+    callback_manager.callback_context.model = model
+    callback_manager.callback_context.optimizer = optimizer
+    callback_manager.callback_context.scheduler = opt_param_scheduler
+    callback_manager.trigger("on_data_init_start")
 
-            print_rank_0(
-                "Building separate RL inference model with custom parallelism: "
-                f"TP={args.rl_inference_tensor_model_parallel_size}, "
-                f"PP={args.rl_inference_pipeline_model_parallel_size}, "
-                f"CP={1 if force_cp1_inference_model else None}, "
-                f"EP={args.rl_inference_expert_model_parallel_size}, "
-                f"ExptTP={args.rl_inference_expert_tensor_model_parallel_size}"
-            )
-            inference_pg_collection = build_inference_pg_collection(
-                args.world_size,
-                tp_size=args.rl_inference_tensor_model_parallel_size,
-                pp_size=args.rl_inference_pipeline_model_parallel_size,
-                cp_size=1 if force_cp1_inference_model else None,
-                ep_size=args.rl_inference_expert_model_parallel_size,
-                expt_tp_size=args.rl_inference_expert_tensor_model_parallel_size,
-                use_tp_pp_dp_mapping=args.use_tp_pp_dp_mapping,
-            )
-
-            # Build an isolated inference config so training config remains unchanged
-            inference_config = copy.deepcopy(model_cfg)
-            if args.rl_inference_tensor_model_parallel_size is not None:
-                inference_config.tensor_model_parallel_size = (
-                    args.rl_inference_tensor_model_parallel_size
-                )
-            if args.rl_inference_pipeline_model_parallel_size is not None:
-                inference_config.pipeline_model_parallel_size = (
-                    args.rl_inference_pipeline_model_parallel_size
-                )
-            if force_cp1_inference_model:
-                inference_config.context_parallel_size = 1
-            if args.rl_inference_expert_model_parallel_size is not None:
-                inference_config.expert_model_parallel_size = (
-                    args.rl_inference_expert_model_parallel_size
-                )
-            if args.rl_inference_expert_tensor_model_parallel_size is not None:
-                inference_config.expert_tensor_parallel_size = (
-                    args.rl_inference_expert_tensor_model_parallel_size
-                )
-
-            # Optionally allocate the RL inference model weights from a unified virtual memory (UVM)
-            # mempool so we can prefetch weights to CPU when idle while keeping CUDA-graph-safe pointers.
-            # Alternatively, use torch_memory_saver to offload the weights to CPU when idle.
-            uvm_mempool = None
-            uvm_level = args.rl_inference_model_unified_memory_level
-            if uvm_level and uvm_level > 0:
-                uvm_mempool = create_unified_mempool()
-
-            # Determine which context manager to use for model allocation
-            # Use torch_memory_saver if offloading is requested but UVM is not enabled
-            use_torch_saver_for_inference_model = (
-                args.rl_offload_inference_model_weights_when_idle
-                and uvm_level == 0
-                and HAVE_TORCH_MEMORY_SAVER
-            )
-            if use_torch_saver_for_inference_model:
-                # Use torch_memory_saver for offloading - allocate within a tagged region
-                model_alloc_ctx = torch_memory_saver.region(
-                    tag="rl_inference_model", enable_cpu_backup=True
-                )
-            elif uvm_mempool is not None:
-                model_alloc_ctx = torch.cuda.use_mem_pool(uvm_mempool)
-            else:
-                model_alloc_ctx = nullcontext()
-
-            with model_alloc_ctx:
-                inference_model = get_model(
-                    model_provider,
-                    model_type,
-                    wrap_with_ddp=False,
-                    pg_collection=inference_pg_collection,
-                    config=inference_config,
-                )
-            inference_model[0].eval()
-
-        # Validate: offloading flag requires a separate inference model
-        if args.rl_offload_inference_model_weights_when_idle and inference_model is None:
-            raise ValueError(
-                "--rl-offload-inference-model-weights-when-idle requires a separate inference model. "
-                "This flag is only useful when doing refit since the weights are shared with the training model."
-            )
-
-    # Data stuff.
+    # Data stuff. Dataset index / dataloader construction (GPTDataset/BlendedDataset
+    # index building or loading from the cache) can be a multi-second chunk of
+    # startup on its own -- the 'data_loading' span group exists exactly for this.
+    # This shares scope with the existing perfetto-native trace_region; the two
+    # tracing systems are independent.
     app_metrics['app_build_dataiters_start_time'] = one_logger_utils.get_timestamp_in_ms()
     timers('train/valid/test-data-iterators-setup', log_level=0).start(barrier=True)
-    if args.virtual_pipeline_model_parallel_size is not None:
-        train_data_iterator = []
-        valid_data_iterator = []
-        test_data_iterator = []
-        for vp_stage in range(len(model)):
-            dataset_provider_parameters = inspect.signature(
-                train_valid_test_dataset_provider
-            ).parameters
-            assert (
-                "vp_stage" in dataset_provider_parameters
-            ), "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
-            vp_stage_train_valid_test_dataset_provider = functools.partial(
-                train_valid_test_dataset_provider, vp_stage=vp_stage
-            )
-            if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
-                vp_stage_train_valid_test_dataset_provider.is_distributed = True
-            iterators = build_train_valid_test_data_iterators(
-                vp_stage_train_valid_test_dataset_provider
-            )
-            train_data_iterator.append(iterators[0])
-            valid_data_iterator.append(iterators[1])
-            test_data_iterator.append(iterators[2])
+    if next_train_iterator is None or train_valid_test_dataset_provider is not None:
+        with _otel_managed_span(
+            'data_loading', 'megatron.startup.dataloader', is_goodput_span=True
+        ):
+            # A caller-provided next_train_iterator owns the training data;
+            # the provider's validation/test data (and the default run_eval over it) still works.
+            build_train = next_train_iterator is None
+            if cfg_container.model.transformer.virtual_pipeline_model_parallel_size is not None:
+                train_data_iterator = []
+                valid_data_iterator = []
+                test_data_iterator = []
+                for vp_stage in range(len(model)):
+                    dataset_provider_parameters = inspect.signature(
+                        train_valid_test_dataset_provider
+                    ).parameters
+                    assert (
+                        "vp_stage" in dataset_provider_parameters
+                    ), "vp_stage must be a kwarg in train_valid_test_dataset_provider when using virtual pipeline parallelism"
+                    vp_stage_train_valid_test_dataset_provider = functools.partial(
+                        train_valid_test_dataset_provider, vp_stage=vp_stage
+                    )
+                    if getattr(train_valid_test_dataset_provider, 'is_distributed', False):
+                        vp_stage_train_valid_test_dataset_provider.is_distributed = True
+                    iterators = build_train_valid_test_data_iterators(
+                        vp_stage_train_valid_test_dataset_provider,
+                        build_train_dataloader=build_train,
+                    )
+                    train_data_iterator.append(iterators[0])
+                    valid_data_iterator.append(iterators[1])
+                    test_data_iterator.append(iterators[2])
+            else:
+                train_data_iterator, valid_data_iterator, test_data_iterator = (
+                    build_train_valid_test_data_iterators(
+                        train_valid_test_dataset_provider, build_train_dataloader=build_train
+                    )
+                )
+            if not build_train:
+                train_data_iterator = None
     else:
-        train_data_iterator, valid_data_iterator, test_data_iterator = (
-            build_train_valid_test_data_iterators(train_valid_test_dataset_provider)
+        # Caller-managed training data with no datasets at all (e.g. RL rollouts).
+        # The flags follow the hooks: train when there are iterations, validate only when
+        # the caller supplied run_eval (no data exists for the default one), never test.
+        backfill_consumed_samples_from_iteration()
+        train_data_iterator = valid_data_iterator = test_data_iterator = None
+        broadcast_data_flags(
+            do_train=(cfg_container.train.train_iters or 0) > 0,
+            do_valid=run_eval is not None
+            and (
+                cfg_container.validation.full_validation or cfg_container.validation.eval_iters > 0
+            ),
+            do_test=False,
         )
     timers('train/valid/test-data-iterators-setup').stop()
     print_datetime('after dataloaders are built')
     app_metrics['app_build_dataiters_finish_time'] = one_logger_utils.get_timestamp_in_ms()
 
-    # Track if training is enabled. Can only be done once args.do_train is assigned after dataloader is built.
+    # The dataloader path's hooks:
+    # keep the iterator the loop started with and validate with evaluate_and_print_results.
+    if next_train_iterator is None:
+
+        def next_train_iterator(iteration, current_iterator):
+            return current_iterator
+
+    if run_eval is None:
+        run_eval = functools.partial(
+            evaluate_and_print_results,
+            forward_step_func=forward_step_func,
+            data_iterator=valid_data_iterator,
+            model=model,
+            process_non_loss_data_func=process_non_loss_data_func,
+            config=model_cfg,
+            non_loss_data_func=non_loss_data_func,
+            pg_collection=pg_collection,
+            p2p_communicator=p2p_communicator,
+            callback_manager=callback_manager,
+            is_test=False,
+        )
+
+    # Track if training is enabled. Can only be done once train_state.do_train is assigned after dataloader is built.
     one_logger_utils.track_config_flags(
-        args.train_iters,
+        cfg_container.train.train_iters,
         cfg_container.validation.skip_train,
-        args.do_train,
-        args.do_valid,
-        args.do_test,
+        train_state.do_train,
+        train_state.do_valid,
+        train_state.do_test,
         args.dataloader_type,
     )
 
@@ -2084,64 +3652,75 @@ def pretrain(
     wandb_writer = get_wandb_writer()
     if wandb_writer:
         # Add job name to the wandb config to make it easier to run more singleton dependency jobs.
-        wandb_writer.config.update({'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")})
-
-    # Initialize RL profiler if enabled
-    if args.rl_profile:
-        # Determine output directory: use rl_profile_dir, or save/profiles, or ./profiles
-        profile_dir = getattr(args, 'rl_profile_dir', None)
-        if profile_dir is None:
-            if args.save:
-                profile_dir = os.path.join(args.save, 'profiles')
-            else:
-                profile_dir = './profiles'
-
-        # Generate run ID from job name or timestamp
-        run_id = os.getenv("SLURM_JOB_ID", None)
-        if run_id is None:
-            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-        initialize_rl_profiler(
-            output_dir=profile_dir,
-            run_id=run_id,
-            enabled=True,
-            log_to_wandb=(wandb_writer is not None),
-            log_to_tensorboard=(get_tensorboard_writer() is not None),
+        # A relaunch resumes the same wandb run, which may hold an earlier job name.
+        wandb_writer.config.update(
+            {'slurm_job_name': os.getenv("SLURM_JOB_NAME", "N/A")}, allow_val_change=True
         )
-        print_rank_0(f'[RLProfiler] Profiling enabled, output: {profile_dir}')
 
-    if not cfg_container.validation.skip_train or args.perform_rl_step:
-        if cfg_container.validation.skip_train:
-            print_rank_0('RL inference-only mode (--skip-train --perform-rl-step) ...')
+    # OTel: megatron.startup deliberately stays open into train() -- its
+    # preamble (weight-hash check, sniff test, cuda-graph setup) is init, not
+    # the loop, so it should parent to startup. train() ends startup and starts
+    # megatron.train itself, right before its loop. If train() isn't called
+    # (do_train False), _end_otel_job_spans() ends startup as an idempotent
+    # fallback.
+
+    # --skip-train never enters the loop; rollout-only iterates it without updates.
+    if not cfg_container.validation.skip_train:
+        if run_train_loop_without_updates:
+            print_rank_0('rollout-only mode: entering the train loop without updates ...')
         else:
             print_rank_0('training ...')
 
         iteration = 0
         args.curr_iteration = iteration
-        if args.do_train and (args.train_iters or 0) > 0:
-            iteration, num_floating_point_operations_so_far = train(
-                forward_step_func,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                train_data_iterator,
-                valid_data_iterator,
-                process_non_loss_data_func,
-                model_cfg,
-                checkpointing_context,
-                non_loss_data_func,
-                inference_model,
-                p2p_communicator=p2p_communicator,
-                pg_collection=pg_collection,
-            )
+        # Mirrors train()'s own loop-entry condition, so the "misaligned save_interval"
+        # fallback below can skip when there was nothing left to train this invocation
+        # (e.g. resubmitting an already-finished job) instead of redoing a redundant save.
+        has_iterations_remaining = train_state.iteration < (cfg_container.train.train_iters or 0)
+        if train_state.do_train and (cfg_container.train.train_iters or 0) > 0:
+            try:
+                iteration, num_floating_point_operations_so_far = train(
+                    forward_step_func,
+                    model,
+                    optimizer,
+                    opt_param_scheduler,
+                    train_data_iterator,
+                    model_cfg,
+                    checkpointing_context,
+                    next_train_iterator=next_train_iterator,
+                    run_eval=run_eval,
+                    p2p_communicator=p2p_communicator,
+                    pg_collection=pg_collection,
+                    callback_manager=callback_manager,
+                    tensor_metric_observer=tensor_metric_observer,
+                    run_train_loop_without_updates=run_train_loop_without_updates,
+                    suppress_microbatch_rampup_handling=suppress_microbatch_rampup_handling,
+                )
+            except Exception:
+                # OTel: an uncaught training exception (a real hardware/CUDA/NCCL
+                # fault, or an injected fault) would skip the _end_otel_job_spans()
+                # at the bottom of pretrain(), leaving the in-flight megatron.train block
+                # unended -> unexported (only the graceful-SIGTERM and normal-exit paths
+                # flush it today). End + flush the open spans here, then re-raise so the
+                # process still dies exactly as before. Idempotent -> no double-flush.
+                # (SystemExit from the exit-interval path is NOT caught here; it already
+                # flushed before sys.exit(). SIGKILL is unrecoverable regardless.)
+                _end_otel_job_spans()
+                raise
 
         print_datetime('after training is done')
 
+        # Without a periodic interval the end of training is the one save of the run.
         if (
-            not cfg_container.validation.skip_train
+            # No updates, nothing new to save.
+            not run_train_loop_without_updates
             and cfg_container.checkpoint.save
             and iteration != 0
-            and iteration % cfg_container.checkpoint.save_interval != 0
+            and has_iterations_remaining
+            and (
+                not cfg_container.checkpoint.save_interval
+                or iteration % cfg_container.checkpoint.save_interval != 0
+            )
         ):
             save_checkpoint_and_time(
                 iteration,
@@ -2151,6 +3730,7 @@ def pretrain(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
+                callback_manager=callback_manager,
             )
 
         one_logger and one_logger.log_metrics(
@@ -2160,46 +3740,18 @@ def pretrain(
     else:
         print_rank_0('skipping training (--skip-train is on) ...')
 
-        iteration = args.iteration
+        iteration = train_state.iteration
 
-    if args.do_valid:
+    if train_state.do_valid:
         prefix = f'iteration {iteration} on validation set'
-        if args.perform_rl_step:
-            rl_eval_model = model
-            rl_training_model = None
-            if inference_model is not None:
-                inf_core = unwrap_model(inference_model[0])
-                # If separate inference and training models, swap training weights
-                # back to the inference model for RL evaluation.
-                rl_utils._maybe_prefetch_separate_inference_model_weights(inf_core, to_cpu=False)
-                swap_model_weights(model, inference_model, args.refit_method)
-                rl_eval_model = inference_model
-                rl_training_model = model
-            rl_utils.evaluate_and_print_results_rl(
-                valid_data_iterator,
-                rl_eval_model,
-                optimizer,
-                iteration,
-                write_to_tensorboard=not cfg_container.validation.skip_train,
-                training_model=rl_training_model,
-            )
-        else:
-            evaluate_and_print_results(
-                prefix,
-                forward_step_func,
-                valid_data_iterator,
-                model,
-                iteration,
-                process_non_loss_data_func,
-                model_cfg,
-                verbose=True,
-                write_to_tensorboard=not cfg_container.validation.skip_train,
-                non_loss_data_func=non_loss_data_func,
-                pg_collection=pg_collection,
-                p2p_communicator=p2p_communicator,
-            )
+        run_eval(
+            prefix=prefix,
+            iteration=iteration,
+            verbose=True,
+            write_to_tensorboard=not cfg_container.validation.skip_train,
+        )
 
-    if args.do_test:
+    if train_state.do_test:
         prefix = f'iteration {iteration} on test set'
         evaluate_and_print_results(
             prefix,
@@ -2214,6 +3766,8 @@ def pretrain(
             non_loss_data_func=non_loss_data_func,
             pg_collection=pg_collection,
             p2p_communicator=p2p_communicator,
+            callback_manager=callback_manager,
+            is_test=True,
         )
 
     wandb_writer = get_wandb_writer()
@@ -2228,53 +3782,22 @@ def pretrain(
         {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
     )
 
-    if args.perform_rl_step:
-        rl_utils.rl_inference_interface_shutdown()
+    if (
+        cfg_container.model.transformer.gtp_remat_nccl_ub
+        or cfg_container.model.transformer.gtp_expert_remat_nccl_ub
+    ):
+        from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
+
+        # Deregister the GTP symmetric-memory pools: windows left registered when the
+        # process groups are destroyed make NCCL abort.
+        deregister_and_clear_gtp_symm_pools()
 
     ft_integration.shutdown()
     one_logger_utils.finish()
 
-
-def update_train_iters(args):
-
-    # For iteration-based training, we don't need to do anything
-    if args.train_iters:
-        return
-
-    if args.step_batch_size_schedule is not None:
-        # Sample based training with step batch size schedule.
-        iterations = 0
-        consumed_samples = 0
-        while consumed_samples < args.train_samples:
-            update_num_microbatches(consumed_samples, consistency_check=False)
-            consumed_samples += get_current_global_batch_size()
-            iterations += 1
-        # Reset
-        update_num_microbatches(0, consistency_check=False)
-        args.train_iters = iterations
-    else:
-        # Constant batch size with sample-based training.
-        args.train_iters = args.train_samples // args.global_batch_size
-
-    print_rank_0(f'setting training iterations to {args.train_iters}')
-
-
-def resolve_ddp_bucket_size(ddp_config, dp_cp_group, overlap_grad_reduce, num_parameters):
-    """Resolve the absolute DDP grad-bucket size.
-
-    With ``num_buckets`` set: ``num_parameters // num_buckets``; else if no explicit
-    ``bucket_size``: ``max(40_000_000, 1_000_000 * dp_cp_size)``; if ``overlap_grad_reduce``
-    is False: ``None`` (overrides the above).
-    """
-    if ddp_config.num_buckets is not None:
-        bucket_size = num_parameters // ddp_config.num_buckets
-    elif ddp_config.bucket_size is None:
-        bucket_size = max(40000000, 1000000 * get_pg_size(dp_cp_group))
-    else:
-        bucket_size = ddp_config.bucket_size
-    if not overlap_grad_reduce:
-        bucket_size = None
-    return bucket_size
+    # OTel: close any still-open span (interval block / startup) and flush all pending
+    # telemetry data.
+    _end_otel_job_spans()
 
 
 def wrap_model_chunks_with_ddp(
@@ -2367,8 +3890,22 @@ def wrap_model_chunks_with_ddp(
                 "wrap_model_chunks_with_ddp requires a dp_cp process group to size "
                 "the distributed-optimizer parameter layout"
             )
-            data_parallel_world_size = get_pg_size(layout_pgs.dp_cp)
-            expert_data_parallel_world_size = get_pg_size(getattr(layout_pgs, "expt_dp", None))
+            # The distributed optimizer shards each bucket over the intra-instance group, which
+            # is what DDP hands to the buffer as its data_parallel_group. Size the layout by that
+            # same group, otherwise the layout reports more shards than the reduce-scatter uses
+            # and the trailing shards of every bucket end up owned by no rank. intra_dp_cp is
+            # the full dp_cp when num_distributed_optimizer_instances is 1, so this only differs
+            # when there are several instances.
+            intra_dp_cp_group = getattr(layout_pgs, "intra_dp_cp", None)
+            intra_expt_dp_group = getattr(layout_pgs, "intra_expt_dp", None)
+            data_parallel_world_size = get_pg_size(
+                intra_dp_cp_group if intra_dp_cp_group is not None else layout_pgs.dp_cp
+            )
+            expert_data_parallel_world_size = get_pg_size(
+                intra_expt_dp_group
+                if intra_expt_dp_group is not None
+                else getattr(layout_pgs, "expt_dp", None)
+            )
             for i, (chunk, bucket_size) in enumerate(zip(model_chunks, bucket_sizes)):
                 all_params = [p for p in chunk.parameters() if p.requires_grad]
                 per_chunk_layouts[i] = compute_layout(
@@ -2380,26 +3917,121 @@ def wrap_model_chunks_with_ddp(
                 )
 
     # Wrap each chunk.
-    wrapped = []
-    for chunk, layout, disable_bucketing in zip(
-        model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
-    ):
-        chunk_kwargs = {}
-        # TorchFSDP takes process_group, not pg_collection.
-        if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
-            chunk_kwargs["pg_collection"] = pg_collection
-        if layout is not None:
-            chunk_kwargs["full_param_layout"] = layout
-        wrapped.append(
-            DP(
-                config=config,
-                ddp_config=ddp_config,
-                module=chunk,
-                disable_bucketing=disable_bucketing,
-                **chunk_kwargs,
+    # MFSDP v2 rejects ``disable_bucketing=True`` (see
+    # FullyShardedDataParallelV2._validate_config) and does not use the classic per-chunk
+    # disabling that the DDP/distributed-optimizer path relies on to size only the first
+    # chunk's parameter layout. Each VPP chunk is sharded independently over its own
+    # FsdpModule, so bucketing must stay enabled for every chunk; otherwise a multi-chunk
+    # (VPP) wrap sets ``disable_bucketing=True`` on non-first chunks and fails validation.
+    #
+    # For MFSDP v2 the adapter joins whatever FsdpContext is already active and only opens
+    # one when none is (see ``current_fully_shard_context``), so opening one ambient context
+    # around the loop below puts every chunk of this call on the same context, sharing
+    # communication streams and prefetch orders. This scope owns the single finalize call.
+    is_mfsdp_v2 = (
+        DP is FullyShardedDataParallel or DP is FullyShardedDataParallelV2
+    ) and ddp_config.megatron_fsdp_version == 2
+    construction_context = (
+        fully_shard_context(
+            FsdpContext(
+                runtime_policy=RuntimePolicy(
+                    use_symmetric_memory=ddp_config.nccl_ub,
+                    caller_managed_grad_sync=True,
+                    overlap_outer_communication=ddp_config.overlap_outer_communication,
+                )
             )
         )
+        if is_mfsdp_v2
+        else nullcontext()
+    )
+    wrapped = []
+    with construction_context:
+        for chunk, layout, disable_bucketing in zip(
+            model_chunks, per_chunk_layouts, disable_bucketing_per_chunk
+        ):
+            chunk_kwargs = {}
+            # TorchFSDP takes process_group, not pg_collection.
+            if pg_collection is not None and not (HAVE_FSDP2 and DP is torch_FSDP):
+                chunk_kwargs["pg_collection"] = pg_collection
+            if layout is not None:
+                chunk_kwargs["full_param_layout"] = layout
+            wrapped.append(
+                DP(
+                    config=config,
+                    ddp_config=ddp_config,
+                    module=chunk,
+                    disable_bucketing=False if is_mfsdp_v2 else disable_bucketing,
+                    **chunk_kwargs,
+                )
+            )
     return wrapped
+
+
+def _freeze_all_model_chunks(model_list):
+    """Freeze all parameters in a list of model chunks (for logits-saving runs)."""
+    for model_module in model_list:
+        model_module.requires_grad_(False)
+        # Additionally freeze expert biases of routers
+        for module in model_module.modules():
+            if hasattr(module, "frozen_expert_bias"):
+                module.frozen_expert_bias = True
+    return model_list
+
+
+def _freeze_base_model_for_mtp(model_list):
+    """Freeze backbone parameters and router bias updates while keeping MTP trainable."""
+    frozen_params = 0
+    trainable_params = 0
+    frozen_router_biases = 0
+
+    for model_module in model_list:
+        for name, param in model_module.named_parameters():
+            is_mtp_parameter = 'mtp.layers.' in name
+            param.requires_grad_(is_mtp_parameter)
+            if is_mtp_parameter:
+                trainable_params += param.numel()
+            else:
+                frozen_params += param.numel()
+
+        for name, module in model_module.named_modules():
+            if hasattr(module, 'expert_bias'):
+                freeze_router_bias = 'mtp.layers.' not in name
+                module.frozen_expert_bias = freeze_router_bias
+                if freeze_router_bias:
+                    frozen_router_biases += 1
+
+    print_rank_0(
+        f'[freeze-base-model-for-mtp] Frozen {frozen_params:,} backbone parameters and '
+        f'{frozen_router_biases:,} backbone router expert-bias buffers. '
+        f'Trainable MTP parameters: {trainable_params:,}.'
+    )
+    return model_list
+
+
+def _add_model_freeze_pre_wrap_hook(model_config, *, freeze_all_layers, freeze_base_model_for_mtp):
+    """Install the requested freeze hook before a config-built model is wrapped."""
+    freeze_hook = None
+    if freeze_all_layers:
+        freeze_hook = _freeze_all_model_chunks
+    elif freeze_base_model_for_mtp:
+        freeze_hook = _freeze_base_model_for_mtp
+
+    if freeze_hook is not None and freeze_hook not in model_config.pre_wrap_hooks:
+        model_config.pre_wrap_hooks.append(freeze_hook)
+
+
+def _forward_backward_grad_context(args):
+    """Grad context for a train step's forward/backward pass.
+
+    Returns a tuple of (grad_context, forward_only).
+    grad_context is ``torch.no_grad()`` when all layers are frozen (e.g. teacher logits
+    dumps), no parameter needs gradients, so there is no reason to build the
+    autograd graph. Otherwise returns a no-op context.
+    forward_only is True when all layers are frozen, False otherwise.
+    """
+    grad_context = torch.no_grad() if getattr(args, "freeze_all_layers", False) else nullcontext()
+    forward_only = getattr(args, "freeze_all_layers", False)
+    return grad_context, forward_only
 
 
 def get_model(
@@ -2408,21 +4040,28 @@ def get_model(
     wrap_with_ddp=True,
     config=None,
     pg_collection=None,
+    ddp_config=None,
 ):
-    """Build the model."""
+    """Build the model using a supplied or registered finalized wrapper configuration."""
+    cfg = get_run_config()
+    if ddp_config is None and isinstance(cfg, PretrainConfigContainer):
+        ddp_config = cfg.ddp
     args = get_args()
+    if config is None:
+        config = cfg.model.transformer
     args.model_type = model_type
     if pg_collection is None:
         pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
-        if args.create_all_gather_group:
+        if wrap_with_ddp and ddp_config.create_all_gather_group:
             timeout = (
-                timedelta(minutes=args.distributed_timeout_minutes)
-                if args.distributed_timeout_minutes
+                timedelta(minutes=cfg.dist.distributed_timeout_minutes)
+                if cfg.dist.distributed_timeout_minutes
                 else None
             )
             dp_cp_ag, expt_dp_ag = create_all_gather_groups(
-                for_expert_parallelism=(args.expert_model_parallel_size > 1), timeout=timeout
+                for_expert_parallelism=(config.expert_model_parallel_size > 1),
+                timeout=timeout,
             )
             pg_collection.dp_cp_ag = dp_cp_ag
             pg_collection.expt_dp_ag = expt_dp_ag
@@ -2432,16 +4071,16 @@ def get_model(
                 print_rank_0(">   including expert parallelism AG group")
 
     if has_nvidia_modelopt:
-        maybe_enable_modelopt(args)
+        maybe_enable_modelopt(args, checkpoint=cfg.checkpoint)
 
     # Build model.
     def build_model():
         if (
             get_pg_size(pg_collection.pp) > 1
-            and args.virtual_pipeline_model_parallel_size is not None
+            and config.virtual_pipeline_model_parallel_size is not None
         ):
             model = []
-            vp_size = args.virtual_pipeline_model_parallel_size
+            vp_size = config.virtual_pipeline_model_parallel_size
             for i in range(vp_size):
                 # Set pre_process and post_process only after virtual rank is set.
                 pre_process = is_pp_first_stage(pg_collection.pp) and is_vp_first_stage(
@@ -2472,7 +4111,7 @@ def get_model(
             model.model_type = model_type
         return model
 
-    if args.init_model_with_meta_device:
+    if config.init_model_with_meta_device:
         with torch.device('meta'):
             model = build_model()
     else:
@@ -2483,12 +4122,9 @@ def get_model(
 
     # For rare operations like post-training logits saving
     if args.freeze_all_layers:
-        for model_module in model:
-            model_module.requires_grad_(False)
-            # Additionally freeze expert biases of routers
-            for module in model_module.modules():
-                if hasattr(module, "frozen_expert_bias"):
-                    module.frozen_expert_bias = True
+        _freeze_all_model_chunks(model)
+    elif config.freeze_base_model_for_mtp:
+        _freeze_base_model_for_mtp(model)
 
     # Set tensor model parallel attributes if not set.
     # Only parameters that are already tensor model parallel have these
@@ -2504,9 +4140,12 @@ def get_model(
     )
     if get_pg_rank(pg_collection.dp) == 0 and get_pg_rank(pg_collection.cp) == 0:
         print(
-            ' > number of parameters on (tensor, pipeline) '
-            'model parallel rank ({}, {}): {}'.format(
-                get_pg_rank(pg_collection.tp), get_pg_rank(pg_collection.pp), num_parameters
+            ' > number of parameters on (tensor, gtp_weight_remat, pipeline) '
+            'model parallel rank ({}, {}, {}): {}'.format(
+                get_pg_rank(pg_collection.tp),
+                get_pg_rank(pg_collection.gtp_remat),
+                get_pg_rank(pg_collection.pp),
+                num_parameters,
             ),
             flush=True,
         )
@@ -2515,19 +4154,29 @@ def get_model(
     # For FSDP2, we don't allocate GPU memory here. We allocate GPU memory
     # in the fully_shard function of FSDP2 instead.
     if (
-        not (args.use_torch_fsdp2 and args.use_cpu_initialization)
-        and not args.init_model_with_meta_device
+        not (
+            ddp_config is not None
+            and isinstance(ddp_config, TorchFullyShardedDataParallelConfig)
+            and config.use_cpu_initialization
+        )
+        and not config.init_model_with_meta_device
     ):
         for model_module in model:
             model_module.cuda(torch.cuda.current_device())
 
     # Fp16 conversion.
-    if args.fp16 or args.bf16:
+    if config.fp16 or config.bf16:
         config = get_model_config(model[0])
         model = [Float16Module(config, model_module) for model_module in model]
 
     # Materialize tensors on meta device (GPU allocation) if not using FSDP2 and not using Megatron FSDP.
-    if args.init_model_with_meta_device and not args.use_torch_fsdp2 and not args.use_megatron_fsdp:
+    if config.init_model_with_meta_device and not (
+        ddp_config is not None
+        and (
+            isinstance(ddp_config, TorchFullyShardedDataParallelConfig)
+            or ddp_config.use_megatron_fsdp
+        )
+    ):
         model = [
             to_empty_if_meta_device(model_module, device=torch.device("cuda"))
             for model_module in model
@@ -2541,21 +4190,21 @@ def get_model(
     correct_amax_history_if_needed(model)
 
     if wrap_with_ddp:
-        if args.use_torch_fsdp2:
+        if isinstance(ddp_config, TorchFullyShardedDataParallelConfig):
             assert HAVE_FSDP2, "Torch FSDP2 requires torch>=2.4.0"
             DP = torch_FSDP
-        elif args.use_megatron_fsdp:
-            DP = megatron_FSDP
+        elif ddp_config.use_megatron_fsdp:
+            DP = FullyShardedDataParallel
         else:
             DP = DDP
 
         config = get_model_config(model[0])
 
-        ddp_config = get_megatron_ddp_config(args)
-        if not getattr(args, "use_torch_fsdp2", False):
+        if not isinstance(ddp_config, TorchFullyShardedDataParallelConfig):
             # In the Megatron FSDP and DDP use path, we need to initialize the bucket size.
-            ddp_config.bucket_size = resolve_ddp_bucket_size(
-                ddp_config, pg_collection.dp_cp, ddp_config.overlap_grad_reduce, num_parameters
+            ddp_config.resolve_bucket_size(
+                num_parameters=num_parameters,
+                data_parallel_size=get_pg_size(pg_collection.dp_cp),
             )
 
         # Compute per-chunk bucket sizes / disable_bucketing flags. Bucketing is
@@ -2563,7 +4212,7 @@ def get_model(
         # is on, or for non-zero pipeline-parallel ranks.
         pp_rank = get_pg_rank(pg_collection.pp)
         per_chunk_disable_bucketing = [
-            (chunk_idx > 0) or args.overlap_param_gather_with_optimizer_step
+            (chunk_idx > 0) or cfg.optimizer.overlap_param_gather_with_optimizer_step
             for chunk_idx in range(len(model))
         ]
         per_chunk_bucket_sizes = [
@@ -2571,31 +4220,38 @@ def get_model(
             for disable in per_chunk_disable_bucketing
         ]
 
-        # Setup stream for ddp initialization. The side-stream may be necessary for cuda graph
-        #  capture support with DDP, but we sync it with the current stream to avoid races.
-        ddp_stream = torch.cuda.Stream()
-        # Wait for the default stream to complete before starting ddp_stream
-        ddp_stream.wait_stream(torch.cuda.current_stream())
-        # Make ddp_stream start after whatever the default stream already queued
+        current_stream = torch.cuda.current_stream()
+        if config.cuda_graph_impl == "full_iteration":
+            # DDP initialization must use the full-iteration capture stream so its retained
+            # AccumulateGrad nodes do not reference a different, non-capturing stream.
+            ddp_stream = get_shared_capture_stream()
+        elif config.cuda_graph_impl == "none":
+            # Eager initialization is serialized with the current stream. A one-shot side stream
+            # can leave cached blocks unavailable to later allocations on the current stream.
+            ddp_stream = current_stream
+        else:
+            # Preserve a dedicated initialization stream for all other implementations.
+            ddp_stream = torch.cuda.Stream()
+        if ddp_stream is not current_stream:
+            ddp_stream.wait_stream(current_stream)
+
         with torch.cuda.stream(ddp_stream):
             model = wrap_model_chunks_with_ddp(
                 model,
                 config,
                 ddp_config,
-                use_layer_wise_distributed_optimizer=getattr(
-                    args, 'use_layer_wise_distributed_optimizer', False
-                ),
+                use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
                 DP=DP,
-                pg_collection=pg_collection if args.use_megatron_fsdp else None,
+                pg_collection=pg_collection if ddp_config.use_megatron_fsdp else None,
                 bucket_sizes=per_chunk_bucket_sizes,
                 disable_bucketing_per_chunk=per_chunk_disable_bucketing,
             )
-        # End of setup_stream
-        # Critical: ensure side-stream work completes before touching params on default stream
-        torch.cuda.current_stream().wait_stream(ddp_stream)
+        # Ensure side-stream initialization completes before touching params on the current stream.
+        if ddp_stream is not current_stream:
+            current_stream.wait_stream(ddp_stream)
 
         # Broadcast params from data parallel src rank to other data parallel ranks.
-        if args.data_parallel_random_init:
+        if cfg.rng.data_parallel_random_init:
             for model_module in model:
                 model_module.broadcast_params()
 
@@ -2604,117 +4260,47 @@ def get_model(
 
 def get_optimizer_param_scheduler(optimizer):
     """Build the learning rate scheduler."""
+    cfg = get_run_config()
     args = get_args()
 
-    # Iteration-based training.
-    if args.train_iters:
-        if args.lr_decay_iters is None:
-            args.lr_decay_iters = args.train_iters
-        lr_decay_steps = args.lr_decay_iters * args.global_batch_size
-        wd_incr_steps = args.train_iters * args.global_batch_size
-        wsd_decay_steps = None
-        if args.lr_wsd_decay_iters is not None:
-            wsd_decay_steps = args.lr_wsd_decay_iters * args.global_batch_size
-        if args.lr_warmup_fraction is not None:
-            lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
-        else:
-            lr_warmup_steps = args.lr_warmup_iters * args.global_batch_size
-    # Sample-based training.
-    elif args.train_samples:
-        # We need to set training iters for later use. Technically
-        # we need to adjust the training samples too (due to last
-        # batch being incomplete) but we leave it as is for now.
-        update_train_iters(args)
-        if args.lr_decay_samples is None:
-            args.lr_decay_samples = args.train_samples
-        lr_decay_steps = args.lr_decay_samples
-        wd_incr_steps = args.train_samples
-        wsd_decay_steps = args.lr_wsd_decay_samples
-        if args.lr_warmup_fraction is not None:
-            lr_warmup_steps = args.lr_warmup_fraction * lr_decay_steps
-        else:
-            lr_warmup_steps = args.lr_warmup_samples
-    else:
+    if cfg.train.train_iters is None and cfg.train.train_samples is None:
         raise Exception('either train-iters or train-samples should be provided.')
 
     opt_param_scheduler = OptimizerParamScheduler(
         optimizer,
-        init_lr=args.lr_warmup_init,
-        max_lr=args.lr,
-        min_lr=args.min_lr,
-        lr_warmup_steps=lr_warmup_steps,
-        lr_decay_steps=lr_decay_steps,
-        lr_decay_style=args.lr_decay_style,
-        start_wd=args.start_weight_decay,
-        end_wd=args.end_weight_decay,
-        wd_incr_steps=wd_incr_steps,
-        wd_incr_style=args.weight_decay_incr_style,
-        use_checkpoint_opt_param_scheduler=args.use_checkpoint_opt_param_scheduler,
-        override_opt_param_scheduler=args.override_opt_param_scheduler,
-        wsd_decay_steps=wsd_decay_steps,
-        lr_wsd_decay_style=args.lr_wsd_decay_style,
+        init_lr=cfg.scheduler.lr_warmup_init,
+        max_lr=cfg.optimizer.lr,
+        min_lr=cfg.optimizer.min_lr,
+        lr_warmup_steps=cfg.scheduler.lr_warmup_steps,
+        lr_decay_steps=cfg.scheduler.lr_decay_steps,
+        lr_decay_style=cfg.scheduler.lr_decay_style,
+        start_wd=cfg.scheduler.start_weight_decay,
+        end_wd=cfg.scheduler.end_weight_decay,
+        wd_incr_steps=cfg.scheduler.wd_incr_steps,
+        wd_incr_style=cfg.scheduler.weight_decay_incr_style,
+        use_checkpoint_opt_param_scheduler=cfg.scheduler.use_checkpoint_opt_param_scheduler,
+        override_opt_param_scheduler=cfg.scheduler.override_opt_param_scheduler,
+        wsd_decay_steps=cfg.scheduler.wsd_decay_steps,
+        lr_wsd_decay_style=cfg.scheduler.lr_wsd_decay_style,
+        step_lr_rescale_schedule=cfg.scheduler.step_lr_rescale_schedule,
+        step_lr_rescale_warmup_samples=cfg.scheduler.step_lr_rescale_warmup_samples,
     )
 
     return opt_param_scheduler
 
 
-def get_megatron_optimizer_config(args: Any) -> OptimizerConfig:
-    """Return a Megatron optimizer config object from Megatron's arguments."""
-
-    kwargs = {}
-    for f in dataclasses.fields(OptimizerConfig):
-        if hasattr(args, f.name):
-            kwargs[f.name] = getattr(args, f.name)
-    config = OptimizerConfig(**kwargs)
-
-    # Construct the appropriate config_overrides object. This default handles many cases, but
-    #  can be added to as needed by the user, or replaced entirely with a custom override.
-    config_overrides = get_standard_config_overrides(config=config)
-
-    return config, config_overrides
-
-
-def get_megatron_ddp_config(args: argparse.Namespace) -> DistributedDataParallelConfig:
-    """Return an MCore DDPConfig from the argparse arguments."""
-
-    if getattr(args, "use_torch_fsdp2", False):
-        reshard_after_forward = getattr(args, "torch_fsdp2_reshard_after_forward", True)
-        return TorchFullyShardedDataParallelConfig(reshard_after_forward=reshard_after_forward)
-    else:
-        kwargs = {}
-        for f in dataclasses.fields(DistributedDataParallelConfig):
-            if hasattr(args, f.name):
-                kwargs[f.name] = getattr(args, f.name)
-        kwargs["grad_reduce_in_fp32"] = args.accumulate_allreduce_grads_in_fp32
-        kwargs["check_for_nan_in_grad"] = args.check_for_nan_in_loss_and_grad
-        kwargs["check_for_large_grads"] = args.check_for_large_grads
-        kwargs["num_buckets"] = args.ddp_num_buckets
-        kwargs["bucket_size"] = args.ddp_bucket_size
-        kwargs["pad_buckets_for_high_nccl_busbw"] = args.ddp_pad_buckets_for_high_nccl_busbw
-        kwargs["reduce_scatter_with_fp32_accumulation"] = (
-            args.ddp_reduce_scatter_with_fp32_accumulation
-        )
-        kwargs["param_name_patterns_for_fp32_local_accumulation"] = tuple(
-            args.ddp_param_name_patterns_for_fp32_local_accumulation
-        )
-        kwargs["average_in_collective"] = args.ddp_average_in_collective
-        # Megatron-FSDP arguments.
-        kwargs["megatron_fsdp_main_params_dtype"] = args.megatron_fsdp_main_params_dtype
-        kwargs["megatron_fsdp_main_grads_dtype"] = args.megatron_fsdp_main_grads_dtype
-        kwargs["megatron_fsdp_grad_comm_dtype"] = args.megatron_fsdp_grad_comm_dtype
-        kwargs["megatron_fsdp_use_decoupled_grad"] = args.use_precision_aware_optimizer
-        if args.use_megatron_fsdp and args.cuda_graph_impl != "none":
-            # Run Megatron-FSDP in CUDA graph-safe mode. Avoids some graph-unsafe host-side
-            # operations (such as pointer dereferencing) that can break CUDA graph replay.
-            kwargs["megatron_fsdp_cuda_graph_mode"] = True
-            if args.cuda_graph_impl == "full_iteration":
-                # When using full-iteration CUDA graphs, Megatron-FSDP should not AG parameters
-                # during start_param_sync(), which is called during the DistOpt.step(). This
-                # causes an error when we wait() on a CUDA kernel launched in a stream beyond
-                # the scope of the full-iter / FWD-BWD CUDA graph capture.
-                kwargs["fsdp_all_gather_in_start_param_sync"] = False
-
-        return DistributedDataParallelConfig(**kwargs)
+def _reduce_sum_across_data_parallel_group(
+    stat: float | None, with_context_parallel: bool = False
+) -> float | None:
+    """Sum an optional scalar across the data-parallel group, optionally including CP."""
+    value = 0.0 if stat is None else stat
+    value = torch.tensor([value], dtype=torch.float32, device=torch.cuda.current_device())
+    torch.distributed.all_reduce(
+        value,
+        op=torch.distributed.ReduceOp.SUM,
+        group=mpu.get_data_parallel_group(with_context_parallel=with_context_parallel),
+    )
+    return None if value.item() == 0.0 else value.item()
 
 
 def setup_model_and_optimizer(
@@ -2724,38 +4310,54 @@ def setup_model_and_optimizer(
     *,
     cfg_container: PretrainConfigContainer | None = None,
     pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None = None,
+    run_train_loop_without_updates: bool = False,
 ):
     """Setup model and optimizer."""
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use cfg_container; remaining settings still use legacy args.
+    cfg = cfg_container if cfg_container is not None else get_run_config()
     args = get_args()
+    train_state = get_train_state()
     timers = get_timers()
     one_logger = get_one_logger()
 
-    # Typically, --skip-train is the only thing needed to disable the optimizer.
-    has_normal_optimizer = not args.skip_train
-    # Even with --skip-train, RL still creates an optimizer unless --no-load-optim is set.
-    has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
-    skip_optimizer = not (has_normal_optimizer or has_rl_optimizer)
-    wrap_with_ddp = not skip_optimizer
+    build_optimizer = not cfg.validation.skip_train and not (
+        run_train_loop_without_updates and not cfg.checkpoint.load_optim
+    )
+    wrap_with_ddp = build_optimizer
 
     if has_nvidia_modelopt:
-        maybe_enable_modelopt(args)
+        maybe_enable_modelopt(args, checkpoint=cfg.checkpoint)
 
-    def _build_model_wrapper(wrap_with_ddp: bool):
-        if cfg_container is not None and getattr(cfg_container, "model", None) is not None:
+    # A typed model config owns inputs without replacing an explicit application callback.
+    use_model_builder = (
+        model_provider_func is None and cfg_container is not None and isinstance(cfg.model, ModelConfig)
+    )
+
+    def _build_model_wrapper(wrap_with_ddp: bool, transformer_config=None):
+        if use_model_builder:
             from megatron.training.utils import start_memory_history_recording
 
             start_memory_history_recording(cfg_container.profiling)
 
-            cfg = cfg_container
             model_config = cfg.model
             builder_cls = model_config.get_builder_cls()
             builder = builder_cls(model_config)
+
+            # Inject selective/all-layer freezing before wrapping so DDP/FSDP only allocates
+            # gradient storage for parameters that remain trainable (matching get_model behavior).
+            _add_model_freeze_pre_wrap_hook(
+                model_config,
+                freeze_all_layers=args.freeze_all_layers,
+                freeze_base_model_for_mtp=cfg.model.transformer.freeze_base_model_for_mtp,
+            )
+
             return builder.build_distributed_models(
                 pg_collection=pg_collection,
                 ddp_config=cfg.ddp,
                 overlap_param_gather_with_optimizer_step=cfg.optimizer.overlap_param_gather_with_optimizer_step,
-                use_megatron_fsdp=cfg.dist.use_megatron_fsdp,
-                use_torch_fsdp2=cfg.dist.use_torch_fsdp2,
+                use_megatron_fsdp=cfg.ddp.use_megatron_fsdp,
+                use_torch_fsdp2=isinstance(cfg.ddp, TorchFullyShardedDataParallelConfig),
                 wrap_with_ddp=wrap_with_ddp,
                 data_parallel_random_init=cfg.rng.data_parallel_random_init,
                 use_layer_wise_distributed_optimizer=cfg.optimizer.use_layer_wise_distributed_optimizer,
@@ -2769,12 +4371,50 @@ def setup_model_and_optimizer(
                 model_type,
                 wrap_with_ddp=wrap_with_ddp,
                 pg_collection=pg_collection,
+                config=transformer_config if transformer_config is not None else cfg.model.transformer,
+                ddp_config=cfg.ddp,
             )
+
+    # Configure GTP weight-remat padding/loss reduction before model construction (pad
+    # alignment governs how dim-0 shards are built). Placed here (not in get_model) so it
+    # also covers the config-container builder path, which does not call get_model.
+    if is_gtp_remat_active(cfg.model.transformer):
+        from megatron.core.process_groups_config import resolve_gtp_remat_group
+        from megatron.core.tensor_parallel.gtp_api import (
+            configure_gtp_remat_from_recipe,
+            register_gtp_symm_pool,
+        )
+
+        configure_gtp_remat_from_recipe(
+            fp4=cfg.model.transformer.fp4 is not None,
+            fp8_recipe=cfg.model.transformer.fp8_recipe,
+            fp8=cfg.model.transformer.fp8 is not None,
+            calculate_per_token_loss=cfg.model.transformer.calculate_per_token_loss,
+            reduce_scatter_with_fp32_accumulation=cfg.ddp.gtp_remat_reduce_scatter_with_fp32_accumulation,
+        )
+
+        if cfg.model.transformer.gtp_remat_nccl_ub:
+            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=False))
+        if cfg.model.transformer.gtp_expert_remat_nccl_ub:
+            register_gtp_symm_pool(resolve_gtp_remat_group(pg_collection, is_expert=True))
 
     model = _build_model_wrapper(wrap_with_ddp)
     unwrapped_model = unwrap_model(model)
 
-    if args.logits_save_dir is not None:
+    # Register default GTP prefetch chains and finalize capture scopes after DDP wrap, before the
+    # first forward. Placed here (not in get_model) so it also covers the config-container
+    # builder path.
+    if is_gtp_remat_active(cfg.model.transformer):
+        from megatron.core.tensor_parallel.gtp_api import classify_gtp_remat_chains
+
+        classify_gtp_remat_chains(
+            model,
+            cuda_graph_modules=cfg.model.transformer.cuda_graph_modules,
+            moe_shared_expert_overlap=cfg.model.transformer.moe_shared_expert_overlap,
+            cuda_graph_impl=cfg.model.transformer.cuda_graph_impl,
+        )
+
+    if args.logits_save_dir is not None and mpu.is_pipeline_last_stage():
         from megatron.training.distillation import LogitsSaverHooks
 
         logits_saver = LogitsSaverHooks(
@@ -2786,7 +4426,7 @@ def setup_model_and_optimizer(
         )
         logits_saver.attach_hooks(unwrapped_model[-1])
 
-    if args.logits_load_dir is not None:
+    if args.logits_load_dir is not None and mpu.is_pipeline_last_stage():
         from megatron.training.distillation import StudentLogitsCapture
 
         student_logits_capture = StudentLogitsCapture()
@@ -2795,32 +4435,30 @@ def setup_model_and_optimizer(
     one_logger and one_logger.log_metrics(
         {"app_build_optimzer_start_time": one_logger_utils.get_timestamp_in_ms()}
     )
-    if skip_optimizer:
+    if not build_optimizer:
         optimizer, opt_param_scheduler = None, None
-        # In RL inference-only mode, train_iters must still be set despite having no optimizer.
-        if args.perform_rl_step:
-            update_train_iters(args)
     else:
-        config, config_overrides = get_megatron_optimizer_config(args)
-        config.timers = timers
-        if getattr(args, "use_mup", False):
+        optim_cfg = cfg.optimizer
+        optim_cfg_overrides = get_standard_config_overrides(optim_cfg)
+        optim_cfg.timers = timers
+        if cfg.model.transformer.use_mup:
             model_config_source = (
                 unwrapped_model[0] if isinstance(unwrapped_model, list) else unwrapped_model
             )
             model_config = get_model_config(model_config_source)
             mup_overrides = get_mup_config_overrides(
-                config=config,
+                config=optim_cfg,
                 mup_width_mult=model_config.mup_width_mult,
-                optimizer_type=config.optimizer,
+                optimizer_type=optim_cfg.optimizer,
             )
             if mup_overrides:
-                config_overrides = {**(config_overrides or {}), **mup_overrides}
+                optim_cfg_overrides = {**(optim_cfg_overrides or {}), **mup_overrides}
 
         optimizer = get_megatron_optimizer(
-            config,
+            optim_cfg,
             model,
-            config_overrides=config_overrides,
-            use_gloo_process_groups=args.use_gloo_process_groups,
+            config_overrides=optim_cfg_overrides,
+            use_gloo_process_groups=cfg.dist.use_gloo_process_groups,
             dump_param_to_param_group_map=args.dump_param_to_param_group_map,
         )
         opt_param_scheduler = get_optimizer_param_scheduler(optimizer)
@@ -2828,10 +4466,15 @@ def setup_model_and_optimizer(
     one_logger and one_logger.log_metrics(
         {"app_build_optimzer_finish_time": one_logger_utils.get_timestamp_in_ms()}
     )
+    # Memory at the setup boundaries. The in-loop report_memory() calls only fire once an
+    # iteration has completed, so a run that dies during startup (e.g., an OOM while loading
+    # a checkpoint into a grid that fits fine from scratch) otherwise leaves no memory trace.
+    setup_dp_group = _get_memory_report_dp_group(_get_model_pg_collection(model[0]))
+    report_memory("(after model and optimizer build)", process_group=setup_dp_group)
 
     if args.moe_use_upcycling:
         torch.distributed.barrier()
-        assert not checkpoint_exists(args.save), (
+        assert not checkpoint_exists(cfg.checkpoint.save), (
             "The upcycling destination directory already exists. "
             "Please check if --moe-use-upcycling is mistakenly enabled. "
             "Upcycling should only be set for the first run when converting the dense model. "
@@ -2848,7 +4491,17 @@ def setup_model_and_optimizer(
         args.ffn_hidden_size = moe_ffn_hidden_size * args.moe_upcycling_granularity
 
         # get dense model
-        dense_model_for_upcycling = _build_model_wrapper(wrap_with_ddp=True)
+        dense_transformer_config = None
+        if not use_model_builder:
+            # Preserve callback upcycling without mutating the live MoE config.
+            # Native-builder upcycling and its legacy policy remain a separate follow-up.
+            dense_transformer_config = copy.deepcopy(cfg.model.transformer)
+            dense_transformer_config.num_moe_experts = None
+            dense_transformer_config.expert_model_parallel_size = 1
+            dense_transformer_config.ffn_hidden_size *= args.moe_upcycling_granularity
+        dense_model_for_upcycling = _build_model_wrapper(
+            wrap_with_ddp=True, transformer_config=dense_transformer_config
+        )
 
         # recover moe upcycling related args in global args before executing upcycling
         args.num_experts = num_experts
@@ -2856,50 +4509,84 @@ def setup_model_and_optimizer(
         args.ffn_hidden_size = moe_ffn_hidden_size
 
         # execute upcycling
-        _, args.num_floating_point_operations_so_far = upcycling_utils.load_and_upcycle_model(
-            load_checkpoint,
-            unwrapped_model,
-            dense_model_for_upcycling,
-            load_kwargs={
-                'model': dense_model_for_upcycling,
-                'optimizer': None,
-                'opt_param_scheduler': None,
-            },
+        _, train_state.num_floating_point_operations_so_far = (
+            upcycling_utils.load_and_upcycle_model(
+                load_checkpoint,
+                unwrapped_model,
+                dense_model_for_upcycling,
+                load_kwargs={
+                    'model': dense_model_for_upcycling,
+                    'optimizer': None,
+                    'opt_param_scheduler': None,
+                    'restore_training_state': True,
+                },
+            )
         )
-        args.iteration = 1
+        train_state.iteration = 1
+        train_state.resume_iteration = 1
+        train_state.resume_num_floating_point_operations = (
+            train_state.num_floating_point_operations_so_far
+        )
+        update_num_microbatches(consumed_samples=train_state.consumed_train_samples, verbose=True)
         save_checkpoint(
-            args.iteration, model, None, None, args.num_floating_point_operations_so_far
+            train_state.iteration,
+            model,
+            None,
+            None,
+            train_state.num_floating_point_operations_so_far,
         )
         torch.distributed.barrier()
         del dense_model_for_upcycling
-        if (args.fp16 or args.bf16) and optimizer is not None:
+        if (cfg.model.transformer.fp16 or cfg.model.transformer.bf16) and optimizer is not None:
             optimizer.reload_model_params()
-        print_rank_0(f'Upcycled checkpoint saved to {args.save}')
+        print_rank_0(f'Upcycled checkpoint saved to {cfg.checkpoint.save}')
 
     if (
-        args.load is not None or args.pretrained_checkpoint is not None
+        cfg.checkpoint.load is not None or cfg.checkpoint.pretrained_checkpoint is not None
     ) and not args.moe_use_upcycling:
         one_logger and one_logger.log_metrics(
             {'load_checkpoint_start_time': one_logger_utils.get_timestamp_in_ms()}
         )
         timers('load-checkpoint', log_level=0).start(barrier=True)
+        with _otel_managed_span(
+            'load_checkpoint', 'megatron.checkpoint.load', is_goodput_span=True
+        ):
 
-        ckpt_pgc = getattr(unwrapped_model[0], "pg_collection", None)
-        args.iteration, args.num_floating_point_operations_so_far = load_checkpoint(
-            model,
-            optimizer,
-            opt_param_scheduler,
-            checkpointing_context=checkpointing_context,
-            skip_load_to_model_and_opt=HAVE_FSDP2
-            and getattr(args, "use_torch_fsdp2", False)
-            and args.ckpt_format == "torch_dist",
-            tp_group=ckpt_pgc.tp if ckpt_pgc is not None else None,
-            pp_group=ckpt_pgc.pp if ckpt_pgc is not None else None,
-            dp_cp_group=ckpt_pgc.dp_cp if ckpt_pgc is not None else None,
-            dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
-            expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
-            rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
-        )
+            ckpt_pgc = getattr(unwrapped_model[0], "pg_collection", None)
+            train_state.iteration, train_state.num_floating_point_operations_so_far = (
+                load_checkpoint(
+                    model,
+                    optimizer,
+                    opt_param_scheduler,
+                    checkpointing_context=checkpointing_context,
+                    restore_training_state=True,
+                    record_finetune=True,
+                    skip_load_to_model_and_opt=HAVE_FSDP2
+                    and isinstance(cfg.ddp, TorchFullyShardedDataParallelConfig)
+                    and cfg.checkpoint.ckpt_format == "torch_dist",
+                    tp_group=ckpt_pgc.tp if ckpt_pgc is not None else None,
+                    pp_group=ckpt_pgc.pp if ckpt_pgc is not None else None,
+                    # Replica_id must match the save path (see save_checkpoint_and_time): use the
+                    # gtp_remat-inclusive group, not replicate dp_cp, or gtp_remat peers collide.
+                    dp_cp_group=getattr(ckpt_pgc, "dp_cp_gtp_remat", None),
+                    dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
+                    expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
+                    rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
+                )
+            )
+            train_state.resume_iteration = train_state.iteration
+            train_state.resume_num_floating_point_operations = (
+                train_state.num_floating_point_operations_so_far
+            )
+            # Checkpoint loading restores progress; training owns the runtime calculator.
+            update_num_microbatches(
+                consumed_samples=train_state.consumed_train_samples, verbose=True
+            )
+        # Barrier + min/max all-reduce right after the load. Unlike the checkpoint
+        # SAVE (ragged writers -> cross-rank skew at timers.log), the fully-parallel
+        # LOAD is uniform across ranks (~ms spread), so no meaningful skew
+        # serializes here -- left unspanned; megatron.checkpoint.load covers the
+        # (uniform) restart cost.
         timers('load-checkpoint').stop(barrier=True)
         timers.log(['load-checkpoint'])
         one_logger and one_logger.log_metrics(
@@ -2909,8 +4596,22 @@ def setup_model_and_optimizer(
             }
         )
     else:
-        args.iteration = 0
-        args.num_floating_point_operations_so_far = 0
+        train_state.iteration = 0
+        train_state.resume_iteration = 0
+        train_state.num_floating_point_operations_so_far = 0
+        train_state.resume_num_floating_point_operations = 0.0
+    # Paired with the report after the model/optimizer build: the delta is what loading the
+    # checkpoint cost. On the from-scratch path, iteration is 0 and this is the baseline.
+    report_memory(
+        f"(after checkpoint load, iteration {train_state.iteration})", process_group=setup_dp_group
+    )
+    # Clear temporary allocations created by load_checkpoint. Run this here to allow for
+    # re-claim from objects created within the scope of load_checkpoint.
+    torch.cuda.empty_cache()
+    report_memory(
+        f"(after empty_cache after checkpoint load, iteration {train_state.iteration})",
+        process_group=setup_dp_group,
+    )
 
     # [ModelOpt]: Load the teacher checkpoint for ModelOpt distillation if applicable.
     # Import locally to prevent circular import: megatron.post_training.checkpointing
@@ -2929,58 +4630,66 @@ def setup_model_and_optimizer(
     data_parallel_size = (
         mpu.get_data_parallel_world_size()
         if mpu.model_parallel_is_initialized()
-        else args.data_parallel_size
+        else cfg.get_batch_parallel_size()
     )
     assert num_microbatches is not None and num_microbatches >= 1, (
         f'current global batch size ({current_global_batch_size}) is too small for '
-        f'micro_batch_size ({args.micro_batch_size}) * data_parallel_size ({data_parallel_size}) = '
-        f'{args.micro_batch_size * data_parallel_size}. The world size cannot accommodate the '
+        f'micro_batch_size ({cfg.train.micro_batch_size}) * data_parallel_size ({data_parallel_size}) = '
+        f'{cfg.train.micro_batch_size * data_parallel_size}. The world size cannot accommodate the '
         f'batch size. This can happen when resuming with more GPUs than the current batch size '
         f'schedule entry supports.'
     )
 
     # get model without FP16 and/or DDP wrappers
     if (
-        args.iteration == 0
+        train_state.iteration == 0
         and len(unwrapped_model) == 1
         and hasattr(unwrapped_model[0], 'init_state_dict_from_bert')
     ):
         print_rank_0("Initializing ICT from pretrained BERT model")
         unwrapped_model[0].init_state_dict_from_bert()
-        if args.fp16:
+        if cfg.model.transformer.fp16:
             optimizer.reload_model_params()
 
-    # Convert checkpoint format.
-    if args.ckpt_convert_format is not None:
-        load_ckpt_format = args.ckpt_format
-        args.ckpt_format = args.ckpt_convert_format
-        args.save = os.path.join(args.ckpt_convert_save, args.ckpt_convert_format)
-        update_use_dist_ckpt(args)
-
+    # Convert checkpoint format: one save under the target format and directory, passed to this
+    # save only; the registered section and the arguments are left as they are.
+    if cfg.checkpoint.ckpt_convert_format is not None:
+        converted_format = cfg.checkpoint.ckpt_convert_format
         save_checkpoint(
-            args.iteration,
+            train_state.iteration,
             model,
             optimizer,
             opt_param_scheduler,
-            args.num_floating_point_operations_so_far,
+            train_state.num_floating_point_operations_so_far,
             preprocess_common_state_dict_fn=preprocess_common_state_dict,
+            save=os.path.join(cfg.checkpoint.ckpt_convert_save, converted_format),
+            ckpt_format=converted_format,
+            verify_integrity=cfg.checkpoint.verify_integrity and converted_format == "torch_dist",
         )
 
-        print_rank_0("> converted checkpoint: %s -> %s." % (load_ckpt_format, args.ckpt_format))
+        print_rank_0(
+            "> converted checkpoint: %s -> %s." % (cfg.checkpoint.ckpt_format, converted_format)
+        )
         torch.distributed.barrier()
         exit()
+
+    # Match training_log's activation gate so every enabled writer is reduced and cleared once
+    # per step. Establish its PP-agreed capacity before the first forward/capture.
+    if (getattr(args, "dsa_indexer_loss_coeff", None) or 0.0) > 0:
+        initialize_dsa_metric_tracker(unwrapped_model, pg_collection)
 
     return model, optimizer, opt_param_scheduler
 
 
 def dummy_train_step(data_iterator):
     """Single dummy training step."""
+    cfg = get_run_config()
     args = get_args()
     tp_rank = mpu.get_tensor_model_parallel_rank()
     has_cu_seqlens = getattr(args, 'sft', False) or getattr(
         args, 'dataloader_inter_document_masking', False
     )
-    is_hybrid_cp = args.dynamic_context_parallel
+    dynamic_cp = cfg.model.transformer.dynamic_context_parallel
 
     BATCH_KEYS = [
         "tokens",
@@ -2992,7 +4701,7 @@ def dummy_train_step(data_iterator):
         "cu_seqlens_padded",
         "max_seqlen",
         "local_cp_size",
-        "hybrid_cp_group",
+        "dynamic_cp_group",
     ]
 
     num_microbatches = get_num_microbatches()
@@ -3014,23 +4723,107 @@ def dummy_train_step(data_iterator):
                 broadcast_src_rank=mpu.get_tensor_model_parallel_src_rank(),
                 broadcast_group=mpu.get_tensor_model_parallel_group(),
                 has_cu_seqlens=has_cu_seqlens,
-                is_hybrid_cp=is_hybrid_cp,
+                dynamic_cp=dynamic_cp,
                 create_attention_mask_in_dataloader=args.create_attention_mask_in_dataloader,
-                cp_size=args.context_parallel_size,
+                cp_size=cfg.model.transformer.context_parallel_size,
                 tp_rank=tp_rank,
-                micro_batch_size=args.micro_batch_size,
+                micro_batch_size=cfg.train.micro_batch_size,
                 seq_length=args.seq_length,
                 mtp_on_this_rank=False,
-                pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+                pipeline_model_parallel_size=cfg.model.transformer.pipeline_model_parallel_size,
                 is_pipeline_first_stage=mpu.is_pipeline_first_stage(),
                 is_pipeline_last_stage=mpu.is_pipeline_last_stage(),
             )
             batch = get_batch_on_this_cp_rank(
                 batch,
-                is_hybrid_cp=is_hybrid_cp,
+                dynamic_cp=dynamic_cp,
                 cp_group=get_context_parallel_group(),
-                hybrid_cp_group_func=get_dynamic_data_context_parallel_groups,
+                dynamic_cp_group_func=get_dynamic_data_context_parallel_groups,
             )
+
+
+def _pop_samples_seen(losses_reduced):
+    """Remove and sum per-microbatch sample-count metadata from reduced losses."""
+    samples_seen = [loss.pop("_samples_seen") for loss in losses_reduced if "_samples_seen" in loss]
+    if not samples_seen:
+        return None
+    if len(samples_seen) != len(losses_reduced):
+        raise ValueError("_samples_seen must be reported by every microbatch or none of them")
+
+    total = sum(samples_seen)
+    if isinstance(total, torch.Tensor) and total.numel() != 1:
+        raise ValueError("_samples_seen must be a scalar")
+    return total
+
+
+def _get_samples_seen_in_iteration(losses_reduced, args, pg_collection):
+    """Return the global sample count and synchronize it across pipeline stages."""
+    cfg = get_run_config()
+    local_samples_seen = _pop_samples_seen(losses_reduced)
+    is_last_stage = is_pp_last_stage(pg_collection.pp)
+
+    if is_last_stage and local_samples_seen is not None:
+        samples_seen = torch.as_tensor(local_samples_seen).detach().to(dtype=torch.int64).view(1)
+        torch.distributed.all_reduce(
+            samples_seen,
+            op=torch.distributed.ReduceOp.SUM,
+            group=mpu.get_data_parallel_group(with_context_parallel=False),
+        )
+    else:
+        samples_seen = torch.tensor([-1], dtype=torch.int64, device=torch.cuda.current_device())
+
+    if get_pg_size(pg_collection.pp) > 1:
+        torch.distributed.broadcast(
+            samples_seen, src=get_pp_last_rank(pg_collection.pp), group=pg_collection.pp
+        )
+
+    samples_seen_value = samples_seen.item()
+    if samples_seen_value >= 0:
+        return int(samples_seen_value)
+    return get_num_microbatches() * cfg.train.micro_batch_size * cfg.get_batch_parallel_size()
+
+
+def _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration):
+    """Return the scheduler increment for the configured training horizon."""
+    cfg = get_run_config()
+    if cfg.train.train_iters and cfg.train.train_samples is None:
+        # Keep iteration-based schedules tied to optimizer steps. The requested
+        # global batch size may be rounded down when batch-size decrease is enabled.
+        return get_current_running_global_batch_size()
+    return samples_seen_in_iteration
+
+
+def _get_memory_report_dp_group(
+    pg_collection: ProcessGroupCollection | MultiModuleProcessGroupCollection | None,
+):
+    """Resolve the DP group that gates report_memory's rank-0 print.
+
+    A MultiModuleProcessGroupCollection carries no axes of its own, so unwrap it to the
+    language model's collection first, or, on a rank that owns only encoders, to that
+    rank's own module. Mirrors the cross-entropy warmup resolution in pretrain().
+    """
+    if isinstance(pg_collection, MultiModuleProcessGroupCollection):
+        pg_collection = (
+            pg_collection.get_language_model_collection()
+            if pg_collection.has_language_model()
+            else next(iter(pg_collection))
+        )
+    return pg_collection.dp if pg_collection is not None else None
+
+
+def _get_model_pg_collection(
+    model_chunk,
+) -> ProcessGroupCollection | MultiModuleProcessGroupCollection:
+    """Return a model's process groups, falling back to the MPU compatibility collection."""
+    while not hasattr(model_chunk, "pg_collection"):
+        model_chunk = getattr(model_chunk, "module", None)
+        if model_chunk is None:
+            return ProcessGroupCollection.use_mpu_process_groups()
+
+    pg_collection = model_chunk.pg_collection
+    if pg_collection is None:
+        return ProcessGroupCollection.use_mpu_process_groups()
+    return pg_collection
 
 
 def train_step(
@@ -3044,6 +4837,7 @@ def train_step(
     iteration=None,
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
     p2p_communicator: Optional[P2PCommunicator] = None,
+    tensor_metric_observer: _TensorMetricObserverCallback | None = None,
 ):
     """Single training step.
 
@@ -3051,7 +4845,12 @@ def train_step(
         preserves the default behavior. Reductions source per-rank groups from the model.
     p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
         preserves the default behavior.
+    tensor_metric_observer: optional callback invoked after backward and immediately before the
+        optimizer step. The callback sees finalized but not necessarily unscaled gradients.
+        Observers exposing `observe_forward_backward` also receive a context around the
+        forward-backward execution for short-lived tensors.
     """
+    cfg = get_run_config()
     args = get_args()
     timers = get_timers()
     num_microbatches = get_num_microbatches()
@@ -3107,28 +4906,45 @@ def train_step(
             )
             config.finalize_model_grads_func = finalize_model_grads_with_state_reload
 
+    # OTel: set up per-step sub-span support.
+    _otel_step_tracer = None
+    if _otel_sg_enabled('forward_backward') or _otel_sg_enabled('optimizer'):
+        from nemo.lens.helpers import safe_set_span_attributes as _otel_set_attrs
+        from nemo.lens.helpers import span_cm
+
+        _otel_step_tracer = get_telemetry().tracer
+
     rerun_state_machine = get_rerun_state_machine()
     packed_data_iterator = None
     has_wrapped_data_iterator = False
+    scheduled_num_microbatches = get_num_microbatches()
     rerun_data_iterator = data_iterator
+    checkpoint = cfg.checkpoint
     save_params_in_this_iteration = (
-        args.save_params_interval is not None and (iteration + 1) % args.save_params_interval == 0
+        checkpoint.save_params_interval is not None
+        and (iteration + 1) % checkpoint.save_params_interval == 0
     )
     save_activations_in_this_iteration = (
-        args.save_activations_interval is not None
-        and (iteration + 1) % args.save_activations_interval == 0
+        checkpoint.save_activations_interval is not None
+        and (iteration + 1) % checkpoint.save_activations_interval == 0
     )
     save_tpe_in_this_iteration = (
-        args.save_tokens_per_expert_interval is not None
-        and (iteration + 1) % args.save_tokens_per_expert_interval == 0
+        checkpoint.save_tokens_per_expert_interval is not None
+        and (iteration + 1) % checkpoint.save_tokens_per_expert_interval == 0
     )
     save_wgrads_in_this_iteration = (
-        args.save_wgrads_interval is not None and (iteration + 1) % args.save_wgrads_interval == 0
+        checkpoint.save_wgrads_interval is not None
+        and (iteration + 1) % checkpoint.save_wgrads_interval == 0
     )
     save_dgrads_in_this_iteration = (
-        args.save_dgrads_interval is not None and (iteration + 1) % args.save_dgrads_interval == 0
+        checkpoint.save_dgrads_interval is not None
+        and (iteration + 1) % checkpoint.save_dgrads_interval == 0
     )
     while rerun_state_machine.should_run_forward_backward(rerun_data_iterator):
+        # Sequence statistics are attempt-scoped: a retried forward/backward replaces, not
+        # adds to, the statistics of the superseded attempt, and nothing accumulated outside
+        # train_step (e.g. by evaluation forwards) reaches this iteration's consumer.
+        reset_seqlen_stats_in_iteration()
         # Start D2H before zeroing gradients. In the MXFP8 staging path, updated masters
         # remain readable until their delayed D2H after the main-param copy below.
         if chunked_optimizer_state_offload and not pre_forward_param_sync_before_master_offload:
@@ -3158,7 +4974,7 @@ def train_step(
             adjust_tensor_shapes_fn = get_tensor_shapes_adjust_fn_for_distillation(
                 model,
                 seq_length=args.seq_length,
-                micro_batch_size=args.micro_batch_size,
+                micro_batch_size=cfg.train.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
             )
         else:
@@ -3178,30 +4994,27 @@ def train_step(
         # and subsequent param_data zero are baked into the graph and replay
         # unconditionally. We must populate param_data so the replayed AG gathers
         # correct weights, even when forward pre-hooks are disabled.
-        if args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather:
+        # A model component's DDP config may differ from the global args. Check the
+        # DistributedOptimizer config that owns the buffers and hooks; non-overlapped
+        # optimizers stage during optimizer.step().
+        optimizer_instances = getattr(optimizer, 'chained_optimizers', [optimizer])
+        mxfp8_overlap_optimizers = [
+            optim_instance
+            for optim_instance in optimizer_instances
+            if (
+                isinstance(optim_instance, DistributedOptimizer)
+                and optim_instance.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                and optim_instance.ddp_config.overlap_param_gather
+            )
+        ]
+        if mxfp8_overlap_optimizers:
             # Check if forward_pre_hook is enabled by checking if hooks are registered.
             forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
             full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
             if forward_pre_hook_enabled or full_cg_captured:
-                for optim_instance in optimizer.chained_optimizers:
-                    if isinstance(optim_instance, DistributedOptimizer):
-                        # Only this DistOpt sibling consumes masters in the MXFP8 param-buffer
-                        # staging pass. The staging entry restores its own offloaded masters;
-                        # do not perturb the LayerWise/Muon master lifecycle here.
-                        optim_instance._copy_main_params_to_param_buffer()
+                for optim_instance in mxfp8_overlap_optimizers:
+                    optim_instance._copy_main_params_to_param_buffer()
 
-        # In the delayed MXFP8 path, optimizer state was offloaded above while masters
-        # remained resident for main-param staging. Start master D2H after that copy.
-        if delay_master_offload_for_param_buffer:
-            optimizer.offload_optimizer_state_for_forward()
-
-        # Forward pass.
-        if save_activations_in_this_iteration:
-            enable_activation_logging(model, args.save)
-        if save_tpe_in_this_iteration:
-            enable_tokens_per_expert_logging(model, args.save)
-        if save_dgrads_in_this_iteration:
-            enable_dgrad_logging(model, args.save)
         if getattr(config, 'sequence_packing_scheduler', None) is not None:
             # Dynamic-CP / sequence packing must happen after the rerun state machine has
             # observed the original RerunDataIterator. The scheduler returns another
@@ -3212,37 +5025,81 @@ def train_step(
                     num_microbatches,
                     seqlen_sum_this_global_batch,
                     seqlen_squared_sum_this_global_batch,
-                ) = wrap_data_iterator(data_iterator, config, get_num_microbatches())
+                ) = wrap_data_iterator(
+                    data_iterator,
+                    config,
+                    get_num_microbatches(),
+                    pg_collection=get_attr_wrapped_model(model[0], "pg_collection"),
+                )
                 has_wrapped_data_iterator = True
                 rerun_data_iterator = packed_data_iterator
             forward_backward_data_iterator = packed_data_iterator
         else:
             num_microbatches = get_num_microbatches()
-            seqlen_sum_this_global_batch = args.seq_length * args.global_batch_size
-            seqlen_squared_sum_this_global_batch = args.seq_length**2 * args.global_batch_size
+            seqlen_sum_this_global_batch = args.seq_length * cfg.train.global_batch_size
+            seqlen_squared_sum_this_global_batch = args.seq_length**2 * cfg.train.global_batch_size
             forward_backward_data_iterator = data_iterator
+
+        scheduled_num_microbatches = num_microbatches
+        if getattr(config, "sequence_packing_scheduler", None) is not None:
+            set_seqlen_stats_in_iteration(
+                seqlen_sum_this_global_batch, seqlen_squared_sum_this_global_batch
+            )
+
+        # In the delayed MXFP8 path, optimizer state was offloaded above while masters
+        # remained resident for main-param staging. Start master D2H after that copy.
+        if delay_master_offload_for_param_buffer:
+            optimizer.offload_optimizer_state_for_forward()
+
+        # Forward pass.
+        if save_activations_in_this_iteration:
+            enable_activation_logging(model, checkpoint.save)
+        if save_tpe_in_this_iteration:
+            enable_tokens_per_expert_logging(model, checkpoint.save)
+        if save_dgrads_in_this_iteration:
+            enable_dgrad_logging(model, checkpoint.save)
 
         if getattr(config, "mtp_num_layers", None):
             # Writer objects only exist on the last rank, so use globally consistent
             # configuration flags to keep the acceptance collective branch rank-aligned.
-            has_acceptance_consumer = bool(
-                getattr(args, "tensorboard_dir", None) or getattr(args, "wandb_project", "")
-            )
+            has_acceptance_consumer = bool(cfg.logger.tensorboard_dir or cfg.logger.wandb_project)
             MTPLossLoggingHelper.configure_acceptance_collection(enabled=has_acceptance_consumer)
-        losses_reduced = forward_backward_func(
-            forward_step_func=forward_step_func,
-            data_iterator=forward_backward_data_iterator,
-            model=model,
-            num_microbatches=num_microbatches,
-            seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
-            decoder_seq_length=args.decoder_seq_length,
-            forward_only=False,
-            adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
-            force_all_reduce=save_wgrads_in_this_iteration,
-            p2p_communicator=p2p_communicator,
-            pg_collection=pg_collection,
+        grad_context, forward_only = _forward_backward_grad_context(args)
+        _fb_cm = (
+            span_cm(
+                "megatron.train.iteration.forward_backward",
+                tracer=_otel_step_tracer,
+                num_microbatches=scheduled_num_microbatches,
+            )
+            if _otel_sg_enabled('forward_backward') and _otel_step_tracer is not None
+            else nullcontext()
         )
+        tensor_metric_context = nullcontext()
+        observe_forward_backward = getattr(
+            tensor_metric_observer, "observe_forward_backward", None
+        )
+        if observe_forward_backward is not None:
+            metric_pg_collection = _get_model_pg_collection(model[0])
+            tensor_metric_context = observe_forward_backward(
+                model=model,
+                iteration=iteration,
+                pg_collection=metric_pg_collection,
+            )
+        with grad_context, tensor_metric_context, _fb_cm:
+            losses_reduced = forward_backward_func(
+                forward_step_func=forward_step_func,
+                data_iterator=forward_backward_data_iterator,
+                model=model,
+                num_microbatches=scheduled_num_microbatches,
+                seq_length=args.seq_length,
+                micro_batch_size=cfg.train.micro_batch_size,
+                decoder_seq_length=args.decoder_seq_length,
+                forward_only=forward_only,
+                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+                force_all_reduce=save_wgrads_in_this_iteration,
+                p2p_communicator=p2p_communicator,
+                pg_collection=pg_collection,
+            )
         if save_activations_in_this_iteration:
             save_activations(iteration + 1)
             disable_activation_logging()
@@ -3274,7 +5131,7 @@ def train_step(
                     state_dict[model_chunk_name][param_name] = tensor_on_cpu
 
         # iteration is 0-indexed, move to 1-indexed for checkpoint name and logging.
-        save_grads(args.save, state_dict, iteration + 1, label)
+        save_grads(checkpoint.save, state_dict, iteration + 1, label)
 
     # Checkpoint wgrads with parameter names.
     if save_wgrads_in_this_iteration:
@@ -3290,31 +5147,57 @@ def train_step(
             exit_code,
             None,
             None,
-            0,
+            None,
             num_microbatches,
             seqlen_sum_this_global_batch,
             seqlen_squared_sum_this_global_batch,
+            None,
+            scheduled_num_microbatches,
         )
 
     # Empty unused memory.
-    if args.empty_unused_memory_level >= 1:
+    if cfg.train.empty_unused_memory_level >= 1:
         torch.cuda.empty_cache()
 
     # Vision gradients.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
-        unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
+        unwrapped_model.cancel_gradients_last_layer(get_train_state().iteration)
+
+    model_pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
+    if model_pg_collection is None:
+        model_pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    samples_seen_in_iteration = _get_samples_seen_in_iteration(
+        losses_reduced, args, model_pg_collection
+    )
+
+    if tensor_metric_observer is not None:
+        metric_pg_collection = _get_model_pg_collection(model[0])
+        tensor_metric_observer(
+            model=model,
+            optimizer=optimizer,
+            iteration=iteration,
+            pg_collection=metric_pg_collection,
+        )
 
     # Update parameters.
 
-    timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
-    update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+    timers('optimizer', log_level=1).start(barrier=config.barrier_with_L1_time)
+    _opt_cm = (
+        span_cm("megatron.train.iteration.optimizer", tracer=_otel_step_tracer)
+        if _otel_sg_enabled('optimizer') and _otel_step_tracer is not None
+        else nullcontext()
+    )
+    with _opt_cm as _opt_span:
+        update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        if _opt_span is not None:
+            _otel_set_attrs(_opt_span, {"megatron.update_successful": bool(update_successful)})
 
     # get max attention logit for logging and run clip_qk()
     # Part of MuonClip Optimizer step
     log_max_attention_logit = 0
-    if args.qk_clip or args.log_max_attention_logit:
-        log_max_attention_logit = clip_qk(model, log_max_only=not args.qk_clip)
+    if cfg.model.transformer.qk_clip or config.log_max_attention_logit:
+        log_max_attention_logit = clip_qk(model, log_max_only=not cfg.model.transformer.qk_clip)
 
     timers('optimizer').stop()
 
@@ -3323,15 +5206,15 @@ def train_step(
         _save_state_dict(attr_name="data", label="params")
 
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
-    pg_collection = get_attr_wrapped_model(model[0], "pg_collection")
-    if pg_collection is None:
-        pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    pg_collection = _get_model_pg_collection(model[0])
     for _required in ("mp", "pp", "dp_cp"):
         assert (
             getattr(pg_collection, _required, None) is not None
         ), f"model pg_collection used by train_step must define {_required}"
     mp_group = pg_collection.mp
-    dp_cp_group = pg_collection.dp_cp
+    # gtp_remat-inclusive: the reported global per-token loss must cover gtp_remat peers' distinct
+    # tokens (replicate dp_cp would report a 1/gtp_remat subsample -> per-step noisy). Display-only.
+    dp_cp_group = getattr(pg_collection, 'dp_cp_gtp_remat', None) or pg_collection.dp_cp
     is_last_stage = is_pp_last_stage(pg_collection.pp)
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
@@ -3339,7 +5222,7 @@ def train_step(
     # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
     # so we must gather across mp ranks
     grad_norm = reduce_max_stat_across_model_parallel_group(grad_norm, group=mp_group)
-    if args.log_num_zeros_in_grad:
+    if cfg.optimizer.log_num_zeros_in_grad:
         num_zeros_in_grad = reduce_max_stat_across_model_parallel_group(
             num_zeros_in_grad, group=mp_group
         )
@@ -3347,18 +5230,18 @@ def train_step(
     # Vision momentum.
     if args.vision_pretraining and args.vision_pretraining_type == "dino":
         unwrapped_model = unwrap_model(model[0])
-        unwrapped_model.update_momentum(args.curr_iteration)
+        unwrapped_model.update_momentum(get_train_state().iteration)
 
     # Update learning rate.
     if update_successful:
-        increment = get_num_microbatches() * args.micro_batch_size * args.data_parallel_size
+        increment = _get_optimizer_param_scheduler_increment(args, samples_seen_in_iteration)
         opt_param_scheduler.step(increment=increment)
         skipped_iter = 0
     else:
         skipped_iter = 1
 
     # Empty unused memory.
-    if args.empty_unused_memory_level >= 2:
+    if cfg.train.empty_unused_memory_level >= 2:
         torch.cuda.empty_cache()
 
     if is_last_stage and losses_reduced:
@@ -3368,11 +5251,42 @@ def train_step(
         for key in losses_reduced[0].keys():
             val = [x[key].view(-1) for x in losses_reduced]
             if val[0].numel() == 2:
-                # there is one dict per microbatch. in new reporting, we average
-                # over the total number of tokens across the global batch.
-                val = torch.vstack(val).sum(dim=0)
-                torch.distributed.all_reduce(val, group=dp_cp_group)
-                loss_reduced[key] = val[0] / val[1]
+                if args.sft and args.sft_loss_log_mode == 'microbatch':
+                    # Some CP shards can legitimately contain no trainable tokens.
+                    # Average only the valid per-microbatch losses.
+                    val = torch.vstack(val)
+                    numerators = val[:, 0]
+                    denominators = val[:, 1]
+                    valid = denominators > 0
+                    if valid.any():
+                        local_sum = (numerators[valid] / denominators[valid]).sum()
+                        local_count = torch.tensor(
+                            float(valid.sum().item()),
+                            dtype=local_sum.dtype,
+                            device=local_sum.device,
+                        )
+                    else:
+                        local_sum = torch.zeros_like(numerators[0])
+                        local_count = torch.zeros_like(denominators[0])
+
+                    torch.distributed.all_reduce(local_sum, group=dp_cp_group)
+                    torch.distributed.all_reduce(local_count, group=dp_cp_group)
+                    loss_reduced[key] = torch.where(
+                        local_count > 0,
+                        local_sum / local_count.clamp(min=1),
+                        torch.zeros_like(local_sum),
+                    )
+                elif args.sft:
+                    # Average over the total number of tokens across the global batch.
+                    val = torch.vstack(val).sum(dim=0)
+                    torch.distributed.all_reduce(val, group=dp_cp_group)
+                    loss_reduced[key] = torch.where(
+                        val[1] > 0, val[0] / val[1].clamp(min=1), torch.zeros_like(val[0])
+                    )
+                else:
+                    val = torch.vstack(val).sum(dim=0)
+                    torch.distributed.all_reduce(val, group=dp_cp_group)
+                    loss_reduced[key] = val[0] / val[1]
             elif val[0].numel() == 1:
                 # legacy behavior, we average over the number of microbatches
                 val = torch.cat(val).mean()
@@ -3391,6 +5305,8 @@ def train_step(
             num_microbatches,
             seqlen_sum_this_global_batch,
             seqlen_squared_sum_this_global_batch,
+            samples_seen_in_iteration,
+            scheduled_num_microbatches,
         )
     return (
         {},
@@ -3404,7 +5320,35 @@ def train_step(
         num_microbatches,
         seqlen_sum_this_global_batch,
         seqlen_squared_sum_this_global_batch,
+        samples_seen_in_iteration,
+        scheduled_num_microbatches,
     )
+
+
+def _get_indexer_logging_layer_counts(model_config) -> tuple[int, int | None]:
+    """Return tracker slots and active CSA indexer modules for loss logging."""
+    transformer_cfg = model_config.transformer
+    tracker_layers = transformer_cfg.num_layers + (transformer_cfg.mtp_num_layers or 0)
+    if transformer_cfg.csa_compress_ratios is None:
+        return tracker_layers, None
+
+    ratios = transformer_cfg.csa_compress_ratios
+    if is_hybrid_model(model_config):
+        from megatron.core.models.hybrid.hybrid_layer_allocation import parse_hybrid_pattern
+
+        parsed_pattern = parse_hybrid_pattern(model_config.hybrid_layer_pattern)
+        mtp_pattern_layers = len(parsed_pattern.mtp_pattern or "")
+        tracker_layers = transformer_cfg.num_layers + mtp_pattern_layers
+        main_indexers = sum(ratio == 4 for ratio in ratios[: transformer_cfg.num_layers])
+        mtp_indexers_per_depth = sum(
+            ratio == 4 for ratio in ratios[transformer_cfg.num_layers : tracker_layers]
+        )
+        mtp_indexer_repeats = 1 if transformer_cfg.mtp_use_repeated_layer else parsed_pattern.mtp_num_depths
+        indexer_layers = main_indexers + (mtp_indexers_per_depth * mtp_indexer_repeats)
+    else:
+        indexer_layers = sum(ratio == 4 for ratio in ratios[:tracker_layers])
+
+    return tracker_layers, 0 if transformer_cfg.csa_dense_mode else indexer_layers
 
 
 def training_log(
@@ -3423,22 +5367,34 @@ def training_log(
     is_first_iteration=False,
     seqlen_squared_sum_in_batch: float | None = None,
     total_real_tokens_in_batch: float | None = None,
+    vision_total_tokens_in_batch: float | None = None,
+    vision_seqlen_squared_sum_in_batch: float | None = None,
+    vision_merged_tokens_in_batch: float | None = None,
     num_microbatches: int | None = None,
+    schedule_pg_collection=None,
+    model=None,
+    callback_manager: CallbackManager | None = None,
+    packed_sequence_stats: Optional[Dict[str, float]] = None,
+    embedding_min_norm_metrics: Dict[str, float] | None = None,
 ):
     """Log training information such as losses, timing, ...."""
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
+    train_state = get_train_state()
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    cfg = get_run_config()
     timers = get_timers()
     writer = get_tensorboard_writer()
     wandb_writer = get_wandb_writer()
     one_logger = get_one_logger()
     energy_monitor = get_energy_monitor()
 
-    # On the first iteration we normally keep the accumulator so the next
-    # regular interval still covers a full window.  With log_interval=1 the
-    # first iteration already is a complete window; retaining it would make
-    # iteration 2 report the average of iterations 1 and 2 instead of the
-    # current loss, which invalidates step-by-step alignment comparisons.
-    should_reset = not is_first_iteration or args.log_interval == 1
+    # total_loss_dict sums over a log interval and is reset once printed. The first
+    # iteration always prints: under --log-interval 100 that is an extra line inside an
+    # interval still accumulating, so it must not reset; under --log-interval 1 that line
+    # *is* the interval, so it must, or the next print covers two iterations.
+    should_reset = not is_first_iteration or iteration % cfg.logger.log_interval == 0
 
     # Advanced, skipped, and Nan iterations.
     advanced_iters_key = 'advanced iterations'
@@ -3468,10 +5424,13 @@ def training_log(
 
     # Logging.
     timers_to_log = []
-    if args.timing_log_level >= 1:
+    if cfg.logger.timing_log_level >= 1:
         timers_to_log.extend(
             [
+                'dataloader-next',
+                'batch-generator',
                 'forward-backward',
+                'tensor-metrics',
                 'layernorm-grads-all-reduce',
                 'embedding-grads-all-reduce',
                 'all-grads-sync',
@@ -3485,10 +5444,9 @@ def training_log(
                 'optimizer',
             ]
         )
-    if args.timing_log_level >= 2:
+    if cfg.logger.timing_log_level >= 2:
         timers_to_log.extend(
             [
-                'batch-generator',
                 'forward-compute',
                 'backward-compute',
                 'forward-recv',
@@ -3502,17 +5460,15 @@ def training_log(
                 'forward-backward-send-forward-backward-recv',
             ]
         )
-    # Add timers from RL loop if needed.
-    if args.perform_rl_step:
-        timers_to_log.extend(RL_LOGGABLE_TIMER_NAMES)
-
-    # Calculate batch size.
-    batch_size = args.micro_batch_size * args.data_parallel_size * get_num_microbatches()
+    # Count independent sequences; weight-sharding ranks may share a sequence through CP.
+    batch_size = cfg.train.micro_batch_size * cfg.get_batch_parallel_size() * get_num_microbatches()
 
     # Track app tag & app tag ID
-    one_logger_utils.track_app_tag(batch_size, args.world_size, args.seq_length)
+    one_logger_utils.track_app_tag(batch_size, safe_get_world_size(), args.seq_length)
 
     total_iterations = total_loss_dict[advanced_iters_key] + total_loss_dict[skipped_iters_key]
+    if packed_sequence_stats and wandb_writer:
+        wandb_writer.log(packed_sequence_stats, iteration)
 
     # learning rate will be None on ranks without trainable params, so we must gather across mp ranks
     _lr_mp_group = pg_collection.mp if pg_collection is not None else None
@@ -3522,73 +5478,67 @@ def training_log(
     if learning_rate is None and args.freeze_all_layers:
         learning_rate = 0.0
     # Tensorboard values.
-    if writer and (iteration % args.tensorboard_log_interval == 0):
+    if writer and (iteration % cfg.logger.tensorboard_log_interval == 0):
         if wandb_writer:
-            wandb_writer.log({'samples vs steps': args.consumed_train_samples}, iteration)
+            wandb_writer.log({'samples vs steps': train_state.consumed_train_samples}, iteration)
         if learning_rate is not None:
             writer.add_scalar('learning-rate', learning_rate, iteration)
             writer.add_scalar(
-                'learning-rate vs samples', learning_rate, args.consumed_train_samples
+                'learning-rate vs samples', learning_rate, train_state.consumed_train_samples
             )
             if wandb_writer:
                 wandb_writer.log({'learning-rate': learning_rate}, iteration)
-        if args.skipped_train_samples > 0:
-            writer.add_scalar('skipped-train-samples', args.skipped_train_samples, iteration)
+        if train_state.skipped_train_samples > 0:
+            writer.add_scalar('skipped-train-samples', train_state.skipped_train_samples, iteration)
             if wandb_writer:
-                wandb_writer.log({'skipped-train-samples': args.skipped_train_samples}, iteration)
+                wandb_writer.log(
+                    {'skipped-train-samples': train_state.skipped_train_samples}, iteration
+                )
         writer.add_scalar('batch-size', batch_size, iteration)
-        writer.add_scalar('batch-size vs samples', batch_size, args.consumed_train_samples)
+        writer.add_scalar('batch-size vs samples', batch_size, train_state.consumed_train_samples)
         if wandb_writer:
             wandb_writer.log({'batch-size': batch_size}, iteration)
-        # Log bins for packed mode
-        if has_rl_utils and args.rl_use_sequence_packing:
-            packing_metrics = rl_utils.get_sequence_packing_tensorboard_metrics(args)
-            for metric_name, metric_value in packing_metrics.items():
-                writer.add_scalar(metric_name, metric_value, iteration)
-            if wandb_writer and packing_metrics:
-                wandb_writer.log(packing_metrics, iteration)
         for key in loss_dict:
             writer.add_scalar(key, loss_dict[key], iteration)
-            writer.add_scalar(key + ' vs samples', loss_dict[key], args.consumed_train_samples)
+            writer.add_scalar(
+                key + ' vs samples', loss_dict[key], train_state.consumed_train_samples
+            )
             if wandb_writer:
                 wandb_writer.log({key: loss_dict[key]}, iteration)
-        if args.log_loss_scale_to_tensorboard:
+        if cfg.logger.log_loss_scale_to_tensorboard:
             writer.add_scalar('loss-scale', loss_scale, iteration)
-            writer.add_scalar('loss-scale vs samples', loss_scale, args.consumed_train_samples)
+            writer.add_scalar(
+                'loss-scale vs samples', loss_scale, train_state.consumed_train_samples
+            )
             if wandb_writer:
                 wandb_writer.log({'loss-scale': loss_scale}, iteration)
-        if args.log_world_size_to_tensorboard:
-            writer.add_scalar('world-size', args.world_size, iteration)
-            writer.add_scalar('world-size vs samples', args.world_size, args.consumed_train_samples)
+        if cfg.logger.log_world_size_to_tensorboard:
+            writer.add_scalar('world-size', safe_get_world_size(), iteration)
+            writer.add_scalar(
+                'world-size vs samples', safe_get_world_size(), train_state.consumed_train_samples
+            )
             if wandb_writer:
-                wandb_writer.log({'world-size': args.world_size}, iteration)
+                wandb_writer.log({'world-size': safe_get_world_size()}, iteration)
         if grad_norm is not None:
             writer.add_scalar('grad-norm', grad_norm, iteration)
-            writer.add_scalar('grad-norm vs samples', grad_norm, args.consumed_train_samples)
+            writer.add_scalar('grad-norm vs samples', grad_norm, train_state.consumed_train_samples)
             if wandb_writer:
                 wandb_writer.log({'grad-norm': grad_norm}, iteration)
         if num_zeros_in_grad is not None:
             writer.add_scalar('num-zeros', num_zeros_in_grad, iteration)
             writer.add_scalar(
-                'num-zeros vs samples', num_zeros_in_grad, args.consumed_train_samples
+                'num-zeros vs samples', num_zeros_in_grad, train_state.consumed_train_samples
             )
             if wandb_writer:
                 wandb_writer.log({'num-zeros': num_zeros_in_grad}, iteration)
         if params_norm is not None:
             writer.add_scalar('params-norm', params_norm, iteration)
-            writer.add_scalar('params-norm vs samples', params_norm, args.consumed_train_samples)
+            writer.add_scalar(
+                'params-norm vs samples', params_norm, train_state.consumed_train_samples
+            )
             if wandb_writer:
                 wandb_writer.log({'params-norm': params_norm}, iteration)
-        if args.perform_rl_step:
-            grpo_collection_iteration = iteration // (
-                args.grpo_iterations * ((args.grpo_samples_per_iteration) // args.global_batch_size)
-            )
-            writer.add_scalar('grpo_collection_iteration', grpo_collection_iteration, iteration)
-            if wandb_writer:
-                wandb_writer.log(
-                    {'grpo_collection_iteration': grpo_collection_iteration}, iteration
-                )
-        if args.log_memory_to_tensorboard:
+        if cfg.logger.log_memory_to_tensorboard:
             mem_stats = torch.cuda.memory_stats()
             writer.add_scalar(
                 "mem-reserved-bytes", mem_stats["reserved_bytes.all.current"], iteration
@@ -3600,62 +5550,93 @@ def training_log(
                 "mem-max-allocated-bytes", mem_stats["allocated_bytes.all.peak"], iteration
             )
             writer.add_scalar("mem-allocated-count", mem_stats["allocation.all.current"], iteration)
-        if args.log_max_attention_logit:
+        model_config = (
+            get_model_config(model[0]) if model else getattr(cfg.model, 'transformer', None)
+        )
+        if model_config is not None and model_config.log_max_attention_logit:
             writer.add_scalar('max_attention_logit', max_attention_logit, iteration)
             if wandb_writer:
                 wandb_writer.log({'max_attention_logit': max_attention_logit}, iteration)
+        callback_manager.callback_context.batch_size = batch_size
+        callback_manager.trigger("on_tensorboard_log")
     # Log MoE metrics.
     moe_log_string = ""
-    if args.num_experts is not None:
+    if cfg.model.transformer.num_moe_experts is not None:
         moe_loss_scale = 1 / (num_microbatches or get_num_microbatches())
         track_names = []
-        if "aux_loss" in args.moe_router_load_balancing_type:
+        if "aux_loss" in cfg.model.transformer.moe_router_load_balancing_type:
             track_names.append("load_balancing_loss")
-        if "seq_aux_loss" in args.moe_router_load_balancing_type:
+        if "seq_aux_loss" in cfg.model.transformer.moe_router_load_balancing_type:
             track_names.append("seq_load_balancing_loss")
-        if "global_aux_loss" in args.moe_router_load_balancing_type:
+        if "global_aux_loss" in cfg.model.transformer.moe_router_load_balancing_type:
             track_names.append("global_load_balancing_loss")
-        if args.moe_z_loss_coeff is not None:
+        if cfg.model.transformer.moe_z_loss_coeff is not None:
             track_names.append("z_loss")
 
-        moe_layer_freq = args.moe_layer_freq
-        mtp_num_layers = args.mtp_num_layers
-        if is_hybrid_model(args):
-            from megatron.core.ssm.mamba_hybrid_layer_allocation import (
+        moe_layer_freq = cfg.model.transformer.moe_layer_freq
+        mtp_num_layers = cfg.model.transformer.mtp_num_layers
+        if is_hybrid_model(cfg.model):
+            from megatron.core.models.hybrid.hybrid_layer_allocation import (
                 Symbols,
                 parse_hybrid_pattern,
             )
 
-            parsed_hybrid_pattern = parse_hybrid_pattern(args.hybrid_layer_pattern)
-            main_pattern = (parsed_hybrid_pattern.main_pattern or "").replace(Symbols.PIPE, "")
-            layers = len(main_pattern) + parsed_hybrid_pattern.mtp_num_depths
-            moe_layer_freq = [int(layer_type == Symbols.MOE) for layer_type in main_pattern]
-            moe_layer_freq.extend(
-                parsed_hybrid_pattern.mtp_pattern.count(Symbols.MOE)
-                for _ in range(parsed_hybrid_pattern.mtp_num_depths)
-            )
-            mtp_num_layers = None
+            parsed_pattern = parse_hybrid_pattern(cfg.model.hybrid_layer_pattern)
+            main_pattern = parsed_pattern.main_pattern or ""
+            mtp_pattern = parsed_pattern.mtp_pattern or ""
+            main_moe_layers = main_pattern.count(Symbols.MOE)
+            # Hybrid hash counts select leading MoE positions, excluding MTP.
+            num_hash_layers = min(main_moe_layers, max(cfg.model.transformer.moe_num_hash_layers, 0))
+            mtp_moe_layers_per_depth = mtp_pattern.count(Symbols.MOE)
+            if parsed_pattern.mtp_num_depths > 0 and mtp_moe_layers_per_depth > 0:
+                mtp_moe_layers = (
+                    mtp_moe_layers_per_depth
+                    if cfg.model.transformer.mtp_use_repeated_layer
+                    else mtp_moe_layers_per_depth * parsed_pattern.mtp_num_depths
+                )
+            else:
+                mtp_moe_layers = 0
+            num_moe_layers = main_moe_layers + mtp_moe_layers
         else:
-            layers = args.num_layers
+            if cfg.model.transformer.moe_layer_freq is None:
+                moe_layer_pattern = [1] * cfg.model.transformer.num_layers
+            elif isinstance(cfg.model.transformer.moe_layer_freq, int):
+                moe_layer_pattern = [
+                    1 if (i % cfg.model.transformer.moe_layer_freq == 0) else 0 for i in range(cfg.model.transformer.num_layers)
+                ]
+            elif isinstance(cfg.model.transformer.moe_layer_freq, list):
+                moe_layer_pattern = cfg.model.transformer.moe_layer_freq
+            else:
+                raise ValueError(f"Invalid moe_layer_freq: {cfg.model.transformer.moe_layer_freq}")
+            main_moe_layers = sum(moe_layer_pattern)
+            # Other stacks select hash routing by transformer-layer number.
+            num_hash_layers = sum(moe_layer_pattern[: max(cfg.model.transformer.moe_num_hash_layers, 0)])
+            mtp_moe_layers = 0
+            if cfg.model.transformer.mtp_num_layers and moe_layer_pattern[-1]:
+                mtp_moe_layers = 1 if cfg.model.transformer.mtp_use_repeated_layer else cfg.model.transformer.mtp_num_layers
+            num_moe_layers = main_moe_layers + mtp_moe_layers
+
+        layers = cfg.model.transformer.num_layers + (cfg.model.transformer.mtp_num_layers or 0)
 
         moe_log_string = get_moe_metrics_tracker().report(
             loss_scale=moe_loss_scale,
             iteration=iteration,
             writer=writer,
             wandb_writer=wandb_writer,
-            per_layer_logging=args.moe_per_layer_logging,
+            per_layer_logging=cfg.model.transformer.moe_per_layer_logging,
             force_initialize=True,
             track_names=track_names,
             num_layers=layers,
-            moe_layer_freq=moe_layer_freq,
-            mtp_num_layers=mtp_num_layers,
+            num_moe_layers=num_moe_layers,
+            moe_layer_freq=cfg.model.transformer.moe_layer_freq,
+            num_hash_layers=num_hash_layers,
             pg_collection=pg_collection,
             total_loss_dict=total_loss_dict,
         )
 
     # Log MTP metrics.
-    if args.mtp_num_layers is not None:
-        if args.calculate_per_token_loss:
+    if cfg.model.transformer.mtp_num_layers is not None:
+        if cfg.model.transformer.calculate_per_token_loss:
             # The tracker already reduces raw loss sums and token counts into a
             # per-token loss, matching the main loss normalization path.
             mtp_loss_scale = 1.0
@@ -3668,73 +5649,150 @@ def training_log(
         )
 
     # Track sparse attention indexer loss.
-    if args.dsa_indexer_loss_coeff is not None and args.dsa_indexer_loss_coeff > 0:
+    should_track_dsa, dsa_metric_pg_collection = resolve_dsa_metric_pg_collection(
+        pg_collection, schedule_pg_collection=schedule_pg_collection
+    )
+    dsa_transformer_cfg = cfg.model.transformer
+    if (
+        dsa_transformer_cfg.dsa_indexer_loss_coeff is not None
+        and dsa_transformer_cfg.dsa_indexer_loss_coeff > 0
+        and should_track_dsa
+    ):
+        # Sequence packing may pass the physical packed microbatch count to training_log, but
+        # Dynamic-CP metric reduction reconstructs equal weighting over the nominal global-batch
+        # samples. Normalize by the calculator's nominal scheduled count deliberately.
         indexer_loss_scale = 1 / get_num_microbatches()
+        if dsa_metric_pg_collection is None:
+            dsa_metric_pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+                required_pgs=(
+                    ['pp', 'dp', 'dp_cp']
+                    if dsa_transformer_cfg.dynamic_context_parallel
+                    else ['pp', 'dp']
+                )
+            )
+        pp_group = None
+        dp_group = None
+        dynamic_cp_parent_group = None
+        if dsa_metric_pg_collection is not None:
+            pp_group = dsa_metric_pg_collection.pp
+            dp_group = dsa_metric_pg_collection.dp
+        if dsa_transformer_cfg.dynamic_context_parallel:
+            if dsa_metric_pg_collection is not None:
+                dynamic_cp_parent_group = dsa_metric_pg_collection.dp_cp
+            else:
+                # Legacy training entry points without a process-group collection.
+                dynamic_cp_parent_group = mpu.get_data_parallel_group(with_context_parallel=True)
+        tracked_layers = dsa_transformer_cfg.num_layers + (dsa_transformer_cfg.mtp_num_layers or 0)
+        if dsa_transformer_cfg.csa_compress_ratios is not None:
+            compress_ratios = dsa_transformer_cfg.csa_compress_ratios
+            if not is_hybrid_model(cfg.model):
+                compress_ratios = [
+                    compress_ratios[layer_number - 1]
+                    for layer_number in _standard_layer_numbers_for_execution(
+                        dsa_transformer_cfg.num_layers,
+                        mtp_num_layers=dsa_transformer_cfg.mtp_num_layers,
+                        mtp_use_repeated_layer=dsa_transformer_cfg.mtp_use_repeated_layer,
+                    )
+                ]
+            num_indexer_layers = sum(ratio == 4 for ratio in compress_ratios)
+        elif is_hybrid_model(cfg.model):
+            num_indexer_layers = _num_hybrid_dsa_indexer_layers(
+                cfg.model.hybrid_layer_pattern,
+                dsa_transformer_cfg.num_layers,
+                dsa_transformer_cfg.dsa_indexer_skip_topk_offset,
+                dsa_transformer_cfg.dsa_indexer_topk_freq,
+            )
+        else:
+            num_indexer_layers = _num_dsa_indexer_layers(
+                dsa_transformer_cfg.num_layers,
+                dsa_transformer_cfg.dsa_indexer_skip_topk_offset,
+                dsa_transformer_cfg.dsa_indexer_topk_freq,
+                mtp_num_layers=dsa_transformer_cfg.mtp_num_layers,
+                mtp_use_repeated_layer=dsa_transformer_cfg.mtp_use_repeated_layer,
+            )
+        if dsa_transformer_cfg.csa_compress_ratios is not None and is_hybrid_model(cfg.model):
+            tracked_layers, num_indexer_layers = _get_indexer_logging_layer_counts(cfg.model)
+        if dsa_transformer_cfg.csa_dense_mode:
+            num_indexer_layers = 0
         DSAIndexerLossLoggingHelper.track_indexer_metrics(
             loss_scale=indexer_loss_scale,
             iteration=iteration,
             writer=writer,
+            pg_collection=pg_collection,
             wandb_writer=wandb_writer,
             total_loss_dict=total_loss_dict,
-            num_layers=args.num_layers + (args.mtp_num_layers or 0),
-            num_indexer_layers=(
-                sum(ratio == 4 for ratio in args.csa_compress_ratios)
-                if args.csa_compress_ratios is not None
-                else None
-            ),
-            preserve_groups=args.cuda_graph_impl != "none",
+            num_layers=tracked_layers,
+            num_indexer_layers=num_indexer_layers,
+            preserve_groups=dsa_transformer_cfg.cuda_graph_impl != "none",
+            dynamic_cp_parent_group=dynamic_cp_parent_group,
+            configured_cp_size=dsa_transformer_cfg.context_parallel_size,
+            pp_group=pp_group,
+            dp_group=dp_group,
         )
 
     # Dump memory snapshot and print metrics to stdout.
-    if iteration % args.log_interval == 0 or is_first_iteration:
-        if args.record_memory_history and (
-            is_last_rank() or torch.distributed.get_backend() == 'fake'
+    if iteration % cfg.logger.log_interval == 0 or is_first_iteration:
+        should_prof_rank = (
+            cfg.profiling.profile_ranks == [] or safe_get_rank() in cfg.profiling.profile_ranks
+        )  # [] is all ranks
+        if cfg.profiling.record_memory_history and (
+            should_prof_rank or torch.distributed.get_backend() == 'fake'
         ):
-            snapshot = torch.cuda.memory._snapshot()
-            from pickle import dump
-
-            with open(args.memory_snapshot_path, 'wb') as f:
-                dump(snapshot, f)
+            rank = safe_get_rank()
+            base, ext = os.path.splitext(cfg.profiling.memory_snapshot_path)
+            snapshot_filename = f"{base}_{rank}{ext}"
+            torch.cuda.memory._dump_snapshot(snapshot_filename)
 
         elapsed_time = timers('interval-time').elapsed(barrier=True, reset=should_reset)
         elapsed_time_per_iteration = elapsed_time / total_iterations
+        llm_world_size = cfg.get_model_world_size()
 
         throughput = num_floating_point_operations(
-            args,
+            cfg.model,
             batch_size,
+            sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
-        ) / (elapsed_time_per_iteration * 10**12 * args.world_size)
+            vision_total_tokens_in_batch=vision_total_tokens_in_batch,
+            vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
+            vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
+            vision_args=args,
+        ) / (elapsed_time_per_iteration * 10**12 * llm_world_size)
 
-        one_logger_utils.track_e2e_metrics(args.log_throughput, throughput)
+        one_logger_utils.track_e2e_metrics(cfg.logger.log_throughput, throughput)
 
         # We log to stdout after the first iteration (controlled by `is_first_iteration`)
         # to document initialization overhead. Log statistics to TensorBoard and
         # WandB according to the regular schedule.
-        if args.log_timers_to_tensorboard and not is_first_iteration:
+        if cfg.logger.log_timers_to_tensorboard and not is_first_iteration:
             if writer:
                 writer.add_scalar('iteration-time', elapsed_time_per_iteration, iteration)
             if wandb_writer:
                 wandb_writer.log({'iteration-time': elapsed_time_per_iteration}, iteration)
         log_string = f" [{datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')}]"
-        log_string += ' iteration {:8d}/{:8d} |'.format(iteration, args.train_iters)
-        log_string += ' consumed samples: {:12d} |'.format(args.consumed_train_samples)
-        if has_rl_utils and args.rl_use_sequence_packing:
-            log_string += rl_utils.get_sequence_packing_log_info(args)
-        if args.skipped_train_samples > 0:
-            log_string += ' skipped samples: {:12d} |'.format(args.skipped_train_samples)
+        log_string += ' iteration {:8d}/{:8d} |'.format(iteration, cfg.train.train_iters)
+        if cfg.train.train_samples:
+            log_string += ' consumed samples: {:12d}/{:12d} ({:.2f}%) |'.format(
+                train_state.consumed_train_samples,
+                cfg.train.train_samples,
+                train_state.consumed_train_samples / cfg.train.train_samples * 100,
+            )
+        else:
+            log_string += ' consumed samples: {:12d} |'.format(train_state.consumed_train_samples)
+        if train_state.skipped_train_samples > 0:
+            log_string += ' skipped samples: {:12d} |'.format(train_state.skipped_train_samples)
         log_string += ' elapsed time per iteration (ms): {:.1f} |'.format(
             elapsed_time_per_iteration * 1000.0
         )
-        if args.log_throughput:
+        if cfg.logger.log_throughput:
             log_string += f' throughput per GPU (TFLOP/s/GPU): {throughput:.1f} |'
-            if args.log_timers_to_tensorboard:
+            if cfg.logger.log_timers_to_tensorboard:
                 if writer:
                     writer.add_scalar('throughput', throughput, iteration)
                 if wandb_writer:
                     wandb_writer.log({'throughput': throughput}, iteration)
-        if args.log_energy:
-            energy = (energy_monitor.lap() / total_iterations) / args.world_size
+        if cfg.logger.log_energy:
+            energy = (energy_monitor.lap() / total_iterations) / safe_get_world_size()
             power = energy / elapsed_time_per_iteration
             log_string += f' energy per GPU (J/iter/GPU): {energy:.1f} |'
             log_string += f' power per GPU (W/GPU): {power:.1f} |'
@@ -3748,6 +5806,27 @@ def training_log(
         if learning_rate is not None:
             log_string += f' learning rate: {learning_rate:.6E} |'
         log_string += f' global batch size: {batch_size:5d} |'
+
+        # OTel: snapshot the accumulator state BEFORE it is torn down. The loop directly
+        # below zeroes each loss tensor when should_reset, and the should_reset block
+        # further down zeroes advanced/skipped/nan_iters -- so anything read after that
+        # point sees 0.0 loss and 0 skipped iterations on EVERY export, which is exactly
+        # what the metrics emission (further below, where the other emission inputs like
+        # `throughput` are in scope) used to do. Take the values here and emit them there.
+        # The .item() is a device sync, so it stays inside the telemetry guard and is not
+        # paid at all when telemetry is off -- the same guard the emission itself uses.
+        _otel_telemetry_log = get_telemetry()
+        _otel_loss_snapshot = None
+        _otel_skipped_iters_snapshot = 0
+        if _otel_telemetry_log is not None and _otel_telemetry_log.is_exporting:
+            _meta_keys = (advanced_iters_key, skipped_iters_key, nan_iters_key)
+            _loss_keys = [k for k in total_loss_dict if k not in _meta_keys]
+            if _loss_keys:
+                _otel_loss_snapshot = total_loss_dict[_loss_keys[0]].item() / float(
+                    max(1, total_loss_dict.get(advanced_iters_key, 1))
+                )
+            _otel_skipped_iters_snapshot = int(total_loss_dict.get(skipped_iters_key, 0))
+
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key, nan_iters_key]:
                 avg = total_loss_dict[key].item() / float(
@@ -3757,7 +5836,7 @@ def training_log(
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 if should_reset:
                     total_loss_dict[key] = torch.tensor([0.0], dtype=torch.float, device='cuda')
-        if args.num_experts is not None and moe_log_string:
+        if cfg.model.transformer.num_moe_experts is not None and moe_log_string:
             log_string += moe_log_string
         log_string += f' loss scale: {loss_scale:.1f} |'
         if grad_norm is not None:
@@ -3771,23 +5850,76 @@ def training_log(
         )
         log_string += ' number of nan iterations: {:3d} |'.format(total_loss_dict[nan_iters_key])
 
-        # RL token throughput metrics.
-        if args.perform_rl_step:
-            log_string += rl_utils.log_rl_throughput_metrics(
-                args, batch_size, elapsed_time_per_iteration, iteration, wandb_writer
+        if embedding_min_norm_metrics is not None:
+            log_string += (
+                " embedding norm floor row events: "
+                f'{int(embedding_min_norm_metrics["embedding-min-norm/row-events-rescaled"])} |'
+                " fraction: "
+                f'{embedding_min_norm_metrics["embedding-min-norm/fraction-rescaled"]:.3E} |'
+                " delta RMS: "
+                f'{embedding_min_norm_metrics["embedding-min-norm/projection-delta-rms"]:.3E} |'
+                " zero-row events: "
+                f'{int(embedding_min_norm_metrics["embedding-min-norm/zero-row-events"])} |'
             )
 
         if should_reset:
             total_loss_dict[advanced_iters_key] = 0
             total_loss_dict[skipped_iters_key] = 0
             total_loss_dict[nan_iters_key] = 0
+
+        log_fragments: list[str] = []
+        callback_manager.callback_context.log_fragments = log_fragments
+        callback_manager.callback_context.timers_to_log = timers_to_log
+        callback_manager.callback_context.batch_size = batch_size
+        callback_manager.callback_context.elapsed_time_per_iteration = elapsed_time_per_iteration
+        callback_manager.callback_context.throughput = (
+            throughput if cfg.logger.log_throughput else None
+        )
+        callback_manager.trigger("on_log")
+        log_string += "".join(log_fragments)
         print_rank_last(log_string)
+
+        # OTel: emit training metrics at log interval (export rank only). Loss and
+        # skipped-iteration counts come from the snapshot taken above, before the
+        # accumulators were reset; everything else is still live at this point.
+        if _otel_telemetry_log is not None and _otel_telemetry_log.is_exporting:
+            from megatron.core.telemetry.training_metrics import record_training_metrics
+
+            _avg_loss = _otel_loss_snapshot
+            _tokens_per_sec = (
+                batch_size * args.seq_length / elapsed_time_per_iteration
+                if elapsed_time_per_iteration > 0
+                else None
+            )
+            _mem_gb = (
+                torch.cuda.max_memory_allocated() / (1024**3) if torch.cuda.is_available() else None
+            )
+            record_training_metrics(
+                meter=_otel_telemetry_log.meter,
+                step_duration_ms=elapsed_time_per_iteration * 1000.0,
+                loss=_avg_loss,
+                throughput_tflops=throughput if cfg.logger.log_throughput else None,
+                grad_norm=grad_norm,
+                learning_rate=learning_rate,
+                skipped_iters=_otel_skipped_iters_snapshot,
+                tokens_per_sec=_tokens_per_sec,
+                memory_allocated_gb=_mem_gb,
+            )
+
         reported_memory_in_this_iteration = False
         if report_memory_flag:
             # Report memory after optimizer state has been initialized.
             if torch.distributed.get_rank() == 0:
                 num_microbatches = get_num_microbatches()
-                report_theoretical_memory(args, num_microbatches=num_microbatches, verbose=True)
+                report_theoretical_memory(
+                    cfg,
+                    sequence_length=args.seq_length,
+                    micro_batch_size=cfg.train.micro_batch_size,
+                    data_parallel_size=cfg.get_data_parallel_size(),
+                    world_size=safe_get_world_size(),
+                    num_microbatches=num_microbatches,
+                    verbose=True,
+                )
             report_memory(
                 f'(after {iteration} iterations)',
                 process_group=pg_collection.dp if pg_collection is not None else None,
@@ -3798,53 +5930,92 @@ def training_log(
                 # Make sure the memory after the second iteration is reported to include optimizer state memory.
                 report_memory_flag = False
         if (
-            args.log_memory_interval is not None
-            and iteration % args.log_memory_interval == 0
+            cfg.logger.log_memory_interval is not None
+            and iteration % cfg.logger.log_memory_interval == 0
             and not reported_memory_in_this_iteration
         ):
             report_memory(
                 f'(after {iteration} iterations)',
                 process_group=pg_collection.dp if pg_collection is not None else None,
             )
-        # Log RL profiling data if enabled (must be before timers.log which resets timers).
-        # Token throughput metrics are read from RLRuntimeState automatically.
-        if args.rl_profile:
-            log_iteration_profile(
-                iteration=iteration,
-                timers=timers,
-                elapsed_time_ms=elapsed_time_per_iteration * 1000.0,
-                throughput_tflops=throughput if args.log_throughput else None,
-                global_batch_size=batch_size,
-                wandb_writer=wandb_writer,
-                tb_writer=writer,
-            )
-
         # Write timers to wandb, don't reset the counts.
-        if args.log_timers_to_tensorboard:
+        if cfg.logger.log_timers_to_tensorboard:
             timers.write(
-                timers_to_log, writer, iteration, normalizer=args.log_interval, reset=False
+                timers_to_log, writer, iteration, normalizer=cfg.logger.log_interval, reset=False
             )
             timers.write(
-                timers_to_log, wandb_writer, iteration, normalizer=args.log_interval, reset=False
+                timers_to_log,
+                wandb_writer,
+                iteration,
+                normalizer=cfg.logger.log_interval,
+                reset=False,
             )
         # Log timers to stdout
-        timers.log(timers_to_log, normalizer=args.log_interval, reset=should_reset)
+        timers.log(timers_to_log, normalizer=cfg.logger.log_interval, reset=should_reset)
 
     return report_memory_flag
 
 
+def _should_compute_params_norm(args, iteration, is_first_iteration):
+    """Whether this iteration can emit the parameter norm."""
+    cfg = get_run_config()
+    return cfg.logger.log_params_norm and (
+        is_first_iteration
+        or iteration % cfg.logger.log_interval == 0
+        or (
+            bool(cfg.logger.tensorboard_dir)
+            and iteration % cfg.logger.tensorboard_log_interval == 0
+        )
+    )
+
+
+@torch.no_grad()
+def _consume_embedding_min_norm_metrics(optimizer) -> Dict[str, float]:
+    """Globally aggregate and reset embedding norm-floor interval statistics."""
+    # [rows scaled, rows checked, squared norm delta, exact-zero rows].
+    local_stats = torch.zeros(4, dtype=torch.float64, device="cuda")
+    leaf_optimizers = (
+        getattr(optimizer, "chained_optimizers", [optimizer]) if optimizer is not None else ()
+    )
+    for current_optimizer in leaf_optimizers:
+        consume_stats = getattr(current_optimizer, "_consume_embedding_min_norm_stats", None)
+        if consume_stats is not None:
+            stats = consume_stats()
+            if stats is not None:
+                local_stats.add_(stats)
+
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(local_stats, op=torch.distributed.ReduceOp.SUM)
+
+    rows_rescaled, rows_checked, norm_delta_squared, zero_rows = local_stats.tolist()
+    fraction_rescaled = rows_rescaled / rows_checked if rows_checked > 0.0 else 0.0
+    norm_delta_rms = (
+        math.sqrt(norm_delta_squared / rows_rescaled) if rows_rescaled > 0.0 else 0.0
+    )
+    return {
+        "embedding-min-norm/row-events-rescaled": rows_rescaled,
+        "embedding-min-norm/fraction-rescaled": fraction_rescaled,
+        "embedding-min-norm/projection-delta-rms": norm_delta_rms,
+        "embedding-min-norm/zero-row-events": zero_rows,
+    }
+
+
 def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point_operations_so_far):
     args = get_args()
-    if args.save is None:
+    cfg = get_run_config()
+    checkpoint = cfg.checkpoint
+    train_state = get_train_state()
+    if checkpoint.save is None:
         return
+    llm_world_size = cfg.get_model_world_size()
 
     # Compute job throughput.
-    # args.num_floating_point_operations_so_far keeps track of floating-point operations
+    # train_state.resume_num_floating_point_operations keeps track of floating-point operations
     # completed at the start of job.
     global _TRAIN_START_TIME
     job_throughput = (
-        num_floating_point_operations_so_far - args.num_floating_point_operations_so_far
-    ) / ((time.time() - _TRAIN_START_TIME) * 10**12 * args.world_size)
+        num_floating_point_operations_so_far - train_state.resume_num_floating_point_operations
+    ) / ((time.time() - _TRAIN_START_TIME) * 10**12 * llm_world_size)
 
     # Compute cumulative throughput since jobs of this world size were launched.
     # `get_start_time_from_progress_log` returns start time and number of floating-point
@@ -3853,12 +6024,12 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     elapsed_time = (datetime.now() - start_time).total_seconds()
     cumulative_throughput = (
         num_floating_point_operations_so_far - start_num_floating_point_operations
-    ) / (elapsed_time * 10**12 * args.world_size)
+    ) / (elapsed_time * 10**12 * llm_world_size)
 
-    tokens_so_far = args.consumed_train_samples * args.seq_length
-    saved_ckpt_prefix = 'Saving async checkpoint' if args.async_save else 'Saved checkpoint'
+    tokens_so_far = train_state.consumed_train_samples * args.seq_length
+    saved_ckpt_prefix = 'Saving async checkpoint' if checkpoint.async_save else 'Saved checkpoint'
     append_to_progress_log(
-        args.save,
+        checkpoint.save,
         f"{saved_ckpt_prefix}\tIteration: {iteration}\t"
         f"Job throughput: {job_throughput:.1f} TFLOP/s/GPU\t"
         f"Cumulative throughput: {cumulative_throughput:.1f} TFLOP/s/GPU\t"
@@ -3867,9 +6038,25 @@ def compute_throughputs_and_append_to_progress_log(iteration, num_floating_point
     )
 
 
+def _assert_param_gather_overlap_model(model_chunk):
+    """Assert that a model chunk implements the parameter-gather overlap lifecycle."""
+    # MimoModel is a composite wrapper rather than a DDP instance, but delegates this
+    # interface to its active inner DDP modules.
+    required_methods = ('enable_forward_pre_hook', 'disable_forward_pre_hook', 'start_param_sync')
+    missing_methods = [
+        method_name
+        for method_name in required_methods
+        if not callable(getattr(model_chunk, method_name, None))
+    ]
+    assert not missing_methods, (
+        f'{type(model_chunk).__name__} does not support parameter-gather overlap; '
+        f'missing callable methods: {", ".join(missing_methods)}'
+    )
+
+
 def enable_forward_pre_hook(model_chunks):
     for model_chunk in model_chunks:
-        assert isinstance(model_chunk, DDP)
+        _assert_param_gather_overlap_model(model_chunk)
         model_chunk.enable_forward_pre_hook()
 
 
@@ -3877,16 +6064,22 @@ def disable_forward_pre_hook(model_chunks, optimizer=None, param_sync=True):
     if param_sync and optimizer is not None:
         optimizer.prepare_model_params_for_param_sync()
     for model_chunk in model_chunks:
-        assert isinstance(model_chunk, DDP)
+        _assert_param_gather_overlap_model(model_chunk)
         model_chunk.disable_forward_pre_hook(param_sync=param_sync)
 
 
-def force_param_sync(model_chunks: list[DDP], optimizer=None) -> None:
+def force_param_sync(model_chunks, optimizer=None) -> None:
     if optimizer is not None:
         optimizer.prepare_model_params_for_param_sync()
     for model_chunk in model_chunks:
-        assert isinstance(model_chunk, DDP)
+        _assert_param_gather_overlap_model(model_chunk)
         model_chunk.start_param_sync(force_sync=True)
+
+
+def _notify_checkpoint_saved(callback_manager, iteration):
+    """Fire on_checkpoint_saved for the checkpoint of ``iteration`` once it is durable."""
+    callback_manager.callback_context.durable_iteration = iteration
+    callback_manager.trigger("on_checkpoint_saved")
 
 
 def save_checkpoint_and_time(
@@ -3898,113 +6091,185 @@ def save_checkpoint_and_time(
     checkpointing_context,
     non_persistent_ckpt=False,
     train_data_iterator=None,
+    callback_manager=None,
 ):
+    callback_manager = normalize_callbacks(callback_manager)
+    cfg = get_run_config()
     args = get_args()
     timers = get_timers()
     energy_monitor = get_energy_monitor()
 
-    # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
-    if should_disable_forward_pre_hook(args):
-        force_param_sync(model, optimizer=optimizer)
+    on_saved = None
+    if callback_manager.has_callbacks("on_checkpoint_saved"):
+        on_saved = functools.partial(_notify_checkpoint_saved, callback_manager, iteration)
 
-    # Stop timer to get accurate train interval time and exclude checkpointing duration
-    timers('interval-time').stop()
-    energy_monitor.pause()
+    # OTel: single goodput span parenting ALL exposed (main-thread) checkpoint
+    # cost -- the total wall-clock the training loop is blocked on the checkpoint:
+    # pre-save buffer free, state-dict generation, the async dispatch, AND the
+    # post-save cross-rank skew wait at timers.log. Everything below nests under
+    # it (megatron.func.save_checkpoint_and_time, megatron.checkpoint.save,
+    # timers_log, post_save_barrier). start_span + context attach (not a `with`)
+    # so the whole body isn't re-indented; ended explicitly at the function end.
+    _exposed_save_span = None
+    _exposed_save_token = None
+    if _otel_sg_enabled('checkpoint'):
+        from opentelemetry import context as _octx
+        from opentelemetry import trace as _otr
 
-    # Log E2E metrics before save-checkpoint
-    one_logger_utils.track_e2e_metrics()
-    # Free overlap param-gather buffers and release cached GPU memory so
-    # that the async checkpoint worker process has enough GPU headroom for
-    # D2H tensor transfers.
-    for model_chunk in model:
-        if hasattr(model_chunk, 'free_overlap_buffers'):
-            model_chunk.free_overlap_buffers()
-    torch.cuda.empty_cache()
+        _exposed_save_span = get_telemetry().tracer.start_span('megatron.checkpoint.exposed_save')
+        _otel_mark_goodput(_exposed_save_span)
+        _exposed_save_span.set_attribute('megatron.iteration', iteration)
+        _exposed_save_token = _octx.attach(_otr.set_span_in_context(_exposed_save_span))
+    try:
 
-    # timer.log() reports the min & max time. We do not need a barrier here.
-    timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
-    timers(timer_key, log_level=0).start(barrier=False)
+        # Synchronize forward pre-hook state before checkpoint save to avoid race conditions
+        if should_disable_forward_pre_hook(args, optimizer):
+            force_param_sync(model, optimizer=optimizer)
 
-    # Resolve checkpoint groups from this rank's module PGC; None for stock runs
-    # falls back to the mpu groups inside save_checkpoint (byte-identical).
-    ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
-    tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
-    pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
-    dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
-    dp_cp_group = getattr(ckpt_pgc, "dp_cp", None) if ckpt_pgc is not None else None
-    expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
-    # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
-    rng_state_key_prefix = getattr(unwrap_model(model)[0], "rng_state_key_prefix", "")
+        # Stop timer to get accurate train interval time and exclude checkpointing duration
+        timers('interval-time').stop()
+        energy_monitor.pause()
 
-    global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
-    should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
+        # Log E2E metrics before save-checkpoint
+        one_logger_utils.track_e2e_metrics()
+        # Free overlap param-gather buffers so that the async checkpoint worker
+        # process has enough GPU headroom for D2H tensor transfers.
+        with _otel_managed_span(
+            'checkpoint', 'megatron.checkpoint.reclaim_memory', is_goodput_span=True
+        ):
+            for model_chunk in model:
+                if hasattr(model_chunk, 'free_overlap_buffers'):
+                    model_chunk.free_overlap_buffers()
 
-    if should_report_memory:
-        # Track memory before checkpoint save.
-        report_memory(f"(before save_checkpoint for iteration {iteration})", process_group=dp_group)
+        # timer.log() reports the min & max time. We do not need a barrier here.
+        timer_key = 'save-checkpoint-non-persistent' if non_persistent_ckpt else 'save-checkpoint'
+        timers(timer_key, log_level=0).start(barrier=False)
 
-    # Save checkpoint.
-    save_checkpoint(
-        iteration,
-        model,
-        optimizer,
-        opt_param_scheduler,
-        num_floating_point_operations_so_far,
-        checkpointing_context,
-        non_persistent_ckpt=non_persistent_ckpt,
-        train_data_iterator=train_data_iterator,
-        preprocess_common_state_dict_fn=preprocess_common_state_dict,
-        tp_group=tp_group,
-        pp_group=pp_group,
-        dp_cp_group=dp_cp_group,
-        dp_group=dp_group,
-        expt_dp_group=expt_dp_group,
-        rng_state_key_prefix=rng_state_key_prefix,
-    )
+        # Resolve checkpoint groups from this rank's module PGC; None for stock runs
+        # falls back to the mpu groups inside save_checkpoint (byte-identical).
+        ckpt_pgc = getattr(unwrap_model(model)[0], "pg_collection", None)
+        tp_group = getattr(ckpt_pgc, "tp", None) if ckpt_pgc is not None else None
+        pp_group = getattr(ckpt_pgc, "pp", None) if ckpt_pgc is not None else None
+        cp_group = getattr(ckpt_pgc, "cp", None) if ckpt_pgc is not None else None
+        dp_group = getattr(ckpt_pgc, "dp", None) if ckpt_pgc is not None else None
+        # Dataloader state is indexed by the rank the loader shards on, which spans gtp_remat.
+        dp_gtp_remat_group = (
+            getattr(ckpt_pgc, "dp_gtp_remat", None) if ckpt_pgc is not None else None
+        )
+        # Replica_id needs the gtp_remat-inclusive group (dp_cp_gtp_remat), not replicate dp_cp.
+        dp_cp_group = getattr(ckpt_pgc, "dp_cp_gtp_remat", None) if ckpt_pgc is not None else None
+        expt_dp_group = getattr(ckpt_pgc, "expt_dp", None) if ckpt_pgc is not None else None
+        # Per-grid rng key namespace set by a multi-grid model; '' for stock single-grid.
+        rng_state_key_prefix = getattr(unwrap_model(model)[0], "rng_state_key_prefix", "")
 
-    # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
-    # Since timer.log() reports the min & max time, we do not need a barrier here.
-    timers(timer_key).stop(barrier=False)
-    save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
+        global num_checkpoints_memory_reported, MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
+        should_report_memory = num_checkpoints_memory_reported < MAX_NUM_CHECKPOINTS_MEMORY_REPORTED
 
-    if should_report_memory:
-        # Track memory after checkpoint save.
-        report_memory(f"(after save_checkpoint for iteration {iteration})", process_group=dp_group)
-    num_checkpoints_memory_reported += 1
+        if should_report_memory:
+            # Track memory before checkpoint save.
+            # Gate on the full data-distribution group so gtp_remat peers do not each report.
+            report_memory(
+                f"(before save_checkpoint for iteration {iteration})",
+                process_group=dp_gtp_remat_group,
+            )
 
-    if args.fp8:
-        # Run garbage collection after checkpoint saving to free memory from
-        # dequantized bf16 tensors that were temporarily created during fp8
-        # model checkpoint saving.
-        gc.collect()
+        # Save checkpoint.
+        with _otel_managed_span(
+            'checkpoint',
+            'megatron.checkpoint.save',
+            is_goodput_span=True,
+            **{'megatron.iteration': iteration},
+        ):
+            save_checkpoint(
+                iteration,
+                model,
+                optimizer,
+                opt_param_scheduler,
+                num_floating_point_operations_so_far,
+                checkpointing_context,
+                non_persistent_ckpt=non_persistent_ckpt,
+                train_data_iterator=train_data_iterator,
+                preprocess_common_state_dict_fn=preprocess_common_state_dict,
+                tp_group=tp_group,
+                pp_group=pp_group,
+                dp_cp_group=dp_cp_group,
+                dp_group=dp_group,
+                dp_gtp_remat_group=dp_gtp_remat_group,
+                expt_dp_group=expt_dp_group,
+                rng_state_key_prefix=rng_state_key_prefix,
+                cp_group=cp_group,
+                on_saved=on_saved,
+            )
 
-    timers.log([timer_key])
+            # Stop timer and compute time elapsed to save checkpoint. Stop timer before timers.log() call as it resets the timer.
+            # Since timer.log() reports the min & max time, we do not need a barrier here.
+            timers(timer_key).stop(barrier=False)
+            save_checkpoint_duration = timers(timer_key).elapsed(reset=False)
+        if should_report_memory:
+            # Track memory after checkpoint save.
+            with _otel_managed_span(
+                'checkpoint', 'megatron.checkpoint.report_memory', is_goodput_span=True
+            ):
+                report_memory(
+                    f"(after save_checkpoint for iteration {iteration})",
+                    process_group=dp_gtp_remat_group,
+                )
+        num_checkpoints_memory_reported += 1
 
-    # Log E2E metrics after save-checkpoint
-    one_logger_utils.track_e2e_metrics()
+        # timers.log reports min & max across ranks -> a collective. Sitting right
+        # after the per-rank-imbalanced save (and outside the save spans), it's a
+        # prime spot for the fast ranks to serialize waiting for the slowest saver.
+        with _otel_managed_span('step', 'megatron.checkpoint.timers_log', is_goodput_span=True):
+            timers.log([timer_key])
 
-    one_logger_utils.on_save_checkpoint_end(save_checkpoint_duration, iteration, args.async_save)
+        # Log E2E metrics after save-checkpoint
+        one_logger_utils.track_e2e_metrics()
 
-    if args.log_progress and not non_persistent_ckpt:
-        compute_throughputs_and_append_to_progress_log(
-            iteration, num_floating_point_operations_so_far
+        one_logger_utils.on_save_checkpoint_end(
+            save_checkpoint_duration, iteration, cfg.checkpoint.async_save
         )
 
-    # Recover timing
-    energy_monitor.resume()
-    timers('interval-time', log_level=0).start(barrier=True)
+        if cfg.logger.log_progress and not non_persistent_ckpt:
+            compute_throughputs_and_append_to_progress_log(
+                iteration, num_floating_point_operations_so_far
+            )
+
+        # Recover timing
+        energy_monitor.resume()
+        # Interval-time timer restarts with an explicit GLOBAL BARRIER -- the first
+        # hard sync after the checkpoint. If the skew didn't already serialize at
+        # timers.log above, it serializes HERE: fast ranks block for the slowest
+        # saver. Outside every save span, so it read as the dark post-checkpoint gap.
+        timers('interval-time', log_level=0).start(barrier=True)
+
+        # OTel: close the exposed-save goodput span that parents all of the above.
+    finally:
+        if _exposed_save_span is not None:
+            from opentelemetry import context as _octx
+
+            _octx.detach(_exposed_save_token)
+            _exposed_save_span.end()
 
 
-def _run_gpu_sniff_test(tag):
+def _run_gpu_sniff_test(tag, span_name='megatron.train.sniff_test'):
     from megatron.core.process_groups_config import ProcessGroupCollection
     from megatron.training.gpu_sniff_test import run_gpu_sniff_test
 
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['ep', 'dp', 'tp'])
-    print_datetime(f'running GPU sniff test ({tag})')
-    timers = get_timers()
-    timers('gpu-sniff-test', log_level=0).start(barrier=True)
-    run_gpu_sniff_test(tag, pg_collection=pg_collection)
-    timers('gpu-sniff-test').stop(barrier=True)
+    # Two call sites with distinct span names (span_name): the once-at-start
+    # 'megatron.startup.sniff_test' run in train()'s preamble, and the periodic
+    # --gpu-sniff-test-interval 'megatron.train.sniff_test' runs in the step
+    # loop. The tag attribute additionally records which invocation this is.
+    with _otel_managed_span(
+        'job', span_name, is_goodput_span=True, **{'megatron.sniff_test.tag': tag}
+    ):
+        pg_collection = ProcessGroupCollection.use_mpu_process_groups(
+            required_pgs=['ep', 'dp', 'tp']
+        )
+        print_datetime(f'running GPU sniff test ({tag})')
+        timers = get_timers()
+        timers('gpu-sniff-test', log_level=0).start(barrier=True)
+        run_gpu_sniff_test(tag, pg_collection=pg_collection)
+        timers('gpu-sniff-test').stop(barrier=True)
     timers.log(['gpu-sniff-test'])
     print_datetime(f'finished GPU sniff test ({tag})')
 
@@ -4020,46 +6285,58 @@ def post_training_step_callbacks(
 ):
     """Run all post-training-step functions (e.g., FT heartbeats, GC)."""
     args = get_args()
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    cfg = get_run_config()
 
     # Bring CPU and GPU back in sync if on right iteration.
-    if args.train_sync_interval and iteration % args.train_sync_interval == 0:
+    if cfg.train.train_sync_interval and iteration % cfg.train.train_sync_interval == 0:
         torch.cuda.synchronize()
 
     # Straggler detector.
-    if iteration % args.log_interval == 0 and args.log_straggler:
+    if (
+        iteration % cfg.logger.log_interval == 0
+        and cfg.straggler is not None
+        and cfg.straggler.log_straggler
+    ):
         # Use FLOPs accumulated since last log event and then reset the counter
-        stimer.report(num_floating_point_operations_since_last_log_event, args.log_interval)
+        stimer.report(num_floating_point_operations_since_last_log_event, cfg.logger.log_interval)
         num_floating_point_operations_since_last_log_event = 0.0
 
     # Check weight hash across DP replicas.
     if (
-        args.check_weight_hash_across_dp_replicas_interval is not None
-        and iteration % args.check_weight_hash_across_dp_replicas_interval == 0
+        cfg.train.check_weight_hash_across_dp_replicas_interval is not None
+        and iteration % cfg.train.check_weight_hash_across_dp_replicas_interval == 0
     ):
-        if should_disable_forward_pre_hook(args):
+        if should_disable_forward_pre_hook(args, optimizer):
             disable_forward_pre_hook(model, optimizer=optimizer)
         assert check_param_hashes_across_dp_replicas(
             model, cross_check=True
         ), "Parameter hashes not matching across DP replicas"
         torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
-        if should_disable_forward_pre_hook(args):
+        if should_disable_forward_pre_hook(args, optimizer):
             enable_forward_pre_hook(model)
 
     # Autoresume.
-    if args.adlr_autoresume and (iteration % args.adlr_autoresume_interval == 0):
+    if cfg.fault_tolerance.adlr_autoresume and (
+        iteration % cfg.fault_tolerance.adlr_autoresume_interval == 0
+    ):
         check_adlr_autoresume_termination(iteration, model, optimizer, opt_param_scheduler)
 
     # Profiling.
     if (
-        args.profile
-        and iteration == args.profile_step_end
-        and (len(args.profile_ranks) == 0 or torch.distributed.get_rank() in args.profile_ranks)
+        (cfg.profiling.use_nsys_profiler or cfg.profiling.use_pytorch_profiler)
+        and iteration == cfg.profiling.profile_step_end
+        and (
+            len(cfg.profiling.profile_ranks) == 0
+            or torch.distributed.get_rank() in cfg.profiling.profile_ranks
+        )
     ):
         # Disable NVTX range when profiling ends.
-        if args.nvtx_ranges:
+        if cfg.profiling.nvtx_ranges:
             configure_nvtx_profiling(False)
-        if args.use_pytorch_profiler:
+        if cfg.profiling.use_pytorch_profiler:
             assert prof is not None
             prof.stop()
             if prof.execution_trace_observer is not None:
@@ -4070,13 +6347,19 @@ def post_training_step_callbacks(
                 nsys_nvtx_context.__exit__(None, None, None)
 
     # GPU sniff test.
-    if args.gpu_sniff_test_interval is not None and iteration % args.gpu_sniff_test_interval == 0:
+    if (
+        cfg.train.gpu_sniff_test_interval is not None
+        and iteration % cfg.train.gpu_sniff_test_interval == 0
+    ):
         _run_gpu_sniff_test(f'iteration {iteration:7d}')
 
-    # Manual garbage collection.
-    if args.manual_gc:
-        if args.manual_gc_interval != 0 and iteration % args.manual_gc_interval == 0:
-            gc.collect()
+    # Manual garbage collection. With --manual-gc the interpreter's automatic
+    # collector is off; this synchronous full collection is the only GC. With
+    # manual_gc_interval=0 (the common case) it never fires.
+    if cfg.train.manual_gc:
+        if cfg.train.manual_gc_interval != 0 and iteration % cfg.train.manual_gc_interval == 0:
+            with _otel_managed_span('step', 'megatron.train.gc_collect', is_goodput_span=True):
+                gc.collect()
 
     # Return updated FLOPs accumulator so caller can persist the reset
     return num_floating_point_operations_since_last_log_event
@@ -4090,19 +6373,21 @@ def checkpoint_and_decide_exit(
     num_floating_point_operations_so_far,
     checkpointing_context,
     train_data_iterator,
+    callback_manager=None,
 ):
     """Save checkpoint and decide whether to exit based on arguments (e.g., if
     --exit-duration-in-mins is set). Actual exit happens in main training loop
     based on the return value of this function."""
+    cfg = get_run_config()
     args = get_args()
     timers = get_timers()
 
     # Exit based on signal handler.
     saved_checkpoint = False
-    if args.exit_signal_handler:
+    if cfg.train.exit_signal_handler:
         signal_handler = get_signal_handler()
         if any(signal_handler.signals_received()):
-            if args.save:
+            if cfg.checkpoint.save:
                 save_checkpoint_and_time(
                     iteration,
                     model,
@@ -4111,13 +6396,18 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    callback_manager=callback_manager,
                 )
             print_datetime('exiting program after receiving SIGTERM.')
 
             return True
 
     # Regular save (persistent and non-persistent).
-    if args.save and args.save_interval and iteration % args.save_interval == 0:
+    if (
+        cfg.checkpoint.save
+        and cfg.checkpoint.save_interval
+        and iteration % cfg.checkpoint.save_interval == 0
+    ):
         save_checkpoint_and_time(
             iteration,
             model,
@@ -4126,13 +6416,14 @@ def checkpoint_and_decide_exit(
             num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator=train_data_iterator,
+            callback_manager=callback_manager,
         )
         saved_checkpoint = True
 
     elif (
-        args.save
-        and args.non_persistent_save_interval
-        and iteration % args.non_persistent_save_interval == 0
+        cfg.checkpoint.save
+        and cfg.checkpoint.non_persistent_save_interval
+        and iteration % cfg.checkpoint.non_persistent_save_interval == 0
     ):
         save_checkpoint_and_time(
             iteration,
@@ -4143,19 +6434,24 @@ def checkpoint_and_decide_exit(
             checkpointing_context,
             non_persistent_ckpt=True,
             train_data_iterator=train_data_iterator,
+            callback_manager=callback_manager,
         )
         saved_checkpoint = True
 
     # Exit based on duration.
-    if args.exit_duration_in_mins:
+    if cfg.train.exit_duration_in_mins:
         train_time = (time.time() - _TRAIN_START_TIME) / 60.0
         done_cuda = torch.tensor(
-            [train_time > args.exit_duration_in_mins], dtype=torch.int, device='cuda'
+            [train_time > cfg.train.exit_duration_in_mins], dtype=torch.int, device='cuda'
         )
+        # MAX all-reduce so every rank makes the SAME exit decision despite each
+        # reading its own wall-clock (a determinism guarantee, not a sync point).
+        # ~0.1ms and left unspanned: the GPU is already drained by here, and the
+        # real post-checkpoint wait is the cross-rank save skew at timers.log.
         torch.distributed.all_reduce(done_cuda, op=torch.distributed.ReduceOp.MAX)
         done = done_cuda.item()
         if done:
-            if args.save and not saved_checkpoint:
+            if cfg.checkpoint.save and not saved_checkpoint:
                 save_checkpoint_and_time(
                     iteration,
                     model,
@@ -4164,16 +6460,17 @@ def checkpoint_and_decide_exit(
                     num_floating_point_operations_so_far,
                     checkpointing_context,
                     train_data_iterator=train_data_iterator,
+                    callback_manager=callback_manager,
                 )
             print_datetime(f'exiting program after {train_time} minutes')
 
             return True
 
     # Exit based on iterations.
-    if (args.exit_interval and iteration % args.exit_interval == 0) or (
+    if (cfg.train.exit_interval and iteration % cfg.train.exit_interval == 0) or (
         args.phase_transition_iterations and iteration in args.phase_transition_iterations
     ):
-        if args.save and not saved_checkpoint:
+        if cfg.checkpoint.save and not saved_checkpoint:
             save_checkpoint_and_time(
                 iteration,
                 model,
@@ -4182,6 +6479,7 @@ def checkpoint_and_decide_exit(
                 num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
+                callback_manager=callback_manager,
             )
         print_datetime(f'exiting program at iteration {iteration}')
 
@@ -4190,38 +6488,68 @@ def checkpoint_and_decide_exit(
     return False
 
 
+def is_batch_size_transition(
+    num_microbatches: int, global_batch_size: int, has_step_batch_size_schedule: bool
+) -> bool:
+    """Return whether the last unchecked microbatch update moved to a new batch size.
+
+    With a step batch-size schedule, compare the global batch size too: the unchecked
+    update rounds the number of microbatches down, so a new batch size that the current
+    data-parallel size does not divide (e.g., 8192 -> 12288 at 8192 ranks) can leave it
+    unchanged. RL without sequence packing resizes the global batch every step, so the
+    comparison is limited to the schedule.
+    """
+    if get_num_microbatches() != num_microbatches:
+        return True
+    return has_step_batch_size_schedule and get_current_global_batch_size() != global_batch_size
+
+
 def train(
     forward_step_func,
     model,
     optimizer,
     opt_param_scheduler,
     train_data_iterator,
-    valid_data_iterator,
-    process_non_loss_data_func,
     config,
     checkpointing_context,
-    non_loss_data_func,
-    inference_model=None,
+    *,
+    next_train_iterator: Callable[[int, Any], Any],
+    run_eval: Callable[..., None],
     p2p_communicator: Optional[P2PCommunicator] = None,
     pg_collection: Optional[ProcessGroupCollection | MultiModuleProcessGroupCollection] = None,
+    callback_manager: CallbackManager | None = None,
+    tensor_metric_observer: _TensorMetricObserverCallback | None = None,
+    run_train_loop_without_updates: bool = False,
+    suppress_microbatch_rampup_handling: bool = False,
 ):
     """Training function: run train_step desired number of times, run validation, checkpoint.
 
+    next_train_iterator(iteration, current_iterator): callback returning the iterator to
+        consume this iteration, starting from train_data_iterator; the dataloader path returns
+        current_iterator, a rollout source rebuilds it on its own schedule.
+    run_eval(prefix=, iteration=, verbose=, write_to_tensorboard=): callback that runs
+        validation at the eval points.
     p2p_communicator: optional communicator forwarded to the schedule for cross-grid P2P; None
         preserves the default behavior.
     pg_collection: optional carrier forwarded to the schedule for the cross-grid case; None
         preserves the default behavior.
+    tensor_metric_observer: optional callback forwarded to each training step.
+    run_train_loop_without_updates: take no optimizer steps.
+    suppress_microbatch_rampup_handling: skip the automatic checkpoint on mid-loop microbatch
+        changes (for data sources that reconfigure microbatches every iteration).
     """
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    cfg = get_run_config()
     timers = get_timers()
-    fault_injector_kwargs = {}
-    for f in dataclasses.fields(FaultInjectorConfig):
-        if hasattr(args, f.name):
-            fault_injector_kwargs[f.name] = getattr(args, f.name)
-    fault_injector_config = FaultInjectorConfig(**fault_injector_kwargs)
+    train_state = get_train_state()
+
+    fault_injector_config = cfg.fault_tolerance.fault_injector
 
     _maybe_raise_workload_exception = None
-    if (
+    if fault_injector_config is not None and (
         fault_injector_config.fault_injector_ranks is not None
         or fault_injector_config.fault_injector_num_ranks is not None
     ):
@@ -4237,54 +6565,6 @@ def train(
         if should_setup_fault_injection_at_start(fault_injector_config):
             setup_fault_injection(fault_injector_config)
 
-    if args.perform_rl_step:
-        assert has_rl_utils, "RL cannot run without the megatron.rl package"
-
-    # Additional variable initialization for RL training
-    if args.perform_rl_step:
-        if args.skip_train:
-            # In inference-only mode, use current weights as reference.
-            print_rank_0("> RL inference-only: using current weights as reference.")
-            ref_state_dict = {
-                k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()
-            }
-        else:
-            print_rank_0("> Loading pretrained checkpoint for reference weights in RL training...")
-            load, finetune, no_load_optim = args.load, args.finetune, args.no_load_optim
-            args.no_load_optim = True
-
-            # Load pretrained checkpoint
-            args.load = None
-            args.finetune = True
-            load_checkpoint(
-                model,
-                None,  # Don't load optimizer state
-                None,  # Don't load scheduler state
-                checkpointing_context=checkpointing_context,
-                skip_load_to_model_and_opt=HAVE_FSDP2
-                and getattr(args, "use_torch_fsdp2", False)
-                and args.ckpt_format == "torch_dist",
-            )
-            ref_state_dict = {
-                k: (v.cpu() if v is not None else v) for k, v in model[0].state_dict().items()
-            }
-
-            # Reload RL training checkpoint weights
-            args.load = load
-            args.finetune = finetune
-            print_rank_0("> Reloading RL training checkpoint...")
-            load_checkpoint(
-                model,
-                None,
-                None,
-                checkpointing_context=checkpointing_context,
-                skip_load_to_model_and_opt=HAVE_FSDP2
-                and getattr(args, "use_torch_fsdp2", False)
-                and args.ckpt_format == "torch_dist",
-            )
-
-            args.no_load_optim = no_load_optim
-
     lang_pgc = (
         pg_collection.get_language_model_collection()
         if isinstance(pg_collection, MultiModuleProcessGroupCollection)
@@ -4293,39 +6573,23 @@ def train(
     )
 
     def _dp_world_size():
+        # Independent-sequence degree, which can differ from the weight-replica degree.
         if lang_pgc is not None:
-            return lang_pgc.dp.size()
+            sample_group = getattr(lang_pgc, "dp_gtp_remat", None)
+            if sample_group is None:
+                if cfg.model.transformer.gtp_remat_num_sequence_shards == 1:
+                    return lang_pgc.dp.size() * cfg.model.transformer.gtp_weight_remat_size
+                raise ValueError("Language process groups must include dp_gtp_remat")
+            return sample_group.size()
         if mpu.model_parallel_is_initialized():
             return mpu.get_data_parallel_world_size()
-        # args.data_parallel_size equals the language (llm) dp on all ranks (entry validate_args).
-        return args.data_parallel_size
-
-    # IMPORTANT FIX: For RL training, reinitialize the microbatch calculator with the correct configuration
-    if args.perform_rl_step:
-        print_rank_0("> Reinitializing microbatch calculator for GRPO training...")
-        from megatron.core.num_microbatches_calculator import (
-            destroy_num_microbatches_calculator,
-            init_num_microbatches_calculator,
-        )
-
-        # First destroy the existing calculator
-        destroy_num_microbatches_calculator()
-        # Then initialize with the correct perform_rl_step=True context
-        init_num_microbatches_calculator(
-            rank=args.rank,
-            global_batch_size=args.global_batch_size,
-            micro_batch_size=args.micro_batch_size,
-            data_parallel_size=_dp_world_size(),
-            decrease_batch_size_if_needed=args.decrease_batch_size_if_needed,
-            step_batch_size_schedule=args.step_batch_size_schedule,
-            seq_length=args.seq_length,
-        )
-        print_rank_0(f"> GRPO training: num_microbatches set to {get_num_microbatches()}")
+        # Bootstrap fallback before process groups are initialized.
+        return cfg.get_batch_parallel_size()
 
     energy_monitor = get_energy_monitor()
     one_logger = get_one_logger()
 
-    if args.run_workload_inspector_server:
+    if cfg.profiling.run_workload_inspector_server:
         try:
             import threading
 
@@ -4350,7 +6614,7 @@ def train(
     total_loss_dict = {}
 
     # Iterations.
-    iteration = args.iteration
+    iteration = train_state.iteration
     # Make sure rerun_state_machine has the right iteration loaded from checkpoint.
     rerun_state_machine = get_rerun_state_machine()
     if rerun_state_machine.current_iteration != iteration:
@@ -4363,22 +6627,28 @@ def train(
     # Track E2E metrics at the start of training.
     one_logger_utils.on_train_start(
         iteration=iteration,
-        consumed_train_samples=args.consumed_train_samples,
-        train_samples=args.train_samples,
+        consumed_train_samples=train_state.consumed_train_samples,
+        train_samples=cfg.train.train_samples,
         seq_length=args.seq_length,
-        train_iters=args.train_iters,
-        save=args.save,
-        async_save=args.async_save,
-        log_throughput=args.log_throughput,
-        num_floating_point_operations_so_far=args.num_floating_point_operations_so_far,
+        train_iters=cfg.train.train_iters,
+        save=cfg.checkpoint.save,
+        async_save=cfg.checkpoint.async_save,
+        log_throughput=cfg.logger.log_throughput,
+        num_floating_point_operations_so_far=train_state.num_floating_point_operations_so_far,
     )
-
-    num_floating_point_operations_so_far = args.num_floating_point_operations_so_far
 
     # Setup some training config params.
     config.grad_scale_func = optimizer.scale_loss if optimizer is not None else None
     config.timers = timers
-    if isinstance(model[0], (megatron_FSDP, DDP)) and args.overlap_grad_reduce:
+    # MFSDP v2 always reduces gradients during backward -- that is how FSDP shards them --
+    # and defers only the DP-outer axis to the last microbatch, so it needs no_sync_func to
+    # know which backward that is. Without it every backward finalizes that axis, the
+    # accumulation buffer is dropped, and only the last microbatch's gradient survives.
+    # DDP and MFSDP v1 instead reduce during backward only when overlap_grad_reduce is on,
+    # so without that flag there is nothing for no_sync to suppress.
+    if isinstance(model[0], FullyShardedDataParallelV2) or (
+        isinstance(model[0], (FullyShardedDataParallelV1, DDP)) and cfg.ddp.overlap_grad_reduce
+    ):
         assert config.no_sync_func is None, (
             'When overlap_grad_reduce is True, config.no_sync_func must be None; '
             'a custom no_sync_func is not supported when overlapping grad-reduce'
@@ -4386,11 +6656,11 @@ def train(
         config.no_sync_func = [model_chunk.no_sync for model_chunk in model]
         if len(model) == 1:
             config.no_sync_func = config.no_sync_func[0]
-        if args.align_grad_reduce:
+        if cfg.dist.align_grad_reduce:
             config.grad_sync_func = [model_chunk.start_grad_sync for model_chunk in model]
             if len(model) == 1:
                 config.grad_sync_func = config.grad_sync_func[0]
-    if args.overlap_param_gather and args.align_param_gather:
+    if cfg.optimizer.overlap_param_gather and cfg.ddp.align_param_gather:
         config.param_sync_func = [model_chunk.start_param_sync for model_chunk in model]
         if len(model) == 1:
             config.param_sync_func = config.param_sync_func[0]
@@ -4398,7 +6668,7 @@ def train(
     if config.finalize_model_grads_func is None:
         config.finalize_model_grads_func = finalize_model_grads
 
-    if args.log_energy:
+    if cfg.logger.log_energy:
         energy_monitor.setup()
         energy_monitor.resume()
 
@@ -4406,23 +6676,23 @@ def train(
     print_datetime('before the start of training step')
 
     # GPU sniff test at start of training.
-    if args.gpu_sniff_test_interval is not None:
-        _run_gpu_sniff_test('before training')
+    if cfg.train.gpu_sniff_test_interval is not None:
+        _run_gpu_sniff_test('before training', span_name='megatron.startup.sniff_test')
 
     # Initialize router trace if requested.  The tracer attaches forward hooks
     # to all TopKRouter modules and writes one JSONL record per (iteration,
     # layer).  advance_step() is called at the end of each train_step().
-    if getattr(args, 'moe_routing_trace_path', None):
+    if cfg.logger.moe_routing_trace_path:
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        max_steps = getattr(args, 'moe_routing_trace_max_training_iters', None) or args.train_iters
+        max_steps = cfg.logger.moe_routing_trace_max_training_iters or cfg.train.train_iters
         init_moe_router_tracer(
-            output_dir=args.moe_routing_trace_path,
+            output_dir=cfg.logger.moe_routing_trace_path,
             max_steps=max_steps,
             rank=rank,
             training_mode=True,
-            capture_hidden_states=getattr(args, 'moe_routing_trace_capture_hidden_states', False),
-            capture_logits=getattr(args, 'moe_routing_trace_capture_logits', False),
-            dump_router_weights=getattr(args, 'moe_routing_trace_dump_weights', False),
+            capture_hidden_states=cfg.logger.moe_routing_trace_capture_hidden_states,
+            capture_logits=cfg.logger.moe_routing_trace_capture_logits,
+            dump_router_weights=cfg.logger.moe_routing_trace_dump_weights,
         )
         get_moe_router_tracer().register_hooks(model)
 
@@ -4432,58 +6702,62 @@ def train(
     exit_code = 0
     is_first_iteration = True
 
-    if args.manual_gc:
+    if cfg.train.manual_gc:
         # Disable the default garbage collector and perform the collection manually.
         # This is to align the timing of garbage collection across ranks.
         assert (
-            args.manual_gc_interval >= 0
+            cfg.train.manual_gc_interval >= 0
         ), 'Manual garbage collection interval should be larger than or equal to 0'
         gc.disable()
         gc.collect()
 
     # Singleton initialization of straggler detector.
-    if args.log_straggler:
+    if cfg.straggler is not None and cfg.straggler.log_straggler:
         global stimer
         world = torch.distributed.get_world_size()
         rank = torch.distributed.get_rank()
-        mmcnt = args.straggler_minmax_count
+        mmcnt = cfg.straggler.straggler_minmax_count
         stimer.configure(
             world,
             rank,
             mmcnt=mmcnt,
-            enabled=not args.disable_straggler_on_startup,
-            port=args.straggler_ctrlr_port,
+            enabled=not cfg.straggler.disable_straggler_on_startup,
+            port=cfg.straggler.straggler_ctrlr_port,
         )
     num_floating_point_operations_since_last_log_event = 0.0
 
     num_microbatches = get_num_microbatches()
+    global_batch_size = get_current_global_batch_size()
     eval_duration = 0.0
     eval_iterations = 0
     # Wrap forward_backward_func for Full iteration CUDA graph
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
-    if args.cuda_graph_impl == "full_iteration":
+    if cfg.model.transformer.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
-            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            cuda_graph_warmup_steps=cfg.model.transformer.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
-    if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+    if cfg.model.transformer.moe_expert_rank_capacity_factor is not None:
+        copy_main_params = (
+            cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag and cfg.optimizer.overlap_param_gather
+        )
         forward_backward_func = PagedStashRunner(
             config, copy_main_params, model, optimizer, forward_backward_func
         )
-    if args.optimizer_cuda_graph:
+    if cfg.optimizer.optimizer_cuda_graph:
         optimizer.step = OptimizerCudaGraphWrapper(
             optimizer.step,
-            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            cuda_graph_warmup_steps=cfg.model.transformer.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
         )
 
     def get_e2e_base_metrics():
         """Get base metrics values for one-logger to calculate E2E tracking metrics."""
         num_floating_point_operations_since_current_train_start = (
-            num_floating_point_operations_so_far - args.num_floating_point_operations_so_far
+            train_state.num_floating_point_operations_so_far
+            - train_state.resume_num_floating_point_operations
         )
         return {
             'iteration': iteration,
@@ -4491,9 +6765,9 @@ def train(
             'eval_duration': eval_duration,
             'eval_iterations': eval_iterations,
             'total_flops_since_current_train_start': num_floating_point_operations_since_current_train_start,
-            'num_floating_point_operations_so_far': num_floating_point_operations_so_far,
-            'consumed_train_samples': args.consumed_train_samples,
-            'world_size': args.world_size,
+            'num_floating_point_operations_so_far': train_state.num_floating_point_operations_so_far,
+            'consumed_train_samples': train_state.consumed_train_samples,
+            'world_size': cfg.get_model_world_size(),
             'seq_length': args.seq_length,
         }
 
@@ -4504,13 +6778,12 @@ def train(
 
     prof = None
     nsys_nvtx_context = None  # reference to context for nsys profiling, so it can be cleaned up
-    if (
-        args.profile
-        and (len(args.profile_ranks) == 0 or torch.distributed.get_rank() in args.profile_ranks)
-        and args.use_pytorch_profiler
+    if cfg.profiling.use_pytorch_profiler and (
+        len(cfg.profiling.profile_ranks) == 0
+        or torch.distributed.get_rank() in cfg.profiling.profile_ranks
     ):
-        if args.pytorch_profiler_collect_chakra:
-            et_dir = Path(f"{args.tensorboard_dir}/../chakra")
+        if cfg.profiling.pytorch_profiler_collect_chakra:
+            et_dir = Path(f"{cfg.logger.tensorboard_dir}/../chakra")
             et_dir.mkdir(parents=True, exist_ok=True)
             et = torch.profiler.ExecutionTraceObserver().register_callback(
                 f"{et_dir}/rank-{torch.distributed.get_rank()}.json.gz"
@@ -4519,20 +6792,20 @@ def train(
             et = None
 
         def trace_handler(p):
-            profile_dir = Path(f"{args.tensorboard_dir}/../torch_profile")
+            profile_dir = Path(f"{cfg.logger.tensorboard_dir}/../torch_profile")
             profile_dir.mkdir(parents=True, exist_ok=True)
             p.export_chrome_trace(f"{profile_dir}/rank-{torch.distributed.get_rank()}.json.gz")
 
         prof = torch.profiler.profile(
             schedule=torch.profiler.schedule(
-                wait=max(args.profile_step_start - 1, 0),
-                warmup=1 if args.profile_step_start > 0 else 0,
-                active=args.profile_step_end - args.profile_step_start,
+                wait=max(cfg.profiling.profile_step_start - 1, 0),
+                warmup=1 if cfg.profiling.profile_step_start > 0 else 0,
+                active=cfg.profiling.profile_step_end - cfg.profiling.profile_step_start,
                 repeat=1,
             ),
             on_trace_ready=trace_handler,
-            record_shapes=args.pytorch_profiler_collect_shapes,
-            with_stack=args.pytorch_profiler_collect_callstack,
+            record_shapes=cfg.profiling.pytorch_profiler_collect_shapes,
+            with_stack=cfg.profiling.pytorch_profiler_collect_callstack,
             execution_trace_observer=et,
         )
         prof.start()
@@ -4541,58 +6814,107 @@ def train(
     # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
     # or random initialization don't propagate to all ranks in first all-gather (which is a
     # no-op if things work correctly).
-    if should_disable_forward_pre_hook(args):
+    if should_disable_forward_pre_hook(args, optimizer):
         disable_forward_pre_hook(model, param_sync=False)
         # Also remove param_sync_func temporarily so that sync calls made in
         # `forward_backward_func` are no-ops.
         param_sync_func = config.param_sync_func
         config.param_sync_func = None
         pre_hook_enabled = False
-    # Also, check weight hash across DP replicas to be very pedantic.
-    if args.check_weight_hash_across_dp_replicas_interval is not None:
-        assert check_param_hashes_across_dp_replicas(
-            model, cross_check=True
-        ), "Parameter hashes not matching across DP replicas"
-        torch.distributed.barrier()
+    # Also, check weight hash across DP replicas to be very pedantic. This hashes
+    # every parameter and all-reduces across DP replicas + a barrier -- it's
+    # typically the dominant cost of the train() preamble, so it gets its own
+    # span (parented to megatron.startup, still open here).
+    if cfg.train.check_weight_hash_across_dp_replicas_interval is not None:
+        with _otel_managed_span('job', 'megatron.startup.weight_hash_check', is_goodput_span=True):
+            assert check_param_hashes_across_dp_replicas(
+                model, cross_check=True
+            ), "Parameter hashes not matching across DP replicas"
+            torch.distributed.barrier()
         print_rank_0(f">>> Weight hashes match after {iteration} iterations...")
 
     # Initialize CUDA Graphs helper.
-    if args.cuda_graph_impl == "transformer_engine":
+    if cfg.model.transformer.cuda_graph_impl == "transformer_engine":
         cuda_graph_helper = TECudaGraphHelper(
             model=model,
             config=config,
             seq_length=args.seq_length,
-            micro_batch_size=args.micro_batch_size,
+            micro_batch_size=cfg.train.micro_batch_size,
             optimizers=[optimizer],
+            pg_collection=model_pg_collection,
             thd_sequence_length_upper_bound=_get_thd_sequence_length_upper_bound(args),
         )
 
+    # OTel: everything above in train() (the preamble: weight-hash check, sniff
+    # test, cuda-graph helper init) was init and parented to megatron.startup, which
+    # stayed open through it. Close startup now; the steady-state loop below is
+    # emitted as one megatron.train span per interval (see
+    # _reroot_otel_interval), not one umbrella. _start_otel_train_span just arms the
+    # per-interval counter; the first loop pass opens the first block.
+    _end_otel_startup_span()
+    _start_otel_train_span()
+
+    # Last report before the loop. Weights, optimizer state, any loaded checkpoint and the
+    # symmetric-memory pools are all resident by now, so a run that OOMs on iteration 1 still
+    # has a number to line up against a healthy run. CUDA graph pools are captured later.
+    report_memory(
+        "(before first iteration)", process_group=_get_memory_report_dp_group(model_pg_collection)
+    )
+
+    def _finished_training(iteration):
+        return (cfg.train.train_iters and iteration >= cfg.train.train_iters) or (
+            cfg.train.train_samples
+            and train_state.consumed_train_samples >= cfg.train.train_samples
+        )
+
+    callback_manager.trigger("on_train_start")
+
     # Run training iterations till done.
-    buffered_rollouts = None
-    while iteration < args.train_iters:
-        if args.profile and (
-            len(args.profile_ranks) == 0 or torch.distributed.get_rank() in args.profile_ranks
+    while not _finished_training(iteration):
+        # At each checkpoint-interval boundary, re-root into a new trace so this
+        # pass's iteration + (this interval's) checkpoint/eval/sniff form one compact
+        # trace instead of accreting into a run-long one. Must be the first thing in
+        # the pass so everything below nests under the current interval root.
+        _maybe_reroot_otel_interval()
+        if (cfg.profiling.use_nsys_profiler or cfg.profiling.use_pytorch_profiler) and (
+            len(cfg.profiling.profile_ranks) == 0
+            or torch.distributed.get_rank() in cfg.profiling.profile_ranks
         ):
             # Enable NVTX range when profiling starts and nvtx_ranges is set.
-            if iteration == args.profile_step_start and args.nvtx_ranges:
+            if iteration == cfg.profiling.profile_step_start and cfg.profiling.nvtx_ranges:
                 configure_nvtx_profiling(True)
-            if args.use_pytorch_profiler:
+            if cfg.profiling.use_pytorch_profiler:
                 prof.step()
-            elif iteration == args.profile_step_start:
+            elif iteration == cfg.profiling.profile_step_start:
                 torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
-                nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(
-                    record_shapes=args.record_shapes
-                )
-                nsys_nvtx_context.__enter__()
+                if cfg.profiling.record_shapes:
+                    nsys_nvtx_context = torch.autograd.profiler.emit_nvtx(
+                        record_shapes=cfg.profiling.record_shapes
+                    )
+                    nsys_nvtx_context.__enter__()
 
-        ft_integration.on_checkpointing_start()
-        maybe_finalize_async_save(blocking=False)
+        # Fault-tolerance heartbeat at the top of the loop -- uninstrumented
+        # main-thread work that sits in the post-checkpoint gap alongside the
+        # exit-duration barrier.
+        with _otel_managed_span(
+            'checkpoint', 'megatron.checkpoint.ft_heartbeat', is_goodput_span=True
+        ):
+            ft_integration.on_checkpointing_start()
+        # Non-blocking finalize of the *previous* async checkpoint, on the
+        # training critical path -- this is the "exposed" cost the async save
+        # imposes back on the loop (the flip side of the background write span
+        # on the worker), and shows up as a per-iteration gap near checkpoint
+        # boundaries. Cheap most iterations, blocks when finalizing.
+        with _otel_managed_span(
+            'checkpoint', 'megatron.checkpoint.save.finalize', is_goodput_span=True
+        ):
+            maybe_finalize_async_save(blocking=False)
         ft_integration.on_checkpointing_end(is_async_finalization=True)
         # Update the timeout for all process groups after initialization
         # We update the timeout after the first successful iteration,
         # which takes longer than others usually
         if (
-            args.distributed_timeout_seconds_after_init is not None
+            cfg.dist.distributed_timeout_seconds_after_init is not None
             and iteration == start_iteration + 1
         ):
             # TODO: some dynamic timeout setting is required
@@ -4600,96 +6922,113 @@ def train(
             # e.g. timeout for normal iterations vs timeout for iterations with checkpoint
             # this timeout is triggered when there's no collective communication
             # for the duration of timeout
-            update_pg_timeout(timedelta(seconds=args.distributed_timeout_seconds_after_init))
+            update_pg_timeout(timedelta(seconds=cfg.dist.distributed_timeout_seconds_after_init))
         # Update number of microbatches first without consistency check to decide if a
-        # checkpoint should be saved. If the number of microbatches is different
-        # from the previous iteration, save a checkpoint. Then run consistency check
+        # checkpoint should be saved. If the global batch size or the number of microbatches is
+        # different from the previous iteration, save a checkpoint. Then run consistency check
         # to make sure training configuration is still valid.
-        # Standard microbatch update (sequence packing overrides this in rl_utils.py)
-        update_num_microbatches(args.consumed_train_samples, consistency_check=False, verbose=True)
-        # Skip automatic checkpoint on microbatch changes when sequence packing is active
-        # as it intentionally reconfigures microbatches.
-        if get_num_microbatches() != num_microbatches and iteration != 0:
-            if args.rl_use_sequence_packing or args.sequence_packing_scheduler is not None:
+        update_num_microbatches(
+            train_state.consumed_train_samples, consistency_check=False, verbose=True
+        )
+        # A batch-size transition saves a checkpoint and exits for a relaunch unless suppressed.
+        # The sequence-packing scheduler intentionally reconfigures microbatches every step,
+        # so its microbatch changes never trigger the automatic checkpoint either.
+        if iteration != 0 and is_batch_size_transition(
+            num_microbatches, global_batch_size, cfg.train.step_batch_size_schedule is not None
+        ):
+            if suppress_microbatch_rampup_handling or args.sequence_packing_scheduler is not None:
                 print_rank_0(
-                    f"[Sequence Packing] Skipping automatic checkpoint at iteration {iteration} "
+                    f"Skipping automatic checkpoint at iteration {iteration} "
                     f"(microbatch change: {num_microbatches} -> {get_num_microbatches()})"
                 )
             else:
-                assert get_num_microbatches() > num_microbatches, (
-                    f"Number of microbatches should not decrease; "
-                    f"going from {num_microbatches} to {get_num_microbatches()}"
+                assert get_current_global_batch_size() > global_batch_size, (
+                    f"Global batch size should not decrease; "
+                    f"going from {global_batch_size} to {get_current_global_batch_size()}"
                 )
-                if args.save is not None:
+                if cfg.checkpoint.save is not None:
+                    print_rank_0(
+                        "[StepBatchsizeNumMicroBatchesCalculator] Reached batch size "
+                        "transition, saving checkpoint before exiting."
+                    )
                     save_checkpoint_and_time(
                         iteration,
                         model,
                         optimizer,
                         opt_param_scheduler,
-                        num_floating_point_operations_so_far,
+                        train_state.num_floating_point_operations_so_far,
                         checkpointing_context,
                         train_data_iterator=train_data_iterator,
+                        callback_manager=callback_manager,
                     )
+                    print_rank_0(
+                        "[StepBatchsizeNumMicroBatchesCalculator] Checkpoint saved, "
+                        "exiting so the run can be relaunched at the new batch size."
+                    )
+                    # Break here rather than leaving it to the `should_exit` check further
+                    # down the loop body, which sits after train_step and would run one more
+                    # iteration at the new microbatch count before stopping.
+                    should_exit = True
+                    break
+                print_rank_0(
+                    "[StepBatchsizeNumMicroBatchesCalculator] Reached batch size "
+                    "transition but --save is unset, so there is no checkpoint to "
+                    "relaunch from; continuing at the new batch size."
+                )
         num_microbatches = get_num_microbatches()
-        update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
+        global_batch_size = get_current_global_batch_size()
+        update_num_microbatches(
+            train_state.consumed_train_samples, consistency_check=True, verbose=True
+        )
 
-        # Capture CUDA Graphs.
+        # Capture CUDA Graphs. One-off, at the warmup-step boundary -- the actual
+        # graph capture (create_cudagraphs) is a notable one-time cost worth its
+        # own span, distinct from the megatron.train.iteration spans around it.
         if (
-            args.cuda_graph_impl == "transformer_engine"
+            cfg.model.transformer.cuda_graph_impl == "transformer_engine"
             and not cuda_graph_helper.capture_finished()
-            and iteration - start_iteration == args.cuda_graph_warmup_steps
+            and iteration - start_iteration == cfg.model.transformer.cuda_graph_warmup_steps
         ):
-            if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
-                disable_forward_pre_hook(model, param_sync=False)
-            cuda_graph_helper.create_cudagraphs()
-            if args.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(args):
-                enable_forward_pre_hook(model)
-                cuda_graph_helper.cuda_graph_set_manual_hooks()
+            with _otel_managed_span(
+                'job',
+                'megatron.train.cuda_graph_capture',
+                is_goodput_span=True,
+                **{'megatron.iteration': iteration},
+            ):
+                if cfg.model.transformer.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(
+                    args, optimizer
+                ):
+                    disable_forward_pre_hook(model, param_sync=False)
+                cuda_graph_helper.create_cudagraphs()
+                if cfg.model.transformer.cuda_graph_warmup_steps > 0 and should_disable_forward_pre_hook(
+                    args, optimizer
+                ):
+                    enable_forward_pre_hook(model)
+                    cuda_graph_helper.cuda_graph_set_manual_hooks()
             if isinstance(forward_backward_func, PagedStashRunner):
                 forward_backward_func.mark_te_graph_captured(num_microbatches)
 
         # Completely skip iteration if needed.
-        if (iteration + 1) in args.iterations_to_skip:
+        if (iteration + 1) in cfg.train.iterations_to_skip:
+            assert (
+                getattr(config, "sequence_packing_scheduler", None) is None
+            ), "Sequence packing scheduler is not supported in skip iteration mode"
             # Dummy train_step to fast forward train_data_iterator.
             dummy_train_step(train_data_iterator)
             if iteration == start_iteration:
                 start_iteration = iteration + 1
-            iteration += 1
-            batch_size = _dp_world_size() * args.micro_batch_size * get_num_microbatches()
-            args.consumed_train_samples += batch_size
-            args.skipped_train_samples += batch_size
+            train_state.iteration += 1
+            iteration = train_state.iteration
+            batch_size = _dp_world_size() * cfg.train.micro_batch_size * get_num_microbatches()
+            train_state.consumed_train_samples += batch_size
+            train_state.skipped_train_samples += batch_size
             continue
 
-        args.curr_iteration = iteration
-        # For GRPO, we keep the data for a few epochs. DeepSeekMath paper calls this number $\mu$.
-        # It is similar to a PPO epoch.
+        # The data hook may replace the iterator each iteration; the dataloader path keeps it.
+        train_data_iterator = next_train_iterator(iteration, train_data_iterator)
 
-        if args.perform_rl_step:
-            if optimizer is None:
-                # Release stale CUDA cached memory before inference.
-                torch.cuda.empty_cache()
-            with torch.no_grad():
-                train_data_iterator = rl_utils.get_grpo_data_iterator(
-                    model,
-                    inference_model,
-                    optimizer,
-                    iteration,
-                    ref_state_dict,
-                    grpo_iterations=args.grpo_iterations,
-                    grpo_prompts_per_step=args.grpo_prompts_per_step,
-                    grpo_group_size=args.grpo_group_size,
-                    global_batch_size=args.global_batch_size,
-                    sequence_packing=args.rl_use_sequence_packing,
-                    buffered_rollouts=buffered_rollouts,
-                    is_correction=args.rl_inference_logprobs_is_correction,
-                    optimizer_is_on_cpu=args.rl_offload_optimizer_during_inference,
-                )
-                # Buffered rollouts are used as a state container for setups when
-                # we use previously-generated data for an update.
-                buffered_rollouts = train_data_iterator
-
-        if args.skip_train:
-            # RL inference-only mode: skip gradient updates, just collect rollouts.
+        if run_train_loop_without_updates:
+            # Rollout-only: the data hook collected this iteration's rollouts; no optimizer step.
             loss_dict = {}
             skipped_iter = 0
             should_checkpoint = False
@@ -4701,52 +7040,104 @@ def train(
             num_microbatches = get_num_microbatches()
             seqlen_sum_this_global_batch = None
             seqlen_squared_sum_this_global_batch = None
+            samples_seen_in_iteration = None
+            scheduled_num_microbatches = get_num_microbatches()
+            _step_span = None
         else:
-            ft_integration.on_training_step_start()
-            (
-                loss_dict,
-                skipped_iter,
-                should_checkpoint,
-                should_exit,
-                exit_code,
-                grad_norm,
-                num_zeros_in_grad,
-                max_attention_logit,
-                num_microbatches,
-                seqlen_sum_this_global_batch,
-                seqlen_squared_sum_this_global_batch,
-            ) = train_step(
-                forward_step_func,
-                train_data_iterator,
-                model,
-                optimizer,
-                opt_param_scheduler,
-                config,
-                forward_backward_func,
-                iteration=iteration,
-                pg_collection=pg_collection,
-                p2p_communicator=p2p_communicator,
+
+            callback_manager.trigger("on_train_step_start")
+
+            # OTel: dedicated span for the first iteration actually executed in this
+            # process (post checkpoint-resume, post iteration-skip) — not iteration 1,
+            # just the first one that runs. Kept separate from the per-step span below
+            # since it captures one-off warmup costs (compilation, CUDA graph capture,
+            # prefetch) that steady-state iterations don't pay.
+            _first_iter_span_cm = (
+                _otel_managed_span(
+                    'first_iteration',
+                    'megatron.train.first_iteration',
+                    is_goodput_span=True,
+                    **{'megatron.iteration': iteration},
+                )
+                if is_first_iteration
+                else nullcontext()
             )
-            ft_integration.on_training_step_end()
-            if _maybe_raise_workload_exception is not None and iteration != start_iteration:
-                _maybe_raise_workload_exception()
-            # Fault delay timing can start at the end of iteration N. Self-firing faults
-            # (signals, GIL, GPU) may then manifest in iteration N or N+1 depending on the
-            # configured delay; workload-exception faults manifest on a later poll.
-            if (
-                _maybe_raise_workload_exception is not None
-                and should_setup_fault_injection_at_iteration(fault_injector_config, iteration)
+            # OTel: optional per-step span wrapping the real train_step.
+            with (
+                _first_iter_span_cm,
+                _otel_managed_span(
+                    'step',
+                    'megatron.train.iteration',
+                    is_goodput_span=True,
+                    **{'megatron.iteration': iteration},
+                ) as _step_span,
             ):
-                setup_fault_injection(fault_injector_config)
+                # Iterations that run the periodic router tensor-metrics reduction are timed
+                # under a separate, generous section so their (potentially minutes-long) cost is
+                # not charged to the tight "step" hang-detection timeout.
+                ft_integration.on_training_step_start(
+                    is_tensor_metrics_iteration=(
+                        tensor_metric_observer is not None
+                        and hasattr(tensor_metric_observer, "has_due_metrics")
+                        and tensor_metric_observer.has_due_metrics(iteration)
+                    )
+                )
+                (
+                    loss_dict,
+                    skipped_iter,
+                    should_checkpoint,
+                    should_exit,
+                    exit_code,
+                    grad_norm,
+                    num_zeros_in_grad,
+                    max_attention_logit,
+                    num_microbatches,
+                    seqlen_sum_this_global_batch,
+                    seqlen_squared_sum_this_global_batch,
+                    samples_seen_in_iteration,
+                    scheduled_num_microbatches,
+                ) = train_step(
+                    forward_step_func,
+                    train_data_iterator,
+                    model,
+                    optimizer,
+                    opt_param_scheduler,
+                    config,
+                    forward_backward_func,
+                    iteration=iteration,
+                    pg_collection=pg_collection,
+                    p2p_communicator=p2p_communicator,
+                    tensor_metric_observer=tensor_metric_observer,
+                )
+                ft_integration.on_training_step_end()
+                if _maybe_raise_workload_exception is not None and iteration != start_iteration:
+                    _maybe_raise_workload_exception()
+                # Fault delay timing can start at the end of iteration N. Self-firing faults
+                # (signals, GIL, GPU) may then manifest in iteration N or N+1 depending on the
+                # configured delay; workload-exception faults manifest on a later poll.
+                if (
+                    _maybe_raise_workload_exception is not None
+                    and should_setup_fault_injection_at_iteration(fault_injector_config, iteration)
+                ):
+                    setup_fault_injection(fault_injector_config)
+                if _step_span is not None:
+                    _otel_safe_set_attrs(_step_span, {'megatron.skipped': bool(skipped_iter)})
+
+            callback_manager.callback_context.loss_dict = loss_dict
+            callback_manager.callback_context.grad_norm = grad_norm
+            callback_manager.callback_context.skipped_iter = bool(skipped_iter)
+            callback_manager.trigger("on_train_step_end")
+
         if should_checkpoint:
             save_checkpoint_and_time(
                 iteration,
                 model,
                 optimizer,
                 opt_param_scheduler,
-                num_floating_point_operations_so_far,
+                train_state.num_floating_point_operations_so_far,
                 checkpointing_context,
                 train_data_iterator=train_data_iterator,
+                callback_manager=callback_manager,
             )
         if should_exit:
             break
@@ -4763,49 +7154,58 @@ def train(
             else:
                 # Enable forward pre-hook after training step has successfully run. All subsequent
                 # forward passes will use the forward pre-hook / `param_sync_func` in
-                # `forward_backward_func`.
-                if should_disable_forward_pre_hook(args):
-                    enable_forward_pre_hook(model)
+                # `forward_backward_func`. One-time (iteration == start_iteration)
+                # param-gather pre-hook re-enable -- runs between the train_step
+                # and train_log spans on the first iteration only, which is
+                # exactly the ~1.8s post-first-iteration gap.
+                if should_disable_forward_pre_hook(args, optimizer):
+                    with _otel_managed_span(
+                        'first_iteration', 'megatron.train.forward_pre_hook', is_goodput_span=True
+                    ):
+                        enable_forward_pre_hook(model)
                     config.param_sync_func = param_sync_func
                     pre_hook_enabled = True
                     # Set the manual hooks here since it's not set right after the capturing.
                     if (
-                        args.cuda_graph_impl == "transformer_engine"
-                        and args.cuda_graph_warmup_steps == 0
+                        cfg.model.transformer.cuda_graph_impl == "transformer_engine"
+                        and cfg.model.transformer.cuda_graph_warmup_steps == 0
                     ):
                         assert (
                             cuda_graph_helper.capture_finished()
                         ), "CUDA Graph capture should have been finished."
                         cuda_graph_helper.cuda_graph_set_manual_hooks()
 
-        iteration += 1
+        train_state.iteration += 1
+        iteration = train_state.iteration
+
+        # Cross-rank agreement on Triton autotune choices, at the cadence
+        # AutotunePolicy.verify_every asks for. Off by default; a step boundary
+        # is where every rank arrives, which the collective inside requires.
+        maybe_verify_choices(iteration)
 
         # If requested, manually register FSDP communication buffers after a short warmup.
         if (
-            getattr(args, "fsdp_manual_registration", False)
-            and getattr(args, "nccl_ub", False)
-            and getattr(args, "use_megatron_fsdp", False)
+            cfg.ddp.fsdp_manual_registration
+            and cfg.ddp.nccl_ub
+            and cfg.ddp.use_megatron_fsdp
             and iteration == start_iteration + 1
         ):
             for model_chunk in model:
-                if isinstance(model_chunk, megatron_FSDP) and getattr(
-                    model_chunk.ddp_config, "fsdp_manual_registration", False
-                ):
+                if isinstance(
+                    model_chunk, (FullyShardedDataParallelV1, FullyShardedDataParallelV2)
+                ) and getattr(model_chunk.ddp_config, "fsdp_manual_registration", False):
                     param_and_grad_buffer = getattr(model_chunk, "param_and_grad_buffer", None)
                     if param_and_grad_buffer is not None:
                         param_and_grad_buffer.manual_buffer_registration()
 
-        if args.perform_rl_step and args.rl_use_sequence_packing:
-            iteration_sequences = rl_utils.get_iteration_sequence_count(args)
-            # Track bins separately for packed mode
-            bin_count = _dp_world_size() * args.micro_batch_size * get_num_microbatches()
-            args.consumed_train_bins += bin_count
+        if samples_seen_in_iteration is not None:
+            iteration_sequences = samples_seen_in_iteration
         else:
-            batch_size = _dp_world_size() * args.micro_batch_size * get_num_microbatches()
+            batch_size = _dp_world_size() * cfg.train.micro_batch_size * get_num_microbatches()
             iteration_sequences = batch_size
 
         # Update consumed samples (always means sequences now)
-        args.consumed_train_samples += iteration_sequences
+        train_state.consumed_train_samples += iteration_sequences
 
         # Use iteration_sequences as batch_size for floating point operations
         batch_size = iteration_sequences
@@ -4813,141 +7213,175 @@ def train(
         num_skipped_samples_in_batch = (
             get_current_global_batch_size() - get_current_running_global_batch_size()
         )
-        if args.decrease_batch_size_if_needed:
+        if cfg.train.decrease_batch_size_if_needed:
             assert num_skipped_samples_in_batch >= 0
         else:
             assert num_skipped_samples_in_batch == 0
-        args.skipped_train_samples += num_skipped_samples_in_batch
-        if getattr(config, 'sequence_packing_scheduler', None) is not None and not args.skip_train:
-            # The scheduler computed these from the real sequence lengths before
-            # CP padding and rerouting, so use them directly for FLOPs accounting.
-            assert seqlen_sum_this_global_batch is not None
-            assert seqlen_squared_sum_this_global_batch is not None
-            total_real_tokens_in_batch = seqlen_sum_this_global_batch
-            seqlen_squared_sum_in_batch = seqlen_squared_sum_this_global_batch
-        else:
-            # Drain the per-iteration packed-sequence stats so the FLOPs computation
-            # reflects THD per-chunk causal attention AND excludes padding tokens
-            # from token-linear work. Returns ``(None, None)`` for unpacked BSHD
-            # runs (no collective issued), letting ``num_floating_point_operations``
-            # fall back to its closed-form defaults.
-            total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
-                consume_seqlen_stats_in_iteration()
-            )
+        train_state.skipped_train_samples += num_skipped_samples_in_batch
+        # Drain the per-iteration packed-sequence stats so the FLOPs computation
+        # reflects THD per-chunk causal attention AND excludes padding tokens
+        # from token-linear work. Returns ``(None, None)`` for unpacked BSHD
+        # runs (no collective issued), letting ``num_floating_point_operations``
+        # fall back to its closed-form defaults.
+        total_real_tokens_in_batch, seqlen_squared_sum_in_batch = (
+            consume_seqlen_stats_in_iteration()
+        )
+        packed_sequence_stats = None
+        if getattr(args, 'log_packed_sequence_stats', False):
+            packed_sequence_stats = consume_packed_sequence_stats_in_iteration()
+        (
+            vision_total_tokens_in_batch,
+            vision_seqlen_squared_sum_in_batch,
+            vision_merged_tokens_in_batch,
+        ) = consume_vision_model_flops_stats(getattr(args, "count_vision_model_flops", False))
         num_floating_point_operations_in_batch = num_floating_point_operations(
-            args,
+            cfg.model,
             batch_size,
+            sequence_length=args.decoder_seq_length if args.decoder_seq_length is not None else args.seq_length,
             seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
             total_real_tokens_in_batch=total_real_tokens_in_batch,
+            vision_total_tokens_in_batch=vision_total_tokens_in_batch,
+            vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
+            vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
+            vision_args=args,
         )
-        num_floating_point_operations_so_far += num_floating_point_operations_in_batch
         num_floating_point_operations_since_last_log_event += num_floating_point_operations_in_batch
+        train_state.num_floating_point_operations_so_far += num_floating_point_operations_in_batch
 
-        # Logging.
-        if optimizer is not None and not optimizer.is_stub_optimizer:
-            loss_scale = optimizer.get_loss_scale().item()
-        else:
-            loss_scale = 1.0
-        params_norm = None
+        # OTel: super-span over the whole post-step REPORTING block (loss-scale
+        # sync, param-norm reduction, throughput/tensorboard/wandb logging). One
+        # goodput span that captures ALL the exposed reporting overhead --
+        # including the loss_scale.item() device sync and misc bookkeeping that
+        # would otherwise be dark -- WITHOUT instrumenting each line. params_norm
+        # and train.log nest under it; its own uninstrumented time is the blank
+        # you'd otherwise see. start_span + attach (no re-indent); closed after
+        # training_log below.
+        _report_span = None
+        _report_token = None
+        if _otel_sg_enabled('step'):
+            from opentelemetry import context as _octx
+            from opentelemetry import trace as _otr
 
-        if args.log_params_norm:
-            params_norm = calc_params_l2_norm(model)
-        if optimizer is not None:
-            learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
-        else:
-            learning_rate = None
-        report_memory_flag = training_log(
-            loss_dict,
-            total_loss_dict,
-            learning_rate,
-            iteration,
-            loss_scale,
-            report_memory_flag,
-            skipped_iter,
-            grad_norm,
-            params_norm,
-            num_zeros_in_grad,
-            max_attention_logit,
-            pg_collection=model_pg_collection,
-            is_first_iteration=is_first_iteration,
-            seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
-            total_real_tokens_in_batch=total_real_tokens_in_batch,
-            num_microbatches=num_microbatches,
-        )
+            _report_span = get_telemetry().tracer.start_span('megatron.train.iteration_report')
+            _otel_mark_goodput(_report_span)
+            _report_token = _octx.attach(_otr.set_span_in_context(_report_span))
+        try:
+
+            # Logging.
+            if optimizer is not None and not optimizer.is_stub_optimizer:
+                # First .item() after the train_step: a device sync draining the
+                # iteration's pending GPU queue (captured under iteration_report).
+                loss_scale = optimizer.get_loss_scale().item()
+            else:
+                loss_scale = 1.0
+            params_norm = None
+            embedding_min_norm_metrics = None
+
+            if (
+                getattr(args, "embedding_min_norm", None) is not None
+                and iteration % cfg.logger.log_interval == 0
+            ):
+                embedding_min_norm_metrics = _consume_embedding_min_norm_metrics(optimizer)
+                writer = get_tensorboard_writer()
+                if writer:
+                    for name, value in embedding_min_norm_metrics.items():
+                        writer.add_scalar(name, value, iteration)
+                wandb_writer = get_wandb_writer()
+                if wandb_writer:
+                    wandb_writer.log(embedding_min_norm_metrics, iteration)
+
+            if _should_compute_params_norm(args, iteration, is_first_iteration):
+                # Cross-rank param L2 norm (--log-params-norm): a full-model reduction
+                # + all-reduce that BLOCKS the training loop -- exposed goodput cost
+                # (~1.5s cold on the first iteration, ~10ms steady). Kept as a real
+                # cost span (it stalls the critical path), unlike passive monitors.
+                with _otel_managed_span('step', 'megatron.train.params_norm', is_goodput_span=True):
+                    params_norm = calc_params_l2_norm(model, pg_collection=pg_collection)
+            if optimizer is not None:
+                learning_rate = get_canonical_lr_for_logging(optimizer.param_groups)
+            else:
+                learning_rate = None
+            # Per-iteration logging (throughput calc, tensorboard/wandb writes) --
+            # uninstrumented per-iteration overhead outside the train_step span.
+            with _otel_managed_span('step', 'megatron.train.log', is_goodput_span=True):
+                report_memory_flag = training_log(
+                    loss_dict,
+                    total_loss_dict,
+                    learning_rate,
+                    iteration,
+                    loss_scale,
+                    report_memory_flag,
+                    skipped_iter,
+                    grad_norm,
+                    params_norm,
+                    num_zeros_in_grad,
+                    max_attention_logit,
+                    pg_collection=model_pg_collection,
+                    is_first_iteration=is_first_iteration,
+                    seqlen_squared_sum_in_batch=seqlen_squared_sum_in_batch,
+                    total_real_tokens_in_batch=total_real_tokens_in_batch,
+                    vision_total_tokens_in_batch=vision_total_tokens_in_batch,
+                    vision_seqlen_squared_sum_in_batch=vision_seqlen_squared_sum_in_batch,
+                    vision_merged_tokens_in_batch=vision_merged_tokens_in_batch,
+                    schedule_pg_collection=pg_collection,
+                    model=model,
+                    callback_manager=callback_manager,
+                    packed_sequence_stats=packed_sequence_stats,
+                    num_microbatches=scheduled_num_microbatches,
+                    embedding_min_norm_metrics=embedding_min_norm_metrics,
+                )
+            # OTel: close the iteration-report super-span (parents params_norm + log;
+            # its own uninstrumented time is the loss_scale sync + FLOPs bookkeeping).
+        finally:
+            if _report_span is not None:
+                from opentelemetry import context as _octx
+
+                _octx.detach(_report_token)
+                _report_span.end()
         is_first_iteration = False
 
         # Evaluation.
         if (
-            args.eval_interval
-            and iteration % args.eval_interval == 0
-            and args.do_valid
-            and (args.start_eval_at_iter is None or iteration >= args.start_eval_at_iter)
+            cfg.validation.eval_interval
+            and iteration % cfg.validation.eval_interval == 0
+            and train_state.do_valid
+            and (
+                cfg.validation.start_eval_at_iter is None
+                or iteration >= cfg.validation.start_eval_at_iter
+            )
         ):
-            if args.log_energy:
+            if cfg.logger.log_energy:
                 energy_monitor.pause()
             timers('interval-time').stop()
-            if should_disable_forward_pre_hook(args):
+            if should_disable_forward_pre_hook(args, optimizer):
                 disable_forward_pre_hook(model, optimizer=optimizer)
                 pre_hook_enabled = False
-            if args.manual_gc and args.manual_gc_eval:
+            if cfg.train.manual_gc and cfg.train.manual_gc_eval:
                 # Collect all objects.
                 gc.collect()
             prefix = f'iteration {iteration}'
             timers('eval-time', log_level=0).start(barrier=True)
-            if args.perform_rl_step:
-                rl_eval_model = model
-                rl_training_model = None
-                # If separate inference and training models, swap training weights
-                # back to the inference model for RL evaluation.
-                if inference_model is not None:
-                    inf_core = unwrap_model(inference_model[0])
-                    rl_utils._maybe_prefetch_separate_inference_model_weights(
-                        inf_core, to_cpu=False
-                    )
-                    swap_model_weights(model, inference_model, args.refit_method)
-                    rl_eval_model = inference_model
-                    rl_training_model = model
-                rl_utils.evaluate_and_print_results_rl(
-                    valid_data_iterator,
-                    rl_eval_model,
-                    optimizer,
-                    iteration,
-                    write_to_tensorboard=True,
-                    training_model=rl_training_model,
-                )
-            else:
-                evaluate_and_print_results(
-                    prefix,
-                    forward_step_func,
-                    valid_data_iterator,
-                    model,
-                    iteration,
-                    process_non_loss_data_func,
-                    config,
-                    verbose=False,
-                    write_to_tensorboard=True,
-                    non_loss_data_func=non_loss_data_func,
-                    pg_collection=pg_collection,
-                    p2p_communicator=p2p_communicator,
-                )
+            run_eval(prefix=prefix, iteration=iteration, verbose=False, write_to_tensorboard=True)
 
             eval_duration += timers('eval-time').elapsed()
             eval_iterations += (
-                sum(args.eval_iters) if isinstance(args.eval_iters, list) else args.eval_iters
+                sum(cfg.validation.eval_iters)
+                if isinstance(cfg.validation.eval_iters, list)
+                else cfg.validation.eval_iters
             )
             timers('eval-time').stop()
             one_logger_utils.track_e2e_metrics()
 
-            if args.manual_gc and args.manual_gc_eval:
+            if cfg.train.manual_gc and cfg.train.manual_gc_eval:
                 # Collect only the objects created and used in evaluation.
                 gc.collect(generation=0)
-            if should_disable_forward_pre_hook(args):
+            if should_disable_forward_pre_hook(args, optimizer):
                 enable_forward_pre_hook(model)
                 pre_hook_enabled = True
             timers('interval-time', log_level=0).start(barrier=True)
-            if args.log_energy:
+            if cfg.logger.log_energy:
                 energy_monitor.resume()
-            if args.num_experts is not None:
+            if cfg.model.transformer.num_moe_experts is not None:
                 get_moe_metrics_tracker().clear()
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
@@ -4963,25 +7397,43 @@ def train(
             nsys_nvtx_context,
         )
 
+        # Detect a dead/broken cached-logits-saver async worker promptly: its
+        # completion queue only ever reports "done", never "failed", so an
+        # uncaught exception there would otherwise stall silently (both future
+        # logits and regular checkpoint saves for that rank) rather than
+        # surfacing until a much later blocking checkpoint finalize hangs.
+        if args.logits_save_dir is not None:
+            from megatron.training.distillation import check_logits_saver_failure
+
+            check_logits_saver_failure()
+
         # Checkpoint and decide whether to exit.
         should_exit = checkpoint_and_decide_exit(
             model,
             optimizer,
             opt_param_scheduler,
             iteration,
-            num_floating_point_operations_so_far,
+            train_state.num_floating_point_operations_so_far,
             checkpointing_context,
             train_data_iterator,
+            callback_manager=callback_manager,
         )
         if should_exit:
             break
 
+    # Early-exit paths (exit-duration / exit-interval / signal handler) sys.exit()
+    # below before the normal-path logging, so record the train-loop finish time here.
+    if should_exit:
+        one_logger and one_logger.log_metrics(
+            {'app_train_loop_finish_time': one_logger_utils.get_timestamp_in_ms()}
+        )
+
     # Destroy CUDA Graphs.
-    if args.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
+    if cfg.model.transformer.cuda_graph_impl == "transformer_engine" and cuda_graph_helper.graphs_created():
         cuda_graph_helper.delete_cuda_graphs()
 
     # Call OptimizerCudaGraph destructor to destroy optimizer CUDA graph
-    if args.optimizer_cuda_graph:
+    if cfg.optimizer.optimizer_cuda_graph:
         del optimizer.step
 
     one_logger_utils.track_e2e_metrics()
@@ -4996,20 +7448,22 @@ def train(
         disable_forward_pre_hook(model, optimizer=optimizer)
 
     ft_integration.on_checkpointing_start()
-    # This will finalize all unfinalized async request and terminate
-    # a persistent async worker if persistent ckpt worker is enabled
-    maybe_finalize_async_save(blocking=True, terminate=True)
+    # Finalize all unfinished async requests and terminate the persistent
+    # async worker (if enabled) if the code is meant to exit and not return from this
+    # function.
+    with _otel_managed_span(
+        'checkpoint', 'megatron.checkpoint.exit_finalize', is_goodput_span=True
+    ):
+        maybe_finalize_async_save(blocking=True, terminate=should_exit)
     ft_integration.on_checkpointing_end(is_async_finalization=True)
 
-    if args.log_energy:
+    if cfg.logger.log_energy:
         energy_monitor.lap()
         total_energy = energy_monitor.get_total()
         print_rank_0(f"Total training energy (GPU): {total_energy / 1e6:.3f} MJ")
         energy_monitor.shutdown()
 
-    # Shutdown RL profiler and export summary
-    if args.rl_profile:
-        shutdown_rl_profiler()
+    callback_manager.trigger("on_train_end")
 
     # If any exit conditions (signal handler, duration, iterations) have been reached, exit.
     if should_exit:
@@ -5018,25 +7472,48 @@ def train(
         # ncclCommDeregister on handles created by ncclCommWindowRegister,
         # causing "NCCL WARN Deregister: Could not find handle" and a crash.
         torch.distributed.barrier()
+        if (
+            cfg.model.transformer.gtp_remat_nccl_ub
+            or cfg.model.transformer.gtp_expert_remat_nccl_ub
+        ):
+            from megatron.core.tensor_parallel.gtp_api import deregister_and_clear_gtp_symm_pools
+
+            # Deregister the GTP symmetric-memory pools: windows left registered when the
+            # process groups are destroyed make NCCL abort.
+            deregister_and_clear_gtp_symm_pools()
+
         for model_module in model:
             if isinstance(model_module, DDP):
                 for buf in model_module.buffers + model_module.expert_parallel_buffers:
-                    if getattr(buf, 'nccl_mem_pool', None) is not None:
-                        nccl_allocator.deregister_mem_pool(
-                            buf.nccl_mem_pool, buf.data_parallel_group
-                        )
+                    buf.deregister_nccl_mem_pools()
+        one_logger and one_logger.log_metrics(
+            {'app_finish_time': one_logger_utils.get_timestamp_in_ms()}
+        )
         wandb_writer = get_wandb_writer()
         if wandb_writer:
             wandb_writer.finish()
         ft_integration.shutdown()
         one_logger_utils.finish()
-        if args.perform_rl_step:
-            rl_utils.rl_inference_interface_shutdown()
+        # This sys.exit() bypasses the rest of pretrain() -- including its normal
+        # _end_otel_job_spans() call -- so the open megatron.train interval block (and
+        # megatron.startup, if it somehow never closed) would otherwise only get ended
+        # later via the atexit fallback, which runs AFTER a bare shutdown() here already
+        # tore down the provider (nothing left to export into). _end_otel_job_spans()
+        # ends the spans first, then shuts down, so it must be this call, not a
+        # standalone get_telemetry().shutdown().
+        _end_otel_job_spans()
         sys.exit(exit_code)
 
-    return iteration, num_floating_point_operations_so_far
+    # OTel: normal loop completion -- end the final megatron.train interval block here
+    # so it doesn't bleed into pretrain()'s post-train eval/test. Those now root their
+    # own traces (there is no umbrella left to parent them). The sys.exit() path above
+    # ends the block via _end_otel_job_spans() instead.
+    _end_otel_train_span()
+
+    return iteration, train_state.num_floating_point_operations_so_far
 
 
+@_otel_trace_fn('evaluate', 'megatron.evaluate')
 def evaluate(
     forward_step_func,
     data_iterator,
@@ -5048,12 +7525,30 @@ def evaluate(
     eval_iters=None,
     pg_collection=None,
     p2p_communicator=None,
+    callback_manager: CallbackManager | None = None,
+    is_test: bool = False,
 ):
     """Evaluation."""
+    callback_manager = normalize_callbacks(callback_manager)
+    cfg = get_run_config()
     args = get_args()
     timers = get_timers()
+    train_state = get_train_state()
+    # Evaluation forwards run the same get_batch / forward_step producers as training, but
+    # their sequence statistics must not reach the training FLOPs consumer: start from, and
+    # leave behind, an empty accumulator.
+    reset_seqlen_stats_in_iteration()
+
+    step_start_event = "on_test_step_start" if is_test else "on_eval_step_start"
+    step_end_event = "on_test_step_end" if is_test else "on_eval_step_end"
 
     timers('evaluate', log_level=0).start(barrier=True)
+
+    # Return training's cached blocks to the driver. Evaluation can route tokens very unevenly
+    # across experts, so its allocations do not match the training-shaped cache and would
+    # otherwise map new memory on top of it.
+    if cfg.validation.eval_empty_cuda_cache:
+        torch.cuda.empty_cache()
 
     # Turn on evaluation mode which disables dropout.
     for model_module in model:
@@ -5067,23 +7562,33 @@ def evaluate(
     total_loss_dict = {}
 
     # make validation batch size independent from training batch size
-    eval_batch_size = args.eval_global_batch_size
-    eval_micro_batch_size = args.eval_micro_batch_size
-    eval_num_microbatches = eval_batch_size // (eval_micro_batch_size * args.data_parallel_size)
+    eval_batch_size = cfg.validation.eval_global_batch_size
+    eval_micro_batch_size = cfg.validation.eval_micro_batch_size
+    # Divide by independently assigned sequences; CP ranks share the same sequence.
+    eval_num_microbatches = eval_batch_size // (
+        eval_micro_batch_size * cfg.get_batch_parallel_size()
+    )
     forward_backward_func = get_forward_backward_func(schedule_pg_collection=pg_collection)
     # Reductions source per-rank groups from the model (encoder rank -> encoder groups).
     eval_pgc = get_attr_wrapped_model(model[0], "pg_collection")
     if eval_pgc is None:
         eval_pgc = ProcessGroupCollection.use_mpu_process_groups()
-    if args.cuda_graph_impl == "full_iteration":
+    # gtp_remat-inclusive, mirroring train_step: gtp_remat peers hold distinct micro-batches, so
+    # the reduction must cover every distinct-data rank. Reducing over the replicate dp_cp would
+    # average a 1/gtp_remat subsample of the eval batch (768 sequences read, 12 averaged at
+    # dp=6/gtp_remat=64) while consumed_valid_samples still books the full eval_batch_size.
+    eval_dp_cp_group = getattr(eval_pgc, 'dp_cp_gtp_remat', None) or eval_pgc.dp_cp
+    if cfg.model.transformer.cuda_graph_impl == "full_iteration":
         forward_backward_func = FullCudaGraphWrapper(
             forward_backward_func,
-            cuda_graph_warmup_steps=args.cuda_graph_warmup_steps,
+            cuda_graph_warmup_steps=cfg.model.transformer.cuda_graph_warmup_steps,
             use_single_mempool=config.cuda_graph_use_single_mempool,
         )
     # Wrap forward_backward_func for overflow handling with moe_expert_rank_capacity_factor
-    if args.moe_expert_rank_capacity_factor is not None:
-        copy_main_params = args.reuse_grad_buf_for_mxfp8_param_ag and args.overlap_param_gather
+    if cfg.model.transformer.moe_expert_rank_capacity_factor is not None:
+        copy_main_params = (
+            cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag and cfg.optimizer.overlap_param_gather
+        )
         forward_backward_func = PagedStashRunner(
             config, copy_main_params, model, None, forward_backward_func
         )
@@ -5100,7 +7605,7 @@ def evaluate(
         adjust_tensor_shapes_fn = None
 
     if eval_iters is None:
-        eval_iters = args.eval_iters
+        eval_iters = cfg.validation.eval_iters
 
     with torch.no_grad():
         iteration = 0
@@ -5113,38 +7618,51 @@ def evaluate(
 
             # Don't care about timing during evaluation
             config.timers = None
-            ft_integration.on_eval_step_start()
-            if getattr(config, 'sequence_packing_scheduler', None) is not None:
+
+            if getattr(config, "sequence_packing_scheduler", None) is not None:
                 try:
-                    (packed_data_iterator, scheduled_eval_num_microbatches, _, _) = (
-                        wrap_data_iterator(data_iterator, config, eval_num_microbatches)
+                    packed_data_iterator, scheduled_eval_num_microbatches, _, _ = (
+                        wrap_data_iterator(
+                            data_iterator, config, eval_num_microbatches, pg_collection=eval_pgc
+                        )
                     )
                 except StopIteration:
-                    # Validation data iterator exhausted, stop evaluation early.
-                    ft_integration.on_eval_step_end()
+                    # A finite validation iterator can end between scheduled global batches.
+                    # No eval step has started yet, so only restore the timers disabled above.
                     config.timers = get_timers()
                     break
             else:
                 packed_data_iterator = data_iterator
                 scheduled_eval_num_microbatches = eval_num_microbatches
-            loss_dicts = forward_backward_func(
-                forward_step_func=forward_step_func,
-                data_iterator=packed_data_iterator,
-                model=model,
-                num_microbatches=scheduled_eval_num_microbatches,
-                seq_length=args.seq_length,
-                micro_batch_size=eval_micro_batch_size,
-                decoder_seq_length=args.decoder_seq_length,
-                forward_only=True,
-                adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
-                pg_collection=pg_collection,
-                p2p_communicator=p2p_communicator,
-            )
+
+            ft_integration.on_eval_step_start()
+
+            callback_manager.trigger(step_start_event)
+
+            with _otel_managed_span(
+                'evaluate', 'megatron.evaluate.step', **{'megatron.eval_iteration': iteration}
+            ):
+                loss_dicts = forward_backward_func(
+                    forward_step_func=forward_step_func,
+                    data_iterator=packed_data_iterator,
+                    model=model,
+                    num_microbatches=scheduled_eval_num_microbatches,
+                    seq_length=args.seq_length,
+                    micro_batch_size=eval_micro_batch_size,
+                    decoder_seq_length=args.decoder_seq_length,
+                    forward_only=True,
+                    adjust_tensor_shapes_fn=adjust_tensor_shapes_fn,
+                    pg_collection=pg_collection,
+                    p2p_communicator=p2p_communicator,
+                )
+
+            callback_manager.trigger(step_end_event)
+
             ft_integration.on_eval_step_end()
             config.timers = get_timers()
 
             # Empty unused memory
-            if args.empty_unused_memory_level >= 1:
+            if cfg.train.empty_unused_memory_level >= 1:
                 torch.cuda.empty_cache()
 
             if is_pp_last_stage(eval_pgc.pp) and loss_dicts:
@@ -5157,19 +7675,11 @@ def evaluate(
                     val = [x[key].view(-1) for x in loss_dicts]
 
                     if val[0].numel() == 2:
-                        if args.sft:
-                            # normalize over micro batch instead of global
-                            val = torch.vstack(val)
-                            val = val[:, 0] / val[:, 1].clamp(min=1)
-                            val = val.mean()
-                            torch.distributed.all_reduce(val, group=eval_pgc.dp_cp)
-                            val /= torch.distributed.get_world_size(group=eval_pgc.dp_cp)
-                            total_loss_dict[key][0] += val
-                            total_loss_dict[key][1] += 1
-                        else:
-                            val = torch.vstack(val).sum(dim=0)
-                            torch.distributed.all_reduce(val, group=eval_pgc.dp_cp)
-                            total_loss_dict[key] += val
+                        # Preserve loss sums and valid-token counts across microbatches,
+                        # DP/CP ranks, and iterations. SFT masks can make counts unequal.
+                        val = torch.vstack(val).sum(dim=0)
+                        torch.distributed.all_reduce(val, group=eval_dp_cp_group)
+                        total_loss_dict[key] += val
                     elif val[0].numel() == 1:
                         val = torch.cat(val).sum()
                         total_loss_dict[key][0] += val
@@ -5177,17 +7687,18 @@ def evaluate(
                     else:
                         raise ValueError(f"Invalid value shape: {val[0].shape} for key {key}")
 
-            args.consumed_valid_samples += eval_batch_size
+            train_state.consumed_valid_samples += eval_batch_size
 
-            if args.exit_duration_in_mins:
+            if cfg.train.exit_duration_in_mins:
                 train_time = (time.time() - _TRAIN_START_TIME) / 60.0
                 done_cuda = torch.tensor(
-                    [train_time > args.exit_duration_in_mins], dtype=torch.int, device='cuda'
+                    [train_time > cfg.train.exit_duration_in_mins], dtype=torch.int, device='cuda'
                 )
                 torch.distributed.all_reduce(done_cuda, op=torch.distributed.ReduceOp.MAX)
                 done = done_cuda.item()
                 if done:
                     rerun_state_machine.set_mode(rerun_mode)
+                    reset_seqlen_stats_in_iteration()
                     print_rank_0('Exiting during evaluation, timelimit reached')
                     return None, None, True
 
@@ -5213,14 +7724,33 @@ def evaluate(
     for model_module in model:
         model_module.train()
 
+    # Return evaluation's cached blocks to the driver. The caching allocator frees its cache and
+    # retries when its own allocations fail, but NCCL allocates from the driver directly, so a
+    # checkpoint save right after evaluation can otherwise fail to allocate collective buffers.
+    if cfg.validation.eval_empty_cuda_cache:
+        torch.cuda.empty_cache()
+
     for key in total_loss_dict:
         numerator, denominator = total_loss_dict[key]
-        total_loss_dict[key] = numerator / denominator
+        total_loss_dict[key] = numerator / denominator.clamp(min=1)
 
     timers('evaluate').stop()
     timers.log(['evaluate'])
 
     rerun_state_machine.set_mode(rerun_mode)
+    reset_seqlen_stats_in_iteration()
+
+    # OTel: set eval_iters on the active span started by the @_otel_trace_fn decorator.
+    # get_current_span() always returns a NonRecordingSpan (no-op) when no span is active,
+    # so this is safe whether or not the group is enabled or the decorator fell back to no-op.
+    try:
+        from opentelemetry import trace as _ot
+
+        _ot.get_current_span().set_attribute(
+            'megatron.eval_iters', eval_iters if eval_iters is not None else 0
+        )
+    except Exception:  # noqa: BLE001 — OTel must never crash evaluation
+        pass
 
     return total_loss_dict, collected_non_loss_data, False
 
@@ -5238,55 +7768,69 @@ def evaluate_and_print_results(
     non_loss_data_func=None,
     pg_collection=None,
     p2p_communicator=None,
+    callback_manager: CallbackManager | None = None,
+    is_test: bool = False,
 ):
     """Helper function to evaluate and dump results on screen."""
+    cfg = get_run_config()
+    callback_manager = normalize_callbacks(callback_manager)
     args = get_args()
+    train_state = get_train_state()
     if write_to_tensorboard:
         writer = get_tensorboard_writer()
     else:
         writer = None
 
+    start_event = "on_test_start" if is_test else "on_eval_start"
+    end_event = "on_test_end" if is_test else "on_eval_end"
+
     wandb_writer = get_wandb_writer()
 
-    data_iterators = data_iterator if args.multiple_validation_sets else [data_iterator]
+    data_iterators = data_iterator if cfg.validation.multiple_validation_sets else [data_iterator]
 
-    if not args.multiple_validation_sets:
-        eval_iters = [args.eval_iters]
+    if not cfg.validation.multiple_validation_sets:
+        eval_iters = [cfg.validation.eval_iters]
     else:
-        eval_iters = args.eval_iters
+        eval_iters = cfg.validation.eval_iters
 
-    if args.full_validation:
+    if cfg.validation.full_validation:
         assert len(eval_iters) == len(data_iterators)
 
         # with full validation we need to distribute eval_iters to all ranks
         if mpu.get_tensor_model_parallel_rank() == 0:
-            eval_iters = torch.tensor(args.eval_iters, dtype=torch.long, device='cuda')
+            eval_iters = torch.tensor(cfg.validation.eval_iters, dtype=torch.long, device='cuda')
         else:
             eval_iters = torch.tensor([0] * len(eval_iters), dtype=torch.long, device='cuda')
         torch.distributed.broadcast(eval_iters, 0)
         eval_iters = eval_iters.tolist()
-        args.eval_iters = eval_iters[0] if not args.multiple_validation_sets else eval_iters
-    elif not args.multiple_validation_sets:
-        eval_iters = [args.eval_iters]
+        cfg.validation.eval_iters = (
+            eval_iters[0] if not cfg.validation.multiple_validation_sets else eval_iters
+        )
+    elif not cfg.validation.multiple_validation_sets:
+        eval_iters = [cfg.validation.eval_iters]
     else:
-        eval_iters = args.eval_iters
+        eval_iters = cfg.validation.eval_iters
 
-    if args.validation_set_names:
+    if cfg.validation.validation_set_names:
         assert (
-            args.multiple_validation_sets
+            cfg.validation.multiple_validation_sets
         ), "--validation-set-names requires --multiple-validation-sets"
-        assert len(args.validation_set_names) == len(data_iterators), (
-            f"Number of --validation-set-names ({len(args.validation_set_names)}) must match "
+        assert len(cfg.validation.validation_set_names) == len(data_iterators), (
+            "Number of --validation-set-names "
+            f"({len(cfg.validation.validation_set_names)}) must match "
             f"the number of validation datasets ({len(data_iterators)})"
         )
 
+    callback_manager.trigger(start_event)
+
     for index, (iterator, iterations) in enumerate(zip(data_iterators, eval_iters)):
         suffix = ""
-        if args.multiple_validation_sets:
-            if args.validation_set_names:
-                suffix = f"-{args.validation_set_names[index]}"
+        if cfg.validation.multiple_validation_sets:
+            if cfg.validation.validation_set_names:
+                suffix = f"-{cfg.validation.validation_set_names[index]}"
             else:
                 suffix = f"-{index}"
+
         total_loss_dict, collected_non_loss_data, timelimit = evaluate(
             forward_step_func,
             iterator,
@@ -5298,6 +7842,8 @@ def evaluate_and_print_results(
             eval_iters=iterations,
             pg_collection=pg_collection,
             p2p_communicator=p2p_communicator,
+            callback_manager=callback_manager,
+            is_test=is_test,
         )
         # Timelimit hit during evaluation
         if timelimit:
@@ -5314,14 +7860,14 @@ def evaluate_and_print_results(
                 writer.add_scalar(
                     '{} validation{} vs samples'.format(key, suffix),
                     total_loss_dict[key].item(),
-                    args.consumed_train_samples,
+                    train_state.consumed_train_samples,
                 )
-                if args.log_validation_ppl_to_tensorboard:
+                if cfg.logger.log_validation_ppl_to_tensorboard:
                     writer.add_scalar('{} validation{} ppl'.format(key, suffix), ppl, iteration)
                     writer.add_scalar(
                         '{} validation{} ppl vs samples'.format(key, suffix),
                         ppl,
-                        args.consumed_train_samples,
+                        train_state.consumed_train_samples,
                     )
                 if wandb_writer and is_last_rank():
                     wandb_writer.log(
@@ -5336,6 +7882,9 @@ def evaluate_and_print_results(
         print_rank_last('-' * length)
         print_rank_last(string)
         print_rank_last('-' * length)
+
+    callback_manager.callback_context.total_loss_dict = total_loss_dict
+    callback_manager.trigger(end_event)
 
 
 def cyclic_iter(iterable):
@@ -5357,36 +7906,61 @@ def cyclic_iter(iterable):
 def get_train_valid_test_num_samples():
     """Train/valid/test num samples."""
 
+    cfg = get_run_config()
     args = get_args()
+    train_state = get_train_state()
 
+    return calculate_train_valid_test_num_samples(
+        cfg.train,
+        cfg.validation,
+        phase_transition_iterations=args.phase_transition_iterations,
+        iteration=train_state.iteration if train_state is not None else 0,
+    )
+
+
+def calculate_train_valid_test_num_samples(
+    train: TrainingConfig,
+    validation: ValidationConfig,
+    *,
+    phase_transition_iterations: list[int] | None,
+    iteration: int,
+) -> tuple[int, int | None, int]:
+    """Calculate dataset sample counts without model or runtime initialization."""
+    eval_global_batch_size = validation.eval_global_batch_size
+    if eval_global_batch_size is None:
+        eval_global_batch_size = train.global_batch_size
     # Number of train/valid/test samples.
-    if args.train_samples:
-        train_samples = args.train_samples
+    if train.train_samples:
+        train_samples = train.train_samples
     else:
-        train_samples = args.train_iters * args.global_batch_size
-    if args.full_validation:
+        train_samples = train.train_iters * train.global_batch_size
+    if validation.full_validation:
         eval_samples = None
     else:
-        if args.skip_train:
-            eval_iters = args.eval_iters
+        if validation.skip_train:
+            eval_iters = validation.eval_iters
         else:
-            assert args.train_iters is not None
-            total_eval_points = args.train_iters // args.eval_interval + 1
-            if args.start_eval_at_iter is not None:
-                skipped_eval_points = args.start_eval_at_iter // args.eval_interval
-                total_eval_points = max(0, total_eval_points - skipped_eval_points)
-            eval_iters = total_eval_points * args.eval_iters
-        eval_samples = eval_iters * getattr(args, 'eval_global_batch_size', args.global_batch_size)
-    test_samples = args.eval_iters * getattr(args, 'eval_global_batch_size', args.global_batch_size)
+            assert train.train_iters is not None
+            if validation.eval_interval:
+                total_eval_points = train.train_iters // validation.eval_interval + 1
+                if validation.start_eval_at_iter is not None:
+                    skipped_eval_points = validation.start_eval_at_iter // validation.eval_interval
+                    total_eval_points = max(0, total_eval_points - skipped_eval_points)
+            else:
+                # Without eval_interval, validation only runs once, after training.
+                total_eval_points = 1
+            eval_iters = total_eval_points * validation.eval_iters
+        eval_samples = eval_iters * eval_global_batch_size
+    test_samples = validation.eval_iters * eval_global_batch_size
 
     # Get train_samples in current phase.
-    if args.phase_transition_iterations:
+    if phase_transition_iterations:
         phase_transition_samples = (
             [0]
-            + [t * args.global_batch_size for t in args.phase_transition_iterations]
-            + [args.train_samples]
+            + [t * train.global_batch_size for t in phase_transition_iterations]
+            + [train.train_samples]
         )
-        current_sample = args.iteration * args.global_batch_size
+        current_sample = iteration * train.global_batch_size
         last_transition_sample = max(s for s in phase_transition_samples if s <= current_sample)
         next_transition_sample = min(s for s in phase_transition_samples if s > current_sample)
         train_samples_in_current_phase = next_transition_sample - last_transition_sample
@@ -5409,44 +7983,35 @@ def build_train_valid_test_datasets(
     return build_train_valid_test_datasets_provider(train_valid_test_num_samples)
 
 
-def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider):
+def build_train_valid_test_data_loaders(
+    build_train_valid_test_datasets_provider, *, build_train_dataloader=True
+):
     """Build pretraining data loaders."""
 
     args = get_args()
+    train_state = get_train_state()
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    cfg = get_run_config()
 
-    (train_dataloader, valid_dataloaders, test_dataloader) = (None, None, None)
+    train_dataloader, valid_dataloaders, test_dataloader = (None, None, None)
 
     print_rank_0('> building train, validation, and test datasets ...')
 
-    # Backward compatibility, assume fixed batch size.
-    if args.iteration > 0 and args.consumed_train_samples == 0:
-        assert (
-            args.train_samples is None
-        ), 'Only backward compatiblity support for iteration-based training'
-
-        args.consumed_train_samples = args.iteration * args.global_batch_size
-    if args.iteration > 0 and args.consumed_valid_samples == 0:
-        if args.train_samples is None:
-            effective_start = args.start_eval_at_iter if args.start_eval_at_iter is not None else 0
-            skipped_intervals = effective_start // args.eval_interval
-            args.consumed_valid_samples = (
-                max(0, args.iteration // args.eval_interval - skipped_intervals)
-                * args.eval_iters
-                * getattr(args, 'eval_global_batch_size', args.global_batch_size)
-            )
+    backfill_consumed_samples_from_iteration()
 
     # Get consumed train samples in this phase.
     if args.phase_transition_iterations:
         last_transition = max(
             iteration
             for iteration in (0, *args.phase_transition_iterations)
-            if iteration <= args.iteration
+            if iteration <= train_state.iteration
         )
         consumed_train_samples_in_current_phase = (
-            args.iteration - last_transition
-        ) * args.global_batch_size
+            train_state.iteration - last_transition
+        ) * cfg.train.global_batch_size
     else:
-        consumed_train_samples_in_current_phase = args.consumed_train_samples
+        consumed_train_samples_in_current_phase = train_state.consumed_train_samples
 
     # Rely on distributed-aware core datasets, temporary
     is_distributed = getattr(build_train_valid_test_datasets_provider, "is_distributed", False)
@@ -5454,73 +8019,103 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     # Construct the data pipeline
     if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
 
-        # Build datasets and dataloders.
-        if args.perform_rl_step:
-            # we don't need to build any dataloaders for RL training
+        # Build datasets.
+        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+            build_train_valid_test_datasets_provider
+        )
+        valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
+        if cfg.validation.skip_train or not build_train_dataloader:
             train_dataloader = None
-            valid_dataloaders = None
-            test_dataloader = None
-            do_train = (args.train_iters or 0) > 0
-            do_valid = args.full_validation or args.eval_iters > 0
-            do_test = args.full_validation or args.eval_iters > 0
-
         else:
-            # Build datasets.
-            train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-                build_train_valid_test_datasets_provider
+            train_dataloader = build_pretraining_data_loader(
+                train_ds, consumed_train_samples_in_current_phase
             )
-            valid_ds = [valid_ds] if not isinstance(valid_ds, list) else valid_ds
-            if args.skip_train:
-                train_dataloader = None
+        valid_dataloaders = []
+        for valid_d in valid_ds:
+            if cfg.validation.skip_train or cfg.validation.full_validation:
+                valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
             else:
-                train_dataloader = build_pretraining_data_loader(
-                    train_ds, consumed_train_samples_in_current_phase
-                )
-            valid_dataloaders = []
-            for valid_d in valid_ds:
-                if args.skip_train or args.full_validation:
-                    valid_dataloaders.append(build_pretraining_data_loader(valid_d, 0))
-                else:
-                    if args.multiple_validation_sets:
-                        # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
-                        # correct and needs to be calculated/set per validation set
-                        raise NotImplementedError(
-                            "--multiple-validation-sets currently requires --full-validation"
-                        )
-                    valid_dataloaders.append(
-                        build_pretraining_data_loader(valid_d, args.consumed_valid_samples)
+                if cfg.validation.multiple_validation_sets:
+                    # TODO(bnorick): for multiple validation sets without full validation, args.consumed_valid_samples is not
+                    # correct and needs to be calculated/set per validation set
+                    raise NotImplementedError(
+                        "--multiple-validation-sets currently requires --full-validation"
                     )
-            if not args.multiple_validation_sets:
-                assert len(valid_dataloaders) == 1
-            test_dataloader = build_pretraining_data_loader(test_ds, 0)
-            do_train = train_dataloader is not None and (args.skip_train or args.train_iters > 0)
-            do_valid = valid_dataloaders is not None and (
-                args.full_validation or args.eval_iters > 0
+                valid_dataloaders.append(
+                    build_pretraining_data_loader(valid_d, train_state.consumed_valid_samples)
+                )
+        if not cfg.validation.multiple_validation_sets:
+            assert len(valid_dataloaders) == 1
+        test_dataloader = build_pretraining_data_loader(test_ds, 0)
+        if build_train_dataloader:
+            do_train = train_dataloader is not None and (
+                cfg.validation.skip_train or cfg.train.train_iters > 0
             )
-            do_test = test_dataloader is not None and (args.full_validation or args.eval_iters > 0)
-
-        flags = torch.tensor(
-            [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
+        else:
+            do_train = (cfg.train.train_iters or 0) > 0
+        do_valid = valid_dataloaders is not None and (
+            cfg.validation.full_validation or cfg.validation.eval_iters > 0
+        )
+        do_test = test_dataloader is not None and (
+            cfg.validation.full_validation or cfg.validation.eval_iters > 0
         )
     else:
-        flags = torch.tensor([0, 0, 0], dtype=torch.long, device='cuda')
+        do_train, do_valid, do_test = False, False, False
 
-    torch.distributed.broadcast(flags, 0)
-
-    args.do_train = getattr(args, "do_train", False) or flags[0].item()
-    args.do_valid = getattr(args, "do_valid", False) or flags[1].item()
-    args.do_test = getattr(args, "do_test", False) or flags[2].item()
+    broadcast_data_flags(do_train=do_train, do_valid=do_valid, do_test=do_test)
     return train_dataloader, valid_dataloaders, test_dataloader
 
 
-def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provider):
+def backfill_consumed_samples_from_iteration():
+    """Backward compatibility for checkpoints without consumed-sample counts (fixed batch size)."""
+    cfg = get_run_config()
+    train_state = get_train_state()
+    if train_state.iteration > 0 and train_state.consumed_train_samples == 0:
+        assert (
+            cfg.train.train_samples is None
+        ), 'Only backward compatibility support for iteration-based training'
+
+        train_state.consumed_train_samples = train_state.iteration * cfg.train.global_batch_size
+    if train_state.iteration > 0 and train_state.consumed_valid_samples == 0:
+        # Without eval_interval, no validation runs during training, so none was consumed.
+        if cfg.train.train_samples is None and cfg.validation.eval_interval:
+            effective_start = (
+                cfg.validation.start_eval_at_iter
+                if cfg.validation.start_eval_at_iter is not None
+                else 0
+            )
+            skipped_intervals = effective_start // cfg.validation.eval_interval
+            train_state.consumed_valid_samples = (
+                max(0, train_state.iteration // cfg.validation.eval_interval - skipped_intervals)
+                * cfg.validation.eval_iters
+                * cfg.validation.eval_global_batch_size
+            )
+
+
+def broadcast_data_flags(*, do_train, do_valid, do_test):
+    """Broadcast rank 0's train/valid/test availability flags into the TrainState."""
+    flags = torch.tensor(
+        [int(do_train), int(do_valid), int(do_test)], dtype=torch.long, device='cuda'
+    )
+    torch.distributed.broadcast(flags, 0)
+
+    train_state = get_train_state()
+    train_state.do_train = train_state.do_train or flags[0].item()
+    train_state.do_valid = train_state.do_valid or flags[1].item()
+    train_state.do_test = train_state.do_test or flags[2].item()
+
+
+def build_train_valid_test_data_iterators(
+    build_train_valid_test_datasets_provider, *, build_train_dataloader=True
+):
     """Build pretraining data iterators."""
 
+    cfg = get_run_config()
     args = get_args()
 
     # Build loaders.
     train_dataloader, valid_dataloaders, test_dataloader = build_train_valid_test_data_loaders(
-        build_train_valid_test_datasets_provider
+        build_train_valid_test_datasets_provider, build_train_dataloader=build_train_dataloader
     )
 
     # Build iterators.
@@ -5550,10 +8145,10 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     if valid_dataloaders is not None:
         # when using full validation, we need to override eval iters with the
         # MAX length across DP ranks so all ranks run the same number of steps
-        if args.full_validation:
-            if args.multiple_validation_sets:
+        if cfg.validation.full_validation:
+            if cfg.validation.multiple_validation_sets:
                 if valid_dataloaders[0] is None:
-                    args.eval_iters = [None] * len(valid_dataloaders)
+                    cfg.validation.eval_iters = [None] * len(valid_dataloaders)
                 else:
                     local_eval_iters = [len(dl) for dl in valid_dataloaders]
                     eval_iters_tensor = torch.tensor(
@@ -5564,7 +8159,7 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
                         op=torch.distributed.ReduceOp.MAX,
                         group=mpu.get_data_parallel_group(with_context_parallel=True),
                     )
-                    args.eval_iters = eval_iters_tensor.tolist()
+                    cfg.validation.eval_iters = eval_iters_tensor.tolist()
             else:
                 local_eval_iters = len(valid_dataloaders[0])
                 eval_iters_tensor = torch.tensor(
@@ -5575,18 +8170,18 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
                     op=torch.distributed.ReduceOp.MAX,
                     group=mpu.get_data_parallel_group(with_context_parallel=True),
                 )
-                args.eval_iters = eval_iters_tensor.item()
+                cfg.validation.eval_iters = eval_iters_tensor.item()
 
-        if args.multiple_validation_sets:
+        if cfg.validation.multiple_validation_sets:
             if valid_dataloaders[0] is None:
                 valid_data_iterators = [None] * len(valid_dataloaders)
             else:
-                valid_dl_type = "cyclic" if args.full_validation else dl_type
+                valid_dl_type = "cyclic" if cfg.validation.full_validation else dl_type
                 valid_data_iterators = [
                     _get_iterator(valid_dl_type, dl) for dl in valid_dataloaders
                 ]
         elif valid_dataloaders[0] is not None:
-            valid_dl_type = "cyclic" if args.full_validation else dl_type
+            valid_dl_type = "cyclic" if cfg.validation.full_validation else dl_type
             valid_data_iterators = _get_iterator(valid_dl_type, valid_dataloaders[0])
         else:
             valid_data_iterators = None
@@ -5601,23 +8196,20 @@ def build_train_valid_test_data_iterators(build_train_valid_test_datasets_provid
     return train_data_iterator, valid_data_iterators, test_data_iterator
 
 
-def should_disable_forward_pre_hook(args):
+def should_disable_forward_pre_hook(args, optimizer):
     """Block forward pre-hook for certain configurations."""
-    # Typically, --skip-train is the only thing needed to disable the optimizer.
-    has_normal_optimizer = not args.skip_train
-    # Even with --skip-train, RL still creates an optimizer unless --no-load-optim is set.
-    has_rl_optimizer = args.perform_rl_step and not args.no_load_optim
     # The forward pre-hooks are part of the distributed optimizer's overlapped param-gather;
     # so in order to disable them, we must check that the optimizer actually exists.
-    has_optimizer = has_normal_optimizer or has_rl_optimizer
+    has_optimizer = optimizer is not None
+    cfg = get_run_config()
     return (
-        not args.use_megatron_fsdp
-        and has_optimizer
+        has_optimizer
+        and not cfg.ddp.use_megatron_fsdp
         and (
-            args.use_distributed_optimizer
-            or getattr(args, 'use_layer_wise_distributed_optimizer', False)
+            cfg.optimizer.use_distributed_optimizer
+            or cfg.optimizer.use_layer_wise_distributed_optimizer
         )
-        and args.overlap_param_gather
+        and cfg.optimizer.overlap_param_gather
     )
 
 

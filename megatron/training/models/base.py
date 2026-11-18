@@ -32,11 +32,11 @@ class Serializable(Protocol):
 class ModelConfig:
     """Base class for model configurations.
 
-    Each model type (GPT, T5, Hybrid, etc.) defines a concrete subclass with its
+    Each builder-backed model type (GPT, Hybrid, etc.) defines a concrete subclass with its
     own model-specific parameters. This class is a pure data container - all model
     construction logic lives in the corresponding ``ModelBuilder`` subclass.
 
-    Subclasses must define:
+    Builder-backed subclasses define:
         - ``builder``: a ``ClassVar[str]`` with the full import path to the
           associated ``ModelBuilder`` (e.g.
           ``'megatron.bridge.models.hybrid.HybridModelBuilder'``).
@@ -102,26 +102,13 @@ class ModelConfig:
         - All dataclass fields, including nested dataclasses
         """
 
-        def _as_dict(config):
-            result = {"_target_": f"{config.__class__.__module__}.{config.__class__.__qualname__}"}
-            for f in dataclass_fields(config):
-                value = getattr(config, f.name)
-                # Skip non-serializable fields
-                if (
-                    callable(value)
-                    or f.name.startswith("_")
-                    or f.name in ["pre_wrap_hooks", "post_wrap_hooks"]
-                ):
-                    continue
+        from megatron.training.config.utils import serialize_dataclass
 
-                if is_dataclass(value):
-                    result[f.name] = _as_dict(value)  # recurse on nested dataclasses
-                else:
-                    result[f.name] = value
-
-            return result
-
-        result = _as_dict(self)
+        result = serialize_dataclass(
+            self,
+            skip_fields=frozenset({"pre_wrap_hooks", "post_wrap_hooks"}),
+            encode_callables=True,
+        )
         result["_builder_"] = self.builder  # Serialize the builder path
         return result
 
@@ -130,7 +117,7 @@ class ModelConfig:
         """Deserialize config from dictionary.
 
         Uses _target_ to determine the correct class to instantiate.
-        The builder is restored from _builder_ or from the class's ClassVar.
+        The builder is restored from the required _builder_ entry.
 
         Args:
             data: Dictionary with _target_ and config fields
@@ -155,14 +142,24 @@ class ModelConfig:
                 k: v for k, v in subdata.items() if k in valid_fields and not k.startswith("_")
             }
 
-            # recurse on serialized nested dataclasses
-            subconfigs = {}
-            for k, v in filtered_data.items():
-                if isinstance(v, dict) and "_target_" in v:
-                    subconfigs[k] = _from_dict(v)
-            filtered_data.update(subconfigs)
+            return config_cls(**{key: _from_value(value) for key, value in filtered_data.items()})
 
-            return config_cls(**filtered_data)
+        def _from_value(value):
+            if isinstance(value, dict):
+                if "_target_" in value:
+                    if (
+                        value.get("_call_", True) is False
+                        or value.get("_partial_", False)
+                        or "_args_" in value
+                    ):
+                        from megatron.training.config.instantiate_utils import instantiate
+
+                        return instantiate(value)
+                    return _from_dict(value)
+                return {key: _from_value(item) for key, item in value.items()}
+            if isinstance(value, (list, tuple)):
+                return type(value)(_from_value(item) for item in value)
+            return value
 
         result = _from_dict(data)
         result.builder = data["_builder_"]
@@ -234,6 +231,7 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
+        use_layer_wise_param_layout: bool | None = None,
     ) -> list[ModelT]:
         """Build model stages and wrap for distributed training.
 
@@ -249,6 +247,11 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
                 parameters for the layer-wise distributed optimizer.
+            use_layer_wise_param_layout: Optional LayerWise layout request kept for API
+                parity with main's ModelBuilder path. ``ddp_config.use_layer_wise_param_layout``
+                is the single layout source (True: padded, False: compact). ``None`` defers to
+                it; with DDP and the layer-wise distributed optimizer, an explicit value that
+                disagrees with it raises ``ValueError``.
 
         Returns:
             List of model stages. If the model does not support virtual pipeline parallelism,
@@ -258,7 +261,7 @@ class ModelBuilder(abc.ABC, Generic[ModelT, BuildConfigT]):
 
 
 def compose_hooks(
-    hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]]
+    hooks: list[Callable[[list[MegatronModule]], list[MegatronModule]]],
 ) -> Callable[[list[MegatronModule]], list[MegatronModule]]:
     """Utility to compose pre/post-wrap hooks into a single function, preserving order.
 

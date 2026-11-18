@@ -32,9 +32,9 @@ MODEL_WEIGHTS_NAME = "model_weights.ckpt"
 CHECKPOINT_NEMO_TRANSFORMER_AUDIO_CONFIG_NAME = "nemo_transformer_audio_config.json"
 CHECKPOINT_NEMO_AUDIO_PREPROCESSOR_CONFIG_NAME = "nemo_audio_preprocessor_config.json"
 
-# Encoder _target_s we know map onto the vendored ``transformer_encoder.TransformerEncoder``.
-# ``transformer_encoder_flex`` is parameter-compatible with the non-flex variant for
-# ``attn_mode == "full"`` (FlexAttention only adds attention-mask plumbing, not new params).
+# Encoder _target_s we know map onto one of the checkpoint-compatible vendored
+# Transformer encoders. ``self_attention_model=rope`` selects the RoPE tower;
+# other recognized configs select ``transformer_encoder.TransformerEncoder``.
 _KNOWN_ENCODER_TARGETS = {
     "nemo.collections.asr.modules.TransformerEncoder",
     "nemo.collections.asr.modules.transformer_encoder.TransformerEncoder",
@@ -156,6 +156,21 @@ def resolve_nemo_audio_configs_from_args(
     left_context = getattr(args, "nemo_transformer_audio_left_context", None)
     if left_context is not None:
         encoder_cfg.left_context = None if left_context < 0 else left_context
+    # ``checkpoint`` is the no-override setting: preserve ``causal_mask`` from
+    # the resolved .nemo or JSON config rather than inferring it from weights.
+    causal_mode = getattr(args, "nemo_transformer_audio_causal_mode", "checkpoint")
+    if causal_mode not in ("checkpoint", "causal", "offline"):
+        raise ValueError(
+            "nemo_transformer_audio_causal_mode must be 'checkpoint', 'causal', or 'offline', "
+            f"got {causal_mode!r}"
+        )
+    if causal_mode != "checkpoint":
+        if encoder_cfg.architecture != "rope_transformer":
+            raise ValueError(
+                "Runtime causal/offline selection requires a rope_transformer audio checkpoint; "
+                f"got architecture={encoder_cfg.architecture!r}"
+            )
+        encoder_cfg.causal_mask = causal_mode == "causal"
     encoder_cfg.recompute_layers = bool(getattr(args, "recompute_audio", False))
     return encoder_cfg, preproc_cfg
 
@@ -318,6 +333,17 @@ def _split_audio_configs(
     pre_cfg = dict(cfg["preprocessor"])
     if "causal_mask" not in enc_cfg and enc_cfg.get("attn_mode") == "causal":
         enc_cfg["causal_mask"] = True
+    # The LLM-style NeMo encoder names its input dimension ``feat_in`` and
+    # uses zero-padded frame stacking + fused QKV/RoPE. Keep this compatibility
+    # mapping here so config-only inspection produces the same model shape as
+    # a converted archive.
+    if "n_mels" not in enc_cfg and "feat_in" in enc_cfg:
+        enc_cfg["n_mels"] = enc_cfg["feat_in"]
+    if enc_cfg.get("self_attention_model") == "rope":
+        enc_cfg.setdefault("architecture", "rope_transformer")
+        enc_cfg.setdefault("pre_encode", "stacking")
+        enc_cfg.setdefault("stacking_pad_mode", "zeros")
+        enc_cfg.setdefault("attn_impl", "te")
 
     enc_target = enc_cfg.get("_target_", "")
     pre_target = pre_cfg.get("_target_", "")
@@ -426,8 +452,15 @@ def _validate_encoder_cfg(
         "n_layers",
         "pre_encode",
         "subsampling_factor",
+        "stacking_pad_mode",
         "qk_norm",
         "qkv_bias",
+        "architecture",
+        "self_attention_model",
+        "rope_base",
+        "rotary_fraction",
+        "ff_expansion",
+        "pre_block_norm",
     )
     mismatches = []
     for field in structural:

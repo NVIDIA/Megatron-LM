@@ -8,13 +8,16 @@ replaces dispatch, routed/shared expert computation, and combine.
 
 from __future__ import annotations
 
+from types import MethodType
 from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
 from torch.distributed import ProcessGroup
 
+from megatron.core.activations import situlu
 from megatron.core.transformer.moe.megakernel.backend import MegakernelBackend
+from megatron.core.transformer.moe.megakernel.factory import split_megakernel_backend_config
 from megatron.core.transformer.moe.megakernel.mok.route_adapter import routing_map_to_mok_inputs
 from megatron.core.transformer.moe.megakernel.mok.runtime import _MoKAutograd
 from megatron.core.transformer.moe.megakernel.mok.weights import (
@@ -40,7 +43,7 @@ class MoKMegakernel(MegakernelBackend):
         config: TransformerConfig,
         ep_group: ProcessGroup,
         routed_experts: nn.Module,
-        shared_experts: nn.Module,
+        shared_experts: nn.Module | None,
         num_local_experts: int,
     ) -> None:
         super().__init__()
@@ -51,31 +54,28 @@ class MoKMegakernel(MegakernelBackend):
             from mok.functional import MoKConfig
         except ImportError as exc:
             raise ImportError(
-                "moe_megakernel_backend='mok' requires the latest mixture-of-kittens package "
-                "on PYTHONPATH"
+                "moe_megakernel_backend='mok' requires the MCore integration fork of "
+                "mixture-of-kittens; see the MOK installation instructions in "
+                "megatron/core/transformer/moe/README.md"
             ) from exc
 
-        # TODO: Add a materialized-wgrad adapter before allowing non-fused accumulation.
         if not config.gradient_accumulation_fusion:
             raise ValueError("MOK currently requires gradient_accumulation_fusion=True")
         if config.moe_mlp_glu_interleave_size is not None:
             raise ValueError("MOK requires non-interleaved native MCore routed FC1 weights")
-        if config.moe_shared_expert_glu_interleave_size is not None:
+        if shared_experts is not None and config.moe_shared_expert_glu_interleave_size is not None:
             raise ValueError("MOK requires non-interleaved native shared FC1 weights")
         if config.moe_pad_expert_input_to_capacity:
             raise ValueError(
                 "MOK supports at most moe_router_topk logical routes per token; "
                 "use MOK internal expert padding instead of moe_pad_expert_input_to_capacity"
             )
-        if config.moe_shared_expert_gate:
-            raise ValueError("MOK does not support MCore's optional shared-expert output gate")
-
         self.ep_group = ep_group
         self.num_local_experts = num_local_experts
-        self.hidden_size = config.hidden_size
+        self.hidden_size = config.moe_latent_size or config.hidden_size
         self.intermediate_size = config.moe_ffn_hidden_size
         shared_intermediate_size = config.moe_shared_expert_intermediate_size
-        if shared_intermediate_size != self.intermediate_size:
+        if shared_experts is not None and shared_intermediate_size != self.intermediate_size:
             raise ValueError(
                 "MOK requires routed and shared experts to use the same intermediate "
                 f"size, got routed={self.intermediate_size}, "
@@ -83,22 +83,18 @@ class MoKMegakernel(MegakernelBackend):
             )
         self.topk = config.moe_router_topk
         self.swiglu_limit = config.activation_func_clamp_value
+        self.situ_beta = (
+            (config.situ_glu_beta1, config.situ_glu_beta2)
+            if config.activation_func == situlu
+            else None
+        )
         self.use_mxfp8_weights = bool(
             config.fp8 is not None and config.fp8_recipe == "mxfp8" and config.fp8_param
         )
-        if self.use_mxfp8_weights:
-            from megatron.core import fp8_utils
-
-            if fp8_utils.te_post_all_gather_processing is None:
-                raise RuntimeError(
-                    "MOK MXFP8 requires Transformer Engine with "
-                    "post_all_gather_processing support (normally TE >= 2.10.0). Older TE "
-                    "versions rely on a later TE expert forward to refresh columnwise weights, "
-                    "but MOK bypasses that forward path."
-                )
         self.native_single_grouped_weights = bool(config.moe_single_grouped_weight)
+        _, backend_options = split_megakernel_backend_config(config)
         try:
-            self.mok_config = MoKConfig(**(config.moe_megakernel_backend_config or {}))
+            self.mok_config = MoKConfig(**backend_options)
         except TypeError as exc:
             raise ValueError(f"Invalid MOK option in moe_megakernel_backend_config: {exc}") from exc
 
@@ -143,7 +139,14 @@ class MoKMegakernel(MegakernelBackend):
             self._routed_fc1_parameter_names = tuple(self._routed_fc1_parameter_names)
             self._routed_fc2_parameter_names = tuple(self._routed_fc2_parameter_names)
 
-        self._register_shared_weights(shared_experts)
+        if shared_experts is None:
+            self.register_parameter("shared_fc1_weight", None)
+            self.register_parameter("shared_fc2_weight", None)
+            self.register_parameter("shared_output_gate_weight", None)
+        else:
+            self._register_shared_weights(
+                shared_experts, use_output_gate=config.moe_shared_expert_gate
+            )
 
         # MegatronModule.set_is_first_microbatch discovers this attribute and resets it
         # once per optimizer iteration, matching TE's weight-cache lifecycle.
@@ -175,8 +178,16 @@ class MoKMegakernel(MegakernelBackend):
 
     def main_grad_arguments(self):
         """Return MOK logical main grads and optional per-expert descriptors."""
-        shared_fc1_grad = _main_grad_buffer(self.shared_fc1_weight)
-        shared_fc2_grad = _main_grad_buffer(self.shared_fc2_weight)
+        shared_fc1_grad = (
+            _main_grad_buffer(self.shared_fc1_weight)
+            if self.shared_fc1_weight is not None
+            else None
+        )
+        shared_fc2_grad = (
+            _main_grad_buffer(self.shared_fc2_weight)
+            if self.shared_fc2_weight is not None
+            else None
+        )
         fc1_main_grads = tuple(_main_grad_buffer(param) for param in self.routed_fc1_parameters)
         fc2_main_grads = tuple(_main_grad_buffer(param) for param in self.routed_fc2_parameters)
         main_grads = (shared_fc1_grad, fc1_main_grads[0], shared_fc2_grad, fc2_main_grads[0])
@@ -203,7 +214,7 @@ class MoKMegakernel(MegakernelBackend):
         return tuple(_finish_weight_gradient(param) for param in self.autograd_routed_parameters)
 
     @torch.no_grad()
-    def _register_shared_weights(self, shared: nn.Module) -> None:
+    def _register_shared_weights(self, shared: nn.Module, *, use_output_gate: bool = False) -> None:
         """Validate and alias MCore-owned native BF16 shared weights."""
         fc1_ref = shared.linear_fc1.weight
         fc2_ref = shared.linear_fc2.weight
@@ -234,10 +245,33 @@ class MoKMegakernel(MegakernelBackend):
         # module remains registered and emits the canonical checkpoint entries.
         self.register_parameter("shared_fc1_weight", fc1_ref)
         self.register_parameter("shared_fc2_weight", fc2_ref)
+        output_gate = getattr(shared, "gate_weight", None) if use_output_gate else None
+        if use_output_gate and (
+            not isinstance(output_gate, nn.Parameter)
+            or is_float8tensor(output_gate)
+            or output_gate.dtype != torch.bfloat16
+            or tuple(output_gate.shape) != (1, h)
+            or not output_gate.is_contiguous()
+        ):
+            raise RuntimeError(
+                "MOK shared output gate must be a native contiguous BF16 Parameter "
+                "with shape [1, H]"
+            )
+        # Include the native gate in parameter-gather hooks without adding a
+        # second optimizer parameter or checkpoint entry.
+        self.register_parameter("shared_output_gate_weight", output_gate)
 
     @torch.no_grad()
     def quantized_routed_weights(self):
-        """Build or refresh cached MOK routed-weight views."""
+        """Alias native payloads and refresh the converted scales after parameter sync.
+
+        With overlapped parameter gathering, DDP's pre-hook on our aliases finishes
+        all-gather before forward.
+        Grad-buffer reuse requantizes into TE storage and clears the staging buffer;
+        the MOK payload views reference TE storage, not that temporary buffer.
+        Scale conversion still needs to run after each optimizer update, in place
+        so descriptors keep their addresses. It does not requantize the weights.
+        """
         needs_weight_view_update = self._routed_weight_view_cache is None or (
             self.use_mxfp8_weights and self.is_first_microbatch
         )
@@ -247,42 +281,41 @@ class MoKMegakernel(MegakernelBackend):
                 if self._routed_weight_view_cache is None
                 else self._routed_weight_view_cache
             )
-            if self.native_single_grouped_weights:
-                fc1_weight_view = _native_single_grouped_weight_view(
-                    self.routed_fc1_parameters[0],
-                    num_experts=self.num_local_experts,
-                    rows=2 * self.intermediate_size,
-                    columns=self.hidden_size,
-                    use_mxfp8=self.use_mxfp8_weights,
-                    cached_view=cached_fc1,
-                )
-                fc2_weight_view = _native_single_grouped_weight_view(
-                    self.routed_fc2_parameters[0],
-                    num_experts=self.num_local_experts,
-                    rows=self.hidden_size,
-                    columns=self.intermediate_size,
-                    use_mxfp8=self.use_mxfp8_weights,
-                    cached_view=cached_fc2,
-                )
-            else:
-                fc1_weight_view = _native_split_weight_view(
-                    self.routed_fc1_parameters,
-                    rows=2 * self.intermediate_size,
-                    columns=self.hidden_size,
-                    use_mxfp8=self.use_mxfp8_weights,
-                    cached_view=cached_fc1,
-                )
-                fc2_weight_view = _native_split_weight_view(
-                    self.routed_fc2_parameters,
-                    rows=self.hidden_size,
-                    columns=self.intermediate_size,
-                    use_mxfp8=self.use_mxfp8_weights,
-                    cached_view=cached_fc2,
-                )
+            fc1_weight_view = self._routed_weight_view(
+                self.routed_fc1_parameters,
+                rows=2 * self.intermediate_size,
+                columns=self.hidden_size,
+                cached_view=cached_fc1,
+            )
+            fc2_weight_view = self._routed_weight_view(
+                self.routed_fc2_parameters,
+                rows=self.hidden_size,
+                columns=self.intermediate_size,
+                cached_view=cached_fc2,
+            )
             self._routed_weight_view_cache = (fc1_weight_view, fc2_weight_view)
 
         self.is_first_microbatch = False
         return self._routed_weight_view_cache
+
+    def _routed_weight_view(self, parameters, *, rows, columns, cached_view):
+        """Select the storage adapter using this backend's layout and precision."""
+        if self.native_single_grouped_weights:
+            return _native_single_grouped_weight_view(
+                parameters[0],
+                num_experts=self.num_local_experts,
+                rows=rows,
+                columns=columns,
+                use_mxfp8=self.use_mxfp8_weights,
+                cached_view=cached_view,
+            )
+        return _native_split_weight_view(
+            parameters,
+            rows=rows,
+            columns=columns,
+            use_mxfp8=self.use_mxfp8_weights,
+            cached_view=cached_view,
+        )
 
     # Checkpoint contract: native MCore expert modules own the canonical parameters,
     # optimizer state, and checkpoint shards. This supports regular/distributed
@@ -308,9 +341,56 @@ class MoKMegakernel(MegakernelBackend):
         self._split_main_grad_descriptor_cache = None
         self.is_first_microbatch = True
 
+    def _apply(self, *args, **kwargs):
+        """Preserve externally attached parameter attributes across device/dtype moves.
+
+        The routed/shared weights registered on this module are ALIASES of parameters owned by TE
+        modules (``TEGroupedLinear`` etc.). ``torch.nn.Module._apply`` moves traceable wrapper
+        subclasses (TE quantized tensors such as ``MXFP8Tensor``) with
+        ``torch.utils.swap_tensors``, which exchanges the parameter object's whole ``__dict__``.
+        TE's own modules re-attach the externally attached state afterwards
+        (``TransformerEngineBaseModule._apply``), but this plain module's visit of the *same*
+        object (e.g. during ``model.cuda()``) swaps it again and nothing restores it, so mcore's
+        ``allreduce`` / ``partition_dim`` / ``tensor_model_parallel`` stamps and TE's
+        ``_high_precision_init_val`` are lost. DDP / the layer-wise optimizer then treat the routed
+        experts as data-parallel replicas (grads all-reduced across EP ranks, master weights
+        sharded over dp_cp, identical experts across the EP group). Mirror TE's fix here.
+        """
+        snapshots = {
+            name: (param, dict(param.__dict__))
+            for name, param in self._parameters.items()
+            if param is not None
+        }
+        out = super()._apply(*args, **kwargs)
+        for name, (old_param, attrs) in snapshots.items():
+            new_param = self._parameters.get(name)
+            if new_param is None:
+                continue
+            for key, value in attrs.items():
+                if key in new_param.__dict__:
+                    continue
+                if isinstance(value, MethodType) and value.__self__ is old_param:
+                    value = MethodType(value.__func__, new_param)
+                setattr(new_param, key, value)
+        # Device/dtype conversion invalidates cached storage views and descriptors.
+        self._routed_weight_view_cache = None
+        self._split_main_grad_descriptor_cache = None
+        self.is_first_microbatch = True
+        return out
+
     def forward(
         self, hidden_states: torch.Tensor, probs: torch.Tensor, routing_map: torch.Tensor
     ) -> torch.Tensor:
+        """Run dispatch, routed experts, optional fused shared experts, and combine.
+
+        Args:
+            hidden_states: Input activations of shape ``[..., hidden_size]``.
+            probs: Router probabilities, flattened to ``[num_tokens, num_experts]``.
+            routing_map: Token-to-expert routing map matching ``probs``.
+
+        Returns:
+            MoE output with the same shape as ``hidden_states``.
+        """
         original_shape = hidden_states.shape
         x = hidden_states.reshape(-1, original_shape[-1]).contiguous()
         probs = probs.reshape(x.shape[0], -1)
@@ -325,6 +405,7 @@ class MoKMegakernel(MegakernelBackend):
             x,
             router_weights,
             top_experts,
+            self.shared_output_gate_weight,
             *self.autograd_routed_parameters,
             self.shared_fc1_weight,
             self.shared_fc2_weight,

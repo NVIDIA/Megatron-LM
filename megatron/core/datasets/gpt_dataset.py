@@ -1,9 +1,9 @@
-# Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import logging
 import os
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from math import ceil
 from typing import Dict, Optional, Tuple
 
@@ -60,9 +60,9 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     """
 
     dynamic_context_parallel: bool = False
-    """Option to enable dynamic context parallelism. When setting this to True, 
+    """Option to enable dynamic context parallelism. When setting this to True,
     each sample should be divisible by the data parallel size * context parallel size * 2.
-    If sequence parallel is enabled, it should be divisible by the 
+    If sequence parallel is enabled, it should be divisible by the
     data parallel size * context parallel size * sequence parallel size * 2.
     """
 
@@ -71,14 +71,25 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
        Check --per-dataset-sequences-path
     """
 
-    token_dtype_code: Optional[int] = field(init=False, default=None)
-    """The dtype code for the token ids. 4 for int32, 8 for uint16."""
-
     context_parallel_size: Optional[int] = None
     """The size of the context parallel group. Needed for padding in packed sequences."""
 
+    inter_document_masking: bool = False
+    """When True, return cu_seqlens marking document boundaries within each sample so
+    that attention is restricted to individual documents."""
     sft_mock_dataset_config_json: Optional[str] = None
-    """This config provides the necessary information for the mock dataset."""
+    """JSON string (or path to a JSON file) configuring the mock SFT dataset's
+    sequence-length distribution. Two modes:
+
+      * ``{"mode": "file", "path": "/path/to/seqlens.csv"}`` -- read the
+        per-sample sequence lengths from a CSV file.
+      * ``{"mode": "distribution", "type": "lognormal", "min_seq_len": 1024,
+        "max_seq_len": 8192, "mean_seq_len": 4096, "lognormal_sigma": 1.1}``
+        -- draw lengths from a clipped lognormal distribution.
+
+    Consumed by ``MockSFTLowLevelDataset`` in
+    ``megatron/training/datasets/sft_dataset.py``, which documents the fields.
+    """
 
     varlen_mock_dataset_config_json: Optional[str] = None
     """Mock-dataset config (same JSON schema as ``sft_mock_dataset_config_json``)
@@ -90,21 +101,43 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
     to ``sequence_length`` (no ``cu_seqlens`` / ``original_seq_len`` /
     ``padded_seq_len``), bypassing the packed-sequence path. Used to obtain a
     SBHD reference run that mirrors the THD path's tokenization but skips all
-    packing — useful for THD numerical-correctness validation."""
+    packing — useful for THD numerical-correctness validation.
 
-    inter_document_masking: bool = False
-    """When True, return cu_seqlens marking document boundaries within each sample so
-    that attention is restricted to individual documents."""
+    NOTE: this is a debugging/verification knob, not a training feature.
+    TODO: drop this field once a functional test covers THD-vs-SBHD numerical
+    parity in CI."""
 
-    def __post_init__(self) -> None:
-        """Do asserts and set fields post init"""
-        super().__post_init__()
+    def validate(self) -> None:
+        """Check a complete config: ``validate_without_tokenizer()``, then the tokenizer and what
+        follows from it. Assertions only, idempotent.
 
-        assert self.tokenizer is not None
+        What ``__post_init__`` asserted before: a config can be constructed before its tokenizer
+        exists and completed later, so run this once it is complete
+        (``BlendedMegatronDatasetBuilder`` runs it before building). ``token_dtype_code`` follows
+        from the tokenizer.
+        """
+        super().validate()
 
-        assert self.reset_position_ids is not None
-        assert self.reset_attention_mask is not None
-        assert self.eod_mask_loss is not None
+        assert (
+            self.tokenizer is not None
+        ), "tokenizer must be bound before the config is validated or the datasets are built."
+
+        if self.sequences_per_dataset is not None:
+            assert (
+                self.token_dtype_code is not None
+            ), "Tokenizer vocab size is not set, deactivate --per-dataset-sequences-path or \
+            fix the tokenizer."
+
+    def validate_without_tokenizer(self) -> None:
+        """The checks that need no tokenizer: the base class's, the three masking / loss booleans,
+        and the SBHD / dynamic-CP exclusion.
+        ``validate()`` runs them first; a caller that checks a config before its tokenizer exists
+        runs this alone."""
+        super().validate_without_tokenizer()
+
+        assert self.reset_position_ids is not None, "reset_position_ids must be defined."
+        assert self.reset_attention_mask is not None, "reset_attention_mask must be defined."
+        assert self.eod_mask_loss is not None, "eod_mask_loss must be defined."
 
         if self.varlen_sbhd_validation:
             assert not self.dynamic_context_parallel, (
@@ -112,16 +145,14 @@ class GPTDatasetConfig(BlendedMegatronDatasetConfig):
                 "--dynamic-context-parallel (SBHD mode is not packed)."
             )
 
-        self.token_dtype_code = (
-            None
-            if self.tokenizer.vocab_size is None
-            else (4 if self.tokenizer.vocab_size > numpy.iinfo(numpy.uint16).max + 1 else 8)
-        )
-        if self.sequences_per_dataset is not None:
-            assert (
-                self.token_dtype_code is not None
-            ), "Tokenizer vocab size is not set, deactivate --per-dataset-sequences-path or \
-            fix the tokenizer."
+    @property
+    def token_dtype_code(self) -> Optional[int]:
+        """The dtype code for the token ids, 4 for int32 and 8 for uint16, from the tokenizer's
+        vocabulary size; None without a tokenizer or a vocabulary size."""
+        vocab_size = None if self.tokenizer is None else self.tokenizer.vocab_size
+        if vocab_size is None:
+            return None
+        return 4 if vocab_size > numpy.iinfo(numpy.uint16).max + 1 else 8
 
 
 class GPTDataset(MegatronDataset):
@@ -166,7 +197,7 @@ class GPTDataset(MegatronDataset):
         self.cached_loss_mask = None
         self.cached_position_ids = None
 
-        (self.document_index, self.sample_index, self.shuffle_index) = (
+        self.document_index, self.sample_index, self.shuffle_index = (
             self._build_document_sample_shuffle_indices()
         )
 
@@ -286,7 +317,10 @@ class GPTDataset(MegatronDataset):
             )
             if self.masks_and_position_ids_are_cacheable:
                 self.cached_attention_mask = attention_mask
-                self.cached_loss_mask = loss_mask
+                # Cache a copy: loss_mask is masked in place below, so caching the
+                # tensor itself would bake this sample's padding into every
+                # subsequent sample served by this dataset.
+                self.cached_loss_mask = loss_mask.clone()
                 self.cached_position_ids = position_ids
                 self.masks_and_position_ids_are_cached = True
         else:

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import gc
 import os
 import sys
@@ -18,10 +18,13 @@ from megatron.core.tensor_parallel.random import HAVE_TE, model_parallel_cuda_ma
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.module import float16_to_fp32
 from megatron.core.utils import is_te_min_version, unwrap_model
+from megatron.training.argument_utils import pretrain_cfg_container_from_args
 from megatron.training.arguments import core_transformer_config_from_args, parse_args, validate_args
+from megatron.training.config.training_config import TokenizerConfig
 from megatron.training.global_vars import (
     destroy_global_vars,
     get_args,
+    get_run_config,
     set_args,
     set_global_variables,
 )
@@ -31,9 +34,6 @@ from tests.unit_tests.a2a_overlap.utils import (
     get_valid_token_dispatcher_types,
 )
 from tests.unit_tests.test_utilities import Utils
-
-# Transformer Engine 2.17 aborts in the A2A overlap suite with a pybind11 GIL dec_ref failure.
-pytestmark = pytest.mark.flaky_in_dev
 
 
 def save(fn, message):
@@ -84,6 +84,7 @@ class TestPartialCudaGraphedA2AOverlap:
     ):
         model_parallel_cuda_manual_seed(123)
         args = get_args()
+        cfg_container = get_run_config()
         config = core_transformer_config_from_args(args)
         transformer_layer_spec = layer_spec_fn(
             config,
@@ -100,7 +101,7 @@ class TestPartialCudaGraphedA2AOverlap:
         return GPTModel(
             config=config,
             transformer_layer_spec=transformer_layer_spec,
-            vocab_size=args.vocab_size,
+            vocab_size=cfg_container.tokenizer.vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
             post_process=post_process,
@@ -122,7 +123,6 @@ class TestPartialCudaGraphedA2AOverlap:
         args = parse_args()
         args.num_layers = 1
         args.mtp_num_layers = None
-        args.vocab_size = 1024
         args.hidden_size = 128
         args.num_attention_heads = 8
         args.max_position_embeddings = 512
@@ -167,7 +167,9 @@ class TestPartialCudaGraphedA2AOverlap:
             setattr(args, key, value)
 
         validate_args(args)
-        set_global_variables(args, False)
+        cfg = pretrain_cfg_container_from_args(args)
+        cfg.tokenizer = TokenizerConfig(vocab_size=1024)
+        set_global_variables(args, cfg, build_tokenizer=False)
         return args
 
     def get_batch(self, seq_length, micro_batch_size):
@@ -400,4 +402,31 @@ class TestPartialCudaGraphedA2AOverlap:
             assert torch.equal(loss_list[i].mean(), loss_list_ref[i].mean()), (
                 f"mHC recompute whole-attention overlap diverged from eager at i={i}: "
                 f"{loss_list[i]} vs {loss_list_ref[i]}"
+            )
+
+    @pytest.mark.skipif(
+        not (HAVE_TE and is_te_min_version("2.10.0")),
+        reason="Partial CUDA graph support requires TransformerEngine version >= 2.10.0",
+    )
+    def test_scheduled_tensor_release_with_partial_cudagraph(self):
+        """A stable capture/replay smoke test for scheduled tensor release."""
+
+        extra_kwargs = {"moe_layer_freq": 1, "moe_token_dispatcher_type": "alltoall"}
+        warmup_steps = 2
+        loss_list_ref = self._run_test_helper(2, "none", None, warmup_steps, **extra_kwargs)
+        cuda_graph_modules = [CudaGraphModule.attn, CudaGraphModule.moe_router]
+        loss_list = self._run_test_helper(
+            2,
+            "transformer_engine",
+            cuda_graph_modules,
+            warmup_steps,
+            ep_overlap=True,
+            ep_overlap_use_scheduled_tensor_release=True,
+            **extra_kwargs,
+        )
+
+        assert len(loss_list) == len(loss_list_ref)
+        for i, (loss, loss_ref) in enumerate(zip(loss_list, loss_list_ref)):
+            assert torch.equal(loss.mean(), loss_ref.mean()), (
+                f"scope={cuda_graph_modules}, i={i}, " f"loss={loss}, loss_ref={loss_ref}"
             )

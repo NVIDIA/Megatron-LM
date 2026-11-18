@@ -2,7 +2,7 @@
 
 from pydantic import BaseModel
 
-from ..__init__ import Request
+from .. import Request
 
 
 class LLMChatMessage(BaseModel):
@@ -24,6 +24,4 @@ class InferenceResponse(BaseModel):
     prompt_length: int | None = None
     logprobs: list[float] | None = None
     finish_reason: str
-    policy_epoch: list[tuple[int, int]]
-    kv_cache_epoch: list[tuple[int, int]]
-    num_evictions: int
+    completion_id: str | None = None

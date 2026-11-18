@@ -1,7 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from types import SimpleNamespace
+
 import pytest
 
+from tests.functional_tests.python_test_utils import common
 from tests.functional_tests.python_test_utils.common import (
     ApproximateTest,
     DeterministicTest,
@@ -10,17 +13,28 @@ from tests.functional_tests.python_test_utils.common import (
     NotApproximateError,
     NotDeterminsticError,
     TypeOfTestResult,
+    ValuePrecision,
     _filter_checks,
     pipeline,
+    read_golden_values_from_json,
+    read_tb_logs_as_list,
 )
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 
-def make_metric(values: dict, step_interval: int = 1) -> GoldenValueMetric:
+def make_metric(
+    values: dict,
+    step_interval: int = 1,
+    value_precision: ValuePrecision = ValuePrecision.ROUNDED_5_DECIMAL_PLACES,
+) -> GoldenValueMetric:
     steps = sorted(values)
     return GoldenValueMetric(
-        start_step=steps[0], end_step=steps[-1], step_interval=step_interval, values=values
+        start_step=steps[0],
+        end_step=steps[-1],
+        step_interval=step_interval,
+        value_precision=value_precision,
+        values=values,
     )
 
 
@@ -33,7 +47,80 @@ def run(golden, actual, checks, compare_approximate=False):
     )
 
 
+# ── read_tb_logs_as_list ─────────────────────────────────────────────────────
+
+
+class FakeEventAccumulator:
+    def __init__(self, values):
+        self.values = values
+
+    def Tags(self):
+        return {"scalars": list(self.values)}
+
+    def Scalars(self, metric):
+        return [SimpleNamespace(step=step, value=value) for step, value in self.values[metric]]
+
+
+def test_read_tb_logs_keeps_only_observed_samples(monkeypatch, tmp_path):
+    (tmp_path / "events.out.tfevents.test").touch()
+    accumulator = FakeEventAccumulator(
+        {
+            "iteration-time": [(10, 0.25), (20, 0.26)],
+            "lm loss": [(1, 1.4), (5, 1.3), (10, 1.2), (15, 1.1), (20, 1.0)],
+        }
+    )
+    monkeypatch.setattr(common, "_load_event_accumulators_with_scalars", lambda _: [accumulator])
+
+    result = read_tb_logs_as_list(str(tmp_path), train_iters=20, start_idx=1, step_size=5)
+
+    assert result["iteration-time"].start_step == 10
+    assert result["iteration-time"].end_step == 20
+    assert result["iteration-time"].step_interval == 10
+    assert result["iteration-time"].values == {10: 0.25, 20: 0.26}
+    assert result["lm loss"].start_step == 1
+    assert result["lm loss"].end_step == 20
+    assert result["lm loss"].step_interval == 5
+    assert result["lm loss"].values == {1: 1.4, 5: 1.3, 10: 1.2, 15: 1.1, 20: 1.0}
+
+
+def test_read_tb_logs_preserves_full_precision(monkeypatch, tmp_path):
+    (tmp_path / "events.out.tfevents.test").touch()
+    accumulator = FakeEventAccumulator({"lm loss": [(1, 1.23456789)]})
+    monkeypatch.setattr(common, "_load_event_accumulators_with_scalars", lambda _: [accumulator])
+
+    result = read_tb_logs_as_list(str(tmp_path), train_iters=1, start_idx=1, step_size=5)
+
+    assert result["lm loss"].value_precision == ValuePrecision.FULL
+    assert result["lm loss"].values == {1: 1.23456789}
+
+
+def test_read_tb_logs_skips_metric_without_sampled_values(monkeypatch, tmp_path):
+    (tmp_path / "events.out.tfevents.test").touch()
+    accumulator = FakeEventAccumulator({"iteration-time": [(2, 0.25), (3, 0.26)]})
+    monkeypatch.setattr(common, "_load_event_accumulators_with_scalars", lambda _: [accumulator])
+
+    result = read_tb_logs_as_list(str(tmp_path), train_iters=10, start_idx=1, step_size=5)
+
+    assert result == {}
+
+
+def test_read_tb_logs_rejects_nonpositive_step_size():
+    with pytest.raises(ValueError, match="step_size must be positive"):
+        read_tb_logs_as_list("unused", step_size=0)
+
+
 # ── ApproximateTest ───────────────────────────────────────────────────────────
+
+
+def test_read_golden_values_defaults_to_legacy_precision(tmp_path):
+    golden_path = tmp_path / "golden_values.json"
+    golden_path.write_text(
+        '{"loss": {"start_step": 1, "end_step": 1, "step_interval": 1, "values": {"1": 1.0}}}'
+    )
+
+    result = read_golden_values_from_json(golden_path)
+
+    assert result["loss"].value_precision == ValuePrecision.ROUNDED_5_DECIMAL_PLACES
 
 
 class TestApproximateTest:
@@ -99,6 +186,29 @@ class TestPipelineDeterministic:
         with pytest.raises(AssertionError, match="loss"):
             run({"loss": golden}, {"loss": actual}, {"loss": [DeterministicTest()]})
 
+    def test_legacy_golden_rounds_actual_to_five_decimal_places(self):
+        golden = make_metric({1: 1.23457})
+        actual = make_metric({1: 1.23456789}, value_precision=ValuePrecision.FULL)
+
+        run({"loss": golden}, {"loss": actual}, {"loss": [DeterministicTest()]})
+
+    def test_full_precision_golden_detects_sub_five_decimal_mismatch(self):
+        golden = make_metric({1: 1.23456781}, value_precision=ValuePrecision.FULL)
+        actual = make_metric({1: 1.23456789}, value_precision=ValuePrecision.FULL)
+
+        with pytest.raises(AssertionError, match="loss"):
+            run({"loss": golden}, {"loss": actual}, {"loss": [DeterministicTest()]})
+
+    def test_full_precision_golden_with_short_spelling_detects_one_ulp_mismatch(self):
+        # The explicit FULL marker, not the decimal spelling of the value, selects the
+        # bit-exact comparison: 0.5 vs the next float32 (0.5 + 2**-24) must fail even
+        # though both round to the same five decimals.
+        golden = make_metric({1: 0.5}, value_precision=ValuePrecision.FULL)
+        actual = make_metric({1: 0.5 + 2**-24}, value_precision=ValuePrecision.FULL)
+
+        with pytest.raises(AssertionError, match="loss"):
+            run({"loss": golden}, {"loss": actual}, {"loss": [DeterministicTest()]})
+
     def test_skipped_in_compare_approximate_mode(self):
         # Deterministic checks must be silently skipped when
         # compare_approximate_results=True, even if values differ wildly.
@@ -121,6 +231,12 @@ class TestPipelineApproximate:
         actual = make_metric({1: 1.04, 2: 2.04})  # 4 % < 5 % rtol
         run({"loss": golden}, {"loss": actual}, {"loss": [ApproximateTest(rtol=0.05)]})
 
+    def test_rounds_full_precision_values_to_five_decimal_places(self):
+        golden = make_metric({1: 1.234571}, value_precision=ValuePrecision.FULL)
+        actual = make_metric({1: 1.234574}, value_precision=ValuePrecision.FULL)
+
+        run({"loss": golden}, {"loss": actual}, {"loss": [ApproximateTest(rtol=0, atol=0)]})
+
     def test_outside_rtol_fails(self):
         golden = make_metric({1: 1.0, 2: 2.0})
         actual = make_metric({1: 1.2, 2: 2.4})  # 20 % > 5 % rtol
@@ -139,7 +255,7 @@ class TestPipelineApproximate:
             run({"loss": golden}, {"loss": actual}, {"loss": [ApproximateTest(atol=1, rtol=0)]})
 
     def test_single_bad_step_in_large_run_passes(self):
-        # With 1000 steps: total_steps_evaluated=1001, num_failing_allowed=10.
+        # With 1000 steps: total_steps_evaluated=1000, num_failing_allowed=10.
         # 1 bad step → mean(is_close) = 999/1000 = 0.999, well above threshold.
         n = 1000
         golden = {i: 1.0 for i in range(1, n + 1)}
@@ -161,6 +277,18 @@ class TestPipelineApproximate:
                 {"loss": [ApproximateTest(rtol=0.05)]},
             )
 
+    def test_sparse_failure_budget_uses_observed_value_count(self):
+        golden_values = {1 + index * 10: 1.0 for index in range(200)}
+        actual_values = dict(golden_values)
+        for step in list(actual_values)[:2]:
+            actual_values[step] = 2.0
+
+        run(
+            {"loss": make_metric(golden_values)},
+            {"loss": make_metric(actual_values)},
+            {"loss": [ApproximateTest(rtol=0.05)]},
+        )
+
 
 # ── pipeline — missing metric ─────────────────────────────────────────────────
 
@@ -178,9 +306,9 @@ class TestPipelineMissingMetric:
 class TestPipelineIterationTime:
     def test_uses_median_not_per_step_values(self):
         # Per-step values diverge but medians match — should pass.
-        golden = make_metric({1: 0.25, 2: 0.25, 3: 0.25, 4: 0.25})
+        golden = make_metric({5: 0.25, 10: 0.25, 15: 0.25, 20: 0.25})
         # median([0.10, 0.25, 0.26, 100.0]) = (0.25+0.26)/2 = 0.255 ≈ 0.25 ✓
-        actual = make_metric({1: 0.10, 2: 0.25, 3: 0.26, 4: 100.0})
+        actual = make_metric({5: 0.10, 10: 0.25, 15: 0.26, 20: 100.0})
         run(
             {"iteration-time": golden},
             {"iteration-time": actual},
@@ -188,8 +316,8 @@ class TestPipelineIterationTime:
         )
 
     def test_diverging_medians_fails(self):
-        golden = make_metric({1: 0.25, 2: 0.25, 3: 0.25})
-        actual = make_metric({1: 0.50, 2: 0.50, 3: 0.50})  # median 0.50, 100 % off
+        golden = make_metric({5: 0.25, 10: 0.25, 15: 0.25})
+        actual = make_metric({5: 0.50, 10: 0.50, 15: 0.50})  # median 0.50, 100 % off
         with pytest.raises(AssertionError, match="iteration-time"):
             run(
                 {"iteration-time": golden},
@@ -198,14 +326,52 @@ class TestPipelineIterationTime:
             )
 
     def test_nan_warmup_step_does_not_break_median(self):
-        # Step 1 is "nan" (warm-up). Median of [inf, 0.25, 0.25, 0.25] = 0.25.
-        golden = make_metric({1: "nan", 2: 0.25, 3: 0.25, 4: 0.25})
-        actual = make_metric({1: "nan", 2: 0.25, 3: 0.25, 4: 0.25})
+        # Legacy placeholders are ignored when selecting finite timing samples.
+        golden = make_metric({5: "nan", 10: 0.25, 15: 0.25, 20: 0.25})
+        actual = make_metric({5: "nan", 10: 0.25, 15: 0.25, 20: 0.25})
         run(
             {"iteration-time": golden},
             {"iteration-time": actual},
             {"iteration-time": [ApproximateTest(rtol=0.05)]},
         )
+
+    def test_sparse_values_match_on_observed_steps(self):
+        golden = make_metric({30: 0.25, 40: 0.25}, step_interval=10)
+        actual = make_metric({30: 0.25, 35: "nan", 40: 0.25, 45: "nan"}, step_interval=5)
+        run(
+            {"iteration-time": golden},
+            {"iteration-time": actual},
+            {"iteration-time": [ApproximateTest(rtol=0.05)]},
+        )
+
+    def test_falls_back_to_first_finite_values_after_warmup(self):
+        golden = make_metric({1: "nan", 100: 0.25, 200: 0.25}, step_interval=100)
+        actual = make_metric({100: 0.25, 200: 0.25}, step_interval=100)
+        run(
+            {"iteration-time": golden},
+            {"iteration-time": actual},
+            {"iteration-time": [ApproximateTest(rtol=0.05)]},
+        )
+
+    def test_trailing_legacy_placeholders_do_not_change_short_run_window(self):
+        golden = make_metric(
+            {**{step: 0.25 for step in range(2, 26)}, **{step: "nan" for step in range(26, 51)}}
+        )
+        actual = make_metric({step: 0.25 for step in range(2, 26)})
+        run(
+            {"iteration-time": golden},
+            {"iteration-time": actual},
+            {"iteration-time": [ApproximateTest(rtol=0.05)]},
+        )
+
+    def test_fails_when_no_finite_value_exists_after_warmup(self):
+        metric = make_metric({1: "nan", 5: "nan"}, step_interval=5)
+        with pytest.raises(AssertionError, match="iteration-time"):
+            run(
+                {"iteration-time": metric},
+                {"iteration-time": metric},
+                {"iteration-time": [ApproximateTest(rtol=0.05)]},
+            )
 
 
 # ── pipeline — "nan" string handling ─────────────────────────────────────────
@@ -222,6 +388,17 @@ class TestPipelineNanHandling:
     def test_nan_in_golden_but_not_actual_fails_deterministic(self):
         golden = make_metric({1: 1.0, 2: "nan"})
         actual = make_metric({1: 1.0, 2: 1.0})
+        with pytest.raises(AssertionError):
+            run({"loss": golden}, {"loss": actual}, {"loss": [DeterministicTest()]})
+
+    def test_missing_actual_value_matches_legacy_nan_placeholder(self):
+        golden = make_metric({1: "nan", 5: 1.0}, step_interval=5)
+        actual = make_metric({5: 1.0}, step_interval=5)
+        run({"loss": golden}, {"loss": actual}, {"loss": [DeterministicTest()]})
+
+    def test_missing_actual_value_fails_against_finite_golden(self):
+        golden = make_metric({1: 1.0, 5: 2.0}, step_interval=5)
+        actual = make_metric({5: 2.0}, step_interval=5)
         with pytest.raises(AssertionError):
             run({"loss": golden}, {"loss": actual}, {"loss": [DeterministicTest()]})
 
@@ -259,3 +436,173 @@ class TestPipelineMultipleMetrics:
                 {"loss": [DeterministicTest()], "num-zeros": [DeterministicTest()]},
             )
         assert "num-zeros" in str(exc_info.value)
+
+
+class TestGoldenErrorDiagnostics:
+    def test_reports_absolute_and_relative_extrema_at_their_own_steps(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        golden = make_metric({10: 4.0, 30: -0.01, 60: 0.0}, value_precision=ValuePrecision.FULL)
+        # The observed samples are deliberately stored in a different order.
+        actual = make_metric({60: 0.0, 30: -0.02, 10: 5.0})
+
+        with pytest.raises(AssertionError, match="loss"):
+            run({"loss": golden}, {"loss": actual}, {"loss": [DeterministicTest()]})
+
+        assert "2/3 samples outside tolerance" in caplog.text
+        assert "max_absolute_error at 10: golden=4, actual=5, absolute_error=1" in caplog.text
+        assert "relative_error=0.25 (25%)" in caplog.text
+        assert "max_relative_error at 30:" in caplog.text
+        assert "absolute_error=0.01, relative_error=1 (100%)" in caplog.text
+        assert "allowed_absolute_error=0" in caplog.text
+        assert "first_outside_tolerance" not in caplog.text
+
+    def test_reports_small_difference_that_passes_tolerance(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        run(
+            {"loss": make_metric({5: 1.0})},
+            {"loss": make_metric({5: 1.04})},
+            {"loss": [ApproximateTest(rtol=0.05)]},
+        )
+
+        assert "[APPROXIMATE]: PASSED; 0/1 samples outside tolerance" in caplog.text
+        assert "absolute_error=0.04, relative_error=0.04 (4%)" in caplog.text
+        assert "allowed_absolute_error=0.05" in caplog.text
+
+    @pytest.mark.parametrize("atol,passes", [(1.0, True), (0.25, False)])
+    def test_zero_golden_uses_absolute_tolerance(self, atol, passes, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        args = (
+            {"loss": make_metric({5: 0.0})},
+            {"loss": make_metric({5: 0.5})},
+            {"loss": [ApproximateTest(atol=atol, rtol=0.05)]},
+        )
+        if passes:
+            run(*args)
+        else:
+            with pytest.raises(AssertionError, match="loss"):
+                run(*args)
+
+        assert "absolute_error=0.5, relative_error=n/a (zero golden)" in caplog.text
+        assert "max_relative_error" not in caplog.text
+
+    def test_near_zero_golden_reports_large_relative_error_within_atol(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        run(
+            {"loss": make_metric({5: 0.00001})},
+            {"loss": make_metric({5: 0.00002})},
+            {"loss": [ApproximateTest(atol=0.001, rtol=0)]},
+        )
+
+        assert "[APPROXIMATE]: PASSED" in caplog.text
+        assert "absolute_error=1e-05, relative_error=1 (100%)" in caplog.text
+        assert "allowed_absolute_error=0.001" in caplog.text
+
+    @pytest.mark.parametrize("actual_value", ["nan", float("nan"), float("inf")])
+    def test_nonfinite_values_have_undefined_errors(self, actual_value, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        with pytest.raises(AssertionError, match="loss"):
+            run(
+                {"loss": make_metric({5: 1.0})},
+                {"loss": make_metric({5: actual_value})},
+                {"loss": [DeterministicTest()]},
+            )
+
+        assert "first_outside_tolerance at 5:" in caplog.text
+        assert "absolute_error=n/a (non-finite or missing)" in caplog.text
+        assert "max_absolute_error" not in caplog.text
+
+    def test_missing_sample_is_identified_even_with_finite_extrema(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        with pytest.raises(AssertionError, match="loss"):
+            run(
+                {"loss": make_metric({5: 1.0, 10: 1.0})},
+                {"loss": make_metric({10: 1.25})},
+                {"loss": [DeterministicTest()]},
+            )
+
+        assert "max_absolute_error, max_relative_error at 10:" in caplog.text
+        assert "first_outside_tolerance at 5:" in caplog.text
+        assert "absolute_error=n/a (non-finite or missing)" in caplog.text
+
+    def test_single_sample_extrema_share_one_precision_appropriate_row(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        with pytest.raises(AssertionError):
+            run(
+                {"loss": make_metric({5: 10.83456})},
+                {"loss": make_metric({5: 10.83457})},
+                {"loss": [ApproximateTest(atol=0, rtol=0)]},
+            )
+        assert caplog.text.count(" at 5: golden=") == 1
+        assert "max_absolute_error, max_relative_error at 5:" in caplog.text
+        assert "golden=10.83456, actual=10.83457," in caplog.text
+        assert "Actual values: [10.83457]" in caplog.text
+        assert "Golden values: [10.83456]" in caplog.text
+
+    def test_legacy_golden_placeholder_retains_undefined_diagnostics(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        with pytest.raises(AssertionError):
+            run(
+                {"loss": make_metric({5: "nan", 10: 1.0})},
+                {"loss": make_metric({5: 0.9, 10: 1.0})},
+                {"loss": [DeterministicTest()]},
+            )
+        assert "first_outside_tolerance at 5: golden=inf" in caplog.text
+        assert "absolute_error=n/a (non-finite or missing)" in caplog.text
+
+    def test_full_precision_error_is_not_rounded_away(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        with pytest.raises(AssertionError, match="loss"):
+            run(
+                {"loss": make_metric({5: 0.5}, value_precision=ValuePrecision.FULL)},
+                {"loss": make_metric({5: 0.5 + 2**-24})},
+                {"loss": [DeterministicTest()]},
+            )
+
+        assert "precision=full" in caplog.text
+        assert "absolute_error=5.96046448e-08" in caplog.text
+
+    def test_reports_both_exact_failure_and_approximate_success(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        with pytest.raises(AssertionError, match="loss"):
+            run(
+                {"loss": make_metric({5: 1.0}, value_precision=ValuePrecision.FULL)},
+                {"loss": make_metric({5: 1.01})},
+                {"loss": [DeterministicTest(), ApproximateTest(rtol=0.05)]},
+            )
+
+        assert "[DETERMINISTIC]: FAILED" in caplog.text
+        assert "[APPROXIMATE]: PASSED" in caplog.text
+
+    def test_approximate_failure_budget_is_visible(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        values = {step: 1.0 for step in range(1, 101)}
+        run(
+            {"loss": make_metric(values)},
+            {"loss": make_metric({**values, 100: 999.0})},
+            {"loss": [ApproximateTest(rtol=0.05)]},
+        )
+
+        assert "[APPROXIMATE]: PASSED; 1/100 samples outside tolerance" in caplog.text
+        assert "max_absolute_error, max_relative_error at 100:" in caplog.text
+
+    def test_timing_error_is_labelled_as_a_median(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        with pytest.raises(AssertionError, match="iteration-time"):
+            run(
+                {"iteration-time": make_metric({5: 0.25, 10: 0.25, 15: 0.25})},
+                {"iteration-time": make_metric({5: 0.5, 10: 0.5, 15: 0.5})},
+                {"iteration-time": [ApproximateTest(rtol=0.05)]},
+            )
+
+        assert (
+            "max_absolute_error, max_relative_error at median over steps 5, 10, 15:" in caplog.text
+        )
+        assert "absolute_error=0.25, relative_error=1 (100%)" in caplog.text
+        assert "precision=full" in caplog.text
+
+    def test_matching_values_do_not_emit_error_diagnostics(self, caplog):
+        caplog.set_level("INFO", logger=common.__name__)
+        metric = make_metric({1: 0.0, 5: 1.0})
+        run({"loss": metric}, {"loss": metric}, {"loss": [DeterministicTest()]})
+
+        assert "Golden comparison" not in caplog.text

@@ -16,7 +16,14 @@ from megatron.core.extensions.transformer_engine import (
 )
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
-from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
+from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+    HAVE_DEEPGEMM_BF16,
+    assert_te_supports_batch_invariant_attention,
+    matmul_persistent,
+    mean_batch_invariant,
+    set_batch_invariant_mode,
+    te_supports_batch_invariant_attention,
+)
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import init_method_normal, is_te_min_version
@@ -28,6 +35,59 @@ try:
     HAVE_FA3 = True
 except ImportError:
     HAVE_FA3 = False
+
+try:
+    from flash_attn.cute import flash_attn_varlen_func as _fa4_varlen_func  # noqa: F401
+
+    HAVE_FA4 = True
+except ImportError:
+    HAVE_FA4 = False
+
+# Batch-invariant mode requires an explicit FlashAttention version.
+_BIK_FA_VERSION = 4 if HAVE_FA4 else 3
+requires_te_batch_invariant_attention = pytest.mark.skipif(
+    not te_supports_batch_invariant_attention(),
+    reason="Batch-invariant attention requires TransformerEngine PR #3204 or >= 2.18.",
+)
+
+
+@pytest.mark.parametrize("te_version", ("2.17.0+cb4a45fd", "2.18.0", "2.19.0.dev0"))
+def test_batch_invariant_accepts_compatible_te(monkeypatch, te_version):
+    import transformer_engine
+
+    monkeypatch.setattr(transformer_engine, "__version__", te_version)
+    assert_te_supports_batch_invariant_attention()
+
+
+def test_batch_invariant_rejects_incompatible_te(monkeypatch):
+    import transformer_engine
+
+    monkeypatch.setattr(transformer_engine, "__version__", "2.17.0+deadbeef")
+    with pytest.raises(AssertionError, match="TransformerEngine PR #3204"):
+        assert_te_supports_batch_invariant_attention()
+
+
+@pytest.mark.parametrize("dim", ([], (), None))
+@pytest.mark.parametrize("keepdim", (False, True))
+def test_mean_batch_invariant_full_reduction(dim, keepdim):
+    """An empty (or None) dim list reduces over every dimension, as aten::mean does."""
+    x = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    out = mean_batch_invariant(x, dim, keepdim=keepdim)
+    torch.testing.assert_close(out, x.mean(dim=(0, 1, 2), keepdim=keepdim))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+def test_full_mean_under_batch_invariant_mode():
+    """`x.mean()` / `torch.mean(x)` dispatch to aten::mean.dim with dim=[]."""
+    x = torch.randn(4, 8, device="cuda", requires_grad=True)
+    ref = x.detach().sum() / x.numel()
+    with set_batch_invariant_mode(True):
+        out = x.mean()
+        out_fn = torch.mean(x)
+        out.backward()
+    torch.testing.assert_close(out.detach(), ref)
+    torch.testing.assert_close(out_fn.detach(), ref)
+    torch.testing.assert_close(x.grad, torch.full_like(x, 1.0 / x.numel()))
 
 
 # ============================================================================
@@ -108,6 +168,7 @@ def test_te_column_parallel_linear_batch_invariant_randomized():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
+        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -154,6 +215,7 @@ def test_te_row_parallel_linear_batch_invariant_randomized():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
+        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -200,6 +262,7 @@ def test_te_layernorm_column_parallel_linear_batch_invariant_randomized():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
+        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -246,6 +309,7 @@ def test_te_norm_batch_invariant_randomized():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
+        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -279,6 +343,7 @@ def test_column_parallel_linear_batch_invariant_randomized():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
+        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -315,6 +380,7 @@ def test_column_parallel_linear_batch_invariant_randomized():
     not (is_te_min_version("2.10.0") and HAVE_FA3),
     reason="TE attention BIK tests require TE >= 2.10.0 and FlashAttention-3",
 )
+@requires_te_batch_invariant_attention
 def test_te_attention_layer_batch_invariant_randomized():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
@@ -332,6 +398,7 @@ def test_te_attention_layer_batch_invariant_randomized():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
+        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -422,6 +489,7 @@ def test_te_column_parallel_linear_parity():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
+        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -517,6 +585,7 @@ def test_te_rmsnorm_parity():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
+        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -596,6 +665,7 @@ def test_te_layernorm_linear_parity():
         hidden_dropout=0.0,
         attention_dropout=0.0,
         batch_invariant_mode=True,
+        flash_attention_version=_BIK_FA_VERSION,
         params_dtype=torch.bfloat16,
         normalization="RMSNorm",
         layernorm_epsilon=1e-5,
@@ -689,6 +759,50 @@ def _te_general_gemm(*args, **kwargs):
     return te_general_gemm(*args, **kwargs)
 
 
+@pytest.mark.parametrize("supported", [False, True])
+def test_te_native_device_metadata_workspace(monkeypatch, supported):
+    """Restrict the full-workspace exception and keep graph layouts isolated."""
+    import transformer_engine.pytorch.cpp_extensions.gemm as te_gemm
+
+    if not hasattr(te_gemm, "_get_grouped_cublas_workspace"):
+        # Exercise the compatibility hook even with TE releases predating the
+        # device-metadata API used in production.
+        def _mock_grouped_workspace(device, layout):
+            del layout
+            return torch.empty(
+                te_gemm.get_cublas_workspace_size_bytes(), dtype=torch.uint8, device=device
+            )
+
+        monkeypatch.setattr(
+            te_gemm, "_get_grouped_cublas_workspace", _mock_grouped_workspace, raising=False
+        )
+
+    monkeypatch.setattr(
+        "megatron.core.transformer.custom_layers.batch_invariant_kernels."
+        "te_supports_batch_invariant_grouped_gemm",
+        lambda device: supported,
+    )
+    unrestricted_bytes = te_gemm.get_cublas_workspace_size_bytes()
+    original_grouped_workspace = te_gemm._get_grouped_cublas_workspace
+    with set_batch_invariant_mode(True, backend="te_native"):
+        assert te_gemm.get_cublas_workspace_size_bytes() == 1024
+        device = torch.cuda.current_device()
+        if supported:
+            workspaces = [
+                te_gemm._get_grouped_cublas_workspace(device, layout)
+                for layout in ("TN", "NN", "NT")
+            ]
+            assert all(ws.numel() == unrestricted_bytes for ws in workspaces)
+            assert len({ws.data_ptr() for ws in workspaces}) == 3
+            assert te_gemm._get_grouped_cublas_workspace(device, "TN") is workspaces[0]
+        else:
+            with pytest.raises(RuntimeError, match="moe_use_grouped_tensor=False"):
+                te_gemm._get_grouped_cublas_workspace(device, "TN")
+
+    assert te_gemm._get_grouped_cublas_workspace is original_grouped_workspace
+    assert te_gemm.get_cublas_workspace_size_bytes() == unrestricted_bytes
+
+
 # ============================================================================
 # Numerical Tests for General GEMM
 # ============================================================================
@@ -735,3 +849,45 @@ def test_bik_te_general_gemm_numerical_parity(dtype):
         C_bik = _te_general_gemm(A, B, out_dtype=dtype, layout="TN")[0]
 
     torch.testing.assert_close(C_bik, C_ref, **_tols(dtype))
+
+
+@pytest.mark.parametrize("rows", [1, 4, 8, 32, 64, 96, 127, 128, 129, 160, 192, 224, 255, 256, 257])
+def test_bik_te_general_gemm_triton_strided_weight_is_bit_exact(rows):
+    """A partial M tile and strided weight preserve bits across batch sizes."""
+    torch.manual_seed(193)
+    weight = torch.randn(256, 128, **_device(torch.bfloat16))
+    full_inputs = torch.randn(384, 128, **_device(torch.bfloat16))
+    inputs = full_inputs[:rows].contiguous()
+    pointer = weight.untyped_storage().data_ptr()
+    with set_batch_invariant_mode(True, backend="triton"):
+        expected = matmul_persistent(inputs, weight.transpose(0, 1).contiguous())
+        actual = _te_general_gemm(weight, inputs, out_dtype=torch.bfloat16, layout="TN")[0]
+        full_actual = _te_general_gemm(weight, full_inputs, out_dtype=torch.bfloat16, layout="TN")[
+            0
+        ]
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual, full_actual[:rows])
+    assert weight.untyped_storage().data_ptr() == pointer
+    assert weight.stride(1) == 1
+
+
+@pytest.mark.skipif(not HAVE_DEEPGEMM_BF16, reason="DeepGEMM bf16 bindings are unavailable")
+def test_bik_te_general_gemm_deepgemm_backend_supports_fp32_router():
+    torch.manual_seed(123)
+    M1, M2, K, N = 37, 23, 128, 128
+    A1 = torch.randn(M1, K, **_device(torch.float32))
+    A2 = torch.randn(M2, K, **_device(torch.float32))
+    A = torch.cat([A1, A2], dim=0)
+    B = torch.randn(K, N, **_device(torch.float32))
+
+    with set_batch_invariant_mode(True, backend="deepgemm"):
+        full = _te_general_gemm(A, B, out_dtype=torch.float32, layout="TN")[0]
+        chunks = torch.cat(
+            [
+                _te_general_gemm(A1, B, out_dtype=torch.float32, layout="TN")[0],
+                _te_general_gemm(A2, B, out_dtype=torch.float32, layout="TN")[0],
+            ],
+            dim=1,
+        )
+
+    assert torch.equal(full, chunks)

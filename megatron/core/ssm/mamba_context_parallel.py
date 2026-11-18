@@ -1,5 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
+import copy
 from typing import Optional
 
 import torch
@@ -59,6 +60,7 @@ class MambaContextParallel:
             The A_log parameter which would be used on this tp rank if cp_size was 1
         D_cp1 (torch.Tensor): The D parameter which would be used on this tp rank if cp_size was 1
         D_has_hdim (bool): D parameter is sized to hidden dimension, rather than being per-head
+        sequence_is_contiguous (bool): Whether CP ranks already hold contiguous causal intervals.
     """
 
     def __init__(
@@ -75,6 +77,7 @@ class MambaContextParallel:
         A_log_cp1: torch.Tensor,
         D_cp1: torch.Tensor,
         D_has_hdim: bool,
+        sequence_is_contiguous: bool = False,
     ) -> None:
         if not HAVE_EINOPS:
             raise ImportError("einops is required by the Mamba model but cannot be imported")
@@ -91,24 +94,29 @@ class MambaContextParallel:
         self.A_log_cp1 = A_log_cp1
         self.D_cp1 = D_cp1
         self.D_has_hdim = D_has_hdim
+        self.sequence_is_contiguous = sequence_is_contiguous
 
         self._set_cp_params()
 
     def _set_cp_params(self) -> None:
-        self.cp_size = self.cp_group.size()
+        """Recompute local dimensions after changing the runtime CP group."""
+        self.cp_size = self.cp_group.size() if self.cp_group is not None else 1
 
         if self.cp_size == 1:
+            self.cp_rank = 0
             self.d_inner_local_tpcp = self.d_inner_local_tp
             self.nheads_local_tpcp = self.nheads_local_tp
             self.ngroups_local_tpcp = self.ngroups_local_tp
+            self.group_repeat_count = 1
             return
 
         self.cp_rank = self.cp_group.rank()
 
         # Ensure that each CP rank gets at least one head:
-        assert (
-            self.nheads_local_tp % self.cp_size == 0
-        ), "nheads must be evenly divisible by tp_size * cp_size"
+        assert self.nheads_local_tp % self.cp_size == 0, (
+            f"TP-local head count {self.nheads_local_tp} must be divisible by "
+            f"runtime CP size {self.cp_size}"
+        )
         # Note that an upper-bound on cp_size is nheads // tp_size
         self.nheads_local_tpcp = self.nheads_local_tp // self.cp_size
 
@@ -120,16 +128,18 @@ class MambaContextParallel:
 
         # Ensure that each CP rank gets a positive integer number of groups:
         if self.ngroups_local_tp < self.cp_size:
-            assert (
-                self.cp_size % self.ngroups_local_tp == 0
-            ), "cp_size must be evenly divisible by ngroups/tp_size"
+            assert self.cp_size % self.ngroups_local_tp == 0, (
+                f"runtime CP size {self.cp_size} must be divisible by "
+                f"TP-local group count {self.ngroups_local_tp}"
+            )
             # Need to replicate the group state (shard the heads of each group) across CP ranks:
             self.group_repeat_count = self.cp_size // self.ngroups_local_tp
             self.ngroups_local_tpcp = 1
         else:
-            assert (
-                self.ngroups_local_tp % self.cp_size == 0
-            ), "ngroups must be evenly divisible by tp_size * cp_size"
+            assert self.ngroups_local_tp % self.cp_size == 0, (
+                f"TP-local group count {self.ngroups_local_tp} must be divisible by "
+                f"runtime CP size {self.cp_size}"
+            )
             # Group state is not replicted across CP ranks. All heads for any group are present on
             # one CP rank
             self.group_repeat_count = 1
@@ -144,6 +154,28 @@ class MambaContextParallel:
         """Set the context parallel group."""
         self.cp_group = cp_group
         self._set_cp_params()
+
+    def _set_context_parallel_group(
+        self, cp_group: Optional[torch.distributed.ProcessGroup]
+    ) -> None:
+        """Set the per-microbatch context-parallel group."""
+        self.cp_group = cp_group
+        self._set_cp_params()
+
+    def for_context_parallel_group(
+        self, cp_group: Optional[torch.distributed.ProcessGroup]
+    ) -> "MambaContextParallel":
+        """Return a forward-local view configured for ``cp_group``.
+
+        Parameters are shared with the build-time helper; only the derived CP
+        geometry is copied. This keeps concurrent autograd state independent
+        across microbatches that select different runtime CP sizes.
+        """
+        if cp_group is self.cp_group:
+            return self
+        runtime_view = copy.copy(self)
+        runtime_view._set_context_parallel_group(cp_group)
+        return runtime_view
 
     def pre_conv_ssm(
         self, input_: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
@@ -201,8 +233,8 @@ class MambaContextParallel:
         dt = _all_to_all_cp2hp(dt, self.cp_group)
 
         output = torch.cat([z, x, B, C, dt], dim=-1)
-        # TODO(duncan): for hybrid models, consider isolating load-balancing to attention layers
-        output = _undo_attention_load_balancing(output, self.cp_size, packed_seq_params)
+        if not self.sequence_is_contiguous:
+            output = _undo_attention_load_balancing(output, self.cp_size, packed_seq_params)
 
         return output
 
@@ -212,11 +244,9 @@ class MambaContextParallel:
         """Method to be applied after the convolution and SSM"""
         if self.cp_size == 1:
             return input_
-        else:
-            return _all_to_all_hp2cp(
-                _redo_attention_load_balancing(input_, self.cp_size, packed_seq_params),
-                self.cp_group,
-            )
+        if not self.sequence_is_contiguous:
+            input_ = _redo_attention_load_balancing(input_, self.cp_size, packed_seq_params)
+        return _all_to_all_hp2cp(input_, self.cp_group)
 
     def conv1d(self, input_: torch.Tensor) -> torch.Tensor:
         """

@@ -1,4 +1,4 @@
-# Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import os
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -12,6 +12,7 @@ import torch
 import torch.distributed as dist
 
 from megatron.training.arguments import parse_args
+from tests.unit_tests.test_utilities import sync_checkpoint_config
 
 nvidia_resiliency_ext = pytest.importorskip(
     "nvidia_resiliency_ext",
@@ -94,10 +95,10 @@ class TestLocalCheckpointingReplication:
         Utils.initialize_model_parallel(tp, pp)
 
         mock_args = parse_args(ignore_unknown_args=True)
+        mock_args.save_tokenizer_assets = False
         with (
             mock.patch('megatron.training.checkpointing.get_args', new=lambda: mock_args),
             mock.patch('megatron.training.async_utils.get_args', new=lambda: mock_args),
-            mock.patch("megatron.training.checkpointing.update_num_microbatches"),
         ):
             self.local_ckpt_dir = (
                 root_tmp_dir / "subdir"
@@ -108,6 +109,7 @@ class TestLocalCheckpointingReplication:
             mock_args.non_persistent_local_ckpt_algo = algo
             mock_args.async_save = async_save
             mock_args.ckpt_fully_parallel_save = True  # ensure proper sharding_type is set
+            sync_checkpoint_config(mock_args)
             repl_groups_init = [dist.new_group(g) for g in repl_groups]
             my_process_group = GroupWrapper.from_list_of_groups(repl_groups_init)
             repl_strategy = CliqueReplicationStrategy(my_process_group, target_device="cpu")
@@ -157,6 +159,7 @@ class TestLocalCheckpointingReplication:
                 optimizer,
                 opt_param_scheduler,
                 checkpointing_context=self.checkpointing_context,
+                restore_training_state=True,
             )
             assert iteration == 1
         # Perform cleanup to ensure no side effects on subsequent tests

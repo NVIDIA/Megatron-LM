@@ -51,8 +51,28 @@ def test_modelopt_configs_resolve_specialized_builders():
 
 def test_entrypoints_select_modelopt_configs():
     """Both entrypoints must pass the ModelOpt config class when enabled."""
-    gpt = (ROOT / "pretrain_gpt.py").read_text()
-    hybrid = (ROOT / "pretrain_hybrid.py").read_text()
-    assert "maybe_enable_modelopt(args)" in gpt
-    assert "gpt_config_from_args(args, model_config_cls=ModelOptModelConfig)" in gpt
-    assert "hybrid_config_from_args(args, model_config_cls=ModelOptHybridModelConfig)" in hybrid
+    for path, builder, config_name in (
+        (ENTRYPOINTS[0], "gpt_config_from_args", "ModelOptModelConfig"),
+        (ENTRYPOINTS[1], "hybrid_config_from_args", "ModelOptHybridModelConfig"),
+    ):
+        calls = [
+            node for node in ast.walk(ast.parse(path.read_text())) if isinstance(node, ast.Call)
+        ]
+        assert any(
+            isinstance(call.func, ast.Name) and call.func.id == "maybe_enable_modelopt"
+            for call in calls
+        )
+        assert any(
+            isinstance(call.func, ast.Name)
+            and call.func.id == builder
+            and call.args
+            and isinstance(call.args[0], ast.Name)
+            and call.args[0].id == "args"
+            and any(
+                keyword.arg == "model_config_cls"
+                and isinstance(keyword.value, ast.Name)
+                and keyword.value.id == config_name
+                for keyword in call.keywords
+            )
+            for call in calls
+        )

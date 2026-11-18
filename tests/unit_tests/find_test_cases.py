@@ -9,6 +9,10 @@ from pathlib import Path
 # by the full recipe bucket. Only files carrying the marker are launched.
 PLATFORM_MARKERS = {"gb200": "launch_on_gb200"}
 
+# Match main #8148: the legacy GDN/TE suite owns a GB200 bucket. H100 still
+# exercises dev's GDN headwise/chunkwise and fusion suites in their own buckets.
+PLATFORM_EXCLUSIONS = {"h100": {"tests/unit_tests/ssm/test_gated_delta_net.py"}}
+
 
 def file_has_marker(filepath, marker):
     """Return True if the test file references the given pytest marker.
@@ -77,7 +81,7 @@ def main():
     bucket_files = set(expand_pattern(BUCKET))
 
     # Collect files from child test cases to ignore
-    files_to_ignore = set()
+    files_to_ignore = set(PLATFORM_EXCLUSIONS.get(GPU_TYPE, ()))
     for test_case in all_test_cases:
         if test_case != BUCKET and is_child_of_bucket(test_case, BUCKET):
             files_to_ignore.update(expand_pattern(test_case))

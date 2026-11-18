@@ -1,6 +1,7 @@
-# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import os
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -89,7 +90,9 @@ def test_layerwise_fraction_zero_skips_offload_specific_child_inspection(monkeyp
         FakeWrappedOptimizer,
     )
     monkeypatch.setattr(LayerWiseDistributedOptimizer, "shard_params", fake_shard_params)
-    config = SimpleNamespace(
+    config = OptimizerConfig(
+        optimizer="muon",
+        use_layer_wise_distributed_optimizer=True,
         bf16=True,
         chunked_optimizer_state_offload=True,
         optimizer_state_offload_fraction=0.0,
@@ -97,7 +100,10 @@ def test_layerwise_fraction_zero_skips_offload_specific_child_inspection(monkeyp
         use_layer_wise_param_layout=False,
     )
 
-    optimizer = LayerWiseDistributedOptimizer([object()], config)
+    # The bf16 constructor path marks main params DP-sharded by iterating each
+    # child's param_groups; expose only that attribute so any other child
+    # inspection still fails loudly.
+    optimizer = LayerWiseDistributedOptimizer([SimpleNamespace(param_groups=[])], config)
 
     assert optimizer._managed_optimizer_state_offload_child_indices() == ()
     LayerWiseDistributedOptimizer._before_child_step(optimizer, 0)
@@ -122,7 +128,9 @@ def test_layerwise_offload_rejects_multiple_nonempty_muon_children(monkeypatch):
     raw_optimizers = []
     for _ in range(2):
         raw_optimizer = object.__new__(TensorParallelMuon)
-        raw_optimizer.param_groups = [{"params": [object()]}]
+        # Main #7132 marks bf16 main params during construction, so the stub params need
+        # tensor attributes (requires_grad/type) before the Muon-child schema check runs.
+        raw_optimizer.param_groups = [{"params": [torch.nn.Parameter(torch.empty(1))]}]
         raw_optimizers.append(raw_optimizer)
 
     monkeypatch.setattr(
@@ -130,7 +138,9 @@ def test_layerwise_offload_rejects_multiple_nonempty_muon_children(monkeypatch):
         FakeWrappedOptimizer,
     )
     monkeypatch.setattr(LayerWiseDistributedOptimizer, "shard_params", fake_shard_params)
-    config = SimpleNamespace(
+    config = OptimizerConfig(
+        optimizer="muon",
+        use_layer_wise_distributed_optimizer=True,
         bf16=True,
         chunked_optimizer_state_offload=True,
         optimizer_state_offload_fraction=1.0,
@@ -140,6 +150,53 @@ def test_layerwise_offload_rejects_multiple_nonempty_muon_children(monkeypatch):
 
     with pytest.raises(AssertionError, match="at most one non-empty TensorParallelMuon child"):
         LayerWiseDistributedOptimizer(raw_optimizers, config)
+
+
+def test_layerwise_offload_rejects_padded_param_layout(monkeypatch):
+    """Chunked optimizer-state offload is wired for the compact LayerWise layout only.
+
+    ``OptimizerConfig`` already rejects the padded layout with Muon offload; the optimizer
+    rejects it explicitly as well so a config assembled past ``__post_init__`` cannot reach
+    the offload lifecycle with a layout that has no fp32-master staging point.
+    """
+
+    from megatron.core.optimizer.emerging_optimizers import TensorParallelMuon
+
+    class FakeWrappedOptimizer:
+        def __init__(self, optimizer, config, grad_scaler, init_state_fn):
+            self.optimizer = optimizer
+            self.config = config
+            self.fp32_from_float16_groups = [[]]
+            self._optimizer_state_offloader = None
+
+    def fake_shard_params(self, optimizers, full_param_layouts=None, model_chunks=None):
+        self.dp_cp_params_list = []
+        self.expt_dp_params_list = []
+
+    raw_optimizer = object.__new__(TensorParallelMuon)
+    # Main #7132 marks bf16 main params during construction, so the stub param needs
+    # tensor attributes (requires_grad/type) before the padded-layout check runs.
+    raw_optimizer.param_groups = [{"params": [torch.nn.Parameter(torch.empty(1))]}]
+
+    monkeypatch.setattr(
+        "megatron.core.optimizer.layer_wise_optimizer.Float16OptimizerWithFloat16Params",
+        FakeWrappedOptimizer,
+    )
+    monkeypatch.setattr(LayerWiseDistributedOptimizer, "shard_params", fake_shard_params)
+    config = OptimizerConfig(
+        optimizer="muon",
+        use_layer_wise_distributed_optimizer=True,
+        bf16=True,
+        chunked_optimizer_state_offload=True,
+        optimizer_state_offload_fraction=1.0,
+        overlap_param_gather=False,
+        use_layer_wise_param_layout=False,
+    )
+    # Flip the layout after construction: __post_init__ rejects the combination itself.
+    config.use_layer_wise_param_layout = True
+
+    with pytest.raises(ValueError, match="requires the compact LayerWise layout"):
+        LayerWiseDistributedOptimizer([raw_optimizer], config)
 
 
 def test_layerwise_param_sync_subset_excludes_distopt_buckets():
@@ -189,7 +246,9 @@ def test_layerwise_prefetches_single_managed_child_state():
 
     def child(name, managed):
         return SimpleNamespace(
-            _optimizer_state_offloader=object() if managed else None,
+            _optimizer_state_offloader=(
+                SimpleNamespace(staging_pool=SimpleNamespace(hold=nullcontext)) if managed else None
+            ),
             prefetch_optimizer_master_weights_for_step=lambda: events.append(f"master:{name}"),
             prefetch_optimizer_state_for_step=lambda: events.append(f"state:{name}"),
             step_with_ready_grads=lambda: events.append(f"step:{name}") or True,
@@ -211,6 +270,67 @@ def test_layerwise_prefetches_single_managed_child_state():
     events.clear()
     assert optimizer._step()
     assert events == ["state:b", "step:a", "step:b", "step:c"]
+
+
+class _FakeLayerwiseBucket:
+    def __init__(self, params):
+        self.params_list = params
+        self.params = set(params)
+        self.layerwise_params_list = None
+        self.layerwise_param_flat_sizes = None
+
+    def set_layerwise_params_list(self, layerwise_params_list):
+        self.layerwise_params_list = layerwise_params_list
+        self.layerwise_param_flat_sizes = [
+            sum(param.numel() for param in param_list) for param_list in layerwise_params_list
+        ]
+
+
+class _FakeBucketGroup:
+    def __init__(self, buckets):
+        self.buckets = buckets
+
+
+class _FakeModelChunk:
+    def __init__(self, bucket):
+        self.bucket_groups = [_FakeBucketGroup([bucket])]
+        self.expert_parallel_bucket_groups = []
+
+
+def test_set_bucket_layerwise_params_list_single_dp_rank():
+    """Single-DP-rank LayerWise buckets should still receive param lists.
+
+    Regression for #5203: shard_params() sets dp_cp_params_list to None when
+    dp_cp_size == 1, but set_bucket_layerwise_params_list() still needs to
+    initialize bucket.layerwise_params_list for the overlap param-gather path.
+    """
+    params = [torch.nn.Parameter(torch.empty(4, 4)), torch.nn.Parameter(torch.empty(2, 2))]
+    for param in params:
+        param.is_managed_by_layer_wise_optimizer = True
+    bucket = _FakeLayerwiseBucket(params)
+
+    optimizer = object.__new__(LayerWiseDistributedOptimizer)
+    optimizer.pg_collection = ProcessGroupCollection(dp_cp=None, expt_dp=None)
+    optimizer.dp_cp_params_list = None
+    optimizer.expt_dp_params_list = None
+
+    optimizer.set_bucket_layerwise_params_list([_FakeModelChunk(bucket)])
+
+    assert bucket.layerwise_params_list == [params]
+    assert bucket.layerwise_param_flat_sizes == [sum(param.numel() for param in params)]
+
+
+class MuonExcludedMatrixModel(nn.Module):
+    """Model with a 2D matrix explicitly routed to the scalar optimizer."""
+
+    def __init__(self):
+        super().__init__()
+        self.scalar = nn.Linear(10, 8)
+        self.muon = nn.Linear(8, 5)
+        self.scalar.weight.use_muon = False
+
+    def forward(self, x):
+        return self.muon(F.relu(self.scalar(x)))
 
 
 @pytest.mark.skipif(
@@ -313,6 +433,7 @@ class TestLayerWiseOptimizer:
         model_kwargs=None,
         copy_from=None,
         overlap_param_gather=True,
+        optimizer_overlap_param_gather=None,
         grad_reduce_in_fp32=False,
         bucket_size=None,
         use_param_layout=False,
@@ -329,6 +450,8 @@ class TestLayerWiseOptimizer:
             model_kwargs: Optional kwargs for model initialization
             copy_from: Optional DDP model to copy weights from
             overlap_param_gather: If True, defer param all-gather to bucket infrastructure
+            optimizer_overlap_param_gather: Optional conflicting OptimizerConfig value used to
+                verify that the DDP config remains authoritative. Defaults to the DDP value.
             grad_reduce_in_fp32: If True, reduce grads in fp32 (regression test for dtype fix)
             bucket_size: Maximum number of parameters per bucket (None = single bucket)
             use_param_layout: If True, supply DDP a precomputed shard-aligned
@@ -380,6 +503,9 @@ class TestLayerWiseOptimizer:
         else:
             model.broadcast_params()
 
+        if optimizer_overlap_param_gather is None:
+            optimizer_overlap_param_gather = overlap_param_gather
+
         optimizer_config = OptimizerConfig(
             optimizer='muon',
             lr=0.01,
@@ -387,7 +513,7 @@ class TestLayerWiseOptimizer:
             bf16=True,
             use_distributed_optimizer=False,
             clip_grad=clip_grad,
-            overlap_param_gather=overlap_param_gather,
+            overlap_param_gather=optimizer_overlap_param_gather,
             muon_tp_mode="duplicated",
             use_layer_wise_distributed_optimizer=True,
         )
@@ -420,6 +546,38 @@ class TestLayerWiseOptimizer:
         # Verify basic properties
         assert optimizer is not None, "Optimizer should not be None"
         assert hasattr(optimizer, 'chained_optimizers'), "Should be a ChainedOptimizer"
+        layer_wise_optimizer = (
+            optimizer
+            if isinstance(optimizer, LayerWiseDistributedOptimizer)
+            else next(
+                sub_optimizer
+                for sub_optimizer in optimizer.chained_optimizers
+                if isinstance(sub_optimizer, LayerWiseDistributedOptimizer)
+            )
+        )
+        assert layer_wise_optimizer.grad_stats_parallel_group is pg_collection.intra_dist_opt
+        for sub_optimizer in layer_wise_optimizer.chained_optimizers:
+            assert sub_optimizer.grad_stats_parallel_group is pg_collection.intra_dist_opt
+
+        if use_param_layout:
+            # AdamW siblings use DistOpt, but compact Muon buffers do not. The model's
+            # flag must not send LayerWise params through those sibling bucket gathers.
+            assert model.ddp_config.use_distributed_optimizer
+            layerwise_groups = [
+                group
+                for group in model.bucket_groups + model.expert_parallel_bucket_groups
+                if any(
+                    getattr(param, "is_managed_by_layer_wise_optimizer", False)
+                    for bucket in group.buckets
+                    for param in bucket.params_list
+                )
+            ]
+            assert layerwise_groups
+            assert all(
+                not group.ddp_config.param_sync_via_bucket_group for group in layerwise_groups
+            )
+            assert not layer_wise_optimizer.use_buffer_param_sync
+            assert not layer_wise_optimizer.layerwise_param_sync_via_bucket_group
 
         reference_model = self.create_reference_model(model)
 
@@ -565,6 +723,27 @@ class TestLayerWiseOptimizer:
         if len(managers) >= 2:
             assert len({id(manager.transfer_streams[0]) for manager in managers}) == 1
             assert len({id(manager.transfer_streams[1]) for manager in managers}) == 1
+
+    def test_explicit_muon_exclusion_updates_with_param_layout(self):
+        """An excluded 2D matrix is updated and synchronized by the scalar DistOpt."""
+        model, optimizer, pg_collection = self.create_model_and_optimizer(
+            model_class=MuonExcludedMatrixModel, use_param_layout=True
+        )
+        excluded_weight = model.module.scalar.weight
+        initial_weight = excluded_weight.detach().clone()
+
+        output = model(torch.randn(16, 10, dtype=torch.bfloat16, device='cuda'))
+        output.sum().backward()
+        update_successful, _, _ = optimizer.step()
+
+        assert update_successful
+        assert not torch.equal(excluded_weight, initial_weight)
+
+        dp_size = get_pg_size(pg_collection.dp_cp)
+        gathered = [torch.empty_like(excluded_weight) for _ in range(dp_size)]
+        torch.distributed.all_gather(gathered, excluded_weight, group=pg_collection.dp_cp)
+        for replica in gathered[1:]:
+            torch.testing.assert_close(gathered[0], replica, rtol=0, atol=0)
 
     def test_get_grad_norm(self):
         """Test LayerWiseDistributedOptimizer gradient norm computation."""
@@ -714,6 +893,29 @@ class TestLayerWiseOptimizer:
 
         assert update_successful, "Optimizer step should be successful"
 
+    def test_bf16_wrapper_uses_preserved_high_precision_initializer(self):
+        """FP32 masters must not be initialized from an already-quantized model weight."""
+        model_param = torch.nn.Parameter(
+            torch.full((2, 2), -1.0, dtype=torch.bfloat16, device='cuda')
+        )
+        preserved_init = torch.full((2, 2), 1.25, dtype=torch.bfloat16)
+        init_state = {'value': preserved_init}
+        model_param.get_high_precision_init_val = lambda: init_state['value']
+        model_param.clear_high_precision_init_val = lambda: init_state.update(value=None)
+
+        base_optimizer = torch.optim.SGD([model_param], lr=0.1)
+        wrapped_optimizer = Float16OptimizerWithFloat16Params(
+            base_optimizer,
+            OptimizerConfig(optimizer='sgd', lr=0.1, bf16=True),
+            None,
+            lambda opt, config: None,
+        )
+
+        main_param = wrapped_optimizer.fp32_from_float16_groups[0][0]
+        torch.testing.assert_close(main_param, preserved_init.cuda().float(), rtol=0, atol=0)
+        assert init_state['value'] is None
+        assert model_param.main_param is main_param
+
     def test_bf16_error(self):
         """Test LayerWiseDistributedOptimizer raises error when receiving pre-wrapped Float16 optimizer."""
         model = SimpleModel().bfloat16().cuda()
@@ -848,6 +1050,33 @@ class TestLayerWiseOptimizer:
             torch.testing.assert_close(param.data, ref_param.data, rtol=0, atol=0)
 
     # ---- Overlap-param-gather tests ----
+
+    @pytest.mark.parametrize('use_param_layout', [False, True])
+    @pytest.mark.parametrize(
+        ('ddp_overlap_param_gather', 'optimizer_overlap_param_gather'),
+        [(False, True), (True, False)],
+    )
+    def test_overlap_param_gather_follows_ddp_config(
+        self, use_param_layout, ddp_overlap_param_gather, optimizer_overlap_param_gather
+    ):
+        """DDP's per-model overlap policy must override the global optimizer value."""
+        model, optimizer, _ = self.create_model_and_optimizer_with_overlap_param_gather(
+            overlap_param_gather=ddp_overlap_param_gather,
+            optimizer_overlap_param_gather=optimizer_overlap_param_gather,
+            use_param_layout=use_param_layout,
+        )
+
+        layer_wise_optimizer = next(
+            (
+                sub_optimizer
+                for sub_optimizer in getattr(optimizer, 'chained_optimizers', [optimizer])
+                if isinstance(sub_optimizer, LayerWiseDistributedOptimizer)
+            ),
+            optimizer,
+        )
+
+        assert layer_wise_optimizer.ddp_config is model.ddp_config
+        assert layer_wise_optimizer.overlap_param_gather == ddp_overlap_param_gather
 
     @pytest.mark.parametrize('use_param_layout', [False, True])
     def test_overlap_param_gather_basic(self, use_param_layout):

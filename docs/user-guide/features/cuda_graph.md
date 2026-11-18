@@ -12,7 +12,7 @@
 CUDA Graphs reduce kernel-launch overhead by recording GPU operations once and replaying the recording on subsequent iterations. Megatron-LM provides three CUDA graph implementations controlled by `--cuda-graph-impl`.
 
 For implementation background and design details, see NVIDIA's
-[Transformer Engine and Megatron-LM CUDA Graph Support](https://docs.nvidia.com/dl-cuda-graph/torch-cuda-graph/te-megatron-cuda-graphs.html).
+[Transformer Engine and Megatron-LM CUDA Graph Support](https://docs.nvidia.com/dl-cuda-graph/latest/torch-cuda-graph/te-megatron-cuda-graphs.html).
 That article is a useful conceptual reference, but some examples there still use older flags such as
 `--enable-cuda-graph` or `--cuda-graph-scope full_iteration`; in this repository, prefer
 `--cuda-graph-impl local|transformer_engine|full_iteration` as documented below.
@@ -99,6 +99,21 @@ wired into custom training loops. The trade-off is that it requires more manual 
 Megatron-LM's stock training loop already wires these calls in `megatron/training/training.py`,
 but custom training scripts must do the same work themselves.
 
+For scheduler-produced THD batches, use `--use-varlen-dataset`,
+`--sequence-packing-scheduler dp_balanced`, `--cuda-graph-modules attn`,
+`--pad-packed-seq-alignment max`, and an explicit `--cuda-graph-thd-max-packed-sequences`. The metadata capacity includes one
+reserved dummy document for token padding. `--max-seqlen-per-dp-cp-rank` sets the
+fixed local token capacity; the source global batch size and micro-batch size 1
+must stay fixed. PP/VPP automatically keeps graph inputs alive until their
+corresponding backward even when packing reduces the number of microbatches.
+Source-batch ramp-up is unsupported: `--step-batch-size-schedule`
+is rejected for this path, and the deprecated `--rampup-batch-size` is ignored by
+the microbatch calculator. Increasing the source batch would require recapturing
+the graphs with a new capacity. Dynamic CP, EP communication overlap, delayed
+wgrad, and paged stash are outside this path. mHC wrappers and attention graph
+splitting require their separate graph integrations; these packing options do
+not enable mHC capture by themselves.
+
 ### Usage
 
 ```bash
@@ -109,6 +124,46 @@ but custom training scripts must do the same work themselves.
 The same training `--cuda-graph-modules` options apply as for `local`, and the default is likewise
 whole-layer training capture when the flag is omitted.
 
+### mHC Attention Split
+
+For mHC selective recompute, `--mhc-recompute-attn-cuda-graph-split` keeps mHC aggregation and
+BDA eager and captures only the input norm and attention. The producer writes directly into
+the graph's single-stream `[s, b, C]` input, including during backward recomputation, instead
+of capturing the whole mHC attention range with an `[s, b, n*C]` input.
+
+This supports GPT mHC layers and HybridStack attention-only mHC wrappers. Hybrid MLP/MoE
+and Mamba layers remain eager under the required `attn`-only scope. On MLA models,
+`mla_up_proj` recompute can be combined with `mhc`; its checkpoint stays inside the
+attention graph:
+
+```bash
+--enable-hyper-connections \
+--recompute-granularity selective \
+--recompute-modules mhc mla_up_proj \
+--cuda-graph-impl transformer_engine \
+--cuda-graph-modules attn \
+--mhc-recompute-attn-cuda-graph-split
+```
+
+Omit `mla_up_proj` for non-MLA models or when only mHC recompute is needed. Packed (THD)
+sequences are supported with the ordinary TE graph packing configuration: a
+`sequence_packing_scheduler`, `max_seqlen_per_dp_cp_rank`, `thd_max_packed_sequences`, and
+fixed padding via `pad_packed_seq_alignment=max`. The split forwards the packed sequence
+tensors and padding mask on every replay; eager MLP/MoE still receives the original metadata.
+
+The split does not support cross-attention or fine-grained offloading of `qkv_linear`,
+`core_attn`, and `attn_proj`. Hybrid wrappers must not combine attention and MLP in the same
+inner layer. Graph capacities and the attention backend's existing THD/CP constraints still apply.
+
+**DSA compact-indexer workspace.** With CUDA graphs the fused compact DSA indexer (`--dsa-kernel-backend cudnn`,
+`--dsa-indexer-precision mxfp8`) keeps a persistent workspace per static geometry: the MXFP8 q/k quantization
+destinations, packed scales and candidate offsets have to be prepared in eager warm-up because their sizing
+synchronises with the host. By default all CSA layers built from one model config share one workspace per geometry
+and balanced-indexer slot (`dsa_compact_indexer_workspace_sharing`); the layers of a graph run serially and nothing in
+the workspace outlives the indexer dispatch that fills it, so sharing removes only duplicates (one workspace per layer
+costs ~7 GiB per rank on DSv4 at 16K tokens per rank). `--no-dsa-compact-indexer-workspace-sharing` restores
+per-layer workspaces.
+
 ---
 
 ## Full-Iteration Training CUDA Graph (`--cuda-graph-impl full_iteration`)
@@ -117,21 +172,32 @@ Captures the entire training iteration (excluding optimizer) as a single CUDA gr
 wrapper is also used for training-loop validation/eval in forward-only mode. This provides the
 largest training/validation latency reduction.
 
+With an eager optimizer, full-iteration training captures model-to-optimizer gradient conversion
+in the forward/backward graph's memory pool. The distributed optimizer and the layer-wise
+mixed-precision optimizer can reuse completed forward/backward scratch for FP32 gradients.
+Replay order must remain forward/backward, gradient conversion, then optimizer update.
+The converted values are valid until the next forward/backward replay; gradient addresses must
+remain stable. Resetting the training graph also invalidates the conversion graph.
+
+This conversion graph is disabled with `--optimizer-cuda-graph`, which captures the optimizer
+step itself. CPU-offloaded and Megatron-FSDP optimizer paths are unchanged, as is the distributed
+precision-aware optimizer path that already aliases model gradients.
+
 This implementation does not create inference CUDA graphs. For inference, use
 `--cuda-graph-impl local --inference-cuda-graph-scope layer|block`.
 
 ### Requirements
 
-- `--no-check-for-nan-in-loss-and-grad` is required: NaN checks involve CPU-GPU synchronization
-  which cannot run inside a CUDA graph.
+- Loss and gradient checks remain enabled. Values passed to the rerun state machine during
+  capture are snapshotted at their validation sites. Host-side checks run after each replay,
+  before the training loop decides whether to rerun or update the optimizer.
 - `--cuda-graph-modules` must be omitted (or left empty): per-module selection has no meaning
   when the entire iteration is captured as a single graph.
 
 ### Example
 
 ```bash
---cuda-graph-impl full_iteration \
---no-check-for-nan-in-loss-and-grad
+--cuda-graph-impl full_iteration
 ```
 
 ---
@@ -152,8 +218,7 @@ All three implementations work for dense models:
 # equivalent: --cuda-graph-impl transformer_engine --cuda-graph-modules attn mlp
 
 # Full-iteration
---cuda-graph-impl full_iteration \
---no-check-for-nan-in-loss-and-grad
+--cuda-graph-impl full_iteration
 ```
 
 ### MoE Model Training
@@ -173,7 +238,6 @@ models as well:
 
 ```bash
 --cuda-graph-impl full_iteration \
---no-check-for-nan-in-loss-and-grad \
 --moe-flex-dispatcher-backend hybridep \
 --use-transformer-engine-op-fuser \
 --moe-expert-rank-capacity-factor <float> \
@@ -192,7 +256,7 @@ models as well:
   `--cuda-graph-impl local`. Use `--inference-cuda-graph-scope layer|block` with
   `local`; all other implementations must set `--inference-cuda-graph-scope none`,
   meaning inference runs in eager mode.
-- Background reference: [Transformer Engine and Megatron-LM CUDA Graph Support](https://docs.nvidia.com/dl-cuda-graph/torch-cuda-graph/te-megatron-cuda-graphs.html),
+- Background reference: [Transformer Engine and Megatron-LM CUDA Graph Support](https://docs.nvidia.com/dl-cuda-graph/latest/torch-cuda-graph/te-megatron-cuda-graphs.html),
   which also covers PyTorch CUDA Graph best practices and lessons learned.
 
 ---

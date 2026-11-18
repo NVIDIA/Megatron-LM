@@ -42,6 +42,7 @@ def _append_kv_cache_kernel(
     n_tokens: tl.int32,
     num_heads: tl.int32,
     H_DIM: tl.int32,
+    dummy_block_idx: tl.int32,
     # --- Compile-Time Constants ---
     BLOCK_SIZE_H: tl.constexpr,
 ):
@@ -64,7 +65,9 @@ def _append_kv_cache_kernel(
         return
 
     # --- Load destination indices for the current token ---
-    block_idx = tl.load(block_idx_ptr + token_idx)
+    # int64: block_idx * stride_cache_block can exceed 2^31 elements on large pools, and an
+    # int32 product would wrap to a wrong block when the caller passes int32 block ids.
+    block_idx = tl.load(block_idx_ptr + token_idx).to(tl.int64)
     local_pos = tl.load(local_kv_seq_idx_ptr + token_idx)
 
     # --- Load the key and value data for the current head of the current token ---
@@ -86,8 +89,11 @@ def _append_kv_cache_kernel(
     value_dest_ptr = value_cache_ptr + dest_offset
 
     # --- Store the head data into the cache ---
-    tl.store(key_dest_ptr + offs_h * stride_cache_hdim, key_to_write, mask=mask_h)
-    tl.store(value_dest_ptr + offs_h * stride_cache_hdim, value_to_write, mask=mask_h)
+    # Tokens routed to the dummy block are padding or recomputed prefix; drop their
+    # stores rather than spend bandwidth on a scratch block nothing reads.
+    write_mask = mask_h & (block_idx != dummy_block_idx)
+    tl.store(key_dest_ptr + offs_h * stride_cache_hdim, key_to_write, mask=write_mask)
+    tl.store(value_dest_ptr + offs_h * stride_cache_hdim, value_to_write, mask=write_mask)
 
 
 def triton_append_key_value_cache(
@@ -98,6 +104,7 @@ def triton_append_key_value_cache(
     padded_active_token_count: int,
     token_to_block_idx: Tensor,
     token_to_local_position_within_kv_block: Tensor,
+    dummy_block_idx: int,
 ) -> None:
     """
     Append to KV cache using a high-performance, standalone Triton kernel.
@@ -112,6 +119,7 @@ def triton_append_key_value_cache(
         the cache.
         token_to_local_position_within_kv_block (Tensor): Tensor mapping token index
         to its position within a block.
+        dummy_block_idx (int): Sentinel block index whose writes are skipped.
     """
     # --- Input Validation and Preparation ---
     assert (
@@ -182,6 +190,7 @@ def triton_append_key_value_cache(
         n_tokens=n_tokens,
         num_heads=num_heads,
         H_DIM=h_dim,
+        dummy_block_idx=dummy_block_idx,
         # Compile-time constant
         BLOCK_SIZE_H=BLOCK_SIZE_H,
     )

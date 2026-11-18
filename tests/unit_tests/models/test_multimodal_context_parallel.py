@@ -8,7 +8,9 @@ import torch
 
 from megatron.core.models.multimodal.context_parallel import (
     GatherFromContextParallelRanks,
+    _compute_token_balanced_split_points,
     _compute_tubelet_aware_split_points,
+    _partition_contiguous_weights,
     _split_num_frames,
     gather_from_context_parallel_ranks,
     gather_from_context_parallel_ranks_dynamic_res,
@@ -64,9 +66,6 @@ class TestComputeTubeletAwareSplitPoints:
             ([8, 8], 8, 2),
             # Mixed-length videos across many cp ranks.
             ([8, 4, 12], 4, 4),
-            # Single short video (1 tubelet) with cp_size=2 (triggers the
-            # num_tubelets<=1 branch that snaps to media_start or media_end).
-            ([4], 4, 2),
             # Temporal patch size 1 degenerates to frame-granular splits.
             ([10], 1, 5),
         ],
@@ -101,15 +100,14 @@ class TestComputeTubeletAwareSplitPoints:
         assert split_points == [0, 4, 6]
 
     @pytest.mark.internal
-    def test_monotonicity_is_enforced(self):
-        # A pathological case where the raw target-based split would go
-        # backwards; the implementation must clamp to the previous split.
-        # 3 frames total, T=2, cp=3, num_tubelets=2 on the only media.
-        # Every interior rank must still produce a monotone sequence.
-        split_points = _compute_tubelet_aware_split_points([3], 2, 3, 3)
-        assert split_points[0] == 0
-        assert split_points[-1] == 3
-        assert all(split_points[i] <= split_points[i + 1] for i in range(3))
+    def test_every_rank_receives_at_least_one_tubelet(self):
+        split_points = _compute_tubelet_aware_split_points([9, 1], 4, 4, 10)
+        assert split_points == [0, 4, 8, 9, 10]
+
+    @pytest.mark.internal
+    def test_requires_padding_when_there_are_too_few_tubelets(self):
+        with pytest.raises(ValueError, match="after padding"):
+            _compute_tubelet_aware_split_points([3], 2, 3, 3)
 
 
 class TestSplitNumFrames:
@@ -146,6 +144,42 @@ class TestSplitNumFrames:
     @pytest.mark.internal
     def test_empty_num_frames(self):
         assert _split_num_frames([], 0, 10) == []
+
+
+class TestTokenBalancedSplitPoints:
+    """Tests for token-balanced contiguous CP partitioning."""
+
+    @pytest.mark.internal
+    def test_minimizes_maximum_contiguous_load(self):
+        weights = [16, 16, 8, 8, 4, 4, 2, 2]
+
+        boundaries = _partition_contiguous_weights(weights, num_parts=4)
+        loads = [sum(weights[boundaries[i] : boundaries[i + 1]]) for i in range(4)]
+
+        assert boundaries == [0, 1, 2, 4, 8]
+        assert loads == [16, 16, 16, 12]
+
+    @pytest.mark.internal
+    def test_non_temporal_split_uses_image_token_weights(self):
+        seqlens = torch.tensor([8, 7, 6, 5, 4, 3, 2, 1], dtype=torch.int32)
+
+        split_points = _compute_token_balanced_split_points(seqlens, cp_size=2)
+
+        assert split_points == [0, 2, 8]
+        loads = [int(seqlens[split_points[i] : split_points[i + 1]].sum()) for i in range(2)]
+        assert loads == [15, 21]
+
+    @pytest.mark.internal
+    def test_temporal_split_preserves_tubelet_boundaries(self):
+        seqlens = torch.tensor([8, 8, 8, 8, 3, 5, 5, 5], dtype=torch.int32)
+        num_frames = [4, 1, 3]
+
+        split_points = _compute_token_balanced_split_points(
+            seqlens, cp_size=3, num_frames=num_frames, temporal_patch_size=2
+        )
+
+        _assert_split_point_invariants(split_points, num_frames, 2, 3)
+        assert all(split_points[i] < split_points[i + 1] for i in range(3))
 
 
 class TestSplitToContextParallelRanks:
@@ -310,6 +344,59 @@ class TestDynamicResCPDistributed:
         assert torch.all(local_t == float(cp_rank))
 
     @pytest.mark.internal
+    def test_token_balanced_split_preserves_global_order(self):
+        """Uneven image sizes are balanced and split/gather remains an exact roundtrip."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+
+        from megatron.core.parallel_state import get_context_parallel_rank
+
+        cp_rank = get_context_parallel_rank()
+        patch_dim = 16
+        hidden = 3 * patch_dim * patch_dim
+        image_seqlens = [8, 7, 6, 5, 4, 3, 2, 1]
+        chunks = [
+            torch.full((seqlen, hidden), float(image_index), device="cuda")
+            for image_index, seqlen in enumerate(image_seqlens)
+        ]
+        global_t = torch.cat(chunks, dim=0).unsqueeze(0)
+        global_imgs_sizes = torch.tensor(
+            [[patch_dim, patch_dim * seqlen] for seqlen in image_seqlens],
+            dtype=torch.int32,
+            device="cuda",
+        )
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(image_seqlens).cumsum(0).tolist()], dtype=torch.int32, device="cuda"
+        )
+        global_packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=max(image_seqlens),
+            max_seqlen_kv=max(image_seqlens),
+        )
+
+        local_t, local_sizes, _packed, _has_pad, _num_padded, _local_frames = (
+            split_to_context_parallel_ranks_dynamic_res(
+                global_t,
+                global_imgs_sizes,
+                global_packed_seq_params,
+                patch_dim=patch_dim,
+                balance_by_tokens=True,
+                profile_partition=True,
+            )
+        )
+
+        expected_num_images = 2 if cp_rank == 0 else 6
+        expected_num_tokens = 15 if cp_rank == 0 else 21
+        assert local_sizes.shape[0] == expected_num_images
+        assert local_t.shape[1] == expected_num_tokens
+
+        gathered = gather_from_context_parallel_ranks_dynamic_res(
+            local_t.permute(1, 0, 2).contiguous()
+        )
+        torch.testing.assert_close(gathered, global_t.permute(1, 0, 2).contiguous(), rtol=0, atol=0)
+
+    @pytest.mark.internal
     def test_split_dynamic_res_temporal_aware_tubelets(self):
         """``temporal_patch_size > 1`` triggers the tubelet-aware split.
 
@@ -355,7 +442,7 @@ class TestDynamicResCPDistributed:
         )
         num_frames = torch.tensor([frames_per_video] * num_videos, dtype=torch.int32, device="cuda")
 
-        (local_t, local_imgs_sizes, _packed, has_padding, num_padded_ranks, local_num_frames) = (
+        local_t, local_imgs_sizes, _packed, has_padding, num_padded_ranks, local_num_frames = (
             split_to_context_parallel_ranks_dynamic_res(
                 global_t,
                 global_imgs_sizes,
@@ -407,6 +494,76 @@ class TestDynamicResCPDistributed:
             )
         )
         # cp_size=2, num_imgs=1 ⇒ one dummy added ⇒ one rank is padded.
+        assert num_padded_ranks == 1
+
+    @pytest.mark.internal
+    def test_token_balanced_split_preserves_dummy_rank_padding(self):
+        """Token balancing keeps trailing CP dummy ranks removable by the gather."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+
+        patch_dim = 16
+        per_img_seq = patch_dim * patch_dim
+        hidden = 3 * patch_dim * patch_dim
+        global_t = torch.zeros((1, per_img_seq, hidden), device="cuda")
+        global_imgs_sizes = torch.tensor([[patch_dim, patch_dim]], dtype=torch.int32, device="cuda")
+        cu_seqlens = torch.tensor([0, per_img_seq], dtype=torch.int32, device="cuda")
+        global_packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=per_img_seq,
+            max_seqlen_kv=per_img_seq,
+        )
+
+        local_t, local_sizes, _packed, _has_pad, num_padded_ranks, _ = (
+            split_to_context_parallel_ranks_dynamic_res(
+                global_t,
+                global_imgs_sizes,
+                global_packed_seq_params,
+                patch_dim=patch_dim,
+                balance_by_tokens=True,
+            )
+        )
+
+        assert local_t.numel() > 0
+        assert local_sizes.shape == (1, 2)
+        assert num_padded_ranks == 1
+
+    @pytest.mark.internal
+    def test_split_dynamic_res_sizes_dummy_for_pixel_shuffle(self):
+        """CP dummy images can provide the 2x2 patch grid required by pixel shuffle."""
+        Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=2)
+
+        from megatron.core.parallel_state import get_context_parallel_rank
+
+        cp_rank = get_context_parallel_rank()
+        patch_dim = 16
+        hidden = 3 * patch_dim * patch_dim
+        global_t = torch.zeros((1, 1, hidden), dtype=torch.float32, device="cuda")
+        global_imgs_sizes = torch.tensor([[patch_dim, patch_dim]], dtype=torch.int32, device="cuda")
+        cu_seqlens = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+        global_packed_seq_params = PackedSeqParams(
+            qkv_format="thd",
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_kv=cu_seqlens,
+            max_seqlen_q=1,
+            max_seqlen_kv=1,
+        )
+
+        local_t, local_sizes, _packed, _has_pad, num_padded_ranks, _ = (
+            split_to_context_parallel_ranks_dynamic_res(
+                global_t,
+                global_imgs_sizes,
+                global_packed_seq_params,
+                patch_dim=patch_dim,
+                dummy_image_size=2 * patch_dim,
+            )
+        )
+
+        expected_size = patch_dim if cp_rank == 0 else 2 * patch_dim
+        expected_seqlen = 1 if cp_rank == 0 else 4
+        assert local_sizes.tolist() == [[expected_size, expected_size]]
+        assert local_t.shape == (1, expected_seqlen, hidden)
         assert num_padded_ranks == 1
 
     @pytest.mark.internal

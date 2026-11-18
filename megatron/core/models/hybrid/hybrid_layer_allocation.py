@@ -2,46 +2,44 @@
 
 import logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, TypeAlias
 
 import torch
 
+from megatron.core.models.hybrid.layers import utils as layer_utils
+from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.utils import log_on_each_pipeline_stage, log_single_rank
+
+Symbols = layer_utils.Symbols
 
 logger = logging.getLogger(__name__)
 
 
-class Symbols:
-    """Symbols for different layer types and pattern separators."""
+class PipelineSplit:
+    """Bare class sentinel that separates pipeline stages in a hybrid config list.
 
-    MAMBA = "M"
-    GDN = 'G'
-    KDA = 'K'
-    ATTENTION = "*"
-    DS_ATTENTION = "D"
-    MLA = "+"
-    CSA = "C"  # DSv4 Compressed Sparse Attention (compress_ratio=4)
-    HCA = "H"  # DSv4 Heavily Compressed Attention (compress_ratio=128)
-    WINDOW = "W"  # DSv4 sliding-window-only attention (compress_ratio=0; no compressor/indexer)
-    MLP = "-"
-    MOE = 'E'
-    PIPE = '|'
-    MTP_SEPARATOR = "/"
-    VALID_LAYERS = {MAMBA, GDN, KDA, ATTENTION, DS_ATTENTION, MLA, CSA, HCA, WINDOW, MLP, MOE}
-    # MLA-based attention layers (incompatible with standard '*' attention in one model).
-    MLA_ATTENTION = {MLA, DS_ATTENTION, CSA, HCA, WINDOW}
+    Add ``PipelineSplit`` itself to the list. Instances of this class are not valid entries.
+    """
 
-    @classmethod
-    def name_sorted_valid_layer_symbols(cls) -> list[str]:
-        """Return the valid layer symbols sorted lexicographically by their public attribute
-        name.
-        """
-        valid_layer_attrs = []
-        for name, value in vars(cls).items():
-            if not name.startswith('_') and value in cls.VALID_LAYERS:
-                valid_layer_attrs.append((name, value))
-        valid_layer_attrs.sort()
-        return [value for (_, value) in valid_layer_attrs]
+    def __init__(self) -> None:
+        raise TypeError(
+            "PipelineSplit must not be instantiated. Use the bare PipelineSplit class instead."
+        )
+
+
+class MTPSplit:
+    """Bare class sentinel that begins an MTP depth in a hybrid config list.
+
+    Add ``MTPSplit`` itself to the list. Instances of this class are not valid entries.
+    """
+
+    def __init__(self) -> None:
+        raise TypeError("MTPSplit must not be instantiated. Use the bare MTPSplit class instead.")
+
+
+# A hybrid architecture entry is a layer config instance or a bare PipelineSplit/MTPSplit class.
+# Parsing enforces the supported config types and marker placement within each section.
+HybridLayerEntry: TypeAlias = TransformerConfig | type[PipelineSplit] | type[MTPSplit]
 
 
 @dataclass
@@ -75,6 +73,148 @@ class ParsedHybridPattern:
     main_pattern: Optional[str]
     mtp_pattern: Optional[str]
     mtp_num_depths: int
+
+
+@dataclass(frozen=True)
+class ParsedHybridConfigList:
+    """Validated view of a hybrid layer config list.
+
+    The returned tuples contain the original objects. Cloning is intentionally deferred until a
+    physical decoder or MTP layer is selected for construction.
+
+    Attributes:
+        main_layer_config_list: Decoder configs and any ``PipelineSplit`` sentinels.
+        mtp_layer_config_list: Source config objects for one MTP depth, or ``None`` without MTP.
+        mtp_num_depths: Number of ``MTPSplit`` sections in the source list.
+    """
+
+    main_layer_config_list: tuple[HybridLayerEntry, ...]
+    mtp_layer_config_list: tuple[TransformerConfig, ...] | None
+    mtp_num_depths: int
+
+
+def _validate_layer_config_sequence(
+    layer_configs: Sequence[TransformerConfig], section_name: str
+) -> None:
+    """Validate exact config types and attention-family compatibility."""
+    config_types = set()
+    supported_types = set(Symbols.LAYER_CONFIG_MAP.values())
+    for index, layer_config in enumerate(layer_configs):
+        if type(layer_config) not in supported_types:
+            raise ValueError(
+                f"{section_name} entry {index} has unsupported hybrid layer config type "
+                f"{type(layer_config).__name__}. Exact built-in layer config types are required."
+            )
+        config_types.add(type(layer_config))
+
+    attention_type = Symbols.LAYER_CONFIG_MAP[Symbols.ATTENTION]
+    mla_types = {Symbols.LAYER_CONFIG_MAP[symbol] for symbol in Symbols.MLA_ATTENTION}
+    if attention_type in config_types and config_types & mla_types:
+        raise ValueError(
+            f"Not supported to have both Attention and MLA/DSA/CSA/HCA/Window in the {section_name}"
+        )
+
+
+def parse_hybrid_layer_config_list(
+    hybrid_layer_config_list: Sequence[HybridLayerEntry],
+    expected_num_layers: int | None = None,
+    expected_mtp_num_layers: int | None = None,
+) -> ParsedHybridConfigList:
+    """Parse and validate a first-class hybrid layer config list.
+
+    ``PipelineSplit`` separates main-decoder pipeline segments. ``MTPSplit`` begins one MTP
+    prediction depth, and every MTP depth must contain the same source objects in the same order.
+    The input is snapshotted as tuples but its configs are not copied or converted to symbols.
+
+    Args:
+        hybrid_layer_config_list: Layer configs plus optional bare split sentinel classes.
+        expected_num_layers: If provided, required number of main-decoder configs.
+        expected_mtp_num_layers: If provided (including zero), required number of MTP depths.
+
+    Returns:
+        A validated, identity-preserving parsed representation.
+
+    Raises:
+        ValueError: If an entry, marker placement, layer count, or MTP template is invalid.
+    """
+    source_entries = tuple(hybrid_layer_config_list)
+    main_entries: list[HybridLayerEntry] = []
+    mtp_sections: list[list[TransformerConfig]] = []
+    current_mtp_section: list[TransformerConfig] | None = None
+
+    for index, entry in enumerate(source_entries):
+        if entry is PipelineSplit:
+            if current_mtp_section is not None:
+                raise ValueError(
+                    f"PipelineSplit at index {index} is not allowed after the first MTPSplit"
+                )
+
+        if entry is MTPSplit:
+            if current_mtp_section is not None:
+                if not current_mtp_section:
+                    raise ValueError("Each MTPSplit must begin a non-empty MTP layer config list")
+                mtp_sections.append(current_mtp_section)
+            current_mtp_section = []
+            continue
+
+        if current_mtp_section is None:
+            main_entries.append(entry)
+        else:
+            current_mtp_section.append(entry)
+
+    if current_mtp_section is not None:
+        if not current_mtp_section:
+            raise ValueError("Each MTPSplit must begin a non-empty MTP layer config list")
+        mtp_sections.append(current_mtp_section)
+
+    main_configs = [entry for entry in main_entries if entry is not PipelineSplit]
+    _validate_layer_config_sequence(main_configs, "main decoder")
+    for depth, mtp_section in enumerate(mtp_sections, start=1):
+        _validate_layer_config_sequence(mtp_section, f"MTP depth {depth}")
+
+    if expected_num_layers is not None and len(main_configs) != expected_num_layers:
+        raise ValueError(
+            "hybrid_layer_config_list defines "
+            f"{len(main_configs)} main decoder layers, but num_layers is {expected_num_layers}"
+        )
+
+    mtp_num_depths = len(mtp_sections)
+    if expected_mtp_num_layers is not None and mtp_num_depths != expected_mtp_num_layers:
+        raise ValueError(
+            "hybrid_layer_config_list defines "
+            f"{mtp_num_depths} MTP depths, but mtp_num_layers is {expected_mtp_num_layers}"
+        )
+
+    mtp_layer_config_list: tuple[TransformerConfig, ...] | None = None
+    if mtp_sections:
+        first_mtp_section = mtp_sections[0]
+        for depth, mtp_section in enumerate(mtp_sections[1:], start=2):
+            if len(mtp_section) != len(first_mtp_section) or any(
+                actual is not expected
+                for actual, expected in zip(mtp_section, first_mtp_section, strict=True)
+            ):
+                raise ValueError(
+                    "All MTP layer config lists must contain the same source objects in the same "
+                    f"order; MTP depth {depth} differs from depth 1"
+                )
+        mtp_layer_config_list = tuple(first_mtp_section)
+
+    return ParsedHybridConfigList(
+        main_layer_config_list=tuple(main_entries),
+        mtp_layer_config_list=mtp_layer_config_list,
+        mtp_num_depths=mtp_num_depths,
+    )
+
+
+def clone_hybrid_layer_config_list(
+    layer_config_list: Sequence[TransformerConfig],
+) -> list[TransformerConfig]:
+    """Clone every physical layer-config occurrence without invoking ``__post_init__``."""
+    _validate_layer_config_sequence(layer_config_list, "hybrid layer config list")
+    cloned_configs = [type(config).from_config(config) for config in layer_config_list]
+    for config in cloned_configs:
+        config.is_hybrid_model = True
+    return cloned_configs
 
 
 def pattern_from_ratios(
@@ -144,7 +284,7 @@ def get_hybrid_total_layer_count(pattern: str) -> int:
         Total number of layers in the main decoder pattern.
     """
     main_pattern = pattern.split(Symbols.MTP_SEPARATOR)[0]
-    _validate_pattern(main_pattern, "main", allow_pipe=True)
+    _validate_pattern(main_pattern, allow_pipe=True)
     return len(main_pattern.replace(Symbols.PIPE, ''))
 
 
@@ -176,7 +316,7 @@ def get_hybrid_layer_counts(pattern: str) -> Dict[str, int]:
 
     Returns:
         Dictionary mapping layer symbol to count. Keys are all valid layer symbols
-            (Symbols.VALID_LAYERS).
+            (the keys of ``Symbols.LAYER_CONFIG_MAP``).
 
     Examples:
         >>> get_hybrid_layer_counts("M*M*")
@@ -244,13 +384,13 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     if len(parts) == 1:
         # No MTP separator found - pattern is main decoder only
         main_pattern = parts[0]
-        _validate_pattern(main_pattern, "main", allow_pipe=True)
+        _validate_pattern(main_pattern, allow_pipe=True)
         return ParsedHybridPattern(main_pattern=main_pattern, mtp_pattern=None, mtp_num_depths=0)
 
     # First part is main decoder pattern
     main_pattern = parts[0]
     if main_pattern:
-        _validate_pattern(main_pattern, "main", allow_pipe=True)
+        _validate_pattern(main_pattern, allow_pipe=True)
 
     # Remaining parts are MTP patterns (one per depth)
     mtp_parts = parts[1:]
@@ -271,7 +411,9 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
                 f"Full pattern: '{pattern}'"
             )
 
-    _validate_pattern(mtp_pattern, "MTP", allow_pipe=False)
+    _validate_pattern(mtp_pattern)
+    # Decoder and MTP share the model's MLA mode and positional embeddings.
+    _validate_pattern(main_pattern + mtp_pattern, allow_pipe=True)
 
     return ParsedHybridPattern(
         main_pattern=main_pattern if main_pattern else None,
@@ -280,74 +422,75 @@ def parse_hybrid_pattern(pattern: Optional[str]) -> ParsedHybridPattern:
     )
 
 
-def _validate_pattern(pattern: str, pattern_name: str, allow_pipe: bool = False) -> None:
+def _validate_pattern(pattern: str, allow_pipe: bool = False) -> None:
     """Validate that a pattern contains only valid layer symbols.
 
     Args:
         pattern: Layer pattern string to validate
-        pattern_name: Name of pattern for error messages (e.g., "main" or "MTP")
         allow_pipe: Whether to allow the pipe '|' separator (for main patterns)
 
     Raises:
         ValueError: If pattern contains invalid symbols
     """
-    valid_chars = Symbols.VALID_LAYERS | {Symbols.PIPE} if allow_pipe else Symbols.VALID_LAYERS
     for char in pattern:
-        if char not in valid_chars:
+        if not layer_utils.is_valid_symbol(char, allow_pipe=allow_pipe):
             raise ValueError(
-                f"In {pattern_name} pattern, '{char}' is not a valid layer symbol. "
-                f"Valid symbols are: {valid_chars}"
+                f"'{char}' is not a valid layer symbol. "
+                f"Valid symbols are: {Symbols.LAYER_CONFIG_MAP.keys()}"
             )
 
-    # Disallow standard Attention ('*') mixed with any MLA-based attention (+/D/C/H/W).
-    # MLA variants (DSA / CSA / HCA / Window) may freely coexist with each other.
-    if Symbols.ATTENTION in pattern and any(s in pattern for s in Symbols.MLA_ATTENTION):
+    # MLA variants may coexist, but standard attention cannot share a model with them.
+    if Symbols.ATTENTION in pattern and any(symbol in pattern for symbol in Symbols.MLA_ATTENTION):
         raise ValueError(
             "Not supported to have both Attention and MLA/DSA/CSA/HCA/Window in one model"
         )
 
 
-def validate_segment_layers(segment: str) -> List[str]:
-    """Validate and convert a single pipeline segment pattern to a layer type list.
+def validate_segment_layers(
+    segment: str, config: Optional[TransformerConfig] = None
+) -> List[TransformerConfig] | List[str]:
+    """Validate and convert a single pipeline segment pattern to layer configs.
 
     This is used after the main pattern has been split by '|' into segments.
     Each segment should contain only valid layer symbols (no '|').
 
+    Each layer config is copied from the source config without running ``__post_init__``
+    a second time.
+
     Args:
         segment: A single pipeline segment pattern string (e.g., "M-M*-")
+        config: Normalized stack-level config to copy for each layer. When omitted,
+            preserve the legacy validation/inspection API returning the symbol list.
 
     Returns:
-        List of layer type characters.
+        List of independent per-layer configs.
 
     Raises:
         ValueError: If segment contains invalid layer symbols.
     """
-    layer_type_list = list(segment)
-    for layer_char in layer_type_list:
-        if layer_char not in Symbols.VALID_LAYERS:
-            raise ValueError(
-                f"In hybrid layer pattern segment, '{layer_char}' is not "
-                f"one of {Symbols.VALID_LAYERS}"
-            )
+    _validate_pattern(segment)
+    if config is None:
+        # Legacy inspection API returns symbols. All model constructors pass config
+        # and use independent per-layer configs as their source of truth.
+        return list(segment)
 
-    # Disallow standard Attention ('*') mixed with any MLA-based attention (+/D/C/H/W).
-    if Symbols.ATTENTION in segment and any(s in segment for s in Symbols.MLA_ATTENTION):
-        raise ValueError(
-            "Not supported to have both Attention and MLA/DSA/CSA/HCA/Window in one model"
-        )
+    layer_configs: list[TransformerConfig] = []
+    for layer_symbol in segment:
+        layer_configs.append(layer_utils.create_layer_config(config, layer_symbol))
 
-    return layer_type_list
+    return layer_configs
 
 
 def select_pipeline_segment(
     main_pattern: str,
+    config: TransformerConfig,
     pp_group: Optional[torch.distributed.ProcessGroup],
     vp_stage: Optional[int],
     first_stage_layers: Optional[int] = None,
     last_stage_layers: Optional[int] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     dp_cp_group: Optional[torch.distributed.ProcessGroup] = None,
-) -> Tuple[List[str], int]:
+) -> Tuple[List[TransformerConfig], int]:
     """Select and validate the pipeline segment for the given PP rank and VP stage.
 
     When the main pattern contains '|' pipe separators, splits by '|' into
@@ -360,6 +503,7 @@ def select_pipeline_segment(
     Args:
         main_pattern: Main decoder pattern (may contain '|' separators).
             Empty string is allowed (produces one empty segment).
+        config: Normalized stack-level config to copy for each selected layer.
         pp_group: Pipeline parallel process group, or None if not using PP.
         vp_stage: Virtual pipeline stage, or None if not using VPP.
         first_stage_layers: Number of layers on the first pipeline stage for
@@ -370,8 +514,8 @@ def select_pipeline_segment(
         dp_cp_group: Optional data/context-parallel process group used for per-stage logging.
 
     Returns:
-        Tuple of (layer_type_list, layer_offset) where layer_type_list is
-        the list of layer type characters for this segment, and layer_offset
+        Tuple of (layer_config_list, layer_offset) where layer_config_list is
+        the list of independent configs for this segment, and layer_offset
         is the sum of layer counts from all preceding segments.
 
     Raises:
@@ -410,8 +554,8 @@ def select_pipeline_segment(
             "Example: 'M*M*M*M*' with pp_size=2 should become 'M*M*|M*M*'.",
         )
         full_pattern = segments[0]
-        layer_type_list = validate_segment_layers(full_pattern)
-        num_layers = len(layer_type_list)
+        _validate_pattern(full_pattern)
+        num_layers = len(full_pattern)
 
         if first_stage_layers is not None or last_stage_layers is not None:
             first = first_stage_layers or 0
@@ -454,12 +598,14 @@ def select_pipeline_segment(
             offset = pp_rank * layers_per_rank
             count = layers_per_rank
 
-        selected = layer_type_list[offset : offset + count]
+        selected_pattern = full_pattern[offset : offset + count]
+        layer_utils.validate_tp_comm_overlap(config, selected_pattern)
+        selected = validate_segment_layers(selected_pattern, config)
         log_on_each_pipeline_stage(
             logger,
             logging.INFO,
             f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_stage}, "
-            f"layers='{''.join(selected)}' ({len(selected)} layers), "
+            f"layers='{selected_pattern}' ({len(selected)} layers), "
             f"layer_offset={offset} (auto-split)",
             tp_group=tp_group,
             dp_cp_group=dp_cp_group,
@@ -488,26 +634,188 @@ def select_pipeline_segment(
     layer_offset = sum(len(segments[i]) for i in range(segment_index))
     my_segment = segments[segment_index]
 
-    layer_type_list = validate_segment_layers(my_segment)
+    layer_utils.validate_tp_comm_overlap(config, my_segment)
+    layer_config_list = validate_segment_layers(my_segment, config)
 
     log_on_each_pipeline_stage(
         logger,
         logging.INFO,
         f"HybridModel: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_rel}, "
         f"segment_index={segment_index}/{len(segments)}, "
-        f"layers='{my_segment}' ({len(layer_type_list)} layers), "
+        f"layers='{my_segment}' ({len(layer_config_list)} layers), "
         f"layer_offset={layer_offset}",
         tp_group=tp_group,
         dp_cp_group=dp_cp_group,
     )
 
-    return layer_type_list, layer_offset
+    return layer_config_list, layer_offset
+
+
+def select_pipeline_segment_from_config_list(
+    parsed_config_list: ParsedHybridConfigList,
+    pp_group: torch.distributed.ProcessGroup | None,
+    vp_stage: int | None,
+    virtual_pipeline_model_parallel_size: int | None = None,
+    first_stage_layers: int | None = None,
+    last_stage_layers: int | None = None,
+    tp_group: torch.distributed.ProcessGroup | None = None,
+    dp_cp_group: torch.distributed.ProcessGroup | None = None,
+) -> Tuple[List[TransformerConfig], int]:
+    """Select and clone this rank's decoder configs from a parsed hybrid config list.
+
+    The PP/VPP segment ordering is VPP-major, matching ``select_pipeline_segment`` and
+    ``PipelineParallelLayerLayout``. Without ``PipelineSplit``, PP uses the existing contiguous
+    even/uneven slicing rules and VPP is unsupported. With explicit markers, the number of
+    segments must exactly equal the configured PP x VPP topology.
+
+    Args:
+        parsed_config_list: Validated architecture returned by ``parse_hybrid_layer_config_list``.
+        pp_group: Pipeline-parallel process group, or ``None`` for one PP rank.
+        vp_stage: Current virtual-pipeline stage, or ``None`` without VPP.
+        virtual_pipeline_model_parallel_size: Configured VPP size, or ``None`` without VPP.
+        first_stage_layers: Uneven first-stage layer count for marker-free lists.
+        last_stage_layers: Uneven last-stage layer count for marker-free lists.
+        tp_group: Optional tensor-parallel process group used for logging.
+        dp_cp_group: Optional data/context-parallel process group used for logging.
+
+    Returns:
+        Independent physical config clones for this segment and its global decoder-layer offset.
+    """
+    source_entries = parsed_config_list.main_layer_config_list
+    source_configs = [entry for entry in source_entries if entry is not PipelineSplit]
+
+    pp_rank = torch.distributed.get_rank(pp_group) if pp_group is not None else 0
+    pp_size = torch.distributed.get_world_size(pp_group) if pp_group is not None else 1
+    if (
+        virtual_pipeline_model_parallel_size is not None
+        and virtual_pipeline_model_parallel_size < 1
+    ):
+        raise ValueError("virtual_pipeline_model_parallel_size must be at least 1")
+
+    has_pipeline_splits = any(entry is PipelineSplit for entry in source_entries)
+    if has_pipeline_splits:
+        if first_stage_layers is not None or last_stage_layers is not None:
+            raise ValueError(
+                "Cannot specify num_layers_in_first_pipeline_stage or "
+                "num_layers_in_last_pipeline_stage when hybrid_layer_config_list contains "
+                "PipelineSplit markers. The pipeline layout is already explicitly defined."
+            )
+
+        segments: list[list[TransformerConfig]] = [[]]
+        for entry in source_entries:
+            if entry is PipelineSplit:
+                segments.append([])
+            else:
+                segments[-1].append(entry)
+
+        vp_size = virtual_pipeline_model_parallel_size or 1
+        expected_segment_count = pp_size * vp_size
+        if len(segments) != expected_segment_count:
+            raise ValueError(
+                f"hybrid_layer_config_list defines {len(segments)} PipelineSplit-delimited "
+                f"segments, but the configured PP x VPP topology requires "
+                f"{expected_segment_count} ({pp_size} x {vp_size})"
+            )
+        if virtual_pipeline_model_parallel_size is None:
+            if vp_stage is not None:
+                raise ValueError(
+                    "vp_stage must be None when virtual_pipeline_model_parallel_size is None"
+                )
+            vp_rel = 0
+        else:
+            if vp_stage is None:
+                raise ValueError(
+                    "vp_stage must be provided when virtual_pipeline_model_parallel_size is set"
+                )
+            if not 0 <= vp_stage < virtual_pipeline_model_parallel_size:
+                raise ValueError(
+                    f"vp_stage {vp_stage} is outside the configured virtual pipeline range "
+                    f"[0, {virtual_pipeline_model_parallel_size})"
+                )
+            vp_rel = vp_stage
+
+        segment_index = vp_rel * pp_size + pp_rank
+        layer_offset = sum(len(segment) for segment in segments[:segment_index])
+        selected_source_configs = segments[segment_index]
+        layer_config_list = clone_hybrid_layer_config_list(selected_source_configs)
+        log_on_each_pipeline_stage(
+            logger,
+            logging.INFO,
+            f"HybridModel config list: pp_rank={pp_rank}/{pp_size}, vp_stage={vp_rel}, "
+            f"segment_index={segment_index}/{len(segments)}, "
+            f"layers={len(layer_config_list)}, layer_offset={layer_offset}",
+            tp_group=tp_group,
+            dp_cp_group=dp_cp_group,
+        )
+        return layer_config_list, layer_offset
+
+    if virtual_pipeline_model_parallel_size is not None or vp_stage is not None:
+        raise ValueError(
+            "Virtual pipeline parallelism is not supported when hybrid_layer_config_list has no "
+            "PipelineSplit markers"
+        )
+
+    num_layers = len(source_configs)
+    if pp_size > 1:
+        if first_stage_layers is not None or last_stage_layers is not None:
+            first = first_stage_layers or 0
+            last = last_stage_layers or 0
+            middle_num_layers = num_layers - first - last
+            middle_stages = pp_size - sum(
+                1 for count in (first_stage_layers, last_stage_layers) if count is not None
+            )
+            if middle_stages > 0:
+                if middle_num_layers % middle_stages != 0:
+                    raise ValueError(
+                        f"Middle layers ({middle_num_layers}) must be evenly divisible "
+                        f"by middle pipeline stages ({middle_stages})."
+                    )
+                layers_per_middle = middle_num_layers // middle_stages
+            else:
+                layers_per_middle = 0
+
+            is_first = first_stage_layers is not None and pp_rank == 0
+            is_last = last_stage_layers is not None and pp_rank == pp_size - 1
+            if is_first:
+                offset = 0
+                count = first
+            elif is_last:
+                offset = num_layers - last
+                count = last
+            else:
+                middle_rank = pp_rank if first_stage_layers is None else pp_rank - 1
+                offset = middle_rank * layers_per_middle + first
+                count = layers_per_middle
+        else:
+            if num_layers % pp_size != 0:
+                raise ValueError(
+                    f"Number of layers ({num_layers}) must be evenly divisible "
+                    f"by pipeline-model-parallel-size ({pp_size}) when no PipelineSplit "
+                    "markers are specified in hybrid_layer_config_list."
+                )
+            count = num_layers // pp_size
+            offset = pp_rank * count
+    else:
+        offset = 0
+        count = num_layers
+
+    selected_source_configs = source_configs[offset : offset + count]
+    layer_config_list = clone_hybrid_layer_config_list(selected_source_configs)
+    log_on_each_pipeline_stage(
+        logger,
+        logging.INFO,
+        f"HybridModel config list: pp_rank={pp_rank}/{pp_size}, vp_stage=None, "
+        f"layers={len(layer_config_list)}, layer_offset={offset} (auto-split)",
+        tp_group=tp_group,
+        dp_cp_group=dp_cp_group,
+    )
+    return layer_config_list, offset
 
 
 def get_layer_maps_from_layer_type_list(layer_type_list: list[str]) -> dict[str, dict[int, int]]:
     """
     Returns maps from global layer index to the corresponding layer index
-    for each valid layer type (those in Symbols.VALID_LAYERS) given a layer type list.
+    for each valid layer type (the keys of Symbols.LAYER_CONFIG_MAP) given a layer type list.
     """
     layer_types = [symbol for symbol in Symbols.name_sorted_valid_layer_symbols()]
     layer_maps = {layer_type: {} for layer_type in layer_types}
@@ -516,3 +824,22 @@ def get_layer_maps_from_layer_type_list(layer_type_list: list[str]) -> dict[str,
         local_layer_idx = len(layer_map)
         layer_map[global_layer_idx] = local_layer_idx
     return layer_maps
+
+
+def get_layer_type_list_from_layer_config_list(
+    layer_config_list: Sequence[TransformerConfig],
+) -> list[str]:
+    """Return the layer symbols corresponding to a sequence of layer configs.
+
+    This compatibility projection keeps ``layer_config_list`` as the source of truth while
+    supporting callers that still read ``HybridStack.layer_type_list``.
+
+    Args:
+        layer_config_list: Per-layer configs in layer order.
+
+    Returns:
+        The canonical layer symbol for each config.
+    """
+    return [
+        layer_utils.get_layer_symbol_from_config(layer_config) for layer_config in layer_config_list
+    ]

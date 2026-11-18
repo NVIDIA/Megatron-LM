@@ -71,6 +71,7 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
             HAVE_FSDP
         ), 'TorchFullyShardedDataParallel requires PyTorch >= 2.4.0 with FSDP 2 support.'
 
+        ddp_config.finalize()
         super().__init__(config=config, module=module)
 
         if process_group is None:
@@ -96,6 +97,8 @@ class TorchFullyShardedDataParallel(_BaseDataParallel):
                     # micro-batch id, thus removing unnecessary memory stores
                     attrs['_fp8_attrs']['transpose_invalid'] = False
                     del attrs['_fp8_attrs']['transpose']
+                # Mark this parameter as an FSDP2 parameter.
+                attrs["is_torch_fsdp2_param"] = True
                 custom_attrs[name] = {k: v for k, v in attrs.items()}
             return custom_attrs
 

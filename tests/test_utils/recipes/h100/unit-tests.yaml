@@ -12,7 +12,9 @@ spec:
   script_setup: |
     set -euo pipefail
     unset https_proxy
-    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+    umask 077
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> "$HOME/.netrc"
+    trap 'rm -f "$HOME/.netrc"; unset RO_API_TOKEN' EXIT
 
     # Checkout latest
     cd /opt
@@ -30,7 +32,11 @@ spec:
       --backwards-commit $MCORE_BACKWARDS_COMMIT \
       --repo $MCORE_REPO
 
+    rm -f "$HOME/.netrc"
+    unset RO_API_TOKEN
   script: |-
+    rm -f "${{HOME}}/.netrc"
+    unset RO_API_TOKEN
     set -euo pipefail
     ls
 
@@ -38,6 +44,20 @@ spec:
     ENVIRONMENT={environment}
     BUCKET="{test_case}"
     UNIT_TEST_REPEAT={n_repeat}
+    export NVTE_FLASH_ATTN_V4=0
+
+    # GTP scales to any world size; the test fixtures don't — most GTP cases
+    # pytest.skip unless world_size==4 exactly (a few also run at 8, see
+    # test_gtp_muon.py/test_gtp_muon_qkv.py, and will skip here instead).
+    if [[ "$BUCKET" == "tests/unit_tests/generalized_tensor_parallel/**/*.py" ]]; then
+        export GPUS_PER_NODE=4
+    elif [[ "$BUCKET" == "tests/unit_tests/inference/engines/test_batch_invariant_handoff.py" ]]; then
+        # One prefill worker and one decode worker exchange a real NIXL handoff.
+        export GPUS_PER_NODE=2
+    elif [[ "$BUCKET" =~ ^tests/unit_tests/inference/(test_coordinator_(execution|media|sampling|schedule)_pairwise|engines/test_batch_invariant_coordinator)\.py$ ]]; then
+        # These owner-selection schedules are written for exactly two DP replicas.
+        export GPUS_PER_NODE=2
+    fi
 
     if [[ "$TAG" == "latest" ]]; then
         TEST_PATH="/opt/megatron-lm"
@@ -45,21 +65,110 @@ spec:
         TEST_PATH="/opt/megatron-lm-legacy/"
     fi
 
-    bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
-      --tag $TAG \
-      --environment $ENVIRONMENT \
-      --bucket $BUCKET \
-      --unit-test-repeat $UNIT_TEST_REPEAT \
-      --log-dir {assets_dir}/logs/1/
+    case "$BUCKET" in
+      tests/unit_tests/inference/test_batch_invariant_fp8.py)
+        bash "$TEST_PATH/tests/test_utils/run_batch_invariant_fp8.sh" \
+          h100 "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "{assets_dir}/logs/1/"
+        ;;
+      tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py|tests/unit_tests/inference/test_disagg_transfer_pairwise.py)
+        bash "$TEST_PATH/tests/test_utils/run_disagg_pairwise.sh" \
+          "$ENVIRONMENT" "$UNIT_TEST_REPEAT" "$BUCKET" "{assets_dir}/logs/1/"
+        ;;
+      *)
+        bash $TEST_PATH/tests/unit_tests/run_ci_test.sh \
+          --tag $TAG \
+          --environment $ENVIRONMENT \
+          --bucket $BUCKET \
+          --unit-test-repeat $UNIT_TEST_REPEAT \
+          --log-dir {assets_dir}/logs/1/
+        ;;
+    esac
 
     ls -al 
 
     cd $TEST_PATH
-    /opt/venv/bin/coverage xml 
-    cp .coverage {assets_dir}/coverage_report
-    cp coverage.xml {assets_dir}
+    if [[ -f .coverage ]]; then
+        /opt/venv/bin/coverage xml
+        cp .coverage {assets_dir}/coverage_report
+        cp coverage.xml {assets_dir}
+    else
+        echo "No unit-test coverage data was produced; skipping coverage export."
+    fi
 
 products:
+  # Runtime topology regressions run separately from the broad SSM/transformer buckets.
+  - test_case: [tests/unit_tests/context_parallel/runtime/**/*.py]
+    products:
+      - environment: [dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  # Run the two-worker handoff separately; the broad inference bucket excludes it.
+  - test_case: [tests/unit_tests/inference/engines/test_batch_invariant_handoff.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        gpus: [2]
+        n_repeat: [1]
+        time_limit: [1800]
+  # Two-replica coordinator schedules; the broad inference bucket excludes them.
+  - test_case: [tests/unit_tests/inference/engines/test_batch_invariant_coordinator.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        gpus: [2]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/test_coordinator_execution_pairwise.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        gpus: [2]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/test_coordinator_media_pairwise.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        gpus: [2]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/test_coordinator_sampling_pairwise.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        gpus: [2]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/test_coordinator_schedule_pairwise.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        gpus: [2]
+        n_repeat: [1]
+        time_limit: [1800]
+  # This file runs in isolated one-rank processes; other buckets exclude it.
+  - test_case: [tests/unit_tests/inference/test_batch_invariant_fp8.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/ops/**/*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/test_model_configs.py]
     products:
       - environment: [lts, dev]
@@ -102,6 +211,13 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  - test_case: [tests/unit_tests/dist_checkpointing/test_layer_wise_optimizer_common_state_dict.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/dist_checkpointing/**/*.py]
     products:
       - environment: [lts, dev]
@@ -123,7 +239,62 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  - test_case: [tests/unit_tests/transformer/experimental_attention_variant/test_dsv4_hybrid_attention_cp_cuda_graph.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/transformer/experimental_attention_variant/test_dsa_tilelang_kernels.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  # Keep DSv4/DSA compilation and parity checks out of the general transformer
+  # bucket's 30-minute budget. More-specific graph/kernel buckets retain ownership.
+  - test_case: [tests/unit_tests/transformer/experimental_attention_variant/test_csa_fused_sparse_attention_dev.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+
+  - test_case: [tests/unit_tests/transformer/experimental_attention_variant/**/*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  # Bound communicator/thread state in the general transformer pytest process.
+  # Keep the complete graph and THD workloads in their own latest-suite buckets.
+  - test_case: [tests/unit_tests/transformer/test_cuda_graphs.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/transformer/test_thd_correctness.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/transformer/**/*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  # Engine tests run apart from the rest of inference so each job fits the CI time limit.
+  - test_case: [tests/unit_tests/inference/engines/**/*.py]
     products:
       - environment: [lts, dev]
         tag: [latest, legacy]
@@ -137,7 +308,28 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/engines/test_dynamic_engine_parallel_and_chunked_prefill.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/inference/test_hybrid_moe.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/engines/test_disagg_coordinator_pairwise.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/inference/test_disagg_transfer_pairwise.py]
     products:
       - environment: [lts, dev]
         tag: [latest]
@@ -193,6 +385,89 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # KDA has independent cold JIT compilation; keep its unchanged cases out of
+  # the broad SSM bucket so both complete within the same per-job time limit.
+  - test_case: [tests/unit_tests/ssm/gated_delta_net/test_kda.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/gated_delta_net/test_kda_fusion.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/test_gated_delta_net_recompute.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/test_gated_delta_net_padding.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/test_gated_delta_net_parallel.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/test_gated_delta_net2.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/test_gdp_dynamic_inference.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/test_gdn_gated_output_norm_fusion.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  # Preserve the distributed matrix separately from local fusion/shape checks,
+  # leaving room for CI container startup and teardown within the same limit.
+  - test_case: [tests/unit_tests/ssm/test_gdn_gated_output_norm_distributed.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  # Run the long hybrid-block and root-level KDA suites separately so the
+  # remaining SSM tests fit within the job timeout, including startup/teardown.
+  - test_case: [tests/unit_tests/ssm/test_hybrid_block.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/ssm/test_kda.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/ssm/**/*.py]
     products:
       - environment: [lts, dev]
@@ -200,10 +475,42 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  - test_case: [tests/unit_tests/transformer/moe/test_token_dispatcher_capacity.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  # Keep the complete dispatcher topology/JIT matrix within its own 30-minute
+  # budget; the general MoE bucket retains every other test.
+  - test_case: [tests/unit_tests/transformer/moe/test_token_dispatcher.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  # Keep the complete early-wgrad backend/recompute/update matrix in its own process.
+  # Preserve every case without adding it to the already large general MoE bucket.
+  - test_case: [tests/unit_tests/transformer/moe/test_early_wgrad.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/transformer/moe/**/*.py]
     products:
       - environment: [lts, dev]
         tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/distributed/mfsdp_v1/test_mfsdp_fully_shard.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
@@ -221,7 +528,65 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  # Isolate the full training/recompute matrices to bound per-bucket runtime
+  # and accumulated process-group/allocator state.
+  - test_case: [tests/unit_tests/a2a_overlap/test_fsdp_1f1b_overlap.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b_layers_1_2.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b_layers_1_1.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b_padding.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b_recompute_uniform.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/a2a_overlap/test_schedule_chunk_1f1b_recompute_block.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/a2a_overlap/**/*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest, legacy]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/generalized_tensor_parallel/**/*.py]
     products:
       - environment: [lts, dev]
         tag: [latest, legacy]
@@ -237,9 +602,34 @@ products:
         scope: [unit-tests]
         n_repeat: [1]
         time_limit: [1800]
+  - test_case: [tests/unit_tests/determinism/kernels/**/*.py]
+    products:
+      # Operator-level bit-exact kernel tests. tag: [latest] only for the same
+      # reason as correctness/ above.
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   # determinism/perf is in its own dedicated recipe (determinism-perf.yaml) —
   # the perf bucket wraps pytest in nsys for per-NVTX-range attribution and
   # can't share the generic ``run_ci_test.sh`` invocation used here.
+  # Keep both the standard and experimental fusion matrices within their own
+  # time budget instead of adding kernel compilation to the catch-all bucket.
+  - test_case: [tests/unit_tests/fusions/test_fused_mhc_kernels.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
+  - test_case: [tests/unit_tests/fusions/**/*.py]
+    products:
+      - environment: [lts, dev]
+        tag: [latest]
+        scope: [unit-tests]
+        n_repeat: [1]
+        time_limit: [1800]
   - test_case: [tests/unit_tests/**/*.py]
     products:
       - environment: [lts, dev]

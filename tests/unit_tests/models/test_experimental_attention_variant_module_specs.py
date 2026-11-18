@@ -1,17 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from megatron.core.transformer.enums import AttnMaskType, LayerType
+from megatron.core.transformer.hyper_connection import HyperConnectionModule
+from megatron.core.transformer.hyper_connection_transformer_layer import (
+    HyperConnectionTransformerLayer,
+)
 from megatron.core.transformer.identity_op import IdentityOp
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_block import TransformerBlockSubmodules
-from megatron.core.transformer.transformer_layer import (
-    HyperConnectionTransformerLayer,
-    TransformerLayer,
-)
+from megatron.core.transformer.transformer_layer import TransformerLayer
 
 # ---------------------------------------------------------------------------
 # Helpers: fake backend and config builders
@@ -43,6 +45,10 @@ class _FakeQKNorm:
 
 
 class _FakeCoreAttention:
+    pass
+
+
+class _FakeBatchedLinear:
     pass
 
 
@@ -86,6 +92,7 @@ def _make_config(**overrides):
         kitchen_attention_backend="sdpa",
         fallback_to_eager_attn=False,
         enable_hyper_connections=False,
+        enable_mhc_connections=False,
     )
     defaults.update(overrides)
     cfg = MagicMock()
@@ -112,6 +119,7 @@ class TestIsLinearAttentionVariant:
         "variant, expected",
         [
             ("gdn", True),
+            ("gdn2", True),
             ("kda", True),
             ("gated_delta_net", True),
             ("dsa", False),
@@ -277,10 +285,12 @@ class TestGetGatedDeltaNetModuleSpec:
         assert spec.metainfo == {"fuse_input_layernorm": True}
 
     def test_kda_uses_direct_projection_submodules(self):
-        """KDA uses separate input and beta projections without fused input norm."""
+        """KDA specs use the expected direct and tensor-parallel projections."""
+        from megatron.core.extensions.transformer_engine import TEColumnParallelLinear, TELinear
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
             get_gated_delta_net_module_spec,
         )
+        from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
         from megatron.core.ssm.gated_delta_net import (
             KimiDeltaAttention,
             KimiDeltaAttentionSubmodules,
@@ -293,8 +303,25 @@ class TestGetGatedDeltaNetModuleSpec:
         assert spec.module is KimiDeltaAttention
         assert isinstance(spec.submodules, KimiDeltaAttentionSubmodules)
         assert spec.submodules.in_proj == _FakeColumnParallelLinear
-        assert spec.submodules.beta_proj == _FakeColumnParallelLinear
+        assert spec.submodules.beta_proj == _FakeLinear
+        assert spec.submodules.f_proj == _FakeColumnParallelLinear
+        assert spec.submodules.f_a_proj == _FakeLinear
+        assert spec.submodules.f_b_proj == _FakeColumnParallelLinear
+        assert spec.submodules.g_proj == _FakeColumnParallelLinear
+        assert spec.submodules.g_a_proj == _FakeLinear
+        assert spec.submodules.g_b_proj == _FakeColumnParallelLinear
         assert spec.metainfo == {"fuse_input_layernorm": False}
+
+        hybrid_submodules = (
+            hybrid_stack_spec.submodules.kda_layer.submodules.self_attention.submodules
+        )
+        assert hybrid_submodules.beta_proj is TELinear
+        assert hybrid_submodules.f_proj is TEColumnParallelLinear
+        assert hybrid_submodules.f_a_proj is TELinear
+        assert hybrid_submodules.f_b_proj is TEColumnParallelLinear
+        assert hybrid_submodules.g_proj is TEColumnParallelLinear
+        assert hybrid_submodules.g_a_proj is TELinear
+        assert hybrid_submodules.g_b_proj is TEColumnParallelLinear
 
     def test_submodules_use_backend_modules(self):
         """Verify backend-provided projection/norm modules are wired into submodules."""
@@ -441,7 +468,7 @@ class TestGetDsaModuleSpec:
         ), f"Expected 1 for_qk=True call (indexer only), got {len(qk_calls)}"
 
     def test_linear_projections(self):
-        """Verify Q/KV projection slots and backend.column_parallel_linear call count."""
+        """Verify Q/KV/gate projection slots and column-parallel backend call count."""
         backend = _make_backend()
         cfg = _make_config(multi_latent_attention=True, qk_l2_norm=False, qk_layernorm=True)
         spec = self._call(cfg=cfg, backend=backend)
@@ -451,10 +478,70 @@ class TestGetDsaModuleSpec:
         assert subs.linear_q_up_proj == _FakeColumnParallelLinear
         assert subs.linear_kv_down_proj == _FakeLinear
         assert subs.linear_kv_up_proj == _FakeColumnParallelLinear
+        assert subs.linear_gate == _FakeColumnParallelLinear
         assert subs.linear_proj == _FakeRowParallelLinear
-        # column_parallel_linear() is called exactly 3 times (q_proj, q_up_proj, kv_up_proj)
-        assert backend.column_parallel_linear.call_count == 3
+        # column_parallel_linear() is called for q_proj, q_up_proj, kv_up_proj, and gate.
+        assert backend.column_parallel_linear.call_count == 4
         assert backend.row_parallel_linear.call_count == 1
+
+
+# ===================================================================
+# Tests for get_dsv4_hybrid_module_spec_for_backend
+# ===================================================================
+
+
+class TestGetDSv4HybridModuleSpec:
+    MODULE = (
+        "megatron.core.transformer.experimental_attention_variant."
+        "deepseek_v4_hybrid_attention_module_specs"
+    )
+
+    @staticmethod
+    def _config():
+        return _make_config(
+            multi_latent_attention=True,
+            qk_l2_norm=False,
+            qk_layernorm=True,
+            experimental_attention_variant="dsv4_hybrid",
+        )
+
+    def _call(self):
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_dsv4_hybrid_module_spec_for_backend,
+        )
+
+        return get_dsv4_hybrid_module_spec_for_backend(
+            config=self._config(), backend=_make_backend()
+        )
+
+    def test_uses_te_batched_linear_when_available(self):
+        """The canonical DSv4 spec should select TE's BatchedLinear operation."""
+        fake_te = SimpleNamespace(
+            pytorch=SimpleNamespace(ops=SimpleNamespace(BatchedLinear=_FakeBatchedLinear))
+        )
+        with (
+            patch(f"{self.MODULE}.HAVE_TE", True),
+            patch(f"{self.MODULE}.te", fake_te, create=True),
+        ):
+            spec = self._call()
+
+        assert spec.submodules.linear_o_group_proj is _FakeBatchedLinear
+
+    @pytest.mark.parametrize(
+        "fake_pytorch",
+        [SimpleNamespace(), SimpleNamespace(ops=SimpleNamespace())],
+        ids=["ops_unavailable", "batched_linear_unavailable"],
+    )
+    def test_sets_none_when_te_batched_linear_is_unavailable(self, fake_pytorch):
+        """Old TE installations should leave construction to the einsum fallback."""
+        fake_te = SimpleNamespace(pytorch=fake_pytorch)
+        with (
+            patch(f"{self.MODULE}.HAVE_TE", True),
+            patch(f"{self.MODULE}.te", fake_te, create=True),
+        ):
+            spec = self._call()
+
+        assert spec.submodules.linear_o_group_proj is None
 
 
 # ===================================================================
@@ -470,6 +557,7 @@ class TestGetExperimentalAttentionVariantModuleSpec:
         [
             ("gdn", "get_gated_delta_net_module_spec"),
             ("kda", "get_gated_delta_net_module_spec"),
+            ("gdn2", "get_gated_delta_net_module_spec"),
             ("gated_delta_net", "get_gated_delta_net_module_spec"),
             ("dsa", "get_dsa_module_spec_for_backend"),
             ("dsv4_hybrid", "get_dsv4_hybrid_module_spec_for_backend"),
@@ -601,7 +689,7 @@ class TestGetTransformerLayerWithExperimentalAttentionVariantSpec:
             num_moe_experts=8,
             moe_layer_freq=2,
             normalization="RMSNorm",
-            enable_hyper_connections=True,
+            enable_mhc_connections=True,
         )
         backend = _make_backend()
         attn_spec = self._make_attention_spec(fuse_input_layernorm=False)
@@ -627,6 +715,50 @@ class TestGetTransformerLayerWithExperimentalAttentionVariantSpec:
         assert specs[3].submodules.mlp is dense_spec
         for s in specs:
             assert s.module is HyperConnectionTransformerLayer
+
+    def test_mhc_wires_hyper_connections_for_mixed_moe_pattern(self):
+        """Verify every mixed layer consumes mHC streams without changing its MLP pattern."""
+        from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+            get_transformer_layer_with_experimental_attention_variant_spec,
+        )
+
+        cfg = _make_config(
+            num_layers=4,
+            experimental_attention_variant="dsv4_hybrid",
+            num_moe_experts=8,
+            moe_layer_freq=2,
+            normalization="RMSNorm",
+            enable_mhc_connections=True,
+        )
+        backend = _make_backend()
+        attn_spec = self._make_attention_spec(fuse_input_layernorm=False)
+        moe_spec = self._make_mlp_spec(fuse_pre_mlp_layernorm=False)
+        dense_spec = self._make_mlp_spec(fuse_pre_mlp_layernorm=True)
+
+        with (
+            patch(
+                f"{self.MODULE}.get_experimental_attention_variant_module_spec",
+                return_value=attn_spec,
+            ),
+            patch(f"{self.MODULE}._get_moe_module_spec", return_value=(moe_spec, False)),
+            patch(f"{self.MODULE}._get_dense_mlp_module_spec", return_value=(dense_spec, True)),
+        ):
+            specs = get_transformer_layer_with_experimental_attention_variant_spec(
+                cfg, backend=backend
+            )
+
+        assert all(spec.module is HyperConnectionTransformerLayer for spec in specs)
+        assert all(
+            spec.submodules.self_attention_hyper_connection is HyperConnectionModule
+            and spec.submodules.mlp_hyper_connection is HyperConnectionModule
+            for spec in specs
+        )
+        assert [spec.submodules.mlp for spec in specs] == [
+            moe_spec,
+            dense_spec,
+            moe_spec,
+            dense_spec,
+        ]
 
 
 # ===================================================================

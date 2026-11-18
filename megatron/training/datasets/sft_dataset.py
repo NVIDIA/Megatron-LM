@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
 
 import atexit
+import csv
 import math
 from collections import Counter
 from typing import Any, Dict, List, Optional, Union
@@ -62,6 +63,8 @@ class SFTDataset(MegatronDataset):
         config: GPTDatasetConfig,
     ) -> None:
         super().__init__(dataset, dataset_path, indices, num_samples, index_split, config)
+        # Pre-calculate padding divisor to avoid redundant computation in get_item
+        self.padding_divisor = self._calculate_padding_divisor()
 
     @staticmethod
     def numel_low_level_dataset(low_level_dataset: LowLevelDataset) -> int:
@@ -148,7 +151,7 @@ class SFTDataset(MegatronDataset):
             assert not self.config.reset_position_ids
             pack_positions.extend(range(len(tokens_list)))
 
-            pad_granularity = self._calculate_padding_divisor()
+            pad_granularity = self.padding_divisor
             mod_token_count = len(pack_tokens) % pad_granularity
             if mod_token_count != 0:
                 pad_len = pad_granularity - mod_token_count
@@ -223,7 +226,11 @@ class SFTDataset(MegatronDataset):
 
 
 class MockSFTLowLevelDataset:
-    """The low-level mock dataset for SFT
+    """The low-level mock dataset for SFT.
+
+    Sequence lengths count content tokens, excluding the EOD appended by the
+    high-level dataset. The next-token shift therefore preserves the configured
+    length before truncation and padding.
 
     Args:
         mode (str): One of 'file', 'distribution', or 'verification'.
@@ -260,9 +267,21 @@ class MockSFTLowLevelDataset:
             )
 
         if mode == "file":
-            import pandas as pd
-
-            self.sequence_lengths = np.array(pd.read_csv(kwargs["path"])).flatten()
+            # One sequence length per CSV line; non-numeric cells (e.g. a
+            # header row) are skipped. Stdlib csv keeps pandas out of the
+            # package's import-time dependencies.
+            lengths = []
+            with open(kwargs["path"], newline="") as f:
+                for row in csv.reader(f):
+                    for cell in row:
+                        cell = cell.strip()
+                        if not cell:
+                            continue
+                        try:
+                            lengths.append(int(float(cell)))
+                        except ValueError:
+                            continue
+            self.sequence_lengths = np.array(lengths)
             self.size = len(self.sequence_lengths)
         elif mode == "distribution":
             min_seq_len = kwargs["min_seq_len"]
@@ -302,11 +321,11 @@ class MockSFTLowLevelDataset:
         return self.size
 
     def __getitem__(self, idx: int) -> np.ndarray:
-        # The returned sample has 'length-1' tokens; an EOD token is appended
-        # later in MockSFTDataset.__getitem__, making the total 'length' tokens.
+        # Return the configured number of content tokens. The high-level
+        # dataset appends EOD to supply the extra target for the next-token shift.
         length = int(self.sequence_lengths[idx % self.size])
         if hasattr(self, 'indexed_dataset'):
-            target = length - 1
+            target = length
             num_docs = len(self.indexed_dataset)
             doc_idx = idx % num_docs
             raw = self.indexed_dataset[doc_idx]
@@ -328,7 +347,7 @@ class MockSFTLowLevelDataset:
             return sample.astype(np.int64)
         else:
             assert self.vocab_size is not None and self.vocab_size >= 2
-            sample = np.arange(1, length, dtype=np.int64)
+            sample = np.arange(1, length + 1, dtype=np.int64)
             # Preserve the original positive-token invariant while bounding IDs to the
             # tokenizer vocabulary. In particular, do not synthesize token 0, which is
             # commonly used as EOD/padding and therefore masked out of the loss.
@@ -378,16 +397,15 @@ class MockSFTDataset(SFTDataset):
 
         tokens = self.dataset[int(self.indices[idx % len(self.indices)])]
 
-        # Convert tokens to list and always append EOD to ensure length consistency.
-        # The low-level dataset returns length-1 tokens, and we add EOD to make it length tokens.
+        # Add the extra target needed to preserve the content length after shift.
         tokens_list = tokens.tolist()
         tokens_list.append(eod)
+        if len(tokens_list) > pack_length + 1:
+            tokens_list = tokens_list[:pack_length] + [eod]
+        valid_len = len(tokens_list) - 1
 
         if self.dataset.format == "sbhd":
             # SBHD format: single padded sequence without cu_seqlens.
-            # Long sequences are truncated to pack_length tokens (including EOD).
-            if len(tokens_list) >= pack_length + 1:
-                tokens_list = tokens_list[: pack_length - 1] + [eod]
             # Pad to pack_length + 1 (offset by 1 for input/label split).
             pad_len = pack_length + 1 - len(tokens_list)
             if pad_len > 0:
@@ -399,7 +417,7 @@ class MockSFTDataset(SFTDataset):
             # matching GPTDataset behavior for standard (non-packed) training.
             position_ids = torch.arange(pack_length, dtype=torch.int64)
             loss_mask = torch.ones(pack_length, dtype=torch.float32)
-            loss_mask[labels == pad] = 0.0
+            loss_mask[valid_len:] = 0.0
             return {
                 'tokens': input_ids,
                 'labels': labels,
@@ -412,13 +430,8 @@ class MockSFTDataset(SFTDataset):
             tokens.extend([pad] * pad_len)
             positions.extend(range(positions[-1] + 1, positions[-1] + 1 + pad_len))
 
-        pack_tokens = list(tokens_list) + [pad]
+        pack_tokens = list(tokens_list)
         pack_positions = list(range(len(pack_tokens)))
-
-        # Truncate if sequence exceeds pack_length + 1 (need +1 for shift).
-        if len(pack_tokens) > pack_length + 1:
-            pack_tokens = pack_tokens[: pack_length - 1] + [eod, pad]
-            pack_positions = pack_positions[: pack_length + 1]
 
         # Pad to pad_granularity alignment (tp * cp * 2).
         # We need final length (after shift) to be divisible by pad_granularity.
@@ -437,9 +450,9 @@ class MockSFTDataset(SFTDataset):
         seq_len = len(input_ids)
         cu_seqlens = [0, seq_len]
 
-        # Loss mask: mask padding tokens
+        # Mask padding by position so a real EOD target stays valid when pad == eod.
         loss_mask = torch.ones(seq_len, dtype=torch.float32)
-        loss_mask[labels == pad] = 0.0
+        loss_mask[valid_len:] = 0.0
 
         cu_seqlens = torch.tensor(cu_seqlens, dtype=torch.int32)
         max_seqlen = torch.tensor(seq_len, dtype=torch.int32)

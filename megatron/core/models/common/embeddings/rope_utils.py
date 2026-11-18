@@ -14,6 +14,7 @@ import torch
 from torch import Tensor
 
 from megatron.core import parallel_state
+from megatron.core._rank_utils import warn_single_rank
 
 logger = logging.getLogger(__name__)
 _ROPE_FUSION_FALLBACK_WARNINGS: set[str] = set()
@@ -76,9 +77,11 @@ __all__ = [
 
 def _is_raw_mrope_freqs(t: Tensor, freqs: Tensor, config: TransformerConfig) -> bool:
     """Return whether freqs is the raw 3-axis mRoPE tensor for fused apply."""
-    if config.mrope_section is None or freqs.dim() != 4 or freqs.shape[0] != 3:
+    # Minimal configs (e.g. SimpleNamespace in unit tests) may omit mrope_section.
+    mrope_section = getattr(config, "mrope_section", None)
+    if mrope_section is None or freqs.dim() != 4 or freqs.shape[0] != 3:
         return False
-    if sum(config.mrope_section) != freqs.shape[-1] or freqs.shape[-1] * 2 > t.shape[-1]:
+    if sum(mrope_section) != freqs.shape[-1] or freqs.shape[-1] * 2 > t.shape[-1]:
         return False
     if t.dim() == 4:
         return freqs.shape[1] == t.shape[1] and freqs.shape[2] == t.shape[0]
@@ -91,13 +94,15 @@ def _is_raw_mrope_freqs_thd(
     t: Tensor, freqs: Tensor, cu_seqlens: Tensor, config: TransformerConfig, cp_size: int
 ) -> bool:
     """Return whether freqs is raw mRoPE for THD layout, or fail on raw-like bad shapes."""
-    if config.mrope_section is None or freqs.dim() != 4 or freqs.shape[0] != 3:
+    # Minimal configs (e.g. SimpleNamespace in unit tests) may omit mrope_section.
+    mrope_section = getattr(config, "mrope_section", None)
+    if mrope_section is None or freqs.dim() != 4 or freqs.shape[0] != 3:
         return False
     if t.dim() != 3:
         raise ValueError(
             f"raw mRoPE THD expects t with shape [tokens, heads, head_dim], got {tuple(t.shape)}"
         )
-    if sum(config.mrope_section) != freqs.shape[-1] or freqs.shape[-1] * 2 > t.shape[-1]:
+    if sum(mrope_section) != freqs.shape[-1] or freqs.shape[-1] * 2 > t.shape[-1]:
         return False
 
     if freqs.shape[1] != 1:
@@ -352,17 +357,19 @@ def _apply_rotary_pos_emb_thd(
     multi_latent_attention: Optional[bool] = None,
     max_seqlen: Optional[int] = None,
 ) -> Tensor:
-    """Apply RoPE for `thd` format using pure CUDA ops (CUDA Graph compatible).
+    """Apply RoPE for `thd` format using vectorized CUDA operations.
 
-    Replaces the original Python-loop + .tolist() implementation with vectorized
-    CUDA operations. No GPU->CPU syncs, compatible with CUDA Graph capture.
+    When ``max_seqlen`` is supplied, this path performs no GPU-to-CPU sync and is
+    compatible with CUDA Graph capture. The compatibility path for legacy callers
+    that omit ``max_seqlen`` retains one GPU-to-CPU sync.
 
     Args:
         t (Tensor): Input tensor of shape [total_tokens, h, d]
         cu_seqlens (Tensor): Cumulative sequence lengths, shape [num_seqs + 1], int32.
         freqs (Tensor): RoPE frequencies, shape [max_s, 1, 1, d] or [total_tokens, 1, 1, d]
         cp_group: Context parallel group
-        max_seqlen: Global max sequence length for this packed batch when known.
+        max_seqlen: Global max sequence length for this packed batch when known. Supplying it
+            avoids the compatibility-path host sync used by legacy callers.
 
     Returns:
         Tensor: Shape [total_tokens, h, d]. Input with RoPE applied.
@@ -417,11 +424,13 @@ def _apply_rotary_pos_emb_thd(
     else:
         freq_pos = local_pos.to(torch.int64)
 
-    assert max_seqlen is not None, (
-        "max_seqlen must be provided for THD RoPE so packed-frequency offset "
-        "detection does not silently depend on tensor shape heuristics."
-    )
-    exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) > max_seqlen
+    if max_seqlen is None:
+        # Backward compatibility for callers that predate ``max_seqlen``. This retains
+        # the old packed-frequency semantics at the cost of a GPU-to-CPU sync. Updated
+        # training paths pass ``max_seqlen`` and stay CUDA-graph safe.
+        exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) == int(cu_seqlens[-1].item())
+    else:
+        exact_packed_freqs = freqs.dim() >= 1 and freqs.size(0) > max_seqlen
     if exact_packed_freqs:
         # `freqs` covers all positions across all sequences (used for non-1D
         # RoPE / VLMs); shift by the per-sequence start offset so each token
@@ -787,6 +796,24 @@ def apply_rotary_pos_emb(
                     ),
                 ]
             )
+            # Like unfused THD, infer packed-token frequencies from rows > max_seqlen.
+            # These rows continue across sequences; shared position tables restart at row 0.
+            freqs_in_packed_order = max_seqlen is not None and freqs.size(0) > max_seqlen
+            if not use_unfused_thd and freqs_in_packed_order:
+                if cp_group.size() == 1 and freqs.size(0) == t.size(0):
+                    # Frequencies already align with local tokens. RoPE is token-wise,
+                    # so the SBHD kernel can treat them as one sequence with batch size 1.
+                    assert (
+                        fused_apply_rotary_pos_emb is not None
+                    ), "apply_rope_fusion is not available."
+                    return fused_apply_rotary_pos_emb(
+                        t.unsqueeze(1), freqs, interleaved=config.rotary_interleaved
+                    ).squeeze(1)
+                warn_single_rank(
+                    "apply_rope_fusion supports per-token RoPE frequencies only with one row per "
+                    "token and no context parallelism. Using unfused implementation."
+                )
+                use_unfused_thd = True
             if use_unfused_thd:
                 return _apply_rotary_pos_emb_thd(
                     t,

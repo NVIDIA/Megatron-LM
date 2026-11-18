@@ -3,7 +3,10 @@
 """Dataloaders."""
 
 
+import os
 import random
+import sys
+from functools import partial
 
 import numpy as np
 import torch
@@ -13,6 +16,30 @@ from megatron.core import mpu
 from megatron.core.datasets.utils import Split
 from megatron.training import get_args
 from megatron.training.dist_signal_handler import DistributedSignalHandler
+from megatron.training.global_vars import get_run_config
+
+
+def _worker_init_fn(_, *, exit_signal_handler: bool, exit_signal: int) -> None:
+    """Initialize workers without relying on parent-process training globals."""
+    # Defensively close GPU device FDs in worker processes so workers do not
+    # keep references into NVIDIA memory space. This helps ensure GPU memory
+    # can be reclaimed even if a dataloader worker is delayed or fails to exit.
+    if sys.platform == 'linux':
+        for fd in os.listdir("/proc/self/fd"):
+            try:
+                path = os.readlink(f"/proc/self/fd/{fd}")
+                if path.startswith("/dev/nvidia"):
+                    os.close(int(fd))
+            except OSError:
+                pass
+
+    if exit_signal_handler:
+        DistributedSignalHandler(exit_signal).__enter__()
+
+
+def _identity_collate(batch: list) -> list:
+    """Keep variable-length samples as a list."""
+    return batch
 
 
 def build_pretraining_data_loader(dataset, consumed_samples):
@@ -20,6 +47,13 @@ def build_pretraining_data_loader(dataset, consumed_samples):
 
     if dataset is None:
         return None
+    # Empty split (e.g. valid/test when --eval-iters 0): return null loader
+    try:
+        if len(dataset) == 0:
+            return None
+    except TypeError:
+        pass
+    cfg = get_run_config()
     args = get_args()
 
     if hasattr(dataset, 'split'):
@@ -37,11 +71,10 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     # Use eval-specific batch sizes for validation/test splits
     is_eval = split in (Split.valid, Split.test)
     micro_batch_size = (
-        getattr(args, 'eval_micro_batch_size', args.micro_batch_size)
-        if is_eval
-        else args.micro_batch_size
+        cfg.validation.eval_micro_batch_size if is_eval else cfg.train.micro_batch_size
     )
-    if split == Split.valid and args.full_validation:
+
+    if split == Split.valid and cfg.validation.full_validation:
         batch_sampler = MegatronFullValidationSampler(
             total_samples=len(dataset),
             data_parallel_rank=mpu.get_data_parallel_rank(),
@@ -70,40 +103,38 @@ def build_pretraining_data_loader(dataset, consumed_samples):
     else:
         raise Exception('{} dataloader type is not supported.'.format(args.dataloader_type))
 
-    def worker_init_fn(_):
-        import os
-
-        # Defensively close GPU device FDs in worker processes so workers do not
-        # keep references into NVIDIA memory space. This helps ensure GPU memory
-        # can be reclaimed even if a dataloader worker is delayed or fails to exit.
-        def close_nvidia_fds():
-            for fd in os.listdir("/proc/self/fd"):
-                try:
-                    path = os.readlink(f"/proc/self/fd/{fd}")
-                    if path.startswith("/dev/nvidia"):
-                        os.close(int(fd))
-                except OSError:
-                    pass
-
-        close_nvidia_fds()
-        if args.exit_signal_handler:
-            DistributedSignalHandler(args.exit_signal).__enter__()
-
-    maybe_worker_init_fn = worker_init_fn if args.num_workers > 0 else None
-    # Identity collate for VarlenDataset and packing-scheduler paths;
-    # they emit one variable-length dict per sample, not stack-able by
-    # the default collate. --varlen-sbhd-validation is excluded: it bypasses
-    # packing and emits fixed-length [seq_length] samples that the default
-    # collate stacks normally.
+    maybe_worker_init_fn = (
+        partial(
+            _worker_init_fn,
+            exit_signal_handler=cfg.train.exit_signal_handler,
+            exit_signal=cfg.train.exit_signal,
+        ) if args.num_workers > 0 else None
+    )
+    # Identity collate for VarlenDataset and packing-scheduler paths; they emit
+    # one variable-length dict per sample, not stack-able by the default
+    # collate. --varlen-sbhd-validation is excluded: it bypasses packing and
+    # emits fixed-length [seq_length] samples that the default collate stacks
+    # normally.
     if (
         (args.use_varlen_dataset and not args.varlen_sbhd_validation)
-        or args.dynamic_context_parallel
-        or args.sequence_packing_scheduler is not None
+        or cfg.model.transformer.dynamic_context_parallel
+        or cfg.model.transformer.sequence_packing_scheduler is not None
         or getattr(args, "use_vanilla_collate_fn", False)
     ):
-        extra_kwargs = {"collate_fn": lambda x: x}
+        extra_kwargs = {"collate_fn": _identity_collate}
     else:
         extra_kwargs = {}
+    # Own generator: otherwise _BaseDataLoaderIter draws _base_seed from the default CPU generator
+    # on ITERATOR creation, after load_checkpoint has restored it. initial_seed() reads the seed
+    # without consuming a draw.
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(torch.initial_seed())
+    if args.sequence_packing_scheduler is not None and args.num_workers > 0 and not is_eval:
+        # Keep a full next global batch in flight for packing schedulers.
+        items_per_step = cfg.train.global_batch_size // (
+            micro_batch_size * mpu.get_data_parallel_world_size()
+        )
+        extra_kwargs["prefetch_factor"] = max(2, -(-items_per_step // args.num_workers))
     return torch.utils.data.DataLoader(
         dataset,
         batch_sampler=batch_sampler,
@@ -111,6 +142,7 @@ def build_pretraining_data_loader(dataset, consumed_samples):
         pin_memory=True,
         persistent_workers=True if args.num_workers > 0 else False,
         worker_init_fn=maybe_worker_init_fn,
+        generator=loader_generator,
         **extra_kwargs,
     )
 

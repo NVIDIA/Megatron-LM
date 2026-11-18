@@ -14,15 +14,78 @@
 
 """Minimal Megatron-FSDP fully_shard entrypoint."""
 
-from collections.abc import Iterator
+import dataclasses
+import functools
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from contextvars import ContextVar
 
 from torch import nn
 from torch.distributed import DeviceMesh
+from torch.distributed.tensor.placement_types import Placement
 
 from ..mixed_precision import MixedPrecisionPolicy
-from .module import FsdpContext, FsdpModule
-from .placement import Placements
+from .context import FsdpContext
+from .module import FsdpModule
+from .placement import ShardLayout
+from .schedule_policy import SchedulePolicy
+
+_FSDP_CONTEXT = ContextVar[FsdpContext | None]("mfsdp_context", default=None)
+
+MeshAxis = int | str
+
+
+@contextmanager
+def fully_shard_context(context: FsdpContext) -> Iterator[FsdpContext]:
+    """Activate ``context`` for FSDP construction, finalizing it on successful exit."""
+    if _FSDP_CONTEXT.get() is not None:
+        raise RuntimeError("fully_shard_context does not support nesting.")
+    if context.is_finalized:
+        raise RuntimeError("Cannot enter fully_shard_context after construction is finalized.")
+    token = _FSDP_CONTEXT.set(context)
+    try:
+        yield context
+        context.finalize()
+    finally:
+        _FSDP_CONTEXT.reset(token)
+
+
+def current_fully_shard_context() -> FsdpContext | None:
+    """Return the innermost active ``fully_shard_context``, or ``None``.
+
+    Read-only counterpart of :func:`fully_shard_context`: it never creates, joins, or
+    finalizes a context, and returns ``None`` whenever no ``fully_shard_context`` scope is
+    active. Callers that must share one context -- for example per-chunk wrappers built by
+    a single wrap call -- use it to join the caller's ambient context instead of opening a
+    second one.
+    """
+    return _FSDP_CONTEXT.get()
+
+
+@dataclasses.dataclass(frozen=True)
+class Placements:
+    """Per-data-parallel-axis placements for MFSDP buffers.
+
+    ``dp_axes`` identifies the parent-mesh axes that form MFSDP's data-parallel
+    mesh. Placement sequences are ordered to match those axes. Use Torch's
+    ``Shard(0)`` for public parameter, gradient, and optimizer sharding.
+    """
+
+    dp_axes: Sequence[MeshAxis]
+    parameter: Sequence[Placement]
+    gradient: Sequence[Placement]
+    optimizer: Sequence[Placement]
+
+    def __post_init__(self) -> None:
+        """Validate placement sequence lengths."""
+        axis_count = len(self.dp_axes)
+        for name, placements in (
+            ("parameter", self.parameter),
+            ("gradient", self.gradient),
+            ("optimizer", self.optimizer),
+        ):
+            if len(placements) != axis_count:
+                raise ValueError(f"Expected {axis_count} {name} placements, got {len(placements)}.")
 
 
 def fully_shard(
@@ -30,7 +93,9 @@ def fully_shard(
     mesh: DeviceMesh,
     placements: Placements,
     mixed_precision_policy: MixedPrecisionPolicy | None = None,
-    use_symm_mem: bool = False,
+    grad_scale: float = 1.0,
+    schedule_policy: SchedulePolicy = SchedulePolicy(),
+    shard_layout: ShardLayout = ShardLayout.PADDED,
 ) -> None:
     """Apply FSDP to a module in place.
 
@@ -39,16 +104,44 @@ def fully_shard(
 
     Args:
         module: Module whose currently unowned parameters are managed by FSDP.
-        mesh: Device mesh used for sharding.
+        mesh: Parent device mesh containing the data-parallel axes.
         placements: Parameter, gradient, and optimizer placements.
         mixed_precision_policy: Optional precision policy. Defaults to FP32 main weights
             and parameter-dtype main gradients.
-        use_symm_mem: Allocate all-gather and reduce-scatter staging buffers from
-            PyTorch's NCCL symmetric-memory pool.
+        grad_scale: Multiplier applied after mesh averaging. Defaults to 1, which is correct when
+            each mesh rank contributes exactly one term to the gradient.
+
+            Expert parallelism is the motivating case. A rank's experts process tokens
+            routed to them from every rank in the expert-parallel group, and the backward
+            pass routes those tokens' gradients back, so a rank's expert gradient already
+            sums over ``ep_size`` ranks' data before any reduction happens. Averaging over
+            the expert-data-parallel mesh alone therefore divides by too little, and
+            ``grad_scale=1 / ep_size`` makes up the difference. Dense parameters see only
+            their own rank's tokens and need no additional scaling.
+
+            For per-token loss, ``grad_scale=mesh.size()`` cancels mesh averaging
+            so gradients are summed. Normalize once by the global token count after
+            accumulating all microbatches and before clipping or updating weights.
+        schedule_policy: Prefetching, execution-hook, and gradient-completion policy
+            for this FSDP module.
+        shard_layout: How RowAtomic/BlockAtomic parameter groups are split across ranks.
+            ``ShardLayout.PADDED`` (default) pads every group to equal shards;
+            ``ShardLayout.UNPADDED`` packs each group without padding and splits it at row
+            boundaries (32-row block boundaries for MXFP8) into generally unequal shards.
     """
     if isinstance(module, FsdpModule):
         raise ValueError("This module is already managed by FSDP.")
+    context = current_fully_shard_context()
+    if context is None:
+        raise RuntimeError("fully_shard must run inside fully_shard_context.")
+    for submodule in module.modules():
+        if isinstance(submodule, FsdpModule) and submodule.context is not context:
+            raise ValueError(
+                "Cannot fully_shard a module containing an FSDP child from another "
+                "fully_shard_context."
+            )
 
+    _validate_dp_axes(mesh, placements.dp_axes)
     mixed_precision_policy = mixed_precision_policy or MixedPrecisionPolicy()
     original_cls = module.__class__
     _attach_mixin(module)
@@ -56,50 +149,83 @@ def fully_shard(
         assert isinstance(module, FsdpModule)
         FsdpModule.__init__(
             module,
+            context=context,
             mesh=mesh,
-            placements=placements,
+            model_weight_placements=tuple(placements.parameter),
+            main_grad_placements=tuple(placements.gradient),
+            main_weight_placements=tuple(placements.optimizer),
             mixed_precision_policy=mixed_precision_policy,
-            use_symm_mem=use_symm_mem,
+            grad_scale=grad_scale,
+            schedule_policy=schedule_policy,
+            use_symmetric_memory=context.use_symmetric_memory,
+            shard_layout=shard_layout,
         )
     except Exception:
         module.__class__ = original_cls
         raise
 
 
+def _validate_dp_axes(mesh: DeviceMesh, dp_axes: Sequence[MeshAxis]) -> None:
+    """Validate the parent mesh's data-parallel axes."""
+    normalized_dp_axes = tuple(_axis_index(mesh, axis) for axis in dp_axes)
+    if len(set(normalized_dp_axes)) != len(normalized_dp_axes):
+        raise ValueError(f"Data-parallel axes must be distinct, got {dp_axes!r}.")
+    if normalized_dp_axes != tuple(sorted(normalized_dp_axes)):
+        raise ValueError(f"Data-parallel axes must be in mesh-axis order, got {dp_axes!r}.")
+    if normalized_dp_axes != tuple(range(mesh.ndim)):
+        raise NotImplementedError(
+            "MFSDP currently requires dp_axes to match every mesh axis in mesh order."
+        )
+
+
+def _axis_index(mesh: DeviceMesh, axis: MeshAxis) -> int:
+    if isinstance(axis, int):
+        axis_index = axis
+        if axis_index < 0:
+            axis_index += mesh.ndim
+        if axis_index < 0 or axis_index >= mesh.ndim:
+            raise ValueError(f"Mesh axis {axis} is out of bounds for mesh ndim {mesh.ndim}.")
+        return axis_index
+
+    dim_names = mesh.mesh_dim_names
+    if dim_names is None or axis not in dim_names:
+        raise ValueError(f"Mesh axis {axis!r} is not present in mesh dim names {dim_names}.")
+    return dim_names.index(axis)
+
+
 @contextmanager
-def microbatch(module: nn.Module, is_last: bool) -> Iterator[None]:
-    """Scope FSDP state to one microbatch.
+def finalize_gradients(context: FsdpContext, enabled: bool = True) -> Iterator[None]:
+    """Control whether backward finalizes accumulated gradients in this context.
+
+    When enabled, backward launches DP-outer reductions and automatically waits
+    for gradient reductions unless the caller manages that wait. When disabled,
+    inner reductions and weight cleanup still run, but outer reductions and the
+    automatic completion wait are deferred.
+
+    Wrap both forward and backward. This scope only changes the finalization
+    setting; entering or exiting it does not launch reductions or wait for them.
 
     Args:
-        module: Module tree whose FSDP roots should use this microbatch state.
-        is_last: Whether forwards in this scope are for the last microbatch.
+        context: FSDP context whose modules should use this finalization setting.
+        enabled: Whether backward should finalize gradients. Defaults to True.
     """
-    contexts: list[FsdpContext] = []
-    _collect_fsdp_contexts(module, contexts)
-    previous_states = [(context, context.is_last_microbatch) for context in contexts]
-    for context in contexts:
-        context.is_last_microbatch = is_last
+    context.ensure_finalized()
+    previous_state = context.finalize_gradients
+    context.finalize_gradients = enabled
 
     try:
         yield
     finally:
-        for context, is_last_microbatch in previous_states:
-            context.is_last_microbatch = is_last_microbatch
+        context.finalize_gradients = previous_state
 
 
 def _attach_mixin(module: nn.Module) -> None:
     if isinstance(module, FsdpModule):
         return
-    module_cls = module.__class__
-    fsdp_cls = type(f"ExperimentalFsdp{module_cls.__name__}", (FsdpModule, module_cls), {})
-    module.__class__ = fsdp_cls
+    module.__class__ = _get_fsdp_class(module.__class__)
 
 
-def _collect_fsdp_contexts(module: nn.Module, contexts: list[FsdpContext]) -> None:
-    if isinstance(module, FsdpModule):
-        module._lazy_init_context()
-        contexts.append(module.context)
-        return
-
-    for child in module.children():
-        _collect_fsdp_contexts(child, contexts)
+@functools.cache
+def _get_fsdp_class(module_cls: type[nn.Module]) -> type[nn.Module]:
+    """Reuse the subclass so classmethods share lazy state, such as CUDA streams."""
+    return type(f"Fsdp{module_cls.__name__}", (FsdpModule, module_cls), {})

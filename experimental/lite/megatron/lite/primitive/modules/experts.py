@@ -11,8 +11,8 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 
+from megatron.core.fusions.fused_bias_swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.lite.primitive import transformer_engine as te
-from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
     SharedGroupedLinearLoRA,
@@ -41,17 +41,10 @@ def swiglu_with_probs(
     y: torch.Tensor, probs: torch.Tensor | None, swiglu_limit: float = 0.0
 ) -> torch.Tensor:
     """SwiGLU with optional expert probability scaling."""
-    if swiglu_limit > 0:
-        gate, up = y.chunk(2, dim=-1)
-        up = torch.clamp(up.float(), min=-swiglu_limit, max=swiglu_limit)
-        gate = torch.clamp(gate.float(), max=swiglu_limit)
-        out = torch.nn.functional.silu(gate) * up
-        if probs is not None:
-            out = out * probs
-        return out.to(dtype=y.dtype)
+    clamp_value = swiglu_limit if swiglu_limit > 0 else None
     if probs is not None:
-        return weighted_bias_swiglu_impl(y, bias=None, weights=probs)
-    return bias_swiglu_impl(y, bias=None)
+        return weighted_bias_swiglu_impl(y, bias=None, weights=probs, clamp_value=clamp_value)
+    return bias_swiglu_impl(y, bias=None, clamp_value=clamp_value)
 
 
 class _AllReduceETP(torch.autograd.Function):
@@ -83,6 +76,9 @@ class Experts(nn.Module):
         self.num_local_experts = ensure_divisible(config.num_experts, ps.ep_size)
         self.fp8 = fp8
         self.moe_act_recompute = moe_act_recompute
+        # ETP is untested and its backward disagrees with lora.py's; refuse it.
+        if ps.etp_size > 1:
+            raise NotImplementedError(f"etp_size={ps.etp_size} unsupported; use 1.")
         self.etp_group = ps.etp_group if ps.etp_size > 1 else None
         self.swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
         self.fc1 = te.GroupedLinear(

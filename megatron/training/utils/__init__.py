@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 from megatron.training.utils.common_utils import (
     average_losses_across_data_parallel_group,
@@ -14,6 +14,7 @@ from megatron.training.utils.common_utils import (
     has_nvrx_checkpointing_async_support,
     has_nvrx_installed,
     is_first_or_last_pipeline_stage,
+    is_gtp_remat_active,
     is_hybrid_model,
     is_last_rank,
     is_rank0,
@@ -23,10 +24,12 @@ from megatron.training.utils.common_utils import (
     print_rank_last,
     reduce_max_stat_across_model_parallel_group,
     report_memory,
+    setup_multi_storage_client,
     to_empty_if_meta_device,
     unwrap_model,
     update_use_dist_ckpt,
     warn_rank_0,
 )
 from megatron.training.utils.log_utils import append_to_progress_log
+from megatron.training.utils.packed_seq_utils import prepare_packed_seq_params
 from megatron.training.utils.utils import start_memory_history_recording

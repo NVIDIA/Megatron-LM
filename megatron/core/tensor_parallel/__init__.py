@@ -1,5 +1,6 @@
 # Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-from .cross_entropy import vocab_parallel_cross_entropy
+from megatron.core.ops.loss.cross_entropy import vocab_parallel_cross_entropy
+
 from .data import broadcast_data
 from .inference_layers import (
     InferenceColumnParallelLinear,
@@ -10,8 +11,11 @@ from .layers import (
     ColumnParallelLinear,
     RowParallelLinear,
     VocabParallelEmbedding,
+    copy_gtp_attributes,
     copy_tensor_model_parallel_attributes,
+    gtp_local_pad_zero_count,
     linear_with_grad_accumulation_and_async_allreduce,
+    param_is_not_gtp_duplicate,
     param_is_not_tensor_parallel_duplicate,
     set_defaults_if_not_set_tensor_model_parallel_attributes,
     set_tensor_model_parallel_attributes,
@@ -58,7 +62,10 @@ __all__ = [
     "set_tensor_model_parallel_attributes",
     "set_defaults_if_not_set_tensor_model_parallel_attributes",
     "copy_tensor_model_parallel_attributes",
+    "copy_gtp_attributes",
     "param_is_not_tensor_parallel_duplicate",
+    "param_is_not_gtp_duplicate",
+    "gtp_local_pad_zero_count",
     "linear_with_grad_accumulation_and_async_allreduce",
     # mappings.py
     "copy_to_tensor_model_parallel_region",

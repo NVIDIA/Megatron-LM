@@ -1,21 +1,30 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
+import argparse
 import inspect
 import logging
 import math
+import os
 import warnings
+from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import Callable, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Self, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 
+from megatron.core._rank_utils import warn_single_rank
+from megatron.core.activations import squared_relu
+from megatron.core.context_parallel import CPLayout
 from megatron.core.enums import Fp4Recipe, Fp8Recipe
 from megatron.core.inference.moe import InferenceGroupedGemmBackend
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.transformer.cuda_graph_config import (
     ALLOWED_INFERENCE_SCOPES,
+    PACKED_DSA_CP_CUDA_GRAPH_WARNING,
+    cuda_graph_captures_attention,
     get_deprecated_cuda_graph_modules_migration,
+    is_packed_dsa_cp_cuda_graph_experimental,
     is_whole_moe_cuda_graph_scope,
     normalize_cuda_graph_modules,
     normalize_inference_cuda_graph_scope,
@@ -30,6 +39,7 @@ from megatron.core.transformer.enums import (
     LayerType,
 )
 from megatron.core.transformer.pipeline_parallel_layer_layout import PipelineParallelLayerLayout
+from megatron.core.transformer.wide_residual_config import WideResidualConfig
 from megatron.core.utils import experimental_api
 
 from .._rank_utils import log_single_rank
@@ -86,13 +96,57 @@ class TransformerConfig(ModelParallelConfig):
     which serves as an additional training objective.
     """
 
+    mtp_loss_type: str = "cross_entropy"
+    """Training objective for Multi-Token Prediction (MTP) heads.
+
+    Supported values are ``cross_entropy`` and ``e2e_tv``. The end-to-end total
+    variation objective directly optimizes the normalized expected acceptance
+    length under rejection-sampling verification.
+    """
+
+    mtp_normalize_loss_by_main_tokens: bool = False
+    """Normalize summed MTP losses with the global main-loss token count.
+
+    By default, each rank and microbatch first normalizes MTP loss with its local number of
+    valid MTP targets. Enabling this option instead leaves MTP losses as sums so the normal
+    per-token gradient finalization divides them by the global main-loss token count. This
+    makes the MTP objective invariant to how samples with different valid-token fractions are
+    partitioned across ranks and gradient-accumulation microbatches. Requires
+    ``calculate_per_token_loss=True``.
+    """
+
     mtp_use_repeated_layer: bool = False
     """Use a single MTP layer repeatedly instead of multiple separate layers."""
+
+    freeze_base_model_for_mtp: bool = False
+    """Freeze every non-MTP parameter and avoid recording backbone activations."""
+
+    keep_mtp_in_bf16: bool = False
+    """Keep MTP layers out of FP8 and FP4 quantization contexts."""
 
     mtp_detach_heads: bool = False
     """If True, detach MTP head inputs from the main model graph.
     This prevents MTP loss gradients from flowing back to the main model,
     only training the MTP heads themselves."""
+
+    mtp_hsm: bool = False
+    """Enable uniform per-token Hidden State Mixing (HSM) for MTP layers.
+    At every MTP depth, each token independently draws its input from the main model
+    hidden state and the outputs of the earlier depths, all aligned on the same target
+    token. Only takes effect during training and requires at least two MTP layers,
+    since a single depth has nothing to mix. Model constructors validate this
+    against the resolved architecture."""
+
+    mtp_loss_early_backward: bool = False
+    """Run each MTP head's vocabulary projection, cross-entropy and their backward back-to-back
+    during the forward pass instead of deferring the backward to the main backward pass.
+    By default autograd keeps the [seq, batch, vocab] fp32 softmax of every MTP head alive from
+    the forward until the main backward reaches it, on top of the main head's, so peak memory
+    grows by one full logits tensor per MTP depth. With this option the loop is
+    fwd(head_k) -> bwd(head_k) for every head: the head's logits/softmax are freed before the
+    next head starts, the output-layer weight gradient is accumulated immediately, and only the
+    [seq, batch, hidden] gradient of the head input is kept and injected into the main backward.
+    No recomputation is involved; total FLOPs are unchanged."""
 
     mtp_hybrid_override_pattern: Optional[str] = None
     """DEPRECATED: Use unified hybrid_layer_pattern instead.
@@ -154,6 +208,16 @@ class TransformerConfig(ModelParallelConfig):
     If attention backend is local we use the local pytorch implementation in mcore.
     Users can specify exact backend by changing this config. """
 
+    flash_attention_version: Optional[Literal[2, 3, 4]] = None
+    """Pin the FlashAttention generation (2, 3, or 4) used by both the training
+    (TransformerEngine) and inference (mcore dynamic-batching) attention paths. When
+    None, each path selects a version automatically based on what is installed. Pinning
+    is required for batch-invariant mode: the training-side logprob recompute and the
+    inference engine must run the same kernel, since different FlashAttention
+    generations use different tile sizes and softmax accumulation orders and therefore
+    differ bitwise. On the training side this is enforced via TransformerEngine's
+    NVTE_FLASH_ATTN_V2/V3/V4 selection environment variables."""
+
     softmax_scale: Optional[float] = None
     """Softmax scale for attention scaling."""
 
@@ -161,6 +225,12 @@ class TransformerConfig(ModelParallelConfig):
     """Applies modified softmax from https://www.evanmiller.org/attention-is-off-by-one.html. 
        Supports both TE FusedAttention and local unfused attention. Supports both a fixed offset and 
        and learnable offset."""
+
+    attn_logit_softcapping: Optional[float] = None
+    """If not None, cap the attention logits at this value using cap * tanh(logits / cap) before
+    softmax. Must be positive; use None to disable softcapping. Note that TransformerEngine
+    spells the disabled state as 0.0 rather than None, so 0.0 is rejected here to keep the two
+    from meaning different things."""
 
     num_query_groups: Optional[int] = field(
         default=None, metadata={"argparse_meta": {"default": 1}}
@@ -224,7 +294,16 @@ class TransformerConfig(ModelParallelConfig):
 
     activation_func_clamp_value: Optional[float] = None
     """Clamp the output of the linear_fc1 in the activation function. Only used when activation_func
-    is quick_gelu or weighted SwiGLU (MoE only)."""
+    is quick_gelu or SwiGLU (MoE only)."""
+
+    activation_func_tanh_clamp_scale: Optional[float] = None
+    """If set, precondition the input of the activation function with `s * tanh(x / s)`, where `s`
+    is this value. For a gated activation (silu only) this instead selects SiTU-GLU. The fused MoE
+    path (use_transformer_engine_op_fuser) requires a Transformer Engine with ScaledTanhSReLU."""
+
+    activation_func_tanh_clamp_scale_linear: Optional[float] = None
+    """Soft clamp scale for the linear (up) half of a gated activation, decoupled from the gate
+    scale in activation_func_tanh_clamp_scale. Requires activation_func_tanh_clamp_scale."""
 
     num_moe_experts: Optional[int] = None
     """Number of experts to use for MoE layer. When set, it replaces MLP with MoE layer. Set to None
@@ -279,6 +358,18 @@ class TransformerConfig(ModelParallelConfig):
     ``elementwise`` projects one gate per attention output element. ``headwise`` projects one
     scalar gate per attention head and is currently supported only by Multi-Latent Attention.
     """
+
+    attention_output_gate_fusion: bool = False
+    """Fuse the elementwise ``attention_output_gate`` of Multi-Latent Attention (the FP32
+    sigmoid, its cast to the activation dtype and the multiply) into one Triton kernel per
+    direction (``megatron.core.fusions.fused_attention_output_gate``). Forward values and
+    gradients are bit-identical to the eager composition, which keeps the FP32 sigmoid output
+    and the cast scale alive until backward; the fusion keeps only the two gate inputs.
+    Requires ``attention_output_gate`` with ``gated_attention_proj_granularity='elementwise'``,
+    ``multi_latent_attention`` and Triton; the headwise gate and regular attention are not
+    supported yet.
+    """
+
     rotary_base_per_layer: Optional[List[float]] = None
     """Per-layer RoPE theta values. Length must equal num_layers. When set, each
     SelfAttention layer creates its own RotaryEmbedding with the corresponding base;
@@ -316,11 +407,14 @@ class TransformerConfig(ModelParallelConfig):
     # attention variant
     ####################
     experimental_attention_variant: Optional[
-        Literal['gdn', 'kda', 'gated_delta_net', 'dsa', 'dsv4_hybrid']
+        Literal['gdn', 'gdn2', 'kda', 'gated_delta_net', 'dsa', 'dsv4_hybrid']
     ] = None
     """Type of experimental attention variant to use.
 
     ``gdn`` and ``kda`` select Gated DeltaNet and Kimi Delta Attention, respectively.
+    ``gdn2`` selects the GDN2 (Gated DeltaNet-2) variant of the gated delta net layer, with
+    channel-wise decay, erase and write gates; it requires flash-linear-attention >= 0.5.1.
+    Both gdn and gdn2 also select the layer built for the hybrid layer pattern symbol 'G'.
     ``gated_delta_net`` is a deprecated compatibility alias for ``gdn`` and is normalized in
     ``__post_init__`` with a ``DeprecationWarning``.
     """
@@ -338,6 +432,9 @@ class TransformerConfig(ModelParallelConfig):
     ####################
     # DSA
     ####################
+    dsa_indexer_mode: Literal['standard', 'simplified'] = 'standard'
+    """DSA indexer formulation. Simplified uses one Q head and a plain Q/K dot product."""
+
     dsa_indexer_n_heads: Optional[int] = None
     """Number of DSA indexer heads."""
 
@@ -353,9 +450,17 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_skip_topk_offset: int = 0
     """Layer offset for DSA cross-layer top-k sharing."""
+    dsa_fwd_use_dense_attn: bool = False
+    """Whether DSA min-memory backends use dense GQA attention forward for indexer warmup."""
+
+    dsa_reset_indexer_on_load: bool = False
+    """Whether to reset DSA indexer parameters and optimizer state after checkpoint load."""
 
     dsa_indexer_loss_coeff: Optional[float] = None
-    """Coefficient for the DSA indexer KL divergence loss. Set to 0 to disable indexer loss."""
+    """Coefficient for the DSA indexer KL divergence loss.
+    Set to 0 to disable indexer loss; in that mode the non-differentiable indexer projections are
+    frozen and excluded from gradient/optimizer bookkeeping.
+    """
 
     dsa_indexer_use_sparse_loss: bool = False
     """Whether to use sparse DSA indexer loss. If True, the indexer loss will be computed using the
@@ -364,8 +469,45 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
     """Precision used only by the fused compact DSA indexer forward and Top-K."""
 
-    dsa_kernel_backend: Literal["none", "tilelang", "cudnn"] = "none"
-    """Optional fused ordinary-DSA kernel backend. Unsupported layouts use PyTorch fallback."""
+    dsa_compact_indexer_workspace_sharing: bool = True
+    """Under CUDA graphs the fused compact DSA indexer keeps a persistent workspace per static
+    geometry (MXFP8 q/k quantization destinations, packed scales, candidate offsets) that has to be
+    prepared outside capture. When True, every CSA layer built from this config shares one such
+    workspace per geometry and balanced-indexer slot instead of owning its own copy: the layers of
+    a graph run serially on one stream and nothing in the workspace outlives the indexer dispatch
+    that fills it, so sharing only removes duplicates (one workspace per layer costs ~7 GiB per
+    rank on DSv4 at 16K tokens). False restores per-layer workspaces."""
+
+    dsa_kernel_backend: (
+        Literal["none", "tilelang", "cudnn", "min-memory-triton", "min-memory-torch", "reference"]
+        | None
+    ) = None
+    """Which DSA implementation to run. This is the only backend selector.
+
+    When unset, DSv4 hybrid resolves to ``cudnn`` and every other attention variant to
+    ``none``, which the DSA-over-GQA path then resolves again as described below.
+    Explicit ``tilelang`` or ``cudnn`` enables only that backend; unsupported DSA-over-MLA
+    layouts continue to use the PyTorch fallback.
+
+    Support matrix:
+
+    =================== ============ ============ =========================================
+    value               DSA over MLA DSA over GQA notes
+    =================== ============ ============ =========================================
+    ``none``            yes          no           no fused kernels; PyTorch fallback
+    ``tilelang``        yes          no           fused TileLang kernels
+    ``cudnn``           yes          no           fused cuDNN kernels
+    ``min-memory-triton`` no         yes          chunked min-memory, Triton kernels
+    ``min-memory-torch``  no         yes          chunked min-memory, Triton dispatch off
+    ``reference``       no           yes          dense-mask reference the kernels are A/B'd against
+    =================== ============ ============ =========================================
+
+    ``cudnn`` selects the fused cuDNN indexer, which exists only on the standard-indexer path
+    and so is MLA-only: the simplified indexer the GQA path requires has no cuDNN branch.
+
+    On the DSA-over-GQA path ``none`` resolves to ``min-memory-triton``, since "no fused
+    kernels" has no meaning there. ``tilelang`` and ``cudnn`` are rejected rather than silently
+    downgraded; see ``__post_init__``."""
 
     dsa_indexer_rope_interleaved: bool = False
     """Whether DSA indexer RoPE should use MLA-style interleaving."""
@@ -376,12 +518,17 @@ class TransformerConfig(ModelParallelConfig):
     dsa_indexer_scoring_relu: bool = True
     """Whether DSA indexer should apply ReLU to q@k scores before weighting."""
 
+    dsa_indexer_qk_proj_use_quantization: bool = True
+    """Whether indexer query/key projections use the enclosing FP8/FP4 context.
+    When disabled, these projections use the configured unquantized dtype (e.g. BF16).
+    This does not control ``linear_weights_proj`` or index-score quantization.
+    """
+
     dsa_indexer_k_norm_epsilon: Optional[float] = None
     """Optional epsilon override for the DSA indexer key LayerNorm."""
 
     dsa_indexer_k_norm_fp32: bool = False
     """Whether DSA indexer key LayerNorm should run on fp32 inputs."""
-
     dsa_indexer_weights_proj_use_quantization: bool = True
     """Whether ``DSAIndexer`` weights projection follows the enclosing FP8/FP4
     quantization context. Disable this to keep the projection parameter outside FP8/FP4;
@@ -394,11 +541,84 @@ class TransformerConfig(ModelParallelConfig):
     backend. The final index scores remain FP32 independently of this option. This option does
     not affect ``CSAIndexer``, which keeps its FP8-disabled BF16 projection."""
 
+    dsa_cp_balance_indexer: bool = False
+    """Enable the load-balanced context-parallel DSA indexer path. The contiguous CP split makes the
+    causal indexer's per-query cost grow with rank, so later CP ranks become stragglers. When True,
+    each rank instead scores a balanced low-position + high-position chunk pair (two launches of the
+    existing indexer kernel) so every rank does ~constant work, then combines the top-k back to
+    contiguous order. Balancing requires the per-sequence zigzag and the fused indexer kernel
+    backend. Eligibility is decided from the actual microbatch: its per-rank row count must be
+    even, and every padded sequence length (including any capacity tail) must be divisible by
+    ``2 * cp_size``. ``pad_packed_seq_alignment`` only controls capacity rounding and may be
+    ``None``, ``"max"``, or an integer; it is not an eligibility guarantee. An ineligible eager
+    pack takes the contiguous reference path for that microbatch, so eager runs may switch paths
+    and capacities between packs. The current
+    fused kernel package silently corrupts any fused call above 32768 query rows that is
+    not the process's first fused call (verified on GB200, cudnn-frontend 1.26.0): the
+    balanced two-half-call path therefore fails closed above per-rank capacities of
+    2 * 32768 rows, balanced-run reference fallbacks above 32768 rows take the unfused
+    implementation, and pre-existing paths keep their behavior with a once-per-process
+    correctness warning. Whether balancing is worthwhile for a workload is decided once,
+    at recipe level, by this flag.
+    Selection Q inherits the effective per-layer precision. Only delayed-scaling selection
+    uses a stateless nonquantized projection; its canonical local projection still records once
+    in eval/no-grad checkpoint forwards so amax and recompute metadata remain consistent.
+    Compact BF16/MXFP8 scoring returns its sparse-loss prediction with the selected indices in
+    the existing combine collectives. MXFP8 never takes an unfused BF16 fallback.
+    For Transformer Engine CUDA graphs that capture attention, fixed-capacity dynamic-pack routing
+    is enabled automatically when ``sequence_packing_scheduler="dp_balanced"``. Data preparation
+    then builds one fixed-shape source plan from each microbatch's ``cu_seqlens``. The decoder stack
+    copies its two typed metadata owners once into a fixed-address graph-slot arena shared by all
+    captured DSA callables. Staged route inputs retain their originating slot so replay cannot
+    follow mutable layer microbatch state; this does not change the existing CUDA-graph/recompute
+    compatibility matrix. PP/VPP also requires ``cuda_graph_dynamic_microbatches`` so a graph input
+    slot cannot be reused while its forward remains live. Dynamic CP, local CUDA graphs, and
+    full-iteration CUDA graphs do not use dynamic-pack routing. A step batch-size schedule may not
+    increase the source global batch size after capture; doing so would require retaining graph
+    instances sized for the largest future schedule entry. Other graph configurations retain the
+    static-composition behavior."""
+
+    @property
+    def dsa_cp_balance_indexer_graph_dynamic_packs(self) -> bool:
+        """Whether CUDA-graphed balanced DSA routing supports varying pack compositions.
+
+        This is derived rather than user-configurable so data preparation, graph capture, and
+        replay always agree on whether fixed-capacity dynamic route metadata is required.
+        """
+        return bool(
+            self.dsa_cp_balance_indexer
+            and self.cuda_graph_impl == "transformer_engine"
+            and cuda_graph_captures_attention(self)
+            and self.sequence_packing_scheduler == "dp_balanced"
+        )
+
+    dsa_indexer_kpool: int = 1
+    """Number of keys per softmax-weighted indexer pool; 1 keeps per-token selection.
+    When greater than one, ``dsa_indexer_topk`` must be divisible by this value.
+    """
+
+    dsa_indexer_kpool_use_quantization: bool = False
+    """Quantize KPool scoring inputs to E4M3 with power-of-two scales after Hadamard
+    rotation. This does not change projection parameter or GEMM precision.
+    """
+
+    dsa_indexer_kpool_always_select_tail: bool = True
+    """Append each query's incomplete causal pool after selected history pools.
+    This widens the output to ``dsa_indexer_topk + dsa_indexer_kpool - 1``; unused slots are -1.
+    Set to False for fixed-width pool-only selection. Only applies when
+    ``dsa_indexer_kpool > 1``.
+    """
+
     ####################
     # DeepSeek-v4 hybrid attention
     ####################
     csa_window_size: int = 128
     """Sliding window size for compressed sparse attention."""
+
+    hca_aligned_backward: bool = False
+    """Enable cuDNN aligned HCA backward for GB300/Rubin, CP4/8/16 and 8K-128K tokens.
+    Requires one padded sequence and a supporting cuDNN Frontend; other layouts use stock.
+    Captured replay must preserve boundaries; warm backward eagerly before capture."""
 
     csa_compress_ratios: Optional[List[int]] = None
     """Per-layer compress ratios, e.g. [0, 0, 4, 128, 4, 128, ...]. A value of 0 is a
@@ -428,6 +648,11 @@ class TransformerConfig(ModelParallelConfig):
     - An integer N: Represents a (N-1):N ratio, meaning (N-1) LA layers for every 1 SDPA layer
     - A list that defines a custom pattern, e.g.: [1,1,1,0,1,1,1,0,1,1,1,0]"""
 
+    gdn_kernel_backend: Literal["transformer_engine", "fla", "torch"] = "fla"
+    """Kernel backend for Gated DeltaNet. The selected backend is required to be available;
+    there is no automatic fallback. ``torch`` selects the PyTorch-native reference
+    implementation and is required when deterministic mode is enabled."""
+
     linear_conv_kernel_dim: Optional[int] = 4
     """Conv kernel dimension for the gated delta net."""
 
@@ -443,6 +668,15 @@ class TransformerConfig(ModelParallelConfig):
     linear_num_value_heads: Optional[int] = 32
     """Number of value and gate heads for the gated delta net."""
 
+    kda_f_lora_rank: Optional[int] = None
+    """Rank of KDA's bias-free low-rank F-decay projection; None keeps it full-rank."""
+
+    kda_gate_lora_rank: Optional[int] = None
+    """Rank of KDA's bias-free low-rank output gate; None keeps it full-rank.
+
+    When both KDA ranks are None, KDA uses its legacy fused input projection.
+    """
+
     kda_safe_gate: bool = False
     """Whether the KDA kernel should use bounded gate values."""
 
@@ -450,12 +684,17 @@ class TransformerConfig(ModelParallelConfig):
     """Optional lower bound for KDA's bounded gate values."""
 
     gdn_pre_gated_delta_rule_fusion: bool = False
-    """Whether to use the streamed Triton fusion for GatedDeltaNet pre-GDR preprocessing."""
+    """Whether to use streamed Triton pre-GDR preprocessing for GDN-family attention."""
 
     gdn_conv_pad_alignment: Optional[int] = None
     """When set, pad packed GDN causal-conv inputs to this token alignment.
     This is only valid without chunkwise CP: padding a chunk-local causal-conv input changes
     the sequence seen by later chunks and therefore changes the GDN recurrence numerics."""
+
+    gdn_gated_output_norm_fusion: bool = False
+    """Fuse GDN-family output RMSNorm with SiLU gating for GDN or sigmoid gating for KDA.
+    Unsupported configurations and layouts raise on every forward; see
+    docs/developer/gdn_ew_fusion.md for requirements."""
 
     ####################
     # initialization
@@ -589,7 +828,9 @@ class TransformerConfig(ModelParallelConfig):
     """If True, use fused RoPE kernel."""
 
     use_fused_weighted_squared_relu: bool = False
-    """If True, uses fused weighted squared relu kernel when using MoE."""
+    """If True, uses the fused squared relu kernel: for MoE experts, the per-token
+    weighted variant; for the dense MLP, the tanh soft-clamped variant when
+    activation_func_tanh_clamp_scale is set."""
 
     fused_single_qkv_rope: bool = False
     """If set, avoid splitting QKV before ROPE forward and avoid concatenating ROPE dgrads."""
@@ -635,8 +876,17 @@ class TransformerConfig(ModelParallelConfig):
     recompute_modules: Optional[List[str]] = None
     """The submodules to recompute.
     choices: "core_attn", "moe_act", "layernorm", "mla_up_proj", "mlp", "moe",
-             "shared_experts", "mhc", "gdn", "gdn_norm_out".
+    "shared_experts", "mhc", "gdn", "gdn_norm_out", "gdp_in_proj", "gdp_qkv",
+    "shortcut_pre_mlp_layernorm", "residual_stream", "dsa_simple_routing",
+    "dsa_indexer_k", "dsa_selected_scores", "attn_res".
     default: ["core_attn"].
+    "attn_res": recompute the Attention Residuals depth aggregation: its output (the
+            sublayer's norm input, or the normalized input under attn_res_norm_fusion) is
+            released after the sublayer's forward and rebuilt from the depth sources when
+            the sublayer output's gradient arrives, before the "layernorm" checkpoint of the
+            same sublayer replays. The depth sources and partial sums stay saved. Requires
+            enable_attention_residuals=True; incompatible with attn_norm/mlp_norm offloading.
+            Uses output-discarding checkpointing.
     "core_attn": recompute the core attention part of the transformer layer.
     "moe_act": recompute the MoE MLP activation function.
     "layernorm": recompute the input_layernorm and pre_mlp_layernorm.
@@ -652,8 +902,36 @@ class TransformerConfig(ModelParallelConfig):
             out_proj). Requires a GDN-family experimental attention variant or a hybrid model.
     "gdn_norm_out": recompute gated output normalization and layout restoration for
             Gated DeltaNet-family layers, including GatedDeltaNet and KDA.
-    "moe_act", "layernorm", "mla_up_proj", "mhc", and "gdn_norm_out" use
-    output-discarding checkpointing,
+    "gdp_in_proj": recompute the GatedDeltaProduct input projection and its CP gather/split
+    preprocessing.
+    "gdp_qkv": recompute the GatedDeltaProduct causal conv and QKV preparation.
+    "moe_act", "layernorm", "mla_up_proj", "mhc", "gdn_norm_out", "gdp_in_proj", and
+    "gdp_qkv" use output-discarding checkpointing,
+    "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
+    "gdn_norm_out": recompute the GatedDeltaNet output norm and HP-to-CP all-to-all.
+    "gdp_in_proj": recompute the GatedDeltaProduct input projection and its CP gather/split
+    preprocessing.
+    "gdp_qkv": recompute the GatedDeltaProduct causal conv and QKV preparation.
+    "mhc": recompute HyperConnection intermediate activations via
+            CheckpointWithoutOutput + CheckpointWithoutOutputManager. Requires
+            enable_mhc_connections=True. Cannot be used with "mlp".
+    "shortcut_pre_mlp_layernorm": recompute the shortcut router's input normalization.
+            Requires moe_shortcut_connection=True and selective recomputation.
+    "residual_stream": replay wide-residual reads, connected norms, and writes via
+            CheckpointWithoutOutput + CheckpointWithoutOutputManager.
+    "dsa_simple_routing": recompute the simplified DSA routing top-k in the backward pass
+            instead of saving the forward indices, trading backward compute for roughly
+            O(batch * seq_len * dsa_indexer_topk) of index storage. Applies only to the
+            min-memory DSA backends, which are the only ones that can save the routing.
+    "dsa_indexer_k": reproject the full DSA indexer K in the backward pass instead of saving
+            it, trading backward compute for roughly
+            O(batch * seq_len * dsa_indexer_head_dim) of storage.
+    "dsa_selected_scores": recompute the selected DSA indexer logits in the backward pass
+            instead of saving roughly O(batch * seq_len * dsa_indexer_topk) of them. Only the
+            sparse KL objective materializes these, so this has no effect without
+            dsa_indexer_use_sparse_loss.
+    "moe_act", "layernorm", "mla_up_proj", "gdn_norm_out", "gdp_in_proj", "gdp_qkv", "mhc",
+    "shortcut_pre_mlp_layernorm", and "residual_stream" use output-discarding checkpointing;
     "core_attn", "mlp", "moe", "shared_experts", and "gdn" use normal checkpointing.
     """
 
@@ -713,6 +991,9 @@ class TransformerConfig(ModelParallelConfig):
     under the MXFP8 autocast context. Only active when fp8=True and
     fp8_recipe='mxfp8'."""
 
+    fp8_recipe_attrs: Optional[Dict[str, Any]] = None
+    """Attributes to set in the FP8 recipe."""
+
     fp8_dot_product_attention: bool = False
     """When set to True, use the FP8 implementation of Dot Product Attention."""
 
@@ -753,8 +1034,9 @@ class TransformerConfig(ModelParallelConfig):
     supports 'nvfp4' which uses NVFP4BlockScaling recipe (requires TE >= 2.7.0.dev0)."""
 
     fp4_recipe: Optional[Literal['nvfp4', 'custom']] = "nvfp4"
-    """If set, enables the use of FP4 precision through Transformer Engine. Currently only
-    'nvfp4' is supported which uses NVFP4BlockScaling recipe for Blackwell+ architecture."""
+    """If set, enables the use of FP4 precision through Transformer Engine."""
+    fp4_recipe_attrs: Optional[Dict[str, Any]] = None
+    """Attributes to set in the FP4 recipe."""
 
     fp4_param: bool = field(
         default=False, metadata={"argparse_meta": {"arg_names": ["--fp4-param-gather"]}}
@@ -806,17 +1088,49 @@ class TransformerConfig(ModelParallelConfig):
     """When set, GLU activations in the shared expert MLP will use a block
     interleaved format. This is only effective when
     use_grouped_gemm_for_shared_expert is set.
+    Requires BF16 or FP16 model parameters when GLU is enabled.
     """
+    moe_shortcut_connection: bool = False
+    """Enable ScMoE shortcut-connected routing. When enabled, the MoE router and routed experts
+    process the preceding layer's output (via a shortcut connection) instead of the current layer's
+    post-attention representation, allowing the two layers to be run in parallel and hiding the MoE
+    layer's A2A communication. Supported only by HybridStack and requires num_moe_experts > 0.
+    CUDA graphs are not supported. For the first MoE layer (no preceding layer), falls back to
+    standard routing."""
+
+    moe_shortcut_post_norm: bool = False
+    """Apply the configured normalization to the combined routed and shared expert output.
+    Requires moe_shortcut_connection = True."""
+
+    moe_shortcut_disable_mtp: bool = False
+    """Disable shortcut MoE connections in hybrid MTP stacks while keeping them in the decoder.
+    Each MTP depth runs its compute and MoE layers sequentially, using the ordinary MoE
+    normalization and routing path. Also applies to a shared, repeated MTP layer.
+    Only affects shortcut MoE; other MTP, recomputation, and offloading settings are preserved.
+    Changing this setting requires converting the MTP state when resuming a checkpoint.
+    Defaults to False to preserve existing MTP behavior."""
+
+    moe_shortcut_parallel: bool = False
+    """Overlap shortcut MoE All-to-All communication with paired Attention/Mamba compute.
+    Dispatch and combine collectives run on a side CUDA stream; routing, experts, and paired
+    compute remain on the main stream. Requires moe_shortcut_connection = True and
+    num_moe_experts > 0. Mutually exclusive with moe_shared_expert_overlap and unsupported with
+    full activation recomputation."""
 
     moe_megakernel_backend: Optional[str] = None
     """Optional backend that replaces MoE dispatch, expert computation, and combine.
-    Supported values: None and "mok".
+    Supported values: None and "mok". When set, the megakernel owns dispatch/combine;
+    moe_token_dispatcher_type and moe_flex_dispatcher_backend do not select its transport.
     """
 
     moe_megakernel_backend_config: Optional[dict] = None
-    """Backend options for moe_megakernel_backend.
+    """MCore-managed common options and backend-specific options for moe_megakernel_backend.
 
-    For example, ``fwd_num_comm_sms`` is a valid MOK backend option.
+    MCore consumes ``shared_expert_mode``: ``auto`` (default) fuses compatible shared
+    MLPs, ``fused`` requires compatibility, and ``native`` runs shared experts in
+    MCore. Activation selection is independent. Native shared experts retain the
+    model's precision policy; MOK-fused shared experts use BF16.
+    Remaining options, such as MOK's ``fwd_num_comm_sms``, are passed to the backend.
     """
 
     moe_layer_freq: Union[int, List[int]] = 1
@@ -836,8 +1150,9 @@ class TransformerConfig(ModelParallelConfig):
     for each individual sample.
     - "global_aux_loss": Load balancing loss calculated at global batch level.
     - "sinkhorn": Balancing algorithm used in S-BASE.
-    - "quantile_balancing": Kimi K3 histogram Quantile Balancing. The histogram is accumulated
-    across the global batch and converted into the next-step per-expert routing bias.
+    - "quantile_balancing": Quantile balancing (QB). ``micro_batch`` preserves the exact
+    per-microbatch estimator, while ``global_batch`` uses Kimi K3's pooled histogram estimator.
+    Load balance is handled internally and auxiliary losses must be disabled.
     - "none": No load balancing.
     A list of strings can be provided to combine multiple aux-loss load balancing types.
     The default is "aux_loss".
@@ -888,8 +1203,8 @@ class TransformerConfig(ModelParallelConfig):
     By default, softmax is done after top-k."""
 
     moe_router_topk_scaling_factor: Optional[float] = None
-    """Scaling factor for routing score in top-k selection, only works when moe_router_pre_softmax
-    enabled. Defaults to None, which means no scaling."""
+    """Scaling factor for routing score in top-k selection. Defaults to None, which means no
+    scaling."""
 
     moe_router_score_function: Literal['softmax', 'sigmoid', 'sqrtsoftplus'] = "softmax"
     """Score function for MoE routing. Can be "softmax", "sigmoid" or "sqrtsoftplus"."""
@@ -898,6 +1213,9 @@ class TransformerConfig(ModelParallelConfig):
     """Data type for routing and expert output weighted averaging. Using fp32 or fp64 can
     improve stability especially when the number of experts is large (e.g. finegrained-moe).
     None means no changes for dtype."""
+
+    moe_router_skip_muon: bool = False
+    """Use the scalar optimizer instead of Muon for MoE router parameters."""
 
     moe_router_enable_expert_bias: bool = False
     """TopK routing with dynamic per-expert bias in the aux-loss-free load balancing strategy.
@@ -910,12 +1228,19 @@ class TransformerConfig(ModelParallelConfig):
     and decreased for the experts with more assigned tokens.
     The default value 1e-3 is same as that used in DeepSeekV3."""
 
-    moe_router_quantile_balancing_estimation_scope: Literal['global_batch'] = "global_batch"
+    moe_router_quantile_balancing_estimation_scope: Literal['global_batch', 'micro_batch'] = (
+        "global_batch"
+    )
     """Population used to estimate the Quantile Balancing bias.
 
-    The ``dev`` implementation provides Kimi K3's ``global_batch`` histogram estimator. The
-    identically named option on ``main`` also accepts ``micro_batch`` for its older exact estimator.
+    ``global_batch`` preserves dev's Kimi K3 histogram estimator. ``micro_batch``
+    selects main's exact dual estimator, averaged and EMA-updated each global batch.
     """
+
+    moe_router_quantile_balancing_ema: float = 0.0
+    """EMA coefficient for the micro-batch quantile-balancing bias (`qb_beta`). At each global
+    batch the bias is updated as `qb_beta = ema * qb_beta + (1 - ema) * local_quantile`. The
+    default 0.0 means no memory: the bias is replaced by the latest estimate each step."""
 
     moe_router_qb_num_bins: int = 1000
     """Number of persistent uniform histogram bins per expert for global-batch QB."""
@@ -942,10 +1267,14 @@ class TransformerConfig(ModelParallelConfig):
     tid2eid lookup buffer in hash-based MoE routing."""
 
     dense_grouped_gemm: bool = False
-    """Use GroupedLinear(num_groups=1) for dense MLP to trigger the
-    ForwardGroupedMLP_CuTeGEMMSwiGLU_MXFP8 fusion on SM100+ with MXFP8 recipe.
-    Requires ``use_te_op_fuser=True`` and SwiGLU activation.
-    """
+    moe_num_hash_layers: int = 0
+    """Number of leading MoE layers that use hash-based routing.
+    In HybridModel this counts MoE positions in the layer pattern rather than
+    all hybrid symbols. Other transformer stacks use the layer number directly."""
+
+    hash_moe_vocab_size: Optional[int] = None
+    """TP-independent vocabulary size of the token-to-expert lookup table.
+    Required when ``moe_num_hash_layers > 0``."""
 
     use_grouped_gemm_for_dense_mlp: bool = False
     """Alias of ``dense_grouped_gemm``. Use GroupedLinear(num_groups=1) for dense MLP to
@@ -959,11 +1288,13 @@ class TransformerConfig(ModelParallelConfig):
     fwd/bwd) to TensorBoard/W&B and console. Records tokens_per_expert.sum() after dispatch;
     use for debugging."""
 
-    moe_grouped_gemm: bool = False
-    """Use grouped GEMM to execute multiple local MoE experts together.
+    moe_grouped_gemm: bool = True
+    """Use grouped GEMM to execute multiple local MoE experts together (enabled by default).
 
     The concrete implementation is selected by Transformer Engine. Set
     ``moe_use_grouped_tensor=True`` to use its CUDA-graph-safe GroupedTensor path.
+    Setting this to False selects the deprecated SequentialMLP on the TE backend.
+    The local backend still uses SequentialMLP regardless of this setting.
     """
 
     moe_use_grouped_tensor: bool = False
@@ -1000,8 +1331,8 @@ class TransformerConfig(ModelParallelConfig):
     specified capacity, similar to GShard, Switch-Transformer, and DeepSpeed-MoE. Note that this is
     currently unsupported so should remain False."""
 
-    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = "allgather"
-    """The type of token dispatcher to use. The default is 'allgather'.
+    moe_token_dispatcher_type: Literal['allgather', 'alltoall', 'flex'] = "alltoall"
+    """The type of token dispatcher to use. The default is 'alltoall'.
     Options are 'allgather','alltoall' and 'flex'."""
 
     moe_enable_deepep: bool = False
@@ -1009,9 +1340,12 @@ class TransformerConfig(ModelParallelConfig):
 
     moe_flex_dispatcher_backend: Literal['deepep', 'deepepv2', 'hybridep', 'ncclep'] = "deepep"
     """[Experimental] The backend to use for flex token dispatcher. The default is "deepep".
-    Options are "deepep", "deepepv2", "hybridep", and "ncclep". Currently only "hybridep" backend
-    supports the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via TransformerEngine's
-    transformer_engine.pytorch.ep API."""
+    Options are "deepep", "deepepv2", "hybridep", and "ncclep". Currently only "hybridep"
+    backend supports the MNNVL case. "ncclep" uses NVIDIA NCCL Expert Parallelism via
+    TransformerEngine's transformer_engine.pytorch.ep API."""
+
+    moe_virtual_expert_load_balance: bool = False
+    """Balance MoE routes by materializing virtual experts over HybridEP."""
 
     moe_permute_fusion_into_hybridep: bool = False
     """Fuse token rearrangement ops during token dispatching for HybridEP."""
@@ -1025,6 +1359,9 @@ class TransformerConfig(ModelParallelConfig):
     upstream and leave this option disabled.
     """
 
+    moe_hybridep_pad_uneven_dispatch_inputs: bool = False
+    """Main-branch spelling of moe_hybridep_pad_variable_tokens; either enables the same padding."""
+
     moe_per_layer_logging: bool = False
     """Enable per-layer logging for MoE, currently supports auxiliary loss and z loss."""
 
@@ -1033,9 +1370,12 @@ class TransformerConfig(ModelParallelConfig):
     will be dropped. The default is None."""
 
     moe_expert_rank_capacity_factor: Optional[float] = None
-    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank. Tokens
-    exceeding this budget will be dropped. None means no token will be dropped.
-    The default is None."""
+    """moe_expert_rank_capacity_factor (float): The capacity factor for each expert rank, i.e. the
+    per-rank token budget. None means no token will be dropped. The default is None.
+    With the 'hybridep' backend, tokens exceeding this budget are dropped. With the 'ncclep'
+    backend, setting it selects static shapes (fixed receive buffer, CUDA-graph capturable) and
+    leaving it None selects eager mode (receive buffer sized per step from the received-token
+    count)."""
 
     moe_pad_expert_input_to_capacity: bool = False
     """moe_pad_expert_input_to_capacity (bool): If True, pads the input for each expert to match
@@ -1065,6 +1405,12 @@ class TransformerConfig(ModelParallelConfig):
     supported in TransformerEngine 2.7.0 and above.
     """
 
+    moe_router_aux_loss_fusion: Optional[bool] = None
+    """Enable fusion for the MoE aux loss only, independently of the fused TopK routing.
+    ``None`` follows ``moe_router_fusion`` and is resolved to a concrete bool in
+    ``__post_init__``.
+    """
+
     moe_apply_probs_on_input: bool = False
     """Apply probs on input of experts instead of applying after activation and glu."""
 
@@ -1074,10 +1420,24 @@ class TransformerConfig(ModelParallelConfig):
     moe_latent_up_projection_rmsnorm: bool = False
     """Apply RMSNorm immediately before the duplicated MoE latent up-projection."""
 
+    moe_use_norm_before_up_proj: bool = False
+    """Apply normalization before the latent-to-hidden MoE projection. Requires
+    ``moe_latent_size`` to be set."""
+
+    gtp_remat_opt_in_modules: list[str] = field(default_factory=list)
+    """Extra modules to apply GTP_remat weight sharding to, beyond the default set (attention,
+    Mamba, MLP, expert linears, embeddings). Allowed values:
+
+      - ``"moe_latent_proj"`` — shard ``fc1_latent_proj`` / ``fc2_latent_proj`` (MoE latent
+        projections, ``parallel_mode="duplicated"``). Only beneficial when ``moe_latent_size``
+        is large enough for the all-gather to amortize.
+    """
+
     moe_flex_dispatcher_num_sms: Optional[int] = None
     """Number of SMs for the flex token dispatcher's dispatch/combine communication, for all
-    backends (deepep, hybridep, ncclep). None lets each backend use its own default. Unifies the
-    deprecated per-backend moe_{deepep,hybridep}_num_sms knobs (routed in __post_init__)."""
+    backends (deepep, deepepv2, hybridep, ncclep). None lets each backend use its own default.
+    Unifies the deprecated per-backend moe_{deepep,hybridep}_num_sms knobs (routed in
+    __post_init__)."""
 
     moe_deepep_num_sms: Optional[int] = None
     """DEPRECATED: use moe_flex_dispatcher_num_sms. Number of SMs to use for DeepEP (historical
@@ -1106,22 +1466,42 @@ class TransformerConfig(ModelParallelConfig):
     Transformer Engine and HybridEP support and the int16 expert limit; unsupported configurations
     fall back to the bool routing-map path."""
 
-    moe_ncclep_static_shape: bool = False
-    """For the 'ncclep' flex dispatcher: feed the experts the full fixed-size receive buffer
-    instead of narrowing to the (data-dependent) number of received tokens, removing the D2H sync
-    and dynamic shapes from the dispatch (required for CUDA-graph capture of the MoE A2A and for the
-    1F1B EP comm overlap). The fused grouped GEMM consumes the ragged per-expert counts on device
-    and walks only the received tokens (no slack GEMM, no last-expert padding). This requires the
-    CuTe DSL / device-offset grouped GEMM, so it is only supported with the fused op
-    (use_transformer_engine_op_fuser, NVTE_CUTEDSL_FUSED_GROUPED_MLP=1) on sm100+ (Blackwell or
-    later); the dispatcher asserts this. On older GPUs leave it False (dynamic shape). Defaults to
-    False (narrow to the received tokens)."""
+    moe_ncclep_static_shape: Optional[bool] = field(
+        default=None,
+        metadata={
+            "argparse_meta": {
+                "action": argparse.BooleanOptionalAction,
+                "arg_names": ["--moe-ncclep-static-shape"],
+            }
+        },
+    )
+    """Compatibility check for NCCL-EP shape policy, not an independent backend switch.
+    A rank capacity selects static shapes; omitting it selects eager shapes. Explicit
+    True/False must agree with that canonical capacity setting. Bounded dynamic views
+    cannot be requested by setting this flag to False while retaining a rank capacity."""
 
     moe_ncclep_use_symm_mem: bool = False
+    """Compatibility alias for moe_ncclep_zero_copy, now implemented by NCCL-EP."""
+    moe_ncclep_zero_copy: bool = False
     """For the 'ncclep' flex dispatcher: use the NCCL symmetric-memory zero-copy IO path
     (ep_bootstrap zero_copy + symm-mem-backed receive/combine buffers) instead of the default HBM
-    staged-copy path. NOT SUPPORTED YET -- the dispatcher rejects this if set; the cross-stream
-    reuse ordering for the persistent symm-mem buffer is not implemented. Leave False."""
+    staged-copy path, saving one copy on the wire. Requires moe_expert_rank_capacity_factor (the
+    symm-mem buffers are a fixed [recv_capacity, hidden] and cannot be resized per step) and the
+    fused op (use_transformer_engine_op_fuser). Defaults to False."""
+
+    moe_dispatch_fwd_dtype: Literal['bf16', 'mxfp8'] = 'bf16'
+    """Wire dtype of the MoE dispatch forward payload ('ncclep' flex dispatcher only). With
+    'mxfp8', TransformerEngine quantizes the payload before the all-to-all and the receive
+    buffer comes back as a per-expert MXFP8 GroupedTensor that the grouped GEMM consumes
+    directly. Requires moe_grouped_gemm and use_transformer_engine_op_fuser. Defaults to
+    'bf16' (no quantization on the wire)."""
+
+    moe_combine_bwd_dtype: Literal['bf16', 'mxfp8'] = 'bf16'
+    """Wire dtype of the MoE combine backward gradient ('ncclep' flex dispatcher only). With
+    'mxfp8', TransformerEngine quantizes the gradient before the all-to-all and the
+    expert-output gradient comes back as a per-expert MXFP8 GroupedTensor that the grouped
+    GEMM backward consumes directly. Same requirements as moe_dispatch_fwd_dtype. Defaults to
+    'bf16' (no quantization on the wire)."""
 
     moe_mlp_glu_interleave_size: Optional[int] = None
     """When set, GLU activations in the MoE grouped MLP layer will use a
@@ -1129,7 +1509,7 @@ class TransformerConfig(ModelParallelConfig):
     as a concatenation of gates and linear units, it will be
     interpreted as alternating blocks of gates and linear units.
     This data format is experimental and primarily intended to enable
-    advanced fused kernels."""
+    advanced fused kernels. Requires BF16 or FP16 model parameters when GLU is enabled."""
 
     ##################
     # Context Parallel
@@ -1152,18 +1532,23 @@ class TransformerConfig(ModelParallelConfig):
     and P2P communications in high-level CP groups (e.g., via IBLink).
     """
 
-    linear_cp_mode: Optional[str] = "chunkwise"
-    """Context-parallel execution mode for linear-attention layers
-    (e.g. Gated Delta Net). Independent of `cp_comm_type`, which only controls standard attention.
-    Can be "chunkwise" or "headwise":
-    "chunkwise": Keep sequence chunks sharded across CP ranks and use CP-aware linear kernels
-    (e.g. chunk_gated_delta_rule + causal_conv1d with a CP context). This follows the chunkwise
-    DeltaNet idea of storing state at chunk boundaries and doing chunk-local matrix work, avoiding
-    a full per-token recurrent state materialization while keeping tensor-core-friendly matmuls.
-    See https://sustcsonglin.github.io/blog/2024/deltanet-2/#a-chunkwise-algorithm-for-deltanet.
-    "headwise": Scatter heads across the CP group with all-to-all (Ulysses-style); each rank runs
-    the linear-attention kernel on the full sequence for a shard of heads. Correct but memory-heavy.
-    """
+    linear_cp_mode: Optional[Literal["headwise", "chunkwise"]] = None
+    """Linear-attention CP algorithm. Unset uses chunkwise for dev GDN/KDA and
+    legacy HybridModel configurations, and headwise for other layer families.
+    Explicit settings take precedence. Layer-specific config views preserve Mamba's
+    headwise default unless the explicit layout API requests chunkwise GDP execution."""
+
+    linear_cp_layout: Optional[CPLayout] = None
+    """Layout at linear-layer boundaries. Unset follows legacy cp_partition_mode;
+    GDN/KDA perform their own module-local chunkwise conversion. Set contiguous
+    explicitly with chunkwise GDP to use stack-level CP layout conversion."""
+
+    _linear_cp_layout_explicit: Optional[bool] = field(default=None, repr=False, compare=False)
+    """Internal: whether linear_cp_layout was set explicitly. Derived in __post_init__ and
+    carried by dataclasses.replace(), so the filled-in zigzag default stays implicit."""
+
+    attention_cp_layout: CPLayout = "zigzag"
+    """CP layout for softmax-attention layers."""
 
     ##################
     # Cuda Graphs
@@ -1186,7 +1571,9 @@ class TransformerConfig(ModelParallelConfig):
     more details, see: https://pytorch.org/docs/stable/generated/torch.Tensor.backward.html."""
 
     cuda_graph_warmup_steps: int = 3
-    """Number of warmup steps for CUDA graphs"""
+    """Number of warmup steps for CUDA graphs. Note: GTP (``gtp_weight_remat_size > 1``) forces a
+    minimum of 2 per-graph warmup steps regardless of this value, because the first warmup builds
+    the weight-prefetch chain and the second exercises the prefetch path before capture."""
 
     external_cuda_graph: bool = False
     """DEPRECATED and replaced by cuda_graph_impl.
@@ -1206,6 +1593,14 @@ class TransformerConfig(ModelParallelConfig):
     CUDA graphs are not supported; inference_cuda_graph_scope must be "none".
     cuda_graph_modules has no effect when cuda_graph_impl="none" and must be empty when
     cuda_graph_impl="full_iteration"."""
+
+    cuda_graph_thd_max_packed_sequences: Optional[int] = None
+    """THD metadata capacity, including the dummy padding document.
+
+    Bounds real-document packing and fixes all four cumulative-offset tensor
+    shapes in eager and TE graph execution. Padding reserves one document slot.
+    Setting this capacity also applies during eager execution; it does not enable CUDA graphs.
+    """
 
     cuda_graph_modules: Union[str, CudaGraphModule, List[str], List[CudaGraphModule]] = "full"
     """Selects training capture coverage within per-layer CUDA graphs (local and
@@ -1282,7 +1677,9 @@ class TransformerConfig(ModelParallelConfig):
     """Allow CUDA graph replay when runtime microbatch count varies across iterations.
     This option is only meaningful for cuda_graph_impl=transformer_engine. For THD sequence
     packing, capture uses a conservative upper bound on the packed microbatch count so graph
-    replay can cover iterations whose real packed microbatch count changes."""
+    replay can cover iterations whose real packed microbatch count changes at a fixed source
+    global batch size. Increasing the source global batch size with step_batch_size_schedule
+    after capture is rejected rather than retaining an unbounded number of graph instances."""
 
     ####################
     # Hyper-Connection Configuration
@@ -1299,35 +1696,37 @@ class TransformerConfig(ModelParallelConfig):
     mhc_init_gating_factor: float = 0.01
     """Initial value of Gating Factor (alpha in paper)."""
 
-    use_fused_mhc: bool = False
-    """Use unified fused kernels for mHC operations.
+    mhc_norm_eps_inside_sqrt: bool = False
+    """Use rsqrt(mean(x**2) + layernorm_epsilon) for the mHC mapping norm."""
 
-    When True, attempts to replace the reference mHC modules (SinkhornKnopp,
-    H_aggregate, H_post_bda, ProjRms) with fused/autograd implementations for
-    better performance on supported GPUs.  Backend selection is internal and
-    op-specific: Triton for Sinkhorn and H_post_bda backward when available,
-    cuTile for the remaining fused kernels when available, then native torch
-    fallback. If every mHC operation uses the native torch fallback,
-    use_fused_mhc remains enabled and a rank-0 warning is emitted. The all-native
-    fallback is functionally equivalent, but may not provide fused backend
-    performance benefits.
+    mhc_keep_mappings_in_fp32: bool = False
+    """Keep mHC coefficients and stream mixing in FP32 until the output cast."""
+
+    mhc_learned_output_contract: bool = True
+    """Contract residual streams to the ordinary hidden width using token-dependent gating;
+    otherwise average the streams."""
+
+    use_fused_mhc: bool = False
+    """Use fused kernels for mHC operations when supported.
+
+    With the default ``auto`` backend policy, selection is operation-specific
+    and unavailable accelerated implementations fall back to native torch.
+    Set ``mhc_fused_backend`` to request an explicit backend policy.
     """
 
     mhc_recompute_layer_num: Optional[int] = None
-    """Number of layers in each mHC recompute group.
+    """Number of layers per MHC recompute block.
 
-    Layers are grouped in their local transformer-block order. The last layer in each group leaves
-    its final MLP BDA output uncheckpointed and closes the current ``MHCCheckpointManager``; a new
-    manager is created for the next group.
+    When set, every `mhc_recompute_layer_num` layers form a recompute block. The last layer
+    in each recompute block (i.e., layer_number % mhc_recompute_layer_num == 0 or the final
+    layer in the transformer block) will:
+    - NOT checkpoint its final MLP BDA
+    - Register the unified recompute hook on its MLP BDA output
+    - A new CheckpointWithoutOutputManager is created for subsequent layers
 
-    In the standard forward path, the group-ending layer registers a unified recompute hook on its
-    MLP BDA output. In the fine-grained expert-parallel overlap schedule, the group outputs are
-    discarded explicitly and a compute-stream schedule node replays the group before its backward
-    computation.
+    If None, all layers in the transformer block share a single recompute block.
 
-    If ``None``, all local layers in the transformer block share one recompute group. The value must
-    be a positive integer when set.
-    """
+    Must be a positive integer when set."""
 
     mhc_recompute_attn_cuda_graph_split: bool = False
     """Opt into the attention-only Transformer Engine CUDA Graph split for mHC recompute.
@@ -1348,7 +1747,106 @@ class TransformerConfig(ModelParallelConfig):
     group is outside the attention graph either way and is unaffected. The split additionally
     constrains the configuration (see ``__post_init__``), which is why it is opt-in rather than
     implied by ``recompute_modules=[mhc]``.
+
+    Supported for GPT mHC layers and HybridStack attention-only mHC wrappers. Other HybridStack
+    layer families remain eager with the attention-only graph scope. ``mla_up_proj`` may also
+    be included in ``recompute_modules``; its checkpoint stays inside the attention consumer,
+    independently of the eager mHC recompute group. Packed (THD) sequences use the same
+    fixed-capacity sequence metadata inputs as ordinary attention CUDA graphs.
     """
+
+    ####################
+    # Hyper-Connection Configuration
+    ####################
+    enable_mhc_connections: bool = False
+    """Enable mHC residual connections."""
+
+    mhc_num_residual_streams: int = 4
+    """Number of residual streams (n in paper)."""
+
+    mhc_fused_backend: Literal["auto", "native", "triton", "cutile"] = "auto"
+    """Backend policy for fused mHC operations.
+
+    ``auto`` selects the fastest available implementation for each operation.
+    Explicit policies require the requested dependency and device support, and
+    never select a different accelerated backend. Operations without an
+    implementation in the selected backend retain their native implementation.
+    """
+
+    ####################
+    # Wide Residual Configuration
+    ####################
+    wide_residual: Optional[WideResidualConfig] = None
+    """Optional streamwise wide-residual architecture configuration.
+
+    When set, the model carries ``num_streams * hidden_size`` features between
+    layers while attention and MLP branches continue to operate at ``hidden_size``.
+    """
+
+    residual_stream_recompute_num_layers: Optional[int] = None
+    """Number of local layers per ordered residual-stream replay block.
+
+    ``None`` places all local layers in one block. This setting requires selective
+    recomputation with ``"residual_stream"`` in ``recompute_modules``.
+    """
+
+    ####################
+    # Attention Residuals (AttnRes) Configuration
+    ####################
+    enable_attention_residuals: bool = False
+    """Enable Attention Residuals (AttnRes, arXiv:2603.15031): replaces the fixed residual
+    accumulation with per-token softmax attention over depth sources (token embedding, completed
+    depth-block sums, and the running intra-block partial sum). Each self-attention and MLP
+    sublayer aggregates the sources with its own zero-initialized pseudo-query, and the final
+    output head aggregates all sources before the final layernorm. Mutually exclusive with
+    enable_hyper_connections / enable_mhc_connections, wide_residual and
+    moe_shortcut_connection."""
+
+    attn_res_block_layers: Optional[int] = None
+    """Block AttnRes: number of transformer layers per depth block for GPT stacks (the paper's
+    block size S counted in sublayers is twice this value), or number of pattern entries per
+    depth block for hybrid stacks (each entry is one sublayer). Required when
+    enable_attention_residuals=True. The total number of trunk depth sources at the network
+    output is
+    floor((num_layers - 1) / attn_res_block_layers) + 2 (completed blocks + token embedding +
+    trailing partial block); every MTP depth reuses this immutable trunk source tuple and adds
+    its own running partial. The paper finds ~8-10 sources recover most of the quality gain."""
+
+    attn_res_impl: str = "fla"
+    """Implementation of the AttnRes depth aggregation.
+
+    Options:
+
+    - 'eager': a memory-lean custom autograd Function built from plain PyTorch ops.
+    - 'compile': a plain PyTorch forward wrapped in torch.compile, with AOTAutograd generating
+      its backward and one specialization per depth arity; falls back to the eager custom
+      Function with a warning if compilation is unavailable.
+    - 'fla': FLA's three-kernel fused training implementation with checkpoint_level=1; requires
+      flash-linear-attention.
+
+    The eager loop is CPU-dispatch-bound — measured ~3-4 ms of CPU wall per aggregation on GB200
+    at small hidden sizes — so 'fla' is the default, with 'compile' as the dependency-free
+    optimized path."""
+
+    attn_res_norm_fusion: bool = False
+    """Fuse the RMSNorm that consumes each AttnRes aggregation (the sublayer's input_layernorm
+    or pre_mlp_layernorm) into FLA's fused AttnRes kernel (``fused_attnres(output_rms_weight=...)``,
+    flash-linear-attention >= 0.5.1): the kernel emits the normalized sublayer input directly and
+    the mixed residual is never materialized. The norm modules keep owning their weights, so
+    checkpoints are interchangeable with the unfused path; only their forward is bypassed.
+    Requires attn_res_impl='fla', RMSNorm without zero-centered gamma and no attn_norm/mlp_norm
+    fine-grained offloading. Sublayers whose norm is folded into their first linear (TE
+    LayerNormLinear specs, e.g. the dense MLP entry of Kimi-K3; mla_down_proj_fusion is rejected)
+    keep the unfused aggregation, and so does the final-norm aggregation. With selective recompute,
+    'attn_res' and 'layernorm' must be enabled together or not at all: the fused output is the
+    norm output, so one output-discarding checkpoint covers both."""
+
+    hybrid_layer_pattern: Optional[str] = None
+    """Unified hybrid layer pattern string (mirrors --hybrid-layer-pattern; populated
+    automatically by the argument bridge). Consumed by config-only consumers that need the
+    hybrid pipeline segmentation — currently the attention-residual pipeline payload widths,
+    whose per-boundary slice counts derive from the cumulative '|' segment lengths. The
+    HybridModel itself keeps receiving the pattern through its constructor argument."""
 
     ####################
     # miscellaneous
@@ -1372,6 +1870,34 @@ class TransformerConfig(ModelParallelConfig):
        in different batch configurations. This will significantly affect speed of 
        training and inference as the kernels are not full optimized.
        Defaults to False."""
+
+    batch_invariant_backend: Literal["te_native", "deepgemm", "triton"] = "te_native"
+    """Which batch-invariant GEMM backend to use when batch_invariant_mode is
+    enabled: "te_native" (default: keep the native cuBLASLt kernels and obtain
+    invariance via workspace starvation — lowest overhead, no extra
+    dependencies, and the configuration verified bitwise-identical to the TE
+    training forward), "deepgemm" (DeepGEMM bf16 kernels), or "triton"
+    (persistent Triton matmul; any dtype)."""
+
+    batch_invariant_collective: Literal["ordered", "multimem"] = "ordered"
+    """Cross-rank EP combine collective under batch_invariant_mode. "ordered"
+    (default) reduces with an explicit fixed rank-order fp32 Triton kernel —
+    deterministic by construction on any hardware. "multimem" keeps the native
+    NVLS in-switch reduce-scatter: measured to return the correctly-rounded
+    exact fp32 sum (bitwise-equal to an fp64 reference over 16.7M adversarial
+    channels on B200), deterministic and batch-invariant, with better scaling
+    at large NVLink domains; software paths that must match it bitwise should
+    accumulate in fp64."""
+
+    moe_ep_invariant_combine: bool = False
+    """Under batch_invariant_mode, combine each token's expert outputs over one fixed fp32
+    reduction tree over the expert ids (moe/ep_invariant_combine.py) instead of per-EP-rank
+    partials added in rank order, so MoE outputs are bitwise identical at every power-of-two
+    expert-parallel size dividing num_moe_experts (e.g. training and inference with
+    different EP). Covers the training AllToAll combine and the inference NVLS combine of
+    the 'torch' and 'vllm' grouped-GEMM backends, which use the ordered fp32 combine
+    (whatever the batch-invariant collective). With expert tensor parallelism, inference
+    sums each expert row over expert TP before the combine, as training does."""
 
     use_te_activation_func: bool = False
     """Whether to use ffn activation functions implemented by TransformerEngine"""
@@ -1411,18 +1937,76 @@ class TransformerConfig(ModelParallelConfig):
     inference_grouped_gemm_backend: Literal['flashinfer', 'torch', 'vllm'] = "vllm"
     """Specifies the backend to use for grouped GEMM operations during inference.
     Options:
-    - 'flashinfer': Uses FlashInfer cutlass_fused_moe. Not compatible with MXFP8.
+    - 'flashinfer': Uses FlashInfer cutlass_fused_moe for BF16 and tanh-clamped
+      squared-ReLU MXFP8, and TRT-LLM routed block-scale MoE for unclamped MXFP8.
+      The MXFP8 paths retain canonical expert weights
+      for refit and also store a derived execution copy, increasing
+      expert-weight memory relative to the torch backend.
     - 'torch': Uses torch.nn.functional.grouped_mm (mcore_fused_moe with Triton kernels).
       Supports both BF16 and MXFP8.
-    - 'vllm': Uses vLLM's Triton fused MoE kernel (BF16). Avoids physical token
-      permutation via indirect addressing.
+    - 'vllm': Uses vLLM's Triton fused MoE kernel for BF16. Avoids physical token
+      permutation via indirect addressing. MXFP8 expert layers use MCore's scaled
+      grouped-GEMM path, allowing per-layer mixed BF16/MXFP8 policies.
     """
 
+    moe_training_matches_inference: bool = False
+    """Run the training MoE forward through generation's FlashInfer routed MXFP8 or
+    per-token NVFP4 expert kernel, so training log-probs match generation bitwise.
+    Tokens go through training's all-to-all dispatcher; the backward comes from the TE
+    recompute pass. Requires transformer_impl='inference_optimized',
+    inference_grouped_gemm_backend='flashinfer', moe_token_dispatcher_type='alltoall',
+    batch_invariant_mode, selective 'moe' recompute, and generation's expert-parallel
+    size. The kernel weights are built
+    from the parameters and held until an in-place write to them, an optimizer step, a
+    checkpoint load, or training_matches_inference.release_inference_value_pass_weights(model).
+    A caller that writes the parameters outside PyTorch in-place ops, an optimizer step
+    or a load (for example TE quantizing a high-precision value into an MXFP8 parameter)
+    must call that first."""
     inference_moe_disable_fused_quant_kernels: bool = False
     """When False (default), use fused kernels that combine permute/activation with
     MXFP8 quantization + swizzle into a single kernel launch. Only applies when
-    fp8_recipe='mxfp8'. Set to True to disable fusion and use separate kernel
-    launches (useful for debugging)."""
+    fp8_recipe='mxfp8' with inference_grouped_gemm_backend='torch' or 'vllm'. Set to
+    True to disable fusion and use separate kernel launches (useful for debugging)."""
+
+    inference_moe_router_backend: Literal['torch', 'triton'] = 'triton'
+    """Backend for InferenceTopKRouter top-k routing in inference mode.
+    - 'torch': torch.compile'd PyTorch routing.
+    - 'triton': A fused Triton sigmoid top-k kernel for sigmoid scores with an expert
+      bias, fp32 logits and top-k up to 32, with or without gradients enabled; its
+      outputs carry no autograd graph. Probabilities match 'torch' bitwise for top-k
+      below eight and to within the last fp32 bit otherwise. Other score functions,
+      group-limited routing, router replay and moe_router_fusion use the 'torch' path.
+      Default.
+    Batch-invariant mode does not use this setting: it runs the same kernel for sigmoid
+    routing with an expert bias in both training and inference."""
+
+    inference_flashinfer_mxfp8_token_capacity: int | None = None
+    """Optional fixed token-row capacity for FlashInfer routed MXFP8 and per-token
+    NVFP4 MoE (inference_moe_nvfp4_recipe).
+
+    Decode-only dynamic-inference graphs use this fixed prefix when their
+    host-known EP-wide token ceiling fits. Prefill, mixed, static-inference,
+    and oversized decode graphs retain the full dispatcher buffer. Requires
+    the NVLS inference dispatcher and EP > 1.
+    """
+
+    inference_moe_nvfp4_recipe: Optional[Literal['per_token']] = None
+    """NVFP4 recipe for routed experts during inference; None keeps them in BF16.
+    Options:
+    - 'per_token': NVFP4 weights x NVFP4 activations with one FP32 scale per token.
+
+    BF16 expert weights are quantized to NVFP4 (one FP32 global scale per expert)
+    when the MoE layer first runs and requantized in place by
+    refresh_flashinfer_nvfp4_weights() when they change; 'per_token' quantizes
+    activations online, so no calibration is required. Uses the
+    FlashInfer CuTe DSL grouped GEMMs (requires nvidia-cutlass-dsl) and requires
+    transformer_impl='inference_optimized', inference_grouped_gemm_backend='flashinfer',
+    non-gated squared-ReLU or gated SiLU (SwiGLU) experts without GLU clamping, offset or
+    interleaving, BF16 expert parameters, and FlashInfer >= 0.7.0 on
+    Blackwell (SM100/SM103). The BF16 expert weights stay resident as the refit
+    destination alongside the padded NVFP4 copy. Supports batch_invariant_mode (with
+    the NVLS dispatcher when EP > 1), like FlashInfer MXFP8.
+    """
 
     inference_moe_token_dispatcher_type: Literal['nccl', 'nvls'] = 'nvls'
     """Token dispatcher to use for MoE expert parallelism during inference.
@@ -1458,6 +2042,18 @@ class TransformerConfig(ModelParallelConfig):
     """The number of heads used in Mamba layers.
     If None, the number of heads will be hidden_size * expand // mamba_head_dim."""
 
+    gdp_num_householder: int = 3
+    """The number of Householder reflections used in Gated Delta Product layers."""
+
+    gdp_g_clamp_value: Optional[float] = None
+    """Optional positive magnitude of the lower bound on GDP's per-token log decay.
+
+    For example, 50 clamps g to a minimum of -50 before the recurrent kernel in
+    training and inference. None leaves g unchanged. GDP gate metrics report raw g.
+    When loading checkpoint arguments, a saved value is restored if this is omitted;
+    an explicit CLI value takes precedence.
+    """
+
     mamba_training_ssm_states_dtype: Optional[torch.dtype] = None
     """dtype of the materialized inter-chunk SSM states in Mamba training forwards and backwards.
     None causes the states to follow the activation dtype."""
@@ -1466,6 +2062,18 @@ class TransformerConfig(ModelParallelConfig):
         default=True, metadata={"argparse_meta": {"arg_names": ["--disable-mamba-mem-eff-path"]}}
     )
     """Controls usage of the memory efficient path for Mamba layers."""
+
+    gdp_cutedsl_kernel: bool = False
+    """Whether to use the CuTeDSL kernel for the GatedDeltaProduct mixer."""
+
+    gdp_num_chunk_states_to_recompute: int = 2
+    """Checkpoint-coarsening ratio N in [0, 64] for the CuTeDSL GatedDeltaProduct kernel.
+    N=0 checkpoints every chunk state for the backward pass (dense, no recompute). N>=1
+    stores one checkpoint per group of N+1 chunks (1/(N+1) the checkpoint memory) and the
+    backward recomputes each group's N missing chunk states, trading recompute time for
+    activation memory monotonically in N (sweet spot N=2..3). Only honored by kernel
+    builds that expose ``recompute_chunk_num`` or the legacy
+    ``num_chunk_states_to_recompute`` argument."""
 
     mlp_chunks_for_prefill: int = 1
     """The number of chunks along the sequence dimension to use for MLP computation
@@ -1506,7 +2114,8 @@ class TransformerConfig(ModelParallelConfig):
     offload_modules: Optional[list[str]] = field(default_factory=list)
     """The submodules to offload its input.
     choices: "attn_norm", "qkv_linear", "core_attn", "attn_proj",
-             "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp".
+             "mlp_norm", "expert_fc1", "moe_act", "fused_group_mlp", "gdp_qkv",
+             "shortcut_post_norm".
     "attn_norm": offload the input of the normalization in the attention part.
     "qkv_linear": offload the input of the qkv linear part.
     "core_attn": offload the input of the core attention part.
@@ -1515,6 +2124,16 @@ class TransformerConfig(ModelParallelConfig):
     "expert_fc1": offload the input of the expert fc1 part.
     "moe_act": offload the input of the moe act part.
     "fused_group_mlp": offload the input of the whole fused grouped MLP.
+        "fused_group_mlp" and "expert_fc1" + "moe_act" are two spellings of the same request
+        for the two GroupedMLP paths (fused TE op-fuser vs. unfused), and are mutually
+        exclusive in the config. Each GroupedMLP instance maps whichever is given onto its own
+        path: a fused instance offloads the block input, an unfused instance offloads the fc1
+        and activation inputs. So either spelling covers a model that mixes fused (quantized)
+        and unfused (e.g. bf16 MTP) experts.
+    "gdp_qkv": offload the input of the causal conv and QKV preparation in the
+               GatedDeltaProduct mixer.
+    "shortcut_post_norm": offload the input of the shortcut output normalization.
+            Requires moe_shortcut_connection=True.
     """
     min_offloaded_tensor_size: int = 1024 * 1024
     """The minimum size of the tensor to be offloaded."""
@@ -1555,7 +2174,7 @@ class TransformerConfig(ModelParallelConfig):
     """Scale factor for paged stash CUDA buffer allocation.
 
     Sign selects sizing: positive = avg-based, negative = actual-max. Magnitude is headroom
-    (e.g. 1.10 = 10%)."""
+    (e.g. 1.10 = 10%%)."""
 
     moe_paged_stash_buffer_size_factor_cpu: float = 0.0
     """Scale factor for paged stash host buffer. 0 disables host buffer.
@@ -1563,18 +2182,504 @@ class TransformerConfig(ModelParallelConfig):
     Same sign convention as moe_paged_stash_buffer_size_factor_cuda: positive = avg-based,
     negative = actual-max; scale = abs(factor)."""
 
+    fine_grained_offloading_buffer_size_gib: float = 0.0
+    """Fixed pinned activation buffer capacity per rank, in GiB; zero disables it.
+    Capacity in bytes must be a positive multiple of 256 bytes and is pinned at that
+    size, not rounded up to a power of two. The buffer is allocated once, at the first
+    forward pass, and never grows; running out raises an error. Space is reused only
+    once every backup has been reloaded, so the buffer must hold everything offloaded
+    between such points, with each tensor aligned to 256 bytes. That is one microbatch
+    when each backward finishes before the next forward starts (PP=1, or the last
+    pipeline stage without virtual pipeline stages, and no
+    overlap_moe_expert_parallel_comm); otherwise it is everything the rank offloads in
+    an iteration, across all microbatches and model chunks. This bounds the shared
+    offload buffer, not other host allocations or allocator caches."""
+
+    @classmethod
+    def from_config(cls, config: "TransformerConfig") -> Self:
+        """Create this config type from an existing normalized transformer config.
+
+        The source config's complete instance state is deep-copied without invoking
+        the target class's initializer or ``__post_init__``. This preserves normalized
+        values and dynamically added attributes while producing an independent config.
+
+        Args:
+            config: The transformer config to copy.
+
+        Returns:
+            An independent copy of ``config`` whose type is ``cls``.
+        """
+        new_config = cls.__new__(cls)
+        memo = {id(config): new_config}
+        new_config.__dict__ = deepcopy(config.__dict__, memo)
+        for config_type in type(config).__mro__:
+            for attr in getattr(config_type, "__slots__", ()):
+                if attr not in ("__dict__", "__weakref__") and hasattr(config, attr):
+                    setattr(new_config, attr, deepcopy(getattr(config, attr), memo))
+        return new_config
+
+    def _normalize_sync_compatibility_fields(self) -> None:
+        """Normalize branch-compatible names before validating the shared configuration."""
+        if self.linear_attention_type is not None:
+            warnings.warn(
+                "linear_attention_type is deprecated, "
+                "use experimental_attention_variant instead."
+            )
+            self.experimental_attention_variant = self.linear_attention_type
+            self.linear_attention_type = None
+        self.moe_hybridep_pad_variable_tokens = (
+            self.moe_hybridep_pad_variable_tokens or self.moe_hybridep_pad_uneven_dispatch_inputs
+        )
+        self.moe_hybridep_pad_uneven_dispatch_inputs = self.moe_hybridep_pad_variable_tokens
+        if self.experimental_attention_variant == "dsv4_hybrid":
+            if self.cp_partition_mode == "contiguous":
+                self.attention_cp_layout = "contiguous"
+            self.cp_partition_mode = self.attention_cp_layout
+            if self.linear_cp_layout is None:
+                self.linear_cp_layout = self.attention_cp_layout
+        for legacy, canonical, default in (
+            ("moe_n_hash_layers", "moe_num_hash_layers", 0),
+            ("actual_vocab_size", "hash_moe_vocab_size", None),
+        ):
+            legacy_value = getattr(self, legacy)
+            canonical_value = getattr(self, canonical)
+            if legacy_value != default:
+                if canonical_value not in (default, legacy_value):
+                    raise ValueError(f"Conflicting {legacy} and {canonical}.")
+                canonical_value = legacy_value
+                setattr(self, canonical, canonical_value)
+            setattr(self, legacy, canonical_value)
+        self.enable_mhc_connections = self.enable_mhc_connections or self.enable_hyper_connections
+        self.enable_hyper_connections = self.enable_mhc_connections
+        if self.num_residual_streams != 4:
+            if self.mhc_num_residual_streams not in (4, self.num_residual_streams):
+                raise ValueError("Conflicting num_residual_streams and mhc_num_residual_streams.")
+            self.mhc_num_residual_streams = self.num_residual_streams
+        self.num_residual_streams = self.mhc_num_residual_streams
+        if self.num_residual_streams < 1:
+            raise ValueError("The number of mHC residual streams must be positive.")
+        if self.moe_latent_up_projection_rmsnorm and self.moe_use_norm_before_up_proj:
+            raise ValueError(
+                "Choose either fused latent RMSNorm or a separate latent norm, not both."
+            )
+        if self.moe_ncclep_use_symm_mem:
+            self.moe_ncclep_zero_copy = True
+        if (
+            self.moe_flex_dispatcher_backend == "ncclep"
+            and self.moe_ncclep_static_shape is True
+            and self.moe_expert_rank_capacity_factor is None
+        ):
+            raise ValueError(
+                "moe_ncclep_static_shape=True requires moe_expert_rank_capacity_factor."
+            )
+        if (
+            self.moe_flex_dispatcher_backend == "ncclep"
+            and self.moe_ncclep_static_shape is False
+            and self.moe_expert_rank_capacity_factor is not None
+        ):
+            raise ValueError(
+                "moe_ncclep_static_shape=False conflicts with moe_expert_rank_capacity_factor; "
+                "NCCL-EP shape policy is selected by the rank capacity, "
+                "not this compatibility flag."
+            )
+        self._linear_cp_mode_was_default = self.linear_cp_mode is None
+        if self.linear_cp_mode is None:
+            variant = self.experimental_attention_variant
+            self.linear_cp_mode = (
+                "headwise"
+                if self.moe_shortcut_connection
+                else (
+                    "chunkwise"
+                    if variant in ("gdn", "gated_delta_net", "kda")
+                    or (self.is_hybrid_model and variant != "gdn2")
+                    else "headwise"
+                )
+            )
+        if self.linear_cp_layout is None:
+            self._linear_cp_layout_explicit = False
+        elif self._linear_cp_layout_explicit is None or self.linear_cp_layout != "zigzag":
+            # dataclasses.replace() passes the filled-in zigzag default back through
+            # __init__; keep the carried flag so that default does not become explicit.
+            self._linear_cp_layout_explicit = True
+        if self.experimental_attention_variant == "dsv4_hybrid":
+            # Preserve dev's uniform runtime-CP ownership for DSv4. Migrating dynamic
+            # and balanced indexer routes to the newer per-layer layout manager is a
+            # separate refactor; the attention modules already own these boundaries.
+            if self.linear_cp_layout not in (None, self.attention_cp_layout) and (
+                self.context_parallel_size > 1 or self.dynamic_context_parallel
+            ):
+                raise ValueError("DSv4 requires a uniform attention/linear CP layout.")
+            self._linear_cp_layout_explicit = False
+        if self.linear_cp_layout is None:
+            self.linear_cp_layout = "zigzag"
+        if hasattr(self, "o_groups"):
+            for legacy, canonical, default in (
+                ("o_groups", "output_projection_groups", 8),
+                ("o_lora_rank", "output_projection_lora_rank", 1024),
+            ):
+                legacy_value = getattr(self, legacy)
+                canonical_value = getattr(self, canonical)
+                if legacy_value is not None:
+                    if canonical_value not in (default, legacy_value):
+                        raise ValueError(f"Conflicting {legacy} and {canonical}.")
+                    canonical_value = legacy_value
+                    setattr(self, canonical, canonical_value)
+                setattr(self, legacy, canonical_value)
+
+    def _validate_dsv4_execution_scope(self) -> None:
+        """Validate dev indexer choices before the shared layout/backend checks."""
+        if self.experimental_attention_variant != "dsv4_hybrid":
+            return
+        if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
+            raise ValueError(
+                "dsa_indexer_precision must be 'bf16' or 'mxfp8', "
+                f"got {self.dsa_indexer_precision!r}"
+            )
+
+    def _validate_cp_layouts(self) -> None:
+        """Validate context-parallel layout settings."""
+        if (
+            self.linear_cp_mode == "chunkwise"
+            and self.linear_cp_layout != "contiguous"
+            and self._linear_cp_layout_explicit
+        ):
+            raise ValueError("linear_cp_mode='chunkwise' requires linear_cp_layout='contiguous'.")
+        if (
+            self.context_parallel_size > 1
+            and self.attention_cp_layout == "contiguous"
+            and self.experimental_attention_variant != "dsv4_hybrid"
+        ):
+            raise ValueError(
+                "attention_cp_layout='contiguous' is not yet supported with context parallelism."
+            )
+        if (
+            self.context_parallel_size > 1
+            and self.linear_cp_layout != self.attention_cp_layout
+            and self.sequence_parallel
+            and self.tensor_model_parallel_size > 1
+            and self.tensor_model_parallel_size % 2 != 0
+        ):
+            raise ValueError(
+                "Sequence-parallel CP layout conversion requires an even "
+                f"tensor-parallel size, got {self.tensor_model_parallel_size}."
+            )
+
+    def _validate_attention_residuals(self):
+        """Validate the Attention Residuals (AttnRes) configuration.
+
+        Supported: eager/compile/FLA training with TP/SP/CP/EP, pipeline parallelism
+        (non-interleaved: full depth-source prefix concatenated along the
+        sequence dimension; interleaved VPP: per-boundary deltas padded to a
+        uniform width plus a rank-local source cache — see
+        attention_residual.AttnResStageSources), selective recompute of modules
+        that live inside a sublayer (e.g. core_attn), MoE (incl. shared-expert
+        overlap), fine-grained activation offloading, and MTP in the standard
+        or hybrid last-stage placement. Everything rejected below either has no
+        mechanism yet (CUDA graphs, full recompute, EP-overlap fine-grained
+        schedule, zero-layer virtual chunks, the per-layer CP layout manager,
+        wide residuals, shortcut MoE blocks) or
+        would silently bypass the AttnRes residual interception (fused residual
+        norms, fp32 residual connection) or the interleaved schedule's uniform
+        payload-width reasoning (variable sequence lengths with VPP).
+
+        Two memory knobs are validated here as well: ``'attn_res'`` in
+        ``recompute_modules`` (output-discarding recompute of the aggregation) and
+        ``attn_res_norm_fusion`` (the consuming RMSNorm fused into the FLA kernel).
+        """
+        recompute_attn_res = (
+            self.recompute_granularity == "selective"
+            and self.recompute_modules is not None
+            and "attn_res" in self.recompute_modules
+        )
+        if not self.enable_attention_residuals:
+            if self.attn_res_block_layers is not None:
+                raise ValueError("attn_res_block_layers requires enable_attention_residuals=True.")
+            if self.attn_res_norm_fusion:
+                raise ValueError("attn_res_norm_fusion requires enable_attention_residuals=True.")
+            if recompute_attn_res:
+                raise ValueError(
+                    "'attn_res' in recompute_modules requires enable_attention_residuals=True."
+                )
+            return
+
+        if self.enable_hyper_connections or self.enable_mhc_connections:
+            raise ValueError(
+                "enable_attention_residuals and enable_hyper_connections / "
+                "enable_mhc_connections are mutually exclusive residual-stream generalizations."
+            )
+        if (
+            not isinstance(self.attn_res_block_layers, int)
+            or isinstance(self.attn_res_block_layers, bool)
+            or self.attn_res_block_layers < 1
+        ):
+            raise ValueError(
+                "enable_attention_residuals requires attn_res_block_layers to be a "
+                f"positive integer, got {self.attn_res_block_layers!r}."
+            )
+        if self.attn_res_impl not in ("eager", "compile", "fla"):
+            raise ValueError(
+                "attn_res_impl must be 'eager', 'compile', or 'fla', "
+                f"got {self.attn_res_impl!r}."
+            )
+        norm_offload_modules = set()
+        if self.fine_grained_activation_offloading and self.offload_modules:
+            norm_offload_modules = {"attn_norm", "mlp_norm"} & set(self.offload_modules)
+        if recompute_attn_res and norm_offload_modules:
+            # Both target the aggregation output (the norm input): the recompute releases it
+            # and regenerates it in backward, so there is nothing for the offload to transfer.
+            raise ValueError(
+                "'attn_res' in recompute_modules is incompatible with offload_modules "
+                f"{sorted(norm_offload_modules)}: they offload the AttnRes aggregation output "
+                "that the recompute discards. Remove one of the two."
+            )
+        if self.attn_res_norm_fusion:
+            if self.attn_res_impl != "fla":
+                raise ValueError(
+                    "attn_res_norm_fusion requires attn_res_impl='fla' (the consuming RMSNorm is "
+                    f"applied by FLA's fused_attnres kernel), got {self.attn_res_impl!r}."
+                )
+            if self.normalization != "RMSNorm" or self.layernorm_zero_centered_gamma:
+                raise ValueError(
+                    "attn_res_norm_fusion fuses a plain RMSNorm (y = x * rsqrt(mean(x^2) + eps) "
+                    "* w) into the aggregation; it requires normalization='RMSNorm' without "
+                    "layernorm_zero_centered_gamma."
+                )
+            if getattr(self, "mla_down_proj_fusion", False):
+                raise ValueError(
+                    "attn_res_norm_fusion requires standalone input norms; mla_down_proj_fusion "
+                    "folds the MLA input norm into the down projections."
+                )
+            if norm_offload_modules:
+                raise ValueError(
+                    "attn_res_norm_fusion is incompatible with offload_modules "
+                    f"{sorted(norm_offload_modules)}: the norm input is never materialized."
+                )
+            recompute_layernorm = (
+                self.recompute_granularity == "selective"
+                and self.recompute_modules is not None
+                and "layernorm" in self.recompute_modules
+            )
+            if recompute_layernorm != recompute_attn_res:
+                raise ValueError(
+                    "With attn_res_norm_fusion, 'attn_res' and 'layernorm' in recompute_modules "
+                    "must be enabled together or not at all: the fused kernel's output is the "
+                    "norm output, so one output-discarding checkpoint covers both (got "
+                    f"layernorm={recompute_layernorm}, attn_res={recompute_attn_res})."
+                )
+        unsupported = []
+        has_variable_sequences = (
+            self.variable_seq_lengths or self.sequence_packing_scheduler is not None
+        )
+        if has_variable_sequences and self.virtual_pipeline_model_parallel_size is not None:
+            # The packing scheduler sets variable_seq_lengths later in
+            # __post_init__, so check the scheduler itself here as well.
+            # Non-interleaved pipeline parallelism is fine with per-microbatch
+            # shapes: the boundary payload is one plain [s * slices, b, h]
+            # tensor whose shape p2p_communication exchanges dynamically, and
+            # unpacking only needs the static slice count derived from the
+            # layer layout. The interleaved schedule instead pads every
+            # boundary to a single uniform width computed from seq_length and
+            # keys its rank-local source cache by microbatch, neither of which
+            # has been reasoned through for variable shapes.
+            unsupported.append(
+                "variable_seq_lengths (incl. sequence packing) together with the "
+                "interleaved (VPP) schedule"
+            )
+        if self.virtual_pipeline_model_parallel_size is not None and (
+            self.account_for_embedding_in_pipeline_split or self.account_for_loss_in_pipeline_split
+        ):
+            # Zero-layer virtual chunks (standalone embedding/loss stages) are
+            # not covered by the delta-payload window bookkeeping yet.
+            unsupported.append(
+                "interleaved VPP together with account_for_embedding/loss_in_pipeline_split"
+            )
+        if self.cuda_graph_impl != "none":
+            unsupported.append(f"cuda_graph_impl={self.cuda_graph_impl!r}")
+        if self.recompute_granularity == "full":
+            unsupported.append("recompute_granularity='full'")
+        if self.overlap_moe_expert_parallel_comm:
+            unsupported.append("overlap_moe_expert_parallel_comm")
+        if self.fused_residual_rmsnorm:
+            unsupported.append("fused_residual_rmsnorm (bypasses residual interception)")
+        if self.fp32_residual_connection:
+            unsupported.append("fp32_residual_connection")
+        if self.apply_residual_connection_post_layernorm:
+            unsupported.append("apply_residual_connection_post_layernorm")
+        if self.cpu_offloading:
+            unsupported.append(
+                "cpu_offloading (depth sources outlive the per-layer lifetime model)"
+            )
+        if self.heterogeneous_block_specs:
+            unsupported.append("heterogeneous_block_specs")
+        if self.pipeline_model_parallel_layout is not None:
+            unsupported.append("pipeline_model_parallel_layout (incl. standalone MTP stages)")
+        if (
+            self.num_layers_in_first_pipeline_stage is not None
+            or self.num_layers_in_last_pipeline_stage is not None
+        ):
+            unsupported.append("num_layers_in_first/last_pipeline_stage")
+        if (
+            self.mtp_num_layers is not None
+            and self.pipeline_model_parallel_size > 1
+            and (
+                self.account_for_embedding_in_pipeline_split
+                or self.account_for_loss_in_pipeline_split
+            )
+        ):
+            # With these splits the final-layernorm stage (which aggregates and
+            # consumes the depth sources) can differ from the post_process stage
+            # that runs MTP; the depth-source hand-off does not cross that
+            # boundary yet.
+            unsupported.append("MTP together with account_for_embedding/loss_in_pipeline_split")
+        if self.wide_residual is not None:
+            # Wide residual streams generalize the residual stream in their own way
+            # (ResidualConnection read/write sites); AttnRes intercepts the same sites.
+            unsupported.append("wide_residual")
+        if self.moe_shortcut_connection:
+            # ShortcutMoEBlock runs an attention + MoE pair as one execution unit and
+            # bypasses the per-entry residual interception of the hybrid stack.
+            unsupported.append("moe_shortcut_connection")
+        if self.is_hybrid_model:
+            if self.pipeline_model_parallel_size > 1:
+                if not self.hybrid_layer_pattern:
+                    raise ValueError(
+                        "enable_attention_residuals with a hybrid model and pipeline "
+                        "parallelism requires hybrid_layer_pattern (the pipeline payload "
+                        "widths derive from the pattern's '|' segmentation)."
+                    )
+                main_pattern = self.hybrid_layer_pattern.split('/')[0]
+                if '|' in main_pattern:
+                    num_segments = main_pattern.count('|') + 1
+                    expected_segments = self.pipeline_model_parallel_size * (
+                        self.virtual_pipeline_model_parallel_size or 1
+                    )
+                    if num_segments != expected_segments:
+                        unsupported.append(
+                            f"hybrid pattern with {num_segments} pipe segments != "
+                            f"pipeline_model_parallel_size x virtual_pipeline_model_parallel_size "
+                            f"= {expected_segments}"
+                        )
+        if unsupported:
+            raise ValueError(
+                "enable_attention_residuals is not yet supported with: " + "; ".join(unsupported)
+            )
+
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
         See https://docs.python.org/3/library/dataclasses.html#post-init-processing for more
         details.
         """
         super().__post_init__()
+        # Dynamic CP can assign a multi-rank group even when configured CP is one.
+        has_context_parallelism = self.context_parallel_size > 1 or self.dynamic_context_parallel
 
         # Imported lazily because the module-spec module imports TransformerConfig.
         from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
             is_gated_delta_net_variant,
             normalize_experimental_attention_variant,
         )
+
+        if self.mtp_loss_type not in ("cross_entropy", "e2e_tv"):
+            raise ValueError(
+                "mtp_loss_type must be one of 'cross_entropy' or 'e2e_tv', "
+                f"got {self.mtp_loss_type!r}."
+            )
+        if self.mtp_loss_type == "e2e_tv":
+            if not self.mtp_detach_heads:
+                warnings.warn(
+                    "mtp_loss_type='e2e_tv' requires detached MTP inputs "
+                    "and shared output weights; "
+                    "setting mtp_detach_heads=True automatically to prevent MTP loss "
+                    "gradients from flowing into the main model.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self.mtp_detach_heads = True
+        self._normalize_sync_compatibility_fields()
+        self._validate_dsv4_execution_scope()
+        self._validate_cp_layouts()
+
+        if self.attn_logit_softcapping is not None and not (
+            math.isfinite(self.attn_logit_softcapping) and self.attn_logit_softcapping > 0
+        ):
+            raise ValueError(
+                "attn_logit_softcapping must be a positive finite value, got "
+                f"{self.attn_logit_softcapping}. Use None to disable softcapping. A cap of 0.0 "
+                "disables softcapping in TransformerEngine but collapses every logit to zero in "
+                "the local attention path, a negative cap is silently applied as its absolute "
+                "value there while FlashAttention ignores it entirely, and a non-finite cap "
+                "produces NaN logits."
+            )
+
+        # Unset means "follow moe_router_fusion". Resolve it here so every consumer
+        # downstream reads a plain bool.
+        if self.moe_router_aux_loss_fusion is None:
+            self.moe_router_aux_loss_fusion = self.moe_router_fusion
+
+        if self.wide_residual is not None:
+            if self.enable_mhc_connections:
+                raise ValueError("wide_residual and enable_mhc_connections are mutually exclusive.")
+            if (
+                self.cuda_graph_impl != "none" or self.enable_cuda_graph or self.external_cuda_graph
+            ) and not (
+                self.cuda_graph_impl == "local"
+                and not self.enable_cuda_graph
+                and not self.external_cuda_graph
+                and normalize_inference_cuda_graph_scope(
+                    self.inference_cuda_graph_scope, self.cuda_graph_impl
+                )
+                == InferenceCudaGraphScope.block
+            ):
+                raise NotImplementedError(
+                    "wide_residual supports CUDA graphs only with cuda_graph_impl='local' "
+                    "and inference_cuda_graph_scope='block'."
+                )
+            if self.pipeline_model_parallel_size > 1:
+                raise NotImplementedError(
+                    "wide_residual does not yet support pipeline_model_parallel_size > 1. "
+                    "Inter-stage communication buffers are still sized from hidden_size."
+                )
+            if self.inference_fuse_tp_communication:
+                raise NotImplementedError(
+                    "wide_residual is not compatible with inference_fuse_tp_communication. "
+                    "The fused inference path assumes an ordinary-width residual tensor."
+                )
+            if self.heterogeneous_block_specs:
+                raise NotImplementedError(
+                    "wide_residual does not yet support heterogeneous_block_specs. "
+                    "Residual-stream width is currently owned by the enclosing block."
+                )
+            if self.overlap_moe_expert_parallel_comm:
+                raise NotImplementedError(
+                    "wide_residual does not yet support overlap_moe_expert_parallel_comm. "
+                    "The fine-grained EP-overlap schedule invokes the pre-MLP norm and MLP BDA "
+                    "outside TransformerLayer._forward_mlp, bypassing the wide-residual MLP "
+                    "read and write connection."
+                )
+
+        if self.experimental_attention_variant is not None:
+            self.experimental_attention_variant = normalize_experimental_attention_variant(
+                self.experimental_attention_variant
+            )
+
+        if self.dsa_kernel_backend is None:
+            self.dsa_kernel_backend = (
+                "cudnn"
+                if self.experimental_attention_variant == "dsv4_hybrid"
+                and self.apply_dsa_kernel_fusion is None
+                else "none"
+            )
+
+        if self.use_transformer_engine_op_fuser and self.moe_grouped_gemm:
+            self.moe_use_grouped_tensor = True
+
+        if self.moe_use_grouped_tensor and not self.moe_grouped_gemm:
+            raise ValueError("moe_use_grouped_tensor=True requires moe_grouped_gemm=True.")
+
+        if self.mtp_normalize_loss_by_main_tokens and not self.calculate_per_token_loss:
+            raise ValueError(
+                "mtp_normalize_loss_by_main_tokens=True requires calculate_per_token_loss=True."
+            )
 
         # When fp32 residual connections are enabled, pipeline parallel communication must
         # use fp32 to match the dtype of the residual stream between pipeline stages.
@@ -1593,6 +2698,16 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 f"Only one of self.fp16: {self.fp16} and self.bf16 {self.bf16} should be True."
             )
+
+        if self.gdp_num_householder < 1:
+            raise ValueError(
+                f"gdp_num_householder must be positive, got {self.gdp_num_householder}."
+            )
+
+        if self.gdp_g_clamp_value is not None and (
+            not math.isfinite(self.gdp_g_clamp_value) or self.gdp_g_clamp_value <= 0
+        ):
+            raise ValueError("gdp_g_clamp_value must be finite and positive when set.")
 
         # Apply BF16 matmul precision setting if needed
         if self.bf16 and self.disable_bf16_reduced_precision_matmul:
@@ -1622,6 +2737,33 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "Regular attention does not support headwise "
                 "gated_attention_proj_granularity; use 'elementwise'."
+            )
+        if self.attention_output_gate_fusion:
+            if not self.attention_output_gate:
+                raise ValueError("attention_output_gate_fusion requires attention_output_gate.")
+            if self.gated_attention_proj_granularity != 'elementwise':
+                raise ValueError(
+                    "attention_output_gate_fusion supports only "
+                    "gated_attention_proj_granularity='elementwise', got "
+                    f"{self.gated_attention_proj_granularity!r}."
+                )
+            if not self.multi_latent_attention:
+                raise ValueError(
+                    "attention_output_gate_fusion is currently supported only with "
+                    "multi_latent_attention."
+                )
+            from megatron.core.fusions.fused_attention_output_gate import HAVE_TRITON
+
+            if not HAVE_TRITON:
+                raise ValueError(
+                    "attention_output_gate_fusion requires Triton >= 3.0 "
+                    "(triton.language.extra.libdevice)."
+                )
+
+        if self.num_query_groups > 0 and self.num_attention_heads % self.num_query_groups != 0:
+            raise ValueError(
+                f"num_query_groups ({self.num_query_groups}) must be a divisor of "
+                f"num_attention_heads ({self.num_attention_heads})."
             )
 
         if (
@@ -1673,14 +2815,30 @@ class TransformerConfig(ModelParallelConfig):
                         f"num_query_groups={self.num_query_groups}, "
                         f"kv_channels={self.kv_channels}, tp={tp}."
                     )
-
-        if self.linear_attention_type is not None:
-            warnings.warn(
-                "linear_attention_type is deprecated, "
-                "use experimental_attention_variant instead."
+        if self.gdn_kernel_backend not in {"transformer_engine", "fla", "torch"}:
+            raise ValueError(
+                "gdn_kernel_backend must be one of {'transformer_engine', 'fla', 'torch'}, "
+                f"got {self.gdn_kernel_backend!r}."
             )
-            self.experimental_attention_variant = self.linear_attention_type
-            self.linear_attention_type = None
+
+        if is_gated_delta_net_variant(self.experimental_attention_variant):
+            if (
+                self.experimental_attention_variant != "kda"
+                and self.deterministic_mode
+                and self.gdn_kernel_backend != "torch"
+            ):
+                raise ValueError(
+                    "deterministic_mode=True requires gdn_kernel_backend='torch' for "
+                    "Gated DeltaNet."
+                )
+
+            # gdn2 may also be enabled for GDN layers built via the hybrid layer pattern
+            # symbol 'G', where linear_attention_freq is unused; the GPT experimental
+            # attention route raises a clear error downstream if it is missing.
+            if self.experimental_attention_variant == "gdn" and not self.is_hybrid_model:
+                assert (
+                    self.linear_attention_freq is not None
+                ), "linear_attention_freq must be set for linear gdn."
 
         if self.experimental_attention_variant is not None:
             self.experimental_attention_variant = normalize_experimental_attention_variant(
@@ -1699,12 +2857,17 @@ class TransformerConfig(ModelParallelConfig):
         if self.cp_partition_mode == "contiguous" and (
             self.context_parallel_size > 1 or self.dynamic_context_parallel
         ):
-            if self.sequence_packing_scheduler is None:
+            if self.sequence_packing_scheduler is None and not (
+                self.experimental_attention_variant == "dsv4_hybrid"
+                and not self.dynamic_context_parallel
+            ):
                 raise ValueError(
                     "cp_partition_mode='contiguous' with context parallelism requires THD "
                     "inputs from a sequence_packing_scheduler; BSHD inputs are not supported. "
                     "The legacy non-scheduler CP batch slicing path only supports zigzag layout."
                 )
+            # Static DSv4 callers may supply THD metadata directly (main #7469).
+            # CSA validates the actual input format at runtime and still rejects SBHD CP.
             if (
                 (self.mtp_num_layers or 0) > 0
                 and self.tensor_model_parallel_size > 1
@@ -1717,7 +2880,7 @@ class TransformerConfig(ModelParallelConfig):
                     "follow-up change."
                 )
 
-        if self.context_parallel_size > 1:
+        if has_context_parallelism:
             if self.cp_partition_mode == "contiguous":
                 if (
                     self.multi_latent_attention
@@ -1743,12 +2906,25 @@ class TransformerConfig(ModelParallelConfig):
                         "cp_partition_mode='contiguous' is incompatible with "
                         "GDN-family linear_cp_mode='headwise'."
                     )
+                if self.experimental_attention_variant == "gdn2":
+                    # GDN2 always runs headwise CP; see linear_cp_mode.
+                    raise ValueError(
+                        "cp_partition_mode='contiguous' is incompatible with "
+                        "experimental_attention_variant='gdn2', which supports only headwise CP."
+                    )
             elif self.cp_partition_mode == "zigzag":
                 if self.experimental_attention_variant == "dsv4_hybrid":
                     raise ValueError(
                         "DSv4 Hybrid with context parallelism requires "
                         "cp_partition_mode='contiguous'."
                     )
+
+        if self.dsa_cp_balance_indexer and self.experimental_attention_variant != "dsv4_hybrid":
+            # The flag is consumed only by the CSA indexer; on any other model the
+            # data-step prebuild would burn per-microbatch host syncs for nothing.
+            raise ValueError(
+                "dsa_cp_balance_indexer requires " "experimental_attention_variant='dsv4_hybrid'."
+            )
 
         # Normalize the deprecated DSv4 kernel switch only after all deprecated attention
         # selectors have been folded into experimental_attention_variant, and immediately
@@ -1797,13 +2973,48 @@ class TransformerConfig(ModelParallelConfig):
         if (
             self.dsa_indexer_weights_proj_output_dtype == "fp32"
             and self.dsa_kernel_backend == "cudnn"
+            and self.dsa_indexer_kpool <= 1
         ):
             raise ValueError(
                 "dsa_indexer_weights_proj_output_dtype='fp32' is not supported by "
-                "dsa_kernel_backend='cudnn', which requires a BF16 indexer weights tensor. "
-                "Use dsa_kernel_backend='tilelang' or 'none'."
+                "dsa_kernel_backend='cudnn' for per-token DSA, which requires a BF16 indexer "
+                "weights tensor. KPool selection bypasses the cuDNN top-k path; use KPool or "
+                "dsa_kernel_backend='tilelang'/'none'."
             )
 
+        if self.dsa_cp_balance_indexer:
+            # Startup preconditions for the flag to be meaningful. The per-pack verdict in
+            # cp_balanced_indexer does the actual routing; ineligible packs take the
+            # contiguous reference path. The alignment setting is intentionally absent
+            # here because it is only a capacity-rounding policy, not proof that the
+            # current pack's sequence boundaries are zigzag-representable.
+            # Evaluated after the deprecated apply_dsa_kernel_fusion switch is folded
+            # into dsa_kernel_backend above, so the predicate sees the final backend.
+            from megatron.core.transformer.experimental_attention_variant.dsa_kernels import (
+                use_fused_dsa_kernels,
+            )
+
+            if not use_fused_dsa_kernels(self):
+                raise ValueError(
+                    "dsa_cp_balance_indexer requires the fused DSA indexer backend "
+                    "(dsa_kernel_backend != 'none' and attention_backend != unfused): "
+                    "the balanced zigzag scorer is fused-only."
+                )
+            if not (self.context_parallel_size > 1 or self.dynamic_context_parallel):
+                raise ValueError(
+                    "dsa_cp_balance_indexer requires active context parallelism "
+                    "(context_parallel_size > 1 or dynamic_context_parallel=True)."
+                )
+            ratios = self.csa_compress_ratios or []
+            if self.csa_dense_mode or 4 not in ratios:
+                raise ValueError(
+                    "dsa_cp_balance_indexer requires a DSA indexer to exist: "
+                    "CompressedSparseAttention builds one only for compress-ratio-4 "
+                    "layers with csa_dense_mode=False "
+                    f"(csa_dense_mode={self.csa_dense_mode}, "
+                    f"csa_compress_ratios={self.csa_compress_ratios}). Without one the "
+                    "flag would only add per-microbatch prebuild work."
+                )
         if is_gated_delta_net_variant(self.experimental_attention_variant):
             if not self.is_hybrid_model:
                 assert (
@@ -1838,6 +3049,14 @@ class TransformerConfig(ModelParallelConfig):
                     raise ValueError("KDA requires equal key and value head counts.")
                 if self.linear_key_head_dim != self.linear_value_head_dim:
                     raise ValueError("KDA requires equal key and value head dimensions.")
+                if self.kda_f_lora_rank is not None and self.kda_f_lora_rank <= 0:
+                    raise ValueError(
+                        f"KDA requires kda_f_lora_rank > 0, got {self.kda_f_lora_rank}."
+                    )
+                if self.kda_gate_lora_rank is not None and self.kda_gate_lora_rank <= 0:
+                    raise ValueError(
+                        "KDA requires kda_gate_lora_rank > 0, " f"got {self.kda_gate_lora_rank}."
+                    )
                 if self.kda_safe_gate:
                     if self.kda_lower_bound is None:
                         raise ValueError("KDA requires kda_lower_bound when kda_safe_gate=True.")
@@ -1847,12 +3066,18 @@ class TransformerConfig(ModelParallelConfig):
                             "when kda_safe_gate=True."
                         )
 
+            if (
+                self.experimental_attention_variant == "gdn2"
+                and has_context_parallelism
+                and self.linear_cp_mode != "headwise"
+            ):
+                raise ValueError("GDN2 context parallelism requires linear_cp_mode='headwise'.")
             assert self.linear_num_value_heads % self.linear_num_key_heads == 0, (
                 f"linear_num_value_heads ({self.linear_num_value_heads}) must be a multiple of "
                 f"linear_num_key_heads ({self.linear_num_key_heads})."
             )
             if (
-                self.experimental_attention_variant == "kda" or self.context_parallel_size > 1
+                self.experimental_attention_variant == "kda" or has_context_parallelism
             ) and self.linear_cp_mode not in ("headwise", "chunkwise"):
                 raise ValueError(
                     f"linear_cp_mode must be either 'headwise' or 'chunkwise', "
@@ -1864,26 +3089,37 @@ class TransformerConfig(ModelParallelConfig):
                     f"got {self.gdn_conv_pad_alignment}."
                 )
 
-            if self.context_parallel_size > 1:
+            if has_context_parallelism:
+                if self.experimental_attention_variant == "gdn2" and self.dynamic_context_parallel:
+                    raise ValueError(
+                        "experimental_attention_variant='gdn2' does not support "
+                        "dynamic_context_parallel=True: GDN2 shards heads over the static CP "
+                        "group and does not follow the per-microbatch CP group."
+                    )
                 if self.gdn_conv_pad_alignment is not None:
                     assert self.linear_cp_mode != "chunkwise", (
                         "gdn_conv_pad_alignment is incompatible with "
-                        "linear_cp_mode='chunkwise' when context_parallel_size > 1. "
+                        "linear_cp_mode='chunkwise' with context parallelism. "
                         "Padding chunk-local GDN causal-conv inputs can change later "
                         "chunk numerics."
                     )
             # Check tensor parallelism compatibility. Headwise CP splits linear-attention heads
-            # across CP ranks; chunkwise CP keeps all TP-local heads on each CP rank.
+            # across CP ranks; chunkwise CP keeps all TP-local heads on each CP rank. GDN2 has no
+            # chunkwise path and always splits its heads across CP ranks.
             linear_head_parallel_size = self.tensor_model_parallel_size
-            if self.context_parallel_size > 1 and self.linear_cp_mode == "headwise":
+            if self.context_parallel_size > 1 and (
+                self.linear_cp_mode == "headwise" or self.experimental_attention_variant == "gdn2"
+            ):
                 linear_head_parallel_size *= self.context_parallel_size
             assert self.linear_num_key_heads % linear_head_parallel_size == 0, (
                 f"{self.linear_num_key_heads=} must be a multiple of "
-                f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
+                f"{linear_head_parallel_size=} for {self.linear_cp_mode=} "
+                f"and {self.experimental_attention_variant=}."
             )
             assert self.linear_num_value_heads % linear_head_parallel_size == 0, (
                 f"{self.linear_num_value_heads=} must be a multiple of "
-                f"{linear_head_parallel_size=} for {self.linear_cp_mode=}."
+                f"{linear_head_parallel_size=} for {self.linear_cp_mode=} "
+                f"and {self.experimental_attention_variant=}."
             )
         if self.experimental_attention_variant == "dsa":
             _validate_dsa_kernel_backend_dependencies(self.dsa_kernel_backend)
@@ -1901,7 +3137,7 @@ class TransformerConfig(ModelParallelConfig):
                     "dsa_indexer_skip_topk_offset must be non-negative, got "
                     f"{self.dsa_indexer_skip_topk_offset}."
                 )
-            if self.context_parallel_size > 1:
+            if has_context_parallelism:
                 cp_comm_types = (
                     self.cp_comm_type
                     if isinstance(self.cp_comm_type, list)
@@ -1914,6 +3150,31 @@ class TransformerConfig(ModelParallelConfig):
                 ), (
                     "DSAttention context parallelism currently supports "
                     "cp_comm_type=allgather only."
+                )
+            if self.dsa_indexer_kpool < 1:
+                raise ValueError(
+                    f"dsa_indexer_kpool must be positive, got {self.dsa_indexer_kpool}."
+                )
+            if self.dsa_indexer_kpool > 1:
+                if self.dsa_indexer_topk is None:
+                    raise ValueError(
+                        "dsa_indexer_topk must be set when dsa_indexer_kpool is greater than 1."
+                    )
+                if self.dsa_indexer_topk < 1:
+                    raise ValueError(
+                        "dsa_indexer_topk must be positive"
+                        " when dsa_indexer_kpool is greater than 1."
+                    )
+                if self.dsa_indexer_topk % self.dsa_indexer_kpool != 0:
+                    raise ValueError(
+                        "dsa_indexer_topk must be divisible"
+                        " by dsa_indexer_kpool for pool selection; "
+                        f"got topk={self.dsa_indexer_topk}, kpool={self.dsa_indexer_kpool}."
+                    )
+            if self.dsa_indexer_kpool > 1 and (self.dsa_indexer_loss_coeff or 0.0) > 0:
+                raise ValueError(
+                    "DSA indexer loss is not supported with kpool selection; set "
+                    "dsa_indexer_loss_coeff=0 or dsa_indexer_kpool=1."
                 )
         elif self.experimental_attention_variant == "dsv4_hybrid":
             if self.dsa_indexer_precision not in ("bf16", "mxfp8"):
@@ -1940,6 +3201,22 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 self.tensor_model_parallel_size == 1
             ), "DSv4 Hybrid Attention only supports TP size 1."
+            if self.context_parallel_size > 1 and self.attention_cp_layout != "contiguous":
+                raise ValueError(
+                    "DSv4 context parallelism requires attention_cp_layout='contiguous'."
+                )
+            if self.dynamic_context_parallel and not self.dsa_cp_balance_indexer:
+                # NOTE(nightly-sync 26_10_2026): main rejects DSv4 + dynamic CP outright
+                # ("not supported yet"), but dev has since implemented it for the balanced
+                # zigzag indexer: the dsa_cp_balance_indexer precondition above accepts
+                # ``dynamic_context_parallel=True`` as a valid CP activation. Scoping the
+                # rejection to the unbalanced path keeps main's guard for the configurations
+                # it was written for while preserving dev's support, so both sides' tests
+                # hold -- test_dsv4_hybrid_attention.py::
+                # test_config_rejects_dynamic_context_parallel (main, no balanced indexer)
+                # and test_cp_balanced_indexer_layout.py::
+                # test_balanced_config_accepts_dynamic_context_parallelism (dev).
+                raise ValueError("DSv4 dynamic context parallelism is not supported yet.")
             assert not self.qk_clip, "QK clipping is not supported with DSv4 Hybrid Attention."
             self.hetereogenous_dist_checkpoint = True
 
@@ -2042,15 +3319,25 @@ class TransformerConfig(ModelParallelConfig):
                             "build or set dsa_kernel_backend='none'."
                         )
 
-        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant == "kda":
-            raise NotImplementedError(
-                "gdn_pre_gated_delta_rule_fusion is not implemented for KDA yet."
-            )
-
-        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant != "gdn":
+        if self.gdn_pre_gated_delta_rule_fusion and self.experimental_attention_variant not in (
+            "gdn",
+            "kda",
+        ):
             raise ValueError(
                 "gdn_pre_gated_delta_rule_fusion is only supported with "
-                "experimental_attention_variant='gdn'."
+                "experimental_attention_variant='gdn' or 'kda'."
+            )
+        # Explicit allow-list: GDN_ATTENTION_VARIANTS also contains "gdn2", which has no
+        # fused gated output norm. The deprecated "gated_delta_net" alias is already
+        # normalized to "gdn" above.
+        if self.gdn_gated_output_norm_fusion and self.experimental_attention_variant not in (
+            "gdn",
+            "kda",
+        ):
+            raise ValueError(
+                "gdn_gated_output_norm_fusion is only supported with "
+                "experimental_attention_variant='gdn' or 'kda' "
+                "or deprecated alias experimental_attention_variant='gated_delta_net'."
             )
 
         if self.fp8:
@@ -2124,10 +3411,32 @@ class TransformerConfig(ModelParallelConfig):
         if self.expert_model_parallel_size > 1 and self.num_moe_experts is None:
             raise ValueError("num_moe_experts must be non None to use expert-parallel.")
 
+        if self.inference_moe_nvfp4_recipe is not None and (
+            self.transformer_impl != "inference_optimized" or self.num_moe_experts is None
+        ):
+            raise ValueError(
+                "inference_moe_nvfp4_recipe requires transformer_impl='inference_optimized' "
+                "and an MoE model (num_moe_experts set)."
+            )
+
         if self.transformer_impl == "inference_optimized" and self.num_moe_experts is not None:
-            if self.expert_tensor_parallel_size > 1:
+            self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend.from_config(
+                self.inference_grouped_gemm_backend
+            )
+            if self.inference_moe_router_backend not in ('torch', 'triton'):
                 raise ValueError(
-                    "Inference-optimized MoE layers does not support expert tensor parallelism."
+                    "inference_moe_router_backend must be 'torch' or 'triton', "
+                    f"got {self.inference_moe_router_backend!r}"
+                )
+
+            mxfp8_enabled = bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8
+            if (
+                self.expert_tensor_parallel_size > 1
+                and self.inference_moe_token_dispatcher_type != "nvls"
+            ):
+                raise ValueError(
+                    "Inference-optimized MoE layers support expert tensor parallelism only "
+                    "with inference_moe_token_dispatcher_type='nvls'."
                 )
             if self.moe_expert_capacity_factor is not None:
                 raise ValueError("Inference-optimized MoE layers only support dropless MoE ")
@@ -2142,13 +3451,104 @@ class TransformerConfig(ModelParallelConfig):
                     "to avoid costly dtype conversions during decode."
                 )
 
-            if self.gated_linear_unit:
+            if self.inference_moe_nvfp4_recipe is not None:
+                if self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER:
+                    raise ValueError(
+                        "inference_moe_nvfp4_recipe requires "
+                        "inference_grouped_gemm_backend='flashinfer', got "
+                        f"'{self.inference_grouped_gemm_backend}'."
+                    )
+                if self.activation_func != (F.silu if self.gated_linear_unit else squared_relu):
+                    raise ValueError(
+                        "inference_moe_nvfp4_recipe supports only non-gated squared-ReLU or "
+                        "gated SiLU (SwiGLU) experts. Set activation_func=squared_relu with "
+                        "gated_linear_unit=False, or activation_func=F.silu with "
+                        "gated_linear_unit=True."
+                    )
+                if self.activation_func_tanh_clamp_scale is not None:
+                    raise ValueError(
+                        "inference_moe_nvfp4_recipe does not support "
+                        "activation_func_tanh_clamp_scale: the FlashInfer per-token NVFP4 "
+                        "kernels only implement unclamped Relu2 and SwiGLU."
+                    )
+                if self.gated_linear_unit and (
+                    self.activation_func_clamp_value is not None
+                    or self.glu_linear_offset != 0.0
+                    or self.moe_mlp_glu_interleave_size is not None
+                ):
+                    raise ValueError(
+                        "inference_moe_nvfp4_recipe supports only plain SwiGLU: "
+                        "activation_func_clamp_value, glu_linear_offset and "
+                        "moe_mlp_glu_interleave_size must be unset."
+                    )
+                if self.fp8 or self.fp4_param:
+                    raise ValueError(
+                        "inference_moe_nvfp4_recipe quantizes BF16 expert weights and "
+                        "cannot be combined with FP8 inference or fp4_param."
+                    )
+
+            # Gated linear units (SwiGLU/GeGLU) are supported by the torch and vLLM
+            # grouped-GEMM backends, and SwiGLU by FlashInfer per-token NVFP4.
+            if (
+                self.gated_linear_unit
+                and self.inference_grouped_gemm_backend
+                not in (InferenceGroupedGemmBackend.TORCH, InferenceGroupedGemmBackend.VLLM)
+                and self.inference_moe_nvfp4_recipe is None
+            ):
                 raise ValueError(
-                    "--transformer-impl='inference_optimized' does not yet support "
-                    "gated linear units (SwiGLU/GeGLU)."
+                    "--transformer-impl='inference_optimized' supports gated linear units "
+                    "(SwiGLU/GeGLU) only with --inference-grouped-gemm-backend torch or vllm, "
+                    "or with inference_moe_nvfp4_recipe, "
+                    f"got '{self.inference_grouped_gemm_backend}'."
                 )
 
-            if self.fp8 == "mxfp8":
+            if (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                and (mxfp8_enabled or self.activation_func_tanh_clamp_scale is not None)
+                and self.activation_func != squared_relu
+            ):
+                raise ValueError(
+                    "FlashInfer MXFP8 or tanh-clamped MoE supports only non-gated squared-ReLU "
+                    "experts."
+                )
+
+            if (
+                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                and self.activation_func_tanh_clamp_scale is not None
+            ):
+                if not math.isfinite(self.activation_func_tanh_clamp_scale):
+                    raise ValueError("FlashInfer ClampedRelu2 requires a finite clamp scale.")
+                if mxfp8_enabled:
+                    expert_hidden = (
+                        self.moe_latent_size
+                        if self.moe_latent_size is not None
+                        else self.hidden_size
+                    )
+                    expert_ffn = (
+                        self.moe_ffn_hidden_size
+                        if self.moe_ffn_hidden_size is not None
+                        else self.ffn_hidden_size
+                    )
+                    if expert_hidden % 128 or expert_ffn % 128:
+                        raise ValueError(
+                            "FlashInfer CUTLASS MXFP8 requires expert hidden and FFN "
+                            f"dimensions divisible by 128; got ({expert_hidden}, {expert_ffn})."
+                        )
+                if self.add_bias_linear:
+                    raise ValueError(
+                        "FlashInfer CUTLASS ClampedRelu2 requires add_bias_linear=False."
+                    )
+                if self.batch_invariant_mode:
+                    raise ValueError(
+                        "FlashInfer CUTLASS ClampedRelu2 does not support batch_invariant_mode."
+                    )
+                if self.inference_flashinfer_mxfp8_token_capacity is not None:
+                    raise ValueError(
+                        "inference_flashinfer_mxfp8_token_capacity is supported only by the "
+                        "unclamped routed backend, not CUTLASS ClampedRelu2."
+                    )
+
+            if mxfp8_enabled:
                 if not self.fp8_param:
                     raise ValueError(
                         "fp8_param must be enabled when using "
@@ -2156,32 +3556,144 @@ class TransformerConfig(ModelParallelConfig):
                         "Please set --fp8-param-gather."
                     )
 
-            try:
-                self.inference_grouped_gemm_backend = InferenceGroupedGemmBackend(
-                    self.inference_grouped_gemm_backend
-                )
-            except ValueError:
-                raise ValueError(
-                    f"inference_grouped_gemm_backend must be 'flashinfer', 'torch', or 'vllm', "
-                    f"got '{self.inference_grouped_gemm_backend}'"
-                )
+            if self.inference_flashinfer_mxfp8_token_capacity is not None:
+                if self.inference_flashinfer_mxfp8_token_capacity <= 0:
+                    raise ValueError(
+                        "inference_flashinfer_mxfp8_token_capacity must be > 0, got "
+                        f"{self.inference_flashinfer_mxfp8_token_capacity}"
+                    )
+                if (
+                    self.inference_grouped_gemm_backend != InferenceGroupedGemmBackend.FLASHINFER
+                    or not (mxfp8_enabled or self.inference_moe_nvfp4_recipe is not None)
+                    or self.inference_moe_token_dispatcher_type != "nvls"
+                    or self.expert_model_parallel_size <= 1
+                ):
+                    raise ValueError(
+                        "inference_flashinfer_mxfp8_token_capacity requires "
+                        "inference_grouped_gemm_backend='flashinfer', FP8 enabled with "
+                        "fp8_recipe='mxfp8' or inference_moe_nvfp4_recipe, "
+                        "inference_moe_token_dispatcher_type='nvls' and "
+                        "expert_model_parallel_size > 1"
+                    )
 
+            if self.batch_invariant_mode:
+                if self.inference_grouped_gemm_backend not in (
+                    InferenceGroupedGemmBackend.FLASHINFER,
+                    InferenceGroupedGemmBackend.TORCH,
+                    InferenceGroupedGemmBackend.VLLM,
+                ):
+                    raise ValueError(
+                        "batch_invariant_mode requires inference_grouped_gemm_backend "
+                        "'flashinfer', 'torch', or 'vllm'."
+                    )
+                if (
+                    self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
+                    and not mxfp8_enabled
+                    and self.inference_moe_nvfp4_recipe is None
+                ):
+                    raise ValueError(
+                        "batch_invariant_mode currently supports the FlashInfer grouped-GEMM "
+                        "backend only for an MXFP8 model configuration or "
+                        "inference_moe_nvfp4_recipe. Selectively BF16 expert layers within "
+                        "an MXFP8 configuration remain supported."
+                    )
+                if (
+                    self.expert_model_parallel_size > 1
+                    and self.inference_moe_token_dispatcher_type != "nvls"
+                ):
+                    raise ValueError(
+                        "batch_invariant_mode with inference-optimized MoE and expert "
+                        "parallelism requires inference_moe_token_dispatcher_type='nvls'."
+                    )
+
+        if self.moe_training_matches_inference:
+            if self.transformer_impl != "inference_optimized":
+                raise ValueError(
+                    "moe_training_matches_inference requires "
+                    f"transformer_impl='inference_optimized'; got '{self.transformer_impl}'."
+                )
+            # Not yet converted to the enum on every path.
+            backend = self.inference_grouped_gemm_backend
+            if isinstance(backend, InferenceGroupedGemmBackend):
+                backend = backend.value
+            if backend != InferenceGroupedGemmBackend.FLASHINFER.value:
+                raise ValueError(
+                    "moe_training_matches_inference supports only "
+                    f"inference_grouped_gemm_backend='flashinfer'; got '{backend}'. "
+                    "The torch and vLLM kernels already match TE training under "
+                    "batch_invariant_mode."
+                )
             if (
-                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.FLASHINFER
-                and self.fp8 == "mxfp8"
+                not (bool(self.fp8) and self.fp8_recipe == Fp8Recipe.mxfp8)
+                and self.inference_moe_nvfp4_recipe is None
             ):
                 raise ValueError(
-                    "FlashInfer is not compatible with MXFP8 quantization. "
-                    "Set inference_grouped_gemm_backend to 'torch'."
+                    "moe_training_matches_inference requires FlashInfer routed MXFP8 "
+                    "(fp8_recipe='mxfp8') or per-token NVFP4 (inference_moe_nvfp4_recipe). "
+                    "The FlashInfer BF16 kernel is not batch invariant."
                 )
-
-            if (
-                self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.VLLM
-                and self.fp8 == "mxfp8"
+            if self.expert_tensor_parallel_size > 1:
+                raise ValueError(
+                    "moe_training_matches_inference does not support expert tensor parallelism."
+                )
+            if not self.batch_invariant_mode:
+                raise ValueError(
+                    "moe_training_matches_inference requires batch_invariant_mode, so "
+                    "that a token's output does not depend on how many tokens share the "
+                    "kernel launch."
+                )
+            if self.moe_token_dispatcher_type != "alltoall":
+                raise ValueError(
+                    "moe_training_matches_inference requires "
+                    "moe_token_dispatcher_type='alltoall', whose batch-invariant combine "
+                    "adds the EP ranks as generation's does; got "
+                    f"'{self.moe_token_dispatcher_type}'."
+                )
+            # moe_layer_recompute (deprecated) adds 'moe' later; None later means ["core_attn"].
+            if not self.moe_layer_recompute and (
+                self.recompute_granularity != "selective"
+                or "moe" not in (self.recompute_modules or [])
             ):
                 raise ValueError(
-                    "vLLM Triton fused MoE only supports BF16. "
-                    "Set inference_grouped_gemm_backend to 'torch' for MXFP8."
+                    "moe_training_matches_inference requires "
+                    "recompute_granularity='selective' with 'moe' in recompute_modules: "
+                    "the value pass stores no activations, so the backward must come "
+                    "from a recompute pass."
+                )
+            if self.cuda_graph_impl == "local":
+                raise ValueError(
+                    "moe_training_matches_inference is incompatible with "
+                    "cuda_graph_impl='local', which disables MoE-layer recompute."
+                )
+            if self.overlap_moe_expert_parallel_comm:
+                raise ValueError(
+                    "moe_training_matches_inference is incompatible with "
+                    "overlap_moe_expert_parallel_comm: the overlapped schedule does "
+                    "not go through MoELayer.forward, where the value pass is chosen."
+                )
+            # The recompute runs the training router; these make it pick other experts than
+            # the value pass, which routes as generation does.
+            balancing = self.moe_router_load_balancing_type
+            balancing = balancing if isinstance(balancing, list) else [balancing]
+            unsupported = {"sinkhorn", "quantile_balancing"}.intersection(balancing)
+            if unsupported:
+                raise ValueError(
+                    f"moe_training_matches_inference does not support "
+                    f"moe_router_load_balancing_type={sorted(unsupported)}: generation "
+                    "routes with plain top-k, so the training forward would select "
+                    "different experts."
+                )
+            if self.moe_input_jitter_eps is not None:
+                raise ValueError(
+                    "moe_training_matches_inference is incompatible with "
+                    "moe_input_jitter_eps: jitter perturbs the router input in "
+                    "training only, so the two forwards would route differently."
+                )
+            if self.moe_router_force_load_balancing or self.moe_router_force_biased is not None:
+                raise ValueError(
+                    "moe_training_matches_inference is incompatible with "
+                    "moe_router_force_load_balancing / moe_router_force_biased, which "
+                    "overwrite the training router's logits."
                 )
 
         if self.num_moe_experts is not None and self.num_moe_experts <= 0:
@@ -2241,15 +3753,6 @@ class TransformerConfig(ModelParallelConfig):
                     "(--fp4-param-gather). Without FP4 parameter gather, Transformer Engine "
                     "uses a split-quantize fallback that is being deprecated."
                 )
-            if not self.use_transformer_engine_op_fuser and self.moe_megakernel_backend != "mok":
-                raise ValueError(
-                    "moe_single_grouped_weight requires "
-                    "use_transformer_engine_op_fuser=True. The non-op-fuser TE GroupedLinear "
-                    "path splits the grouped parameter into per-expert tensors and does not "
-                    "support single-grouped-weight training. The MOK integration is the only "
-                    "exception because it consumes the grouped parameter directly and never "
-                    "calls the TE GroupedLinear forward path."
-                )
             if not self.moe_use_grouped_tensor:
                 raise ValueError("moe_single_grouped_weight requires moe_use_grouped_tensor=True.")
         if self.moe_single_grouped_bias and not self.add_bias_linear:
@@ -2260,7 +3763,7 @@ class TransformerConfig(ModelParallelConfig):
         if self.moe_enable_deepep:
             if self.moe_token_dispatcher_type != "flex":
                 raise ValueError("DeepEP backend is only supported with flex token dispatcher.")
-            if self.moe_flex_dispatcher_backend in ("deepepv2", "hybridep"):
+            if self.moe_flex_dispatcher_backend != "deepep":
                 raise ValueError("Only one backend is supported for flex token dispatcher.")
             self.moe_flex_dispatcher_backend = "deepep"
             warnings.warn(
@@ -2279,6 +3782,18 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.moe_hybridep_routing_map_mode not in ("indices", "bool"):
             raise ValueError("moe_hybridep_routing_map_mode must be one of 'indices' or 'bool'.")
+        if (
+            self.moe_hybridep_routing_map_mode == "indices"
+            and self.moe_pad_expert_input_to_capacity
+            and self.moe_token_dispatcher_type == "flex"
+            and self.moe_flex_dispatcher_backend == "hybridep"
+        ):
+            warnings.warn(
+                "moe_hybridep_routing_map_mode='indices' is disabled by "
+                "moe_pad_expert_input_to_capacity: a pad-to-capacity routing map can hold more "
+                "than topk assignments per token, which dense top-k indices cannot represent. "
+                "HybridEP will use the bool routing-map path."
+            )
 
         if self.moe_flex_dispatcher_backend == "ncclep":
             if self.moe_token_dispatcher_type != "flex":
@@ -2286,12 +3801,25 @@ class TransformerConfig(ModelParallelConfig):
                     "moe_flex_dispatcher_backend='ncclep' requires "
                     "moe_token_dispatcher_type='flex'."
                 )
-            if self.moe_use_grouped_tensor and not self.use_transformer_engine_op_fuser:
+
+        if self.moe_dispatch_fwd_dtype != 'bf16' or self.moe_combine_bwd_dtype != 'bf16':
+            if (
+                self.moe_token_dispatcher_type != "flex"
+                or self.moe_flex_dispatcher_backend != "ncclep"
+            ):
                 raise ValueError(
-                    "moe_use_grouped_tensor=True without use_transformer_engine_op_fuser is "
-                    "not yet supported with the NCCL-EP dispatcher. Use the TE op-fuser path "
-                    "or select the alltoall, DeepEP, or HybridEP dispatcher."
+                    "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype require the 'ncclep' flex "
+                    "dispatcher backend."
                 )
+            if not (self.use_transformer_engine_op_fuser and self.moe_grouped_gemm):
+                raise ValueError(
+                    "moe_dispatch_fwd_dtype / moe_combine_bwd_dtype = 'mxfp8' require BOTH "
+                    "use_transformer_engine_op_fuser and moe_grouped_gemm: only the fused "
+                    "grouped GEMM path consumes the pre-quantized MXFP8 GroupedTensor payload."
+                )
+
+        if self.moe_use_norm_before_up_proj and self.moe_latent_size is None:
+            raise ValueError("moe_use_norm_before_up_proj requires moe_latent_size to be set.")
 
         # moe_deepep_num_sms / moe_hybridep_num_sms are deprecated and unified into
         # moe_flex_dispatcher_num_sms. If either is set, route it (an explicit
@@ -2302,7 +3830,7 @@ class TransformerConfig(ModelParallelConfig):
             if getattr(self, name) is not None
         }
         if _deprecated_num_sms:
-            warnings.warn(
+            warn_single_rank(
                 f"{', '.join(_deprecated_num_sms)} is deprecated. "
                 "Use moe_flex_dispatcher_num_sms instead."
             )
@@ -2313,6 +3841,135 @@ class TransformerConfig(ModelParallelConfig):
                         "single moe_flex_dispatcher_num_sms instead."
                     )
                 self.moe_flex_dispatcher_num_sms = next(iter(_deprecated_num_sms.values()))
+        shortcut_pre_norm_recompute = "shortcut_pre_mlp_layernorm" in (self.recompute_modules or [])
+        shortcut_post_norm_offload = "shortcut_post_norm" in (self.offload_modules or [])
+        if (shortcut_pre_norm_recompute or shortcut_post_norm_offload) and not (
+            self.moe_shortcut_connection
+        ):
+            raise ValueError(
+                "shortcut_pre_mlp_layernorm recompute and shortcut_post_norm offload require "
+                "moe_shortcut_connection=True."
+            )
+        if shortcut_pre_norm_recompute and self.recompute_granularity != "selective":
+            raise ValueError(
+                "shortcut_pre_mlp_layernorm in recompute_modules requires "
+                "recompute_granularity='selective'."
+            )
+
+        if self.moe_shortcut_connection:
+            assert (
+                self.num_moe_experts is not None and self.num_moe_experts > 0
+            ), "moe_shortcut_connection requires MoE to be enabled (num_moe_experts > 0)"
+            if self.recompute_granularity == 'full':
+                raise ValueError(
+                    "moe_shortcut_connection is not supported with full activation recomputation"
+                )
+            if self.moe_shared_expert_overlap:
+                raise ValueError(
+                    "moe_shortcut_connection is mutually exclusive with "
+                    "moe_shared_expert_overlap. ScMoE computes shared experts inline."
+                )
+
+        if self.moe_shortcut_post_norm and not self.moe_shortcut_connection:
+            raise ValueError("moe_shortcut_post_norm requires moe_shortcut_connection = True.")
+        if shortcut_post_norm_offload and not self.moe_shortcut_post_norm:
+            raise ValueError(
+                "shortcut_post_norm in offload_modules requires " "moe_shortcut_post_norm = True."
+            )
+
+        if self.moe_shortcut_parallel:
+            assert (
+                self.moe_shortcut_connection
+            ), "moe_shortcut_parallel requires moe_shortcut_connection = True"
+            assert (
+                self.num_moe_experts is not None and self.num_moe_experts > 0
+            ), "moe_shortcut_parallel requires MoE to be enabled (num_moe_experts > 0)"
+
+        if self.moe_virtual_expert_load_balance:
+            if self.moe_megakernel_backend == "mok":
+                raise ValueError("MOK does not support MoonEP (moe_virtual_expert_load_balance)")
+            MAX_VIRTUAL_EXPERT_EP_SIZE = 64
+
+            def require(condition: bool, message: str) -> None:
+                if not condition:
+                    raise ValueError(f"Virtual-expert load balancing requires {message}.")
+
+            required_values = {
+                "moe_token_dispatcher_type": "flex",
+                "moe_flex_dispatcher_backend": "hybridep",
+                "moe_hybridep_routing_map_mode": "indices",
+                "bf16": True,
+                "params_dtype": torch.bfloat16,
+                "fp4": None,
+                "add_bias_linear": False,
+                "moe_grouped_gemm": True,
+                "moe_single_grouped_weight": False,
+                "moe_expert_rank_capacity_factor": None,
+                "moe_paged_stash": False,
+                "moe_use_grouped_tensor": True,
+                "gradient_accumulation_fusion": True,
+                "moe_router_dtype": "fp32",
+                "moe_router_enable_expert_bias": False,
+                "expert_tensor_parallel_size": 1,
+                "delay_wgrad_compute": False,
+                "overlap_dispatch_backward_with_experts_wgrad": False,
+                "overlap_moe_expert_parallel_comm": False,
+                "moe_shared_expert_overlap": False,
+                "moe_expert_capacity_factor": None,
+                "moe_hybridep_pad_uneven_dispatch_inputs": False,
+                "moe_token_dropping": False,
+                "moe_apply_probs_on_input": False,
+            }
+            for name, value in required_values.items():
+                require(getattr(self, name) == value, f"{name}={value!r}")
+            require(
+                2 <= self.expert_model_parallel_size <= MAX_VIRTUAL_EXPERT_EP_SIZE,
+                f"2<=expert_model_parallel_size<={MAX_VIRTUAL_EXPERT_EP_SIZE}",
+            )
+            require(
+                self.num_moe_experts is not None and self.num_moe_experts <= 8192,
+                "1<=num_moe_experts<=8192",
+            )
+            require(
+                self.num_moe_experts % self.expert_model_parallel_size == 0,
+                "num_moe_experts divisible by expert_model_parallel_size",
+            )
+            require(
+                1 <= self.moe_router_topk <= min(32, self.num_moe_experts),
+                "1<=moe_router_topk<=min(32, num_moe_experts)",
+            )
+            routing = self.moe_router_load_balancing_type
+            require(
+                "sinkhorn" not in ((routing,) if isinstance(routing, str) else routing),
+                "no sinkhorn routing",
+            )
+            require(
+                (self.gated_linear_unit and self.activation_func in (F.silu, quick_gelu))
+                or (
+                    not self.gated_linear_unit
+                    and self.activation_func == squared_relu
+                    and self.use_fused_weighted_squared_relu
+                ),
+                "fused SwiGLU, quick-GeGLU, or weighted squared-ReLU activation",
+            )
+            require(
+                (self.moe_latent_size or self.hidden_size) % 128 == 0,
+                "moe_latent_size (or hidden_size) divisible by 128",
+            )
+            require(self.moe_ffn_hidden_size % 128 == 0, "moe_ffn_hidden_size divisible by 128")
+            mxfp8 = self.fp8 == "e4m3" and self.fp8_recipe == Fp8Recipe.mxfp8 and self.fp8_param
+            require(
+                not self.fp8 or mxfp8,
+                "fp8=None for BF16, or fp8='e4m3' with fp8_recipe='mxfp8' " "and fp8_param=True",
+            )
+            require(
+                not self.moe_router_padding_for_quantization or mxfp8,
+                "moe_router_padding_for_quantization=False unless using native MXFP8",
+            )
+            require(
+                self.moe_flex_dispatcher_num_sms is None or self.moe_flex_dispatcher_num_sms > 0,
+                "moe_flex_dispatcher_num_sms>0",
+            )
 
         if self.moe_shared_expert_intermediate_size is not None:
             if self.moe_shared_expert_intermediate_size <= 0:
@@ -2348,13 +4005,27 @@ class TransformerConfig(ModelParallelConfig):
             raise ValueError(
                 "moe_megakernel_backend_config requires moe_megakernel_backend to be set"
             )
-
         if self.moe_megakernel_backend == "mok":
+            from megatron.core.transformer.moe.megakernel import megakernel_fuses_shared_expert
+
+            fuse_shared = megakernel_fuses_shared_expert(self)
+            if self.moe_router_dtype == "fp64":
+                raise ValueError("MOK does not support moe_router_dtype='fp64'; use 'fp32' instead")
+            if self.use_transformer_engine_op_fuser:
+                raise ValueError("MOK requires use_transformer_engine_op_fuser=False")
             # TODO: Add a materialized-wgrad adapter for non-fused accumulation.
             if not self.gradient_accumulation_fusion:
                 raise ValueError("MOK currently requires gradient_accumulation_fusion=True")
             if not self.moe_grouped_gemm:
                 raise ValueError("MOK currently requires moe_grouped_gemm=True")
+            if self.add_bias_linear:
+                raise ValueError("MOK requires add_bias_linear=False")
+            if self.moe_apply_probs_on_input:
+                raise ValueError("MOK does not support moe_apply_probs_on_input")
+            if self.glu_linear_offset != 0.0:
+                raise ValueError("MOK requires glu_linear_offset=0.0")
+            if self.activation_func_tanh_clamp_scale is not None:
+                raise ValueError("MOK does not support activation_func_tanh_clamp_scale")
             mok_bf16 = (
                 self.bf16
                 and not self.fp16
@@ -2376,6 +4047,10 @@ class TransformerConfig(ModelParallelConfig):
                     "MOK does not support overlap_moe_expert_parallel_comm; the megakernel "
                     "replaces MCore's dispatcher/expert/combine schedule"
                 )
+            if self.moe_shortcut_connection:
+                raise ValueError("MOK does not support moe_shortcut_connection")
+            if self.transformer_impl == "inference_optimized":
+                raise ValueError("MOK does not support inference_optimized layers")
             if self.delay_wgrad_compute:
                 raise ValueError("MOK does not support delay_wgrad_compute")
             if self.overlap_dispatch_backward_with_experts_wgrad:
@@ -2383,17 +4058,26 @@ class TransformerConfig(ModelParallelConfig):
                     "MOK does not support overlap_dispatch_backward_with_experts_wgrad; "
                     "the megakernel never runs the native dispatch path"
                 )
-            if self.tensor_model_parallel_size != 1 or self.expert_tensor_parallel_size != 1:
-                raise ValueError("MOK currently requires TP=1 and expert TP=1")
+            if self.gtp_weight_remat_size != 1 or self.expert_gtp_weight_remat_size != 1:
+                raise ValueError(
+                    "MOK does not support GTP weight rematerialization; the megakernel "
+                    "bypasses native expert weight-gather hooks"
+                )
+            if self.expert_tensor_parallel_size != 1:
+                raise ValueError("MOK currently requires expert TP=1")
+            # ETP=1 routed weights are unsharded; MOK consumes each rank's SP tokens.
+            # TP-sharded shared experts and duplicated latent projections stay native.
+            if self.tensor_model_parallel_size > 1 and not self.sequence_parallel:
+                raise ValueError("MOK with TP>1 requires sequence_parallel=True")
             if self.expert_model_parallel_size not in (1, 4, 8, 16, 32, 64):
                 raise ValueError("MOK requires EP in {1, 4, 8, 16, 32, 64}")
-            if self.moe_shared_expert_intermediate_size is None:
-                raise ValueError("MOK requires a shared expert")
-            if self.moe_shared_expert_gate or self.moe_shared_expert_overlap:
-                raise ValueError("MOK does not support the MCore shared-expert gate/overlap")
-            if self.moe_latent_size is not None:
-                raise ValueError("MOK does not support latent MoE")
-            if self.recompute_modules and "shared_experts" in self.recompute_modules:
+            if self.moe_shared_expert_overlap:
+                raise ValueError("MOK does not support MCore shared-expert overlap")
+            if (
+                fuse_shared
+                and self.recompute_modules
+                and "shared_experts" in self.recompute_modules
+            ):
                 raise ValueError(
                     "MOK does not support recompute_modules=['shared_experts']; shared-expert "
                     "computation is fused into the megakernel. Use whole-MoE recompute "
@@ -2404,8 +4088,8 @@ class TransformerConfig(ModelParallelConfig):
                     "MOK does not support log_moe_overload_factor because it bypasses the "
                     "native token-dispatcher accounting path"
                 )
-            if not self.gated_linear_unit or self.activation_func != F.silu:
-                raise ValueError("MOK currently requires SwiGLU")
+            if not self.gated_linear_unit or self.activation_func not in (F.silu, situlu):
+                raise ValueError("MOK requires SwiGLU or SiTU-GLU")
 
         if isinstance(self.moe_router_load_balancing_type, list):
             assert isinstance(self.moe_aux_loss_coeff, list) and len(
@@ -2431,15 +4115,31 @@ class TransformerConfig(ModelParallelConfig):
                     "quantile_balancing requires moe_aux_loss_coeff=0 because it replaces "
                     "the auxiliary load-balancing loss."
                 )
-            if self.moe_router_quantile_balancing_estimation_scope != "global_batch":
+            if self.moe_router_quantile_balancing_estimation_scope not in (
+                "global_batch",
+                "micro_batch",
+            ):
                 raise ValueError(
-                    "Megatron-LM dev supports only "
-                    "moe_router_quantile_balancing_estimation_scope='global_batch'."
+                    "quantile balancing estimation scope must be global_batch or micro_batch."
                 )
-            if self.moe_router_score_function != "sigmoid":
-                raise ValueError("quantile_balancing requires moe_router_score_function='sigmoid'.")
-            if self.moe_router_pre_softmax:
-                raise ValueError("quantile_balancing does not use pre-softmax routing.")
+            if not 0.0 <= self.moe_router_quantile_balancing_ema <= 1.0:
+                raise ValueError("moe_router_quantile_balancing_ema must be between zero and one.")
+            if self.moe_router_quantile_balancing_estimation_scope == "micro_batch":
+                if self.moe_router_fusion:
+                    raise ValueError("micro_batch quantile balancing requires native routing.")
+                if self.dynamic_context_parallel:
+                    raise ValueError("micro_batch quantile balancing requires static TP/CP groups.")
+            elif self.moe_router_quantile_balancing_ema != 0.0:
+                raise ValueError(
+                    "quantile balancing EMA is supported only with micro_batch estimation."
+                )
+            if self.moe_router_quantile_balancing_estimation_scope == "global_batch":
+                if self.moe_router_score_function != "sigmoid":
+                    raise ValueError(
+                        "quantile_balancing requires moe_router_score_function='sigmoid'."
+                    )
+                if self.moe_router_pre_softmax:
+                    raise ValueError("quantile_balancing does not use pre-softmax routing.")
             if self.moe_router_enable_expert_bias:
                 raise ValueError(
                     "quantile_balancing selects the expert-bias update rule; do not also enable "
@@ -2449,7 +4149,11 @@ class TransformerConfig(ModelParallelConfig):
                 raise ValueError("quantile_balancing does not support group-limited routing.")
             if self.moe_enable_routing_replay:
                 raise ValueError("quantile_balancing does not support routing replay.")
-            if self.moe_expert_capacity_factor is not None and self.moe_expert_capacity_factor >= 0:
+            if (
+                self.moe_router_quantile_balancing_estimation_scope == "global_batch"
+                and self.moe_expert_capacity_factor is not None
+                and self.moe_expert_capacity_factor >= 0
+            ):
                 raise ValueError("quantile_balancing does not support per-expert token dropping.")
             if self.moe_expert_rank_capacity_factor is not None and not self.moe_paged_stash:
                 raise ValueError(
@@ -2574,6 +4278,11 @@ class TransformerConfig(ModelParallelConfig):
             self.recompute_modules = ["core_attn"]
 
         if self.recompute_granularity == "selective":
+            from megatron.core.ssm.kda_layer_config import KDALayerConfig
+
+            is_kda_variant = isinstance(self, KDALayerConfig) or (
+                self.experimental_attention_variant == "kda"
+            )
             if len(self.recompute_modules) > 0:
                 allowed_modules = {
                     "core_attn",
@@ -2583,9 +4292,17 @@ class TransformerConfig(ModelParallelConfig):
                     "mlp",
                     "moe",
                     "shared_experts",
-                    "mhc",
                     "gdn",
                     "gdn_norm_out",
+                    "gdp_in_proj",
+                    "gdp_qkv",
+                    "mhc",
+                    "shortcut_pre_mlp_layernorm",
+                    "residual_stream",
+                    "dsa_simple_routing",
+                    "dsa_indexer_k",
+                    "dsa_selected_scores",
+                    "attn_res",
                 }
                 invalid_modules = set(self.recompute_modules) - allowed_modules
                 assert not invalid_modules, (
@@ -2607,6 +4324,7 @@ class TransformerConfig(ModelParallelConfig):
             if (
                 "gdn_norm_out" in self.recompute_modules
                 and not self.is_hybrid_model
+                and not is_kda_variant
                 and not is_gated_delta_net_variant(self.experimental_attention_variant)
             ):
                 raise ValueError(
@@ -2617,6 +4335,7 @@ class TransformerConfig(ModelParallelConfig):
             if (
                 "gdn" in self.recompute_modules
                 and not self.is_hybrid_model
+                and not is_kda_variant
                 and not is_gated_delta_net_variant(self.experimental_attention_variant)
             ):
                 raise ValueError(
@@ -2647,15 +4366,21 @@ class TransformerConfig(ModelParallelConfig):
                     )
 
             if self.fp8:
-                if "moe_act" in self.recompute_modules or "layernorm" in self.recompute_modules:
+                fp8_output_discarding_modules = {
+                    "moe_act",
+                    "layernorm",
+                    "shortcut_pre_mlp_layernorm",
+                }
+                if fp8_output_discarding_modules & set(self.recompute_modules):
                     if self.fp8_recipe == 'delayed':
                         raise ValueError(
-                            "Delayed scaling does not support moe_act and layernorm recompute "
-                            "for fp8."
+                            "Delayed scaling does not support moe_act, layernorm, or "
+                            "shortcut_pre_mlp_layernorm recompute for fp8."
                         )
                     if not is_te_min_version("2.6.0dev0"):
                         raise ValueError(
-                            "moe_act and layernorm recompute for fp8 needs "
+                            "moe_act, layernorm, and shortcut_pre_mlp_layernorm recompute for "
+                            "fp8 need "
                             "transformer-engine>=2.6.0dev0, "
                             f"but your version is {get_te_version()}."
                         )
@@ -2717,6 +4442,47 @@ class TransformerConfig(ModelParallelConfig):
                         f"recompute_modules."
                     )
 
+        use_residual_stream_recompute = (
+            self.recompute_granularity == "selective"
+            and "residual_stream" in self.recompute_modules
+        )
+        if "residual_stream" in self.recompute_modules and not use_residual_stream_recompute:
+            raise ValueError(
+                "'residual_stream' in recompute_modules requires "
+                "recompute_granularity='selective'."
+            )
+        if use_residual_stream_recompute:
+            if self.wide_residual is None:
+                raise ValueError(
+                    "'residual_stream' recomputation requires a configured wide residual stream."
+                )
+            if self.residual_stream_recompute_num_layers is not None and (
+                isinstance(self.residual_stream_recompute_num_layers, bool)
+                or not isinstance(self.residual_stream_recompute_num_layers, int)
+                or self.residual_stream_recompute_num_layers < 1
+            ):
+                raise ValueError(
+                    "residual_stream_recompute_num_layers must be a positive integer or None."
+                )
+            if self.fine_grained_activation_offloading:
+                replay_owned_norms = {"attn_norm", "mlp_norm"} & set(self.offload_modules or [])
+                if replay_owned_norms:
+                    warnings.warn(
+                        "Residual-stream recomputation owns residual reads, connected-branch "
+                        "norms, and writes. Fine-grained activation offloading will skip "
+                        f"{sorted(replay_owned_norms)} only on connected branches."
+                    )
+            if self.cuda_graph_impl != "none":
+                raise ValueError(
+                    "'residual_stream' recomputation requires cuda_graph_impl='none' because "
+                    "its Python checkpoint manager remains outside CUDA graph capture."
+                )
+        elif self.residual_stream_recompute_num_layers is not None:
+            raise ValueError(
+                "residual_stream_recompute_num_layers requires selective recomputation with "
+                "'residual_stream' in recompute_modules."
+            )
+
         use_mhc_recompute = (
             self.recompute_granularity == "selective" and "mhc" in self.recompute_modules
         )
@@ -2747,6 +4513,77 @@ class TransformerConfig(ModelParallelConfig):
         if self.use_fused_mhc:
             if not self.enable_hyper_connections:
                 raise ValueError("use_fused_mhc requires enable_hyper_connections=True.")
+            if self.mhc_norm_eps_inside_sqrt or self.mhc_keep_mappings_in_fp32:
+                raise ValueError(
+                    "use_fused_mhc does not support mhc_norm_eps_inside_sqrt or "
+                    "mhc_keep_mappings_in_fp32; use the unfused mHC path."
+                )
+
+        valid_mhc_fused_backends = ("auto", "native", "triton", "cutile")
+        if self.mhc_fused_backend not in valid_mhc_fused_backends:
+            raise ValueError(
+                f"Unknown mhc_fused_backend {self.mhc_fused_backend!r}; expected one of "
+                f"{valid_mhc_fused_backends}."
+            )
+        if self.mhc_fused_backend != "auto" and not self.use_fused_mhc:
+            raise ValueError("mhc_fused_backend requires use_fused_mhc=True when set explicitly.")
+
+        if self.enable_mhc_connections and self.inference_fuse_tp_communication:
+            raise NotImplementedError(
+                "mHC is not compatible with inference_fuse_tp_communication; "
+                "that path expects a single residual stream."
+            )
+        if self.enable_mhc_connections:
+            # Dev's GPT combined-1F1B schedule carries mHC streams through VPP
+            # and runs mHC post-processing on the compute stream. Main's HybridModel
+            # has no equivalent overlap schedule, so keep its restriction scoped.
+            if (
+                self.is_hybrid_model
+                and self.pipeline_model_parallel_size > 1
+                and self.overlap_moe_expert_parallel_comm
+            ):
+                raise NotImplementedError(
+                    "mHC HybridModel pipeline parallelism does not support "
+                    "overlap_moe_expert_parallel_comm. "
+                    "Use the ordinary pipeline schedule for multi-stream residuals."
+                )
+            if self.fp32_residual_connection:
+                raise NotImplementedError(
+                    "enable_mhc_connections is not compatible with fp32_residual_connection: "
+                    "the multi-stream residual and H_res batched matmul require the same dtype."
+                )
+            if self.mhc_sinkhorn_iterations < 1:
+                raise ValueError(
+                    "mhc_sinkhorn_iterations must be >= 1; the Sinkhorn-Knopp backward "
+                    f"assumes at least one row-normalization pass, got "
+                    f"{self.mhc_sinkhorn_iterations}."
+                )
+
+            if self.mhc_init_gating_factor < 0:
+                raise ValueError(
+                    "mhc_init_gating_factor must be non-negative, got "
+                    f"{self.mhc_init_gating_factor}."
+                )
+
+        buffer_size = self.fine_grained_offloading_buffer_size_gib
+        if buffer_size != 0:
+            buffer_bytes = buffer_size * 2**30
+            if not math.isfinite(buffer_bytes) or buffer_bytes <= 0:
+                raise ValueError("Pinned offload buffer requires a finite positive buffer_size_gib")
+            if not self.fine_grained_activation_offloading:
+                raise ValueError(
+                    "Pinned offload buffer requires fine_grained_activation_offloading"
+                )
+            capacity = int(buffer_bytes)
+            if capacity != buffer_bytes or capacity < 256 or capacity % 256:
+                raise ValueError(
+                    "Pinned offload buffer capacity must be a positive multiple of 256 bytes, "
+                    "so the size in GiB must be a multiple of 2**-22 (for example 152 or "
+                    f"152.5); got fine_grained_offloading_buffer_size_gib={buffer_size} "
+                    f"({buffer_bytes} bytes)"
+                )
+
+        self._validate_attention_residuals()
 
         if self.fine_grained_activation_offloading:
             assert (
@@ -2762,6 +4599,8 @@ class TransformerConfig(ModelParallelConfig):
                 "attn_norm",
                 "mlp_norm",
                 "qkv_linear",
+                "gdp_qkv",
+                "shortcut_post_norm",
             }
             invalid_modules = set(self.offload_modules) - allowed_modules
             assert not invalid_modules, (
@@ -2773,6 +4612,17 @@ class TransformerConfig(ModelParallelConfig):
                     "attn_proj cannot be set to offload_modules alone without core_attn "
                     "because the input of attn_proj is the output of core_attn, "
                     "which is needed in core_attn.backward()."
+                )
+            if (
+                "gdp_qkv" in self.offload_modules
+                and self.recompute_granularity == "selective"
+                and "gdp_in_proj" in self.recompute_modules
+            ):
+                raise ValueError(
+                    "gdp_qkv cannot be set in offload_modules together with gdp_in_proj in "
+                    "recompute_modules, because gdp_in_proj discards the input of the causal "
+                    "conv and rematerializes it at the start of the mixer backward, leaving "
+                    "nothing for the gdp_qkv offload group to keep on the host."
                 )
             if self.recompute_granularity == "selective" and "moe" in self.recompute_modules:
                 offload_inside_moe = {"moe_act", "expert_fc1", "fused_group_mlp"} & set(
@@ -2801,12 +4651,30 @@ class TransformerConfig(ModelParallelConfig):
             if "fused_group_mlp" in self.offload_modules:
                 if not self.use_transformer_engine_op_fuser:
                     raise ValueError("fused_group_mlp requires use_transformer_engine_op_fuser.")
+                # "fused_group_mlp" and "expert_fc1" + "moe_act" are equivalent spellings that
+                # each GroupedMLP maps onto its own path; listing both is redundant.
                 moe_partial_offload = {"expert_fc1", "moe_act"} & set(self.offload_modules)
                 if moe_partial_offload:
                     raise ValueError(
-                        "fused_group_mlp offloads the whole fused grouped MLP and cannot be "
-                        f"combined with expert_fc1 or moe_act. Remove: {moe_partial_offload}"
+                        "fused_group_mlp is equivalent to expert_fc1 + moe_act (each GroupedMLP "
+                        "maps either onto its own fused/unfused path), so it cannot be combined "
+                        f"with expert_fc1 or moe_act. Remove: {moe_partial_offload}"
                     )
+
+        if self.gdp_cutedsl_kernel:
+            assert 0 <= self.gdp_num_chunk_states_to_recompute <= 64, (
+                "gdp_num_chunk_states_to_recompute must be in range [0, 64], got "
+                f"{self.gdp_num_chunk_states_to_recompute}."
+            )
+
+        if self.gtp_remat_opt_in_modules:
+            _allowed_gtp_remat_opt_in_modules = {"moe_latent_proj"}
+            invalid = set(self.gtp_remat_opt_in_modules) - _allowed_gtp_remat_opt_in_modules
+            assert not invalid, (
+                f"Invalid choices for gtp_remat_opt_in_modules: {invalid}. "
+                f"Allowed modules are: {_allowed_gtp_remat_opt_in_modules}"
+            )
+
         if self.moe_paged_stash:
             assert not self.cpu_offloading, "moe_paged_stash cannot be enabled with cpu_offloading."
             assert self.moe_expert_rank_capacity_factor is not None, (
@@ -2816,12 +4684,31 @@ class TransformerConfig(ModelParallelConfig):
             moe_offload_conflict = {"expert_fc1", "moe_act", "fused_group_mlp"} & set(
                 self.offload_modules
             )
-            assert not moe_offload_conflict, (
-                "When moe_paged_stash is enabled, offload_modules must not include "
-                f"expert_fc1, moe_act, or fused_group_mlp "
-                f"(paged stash covers those activations). "
-                f"Remove: {moe_offload_conflict}"
-            )
+            if moe_offload_conflict:
+                raise ValueError(
+                    "When moe_paged_stash is enabled, offload_modules must not include "
+                    f"expert_fc1, moe_act, or fused_group_mlp "
+                    f"(paged stash covers those activations). "
+                    f"Remove: {moe_offload_conflict}"
+                )
+            if not self.use_transformer_engine_op_fuser:
+                if not self.moe_use_grouped_tensor:
+                    raise ValueError(
+                        "moe_paged_stash without use_transformer_engine_op_fuser requires "
+                        "moe_use_grouped_tensor=True."
+                    )
+                if (
+                    not self.bias_activation_fusion
+                    or not self.gated_linear_unit
+                    or self.activation_func not in (F.silu, quick_gelu)
+                    or self.moe_mlp_glu_interleave_size is not None
+                ):
+                    raise ValueError(
+                        "moe_paged_stash with the non-op-fuser GroupedTensor path requires "
+                        "fused SwiGLU or QuickGeGLU: set bias_activation_fusion=True, "
+                        "gated_linear_unit=True, activation_func to silu or quick_gelu, and "
+                        "moe_mlp_glu_interleave_size=None."
+                    )
 
         if (
             self.num_layers_in_first_pipeline_stage is not None
@@ -2884,9 +4771,14 @@ class TransformerConfig(ModelParallelConfig):
                 self.virtual_pipeline_model_parallel_size = detected_vpp_size
 
             # Check whether the layout is valid.
+            mtp_was_standalone = self.mtp_standalone
             self.mtp_standalone = self.pipeline_model_parallel_layout.validate_layer_layout(
                 num_layers=self.num_layers, mtp_num_layers=self.mtp_num_layers
             )
+            if self.mtp_standalone and not mtp_was_standalone:
+                # The base config cannot see layout-derived standalone MTP. Warn once when this
+                # post-layout transition makes the fixed-shape flag a no-op.
+                self._warn_if_pipeline_p2p_fixed_shape_has_no_effect()
 
         # Uneven PP
         elif (
@@ -3014,6 +4906,29 @@ class TransformerConfig(ModelParallelConfig):
         if self.apply_query_key_layer_scaling:
             self.attention_softmax_in_fp32 = True
 
+        has_glu_interleave = self.moe_mlp_glu_interleave_size is not None or (
+            self.use_grouped_gemm_for_shared_expert
+            and self.moe_shared_expert_glu_interleave_size is not None
+        )
+        if self.gated_linear_unit and has_glu_interleave and self.params_dtype == torch.float32:
+            raise ValueError(
+                "GLU interleave is not supported with FP32 model parameters. Use BF16 or FP16."
+            )
+        if self.gated_linear_unit and self.moe_mlp_glu_interleave_size is not None:
+            assert self.expert_gtp_weight_remat_size == 1, (
+                "Routed expert GLU interleave is not supported with GTP weight sharding. "
+                "Disable routed expert GLU interleave or expert GTP weight sharding."
+            )
+        if (
+            self.gated_linear_unit
+            and self.use_grouped_gemm_for_shared_expert
+            and self.moe_shared_expert_glu_interleave_size is not None
+        ):
+            assert self.gtp_weight_remat_size == 1, (
+                "Shared expert GLU interleave is not supported with GTP weight sharding. "
+                "Disable shared expert GLU interleave or GTP weight sharding."
+            )
+
         if self.bias_activation_fusion:
             if self.activation_func not in [F.gelu, F.silu, quick_gelu]:
                 raise ValueError(
@@ -3074,22 +4989,83 @@ class TransformerConfig(ModelParallelConfig):
             if not math.isfinite(self.situ_glu_beta2) or self.situ_glu_beta2 <= 0:
                 raise ValueError("situ_glu_beta2 must be finite and positive.")
 
+        if self.activation_func_tanh_clamp_scale is not None:
+            if self.activation_func_tanh_clamp_scale <= 0.0:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale must be positive, got "
+                    f"{self.activation_func_tanh_clamp_scale}."
+                )
+            if self.use_te_activation_func:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale is not supported with "
+                    "use_te_activation_func, since the TE activation modules cannot clamp."
+                )
+            if self.gated_linear_unit and self.activation_func != F.silu:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale with a gated activation is implemented as "
+                    "SiTU-GLU, which replaces the swish gate, so it requires silu."
+                )
+            if self.bias_activation_fusion and not (
+                self.activation_func == F.silu and self.gated_linear_unit
+            ):
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale with bias_activation_fusion is only "
+                    "implemented for SwiGLU. The fused gelu, geglu and quick_geglu kernels do not "
+                    "apply the clamp, so set bias_activation_fusion to False."
+                )
+            if self.activation_func_clamp_value is not None:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale and activation_func_clamp_value both clamp "
+                    "the activation input; set only one of them."
+                )
+
+        if self.activation_func_tanh_clamp_scale_linear is not None:
+            if self.activation_func_tanh_clamp_scale_linear <= 0.0:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale_linear must be positive, got "
+                    f"{self.activation_func_tanh_clamp_scale_linear}."
+                )
+            if self.activation_func_tanh_clamp_scale is None:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale_linear only clamps the linear half of "
+                    "SiTU-GLU, so it requires activation_func_tanh_clamp_scale for the gate half. "
+                    "Clamping the linear half alone would leave the gate unbounded."
+                )
+            if not self.gated_linear_unit:
+                raise ValueError(
+                    "activation_func_tanh_clamp_scale_linear requires gated_linear_unit."
+                )
+
         if self.activation_func_fp8_input_store:
             if self.activation_func != F.silu or not self.gated_linear_unit:
                 raise ValueError("Storing activation input in FP8 is supported only for SwiGLU.")
 
-        if self.activation_func_clamp_value is not None:
-            # swiglu
-            if self.activation_func == F.silu and self.gated_linear_unit:
-                if self.num_moe_experts is None:
-                    raise ValueError(
-                        "activation_func_clamp_value for SwiGLU is only supported with MoE."
-                    )
-                if self.use_te_activation_func:
-                    raise ValueError(
-                        "use_te_activation_func must be False "
-                        "when activation_func_clamp_value is not None for SwiGLU"
-                    )
+        if (
+            self.activation_func_clamp_value is not None
+            and self.activation_func == F.silu
+            and self.gated_linear_unit
+        ):
+            if (
+                not math.isfinite(self.activation_func_clamp_value)
+                or self.activation_func_clamp_value <= 0
+            ):
+                raise ValueError(
+                    "activation_func_clamp_value for SwiGLU must be finite and greater than zero."
+                )
+            if self.num_moe_experts is None:
+                raise ValueError(
+                    "activation_func_clamp_value for SwiGLU is only supported with MoE."
+                )
+            if self.glu_linear_offset != 0.0:
+                raise ValueError(
+                    "glu_linear_offset must be zero when activation_func_clamp_value "
+                    "is set for SwiGLU."
+                )
+            if self.use_te_activation_func:
+                raise ValueError(
+                    "use_te_activation_func must be False "
+                    "when activation_func_clamp_value is not None for SwiGLU"
+                )
 
         if self.apply_rope_fusion:
             if self.multi_latent_attention:
@@ -3236,37 +5212,31 @@ class TransformerConfig(ModelParallelConfig):
                 "'sqrtsoftplus', or unset --moe-router-enable-expert-bias."
             )
 
-        if self.moe_n_hash_layers > 0:
+        if self.moe_num_hash_layers > 0:
             assert (
-                self.actual_vocab_size is not None
-            ), "actual_vocab_size must be set when moe_n_hash_layers > 0."
+                self.hash_moe_vocab_size is not None and self.hash_moe_vocab_size > 0
+            ), "hash_moe_vocab_size must be positive when moe_num_hash_layers > 0."
+            assert (
+                self.num_moe_experts is not None
+            ), "num_moe_experts must be set when moe_num_hash_layers > 0."
+            if not 1 <= self.moe_router_topk <= self.num_moe_experts:
+                raise ValueError("Hash MoE requires 1 <= moe_router_topk <= num_moe_experts.")
             if self.pipeline_model_parallel_size > 1 and not self.is_hybrid_model:
                 assert self.pipeline_model_parallel_layout is not None, (
                     "pipeline_model_parallel_layout must be set when using hash MoE "
                     "layers with pipeline parallelism (PP > 1)."
                 )
-                # The embedding is always in layout[0][0] (PP rank 0, VPP rank 0).
-                # All hash MoE layers must be in the same virtual pipeline stage.
                 embedding_stage = self.pipeline_model_parallel_layout.layout[0][0]
                 n_decoders_with_embedding = embedding_stage.count(LayerType.decoder)
-                assert self.moe_n_hash_layers <= n_decoders_with_embedding, (
-                    f"Currently, All hash MoE layers must be in the same virtual pipeline stage "
-                    f"as the embedding. The embedding stage has "
+                assert self.moe_num_hash_layers <= n_decoders_with_embedding, (
+                    "All hash MoE layers must currently share the virtual pipeline stage "
+                    "that owns the embedding. The embedding stage has "
                     f"{n_decoders_with_embedding} decoder layers, but "
-                    f"moe_n_hash_layers={self.moe_n_hash_layers}."
+                    f"moe_num_hash_layers={self.moe_num_hash_layers}."
                 )
             assert (
                 not self.overlap_moe_expert_parallel_comm
-            ), "overlap_moe_expert_parallel_comm does not support moe_n_hash_layers > 0 for now."
-            log_single_rank(
-                logger,
-                logging.WARNING,
-                f"Hash MoE layer initialized with placeholder round-robin tid2eid. "
-                f"For real training, you MUST either (a) load tid2eid from a "
-                f"pre-trained DSv4 checkpoint, or (b) provide a frequency-aware "
-                f"initialization (e.g., Sinkhorn-balanced over token frequency). "
-                f"Round-robin will cause severe expert imbalance.",
-            )
+            ), "overlap_moe_expert_parallel_comm does not support hash MoE layers yet."
 
         if self.num_moe_experts and self.fp8:
             # TE version below 1.7.0 will raise Error when handle zeros tokens for expert
@@ -3357,6 +5327,42 @@ class TransformerConfig(ModelParallelConfig):
                 )
                 self.cuda_graph_impl = "transformer_engine"
 
+        if self.dynamic_context_parallel:
+            # Captured graphs bake in static communicators, so they cannot follow the
+            # per-microbatch CP group that dynamic context parallelism selects at runtime.
+            # NOTE(nightly-sync 26_10_2026): dev has since implemented packed-DSA
+            # dynamic CP under CUDA graphs as an experimental-but-supported path --
+            # is_packed_dsa_cp_cuda_graph_experimental() takes dynamic_context_parallel
+            # as an explicit input and only warns (see the warnings.warn call later in
+            # this method, plus PACKED_DSA_CP_CUDA_GRAPH_WARNING's "set
+            # cuda_graph_impl='none' to use the supported eager path"). Main's blanket
+            # rejection would make that whole path unreachable, so scope it to the
+            # configurations main wrote it for. Main's guard tests set neither
+            # experimental_attention_variant="dsa" nor the dynamic-pack scheduler, so
+            # the predicate is False for them and they still raise --
+            # test_transformer_config.py::test_dynamic_context_parallel_validation and
+            # test_hybrid_context_parallel_args.py::
+            # test_hybrid_context_parallel_rejects_cuda_graph_impl hold, as does dev's
+            # test_attention_variant_dsa.py::
+            # test_packed_dsa_cp_cuda_graph_warning_boundary[dynamic_te_mlp].
+            packed_dsa_cp_cuda_graphs = is_packed_dsa_cp_cuda_graph_experimental(
+                experimental_attention_variant=self.experimental_attention_variant,
+                sequence_packing_scheduler=self.sequence_packing_scheduler,
+                dynamic_context_parallel=self.dynamic_context_parallel,
+                context_parallel_size=self.context_parallel_size,
+                cuda_graph_impl=self.cuda_graph_impl,
+            )
+            assert (
+                self.cuda_graph_impl == "none" or packed_dsa_cp_cuda_graphs
+            ), "Dynamic context parallelism not supported with CUDA Graph"
+            assert (
+                self.calculate_per_token_loss
+            ), "Dynamic context parallelism must be used with calculate_per_token_loss"
+            # The router z-loss still scales by the static TP x CP group, not the runtime one.
+            assert (
+                self.moe_z_loss_coeff is None
+            ), "Dynamic context parallelism not supported with moe_z_loss_coeff"
+
         if self.cuda_graph_scope is not None:
             assert self.cuda_graph_modules in (
                 "full",
@@ -3426,6 +5432,39 @@ class TransformerConfig(ModelParallelConfig):
             "full_iteration",
         ], f"Invalid cuda graph implementation: {self.cuda_graph_impl}"
 
+        if self.cuda_graph_thd_max_packed_sequences is not None:
+            # Dev's --thd-max-packed-sequences already provides a static THD capacity with its own
+            # padding and graph path, so the two capacity settings must not be combined.
+            assert self.thd_max_packed_sequences is None, (
+                "cuda_graph_thd_max_packed_sequences and thd_max_packed_sequences both set the "
+                "static THD capacity; set only one of them."
+            )
+            assert self.sequence_packing_scheduler == "dp_balanced"
+            assert not self.dynamic_context_parallel
+            pad_enabled = self.pad_packed_seq_alignment is not None or (
+                self.fp8 is not None and self.fp8_recipe == Fp8Recipe.mxfp8
+            )
+            assert self.cuda_graph_thd_max_packed_sequences >= (
+                2 if pad_enabled else 1
+            ), "THD metadata capacity must leave room for the dummy padding document."
+        # These constraints belong to the cuda_graph_thd_max_packed_sequences path. THD CUDA
+        # graphs configured with thd_max_packed_sequences keep the checks below.
+        scheduler_te_graphs = (
+            self.sequence_packing_scheduler is not None
+            and self.cuda_graph_impl == "transformer_engine"
+            and self.cuda_graph_thd_max_packed_sequences is not None
+        )
+        if scheduler_te_graphs and self.pipeline_model_parallel_size > 1:
+            assert not self.overlap_moe_expert_parallel_comm and not self.delay_wgrad_compute
+            assert not self.moe_paged_stash
+        if scheduler_te_graphs:
+            assert self.pad_packed_seq_alignment in ("max", self.max_seqlen_per_dp_cp_rank)
+            assert self.cuda_graph_thd_max_packed_sequences is not None
+            assert self.cuda_graph_modules == [
+                CudaGraphModule.attn
+            ], "Scheduler-produced THD CUDA graphs currently support attention capture only."
+            assert is_te_min_version("2.18.0"), "Packed TE graphs require TE >= 2.18.0."
+
         self.inference_cuda_graph_scope = normalize_inference_cuda_graph_scope(
             self.inference_cuda_graph_scope, self.cuda_graph_impl
         )
@@ -3439,8 +5478,26 @@ class TransformerConfig(ModelParallelConfig):
             self.cuda_graph_impl == "full_iteration" and self.cuda_graph_modules
         ), 'cuda_graph_modules must be empty when cuda_graph_impl="full_iteration".'
 
+        if (
+            self.mlp_chunks_for_training > 1
+            and (self.num_moe_experts or 0) > 0
+            and self.cuda_graph_impl != "none"
+            and (
+                is_whole_moe_cuda_graph_scope(self.cuda_graph_modules)
+                or CudaGraphModule.moe_router in self.cuda_graph_modules
+                or CudaGraphModule.moe_preprocess in self.cuda_graph_modules
+            )
+        ):
+            raise ValueError(
+                "Chunked MoE training does not support CUDA graphs that capture MoE routing "
+                "or dispatch. Use attention-only capture or unchunked MoE execution."
+            )
+
         if self.moe_megakernel_backend == "mok":
             if self.cuda_graph_impl in ("local", "transformer_engine"):
+                # Empty modules mean whole-layer capture here, not full_iteration.
+                # Per-layer replay needs per-microbatch ownership or recomputation
+                # of MOK's saved schedule/activations; this bridge has no stash integration.
                 if not self.cuda_graph_modules:
                     raise ValueError(
                         "MOK does not support per-layer whole-layer CUDA Graph capture"
@@ -3568,12 +5625,10 @@ class TransformerConfig(ModelParallelConfig):
         if (
             use_mhc_recompute
             and not self.mhc_recompute_attn_cuda_graph_split
-            and not self.is_hybrid_model  # hybrid cannot take the switch this
-            # message recommends (rejected above); hybrid_block emits its own
-            # capture-scope warning instead
+            and not self.is_hybrid_model  # hybrid_block emits its own capture-scope warning
             and self.cuda_graph_impl == "transformer_engine"
             and list(self.cuda_graph_modules or []) == [CudaGraphModule.attn]
-            and list(self.recompute_modules) == ["mhc"]
+            and set(self.recompute_modules) <= {"mhc", "mla_up_proj"}
         ):
             # Exactly the shape that ran the #5841 split implicitly: such configs
             # hit this branch when they omit the new switch, and whole-attention
@@ -3581,18 +5636,14 @@ class TransformerConfig(ModelParallelConfig):
             # captured (its checkpoint no longer pays) and the static hidden input
             # grows from [s, b, C] to [s, b, n*C]. Say so once at config time,
             # since the alternative is a silent memory regression relative to the
-            # split. Deliberately narrow: broader attn-containing shapes (extra
-            # graph scopes, extra recompute modules) never ran the split, and the
-            # switch this message recommends is rejected for them.
+            # split. Only recommend the switch for supported recompute modules.
             warnings.warn(
                 "mHC recompute with an attn-scope Transformer Engine CUDA Graph is "
                 "capturing the whole attention range: the captured mHC producer's "
                 "checkpoint is not recovered and the static graph input is "
                 "[s, b, n*C]. Set mhc_recompute_attn_cuda_graph_split=True for the "
                 "attention-only split, which keeps the producer eager and shrinks "
-                "the captured input to [s, b, C]. (The split's replay does not yet "
-                "forward THD captured kwargs; on packed sequences keep the switch "
-                "off.)",
+                "the captured input to [s, b, C].",
                 UserWarning,
                 stacklevel=2,
             )
@@ -3612,16 +5663,6 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if use_mhc_recompute and self.mhc_recompute_attn_cuda_graph_split:
-            if self.is_hybrid_model:
-                raise ValueError(
-                    "mhc_recompute_attn_cuda_graph_split is not implemented for "
-                    "HybridStack mHC layers: HyperConnectionHybridLayer always "
-                    "captures the whole wrapper (mHC aggregate included) with an "
-                    "[s, b, n*C] static input and has no attention-consumer split "
-                    "path, so the switch would silently change nothing while the "
-                    "config claims the split is on. Keep the switch off for "
-                    "hybrid models."
-                )
             if self.cuda_graph_impl != "transformer_engine":
                 raise ValueError(
                     "mhc_recompute_attn_cuda_graph_split requires "
@@ -3629,25 +5670,17 @@ class TransformerConfig(ModelParallelConfig):
                     f"{self.cuda_graph_impl!r}: the split is a Transformer Engine "
                     "per-layer capture."
                 )
-            if list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or list(
+            if list(self.cuda_graph_modules or []) != [CudaGraphModule.attn] or set(
                 self.recompute_modules
-            ) != ["mhc"]:
+            ) - {"mhc", "mla_up_proj"}:
                 raise ValueError(
                     "mhc_recompute_attn_cuda_graph_split requires "
-                    "cuda_graph_modules=[attn] with recompute_modules=[mhc]: the split "
+                    "cuda_graph_modules=[attn] with recompute_modules=[mhc] or "
+                    "[mhc, mla_up_proj]: the split "
                     "captures input-layernorm plus self-attention only, so the eager mHC "
                     "producer stays outside the captured consumer. Clear "
                     "mhc_recompute_attn_cuda_graph_split to capture the whole attention "
                     "range instead."
-                )
-            if self.sequence_packing_scheduler is not None:
-                raise ValueError(
-                    "mhc_recompute_attn_cuda_graph_split does not support packed "
-                    "(THD) sequences: THD capture takes cu_seqlens_*/padding_mask "
-                    "as captured kwargs and the split's replay does not forward "
-                    "them, so the first replay fails at the Transformer Engine "
-                    "boundary. Keep the switch off on packed-sequence runs to "
-                    "capture the whole attention range instead."
                 )
             if self.fine_grained_activation_offloading:
                 # HyperConnectionTransformerLayer._te_cuda_graph_capture replaces
@@ -3676,18 +5709,96 @@ class TransformerConfig(ModelParallelConfig):
                         f"offload_modules, or clear mhc_recompute_attn_cuda_graph_split."
                     )
 
-        cuda_graph_captures_attention = self.cuda_graph_impl == "full_iteration" or (
-            self.cuda_graph_impl in ("local", "transformer_engine")
-            and (not self.cuda_graph_modules or CudaGraphModule.attn in self.cuda_graph_modules)
-        )
+        graph_captures_attention = cuda_graph_captures_attention(self)
+
+        if self.dsa_cp_balance_indexer_graph_dynamic_packs:
+            if self.dynamic_context_parallel or self.context_parallel_size <= 1:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing requires fixed context "
+                    "parallelism with context_parallel_size > 1 and dynamic_context_parallel=False."
+                )
+            if self.max_seqlen_per_dp_cp_rank is None:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing requires "
+                    "max_seqlen_per_dp_cp_rank to define the fixed per-rank graph capacity."
+                )
+            if self.max_seqlen_per_dp_cp_rank <= 0:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing requires a positive "
+                    "max_seqlen_per_dp_cp_rank."
+                )
+            if self.max_seqlen_per_dp_cp_rank % 2 != 0:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing requires an even "
+                    "max_seqlen_per_dp_cp_rank because every rank scores two fixed-size halves."
+                )
+            from megatron.core.transformer.experimental_attention_variant.dsa_fused_safety import (
+                FUSED_INDEXER_MAX_SAFE_ROWS,
+            )
+
+            if self.max_seqlen_per_dp_cp_rank // 2 > FUSED_INDEXER_MAX_SAFE_ROWS:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing would issue fused "
+                    "indexer calls "
+                    f"with {self.max_seqlen_per_dp_cp_rank // 2} rows, above the verified-safe "
+                    f"limit of {FUSED_INDEXER_MAX_SAFE_ROWS}. Increase CP or reduce "
+                    "max_seqlen_per_dp_cp_rank."
+                )
+            graph_dynamic_pp_vpp = (
+                self.pipeline_model_parallel_size > 1
+                or (self.virtual_pipeline_model_parallel_size or 1) > 1
+            )
+            if graph_dynamic_pp_vpp and not self.cuda_graph_dynamic_microbatches:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing with PP/VPP requires "
+                    "cuda_graph_dynamic_microbatches=True so each in-flight forward owns a "
+                    "distinct CUDA graph input slot until its backward completes."
+                )
+            if self.overlap_moe_expert_parallel_comm or self.delay_wgrad_compute:
+                raise ValueError(
+                    "CUDA-graphed balanced DSA dynamic-pack routing does not yet support "
+                    "overlap_moe_expert_parallel_comm or delay_wgrad_compute: those modes force "
+                    "CUDA graph capture back to the runtime microbatch count instead of the THD "
+                    "packing upper bound, so a still-live graph input slot could be reused."
+                )
+        if (
+            self.dsa_cp_balance_indexer
+            and not self.dsa_cp_balance_indexer_graph_dynamic_packs
+            and graph_captures_attention
+            and (
+                self.pipeline_model_parallel_size > 1
+                or (self.virtual_pipeline_model_parallel_size or 1) > 1
+            )
+        ):
+            # The legacy graph path pins one static pack composition and cannot
+            # disambiguate the different PackedSeqParams views hosted by PP/VPP.
+            raise ValueError(
+                "dsa_cp_balance_indexer with attention-capturing CUDA graphs currently "
+                "supports PP/VPP only when dynamic-pack routing is inferred from "
+                "cuda_graph_impl='transformer_engine' and "
+                "sequence_packing_scheduler='dp_balanced'. Use those settings, disable "
+                "attention capture, or disable pipeline parallelism."
+            )
+
+        if is_packed_dsa_cp_cuda_graph_experimental(
+            experimental_attention_variant=self.experimental_attention_variant,
+            sequence_packing_scheduler=self.sequence_packing_scheduler,
+            dynamic_context_parallel=self.dynamic_context_parallel,
+            context_parallel_size=self.context_parallel_size,
+            cuda_graph_impl=self.cuda_graph_impl,
+        ):
+            warnings.warn(PACKED_DSA_CP_CUDA_GRAPH_WARNING, stacklevel=2)
 
         cp_layout_conversion_required = is_gated_delta_net_variant(
             self.experimental_attention_variant
         )
+        # (dsa_cp_balance_indexer does NOT belong in this predicate: the balanced DSA
+        # indexer operates natively on the contiguous layout and performs no
+        # module-local THD CP layout conversion.)
         if (
             (self.context_parallel_size > 1 or self.dynamic_context_parallel)
             and self.sequence_packing_scheduler is not None
-            and cuda_graph_captures_attention
+            and graph_captures_attention
             and cp_layout_conversion_required
         ):
             raise ValueError(
@@ -3698,6 +5809,18 @@ class TransformerConfig(ModelParallelConfig):
                 f"cuda_graph_impl={self.cuda_graph_impl!r}, "
                 f"cuda_graph_modules={self.cuda_graph_modules!r})."
             )
+
+        assert not (
+            self.moe_shortcut_connection
+            and self.cuda_graph_impl != "none"
+            and not (
+                self.cuda_graph_impl == "local"
+                and self.inference_cuda_graph_scope == InferenceCudaGraphScope.block
+            )
+        ), (
+            "moe_shortcut_connection supports CUDA graphs only with "
+            "cuda_graph_impl='local' and inference_cuda_graph_scope='block'."
+        )
 
         if self.cuda_graph_impl != "none":
 
@@ -3745,7 +5868,17 @@ class TransformerConfig(ModelParallelConfig):
                             'mlp cuda graph is only supported for dense layers, '
                             'but not found in the model.'
                         )
-                    if (
+                    if self.moe_virtual_expert_load_balance:
+                        # The virtual-expert planner keeps its routing metadata private to one
+                        # forward, which only the whole-layer moe scope preserves.
+                        assert not {
+                            CudaGraphModule.moe_router,
+                            CudaGraphModule.moe_preprocess,
+                        } & set(self.cuda_graph_modules), (
+                            'virtual-expert load balancing supports the moe CUDA graph scope only; '
+                            'moe_router and moe_preprocess are not supported.'
+                        )
+                    elif (
                         self.moe_expert_capacity_factor is None
                         or not self.moe_pad_expert_input_to_capacity
                     ):
@@ -3835,6 +5968,27 @@ class TransformerConfig(ModelParallelConfig):
                             "moe_input_jitter_eps is not supported with graphed moe recomputation."
                         )
 
+                    if (
+                        self.gtp_weight_remat_size > 1
+                        and self.cuda_graph_impl == "local"
+                        and (self.fp8 is not None or self.fp4 is not None)
+                        and self.moe_shared_expert_intermediate_size is not None
+                        and not self.moe_shared_expert_overlap
+                        and (
+                            full_cudagraph
+                            or CudaGraphModule.moe in self.cuda_graph_modules
+                            or CudaGraphModule.moe_router in self.cuda_graph_modules
+                        )
+                    ):
+                        assert "shared_experts" not in self.recompute_modules, (
+                            "GTP + local CUDA graphs that capture shared_experts "
+                            "(moe_router/moe scope) cannot recompute it under fp8/fp4: "
+                            "te_checkpoint requires .backward(), but the local fwd-graph "
+                            "warmup uses .grad(). Drop 'shared_experts' from "
+                            "--recompute-modules (GTP-shard + offload instead), or use "
+                            "--cuda-graph-impl full_iteration."
+                        )
+
             if self.fine_grained_activation_offloading:
                 offload_modules = set(self.offload_modules or [])
                 if self.cuda_graph_impl == "local":
@@ -3879,6 +6033,8 @@ class TransformerConfig(ModelParallelConfig):
                         "fine-grained activation offloading with full-iteration CUDA graphs "
                     )
 
+        # Only meaningful for MoE models; dense models never dispatch tokens,
+        # so the (unused) dispatcher default must not fail validation.
         if self.num_moe_experts is not None and self.moe_token_dispatcher_type in ["allgather"]:
             if self.variable_seq_lengths is True:
                 raise ValueError(
@@ -3929,6 +6085,12 @@ class TransformerConfig(ModelParallelConfig):
                 # the shared checks above. MTP under 'block' and the FP8/FP4 block window
                 # intentionally differ from the non-overlap checkpoint path. See
                 # megatron/core/models/common/model_chunk_schedule_plan.py.
+                # Segment replay is currently supported only in eager execution,
+                # including when the generic full-iteration graph checks allow recompute.
+                assert self.cuda_graph_impl == "none", (
+                    "overlap_moe_expert_parallel_comm full recompute is not yet supported "
+                    "together with CUDA graphs (cuda_graph_impl != \"none\")."
+                )
                 # The replay is hand-rolled rather than a checkpoint primitive, so it
                 # cannot shard the retained segment input across TP ranks.
                 assert not self.distribute_saved_activations, (
@@ -3969,6 +6131,24 @@ class TransformerConfig(ModelParallelConfig):
                     'recompute would double-update the persistent amax_history. Use a '
                     'current-scaling recipe (tensorwise / mxfp8 / blockwise) instead.'
                 )
+                # The offload manager pairs a forward-pushed group with the backward that
+                # pops it. Under full recompute the initial forward saves nothing and the
+                # replay pushes its groups immediately before its own backward, which does
+                # not fit that pairing.
+                assert not self.fine_grained_activation_offloading, (
+                    "overlap_moe_expert_parallel_comm full recompute is not yet supported "
+                    "together with fine_grained_activation_offloading."
+                )
+                # Paged stash numbers layers and indexes its captured pipeline schedule from a
+                # process-wide manager (PagedStashManager.current_layer /
+                # current_schedule_index), advanced on every group commit. Under full recompute
+                # the initial no_grad forward and the segment replay both commit the same layer
+                # while only the replay registers a backward, and the segment snapshots do not
+                # cover that manager, so its bookkeeping no longer matches the execution order.
+                assert not self.moe_paged_stash, (
+                    "overlap_moe_expert_parallel_comm full recompute is not yet supported "
+                    "together with moe_paged_stash."
+                )
             else:
                 assert self.recompute_method is None, (
                     'disable recomputation method when enabling ' 'overlap_moe_expert_parallel_comm'
@@ -3989,9 +6169,37 @@ class TransformerConfig(ModelParallelConfig):
             assert (
                 not self.moe_shared_expert_overlap
             ), 'disable moe_shared_expert_overlap when enabling overlap_moe_expert_parallel_comm'
-            assert (
-                self.mtp_num_layers is None or self.mtp_num_layers == 1
-            ), 'MTP layernum only supports 1 when enabling overlap_moe_expert_parallel_comm.'
+            assert self.mtp_num_layers is None or self.mtp_num_layers >= 0, (
+                "mtp_num_layers must be non-negative when enabling "
+                "overlap_moe_expert_parallel_comm."
+            )
+            if self.mtp_num_layers is not None and self.mtp_num_layers > 1:
+                # The schedule plan runs each MTP layer module as its own layer plan and
+                # chains the depths in its callables instead of calling
+                # MultiTokenPredictionBlock.forward, so depth-level features that live in
+                # that forward (or need a cross-depth hand-off) are gated here.
+                assert not self.mtp_use_repeated_layer, (
+                    "mtp_use_repeated_layer with mtp_num_layers > 1 is not yet supported with "
+                    "overlap_moe_expert_parallel_comm: the schedule plan builds one layer plan "
+                    "per MTP layer module, so a shared layer would run only one depth."
+                )
+                assert not self.mtp_hsm, (
+                    "mtp_hsm is not yet supported with overlap_moe_expert_parallel_comm: the "
+                    "hidden-state mixing runs in MultiTokenPredictionBlock.forward, which the "
+                    "overlap schedule does not call."
+                )
+                assert not self.enable_mhc_connections, (
+                    "enable_mhc_connections with mtp_num_layers > 1 is not yet supported with "
+                    "overlap_moe_expert_parallel_comm: the overlap schedule feeds each MTP depth "
+                    "the contracted, normalized output of the previous depth instead of its "
+                    "multi-stream output."
+                )
+                assert self.recompute_granularity != "full", (
+                    "full recompute with mtp_num_layers > 1 is not yet supported with "
+                    "overlap_moe_expert_parallel_comm: each MTP depth is its own recompute "
+                    "segment, and replaying a later depth would reuse the no-grad outputs of "
+                    "the earlier depths and drop their loss gradients."
+                )
 
             # NCCL EP (ncclep flex backend) mirrors hybridep's comm/compute overlap, but a few
             # configs are not yet safe under the 1F1B split and are gated here.
@@ -3999,14 +6207,6 @@ class TransformerConfig(ModelParallelConfig):
                 self.moe_token_dispatcher_type == 'flex'
                 and self.moe_flex_dispatcher_backend == 'ncclep'
             ):
-                if not self.moe_ncclep_static_shape:
-                    warnings.warn(
-                        'overlap_moe_expert_parallel_comm with ncclep and '
-                        'moe_ncclep_static_shape=False: get_permuted_hidden_states_by_experts '
-                        'does a device-to-host sync that serializes the 1F1B overlap (correct, '
-                        'but loses the overlap benefit). Set moe_ncclep_static_shape=True for '
-                        'the overlapped path (needs the fused op on sm100+).'
-                    )
                 assert not (
                     self.fine_grained_activation_offloading
                     and 'expert_fc1' in (self.offload_modules or [])
@@ -4063,7 +6263,21 @@ class TransformerConfig(ModelParallelConfig):
                 'ep_overlap_early_attn_memory_release'
             )
 
-        if self.context_parallel_size > 1 and self.cp_comm_type is not None:
+        if self.ep_overlap_use_scheduled_tensor_release:
+            if self.moe_ncclep_zero_copy:
+                # NCCL-EP zero-copy routes persistent symmetric-memory buffers through the 1F1B
+                # schedule nodes. Scheduled release would take ownership of those shared buffers
+                # and empty their storage, bypassing ScheduleNode's symmetric-memory exemption.
+                raise ValueError(
+                    'moe_ncclep_zero_copy is not supported with '
+                    'ep_overlap_use_scheduled_tensor_release'
+                )
+            assert self.overlap_moe_expert_parallel_comm, (
+                'overlap_moe_expert_parallel_comm must be enabled when enabling '
+                'ep_overlap_use_scheduled_tensor_release'
+            )
+
+        if has_context_parallelism and self.cp_comm_type is not None:
             if isinstance(self.cp_comm_type, list):
                 assert len(self.cp_comm_type) == self.num_layers, (
                     f"Length of cp_comm_type ({len(self.cp_comm_type)}) should equal to "
@@ -4132,7 +6346,7 @@ class TransformerConfig(ModelParallelConfig):
             )
 
         if self.fallback_to_eager_attn or self.transformer_impl == "local":
-            if self.context_parallel_size > 1 and self.cp_comm_type is not None:
+            if has_context_parallelism and self.cp_comm_type is not None:
                 all_cp_comm_types_are_all_gather = (
                     all(item == "all_gather" for item in self.cp_comm_type)
                     if isinstance(self.cp_comm_type, list)
@@ -4151,6 +6365,130 @@ class TransformerConfig(ModelParallelConfig):
             assert not self.add_qkv_bias
             assert not self.use_kitchen
 
+        if self.dsa_fwd_use_dense_attn:
+            assert (
+                self.experimental_attention_variant == "dsa"
+            ), "dsa_fwd_use_dense_attn requires experimental_attention_variant='dsa'."
+        if self.dsa_indexer_mode == "simplified":
+            assert (
+                self.experimental_attention_variant == "dsa"
+            ), "dsa_indexer_mode='simplified' requires experimental_attention_variant='dsa'."
+        if self.dsa_reset_indexer_on_load:
+            assert (
+                self.experimental_attention_variant == "dsa"
+            ), "dsa_reset_indexer_on_load requires experimental_attention_variant='dsa'."
+
+        if self.experimental_attention_variant == "dsa":
+            assert self.dsa_indexer_mode in (
+                'standard',
+                'simplified',
+            ), "dsa_indexer_mode must be 'standard' or 'simplified'."
+            simplified_indexer = self.dsa_indexer_mode == 'simplified'
+            # The dense indexer warmup and the indexer reset were built for, and have only
+            # been exercised with, the simplified indexer. The standard DeepSeek indexer
+            # reaches the same code paths, so refuse the combination rather than let an
+            # untested one run.
+            assert (
+                simplified_indexer or not self.dsa_fwd_use_dense_attn
+            ), "dsa_fwd_use_dense_attn requires dsa_indexer_mode='simplified'."
+            assert (
+                simplified_indexer or not self.dsa_reset_indexer_on_load
+            ), "dsa_reset_indexer_on_load requires dsa_indexer_mode='simplified'."
+            if simplified_indexer:
+                assert (
+                    self.num_query_groups == 1
+                ), "The initial simplified DSA implementation requires num_query_groups == 1."
+                assert self.dsa_indexer_n_heads in (None, 1), (
+                    "Simplified DSA derives one indexer Q head from the single KV group; "
+                    "leave dsa_indexer_n_heads unset or set it to 1."
+                )
+                assert self.dsa_indexer_head_dim is None or self.dsa_indexer_head_dim > 0, (
+                    "Simplified DSA requires a positive dsa_indexer_head_dim when "
+                    "explicitly set."
+                )
+                assert (
+                    self.dsa_indexer_topk is not None and self.dsa_indexer_topk > 0
+                ), "dsa_indexer_topk must be set to a positive integer when using DSA."
+                self.dsa_indexer_n_heads = 1
+                if self.dsa_indexer_head_dim is None:
+                    self.dsa_indexer_head_dim = self.kv_channels
+                # Simplified DSA scores a plain Q/K dot product, with no Hadamard rotation to
+                # apply. dsa_indexer_rotate_activation defaults True for the standard indexer,
+                # so resolve it here rather than making every simplified config turn it off.
+                self.dsa_indexer_rotate_activation = False
+            else:
+                # The standard indexer belongs to DSA over MLA, which upstream reaches through
+                # the 'D' layer-pattern symbol. That symbol sets experimental_attention_variant
+                # for the user without supplying indexer parameters, so requiring them here
+                # would reject a configuration upstream considers valid. Sanity-check what is
+                # set and leave the rest to that path's own owner.
+                assert (
+                    self.dsa_indexer_topk is None or self.dsa_indexer_topk > 0
+                ), "dsa_indexer_topk must be positive when set."
+            # These limits are DSGroupedSelfAttention's, and the simplified indexer is the only
+            # signal the config has for it. Non-MLA alone also caught standard-indexer
+            # DSAttention with one query group, which has none of them.
+            dsa_over_gqa = not self.multi_latent_attention and self.dsa_indexer_mode == 'simplified'
+            # 'none' is the field default and means "no fused kernels" on the MLA path. The GQA
+            # path has no such mode, so resolve it to the chunked min-memory backend -- the one
+            # intended for production -- rather than failing. Note this is not a literal reading
+            # of "none": that backend does use Triton kernels. Resolve before anything reads the
+            # field, so the checks below see the backend that will actually run.
+            if dsa_over_gqa and self.dsa_kernel_backend == 'none':
+                self.dsa_kernel_backend = 'min-memory-triton'
+            min_memory_dsa_backend = self.dsa_kernel_backend in (
+                'min-memory-triton',
+                'min-memory-torch',
+            )
+            dense_dsa_warmup = self.dsa_fwd_use_dense_attn
+            assert (
+                not dense_dsa_warmup or min_memory_dsa_backend
+            ), "dsa_fwd_use_dense_attn requires a min-memory dsa_kernel_backend."
+            # The simplified indexer has only ever been exercised on the GQA path. Rather than
+            # let an untested combination run, refuse it; the MLA path keeps the standard indexer.
+            assert not (
+                self.multi_latent_attention and self.dsa_indexer_mode == 'simplified'
+            ), "dsa_indexer_mode='simplified' is not supported with multi_latent_attention."
+
+            if dsa_over_gqa:
+                assert self.dsa_kernel_backend in (
+                    'min-memory-triton',
+                    'min-memory-torch',
+                    'reference',
+                ), (
+                    "DSA over GQA supports dsa_kernel_backend in ('min-memory-triton', "
+                    f"'min-memory-torch', 'reference'); got {self.dsa_kernel_backend!r}. "
+                    "'tilelang' and 'cudnn' select fused kernels and are MLA-only."
+                )
+                # DSA over MLA supports CP/SP (upstream gates CP on cp_comm_type=allgather
+                # below). The GQA path does not: its min-memory kernels have no
+                # sequence-parallel gather and no CP support yet.
+                assert (
+                    self.context_parallel_size == 1
+                ), "Context parallelism is not supported by DSA over GQA."
+                assert (
+                    not self.sequence_parallel
+                ), "Sequence parallelism is not supported by DSA over GQA."
+                # Fused RoPE packing covers DSA over MLA only; it is untested on the GQA path.
+                assert not self.apply_rope_fusion, "RoPE fusion is not supported by DSA over GQA."
+            if min_memory_dsa_backend:
+                if dense_dsa_warmup:
+                    assert not self.dsa_indexer_use_sparse_loss, (
+                        "dsa_fwd_use_dense_attn uses dense indexer loss; do not set "
+                        "dsa_indexer_use_sparse_loss."
+                    )
+                    assert (
+                        self.dsa_indexer_loss_coeff or 0.0
+                    ) > 0.0, "dsa_fwd_use_dense_attn requires dsa_indexer_loss_coeff > 0."
+                else:
+                    assert (
+                        self.dsa_indexer_loss_coeff or 0.0
+                    ) > 0.0, "min-memory dsa_kernel_backend requires dsa_indexer_loss_coeff > 0."
+                assert simplified_indexer or self.dsa_indexer_rotate_activation, (
+                    "min-memory dsa_kernel_backend requires dsa_indexer_rotate_activation for "
+                    "the standard DeepSeek indexer."
+                )
+
         if self.inference_fuse_tp_communication:
             assert self.transformer_impl == "inference_optimized", (
                 "inference_fuse_tp_communication is only supported "
@@ -4166,15 +6504,227 @@ class TransformerConfig(ModelParallelConfig):
                 "for inference_optimized transformer implementation."
             )
 
+        if self.flash_attention_version is not None:
+            assert self.flash_attention_version in (2, 3, 4), (
+                "flash_attention_version must be one of 2, 3, or 4, got "
+                f"{self.flash_attention_version}"
+            )
+
+        if self.moe_ep_invariant_combine:
+            if not self.batch_invariant_mode:
+                raise ValueError("moe_ep_invariant_combine requires batch_invariant_mode=True.")
+            if self.num_moe_experts:
+                from megatron.core.transformer.moe.ep_invariant_combine import check_ep_size
+
+                check_ep_size(self.num_moe_experts, self.expert_model_parallel_size)
+            if self.transformer_impl == "inference_optimized" and (
+                self.inference_grouped_gemm_backend
+                not in (InferenceGroupedGemmBackend.TORCH, InferenceGroupedGemmBackend.VLLM)
+            ):
+                raise ValueError(
+                    "moe_ep_invariant_combine supports inference_grouped_gemm_backend="
+                    "'torch' or 'vllm' for inference-optimized MoE: FlashInfer sums a "
+                    "token's routes inside its kernel."
+                )
+
         if self.batch_invariant_mode:
+            from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+                _BATCH_INVARIANT_BACKENDS,
+            )
+
+            # argparse validates via the Literal annotation; guard here too so
+            # programmatic TransformerConfig construction fails at build time
+            # rather than inside enable_batch_invariant_mode() after model init.
+            assert self.batch_invariant_backend in _BATCH_INVARIANT_BACKENDS, (
+                f"Unknown batch_invariant_backend {self.batch_invariant_backend!r}; "
+                f"expected one of {_BATCH_INVARIANT_BACKENDS}."
+            )
+            assert self.params_dtype == torch.bfloat16, (
+                "Batch invariant mode supports BF16 model parameters only; "
+                f"got {self.params_dtype}."
+            )
+            # Current tensorwise scaling uses an activation amax across batch
+            # rows, so neighbors change quantized target values before GEMM.
+            assert not (self.fp8 and self.fp8_recipe == Fp8Recipe.tensorwise), (
+                "Batch invariant mode does not support tensorwise FP8: current "
+                "activation scaling depends on neighboring batch rows."
+            )
+            # Default NVFP4 shares activation scaling across rows; TE's row-local
+            # alternative cannot retain the required columnwise training storage.
+            assert not (self.fp4 and self.fp4_recipe == Fp4Recipe.nvfp4), (
+                "Batch invariant mode does not support NVFP4: tensor-global "
+                "activation scaling depends on neighboring batch rows."
+            )
             assert (
                 self.attention_backend == AttnBackend.flash
-            ), "Batch invariant mode only supports FlashAttention"
+            ), "Batch invariant mode only supports FlashAttention (--attention-backend flash)"
+            # The training (TransformerEngine) and inference attention paths must run
+            # the same FlashAttention kernel, so the version cannot be left to each
+            # path's autodetection. FlashAttention-2 is excluded because it does not
+            # expose the fixed num_splits schedule the batch-invariant kernels require.
+            assert self.flash_attention_version in (3, 4), (
+                "Batch invariant mode requires --flash-attention-version 3 or 4 so the "
+                "training and inference attention paths run the same batch-invariant "
+                f"FlashAttention kernel (got {self.flash_attention_version})."
+            )
+            if self.is_hybrid_model:
+                from megatron.core.ssm.ops.common.determinism import use_deterministic_mode
+
+                # Checked rather than set: the autotune config lists are fixed at
+                # import, so setting the flag here would change nothing.
+                assert use_deterministic_mode(), (
+                    "Batch invariant mode on a hybrid model requires MAMBA_DETERMINISTIC=1 "
+                    "in the environment before Megatron is imported, so the SSM Triton "
+                    "kernels pin their autotune configs instead of choosing per call "
+                    "shape. Setting it after import has no effect; relaunch with it set."
+                )
+
+            # Context parallelism routes through TE's FA2 fwd/bwd kernels directly, which
+            # cannot be pinned to another version; dropout is not batch-invariant.
+            assert (
+                self.context_parallel_size == 1
+            ), "Batch invariant mode does not support context parallelism"
+            assert (
+                self.attention_dropout == 0.0
+            ), "Batch invariant mode does not support attention dropout"
+            if (self.num_moe_experts or 0) > 0:
+                from megatron.core.transformer.custom_layers.batch_invariant_kernels import (
+                    HAVE_DEEPGEMM_BF16,
+                )
+
+                if self.transformer_impl != "inference_optimized":
+                    assert self.moe_token_dispatcher_type == "alltoall", (
+                        "Batch-invariant MoE training requires "
+                        "moe_token_dispatcher_type='alltoall'."
+                    )
+                    if self.batch_invariant_backend == "te_native":
+                        # Import lazily: the TE extension imports TransformerConfig.
+                        from megatron.core.extensions.transformer_engine import (
+                            TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT,
+                        )
+
+                        assert (
+                            not self.use_transformer_engine_op_fuser
+                        ), "Batch-invariant training does not support TE op fuser."
+                        assert self.moe_use_grouped_tensor or not bool(
+                            int(os.getenv("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "0"))
+                        ), (
+                            "Enable device-metadata GEMM with moe_use_grouped_tensor=True, "
+                            "not just NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM, so expert "
+                            "padding uses the required "
+                            f"{TE_GROUPED_GEMM_EXPERT_TOKEN_ALIGNMENT}-row alignment."
+                        )
+                mxfp8_params_enabled = (
+                    bool(self.fp8)
+                    and self.fp8_recipe == Fp8Recipe.mxfp8
+                    and self.fp8_param
+                    and not self.fp4
+                )
+                # DeepGEMM is used by the "deepgemm"/"triton" backends, and by
+                # the torch inference path for BF16 experts. MXFP8 experts use
+                # torch scaled_grouped_mm directly and do not need DeepGEMM.
+                needs_deepgemm = self.batch_invariant_backend in ("deepgemm", "triton") or (
+                    self.transformer_impl == "inference_optimized"
+                    and self.inference_grouped_gemm_backend == InferenceGroupedGemmBackend.TORCH
+                    and not mxfp8_params_enabled
+                )
+                assert not needs_deepgemm or HAVE_DEEPGEMM_BF16, (
+                    "batch_invariant_mode=True with MoE requires DeepGEMM with bf16 "
+                    "grouped-GEMM bindings (m_grouped_bf16_gemm_nt_contiguous) for "
+                    "this backend combination. "
+                    "Install via `uv pip install -e .[batch_invariant]`."
+                )
+                squared_relu_or_swiglu = (
+                    not self.gated_linear_unit and self.activation_func == squared_relu
+                ) or (self.gated_linear_unit and self.activation_func == F.silu)
+                if self.transformer_impl == "inference_optimized":
+                    mxfp8_supported = mxfp8_params_enabled and (
+                        (
+                            self.inference_grouped_gemm_backend
+                            in (InferenceGroupedGemmBackend.TORCH, InferenceGroupedGemmBackend.VLLM)
+                            and squared_relu_or_swiglu
+                        )
+                        or (
+                            self.inference_grouped_gemm_backend
+                            == InferenceGroupedGemmBackend.FLASHINFER
+                            and not self.gated_linear_unit
+                            and self.activation_func == squared_relu
+                        )
+                    )
+                else:
+                    # The training policy uses TE GroupedLinear directly; the inference
+                    # backend selector is generation-only and therefore irrelevant here.
+                    mxfp8_supported = (
+                        mxfp8_params_enabled
+                        and self.moe_grouped_gemm
+                        and self.batch_invariant_backend == "te_native"
+                        and squared_relu_or_swiglu
+                    )
+                assert mxfp8_supported or not (self.fp8 or self.fp4), (
+                    "Batch-invariant MoE supports BF16; TE MXFP8 squared-ReLU/SwiGLU "
+                    "training experts; and Torch/vLLM MXFP8 squared-ReLU/SwiGLU "
+                    "or FlashInfer MXFP8 squared-ReLU inference experts."
+                )
+                assert not (self.moe_permute_fusion or self.moe_permute_fusion_into_hybridep), (
+                    "Batch-invariant MoE requires the unfused permute/unpermute path so "
+                    "top-k reductions use the fixed batch-invariant add tree."
+                )
+                assert not (
+                    self.moe_pad_expert_input_to_capacity
+                    or self.moe_pad_experts_for_cuda_graph_inference
+                ), (
+                    "Batch-invariant MoE supports dynamic dropless routing only. "
+                    "Disable MoE capacity/expert padding."
+                )
+
+        # Scheduler-value, max-seqlen, and variable_seq_lengths handling live in
+        # ModelParallelConfig.__post_init__ next to the field definitions; only the
+        # transformer-stack requirements are validated here.
+        if self.sequence_packing_scheduler is not None:
+            # Check TE version.
+            if not HAVE_PACKAGING:
+                raise ImportError(
+                    "packaging is not installed. Please install it with `pip install packaging`."
+                )
+            # TODO: remove this after we fix the convergence issue with TE < 2.9.
+            if not (
+                is_te_min_version("2.9.0") or get_te_version() == PkgVersion("2.9.0.dev0+5b3092a")
+            ):
+                raise ValueError(
+                    "SFT sequence packing requires Transformer Engine >= 2.9.0 "
+                    f"but got {get_te_version()} (TE < 2.9.0 may have convergence issues)."
+                )
+
+            # TODO(tailaim): add support for other dispatcher types
+            # Only relevant for MoE models; dense models never dispatch tokens,
+            # so the (unused) dispatcher default must not fail validation. For
+            # allgather specifically, the general variable_seq_lengths check
+            # above raises first (packing derives variable_seq_lengths=True).
+            if self.num_moe_experts is not None:
+                assert self.moe_token_dispatcher_type in ("alltoall", "flex"), (
+                    "sequence_packing only supports moe_token_dispatcher_type in "
+                    "('alltoall', 'flex'), "
+                    f"got '{self.moe_token_dispatcher_type}'"
+                )
+                if (
+                    self.moe_megakernel_backend is None
+                    and self.moe_token_dispatcher_type == "flex"
+                    and self.moe_flex_dispatcher_backend == "hybridep"
+                    and not self.moe_hybridep_pad_variable_tokens
+                ):
+                    raise ValueError(
+                        "sequence_packing with HybridEP requires "
+                        "moe_hybridep_pad_variable_tokens=True because packed token "
+                        "counts can differ across dispatcher ranks"
+                    )
 
         if self.cuda_graph_impl != "none" and (
             self.sequence_packing_scheduler is not None or self.dynamic_context_parallel
         ):
-            if self.thd_max_packed_sequences is None:
+            if (
+                self.thd_max_packed_sequences is None
+                and self.cuda_graph_thd_max_packed_sequences is None
+            ):
                 raise ValueError("THD CUDA Graph requires --thd-max-packed-sequences to be set.")
             assert (
                 self.pad_packed_seq_alignment is not None
@@ -4250,6 +6800,26 @@ class MLATransformerConfig(TransformerConfig):
     multi_latent_attention: bool = True
     """Whether to use Multi-Latent Attention."""
 
+    mla_proj_use_quantization: bool = True
+    """Whether absorbed-MLA projections use the enclosing FP8/FP4 context.
+    When disabled, they use the configured unquantized dtype (e.g. BF16). Core-attention
+    precision is unchanged.
+    """
+
+    use_fused_mla_q_uproj: bool = False
+    """Use the cuDNN fused MLA Q up-proj + per-head RoPE + MXFP8-quant kernel (SM100 only).
+    Requires apply_rope_fusion=True, q_lora_rank set, TP=1, SBHD, MXFP8 DPA, and zero
+    attention dropout."""
+
+    use_fused_mla_kv_rope_quant: bool = False
+    """Split the key/value up-projection output, apply RoPE to the key and quantize key and value
+    for MXFP8 attention in one Transformer Engine kernel (SM100 only), and quantize the RoPE'd
+    query before attention, instead of writing BF16 key and value that attention then
+    quantizes. Bitwise identical. Requires apply_rope_fusion=True, MXFP8 DPA, zero attention
+    dropout and qk_head_dim=128, qk_pos_emb_head_dim=64, v_head_dim=128; layers with TP or CP
+    above 1, THD inputs, FP16 inputs, recomputed up-projections or checkpointed core attention,
+    NVTE_FP8_DPA_BWD=0 and evaluation use the unfused path."""
+
     q_lora_rank: int = 512
     """Rank of Query tensor's low rank representation."""
 
@@ -4301,11 +6871,17 @@ class MLATransformerConfig(TransformerConfig):
     mscale_all_dim: float = 0.0
     """Mscale all dimensions for YaRN RoPE in Multi-Latent Attention, used by yarn."""
 
-    o_groups: int = 8
-    """Number of groups for grouped low-rank output projection (wo_a)."""
+    o_groups: Optional[int] = None
+    """Deprecated alias for output_projection_groups."""
 
-    o_lora_rank: int = 1024
-    """Low-rank dimension per group for grouped output (wo_a). Used when o_groups > 0."""
+    o_lora_rank: Optional[int] = None
+    """Deprecated alias for output_projection_lora_rank."""
+
+    output_projection_groups: int = 8
+    """Number of groups for the grouped low-rank output projection (wo_a)."""
+
+    output_projection_lora_rank: int = 1024
+    """Low-rank dimension per group for the grouped output projection (wo_a)."""
 
     cache_mla_latents: bool = False
     """Cache the low dimensional tensors for MLA rather than full KV cache.
@@ -4322,29 +6898,71 @@ class MLATransformerConfig(TransformerConfig):
         if self.attention_latent_norm_epsilon is None:
             self.attention_latent_norm_epsilon = self.layernorm_epsilon
 
+        if (
+            self.multi_latent_attention
+            and self.apply_rope_fusion
+            and self.rope_type not in ("rope", "yarn")
+            and self.experimental_attention_variant != "dsv4_hybrid"
+        ):
+            raise ValueError("apply_rope_fusion for MLA requires standard or YARN RoPE.")
+
+        if self.use_fused_mla_q_uproj and (
+            self.fp8 is None
+            or self.fp8_recipe != Fp8Recipe.mxfp8
+            or not self.fp8_dot_product_attention
+            or self.attention_dropout != 0.0
+        ):
+            raise ValueError(
+                "use_fused_mla_q_uproj requires FP8 with fp8_recipe='mxfp8' and "
+                "fp8_dot_product_attention=True so TE interprets the pre-quantized Q/K/V "
+                "scale layout correctly, plus attention_dropout=0.0 because MXFP8 attention "
+                "backward does not support dropout."
+            )
+
+        if self.use_fused_mla_kv_rope_quant and (
+            self.fp8 is None
+            or self.fp8_recipe != Fp8Recipe.mxfp8
+            or not self.fp8_dot_product_attention
+            or self.attention_dropout != 0.0
+        ):
+            raise ValueError(
+                "use_fused_mla_kv_rope_quant requires FP8 with fp8_recipe='mxfp8' and "
+                "fp8_dot_product_attention=True, because it feeds MXFP8 Q/K/V to attention, "
+                "plus attention_dropout=0.0 because MXFP8 attention backward does not support "
+                "dropout."
+            )
+
         if self.attention_output_gate and self.mla_down_proj_fusion:
-            # Fused MLA hides the post-input-LayerNorm activation inside the fused
-            # LayerNorm+linear module. Gated MLA must consume that activation as the
-            # gate input; using raw hidden_states would silently change the model.
-            # Keep this combination fail-fast until the fused API exposes the
-            # normalized activation.
             raise ValueError(
                 "MLA output gating does not support fused down projections; "
                 "disable mla_down_proj_fusion to use the unfused path."
             )
 
-        # DSv4 hybrid: derive qk_head_dim and kv_lora_rank from v_head_dim and qk_pos_emb_head_dim
+        # DSv4 hybrid: derive qk_head_dim and kv_lora_rank from v_head_dim and qk_pos_emb_head_dim.
         if self.experimental_attention_variant == "dsv4_hybrid":
             assert (
                 not self.mla_down_proj_fusion
             ), "MLA down projection fusion must be disabled for DSv4 hybrid mode."
+            assert self.q_lora_rank is not None, "DSv4 hybrid mode requires q_lora_rank."
+            assert (
+                self.output_projection_groups > 0
+            ), "DSv4 hybrid mode requires output_projection_groups to be positive."
+            assert (
+                self.output_projection_lora_rank > 0
+            ), "DSv4 hybrid mode requires output_projection_lora_rank to be positive."
+            assert (
+                self.num_attention_heads * self.v_head_dim
+            ) % self.output_projection_groups == 0, (
+                "num_attention_heads * v_head_dim must be divisible by " "output_projection_groups."
+            )
             log_single_rank(
                 logger,
                 logging.WARNING,
-                f"DSv4 hybrid mode is enabled, deriving qk_head_dim and kv_lora_rank from "
-                f"v_head_dim and qk_pos_emb_head_dim",
+                "DSv4 hybrid mode is enabled, deriving qk_head_dim and kv_lora_rank from "
+                "v_head_dim and qk_pos_emb_head_dim",
             )
             derived = self.v_head_dim - self.qk_pos_emb_head_dim
+            assert derived > 0, "v_head_dim must be greater than qk_pos_emb_head_dim."
             self.qk_head_dim = derived
             self.kv_lora_rank = derived
 

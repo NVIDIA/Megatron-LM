@@ -15,6 +15,8 @@ MODEL_ARGS:
   --qk-pos-emb-head-dim: 8
   --v-head-dim: 16
   --experimental-attention-variant: dsv4_hybrid
+  # CSA owns causal masking; do not pass a redundant dense dataloader mask.
+  --no-create-attention-mask-in-dataloader: true
   --dsa-indexer-n-heads: 64
   --dsa-indexer-head-dim: 128
   --dsa-indexer-topk: 512

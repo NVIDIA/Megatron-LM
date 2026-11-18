@@ -1,16 +1,34 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import math
+from collections.abc import Callable
+from dataclasses import dataclass
+from functools import partial
 from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
+from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
 from megatron.core.transformer.module import MegatronModule, mark_keep_in_fp32
+from megatron.core.transformer.residual_connection import (
+    ResidualBranchOutput,
+    ResidualConnection,
+    ResidualConnectionOperation,
+    ResidualConnectionState,
+)
+from megatron.core.transformer.residual_recompute import (
+    ResidualStreamRecomputeContext,
+    build_recompute_block_end_plan,
+    build_recompute_layer_managers,
+    finalize_recompute_block,
+)
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.utils import nvtx_decorator
+from megatron.core.typed_torch import apply_module
+from megatron.core.utils import ensure_params_ready, nvtx_decorator
 
 if TYPE_CHECKING:
     from megatron.core.tensor_parallel.random import MHCCheckpointManager
@@ -18,6 +36,58 @@ if TYPE_CHECKING:
 
 _MHC_SINKHORN_EPS = 1e-6
 _MHC_COMPUTE_H_EPS = 1e-6
+
+
+def _resolve_mhc_checkpoint(
+    manager: CheckpointWithoutOutputManager | None,
+    checkpoint_fn: Callable[..., Tensor] | None,
+    *,
+    output_slot: Optional['MHCRecomputeArenaSlot'] = None,
+) -> Callable[..., Tensor]:
+    """Resolve a ``checkpoint(function, *args)`` callable.
+
+    Use checkpoint_fn if supplied; otherwise create a fresh CheckpointWithoutOutput
+    per call and register it with manager, if provided. The managed checkpoint writes
+    its single output into output_slot, if provided. Reject supplying checkpoint_fn
+    together with manager or output_slot.
+    """
+    if checkpoint_fn is not None:
+        if manager is not None:
+            raise ValueError("Specify either checkpoint_fn or an mHC recompute manager, not both.")
+        if output_slot is not None:
+            raise ValueError(
+                "An mHC output_slot requires an mHC recompute manager, not checkpoint_fn."
+            )
+        return checkpoint_fn
+
+    from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+
+    def checkpoint_with_manager(function, *args):
+        # Preserve the legacy fp8=False default.
+        ckpt = CheckpointWithoutOutput(ckpt_manager=manager, output_slot=output_slot)
+        return ckpt.checkpoint(function, *args)
+
+    return checkpoint_with_manager
+
+
+def build_mhc_recompute_layer_plan(
+    num_layers: int, mhc_recompute_layer_num: Optional[int], use_mhc_recompute: bool
+) -> Tuple[list[Optional[CheckpointWithoutOutputManager]], list[bool]]:
+    """Build per-layer mHC recompute managers and recompute-block end markers."""
+    if not use_mhc_recompute or num_layers == 0:
+        return [None] * num_layers, [False] * num_layers
+
+    block_ends = build_recompute_block_end_plan(num_layers, mhc_recompute_layer_num)
+    return build_recompute_layer_managers(block_ends), list(block_ends)
+
+
+def finalize_mhc_recompute_layer(
+    mhc_manager: Optional[CheckpointWithoutOutputManager],
+    hidden_states: Tensor,
+    is_last_in_recompute_block: bool,
+) -> None:
+    """Finalize mHC recompute state when the current recompute block ends."""
+    finalize_recompute_block(mhc_manager, hidden_states, is_last_in_recompute_block)
 
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
@@ -42,7 +112,10 @@ class SinkhornKnopp(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_logits: Tensor, num_iterations: int, eps: float = 1e-6) -> Tensor:
         """Run Sinkhorn iterations and save inputs for backward recomputation."""
-        M = _sinkhorn_iterations(input_logits, num_iterations, eps)
+        # This forward is always no-grad. Canonicalize the input's requires_grad flag
+        # too, so checkpointing reuses the same compiled specialization even when
+        # Dynamo's cache is full instead of mixing compiled and eager arithmetic.
+        M = _sinkhorn_iterations(input_logits.detach(), num_iterations, eps)
         ctx.save_for_backward(input_logits)
         ctx.num_iterations = num_iterations
         ctx.eps = eps
@@ -68,7 +141,13 @@ def native_sinkhorn(input_logits: Tensor, num_iterations: int, eps: float = 1e-6
 @torch.compile
 def native_h_aggregate(x: Tensor, h_pre: Tensor) -> Tensor:
     """Native n-stream weighted aggregation: out = sum_j(h_pre_j * x_j)."""
-    return (x * h_pre.unsqueeze(-1)).sum(dim=2)
+    return (x * h_pre.unsqueeze(-1)).sum(dim=2).to(x.dtype)
+
+
+@torch.compile
+def _native_h_aggregate_into_forward(x: Tensor, h_pre: Tensor, out: Tensor) -> Tensor:
+    """Fuse the same multiply/reduction as native_h_aggregate into caller-owned storage."""
+    return torch.sum(x * h_pre.unsqueeze(-1), dim=2, out=out)
 
 
 class NativeHAggregateInto(torch.autograd.Function):
@@ -100,7 +179,10 @@ class NativeHAggregateInto(torch.autograd.Function):
             raise ValueError("H-aggregate caller-owned output must be a detached tensor")
 
         ctx.mark_dirty(out)
-        torch.sum(x * h_pre.unsqueeze(-1), dim=2, out=out)
+        # An eager multiply materializes a rounded intermediate;
+        # the allocating path fuses it with the reduction. Keep both paths fused
+        # without allocating an aggregate and copying it into the graph's slot.
+        _native_h_aggregate_into_forward(x, h_pre, out)
         ctx.save_for_backward(x, h_pre)
         return out
 
@@ -135,25 +217,45 @@ def native_h_post_bda(
     """Native H_res.T @ residual + H_post * (x [+ bias])."""
     s, b, n, C = original_residual.shape
     h_res_batched = h_res.view(s * b, n, n)
-    residual_batched = original_residual.view(s * b, n, C)
-    mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched).view(s, b, n, C)
+    residual_batched = original_residual.view(s * b, n, C).to(h_res.dtype)
+    with torch.autocast(device_type=h_res_batched.device.type, enabled=False):
+        mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched).view(s, b, n, C)
     x_expanded = h_post.unsqueeze(-1) * x.unsqueeze(2)
     if bias is not None:
         bias_expanded = h_post.unsqueeze(-1) * bias.view(1, 1, 1, C)
-        return x_expanded + bias_expanded + mixed
-    return x_expanded + mixed
+        return (x_expanded + bias_expanded + mixed).to(original_residual.dtype)
+    return (x_expanded + mixed).to(original_residual.dtype)
+
+
+def _proj_rms_impl(
+    x: Tensor, weight: Tensor, eps: float = 1e-6, eps_inside_sqrt: bool = False
+) -> Tuple[Tensor, Tensor]:
+    """FP32 projection + RMS normalization from an activation-dtype input."""
+    x = x.to(torch.float32)
+    weight = weight.to(torch.float32)
+    # Casting the operands is not sufficient under CUDA/CPU autocast: matmul and
+    # reductions are still eligible to downcast float32 inputs.  Keep the whole
+    # projection/RMS recipe in FP32; the caller controls the output cast.
+    with torch.autocast(device_type=x.device.type, enabled=False):
+        proj = torch.matmul(x, weight.t())
+        if eps_inside_sqrt:
+            norm = torch.rsqrt(x.square().mean(dim=-1, keepdim=True) + eps)
+        else:
+            norm = 1.0 / (x.norm(dim=-1, keepdim=True) / math.sqrt(x.shape[-1]) + eps)
+    return proj, norm
 
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
 @torch.compile
-def native_proj_rms(x: Tensor, weight: Tensor, eps: float = 1e-6) -> Tuple[Tensor, Tensor]:
-    """Native fused projection + RMS normalization."""
-    proj = torch.matmul(x, weight.t())
-    norm = x.norm(dim=-1, keepdim=True)
-    K = x.shape[-1]
-    v = norm / math.sqrt(K) + eps
-    r = 1.0 / v
-    return proj, r
+def native_proj_rms(
+    x: Tensor, weight: Tensor, eps: float = 1e-6, eps_inside_sqrt: bool = False
+) -> Tuple[Tensor, Tensor]:
+    """Compiled FP32 projection + RMS normalization.
+
+    ``x`` may retain the activation dtype so callers can checkpoint this function without
+    saving an FP32 upcast of the residual stream.
+    """
+    return _proj_rms_impl(x, weight, eps, eps_inside_sqrt)
 
 
 # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
@@ -264,7 +366,7 @@ class HyperConnectionModule(MegatronModule):
         mark_keep_in_fp32(self.alpha_post)
         mark_keep_in_fp32(self.alpha_res)
         mark_keep_in_fp32(self.bias)
-        self.norm_eps = 1e-6
+        self.norm_eps = config.layernorm_epsilon if config.mhc_norm_eps_inside_sqrt else 1e-6
 
         # Choose implementation: unified fused kernels vs reference modules.
         # The fused public API selects the backend per operation internally.
@@ -276,9 +378,13 @@ class HyperConnectionModule(MegatronModule):
         # The fused path computes the projection and compute_h in one op, so
         # _projection_and_get_norm — and therefore _proj_rms_op — is only ever
         # reached on the unfused path.
-        self._proj_rms_op = native_proj_rms
+        # Full recompute forwards run under no_grad and replay with gradients. Use the
+        # same FP32 arithmetic in both passes; compiling only one changes norm reductions.
+        self._proj_rms_op = partial(_proj_rms_impl, eps_inside_sqrt=config.mhc_norm_eps_inside_sqrt)
 
         if config.use_fused_mhc:
+            if config.mhc_norm_eps_inside_sqrt or config.mhc_keep_mappings_in_fp32:
+                raise ValueError("Fused mHC does not support FP32 mixing or epsilon inside sqrt.")
             from megatron.core.fusions.fused_mhc_kernels import (
                 fused_h_aggregate,
                 fused_h_aggregate_into,
@@ -288,12 +394,13 @@ class HyperConnectionModule(MegatronModule):
                 log_fused_mhc_backend_once,
             )
 
-            log_fused_mhc_backend_once()
-            self._sinkhorn_op = fused_sinkhorn
-            self._h_aggregate_op = fused_h_aggregate
-            self._h_aggregate_into_op = fused_h_aggregate_into
-            self._h_post_bda_op = fused_h_post_bda
-            self._proj_rms_compute_h_op = fused_proj_rms_compute_h
+            backend = config.mhc_fused_backend
+            log_fused_mhc_backend_once(backend)
+            self._sinkhorn_op = partial(fused_sinkhorn, backend=backend)
+            self._h_aggregate_op = partial(fused_h_aggregate, backend=backend)
+            self._h_aggregate_into_op = partial(fused_h_aggregate_into, backend=backend)
+            self._h_post_bda_op = partial(fused_h_post_bda, backend=backend)
+            self._proj_rms_compute_h_op = partial(fused_proj_rms_compute_h, backend=backend)
         else:
             self._sinkhorn_op = native_sinkhorn
             self._h_aggregate_op = native_h_aggregate
@@ -305,7 +412,10 @@ class HyperConnectionModule(MegatronModule):
 
     def _init_weights(self) -> None:
         """Initialize weights for stable training."""
-        nn.init.xavier_uniform_(self.mapping_proj.weight)
+        # Honor the mcore convention: skip weight init when the caller will load a
+        # checkpoint over these parameters anyway (e.g. meta-device construction).
+        if self.config.perform_initialization:
+            nn.init.xavier_uniform_(self.mapping_proj.weight)
 
         # Set sequence_parallel attribute on parameters for gradient synchronization
         # across TP ranks when sequence_parallel is enabled.
@@ -326,12 +436,23 @@ class HyperConnectionModule(MegatronModule):
             x: [s, b, n*C] - n-stream hidden states
         """
         s, b, nC = x.shape
-        # The mHC mapping computation runs in FP32: the parameters are kept in
-        # FP32 and the activations are upcast here, then compute_mappings casts
-        # the bounded mixing weights back to the activation dtype.
-        x_2d = x.reshape(s * b, nC).to(torch.float32)
-        weight = self.mapping_proj.weight.to(torch.float32)
-        proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
+        # Keep the activation-dtype input in autograd and upcast inside the recomputed
+        # projection. This avoids retaining a full FP32 copy of the residual stream.
+        x_2d = x.reshape(s * b, nC)
+        # mapping_proj is read here, not called, so its forward pre-hook never publishes it.
+        ensure_params_ready([self.mapping_proj.weight])
+        weight = self.mapping_proj.weight
+        if torch.is_grad_enabled() and (x_2d.requires_grad or weight.requires_grad):
+            proj, r = checkpoint(
+                self._proj_rms_op,
+                x_2d,
+                weight,
+                self.norm_eps,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        else:
+            proj, r = self._proj_rms_op(x_2d, weight, self.norm_eps)
         return proj.view(s, b, proj.shape[-1]), r.view(s, b, 1)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
@@ -387,6 +508,8 @@ class HyperConnectionModule(MegatronModule):
         if self._proj_rms_compute_h_op is not None:
             # Fused path: proj_rms + compute_h in one kernel launch sequence
             x_2d = x.reshape(s * b, self.n * self.hidden_size)
+            # The fused kernel reads mapping_proj.weight without calling mapping_proj.
+            ensure_params_ready([self.mapping_proj.weight])
             with torch.cuda.nvtx.range("HyperConnection::fused_proj_rms_compute_h"):
                 h_pre, h_post, h_res, _ = self._proj_rms_compute_h_op(
                     x_2d,
@@ -414,10 +537,7 @@ class HyperConnectionModule(MegatronModule):
             h_res, self.sinkhorn_iterations, self.sinkhorn_eps
         )  # [s, b, n, n]
 
-        # The mixing weights are bounded (sigmoid outputs / doubly stochastic
-        # matrix), so after the FP32 computation they are safe to apply to the
-        # streams in the activation dtype.
-        dtype = x.dtype
+        dtype = torch.float32 if self.config.mhc_keep_mappings_in_fp32 else x.dtype
         return h_pre.to(dtype), h_post.to(dtype), h_res.to(dtype)
 
     # dynamic=True handles the hybrid mHC variable-shape path (was blanket-disabled)
@@ -541,10 +661,11 @@ class HyperConnectionModule(MegatronModule):
         # Reshape for bmm: [s, b, n, n] -> [s*b, n, n]
         h_res_batched = h_res.view(s * b, n, n)
         # [s, b, n*C] -> [s, b, n, C] -> [s*b, n, C]
-        residual_batched = residual.view(s, b, n, C).view(s * b, n, C)
+        residual_batched = residual.view(s * b, n, C).to(h_res.dtype)
 
         # Batch matrix multiply: [s*b, n, n].T @ [s*b, n, C] -> [s*b, n, C]
-        mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched)
+        with torch.autocast(device_type=h_res_batched.device.type, enabled=False):
+            mixed = torch.bmm(h_res_batched.transpose(1, 2), residual_batched)
 
         return mixed.view(s, b, n * C)
 
@@ -553,7 +674,10 @@ class HyperConnectionModule(MegatronModule):
         hidden_states: Tensor,
         mhc_recompute_manager: Optional['MHCCheckpointManager'] = None,
         output_slot: Optional['MHCRecomputeArenaSlot'] = None,
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        return_residual: bool = False,
+        *,
+        checkpoint_fn: Callable[..., Tensor] | None = None,
+    ) -> Tuple[Tensor, ...]:
         """
         Full mHC forward pass.
 
@@ -567,25 +691,35 @@ class HyperConnectionModule(MegatronModule):
             mhc_recompute_manager: Optional MHCCheckpointManager for checkpoint management.
                 When provided, uses _forward_with_checkpoint for memory-efficient execution.
             output_slot: Optional arena slot used as the aggregate kernel's
-                caller-owned output for both forward and recompute.
+                caller-owned output for both forward and recompute. A differing
+                slot dtype is handled by casting the aggregate into the slot.
+                Requires mhc_recompute_manager.
+            return_residual: Also return the residual view selected by BroadcastTensorFused.
+            checkpoint_fn: Checkpoint callable for aggregation; mutually exclusive with
+                mhc_recompute_manager and output_slot.
 
         Returns:
-            A 4-tuple. This is an intentional breaking change from the older
-            3-tuple API because fused_h_res_h_post_bda consumes the residual
-            branch created by BroadcastTensorFused.
+            A 3-tuple by default, or a 4-tuple when return_residual=True.
+            Internal mHC consumers request the residual branch explicitly so
+            fused_h_res_h_post_bda consumes the BroadcastTensorFused output.
             aggregated: [s, b, C] - aggregated input for layer computation
             h_res: [s, b, n, n] - residual mixing matrix (for fused kernel)
             h_post: [s, b, n] - expansion weights
             residual: [s, b, n*C] - residual view for fused_h_res_h_post_bda
         """
-        if mhc_recompute_manager is not None:
-            return self._forward_with_checkpoint(
-                hidden_states, mhc_recompute_manager, output_slot=output_slot
+
+        if mhc_recompute_manager is not None or checkpoint_fn is not None:
+            result = self._forward_with_checkpoint(
+                hidden_states,
+                mhc_recompute_manager,
+                output_slot=output_slot,
+                checkpoint_fn=checkpoint_fn,
             )
         else:
             if output_slot is not None:
                 raise ValueError("fixed mHC outputs require an mHC recompute manager")
-            return self._forward_normal(hidden_states)
+            result = self._forward_normal(hidden_states)
+        return result if return_residual else result[:3]
 
     def _forward_normal(self, hidden_states: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
@@ -617,8 +751,10 @@ class HyperConnectionModule(MegatronModule):
     def _forward_with_checkpoint(
         self,
         hidden_states: Tensor,
-        manager: 'MHCCheckpointManager',
+        manager: Optional['MHCCheckpointManager'] = None,
         output_slot: Optional['MHCRecomputeArenaSlot'] = None,
+        *,
+        checkpoint_fn: Callable[..., Tensor] | None = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
         """
         Forward pass with checkpointing for memory efficiency.
@@ -630,8 +766,12 @@ class HyperConnectionModule(MegatronModule):
 
         Args:
             hidden_states: [s, b, n*C] - n-stream hidden states
-            manager: MHCCheckpointManager for unified recomputation
-            output_slot: Optional direct-write attention CUDA Graph input slot.
+            manager: Optional MHCCheckpointManager for unified recomputation
+            output_slot: Optional attention CUDA Graph input slot. Aggregation
+                preserves the input dtype before casting into a differing slot dtype.
+                Requires manager.
+            checkpoint_fn: Checkpoint callable, mutually exclusive with manager and
+                output_slot.
 
         Returns:
             aggregated: [s, b, C] - aggregated input for layer computation
@@ -639,7 +779,7 @@ class HyperConnectionModule(MegatronModule):
             h_post: [s, b, n] - expansion weights
             residual: [s, b, n*C] - residual view for fused_h_res_h_post_bda
         """
-        from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+        checkpoint_fn = _resolve_mhc_checkpoint(manager, checkpoint_fn, output_slot=output_slot)
 
         # Split into 3 views to avoid extra grad accumulations in backward
         hs_for_mappings, hs_for_aggregate, hs_for_residual = BroadcastTensorFused.apply(
@@ -648,19 +788,22 @@ class HyperConnectionModule(MegatronModule):
 
         h_pre, h_post, h_res = self.compute_mappings(hs_for_mappings)
 
-        # Checkpoint aggregate - auto-registers to manager
-        # With an arena slot the aggregate direct-writes into the graph consumer's
-        # captured input surface, so forward and recompute land at the same fixed
-        # address. writer is read per call by design: it hands back a fresh view.
-        aggregate_function = (
-            self.aggregate
-            if output_slot is None
-            else lambda x, h: self.aggregate(x, h, out=output_slot.writer)
-        )
+        def aggregate_function(x, h):
+            # Both forward and recompute must populate the graph's captured input address.
+            # Read writer per call so each invocation gets a fresh detached view.
+            out = output_slot.writer
+            if out.dtype == x.dtype:
+                return self.aggregate(x, h, out=out)
 
-        aggregated = CheckpointWithoutOutput(
-            ckpt_manager=manager, output_slot=output_slot
-        ).checkpoint(aggregate_function, hs_for_aggregate, h_pre)
+            # FP32 residual streams can feed a lower-precision attention graph.
+            # Preserve the aggregation precision and checkpoint the cast/copy too,
+            # so recompute restores the captured bytes before attention backward.
+            return out.copy_(self.aggregate(x, h))
+
+        # Checkpoint aggregate - auto-registers to manager. Without an output slot, pass the
+        # bound aggregate so a caller-supplied checkpoint_fn receives the owner method.
+        aggregate_fn = self.aggregate if output_slot is None else aggregate_function
+        aggregated = checkpoint_fn(aggregate_fn, hs_for_aggregate, h_pre)
 
         return aggregated, h_res, h_post, hs_for_residual
 
@@ -701,9 +844,10 @@ class HyperConnectionModule(MegatronModule):
         """
         s, b, nC = x.shape
         C = nC // n
-        # Average all streams
+        # Average all streams. Accumulate the reduction in fp32 (then downcast to
+        # the input dtype) to avoid bf16 accumulation drift in the final contracted stream.
         x_streams = x.view(s, b, n, C)
-        contracted = x_streams.mean(dim=2)
+        contracted = x_streams.float().mean(dim=2).to(x.dtype)
         return contracted
 
     # ==================== Fused kernel placeholder ====================
@@ -719,6 +863,8 @@ class HyperConnectionModule(MegatronModule):
         training: bool,
         fused: bool,
         manager: Optional['MHCCheckpointManager'] = None,
+        *,
+        checkpoint_fn: Callable[..., Tensor] | None = None,
     ) -> Tensor:
         """
         Fused kernel combining apply_h_res, apply_h_post and bias-dropout-add.
@@ -743,11 +889,13 @@ class HyperConnectionModule(MegatronModule):
             fused: Whether to use fused BDA implementation
             manager: Optional MHCCheckpointManager for checkpoint management.
                 When provided, each operation is wrapped with CheckpointWithoutOutput.
+            checkpoint_fn: Optional output-discard checkpoint callable for this write.
+                Mutually exclusive with manager; omit both for an eager or terminal write.
 
         Returns:
             output: [s, b, n*C] - final output after all operations
         """
-        if manager is not None:
+        if manager is not None or checkpoint_fn is not None:
             return self._fused_h_res_h_post_bda_with_checkpoint(
                 h_res,
                 original_residual,
@@ -757,6 +905,7 @@ class HyperConnectionModule(MegatronModule):
                 training,
                 fused,
                 manager,
+                checkpoint_fn=checkpoint_fn,
             )
         else:
             return self._fused_h_res_h_post_bda_native(
@@ -779,8 +928,33 @@ class HyperConnectionModule(MegatronModule):
         training: bool,
         fused: bool,
     ) -> Tensor:
+        """Run the shared write arithmetic eagerly."""
+        x, bias = layer_output_with_bias
+        return self._compute_write(
+            h_res,
+            original_residual,
+            h_post,
+            x,
+            bias,
+            dropout_prob=dropout_prob,
+            training=training,
+            fused=fused,
+        )
+
+    def _compute_write(
+        self,
+        h_res: Tensor,
+        original_residual: Tensor,
+        h_post: Tensor,
+        x: Tensor,
+        bias: Optional[Tensor],
+        *,
+        dropout_prob: float,
+        training: bool,
+        fused: bool,
+    ) -> Tensor:
         """
-        h_res, h_post and bda.
+        Compute the residual update for eager execution and checkpoint replay.
 
         When dropout is zero (or inference), uses a single fused/reference kernel
         for H_res.T @ residual + H_post * (x + bias). Falls back to unfused
@@ -790,7 +964,8 @@ class HyperConnectionModule(MegatronModule):
             h_res: [s, b, n, n] - residual mixing matrix
             original_residual: [s, b, n*C] - n-stream hidden states
             h_post: [s, b, n] - expansion weights
-            layer_output_with_bias: Tuple of (x, bias)
+            x: [s, b, C] - layer output
+            bias: [C] or None - optional bias tensor
             dropout_prob: Dropout probability
             training: Whether in training mode
             fused: Whether to use fused BDA implementation
@@ -798,8 +973,6 @@ class HyperConnectionModule(MegatronModule):
         Returns:
             output: [s, b, n*C] - final output
         """
-        x, bias = layer_output_with_bias
-
         if dropout_prob == 0.0 or not training:
             s, b, _ = original_residual.shape
             n = self.n
@@ -818,7 +991,7 @@ class HyperConnectionModule(MegatronModule):
         bda_func = get_bias_dropout_add(training, fused)
         with torch.cuda.nvtx.range("HyperConnection::bda"):
             output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
-        return output
+        return output.to(original_residual.dtype)
 
     @nvtx_decorator(message="HyperConnection::fused_h_res_h_post_bda_with_checkpoint")
     def _fused_h_res_h_post_bda_with_checkpoint(
@@ -830,15 +1003,17 @@ class HyperConnectionModule(MegatronModule):
         dropout_prob: float,
         training: bool,
         fused: bool,
-        manager: 'MHCCheckpointManager',
+        manager: Optional['MHCCheckpointManager'] = None,
+        *,
+        checkpoint_fn: Callable[..., Tensor] | None = None,
     ) -> Tensor:
         """
         Checkpointed variant of _fused_h_res_h_post_bda_native.
 
         Wraps compute in CheckpointWithoutOutput for activation memory savings.
-        Cannot reuse _native directly because checkpoint requires all args to be
-        positional Tensors; tuple/Optional/scalar args are unpacked or captured
-        via closure instead.
+        Tensor operands are separate positional arguments so checkpointing tracks
+        their gradients. Optional bias may be None; execution settings are bound
+        for replay while eager execution uses the same numerical helper.
 
         Args:
             h_res: [s, b, n, n] - residual mixing matrix
@@ -848,60 +1023,186 @@ class HyperConnectionModule(MegatronModule):
             dropout_prob: Dropout probability
             training: Whether in training mode
             fused: Whether to use fused BDA implementation
-            manager: MHCCheckpointManager for checkpoint management
+            manager: Optional MHCCheckpointManager for checkpoint management
+            checkpoint_fn: Checkpoint callable, mutually exclusive with manager.
 
         Returns:
             output: [s, b, n*C] - final output
         """
-        from megatron.core.tensor_parallel.random import CheckpointWithoutOutput
+        checkpoint_fn = _resolve_mhc_checkpoint(manager, checkpoint_fn)
 
         x, bias = layer_output_with_bias
-        n = self.n
-        C = self.hidden_size
+        return checkpoint_fn(
+            partial(self._compute_write, dropout_prob=dropout_prob, training=training, fused=fused),
+            h_res,
+            original_residual,
+            h_post,
+            x,
+            bias,
+        )
 
-        # Fast path: no dropout — use fused/reference h_post_bda kernel (same as _native)
-        if dropout_prob == 0.0 or not training:
 
-            def _fused_wrapper(h_res, original_residual, h_post, x, *optional_bias):
-                s, b, _ = original_residual.shape
-                orig_reshaped = original_residual.view(s, b, n, C)
-                b_arg = optional_bias[0] if optional_bias else None
-                return self._h_post_bda_op(h_res, orig_reshaped, h_post, x, b_arg).view(s, b, n * C)
+@dataclass(frozen=True)
+class HyperConnectionExecutionContext:
+    """Current mHC parameter owner and BDA fusion setting for one residual operation."""
 
-            ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
-            if bias is not None:
-                output = ckpt.checkpoint(_fused_wrapper, h_res, original_residual, h_post, x, bias)
-            else:
-                output = ckpt.checkpoint(_fused_wrapper, h_res, original_residual, h_post, x)
+    owner: HyperConnectionModule
+    bias_dropout_fusion: bool = False
 
-        # Slow path: dropout required — fused kernel does not support dropout,
-        # fall back to sequential apply_h_res + apply_h_post + bda
+
+class HyperConnectionResidualConnection(ResidualConnection):
+    """Parameterless mHC read or write adapter using the owner supplied at each call.
+
+    Reads carry the residual and predicted maps to the write. Set use_input_residual
+    to preserve callers that carry the input instead of the owner's residual view.
+    Owner dtypes are preserved; incompatible branch dtype requests are rejected.
+    Output-discard replay covers aggregation and nonterminal writes only.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        *,
+        operation: ResidualConnectionOperation,
+        use_input_residual: bool = False,
+    ) -> None:
+        super().__init__(
+            config.mhc_num_residual_streams * config.hidden_size,
+            config.hidden_size,
+            operation=operation,
+        )
+        if use_input_residual and operation != "read":
+            raise ValueError("use_input_residual is only supported for mHC reads.")
+        self.use_input_residual = use_input_residual
+
+    @staticmethod
+    def _execution_context(execution_context: object | None) -> HyperConnectionExecutionContext:
+        if not isinstance(execution_context, HyperConnectionExecutionContext):
+            raise TypeError("mHC residual operations require HyperConnectionExecutionContext.")
+        return execution_context
+
+    def _eager_read(
+        self,
+        hidden_states: Tensor,
+        *,
+        fp32_residual_connection: bool,
+        branch_input_dtype: torch.dtype | None,
+        execution_context: object | None,
+    ) -> tuple[Tensor, ResidualConnectionState]:
+        """Read eagerly, without registering output-discard replay."""
+
+        # The owner chooses dtypes; the base validates any requested branch dtype.
+        del fp32_residual_connection, branch_input_dtype
+        return self._read_from_owner(
+            hidden_states, self._execution_context(execution_context), checkpoint_fn=None
+        )
+
+    def _read_from_owner(
+        self,
+        hidden_states: Tensor,
+        execution_context: HyperConnectionExecutionContext,
+        *,
+        checkpoint_fn: Callable[..., Tensor] | None,
+    ) -> tuple[Tensor, ResidualConnectionState]:
+        """Share owner invocation and state packing without choosing a replay policy."""
+
+        if self.use_input_residual:
+            # Preserve the dedicated Transformer's residual path and three-output owner hooks.
+            residual = hidden_states
+            branch_input, h_res, h_post = apply_module(execution_context.owner)(
+                hidden_states, checkpoint_fn=checkpoint_fn
+            )
         else:
-            from megatron.core.fusions.fused_bias_dropout import get_bias_dropout_add
+            branch_input, h_res, h_post, residual = apply_module(execution_context.owner)(
+                hidden_states, return_residual=True, checkpoint_fn=checkpoint_fn
+            )
+        return branch_input, (residual, h_res, h_post)
 
-            bda_func = get_bias_dropout_add(training, fused)
-            has_bias = bias is not None
+    def _eager_write(
+        self,
+        branch_output: ResidualBranchOutput,
+        state: ResidualConnectionState,
+        *,
+        dropout_probability: float,
+        training: bool,
+        execution_context: object | None,
+    ) -> Tensor:
+        """Write eagerly, without registering output-discard replay."""
 
-            def _native_wrapper(h_res, original_residual, h_post, x, *optional_bias):
-                with torch.cuda.nvtx.range("HyperConnection::apply_h_res"):
-                    mixed = self.apply_h_res(h_res, original_residual)
-                with torch.cuda.nvtx.range("HyperConnection::apply_h_post"):
-                    x_expanded = self._apply_h_post(x, h_post)
-                    if has_bias:
-                        bias_expanded = self._apply_h_post(optional_bias[0], h_post)
-                    else:
-                        bias_expanded = None
-                with torch.cuda.nvtx.range("HyperConnection::bda"):
-                    output = bda_func((x_expanded, bias_expanded), mixed, dropout_prob)
-                return output
+        return self._write_to_owner(
+            branch_output,
+            state,
+            self._execution_context(execution_context),
+            dropout_probability=dropout_probability,
+            training=training,
+            checkpoint_fn=None,
+        )
 
-            ckpt = CheckpointWithoutOutput(ckpt_manager=manager)
-            if has_bias:
-                output = ckpt.checkpoint(_native_wrapper, h_res, original_residual, h_post, x, bias)
-            else:
-                output = ckpt.checkpoint(_native_wrapper, h_res, original_residual, h_post, x)
+    @staticmethod
+    def _write_to_owner(
+        branch_output: ResidualBranchOutput,
+        state: ResidualConnectionState,
+        execution_context: HyperConnectionExecutionContext,
+        *,
+        dropout_probability: float,
+        training: bool,
+        checkpoint_fn: Callable[..., Tensor] | None,
+    ) -> Tensor:
+        """Invoke the owner's write without changing its output dtype."""
 
-        return output
+        if len(state) != 3:
+            raise ValueError("mHC residual write requires the selected residual and both maps.")
+        residual, h_res, h_post = state
+        value = branch_output if isinstance(branch_output, tuple) else (branch_output, None)
+        return execution_context.owner.fused_h_res_h_post_bda(
+            h_res,
+            residual,
+            h_post,
+            value,
+            dropout_prob=dropout_probability,
+            training=training,
+            fused=execution_context.bias_dropout_fusion,
+            checkpoint_fn=checkpoint_fn,
+        )
+
+    def _checkpoint_read(
+        self,
+        hidden_states: Tensor,
+        context: ResidualStreamRecomputeContext,
+        *,
+        fp32_residual_connection: bool,
+        branch_input_dtype: torch.dtype | None,
+        execution_context: object | None,
+    ) -> tuple[Tensor, ResidualConnectionState]:
+        # Let the existing mHC owner checkpoint aggregation rather than replaying prediction
+        # and rebuilding the selected residual alias through the generic whole-read path.
+        del fp32_residual_connection, branch_input_dtype
+        return self._read_from_owner(
+            hidden_states,
+            self._execution_context(execution_context),
+            checkpoint_fn=context.checkpoint,
+        )
+
+    def _checkpoint_write(
+        self,
+        branch_output: ResidualBranchOutput,
+        state: ResidualConnectionState,
+        context: ResidualStreamRecomputeContext,
+        *,
+        dropout_probability: float,
+        training: bool,
+        execution_context: object | None,
+    ) -> Tensor:
+        """Replay nonterminal writes while retaining the block's terminal output."""
+
+        return self._write_to_owner(
+            branch_output,
+            state,
+            self._execution_context(execution_context),
+            dropout_probability=dropout_probability,
+            training=training,
+            checkpoint_fn=None if context.is_block_end else context.checkpoint,
+        )
 
 
 # ==================== Checkpoint utilities for mHC ====================

@@ -1,4 +1,4 @@
-# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import argparse
 import os
@@ -88,9 +88,38 @@ def test_qb_cli_exposes_global_batch_scope_and_histogram_bins():
     assert args.moe_router_qb_num_bins == 257
 
 
-def test_qb_dev_rejects_micro_batch_scope():
-    with pytest.raises(ValueError, match="dev supports only"):
-        _config(moe_router_quantile_balancing_estimation_scope="micro_batch")
+def test_qb_accepts_upstream_micro_batch_scope():
+    config = _config(moe_router_quantile_balancing_estimation_scope="micro_batch")
+    assert config.moe_router_quantile_balancing_estimation_scope == "micro_batch"
+
+
+@pytest.mark.parametrize(
+    "overrides, error_match",
+    [
+        ({"moe_router_fusion": True}, "requires native routing"),
+        (
+            {"dynamic_context_parallel": True, "max_seqlen_per_dp_cp_rank": 128},
+            "requires static TP/CP groups",
+        ),
+    ],
+)
+def test_qb_micro_batch_rejects_unsupported_paths(overrides, error_match):
+    with pytest.raises(ValueError, match=error_match):
+        _config(moe_router_quantile_balancing_estimation_scope="micro_batch", **overrides)
+
+
+def test_qb_defaults_to_global_batch_scope():
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=16,
+        num_attention_heads=4,
+        num_moe_experts=4,
+        moe_router_topk=1,
+        moe_router_score_function="sigmoid",
+        moe_router_load_balancing_type="quantile_balancing",
+        moe_aux_loss_coeff=0.0,
+    )
+    assert config.moe_router_quantile_balancing_estimation_scope == "global_batch"
 
 
 def test_qb_rejects_nonzero_aux_loss():
@@ -101,6 +130,28 @@ def test_qb_rejects_nonzero_aux_loss():
 def test_qb_rejects_pre_softmax_routing():
     with pytest.raises(ValueError, match="does not use pre-softmax"):
         _config(moe_router_pre_softmax=True)
+
+
+@pytest.mark.parametrize("scope", ["micro_batch", "global_batch"])
+@pytest.mark.parametrize("num_experts, topk", [(8, 8), (1, 1), (8, 9), (8, 0), (8, -1)])
+def test_qb_rejects_invalid_topk(scope, num_experts, topk):
+    with pytest.raises(ValueError, match="0 < moe_router_topk < num_moe_experts"):
+        _config(
+            moe_router_quantile_balancing_estimation_scope=scope,
+            num_moe_experts=num_experts,
+            moe_router_topk=topk,
+        )
+
+
+@pytest.mark.parametrize("scope", ["micro_batch", "global_batch"])
+@pytest.mark.parametrize("num_experts, topk", [(2, 1), (8, 1), (8, 7)])
+def test_qb_accepts_valid_topk(scope, num_experts, topk):
+    config = _config(
+        moe_router_quantile_balancing_estimation_scope=scope,
+        num_moe_experts=num_experts,
+        moe_router_topk=topk,
+    )
+    assert config.moe_router_topk == topk
 
 
 def test_qb_treats_negative_capacity_as_disabled():
@@ -282,6 +333,98 @@ def test_qb_fused_atomic_matches_unfused_histogram():
     torch.testing.assert_close(fused_histogram, unfused_histogram)
 
 
+def test_qb_unfused_histogram_skips_padded_tokens():
+    torch.manual_seed(7)
+    logits = torch.randn(6, 5, dtype=torch.float32)
+    bias = torch.linspace(-0.1, 0.1, 5, dtype=torch.float32)
+    bounds = torch.tensor([-1.0, 1.0], dtype=torch.float32)
+    valid = torch.tensor([True, False, True, True, False, True])
+
+    masked_histogram = torch.zeros(5, 16, dtype=torch.int32)
+    masked_probs, masked_map = topk_routing_with_score_function(
+        logits,
+        topk=2,
+        score_function="sigmoid",
+        expert_bias=bias,
+        fused=False,
+        qb_histogram=masked_histogram,
+        qb_bin_bounds=bounds,
+        qb_valid_mask=valid,
+    )
+    # Reference: the histogram of the valid rows alone, routing of all rows unchanged.
+    valid_only_histogram = torch.zeros_like(masked_histogram)
+    topk_routing_with_score_function(
+        logits[valid],
+        topk=2,
+        score_function="sigmoid",
+        expert_bias=bias,
+        fused=False,
+        qb_histogram=valid_only_histogram,
+        qb_bin_bounds=bounds,
+    )
+    plain_probs, plain_map = topk_routing_with_score_function(
+        logits, topk=2, score_function="sigmoid", expert_bias=bias, fused=False
+    )
+
+    torch.testing.assert_close(masked_histogram, valid_only_histogram)
+    assert int(masked_histogram.sum()) == int(valid.sum()) * 5
+    torch.testing.assert_close(masked_probs, plain_probs)
+    torch.testing.assert_close(masked_map, plain_map)
+
+
+def test_qb_valid_mask_requires_histogram():
+    logits = torch.randn(4, 3, dtype=torch.float32)
+    with pytest.raises(ValueError, match="qb_valid_mask requires"):
+        topk_routing_with_score_function(
+            logits,
+            topk=1,
+            score_function="sigmoid",
+            expert_bias=torch.zeros(3),
+            fused=False,
+            qb_valid_mask=torch.ones(4, dtype=torch.bool),
+        )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not fused_topk_with_score_function_supports_qb,
+    reason="requires the Transformer Engine QB fused-router API",
+)
+def test_qb_fused_histogram_with_padding_matches_unfused():
+    torch.manual_seed(4321)
+    logits = torch.randn(41, 64, device="cuda", dtype=torch.float32)
+    bias = torch.linspace(-0.1, 0.1, 64, device="cuda", dtype=torch.float32)
+    bounds = torch.tensor([-1.1, 1.1], device="cuda", dtype=torch.float32)
+    valid = torch.rand(41, device="cuda") > 0.3
+    unfused_histogram = torch.zeros(64, 128, device="cuda", dtype=torch.int32)
+    fused_histogram = torch.zeros_like(unfused_histogram)
+
+    unfused_probs, unfused_map = topk_routing_with_score_function(
+        logits,
+        topk=8,
+        score_function="sigmoid",
+        expert_bias=bias,
+        fused=False,
+        qb_histogram=unfused_histogram,
+        qb_bin_bounds=bounds,
+        qb_valid_mask=valid,
+    )
+    fused_probs, fused_map = topk_routing_with_score_function(
+        logits,
+        topk=8,
+        score_function="sigmoid",
+        expert_bias=bias,
+        fused=True,
+        qb_histogram=fused_histogram,
+        qb_bin_bounds=bounds,
+        qb_valid_mask=valid,
+    )
+
+    torch.testing.assert_close(fused_probs, unfused_probs)
+    torch.testing.assert_close(fused_map, unfused_map)
+    torch.testing.assert_close(fused_histogram, unfused_histogram)
+    assert int(fused_histogram.sum()) == int(valid.sum()) * 64
+
+
 def test_qb_finalize_updates_once_and_reset_preserves_buffers():
     router = torch.nn.Module()
     router.register_buffer("expert_bias", torch.zeros(2, dtype=torch.float32))
@@ -302,7 +445,7 @@ def test_qb_finalize_updates_once_and_reset_preserves_buffers():
     histogram_ptr = router.qb_histogram.data_ptr()
     bounds_ptr = router.qb_bin_bounds.data_ptr()
 
-    _update_router_expert_bias_with_quantile([model], config)
+    _update_router_expert_bias_with_quantile([model], config, reduction_groups=())
 
     torch.testing.assert_close(router.expert_bias, torch.tensor([0.25, -0.25]))
     reset_model_temporary_tensors(config, [model])
@@ -315,7 +458,7 @@ def test_qb_finalize_without_active_router_is_a_noop():
     model = torch.nn.Module()
     config = SimpleNamespace(moe_router_topk=1)
 
-    _update_router_expert_bias_with_quantile([model], config)
+    _update_router_expert_bias_with_quantile([model], config, reduction_groups=())
 
 
 def test_qb_router_maintains_float32_bias_and_bounds():
@@ -415,7 +558,7 @@ def test_qb_mcore_router_accumulates_microbatches_and_finalizes(fused, monkeypat
         marked_bounds.append,
     )
     _update_router_expert_bias_with_quantile(
-        [layer], config, tp_dp_cp_group=torch.distributed.group.WORLD
+        [layer], config, reduction_groups=(torch.distributed.group.WORLD,)
     )
 
     assert len(marked_bounds) == 1

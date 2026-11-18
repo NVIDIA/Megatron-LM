@@ -1,4 +1,4 @@
-# Copyright (c) 2024-2026, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 """ModelOpt GPT model provider."""
 
@@ -28,9 +28,12 @@ from megatron.core.post_training.modelopt.hybrid.model_specs import get_hybrid_s
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.transformer.module import MegatronModule
 from megatron.post_training.checkpointing import load_modelopt_state
+from megatron.post_training.optimizer import install_lsq_optimizer_overrides
 from megatron.post_training.utils import print_distributed_quant_summary
 from megatron.training import get_args, print_rank_0
 from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.config import PretrainConfigContainer
+from megatron.training.global_vars import get_run_config
 from megatron.training.models.gpt import GPTModelBuilder, GPTModelConfig
 from megatron.training.models.hybrid import HybridModelBuilder, HybridModelConfig
 
@@ -269,6 +272,34 @@ def _freeze_base_for_mtp(model):
     _freeze_for_qad(model, "mtp")
 
 
+def _propagate_expert_allreduce_to_lsq_params(model):
+    """Copy each weight's MCore ``allreduce`` flag onto its LSQ ``_amax_{pre,post}`` params.
+
+    Without the flag, expert amax params get bucketed into the global data-parallel group
+    instead of the expert-data-parallel group (wrong grad reduction under expert parallelism).
+    """
+    module_by_name = dict(model.named_modules())
+    for name, param in model.named_parameters():
+        if not (name.endswith("_amax_pre") or name.endswith("_amax_post")):
+            continue
+        marker = ".weight_quantizer"
+        if marker not in name:
+            continue
+        linear = module_by_name.get(name.split(marker, 1)[0])
+        if linear is None:
+            continue
+        allreduce = next(
+            (
+                w.allreduce
+                for wname, w in linear.named_parameters(recurse=False)
+                if "weight" in wname and hasattr(w, "allreduce")
+            ),
+            None,
+        )
+        if allreduce is not None:
+            param.allreduce = allreduce
+
+
 def modelopt_gpt_hybrid_builder(
     args,
     pre_process,
@@ -302,6 +333,7 @@ def modelopt_gpt_hybrid_builder(
         MCoreGPTModel | MCoreHybridModel: The returned model
     """
     print_rank_0("building GPT model ...")
+    cfg_container = get_run_config()
 
     # ModelOpt by default assumes none homogenous layers. This affect the storage format of the sharded checkpoint.
     config = core_transformer_config_from_args(args)
@@ -384,22 +416,27 @@ def modelopt_gpt_hybrid_builder(
             use_te = args.transformer_impl == "transformer_engine"
             decoder_layer_specs = get_gpt_decoder_layer_specs(config, use_transformer_engine=use_te)
             mtp_block_spec = get_gpt_mtp_block_spec(
-                config, decoder_layer_specs[-1], use_transformer_engine=use_te
+                config,
+                decoder_layer_specs[-1],
+                use_transformer_engine=use_te,
+                pp_rank=pg_collection.pp.rank() if pg_collection is not None else None,
             )
 
         model_kwargs = {
             "transformer_layer_spec": transformer_layer_spec,
-            "vocab_size": args.padded_vocab_size,
+            "vocab_size": cfg_container.tokenizer.padded_vocab_size,
             "max_sequence_length": args.max_position_embeddings,
             "pre_process": pre_process,
             "post_process": post_process,
             "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
+            "logit_dtype": getattr(args, "logit_dtype", None),
             "parallel_output": True,
             "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
             "position_embedding_type": args.position_embedding_type,
             "rotary_percent": args.rotary_percent,
             "rotary_base": args.rotary_base,
             "rope_scaling": args.use_rope_scaling,
+            "rope_scaling_factor": args.rope_scaling_factor,
             "mtp_block_spec": mtp_block_spec,
             "pg_collection": pg_collection,
         }
@@ -436,12 +473,13 @@ def modelopt_gpt_hybrid_builder(
         )
         model_kwargs = {
             "hybrid_stack_spec": hybrid_stack_spec,
-            "vocab_size": args.padded_vocab_size,
+            "vocab_size": cfg_container.tokenizer.padded_vocab_size,
             "max_sequence_length": args.max_position_embeddings,
             "hybrid_layer_pattern": args.hybrid_layer_pattern,
             "pre_process": pre_process,
             "post_process": post_process,
             "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
+            "logit_dtype": getattr(args, "logit_dtype", None),
             "parallel_output": True,
             "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
             "position_embedding_type": args.position_embedding_type,
@@ -466,7 +504,7 @@ def modelopt_gpt_hybrid_builder(
     # too late since Megatron created the optimizer right after calling model_provider before loading
     # the checkpoint. To ensure all trainable parameters are reigistered, we try to resume the
     # modelopt_state (which transforms the model to have additional parameters) before returning.
-    if args.load is not None:
+    if get_run_config().checkpoint.load is not None:
         load_modelopt_state(model=model)
 
     qad_train_target = getattr(args, 'qad_train_target', None)
@@ -480,6 +518,12 @@ def modelopt_gpt_hybrid_builder(
     if qad_train_target is not None:
         _freeze_for_qad(model, qad_train_target)
 
+    # LSQ _amax_* params lack MCore's ``allreduce`` attribute; propagate it from each weight
+    # before get_model() builds DDP and the distributed optimizer. No-op without LSQ params.
+    _propagate_expert_allreduce_to_lsq_params(model)
+    if getattr(args, "lsq_scale_lr", None) is not None:
+        install_lsq_optimizer_overrides()
+
     _add_load_convert_hooks(model)
 
     # Distillation mode.
@@ -489,9 +533,11 @@ def modelopt_gpt_hybrid_builder(
         # NOTE: Unknown memory leak occuring per fwd-bwd pass if model
         # is converted to a `modelopt.torch.opt.DynamicModule`.
         # Argument `--manual-gc` can result in an eventual OOM.
-        assert (
-            not args.manual_gc
-        ), "ModelOpt Distillation currently incompatible with `--manual-gc` option."
+        cfg = get_run_config()
+        if isinstance(cfg, PretrainConfigContainer):
+            assert (
+                not cfg.train.manual_gc
+            ), "ModelOpt Distillation currently incompatible with `--manual-gc` option."
         assert (
             not args.tp_comm_overlap
         ), "ModelOpt Distillation currently incompatible with `--tp-comm-overlap` option."

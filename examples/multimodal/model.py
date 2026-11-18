@@ -4,7 +4,12 @@ import warnings
 from copy import deepcopy
 
 import torch
-from config import get_language_model_config, get_vision_model_config, get_vision_projection_config
+from config import (
+    get_language_model_config,
+    get_vision_model_config,
+    get_vision_projection_config,
+    is_hybrid_language_model_type,
+)
 from layer_specs import (
     get_hybrid_layer_spec_te,
     get_layer_spec,
@@ -13,11 +18,14 @@ from layer_specs import (
     get_norm_mlp_module_spec_te,
 )
 
-from megatron.core.models.multimodal.llava_model import IMAGE_TOKEN, LLaVAModel
+from megatron.core.models.gpt.gpt_layer_specs import get_gpt_decoder_block_spec
+from megatron.core.models.multimodal.llava_model import LLaVAModel
 from megatron.core.models.vision.clip_vit_model import get_num_image_embeddings
+from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import log_single_rank
 from megatron.training import get_args, get_tokenizer, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.global_vars import get_run_config
+from megatron.training.vocab_utils import model_vocab_size
 
 
 def model_provider(
@@ -39,43 +47,62 @@ def model_provider(
             will live on only a subset of the pipeline stages (specifically, only the first stage).
         add_decoder (bool): Construct the decoder module (used with pipeline parallelism). Defaults to True. When we use pipelining, the decoder
             will live on only a subset of the pipeline stages (specifically, every stage after the first one).
-        parallel_output (bool): Enable parallel model output.
         vp_stage: Optional virtual pipeline stage. Used with virtual pipeline parallelism.
-        config: Optional transformer config. If None, will be created from args.
+        config: Optional transformer config. Defaults to cfg.model.transformer.
         pg_collection: Optional process group collection. If None, will use default.
+        parallel_output (bool): Enable parallel model output.
 
     Returns:
         model: A multimodal model.
     """
     args = get_args()
+    cfg = get_run_config()
     use_te = args.use_te
 
     print_rank_0('building a multimodal model ...')
 
-    num_image_embeddings = get_num_image_embeddings(
-        args.img_h,
-        args.img_w,
-        args.patch_dim,
-        args.vision_model_type,
-        args.disable_vision_class_token,
-        1,
-        args.pixel_shuffle,
-        args.use_tile_tags,
-        args.max_num_tiles,
-        args.tokenizer_prompt_format,
-    )
-    old_seq_length = args.seq_length
-    args.seq_length = args.encoder_seq_length = num_image_embeddings
-    if old_seq_length != args.seq_length:
-        log_single_rank(
-            logging.getLogger(__name__),
-            logging.WARNING,
-            f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})",
-        )
+    if getattr(args, 'dynamic_resolution', False):
+        max_num_image_embeddings = args.seq_length
+        num_image_embeddings = args.seq_length
+        if args.pixel_shuffle:
+            max_num_image_embeddings //= 4
+            num_image_embeddings //= 4
+        if getattr(args, 'conv_merging', False):
+            max_num_image_embeddings //= 4
+            num_image_embeddings //= 4
+    else:
+        temporal_patch_dim = getattr(args, 'video_temporal_patch_size', 1)
+        if temporal_patch_dim != 1:
+            raise NotImplementedError(
+                "Temporal compression currently requires --dynamic-resolution. "
+                f"Found --video-temporal-patch-size={temporal_patch_dim}."
+            )
 
-    max_num_image_embeddings = (
-        max((args.max_num_tiles + int(args.use_thumbnail)), args.num_frames) * num_image_embeddings
-    )
+        num_image_embeddings = get_num_image_embeddings(
+            img_h=args.img_h,
+            img_w=args.img_w,
+            patch_dim=args.patch_dim,
+            vision_model_type=args.vision_model_type,
+            disable_vision_class_token=args.disable_vision_class_token,
+            class_token_len=getattr(args, 'class_token_len', None) or 1,
+            pixel_shuffle=args.pixel_shuffle,
+            use_tile_tags=args.use_tile_tags,
+            max_num_tiles=args.max_num_tiles,
+            tokenizer_type=cfg.tokenizer.tokenizer_prompt_format,
+        )
+        old_seq_length = args.seq_length
+        args.seq_length = args.encoder_seq_length = num_image_embeddings
+        if old_seq_length != args.seq_length:
+            log_single_rank(
+                logging.getLogger(__name__),
+                logging.WARNING,
+                f"Changed seq_length and encoder_seq_length (vision model sequence length) from {old_seq_length} to num_image_tokens ({num_image_embeddings})",
+            )
+
+        max_num_image_embeddings = (
+            max((args.max_num_tiles + int(args.use_thumbnail)), args.num_frames)
+            * num_image_embeddings
+        )
 
     assert (
         args.decoder_seq_length is not None
@@ -92,33 +119,52 @@ def model_provider(
     language_model_type = args.language_model_type
     vision_model_type = args.vision_model_type
 
-    base_config = core_transformer_config_from_args(get_args())
+    base_config = deepcopy(config if config is not None else cfg.model.transformer)
     base_config.language_model_type = args.language_model_type
     base_config.vision_model_type = args.vision_model_type
-    base_config.calculate_per_token_loss = True
+    base_config.calculate_per_token_loss = not getattr(args, "no_calculate_per_token_loss", False)
+
+    if getattr(args, "no_calculate_per_token_loss", False):
+        assert (
+            not args.use_loss_scaling
+        ), "--no-calculate-per-token-loss and --use-loss-scaling cannot be used together"
 
     language_config = deepcopy(base_config)
-    language_config = get_language_model_config(language_config)
+    language_config = get_language_model_config(language_config, enable_fusions=args.enable_fusions)
 
     if language_model_type.startswith("hf://"):
         assert (
-            args.tensor_model_parallel_size == 1
+            base_config.tensor_model_parallel_size == 1
         ), "Huggingface models do not support --tensor-model-parallel-size > 1"
         assert (
-            args.pipeline_model_parallel_size < 2
+            base_config.pipeline_model_parallel_size < 2
         ), "Huggingface models do not support --pipeline-model-parallel-size > 1"
-        assert not args.sequence_parallel, "Huggingface models do not support --sequence-parallel"
         assert (
-            args.context_parallel_size < 2
+            not base_config.sequence_parallel
+        ), "Huggingface models do not support --sequence-parallel"
+        assert (
+            base_config.context_parallel_size < 2
         ), "Huggingface models do not support --context-parallel-size > 1"
 
     if language_model_type.startswith("hf://"):
         language_transformer_layer_spec = None
     elif use_te:
         # Padding mask needed for SP/CP.
-        padding = args.context_parallel_size > 1 and args.sequence_parallel
-        if args.language_model_type.startswith('nemotron5-hybrid'):
-            language_transformer_layer_spec = get_hybrid_layer_spec_te(padding=padding)
+        padding = base_config.context_parallel_size > 1 and base_config.sequence_parallel
+        if args.spec is not None:
+            language_transformer_layer_spec = import_module(args.spec)
+        # Resolve the same model-name aliases used by the configuration builders.
+        elif is_hybrid_language_model_type(args.language_model_type):
+            language_transformer_layer_spec = get_hybrid_layer_spec_te(
+                config=language_config, padding=padding
+            )
+        elif language_config.num_moe_experts is not None:
+            language_transformer_layer_spec = get_gpt_decoder_block_spec(
+                language_config,
+                use_transformer_engine=use_te,
+                normalization=language_config.normalization,
+                qk_l2_norm=language_config.qk_l2_norm,
+            )
         else:
             language_transformer_layer_spec = get_layer_spec_te(
                 is_vit=False, padding=padding
@@ -129,13 +175,14 @@ def model_provider(
         )
 
     vision_config = deepcopy(base_config)
-    vision_config = get_vision_model_config(
-        vision_config, apply_query_key_layer_scaling=args.apply_query_key_layer_scaling
-    )
+    vision_config = get_vision_model_config(vision_config, enable_fusions=args.enable_fusions)
+    # Most ViT checkpoints use bias in linear layers; override --disable-bias-linear.
+    # Pixtral (both sizes) uses no bias — config.py already sets add_bias_linear=False.
+    if vision_model_type not in ("pixtral-vit", "pixtral-vit-large"):
+        vision_config.add_bias_linear = True
     if vision_model_type.startswith("hf://"):
-        assert not args.sequence_parallel, "Huggingface models do not support --sequence-parallel"
         assert (
-            args.context_parallel_size < 2
+            base_config.context_parallel_size < 2
         ), "Huggingface models do not support --context-parallel-size > 1"
 
     if vision_model_type in ["clip", "siglip", "radio", "cradio-g"]:
@@ -168,6 +215,13 @@ def model_provider(
         from nvlm.internvit import get_internvit300M_layer_spec
 
         vision_transformer_layer_spec = get_internvit300M_layer_spec(use_te=use_te)
+    elif vision_model_type in ("pixtral-vit", "pixtral-vit-large", "qwen-vl", "kimi-vit"):
+        if use_te:
+            vision_transformer_layer_spec = get_layer_spec_te(is_vit=True)
+        else:
+            vision_transformer_layer_spec = get_layer_spec(
+                is_vit=True, normalization=vision_config.normalization
+            )
     elif vision_model_type.startswith("hf://"):
         vision_transformer_layer_spec = None
     else:
@@ -176,7 +230,7 @@ def model_provider(
     vision_projection_config = deepcopy(base_config)
 
     vision_projection_config = get_vision_projection_config(
-        vision_projection_config, language_config.hidden_size
+        vision_projection_config, language_config.hidden_size, enable_fusions=args.enable_fusions
     )
 
     # Make sure vision model pipeline parallel size is not inherited from the language model pipeline parallel size.
@@ -186,8 +240,10 @@ def model_provider(
     )
 
     # Make sure the vision model does not inherit first and last pipeline num layers from the language model.
-    vision_config.first_pipeline_num_layers = vision_config.last_pipeline_num_layers = None
+    vision_config.num_layers_in_first_pipeline_stage = None
+    vision_config.num_layers_in_last_pipeline_stage = None
 
+    # The projector consumes the MLP submodules rather than the enclosing ModuleSpec.
     if vision_projection_config.normalization:
         vision_projection_layer_spec = get_norm_mlp_module_spec_te().submodules
     else:
@@ -195,19 +251,26 @@ def model_provider(
 
     # Toggle --recompute* for the vision and language model separately.
     if args.recompute_vision:
-        if (
-            vision_config.recompute_method is not None
-            and vision_config.recompute_granularity is not None
-        ):
-            vision_config.recompute_num_layers = vision_config.num_layers
+        vision_config.recompute_num_layers = (
+            args.recompute_vision_num_layers
+            if args.recompute_vision_num_layers > 0
+            else vision_config.num_layers
+        )
+        if args.recompute_granularity_vision is not None:
+            vision_config.recompute_granularity = args.recompute_granularity_vision
+        if args.recompute_method_vision is not None:
+            vision_config.recompute_method = args.recompute_method_vision
     else:
         vision_config.recompute_granularity = None
         vision_config.recompute_method = None
         vision_config.recompute_num_layers = None
 
-    vision_projection_config.recompute_granularity = None
-    vision_projection_config.recompute_method = None
-    vision_projection_config.recompute_num_layers = None
+    if args.recompute_vision_projection:
+        vision_projection_config.recompute_granularity = "full"
+    else:
+        vision_projection_config.recompute_granularity = None
+        vision_projection_config.recompute_method = None
+        vision_projection_config.recompute_num_layers = None
 
     # TODO: Vision model and projection do not use SP/CP yet.
     vision_config.sequence_parallel = False
@@ -219,29 +282,32 @@ def model_provider(
     vision_projection_config.tp_comm_overlap = False
 
     tokenizer = get_tokenizer()
-    image_token_index = tokenizer.convert_tokens_to_ids(IMAGE_TOKEN)
-    assert (
-        image_token_index is not None
-    ), f"IMAGE_TOKEN={IMAGE_TOKEN} needs to be added using the --special-tokens arg."
+    image_token_index = tokenizer.image_token_index
 
-    tile_tags = _get_tile_tags(args, tokenizer)
+    tile_tags = _get_tile_tags(args, tokenizer, cfg.tokenizer.tokenizer_prompt_format)
 
     model = LLaVAModel(
         language_transformer_config=language_config,
         language_transformer_layer_spec=language_transformer_layer_spec,
-        language_vocab_size=args.padded_vocab_size,
+        language_vocab_size=model_vocab_size(
+            cfg.model.vocab_size,
+            should_pad_vocab=cfg.model.should_pad_vocab,
+            make_vocab_size_divisible_by=cfg.model.make_vocab_size_divisible_by,
+            tensor_model_parallel_size=cfg.model.transformer.tensor_model_parallel_size,
+        ),
         language_max_sequence_length=args.decoder_seq_length,
         vision_transformer_config=vision_config,
         vision_transformer_layer_spec=vision_transformer_layer_spec,
         drop_vision_class_token=args.disable_vision_class_token,
         vision_projection_config=vision_projection_config,
         vision_projection_layer_spec=vision_projection_layer_spec,
-        vision_projection_type="mlp",
+        vision_projection_type=args.vision_projection_type,
         allow_missing_vision_projection_checkpoint=args.allow_missing_vision_projection_checkpoint,
+        allow_llm_only_checkpoint=args.allow_llm_only_checkpoint,
         parallel_output=parallel_output,
-        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-        language_position_embedding_type=args.position_embedding_type,
-        language_rotary_percent=args.rotary_percent,
+        share_embeddings_and_output_weights=cfg.model.share_embeddings_and_output_weights,
+        language_position_embedding_type=cfg.model.position_embedding_type,
+        language_rotary_percent=cfg.model.rotary_percent,
         pre_process=pre_process,
         post_process=post_process,
         add_encoder=add_encoder,
@@ -249,27 +315,50 @@ def model_provider(
         img_h=args.img_h,
         img_w=args.img_w,
         patch_dim=args.patch_dim,
-        language_rotary_base=args.rotary_base,
-        language_rope_scaling=args.use_rope_scaling,
-        hybrid_layer_pattern=args.hybrid_layer_pattern,
-        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        language_rotary_base=cfg.model.rotary_base,
+        language_rope_scaling=cfg.model.rope_scaling,
+        language_rope_scaling_factor=cfg.model.rope_scaling_factor,
+        hybrid_layer_pattern=cfg.model.hybrid_layer_pattern,
+        fp16_lm_cross_entropy=cfg.model.fp16_lm_cross_entropy,
         image_token_index=image_token_index,
         pixel_shuffle=args.pixel_shuffle,
+        conv_merging=getattr(args, "conv_merging", False),
         tile_tags=tile_tags,
         max_num_tiles=args.max_num_tiles,
-        tokenizer_type=args.tokenizer_prompt_format,
+        tokenizer_type=cfg.tokenizer.tokenizer_prompt_format,
+        use_vision_backbone_fp8_arch=getattr(args, "use_vision_backbone_fp8_arch", False),
+        dynamic_resolution=getattr(args, "dynamic_resolution", False),
+        class_token_len=getattr(args, "class_token_len", None),
+        radio_force_eval_mode=getattr(args, "radio_force_eval_mode", False),
+        radio_force_cpe_eval_mode=getattr(args, "radio_force_cpe_eval_mode", False),
+        radio_interpolate_only_cpe=getattr(args, "radio_interpolate_only_cpe", False),
+        radio_cpe_aspect_ratio_select=getattr(args, "radio_cpe_aspect_ratio_select", False),
+        radio_disable_cpe=getattr(args, "radio_disable_cpe", False),
+        use_loss_scaling=args.use_loss_scaling,
+        temporal_patch_dim=getattr(args, "video_temporal_patch_size", 1),
+        separate_video_embedder=getattr(args, "separate_video_embedder", False),
+        temporal_ckpt_compat=getattr(args, "allow_checkpoint_without_temporal_compression", False),
+        balance_vision_context_parallel_by_tokens=getattr(
+            args, "balance_vision_context_parallel_by_tokens", False
+        ),
+        profile_vision_context_parallel_partition=getattr(
+            args, "profile_vision_context_parallel_partition", False
+        ),
+        vp_stage=vp_stage,
+        pg_collection=pg_collection,
     )
 
     model.freeze(
         freeze_language_model=args.freeze_LM,
         freeze_vision_model=args.freeze_ViT,
-        freeze_vision_projection=False,
+        freeze_vision_projection=args.freeze_vision_projection,
+        unfreeze_router=args.unfreeze_router,
     )
 
     return model
 
 
-def _get_tile_tags(args, tokenizer):
+def _get_tile_tags(args, tokenizer, tokenizer_prompt_format):
     """Tile tags are used in NVLM to surround image tiles with text tags."""
     if not args.use_tile_tags:
         return None
@@ -277,10 +366,10 @@ def _get_tile_tags(args, tokenizer):
     # We expect the tokenized length of the tags is same.
     if args.max_num_tiles < 10:
         thumbnail_tag_text = "<tile_global_thumbnail>"
-        if args.tokenizer_prompt_format == "nvlm-yi-34b":
+        if tokenizer_prompt_format == "nvlm-yi-34b":
             thumbnail_tag_text = "<tile_global>"
 
-        if args.tokenizer_prompt_format.startswith("nemotron"):
+        if tokenizer_prompt_format.startswith("nemotron"):
             tile_tags_text = [f"<tile_{i:02d}>" for i in range(1, args.max_num_tiles + 1)] + [
                 thumbnail_tag_text
             ]
@@ -290,11 +379,11 @@ def _get_tile_tags(args, tokenizer):
             ]
     elif args.max_num_tiles <= 12:
         thumbnail_tag_text = "<tile_global_thumbnail0>"
-        if args.tokenizer_prompt_format == "nvlm-yi-34b":
+        if tokenizer_prompt_format == "nvlm-yi-34b":
             thumbnail_tag_text = "<tile_global0>"
         elif (
-            args.tokenizer_prompt_format.startswith("nemotron")
-            or args.tokenizer_prompt_format == "llama3p1"
+            tokenizer_prompt_format.startswith("nemotron")
+            or tokenizer_prompt_format == "llama3p1"
         ):
             thumbnail_tag_text = "<tile_global_thumbnail>"
         tile_tags_text = [f"<tile_{i:02d}>" for i in range(1, args.max_num_tiles + 1)] + [

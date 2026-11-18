@@ -125,7 +125,9 @@ class RankRole:
             pp_size = pp_group.size()
             is_first = pp_rank == 0
             is_last = pp_rank == pp_size - 1
-            logger.info(
+            # Per-rank fact, so it cannot be reduced to one rank; DEBUG keeps a 512-rank
+            # job from writing the same line once per rank at the default level.
+            logger.debug(
                 f"[RankRole._from_grid_map] Rank {current_rank}: module={module_name}, "
                 f"pp_rank={pp_rank}/{pp_size}, is_first_stage={is_first}, is_last_stage={is_last}"
             )

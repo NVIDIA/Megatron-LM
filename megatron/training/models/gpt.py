@@ -1,10 +1,11 @@
-# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import inspect
 import logging
-from typing import Any, Callable, ClassVar, Literal, override
+from typing import Any, Callable, ClassVar, Literal
 
 import torch
+from typing_extensions import override
 
 from megatron.core.distributed.distributed_data_parallel_config import DistributedDataParallelConfig
 from megatron.core.enums import ModelType
@@ -55,7 +56,12 @@ def default_layer_spec(config: "GPTModelConfig", vp_stage: int) -> ModuleSpec:
     """Determine the most appropriate layer specification based on availability."""
     transformer_cfg = config.transformer
     use_te = transformer_cfg.transformer_impl == "transformer_engine"
-    if transformer_cfg.transformer_impl == "inference_optimized":
+    if (
+        transformer_cfg.transformer_impl == "inference_optimized"
+        and transformer_cfg.num_moe_experts is None
+    ):
+        # MoE models fall through to the shared num_moe_experts branch below;
+        # get_gpt_decoder_block_spec already handles the inference_optimized impl.
         return get_gpt_layer_with_inference_spec(
             transformer_cfg.qk_layernorm,
             transformer_cfg.multi_latent_attention,
@@ -174,7 +180,12 @@ class GPTModelConfig(ModelConfig):
 
     ### GPT Model initialization ###
     seq_length: int = 1024
+    """Position-embedding capacity, passed to GPTModel as max_sequence_length; the launcher fills
+    it from --max-position-embeddings. The training sequence length that core modules size
+    buffers from is TransformerConfig.max_seq_length_per_sample on ``transformer``.
+    """
     fp16_lm_cross_entropy: bool = False
+    logit_dtype: torch.dtype | None = None
     parallel_output: bool = True
     share_embeddings_and_output_weights: bool = False
     position_embedding_type: Literal["learned_absolute", "rope", "mrope", "yarn", "none"] = (
@@ -209,6 +220,25 @@ class GPTModelConfig(ModelConfig):
 
     @override
     def __setattr__(self, name: str, value: Any, /) -> None:
+        # Own dataclass fields always live on this object: proxying them only to
+        # the embedded TransformerConfig would leave the class-level default
+        # visible through normal attribute lookup on self whenever
+        # TransformerConfig declares a same-named field (e.g.
+        # ``hybrid_layer_pattern``), silently dropping the configured value.
+        # The value is still mirrored into the transformer config when it
+        # declares the same attribute (e.g. ``rotary_base`` / ``rotary_percent``
+        # on MLATransformerConfig, which MLA reads from the inner config).
+        if name in type(self).__dataclass_fields__:
+            super().__setattr__(name, value)
+            if name == "transformer":
+                return
+            try:
+                transformer = object.__getattribute__(self, "transformer")
+            except AttributeError:
+                return
+            if hasattr(transformer, name):
+                setattr(transformer, name, value)
+            return
         # Use object.__getattribute__ to avoid triggering __getattr__ while
         # `transformer` may not yet exist (e.g. during dataclass __init__).
         try:
@@ -222,18 +252,8 @@ class GPTModelConfig(ModelConfig):
         else:
             super().__setattr__(name, value)
 
-    def finalize(self) -> None:
-        """One time validation to run once config is ready to be used by builder."""
-
-        if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
-            self.transformer.finalize()
-
-        if self.transformer.cuda_graph_impl != "none":
-            assert self.transformer.use_te_rng_tracker, (
-                "Transformer engine's RNG tracker is required for cudagraphs, it can be "
-                "enabled with use_te_rng_tracker=True'."
-            )
-
+    def validate(self) -> None:
+        """Check model layout without mutation or runtime-derived RNG settings."""
         vp_size = self.transformer.virtual_pipeline_model_parallel_size
         is_pipeline_asymmetric = (
             self.transformer.account_for_embedding_in_pipeline_split
@@ -253,6 +273,14 @@ class GPTModelConfig(ModelConfig):
             ) % vp_size == 0, (
                 "Make sure the number of model chunks is the same across all pipeline stages."
             )
+
+    def finalize(self) -> None:
+        """Finalize nested model settings after the run has propagated its RNG policy."""
+        if hasattr(self.transformer, "finalize") and callable(self.transformer.finalize):
+            self.transformer.finalize()
+
+        # Standalone model finalization retains the same layout checks as container startup.
+        self.validate()
 
 
 class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
@@ -316,7 +344,12 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         else:
             padded_vocab_size = self._model_config.vocab_size
 
-        mtp_spec = mtp_block_spec(self._model_config, transformer_layer_spec, vp_stage=vp_stage)
+        mtp_spec = mtp_block_spec(
+            self._model_config,
+            transformer_layer_spec,
+            vp_stage=vp_stage,
+            pp_rank=pg_collection.pp.rank(),
+        )
 
         # override spec with local backend if configured
         if self._model_config.attention_backend == AttnBackend.local:
@@ -343,6 +376,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             vocab_size=padded_vocab_size,
             max_sequence_length=self._model_config.seq_length,
             fp16_lm_cross_entropy=self._model_config.fp16_lm_cross_entropy,
+            logit_dtype=self._model_config.logit_dtype,
             parallel_output=self._model_config.parallel_output,
             share_embeddings_and_output_weights=self._model_config.share_embeddings_and_output_weights,
             position_embedding_type=self._model_config.position_embedding_type,
@@ -374,6 +408,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
         ) = Float16Module,
         model_type: ModelType = ModelType.encoder_or_decoder,
         use_layer_wise_distributed_optimizer: bool = False,
+        use_layer_wise_param_layout: bool | None = None,
     ) -> list[GPTModel]:
         """Build model stages and wrap for distributed training.
 
@@ -390,6 +425,11 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             model_type: Deprecated flag, only used for backwards compatibility.
             use_layer_wise_distributed_optimizer: Whether DDP should route and lay out
                 parameters for the layer-wise distributed optimizer.
+            use_layer_wise_param_layout: Optional LayerWise layout request kept for API
+                parity with main's ModelBuilder path. ``ddp_config.use_layer_wise_param_layout``
+                is the single layout source (True: padded, False: compact). ``None`` defers to
+                it; with DDP and the layer-wise distributed optimizer, an explicit value that
+                disagrees with it raises ``ValueError``.
 
         Returns:
             List of model stages.
@@ -410,6 +450,7 @@ class GPTModelBuilder(ModelBuilder[GPTModel, GPTModelConfig]):
             composed_pre_wrap_hook,
             model_type,
             use_layer_wise_distributed_optimizer=use_layer_wise_distributed_optimizer,
+            use_layer_wise_param_layout=use_layer_wise_param_layout,
         )
 
         composed_post_wrap_hook = compose_hooks(self._model_config.post_wrap_hooks)
@@ -426,13 +467,15 @@ def mtp_block_spec(
     config: "GPTModelConfig",
     transformer_layer_spec: ModuleSpec | TransformerBlockSubmodules,
     vp_stage: int | None = None,
+    pp_rank: int | None = None,
 ) -> ModuleSpec | None:
     """Create MTP block spec if model has MTP layers.
 
     Args:
-        config: Full model configuration.
-        transformer_layer_spec: Resolved decoder layer or block specification.
-        vp_stage: Optional virtual-pipeline stage.
+        config: full model config
+        transformer_layer_spec: resolved decoder layer or block specification
+        vp_stage: virtual pipeline stage
+        pp_rank: pipeline rank from the model process group
 
     Returns:
         ModuleSpec: The MTP module specification
@@ -445,6 +488,7 @@ def mtp_block_spec(
 
         if isinstance(transformer_layer_spec, TransformerBlockSubmodules):
             if transformer_layer_spec.layer_specs:
+                # Reuse the resolved spec: the generic decoder builder rejects experimental attention.
                 spec = transformer_layer_spec.layer_specs[-1]
             else:
                 # A pipeline stage with no decoder layers still needs a decoder spec for MTP.
@@ -453,7 +497,7 @@ def mtp_block_spec(
             spec = transformer_layer_spec
 
         return get_gpt_mtp_block_spec(
-            transformer_cfg, spec, use_transformer_engine=use_te, vp_stage=vp_stage
+            transformer_cfg, spec, use_transformer_engine=use_te, vp_stage=vp_stage, pp_rank=pp_rank
         )
     else:
         return None

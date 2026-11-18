@@ -13,7 +13,9 @@ spec:
   script_setup: |
     set -euo pipefail
     unset https_proxy
-    echo "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" | tee -a /root/.netrc
+    umask 077
+    printf '%s\n' "machine gitlab-master.nvidia.com login okoenig password $RO_API_TOKEN" >> "$HOME/.netrc"
+    trap 'rm -f "$HOME/.netrc"; unset RO_API_TOKEN' EXIT
 
     # Checkout latest
     cd /opt
@@ -34,13 +36,16 @@ spec:
     git checkout $MCORE_BACKWARDS_COMMIT
     git rev-parse HEAD
     rm -rf megatron; cp -a /opt/megatron-lm/megatron ./
+    rm -f "$HOME/.netrc"
+    unset RO_API_TOKEN
   script: |-
+    rm -f "${{HOME}}/.netrc"
+    unset RO_API_TOKEN
     set -euo pipefail
     : "${{RUN_ID:=pr-$$}}"
     ls
     cd /opt/megatron-lm
 
-    NAME=$(echo {test_case}_{environment} | sed 's/dgx_gb200/dgx_a100/g')
     export GPUS_PER_NODE={gpus}
 
     ARGUMENTS=(
@@ -61,10 +66,16 @@ spec:
     bash ./tests/functional_tests/shell_test_utils/run_ci_test.sh ${{ARGUMENTS[@]}}
 
 products:
-  - test_case: [deepseek_proxy_fsdp_ep2_fsdp2_1node]
+  # Per-token loss normalization with EP=2 and four accumulated microbatches.
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_mb4_per_token_loss_1node]
     products:
       - environment: [dev]
-        scope: [mr-github, mr-github-slim]
+        scope: [mr, mr-github]
+        platforms: [dgx_gb200]
+  - test_case: [deepseek_proxy_mfsdp_v1_ep2_1node]
+    products:
+      - environment: [dev]
+        scope: [nightly]
         platforms: [dgx_gb200]
   - test_case: [gpt3_moe_mcore_te_ep8_resume_torch_dist_muon_1node]
     products:
@@ -132,4 +143,20 @@ products:
     products:
       - environment: [dev]
         scope: [mr-github-temp-disabled]
+        platforms: [dgx_gb200]
+
+  #######################################################################
+  # MFSDP v2 + EP2 bf16, full-iteration CUDA graph incl. optimizer.step #
+  #######################################################################
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_bf16_cg_optim_1node]
+    products:
+      - environment: [dev]
+        scope: [mr]
+        platforms: [dgx_gb200]
+
+  # MFSDP v2 + EP2 with MXFP8 compute and parameter gather.
+  - test_case: [deepseek_proxy_mfsdp_v2_ep2_mxfp8_1node]
+    products:
+      - environment: [dev]
+        scope: [mr]
         platforms: [dgx_gb200]
