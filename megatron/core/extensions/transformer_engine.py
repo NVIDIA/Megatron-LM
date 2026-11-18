@@ -29,15 +29,17 @@ from megatron.core.model_parallel_config import ModelParallelConfig
 from megatron.core.ops.norm.torch_norm import LayerNormInterface
 from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.parallel_state import (
+    TeardownStage,
     get_amax_reduction_group,
     get_context_parallel_group,
     get_hierarchical_context_parallel_groups,
     get_tensor_model_parallel_group,
-    get_tensor_model_parallel_world_size,
     model_parallel_is_initialized,
+    register_model_parallel_teardown,
 )
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
+    amax_reduction_group,
     resolve_gtp_remat_group,
     warn_global_process_group_fallback,
 )
@@ -119,6 +121,38 @@ HAVE_TE_GDN = _TE_LINEAR_ATTENTION is not None
 
 _TE_CONFIG_TYPE_KEY = "transformer_engine_config_type"
 _EXPERT_PARAMETER_NAME_PATTERN = re.compile(r"(weight|bias)\d*")
+
+
+def _te_autocast_depth() -> int:
+    """Return the nesting depth of Transformer Engine autocast contexts."""
+    if is_te_min_version("2.15.0"):
+        return FP8GlobalStateManager.quantization_state.autocast_depth
+    if is_te_min_version("2.9.0"):
+        return FP8GlobalStateManager.AUTOCAST_DEPTH
+    return FP8GlobalStateManager.FP8_AUTOCAST_DEPTH
+
+
+def _check_te_autocast_exited() -> None:
+    """Refuse model-parallel teardown inside a Transformer Engine autocast context.
+
+    On exit, an open context can reduce FP8 scaling statistics over its process group,
+    which teardown destroys, and it reads the global state that teardown resets. A
+    negative depth is accepted: in-process restart with NVIDIA Resiliency Extension
+    resets TE before the interrupted main thread unwinds its autocast, whose exit then
+    decrements the reset depth below zero.
+    """
+    if _te_autocast_depth() > 0:
+        raise RuntimeError("Exit Transformer Engine autocast before destroying model parallelism.")
+
+
+def _reset_te_global_state() -> None:
+    """Drop TE's FP8 reduction groups and per-model tensor caches."""
+    FP8GlobalStateManager.reset()
+
+
+if HAVE_TE:
+    register_model_parallel_teardown(TeardownStage.VALIDATE, _check_te_autocast_exited)
+    register_model_parallel_teardown(TeardownStage.RESET_STATE, _reset_te_global_state)
 
 
 def mark_grouped_tensor(*tensors: torch.Tensor | None) -> None:
@@ -424,7 +458,18 @@ def _get_fp8_model_init_for_quant_params(qparams: TEQuantizationParams | None, t
     return _get_fp8_model_init_for_quant_recipe(qrecipe)
 
 
-def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
+def _get_fp8_autocast_for_quant_recipe(
+    qrecipe: TEQuantizationRecipe, *, pg_collection: Optional[ProcessGroupCollection] = None
+):
+    """Return the autocast context that applies a per-module quantization recipe.
+
+    Args:
+        qrecipe: Recipe of the module.
+        pg_collection: Process groups of the model that owns the module. A quantized autocast
+            reduces amaxes over ``amax_reduction_group(pg_collection, qrecipe.tp_only_amax_red)``.
+            When omitted, it uses the global amax reduction group of ``parallel_state`` if model
+            parallelism is initialized, and passes no group otherwise.
+    """
     if FP8GlobalStateManager.is_fp8_enabled():
         if not qrecipe.override_quantized_autocast:
             return nullcontext()
@@ -436,11 +481,14 @@ def _get_fp8_autocast_for_quant_recipe(qrecipe: TEQuantizationRecipe):
         # Force BF16 for this layer and override autocast
         return fp8_autocast(enabled=False)
     else:
-        amax_group = None
-        if model_parallel_is_initialized():
+        if pg_collection is not None:
+            amax_group = amax_reduction_group(pg_collection, qrecipe.tp_only_amax_red)
+        elif model_parallel_is_initialized():
             amax_group = get_amax_reduction_group(
                 with_context_parallel=True, tp_only_amax_red=qrecipe.tp_only_amax_red
             )
+        else:
+            amax_group = None
         if (
             qrecipe.fp8_quantization_recipe == Fp8Recipe.custom
             or qrecipe.fp4_quantization_recipe == Fp4Recipe.custom
@@ -499,9 +547,24 @@ def _get_fp8_autocast_recipe_for_quant_params(
     return recipe if recipe.override_nonquantized_autocast else None
 
 
-def _get_fp8_autocast_for_quant_params(qparams: TEQuantizationParams | None, training: bool):
+def _get_fp8_autocast_for_quant_params(
+    qparams: TEQuantizationParams | None,
+    training: bool,
+    *,
+    pg_collection: Optional[ProcessGroupCollection] = None,
+):
+    """Return the autocast context for the training or evaluation recipe in ``qparams``.
+
+    Args:
+        qparams: Per-module quantization parameters, or None if the module has none.
+        training: Whether the module is in training mode.
+        pg_collection: Process groups of the model that owns the module; see
+            ``_get_fp8_autocast_for_quant_recipe``.
+    """
     recipe = _get_fp8_autocast_recipe_for_quant_params(qparams, training)
-    return nullcontext() if recipe is None else _get_fp8_autocast_for_quant_recipe(recipe)
+    if recipe is None:
+        return nullcontext()
+    return _get_fp8_autocast_for_quant_recipe(recipe, pg_collection=pg_collection)
 
 
 def _get_should_context_be_quantized_recipe(
@@ -1018,14 +1081,20 @@ if HAVE_TE and is_te_min_version("1.13.0"):
                 f"{', '.join(missing_attrs)}."
             )
 
-    def _get_te_ops_tensor_parallel_context() -> (
-        Tuple[int, Optional[torch.distributed.ProcessGroup]]
-    ):
-        """Return tensor-parallel world size and group for TE ops."""
-        tp_world_size = get_tensor_model_parallel_world_size()
-        tp_group = None
-        if tp_world_size > 1:
-            tp_group = get_tensor_model_parallel_group()
+    def _get_te_ops_tensor_parallel_context(
+        tp_group: Optional[torch.distributed.ProcessGroup],
+    ) -> Tuple[int, Optional[torch.distributed.ProcessGroup]]:
+        """Return tensor-parallel world size and group for TE ops.
+
+        Args:
+            tp_group: Tensor-parallel group of the module that the TE ops implement.
+
+        Returns:
+            The size of ``tp_group``, and ``tp_group`` if that size is greater than 1, else None.
+        """
+        tp_world_size = get_pg_size(tp_group)
+        if tp_world_size == 1:
+            tp_group = None
         return tp_world_size, tp_group
 
     def _get_te_ops_rng_state_tracker_function() -> Optional[Callable]:
@@ -1331,10 +1400,19 @@ class TELinear(te.pytorch.Linear):
         name: str | None = None,
         gtp_remat_group: Optional[torch.distributed.ProcessGroup] = None,
         gtp_replica_group: Optional[torch.distributed.ProcessGroup] = None,
+        pg_collection: Optional[ProcessGroupCollection] = None,
     ):
         """
         Args:
+            tp_group (Optional[torch.distributed.ProcessGroup]): tensor-parallel group of the
+                module that owns this layer. In "column" and "row" mode the weight is sharded
+                over it. In "duplicated" mode every rank of the group holds the full weight,
+                Transformer Engine runs the layer without TP communication, and the group only
+                sets the weight's checkpoint replica id. None falls back to the global group.
             name (str | None): module instance name passed top-down from its paranet module
+            pg_collection (ProcessGroupCollection | None): process groups of the model that owns
+                this layer. A per-module quantization recipe reduces amaxes over its amax
+                reduction group. Falls back to the MPU global process groups when not given.
         """
         if not HAVE_TE:
             raise ImportError(
@@ -1343,6 +1421,7 @@ class TELinear(te.pytorch.Linear):
             )
 
         self.config = config
+        self._pg_collection = pg_collection
 
         # TE returns a zero length Tensor when bias=False and
         # return_bias=True, but we prefer None.  So in that case we
@@ -1420,7 +1499,6 @@ class TELinear(te.pytorch.Linear):
             ), "Must have at least TE version 2.3 or higher to use symmetric memory all reduce"
             extra_kwargs["symmetric_ar_type"] = symmetric_ar_type
         if parallel_mode == "duplicated":
-            assert tp_group is None, "duplicated linear should not have tp_group set"
             tp_size = 1
         else:
             tp_size = get_pg_size(tp_group)
@@ -1531,7 +1609,9 @@ class TELinear(te.pytorch.Linear):
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Forward."""
         _is_first_microbatch = _resolve_is_first_microbatch(self)
-        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+        quant_context = _get_fp8_autocast_for_quant_params(
+            self.te_quant_params, self.training, pg_collection=self._pg_collection
+        )
 
         with quant_context:
             out = super().forward(x, is_first_microbatch=_is_first_microbatch)
@@ -1603,6 +1683,7 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
             )
 
         self.config = config
+        self._pg_collection = pg_collection
 
         if gather_output:
             raise ValueError("Transformer Engine linear layers do not support gather_output = True")
@@ -1783,7 +1864,9 @@ class TELayerNormColumnParallelLinear(te.pytorch.LayerNormLinear):
     def forward(self, x):
         """Forward."""
         _is_first_microbatch = _resolve_is_first_microbatch(self)
-        quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+        quant_context = _get_fp8_autocast_for_quant_params(
+            self.te_quant_params, self.training, pg_collection=self._pg_collection
+        )
 
         # FP32 residual connections pass the FP32 residual stream into this fused module, but
         # TE LayerNormLinear requires its input dtype to match its BF16/FP16 parameters outside
@@ -1901,6 +1984,7 @@ class TEColumnParallelLinear(TELinear):
             name=name,
             gtp_remat_group=gtp_remat_group,
             gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
+            pg_collection=pg_collection,
         )
 
         # Set proper partition_stride
@@ -2110,7 +2194,7 @@ class TELMHeadColumnParallelLinear(TEColumnParallelLinear):
                 ),
             )
         else:
-            lm_head_context = get_fp8_context(self.config)
+            lm_head_context = get_fp8_context(self.config, pg_collection=self._pg_collection)
         with lm_head_context:
             torch.cuda.nvtx.range_push("mxfp8_output_proj_telinear")
             try:
@@ -2189,6 +2273,7 @@ class TERowParallelLinear(TELinear):
             name=name,
             gtp_remat_group=gtp_remat_group,
             gtp_replica_group=getattr(pg_collection, "expt_dp" if is_expert else "dp_cp", None),
+            pg_collection=pg_collection,
         )
         if config.use_cpu_initialization:
             world_size = get_pg_size(tp_group)
@@ -2353,9 +2438,11 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
     """Wrapper for the Transformer-Engine's `DotProductAttention` layer
     that also has "flash attention" enabled.
 
-    Note that if Megatron's parallel_state has not been initialized yet, the
-    tp_group and cp_group passed to TE will be None and must be set later
-    via set_tensor_parallel_group() and set_context_parallel_group().
+    Note that if no pg_collection is passed and Megatron's parallel_state has
+    not been initialized yet, the tp_group and cp_group passed to TE will be
+    None and must be set later via set_tensor_parallel_group() and
+    set_context_parallel_group(). A pg_collection that is passed must hold the
+    context-parallel group when context_parallel_size > 1.
     """
 
     cp_stream: torch.cuda.Stream = None
@@ -2409,6 +2496,7 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
                 f"num_attention_heads ({self.config.num_attention_heads}))"
             )
 
+        used_global_fallback = pg_collection is None
         if pg_collection is None:
             warn_global_process_group_fallback(type(self).__name__)
             pg_collection = ProcessGroupCollection(
@@ -2439,6 +2527,15 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         # This check is important as CP config can be disabled while having a valid CP group
         # Example - Disabling CP for encoder while a valid CP group exists for decoder
         if self.config.context_parallel_size > 1:
+            # torch.distributed resolves a None group to the default group, so the ranks of the
+            # whole job would become the context-parallel ranks. The deprecated fallback keeps
+            # the None group of an uninitialized parallel_state, which the caller sets later
+            # through set_context_parallel_group().
+            if pg_collection.cp is None and not used_global_fallback:
+                raise ValueError(
+                    "TEDotProductAttention with context_parallel_size > 1 requires a "
+                    "context-parallel group in pg_collection.cp"
+                )
             assert is_te_min_version(
                 "1.0.0"
             ), "Only Transformer-Engine version >= 1.0.0 supports context parallelism!"
@@ -3123,7 +3220,9 @@ if HAVE_TE and is_te_min_version("1.9.0.dev0"):
                 _is_first_microbatch = None
             else:
                 _is_first_microbatch = _resolve_is_first_microbatch(self)
-            quant_context = _get_fp8_autocast_for_quant_params(self.te_quant_params, self.training)
+            quant_context = _get_fp8_autocast_for_quant_params(
+                self.te_quant_params, self.training, pg_collection=self._pg_collection
+            )
 
             with quant_context:
                 out = super().forward(x, m_splits, is_first_microbatch=_is_first_microbatch)
@@ -3437,7 +3536,8 @@ if HAVE_TE and is_te_min_version("1.13.0"):
             # Container for fusible ops
             fused_impl = te.pytorch.ops.Sequential()
 
-            tp_world_size, tp_group = _get_te_ops_tensor_parallel_context()
+            # The ops alias FC1's and FC2's weights, which MLP shards over self.tp_group.
+            tp_world_size, tp_group = _get_te_ops_tensor_parallel_context(self.tp_group)
             rng_state_tracker_function = _get_te_ops_rng_state_tracker_function()
 
             # Check submodule types
@@ -3598,7 +3698,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         def _make_fused_impl(self) -> te.pytorch.ops.Sequential:
             """Construct fused module with GroupedLinear(num_groups=1) + ScaledSwiGLU."""
 
-            tp_world_size = get_tensor_model_parallel_world_size()
+            tp_world_size = get_pg_size(self.tp_group)
             if tp_world_size > 1:
                 return super()._make_fused_impl()
 
@@ -3703,7 +3803,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         ) -> None:
             """Register hook forwarding for the grouped and normalization boundaries."""
 
-            if get_tensor_model_parallel_world_size() > 1:
+            if get_pg_size(self.tp_group) > 1:
                 super()._register_hooks_on_fused_impl(
                     fused_impl, pre_forward_submodules=pre_forward_submodules
                 )
@@ -3732,7 +3832,7 @@ if HAVE_TE and is_te_min_version("1.13.0"):
         def forward(self, hidden_states: torch.Tensor, **kwargs) -> Tuple[Tensor, Optional[Tensor]]:
             """Forward pass using GroupedLinear(num_groups=1) + ScaledSwiGLU."""
 
-            if get_tensor_model_parallel_world_size() > 1:
+            if get_pg_size(self.tp_group) > 1:
                 return super().forward(hidden_states, **kwargs)
 
             orig_shape = hidden_states.shape

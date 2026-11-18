@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.training.distillation import logits_saver
 from megatron.training.distillation import utils as distillation_utils
 from megatron.training.distillation.logits_saver import LogitsSaverHooks
@@ -166,19 +167,12 @@ def test_buffered_payload_rejects_mixed_none_and_present_cu_seqlens(monkeypatch)
 # ---------------------------------------------------------------------------
 
 
+def _fake_group(size):
+    return SimpleNamespace(rank=lambda: 0, size=lambda: size)
+
+
 def _patch_init_deps(monkeypatch, *, cp_size, sft):
-    fake_ps = SimpleNamespace(
-        get_tensor_model_parallel_rank=lambda: 0,
-        get_tensor_model_parallel_world_size=lambda: 1,
-        get_tensor_model_parallel_group=lambda: None,
-        get_context_parallel_rank=lambda: 0,
-        get_context_parallel_world_size=lambda: cp_size,
-        get_context_parallel_group=lambda: None,
-        get_data_parallel_rank=lambda: 0,
-        get_data_parallel_world_size=lambda: 1,
-        get_tensor_model_parallel_src_rank=lambda: 0,
-    )
-    monkeypatch.setattr(logits_saver, "parallel_state", fake_ps)
+    """Patch the saver's run-state dependencies and return the model's process groups."""
     monkeypatch.setattr(logits_saver.dist, "get_global_rank", lambda group, rank: 0)
 
     args = SimpleNamespace(
@@ -196,33 +190,39 @@ def _patch_init_deps(monkeypatch, *, cp_size, sft):
     monkeypatch.setattr(distillation_utils, "get_args", lambda: args)
     monkeypatch.setattr(logits_saver, "compute_dataset_hash", lambda: ("hash", {}))
     monkeypatch.setattr(logits_saver, "storage_makedirs", lambda *a, **k: None)
+    return ProcessGroupCollection(
+        tp=_fake_group(1),
+        cp=_fake_group(cp_size),
+        dp_gtp_remat=_fake_group(1),
+        tp_dp_cp=_fake_group(1),
+    )
 
 
 def test_init_prints_cp_compatibility_note_for_packed_cp_gt_1(tmp_path, monkeypatch):
-    _patch_init_deps(monkeypatch, cp_size=4, sft=True)
+    pg_collection = _patch_init_deps(monkeypatch, cp_size=4, sft=True)
     messages = []
     monkeypatch.setattr(logits_saver, "print_rank_last", messages.append)
 
-    LogitsSaverHooks(save_dir=str(tmp_path), k=4)
+    LogitsSaverHooks(save_dir=str(tmp_path), k=4, pg_collection=pg_collection)
 
     assert any("context-parallel size 4" in m for m in messages)
 
 
 def test_init_no_note_when_cp_size_one(tmp_path, monkeypatch):
-    _patch_init_deps(monkeypatch, cp_size=1, sft=True)
+    pg_collection = _patch_init_deps(monkeypatch, cp_size=1, sft=True)
     messages = []
     monkeypatch.setattr(logits_saver, "print_rank_last", messages.append)
 
-    LogitsSaverHooks(save_dir=str(tmp_path), k=4)
+    LogitsSaverHooks(save_dir=str(tmp_path), k=4, pg_collection=pg_collection)
 
     assert not any("context-parallel" in m for m in messages)
 
 
 def test_init_no_note_when_not_packed(tmp_path, monkeypatch):
-    _patch_init_deps(monkeypatch, cp_size=4, sft=False)
+    pg_collection = _patch_init_deps(monkeypatch, cp_size=4, sft=False)
     messages = []
     monkeypatch.setattr(logits_saver, "print_rank_last", messages.append)
 
-    LogitsSaverHooks(save_dir=str(tmp_path), k=4)
+    LogitsSaverHooks(save_dir=str(tmp_path), k=4, pg_collection=pg_collection)
 
     assert not any("context-parallel" in m for m in messages)
