@@ -24,6 +24,8 @@ from megatron.core.models.multimodal.context_parallel import (
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import (
     ProcessGroupCollection,
+    ProcessGroupFallbackWarning,
+    resolve_process_groups,
     warn_global_process_group_fallback,
 )
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
@@ -77,6 +79,103 @@ def test_fallback_warning_is_emitted_once_per_owner():
         warn_global_process_group_fallback("Owner", "cp_group")
     with pytest.warns(FutureWarning, match="OtherOwner was called without `pg_collection`"):
         warn_global_process_group_fallback("OtherOwner")
+
+
+def test_fallback_warning_is_a_future_warning():
+    # Filters and tests written for FutureWarning keep matching the fallback warning.
+    with pytest.warns(FutureWarning) as record:
+        warn_global_process_group_fallback("Owner")
+    assert _fallback_warning(record, "Owner").category is ProcessGroupFallbackWarning
+
+
+def test_fallback_warning_carries_the_versions_of_the_call():
+    with pytest.warns(ProcessGroupFallbackWarning) as record:
+        warn_global_process_group_fallback(
+            "Owner", "tp_group", deprecated_in="0.22", removed_in="0.24"
+        )
+    message = str(_fallback_warning(record, "Owner", "tp_group").message)
+    assert "deprecated since Megatron Core 0.22 and will be removed in 0.24" in message
+
+
+def test_each_omitted_argument_of_an_owner_warns_once():
+    with pytest.warns(ProcessGroupFallbackWarning) as record:
+        for _ in range(2):
+            warn_global_process_group_fallback("Owner", "tp_group")
+            warn_global_process_group_fallback("Owner", "cp_group")
+    _fallback_warning(record, "Owner", "tp_group")
+    _fallback_warning(record, "Owner", "cp_group")
+
+
+def test_warning_hook_that_reaches_the_same_fallback_does_not_recurse():
+    shown = []
+
+    def showwarning(message, category, *args, **kwargs):
+        shown.append(str(message))
+        # For example, a logging hook whose code builds a component that falls back too.
+        warn_global_process_group_fallback("Owner")
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("always")
+        warnings.showwarning = showwarning
+        warn_global_process_group_fallback("Owner")
+        warn_global_process_group_fallback("Owner")
+    assert len(shown) == 1
+    assert "Owner was called without `pg_collection`" in shown[0]
+
+
+def test_strict_mode_turns_every_fallback_into_an_error():
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        warnings.simplefilter("error", ProcessGroupFallbackWarning)
+        warnings.warn("an unrelated FutureWarning", FutureWarning)
+        # A fallback that raised is not recorded as warned, so the next one raises too.
+        for _ in range(2):
+            with pytest.raises(ProcessGroupFallbackWarning, match="Owner was called without"):
+                warn_global_process_group_fallback("Owner")
+    assert [str(w.message) for w in record] == ["an unrelated FutureWarning"]
+
+
+def _forbid_global_collection(monkeypatch):
+    def forbid(*args, **kwargs):
+        raise AssertionError("resolve_process_groups read the global grid")
+
+    monkeypatch.setattr(ProcessGroupCollection, "use_mpu_process_groups", forbid)
+
+
+def test_resolve_returns_an_explicit_collection_without_warning(monkeypatch):
+    _forbid_global_collection(monkeypatch)
+    # An explicit None marks an axis that is off, so it satisfies the requirement.
+    pg_collection = ProcessGroupCollection(tp=object(), embd=None)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        resolved = resolve_process_groups(pg_collection, owner="Owner", required=("tp", "embd"))
+    assert resolved is pg_collection
+
+
+def test_resolve_rejects_a_single_name_before_falling_back(monkeypatch):
+    _forbid_global_collection(monkeypatch)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        with pytest.raises(TypeError, match=r"\('tp',\), not the string 'tp'"):
+            resolve_process_groups(None, owner="Owner", required="tp")
+
+
+def test_resolve_requires_every_field_of_an_explicit_collection(monkeypatch):
+    _forbid_global_collection(monkeypatch)
+    with pytest.raises(ValueError, match="Owner requires pg_collection to set pp, embd"):
+        resolve_process_groups(
+            ProcessGroupCollection(tp=object()), owner="Owner", required=("tp", "pp", "embd")
+        )
+
+
+def test_resolve_in_strict_mode_raises_before_reading_the_global_grid(monkeypatch):
+    _forbid_global_collection(monkeypatch)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", ProcessGroupFallbackWarning)
+        with pytest.raises(
+            ProcessGroupFallbackWarning, match="Owner was called without `tp_group`"
+        ):
+            resolve_process_groups(None, owner="Owner", required=("tp",), argument="tp_group")
 
 
 def test_mtp_placement_without_mtp_layers_needs_no_pp_group():
@@ -189,6 +288,11 @@ class TestGlobalProcessGroupFallbacks:
         _fallback_warning(record, "TEDotProductAttention")
         assert attention.tp_group is None
         assert attention.core_attention._tp_group is None
+        # The linears are handed no collection either. With the fallback's all-None collection
+        # a per-module FP8/FP4 recipe would raise for its missing amax group at forward time,
+        # instead of using the global group once model parallelism is initialized.
+        assert attention.linear_qkv._pg_collection is None
+        assert attention.linear_proj._pg_collection is None
 
         # An explicit collection without a TP group is still rejected.
         with pytest.raises(ValueError, match="non-None tp process group"):
@@ -429,6 +533,29 @@ class TestGlobalProcessGroupFallbacks:
             assert groups["dp_gtp_remat"] is parallel_state.get_data_parallel_group()
             assert groups["dp"] is parallel_state.get_data_parallel_group(with_gtp_remat=False)
             assert attention._realtime_test_dp_group() is groups["dp_gtp_remat"]
+
+    @pytest.mark.skipif(
+        Utils.world_size % 4 != 0, reason="four pipeline stages need a multiple of four ranks"
+    )
+    def test_resolve_without_collection_warns_and_uses_global_groups(self):
+        # With four pipeline stages, the middle stages are not in the embedding group.
+        Utils.initialize_model_parallel(pipeline_model_parallel_size=4)
+        with pytest.warns(ProcessGroupFallbackWarning) as record:
+            pg_collection = resolve_process_groups(
+                None,
+                owner="Owner",
+                required=("pp", "embd"),
+                deprecated_in="0.22",
+                removed_in="0.24",
+            )
+        message = str(_fallback_warning(record, "Owner").message)
+        assert "since Megatron Core 0.22 and will be removed in 0.24" in message
+        # Only the required fields are built, and a non-member's embd is an explicit None.
+        assert set(vars(pg_collection)) == {"pp", "embd"}
+        assert pg_collection.pp is parallel_state.get_pipeline_model_parallel_group()
+        assert pg_collection.embd is parallel_state.get_embedding_group(check_initialized=False)
+        middle_stage = parallel_state.get_pipeline_model_parallel_rank() in (1, 2)
+        assert (pg_collection.embd is None) == middle_stage
 
     def test_mtp_placement_without_pp_group_uses_global_group(self):
         Utils.initialize_model_parallel(pipeline_model_parallel_size=2)
