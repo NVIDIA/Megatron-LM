@@ -740,6 +740,9 @@ def test_config_tables():
         knobs = backward_kernel.get_backward_knobs(m, h, 3, readers)
         assert knobs.TARGET_CTAS == {3072: 456, 4096: 448, 10240: 440}[h]
         assert knobs.EARLY_CARRY == (h == 4096 and readers == 1)
+        bf16 = backward_kernel.get_backward_knobs(m, h, 3, readers, bf16=True)
+        four = {3072: 600, 4096: 608, 10240: 600}[h] if readers == 1 else knobs.TARGET_CTAS
+        assert (bf16.TARGET_CTAS, bf16.MAXNREG) == (four, 128 if readers == 1 else 168)
         outputs = formats(readers, mxfp8)
         for rows in (2048, m, m + 1024, 65536):
             assert choose(rows, h, 3, readers, outputs=outputs) is table[h, readers, mxfp8]
