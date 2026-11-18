@@ -18,6 +18,7 @@ from megatron.core.ops.loss.vocab_sum import batch_invariant_vocab_sum
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel import mappings
 from megatron.core.tensor_parallel.gtp_api import HAVE_GTP
+from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.custom_layers.batch_invariant_kernels import set_batch_invariant_mode
 from megatron.core.transformer.enums import AttnBackend
 from megatron.core.transformer.transformer_config import TransformerConfig
@@ -97,6 +98,7 @@ class TestOrderedReduceKernels:
             pytest.skip("GTP requires TransformerEngine >= 2.19")
 
         Utils.initialize_model_parallel(2, 1, gtp_remat_size=2)
+        model_parallel_cuda_manual_seed(123)
         self._tp = 2
         groups = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "gtp_remat"])
         monkeypatch.setattr(gtp.GTP_CONFIG, "calculate_per_token_loss", True)
@@ -109,7 +111,7 @@ class TestOrderedReduceKernels:
             sequence_parallel=sequence_parallel,
             params_dtype=torch.bfloat16,
             batch_invariant_mode=True,
-            batch_invariant_tp_shards=4,
+            batch_invariant_peer_tp_size=4,
             gradient_accumulation_fusion=fused_wgrad,
             attention_backend=AttnBackend.flash,
             flash_attention_version=4,

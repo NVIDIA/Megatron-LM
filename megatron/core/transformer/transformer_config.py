@@ -1549,19 +1549,12 @@ class TransformerConfig(ModelParallelConfig):
     at large NVLink domains; software paths that must match it bitwise should
     accumulate in fp64."""
 
-    batch_invariant_tp_shards: Optional[int] = None
-    """Under batch_invariant_mode, make the forward bits of every row-parallel (non-expert)
-    linear independent of tensor_model_parallel_size. The reduction dimension is split into
-    this many fixed shards; each shard's GEMM output is one partial, and the partials are
-    summed in shard order (fp32 accumulator, one rounding; see
-    ops/linear/ordered.py). Any TP size that divides this value then gives the
-    same bits, so training and inference can use different TP sizes. At TP equal to this
-    value each rank owns one shard and the reduction is the ordered TP reduction; at a
-    smaller TP each rank computes its shards in one batched GEMM and sends one partial per
-    shard (BF16; see __post_init__ for the options not supported there yet); the backward is
-    the stock row-parallel one. The native vocab-parallel cross entropy sums its softmax
-    denominator over the same number of fixed vocab shards. None (default) keeps the
-    reductions tied to the TP size."""
+    batch_invariant_peer_tp_size: Optional[int] = None
+    """The other model's tensor-parallel size when matching training and inference forward
+    bits under batch_invariant_mode. Set this to inference TP on the trainer and training
+    TP on inference. Row-parallel linears and native vocab-parallel cross entropy use a
+    common reduction partition derived from both TP sizes. Both models must use the same
+    padded vocabulary. None keeps reductions tied to this model's TP size."""
 
     moe_ep_invariant_combine: bool = False
     """Under batch_invariant_mode, combine each token's expert outputs over one fixed fp32
@@ -1913,6 +1906,13 @@ class TransformerConfig(ModelParallelConfig):
                 "Sequence-parallel CP layout conversion requires an even "
                 f"tensor-parallel size, got {self.tensor_model_parallel_size}."
             )
+
+    @property
+    def batch_invariant_tp_shards(self) -> Optional[int]:
+        """Common reduction partition for this model and its batch-invariant peer."""
+        if self.batch_invariant_peer_tp_size is None:
+            return None
+        return math.lcm(self.tensor_model_parallel_size, self.batch_invariant_peer_tp_size)
 
     def __post_init__(self):
         """Python dataclass method that is used to modify attributes after initialization.
@@ -4984,19 +4984,18 @@ class TransformerConfig(ModelParallelConfig):
                 f"{self.flash_attention_version}"
             )
 
-        if self.batch_invariant_tp_shards is not None:
+        if self.batch_invariant_peer_tp_size is not None:
             assert (
                 self.batch_invariant_mode
-            ), "batch_invariant_tp_shards requires batch_invariant_mode"
-            assert self.batch_invariant_tp_shards >= 1 and (
-                self.batch_invariant_tp_shards % self.tensor_model_parallel_size == 0
-            ), (
-                f"batch_invariant_tp_shards ({self.batch_invariant_tp_shards}) must be a multiple "
-                f"of tensor_model_parallel_size ({self.tensor_model_parallel_size})"
-            )
+            ), "batch_invariant_peer_tp_size requires batch_invariant_mode"
+            assert (
+                isinstance(self.batch_invariant_peer_tp_size, int)
+                and not isinstance(self.batch_invariant_peer_tp_size, bool)
+                and self.batch_invariant_peer_tp_size > 0
+            ), "batch_invariant_peer_tp_size must be a positive integer"
             if self.cross_entropy_loss_fusion and self.cross_entropy_fusion_impl == "te":
                 raise ValueError(
-                    "batch_invariant_tp_shards needs the native cross entropy: TE's fused "
+                    "batch_invariant_peer_tp_size needs the native cross entropy: TE's fused "
                     "cross entropy sums each rank's vocab slice, which depends on the TP size."
                 )
             if self.batch_invariant_tp_shards > self.tensor_model_parallel_size:
@@ -5017,7 +5016,7 @@ class TransformerConfig(ModelParallelConfig):
                 names = sorted(name for name, enabled in unsupported.items() if enabled)
                 if names:
                     raise ValueError(
-                        f"batch_invariant_tp_shards ({self.batch_invariant_tp_shards}) above "
+                        f"Matching peer TP {self.batch_invariant_peer_tp_size} from "
                         f"tensor_model_parallel_size ({self.tensor_model_parallel_size}) is not "
                         f"supported with {', '.join(names)} yet."
                     )

@@ -1245,7 +1245,7 @@ def test_te_row_parallel_linear_batch_invariant_replays(tp, shards, sequence_par
             sequence_parallel=sequence_parallel,
             batch_invariant_mode=True,
             batch_invariant_backend="te_native",
-            batch_invariant_tp_shards=shards,
+            batch_invariant_peer_tp_size=shards,
             add_bias_linear=False,
             attention_backend=AttnBackend.flash,
             flash_attention_version=4 if _IS_BLACKWELL else 3,

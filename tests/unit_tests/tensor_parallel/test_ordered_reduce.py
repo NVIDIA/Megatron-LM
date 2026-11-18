@@ -419,18 +419,19 @@ def _check_te_row_parallel_linear(sequence_parallel):
         is_expert=False,
     ).cuda()
     assert layer._bi_tp_forward is _BITPForward.ORDERED_REDUCE
-    assert not SymmetricMemoryManager.is_initialized(orl._training_buffer_key(layer._tp_group))
     assert layer.weight.shape == (768, cfg.hidden_size // TP)
     assert layer.weight.tensor_model_parallel and layer.weight.partition_dim == 1
     assert layer.bias.sequence_parallel == sequence_parallel
 
     with set_batch_invariant_mode(True, backend="te_native"):
         x = _partials((64, 2, cfg.hidden_size // TP), torch.bfloat16, seed=21)
+        key, _ = orl._training_buffer_spec(group, 64 * 2 * 768 * x.element_size())
+        assert not SymmetricMemoryManager.is_initialized(key)
         layer(x)
-        assert SymmetricMemoryManager.is_initialized(orl._training_buffer_key(group))
-        scratch = SymmetricMemoryManager.get_buffer(
-            orl._training_buffer_key(group)
-        ).maybe_get_tensor((1, *x.shape[:-1], 768), dtype=x.dtype)
+        assert SymmetricMemoryManager.is_initialized(key)
+        scratch = SymmetricMemoryManager.get_buffer(key).maybe_get_tensor(
+            (1, *x.shape[:-1], 768), dtype=x.dtype
+        )
         if scratch["handle"] is not None:
             scratch["tensor"].fill_(float("nan"))
         out, out_bias = layer(x)
@@ -506,7 +507,7 @@ def _check_te_row_parallel_linear(sequence_parallel):
 
 @requires_tp4
 def test_inference_row_linear_uses_only_inference_scratch():
-    """An inference layer must not reserve the separate 512 MiB training pool."""
+    """An inference layer must not reserve the separate training pool."""
     Utils.initialize_model_parallel(TP, 1)
     try:
         group = get_tensor_model_parallel_group_if_none(tp_group=None)
@@ -544,7 +545,9 @@ def test_inference_row_linear_uses_only_inference_scratch():
         expected = expected[group.rank() * 8 : (group.rank() + 1) * 8]
         assert torch.equal(_bits(out), _bits(expected))
         assert SymmetricMemoryManager.is_initialized("tp")
-        assert not SymmetricMemoryManager.is_initialized(orl._training_buffer_key(group))
+        assert not any(
+            key.startswith("tp_ordered_training:") for key in SymmetricMemoryManager._buffers
+        )
     finally:
         torch.cuda.synchronize()
         dist.barrier()
@@ -561,15 +564,68 @@ def test_direct_gemm_falls_back_when_scratch_does_not_fit(dtype):
     Utils.initialize_model_parallel(TP, 1)
     try:
         group = get_tensor_model_parallel_group_if_none(tp_group=None)
-        SymmetricMemoryManager.get_buffer(
-            orl._training_buffer_key(group), process_group=group, size_mb=1
-        )
         x = _partials((2048, 128), dtype, seed=51)
         weight = _partials((512, 128), dtype, seed=52)
+        key, _ = orl._training_buffer_spec(group, 2048 * 512 * x.element_size())
+        SymmetricMemoryManager.get_buffer(key, process_group=group, size_mb=1)
         out = orl.tp_shard_row_linear(x, weight, group, 1, True, use_te_gemm=True)
         partial = general_gemm(weight, x, out_dtype=x.dtype)[0]
         expected = orr.ordered_reduce_scatter(partial, group)
         assert torch.equal(_bits(out), _bits(expected))
+    finally:
+        torch.cuda.synchronize()
+        dist.barrier()
+        SymmetricMemoryManager.destroy()
+        Utils.destroy_model_parallel()
+
+
+@requires_tp4
+@pytest.mark.parametrize("tp,local_shards,hidden", [(4, 1, 4096), (2, 2, 2048)])
+def test_training_scratch_grows_past_512_mib_without_invalidating_graphs(tp, local_shards, hidden):
+    """Size all shard outputs, preserving an earlier graph's smaller allocation."""
+    Utils.initialize_model_parallel(tp, 1)
+    try:
+        group = get_tensor_model_parallel_group_if_none(tp_group=None)
+        weight = torch.ones(hidden, 64, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        small = torch.full((32, 64), group.rank() + 1, device="cuda", dtype=weight.dtype)
+        use_te_gemm = local_shards == 1
+        with set_batch_invariant_mode(True, backend="te_native"):
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                orl.tp_shard_row_linear(
+                    small, weight, group, local_shards, True, use_te_gemm=use_te_gemm
+                )
+            torch.cuda.current_stream().wait_stream(stream)
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                captured = orl.tp_shard_row_linear(
+                    small, weight, group, local_shards, True, use_te_gemm=use_te_gemm
+                )
+            graph.replay()
+            expected = 64 * sum(range(1, tp + 1))
+            assert (captured == expected).all()
+            # 512 MiB plus 32 KiB of local shard outputs, before reduce-scatter.
+            x = torch.full(
+                (65540, 64), group.rank() + 1, device="cuda", dtype=weight.dtype, requires_grad=True
+            )
+            out = orl.tp_shard_row_linear(
+                x, weight, group, local_shards, True, use_te_gemm=use_te_gemm
+            )
+            nbytes = local_shards * 65540 * hidden * x.element_size()
+            key, _ = orl._training_buffer_spec(group, nbytes)
+            buf = SymmetricMemoryManager.get_buffer(key)
+            assert buf.symm_mem_hdl is not None, buf.init_failure_reason
+            assert buf.symm_buffer.numel() >= nbytes
+            assert (out == expected).all()
+            out.sum().backward()
+            assert (x.grad == hidden).all()
+            expected_wgrad = torch.tensor(
+                65540 * (group.rank() + 1), device="cuda", dtype=weight.dtype
+            )
+            assert (weight.grad == expected_wgrad).all()
+            graph.replay()
+            assert (captured == expected).all()
     finally:
         torch.cuda.synchronize()
         dist.barrier()

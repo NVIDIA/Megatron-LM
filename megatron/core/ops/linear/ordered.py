@@ -7,6 +7,7 @@ The caller supplies the process group. Backward keeps ordinary TP collectives.
 Scratch is allocated on first eager use; CUDA graphs reuse it after warmup or use
 the all-to-all fallback when captured without warmup."""
 
+import math
 from typing import Optional
 
 import torch
@@ -46,8 +47,11 @@ except ImportError:
     HAVE_DISTRIBUTED_WEIGHT = False
 
 
-def _training_buffer_key(group) -> str:
-    return f"tp_ordered_training:{group.group_name}"
+def _training_buffer_spec(group, nbytes: int) -> tuple[str, int]:
+    """Power-of-two MiB capacity; distinct sizes preserve captured buffer addresses."""
+    size_mb = max(1, (nbytes + (1 << 20) - 1) // (1 << 20))
+    size_mb = 1 << (size_mb - 1).bit_length()
+    return f"tp_ordered_training:{group.group_name}:{size_mb}", size_mb
 
 
 def row_parallel_shard_partials(
@@ -142,7 +146,7 @@ class _TPShardRowLinear(torch.autograd.Function):
             weight = materialize_weight_for_forward(weight)[0]
         shape = (num_shards, *x.shape[:-1], weight.shape[0])
         scratch = {"tensor": None, "handle": None}
-        key = _training_buffer_key(group)
+        key, size_mb = _training_buffer_spec(group, math.prod(shape) * x.element_size())
         if (
             group.size() > 1
             and x.shape[0] % group.size() == 0
@@ -151,9 +155,9 @@ class _TPShardRowLinear(torch.autograd.Function):
                 or not torch.cuda.is_current_stream_capturing()
             )
         ):
-            scratch = SymmetricMemoryManager.get_buffer(key, process_group=group).maybe_get_tensor(
-                shape, x.dtype
-            )
+            scratch = SymmetricMemoryManager.get_buffer(
+                key, process_group=group, size_mb=size_mb
+            ).maybe_get_tensor(shape, x.dtype)
         if use_te_gemm:
             # Keep TE's GEMM definition: a torch GEMM need not have the same fp32 bits.
             assert num_shards == 1

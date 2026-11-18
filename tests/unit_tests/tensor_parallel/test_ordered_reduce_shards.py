@@ -136,7 +136,7 @@ class TestTERowParallelShards:
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
             batch_invariant_mode=True,
-            batch_invariant_tp_shards=shards,
+            batch_invariant_peer_tp_size=2 if tp == 4 else 4,
             attention_backend=AttnBackend.flash,
             flash_attention_version=4,
             attention_dropout=0.0,
@@ -184,7 +184,7 @@ class TestTERowParallelShards:
             params_dtype=torch.bfloat16,
             add_bias_linear=False,
             batch_invariant_mode=True,
-            batch_invariant_tp_shards=4,
+            batch_invariant_peer_tp_size=4,
             attention_backend=AttnBackend.flash,
             flash_attention_version=4,
             attention_dropout=0.0,
@@ -277,7 +277,7 @@ def test_config_rejects_unsupported_multi_shard_combinations():
         hidden_size=64,
         num_attention_heads=4,
         batch_invariant_mode=True,
-        batch_invariant_tp_shards=4,
+        batch_invariant_peer_tp_size=4,
         tensor_model_parallel_size=2,
         params_dtype=torch.bfloat16,
         bf16=True,
@@ -286,3 +286,36 @@ def test_config_rejects_unsupported_multi_shard_combinations():
         TransformerConfig(**base, fp8="e4m3")
     with pytest.raises(ValueError, match="native cross entropy"):
         TransformerConfig(**base, cross_entropy_loss_fusion=True, cross_entropy_fusion_impl="te")
+
+
+@pytest.mark.parametrize("tp,peer_tp,expected", [(1, 4, 4), (4, 1, 4), (2, 3, 6), (3, 2, 6)])
+def test_peer_tp_derives_common_reduction_partition(tp, peer_tp, expected):
+    config = TransformerConfig(
+        num_layers=1,
+        hidden_size=384,
+        num_attention_heads=12,
+        tensor_model_parallel_size=tp,
+        batch_invariant_peer_tp_size=peer_tp,
+        batch_invariant_mode=True,
+        attention_backend=AttnBackend.flash,
+        flash_attention_version=4,
+        attention_dropout=0.0,
+        hidden_dropout=0.0,
+        bf16=True,
+        params_dtype=torch.bfloat16,
+    )
+    assert config.batch_invariant_tp_shards == expected
+
+
+@pytest.mark.parametrize("peer_tp", [0, -1, 1.5, True])
+def test_peer_tp_rejects_invalid_sizes(peer_tp):
+    with pytest.raises(AssertionError, match="positive integer"):
+        TransformerConfig(
+            num_layers=1,
+            hidden_size=64,
+            num_attention_heads=4,
+            batch_invariant_mode=True,
+            batch_invariant_peer_tp_size=peer_tp,
+            bf16=True,
+            params_dtype=torch.bfloat16,
+        )
