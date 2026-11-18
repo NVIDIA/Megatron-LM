@@ -13,6 +13,7 @@ from megatron.core.models.bert.bert_layer_specs import (
 )
 from megatron.core.models.bert.bert_lm_head import BertLMHead
 from megatron.core.models.bert.bert_model import BertModel
+from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer.enums import AttnBackend, AttnMaskType
 from megatron.core.transformer.spec_utils import ModuleSpec
@@ -45,6 +46,7 @@ class TestBertModel:
             transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
             vocab_size=100,
             max_sequence_length=4,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     def teardown_method(self, method):
@@ -107,6 +109,7 @@ class TestBertModel:
             max_sequence_length=self.bert_model.max_sequence_length,
             apply_lm_head=False,
             output_layer_bias=False,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
         assert bert_model.output_layer.bias is None
@@ -124,6 +127,7 @@ class TestBertModel:
             vocab_size=100,
             max_sequence_length=sequence_length,
             apply_lm_head=False,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         assert bert_model.lm_head is None
         bert_model.cuda()
@@ -179,6 +183,7 @@ class TestBertModel:
             transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
             vocab_size=100,
             max_sequence_length=4,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
         attention = bert_model.encoder.layers[0].self_attention
         assert isinstance(attention.q_layernorm, te_pytorch.LayerNorm)
@@ -208,6 +213,7 @@ class TestBertModelAttentionDimensions:
             transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
             vocab_size=100,
             max_sequence_length=4,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         )
 
     @pytest.mark.internal
@@ -272,6 +278,7 @@ class TestBertModelAttentionDimensions:
                 transformer_layer_spec=ModuleSpec(module=TransformerLayer, submodules=submodules),
                 vocab_size=100,
                 max_sequence_length=4,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
         assert str(exc_info.value) == (
             "Linear.__init__() got an unexpected keyword argument 'rng_tracker_name' when "
@@ -311,6 +318,7 @@ class TestBertModelAttentionDimensions:
                 transformer_layer_spec=get_bert_layer_with_transformer_engine_spec(),
                 vocab_size=100,
                 max_sequence_length=4,
+                pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
             )
 
         assert str(exc_info.value) == (

@@ -933,14 +933,11 @@ def test_callbacks_construct_from_registered_model_config(
     monkeypatch.setattr(provider, "get_args", lambda: args)
     build = Mock()
     monkeypatch.setattr(provider, "BertModel" if family == "bert" else "T5Model", build)
-    if family == "t5":
-        # The T5 callback resolves the global process groups itself and passes them on.
-        global_groups = Mock()
-        monkeypatch.setattr(
-            provider.ProcessGroupCollection,
-            "use_mpu_process_groups",
-            Mock(return_value=global_groups),
-        )
+    # Both callbacks resolve the global process groups themselves and pass them on.
+    global_groups = Mock()
+    monkeypatch.setattr(
+        provider.ProcessGroupCollection, "use_mpu_process_groups", Mock(return_value=global_groups)
+    )
     for name in (
         "hidden_size",
         "num_layers",
@@ -963,6 +960,7 @@ def test_callbacks_construct_from_registered_model_config(
     assert build.call_args.kwargs["vocab_size"] == 128
     assert build.call_args.kwargs["max_sequence_length"] == 64
     assert build.call_args.kwargs["share_embeddings_and_output_weights"] is True
+    assert build.call_args.kwargs["pg_collection"] is global_groups
     if family == "bert":
         assert build.call_args.kwargs["add_binary_head"] is binary_head
         assert build.call_args.kwargs["num_tokentypes"] == (2 if binary_head else 0)
@@ -985,7 +983,6 @@ def test_callbacks_construct_from_registered_model_config(
         assert build.call_args.kwargs["encoder_config"].num_layers == 2
         assert build.call_args.kwargs["relative_attention_num_buckets"] == 32
         assert build.call_args.kwargs["relative_attention_max_distance"] == 128
-        assert build.call_args.kwargs["pg_collection"] is global_groups
 
 
 @pytest.mark.parametrize("fp8_recipe", ["delayed", "tensorwise"])
