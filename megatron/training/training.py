@@ -2746,6 +2746,7 @@ def setup_model_and_optimizer(
                 dp_group=ckpt_pgc.dp if ckpt_pgc is not None else None,
                 expt_dp_group=ckpt_pgc.expt_dp if ckpt_pgc is not None else None,
                 rng_state_key_prefix=getattr(unwrapped_model[0], "rng_state_key_prefix", ""),
+                dp_cp_gtp_remat=getattr(ckpt_pgc, "dp_cp_gtp_remat", None),
             )
             train_state.resume_iteration = train_state.iteration
             train_state.resume_num_floating_point_operations = (
