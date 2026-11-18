@@ -132,6 +132,8 @@ def backward(
         raise ValueError("a reader takes one gradient or a pair (first not None)")
     dys = tuple(torch.zeros_like(saved.update) if dy is None else dy for dy, _ in pairs)
     seconds = tuple(second for _, second in pairs)
+    if any(second is not None for second in seconds[:-1]):
+        raise ValueError("only the last reader may take a second gradient")
     for first, second in zip(dys, seconds):
         if second is not None and (
             second.shape != first.shape or second.dtype != first.dtype or not second.is_contiguous()
@@ -195,6 +197,8 @@ def backward(
         R_DESC=_descriptor(previous, slice_shape),
         DY0_DESC=_descriptor(dys[0] if streams < 6 else None, slice_shape),
         DY1_DESC=_descriptor(dys[1] if streams < 6 and n == 2 else None, slice_shape),
+        # The last reader's second consumer gradient, staged with the others.
+        DY2_DESC=_descriptor(seconds[-1] if streams < 6 else None, slice_shape),
         U_DESC=_descriptor(saved.update, slice_shape),
         maxnreg=knobs.MAXNREG,
         num_warps=4,
@@ -389,22 +393,30 @@ def _widen_bf16(x):
 
 
 @g.jit
+def _staged_dy(ds, row: gl.constexpr, WIDEN: gl.constexpr):
+    if WIDEN:
+        return _widen_bf16(ds.slice(row, 16).load(_GRADIENT_LAYOUT))
+    return ds.slice(row, 16).load(_GRADIENT_LAYOUT).to(gl.float32)
+
+
+@g.jit
 def _load_dy(
-    inputs, ds, reader: gl.constexpr, part: gl.constexpr, offset, mask, WIDEN: gl.constexpr
+    inputs, ds, ds2, reader: gl.constexpr, part: gl.constexpr, offset, mask, WIDEN: gl.constexpr
 ):
     """A reader's FP32 dy slice from global memory or staged BF16 (WIDEN: by bit shift), plus
-    a second consumer's gradient (from global memory) when the reader has one.
+    a second consumer's gradient when the reader has one (staged after the readers' slices).
 
     Both conversions are exact, but they schedule (and so contract) differently.
     """
+    second = inputs.second_grads[reader]
     if ds is None:
         dy = gl.load(inputs.reader_grads[reader] + offset, mask, 0).to(gl.float32)
-    elif WIDEN:
-        dy = _widen_bf16(ds.slice(reader * 32 + part * 16, 16).load(_GRADIENT_LAYOUT))
+        if second is not None:
+            dy += gl.load(second + offset, mask, 0).to(gl.float32)
     else:
-        dy = ds.slice(reader * 32 + part * 16, 16).load(_GRADIENT_LAYOUT).to(gl.float32)
-    if inputs.second_grads[reader] is not None:
-        dy += gl.load(inputs.second_grads[reader] + offset, mask, 0).to(gl.float32)
+        dy = _staged_dy(ds, reader * 32 + part * 16, WIDEN)
+        if second is not None:
+            dy += _staged_dy(ds2, part * 16, WIDEN)
     return dy
 
 
@@ -520,6 +532,7 @@ def _backward_body(
     R_DESC,
     DY0_DESC,
     DY1_DESC,
+    DY2_DESC,
     U_DESC,
 ):
     """Persistent 16-row tiles in width-spanning CTA groups; ticket admission (each group
@@ -539,9 +552,13 @@ def _backward_body(
         residuals += (gl.allocate_shared_memory(R_DESC.dtype, [32, 128], R_DESC.layout),)
     # Staged unscaled BF16 dy; six streams skip it to keep two-CTA residency.
     STAGE_DY: gl.constexpr = DY0_DESC is not None
+    SECOND: gl.constexpr = DY2_DESC is not None
     ds = None
     if STAGE_DY:
         ds = gl.allocate_shared_memory(DY0_DESC.dtype, [NREADERS * 32, 128], DY0_DESC.layout)
+    ds2 = None  # the last reader's second consumer gradient
+    if SECOND:
+        ds2 = gl.allocate_shared_memory(DY2_DESC.dtype, [32, 128], DY2_DESC.layout)
     update_shared = gl.allocate_shared_memory(U_DESC.dtype, [32, 128], U_DESC.layout)
 
     HALF_BYTES: gl.constexpr = (  # one column half of a tile's TMA copies
@@ -549,11 +566,12 @@ def _backward_body(
         * 128
         * (
             R_DESC.dtype.primitive_bitwidth // 8 * streams
-            + 2 * NREADERS * STAGE_DY
+            + 2 * (NREADERS + SECOND) * STAGE_DY
             + U_DESC.dtype.primitive_bitwidth // 8
         )
     )
-    copy_deps = ((ds,) if STAGE_DY else ()) + (update_shared,) + residuals
+    copy_deps = ((ds,) if STAGE_DY else ()) + ((ds2,) if SECOND else ()) + (update_shared,)
+    copy_deps += residuals
     # Carry s > 0 lands on barrier s - 1, the last two complete each half's copy phase; one
     # allocation keeps them all reserved (a dead barrier was once reused for staged gamma).
     barrier_storage = gl.allocate_shared_memory(
@@ -594,6 +612,8 @@ def _backward_body(
             reader_copies += (
                 ((DY0_DESC, DY1_DESC)[reader], ds.slice(reader * 32, 32), column_tile * 256),
             )
+        if SECOND:
+            reader_copies += ((DY2_DESC, ds2, column_tile * 256),)
     reader_copies += ((U_DESC, update_shared, column_tile * 256),)
     COEFFICIENTS: gl.constexpr = triton.next_power_of_2(4 * streams)
     cs = gl.allocate_shared_memory(gl.float32, [COEFFICIENTS], LINEAR_SHARED)
@@ -675,7 +695,7 @@ def _backward_body(
             new_projections = ()
             for reader in gl.static_range(NREADERS):
                 z = _fma2(mixes[reader], u, xs[reader]) * rs[reader][:, None]
-                dy = _load_dy(inputs, ds, reader, part, rr[:, None] * h + cols, mask, False)
+                dy = _load_dy(inputs, ds, ds2, reader, part, rr[:, None] * h + cols, mask, False)
                 gamma = gs.slice(reader * 256 + part * 128, 128).load(
                     gl.constexpr(SliceLayout(0, L))
                 )
@@ -787,7 +807,7 @@ def _backward_body(
             dxs = ()
             update_mixes = ()
             for reader in gl.static_range(NREADERS):
-                dy = _load_dy(inputs, ds, reader, part, offset, mask, TWO)
+                dy = _load_dy(inputs, ds, ds2, reader, part, offset, mask, TWO)
                 gamma = gs.slice(reader * 256 + part * 128, 128).load(
                     gl.constexpr(SliceLayout(0, L))
                 )[None, :]
