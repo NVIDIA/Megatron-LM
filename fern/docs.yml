@@ -4,6 +4,8 @@ instances:
   - url: https://nvidia-megatron.docs.buildwithfern.com/megatron
     custom-domain: docs.nvidia.com/megatron
 
+redirects: ./redirects.yml
+
 title: Megatron Core
 
 global-theme: nvidia
