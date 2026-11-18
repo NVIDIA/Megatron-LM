@@ -409,7 +409,8 @@ class TransformerConfig(ModelParallelConfig):
 
     dsa_indexer_precision: Literal["bf16", "mxfp8"] = "bf16"
     """CSA indexer scoring precision; MXFP8 uses compact cuDNN forward + Top-K.
-    Projection parameters and indexer backward remain BF16, independent of model FP8.
+    Selects scoring precision only; projection parameter policy is unchanged.
+    Indexer backward consumes the original BF16 Q/K inputs.
     """
 
     dsa_compact_indexer_workspace_sharing: bool = True
