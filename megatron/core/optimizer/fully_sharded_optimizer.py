@@ -254,12 +254,12 @@ class FullyShardedOptimizer(MixedPrecisionOptimizer):
         :meth:`DistributedOptimizer.load_state_dict`.
         """
         param_groups = self._param_groups_from_group_meta(state_dict["param_to_group_meta"])
-        # A chain shares one FQN-keyed checkpoint; take this optimizer's parameters from it.
+        # A chain shares one FQN-keyed checkpoint, so select only this optimizer's parameters.
+        owned_fqns = {fqn for group in param_groups for fqn in group["params"]}
         state = {
-            fqn: state_dict["state"][fqn]
-            for group in param_groups
-            for fqn in group["params"]
-            if fqn in state_dict["state"]
+            fqn: param_state
+            for fqn, param_state in state_dict["state"].items()
+            if fqn in owned_fqns
         }
         self.optimizer.load_state_dict({"state": state, "param_groups": param_groups})
 
