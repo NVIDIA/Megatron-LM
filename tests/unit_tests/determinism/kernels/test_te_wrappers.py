@@ -357,6 +357,20 @@ class TestTEWrappers:
         if "zero_tensor" in inspect.signature(get_dummy_wgrad).parameters:
             assert head.weight.grad._is_zerotensor()
 
+    @pytest.mark.skipif(not _IS_BLACKWELL, reason="MXFP8 output projection requires Blackwell")
+    def test_te_lm_head_fp4_replays(self):
+        """The LM head of an FP4 model, which runs under its own MXFP8 autocast."""
+        seeded()
+        config = _config(fp4="e2m1", fp8_output_proj=True)
+        head = TELMHeadColumnParallelLinear(
+            HIDDEN, 4096, config=config, init_method=init_method_normal(0.02), bias=False
+        ).cuda()
+        x = torch.randn(1024, 2, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        assert_module_replays_bit_exact(
+            head, (x,), replays=3, contention=True, what="TELMHeadColumnParallelLinear fp4"
+        )
+        assert head.fp8_meta["recipe"].mxfp8()
+
     @pytest.mark.parametrize(
         "backend", ["te", "torch"], ids=["te-general-gemm", "torch-mm-fallback"]
     )
@@ -500,6 +514,7 @@ class TestTEWrappers:
                     bias=False,
                     skip_bias_add=False,
                     is_expert=True,
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
                 )
                 .cuda()
                 .train()
@@ -663,6 +678,7 @@ class TestTEWrappers:
             bias=False,
             skip_bias_add=False,
             is_expert=True,
+            pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
         ).cuda()
         m_splits = [4096, 13, 0, 2048, 1, 8191, 33, 1999]
         x = torch.randn(
@@ -814,6 +830,7 @@ class TestTEWrappers:
                     skip_bias_add=False,
                     is_expert=True,
                     name=name,
+                    pg_collection=ProcessGroupCollection.use_mpu_process_groups(),
                 )
 
         edge = build(0)
