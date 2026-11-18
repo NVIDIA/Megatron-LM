@@ -4373,6 +4373,27 @@ class TransformerConfig(ModelParallelConfig):
             "inference_cuda_graph_scope='block'."
         )
 
+        if (
+            self.cuda_graph_impl == "full_iteration"
+            and self.num_moe_experts is not None
+            and self.moe_megakernel_backend is None
+        ):
+            if self.moe_token_dispatcher_type == "allgather":
+                raise ValueError(
+                    "Full-iteration CUDA graphs do not support the AllGather "
+                    "dispatcher because it copies routing metadata to the CPU."
+                )
+
+            if self.moe_token_dispatcher_type == "alltoall" and not (
+                self.moe_expert_capacity_factor is not None
+                and self.moe_pad_expert_input_to_capacity
+            ):
+                raise ValueError(
+                    "Full-iteration CUDA graphs with the AlltoAll dispatcher "
+                    "require expert capacity and padding to capacity, because "
+                    "the variable-size path synchronizes routing metadata with the CPU."
+                )
+
         if self.cuda_graph_impl != "none":
 
             if self.cpu_offloading and self.cuda_graph_impl != "full_iteration":
