@@ -465,6 +465,8 @@ def test_virtual_expert_planner_graph_replay(virtual_expert_planner_group, ep_si
                             f"graph {num_tokens=} {topk=} {alignment=} {skew=} {replay=} {label}",
                             errors,
                         )
+                    # Finish reading before peers overwrite the shared histogram on replay.
+                    dist.barrier(group=group)
         _report(errors, dist.group.WORLD)
     finally:
         workspace.destroy()
