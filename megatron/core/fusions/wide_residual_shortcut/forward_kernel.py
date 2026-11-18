@@ -76,7 +76,7 @@ class _ForwardConfig(NamedTuple):
     VECTOR: int = 4
 
 
-# GB300 training/prefill configs (3 streams, rows >= 2048) from a paired sweep at 2K-16K rows.
+# GB300 prefill configs (inference, 3 streams, rows >= 2048) from a paired sweep at 2K-16K rows.
 # Key: (hidden, readers, MXFP8 handoff).
 # fmt: off
 _FORWARD_CONFIGS = {
@@ -99,8 +99,8 @@ def _bf16_config(*fields, vector):
     return _ForwardConfig(*fields, LOADS_FIRST=True, VECTOR=vector)
 
 
-# GB300 configs for a BF16 residual stream (3 streams; training from 2048 rows, inference from
-# 512), which needs more rows in flight. Key: (hidden, readers, updates, MXFP8 handoff).
+# GB300 inference configs for a BF16 residual stream (3 streams, from 512 rows), which needs
+# more rows in flight. Key: (hidden, readers, updates, MXFP8 handoff).
 _FORWARD_CONFIGS_BF16 = {
     (3072, 1, 1, False): _bf16_config(4096, 1, 0, False, 0, 8, None, True, vector=4),
     (3072, 1, 1, True): _bf16_config(4096, 2, 0, False, 0, 8, 80, False, vector=4),
@@ -120,80 +120,6 @@ _FORWARD_CONFIGS_BF16 = {
     (10240, 2, 1, True): _bf16_config(2048, 2, 1, True, 0, 8, 128, False, vector=8),
     (10240, 2, 2, False): _bf16_config(2048, 2, 1, True, 0, 8, 128, False, vector=8),
     (10240, 2, 2, True): _bf16_config(2048, 2, 1, True, 0, 8, 128, False, vector=4),
-}
-# fmt: on
-
-# BF16 residual streams of other shapes from 2048 rows: the sweep's most robust config.
-_BF16_STREAM_CONFIG = _ForwardConfig(4096, 1, 1, False, 0, 8, 128, False, LOADS_FIRST=True)
-
-
-def _format_config(*fields, vector=4):
-    return _ForwardConfig(*fields, LOADS_FIRST=True, VECTOR=vector)
-
-
-# GB300 training configs (3 streams, rows >= 2048) for reader output formats that the tables
-# above, keyed only by whether reader zero is MXFP8, schedule slower. From a format sweep of ~15K
-# configs at 4K rows whose best were re-timed at 2K-16K rows: an entry beat the MXFP8-presence
-# choice by over 2% (geometric mean), and by no less than -1% at any row count.
-# Key: (hidden, BF16 residual) -> (updates, per-reader output formats).
-# fmt: off
-_FORMAT_CONFIGS = {
-    (3072, False): {
-        (1, ("bf16", "mxfp8")): _ForwardConfig(4096, 2, 0, True, 0, 8, 80, False),
-        (1, ("both", "both")): _format_config(1024, 2, 0, True, 0, 8, 80, False),
-        (1, ("both", "mxfp8")): _format_config(4096, 2, 0, True, 0, 8, 80, True),
-        (1, ("mxfp8", "both")): _format_config(4096, 2, 0, True, 0, 8, 80, True),
-        (1, ("mxfp8", "mxfp8")): _format_config(4096, 2, 0, True, 0, 8, 80, False),
-        (2, ("mxfp8", "mxfp8")): _format_config(4096, 2, 0, True, 0, 8, 80, False),
-    },
-    (3072, True): {
-        (1, ("both",)): _format_config(1024, 2, 2, False, 16, 4, None, False, vector=8),
-        (1, ("bf16", "both")): _format_config(2048, 1, 1, True, 0, 4, None, True, vector=8),
-        (1, ("bf16", "mxfp8")): _format_config(1024, 2, 2, False, 1, 4, 64, False, vector=8),
-        (1, ("both", "bf16")): _format_config(1024, 4, 0, False, 4, 8, 64, False),
-        (1, ("both", "both")): _format_config(4096, 2, 0, False, 16, 4, None, False, vector=8),
-        (1, ("both", "mxfp8")): _format_config(1024, 1, 2, False, 0, 4, None, False, vector=8),
-        (1, ("mxfp8", "both")): _format_config(2048, 2, 1, True, 0, 4, 64, False, vector=8),
-        (1, ("mxfp8", "mxfp8")): _format_config(2048, 4, 1, True, 4, 4, 80, True, vector=8),
-        (2, ("both", "both")): _format_config(1024, 4, 1, True, 16, 8, 80, True),
-        (2, ("both", "mxfp8")): _format_config(1024, 2, 0, False, 0, 4, None, False, vector=8),
-        (2, ("mxfp8", "both")): _format_config(1024, 2, 2, True, 4, 4, None, False, vector=8),
-        (2, ("mxfp8", "mxfp8")): _format_config(1024, 2, 2, False, 4, 4, None, True),
-    },
-    (4096, False): {
-        (2, ("bf16", "both")): _format_config(2048, 2, 1, False, 0, 8, 128, False),
-    },
-    (4096, True): {
-        (1, ("both",)): _format_config(2048, 2, 1, False, 1, 8, 80, True, vector=8),
-        (2, ("bf16", "both")): _format_config(2048, 1, 1, False, 4, 4, None, False, vector=8),
-        (2, ("bf16", "mxfp8")): _format_config(2048, 4, 0, False, 4, 8, 80, True, vector=8),
-        (2, ("both", "both")): _format_config(2048, 4, 1, False, 0, 4, None, False, vector=8),
-        (2, ("both", "mxfp8")): _format_config(2048, 4, 1, True, 16, 4, None, True, vector=8),
-        (2, ("mxfp8", "both")): _format_config(2048, 2, 0, True, 1, 8, 80, False, vector=8),
-        (2, ("mxfp8", "mxfp8")): _format_config(2048, 2, 1, False, 16, 8, 64, False, vector=8),
-    },
-    (10240, False): {
-        (2, ("bf16", "both")): _format_config(4096, 4, 1, False, 0, 16, 128, True),
-        (2, ("both", "bf16")): _format_config(4096, 4, 1, False, 0, 16, 128, True),
-        (2, ("both", "mxfp8")): _format_config(4096, 4, 1, False, 0, 16, 128, True),
-        (2, ("mxfp8", "both")): _format_config(4096, 4, 1, False, 0, 16, 128, True),
-        (2, ("mxfp8", "mxfp8")): _format_config(4096, 4, 1, False, 0, 16, 128, True),
-    },
-    (10240, True): {
-        (1, ("bf16", "both")): _format_config(2048, 2, 1, True, 0, 8, 128, False),
-        (1, ("bf16", "mxfp8")): _format_config(2048, 2, 1, True, 0, 8, 128, False),
-        (1, ("both", "bf16")): _format_config(2048, 2, 2, True, 0, 8, 128, False, vector=8),
-        (1, ("both", "both")): _format_config(2048, 2, 2, True, 0, 8, 128, False, vector=8),
-        (1, ("both", "mxfp8")): _format_config(2048, 2, 2, True, 0, 8, 128, False, vector=8),
-        (1, ("mxfp8", "both")): _format_config(2048, 2, 2, True, 0, 8, 128, False, vector=8),
-        (1, ("mxfp8", "mxfp8")): _format_config(2048, 2, 2, True, 0, 8, 128, False, vector=8),
-        (2, ("bf16", "both")): _format_config(4096, 1, 1, False, 0, 8, 128, False),
-        (2, ("bf16", "mxfp8")): _format_config(2048, 2, 1, True, 4, 8, 128, False, vector=8),
-        (2, ("both", "both")): _format_config(2048, 2, 2, True, 0, 8, 128, False, vector=8),
-        (2, ("both", "mxfp8")): _format_config(2048, 2, 2, True, 0, 8, 128, False, vector=8),
-        (2, ("mxfp8", "both")): _format_config(2048, 2, 2, True, 0, 8, 128, False, vector=8),
-        (2, ("mxfp8", "mxfp8")): _format_config(4096, 1, 1, False, 4, 8, 128, False, vector=8),
-    },
 }
 # fmt: on
 
@@ -269,8 +195,8 @@ def _inference_config(m, h, streams, readers, mxfp8, updates):
     return _replicated(_ForwardConfig(*fields, LOADS_FIRST=True), replicas, readers, h)
 
 
-def _training_config(h, streams, readers):
-    """Training tree for rows >= 2048 (no row dependence in a 107-shape GB300 sweep)."""
+def _prefill_config(h, streams, readers):
+    """Prefill tree for rows >= 2048 (no row dependence in a 107-shape GB300 sweep)."""
     half = (2048, 2, 1, True, 0, 8, 128, False)
     if h <= 9728:
         fields = (4096, 2, 0, True, 0, 8, 80, False) if streams <= 1 else half
@@ -281,6 +207,42 @@ def _training_config(h, streams, readers):
     else:
         fields = (4096, 2, 0, True, 0, 16, None, True)
     return _ForwardConfig(*fields, LOADS_FIRST=True)
+
+
+def _training_config(h, streams, readers, bf16_residual):
+    """Training decision tree (rows >= 2048, hidden 2048-16384, 1-6 streams).
+
+    Fit to a cold-L2 GB300 sweep of 578 cells (hidden 2048-16384, 1-6 streams, 2K-16K rows, both
+    residual dtypes, one and two readers with and without a shortcut add, every output format):
+    each leaf holds the schedule with the lowest mean slowdown against its cells' best. The
+    residual row's bytes decide first; no leaf depends on the readers' output formats. Mean
+    slowdown 1.3% against the per-cell best of the sweep's schedules.
+    """
+    row_bytes = streams * h * (2 if bf16_residual else 4)
+    vector = 4
+    if row_bytes <= 12288:
+        fields, vector = (1024, 2, 0, False, 0, 4, None, False), 8
+    elif row_bytes <= 24576:
+        if not bf16_residual:
+            fields = (1024, 4, 0, False, 4, 8, 64, False)
+        elif readers == 1:
+            fields, vector = (1024, 2, 0, False, 0, 4, None, False), 8
+        elif h <= 4096:
+            fields, vector = (2048, 4, 1, False, 0, 4, None, False), 8
+        else:
+            fields, vector = (2048, 2, 1, True, 0, 8, 128, False), 8
+    elif row_bytes <= 73728:
+        if h <= 4096:
+            fields = (1024, 4, 1, True, 16, 8, 80, True)
+        elif bf16_residual:
+            fields, vector = (2048, 2, 2, True, 0, 8, 128, False), 8
+        else:
+            fields = (2048, 2, 1, False, 0, 8, 128, False)
+    elif row_bytes <= 98304:
+        fields = (2048, 2, 1, True, 0, 8, 128, False)
+    else:
+        fields = (4096, 4, 0, False, 0, 16, 128, True)
+    return _ForwardConfig(*fields, LOADS_FIRST=True, VECTOR=vector)
 
 
 @lru_cache
@@ -295,10 +257,9 @@ def choose_forward_config(
     """Choose the row-kernel schedule; ``updates`` None means one per reader and ``outputs`` (the
     readers' formats, ``OUTPUT_FORMATS``) None means BF16 readers."""
     outputs = ("bf16",) * readers if outputs is None else tuple(outputs)
-    cfg = None
-    if not inference and streams == 3 and m >= 2048:
-        cfg = _FORMAT_CONFIGS.get((h, bf16_residual), {}).get((updates or readers, outputs))
-    if cfg is None:
+    if not inference and m >= 2048 and 2048 <= h <= 16384 and streams <= 6:
+        cfg = _training_config(h, streams, readers, bf16_residual)
+    else:
         # Otherwise schedules depend only on MXFP8 presence (reader zero's, where tuned).
         mxfp8 = any(f != "bf16" for f in outputs)
         cfg = _choose(m, h, streams, readers, mxfp8, inference, updates, bf16_residual)
@@ -312,8 +273,6 @@ def _choose(m, h, streams, readers, mxfp8, inference, updates, bf16_residual):
         cfg = _FORWARD_CONFIGS_BF16.get((h, readers, updates or readers, mxfp8))
         if streams == 3 and cfg is not None and m >= (512 if inference else 2048):
             return cfg
-        if not inference and m >= 2048 and tuned:
-            return _BF16_STREAM_CONFIG
     if inference and m <= 1024:
         if tuned:
             return _inference_config(m, h, streams, readers, mxfp8, updates)
@@ -327,7 +286,7 @@ def _choose(m, h, streams, readers, mxfp8, inference, updates, bf16_residual):
         if streams == 3 and m >= 2048 and (h, readers, mxfp8) in _FORWARD_CONFIGS:
             return _FORWARD_CONFIGS[h, readers, mxfp8]
         if m >= 2048 and tuned:
-            return _training_config(h, streams, readers)
+            return _prefill_config(h, streams, readers)
         if h * streams <= 10240:
             profile = "compact" if h * streams <= 5120 else "paired"
         elif h <= 13312:
