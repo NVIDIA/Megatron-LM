@@ -1,7 +1,7 @@
 #!/bin/bash
 # Wrap a Python entry point under nsys twice (det + nondet) and print the
 # per-NVTX-range diff. Entry point reads DETERMINISM_PERF_MODE and must call
-# cudaProfilerStart/Stop (Megatron's --profile flag handles this).
+# cudaProfilerStart/Stop (Megatron's --profile flag handles this), then exit on its own.
 # Usage: bash run_nsys_breakdown.sh OUTDIR -- CMD...
 set -euo pipefail
 OUT_ARG="${1:?usage: $0 OUTDIR -- CMD...}"; shift
@@ -13,7 +13,7 @@ OUT=$(realpath "$OUT_ARG")
 for MODE in det nondet; do
   DETERMINISM_PERF_MODE=$MODE \
     nsys profile -t cuda,nvtx -f true \
-      --capture-range=cudaProfilerApi --capture-range-end=stop-shutdown \
+      --capture-range=cudaProfilerApi --capture-range-end=stop \
       -o "$OUT/nsys-$MODE" "$@"
   nsys stats --force-export=true --report nvtx_sum --format csv "$OUT/nsys-$MODE.nsys-rep" > "$OUT/nsys-$MODE.csv"
 done

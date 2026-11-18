@@ -342,7 +342,8 @@ def test_cp_layout_uses_main_packed_metadata():
 @pytest.mark.launch_on_gb200
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("ratio", [1, 2])
-def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, ratio):
+@pytest.mark.parametrize("output_rope", [False, True])
+def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, ratio, output_rope):
     """Exercise real Full/Reindex/Reuse kernels with shared producer gradients."""
     import os
     import shutil
@@ -350,6 +351,7 @@ def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, 
     from dataclasses import replace
 
     from megatron.core.models.common.embeddings.rotary_pos_embedding import RotaryEmbedding
+    from megatron.core.ops.attention.csa.output_rope import OutputRopeParams
 
     pytest.importorskip("cudnn")
     flash_mla_cuda = pytest.importorskip("flash_mla.cuda")
@@ -439,13 +441,17 @@ def test_fused_shared_attention_and_indexer_gradients_match_native(monkeypatch, 
         tuple(torch.randn(shape, device='cuda', dtype=torch.bfloat16) for shape in shapes)
         for _ in range(3)
     ]
+    out_rope = None
+    if output_rope:
+        cos, sin = rope.get_cached_cos_sin(32, dtype=torch.bfloat16, mscale=1.0)
+        out_rope = OutputRopeParams(cos, sin, 448, 64, sbhd_batch_size=2)
     results = []
     for layers in (native, fused):
         state, outputs, leaves = CSA2State(), [], []
         for layer, values in zip(layers, inputs):
             q, kv, x, qr = [v.detach().clone().requires_grad_() for v in values]
             leaves.extend((q, kv, x, qr))
-            outputs.append(layer(q, kv, kv, None, x=x, qr=qr, csa2_state=state))
+            outputs.append(layer(q, kv, kv, None, x=x, qr=qr, csa2_state=state, out_rope=out_rope))
         sum(y.float().square().mean() for y in outputs).backward()
         grads = [p.grad for p in layers.parameters()] + [x.grad for x in leaves]
         results.append((outputs, grads))

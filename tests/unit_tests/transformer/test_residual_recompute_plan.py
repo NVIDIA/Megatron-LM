@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """CPU logic contracts for shared residual-recompute planning and its adapters."""
 
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,7 +10,7 @@ import torch
 
 from megatron.core.models.hybrid.hybrid_block import HybridStack
 from megatron.core.tensor_parallel.random import CheckpointWithoutOutputManager
-from megatron.core.transformer import residual_recompute_plan
+from megatron.core.transformer import residual_recompute
 from megatron.core.transformer.hyper_connection import (
     build_mhc_recompute_layer_plan,
     finalize_mhc_recompute_layer,
@@ -66,7 +67,7 @@ def _assert_manager_partition(managers, block_ends):
     ],
 )
 def test_block_end_plan(num_layers, block_size, atomic_layer_pairs, expected):
-    block_ends = residual_recompute_plan.build_recompute_block_end_plan(
+    block_ends = residual_recompute.build_recompute_block_end_plan(
         num_layers, block_size, atomic_layer_pairs=atomic_layer_pairs
     )
 
@@ -78,7 +79,7 @@ def test_block_end_plan(num_layers, block_size, atomic_layer_pairs, expected):
 @pytest.mark.parametrize("block_size", [False, True, 0, -1, 1.5])
 def test_block_end_plan_rejects_invalid_block_size(block_size):
     with pytest.raises(ValueError, match="positive integer"):
-        residual_recompute_plan.build_recompute_block_end_plan(3, block_size)
+        residual_recompute.build_recompute_block_end_plan(3, block_size)
 
 
 @pytest.mark.parametrize(
@@ -101,18 +102,21 @@ def test_block_end_plan_rejects_invalid_block_size(block_size):
 )
 def test_block_end_plan_rejects_malformed_pairs(pairs, message):
     with pytest.raises(ValueError, match=message):
-        residual_recompute_plan.build_recompute_block_end_plan(3, 2, atomic_layer_pairs=pairs)
+        residual_recompute.build_recompute_block_end_plan(3, 2, atomic_layer_pairs=pairs)
 
 
 def test_block_end_plan_rejects_negative_layer_count():
     with pytest.raises(ValueError, match="non-negative layer count"):
-        residual_recompute_plan.build_recompute_block_end_plan(-1, None)
+        residual_recompute.build_recompute_block_end_plan(-1, None)
 
 
 @pytest.mark.parametrize("block_size", [False, True, 0, -1, 1.5])
 def test_active_mhc_adapters_reject_sizes_disallowed_by_config(block_size):
     for num_layers in (1, 3):
-        with pytest.raises(ValueError, match="positive integer"):
+        with (
+            pytest.warns(DeprecationWarning, match="build_residual_stream_recompute_plan"),
+            pytest.raises(ValueError, match="positive integer"),
+        ):
             build_mhc_recompute_layer_plan(num_layers, block_size, True)
         stack = _make_hybrid_stack(num_layers, block_size)
         with pytest.raises(ValueError, match="positive integer"):
@@ -120,13 +124,16 @@ def test_active_mhc_adapters_reject_sizes_disallowed_by_config(block_size):
 
 
 def test_active_mhc_adapter_rejects_negative_layer_count():
-    with pytest.raises(ValueError, match="non-negative layer count"):
+    with (
+        pytest.warns(DeprecationWarning, match="build_residual_stream_recompute_plan"),
+        pytest.raises(ValueError, match="non-negative layer count"),
+    ):
         build_mhc_recompute_layer_plan(-1, None, True)
 
 
 def test_empty_residual_plan_still_short_circuits_validation(monkeypatch):
     constructor = Mock(wraps=CheckpointWithoutOutputManager)
-    monkeypatch.setattr(residual_recompute_plan, "CheckpointWithoutOutputManager", constructor)
+    monkeypatch.setattr(residual_recompute, "CheckpointWithoutOutputManager", constructor)
 
     assert build_residual_stream_recompute_plan(0, 0, atomic_layer_pairs=((0, 2),)) == []
     constructor.assert_not_called()
@@ -139,13 +146,13 @@ def test_empty_residual_plan_still_short_circuits_validation(monkeypatch):
 )
 def test_managers_are_fresh_with_exactly_one_allocation_per_block(monkeypatch, block_ends):
     constructor = Mock(wraps=CheckpointWithoutOutputManager)
-    monkeypatch.setattr(residual_recompute_plan, "CheckpointWithoutOutputManager", constructor)
+    monkeypatch.setattr(residual_recompute, "CheckpointWithoutOutputManager", constructor)
 
-    first = residual_recompute_plan.build_recompute_layer_managers(block_ends)
+    first = residual_recompute.build_recompute_layer_managers(block_ends)
     _assert_manager_partition(first, block_ends)
     assert constructor.call_count == sum(block_ends)
 
-    second = residual_recompute_plan.build_recompute_layer_managers(block_ends)
+    second = residual_recompute.build_recompute_layer_managers(block_ends)
     _assert_manager_partition(second, block_ends)
     assert constructor.call_count == 2 * sum(block_ends)
     assert first is not second
@@ -154,14 +161,19 @@ def test_managers_are_fresh_with_exactly_one_allocation_per_block(monkeypatch, b
 
 @pytest.mark.parametrize("num_layers,block_size", [(0, None), (5, None), (5, 2), (3, 1)])
 def test_adapters_agree_without_atomic_pairs(num_layers, block_size):
-    expected = residual_recompute_plan.build_recompute_block_end_plan(num_layers, block_size)
+    expected = residual_recompute.build_recompute_block_end_plan(num_layers, block_size)
     stack = _make_hybrid_stack(num_layers, block_size)
     assert stack._compute_mhc_block_end_plan() == expected
     assert isinstance(stack._compute_mhc_block_end_plan(), tuple)
     prior_managers = []
 
     for _ in range(2):
-        mhc_managers, mhc_ends = build_mhc_recompute_layer_plan(num_layers, block_size, True)
+        with pytest.warns(
+            DeprecationWarning, match="build_residual_stream_recompute_plan"
+        ) as warnings:
+            mhc_managers, mhc_ends = build_mhc_recompute_layer_plan(num_layers, block_size, True)
+        assert len(warnings) == 1
+        assert warnings[0].filename == __file__
         contexts = build_residual_stream_recompute_plan(num_layers, block_size)
         hybrid_managers, hybrid_ends = HybridStack._build_mhc_recompute_layer_plan(stack, True)
 
@@ -214,13 +226,15 @@ def test_hybrid_caches_only_immutable_boundaries(monkeypatch):
 @pytest.mark.parametrize("num_layers,enabled", [(3, False), (0, False), (0, True)])
 def test_disabled_or_empty_mhc_adapters_do_not_allocate(monkeypatch, num_layers, enabled):
     constructor = Mock(wraps=CheckpointWithoutOutputManager)
-    monkeypatch.setattr(residual_recompute_plan, "CheckpointWithoutOutputManager", constructor)
+    monkeypatch.setattr(residual_recompute, "CheckpointWithoutOutputManager", constructor)
     stack = _make_hybrid_stack(num_layers, 0)
     compute = Mock(wraps=stack._compute_mhc_block_end_plan)
     monkeypatch.setattr(stack, "_compute_mhc_block_end_plan", compute)
 
+    with pytest.warns(DeprecationWarning, match="build_residual_stream_recompute_plan"):
+        mhc_plan = build_mhc_recompute_layer_plan(num_layers, 0, enabled)
     for managers, block_ends in (
-        build_mhc_recompute_layer_plan(num_layers, 0, enabled),
+        mhc_plan,
         HybridStack._build_mhc_recompute_layer_plan(stack, enabled),
     ):
         assert isinstance(managers, list)
@@ -236,7 +250,7 @@ def test_disabled_or_empty_mhc_adapters_do_not_allocate(monkeypatch, num_layers,
 @pytest.mark.parametrize(
     "finalize",
     [
-        residual_recompute_plan.finalize_recompute_block,
+        residual_recompute.finalize_recompute_block,
         finalize_mhc_recompute_layer,
         HybridStack._finalize_mhc_recompute_layer,
     ],
@@ -247,12 +261,21 @@ def test_finalization_dispatches_only_at_boundaries(finalize):
     manager = Mock(spec=CheckpointWithoutOutputManager)
     dispatch = manager.discard_all_outputs_and_register_unified_recompute
 
-    assert finalize(None, hidden_states, False) is None
-    assert finalize(None, hidden_states, True) is None
-    assert finalize(manager, hidden_states, False) is None
-    dispatch.assert_not_called()
+    warning_context = (
+        pytest.warns(DeprecationWarning, match=r"ResidualStreamRecomputeContext\.finalize")
+        if finalize is finalize_mhc_recompute_layer
+        else nullcontext()
+    )
+    with warning_context as warnings:
+        assert finalize(None, hidden_states, False) is None
+        assert finalize(None, hidden_states, True) is None
+        assert finalize(manager, hidden_states, False) is None
+        dispatch.assert_not_called()
 
-    assert finalize(manager, hidden_states, True) is None
+        assert finalize(manager, hidden_states, True) is None
+    if warnings is not None:
+        assert len(warnings) == 4
+        assert all(warning.filename == __file__ for warning in warnings)
     dispatch.assert_called_once_with(hidden_states)
     assert dispatch.call_args.args[0] is hidden_states
 

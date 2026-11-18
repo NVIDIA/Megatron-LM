@@ -19,7 +19,6 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
 )
-from megatron.core.tokenizers.utils.build_tokenizer import build_tokenizer
 from megatron.core.transformer.module import MegatronModule
 from megatron.inference.utils import (
     add_inference_args,
@@ -161,14 +160,14 @@ def main():
             'exit_on_missing_checkpoint': True,
         },
     )
-    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    set_run_config(inference_cfg_container_from_args(args))
     initialize_megatron()
 
     args = get_args()
 
     model = get_model_for_inference()
 
-    tokenizer = build_tokenizer(args)
+    tokenizer = get_tokenizer()
 
     assert (args.prompts is None) ^ (
         args.num_input_tokens is None
