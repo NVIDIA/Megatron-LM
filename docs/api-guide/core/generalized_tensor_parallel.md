@@ -785,8 +785,10 @@ A weight can be kept **out** of a chain by setting `weight.prefetch_initialized 
 
 **Production defaults require no user calls.** After DDP wrapping,
 `classify_gtp_remat_chains` registers dense, grouped-expert FC1, and grouped-expert FC2
-chains per process group, preserving explicit overrides and skipping replicated weights.
-Both Mamba projections stay in the dense chain.
+chains per process group and model chunk, preserving explicit overrides and skipping
+replicated weights. Both Mamba projections stay in their chunk's dense chain.
+Virtual pipeline chunks execute forward and backward independently; separate default
+chains prevent one chunk's gather from overwriting another chunk's live weight buffer.
 
 For a custom chain, register after parameter wrapping and before classification/warmup:
 
