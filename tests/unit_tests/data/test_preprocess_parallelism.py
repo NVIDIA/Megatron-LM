@@ -14,8 +14,23 @@ import pytest
 
 @pytest.mark.skipif(os.name != "posix", reason="requires process-group cleanup")
 @pytest.mark.parametrize("start_method", multiprocessing.get_all_start_methods())
-@pytest.mark.parametrize("parallelism", [None, "true", "false"], ids=["unset", "true", "false"])
-def test_preprocess_parallelism(tmp_path: Path, start_method: str, parallelism: str | None) -> None:
+@pytest.mark.parametrize(
+    "parallelism,enable_parallelism,expected",
+    [
+        pytest.param(None, False, "false", id="default"),
+        pytest.param("true", False, "true", id="env-true"),
+        pytest.param("false", False, "false", id="env-false"),
+        pytest.param(None, True, "true", id="flag"),
+        pytest.param("false", True, "false", id="env-overrides-flag"),
+    ],
+)
+def test_preprocess_parallelism(
+    tmp_path: Path,
+    start_method: str,
+    parallelism: str | None,
+    enable_parallelism: bool,
+    expected: str,
+) -> None:
     """Check initialization order, process isolation, overrides, and encoded output."""
     env = dict(os.environ)
     env.pop("TOKENIZERS_PARALLELISM", None)
@@ -31,7 +46,10 @@ def test_preprocess_parallelism(tmp_path: Path, start_method: str, parallelism: 
         "tests.unit_tests.data.preprocess_parallelism_runner",
         start_method,
         str(tmp_path),
+        expected,
     ]
+    if enable_parallelism:
+        command.append("--tokenizer-parallelism")
     with subprocess.Popen(
         command,
         cwd=root,

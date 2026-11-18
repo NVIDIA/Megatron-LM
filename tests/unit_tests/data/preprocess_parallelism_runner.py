@@ -8,7 +8,6 @@ import multiprocessing as mp
 import os
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 PARALLELISM = "TOKENIZERS_PARALLELISM"
 _INITIAL_VALUE = os.environ.get(PARALLELISM)
@@ -42,11 +41,10 @@ def _check_observations(directory: Path, expected: str, count: int) -> None:
         assert json.loads(path.read_text())["parallelism"] == expected, path.read_text()
 
 
-def main(start_method: str, directory: Path) -> None:
+def main(start_method: str, directory: Path, expected: str, tokenizer_args: list[str]) -> None:
     """Exercise an independent worker and a partition with a nested worker pool."""
     assert _VALUE_AFTER_IMPORT == _INITIAL_VALUE, "Import changed tokenizer parallelism"
     mp.set_start_method(start_method)
-    expected = "false" if _INITIAL_VALUE is None else _INITIAL_VALUE
     # Prime the forkserver while the setting is still unset (or user-supplied).
     # This also proves the selected context starts workers with the initial value.
     with mp.Pool(1) as pool:
@@ -54,16 +52,25 @@ def main(start_method: str, directory: Path) -> None:
 
     worker_dir = directory / "worker"
     worker_dir.mkdir()
-    args = SimpleNamespace(
-        tokenizer_type="NullTokenizer",
-        vocab_size=32,
-        split_sentences=False,
-        json_keys=["text"],
-        append_eod=False,
-        log_interval=100,
-        find_optimal_num_workers=False,
-        observation_dir=str(worker_dir),
-    )
+    input_path = directory / "input.jsonl"
+    prefix = str(directory / "tokens")
+    sys.argv = [
+        "preprocess_data.py",
+        "--tokenizer-type",
+        "NullTokenizer",
+        "--vocab-size",
+        "32",
+        "--input",
+        str(input_path),
+        "--output-prefix",
+        prefix,
+        "--workers",
+        "1",
+        *tokenizer_args,
+    ]
+    args = preprocess_data.get_args()
+    assert os.environ.get(PARALLELISM) == _INITIAL_VALUE
+    args.observation_dir = str(worker_dir)
     document = json.dumps({"text": "1 2"})
     encoder = preprocess_data.Encoder(args)
     # Exercise this path independently so a partition's default cannot mask
@@ -78,9 +85,7 @@ def main(start_method: str, directory: Path) -> None:
     partition_dir = directory / "partition"
     partition_dir.mkdir()
     args.observation_dir = str(partition_dir)
-    input_path = directory / "input.jsonl"
     input_path.write_text(document + "\n")
-    prefix = str(directory / "tokens")
     partition = preprocess_data.Partition(args, workers=1)
     process = mp.Process(target=partition.process_json_file, args=((str(input_path), prefix),))
     process.start()
@@ -104,4 +109,4 @@ def main(start_method: str, directory: Path) -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], Path(sys.argv[2]))
+    main(sys.argv[1], Path(sys.argv[2]), sys.argv[3], sys.argv[4:])
