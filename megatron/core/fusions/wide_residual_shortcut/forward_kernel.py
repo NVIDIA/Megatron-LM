@@ -680,10 +680,8 @@ def _mix_fragment(
         write = _coefficient(coefficients, stream)
         retain = _coefficient(coefficients, STREAMS + stream) if HAS_RETENTION else 1.0
 
-        separate = write * update + retain * old
-        # The native writer's row/stream FMA contraction pattern, which replay reproduces.
-        contracted = (stream == 0) | ((stream == 1) & (row % 32 < 12))
-        value = gl.where(contracted, gl.fma(write, update, retain * old), separate)
+        # One rounded retain product, then a fused write: the rounding replay reproduces.
+        value = gl.fma(write, update, retain * old)
 
         stored = value.to(write_tensors.output.dtype.element_ty)  # RN for a BF16 residual
         if not CONFIG.STORE_LATE:

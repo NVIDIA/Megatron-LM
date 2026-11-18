@@ -471,20 +471,13 @@ def test_interval_replay_matches_forward_bits(depth, streams, columns):
 
 
 def _advance(previous, tape):
-    """Emulate the forward's RN/FMA residual write in FP64."""
+    """Emulate the forward's residual write in FP64: an RN retain product, then one FMA."""
     m, h = tape.update.shape
     c = tape.coefficients.double().view(8, tape.num_streams)
-    rows = torch.arange(m, device=previous.device)[:, None]
     result = []
     for stream, value in enumerate(previous.view(m, tape.num_streams, h).unbind(1)):
         retained = (value.double() * c[1, stream]).float().double()
-        update = tape.update.double() * c[0, stream]
-        fused = (stream == 0) | ((stream == 1) & (rows % 32 < 12))
-        result.append(
-            torch.where(
-                fused, (retained + update).float(), (retained + update.float().double()).float()
-            )
-        )
+        result.append((retained + tape.update.double() * c[0, stream]).float())
     return torch.stack(result, 1).flatten(1)
 
 
