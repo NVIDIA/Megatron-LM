@@ -35,7 +35,7 @@ except ImportError as exc:
 from . import layout_builder
 from .dbuffer import DBuffer
 from .layout import GlobalLayout, Shape
-from .placement import BlockAtomic, RowAtomic
+from .placement import BlockAtomic, RowAtomic, ShardLayout
 
 _MXFP8_DTYPE = tex.DType.kFloat8E4M3
 _MXFP8_BLOCK_SIZE = 32
@@ -205,10 +205,24 @@ class QuantizedDBuffer:
         placements: Iterable[Placement],
         tensor_shapes: Iterable[Shape],
         device: torch.device | str,
+        *,
+        shard_layout: ShardLayout = ShardLayout.PADDED,
     ) -> "QuantizedDBuffer":
-        """Build an MXFP8 layout from logical tensor shapes and allocate its planes."""
-        layout = layout_builder.build_for_row_atomic(
-            tensor_shapes, dp_size=mesh.size(), block_size=_MXFP8_BLOCK_SIZE
+        """Build an MXFP8 layout from logical tensor shapes and allocate its planes.
+
+        Args:
+            mesh: Device mesh whose dimensions correspond to ``placements``.
+            placements: Per-mesh-axis DBuffer placements.
+            tensor_shapes: Logical 2D shapes that the buffer manages.
+            device: Device for the local planes.
+            shard_layout: Padded (equal) or unpadded (32-row-block-aligned, unequal) rank
+                segments; see ``DBuffer.empty``.
+        """
+        layout = layout_builder.build_row_atomic_layout(
+            tensor_shapes,
+            dp_size=mesh.size(),
+            block_size=_MXFP8_BLOCK_SIZE,
+            shard_layout=shard_layout,
         )
         return cls(mesh, placements, layout, device)
 
@@ -341,6 +355,13 @@ class QuantizedDBuffer:
         for plane in self.planes_for(rowwise=True, columnwise=not rowwise_only):
             plane.release_storage()
 
+    def can_redistribute_locally(self, placements: Iterable[Placement]) -> bool:
+        """Whether every plane can preserve its values through a local view.
+
+        All planes use the same mesh partition, so the rowwise-data check suffices.
+        """
+        return self.rowwise_data.can_redistribute_locally(placements)
+
     def view(self, placements: Iterable[Placement]) -> "QuantizedDBuffer":
         """Return a storage-sharing view of every physical plane."""
         placements = tuple(placements)
@@ -351,6 +372,12 @@ class QuantizedDBuffer:
             self.columnwise_data.view(placements),
             self.rowwise_scale.view(placements),
             self.columnwise_scale.view(_block_atomic_to_flat(placements)),
+        )
+
+    def is_alias_of(self, other: "QuantizedDBuffer") -> bool:
+        """Whether every corresponding plane shares backing storage."""
+        return all(
+            plane.is_alias_of(other_plane) for plane, other_plane in zip(self.planes, other.planes)
         )
 
     def redistribute(

@@ -1,8 +1,11 @@
 # Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 """Mamba layer specialization for streamwise wide-residual connections."""
 
+from contextlib import nullcontext
+
 from torch import Tensor
 
+from megatron.core.dist_checkpointing.mapping import ShardedStateDict
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_layer import MambaLayer, MambaLayerSubmodules
 from megatron.core.transformer.identity_op import IdentityOp
@@ -10,14 +13,11 @@ from megatron.core.transformer.residual_connection import (
     ResidualBranchInput,
     ResidualConnectionState,
 )
-from megatron.core.transformer.residual_recompute import (
-    ResidualStreamRecomputeContext,
-    checkpoint_residual_read,
-    checkpoint_residual_write,
-)
+from megatron.core.transformer.residual_recompute import ResidualStreamRecomputeContext
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.wide_residual_layer import (
+from megatron.core.transformer.wide_residual import (
     StreamwiseSigmoidWideResidualConnection,
+    apply_combined_residual_keys,
     load_residual_state,
 )
 from megatron.core.typed_torch import apply_module
@@ -84,6 +84,14 @@ class WideResidualMambaLayer(MambaLayer):
                 f"{self.residual_read.branch_hidden_size}."
             )
 
+    def sharded_state_dict(
+        self, prefix: str = "", sharded_offsets: tuple = (), metadata: dict | None = None
+    ) -> ShardedStateDict:
+        """Build the sharded state dict, using combined residual keys when loading them."""
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        apply_combined_residual_keys(sharded_state_dict, prefix, metadata)
+        return sharded_state_dict
+
     def _get_residual_connection(self):
         """Return the connection surrounding the Mamba mixer."""
 
@@ -97,20 +105,12 @@ class WideResidualMambaLayer(MambaLayer):
         """Read the wide stream and optionally replay its connected input normalization."""
 
         recompute_context = residual_stream_recompute_context
-        if recompute_context is None:
-            hidden_states, connection_state = apply_module(self.residual_read)(
-                hidden_states,
-                fp32_residual_connection=self.config.fp32_residual_connection,
-                branch_input_dtype=self.config.params_dtype,
-            )
-        else:
-            hidden_states, connection_state = checkpoint_residual_read(
-                self.residual_read,
-                hidden_states,
-                recompute_context,
-                fp32_residual_connection=self.config.fp32_residual_connection,
-                branch_input_dtype=self.config.params_dtype,
-            )
+        hidden_states, connection_state = apply_module(self.residual_read)(
+            hidden_states,
+            fp32_residual_connection=self.config.fp32_residual_connection,
+            branch_input_dtype=self.config.params_dtype,
+            recompute_context=recompute_context,
+        )
         # Validate the carried state before normalization can consume a hook-modified read.
         self.residual_read.residual_stream(connection_state)
 
@@ -131,21 +131,27 @@ class WideResidualMambaLayer(MambaLayer):
 
         if state is None:
             raise RuntimeError("Missing state for the Mamba residual connection.")
-        if recompute_context is not None and not recompute_context.is_block_end:
-            return checkpoint_residual_write(
-                self.residual_write,
-                mixer_out_with_bias,
-                state,
-                recompute_context,
-                dropout_probability=self.hidden_dropout,
-                training=self.training,
-            )
-        with self.bias_dropout_add_exec_handler():
+        # Block finalization discards checkpointed outputs. Keep the final write eager
+        # so its output stays live for the next forward operation and backward replay hook.
+        write_recompute_context = (
+            recompute_context
+            if recompute_context is not None and not recompute_context.is_block_end
+            else None
+        )
+        # Preserve the eager grad handler. Checkpointing must see the caller's grad mode
+        # so an outer no_grad() still disables replay registration.
+        grad_scope = (
+            self.bias_dropout_add_exec_handler()
+            if write_recompute_context is None
+            else nullcontext()
+        )
+        with grad_scope:
             return apply_module(self.residual_write)(
                 mixer_out_with_bias,
                 state=state,
                 dropout_probability=self.hidden_dropout,
                 training=self.training,
+                recompute_context=write_recompute_context,
             )
 
     def _pack_two_stage_output(

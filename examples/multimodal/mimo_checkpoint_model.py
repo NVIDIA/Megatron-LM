@@ -10,8 +10,10 @@ state dict uses the checkpoint's MIMO key names, so it loads with the standard c
 
 from dataclasses import replace
 
+from megatron.training.global_vars import get_run_config
 import torch
 
+from megatron.core.activations import unfused_fast_gelu as _unfused_fast_gelu
 from megatron.core.dist_checkpointing.dict_utils import nested_values
 from megatron.core.dist_checkpointing.mapping import ShardedTensor, ShardedTensorFactory
 from megatron.core.dist_checkpointing.utils import apply_prefix_mapping
@@ -34,15 +36,6 @@ _VISION_SIZE_FIELDS = (
     "num_query_groups",
     "kv_channels",
 )
-
-
-def _unfused_fast_gelu(x: torch.Tensor) -> torch.Tensor:
-    """Fast GELU without the global MCore torch.compile decorator.
-
-    The projection input's token count varies with the number and size of images, so a compiled
-    activation would recompile for each new shape.
-    """
-    return 0.5 * x * (1.0 + torch.tanh(x * 0.7978845608 * (1.0 + 0.044715 * x * x)))
 
 
 _PROJECTION_ACTIVATIONS = {"gelu": torch.nn.functional.gelu, "fast_gelu": _unfused_fast_gelu}
@@ -128,7 +121,10 @@ def vision_projection_config(args, language_config: TransformerConfig, add_bias:
         num_layers=1,
         hidden_size=language_config.hidden_size,
         ffn_hidden_size=language_config.hidden_size,
-        num_attention_heads=1,
+        # The projection is an MLP with no attention, but TransformerConfig requires a head
+        # count divisible by the TP size. Inherit the language model's, which is valid at any TP
+        # the language model runs at (as LLaVA's projection config does).
+        num_attention_heads=language_config.num_attention_heads,
         activation_func=_PROJECTION_ACTIVATIONS[args.vision_projection_activation],
         gated_linear_unit=False,
         add_bias_linear=add_bias,
@@ -148,6 +144,7 @@ def model_provider(
 ) -> LLaVAModel:
     """Build a LLaVAModel that loads the MIMO checkpoint described by the arguments."""
     args = get_args()
+    cfg_container = get_run_config()
     print_rank_0('building a LLaVA model for a MIMO checkpoint ...')
 
     language_model_config = hybrid_config_from_args(args, config)
@@ -162,7 +159,7 @@ def model_provider(
         checkpoint_prefix_map=args.mimo_checkpoint_prefix_map,
         language_transformer_config=language_config,
         language_transformer_layer_spec=resolve_hybrid_stack_spec(language_model_config),
-        language_vocab_size=args.padded_vocab_size,
+        language_vocab_size=cfg_container.tokenizer.padded_vocab_size,
         language_max_sequence_length=args.max_position_embeddings,
         vision_transformer_config=encoder_config,
         vision_transformer_layer_spec=get_vit_layer_with_transformer_engine_spec(),
@@ -193,7 +190,7 @@ def model_provider(
         conv_merging=args.conv_merging,
         dynamic_resolution=args.dynamic_resolution,
         max_num_tiles=args.max_num_tiles,
-        tokenizer_type=args.tokenizer_prompt_format,
+        tokenizer_type=cfg_container.tokenizer.tokenizer_prompt_format,
         pg_collection=pg_collection,
         vp_stage=vp_stage,
     )

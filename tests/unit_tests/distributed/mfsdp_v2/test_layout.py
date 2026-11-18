@@ -9,7 +9,10 @@ from torch.distributed.tensor import Replicate
 
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental import layout_builder
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.layout import GlobalLayout
-from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import RowAtomic
+from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.placement import (
+    RowAtomic,
+    ShardLayout,
+)
 from megatron.core.distributed.fsdp.src.megatron_fsdp.experimental.range import Range
 
 
@@ -30,6 +33,104 @@ def test_layout_aligns_fragment_offsets_to_rows():
 
     assert layout.tensor_to_offset == (0, 18)
     assert layout.size == 24
+
+
+def test_uneven_layout_packs_without_padding_and_snaps_to_row_boundaries():
+    """The uneven builder stores exactly the data and rounds the even split to a row edge."""
+    shapes = [torch.Size((2, 6)), torch.Size((4, 4)), torch.Size((1, 2))]
+    layout = layout_builder.build_for_row_atomic_unpadding(shapes, dp_size=2)
+
+    assert layout.tensor_shapes == tuple(shapes)
+    assert layout.tensor_to_offset == (0, 12, 28)
+    assert layout.size == 30
+    # The even split at 15 lands inside P1 (row size 4) and snaps to its row boundary at 16.
+    assert layout.rank_to_offset == (0, 16)
+    assert not layout.has_equal_shard_sizes
+
+
+def test_uneven_layout_keeps_blocks_whole():
+    """Block boundaries, not row boundaries, are the snapping unit for BlockAtomic."""
+    shapes = [torch.Size((4, 3)), torch.Size((6, 2))]
+    layout = layout_builder.build_for_row_atomic_unpadding(shapes, dp_size=4, block_size=2)
+
+    assert layout.size == 24
+    # Even splits 6, 12, 18: P0 blocks are 6 elements, P1 blocks are 4 elements starting at 12,
+    # so 18 is equidistant from 16 and 20 and rounds down.
+    assert layout.rank_to_offset == (0, 6, 12, 16)
+    assert [layout.rank_size(rank) for rank in range(4)] == [6, 6, 4, 8]
+
+
+def test_uneven_layout_leaves_ranks_empty_when_boundaries_are_scarce():
+    """Fewer row boundaries than ranks leaves some ranks with empty segments."""
+    layout = layout_builder.build_for_row_atomic_unpadding([torch.Size((2, 8))], dp_size=4)
+
+    assert layout.rank_to_offset == (0, 0, 8, 8)
+    assert [layout.rank_size(rank) for rank in range(4)] == [0, 8, 0, 8]
+
+    empty = layout_builder.build_for_row_atomic_unpadding([torch.Size((0, 8))], dp_size=3)
+    assert empty.size == 0
+    assert empty.rank_to_offset == (0, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "build",
+    [layout_builder.build_for_row_atomic, layout_builder.build_for_row_atomic_unpadding],
+    ids=["padded", "unpadded"],
+)
+def test_row_atomic_builders_reject_invalid_shapes_and_sizes(build):
+    """Both RowAtomic builders share the same shape and size validation."""
+    with pytest.raises(ValueError, match="DP size must be positive"):
+        build([torch.Size((4, 4))], dp_size=0)
+    with pytest.raises(ValueError, match="Block size must be positive"):
+        build([torch.Size((4, 4))], dp_size=2, block_size=0)
+    with pytest.raises(ValueError, match="zero-sized non-leading dims"):
+        build([torch.Size((4, 0))], dp_size=2)
+    with pytest.raises(ValueError, match="must be divisible by block size"):
+        build([torch.Size((6, 4))], dp_size=2, block_size=4)
+
+
+def test_build_row_atomic_layout_dispatches_on_shard_layout():
+    """The dispatcher selects the padded or unpadded builder and rejects anything else."""
+    shapes = [torch.Size((2, 6)), torch.Size((4, 4)), torch.Size((1, 2))]
+    padded = layout_builder.build_row_atomic_layout(
+        shapes, dp_size=2, shard_layout=ShardLayout.PADDED
+    )
+    unpadded = layout_builder.build_row_atomic_layout(
+        shapes, dp_size=2, shard_layout=ShardLayout.UNPADDED
+    )
+    assert padded == layout_builder.build_for_row_atomic(shapes, dp_size=2)
+    assert unpadded == layout_builder.build_for_row_atomic_unpadding(shapes, dp_size=2)
+    with pytest.raises(ValueError, match="Unsupported shard layout"):
+        layout_builder.build_row_atomic_layout(shapes, dp_size=2, shard_layout="padded")
+
+
+def test_validate_for_row_atomic_checks_boundaries_not_segment_sizes():
+    """Unequal segments pass when every boundary is a whole number of rows into its tensor."""
+    shapes = (torch.Size((4, 4)), torch.Size((2, 4)))
+    GlobalLayout(
+        tensor_shapes=shapes, tensor_to_offset=(0, 16), size=24, rank_to_offset=(0, 20)
+    ).validate_for_row_atomic()
+    # Tensor starts need not be globally aligned: the boundary at 15 is row-aligned
+    # relative to the (3, 5) tensor that starts at 10.
+    GlobalLayout(
+        tensor_shapes=(torch.Size((2, 5)), torch.Size((3, 5))),
+        tensor_to_offset=(0, 10),
+        size=25,
+        rank_to_offset=(0, 15),
+    ).validate_for_row_atomic()
+
+    split_row = GlobalLayout(
+        tensor_shapes=shapes, tensor_to_offset=(0, 16), size=24, rank_to_offset=(0, 18)
+    )
+    with pytest.raises(ValueError, match="Rank offsets.*incompatible with alignment 4"):
+        split_row.validate_for_row_atomic()
+
+    split_block = GlobalLayout(
+        tensor_shapes=shapes, tensor_to_offset=(0, 16), size=24, rank_to_offset=(0, 4)
+    )
+    split_block.validate_for_row_atomic()
+    with pytest.raises(ValueError, match="Rank offsets.*incompatible with alignment 8"):
+        split_block.validate_for_row_atomic(block_size=2)
 
 
 def test_tensor_atomic_layout_preserves_tensor_ids_with_non_monotonic_owners():
