@@ -344,6 +344,7 @@ class MegatronLLMEngine(LLMEngine):
         if not token_ids:
             raise ValueError("Megatron backend requires token_ids")
         params = build_sampling_params(request)
+        params.add_attributes({"streaming_interval": self.config.streaming_interval})
         n = int((request.get("sampling_options") or {}).get("n") or 1)
         if n != 1:
             raise ValueError("Megatron Dynamo backend currently supports sampling n=1")
