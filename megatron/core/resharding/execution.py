@@ -144,9 +144,7 @@ def _resolve_refit_dtypes(gathered) -> dict[int, torch.dtype]:
                 if previous_buffer_dtype != receive_dtype:
                     # Validate N-to-1 sends globally so every participating rank
                     # fails before any destination buffer is modified.
-                    raise ValueError(
-                        f"Source shards disagree on buffer dtype for {param_name}."
-                    )
+                    raise ValueError(f"Source shards disagree on buffer dtype for {param_name}.")
             # Track the destination dtype by task for source dtype casting.
             previous = task_dtypes.setdefault(task_id, receive_dtype)
             if previous != receive_dtype:
