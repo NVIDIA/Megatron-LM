@@ -19,6 +19,7 @@ import threading
 from typing import Optional
 
 import torch
+from packaging import version
 
 try:
     from causal_conv1d.cpp_functions import causal_conv1d_bwd_function, causal_conv1d_fwd_function
@@ -33,12 +34,19 @@ except ImportError:
 
 CUDNN_MAMBA2_HEAD_DIM = 64
 CUDNN_MAMBA2_STATE_DIM = 128
+# Training convergence is validated from this release on; earlier releases compute less accurate
+# dt_bias and A_log gradients.
+CUDNN_FRONTEND_MIN_VERSION = "1.33.0"
 
 
 @functools.lru_cache(maxsize=None)
 def _cudnn_mamba2_import_error() -> Optional[str]:
-    """Register torch.ops.cudnn.mamba2_* on first use; importing cudnn pulls in the CuTe DSL."""
+    """Register torch.ops.cudnn.mamba2_* on first use; importing the ops pulls in the CuTe DSL."""
     try:
+        import cudnn
+
+        if version.parse(cudnn.__version__) < version.parse(CUDNN_FRONTEND_MIN_VERSION):
+            return f"found {cudnn.__version__}"
         import cudnn.linear_attention.ops  # noqa: F401  pylint: disable=unused-import
     except (ImportError, OSError) as exc:
         return f"{type(exc).__name__}: {exc}"
@@ -58,7 +66,10 @@ def cudnn_mamba2_unsupported_reason(headdim: int, d_state: int) -> Optional[str]
         return "causal_conv1d.cpp_functions (causal-conv1d) is not installed"
     import_error = _cudnn_mamba2_import_error()
     if import_error is not None:
-        return f"the cuDNN Mamba-2 ops need nvidia-cudnn-frontend[cutedsl]>=1.32.0 ({import_error})"
+        return (
+            f"the cuDNN Mamba-2 ops need nvidia-cudnn-frontend[cutedsl]>="
+            f"{CUDNN_FRONTEND_MIN_VERSION} ({import_error})"
+        )
     if not torch.cuda.is_available():
         return "no CUDA device is available"
     major, minor = torch.cuda.get_device_capability()
@@ -68,9 +79,21 @@ def cudnn_mamba2_unsupported_reason(headdim: int, d_state: int) -> Optional[str]
     return None
 
 
+# The channel-last conv and the cuDNN kernels' TMA loads and stores need [b, l, d] buffers whose
+# row stride, stride(1), is a multiple of 8 (16 bytes in 16-bit types). The slices of zxBCdt and
+# dzxBCdt share its row of 129 * nheads + 256 * ngroups values, aligned only when nheads is a
+# multiple of 8; cuDNN does not check this, so other head counts go through packed copies.
+
+
 def _ensure_stride(t: torch.Tensor) -> torch.Tensor:
-    """The channel-last conv needs stride(1) of a [b, l, d] tensor to be a multiple of 8."""
-    return t if t.stride(1) % 8 == 0 else t.contiguous()
+    """``t``, or a packed copy if its row stride is not a multiple of 8."""
+    # Not contiguous(): PyTorch calls a [1, 1, d] slice contiguous whatever its row stride.
+    return t if t.stride(1) % 8 == 0 else t.clone(memory_format=torch.contiguous_format)
+
+
+def _aligned_out(t: torch.Tensor) -> torch.Tensor:
+    """``t``, or a packed buffer to copy into ``t`` if its row stride is not a multiple of 8."""
+    return t if t.stride(1) % 8 == 0 else t.new_empty(t.shape)
 
 
 def _conv1d_silu(xBC, weight, bias, seq_idx, out=None):
@@ -236,14 +259,14 @@ class CudnnMambaSplitConv1dScanCombinedFn(torch.autograd.Function):
         # cudnn-frontend 1.33 appends composed_initial_state to the outputs.
         y, _, _, y_pre, *_ = torch.ops.cudnn.mamba2_fwd(
             x,
-            dt.flatten(0, 1),
+            _ensure_stride(dt).flatten(0, 1),
             A,
             B,
             C,
             cu_seqlens,
             D=D,
             dt_bias=dt_bias,
-            z=_heads(z, headdim),
+            z=_heads(_ensure_stride(z), headdim),
             output_pre_gate=True,
             batch_invariant=batch_invariant,
         )
@@ -278,30 +301,35 @@ class CudnnMambaSplitConv1dScanCombinedFn(torch.autograd.Function):
             ngroups,
             headdim,
         )
-        # dz and ddt go straight into their dzxBCdt slices, and dx, dB and dC into one dxBC
-        # buffer for the conv backward.
+        # dz and ddt go straight into their dzxBCdt slices if its rows are aligned, and dx, dB and
+        # dC into one dxBC buffer for the conv backward.
+        dz_out, ddt_out = _aligned_out(dz), _aligned_out(ddt)
         dxBC = zxBCdt.new_empty(batch, seqlen, conv_dim)
         dx, dB, dC = _split_xBC(dxBC, d_inner, ngroups, headdim)
         dA, dD, ddt_bias = _mamba2_bwd(
             _heads(dy.contiguous(), headdim),
             x,
-            dt.flatten(0, 1),
+            _ensure_stride(dt).flatten(0, 1),
             A,
             B,
             C,
             cu_seqlens,
             D,
             dt_bias,
-            _heads(z, headdim),
+            _heads(_ensure_stride(z), headdim),
             y_pre,
             ctx.batch_invariant,
             dx=dx,
-            ddt=ddt.flatten(0, 1),
+            ddt=ddt_out.flatten(0, 1),
             dB=dB,
             dC=dC,
-            dz=_heads(dz, headdim),
+            dz=_heads(dz_out, headdim),
         )
         del x, B, C, dx, dB, dC
+        if dz_out is not dz:
+            dz.copy_(dz_out)
+            ddt.copy_(ddt_out)
+            del dz_out, ddt_out
 
         dxBC_in, dweight, dbias, *_ = causal_conv1d_bwd_function(
             _ensure_stride(xBC).transpose(1, 2),

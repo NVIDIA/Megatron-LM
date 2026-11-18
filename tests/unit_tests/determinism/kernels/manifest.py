@@ -549,7 +549,8 @@ KERNELS: Tuple[KernelEntry, ...] = (
         "(torch.ops.cudnn.mamba2_fwd) and backward (cudnn.pygraph mamba2_bwd) around the "
         "causal_conv1d channel-last conv, replayed forward and backward, batched and packed, "
         "with and without batch_invariant. Needs SM100-SM103/SM107 and "
-        "nvidia-cudnn-frontend[cutedsl]; the tests skip on the H100 kernel bucket.",
+        "nvidia-cudnn-frontend[cutedsl]: the cuDNN cases are marked launch_on_gb200 and skip "
+        "on H100.",
     ),
     KernelEntry(
         name="ssm_common_kernels",

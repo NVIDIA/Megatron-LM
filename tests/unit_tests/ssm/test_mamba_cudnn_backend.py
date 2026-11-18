@@ -2,6 +2,9 @@
 
 """mamba_kernel_backend='cudnn' against the Triton training path of MambaMixer."""
 
+import sys
+import types
+
 import pytest
 import torch
 
@@ -9,7 +12,11 @@ from megatron.core.models.hybrid.hybrid_layer_specs import hybrid_stack_spec
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.ssm.mamba_mixer import MambaMixer
-from megatron.core.ssm.ops.mamba2.cudnn_ssd import cudnn_mamba2_unsupported_reason
+from megatron.core.ssm.ops.mamba2.cudnn_ssd import (
+    _cudnn_mamba2_import_error,
+    _ensure_stride,
+    cudnn_mamba2_unsupported_reason,
+)
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
@@ -18,17 +25,14 @@ HIDDEN_SIZE = 256
 
 
 def _config(**kwargs):
-    return TransformerConfig(
-        hidden_size=HIDDEN_SIZE,
-        num_layers=1,
-        num_attention_heads=1,
-        use_cpu_initialization=True,
-        **kwargs,
+    defaults = dict(
+        hidden_size=HIDDEN_SIZE, num_layers=1, num_attention_heads=1, use_cpu_initialization=True
     )
+    return TransformerConfig(**(defaults | kwargs))
 
 
 def _mixer(config, **kwargs):
-    pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=['tp', 'cp'])
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups(required_pgs=["tp", "cp"])
     return MambaMixer(
         config,
         hybrid_stack_spec.submodules.mamba_layer.submodules.mixer.submodules,
@@ -59,6 +63,30 @@ def test_config_rejects_unknown_backend():
         _config(mamba_kernel_backend="cutlass")
 
 
+def test_ensure_stride_aligns_rows():
+    # A [1, 1, d] slice is contiguous to PyTorch whatever its row stride.
+    one_token = torch.randn(1, 1, 385)[..., :320]
+    assert one_token.is_contiguous() and one_token.stride(1) == 385
+    aligned = _ensure_stride(one_token)
+    assert aligned.stride(1) % 8 == 0 and torch.equal(aligned, one_token)
+
+    multi_token = torch.randn(2, 3, 385)[..., :320]
+    aligned = _ensure_stride(multi_token)
+    assert aligned.stride(1) % 8 == 0 and torch.equal(aligned, multi_token)
+
+    already_aligned = torch.randn(1, 4, 392)[..., :320]
+    assert _ensure_stride(already_aligned) is already_aligned
+
+
+def test_rejects_old_cudnn_frontend(monkeypatch):
+    monkeypatch.setitem(sys.modules, "cudnn", types.SimpleNamespace(__version__="1.32.0"))
+    _cudnn_mamba2_import_error.cache_clear()
+    try:
+        assert _cudnn_mamba2_import_error() == "found 1.32.0"
+    finally:
+        _cudnn_mamba2_import_error.cache_clear()
+
+
 class TestMambaCudnnBackendErrorChecks:
 
     def setup_method(self, method):
@@ -81,6 +109,7 @@ class TestMambaCudnnBackendErrorChecks:
             _mixer(config)
 
 
+@pytest.mark.launch_on_gb200
 class TestMambaCudnnBackendParity:
 
     def setup_method(self, method):
@@ -94,15 +123,28 @@ class TestMambaCudnnBackendParity:
         Utils.destroy_model_parallel()
 
     @pytest.mark.parametrize(
-        "ngroups, D_has_hdim, packing",
-        [(8, False, None), (2, True, None), (8, False, "seq_idx"), (2, False, "cu_seqlens")],
+        "nheads, ngroups, D_has_hdim, packing",
+        [
+            (8, 8, False, None),
+            (8, 2, True, None),
+            (8, 8, False, "seq_idx"),
+            (8, 2, False, "cu_seqlens"),
+            # zxBCdt rows that are not 16-byte aligned, which go through packed copies.
+            (4, 2, False, None),
+            (12, 4, True, "cu_seqlens"),
+            (20, 4, False, "seq_idx"),
+        ],
     )
-    def test_matches_triton(self, ngroups, D_has_hdim, packing):
+    def test_matches_triton(self, nheads, ngroups, D_has_hdim, packing):
+        hidden_size = 32 * nheads
         mixer = _mixer(
-            _config(mamba_kernel_backend="cudnn", mamba_num_groups=ngroups), D_has_hdim=D_has_hdim
+            _config(
+                mamba_kernel_backend="cudnn", hidden_size=hidden_size, mamba_num_groups=ngroups
+            ),
+            D_has_hdim=D_has_hdim,
         )
         mixer = mixer.cuda().bfloat16()
-        assert mixer.use_cudnn_kernels
+        assert mixer.use_cudnn_kernels and mixer.nheads == nheads
 
         seqlen, batch = 512, 2
         packed_seq_params = None
@@ -118,7 +160,7 @@ class TestMambaCudnnBackendParity:
             )
             assert (packed_seq_params.seq_idx is not None) == (packing == "seq_idx")
 
-        hidden = torch.randn(seqlen, batch, HIDDEN_SIZE, device="cuda", dtype=torch.bfloat16)
+        hidden = torch.randn(seqlen, batch, hidden_size, device="cuda", dtype=torch.bfloat16)
         dout = torch.randn_like(hidden)
 
         mixer.use_cudnn_kernels = False
@@ -134,3 +176,26 @@ class TestMambaCudnnBackendParity:
             tol = 0.5 if name in ("A_log", "dt_bias", "D") else 2e-2
             assert grads[name] is not None, name
             assert _rel(grads[name], expected_grad) < tol, name
+
+    @pytest.mark.parametrize("ngroups", [1, 2])
+    def test_single_token(self, ngroups):
+        """One token with four heads, whose zxBCdt rows are not 16-byte aligned.
+
+        Compares the single-token output with token 0 of an 8-token run, both on the same cuDNN
+        mixer, which is causal. The gradients are only checked for being finite.
+        """
+        hidden_size = 128
+        mixer = _mixer(
+            _config(mamba_kernel_backend="cudnn", hidden_size=hidden_size, mamba_num_groups=ngroups)
+        )
+        mixer = mixer.cuda().bfloat16()
+        assert mixer.nheads == 4 and mixer.in_proj.weight.shape[0] % 8 != 0
+
+        hidden = torch.randn(8, 1, hidden_size, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            expected, _ = mixer(hidden)
+        actual, grads = _fwd_bwd(mixer, hidden[:1], torch.randn_like(hidden[:1]), None)
+
+        assert _rel(actual, expected[:1]) < 1e-2
+        for name, grad in grads.items():
+            assert grad is not None and torch.isfinite(grad).all(), name

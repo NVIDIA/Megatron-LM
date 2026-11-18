@@ -213,6 +213,7 @@ def test_mamba_chunk_scan_combined_varlen_replays():
     )
 
 
+@pytest.mark.launch_on_gb200
 @pytest.mark.parametrize("batch_invariant", [False, True], ids=["default", "batch-invariant"])
 @pytest.mark.parametrize("packed", [False, True], ids=["batched", "packed"])
 def test_cudnn_mamba_split_conv1d_scan_combined_replays(monkeypatch, packed, batch_invariant):

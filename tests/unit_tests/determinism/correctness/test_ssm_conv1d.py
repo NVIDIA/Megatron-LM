@@ -175,7 +175,9 @@ class TestMambaMixerDeterminism:
 
     @requires_deterministic_conv1d
     @pytest.mark.parametrize("packed_layout", ["none", "unpadded", "padded"])
-    @pytest.mark.parametrize("backend", ["triton", "cudnn"])
+    @pytest.mark.parametrize(
+        "backend", ["triton", pytest.param("cudnn", marks=pytest.mark.launch_on_gb200)]
+    )
     def test_mixer_replays_bit_exactly(self, monkeypatch, backend, packed_layout):
         """Two runs of one mixer agree bitwise under the deterministic conv reduction.
 
